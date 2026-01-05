@@ -288,6 +288,58 @@ export interface MindooTenant {
   ): Promise<void>;
 
   /**
+   * Encrypt a payload using the symmetric key identified by decryptionKeyId.
+   * For "default", uses the tenant encryption key.
+   * For named keys, uses the named symmetric key (trying newest versions first for key rotation).
+   * This method handles all key management internally.
+   * 
+   * @param payload The payload to encrypt (binary data)
+   * @param decryptionKeyId The key ID ("default" or a named key ID)
+   * @return The encrypted payload (binary data, AES-256-GCM)
+   */
+  encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array>;
+
+  /**
+   * Decrypt a payload using the symmetric key identified by decryptionKeyId.
+   * For "default", uses the tenant encryption key.
+   * For named keys, uses the named symmetric key (trying newest versions first for key rotation).
+   * This method handles all key management internally.
+   * 
+   * @param encryptedPayload The encrypted payload to decrypt (binary data, AES-256-GCM)
+   * @param decryptionKeyId The key ID ("default" or a named key ID)
+   * @return The decrypted payload (binary data)
+   */
+  decryptPayload(encryptedPayload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array>;
+
+  /**
+   * Validates a public signing key by checking if it belongs to a trusted user in the tenant.
+   * This is used for signature verification when loading changes from the append-only store.
+   * 
+   * @param publicKey The public signing key to validate (Ed25519, PEM format)
+   * @return True if the public key belongs to a trusted (registered and not revoked) user, false otherwise
+   */
+  validatePublicSigningKey(publicKey: string): Promise<boolean>;
+
+  /**
+   * Get the current user ID for the tenant.
+   * This provides user context for operations that need to know which user is performing them.
+   * Used for signing document changes.
+   * 
+   * @return The current user's public user ID (always set, never null)
+   */
+  getCurrentUserId(): Promise<PublicUserId>;
+
+  /**
+   * Sign a payload with the current user's signing private key.
+   * This is used by MindooDB operations (like changeDoc) to sign document changes.
+   * The signature proves authenticity and integrity of the payload.
+   * 
+   * @param payload The payload to sign (binary data)
+   * @return The signature (Ed25519 signature as Uint8Array)
+   */
+  signPayload(payload: Uint8Array): Promise<Uint8Array>;
+
+  /**
    * Convenience method to open the directory database for this tenant
    *
    * @return The directory database
@@ -359,37 +411,15 @@ export interface AppendOnlyStore {
 }
 
 /**
- * Document metadata stored in the first change of a document.
- * This metadata is embedded in the Automerge document itself and is accessible
- * after decrypting the first change.
- */
-export interface DocumentMetadata {
-  /**
-   * The ID of the symmetric key used to encrypt this document.
-   * "default" means tenant encryption key (all tenant members can decrypt).
-   * Other IDs refer to named symmetric keys (only users with that key can decrypt).
-   */
-  decryptionKeyId: string;
-
-  /**
-   * Optional list of user IDs that should have access to decrypt this document.
-   * Only relevant for named keys (not "default").
-   * For "default", all tenant members have access.
-   * This is informational - actual access is controlled by key distribution.
-   */
-  encryptedForUsers?: string[];
-
-  /**
-   * The timestamp when the document was created (milliseconds since Unix epoch)
-   */
-  createdAt: number;
-}
-
-/**
- * This is the public unencrypted data that we store about document
- * changes in the append only store.
+ * This is the meta data for changes and snapshots that we store for the document in the append only store.
+ * It does not contain the actual change/snapshot payload to save space during synchronization.
  */
 export interface MindooDocChangeHashes {
+  /**
+   * The type of this entry: "change" for document changes, "snapshot" for document snapshots.
+   */
+  type: "change" | "snapshot";
+
   /**
    * The ID of the document that the change is for (UUID7 format)
    *
@@ -412,7 +442,7 @@ export interface MindooDocChangeHashes {
   depsHashes: string[];
 
   /**
-   * The timestamp of the change in milliseconds since the Unix epoch
+   * The timestamp of the change creation in milliseconds since the Unix epoch
    */
   createdAt: number;
 
@@ -422,18 +452,6 @@ export interface MindooDocChangeHashes {
    * This is a cryptographic identifier that can be verified against signatures.
    */
   createdByPublicKey: string;
-}
-
-export interface MindooDocChange extends MindooDocChangeHashes {
-  /**
-   * The binary automerge change
-   */
-  payload: Uint8Array;
-
-  /**
-   * The signature of the change (signed with the user's signing key)
-   */
-  signature: Uint8Array;
 
   /**
    * The ID of the symmetric key used to encrypt this change.
@@ -442,6 +460,20 @@ export interface MindooDocChange extends MindooDocChangeHashes {
    * Always present if isEncrypted is true. If not specified, defaults to "default".
    */
   decryptionKeyId: string;
+
+  /**
+   * The signature of the change (signed with the user's signing key)
+   */
+  signature: Uint8Array;
+}
+
+export interface MindooDocChange extends MindooDocChangeHashes {
+  /**
+   * The binary payload data.
+   * - For type "change": Contains the binary Automerge change
+   * - For type "snapshot": Contains the binary Automerge snapshot
+   */
+  payload: Uint8Array;
 }
 
 /**
@@ -549,27 +581,25 @@ export interface MindooDB {
 
   /**
    * Change a document. This internally produces a binary Automerge change
-   * to the underlying Automerge document, signs it with the user's signing key,
+   * to the underlying Automerge document, signs it with the current user's signing key,
    * optionally encrypts it with the appropriate encryption key, and appends it to the attached AppendOnlyStore.
    * 
    * Note: Signing and encryption use different keys:
-   * - Signing uses the user's signing key (Ed25519) - proves authorship and integrity
+   * - Signing uses the current user's signing key (Ed25519) - proves authorship and integrity
+   *   The signature is created via tenant.signPayload()
    * - Encryption uses the tenant encryption key or a named symmetric key (AES-256) - protects content
+   *   Encryption/decryption is handled via tenant.encryptPayload() and tenant.decryptPayload()
    * 
-   * The encryption key ID is determined from the document's DocumentMetadata (stored in first change).
+   * The encryption key ID is determined from the first change's decryptionKeyId (stored in MindooDocChangeHashes).
    * If the document was created with a named key, all subsequent changes use that same key.
    * 
    * @param doc The document to change
    * @param changeFunc The function to change the document
-   * @param userSigningPrivateKey The user's signing private key (encrypted, used ONLY for signing)
-   * @param userSigningPrivateKeyPassword The password to decrypt the signing private key
    * @return A promise that resolves when the document is changed
    */
   changeDoc(
     doc: MindooDoc,
-    changeFunc: (doc: MindooDoc) => void,
-    userSigningPrivateKey: EncryptedPrivateKey,
-    userSigningPrivateKeyPassword: string
+    changeFunc: (doc: MindooDoc) => void
   ): Promise<void>;
 
   /**
