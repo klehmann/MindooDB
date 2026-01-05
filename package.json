@@ -1,0 +1,19 @@
+{
+  "name": "mindoodb2",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Mindoo GmbH",
+  "license": "ISC",
+  "dependencies": {
+    "@automerge/automerge": "^2.0.2"
+
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "ts-node-dev": "^2.0.0"
+  }
+}
