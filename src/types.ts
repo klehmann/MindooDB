@@ -121,20 +121,29 @@ export interface TenantFactory {
    * Opens an existing tenant with previously created keys.
    * 
    * @param tenantId The ID of the tenant
-   * @param tenantEncryptionPublicKey The tenant encryption public key
-   * @param tenantEncryptionPrivateKey The tenant encryption private key
+   * @param tenantEncryptionPublicKey The tenant encryption public key identifier
+   * @param tenantEncryptionPrivateKey The tenant encryption private key (AES-256, encrypted)
    * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption private key
    * @param namedSymmetricKeys Map of key IDs to encrypted symmetric keys for document encryption.
    *                          Should include "default" key (tenant encryption key).
    *                          The implementation handles persistence of this map (encrypted on disk).
+   * @param administrationPublicKey Optional administration public key (Ed25519, PEM format).
+   *                               Required only for users who need to perform administrative operations.
+   * @param administrationPrivateKey Optional administration private key (encrypted).
+   *                                 Required only for users who need to perform administrative operations.
+   * @param administrationPrivateKeyPassword Optional password to decrypt the administration private key.
+   *                                        Required only if administrationPrivateKey is provided.
    * @return The tenant
    */
   openTenantWithKeys(
     tenantId: string,
     tenantEncryptionPublicKey: string,
-    tenantEncryptionPrivateKey: string,
+    tenantEncryptionPrivateKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
-    namedSymmetricKeys: NamedSymmetricKeysMap
+    namedSymmetricKeys: NamedSymmetricKeysMap,
+    administrationPublicKey?: string,
+    administrationPrivateKey?: EncryptedPrivateKey,
+    administrationPrivateKeyPassword?: string
   ): Promise<MindooTenant>;
 
   /**
@@ -243,6 +252,42 @@ export interface MindooTenant {
   ): Promise<void>;
 
   /**
+   * Revokes a user's access to the tenant by adding a revocation record to the directory.
+   * This prevents the user from decrypting future changes, but they retain access to previously
+   * decrypted changes (append-only limitation).
+   * 
+   * @param username The username of the user to revoke (format: "CN=<username>/O=<tenantId>")
+   * @param administrationPrivateKey The administration private key to sign the revocation (signing only)
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the user is revoked
+   */
+  revokeUser(username: string, administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
+
+  /**
+   * Adds a named symmetric key to the tenant's key map.
+   * This is used when a user receives a key from an administrator (via email, shared folder, etc.).
+   * The key will be stored encrypted on disk using the user's encryption key pair.
+   * 
+   * After adding a key, use discoverDocumentsForKey() to find documents encrypted with this key.
+   * 
+   * @param keyId The ID of the key to add
+   * @param encryptedKey The encrypted symmetric key to add
+   * @param additionalPassword Optional additional password if the key was password-protected
+   * @param userEncryptionPrivateKey The user's encryption private key (encrypted)
+   * @param userEncryptionPrivateKeyPassword The password to decrypt the user's encryption private key
+   * @return A promise that resolves when the key is added
+   */
+  addNamedSymmetricKey(
+    keyId: string,
+    encryptedKey: EncryptedPrivateKey,
+    additionalPassword: string | undefined,
+    userEncryptionPrivateKey: EncryptedPrivateKey,
+    userEncryptionPrivateKeyPassword: string
+  ): Promise<void>;
+
+  /**
    * Convenience method to open the directory database for this tenant
    *
    * @return The directory database
@@ -314,6 +359,33 @@ export interface AppendOnlyStore {
 }
 
 /**
+ * Document metadata stored in the first change of a document.
+ * This metadata is embedded in the Automerge document itself and is accessible
+ * after decrypting the first change.
+ */
+export interface DocumentMetadata {
+  /**
+   * The ID of the symmetric key used to encrypt this document.
+   * "default" means tenant encryption key (all tenant members can decrypt).
+   * Other IDs refer to named symmetric keys (only users with that key can decrypt).
+   */
+  decryptionKeyId: string;
+
+  /**
+   * Optional list of user IDs that should have access to decrypt this document.
+   * Only relevant for named keys (not "default").
+   * For "default", all tenant members have access.
+   * This is informational - actual access is controlled by key distribution.
+   */
+  encryptedForUsers?: string[];
+
+  /**
+   * The timestamp when the document was created (milliseconds since Unix epoch)
+   */
+  createdAt: number;
+}
+
+/**
  * This is the public unencrypted data that we store about document
  * changes in the append only store.
  */
@@ -339,33 +411,37 @@ export interface MindooDocChangeHashes {
    */
   depsHashes: string[];
 
-  /* The timestamp of the change in milliseconds since the Unix epoch */
+  /**
+   * The timestamp of the change in milliseconds since the Unix epoch
+   */
   createdAt: number;
+
+  /**
+   * The public signing key of the user who created this change (Ed25519, PEM format).
+   * Used for signature verification and audit trails in a zero-trust system.
+   * This is a cryptographic identifier that can be verified against signatures.
+   */
+  createdByPublicKey: string;
 }
 
 export interface MindooDocChange extends MindooDocChangeHashes {
-  /* The binary automerge change */
+  /**
+   * The binary automerge change
+   */
   payload: Uint8Array;
-  /* The signature of the change */
+
+  /**
+   * The signature of the change (signed with the user's signing key)
+   */
   signature: Uint8Array;
-  /* Whether the change is encrypted */
-  isEncrypted: boolean;
 
   /**
    * The ID of the symmetric key used to encrypt this change.
    * "default" means tenant encryption key (all tenant members can decrypt).
    * Other IDs refer to named symmetric keys (only users with that key can decrypt).
-   * Only present if isEncrypted is true.
+   * Always present if isEncrypted is true. If not specified, defaults to "default".
    */
-  decryptionKeyId?: string;
-
-  /**
-   * List of user IDs that should have access to decrypt this change.
-   * Only relevant for named keys (not "default").
-   * For "default", all tenant members have access.
-   * This is informational - actual access is controlled by key distribution.
-   */
-  encryptedForUsers?: string[];
+  decryptionKeyId: string;
 }
 
 /**
@@ -447,6 +523,23 @@ export interface MindooDB {
   getDocument(docId: string): Promise<MindooDoc>;
 
   /**
+   * Get a document at a specific point in time by applying changes up to the given timestamp.
+   * This enables historical analysis and time travel functionality.
+   *
+   * @param docId The ID of the document
+   * @param timestamp The timestamp to reconstruct the document at (milliseconds since Unix epoch)
+   * @return The document at the specified timestamp, or null if the document didn't exist at that time
+   */
+  getDocumentAtTimestamp(docId: string, timestamp: number): Promise<MindooDoc | null>;
+
+  /**
+   * Get all document IDs in this database.
+   *
+   * @return A list of document IDs
+   */
+  getAllDocumentIds(): Promise<string[]>;
+
+  /**
    * Delete a document by its ID
    *
    * @param docId The ID of the document
@@ -463,7 +556,7 @@ export interface MindooDB {
    * - Signing uses the user's signing key (Ed25519) - proves authorship and integrity
    * - Encryption uses the tenant encryption key or a named symmetric key (AES-256) - protects content
    * 
-   * The encryption key ID is determined from the document's metadata (stored in first change).
+   * The encryption key ID is determined from the document's DocumentMetadata (stored in first change).
    * If the document was created with a named key, all subsequent changes use that same key.
    * 
    * @param doc The document to change
