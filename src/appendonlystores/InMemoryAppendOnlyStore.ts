@@ -1,22 +1,24 @@
 import {
-  MindooTenant,
   AppendOnlyStore,
+  AppendOnlyStoreFactory,
+} from "./types";
+import type {
   MindooDocChange,
   MindooDocChangeHashes,
-} from "./types";
+} from "../types";
 
 /**
  * A simple in-memory implementation of AppendOnlyStore for testing purposes.
  * Stores all changes in an array and provides fast lookups via Maps.
  */
 export class InMemoryAppendOnlyStore implements AppendOnlyStore {
-  private tenant: MindooTenant;
+  private dbId: string;
   private changes: MindooDocChange[] = [];
   private changeHashIndex: Map<string, MindooDocChange> = new Map();
   private docIdIndex: Map<string, MindooDocChange[]> = new Map();
 
-  constructor(tenant: MindooTenant) {
-    this.tenant = tenant;
+  constructor(dbId: string) {
+    this.dbId = dbId;
   }
 
   /**
@@ -29,7 +31,7 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
   async append(change: MindooDocChange): Promise<void> {
     // Check if we already have this change (no-op if exists)
     if (this.changeHashIndex.has(change.changeHash)) {
-      console.log(`[InMemoryAppendOnlyStore] Change ${change.changeHash} already exists, skipping`);
+      console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Change ${change.changeHash} already exists, skipping`);
       return;
     }
 
@@ -45,7 +47,7 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
     }
     this.docIdIndex.get(change.docId)!.push(change);
 
-    console.log(`[InMemoryAppendOnlyStore] Appended change ${change.changeHash} for doc ${change.docId}`);
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Appended change ${change.changeHash} for doc ${change.docId}`);
   }
 
   /**
@@ -71,7 +73,7 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
       }
     }
 
-    console.log(`[InMemoryAppendOnlyStore] Found ${newChanges.length} new changes out of ${this.changes.length} total`);
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Found ${newChanges.length} new changes out of ${this.changes.length} total`);
     return newChanges;
   }
 
@@ -89,11 +91,11 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
       if (change) {
         result.push(change);
       } else {
-        console.warn(`[InMemoryAppendOnlyStore] Change ${hashInfo.changeHash} not found`);
+        console.warn(`[InMemoryAppendOnlyStore:${this.dbId}] Change ${hashInfo.changeHash} not found`);
       }
     }
 
-    console.log(`[InMemoryAppendOnlyStore] Retrieved ${result.length} changes out of ${changeHashes.length} requested`);
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Retrieved ${result.length} changes out of ${changeHashes.length} requested`);
     return result;
   }
 
@@ -111,7 +113,7 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
       result.push(hashMetadata);
     }
 
-    console.log(`[InMemoryAppendOnlyStore] Returning ${result.length} change hashes`);
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${result.length} change hashes`);
     return result;
   }
 
@@ -126,7 +128,7 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
     const docChanges = this.docIdIndex.get(docId) || [];
 
     if (docChanges.length === 0) {
-      console.log(`[InMemoryAppendOnlyStore] No changes found for doc ${docId}`);
+      console.log(`[InMemoryAppendOnlyStore:${this.dbId}] No changes found for doc ${docId}`);
       return [];
     }
 
@@ -152,7 +154,7 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
           return hashMetadata;
         });
 
-        console.log(`[InMemoryAppendOnlyStore] Returning ${result.length} changes for doc ${docId} after snapshot`);
+        console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${result.length} changes for doc ${docId} after snapshot`);
         return result;
       }
     }
@@ -163,8 +165,18 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
       return hashMetadata;
     });
 
-    console.log(`[InMemoryAppendOnlyStore] Returning ${result.length} changes for doc ${docId}`);
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${result.length} changes for doc ${docId}`);
     return result;
+  }
+}
+
+/**
+ * Factory for creating InMemoryAppendOnlyStore instances.
+ * Each database gets its own isolated in-memory store.
+ */
+export class InMemoryAppendOnlyStoreFactory implements AppendOnlyStoreFactory {
+  createStore(dbId: string): AppendOnlyStore {
+    return new InMemoryAppendOnlyStore(dbId);
   }
 }
 

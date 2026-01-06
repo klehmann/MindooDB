@@ -6,8 +6,8 @@ import {
   MindooDocChange,
   MindooDocChangeHashes,
   MindooTenant,
-  AppendOnlyStore,
 } from "./types";
+import type { AppendOnlyStore } from "./appendonlystores/types";
 
 /**
  * Internal representation of a document with its Automerge state

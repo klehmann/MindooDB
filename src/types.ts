@@ -1,3 +1,7 @@
+import type { KeyBag } from "./keys/KeyBag";
+import type { PublicUserId, PrivateUserId } from "./userid";
+import type { AppendOnlyStore } from "./appendonlystores/types";
+
 /**
  * An EncryptedPrivateKey is a private key that is encrypted with a password.
  * Used for both asymmetric keys (RSA, Ed25519, ECDH) and symmetric keys (AES-256).
@@ -23,76 +27,8 @@ export interface EncryptedPrivateKey {
  */
 export type NamedSymmetricKeysMap = Map<string, EncryptedPrivateKey[]>;
 
-/**
- * Public info for a user of the platform
- */
-export interface PublicUserId {
-  /**
-   * The username of the user (format: "CN=<username>/O=<tenantId>")
-   */
-  username: string;
-
-  /**
-   * Signature by the administration key proving that an admin has granted this user
-   * access to the tenant. This signature covers the username and other user identification.
-   */
-  administrationSignature: string;
-
-  /**
-   * The public key for signing (Ed25519, PEM format)
-   * Used ONLY for signing document changes, not for encryption.
-   */
-  userSigningPublicKey: string;
-
-  /**
-   * The public key for encryption (RSA or ECDH, PEM format)
-   * Used ONLY for encrypting/decrypting the named symmetric keys map stored on disk, not for signing.
-   */
-  userEncryptionPublicKey: string;
-}
-
-/**
- * Private info for a user of the platform
- * This is used to sign and encrypt operations for the user and not publicly shared.
- */
-export interface PrivateUserId {
-  /**
-   * The username of the user (format: "CN=<username>/O=<tenantId>")
-   */
-  username: string;
-
-  /**
-   * Signature by the administration key proving that an admin has granted this user
-   * access to the tenant. This signature covers the username and other user identification.
-   */
-  administrationSignature: string;
-
-  /**
-   * The public key for signing (Ed25519, PEM format)
-   * Used ONLY for signing document changes, not for encryption.
-   */
-  userSigningPublicKey: string;
-
-  /**
-   * The encrypted private key for signing (Ed25519)
-   * Encrypted with password via key derivation (salt: "signing")
-   * Used ONLY for signing document changes, not for encryption.
-   */
-  userSigningPrivateKey: EncryptedPrivateKey;
-
-  /**
-   * The public key for encryption (RSA or ECDH, PEM format)
-   * Used ONLY for encrypting/decrypting the named symmetric keys map stored on disk, not for signing.
-   */
-  userEncryptionPublicKey: string;
-
-  /**
-   * The encrypted private key for encryption (RSA or ECDH)
-   * Encrypted with password via key derivation (salt: "encryption")
-   * Used ONLY for encrypting/decrypting the named symmetric keys map stored on disk, not for signing.
-   */
-  userEncryptionPrivateKey: EncryptedPrivateKey;
-}
+// Re-export PublicUserId and PrivateUserId from userid module
+export type { PublicUserId, PrivateUserId };
 
 /**
  * A TenantFactory is a factory for creating and managing tenants.
@@ -112,10 +48,19 @@ export interface TenantFactory {
    * @param administrationKeyPassword The password used to encrypt the administration private key
    *                                 (this key is used to register new users and sign administrative operations)
    * @param tenantEncryptionKeyPassword The password to be set to decrypt the tenant encryption private key
+   * @param currentUser The current user's private user ID (required for tenant operations)
+   * @param currentUserPassword The password to decrypt the current user's private keys
+   * @param keyBag The KeyBag instance for storing and loading named encrypted keys
    * @return The new tenant
    */
-  createTenant(tenantId: string, administrationKeyPassword: string,
-    tenantEncryptionKeyPassword: string): Promise<MindooTenant>;
+  createTenant(
+    tenantId: string,
+    administrationKeyPassword: string,
+    tenantEncryptionKeyPassword: string,
+    currentUser: PrivateUserId,
+    currentUserPassword: string,
+    keyBag: KeyBag
+  ): Promise<MindooTenant>;
 
   /**
    * Opens an existing tenant with previously created keys.
@@ -124,9 +69,9 @@ export interface TenantFactory {
    * @param tenantEncryptionPublicKey The tenant encryption public key identifier
    * @param tenantEncryptionPrivateKey The tenant encryption private key (AES-256, encrypted)
    * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption private key
-   * @param namedSymmetricKeys Map of key IDs to encrypted symmetric keys for document encryption.
-   *                          Should include "default" key (tenant encryption key).
-   *                          The implementation handles persistence of this map (encrypted on disk).
+   * @param currentUser The current user's private user ID (required for tenant operations)
+   * @param currentUserPassword The password to decrypt the current user's private keys
+   * @param keyBag The KeyBag instance for storing and loading named encrypted keys
    * @param administrationPublicKey Optional administration public key (Ed25519, PEM format).
    *                               Required only for users who need to perform administrative operations.
    * @param administrationPrivateKey Optional administration private key (encrypted).
@@ -140,7 +85,9 @@ export interface TenantFactory {
     tenantEncryptionPublicKey: string,
     tenantEncryptionPrivateKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
-    namedSymmetricKeys: NamedSymmetricKeysMap,
+    currentUser: PrivateUserId,
+    currentUserPassword: string,
+    keyBag: KeyBag,
     administrationPublicKey?: string,
     administrationPrivateKey?: EncryptedPrivateKey,
     administrationPrivateKeyPassword?: string
@@ -182,27 +129,6 @@ export interface MindooTenant {
   getId(): string;
 
   /**
-   * Returns the public key for the administration key used to sign administrative
-   * operations like registering users (so that only the tenant admin can add users to the tenant).
-   * 
-   * Note: This key is used ONLY for signing, not for encryption.
-   * 
-   * @return The administration public key (PEM format, Ed25519)
-   */
-  getAdministrationPublicKey(): string;
-
-  /**
-   * Returns the private key for the administration key used to sign administrative
-   * operations like registering users.
-   * 
-   * Note: This key is used ONLY for signing, not for encryption.
-   * 
-   * @param password The password to decrypt the administration private key
-   * @return The administration private key (Ed25519, encrypted)
-   */
-  getAdministrationPrivateKey(password: string): EncryptedPrivateKey;
-
-  /**
    * Returns the public key for the encryption key used to encrypt all communication in this tenant
    * (e.g. the document changesets).
    * 
@@ -219,24 +145,19 @@ export interface MindooTenant {
    * 
    * Note: This is a symmetric key (AES-256) used ONLY for encryption/decryption, not for signing.
    * 
-   * @param password The password to decrypt the tenant encryption private key
    * @return The tenant encryption private key (AES-256, encrypted)
    */
-  getTenantEncryptionPrivateKey(password: string): EncryptedPrivateKey;
+  getTenantEncryptionPrivateKey(): EncryptedPrivateKey;
 
   /**
-   * Creates a new named symmetric key for document encryption.
-   * The key can be distributed via insecure channels (email, shared folder) and protected
-   * with an additional password communicated via secure channels (phone, in-person).
+   * Creates a new encrypted symmetric key (AES-256) for document encryption.
+   * The key is encrypted with the provided password and can be distributed to authorized users.
+   * Use addNamedKey() to store the returned key in the tenant's key map.
    * 
-   * @param keyId Unique identifier for this key (e.g., "project-alpha", "executive-only")
-   *              Must not be "default" (reserved for tenant encryption key)
-   * @param additionalPassword Optional additional password for extra protection.
-   *                          If provided, the key must be decrypted with both the user's
-   *                          main password AND this additional password.
+   * @param password The password to encrypt the symmetric key with (mandatory)
    * @return The encrypted symmetric key that can be distributed to authorized users
    */
-  createNamedSymmetricKey(keyId: string, additionalPassword?: string): Promise<EncryptedPrivateKey>;
+  createEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey>;
 
   /**
    * Adds a new user to the tenant. The user is identified by its user ID.
@@ -267,25 +188,18 @@ export interface MindooTenant {
 
   /**
    * Adds a named symmetric key to the tenant's key map.
-   * This is used when a user receives a key from an administrator (via email, shared folder, etc.).
-   * The key will be stored encrypted on disk using the user's encryption key pair.
+   * This is used when a user receives a key from an administrator or colleague
+   * (via email, shared folder with password protection and a password sent via secure channel).
    * 
-   * After adding a key, use discoverDocumentsForKey() to find documents encrypted with this key.
+   * The method decrypts the encrypted key and adds it to the key bag.
+   * The key is then stored in the key bag and can be used to encrypt and decrypt documents.
    * 
    * @param keyId The ID of the key to add
    * @param encryptedKey The encrypted symmetric key to add
-   * @param additionalPassword Optional additional password if the key was password-protected
-   * @param userEncryptionPrivateKey The user's encryption private key (encrypted)
-   * @param userEncryptionPrivateKeyPassword The password to decrypt the user's encryption private key
-   * @return A promise that resolves when the key is added
+   * @param encryptedKeyPassword The password to decrypt the encrypted symmetric key (mandatory)
+   * @return A promise that resolves when the key is added and persisted
    */
-  addNamedSymmetricKey(
-    keyId: string,
-    encryptedKey: EncryptedPrivateKey,
-    additionalPassword: string | undefined,
-    userEncryptionPrivateKey: EncryptedPrivateKey,
-    userEncryptionPrivateKeyPassword: string
-  ): Promise<void>;
+  addNamedKey(keyId: string, encryptedKey: EncryptedPrivateKey, encryptedKeyPassword: string): Promise<void>;
 
   /**
    * Encrypt a payload using the symmetric key identified by decryptionKeyId.
@@ -350,65 +264,13 @@ export interface MindooTenant {
    * Opens a new database for this tenant
    *
    * @param id The ID of the database
-   * @param store The append only store to use
    * @return The new database
    */
-  openDB(id: string, store: AppendOnlyStore): Promise<MindooDB>;
+  openDB(id: string): Promise<MindooDB>;
 }
 
-/**
- * An AppendOnlyStore is a store that is used to store signed and optionally encrypted
- * binary automerge changes to the documents in a MindooDB.
- * 
- * The AppendOnlyStore is responsible for storing the changes and providing
- * methods to get changes by their hashes, find new changes and get all change hashes.
- * 
- * The append only structure makes synchronization of changes easy between peers (client-client,
- * client-server, server-server).
- */
-export interface AppendOnlyStore {
-
-  /**
-   * Append a new change to the store. No-op if we already have this
-   * change in the store (based on the change ID).
-   *
-   * @param change The change to append
-   * @return A promise that resolves when the change is appended
-   */
-  append(change: MindooDocChange): Promise<void>;
-
-  /**
-   * Find changes in the store that are not listed in the given list of change hashes
-   *
-   * @param haveChangeHashes The list of document IDs and change hashes we already have
-   * @return A list of document IDs and change hashes that we don't have yet
-   */
-  findNewChanges(haveChangeHashes: MindooDocChangeHashes[]): Promise<MindooDocChangeHashes[]>;
-
-  /**
-   * Bulk method to get multiple changes given their hash infos
-   *
-   * @param changeHashes The hashes of the changes to fetch
-   * @return A list of changes with payload and signature
-   */
-  getChanges(changeHashes: MindooDocChangeHashes[]): Promise<MindooDocChange[]>;
-
-  /**
-   * Get all change hashes that are stored in the store
-   *
-   * @return A list of change hashes
-  */
-  getAllChangeHashes(): Promise<MindooDocChangeHashes[]>;
-
-  /**
-   * Get all change hashes for a document
-   *
-   * @param docId The ID of the document
-   * @param fromLastSnapshot Whether to start from the last snapshot (if there is any)
-   * @return A list of change hashes
-   */
-  getAllChangeHashesForDoc(docId: string, fromLastSnapshot: boolean): Promise<MindooDocChangeHashes[]>;
-}
+// Re-export AppendOnlyStore and AppendOnlyStoreFactory from appendonlystores
+export type { AppendOnlyStore, AppendOnlyStoreFactory } from "./appendonlystores/types";
 
 /**
  * This is the meta data for changes and snapshots that we store for the document in the append only store.
