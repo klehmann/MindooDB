@@ -39,10 +39,6 @@ interface InternalDoc {
  * - Automerge.getHeads(doc) - verify method name  
  * - Automerge.load(bytes) - verify method name for snapshots
  * - Automerge.applyChanges(doc, changes) - verify method signature
- * 
- * TODO: Add UUID7 dependency:
- * - Install 'uuid7' npm package for proper UUID7 generation
- * - Currently using crypto.randomUUID() (UUIDv4) as placeholder
  */
 export class BaseMindooDB implements MindooDB {
   private tenant: MindooTenant;
@@ -54,6 +50,10 @@ export class BaseMindooDB implements MindooDB {
   
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
+  
+  // Monotonic counter for UUID7 generation (ensures uniqueness within same millisecond)
+  private uuid7Counter: number = 0;
+  private uuid7LastTimestamp: number = 0;
 
   constructor(tenant: MindooTenant, id: string, store: AppendOnlyStore) {
     this.tenant = tenant;
@@ -687,69 +687,76 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Generate a UUID7 identifier
-   * Uses the 'uuid7-typed' npm package for proper UUID7 generation
-   * Falls back to a simple UUID7 implementation if the package is not available
+   * Generate a UUID7 identifier with monotonic counter for same-millisecond collisions
+   * 
+   * Platform-agnostic implementation that works in both browser and Node.js.
+   * Uses crypto.getRandomValues() when available, falls back to Math.random() otherwise.
+   * 
+   * UUID7 format: timestamp (48 bits) + random (74 bits) = 122 bits total
+   * Format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
+   * Where 7 indicates version 7, and y is one of 8, 9, A, or B
+   * 
+   * Note: Uses millisecond precision (Date.now()). For higher precision, consider
+   * using a proper UUID7 library that supports microsecond timestamps.
    */
   private generateUUID7(): string {
-    // Try to use uuid7-typed library if available
-    try {
-      // Dynamic import to support both CommonJS and ES modules
-      const uuid7 = require("uuid7-typed");
-      if (typeof uuid7 === "function") {
-        return uuid7();
+    // Get millisecond timestamp (48 bits can represent ~8,925 years from Unix epoch)
+    const timestampMs = Date.now();
+    
+    // Handle monotonic counter for same-millisecond collisions
+    // This ensures uniqueness even when generating multiple UUIDs in the same millisecond
+    if (timestampMs === this.uuid7LastTimestamp) {
+      // Same millisecond - increment counter
+      this.uuid7Counter++;
+      // Counter is 12 bits max (0-4095), if it overflows, we wait for next millisecond
+      if (this.uuid7Counter >= 4096) {
+        // Wait until next millisecond (extremely rare - would require 4096+ UUIDs in 1ms)
+        while (Date.now() === timestampMs) {
+          // Busy wait - should be extremely rare
+        }
+        this.uuid7Counter = 0;
+        this.uuid7LastTimestamp = Date.now();
       }
-      if (typeof uuid7.uuid7 === "function") {
-        return uuid7.uuid7();
-      }
-      if (typeof uuid7.generate === "function") {
-        return uuid7.generate();
-      }
-    } catch (e) {
-      // Fall through to fallback implementation
+    } else {
+      // New millisecond - reset counter
+      this.uuid7Counter = 0;
+      this.uuid7LastTimestamp = timestampMs;
     }
     
-    // Fallback: Simple UUID7 implementation
-    // UUID7 format: timestamp (48 bits) + random (74 bits) = 122 bits total
-    // Format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
-    // Where 7 indicates version 7, and y is one of 8, 9, A, or B
-    return this.generateUUID7Fallback();
-  }
-
-  /**
-   * Simple UUID7 fallback implementation
-   * Generates a UUID7-compatible identifier with timestamp and random components
-   */
-  private generateUUID7Fallback(): string {
-    const now = Date.now();
-    
-    // Get high-resolution timestamp if available (milliseconds since Unix epoch)
-    // UUID7 uses 48 bits for timestamp (milliseconds since Unix epoch)
-    const timestamp = now;
-    
-    // Generate random bytes for the rest
+    // Generate random bytes (10 bytes = 80 bits, we'll use 62 bits for random field)
     const randomBytes = new Uint8Array(10);
     if (typeof crypto !== "undefined" && crypto.getRandomValues) {
       crypto.getRandomValues(randomBytes);
     } else {
       // Fallback for environments without crypto.getRandomValues
+      // WARNING: Math.random() is not cryptographically secure and may have collisions
+      // For production use, ensure crypto.getRandomValues is available
       for (let i = 0; i < randomBytes.length; i++) {
         randomBytes[i] = Math.floor(Math.random() * 256);
       }
     }
     
+    // Incorporate monotonic counter into the random field (first 12 bits)
+    // This ensures uniqueness within the same millisecond while maintaining time-ordering
+    // Counter is 12 bits (0-4095), stored in first 1.5 bytes of random field
+    const counterHigh = (this.uuid7Counter >> 8) & 0xFF;
+    const counterLow = this.uuid7Counter & 0xFF;
+    randomBytes[0] = counterHigh;
+    randomBytes[1] = (counterLow << 4) | (randomBytes[1] & 0x0F); // Preserve lower 4 bits for variant
+    
     // Build UUID7 format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
-    // Timestamp (48 bits = 12 hex digits)
-    const timestampHex = timestamp.toString(16).padStart(12, "0");
+    // Timestamp (48 bits = 12 hex digits) - milliseconds since Unix epoch
+    const timestampHex = timestampMs.toString(16).padStart(12, "0");
     
     // Version 7 indicator (4 bits = 1 hex digit, value 7)
     const version = "7";
     
     // Variant (2 bits = 1 hex digit, value 8, 9, A, or B)
-    const variant = (8 + (randomBytes[0] & 0x3)).toString(16).toUpperCase();
+    const variant = (8 + (randomBytes[1] & 0x3)).toString(16).toUpperCase();
     
-    // Random data (62 bits = 15.5 hex digits, we'll use 15)
-    const randomHex = Array.from(randomBytes.slice(1))
+    // Random data (62 bits = 15 hex digits)
+    // First 12 bits are the counter, remaining 50 bits are random
+    const randomHex = Array.from(randomBytes)
       .map(b => b.toString(16).padStart(2, "0"))
       .join("")
       .substring(0, 15);
