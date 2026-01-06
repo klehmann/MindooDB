@@ -416,9 +416,13 @@ export interface AppendOnlyStore {
  */
 export interface MindooDocChangeHashes {
   /**
-   * The type of this entry: "change" for document changes, "snapshot" for document snapshots.
+   * The type of this entry: 
+   * - "create" for document creation
+   * - "change" for document changes
+   * - "snapshot" for document snapshots
+   * - "delete" for document deletion (tombstone entry)
    */
-  type: "change" | "snapshot";
+  type: "create" | "change" | "snapshot" | "delete";
 
   /**
    * The ID of the document that the change is for (UUID7 format)
@@ -488,6 +492,8 @@ export interface MindooDoc {
   */
   getId(): string;
 
+  getCreatedAt(): number;
+
   /**
    * Get the timestamp of the last modification of the document
    * in milliseconds since the Unix epoch.
@@ -495,6 +501,14 @@ export interface MindooDoc {
    * @return The timestamp of the last modification of the document
    */
   getLastModified(): number;
+  
+  /**
+   * Check if the document has been deleted.
+   * Deletion is tracked via "delete" type entries in the append-only store.
+   *
+   * @return True if the document has been deleted, false otherwise
+   */
+  isDeleted(): boolean;
   
   /*
    * Get the payload of the document

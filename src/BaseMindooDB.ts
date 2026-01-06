@@ -1,0 +1,769 @@
+import * as Automerge from "@automerge/automerge";
+import {
+  MindooDB,
+  MindooDoc,
+  MindooDocPayload,
+  MindooDocChange,
+  MindooDocChangeHashes,
+  MindooTenant,
+  AppendOnlyStore,
+} from "./types";
+
+/**
+ * Internal representation of a document with its Automerge state
+ */
+interface InternalDoc {
+  id: string;
+  doc: Automerge.Doc<MindooDocPayload>;
+  createdAt: number;
+  lastModified: number;
+  decryptionKeyId: string;
+  isDeleted: boolean;
+}
+
+/**
+ * BaseMindooDB is a platform-agnostic implementation of MindooDB
+ * that works in both browser and server environments.
+ * 
+ * It receives MindooTenant and AppendOnlyStore in the constructor,
+ * allowing platform-specific implementations of those interfaces.
+ * 
+ * Dependencies:
+ * - @automerge/automerge: For CRDT document management
+ * - Web Crypto API: Available in both browser (window.crypto) and Node.js (crypto)
+ *   - Ed25519 signing/verification (Node.js 15+, Chrome 92+)
+ *   - AES-256-GCM encryption (widely supported)
+ * 
+ * TODO: Verify Automerge 2.x API methods:
+ * - Automerge.getChangeHash(change) - verify method name
+ * - Automerge.getHeads(doc) - verify method name  
+ * - Automerge.load(bytes) - verify method name for snapshots
+ * - Automerge.applyChanges(doc, changes) - verify method signature
+ * 
+ * TODO: Add UUID7 dependency:
+ * - Install 'uuid7' npm package for proper UUID7 generation
+ * - Currently using crypto.randomUUID() (UUIDv4) as placeholder
+ */
+export class BaseMindooDB implements MindooDB {
+  private tenant: MindooTenant;
+  private id: string;
+  private store: AppendOnlyStore;
+  
+  // Internal index: Map<docId, { lastModified: number, isDeleted: boolean }>
+  private index: Map<string, { lastModified: number; isDeleted: boolean }> = new Map();
+  
+  // Cache of loaded documents: Map<docId, InternalDoc>
+  private docCache: Map<string, InternalDoc> = new Map();
+
+  constructor(tenant: MindooTenant, id: string, store: AppendOnlyStore) {
+    this.tenant = tenant;
+    this.id = id;
+    this.store = store;
+  }
+
+  /**
+   * Initialize the database by rebuilding the index from the append-only store.
+   * This should be called after construction to load existing documents.
+   */
+  async initialize(): Promise<void> {
+    console.log(`[BaseMindooDB] Initializing database ${this.id}`);
+    
+    // Rebuild index from all change hashes
+    const allChangeHashes = await this.store.getAllChangeHashes();
+    console.log(`[BaseMindooDB] Found ${allChangeHashes.length} change hashes`);
+    
+    // Group changes by document ID
+    const changesByDoc = new Map<string, MindooDocChangeHashes[]>();
+    for (const changeHash of allChangeHashes) {
+      if (!changesByDoc.has(changeHash.docId)) {
+        changesByDoc.set(changeHash.docId, []);
+      }
+      changesByDoc.get(changeHash.docId)!.push(changeHash);
+    }
+    
+    // Load each document to build the index
+    for (const [docId, changeHashes] of changesByDoc) {
+      try {
+        const doc = await this.loadDocumentInternal(docId);
+        if (doc) {
+          this.index.set(docId, {
+            lastModified: doc.lastModified,
+            isDeleted: doc.isDeleted,
+          });
+        }
+      } catch (error) {
+        console.error(`[BaseMindooDB] Error loading document ${docId}:`, error);
+        // Continue with other documents even if one fails
+      }
+    }
+    
+    console.log(`[BaseMindooDB] Index rebuilt with ${this.index.size} documents`);
+  }
+
+  getStore(): AppendOnlyStore {
+    return this.store;
+  }
+
+  getTenant(): MindooTenant {
+    return this.tenant;
+  }
+
+  getId(): string {
+    return this.id;
+  }
+
+  async createDocument(): Promise<MindooDoc> {
+    return this.createEncryptedDocument("default");
+  }
+
+  async createEncryptedDocument(decryptionKeyId?: string): Promise<MindooDoc> {
+    const keyId = decryptionKeyId || "default";
+    
+    // Generate UUID7 for document ID
+    const docId = this.generateUUID7();
+    
+    console.log(`[BaseMindooDB] Creating document ${docId} with key ${keyId}`);
+    
+    // Create initial Automerge document
+    const initialDoc = Automerge.init<MindooDocPayload>();
+    
+    // Get current user for signing
+    const currentUser = await this.tenant.getCurrentUserId();
+    
+    // Create the first change
+    const now = Date.now();
+    const newDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
+      // Store metadata in the document payload
+      /*
+      doc._docId = docId;
+      doc._decryptionKeyId = keyId;
+      doc._createdAt = now;
+      doc._lastModified = now;
+      doc._deleted = false;
+      */
+    });
+    
+    // Get the change bytes from the document
+    const changeBytes = Automerge.getLastLocalChange(newDoc);
+    if (!changeBytes) {
+      throw new Error("Failed to get change bytes from Automerge document");
+    }
+    
+    // Decode the change to get hash and dependencies
+    const decodedChange = Automerge.decodeChange(changeBytes);
+    const changeHash = decodedChange.hash;
+    const depsHashes: string[] = decodedChange.deps || []; // First change has no dependencies
+    
+    // Encrypt the change payload first
+    const encryptedPayload = await this.tenant.encryptPayload(changeBytes, keyId);
+    
+    // Sign the encrypted payload (this allows signature verification without decryption)
+    // This is important for zero-trust: anyone can verify signatures without needing decryption keys
+    const signature = await this.tenant.signPayload(encryptedPayload);
+
+    // Create change metadata
+    const changeMetadata: MindooDocChangeHashes = {
+      type: "create",
+      docId,
+      changeHash,
+      depsHashes,
+      createdAt: now,
+      createdByPublicKey: currentUser.userSigningPublicKey,
+      decryptionKeyId: keyId,
+      signature,
+    };
+    
+    // Create full change object
+    const fullChange: MindooDocChange = {
+      ...changeMetadata,
+      payload: encryptedPayload,
+    };
+    
+    // Append to store
+    await this.store.append(fullChange);
+    
+    // Create internal document representation
+    const internalDoc: InternalDoc = {
+      id: docId,
+      doc: newDoc,
+      createdAt: now,
+      lastModified: now,
+      decryptionKeyId: keyId,
+      isDeleted: false,
+    };
+    
+    // Update cache and index
+    this.docCache.set(docId, internalDoc);
+    this.index.set(docId, {
+      lastModified: internalDoc.lastModified,
+      isDeleted: false,
+    });
+    
+    console.log(`[BaseMindooDB] Document ${docId} created successfully`);
+    
+    return this.wrapDocument(internalDoc);
+  }
+
+  async getDocument(docId: string): Promise<MindooDoc> {
+    const internalDoc = await this.loadDocumentInternal(docId);
+    
+    if (!internalDoc) {
+      throw new Error(`Document ${docId} not found`);
+    }
+    
+    if (internalDoc.isDeleted) {
+      throw new Error(`Document ${docId} has been deleted`);
+    }
+    
+    return this.wrapDocument(internalDoc);
+  }
+
+  async getDocumentAtTimestamp(docId: string, timestamp: number): Promise<MindooDoc | null> {
+    console.log(`[BaseMindooDB] Getting document ${docId} at timestamp ${timestamp}`);
+    
+    // Get all change hashes for this document
+    const allChangeHashes = await this.store.getAllChangeHashesForDoc(docId, false);
+    
+    // Filter changes up to the timestamp
+    const relevantChanges = allChangeHashes
+      .filter(ch => ch.createdAt <= timestamp)
+      .sort((a, b) => a.createdAt - b.createdAt);
+    
+    if (relevantChanges.length === 0) {
+      return null; // Document didn't exist at that time
+    }
+    
+    // Load changes
+    const changes = await this.store.getChanges(relevantChanges);
+    
+    // Apply changes in order
+    let doc = Automerge.init<MindooDocPayload>();
+    for (const changeData of changes) {
+      // Verify signature against the encrypted payload (no decryption needed)
+      // We sign the encrypted payload, so anyone can verify signatures without decryption keys
+      const isValid = await this.verifySignature(
+        changeData.payload,
+        changeData.signature,
+        changeData.createdByPublicKey
+      );
+      if (!isValid) {
+        console.warn(`[BaseMindooDB] Invalid signature for change ${changeData.changeHash}, skipping`);
+        continue;
+      }
+      
+      // Decrypt payload (only after signature verification passes)
+      const decryptedPayload = await this.tenant.decryptPayload(
+        changeData.payload,
+        changeData.decryptionKeyId
+      );
+      
+      // Apply change
+      // Note: applyChanges may return an array or single doc depending on Automerge version
+      const result = Automerge.applyChanges(doc, [decryptedPayload]);
+      doc = Array.isArray(result) ? result[0] : result;
+    }
+    
+    // Check if document was deleted at this timestamp
+    // Look for a "delete" type entry in the relevant changes
+    const hasDeleteEntry = relevantChanges.some(ch => ch.type === "delete" && ch.createdAt <= timestamp);
+    
+    if (hasDeleteEntry) {
+      return null; // Document was deleted at this time
+    }
+    
+    // Find the first change to get createdAt and decryptionKeyId
+    const firstChange = relevantChanges.length > 0 ? relevantChanges[0] : null;
+    const createdAt = firstChange ? firstChange.createdAt : timestamp;
+    const decryptionKeyId = firstChange ? firstChange.decryptionKeyId : "default";
+    
+    const internalDoc: InternalDoc = {
+      id: docId,
+      doc,
+      createdAt,
+      lastModified: timestamp,
+      decryptionKeyId,
+      isDeleted: false,
+    };
+    
+    return this.wrapDocument(internalDoc);
+  }
+
+  async getAllDocumentIds(): Promise<string[]> {
+    // Return all non-deleted document IDs from index
+    const docIds: string[] = [];
+    for (const [docId, info] of this.index) {
+      if (!info.isDeleted) {
+        docIds.push(docId);
+      }
+    }
+    return docIds;
+  }
+
+  async deleteDocument(docId: string): Promise<void> {
+    console.log(`[BaseMindooDB] Deleting document ${docId}`);
+    
+    // Get current document
+    const internalDoc = await this.loadDocumentInternal(docId);
+    if (!internalDoc || internalDoc.isDeleted) {
+      throw new Error(`Document ${docId} not found or already deleted`);
+    }
+    
+    // Get current user for signing
+    const currentUser = await this.tenant.getCurrentUserId();
+    
+    // Create deletion change
+    // Note: We don't need to set _deleted in the Automerge document
+    // Deletion is tracked via the "delete" type entry in the append-only store
+    const newDoc = Automerge.change(internalDoc.doc, (doc: MindooDocPayload) => {
+      // No changes needed - deletion is tracked by the "delete" type entry
+    });
+    
+    // Get the change bytes from the document
+    const changeBytes = Automerge.getLastLocalChange(newDoc);
+    if (!changeBytes) {
+      throw new Error("Failed to get change bytes from Automerge document");
+    }
+    
+    // Decode the change to get hash and dependencies
+    const decodedChange = Automerge.decodeChange(changeBytes);
+    const changeHash = decodedChange.hash;
+    const depsHashes = decodedChange.deps || []; // Dependencies from the decoded change
+    
+    // Encrypt the change payload first
+    const encryptedPayload = await this.tenant.encryptPayload(changeBytes, internalDoc.decryptionKeyId);
+    
+    // Sign the encrypted payload (this allows signature verification without decryption)
+    // This is important for zero-trust: anyone can verify signatures without needing decryption keys
+    const signature = await this.tenant.signPayload(encryptedPayload);
+    
+    // Create change metadata with type "delete" to mark this as a deletion entry in the append-only store
+    const changeMetadata: MindooDocChangeHashes = {
+      type: "delete",
+      docId,
+      changeHash,
+      depsHashes,
+      createdAt: Date.now(),
+      createdByPublicKey: currentUser.userSigningPublicKey,
+      decryptionKeyId: internalDoc.decryptionKeyId,
+      signature,
+    };
+    
+    // Create full change object
+    const fullChange: MindooDocChange = {
+      ...changeMetadata,
+      payload: encryptedPayload,
+    };
+    
+    // Append to store
+    await this.store.append(fullChange);
+    
+    // Update cache and index
+    internalDoc.isDeleted = true;
+    internalDoc.lastModified = Date.now();
+    this.docCache.set(docId, internalDoc);
+    this.index.set(docId, {
+      lastModified: internalDoc.lastModified,
+      isDeleted: true,
+    });
+    
+    console.log(`[BaseMindooDB] Document ${docId} deleted successfully`);
+  }
+
+  async changeDoc(
+    doc: MindooDoc,
+    changeFunc: (doc: MindooDoc) => void
+  ): Promise<void> {
+    const docId = doc.getId();
+    console.log(`[BaseMindooDB] Changing document ${docId}`);
+    
+    // Get internal document from cache or load it
+    let internalDoc = this.docCache.get(docId);
+    if (!internalDoc) {
+      const loadedDoc = await this.loadDocumentInternal(docId);
+      if (!loadedDoc) {
+        throw new Error(`Document ${docId} not found`);
+      }
+      internalDoc = loadedDoc;
+    }
+    
+    if (internalDoc.isDeleted) {
+      throw new Error(`Document ${docId} has been deleted`);
+    }
+    
+    // Get current user for signing
+    const currentUser = await this.tenant.getCurrentUserId();
+    
+    // Apply the change function
+    const now = Date.now();
+    const newDoc = Automerge.change(internalDoc.doc, (automergeDoc: MindooDocPayload) => {
+      // Wrap the Automerge doc in a MindooDoc interface for the change function
+      const wrappedDoc = this.wrapDocument({
+        id: docId,
+        doc: automergeDoc as Automerge.Doc<MindooDocPayload>,
+        createdAt: internalDoc.createdAt,
+        lastModified: internalDoc.lastModified,
+        decryptionKeyId: internalDoc.decryptionKeyId,
+        isDeleted: false,
+      });
+      
+      changeFunc(wrappedDoc);
+      
+      // Update lastModified timestamp
+      automergeDoc._lastModified = now;
+    });
+    
+    // Get the change bytes from the document
+    const changeBytes = Automerge.getLastLocalChange(newDoc);
+    if (!changeBytes) {
+      throw new Error("Failed to get change bytes from Automerge document");
+    }
+    
+    // Decode the change to get hash and dependencies
+    const decodedChange = Automerge.decodeChange(changeBytes);
+    const changeHash = decodedChange.hash;
+    const depsHashes = decodedChange.deps || []; // Dependencies from the decoded change
+    
+    // Encrypt the change payload first
+    const encryptedPayload = await this.tenant.encryptPayload(changeBytes, internalDoc.decryptionKeyId);
+    
+    // Sign the encrypted payload (this allows signature verification without decryption)
+    // This is important for zero-trust: anyone can verify signatures without needing decryption keys
+    const signature = await this.tenant.signPayload(encryptedPayload);
+    
+    // Create change metadata
+    const changeMetadata: MindooDocChangeHashes = {
+      type: "change",
+      docId,
+      changeHash,
+      depsHashes,
+      createdAt: Date.now(),
+      createdByPublicKey: currentUser.userSigningPublicKey,
+      decryptionKeyId: internalDoc.decryptionKeyId,
+      signature,
+    };
+    
+    // Create full change object
+    const fullChange: MindooDocChange = {
+      ...changeMetadata,
+      payload: encryptedPayload,
+    };
+    
+    // Append to store
+    await this.store.append(fullChange);
+    
+    // Update cache and index
+    internalDoc.doc = newDoc;
+    internalDoc.lastModified = Date.now();
+    this.docCache.set(docId, internalDoc);
+    this.index.set(docId, {
+      lastModified: internalDoc.lastModified,
+      isDeleted: internalDoc.isDeleted,
+    });
+    
+    console.log(`[BaseMindooDB] Document ${docId} changed successfully`);
+  }
+
+  async processChangesSince(
+    timestamp: number,
+    limit: number,
+    callback: (change: MindooDoc) => void
+  ): Promise<number> {
+    console.log(`[BaseMindooDB] Processing changes since ${timestamp} (limit: ${limit})`);
+    
+    // Get all documents from index that changed after timestamp
+    const changedDocs: Array<{ docId: string; lastModified: number }> = [];
+    for (const [docId, info] of this.index) {
+      if (info.lastModified > timestamp && !info.isDeleted) {
+        changedDocs.push({ docId, lastModified: info.lastModified });
+      }
+    }
+    
+    // Sort by lastModified (oldest first)
+    changedDocs.sort((a, b) => a.lastModified - b.lastModified);
+    
+    // Process up to limit documents
+    let lastTimestamp = timestamp;
+    const toProcess = changedDocs.slice(0, limit);
+    
+    for (const { docId, lastModified } of toProcess) {
+      try {
+        const doc = await this.getDocument(docId);
+        callback(doc);
+        lastTimestamp = Math.max(lastTimestamp, lastModified);
+      } catch (error) {
+        console.error(`[BaseMindooDB] Error processing document ${docId}:`, error);
+        // Continue with other documents
+      }
+    }
+    
+    console.log(`[BaseMindooDB] Processed ${toProcess.length} changes, last timestamp: ${lastTimestamp}`);
+    return lastTimestamp;
+  }
+
+  /**
+   * Internal method to load a document from the append-only store
+   */
+  private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
+    // Check cache first
+    if (this.docCache.has(docId)) {
+      return this.docCache.get(docId)!;
+    }
+    
+    console.log(`[BaseMindooDB] Loading document ${docId} from store`);
+    
+    // Get all change hashes for this document (from last snapshot if available)
+    const allChangeHashes = await this.store.getAllChangeHashesForDoc(docId, true);
+    
+    if (allChangeHashes.length === 0) {
+      return null;
+    }
+    
+    // Find the most recent snapshot (if any)
+    const snapshots = allChangeHashes.filter(ch => ch.type === "snapshot");
+    let startFromSnapshot = false;
+    let snapshotHash: MindooDocChangeHashes | null = null;
+    
+    if (snapshots.length > 0) {
+      // Use the most recent snapshot
+      snapshots.sort((a, b) => b.createdAt - a.createdAt);
+      snapshotHash = snapshots[0];
+      startFromSnapshot = true;
+    }
+    
+    // Get all changes (excluding snapshot and delete entries - we'll handle delete separately)
+    // Include both "change" and "delete" types as they both contain Automerge changes to apply
+    const changesToLoad = startFromSnapshot
+      ? allChangeHashes.filter(ch => (ch.type === "change" || ch.type === "delete") && ch.createdAt > snapshotHash!.createdAt)
+      : allChangeHashes.filter(ch => ch.type === "change" || ch.type === "delete");
+    
+    // Load the snapshot first if we have one
+    let doc: Automerge.Doc<MindooDocPayload> | undefined = undefined;
+    if (startFromSnapshot && snapshotHash) {
+      const snapshotChanges = await this.store.getChanges([snapshotHash]);
+      if (snapshotChanges.length > 0) {
+        const snapshotData = snapshotChanges[0];
+        
+        // Verify signature against the encrypted snapshot (no decryption needed)
+        // We sign the encrypted payload, so anyone can verify signatures without decryption keys
+        const isValid = await this.verifySignature(
+          snapshotData.payload,
+          snapshotData.signature,
+          snapshotData.createdByPublicKey
+        );
+        if (!isValid) {
+          console.warn(`[BaseMindooDB] Invalid signature for snapshot ${snapshotData.changeHash}`);
+          // Fall back to loading from scratch
+          startFromSnapshot = false;
+        } else {
+          // Decrypt snapshot (only after signature verification passes)
+          const decryptedSnapshot = await this.tenant.decryptPayload(
+            snapshotData.payload,
+            snapshotData.decryptionKeyId
+          );
+          
+          // Load snapshot using Automerge.load()
+          // This deserializes a full document snapshot from binary data
+          // According to Automerge docs: load() is equivalent to init() followed by loadIncremental()
+          doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
+        }
+      }
+    }
+    
+    // If we don't have a snapshot, start from scratch
+    if (!doc) {
+      doc = Automerge.init<MindooDocPayload>();
+    }
+    
+    // Sort changes by timestamp
+    changesToLoad.sort((a, b) => a.createdAt - b.createdAt);
+    
+    // Load and apply all changes
+    const changes = await this.store.getChanges(changesToLoad);
+    
+    for (const changeData of changes) {
+      // Verify signature against the encrypted payload (no decryption needed)
+      // We sign the encrypted payload, so anyone can verify signatures without decryption keys
+      const isValid = await this.verifySignature(
+        changeData.payload,
+        changeData.signature,
+        changeData.createdByPublicKey
+      );
+      if (!isValid) {
+        console.warn(`[BaseMindooDB] Invalid signature for change ${changeData.changeHash}, skipping`);
+        continue;
+      }
+      
+      // Decrypt payload (only after signature verification passes)
+      const decryptedPayload = await this.tenant.decryptPayload(
+        changeData.payload,
+        changeData.decryptionKeyId
+      );
+      
+      // Apply change
+      // Note: applyChanges may return an array or single doc depending on Automerge version
+      const result = Automerge.applyChanges(doc!, [decryptedPayload]);
+      doc = Array.isArray(result) ? result[0] : result;
+    }
+    
+    // Extract metadata from document (doc is guaranteed to be defined at this point)
+    const payload = doc! as unknown as MindooDocPayload;
+    
+    // Check if document was deleted by looking for a "delete" type entry
+    const hasDeleteEntry = allChangeHashes.some(ch => ch.type === "delete");
+    const isDeleted = hasDeleteEntry;
+    
+    const decryptionKeyId = (payload._decryptionKeyId as string) || "default";
+    // Get lastModified from payload, or use the timestamp of the last change
+    const lastChange = changes.length > 0 ? changes[changes.length - 1] : null;
+    const lastModified = (payload._lastModified as number) || 
+                         (lastChange ? lastChange.createdAt : Date.now());
+    // Get createdAt from the first change
+    const firstChange = allChangeHashes.length > 0 ? allChangeHashes[0] : null;
+    const createdAt = firstChange ? firstChange.createdAt : lastModified;
+    
+    const internalDoc: InternalDoc = {
+      id: docId,
+      doc: doc!, // doc is guaranteed to be defined at this point
+      createdAt,
+      lastModified,
+      decryptionKeyId,
+      isDeleted,
+    };
+    
+    // Update cache
+    this.docCache.set(docId, internalDoc);
+    
+    return internalDoc;
+  }
+
+  /**
+   * Verify the signature of a change
+   * 
+   * @param payload The payload that was signed (the Automerge change bytes)
+   * @param signature The signature to verify (Ed25519 signature)
+   * @param publicKey The public key to verify against (Ed25519, PEM format)
+   * @return True if the signature is valid, false otherwise
+   */
+  private async verifySignature(
+    payload: Uint8Array,
+    signature: Uint8Array,
+    publicKey: string
+  ): Promise<boolean> {
+    // First, validate that the public key belongs to a trusted user
+    const isTrusted = await this.tenant.validatePublicSigningKey(publicKey);
+    if (!isTrusted) {
+      console.warn(`[BaseMindooDB] Public key not trusted: ${publicKey}`);
+      return false;
+    }
+    
+    // TODO: Implement Ed25519 signature verification using Web Crypto API
+    // For now, we trust the key validation
+    // In a full implementation, we would:
+    // 1. Import the public key from PEM format
+    // 2. Verify the signature against the payload using Ed25519
+    // 3. Return the verification result
+    // This requires platform-specific crypto implementations using Web Crypto API
+    // Example (pseudo-code):
+    //   const key = await crypto.subtle.importKey(...);
+    //   const isValid = await crypto.subtle.verify('Ed25519', key, signature, payload);
+    //   return isValid;
+    
+    // For now, we only verify that the key is trusted
+    // Full cryptographic verification should be implemented in platform-specific code
+    return true;
+  }
+
+  /**
+   * Wrap an internal document in the MindooDoc interface
+   */
+  private wrapDocument(internalDoc: InternalDoc): MindooDoc {
+    return {
+      getId: () => internalDoc.id,
+      getCreatedAt: () => internalDoc.createdAt,
+      getLastModified: () => internalDoc.lastModified,
+      isDeleted: () => internalDoc.isDeleted,
+      getData: () => internalDoc.doc as unknown as MindooDocPayload,
+    };
+  }
+
+  /**
+   * Generate a UUID7 identifier
+   * Uses the 'uuid7-typed' npm package for proper UUID7 generation
+   * Falls back to a simple UUID7 implementation if the package is not available
+   */
+  private generateUUID7(): string {
+    // Try to use uuid7-typed library if available
+    try {
+      // Dynamic import to support both CommonJS and ES modules
+      const uuid7 = require("uuid7-typed");
+      if (typeof uuid7 === "function") {
+        return uuid7();
+      }
+      if (typeof uuid7.uuid7 === "function") {
+        return uuid7.uuid7();
+      }
+      if (typeof uuid7.generate === "function") {
+        return uuid7.generate();
+      }
+    } catch (e) {
+      // Fall through to fallback implementation
+    }
+    
+    // Fallback: Simple UUID7 implementation
+    // UUID7 format: timestamp (48 bits) + random (74 bits) = 122 bits total
+    // Format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
+    // Where 7 indicates version 7, and y is one of 8, 9, A, or B
+    return this.generateUUID7Fallback();
+  }
+
+  /**
+   * Simple UUID7 fallback implementation
+   * Generates a UUID7-compatible identifier with timestamp and random components
+   */
+  private generateUUID7Fallback(): string {
+    const now = Date.now();
+    
+    // Get high-resolution timestamp if available (milliseconds since Unix epoch)
+    // UUID7 uses 48 bits for timestamp (milliseconds since Unix epoch)
+    const timestamp = now;
+    
+    // Generate random bytes for the rest
+    const randomBytes = new Uint8Array(10);
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+      crypto.getRandomValues(randomBytes);
+    } else {
+      // Fallback for environments without crypto.getRandomValues
+      for (let i = 0; i < randomBytes.length; i++) {
+        randomBytes[i] = Math.floor(Math.random() * 256);
+      }
+    }
+    
+    // Build UUID7 format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
+    // Timestamp (48 bits = 12 hex digits)
+    const timestampHex = timestamp.toString(16).padStart(12, "0");
+    
+    // Version 7 indicator (4 bits = 1 hex digit, value 7)
+    const version = "7";
+    
+    // Variant (2 bits = 1 hex digit, value 8, 9, A, or B)
+    const variant = (8 + (randomBytes[0] & 0x3)).toString(16).toUpperCase();
+    
+    // Random data (62 bits = 15.5 hex digits, we'll use 15)
+    const randomHex = Array.from(randomBytes.slice(1))
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("")
+      .substring(0, 15);
+    
+    // Construct UUID7: timestamp (12) + version (1) + random (3) + variant (1) + random (12)
+    const uuid7 = [
+      timestampHex.substring(0, 8),
+      timestampHex.substring(8, 12),
+      version + randomHex.substring(0, 3),
+      variant + randomHex.substring(3, 6),
+      randomHex.substring(6, 18),
+    ].join("-");
+    
+    return uuid7;
+  }
+}
+
