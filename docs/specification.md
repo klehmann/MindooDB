@@ -50,7 +50,7 @@ Users are identified by cryptographic key pairs and registered in the tenant dir
 
 **User Key Pairs:**
 - **Signing Key Pair** (Ed25519): Used **only for signing** document changes, proving authorship and integrity (signing only, not encryption)
-- **Encryption Key Pair** (RSA or ECDH): Used **only for encryption/decryption** of the named symmetric keys map stored on disk (encryption only, not signing)
+- **Encryption Key Pair** (RSA-OAEP): Used **only for encryption/decryption** of the KeyBag stored on disk (encryption only, not signing)
 
 **User Registration:**
 - Users are registered by administrators using the administration key (for signing the registration)
@@ -62,7 +62,7 @@ Users are identified by cryptographic key pairs and registered in the tenant dir
 - Key derivation function (KDF) uses different salts for each key:
   - Signing key: salt = "signing"
   - Encryption key: salt = "encryption"
-  - Named symmetric keys: salt = key ID (e.g., "default", "project-alpha")
+  - Named symmetric keys: salt = "symmetric" (for keys created via `createSymmetricEncryptedPrivateKey()`)
 
 ### 3. Documents and Automerge
 
@@ -123,15 +123,17 @@ MindooDB uses a **hybrid encryption model**:
 - Key IDs are stored in document changes (`decryptionKeyId` field)
 
 **Key Distribution:**
-- Named keys are created using `createNamedSymmetricKey()`
-- Keys can be protected with an additional password (distributed via secure channel)
-- Keys are stored encrypted on disk using the user's encryption key pair
-- Key rotation is supported by storing multiple versions per key ID
+- Named keys are created using `createSymmetricEncryptedPrivateKey()` (returns an `EncryptedPrivateKey`)
+- Keys can be protected with a password (distributed via secure channel)
+- Keys are stored in a **KeyBag** which is encrypted on disk using the user's encryption key password (via PBKDF2)
+- Key rotation is supported by storing multiple versions per key ID (newest tried first)
 
 **Key Storage:**
-- Named symmetric keys are stored in a map: `Map<keyId, EncryptedPrivateKey[]>`
-- The map itself is stored on disk encrypted with the user's encryption key pair
-- Users unlock their encryption key with their password to access named keys
+- Named symmetric keys are stored in a **KeyBag** instance
+- The KeyBag internally uses `Map<keyId, KeyEntry[]>` where each `KeyEntry` contains the decrypted key bytes and optional `createdAt` timestamp
+- The KeyBag is stored on disk encrypted with the user's encryption key password (using PBKDF2 with salt derived from the user encryption key)
+- Users unlock their KeyBag with their password to access named keys
+- The KeyBag provides methods: `get(keyId)`, `set(keyId, key, createdAt)`, `listKeys()`, `save()`, `load()`
 
 ### 6. Security Model
 
@@ -172,21 +174,27 @@ MindooDB uses a **hybrid encryption model**:
    - Tenant ID
    - Administration key password
    - Tenant encryption key password
+   - Current user (PrivateUserId)
+   - Current user password
+   - KeyBag instance
 2. System generates:
    - Administration key pair (Ed25519)
-   - Tenant encryption key (AES-256, stored as "default" in named keys map)
-3. Tenant is ready for use
+   - Tenant encryption key (AES-256, encrypted with password)
+3. Tenant is ready for use (tenant encryption key is used for "default" key ID)
 
 ### Creating a User
 
 1. Client calls `TenantFactory.createUserId()` with username and password
 2. System generates:
    - Signing key pair (Ed25519)
-   - Encryption key pair (RSA or ECDH)
-3. Both private keys are encrypted with the password (via key derivation)
-4. Administrator registers the user using `registerUser()` with administration key
-5. This adds the user to the special MindooDB named "directory", signed with the administration key to verify the user is trusted.
-6. For users with revoked tenant access, we might add a record to the directory as well so that their changes are no longer trusted and ignored.
+   - Encryption key pair (RSA-OAEP, 3072 bits)
+3. Both private keys are encrypted with the password (via key derivation with different salts)
+4. Administrator opens the directory using `Tenant.openDirectory()` and registers the user using `MindooTenantDirectory.registerUser()` with:
+   - Public user ID (from `TenantFactory.toPublicUserId()`)
+   - Administration private key (encrypted)
+   - Administration key password
+5. This adds the user to the special MindooDB named "directory", signed with the administration key to verify the user is trusted
+6. For users with revoked tenant access, administrators can call `MindooTenantDirectory.revokeUser()` to add a revocation record so that their changes are no longer trusted and ignored
 
 ### Creating a Document
 
@@ -209,29 +217,41 @@ MindooDB uses a **hybrid encryption model**:
 
 ### Synchronizing Changes
 
+**Low-Level Synchronization (AppendOnlyStore):**
 1. Client A calls `AppendOnlyStore.findNewChanges()` with list of known change hashes
 2. Client B (or server) returns list of missing changes
 3. Client A calls `AppendOnlyStore.getChanges()` to fetch the actual changes
-4. For each change:
-   - Verify signature (prove authenticity and integrity)
-   - Decrypt payload if encrypted (using appropriate key from user's key map)
-   - Apply change to Automerge document
-5. Updated document state is available
-6. **Internal Index Update**: The local MindooDB instance updates its internal index when documents actually change (after applying changes)
-7. The index tracks which documents have changed and when, enabling incremental operations on the database
-8. `processChangesSince()` uses this index to efficiently find documents that changed since a given timestamp
-9. This enables external systems to efficiently query for document changes and update their own indexes incrementally
+
+**High-Level Synchronization (MindooDB):**
+1. Client calls `MindooDB.syncStoreChanges()` to sync changes from the local append-only store
+   - This finds new changes using `findNewChanges()`
+   - Processes each change: verifies signature, decrypts payload, applies to Automerge document
+   - Updates internal index
+2. For remote synchronization:
+   - `MindooDB.pullChangesFrom(remoteStore)` - pulls changes from a remote store
+   - `MindooDB.pushChangesTo(remoteStore)` - pushes local changes to a remote store
+
+**Change Processing:**
+- For each change:
+  - Verify signature (prove authenticity and integrity)
+  - Decrypt payload if encrypted (using appropriate key from KeyBag via `Tenant.decryptPayload()`)
+  - Apply change to Automerge document
+- Updated document state is available
+- **Internal Index Update**: The local MindooDB instance updates its internal index when documents actually change (after applying changes)
+- The index tracks which documents have changed and when, enabling incremental operations on the database
+- `processChangesSince()` uses this index to efficiently find documents that changed since a given cursor
+- This enables external systems to efficiently query for document changes and update their own indexes incrementally
 
 ### Key Distribution
 
-1. Administrator creates named key: `createNamedSymmetricKey(keyId, optionalPassword)`
+1. Administrator creates named key: `TenantFactory.createSymmetricEncryptedPrivateKey(password)` which returns an `EncryptedPrivateKey`
 2. Encrypted key is distributed to authorized users (email, shared folder, etc.)
-3. If password-protected, password is communicated via secure channel (phone, in-person)
-4. Users add the key to their `NamedSymmetricKeysMap`
-5. Key is stored encrypted on disk using user's encryption key pair
-6. **Access Discovery**: When a new key is added to a user's `NamedSymmetricKeysMap`, the system scans all append-only stores to identify documents encrypted with that key ID
-7. For newly accessible documents, the system builds their latest state by applying all changes
-8. Users can now decrypt and access documents encrypted with that key ID
+3. Password is communicated via secure channel (phone, in-person)
+4. Users add the key to their tenant using `Tenant.addNamedKey(keyId, encryptedKey, encryptedKeyPassword)`
+5. The tenant decrypts the key and stores it in the user's **KeyBag** (which is encrypted on disk using the user's encryption key password)
+6. The KeyBag can be saved/loaded using `KeyBag.save()` and `KeyBag.load()` methods
+7. **Note**: Access discovery (scanning append-only stores when a new key is added) is a potential future enhancement but not currently implemented
+8. Users can now decrypt and access documents encrypted with that key ID using `Tenant.encryptPayload()` and `Tenant.decryptPayload()`
 
 ## Performance Considerations
 
@@ -290,8 +310,9 @@ Due to the append-only nature of the store:
 
 **Mitigation:**
 - Single password unlocks all keys (via key derivation)
-- Named keys stored encrypted on disk (unlocked with user encryption key)
+- Named keys stored in KeyBag encrypted on disk (unlocked with user encryption key password via PBKDF2)
 - Clear key ID system for identifying which key to use
+- KeyBag provides unified interface for key management (`get()`, `set()`, `listKeys()`, `save()`, `load()`)
 
 ## Use Cases
 
