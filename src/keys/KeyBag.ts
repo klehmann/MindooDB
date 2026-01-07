@@ -105,16 +105,59 @@ export class KeyBag {
    * @param keyId The ID to store the decrypted key under
    * @param key The encrypted private key to decrypt
    * @param password The password to decrypt the key
+   * @param saltString Optional salt string for key derivation. Defaults to keyId.
+   *                   Use "symmetric" for keys created by createSymmetricEncryptedPrivateKey.
    * @return A promise that resolves when the key is decrypted and stored
    */
-  async decryptAndImportKey(keyId: string, key: EncryptedPrivateKey, password: string): Promise<void> {
-    const decryptedKeyBytes = await this.decryptPrivateKey(key, password, keyId);
+  async decryptAndImportKey(keyId: string, key: EncryptedPrivateKey, password: string, saltString?: string): Promise<void> {
+    const salt = saltString ?? keyId;
+    const decryptedKeyBytes = await this.decryptPrivateKey(key, password, salt);
     const keyEntries = this.keys.get(keyId) || [];
     keyEntries.push({ 
       key: new Uint8Array(decryptedKeyBytes),
       createdAt: key.createdAt 
     });
     this.keys.set(keyId, keyEntries);
+  }
+
+  /**
+   * Encrypts a key from the key bag with the given password and exports it as an EncryptedPrivateKey.
+   * Returns the newest key (based on createdAt) or the first key if no timestamps are available.
+   * 
+   * @param keyId The ID of the key to encrypt and export
+   * @param password The password to encrypt the key with
+   * @return A promise that resolves to the encrypted private key, or null if the key is not found
+   */
+  async encryptAndExportKey(keyId: string, password: string): Promise<EncryptedPrivateKey | null> {
+    const key = await this.get(keyId);
+    if (!key) {
+      return null;
+    }
+    
+    // Get the createdAt timestamp from the newest key entry
+    const keyEntries = this.keys.get(keyId);
+    if (!keyEntries || keyEntries.length === 0) {
+      return null;
+    }
+    
+    // Sort by createdAt (newest first) to get the timestamp
+    const sorted = [...keyEntries].sort((a, b) => {
+      const aTime = a.createdAt ?? 0;
+      const bTime = b.createdAt ?? 0;
+      return bTime - aTime; // Descending order (newest first)
+    });
+    
+    const createdAt = sorted[0].createdAt;
+    
+    // Encrypt the key using the same pattern as decryptPrivateKey
+    const encryptedKey = await this.encryptPrivateKey(key, password, keyId);
+    
+    // Include the createdAt timestamp if available
+    if (createdAt !== undefined) {
+      encryptedKey.createdAt = createdAt;
+    }
+    
+    return encryptedKey;
   }
 
   /**
@@ -158,7 +201,8 @@ export class KeyBag {
     const plaintext = new TextEncoder().encode(jsonString);
     
     const subtle = this.cryptoAdapter.getSubtle();
-    const randomValues = this.cryptoAdapter.getRandomValues;
+    // Bind getRandomValues to maintain 'this' context
+    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
     
     // Derive an AES-GCM key using PBKDF2 with the user encryption key's salt
     // Use the salt from the user encryption key as part of the key derivation
@@ -393,6 +437,95 @@ export class KeyBag {
     );
 
     return decrypted;
+  }
+
+  /**
+   * Internal method to encrypt a private key using password-based key derivation.
+   * This is the reverse of decryptPrivateKey().
+   * 
+   * @param privateKeyBytes The private key bytes to encrypt
+   * @param password The password to encrypt the key with
+   * @param saltString The salt string for key derivation (e.g., keyId)
+   * @returns The encrypted private key
+   */
+  private async encryptPrivateKey(
+    privateKeyBytes: Uint8Array,
+    password: string,
+    saltString: string
+  ): Promise<EncryptedPrivateKey> {
+    const subtle = this.cryptoAdapter.getSubtle();
+    // Bind getRandomValues to maintain 'this' context
+    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
+
+    // Generate random salt and IV
+    const saltArray = new Uint8Array(16); // 16 bytes salt
+    randomValues(saltArray);
+    const salt = new Uint8Array(saltArray);
+
+    const ivArray = new Uint8Array(12); // 12 bytes for AES-GCM
+    randomValues(ivArray);
+    const iv = new Uint8Array(ivArray);
+
+    // Combine salt with saltString for key derivation (same as decryption)
+    const saltStringBytes = new TextEncoder().encode(saltString);
+    const combinedSalt = new Uint8Array(salt.length + saltStringBytes.length);
+    combinedSalt.set(salt);
+    combinedSalt.set(saltStringBytes, salt.length);
+
+    // Derive encryption key from password using PBKDF2
+    const passwordKey = await subtle.importKey(
+      "raw",
+      new TextEncoder().encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits", "deriveKey"]
+    );
+
+    const iterations = 310000; // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
+    const derivedKey = await subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt: combinedSalt,
+        iterations: iterations,
+        hash: "SHA-256",
+      },
+      passwordKey,
+      {
+        name: "AES-GCM",
+        length: 256,
+      },
+      false,
+      ["encrypt"]
+    );
+
+    // Encrypt the private key
+    const encrypted = await subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv,
+        tagLength: 128,
+      },
+      derivedKey,
+      privateKeyBytes.buffer as ArrayBuffer
+    );
+
+    // Extract ciphertext and tag from encrypted data
+    // AES-GCM appends the tag at the end
+    const encryptedArray = new Uint8Array(encrypted);
+    const tagLength = 16; // 128 bits = 16 bytes
+    const ciphertext = encryptedArray.slice(0, encryptedArray.length - tagLength);
+    const tag = encryptedArray.slice(encryptedArray.length - tagLength);
+
+    // Create encrypted key structure
+    const encryptedKey: EncryptedPrivateKey = {
+      ciphertext: this.uint8ArrayToBase64(ciphertext),
+      iv: this.uint8ArrayToBase64(iv),
+      tag: this.uint8ArrayToBase64(tag),
+      salt: this.uint8ArrayToBase64(salt),
+      iterations: iterations,
+    };
+
+    return encryptedKey;
   }
 
   /**
