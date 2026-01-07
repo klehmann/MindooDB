@@ -591,11 +591,13 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async processChangesSince(
-    cursor: ProcessChangesCursor,
+    cursor: ProcessChangesCursor | null,
     limit: number,
     callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void
   ): Promise<ProcessChangesCursor> {
-    console.log(`[BaseMindooDB] Processing changes since cursor ${JSON.stringify(cursor)} (limit: ${limit})`);
+    // Default to initial cursor if null is provided
+    const actualCursor: ProcessChangesCursor = cursor ?? { lastModified: 0, docId: "" };
+    console.log(`[BaseMindooDB] Processing changes since cursor ${JSON.stringify(actualCursor)} (limit: ${limit})`);
     
     // Find starting position using binary search
     // We want to find the first entry that is greater than the cursor
@@ -608,7 +610,7 @@ export class BaseMindooDB implements MindooDB {
         const mid = Math.floor((left + right) / 2);
         const entry = this.index[mid];
         const cmp = this.compareIndexEntries(
-          { docId: cursor.docId, lastModified: cursor.lastModified },
+          { docId: actualCursor.docId, lastModified: actualCursor.lastModified },
           entry
         );
         
@@ -624,7 +626,7 @@ export class BaseMindooDB implements MindooDB {
       // If we found an exact match, start from the next entry
       if (startIndex < this.index.length) {
         const entry = this.index[startIndex];
-        if (entry.lastModified === cursor.lastModified && entry.docId === cursor.docId) {
+        if (entry.lastModified === actualCursor.lastModified && entry.docId === actualCursor.docId) {
           startIndex++;
         }
       }
@@ -632,7 +634,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Process documents in order from the starting position
     let processedCount = 0;
-    let lastCursor: ProcessChangesCursor = cursor;
+    let lastCursor: ProcessChangesCursor = actualCursor;
     
     for (let i = startIndex; i < this.index.length && processedCount < limit; i++) {
       const entry = this.index[i];

@@ -582,12 +582,12 @@ export interface MindooDB {
    * The callback can return `false` to stop processing early. If the callback throws an error
    * or if there's an error processing a document, the loop will stop and the error will be propagated.
    *
-   * @param cursor The cursor to start processing changes from. Use { lastModified: 0, docId: "" } to start from the beginning.
+   * @param cursor The cursor to start processing changes from. Use `null` or `{ lastModified: 0, docId: "" }` to start from the beginning.
    * @param limit The maximum number of changes to process (for pagination)
    * @param callback The function to call for each change. Receives the document and its cursor position. Return `false` to stop processing, or `true`/`undefined` to continue.
    * @return The cursor of the last change processed, can be used to continue processing from this position
    */
-  processChangesSince(cursor: ProcessChangesCursor, limit: number, callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void): Promise<ProcessChangesCursor>;
+  processChangesSince(cursor: ProcessChangesCursor | null, limit: number, callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void): Promise<ProcessChangesCursor>;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.
