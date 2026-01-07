@@ -1,4 +1,4 @@
-import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, ProcessChangesCursor, PublicUserId } from "./types";
+import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, PublicUserId } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
@@ -93,64 +93,20 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // Sync changes to make sure everything is processed
     await this.directoryDB.syncStoreChanges();
     
-    // Process changes in pages until we find the document or reach the end
-    const pageSize = 100; // Process documents in batches
-    let cursor: ProcessChangesCursor | null = null; // Start from the beginning
-    let foundDoc: MindooDoc | null = null;
-    
-    while (foundDoc === null) {
-      let documentsProcessed = 0;
-      
-      // Process one page of changes
-      const returnedCursor = await this.directoryDB.processChangesSince(
-        cursor,
-        pageSize,
-        (doc: MindooDoc, currentCursor: ProcessChangesCursor) => {
-          documentsProcessed++;
-          const data = doc.getData();
-          // Check if this is the grant access document we're looking for
-          if (data.form === "useroperation" && 
-              data.type === "grantaccess" && 
-              data.username === username) {
-            foundDoc = doc;
-            // Stop processing this page early since we found what we're looking for
-            return false;
-          }
-          // Continue processing this page
-          return true;
-        }
-      );
-      
-      // If we found the document, break out of the loop
-      if (foundDoc !== null) {
-        break;
+    // Use the generator-based iteration API for cleaner code
+    for await (const { doc } of this.directoryDB.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      // Check if this is the grant access document we're looking for
+      if (data.form === "useroperation" && 
+          data.type === "grantaccess" && 
+          data.username === username) {
+        console.log(`[BaseMindooTenantDirectory] Found grant access document for username: ${username}`);
+        return doc;
       }
-      
-      // If we processed fewer documents than the page size, we've reached the end
-      if (documentsProcessed < pageSize) {
-        console.log(`[BaseMindooTenantDirectory] Reached end of documents, processed ${documentsProcessed} in last page`);
-        break;
-      }
-      
-      // If the cursor didn't advance, we've reached the end
-      if (cursor !== null && 
-          returnedCursor.lastModified === cursor.lastModified && 
-          returnedCursor.docId === cursor.docId) {
-        console.log(`[BaseMindooTenantDirectory] Cursor did not advance, reached end of documents`);
-        break;
-      }
-      
-      // Continue with the next page using the returned cursor
-      cursor = returnedCursor;
     }
     
-    if (foundDoc) {
-      console.log(`[BaseMindooTenantDirectory] Found grant access document for username: ${username}`);
-    } else {
-      console.log(`[BaseMindooTenantDirectory] No grant access document found for username: ${username}`);
-    }
-    
-    return foundDoc;
+    console.log(`[BaseMindooTenantDirectory] No grant access document found for username: ${username}`);
+    return null;
   }
 
   async revokeUser(

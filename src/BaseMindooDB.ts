@@ -7,6 +7,7 @@ import {
   MindooDocChangeHashes,
   MindooTenant,
   ProcessChangesCursor,
+  ProcessChangesResult,
 } from "./types";
 import type { AppendOnlyStore } from "./appendonlystores/types";
 
@@ -675,6 +676,57 @@ export class BaseMindooDB implements MindooDB {
     
     console.log(`[BaseMindooDB] Processed ${processedCount} changes, last cursor: ${JSON.stringify(lastCursor)}`);
     return lastCursor;
+  }
+
+  async *iterateChangesSince(
+    cursor: ProcessChangesCursor | null,
+    pageSize: number = 100
+  ): AsyncGenerator<ProcessChangesResult, void, unknown> {
+    console.log(`[BaseMindooDB] Starting iteration from cursor ${JSON.stringify(cursor)} (pageSize: ${pageSize})`);
+    
+    let currentCursor: ProcessChangesCursor | null = cursor;
+    
+    while (true) {
+      // Collect documents from this page
+      const pageResults: ProcessChangesResult[] = [];
+      let documentsProcessed = 0;
+      
+      // Process one page of changes
+      const returnedCursor = await this.processChangesSince(
+        currentCursor,
+        pageSize,
+        (doc: MindooDoc, docCursor: ProcessChangesCursor) => {
+          documentsProcessed++;
+          pageResults.push({ doc, cursor: docCursor });
+          // Always continue processing the page
+          return true;
+        }
+      );
+      
+      // Yield all documents from this page
+      for (const result of pageResults) {
+        yield result;
+      }
+      
+      // If we processed fewer documents than the page size, we've reached the end
+      if (documentsProcessed < pageSize) {
+        console.log(`[BaseMindooDB] Reached end of documents, processed ${documentsProcessed} in last page`);
+        break;
+      }
+      
+      // If the cursor didn't advance, we've reached the end
+      if (currentCursor !== null && 
+          returnedCursor.lastModified === currentCursor.lastModified && 
+          returnedCursor.docId === currentCursor.docId) {
+        console.log(`[BaseMindooDB] Cursor did not advance, reached end of documents`);
+        break;
+      }
+      
+      // Continue with the next page using the returned cursor
+      currentCursor = returnedCursor;
+    }
+    
+    console.log(`[BaseMindooDB] Iteration completed`);
   }
 
   /**

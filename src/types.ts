@@ -479,6 +479,22 @@ export interface ProcessChangesCursor {
   docId: string;
 }
 
+/**
+ * Result yielded by the iterateChangesSince generator.
+ * Contains both the document and its cursor position for tracking progress.
+ */
+export interface ProcessChangesResult {
+  /**
+   * The document that was processed
+   */
+  doc: MindooDoc;
+  
+  /**
+   * The cursor position of this document
+   */
+  cursor: ProcessChangesCursor;
+}
+
 export interface MindooDB {
 
   /**
@@ -588,6 +604,30 @@ export interface MindooDB {
    * @return The cursor of the last change processed, can be used to continue processing from this position
    */
   processChangesSince(cursor: ProcessChangesCursor | null, limit: number, callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void): Promise<ProcessChangesCursor>;
+
+  /**
+   * Iterate over documents that changed since a given cursor using an async generator.
+   * This provides a cleaner iteration pattern compared to the callback-based processChangesSince.
+   * 
+   * Documents are returned in modification order (oldest first).
+   * The generator automatically handles pagination internally.
+   * 
+   * Example usage:
+   * ```typescript
+   * for await (const { doc, cursor } of db.iterateChangesSince(null, 100)) {
+   *   const data = doc.getData();
+   *   if (data.type === "target") {
+   *     // Process document
+   *     break; // Stop iteration early if needed
+   *   }
+   * }
+   * ```
+   *
+   * @param cursor The cursor to start processing changes from. Use `null` to start from the beginning.
+   * @param pageSize The number of documents to process per page (for internal pagination). Defaults to 100.
+   * @return An async generator that yields ProcessChangesResult objects containing the document and its cursor
+   */
+  iterateChangesSince(cursor: ProcessChangesCursor | null, pageSize?: number): AsyncGenerator<ProcessChangesResult, void, unknown>;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.
