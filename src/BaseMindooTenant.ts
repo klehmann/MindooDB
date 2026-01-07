@@ -111,9 +111,12 @@ export class BaseMindooTenant implements MindooTenant {
     }
     console.log(`[BaseMindooTenant] Adding named key: ${keyId}`);
 
-    // Decrypt the encrypted key and store it in KeyBag
-    // KeyBag handles persistence via its save() method (called by the caller)
-    await this.keyBag.decryptAndImportKey(keyId, encryptedKey, encryptedKeyPassword);
+    // Decrypt the encrypted key using the correct salt string ("symmetric" for symmetric keys)
+    // The key was encrypted with salt "symmetric" by createSymmetricEncryptedPrivateKey
+    const decryptedKeyBytes = await this.decryptPrivateKey(encryptedKey, encryptedKeyPassword, "symmetric");
+    
+    // Store the decrypted key in KeyBag
+    await this.keyBag.set(keyId, new Uint8Array(decryptedKeyBytes), encryptedKey.createdAt);
     
     console.log(`[BaseMindooTenant] Added named key: ${keyId}`);
   }
@@ -147,7 +150,8 @@ export class BaseMindooTenant implements MindooTenant {
     }
     
     const subtle = this.cryptoAdapter.getSubtle();
-    const randomValues = this.cryptoAdapter.getRandomValues;
+    // Bind getRandomValues to maintain 'this' context
+    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
 
     // Import the symmetric key
     const cryptoKey = await subtle.importKey(
