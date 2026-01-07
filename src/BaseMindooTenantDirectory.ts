@@ -24,10 +24,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const baseTenant = this.tenant as BaseMindooTenant;
 
     // Decrypt the administration private key
+    // Note: Administration keys can use salt "signing" (same as user signing keys)
     const adminKey = await this.tenant.decryptPrivateKey(
       administrationPrivateKey,
       administrationPrivateKeyPassword,
-      "administration"
+      "signing"
     );
 
     // Sign the user registration with the administration key
@@ -55,17 +56,33 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     );
 
     // Add user to directory database
+    console.log(`[BaseMindooTenantDirectory] Creating document for user registration`);
     const newDoc = await this.directoryDB.createDocument();
-    await this.directoryDB.changeDoc(newDoc, (doc: MindooDoc) => {
-      const data = doc.getData();
-      data.form = "useroperation";
-      data.type = "grantaccess";
-      data.username = userId.username;
-      data.userSigningPublicKey = userId.userSigningPublicKey;
-      data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
-      data.registrationData = baseTenant.uint8ArrayToBase64(registrationDataBytes);
-      data.administrationSignature = baseTenant.uint8ArrayToBase64(new Uint8Array(signature));
-    });
+    console.log(`[BaseMindooTenantDirectory] Document created: ${newDoc.getId()}`);
+    console.log(`[BaseMindooTenantDirectory] About to call changeDoc to modify document`);
+    try {
+      await this.directoryDB.changeDoc(newDoc, (doc: MindooDoc) => {
+        console.log(`[BaseMindooTenantDirectory] Inside changeDoc callback, modifying document ${doc.getId()}`);
+        const data = doc.getData();
+        data.form = "useroperation";
+        data.type = "grantaccess";
+        data.username = userId.username;
+        data.userSigningPublicKey = userId.userSigningPublicKey;
+        data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
+        data.registrationData = baseTenant.uint8ArrayToBase64(registrationDataBytes);
+        data.administrationSignature = baseTenant.uint8ArrayToBase64(new Uint8Array(signature));
+        console.log(`[BaseMindooTenantDirectory] Finished modifying document data in callback`);
+      });
+      console.log(`[BaseMindooTenantDirectory] changeDoc completed successfully`);
+    } catch (error) {
+      console.error(`[BaseMindooTenantDirectory] ERROR in changeDoc:`, error);
+      console.error(`[BaseMindooTenantDirectory] Error type: ${error instanceof Error ? error.constructor.name : typeof error}`);
+      console.error(`[BaseMindooTenantDirectory] Error message: ${error instanceof Error ? error.message : String(error)}`);
+      if (error instanceof Error && error.stack) {
+        console.error(`[BaseMindooTenantDirectory] Error stack: ${error.stack}`);
+      }
+      throw error;
+    }
     
     console.log(`[BaseMindooTenantDirectory] Registered user: ${userId.username}`);
   }
@@ -81,10 +98,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const baseTenant = this.tenant as BaseMindooTenant;
 
     // Decrypt the administration private key
+    // Note: Administration keys can use salt "signing" (same as user signing keys)
     const adminKey = await baseTenant.decryptPrivateKey(
       administrationPrivateKey,
       administrationPrivateKeyPassword,
-      "administration"
+      "signing"
     );
 
     // Sign the revocation with the administration key

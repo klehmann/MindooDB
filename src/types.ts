@@ -65,17 +65,17 @@ export type { PublicUserId, PrivateUserId };
 export interface MindooTenantFactory {
 
   /**
-   * Create a new tenant with a new tenant encryption key and administration key.
+   * Create a new tenant with a new tenant encryption key.
    * 
    * The tenant encryption key is used as the default document encryption key
    * (so that all data within the tenant is secure by default).
    * 
-   * The administration key is used for administrative operations within the tenant,
-   * such as adding new users to the tenant.
+   * The administration public key must be created beforehand using createSigningKeyPair()
+   * and passed to this method. The administration key is used for administrative operations
+   * within the tenant, such as adding new users to the tenant.
    *
    * @param tenantId The ID of the tenant
-   * @param administrationKeyPassword The password used to encrypt the administration private key
-   *                                 (this key is used to register new users and sign administrative operations)
+   * @param administrationPublicKey The administration public key (Ed25519, PEM format) created using createSigningKeyPair()
    * @param tenantEncryptionKeyPassword The password to be set to decrypt the tenant encryption private key
    * @param currentUser The current user's private user ID (required for tenant operations)
    * @param currentUserPassword The password to decrypt the current user's private keys
@@ -84,7 +84,7 @@ export interface MindooTenantFactory {
    */
   createTenant(
     tenantId: string,
-    administrationKeyPassword: string,
+    administrationPublicKey: string,
     tenantEncryptionKeyPassword: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,

@@ -28,10 +28,13 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   }
 
   /**
-   * Create a new tenant from scratch with a new tenant encryption key and administration key.
+   * Create a new tenant from scratch with a new tenant encryption key.
+   * 
+   * The administration public key must be created beforehand using createSigningKeyPair()
+   * and passed to this method.
    * 
    * @param tenantId The ID of the tenant
-   * @param administrationKeyPassword The password used to encrypt the administration private key
+   * @param administrationPublicKey The administration public key (Ed25519, PEM format) created using createSigningKeyPair()
    * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption private key
    * @param currentUser The current user's private user ID (required for tenant operations)
    * @param currentUserPassword The password to decrypt the current user's private keys
@@ -40,7 +43,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    */
   async createTenant(
     tenantId: string,
-    administrationKeyPassword: string,
+    administrationPublicKey: string,
     tenantEncryptionKeyPassword: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
@@ -49,7 +52,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log(`[BaseTenantFactory] Creating tenant: ${tenantId}`);
 
     const subtle = this.cryptoAdapter.getSubtle();
-    const randomValues = this.cryptoAdapter.getRandomValues;
 
     // Generate tenant encryption key (AES-256)
     const tenantEncryptionKey = await subtle.generateKey(
@@ -70,39 +72,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       tenantKeyBytes,
       tenantEncryptionKeyPassword,
       "default"
-    );
-
-    // Generate administration key pair (Ed25519)
-    const administrationKeyPair = await subtle.generateKey(
-      {
-        name: "Ed25519",
-      },
-      true, // extractable
-      ["sign", "verify"]
-    );
-
-    // Export administration public key (PEM format)
-    const administrationPublicKeyBuffer = await subtle.exportKey(
-      "spki",
-      administrationKeyPair.publicKey
-    );
-    const administrationPublicKey = this.arrayBufferToPEM(
-      administrationPublicKeyBuffer,
-      "PUBLIC KEY"
-    );
-
-    // Export administration private key
-    const administrationPrivateKeyBuffer = await subtle.exportKey(
-      "pkcs8",
-      administrationKeyPair.privateKey
-    );
-    const administrationPrivateKeyBytes = new Uint8Array(administrationPrivateKeyBuffer);
-
-    // Encrypt the administration private key with password
-    const encryptedAdministrationKey = await this.encryptPrivateKey(
-      administrationPrivateKeyBytes,
-      administrationKeyPassword,
-      "administration"
     );
 
     return this.openTenantWithKeys(
@@ -304,8 +273,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     const keyBytes = new Uint8Array(keyMaterial);
 
     // Encrypt the key material using the shared helper
-    // Use "symmetric" as the salt string for generic symmetric keys
-    const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "symmetric");
+    // Use "default" as the salt string to match how tenant encryption keys are decrypted
+    const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "default");
 
     console.log(`[BaseTenantFactory] Created encrypted symmetric key`);
     return encryptedKey;

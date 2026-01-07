@@ -123,63 +123,118 @@ export class BaseMindooTenant implements MindooTenant {
 
   async encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
     console.log(`[BaseMindooTenant] Encrypting payload with key: ${decryptionKeyId}`);
+    console.log(`[BaseMindooTenant] Payload size: ${payload.length} bytes`);
 
     // Get the symmetric key for this key ID
     let symmetricKey: Uint8Array;
-    if (decryptionKeyId === "default") {
-      // Use cached tenant encryption key if available
-      if (this.decryptedTenantKeyCache) {
-        symmetricKey = this.decryptedTenantKeyCache;
+    try {
+      if (decryptionKeyId === "default") {
+        console.log(`[BaseMindooTenant] Using default key (tenant encryption key)`);
+        // Use cached tenant encryption key if available
+        if (this.decryptedTenantKeyCache) {
+          symmetricKey = this.decryptedTenantKeyCache;
+          console.log(`[BaseMindooTenant] Using cached tenant key, length: ${symmetricKey.length} bytes`);
+        } else {
+          console.log(`[BaseMindooTenant] Decrypting tenant encryption key`);
+          // Decrypt tenant encryption key
+          const decrypted = await this.decryptPrivateKey(
+            this.tenantEncryptionKey,
+            this.tenantEncryptionKeyPassword,
+            "default"
+          );
+          symmetricKey = new Uint8Array(decrypted);
+          this.decryptedTenantKeyCache = symmetricKey;
+          console.log(`[BaseMindooTenant] Decrypted tenant key, length: ${symmetricKey.length} bytes`);
+        }
       } else {
-        // Decrypt tenant encryption key
-        const decrypted = await this.decryptPrivateKey(
-          this.tenantEncryptionKey,
-          this.tenantEncryptionKeyPassword,
-          "default"
-        );
-        symmetricKey = new Uint8Array(decrypted);
-        this.decryptedTenantKeyCache = symmetricKey;
+        console.log(`[BaseMindooTenant] Getting named key from KeyBag: ${decryptionKeyId}`);
+        // Get the decrypted key from KeyBag
+        const decryptedKey = await this.keyBag.get(decryptionKeyId);
+        if (!decryptedKey) {
+          throw new Error(`Symmetric key not found: ${decryptionKeyId}`);
+        }
+        symmetricKey = decryptedKey;
+        console.log(`[BaseMindooTenant] Got named key, length: ${symmetricKey.length} bytes`);
       }
-    } else {
-      // Get the decrypted key from KeyBag
-      const decryptedKey = await this.keyBag.get(decryptionKeyId);
-      if (!decryptedKey) {
-        throw new Error(`Symmetric key not found: ${decryptionKeyId}`);
-      }
-      symmetricKey = decryptedKey;
+    } catch (error) {
+      console.error(`[BaseMindooTenant] Error getting symmetric key:`, error);
+      throw error;
     }
+    
+    console.log(`[BaseMindooTenant] Got symmetric key, length: ${symmetricKey.length} bytes`);
     
     const subtle = this.cryptoAdapter.getSubtle();
     // Bind getRandomValues to maintain 'this' context
     const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
 
     // Import the symmetric key
-    const cryptoKey = await subtle.importKey(
-      "raw",
-      symmetricKey.buffer as ArrayBuffer,
-      { name: "AES-GCM" },
-      false, // not extractable
-      ["encrypt"]
-    );
+    console.log(`[BaseMindooTenant] Importing symmetric key for AES-GCM`);
+    let cryptoKey: CryptoKey;
+    try {
+      // Create a new Uint8Array to ensure we have a proper ArrayBuffer
+      const keyArray = new Uint8Array(symmetricKey);
+      console.log(`[BaseMindooTenant] Key buffer size: ${keyArray.buffer.byteLength} bytes`);
+      cryptoKey = await subtle.importKey(
+        "raw",
+        keyArray.buffer,
+        { name: "AES-GCM" },
+        false, // not extractable
+        ["encrypt"]
+      );
+      console.log(`[BaseMindooTenant] Successfully imported key`);
+    } catch (error) {
+      console.error(`[BaseMindooTenant] Error importing key:`, error);
+      console.error(`[BaseMindooTenant] Key length: ${symmetricKey.length}, expected: 32 bytes for AES-256`);
+      throw error;
+    }
 
     // Generate IV (12 bytes for AES-GCM)
-    const ivArray = new Uint8Array(12);
-    randomValues(ivArray);
-    const iv = new Uint8Array(ivArray.buffer, ivArray.byteOffset, ivArray.byteLength);
+    console.log(`[BaseMindooTenant] Generating IV`);
+    let iv: Uint8Array;
+    try {
+      const ivArray = new Uint8Array(12);
+      randomValues(ivArray);
+      iv = new Uint8Array(ivArray.buffer, ivArray.byteOffset, ivArray.byteLength);
+      console.log(`[BaseMindooTenant] Generated IV: ${iv.length} bytes`);
+    } catch (error) {
+      console.error(`[BaseMindooTenant] Error generating IV:`, error);
+      throw error;
+    }
 
     // Encrypt the payload
-    const encrypted = await subtle.encrypt(
-      {
-        name: "AES-GCM",
-        iv: iv as BufferSource,
-        tagLength: 128, // 128-bit authentication tag
-      },
-      cryptoKey,
-      payload.buffer as ArrayBuffer
-    );
+    console.log(`[BaseMindooTenant] Encrypting payload with AES-GCM`);
+    console.log(`[BaseMindooTenant] Payload buffer size: ${payload.buffer.byteLength} bytes`);
+    console.log(`[BaseMindooTenant] Payload byteOffset: ${payload.byteOffset}, byteLength: ${payload.byteLength}`);
+    let encrypted: ArrayBuffer;
+    try {
+      // Create a new Uint8Array to ensure we have a proper ArrayBuffer
+      const payloadArray = new Uint8Array(payload);
+      console.log(`[BaseMindooTenant] Using payload array: ${payloadArray.length} bytes`);
+      encrypted = await subtle.encrypt(
+        {
+          name: "AES-GCM",
+          iv: iv as BufferSource,
+          tagLength: 128, // 128-bit authentication tag
+        },
+        cryptoKey,
+        payloadArray
+      );
+      console.log(`[BaseMindooTenant] Successfully encrypted payload, encrypted size: ${encrypted.byteLength} bytes`);
+    } catch (error) {
+      console.error(`[BaseMindooTenant] Error encrypting payload:`, error);
+      console.error(`[BaseMindooTenant] Error details:`, {
+        errorName: error instanceof Error ? error.name : typeof error,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        payloadLength: payload.length,
+        keyLength: symmetricKey.length,
+        ivLength: iv.length,
+      });
+      throw error;
+    }
 
     // Combine IV and encrypted data
     // Format: IV (12 bytes) + encrypted data (includes authentication tag)
+    console.log(`[BaseMindooTenant] Combining IV and encrypted data`);
     const encryptedArray = new Uint8Array(encrypted);
     const result = new Uint8Array(12 + encryptedArray.length);
     result.set(iv, 0);
@@ -410,62 +465,126 @@ export class BaseMindooTenant implements MindooTenant {
     password: string,
     saltString: string
   ): Promise<ArrayBuffer> {
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Starting decryption with saltString: ${saltString}`);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Password length: ${password.length}`);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: EncryptedKey iterations: ${encryptedKey.iterations}`);
+    
     const subtle = this.cryptoAdapter.getSubtle();
 
     // Decode base64 strings
-    const ciphertext = this.base64ToUint8Array(encryptedKey.ciphertext);
-    const iv = this.base64ToUint8Array(encryptedKey.iv);
-    const tag = this.base64ToUint8Array(encryptedKey.tag);
-    const saltBytes = this.base64ToUint8Array(encryptedKey.salt);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Decoding base64 strings`);
+    let ciphertext: Uint8Array;
+    let iv: Uint8Array;
+    let tag: Uint8Array;
+    let saltBytes: Uint8Array;
+    try {
+      ciphertext = this.base64ToUint8Array(encryptedKey.ciphertext);
+      iv = this.base64ToUint8Array(encryptedKey.iv);
+      tag = this.base64ToUint8Array(encryptedKey.tag);
+      saltBytes = this.base64ToUint8Array(encryptedKey.salt);
+      console.log(`[BaseMindooTenant] decryptPrivateKey: Decoded - ciphertext: ${ciphertext.length} bytes, iv: ${iv.length} bytes, tag: ${tag.length} bytes, salt: ${saltBytes.length} bytes`);
+    } catch (error) {
+      console.error(`[BaseMindooTenant] decryptPrivateKey: Error decoding base64:`, error);
+      throw error;
+    }
 
     // Derive key from password using PBKDF2
     // Combine the stored salt bytes with the salt string for additional security
     // This ensures different key types (signing, encryption, etc.) use different derived keys
     // even if they share the same password
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Combining salt with saltString`);
     const saltStringBytes = new TextEncoder().encode(saltString);
     const combinedSalt = new Uint8Array(saltBytes.length + saltStringBytes.length);
     combinedSalt.set(saltBytes);
     combinedSalt.set(saltStringBytes, saltBytes.length);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Combined salt length: ${combinedSalt.length} bytes`);
 
-    const passwordKey = await subtle.importKey(
-      "raw",
-      new TextEncoder().encode(password),
-      "PBKDF2",
-      false,
-      ["deriveBits", "deriveKey"]
-    );
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Importing password key for PBKDF2`);
+    let passwordKey: CryptoKey;
+    try {
+      passwordKey = await subtle.importKey(
+        "raw",
+        new TextEncoder().encode(password),
+        "PBKDF2",
+        false,
+        ["deriveBits", "deriveKey"]
+      );
+      console.log(`[BaseMindooTenant] decryptPrivateKey: Successfully imported password key`);
+    } catch (error) {
+      console.error(`[BaseMindooTenant] decryptPrivateKey: Error importing password key:`, error);
+      throw error;
+    }
 
-    const derivedKey = await subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: combinedSalt,
-        iterations: encryptedKey.iterations,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      false,
-      ["decrypt"]
-    );
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Deriving key with PBKDF2 (iterations: ${encryptedKey.iterations})`);
+    let derivedKey: CryptoKey;
+    try {
+      derivedKey = await subtle.deriveKey(
+        {
+          name: "PBKDF2",
+          salt: combinedSalt,
+          iterations: encryptedKey.iterations,
+          hash: "SHA-256",
+        },
+        passwordKey,
+        {
+          name: "AES-GCM",
+          length: 256,
+        },
+        false,
+        ["decrypt"]
+      );
+      console.log(`[BaseMindooTenant] decryptPrivateKey: Successfully derived key`);
+    } catch (error) {
+      console.error(`[BaseMindooTenant] decryptPrivateKey: Error deriving key:`, error);
+      throw error;
+    }
 
     // Combine ciphertext and tag (GCM authentication tag is separate)
+    // AES-GCM expects the tag to be appended to the ciphertext
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Combining ciphertext and tag`);
     const encryptedData = new Uint8Array(ciphertext.length + tag.length);
     encryptedData.set(ciphertext);
     encryptedData.set(tag, ciphertext.length);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Combined encrypted data length: ${encryptedData.length} bytes`);
 
     // Decrypt the private key
-    const decrypted = await subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv: iv as BufferSource,
-        tagLength: 128,
-      },
-      derivedKey,
-      encryptedData.buffer as ArrayBuffer
-    );
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Decrypting with AES-GCM`);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: IV length: ${iv.length} bytes (expected: 12 for AES-GCM)`);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Tag length: ${tag.length} bytes (expected: 16 for 128-bit tag)`);
+    console.log(`[BaseMindooTenant] decryptPrivateKey: Ciphertext length: ${ciphertext.length} bytes`);
+    let decrypted: ArrayBuffer;
+    try {
+      // Create a new ArrayBuffer to ensure we have the correct buffer without any offset issues
+      const encryptedBuffer = new Uint8Array(encryptedData).buffer;
+      console.log(`[BaseMindooTenant] decryptPrivateKey: Encrypted buffer size: ${encryptedBuffer.byteLength} bytes`);
+      
+      decrypted = await subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: new Uint8Array(iv), // Create a new Uint8Array to ensure proper buffer
+          tagLength: 128,
+        },
+        derivedKey,
+        encryptedBuffer
+      );
+      console.log(`[BaseMindooTenant] decryptPrivateKey: Successfully decrypted, result length: ${decrypted.byteLength} bytes`);
+    } catch (error) {
+      console.error(`[BaseMindooTenant] decryptPrivateKey: Error during decryption:`, error);
+      console.error(`[BaseMindooTenant] decryptPrivateKey: Error details:`, {
+        errorName: error instanceof Error ? error.name : typeof error,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        ivLength: iv.length,
+        tagLength: tag.length,
+        ciphertextLength: ciphertext.length,
+        encryptedDataLength: encryptedData.length,
+        iterations: encryptedKey.iterations,
+        saltString: saltString,
+        encryptedDataByteOffset: encryptedData.byteOffset,
+        encryptedDataByteLength: encryptedData.byteLength,
+        encryptedDataBufferLength: encryptedData.buffer.byteLength,
+      });
+      throw error;
+    }
 
     return decrypted;
   }
