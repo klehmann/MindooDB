@@ -121,7 +121,7 @@ export class KeyBag {
       {
         name: "PBKDF2",
         salt: combinedSalt,
-        iterations: 100000,
+        iterations: 310000, // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
         hash: "SHA-256",
       },
       passwordKey,
@@ -211,7 +211,7 @@ export class KeyBag {
       {
         name: "PBKDF2",
         salt: combinedSalt,
-        iterations: 100000,
+        iterations: 310000, // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
         hash: "SHA-256",
       },
       passwordKey,

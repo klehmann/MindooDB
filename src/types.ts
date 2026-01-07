@@ -27,13 +27,50 @@ export interface EncryptedPrivateKey {
  */
 export type NamedSymmetricKeysMap = Map<string, EncryptedPrivateKey[]>;
 
+/**
+ * A signing key pair containing both the public and encrypted private key.
+ * The public key is needed for signature verification by other users.
+ */
+export interface SigningKeyPair {
+  /**
+   * The public signing key (Ed25519, PEM format).
+   * This is used by others to verify signatures created with the private key.
+   */
+  publicKey: string;
+  
+  /**
+   * The encrypted private signing key (Ed25519).
+   * This is used to create signatures.
+   */
+  privateKey: EncryptedPrivateKey;
+}
+
+/**
+ * An encryption key pair containing both the public and encrypted private key.
+ * The public key can be shared with others to allow them to encrypt data specifically for the key owner.
+ * Only the owner with the private key can decrypt the data.
+ */
+export interface EncryptionKeyPair {
+  /**
+   * The public encryption key (RSA-OAEP, PEM format).
+   * This can be shared with others to allow them to encrypt data for the key owner.
+   */
+  publicKey: string;
+  
+  /**
+   * The encrypted private encryption key (RSA-OAEP).
+   * This is used to decrypt data encrypted with the corresponding public key.
+   */
+  privateKey: EncryptedPrivateKey;
+}
+
 // Re-export PublicUserId and PrivateUserId from userid module
 export type { PublicUserId, PrivateUserId };
 
 /**
  * A TenantFactory is a factory for creating and managing tenants.
  */
-export interface TenantFactory {
+export interface MindooTenantFactory {
 
   /**
    * Create a new tenant with a new tenant encryption key and administration key.
@@ -104,22 +141,40 @@ export interface TenantFactory {
   toPublicUserId(privateUserId: PrivateUserId): PublicUserId;
 
   /**
-   * Creates a new signing private key for the tenant.
+   * Creates a new signing key pair for the tenant.
+   * Returns both the public and encrypted private key, as the public key is needed
+   * for signature verification by other users.
    * 
    * @param password The password to encrypt the signing private key with
-   * @return The signing private key (Ed25519, encrypted)
+   * @return The signing key pair containing both public key (PEM format) and encrypted private key (Ed25519)
    */
-  createSigningPrivateKey(password: string): Promise<EncryptedPrivateKey>;
+  createSigningKeyPair(password: string): Promise<SigningKeyPair>;
 
   /**
    * Creates a new encrypted symmetric key (AES-256) for document encryption.
    * The key is encrypted with the provided password and can be distributed to authorized users.
    * Use addNamedKey() to store the returned key in the tenant's key map.
    * 
+   * Symmetric keys are shared secrets - anyone with the key can both encrypt and decrypt.
+   * For user-to-user encryption where only the recipient can decrypt, use createEncryptionKeyPair() instead.
+   * 
    * @param password The password to encrypt the symmetric key with (mandatory)
    * @return The encrypted symmetric key that can be distributed to authorized users
    */
-  createEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey>;
+  createSymmetricEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey>;
+
+  /**
+   * Creates a new asymmetric encryption key pair (RSA-OAEP) for user-to-user encryption.
+   * Returns both the public and encrypted private key.
+   * 
+   * Use case: User A can fetch User B's public key from the directory DB, encrypt data with it,
+   * and only User B (with the private key) can decrypt it. This enables secure point-to-point
+   * encryption without sharing symmetric keys.
+   * 
+   * @param password The password to encrypt the private key with (mandatory)
+   * @return The encryption key pair containing both public key (PEM format) and encrypted private key (RSA-OAEP)
+   */
+  createEncryptionKeyPair(password: string): Promise<EncryptionKeyPair>;
 }
 
 /**
