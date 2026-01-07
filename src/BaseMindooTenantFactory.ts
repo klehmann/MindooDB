@@ -370,7 +370,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     saltString: string
   ): Promise<EncryptedPrivateKey> {
     const subtle = this.cryptoAdapter.getSubtle();
-    const randomValues = this.cryptoAdapter.getRandomValues;
+    // Bind getRandomValues to maintain 'this' context
+    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
 
     // Generate random salt and IV
     const saltArray = new Uint8Array(16); // 16 bytes salt
