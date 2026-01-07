@@ -30,6 +30,7 @@ export class BaseMindooTenant implements MindooTenant {
   private tenantEncryptionKey: EncryptedPrivateKey;
   private tenantEncryptionPublicKey: string; // Key identifier (PEM format for compatibility)
   private tenantEncryptionKeyPassword: string; // Password to decrypt tenant encryption key
+  private administrationPublicKey: string; // Administration public key (Ed25519, PEM format)
   private currentUser: PrivateUserId;
   private currentUserPassword: string; // Password to decrypt user's private keys
   private cryptoAdapter: CryptoAdapter;
@@ -47,6 +48,7 @@ export class BaseMindooTenant implements MindooTenant {
     tenantEncryptionKey: EncryptedPrivateKey,
     tenantEncryptionPublicKey: string,
     tenantEncryptionKeyPassword: string,
+    administrationPublicKey: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
@@ -57,6 +59,7 @@ export class BaseMindooTenant implements MindooTenant {
     this.tenantEncryptionKey = tenantEncryptionKey;
     this.tenantEncryptionPublicKey = tenantEncryptionPublicKey;
     this.tenantEncryptionKeyPassword = tenantEncryptionKeyPassword;
+    this.administrationPublicKey = administrationPublicKey;
     this.currentUser = currentUser;
     this.currentUserPassword = currentUserPassword;
     this.keyBag = keyBag;
@@ -90,93 +93,6 @@ export class BaseMindooTenant implements MindooTenant {
 
   getTenantEncryptionPrivateKey(): EncryptedPrivateKey {
     return this.tenantEncryptionKey;
-  }
-
-  async createEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey> {
-    console.log(`[BaseMindooTenant] Creating encrypted symmetric key`);
-
-    const subtle = this.cryptoAdapter.getSubtle();
-    const randomValues = this.cryptoAdapter.getRandomValues;
-
-    // Generate a new AES-256 key
-    const key = await subtle.generateKey(
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      true, // extractable
-      ["encrypt", "decrypt"]
-    );
-
-    // Export the key material
-    const keyMaterial = await subtle.exportKey("raw", key);
-    const keyBytes = new Uint8Array(keyMaterial);
-
-    // Generate IV and salt
-    const ivArray = new Uint8Array(12); // 12 bytes for AES-GCM
-    randomValues(ivArray);
-    const iv = Uint8Array.from(ivArray);
-    
-    const saltArray = new Uint8Array(16); // 16 bytes salt
-    randomValues(saltArray);
-    const salt = Uint8Array.from(saltArray);
-
-    // Derive encryption key from password using PBKDF2
-    const passwordKey = await subtle.importKey(
-      "raw",
-      new TextEncoder().encode(password),
-      "PBKDF2",
-      false,
-      ["deriveBits", "deriveKey"]
-    );
-
-    // Use only the salt (no keyId mixing)
-    const derivedKey = await subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: salt,
-        iterations: 100000,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      false,
-      ["encrypt"]
-    );
-
-    // Encrypt the symmetric key
-    const encrypted = await subtle.encrypt(
-      {
-        name: "AES-GCM",
-        iv: iv,
-        tagLength: 128,
-      },
-      derivedKey,
-      keyBytes.buffer as ArrayBuffer
-    );
-
-    // Extract ciphertext and tag from encrypted data
-    // AES-GCM appends the tag at the end
-    const encryptedArray = new Uint8Array(encrypted);
-    const tagLength = 16; // 128 bits = 16 bytes
-    const ciphertext = encryptedArray.slice(0, encryptedArray.length - tagLength);
-    const tag = encryptedArray.slice(encryptedArray.length - tagLength);
-
-    // Create encrypted key structure
-    const encryptedKey: EncryptedPrivateKey = {
-      ciphertext: this.uint8ArrayToBase64(ciphertext),
-      iv: this.uint8ArrayToBase64(iv),
-      tag: this.uint8ArrayToBase64(tag),
-      salt: this.uint8ArrayToBase64(salt),
-      iterations: 100000,
-      createdAt: Date.now(),
-    };
-
-    console.log(`[BaseMindooTenant] Created encrypted symmetric key`);
-    return encryptedKey;
   }
 
   async addNamedKey(

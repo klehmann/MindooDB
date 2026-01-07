@@ -69,15 +69,10 @@ export interface TenantFactory {
    * @param tenantEncryptionPublicKey The tenant encryption public key identifier
    * @param tenantEncryptionPrivateKey The tenant encryption private key (AES-256, encrypted)
    * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption private key
+   * @param administrationPublicKey The administration public key (Ed25519, PEM format)
    * @param currentUser The current user's private user ID (required for tenant operations)
    * @param currentUserPassword The password to decrypt the current user's private keys
    * @param keyBag The KeyBag instance for storing and loading named encrypted keys
-   * @param administrationPublicKey Optional administration public key (Ed25519, PEM format).
-   *                               Required only for users who need to perform administrative operations.
-   * @param administrationPrivateKey Optional administration private key (encrypted).
-   *                                 Required only for users who need to perform administrative operations.
-   * @param administrationPrivateKeyPassword Optional password to decrypt the administration private key.
-   *                                        Required only if administrationPrivateKey is provided.
    * @return The tenant
    */
   openTenantWithKeys(
@@ -85,12 +80,10 @@ export interface TenantFactory {
     tenantEncryptionPublicKey: string,
     tenantEncryptionPrivateKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
+    administrationPublicKey: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
-    administrationPublicKey?: string,
-    administrationPrivateKey?: EncryptedPrivateKey,
-    administrationPrivateKeyPassword?: string
   ): Promise<MindooTenant>;
 
   /**
@@ -109,6 +102,24 @@ export interface TenantFactory {
    * @return The public user ID
    */
   toPublicUserId(privateUserId: PrivateUserId): PublicUserId;
+
+  /**
+   * Creates a new signing private key for the tenant.
+   * 
+   * @param password The password to encrypt the signing private key with
+   * @return The signing private key (Ed25519, encrypted)
+   */
+  createSigningPrivateKey(password: string): Promise<EncryptedPrivateKey>;
+
+  /**
+   * Creates a new encrypted symmetric key (AES-256) for document encryption.
+   * The key is encrypted with the provided password and can be distributed to authorized users.
+   * Use addNamedKey() to store the returned key in the tenant's key map.
+   * 
+   * @param password The password to encrypt the symmetric key with (mandatory)
+   * @return The encrypted symmetric key that can be distributed to authorized users
+   */
+  createEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey>;
 }
 
 /**
@@ -148,16 +159,6 @@ export interface MindooTenant {
    * @return The tenant encryption private key (AES-256, encrypted)
    */
   getTenantEncryptionPrivateKey(): EncryptedPrivateKey;
-
-  /**
-   * Creates a new encrypted symmetric key (AES-256) for document encryption.
-   * The key is encrypted with the provided password and can be distributed to authorized users.
-   * Use addNamedKey() to store the returned key in the tenant's key map.
-   * 
-   * @param password The password to encrypt the symmetric key with (mandatory)
-   * @return The encrypted symmetric key that can be distributed to authorized users
-   */
-  createEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey>;
 
   /**
    * Adds a new user to the tenant. The user is identified by its user ID.

@@ -26,7 +26,7 @@ export class BaseTenantFactory implements TenantFactory {
   }
 
   /**
-   * Create a new tenant with a new tenant encryption key and administration key.
+   * Create a new tenant from scratch with a new tenant encryption key and administration key.
    * 
    * @param tenantId The ID of the tenant
    * @param administrationKeyPassword The password used to encrypt the administration private key
@@ -114,12 +114,10 @@ export class BaseTenantFactory implements TenantFactory {
       tenantEncryptionPublicKey,
       encryptedTenantKey,
       tenantEncryptionKeyPassword,
+      administrationPublicKey,
       currentUser,
       currentUserPassword,
-      keyBag,
-      administrationPublicKey,
-      encryptedAdministrationKey,
-      administrationKeyPassword
+      keyBag
     );
   }
 
@@ -131,12 +129,10 @@ export class BaseTenantFactory implements TenantFactory {
     tenantEncryptionPublicKey: string,
     tenantEncryptionPrivateKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
+    administrationPublicKey: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
-    administrationPublicKey?: string,
-    administrationPrivateKey?: EncryptedPrivateKey,
-    administrationPrivateKeyPassword?: string
   ): Promise<MindooTenant> {
     console.log(`[BaseTenantFactory] Opening tenant: ${tenantId}`);
 
@@ -145,6 +141,7 @@ export class BaseTenantFactory implements TenantFactory {
       tenantEncryptionPrivateKey,
       tenantEncryptionPublicKey,
       tenantEncryptionKeyPassword,
+      administrationPublicKey,
       currentUser,
       currentUserPassword,
       keyBag,
@@ -244,6 +241,64 @@ export class BaseTenantFactory implements TenantFactory {
       userSigningPublicKey: privateUserId.userSigningPublicKey,
       userEncryptionPublicKey: privateUserId.userEncryptionPublicKey,
     };
+  }
+
+  /**
+   * Creates a new signing private key for the tenant.
+   */
+  async createSigningPrivateKey(password: string): Promise<EncryptedPrivateKey> {
+    console.log(`[BaseTenantFactory] Creating encrypted signing private key`);
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Generate a new Ed25519 signing key pair
+    const keyPair = await subtle.generateKey(
+      {
+        name: "Ed25519",
+      },
+      true, // extractable
+      ["sign", "verify"]
+    );
+
+    // Export the private key in PKCS8 format
+    const privateKeyBuffer = await subtle.exportKey("pkcs8", keyPair.privateKey);
+    const keyBytes = new Uint8Array(privateKeyBuffer);
+
+    // Encrypt the key material using the shared helper
+    const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "signing");
+
+    console.log(`[BaseTenantFactory] Created encrypted signing private key`);
+    return encryptedKey;
+  }
+
+  /**
+   * Creates a new encrypted symmetric key (AES-256) for document encryption.
+   */
+  async createEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey> {
+    console.log(`[BaseTenantFactory] Creating encrypted symmetric key`);
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Generate a new AES-256 key
+    const key = await subtle.generateKey(
+      {
+        name: "AES-GCM",
+        length: 256,
+      },
+      true, // extractable
+      ["encrypt", "decrypt"]
+    );
+
+    // Export the key material
+    const keyMaterial = await subtle.exportKey("raw", key);
+    const keyBytes = new Uint8Array(keyMaterial);
+
+    // Encrypt the key material using the shared helper
+    // Use "symmetric" as the salt string for generic symmetric keys
+    const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "symmetric");
+
+    console.log(`[BaseTenantFactory] Created encrypted symmetric key`);
+    return encryptedKey;
   }
 
   /**
