@@ -269,6 +269,16 @@ export interface MindooTenant {
   signPayload(payload: Uint8Array): Promise<Uint8Array>;
 
   /**
+   * Verify a signature for a payload with a public key.
+   *
+   * @param payload The payload to verify the signature for (binary data)
+   * @param signature The signature to verify (Ed25519 signature as Uint8Array)
+   * @param publicKey The public key to verify the signature with (Ed25519, PEM format)
+   * @return True if the signature is valid, false otherwise
+   */
+  verifySignature(payload: Uint8Array, signature: Uint8Array, publicKey: string): Promise<boolean>;
+
+  /**
    * Method to open the directory for this tenant
    *
    * @return The directory
@@ -376,6 +386,12 @@ export interface MindooDoc {
   */
   getId(): string;
 
+  /**
+   * Get the timestamp of the creation of the document
+   * in milliseconds since the Unix epoch.
+   *
+   * @return The timestamp of the creation of the document
+   */
   getCreatedAt(): number;
 
   /**
@@ -435,6 +451,14 @@ export interface MindooTenantDirectory {
     administrationPrivateKeyPassword: string
   ): Promise<void>;
 
+  /**
+   * Validates a public signing key by checking if it belongs to a trusted user in the tenant.
+   * This is used for signature verification when loading changes from the append-only store.
+   * 
+   * @param publicKey The public signing key to validate (Ed25519, PEM format)
+   * @return True if the public key belongs to a trusted (registered and not revoked) user, false otherwise
+   */
+  validatePublicSigningKey(publicKey: string): Promise<boolean>;
 }
 
 export interface MindooDB {

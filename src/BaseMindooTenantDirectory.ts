@@ -123,4 +123,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     console.log(`[BaseMindooTenantDirectory] Revoked user: ${username}`);
   }
+
+  async validatePublicSigningKey(publicKey: string): Promise<boolean> {
+    // Empty implementation returning true
+    // TODO: Implement actual validation against directory database
+    return true;
+  }
 }

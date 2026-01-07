@@ -63,13 +63,10 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Initialize the database by rebuilding the index from the append-only store.
-   * This should be called after construction to load existing documents.
-   * 
-   * @deprecated Use syncStoreChanges() instead. This method is kept for backward compatibility.
+   * Initialize the database instance.
    */
   async initialize(): Promise<void> {
-    console.log(`[BaseMindooDB] Initializing database ${this.id}`);
+    console.log(`[BaseMindooDB] Initializing database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
     await this.syncStoreChanges();
   }
 
@@ -264,7 +261,7 @@ export class BaseMindooDB implements MindooDB {
     for (const changeData of changes) {
       // Verify signature against the encrypted payload (no decryption needed)
       // We sign the encrypted payload, so anyone can verify signatures without decryption keys
-      const isValid = await this.verifySignature(
+      const isValid = await this.tenant.verifySignature(
         changeData.payload,
         changeData.signature,
         changeData.createdByPublicKey
@@ -568,7 +565,7 @@ export class BaseMindooDB implements MindooDB {
         
         // Verify signature against the encrypted snapshot (no decryption needed)
         // We sign the encrypted payload, so anyone can verify signatures without decryption keys
-        const isValid = await this.verifySignature(
+        const isValid = await this.tenant.verifySignature(
           snapshotData.payload,
           snapshotData.signature,
           snapshotData.createdByPublicKey
@@ -606,7 +603,7 @@ export class BaseMindooDB implements MindooDB {
     for (const changeData of changes) {
       // Verify signature against the encrypted payload (no decryption needed)
       // We sign the encrypted payload, so anyone can verify signatures without decryption keys
-      const isValid = await this.verifySignature(
+      const isValid = await this.tenant.verifySignature(
         changeData.payload,
         changeData.signature,
         changeData.createdByPublicKey
@@ -659,42 +656,6 @@ export class BaseMindooDB implements MindooDB {
     return internalDoc;
   }
 
-  /**
-   * Verify the signature of a change
-   * 
-   * @param payload The payload that was signed (the Automerge change bytes)
-   * @param signature The signature to verify (Ed25519 signature)
-   * @param publicKey The public key to verify against (Ed25519, PEM format)
-   * @return True if the signature is valid, false otherwise
-   */
-  private async verifySignature(
-    payload: Uint8Array,
-    signature: Uint8Array,
-    publicKey: string
-  ): Promise<boolean> {
-    // First, validate that the public key belongs to a trusted user
-    const isTrusted = await this.tenant.validatePublicSigningKey(publicKey);
-    if (!isTrusted) {
-      console.warn(`[BaseMindooDB] Public key not trusted: ${publicKey}`);
-      return false;
-    }
-    
-    // TODO: Implement Ed25519 signature verification using Web Crypto API
-    // For now, we trust the key validation
-    // In a full implementation, we would:
-    // 1. Import the public key from PEM format
-    // 2. Verify the signature against the payload using Ed25519
-    // 3. Return the verification result
-    // This requires platform-specific crypto implementations using Web Crypto API
-    // Example (pseudo-code):
-    //   const key = await crypto.subtle.importKey(...);
-    //   const isValid = await crypto.subtle.verify('Ed25519', key, signature, payload);
-    //   return isValid;
-    
-    // For now, we only verify that the key is trusted
-    // Full cryptographic verification should be implemented in platform-specific code
-    return true;
-  }
 
   /**
    * Wrap an internal document in the MindooDoc interface

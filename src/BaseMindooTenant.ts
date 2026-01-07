@@ -268,6 +268,46 @@ export class BaseMindooTenant implements MindooTenant {
     return new Uint8Array(signature);
   }
 
+  async verifySignature(payload: Uint8Array, signature: Uint8Array, publicKey: string): Promise<boolean> {
+    console.log(`[BaseMindooTenant] Verifying signature`);
+
+    const directory = await this.openDirectory();
+    const isTrusted = await directory.validatePublicSigningKey(publicKey);
+    if (!isTrusted) {
+      console.warn(`[BaseMindooTenant] Public key not trusted: ${publicKey}`);
+      return false;
+    }
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Convert PEM format to ArrayBuffer
+    const publicKeyBuffer = this.pemToArrayBuffer(publicKey);
+
+    // Import the public key from SPKI format
+    const cryptoKey = await subtle.importKey(
+      "spki",
+      publicKeyBuffer,
+      {
+        name: "Ed25519",
+      },
+      false, // not extractable
+      ["verify"]
+    );
+
+    // Verify the signature
+    const isValid = await subtle.verify(
+      {
+        name: "Ed25519",
+      },
+      cryptoKey,
+      signature.buffer as ArrayBuffer,
+      payload.buffer as ArrayBuffer
+    );
+
+    console.log(`[BaseMindooTenant] Signature verification result: ${isValid}`);
+    return isValid;
+  }
+
   async validatePublicSigningKey(publicKey: string): Promise<boolean> {
     console.log(`[BaseMindooTenant] Validating public signing key`);
 
@@ -310,7 +350,7 @@ export class BaseMindooTenant implements MindooTenant {
 
     // Create the database store using the factory
     const store = this.storeFactory.createStore(id);
-    const db = new BaseMindooDB(this, id, store);
+    const db = new BaseMindooDB(this, store);
     await db.initialize();
     
     // Cache the database for future use
@@ -449,6 +489,32 @@ export class BaseMindooTenant implements MindooTenant {
       binary += String.fromCharCode(bytes[i]);
     }
     return btoa(binary);
+  }
+
+  /**
+   * Helper method to convert PEM format to ArrayBuffer
+   * Removes PEM headers/footers and decodes base64 content
+   */
+  private pemToArrayBuffer(pem: string): ArrayBuffer {
+    // Remove PEM headers and footers
+    const pemHeader = "-----BEGIN PUBLIC KEY-----";
+    const pemFooter = "-----END PUBLIC KEY-----";
+    
+    let base64 = pem
+      .replace(pemHeader, "")
+      .replace(pemFooter, "")
+      .replace(/\s/g, ""); // Remove all whitespace (newlines, spaces, etc.)
+
+    // Decode base64 to binary string
+    const binary = atob(base64);
+    
+    // Convert binary string to Uint8Array
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    
+    return bytes.buffer;
   }
 }
 
