@@ -2,16 +2,17 @@ import {
   MindooTenant,
   EncryptedPrivateKey,
   MindooDB,
-  AppendOnlyStore,
   AppendOnlyStoreFactory,
   MindooTenantFactory,
   MindooTenantDirectory,
+  SigningKeyPair,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { KeyBag } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
+import { MindooDocSigner } from "./crypto/MindooDocSigner";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -95,6 +96,16 @@ export class BaseMindooTenant implements MindooTenant {
 
   getId(): string {
     return this.tenantId;
+  }
+
+  /**
+   * Get the administration public key for this tenant.
+   * Used for creating document signers for administrative operations.
+   * 
+   * @return The administration public key (Ed25519, PEM format)
+   */
+  getAdministrationPublicKey(): string {
+    return this.administrationPublicKey;
   }
 
   getTenantEncryptionKey(): EncryptedPrivateKey {
@@ -417,6 +428,11 @@ export class BaseMindooTenant implements MindooTenant {
     return db;
   }
 
+  createDocSignerFor(signKey: SigningKeyPair): MindooDocSigner {
+    console.log(`[BaseMindooTenant] Creating MindooDocSigner for signing key pair`);
+    return new MindooDocSigner(this, signKey);
+  }
+
   /**
    * Internal method to get the decrypted signing key for the current user.
    */
@@ -617,8 +633,9 @@ export class BaseMindooTenant implements MindooTenant {
   /**
    * Helper method to convert PEM format to ArrayBuffer
    * Removes PEM headers/footers and decodes base64 content
+   * Public so that MindooDocSigner and other utilities can use it.
    */
-  private pemToArrayBuffer(pem: string): ArrayBuffer {
+  public pemToArrayBuffer(pem: string): ArrayBuffer {
     // Remove PEM headers and footers
     const pemHeader = "-----BEGIN PUBLIC KEY-----";
     const pemFooter = "-----END PUBLIC KEY-----";

@@ -486,7 +486,7 @@ export class BaseMindooDB implements MindooDB {
 
   async changeDoc(
     doc: MindooDoc,
-    changeFunc: (doc: MindooDoc) => void
+    changeFunc: (doc: MindooDoc) => void | Promise<void>
   ): Promise<void> {
     const docId = doc.getId();
     console.log(`[BaseMindooDB] ===== changeDoc called for document ${docId} =====`);
@@ -516,20 +516,92 @@ export class BaseMindooDB implements MindooDB {
     const now = Date.now();
     console.log(`[BaseMindooDB] Applying change function to document ${docId}`);
     console.log(`[BaseMindooDB] Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
+    
+    // For async callbacks, we need to handle document modifications carefully.
+    // Automerge.change() requires synchronous modifications, so we'll:
+    // 1. Execute the async callback to do any async work (like signing)
+    // 2. Apply document modifications synchronously within Automerge.change()
+    // 
+    // We use a two-phase approach: the callback can do async work and collect
+    // what needs to be changed, then we apply those changes in Automerge.change()
+    const pendingChanges = new Map<string, unknown>();
+    const pendingDeletions = new Set<string>();
+    
+    // Create a document wrapper that collects changes
+    const collectingDoc: MindooDoc = {
+      getDatabase: () => this,
+      getId: () => docId,
+      getCreatedAt: () => internalDoc.createdAt,
+      getLastModified: () => internalDoc.lastModified,
+      isDeleted: () => false,
+      getData: () => {
+        // Return a proxy that collects property assignments and deletions
+        const currentData = internalDoc.doc as unknown as MindooDocPayload;
+        return new Proxy(currentData, {
+          set: (target, prop, value) => {
+            if (typeof prop === 'string') {
+              // If this property was marked for deletion, remove it from deletions
+              pendingDeletions.delete(prop);
+              // Track the change
+              pendingChanges.set(prop, value);
+              // Also set on the target for immediate access
+              (target as any)[prop] = value;
+            }
+            return true;
+          },
+          deleteProperty: (target, prop) => {
+            if (typeof prop === 'string') {
+              // Mark for deletion
+              pendingDeletions.add(prop);
+              // Remove from pending changes if it was there
+              pendingChanges.delete(prop);
+              // Also delete from the target for immediate access
+              delete (target as any)[prop];
+            }
+            return true;
+          },
+          get: (target, prop) => {
+            // If marked for deletion, return undefined
+            if (typeof prop === 'string' && pendingDeletions.has(prop)) {
+              return undefined;
+            }
+            // Check pending changes first, then target
+            if (typeof prop === 'string' && pendingChanges.has(prop)) {
+              return pendingChanges.get(prop);
+            }
+            return (target as any)[prop];
+          },
+          has: (target, prop) => {
+            // If marked for deletion, it doesn't exist
+            if (typeof prop === 'string' && pendingDeletions.has(prop)) {
+              return false;
+            }
+            // Check pending changes first, then target
+            if (typeof prop === 'string' && pendingChanges.has(prop)) {
+              return true;
+            }
+            return prop in target;
+          }
+        }) as MindooDocPayload;
+      }
+    };
+    
+    // Execute the async callback (this may do async operations like signing)
+    await changeFunc(collectingDoc);
+    
+    // Now apply the collected changes synchronously in Automerge.change()
     let newDoc: Automerge.Doc<MindooDocPayload>;
     try {
       newDoc = Automerge.change(internalDoc.doc, (automergeDoc: MindooDocPayload) => {
-        // Wrap the Automerge doc in a MindooDoc interface for the change function
-        const wrappedDoc = this.wrapDocument({
-          id: docId,
-          doc: automergeDoc as Automerge.Doc<MindooDocPayload>,
-          createdAt: internalDoc.createdAt,
-          lastModified: internalDoc.lastModified,
-          decryptionKeyId: internalDoc.decryptionKeyId,
-          isDeleted: false,
-        });
+        // Apply all pending changes (sets/updates)
+        for (const [key, value] of pendingChanges) {
+          (automergeDoc as any)[key] = value;
+        }
         
-        changeFunc(wrappedDoc);
+        // Apply all pending deletions
+        for (const key of pendingDeletions) {
+          delete (automergeDoc as any)[key];
+        }
         
         // Update lastModified timestamp
         automergeDoc._lastModified = now;

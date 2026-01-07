@@ -1,6 +1,7 @@
 import type { KeyBag } from "./keys/KeyBag";
 import type { PublicUserId, PrivateUserId } from "./userid";
 import type { AppendOnlyStore } from "./appendonlystores/types";
+import { MindooDocSigner } from "./crypto/MindooDocSigner";
 
 /**
  * An EncryptedPrivateKey is a private key that is encrypted with a password.
@@ -292,6 +293,15 @@ export interface MindooTenant {
    * @return The new database
    */
   openDB(id: string): Promise<MindooDB>;
+
+  /**
+   * Creates a MindooDocSigner instance for signing and verifying document items.
+   * The signer uses the tenant's cryptographic infrastructure for key management.
+   * 
+   * @param signKey The signing key pair to use for document item signatures
+   * @return A MindooDocSigner instance configured with this tenant and the provided signing key
+   */
+  createDocSignerFor(signKey: SigningKeyPair): MindooDocSigner;
 }
 
 // Re-export AppendOnlyStore and AppendOnlyStoreFactory from appendonlystores
@@ -576,12 +586,12 @@ export interface MindooDB {
    * If the document was created with a named key, all subsequent changes use that same key.
    * 
    * @param doc The document to change
-   * @param changeFunc The function to change the document
+   * @param changeFunc The function to change the document (can be async to perform operations like signing)
    * @return A promise that resolves when the document is changed
    */
   changeDoc(
     doc: MindooDoc,
-    changeFunc: (doc: MindooDoc) => void
+    changeFunc: (doc: MindooDoc) => void | Promise<void>
   ): Promise<void>;
 
   /**
