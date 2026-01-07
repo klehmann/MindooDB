@@ -6,6 +6,7 @@ import {
   MindooDocChange,
   MindooDocChangeHashes,
   MindooTenant,
+  ProcessChangesCursor,
 } from "./types";
 import type { AppendOnlyStore } from "./appendonlystores/types";
 
@@ -44,8 +45,12 @@ export class BaseMindooDB implements MindooDB {
   private tenant: MindooTenant;
   private store: AppendOnlyStore;
   
-  // Internal index: Map<docId, { lastModified: number, isDeleted: boolean }>
-  private index: Map<string, { lastModified: number; isDeleted: boolean }> = new Map();
+  // Internal index: sorted array of document entries, maintained in order by (lastModified, docId)
+  // This allows efficient incremental processing without sorting on each call
+  private index: Array<{ docId: string; lastModified: number; isDeleted: boolean }> = [];
+  
+  // Lookup map for O(1) access to index entries by docId
+  private indexLookup: Map<string, number> = new Map(); // Map<docId, arrayIndex>
   
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
@@ -60,6 +65,72 @@ export class BaseMindooDB implements MindooDB {
   constructor(tenant: MindooTenant, store: AppendOnlyStore) {
     this.tenant = tenant;
     this.store = store;
+  }
+
+  /**
+   * Compare two index entries for sorting.
+   * Returns negative if a < b, positive if a > b, 0 if equal.
+   * Sorts by lastModified first, then by docId for uniqueness.
+   */
+  private compareIndexEntries(
+    a: { docId: string; lastModified: number },
+    b: { docId: string; lastModified: number }
+  ): number {
+    if (a.lastModified !== b.lastModified) {
+      return a.lastModified - b.lastModified;
+    }
+    return a.docId.localeCompare(b.docId);
+  }
+
+  /**
+   * Update the index entry for a document.
+   * When a document changes, it's removed from its current position and inserted
+   * at the correct sorted position to maintain order by (lastModified, docId).
+   * 
+   * @param docId The document ID
+   * @param lastModified The new last modified timestamp
+   * @param isDeleted Whether the document is deleted
+   */
+  private updateIndex(docId: string, lastModified: number, isDeleted: boolean): void {
+    // Remove existing entry if present
+    const existingIndex = this.indexLookup.get(docId);
+    if (existingIndex !== undefined) {
+      // Remove from array
+      this.index.splice(existingIndex, 1);
+      // Update lookup map for all entries after the removed one
+      for (let i = existingIndex; i < this.index.length; i++) {
+        this.indexLookup.set(this.index[i].docId, i);
+      }
+      // Remove the entry from lookup
+      this.indexLookup.delete(docId);
+    }
+    
+    // Find insertion point using binary search to maintain sorted order
+    const newEntry = { docId, lastModified, isDeleted };
+    let insertIndex = this.index.length; // Default to end
+    
+    // Binary search for insertion point
+    let left = 0;
+    let right = this.index.length - 1;
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      const cmp = this.compareIndexEntries(newEntry, this.index[mid]);
+      if (cmp < 0) {
+        right = mid - 1;
+        insertIndex = mid;
+      } else {
+        left = mid + 1;
+        insertIndex = mid + 1;
+      }
+    }
+    
+    // Insert at the correct position
+    this.index.splice(insertIndex, 0, newEntry);
+    
+    // Update lookup map for all entries from insertion point onwards
+    for (let i = insertIndex; i < this.index.length; i++) {
+      this.indexLookup.set(this.index[i].docId, i);
+    }
   }
 
   /**
@@ -107,10 +178,7 @@ export class BaseMindooDB implements MindooDB {
         // Reload document (this will load all changes including new ones)
         const doc = await this.loadDocumentInternal(docId);
         if (doc) {
-          this.index.set(docId, {
-            lastModified: doc.lastModified,
-            isDeleted: doc.isDeleted,
-          });
+          this.updateIndex(docId, doc.lastModified, doc.isDeleted);
         }
       } catch (error) {
         console.error(`[BaseMindooDB] Error processing document ${docId}:`, error);
@@ -121,7 +189,7 @@ export class BaseMindooDB implements MindooDB {
     // Append new change hashes to our processed list
     this.processedChangeHashes.push(...newChangeHashes);
     
-    console.log(`[BaseMindooDB] Synced ${newChangeHashes.length} new changes, index now has ${this.index.size} documents`);
+    console.log(`[BaseMindooDB] Synced ${newChangeHashes.length} new changes, index now has ${this.index.length} documents`);
   }
 
   getStore(): AppendOnlyStore {
@@ -214,10 +282,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Update cache and index
     this.docCache.set(docId, internalDoc);
-    this.index.set(docId, {
-      lastModified: internalDoc.lastModified,
-      isDeleted: false,
-    });
+    this.updateIndex(docId, internalDoc.lastModified, false);
     
     console.log(`[BaseMindooDB] Document ${docId} created successfully`);
     
@@ -311,9 +376,9 @@ export class BaseMindooDB implements MindooDB {
   async getAllDocumentIds(): Promise<string[]> {
     // Return all non-deleted document IDs from index
     const docIds: string[] = [];
-    for (const [docId, info] of this.index) {
-      if (!info.isDeleted) {
-        docIds.push(docId);
+    for (const entry of this.index) {
+      if (!entry.isDeleted) {
+        docIds.push(entry.docId);
       }
     }
     return docIds;
@@ -381,10 +446,7 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.isDeleted = true;
     internalDoc.lastModified = Date.now();
     this.docCache.set(docId, internalDoc);
-    this.index.set(docId, {
-      lastModified: internalDoc.lastModified,
-      isDeleted: true,
-    });
+    this.updateIndex(docId, internalDoc.lastModified, true);
     
     console.log(`[BaseMindooDB] Document ${docId} deleted successfully`);
   }
@@ -475,49 +537,92 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.doc = newDoc;
     internalDoc.lastModified = Date.now();
     this.docCache.set(docId, internalDoc);
-    this.index.set(docId, {
-      lastModified: internalDoc.lastModified,
-      isDeleted: internalDoc.isDeleted,
-    });
+    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted);
     
     console.log(`[BaseMindooDB] Document ${docId} changed successfully`);
   }
 
   async processChangesSince(
-    timestamp: number,
+    cursor: ProcessChangesCursor,
     limit: number,
-    callback: (change: MindooDoc) => void
-  ): Promise<number> {
-    console.log(`[BaseMindooDB] Processing changes since ${timestamp} (limit: ${limit})`);
+    callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void
+  ): Promise<ProcessChangesCursor> {
+    console.log(`[BaseMindooDB] Processing changes since cursor ${JSON.stringify(cursor)} (limit: ${limit})`);
     
-    // Get all documents from index that changed after timestamp
-    const changedDocs: Array<{ docId: string; lastModified: number }> = [];
-    for (const [docId, info] of this.index) {
-      if (info.lastModified > timestamp && !info.isDeleted) {
-        changedDocs.push({ docId, lastModified: info.lastModified });
+    // Find starting position using binary search
+    // We want to find the first entry that is greater than the cursor
+    let startIndex = 0;
+    if (this.index.length > 0) {
+      let left = 0;
+      let right = this.index.length - 1;
+      
+      while (left <= right) {
+        const mid = Math.floor((left + right) / 2);
+        const entry = this.index[mid];
+        const cmp = this.compareIndexEntries(
+          { docId: cursor.docId, lastModified: cursor.lastModified },
+          entry
+        );
+        
+        if (cmp < 0) {
+          right = mid - 1;
+          startIndex = mid;
+        } else {
+          left = mid + 1;
+          startIndex = mid + 1;
+        }
+      }
+      
+      // If we found an exact match, start from the next entry
+      if (startIndex < this.index.length) {
+        const entry = this.index[startIndex];
+        if (entry.lastModified === cursor.lastModified && entry.docId === cursor.docId) {
+          startIndex++;
+        }
       }
     }
     
-    // Sort by lastModified (oldest first)
-    changedDocs.sort((a, b) => a.lastModified - b.lastModified);
+    // Process documents in order from the starting position
+    let processedCount = 0;
+    let lastCursor: ProcessChangesCursor = cursor;
     
-    // Process up to limit documents
-    let lastTimestamp = timestamp;
-    const toProcess = changedDocs.slice(0, limit);
-    
-    for (const { docId, lastModified } of toProcess) {
+    for (let i = startIndex; i < this.index.length && processedCount < limit; i++) {
+      const entry = this.index[i];
+      
+      // Skip deleted documents (they're still in index for tracking, but shouldn't be processed)
+      if (entry.isDeleted) {
+        continue;
+      }
+      
       try {
-        const doc = await this.getDocument(docId);
-        callback(doc);
-        lastTimestamp = Math.max(lastTimestamp, lastModified);
+        const doc = await this.getDocument(entry.docId);
+        
+        // Create cursor for current document
+        const currentCursor: ProcessChangesCursor = {
+          lastModified: entry.lastModified,
+          docId: entry.docId,
+        };
+        
+        const shouldContinue = callback(doc, currentCursor);
+        
+        // Update cursor to the last successfully processed document
+        lastCursor = currentCursor;
+        processedCount++;
+        
+        // Stop if callback returns false
+        if (shouldContinue === false) {
+          console.log(`[BaseMindooDB] Callback requested to stop processing`);
+          break;
+        }
       } catch (error) {
-        console.error(`[BaseMindooDB] Error processing document ${docId}:`, error);
-        // Continue with other documents
+        console.error(`[BaseMindooDB] Error processing document ${entry.docId}:`, error);
+        // Stop processing on error
+        throw error;
       }
     }
     
-    console.log(`[BaseMindooDB] Processed ${toProcess.length} changes, last timestamp: ${lastTimestamp}`);
-    return lastTimestamp;
+    console.log(`[BaseMindooDB] Processed ${processedCount} changes, last cursor: ${JSON.stringify(lastCursor)}`);
+    return lastCursor;
   }
 
   /**

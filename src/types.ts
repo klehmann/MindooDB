@@ -461,6 +461,24 @@ export interface MindooTenantDirectory {
   validatePublicSigningKey(publicKey: string): Promise<boolean>;
 }
 
+/**
+ * Cursor for incremental processing of document changes.
+ * Contains both timestamp and document ID to ensure uniqueness
+ * and prevent duplicate processing when multiple documents have the same timestamp.
+ */
+export interface ProcessChangesCursor {
+  /**
+   * The timestamp of the last processed change (milliseconds since Unix epoch)
+   */
+  lastModified: number;
+  
+  /**
+   * The document ID of the last processed change.
+   * Used to break ties when multiple documents have the same timestamp.
+   */
+  docId: string;
+}
+
 export interface MindooDB {
 
   /**
@@ -552,19 +570,24 @@ export interface MindooDB {
 
   /**
    * Each MindooDB maintains an internal index that tracks documents and their latest state,
-   * sorted by their last modified timestamp. The index is updated when documents actually change
-   * (after applying changes), enabling incremental operations on the database.
+   * sorted by their last modified timestamp (then by document ID for uniqueness).
+   * The index is updated when documents actually change (after applying changes),
+   * enabling incremental operations on the database.
    * 
    * This method uses the internal index to efficiently find and process documents that changed
-   * since a given timestamp, useful for incremental processing of changes.
+   * since a given cursor, useful for incremental processing of changes.
+   * Documents are returned in modification order (oldest first).
    * The callback will receive new documents, changes and deletions.
+   * 
+   * The callback can return `false` to stop processing early. If the callback throws an error
+   * or if there's an error processing a document, the loop will stop and the error will be propagated.
    *
-   * @param timestamp The timestamp to start processing changes from
+   * @param cursor The cursor to start processing changes from. Use { lastModified: 0, docId: "" } to start from the beginning.
    * @param limit The maximum number of changes to process (for pagination)
-   * @param callback The function to call for each change
-   * @return The timestamp of the last change processed, can be used to continue processing from this timestamp
+   * @param callback The function to call for each change. Receives the document and its cursor position. Return `false` to stop processing, or `true`/`undefined` to continue.
+   * @return The cursor of the last change processed, can be used to continue processing from this position
    */
-  processChangesSince(timestamp: number, limit: number, callback: (change: MindooDoc) => void): Promise<number>;
+  processChangesSince(cursor: ProcessChangesCursor, limit: number, callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void): Promise<ProcessChangesCursor>;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.
