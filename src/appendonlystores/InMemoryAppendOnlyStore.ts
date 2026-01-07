@@ -21,6 +21,10 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
     this.dbId = dbId;
   }
 
+  getId(): string {
+    return this.dbId;
+  }
+
   /**
    * Append a new change to the store. No-op if we already have this
    * change in the store (based on the change ID).

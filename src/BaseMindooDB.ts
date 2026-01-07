@@ -42,7 +42,6 @@ interface InternalDoc {
  */
 export class BaseMindooDB implements MindooDB {
   private tenant: MindooTenant;
-  private id: string;
   private store: AppendOnlyStore;
   
   // Internal index: Map<docId, { lastModified: number, isDeleted: boolean }>
@@ -51,39 +50,64 @@ export class BaseMindooDB implements MindooDB {
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
   
+  // Track which change hashes we've already processed
+  private processedChangeHashes: MindooDocChangeHashes[] = [];
+  
   // Monotonic counter for UUID7 generation (ensures uniqueness within same millisecond)
   private uuid7Counter: number = 0;
   private uuid7LastTimestamp: number = 0;
 
-  constructor(tenant: MindooTenant, id: string, store: AppendOnlyStore) {
+  constructor(tenant: MindooTenant, store: AppendOnlyStore) {
     this.tenant = tenant;
-    this.id = id;
     this.store = store;
   }
 
   /**
    * Initialize the database by rebuilding the index from the append-only store.
    * This should be called after construction to load existing documents.
+   * 
+   * @deprecated Use syncStoreChanges() instead. This method is kept for backward compatibility.
    */
   async initialize(): Promise<void> {
     console.log(`[BaseMindooDB] Initializing database ${this.id}`);
+    await this.syncStoreChanges();
+  }
+
+  /**
+   * Sync changes from the append-only store by finding new changes and processing them.
+   * This method can be called multiple times to incrementally sync new changes.
+   * On first call (when processedChangeHashes is empty), it will process all changes.
+   */
+  async syncStoreChanges(): Promise<void> {
+    console.log(`[BaseMindooDB] Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
+    console.log(`[BaseMindooDB] Already processed ${this.processedChangeHashes.length} change hashes`);
     
-    // Rebuild index from all change hashes
-    const allChangeHashes = await this.store.getAllChangeHashes();
-    console.log(`[BaseMindooDB] Found ${allChangeHashes.length} change hashes`);
+    // Find new changes that we haven't processed yet
+    const newChangeHashes = await this.store.findNewChanges(this.processedChangeHashes);
+    console.log(`[BaseMindooDB] Found ${newChangeHashes.length} new change hashes`);
     
-    // Group changes by document ID
+    if (newChangeHashes.length === 0) {
+      console.log(`[BaseMindooDB] No new changes to process`);
+      return;
+    }
+    
+    // Group new changes by document ID
     const changesByDoc = new Map<string, MindooDocChangeHashes[]>();
-    for (const changeHash of allChangeHashes) {
+    for (const changeHash of newChangeHashes) {
       if (!changesByDoc.has(changeHash.docId)) {
         changesByDoc.set(changeHash.docId, []);
       }
       changesByDoc.get(changeHash.docId)!.push(changeHash);
     }
     
-    // Load each document to build the index
+    // Process each document with new changes
+    // Reload documents to apply all changes (including new ones)
     for (const [docId, changeHashes] of changesByDoc) {
       try {
+        // Clear cache for this document so it gets reloaded with all changes
+        this.docCache.delete(docId);
+        
+        // Reload document (this will load all changes including new ones)
         const doc = await this.loadDocumentInternal(docId);
         if (doc) {
           this.index.set(docId, {
@@ -92,12 +116,15 @@ export class BaseMindooDB implements MindooDB {
           });
         }
       } catch (error) {
-        console.error(`[BaseMindooDB] Error loading document ${docId}:`, error);
+        console.error(`[BaseMindooDB] Error processing document ${docId}:`, error);
         // Continue with other documents even if one fails
       }
     }
     
-    console.log(`[BaseMindooDB] Index rebuilt with ${this.index.size} documents`);
+    // Append new change hashes to our processed list
+    this.processedChangeHashes.push(...newChangeHashes);
+    
+    console.log(`[BaseMindooDB] Synced ${newChangeHashes.length} new changes, index now has ${this.index.size} documents`);
   }
 
   getStore(): AppendOnlyStore {
@@ -106,10 +133,6 @@ export class BaseMindooDB implements MindooDB {
 
   getTenant(): MindooTenant {
     return this.tenant;
-  }
-
-  getId(): string {
-    return this.id;
   }
 
   async createDocument(): Promise<MindooDoc> {
@@ -772,6 +795,101 @@ export class BaseMindooDB implements MindooDB {
     ].join("-");
     
     return uuid7;
+  }
+
+  /**
+   * Pull changes from a remote append-only store.
+   * 
+   * This method:
+   * 1. Finds changes in the remote store that we don't have locally
+   * 2. Retrieves those changes from the remote store
+   * 3. Appends them to our local store
+   * 4. Syncs the local store to process the new changes
+   *
+   * @param remoteStore The remote append-only store to pull changes from
+   * @return A promise that resolves when the pull is complete
+   */
+  async pullChangesFrom(remoteStore: AppendOnlyStore): Promise<void> {
+    if (this.store.getId() !== remoteStore.getId()) {
+      throw new Error(`[BaseMindooDB] Cannot pull changes from the incompatible store ${this.store.getId()}`);
+    }
+
+    console.log(`[BaseMindooDB] Pulling changes from remote store ${remoteStore.getId()}`);
+    
+    // Get all change hashes we already have in our local store
+    const localChangeHashes = await this.store.getAllChangeHashes();
+    console.log(`[BaseMindooDB] Local store has ${localChangeHashes.length} change hashes`);
+    
+    // Find changes in the remote store that we don't have
+    const newChangeHashes = await remoteStore.findNewChanges(localChangeHashes);
+    console.log(`[BaseMindooDB] Found ${newChangeHashes.length} new changes in remote store`);
+    
+    if (newChangeHashes.length === 0) {
+      console.log(`[BaseMindooDB] No new changes to pull`);
+      return;
+    }
+    
+    // Get the full changes from the remote store
+    const newChanges = await remoteStore.getChanges(newChangeHashes);
+    console.log(`[BaseMindooDB] Retrieved ${newChanges.length} changes from remote store`);
+    
+    // Append each change to our local store
+    // The append method handles deduplication (no-op if change already exists)
+    for (const change of newChanges) {
+      await this.store.append(change);
+    }
+    
+    console.log(`[BaseMindooDB] Appended ${newChanges.length} changes to local store`);
+    
+    // Sync the local store to process the new changes
+    // This will update the index, cache, and processedChangeHashes
+    await this.syncStoreChanges();
+    
+    console.log(`[BaseMindooDB] Pull complete, synced ${newChanges.length} changes`);
+  }
+
+  /**
+   * Push changes to a remote append-only store.
+   * 
+   * This method:
+   * 1. Finds changes in our local store that the remote doesn't have
+   * 2. Retrieves those changes from our local store
+   * 3. Appends them to the remote store
+   *
+   * @param remoteStore The remote append-only store to push changes to
+   * @return A promise that resolves when the push is complete
+   */
+  async pushChangesTo(remoteStore: AppendOnlyStore): Promise<void> {
+    if (this.store.getId() !== remoteStore.getId()) {
+      throw new Error(`[BaseMindooDB] Cannot push changes to the incompatible store ${this.store.getId()}`);
+    }
+
+    console.log(`[BaseMindooDB] Pushing changes to remote store ${remoteStore.getId()}`);
+    
+    // Get all change hashes the remote store already has
+    const remoteChangeHashes = await remoteStore.getAllChangeHashes();
+    console.log(`[BaseMindooDB] Remote store has ${remoteChangeHashes.length} change hashes`);
+    
+    // Find changes in our local store that the remote doesn't have
+    const newChangeHashes = await this.store.findNewChanges(remoteChangeHashes);
+    console.log(`[BaseMindooDB] Found ${newChangeHashes.length} new changes to push`);
+    
+    if (newChangeHashes.length === 0) {
+      console.log(`[BaseMindooDB] No new changes to push`);
+      return;
+    }
+    
+    // Get the full changes from our local store
+    const newChanges = await this.store.getChanges(newChangeHashes);
+    console.log(`[BaseMindooDB] Retrieved ${newChanges.length} changes from local store`);
+    
+    // Append each change to the remote store
+    // The append method handles deduplication (no-op if change already exists)
+    for (const change of newChanges) {
+      await remoteStore.append(change);
+    }
+    
+    console.log(`[BaseMindooDB] Pushed ${newChanges.length} changes to remote store`);
   }
 }
 

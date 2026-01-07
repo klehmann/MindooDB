@@ -202,33 +202,6 @@ export interface MindooTenant {
   getTenantEncryptionKey(): EncryptedPrivateKey;
 
   /**
-   * Adds a new user to the tenant. The user is identified by its user ID.
-   * The registration operation is signed with the administration key (signing only, not encryption).
-   * 
-   * @param userId The user ID to register
-   * @param administrationPrivateKey The administration private key to sign the registration operation with (signing only)
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
-   * @return A promise that resolves when the user is registered
-   */
-  registerUser(userId: PublicUserId, administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
-  ): Promise<void>;
-
-  /**
-   * Revokes a user's access to the tenant by adding a revocation record to the directory.
-   * This prevents the user from decrypting future changes, but they retain access to previously
-   * decrypted changes (append-only limitation).
-   * 
-   * @param username The username of the user to revoke (format: "CN=<username>/O=<tenantId>")
-   * @param administrationPrivateKey The administration private key to sign the revocation (signing only)
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
-   * @return A promise that resolves when the user is revoked
-   */
-  revokeUser(username: string, administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
-  ): Promise<void>;
-
-  /**
    * Adds a named symmetric key to the tenant's key map.
    * This is used when a user receives a key from an administrator or colleague
    * (via email, shared folder with password protection and a password sent via secure channel).
@@ -296,11 +269,11 @@ export interface MindooTenant {
   signPayload(payload: Uint8Array): Promise<Uint8Array>;
 
   /**
-   * Convenience method to open the directory database for this tenant
+   * Method to open the directory for this tenant
    *
-   * @return The directory database
+   * @return The directory
    */
-  openDirectoryDB(): Promise<MindooDB>;
+  openDirectory(): Promise<MindooTenantDirectory>;
 
   /**
    * Opens a new database for this tenant
@@ -433,12 +406,38 @@ export interface MindooDocPayload {
   [key: string]: unknown;
 }
 
-export interface MindooDB {
+export interface MindooTenantDirectory {
 
   /**
-   * Returns the underlying append only store that is used to store the changes for this document.
+   * Adds a new user to the tenant. The user is identified by its user ID.
+   * The registration operation is signed with the administration key (signing only, not encryption).
+   * 
+   * @param userId The user ID to register
+   * @param administrationPrivateKey The administration private key to sign the registration operation with (signing only)
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the user is registered
    */
-  getStore(): AppendOnlyStore;
+  registerUser(userId: PublicUserId, administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
+
+  /**
+   * Revokes a user's access to the tenant by adding a revocation record to the directory.
+   * This prevents the user from decrypting future changes, but they retain access to previously
+   * decrypted changes (append-only limitation).
+   * 
+   * @param username The username of the user to revoke (format: "CN=<username>/O=<tenantId>")
+   * @param administrationPrivateKey The administration private key to sign the revocation (signing only)
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the user is revoked
+   */
+  revokeUser(username: string, administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
+
+}
+
+export interface MindooDB {
 
   /**
    * Get the tenant that this database belongs to
@@ -448,11 +447,11 @@ export interface MindooDB {
   getTenant(): MindooTenant;
 
   /**
-   * Get the ID of the database
+   * Get the append-only store that is used to store the changes for this database.
    *
-   * @return The ID of the database
+   * @return The append-only store
    */
-  getId(): string;
+  getStore(): AppendOnlyStore;
 
   /**
    * Create a new document (unencrypted, uses tenant default encryption)
@@ -542,4 +541,34 @@ export interface MindooDB {
    * @return The timestamp of the last change processed, can be used to continue processing from this timestamp
    */
   processChangesSince(timestamp: number, limit: number, callback: (change: MindooDoc) => void): Promise<number>;
+
+  /**
+   * Sync changes from the append-only store by finding new changes and processing them.
+   * This method can be called multiple times to incrementally sync new changes.
+   * On first call (when processedChangeHashes is empty), it will process all changes.
+   * 
+   * The method uses a stored list of processed change hashes to determine which changes
+   * are new. It calls AppendOnlyStore.findNewChanges() to find unprocessed changes,
+   * then processes them to update the cached database documents and index.
+   * After processing, the new change hashes are appended to the stored list.
+   *
+   * @return A promise that resolves when the sync is complete
+   */
+  syncStoreChanges(): Promise<void>;
+
+  /**
+   * Pull changes from a remote append-only store.
+   *
+   * @param remoteStore The remote append-only store to pull changes from
+   * @return A promise that resolves when the pull is complete
+   */
+  pullChangesFrom(remoteStore: AppendOnlyStore): Promise<void>;
+
+  /**
+   * Push changes to a remote append-only store.
+   *
+   * @param remoteStore The remote append-only store to push changes to
+   * @return A promise that resolves when the push is complete
+   */
+  pushChangesTo(remoteStore: AppendOnlyStore): Promise<void>;
 }

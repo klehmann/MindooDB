@@ -4,13 +4,14 @@ import {
   MindooDB,
   AppendOnlyStore,
   AppendOnlyStoreFactory,
-  MindooDoc,
   MindooTenantFactory,
+  MindooTenantDirectory,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { KeyBag } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
+import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -34,7 +35,7 @@ export class BaseMindooTenant implements MindooTenant {
   private administrationPublicKey: string; // Administration public key (Ed25519, PEM format)
   private currentUser: PrivateUserId;
   private currentUserPassword: string; // Password to decrypt user's private keys
-  private cryptoAdapter: CryptoAdapter;
+  protected cryptoAdapter: CryptoAdapter;
   private keyBag: KeyBag;
   private storeFactory: AppendOnlyStoreFactory;
   private databaseCache: Map<string, MindooDB> = new Map();
@@ -82,6 +83,10 @@ export class BaseMindooTenant implements MindooTenant {
     // KeyBag is already loaded by the caller before passing it to the constructor
     const keyCount = (await this.keyBag.listKeys()).length;
     console.log(`[BaseMindooTenant] Tenant initialized with ${keyCount} keys in KeyBag`);
+  }
+
+  getCryptoAdapter(): CryptoAdapter {
+    return this.cryptoAdapter;
   }
 
   getFactory(): MindooTenantFactory {
@@ -267,7 +272,7 @@ export class BaseMindooTenant implements MindooTenant {
     console.log(`[BaseMindooTenant] Validating public signing key`);
 
     // Load the directory database to check if this key belongs to a trusted user
-    const directoryDB = await this.openDirectoryDB();
+    const directoryDB = await this.openDB("directory");
     
     // TODO: Query the directory database to check if this public key belongs to a registered,
     // non-revoked user. For now, return true as a placeholder.
@@ -291,112 +296,10 @@ export class BaseMindooTenant implements MindooTenant {
     };
   }
 
-  async registerUser(
-    userId: PublicUserId,
-    administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
-  ): Promise<void> {
-    console.log(`[BaseMindooTenant] Registering user: ${userId.username}`);
-
-    // Decrypt the administration private key
-    const adminKey = await this.decryptPrivateKey(
-      administrationPrivateKey,
-      administrationPrivateKeyPassword,
-      "administration"
-    );
-
-    // Sign the user registration with the administration key
-    const registrationData = JSON.stringify({
-      username: userId.username,
-      userSigningPublicKey: userId.userSigningPublicKey,
-      userEncryptionPublicKey: userId.userEncryptionPublicKey,
-      timestamp: Date.now(),
-    });
-    const registrationDataBytes = new TextEncoder().encode(registrationData);
-
-    const subtle = this.cryptoAdapter.getSubtle();
-    const cryptoKey = await subtle.importKey(
-      "pkcs8",
-      adminKey,
-      { name: "Ed25519" },
-      false,
-      ["sign"]
-    );
-
-    const signature = await subtle.sign(
-      { name: "Ed25519" },
-      cryptoKey,
-      registrationDataBytes
-    );
-
-    // Add user to directory database
-    const directoryDB = await this.openDirectoryDB();
-    const newDoc = await directoryDB.createDocument();
-    await directoryDB.changeDoc(newDoc, (doc: MindooDoc) => {
-      const data = doc.getData();
-      data.username = userId.username;
-      data.userSigningPublicKey = userId.userSigningPublicKey;
-      data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
-      data.registrationData = this.uint8ArrayToBase64(registrationDataBytes);
-      data.administrationSignature = this.uint8ArrayToBase64(new Uint8Array(signature));
-    });
-    
-    console.log(`[BaseMindooTenant] Registered user: ${userId.username}`);
-  }
-
-  async revokeUser(
-    username: string,
-    administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
-  ): Promise<void> {
-    console.log(`[BaseMindooTenant] Revoking user: ${username}`);
-
-    // Decrypt the administration private key
-    const adminKey = await this.decryptPrivateKey(
-      administrationPrivateKey,
-      administrationPrivateKeyPassword,
-      "administration"
-    );
-
-    // Sign the revocation with the administration key
-    const revocationData = JSON.stringify({
-      username: username,
-      revokedAt: Date.now(),
-    });
-    const revocationDataBytes = new TextEncoder().encode(revocationData);
-
-    const subtle = this.cryptoAdapter.getSubtle();
-    const cryptoKey = await subtle.importKey(
-      "pkcs8",
-      adminKey,
-      { name: "Ed25519" },
-      false,
-      ["sign"]
-    );
-
-    const signature = await subtle.sign(
-      { name: "Ed25519" },
-      cryptoKey,
-      revocationDataBytes
-    );
-
-    // Add revocation record to directory database
-    const directoryDB = await this.openDirectoryDB();
-    
-    const newDoc = await directoryDB.createDocument();
-    await directoryDB.changeDoc(newDoc, (doc: MindooDoc) => {
-      const data = doc.getData();
-      data.username = username;
-      data.revokedAt = Date.now();
-      data.revocationData = this.uint8ArrayToBase64(revocationDataBytes);
-      data.revocationSignature = this.uint8ArrayToBase64(new Uint8Array(signature));
-    });
-    
-    console.log(`[BaseMindooTenant] Revoked user: ${username}`);
-  }
-
-  async openDirectoryDB(): Promise<MindooDB> {
-    return this.openDB("directory");
+  async openDirectory(): Promise<MindooTenantDirectory> {
+    const directory = new BaseMindooTenantDirectory(this);
+    await directory.initialize();
+    return directory;
   }
 
   async openDB(id: string): Promise<MindooDB> {
@@ -450,6 +353,7 @@ export class BaseMindooTenant implements MindooTenant {
 
   /**
    * Internal method to decrypt a private key using password-based key derivation.
+   * Protected so that BaseMindooTenantDirectory can access it.
    * 
    * @param encryptedKey The encrypted private key
    * @param password The password to decrypt the key
@@ -457,7 +361,7 @@ export class BaseMindooTenant implements MindooTenant {
    *                   This is combined with the encryptedKey.salt for additional security
    * @returns The decrypted private key as ArrayBuffer
    */
-  private async decryptPrivateKey(
+  public async decryptPrivateKey(
     encryptedKey: EncryptedPrivateKey,
     password: string,
     saltString: string
@@ -524,8 +428,9 @@ export class BaseMindooTenant implements MindooTenant {
 
   /**
    * Helper method to convert base64 string to Uint8Array
+   * Protected so that BaseMindooTenantDirectory can access it.
    */
-  private base64ToUint8Array(base64: string): Uint8Array {
+  protected base64ToUint8Array(base64: string): Uint8Array {
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
@@ -536,8 +441,9 @@ export class BaseMindooTenant implements MindooTenant {
 
   /**
    * Helper method to convert Uint8Array to base64 string
+   * Protected so that BaseMindooTenantDirectory can access it.
    */
-  private uint8ArrayToBase64(bytes: Uint8Array): string {
+  public uint8ArrayToBase64(bytes: Uint8Array): string {
     let binary = "";
     for (let i = 0; i < bytes.length; i++) {
       binary += String.fromCharCode(bytes[i]);

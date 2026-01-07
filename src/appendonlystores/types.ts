@@ -26,6 +26,12 @@ export interface AppendOnlyStoreFactory {
  * client-server, server-server).
  */
 export interface AppendOnlyStore {
+  /**
+   * Get the ID of the store
+   *
+   * @return The ID of the store
+   */
+  getId(): string;
 
   /**
    * Append a new change to the store. No-op if we already have this
