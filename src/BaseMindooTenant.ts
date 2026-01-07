@@ -5,6 +5,7 @@ import {
   AppendOnlyStore,
   AppendOnlyStoreFactory,
   MindooDoc,
+  MindooTenantFactory,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
@@ -26,9 +27,9 @@ import { BaseMindooDB } from "./BaseMindooDB";
  *   - PBKDF2 key derivation (for password-based key derivation)
  */
 export class BaseMindooTenant implements MindooTenant {
+  private factory: MindooTenantFactory;
   private tenantId: string;
   private tenantEncryptionKey: EncryptedPrivateKey;
-  private tenantEncryptionPublicKey: string; // Key identifier (PEM format for compatibility)
   private tenantEncryptionKeyPassword: string; // Password to decrypt tenant encryption key
   private administrationPublicKey: string; // Administration public key (Ed25519, PEM format)
   private currentUser: PrivateUserId;
@@ -44,9 +45,9 @@ export class BaseMindooTenant implements MindooTenant {
   private decryptedUserEncryptionKeyCache?: CryptoKey;
 
   constructor(
+    factory: MindooTenantFactory,
     tenantId: string,
     tenantEncryptionKey: EncryptedPrivateKey,
-    tenantEncryptionPublicKey: string,
     tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
     currentUser: PrivateUserId,
@@ -55,9 +56,9 @@ export class BaseMindooTenant implements MindooTenant {
     storeFactory: AppendOnlyStoreFactory,
     cryptoAdapter?: CryptoAdapter
   ) {
+    this.factory = factory;
     this.tenantId = tenantId;
     this.tenantEncryptionKey = tenantEncryptionKey;
-    this.tenantEncryptionPublicKey = tenantEncryptionPublicKey;
     this.tenantEncryptionKeyPassword = tenantEncryptionKeyPassword;
     this.administrationPublicKey = administrationPublicKey;
     this.currentUser = currentUser;
@@ -83,15 +84,15 @@ export class BaseMindooTenant implements MindooTenant {
     console.log(`[BaseMindooTenant] Tenant initialized with ${keyCount} keys in KeyBag`);
   }
 
+  getFactory(): MindooTenantFactory {
+    return this.factory;
+  }
+
   getId(): string {
     return this.tenantId;
   }
 
-  getTenantEncryptionPublicKey(): string {
-    return this.tenantEncryptionPublicKey;
-  }
-
-  getTenantEncryptionPrivateKey(): EncryptedPrivateKey {
+  getTenantEncryptionKey(): EncryptedPrivateKey {
     return this.tenantEncryptionKey;
   }
 
@@ -285,8 +286,8 @@ export class BaseMindooTenant implements MindooTenant {
     return {
       username: this.currentUser.username,
       administrationSignature: this.currentUser.administrationSignature,
-      userSigningPublicKey: this.currentUser.userSigningPublicKey,
-      userEncryptionPublicKey: this.currentUser.userEncryptionPublicKey,
+      userSigningPublicKey: this.currentUser.userSigningKeyPair.publicKey,
+      userEncryptionPublicKey: this.currentUser.userEncryptionKeyPair.publicKey,
     };
   }
 
@@ -425,7 +426,7 @@ export class BaseMindooTenant implements MindooTenant {
 
     // Decrypt the user's signing private key
     const decryptedKeyBuffer = await this.decryptPrivateKey(
-      this.currentUser.userSigningPrivateKey,
+      this.currentUser.userSigningKeyPair.privateKey,
       this.currentUserPassword,
       "signing"
     );
@@ -444,62 +445,6 @@ export class BaseMindooTenant implements MindooTenant {
     );
 
     this.decryptedUserSigningKeyCache = cryptoKey;
-    return cryptoKey;
-  }
-
-  /**
-   * Internal method to get the decrypted encryption key for the current user.
-   * Used for encrypting/decrypting the named symmetric keys map.
-   */
-  private async getDecryptedUserEncryptionKey(): Promise<CryptoKey> {
-    // Use cached encryption key if available
-    if (this.decryptedUserEncryptionKeyCache) {
-      return this.decryptedUserEncryptionKeyCache;
-    }
-
-    // Decrypt the user's encryption private key
-    const decryptedKeyBuffer = await this.decryptPrivateKey(
-      this.currentUser.userEncryptionPrivateKey,
-      this.currentUserPassword,
-      "encryption"
-    );
-
-    const subtle = this.cryptoAdapter.getSubtle();
-
-    // Import the decrypted key - try RSA-OAEP first, fall back to ECDH if needed
-    // The key format depends on what was used during key creation
-    let cryptoKey: CryptoKey;
-    try {
-      // Try RSA-OAEP (RSA encryption)
-      cryptoKey = await subtle.importKey(
-        "pkcs8",
-        decryptedKeyBuffer,
-        {
-          name: "RSA-OAEP",
-          hash: "SHA-256",
-        },
-        false,
-        ["decrypt"]
-      );
-    } catch (error) {
-      // Fall back to ECDH if RSA fails
-      try {
-        cryptoKey = await subtle.importKey(
-          "pkcs8",
-          decryptedKeyBuffer,
-          {
-            name: "ECDH",
-            namedCurve: "P-256",
-          },
-          false,
-          ["deriveKey", "deriveBits"]
-        );
-      } catch (error2) {
-        throw new Error(`Failed to import user encryption key. Tried RSA-OAEP and ECDH. Error: ${error2}`);
-      }
-    }
-
-    this.decryptedUserEncryptionKeyCache = cryptoKey;
     return cryptoKey;
   }
 

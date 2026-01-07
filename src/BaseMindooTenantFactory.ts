@@ -72,12 +72,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       "default"
     );
 
-    // Generate tenant encryption public key identifier (PEM format for compatibility)
-    // For symmetric keys, we use a hash of the key as the identifier
-    const keyHash = await subtle.digest("SHA-256", tenantKeyBytes);
-    const keyHashArray = new Uint8Array(keyHash);
-    const tenantEncryptionPublicKey = this.uint8ArrayToPEM(keyHashArray, "PUBLIC KEY");
-
     // Generate administration key pair (Ed25519)
     const administrationKeyPair = await subtle.generateKey(
       {
@@ -113,7 +107,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
 
     return this.openTenantWithKeys(
       tenantId,
-      tenantEncryptionPublicKey,
       encryptedTenantKey,
       tenantEncryptionKeyPassword,
       administrationPublicKey,
@@ -128,7 +121,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    */
   async openTenantWithKeys(
     tenantId: string,
-    tenantEncryptionPublicKey: string,
     tenantEncryptionPrivateKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
@@ -139,9 +131,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log(`[BaseTenantFactory] Opening tenant: ${tenantId}`);
 
     const tenant = new BaseMindooTenant(
+      this,
       tenantId,
       tenantEncryptionPrivateKey,
-      tenantEncryptionPublicKey,
       tenantEncryptionKeyPassword,
       administrationPublicKey,
       currentUser,
@@ -224,10 +216,14 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     const privateUserId: PrivateUserId = {
       username,
       administrationSignature: "", // Will be set when user is registered by an admin
-      userSigningPublicKey: signingPublicKey,
-      userSigningPrivateKey: encryptedSigningKey,
-      userEncryptionPublicKey: encryptionPublicKey,
-      userEncryptionPrivateKey: encryptedEncryptionKey,
+      userSigningKeyPair: {
+        publicKey: signingPublicKey,
+        privateKey: encryptedSigningKey,
+      },
+      userEncryptionKeyPair: {
+        publicKey: encryptionPublicKey,
+        privateKey: encryptedEncryptionKey,
+      },
     };
 
     console.log(`[BaseTenantFactory] Created user ID: ${username}`);
@@ -241,8 +237,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     return {
       username: privateUserId.username,
       administrationSignature: privateUserId.administrationSignature,
-      userSigningPublicKey: privateUserId.userSigningPublicKey,
-      userEncryptionPublicKey: privateUserId.userEncryptionPublicKey,
+      userSigningPublicKey: privateUserId.userSigningKeyPair.publicKey,
+      userEncryptionPublicKey: privateUserId.userEncryptionKeyPair.publicKey,
     };
   }
 

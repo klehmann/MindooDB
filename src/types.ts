@@ -20,14 +20,6 @@ export interface EncryptedPrivateKey {
 }
 
 /**
- * Map of key IDs to their encrypted symmetric keys.
- * Supports key rotation by storing multiple versions per ID.
- * Key: key ID (string)
- * Value: array of encrypted keys (newest first, or sorted by createdAt)
- */
-export type NamedSymmetricKeysMap = Map<string, EncryptedPrivateKey[]>;
-
-/**
  * A signing key pair containing both the public and encrypted private key.
  * The public key is needed for signature verification by other users.
  */
@@ -103,9 +95,8 @@ export interface MindooTenantFactory {
    * Opens an existing tenant with previously created keys.
    * 
    * @param tenantId The ID of the tenant
-   * @param tenantEncryptionPublicKey The tenant encryption public key identifier
-   * @param tenantEncryptionPrivateKey The tenant encryption private key (AES-256, encrypted)
-   * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption private key
+   * @param tenantEncryptionPrivateKey The tenant encryption key (AES-256, encrypted)
+   * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption key
    * @param administrationPublicKey The administration public key (Ed25519, PEM format)
    * @param currentUser The current user's private user ID (required for tenant operations)
    * @param currentUserPassword The password to decrypt the current user's private keys
@@ -114,7 +105,6 @@ export interface MindooTenantFactory {
    */
   openTenantWithKeys(
     tenantId: string,
-    tenantEncryptionPublicKey: string,
     tenantEncryptionPrivateKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
@@ -188,6 +178,13 @@ export interface MindooTenantFactory {
  */
 export interface MindooTenant {
   /**
+   * Get the factory that was used to create this tenant.
+   * 
+   * @return The factory that was used to create this tenant
+   */
+  getFactory(): MindooTenantFactory;
+
+  /**
    * Get the ID of the tenant (UUID7 format)
    *
    * @return The ID of the tenant
@@ -195,25 +192,14 @@ export interface MindooTenant {
   getId(): string;
 
   /**
-   * Returns the public key for the encryption key used to encrypt all communication in this tenant
-   * (e.g. the document changesets).
-   * 
-   * Note: This is a symmetric key (AES-256), so "public key" refers to the key identifier.
-   * The actual key is stored encrypted in the named symmetric keys map with ID "default".
-   * 
-   * @return The tenant encryption public key identifier (PEM format for compatibility)
-   */
-  getTenantEncryptionPublicKey(): string;
-
-  /**
-   * Returns the private key for the encryption key used to encrypt all communication in this tenant
+   * Returns the encryption key used to encrypt all communication in this tenant
    * (e.g. the document changesets).
    * 
    * Note: This is a symmetric key (AES-256) used ONLY for encryption/decryption, not for signing.
    * 
-   * @return The tenant encryption private key (AES-256, encrypted)
+   * @return The tenant encryption key (AES-256, encrypted)
    */
-  getTenantEncryptionPrivateKey(): EncryptedPrivateKey;
+  getTenantEncryptionKey(): EncryptedPrivateKey;
 
   /**
    * Adds a new user to the tenant. The user is identified by its user ID.
@@ -403,6 +389,13 @@ export interface MindooDocChange extends MindooDocChangeHashes {
  * It's a wrapper around the Automerge document.
  */
 export interface MindooDoc {
+  /**
+   * Get the database that this document belongs to
+   *
+   * @return The database that this document belongs to
+   */
+  getDatabase(): MindooDB;
+
   /*
    * Get the ID of the document (UUID7 format)
    *

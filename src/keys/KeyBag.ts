@@ -2,13 +2,22 @@ import { EncryptedPrivateKey } from "../types";
 import { CryptoAdapter, createCryptoAdapter } from "../crypto/CryptoAdapter";
 
 /**
+ * Internal structure for storing a key with optional creation timestamp.
+ */
+interface KeyEntry {
+  key: Uint8Array;
+  createdAt?: number; // milliseconds since Unix epoch
+}
+
+/**
  * The KeyBag is used to store encryption keys that the current user has access to
- * in order to decrypt decrypt document changes stored in the AppendOnlyStore.
+ * in order to decrypt document changes stored in the AppendOnlyStore.
+ * Supports key rotation by storing multiple versions per keyId (newest first).
  */
 export class KeyBag {
   private userEncryptionKey: EncryptedPrivateKey;
   private userEncryptionKeyPassword: string;
-  private keys: Map<string, Uint8Array> = new Map();
+  private keys: Map<string, KeyEntry[]> = new Map();
   private cryptoAdapter: CryptoAdapter;
 
   /**
@@ -31,20 +40,67 @@ export class KeyBag {
 
   /**
    * Reads a key from the key bag.
+   * Returns the newest key (based on createdAt) or the first key if no timestamps are available.
    *
    * @param keyId The ID of the key to read
-   * @return The exported key
+   * @return The exported key, or null if not found
    */
   async get(keyId: string): Promise<Uint8Array | null> {
-    return this.keys.get(keyId) ?? null;
+    const keyEntries = this.keys.get(keyId);
+    if (!keyEntries || keyEntries.length === 0) {
+      return null;
+    }
+    
+    // Sort by createdAt (newest first), then return the first one
+    const sorted = [...keyEntries].sort((a, b) => {
+      const aTime = a.createdAt ?? 0;
+      const bTime = b.createdAt ?? 0;
+      return bTime - aTime; // Descending order (newest first)
+    });
+    
+    return sorted[0].key;
   }
 
-  async set(keyId: string, key: Uint8Array): Promise<void> {
-    this.keys.set(keyId, key);
+  /**
+   * Gets all keys for a given keyId, sorted by createdAt (newest first).
+   * Useful for trying multiple keys during decryption (key rotation support).
+   *
+   * @param keyId The ID of the keys to read
+   * @return Array of keys sorted by createdAt (newest first), or empty array if not found
+   */
+  async getAllKeys(keyId: string): Promise<Uint8Array[]> {
+    const keyEntries = this.keys.get(keyId);
+    if (!keyEntries || keyEntries.length === 0) {
+      return [];
+    }
+    
+    // Sort by createdAt (newest first)
+    const sorted = [...keyEntries].sort((a, b) => {
+      const aTime = a.createdAt ?? 0;
+      const bTime = b.createdAt ?? 0;
+      return bTime - aTime; // Descending order (newest first)
+    });
+    
+    return sorted.map(entry => entry.key);
+  }
+
+  /**
+   * Sets a key in the key bag.
+   * Adds the key to the array of keys for this keyId (supports key rotation).
+   * 
+   * @param keyId The ID of the key
+   * @param key The key bytes
+   * @param createdAt Optional creation timestamp (milliseconds since Unix epoch)
+   */
+  async set(keyId: string, key: Uint8Array, createdAt?: number): Promise<void> {
+    const keyEntries = this.keys.get(keyId) || [];
+    keyEntries.push({ key, createdAt });
+    this.keys.set(keyId, keyEntries);
   }
 
   /**
    * Decrypts an encrypted private key with the given password and imports it into the key bag.
+   * Adds the key to the array of keys for this keyId (supports key rotation).
    * 
    * @param keyId The ID to store the decrypted key under
    * @param key The encrypted private key to decrypt
@@ -53,14 +109,19 @@ export class KeyBag {
    */
   async decryptAndImportKey(keyId: string, key: EncryptedPrivateKey, password: string): Promise<void> {
     const decryptedKeyBytes = await this.decryptPrivateKey(key, password, keyId);
-    this.keys.set(keyId, new Uint8Array(decryptedKeyBytes));
+    const keyEntries = this.keys.get(keyId) || [];
+    keyEntries.push({ 
+      key: new Uint8Array(decryptedKeyBytes),
+      createdAt: key.createdAt 
+    });
+    this.keys.set(keyId, keyEntries);
   }
 
   /**
-   * Deletes a key from the key bag.
+   * Deletes all keys for a given keyId from the key bag.
    * 
-   * @param keyId The ID of the key to delete
-   * @return A promise that resolves when the key is deleted
+   * @param keyId The ID of the keys to delete
+   * @return A promise that resolves when the keys are deleted
    */
   async deleteKey(keyId: string): Promise<void> {
     this.keys.delete(keyId);
@@ -85,9 +146,13 @@ export class KeyBag {
     
     // Serialize the map to JSON and convert to Uint8Array
     // Convert Uint8Array values to base64 strings for JSON serialization
-    const mapArray: Array<[string, string]> = Array.from(this.keys.entries()).map(([keyId, keyBytes]) => [
+    // Support multiple keys per keyId with createdAt timestamps
+    const mapArray: Array<[string, Array<{key: string, createdAt?: number}>]> = Array.from(this.keys.entries()).map(([keyId, keyEntries]) => [
       keyId,
-      this.uint8ArrayToBase64(keyBytes)
+      keyEntries.map(entry => ({
+        key: this.uint8ArrayToBase64(entry.key),
+        createdAt: entry.createdAt
+      }))
     ]);
     const jsonString = JSON.stringify(mapArray);
     const plaintext = new TextEncoder().encode(jsonString);
@@ -242,11 +307,18 @@ export class KeyBag {
     // Deserialize JSON to map
     const decryptedArray = new Uint8Array(decrypted);
     const jsonString = new TextDecoder().decode(decryptedArray);
-    const mapArray: Array<[string, string]> = JSON.parse(jsonString);
+    const mapArray: Array<[string, Array<{key: string, createdAt?: number}>]> = JSON.parse(jsonString);
     
-    // Convert base64 strings back to Uint8Array
+    // Convert base64 strings back to Uint8Array arrays
+    // Support multiple keys per keyId with createdAt timestamps
     this.keys = new Map(
-      mapArray.map(([keyId, keyBase64]) => [keyId, this.base64ToUint8Array(keyBase64)])
+      mapArray.map(([keyId, keyEntries]) => [
+        keyId,
+        keyEntries.map(entry => ({
+          key: this.base64ToUint8Array(entry.key),
+          createdAt: entry.createdAt
+        }))
+      ])
     );
     
     console.log(`[KeyBag] Loaded key bag (${encryptedData.length} -> ${this.keys.size} keys)`);

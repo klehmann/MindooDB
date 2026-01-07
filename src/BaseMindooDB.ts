@@ -678,6 +678,7 @@ export class BaseMindooDB implements MindooDB {
    */
   private wrapDocument(internalDoc: InternalDoc): MindooDoc {
     return {
+      getDatabase: () => this,
       getId: () => internalDoc.id,
       getCreatedAt: () => internalDoc.createdAt,
       getLastModified: () => internalDoc.lastModified,

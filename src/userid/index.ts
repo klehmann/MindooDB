@@ -1,4 +1,4 @@
-import { EncryptedPrivateKey } from "../types";
+import { SigningKeyPair, EncryptionKeyPair } from "../types";
 
 /**
  * Public info for a user of the platform
@@ -22,7 +22,7 @@ export interface PublicUserId {
   userSigningPublicKey: string;
 
   /**
-   * The public key for encryption (RSA or ECDH, PEM format)
+   * The public key for encryption (RSA-OAEP, PEM format)
    * Used ONLY for encrypting/decrypting the named symmetric keys map stored on disk, not for signing.
    */
   userEncryptionPublicKey: string;
@@ -45,29 +45,17 @@ export interface PrivateUserId {
   administrationSignature: string;
 
   /**
-   * The public key for signing (Ed25519, PEM format)
+   * The signing key pair (Ed25519).
+   * Contains both public and encrypted private key.
    * Used ONLY for signing document changes, not for encryption.
    */
-  userSigningPublicKey: string;
+  userSigningKeyPair: SigningKeyPair;
 
   /**
-   * The encrypted private key for signing (Ed25519)
-   * Encrypted with password via key derivation (salt: "signing")
-   * Used ONLY for signing document changes, not for encryption.
-   */
-  userSigningPrivateKey: EncryptedPrivateKey;
-
-  /**
-   * The public key for encryption (RSA or ECDH, PEM format)
+   * The encryption key pair (RSA-OAEP).
+   * Contains both public and encrypted private key.
    * Used ONLY for encrypting/decrypting the named symmetric keys map stored on disk, not for signing.
    */
-  userEncryptionPublicKey: string;
-
-  /**
-   * The encrypted private key for encryption (RSA or ECDH)
-   * Encrypted with password via key derivation (salt: "encryption")
-   * Used ONLY for encrypting/decrypting the named symmetric keys map stored on disk, not for signing.
-   */
-  userEncryptionPrivateKey: EncryptedPrivateKey;
+  userEncryptionKeyPair: EncryptionKeyPair;
 }
 
