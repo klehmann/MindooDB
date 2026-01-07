@@ -1,8 +1,10 @@
 import {
-  TenantFactory,
+  MindooTenantFactory,
   MindooTenant,
   EncryptedPrivateKey,
   AppendOnlyStoreFactory,
+  SigningKeyPair,
+  EncryptionKeyPair,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
@@ -16,7 +18,7 @@ import { KeyBag } from "./keys/KeyBag";
  * It uses CryptoAdapter to abstract platform-specific crypto operations,
  * allowing the same implementation to work in browsers and Node.js.
  */
-export class BaseTenantFactory implements TenantFactory {
+export class BaseMindooTenantFactory implements MindooTenantFactory {
   private cryptoAdapter: CryptoAdapter;
   private storeFactory: AppendOnlyStoreFactory;
 
@@ -187,11 +189,12 @@ export class BaseTenantFactory implements TenantFactory {
       "signing"
     );
 
-    // Generate encryption key pair (RSA-OAEP, 2048 bits for good compatibility)
+    // Generate encryption key pair (RSA-OAEP, 3072 bits for state-of-the-art security)
+    // NIST recommends 3072-bit RSA for new applications (security through 2030+)
     const encryptionKeyPair = await subtle.generateKey(
       {
         name: "RSA-OAEP",
-        modulusLength: 2048,
+        modulusLength: 3072,
         publicExponent: new Uint8Array([1, 0, 1]), // 65537
         hash: "SHA-256",
       },
@@ -244,10 +247,12 @@ export class BaseTenantFactory implements TenantFactory {
   }
 
   /**
-   * Creates a new signing private key for the tenant.
+   * Creates a new signing key pair for the tenant.
+   * Returns both the public and encrypted private key, as the public key is needed
+   * for signature verification by other users.
    */
-  async createSigningPrivateKey(password: string): Promise<EncryptedPrivateKey> {
-    console.log(`[BaseTenantFactory] Creating encrypted signing private key`);
+  async createSigningKeyPair(password: string): Promise<SigningKeyPair> {
+    console.log(`[BaseTenantFactory] Creating signing key pair`);
 
     const subtle = this.cryptoAdapter.getSubtle();
 
@@ -260,6 +265,10 @@ export class BaseTenantFactory implements TenantFactory {
       ["sign", "verify"]
     );
 
+    // Export the public key (PEM format) - needed for signature verification
+    const publicKeyBuffer = await subtle.exportKey("spki", keyPair.publicKey);
+    const publicKey = this.arrayBufferToPEM(publicKeyBuffer, "PUBLIC KEY");
+
     // Export the private key in PKCS8 format
     const privateKeyBuffer = await subtle.exportKey("pkcs8", keyPair.privateKey);
     const keyBytes = new Uint8Array(privateKeyBuffer);
@@ -267,14 +276,19 @@ export class BaseTenantFactory implements TenantFactory {
     // Encrypt the key material using the shared helper
     const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "signing");
 
-    console.log(`[BaseTenantFactory] Created encrypted signing private key`);
-    return encryptedKey;
+    console.log(`[BaseTenantFactory] Created signing key pair`);
+    return {
+      publicKey,
+      privateKey: encryptedKey,
+    };
   }
 
   /**
    * Creates a new encrypted symmetric key (AES-256) for document encryption.
+   * Symmetric keys are shared secrets - anyone with the key can both encrypt and decrypt.
+   * For user-to-user encryption where only the recipient can decrypt, use createEncryptionKeyPair() instead.
    */
-  async createEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey> {
+  async createSymmetricEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey> {
     console.log(`[BaseTenantFactory] Creating encrypted symmetric key`);
 
     const subtle = this.cryptoAdapter.getSubtle();
@@ -299,6 +313,50 @@ export class BaseTenantFactory implements TenantFactory {
 
     console.log(`[BaseTenantFactory] Created encrypted symmetric key`);
     return encryptedKey;
+  }
+
+  /**
+   * Creates a new asymmetric encryption key pair (RSA-OAEP) for user-to-user encryption.
+   * Returns both the public and encrypted private key.
+   * 
+   * Use case: User A can fetch User B's public key from the directory DB, encrypt data with it,
+   * and only User B (with the private key) can decrypt it.
+   */
+  async createEncryptionKeyPair(password: string): Promise<EncryptionKeyPair> {
+    console.log(`[BaseTenantFactory] Creating encryption key pair`);
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Generate a new RSA-OAEP encryption key pair (3072 bits for state-of-the-art security)
+    // NIST recommends 3072-bit RSA for new applications (security through 2030+)
+    const encryptionKeyPair = await subtle.generateKey(
+      {
+        name: "RSA-OAEP",
+        modulusLength: 3072,
+        publicExponent: new Uint8Array([1, 0, 1]), // 65537
+        hash: "SHA-256",
+      },
+      true, // extractable
+      ["encrypt", "decrypt"]
+    );
+
+    // Export the public key (PEM format) - can be shared for encryption
+    const publicKeyBuffer = await subtle.exportKey("spki", encryptionKeyPair.publicKey);
+    const publicKey = this.arrayBufferToPEM(publicKeyBuffer, "PUBLIC KEY");
+
+    // Export the private key in PKCS8 format
+    const privateKeyBuffer = await subtle.exportKey("pkcs8", encryptionKeyPair.privateKey);
+    const privateKeyBytes = new Uint8Array(privateKeyBuffer);
+
+    // Encrypt the private key material using the shared helper
+    // Use "encryption" as the salt string (same as user encryption keys)
+    const encryptedKey = await this.encryptPrivateKey(privateKeyBytes, password, "encryption");
+
+    console.log(`[BaseTenantFactory] Created encryption key pair`);
+    return {
+      publicKey,
+      privateKey: encryptedKey,
+    };
   }
 
   /**
@@ -342,7 +400,7 @@ export class BaseTenantFactory implements TenantFactory {
       ["deriveBits", "deriveKey"]
     );
 
-    const iterations = 100000; // Standard PBKDF2 iterations
+    const iterations = 310000; // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
     const derivedKey = await subtle.deriveKey(
       {
         name: "PBKDF2",
