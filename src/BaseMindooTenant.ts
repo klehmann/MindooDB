@@ -122,9 +122,9 @@ export class BaseMindooTenant implements MindooTenant {
     }
     console.log(`[BaseMindooTenant] Adding named key: ${keyId}`);
 
-    // Decrypt the encrypted key using the correct salt string ("symmetric" for symmetric keys)
-    // The key was encrypted with salt "symmetric" by createSymmetricEncryptedPrivateKey
-    const decryptedKeyBytes = await this.decryptPrivateKey(encryptedKey, encryptedKeyPassword, "symmetric");
+    // Decrypt the encrypted key using the correct salt string ("default" for symmetric keys)
+    // The key was encrypted with salt "default" by createSymmetricEncryptedPrivateKey
+    const decryptedKeyBytes = await this.decryptPrivateKey(encryptedKey, encryptedKeyPassword, "default");
     
     // Store the decrypted key in KeyBag
     await this.keyBag.set(keyId, new Uint8Array(decryptedKeyBytes), encryptedKey.createdAt);

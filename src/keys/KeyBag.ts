@@ -106,7 +106,7 @@ export class KeyBag {
    * @param key The encrypted private key to decrypt
    * @param password The password to decrypt the key
    * @param saltString Optional salt string for key derivation. Defaults to keyId.
-   *                   Use "symmetric" for keys created by createSymmetricEncryptedPrivateKey.
+   *                   Use "default" for keys created by createSymmetricEncryptedPrivateKey.
    * @return A promise that resolves when the key is decrypted and stored
    */
   async decryptAndImportKey(keyId: string, key: EncryptedPrivateKey, password: string, saltString?: string): Promise<void> {

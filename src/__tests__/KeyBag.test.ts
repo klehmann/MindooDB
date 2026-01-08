@@ -158,11 +158,11 @@ describe("KeyBag", () => {
       const keyId = "imported-key";
       const keyPassword = "keypassword123";
       
-      // Create an encrypted key using the factory (uses "symmetric" as salt string)
+      // Create an encrypted key using the factory (uses "default" as salt string)
       const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
 
-      // Pass "symmetric" as salt string to match what the factory used
-      await keyBag.decryptAndImportKey(keyId, encryptedKey, keyPassword, "symmetric");
+      // Pass "default" as salt string to match what the factory used
+      await keyBag.decryptAndImportKey(keyId, encryptedKey, keyPassword, "default");
       
       const retrieved = await keyBag.get(keyId);
       expect(retrieved).toBeDefined();
@@ -177,8 +177,8 @@ describe("KeyBag", () => {
       const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
       encryptedKey.createdAt = createdAt;
 
-      // Pass "symmetric" as salt string to match what the factory used
-      await keyBag.decryptAndImportKey(keyId, encryptedKey, keyPassword, "symmetric");
+      // Pass "default" as salt string to match what the factory used
+      await keyBag.decryptAndImportKey(keyId, encryptedKey, keyPassword, "default");
       
       // Verify the key was imported
       const retrieved = await keyBag.get(keyId);
@@ -195,9 +195,9 @@ describe("KeyBag", () => {
       const encryptedKey2 = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
       encryptedKey2.createdAt = 2000;
 
-      // Pass "symmetric" as salt string to match what the factory used
-      await keyBag.decryptAndImportKey(keyId, encryptedKey1, keyPassword, "symmetric");
-      await keyBag.decryptAndImportKey(keyId, encryptedKey2, keyPassword, "symmetric");
+      // Pass "default" as salt string to match what the factory used
+      await keyBag.decryptAndImportKey(keyId, encryptedKey1, keyPassword, "default");
+      await keyBag.decryptAndImportKey(keyId, encryptedKey2, keyPassword, "default");
       
       const allKeys = await keyBag.getAllKeys(keyId);
       expect(allKeys).toHaveLength(2);
@@ -520,20 +520,20 @@ describe("KeyBag", () => {
       const keyId = "rotation-test";
       const keyPassword = "keypassword123";
 
-      // Import initial key (factory uses "symmetric" as salt string)
+      // Import initial key (factory uses "default" as salt string)
       const encryptedKey1 = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
       encryptedKey1.createdAt = 1000;
-      await keyBag.decryptAndImportKey(keyId, encryptedKey1, keyPassword, "symmetric");
+      await keyBag.decryptAndImportKey(keyId, encryptedKey1, keyPassword, "default");
 
       // Rotate: export and re-import with new timestamp (exported keys use keyId as salt string)
       const exported = await keyBag.encryptAndExportKey(keyId, keyPassword);
       exported!.createdAt = 2000;
       await keyBag.decryptAndImportKey(keyId, exported!, keyPassword); // Uses keyId by default
 
-      // Add another version directly (factory uses "symmetric" as salt string)
+      // Add another version directly (factory uses "default" as salt string)
       const encryptedKey2 = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
       encryptedKey2.createdAt = 3000;
-      await keyBag.decryptAndImportKey(keyId, encryptedKey2, keyPassword, "symmetric");
+      await keyBag.decryptAndImportKey(keyId, encryptedKey2, keyPassword, "default");
 
       // Should have 3 versions, newest first
       const allKeys = await keyBag.getAllKeys(keyId);
@@ -548,9 +548,9 @@ describe("KeyBag", () => {
       const keyId = "encrypted-key";
       const keyPassword = "keypassword123";
 
-      // Import an encrypted key (uses "symmetric" as salt string)
+      // Import an encrypted key (uses "default" as salt string)
       const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
-      await keyBag.decryptAndImportKey(keyId, encryptedKey, keyPassword, "symmetric");
+      await keyBag.decryptAndImportKey(keyId, encryptedKey, keyPassword, "default");
 
       // Save and load
       const saved = await keyBag.save();

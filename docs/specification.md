@@ -302,6 +302,8 @@ Due to the append-only nature of the store:
 - Rotate keys when users leave (they can't decrypt new changes)
 - Accept that historical access cannot be retroactively revoked
 
+**Note**: There is a critical security concern regarding **revocation timestamp protection** - preventing revoked users from creating backdated changes by manipulating their system clock. See [Revocation Timestamp Protection Concept Document](./revocation-timestamp-protection.md) for a detailed analysis of the problem and proposed solutions.
+
 ### Key Management Complexity
 
 - Users must manage multiple keys (signing, encryption, named symmetric keys)

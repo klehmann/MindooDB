@@ -30,9 +30,12 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
+      // Create administration key pair first
+      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+
       const tenant = await factory.createTenant(
         tenantId,
-        administrationKeyPassword,
+        adminKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -49,9 +52,12 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
+      // Create administration key pair first
+      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+
       const tenant = await factory.createTenant(
         tenantId,
-        administrationKeyPassword,
+        adminKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -71,9 +77,12 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
+      // Create administration key pair first
+      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+
       tenant = await factory.createTenant(
         tenantId,
-        administrationKeyPassword,
+        adminKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -118,9 +127,12 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
+      // Create administration key pair first
+      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+
       tenant = await factory.createTenant(
         tenantId,
-        administrationKeyPassword,
+        adminKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -217,9 +229,12 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
+      // Create administration key pair first
+      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+
       tenant = await factory.createTenant(
         tenantId,
-        administrationKeyPassword,
+        adminKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -285,9 +300,12 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
+      // Create administration key pair first
+      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+
       tenant = await factory.createTenant(
         tenantId,
-        administrationKeyPassword,
+        adminKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -352,9 +370,12 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
+      // Create administration key pair first
+      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+
       tenant = await factory.createTenant(
         tenantId,
-        administrationKeyPassword,
+        adminKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,

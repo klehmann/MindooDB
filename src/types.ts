@@ -193,6 +193,15 @@ export interface MindooTenant {
   getId(): string;
 
   /**
+   * Get the administration public key for this tenant.
+   * Used for creating document signers for administrative operations and verifying
+   * signatures on administrative documents (e.g., user registration, revocation).
+   * 
+   * @return The administration public key (Ed25519, PEM format)
+   */
+  getAdministrationPublicKey(): string;
+
+  /**
    * Returns the encryption key used to encrypt all communication in this tenant
    * (e.g. the document changesets).
    * 
