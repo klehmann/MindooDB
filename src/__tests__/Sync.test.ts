@@ -123,7 +123,7 @@ describe("sync test", () => {
     // Step 4: User2 opens "directory" and "contacts" databases (which are empty by default)
     const directory2 = await tenant2.openDB("directory");    
     const contactsDB2 = await tenant2.openDB("contacts");
-    
+
     // Verify both databases are empty for user2
     const allDirectoryDocs2 = await directory2.getAllDocumentIds();
     const allContacts2 = await contactsDB2.getAllDocumentIds();
@@ -151,11 +151,53 @@ describe("sync test", () => {
     
     // Verify the contact document content
     const contactDocId = allContacts2After[0];
+    expect(contactDocId).toBe(contactDoc.getId());
     const contactDoc2 = await contactsDB2.getDocument(contactDocId);
     const contactData = contactDoc2.getData();
     expect(contactData.name).toBe("John Doe");
     expect(contactData.email).toBe("john.doe@example.com");
     expect(contactData.phone).toBe("+1234567890");
+    
+    // Step 7: User2 modifies the contact document
+    await contactsDB2.changeDoc(contactDoc2, async (doc) => {
+      const data = doc.getData();
+      data.name = "John Smith"; // Changed name
+      data.email = "john.smith@example.com"; // Changed email
+      data.phone = "+9876543210"; // Changed phone
+      data.address = "123 Main St"; // Added new field
+    });
+    
+    // Verify user2 sees the updated document
+    const updatedContactDoc2 = await contactsDB2.getDocument(contactDocId);
+    const updatedContactData2 = updatedContactDoc2.getData();
+    expect(updatedContactData2.name).toBe("John Smith");
+    expect(updatedContactData2.email).toBe("john.smith@example.com");
+    expect(updatedContactData2.phone).toBe("+9876543210");
+    expect(updatedContactData2.address).toBe("123 Main St");
+    
+    // Step 8: User2 pushes changes back to user1's store
+    // Reuse the contactsStore1 that was already retrieved in Step 5
+    // Push changes from user2's store to user1's store
+    await contactsDB2.pushChangesTo(contactsStore1);
+    
+    // Step 9: User1 syncs his store to process the new changes
+    await contactsDB1.syncStoreChanges();
+    
+    // Step 10: User1 refetches the document and verifies it has the updated content
+    const updatedContactDoc1 = await contactsDB1.getDocument(contactDocId);
+    const updatedContactData1 = updatedContactDoc1.getData();
+    
+    // Verify all the changes made by user2 are visible to user1
+    expect(updatedContactData1.name).toBe("John Smith");
+    expect(updatedContactData1.email).toBe("john.smith@example.com");
+    expect(updatedContactData1.phone).toBe("+9876543210");
+    expect(updatedContactData1.address).toBe("123 Main St");
+    
+    // Verify the document ID is still the same
+    expect(updatedContactDoc1.getId()).toBe(contactDocId);
+    
+    // Verify the lastModified timestamp has been updated
+    expect(updatedContactDoc1.getLastModified()).toBeGreaterThan(contactDoc.getLastModified());
   });
 });
 
