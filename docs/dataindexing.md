@@ -55,16 +55,286 @@ function reduceFunction(keys, values) {
 - Proven pattern: Widely understood from CouchDB
 - Supports complex queries: Multiple keys, ranges, aggregations
 
+**Incremental Update Mechanism:**
+
+The key to efficient incremental map/reduce is **caching map outputs** in the index. Here's how it works:
+
+1. **Store Map Outputs**: For each document, store the key-value pairs emitted by the map function
+   - Index structure: `Map<docId, Array<{key, value}>>` - tracks what each document emitted
+   - View index: `Map<key, Array<{docId, value}>>` - organizes by emitted keys
+
+2. **Document Updates**: When a document changes via `processChangesSince()`:
+   - **Remove old entries**: Look up cached map outputs for the document, remove those key-value pairs from the view index
+   - **Add new entries**: Run map function on the updated document, add new key-value pairs to the view index
+   - **Update cache**: Replace cached map outputs with new ones
+   - **Incremental reduce**: Update reduce results by subtracting old values and adding new values
+
+3. **Document Deletions**: When a document is deleted:
+   - **Remove entries**: Look up cached map outputs, remove all key-value pairs from the view index
+   - **Clear cache**: Remove document from the map output cache
+   - **Incremental reduce**: Subtract deleted document's contributions from reduce results
+
+**Example Implementation:**
+
+```typescript
+class MapReduceView {
+  // Cache of map outputs per document
+  private mapOutputs: Map<string, Array<{key: any, value: any}>> = new Map();
+  
+  // View index: organized by emitted keys
+  private viewIndex: Map<string, Array<{docId: string, value: any}>> = new Map();
+  
+  // Reduce cache: pre-computed reduce results per key
+  private reduceCache: Map<string, any> = new Map();
+  
+  async updateDocument(doc: MindooDoc) {
+    const docId = doc.getId();
+    
+    // Get old map outputs (if document existed before)
+    const oldOutputs = this.mapOutputs.get(docId) || [];
+    
+    // Compute new map outputs
+    const newOutputs = this.mapFunction(doc);
+    
+    // Remove old entries from view index
+    for (const {key, value} of oldOutputs) {
+      this.removeFromViewIndex(key, docId);
+      this.updateReduce(key, value, 'subtract');
+    }
+    
+    // Add new entries to view index
+    for (const {key, value} of newOutputs) {
+      this.addToViewIndex(key, docId, value);
+      this.updateReduce(key, value, 'add');
+    }
+    
+    // Update cache
+    this.mapOutputs.set(docId, newOutputs);
+  }
+  
+  async deleteDocument(docId: string) {
+    const oldOutputs = this.mapOutputs.get(docId);
+    if (!oldOutputs) return;
+    
+    // Remove all entries
+    for (const {key, value} of oldOutputs) {
+      this.removeFromViewIndex(key, docId);
+      this.updateReduce(key, value, 'subtract');
+    }
+    
+    // Clear cache
+    this.mapOutputs.delete(docId);
+  }
+  
+  private updateReduce(key: any, value: any, operation: 'add' | 'subtract') {
+    const currentValues = this.viewIndex.get(key) || [];
+    const newReduceResult = this.reduceFunction(key, currentValues);
+    this.reduceCache.set(key, newReduceResult);
+  }
+}
+```
+
+**Reduce Function Requirements:**
+
+**Critical Limitation: NOT all reduce functions work incrementally!**
+
+For incremental updates to work correctly, reduce functions must be:
+- **Associative**: `reduce(a, reduce(b, c)) === reduce(reduce(a, b), c)` - order of grouping doesn't matter
+- **Commutative**: `reduce(a, b) === reduce(b, a)` - order of operands doesn't matter
+
+This allows partial reductions to be combined in any order, which is essential for incremental updates where we subtract old values and add new values.
+
+**Reduce Functions That Work Incrementally:**
+
+✅ **Count**: `(keys, values) => values.length`
+```typescript
+// Incremental: count = oldCount - removedCount + newCount
+```
+
+✅ **Sum**: `(keys, values) => values.reduce((a, b) => a + b, 0)`
+```typescript
+// Incremental: sum = oldSum - removedSum + newSum
+```
+
+✅ **Min/Max**: `(keys, values) => Math.min(...values)` or `Math.max(...values)`
+```typescript
+// Incremental: Need to track all values or recompute, but can be done
+// More efficient: Store sorted list and update incrementally
+```
+
+✅ **Average** (with count): Store both sum and count, compute average on query
+```typescript
+// Incremental: sum and count updated separately, average computed on-demand
+reduce: (keys, values) => ({ sum: values.reduce((a, b) => a + b, 0), count: values.length })
+query: (result) => result.sum / result.count
+```
+
+✅ **Set Union**: `(keys, values) => [...new Set(values.flat())]`
+```typescript
+// Incremental: Can add/remove individual values
+```
+
+✅ **Boolean OR/AND**: `(keys, values) => values.some(v => v)` or `values.every(v => v)`
+```typescript
+// Incremental: Can update based on individual value changes
+```
+
+**Reduce Functions That DON'T Work Incrementally:**
+
+❌ **Last Value**: `(keys, values) => values[values.length - 1]`
+```typescript
+// Problem: Order-dependent, not commutative
+// If we remove a value, we don't know which was "last" without full recomputation
+```
+
+❌ **Median**: `(keys, values) => { const sorted = values.sort(); return sorted[Math.floor(sorted.length/2)]; }`
+```typescript
+// Problem: Requires all values to compute, can't incrementally update
+// Workaround: Store all values, recompute median on query (defeats purpose)
+```
+
+❌ **Standard Deviation**: Requires mean and all values
+```typescript
+// Problem: Can't compute incrementally without storing all values
+// Workaround: Store all values, recompute on query
+```
+
+❌ **Percentiles**: Requires sorted list of all values
+```typescript
+// Problem: Order-dependent, requires full value set
+```
+
+❌ **Distinct Count with Details**: `(keys, values) => ({ count: new Set(values).size, items: [...new Set(values)] })`
+```typescript
+// Problem: While count is incremental, maintaining the full list of distinct items
+// requires tracking all values, which defeats incremental benefits
+```
+
+**Why Some Functions Don't Work:**
+
+The fundamental issue is that incremental updates require:
+1. **Subtracting old contributions**: When a document changes, we need to remove its old map outputs
+2. **Adding new contributions**: Then add the new map outputs
+
+For functions like "last value" or "median", removing a value changes the result in ways that can't be computed without knowing all remaining values. The result isn't just `oldResult - removedValue + newValue`; it depends on the entire set.
+
+**Workarounds for Non-Incremental Reduce Functions:**
+
+1. **Store All Values**: Keep all values in the reduce result, recompute on query
+   ```typescript
+   reduce: (keys, values) => values  // Store all values
+   query: (result) => computeMedian(result)  // Recompute on query
+   ```
+   - ✅ Works for any function
+   - ❌ Defeats storage benefits of reduction
+   - ❌ Slower queries (full recomputation)
+
+2. **Approximate Algorithms**: Use algorithms that can be updated incrementally
+   - **Approximate Median**: Use streaming algorithms (e.g., T-Digest)
+   - **Approximate Percentiles**: Use quantile sketches
+   - ✅ Incremental updates possible
+   - ❌ Approximate results (may be acceptable)
+
+3. **Hybrid Approach**: Cache map outputs, but recompute reduce on query
+   - Still get efficient updates/deletions (via cached map outputs)
+   - Accept slower queries (recompute reduce)
+   - ✅ Works for any reduce function
+   - ❌ Slower queries
+
+4. **Periodic Full Rebuild**: For complex reduce functions, periodically rebuild
+   - Incremental updates for simple cases
+   - Full rebuild during maintenance window
+   - ✅ Works for any function
+   - ❌ Not real-time
+
+**Recommendation for MindooDB:**
+
+- **Support incremental reduce** for associative/commutative functions (count, sum, min, max, average)
+- **Support "store all values" mode** for complex functions (median, percentiles) with clear documentation that queries will be slower
+- **Provide approximate algorithms** where possible (e.g., approximate percentiles)
+- **Allow users to choose** between incremental (fast queries) and recompute-on-query (works for any function)
+
+**Alternative: Recompute Reduce On-The-Fly**
+
+Instead of caching reduce results, you could:
+- Cache only map outputs
+- Recompute reduce results when queried by aggregating all values for a key
+
+This trades query performance (slower queries) for update performance (faster updates) and storage (less storage). For most use cases, caching reduce results is preferred.
+
 **Challenges:**
-- Need to handle document deletions (remove from index)
-- Map functions must be deterministic
-- Reduce functions need to handle incremental updates correctly
+- Need to handle document deletions (remove from index) - **solved by caching map outputs**
+- Map functions must be deterministic - required for consistency
+- Reduce functions need to be associative and commutative - required for incremental updates
 - Index storage and querying infrastructure required
+- Storage overhead for caching map outputs and reduce results
+
+**CouchDB's Implementation (Reference):**
+
+CouchDB's incremental map/reduce is well-documented and provides a proven reference implementation:
+
+**Key Documentation:**
+- **[CouchDB Guide: Views](https://guide.couchdb.org/editions/1/en/views.html)**: Comprehensive guide to how views work
+- **[CouchDB Documentation: Design Documents](https://docs.couchdb.org/en/stable/ddocs/ddocs.html)**: Official documentation on views and reduce functions
+- **[CouchDB Performance Guide](https://docs.couchdb.org/en/stable/maintenance/performance.html)**: Performance considerations for views
+
+**How CouchDB Does It:**
+
+1. **B-Tree Index Structure**: CouchDB stores view indexes as B-trees where:
+   - **Leaf nodes**: Contain the actual map outputs (key-value pairs)
+   - **Internal nodes**: Contain pre-computed reduce values
+   - Each node stores reduce results, enabling efficient incremental updates
+
+2. **Document Revision Tracking**: CouchDB tracks document revisions (sequence numbers) to identify:
+   - Which documents have changed since last view update
+   - Which map outputs need to be removed (old document state)
+   - Which map outputs need to be added (new document state)
+
+3. **Incremental Update Process**:
+   - When a document changes, CouchDB:
+     1. Identifies the affected keys in the B-tree (from old map outputs)
+     2. Removes old map outputs from leaf nodes
+     3. Adds new map outputs to leaf nodes
+     4. Recalculates reduce values only for affected internal nodes (bottom-up)
+     5. Updates the B-tree structure as needed
+
+4. **Reduce Function Requirements**: CouchDB requires reduce functions to be:
+   - **Associative**: `reduce(a, reduce(b, c)) === reduce(reduce(a, b), c)`
+   - **Commutative**: `reduce(a, b) === reduce(b, a)`
+   - This allows partial reductions to be combined in any order
+
+5. **Built-in Reduce Functions**: CouchDB provides optimized built-in reduce functions:
+   - `_count`: Count documents
+   - `_sum`: Sum numeric values
+   - `_stats`: Statistical aggregations (min, max, sum, count)
+   - These are implemented in Erlang (not JavaScript) for better performance
+
+**Key Insight from CouchDB:**
+
+CouchDB doesn't explicitly "cache" map outputs in a separate structure. Instead, the **B-tree index itself serves as the cache**:
+- Map outputs are stored in leaf nodes of the B-tree
+- The B-tree is organized by emitted keys
+- Document IDs are stored alongside map outputs, allowing efficient lookup
+- When a document changes, CouchDB can find and remove old entries by traversing the B-tree
+
+**For MindooDB Implementation:**
+
+We can learn from CouchDB's approach:
+- **Use B-tree or similar structure** for the view index (organized by keys)
+- **Store document ID with map outputs** to enable efficient removal
+- **Track document sequence numbers** (or use `processChangesSince()` cursors) to identify changes
+- **Pre-compute reduce values** in internal nodes for fast queries
+- **Require associative/commutative reduce functions** for incremental updates
 
 **Open Source Options:**
-- **PouchDB**: Client-side CouchDB implementation with map/reduce views
+- **PouchDB**: Client-side CouchDB implementation with map/reduce views - uses this incremental approach
+  - PouchDB's source code is a good reference: [GitHub - pouchdb/pouchdb](https://github.com/pouchdb/pouchdb)
+  - Look at the `mapreduce` module for view implementation details
+- **CouchDB Source Code**: [GitHub - apache/couchdb](https://github.com/apache/couchdb)
+  - The view index implementation is in Erlang
+  - Can study the B-tree structure and update algorithms
 - **Hoodie**: Uses PouchDB, could provide inspiration for view management
-- **Custom Implementation**: Build a lightweight map/reduce engine tailored to MindooDB
+- **Custom Implementation**: Build a lightweight map/reduce engine tailored to MindooDB, inspired by CouchDB's approach
 
 ### 2. Categorized Views (Notes/Domino-inspired)
 
@@ -372,6 +642,104 @@ class IndexManager {
   }
 }
 ```
+
+## Incremental Map/Reduce: Deep Dive
+
+### The Core Question: Cache Map Values or Recompute?
+
+When implementing incremental map/reduce views, there are two main approaches:
+
+**Approach 1: Cache Map Values (Recommended)**
+
+This is how CouchDB and similar systems work:
+
+- **Store map outputs**: For each document, cache the `(key, value)` pairs emitted by the map function
+- **Index structure**: Maintain both:
+  - `docId → [map outputs]` - tracks what each document emitted
+  - `key → [docId, value]` - organizes by emitted keys for efficient querying
+- **Incremental updates**: When a document changes:
+  1. Look up cached map outputs for the document
+  2. Remove old `(key, value)` pairs from the view index
+  3. Run map function on updated document
+  4. Add new `(key, value)` pairs to the view index
+  5. Update cached map outputs
+  6. Incrementally update reduce results (subtract old, add new)
+
+**Benefits:**
+- ✅ Efficient deletions: Can remove document from view without re-running map function
+- ✅ Efficient updates: Only need to diff old vs new map outputs
+- ✅ Fast reduce updates: Can incrementally update reduce results
+- ✅ Handles document state changes: If document no longer matches map criteria, old entries are cleanly removed
+
+**Storage Cost:**
+- Stores map outputs for every document (even if document is deleted from view)
+- Typically acceptable: map outputs are usually small (just keys and values)
+
+**Approach 2: Recompute Reduce On-The-Fly**
+
+Alternative approach that doesn't cache map outputs:
+
+- **No map cache**: Don't store what each document emitted
+- **On update**: Re-run map function on document, but don't know what it emitted before
+- **Problem**: Can't efficiently remove old entries without knowing what they were
+- **Solution**: Mark document as "dirty" and rebuild reduce for affected keys
+
+**Benefits:**
+- ✅ Lower storage: No map output cache
+- ✅ Simpler: Less state to manage
+
+**Drawbacks:**
+- ❌ Inefficient deletions: Need to rebuild reduce for potentially many keys
+- ❌ Can't efficiently remove old entries: Don't know what document emitted before
+- ❌ Slower updates: May need to recompute reduce for multiple keys
+
+**Hybrid Approach: Cache Map, Recompute Reduce**
+
+Middle ground:
+
+- **Cache map outputs**: Store what each document emitted
+- **Don't cache reduce results**: Recompute reduce when queried
+
+**Benefits:**
+- ✅ Efficient updates/deletions: Can remove old entries using cached map outputs
+- ✅ Lower storage: No reduce result cache
+- ✅ Always fresh: Reduce results computed from current view state
+
+**Drawbacks:**
+- ❌ Slower queries: Reduce computed on-demand
+- ❌ Still need map output cache: So storage savings are limited
+
+### Recommended Implementation Strategy
+
+**For MindooDB, use Approach 1 (Cache Map Values):**
+
+1. **Cache map outputs per document**: `Map<docId, Array<{key, value}>>`
+2. **Maintain view index**: `Map<key, Array<{docId, value}>>` for efficient key lookups
+3. **Cache reduce results**: `Map<key, reducedValue>` for fast queries
+4. **Incremental updates**: Use cached map outputs to efficiently add/remove entries
+
+**Why this works well with `processChangesSince()`:**
+
+```typescript
+async function updateView(db: MindooDB, view: MapReduceView, cursor: ProcessChangesCursor | null) {
+  await db.processChangesSince(cursor, 100, async (doc, currentCursor) => {
+    if (doc.isDeleted()) {
+      // Efficiently remove using cached map outputs
+      await view.deleteDocument(doc.getId());
+    } else {
+      // Efficiently update using cached map outputs
+      await view.updateDocument(doc);
+    }
+    return currentCursor;
+  });
+}
+```
+
+The cached map outputs enable efficient incremental updates because:
+- We know exactly what to remove (old map outputs)
+- We know exactly what to add (new map outputs)
+- We can incrementally update reduce results (subtract old, add new)
+- No need to scan or recompute anything
 
 ## Implementation Considerations
 
