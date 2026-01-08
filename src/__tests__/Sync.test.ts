@@ -59,19 +59,17 @@ describe("sync test", () => {
     
     // Create tenant encryption key (store it so user2 can use the same one)
     tenantEncryptionKeyPassword = "tenantkeypass123";
-    tenantEncryptionKey = await factory1.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
     
     // Create tenant for user1 using factory1
     tenantId = "test-tenant-sync";
-    tenant1 = await factory1.openTenantWithKeys(
-      tenantId,
-      tenantEncryptionKey,
-      tenantEncryptionKeyPassword,
+    tenant1 = await factory1.createTenant(tenantId,
       adminSigningKeyPair.publicKey,
+      tenantEncryptionKeyPassword,
       user1,
       user1Password,
       user1KeyBag
     );
+    tenantEncryptionKey = tenant1.getTenantEncryptionKey();
   }, 30000);
 
   it("should sync data from first user to second user using pullChangesFrom", async () => {
