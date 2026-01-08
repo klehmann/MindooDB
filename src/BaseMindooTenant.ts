@@ -112,26 +112,6 @@ export class BaseMindooTenant implements MindooTenant {
     return this.tenantEncryptionKey;
   }
 
-  async addNamedKey(
-    keyId: string,
-    encryptedKey: EncryptedPrivateKey,
-    encryptedKeyPassword: string
-  ): Promise<void> {
-    if (keyId === "default") {
-      throw new Error('Key ID "default" is reserved for the tenant encryption key');
-    }
-    console.log(`[BaseMindooTenant] Adding named key: ${keyId}`);
-
-    // Decrypt the encrypted key using the correct salt string ("default" for symmetric keys)
-    // The key was encrypted with salt "default" by createSymmetricEncryptedPrivateKey
-    const decryptedKeyBytes = await this.decryptPrivateKey(encryptedKey, encryptedKeyPassword, "default");
-    
-    // Store the decrypted key in KeyBag
-    await this.keyBag.set(keyId, new Uint8Array(decryptedKeyBytes), encryptedKey.createdAt);
-    
-    console.log(`[BaseMindooTenant] Added named key: ${keyId}`);
-  }
-
   async encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
     console.log(`[BaseMindooTenant] Encrypting payload with key: ${decryptionKeyId}`);
     console.log(`[BaseMindooTenant] Payload size: ${payload.length} bytes`);

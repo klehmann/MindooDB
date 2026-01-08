@@ -144,7 +144,7 @@ export interface MindooTenantFactory {
   /**
    * Creates a new encrypted symmetric key (AES-256) for document encryption.
    * The key is encrypted with the provided password and can be distributed to authorized users.
-   * Use addNamedKey() to store the returned key in the tenant's key map.
+   * Use KeyBag.decryptAndImportKey() to store the returned key in the user's KeyBag.
    * 
    * Symmetric keys are shared secrets - anyone with the key can both encrypt and decrypt.
    * For user-to-user encryption where only the recipient can decrypt, use createEncryptionKeyPair() instead.
@@ -210,21 +210,6 @@ export interface MindooTenant {
    * @return The tenant encryption key (AES-256, encrypted)
    */
   getTenantEncryptionKey(): EncryptedPrivateKey;
-
-  /**
-   * Adds a named symmetric key to the tenant's key map.
-   * This is used when a user receives a key from an administrator or colleague
-   * (via email, shared folder with password protection and a password sent via secure channel).
-   * 
-   * The method decrypts the encrypted key and adds it to the key bag.
-   * The key is then stored in the key bag and can be used to encrypt and decrypt documents.
-   * 
-   * @param keyId The ID of the key to add
-   * @param encryptedKey The encrypted symmetric key to add
-   * @param encryptedKeyPassword The password to decrypt the encrypted symmetric key (mandatory)
-   * @return A promise that resolves when the key is added and persisted
-   */
-  addNamedKey(keyId: string, encryptedKey: EncryptedPrivateKey, encryptedKeyPassword: string): Promise<void>;
 
   /**
    * Encrypt a payload using the symmetric key identified by decryptionKeyId.

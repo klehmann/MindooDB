@@ -247,9 +247,9 @@ MindooDB uses a **hybrid encryption model**:
 1. Administrator creates named key: `TenantFactory.createSymmetricEncryptedPrivateKey(password)` which returns an `EncryptedPrivateKey`
 2. Encrypted key is distributed to authorized users (email, shared folder, etc.)
 3. Password is communicated via secure channel (phone, in-person)
-4. Users add the key to their tenant using `Tenant.addNamedKey(keyId, encryptedKey, encryptedKeyPassword)`
-5. The tenant decrypts the key and stores it in the user's **KeyBag** (which is encrypted on disk using the user's encryption key password)
-6. The KeyBag can be saved/loaded using `KeyBag.save()` and `KeyBag.load()` methods
+4. Users add the key to their KeyBag using `KeyBag.decryptAndImportKey(keyId, encryptedKey, encryptedKeyPassword)`
+5. The KeyBag decrypts the key and stores it (the KeyBag itself is encrypted on disk using the user's encryption key password)
+6. The KeyBag can be saved/loaded using `KeyBag.save()` and `KeyBag.load()` methods (encrypts the KeyBag content and returns it as byte sequence)
 7. **Note**: Access discovery (scanning append-only stores when a new key is added) is a potential future enhancement but not currently implemented
 8. Users can now decrypt and access documents encrypted with that key ID using `Tenant.encryptPayload()` and `Tenant.decryptPayload()`
 
