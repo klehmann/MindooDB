@@ -10,7 +10,7 @@
   "author": "Mindoo GmbH",
   "license": "ISC",
   "dependencies": {
-    "@automerge/automerge": "^2.0.2"
+    "@automerge/automerge": "^3.2.1"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",
