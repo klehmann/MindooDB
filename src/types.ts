@@ -343,7 +343,7 @@ export interface MindooDocChangeHashes {
 
   /**
    * The public signing key of the user who created this change (Ed25519, PEM format).
-   * Used for signature verification and audit trails in a zero-trust system.
+   * Used for signature verification and audit trails in an end-to-end encrypted system.
    * This is a cryptographic identifier that can be verified against signatures.
    */
   createdByPublicKey: string;

@@ -2,11 +2,11 @@
 
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
-MindooDB is a **zero-trust replicating platform** for secure, distributed document storage and synchronization. Everything on the server side is encrypted—even if attackers gain access to your infrastructure, they can't read your data without the encryption keys that never leave your clients.
+MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** for secure, distributed document storage and synchronization. Everything on the server side is encrypted—even if attackers gain access to your infrastructure, they can't read your data without the encryption keys that never leave your clients.
 
 ## Why MindooDB?
 
-### 🛡️ Zero-Trust Security
+### 🛡️ End-to-End Encrypted Security
 - **No central authority required** - Tenants are created entirely on the client side
 - **Cryptographically verified** - All operations are signed and encrypted
 - **Server-side encryption** - Your hosting provider can't read your data, even if compromised
@@ -175,7 +175,7 @@ This ensures that revocation actually prevents future changes, even if a user tr
 
 ## Architecture Highlights
 
-### Zero-Trust Model
+### End-to-End Encrypted Model
 - No central authority for tenant creation or user management
 - All operations cryptographically verified
 - Trust established through cryptographic proofs, not server-side authentication
@@ -204,7 +204,7 @@ This ensures that revocation actually prevents future changes, even if a user tr
 
 MindooDB is designed to provide **strong security guarantees** while maintaining practical usability:
 
-1. **Zero-Trust Architecture**: No reliance on central authorities or trusted servers
+1. **End-to-End Encrypted Architecture**: No reliance on central authorities or trusted servers
 2. **Offline-First Operation**: System works when offline, syncs when connectivity is available
 3. **Cryptographic Integrity**: All operations provable through cryptography
 4. **Hybrid Deployment**: Seamless operation across local and remote stores

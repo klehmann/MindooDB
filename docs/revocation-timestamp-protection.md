@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This document describes a critical security problem in MindooDB: **how to prevent revoked users from creating backdated changes by manipulating their system clock**. The problem arises from the zero-trust, offline-first architecture where clients control change timestamps. We analyze multiple cryptographic approaches to solve this problem while maintaining the system's core principles: zero-trust, offline operation, and hybrid deployment models.
+This document describes a critical security problem in MindooDB: **how to prevent revoked users from creating backdated changes by manipulating their system clock**. The problem arises from the end-to-end encrypted, offline-first architecture where clients control change timestamps. We analyze multiple cryptographic approaches to solve this problem while maintaining the system's core principles: end-to-end encryption, offline operation, and hybrid deployment models.
 
 **Recommended Solution**: Hybrid approach using directory sequence numbers combined with local monotonic counters (Solution D), providing defense-in-depth protection while maintaining offline capabilities.
 
@@ -34,7 +34,7 @@ In the current implementation:
 - Revoked users can continue to create documents that appear to predate their revocation
 - Undermines the security model: revocation should prevent future changes
 - Compromises audit trails and compliance requirements
-- Breaks trust in the zero-trust model
+- Breaks trust in the end-to-end encrypted model
 
 ### Current System Behavior
 
@@ -51,7 +51,7 @@ Currently, when processing changes:
 
 Any solution must respect MindooDB's fundamental principles:
 
-1. **Zero-Trust Architecture**
+1. **End-to-End Encrypted Architecture**
    - No central authority required
    - All operations cryptographically verified
    - Trust established through cryptographic proofs
@@ -124,7 +124,7 @@ const wasAuthorized = await tenant.validatePublicSigningKey(
 
 **Offline Behavior**: Works if directory was synced before going offline. May reject valid changes if directory is stale.
 
-**Zero-Trust Compliance**: ✅ Yes - uses existing cryptographic directory
+**E2E Encryption Compliance**: ✅ Yes - uses existing cryptographic directory
 
 ---
 
@@ -174,7 +174,7 @@ async function validateChangeOrdering(
 
 **Offline Behavior**: ✅ Works completely offline
 
-**Zero-Trust Compliance**: ✅ Yes - uses cryptographic dependencies
+**E2E Encryption Compliance**: ✅ Yes - uses cryptographic dependencies
 
 ---
 
@@ -195,14 +195,14 @@ async function validateChangeOrdering(
 
 **Cons**:
 - ❌ **Requires network connectivity** (breaks offline requirement)
-- ❌ External dependency (breaks zero-trust principle)
+- ❌ External dependency (breaks E2E encryption principle)
 - ❌ Additional latency for change creation
 - ❌ Service availability concerns
 - ❌ Cost considerations
 
 **Offline Behavior**: ❌ Does not work offline
 
-**Zero-Trust Compliance**: ❌ No - requires external trusted service
+**E2E Encryption Compliance**: ❌ No - requires external trusted service
 
 **Verdict**: **Not suitable** for MindooDB due to offline requirement.
 
@@ -248,7 +248,7 @@ interface MindooDocChangeHashes {
 
 **Offline Behavior**: Works if directory was synced. Cannot create changes if directory is completely unknown.
 
-**Zero-Trust Compliance**: ✅ Yes - uses existing cryptographic directory
+**E2E Encryption Compliance**: ✅ Yes - uses existing cryptographic directory
 
 ---
 
@@ -276,7 +276,7 @@ interface MindooDocChangeHashes {
 
 **Offline Behavior**: ⚠️ Works if peers are available, but may not work in isolation
 
-**Zero-Trust Compliance**: ✅ Yes - uses peer signatures
+**E2E Encryption Compliance**: ✅ Yes - uses peer signatures
 
 **Verdict**: **Complex** and may not work in all scenarios.
 
@@ -330,7 +330,7 @@ interface MindooDocChangeHashes {
 
 **Offline Behavior**: ✅ Excellent - local counter provides ordering even when offline
 
-**Zero-Trust Compliance**: ✅ Yes - both mechanisms are cryptographic
+**E2E Encryption Compliance**: ✅ Yes - both mechanisms are cryptographic
 
 **Additional Security Benefits**:
 - Prevents creating multiple changes with same directory sequence but different local sequences
@@ -342,7 +342,7 @@ interface MindooDocChangeHashes {
 
 ## Comparison Matrix
 
-| Solution | Offline | Zero-Trust | Complexity | Security | Recommended |
+| Solution | Offline | E2E Encrypted | Complexity | Security | Recommended |
 |----------|---------|------------|------------|----------|-------------|
 | 1. Timestamp Check | ⚠️ If synced | ✅ | Low | Medium | Consider |
 | 2. Chain Ordering | ✅ | ✅ | Medium | Medium | Consider |
@@ -359,7 +359,7 @@ Use **directory sequence numbers combined with local monotonic counters** becaus
 
 1. **Strongest Security**: Defense-in-depth with two independent mechanisms
 2. **Offline Capable**: Local counter works even when directory isn't synced
-3. **Zero-Trust Compliant**: Both mechanisms are cryptographic, no external dependencies
+3. **E2E Encryption Compliant**: Both mechanisms are cryptographic, no external dependencies
 4. **Hybrid Deployment Friendly**: Works with local and remote stores
 5. **Tamper Detection**: Local counter resets are detectable
 6. **Better Audit Trail**: Clear ordering even during offline periods
@@ -479,7 +479,7 @@ Use **directory sequence numbers combined with local monotonic counters** becaus
 
 ## Conclusion
 
-The hybrid approach (Solution 6) provides the strongest security while maintaining MindooDB's core principles of zero-trust, offline operation, and hybrid deployment. The combination of directory sequence numbers and local monotonic counters creates defense-in-depth that prevents clock manipulation attacks while remaining practical to implement and maintain.
+The hybrid approach (Solution 6) provides the strongest security while maintaining MindooDB's core principles of end-to-end encryption, offline operation, and hybrid deployment. The combination of directory sequence numbers and local monotonic counters creates defense-in-depth that prevents clock manipulation attacks while remaining practical to implement and maintain.
 
-The solution respects the append-only nature of the system, works in offline scenarios, and provides cryptographic guarantees without requiring external services or breaking the zero-trust model.
+The solution respects the append-only nature of the system, works in offline scenarios, and provides cryptographic guarantees without requiring external services or breaking the end-to-end encrypted model.
 

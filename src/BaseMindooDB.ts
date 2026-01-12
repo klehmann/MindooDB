@@ -278,7 +278,7 @@ export class BaseMindooDB implements MindooDB {
     console.log(`[BaseMindooDB] Encrypted payload: ${changeBytes.length} -> ${encryptedPayload.length} bytes`);
     
     // Sign the encrypted payload (this allows signature verification without decryption)
-    // This is important for zero-trust: anyone can verify signatures without needing decryption keys
+    // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
     console.log(`[BaseMindooDB] Signing encrypted payload for document ${docId}`);
     const signature = await this.tenant.signPayload(encryptedPayload);
     console.log(`[BaseMindooDB] Signed payload, signature length: ${signature.length} bytes`);
@@ -451,7 +451,7 @@ export class BaseMindooDB implements MindooDB {
     const encryptedPayload = await this.tenant.encryptPayload(changeBytes, internalDoc.decryptionKeyId);
     
     // Sign the encrypted payload (this allows signature verification without decryption)
-    // This is important for zero-trust: anyone can verify signatures without needing decryption keys
+    // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
     const signature = await this.tenant.signPayload(encryptedPayload);
     
     // Create change metadata with type "delete" to mark this as a deletion entry in the append-only store
@@ -630,7 +630,7 @@ export class BaseMindooDB implements MindooDB {
     const encryptedPayload = await this.tenant.encryptPayload(changeBytes, internalDoc.decryptionKeyId);
     
     // Sign the encrypted payload (this allows signature verification without decryption)
-    // This is important for zero-trust: anyone can verify signatures without needing decryption keys
+    // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
     const signature = await this.tenant.signPayload(encryptedPayload);
     
     // Create change metadata

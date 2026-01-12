@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB's network synchronization protocol enables secure data exchange between clients and servers (or peer-to-peer between clients). The protocol is designed with a zero-trust architecture, ensuring that data remains secure even when transmitted over untrusted networks.
+MindooDB's network synchronization protocol enables secure data exchange between clients and servers (or peer-to-peer between clients). The protocol is designed with an end-to-end encrypted, offline-first architecture, ensuring that data remains secure even when transmitted over untrusted networks.
 
 ## Architecture
 

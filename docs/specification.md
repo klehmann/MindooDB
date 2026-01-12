@@ -2,13 +2,13 @@
 
 ## Overview
 
-MindooDB is a **zero-trust replicating platform** designed for secure, distributed document storage and synchronization. The platform enables clients to create tenants locally and synchronize document changes across multiple clients and servers through append-only stores containing cryptographically signed and encrypted document histories.
+MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** designed for secure, distributed document storage and synchronization. The platform enables clients to create tenants locally and synchronize document changes across multiple clients and servers through append-only stores containing cryptographically signed and encrypted document histories.
 
 ## Core Principles
 
-### Zero-Trust Architecture
+### End-to-End Encrypted, Offline-first Architecture
 
-MindooDB operates on a zero-trust model where:
+MindooDB operates on an end-to-end encrypted, offline-first model where:
 - **No central authority** is required for tenant creation or user management
 - **All operations are cryptographically verified** through digital signatures
 - **Access control is enforced** through encryption keys distributed offline
