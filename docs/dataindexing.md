@@ -336,50 +336,57 @@ We can learn from CouchDB's approach:
 - **Hoodie**: Uses PouchDB, could provide inspiration for view management
 - **Custom Implementation**: Build a lightweight map/reduce engine tailored to MindooDB, inspired by CouchDB's approach
 
-### 2. Categorized Views (Notes/Domino-inspired)
+### 2. Categorized Views (Notes/Domino-inspired) - VirtualView ✅ IMPLEMENTED
+
+> **📚 See [VirtualView Documentation](./virtualview.md) for comprehensive documentation, API reference, and examples.**
 
 **Concept:**
 Lotus Notes/Domino uses categorized views that group documents into hierarchical categories based on field values. Categories can be nested, and documents appear under their category paths.
 
-**Application to MindooDB:**
-- **View Definition**: Define categories based on document fields (e.g., `data.category`, `data.status`, `data.priority`)
-- **Category Hierarchy**: Support nested categories (e.g., `["Projects", "Active", "High Priority"]`)
-- **Incremental Updates**: When a document changes, remove it from old categories and add to new ones
-- **Query Interface**: Query by category path, support wildcards, range queries
+**Implementation:**
+MindooDB includes a full **VirtualView** implementation, inspired by and adapted from **Karsten Lehmann's Domino JNA project** ([klehmann/domino-jna](https://github.com/klehmann/domino-jna)). This provides:
 
-**Example Use Case:**
+- **VirtualViewColumn**: Define columns for categorization, sorting, display, and totals
+- **VirtualViewEntryData**: Tree nodes representing categories or documents
+- **VirtualViewNavigator**: Hierarchical navigation with expand/collapse and selection
+- **MindooDBVirtualViewDataProvider**: Incremental updates via `processChangesSince()`
+- **Multi-Database Views**: Combine documents from multiple MindooDB instances
+- **Multi-Tenant Views**: Span views across different MindooTenants
+- **Category Totals**: Built-in SUM and AVERAGE aggregations
+
+**Quick Example:**
 ```typescript
-// View definition
-const view = {
-  name: "tasks-by-status",
-  categories: [
-    { field: "project", type: "string" },
-    { field: "status", type: "string" },
-    { field: "priority", type: "enum", values: ["low", "medium", "high"] }
-  ]
-};
+import { VirtualViewFactory, ColumnSorting, TotalMode } from "./indexing/virtualviews";
 
-// Documents are indexed as:
-// "Projects/ProjectA/Active/High" -> [docId1, docId2, ...]
-// "Projects/ProjectB/Completed/Medium" -> [docId3, ...]
+// Create a categorized view with totals
+const view = await VirtualViewFactory.createView()
+  .addCategoryColumn("department", { sorting: ColumnSorting.ASCENDING })
+  .addCategoryColumn("year", { sorting: ColumnSorting.DESCENDING })
+  .addSortedColumn("lastName")
+  .addTotalColumn("salary", TotalMode.SUM)
+  .withDB("employees", employeeDB)
+  .buildAndUpdate();
+
+// Navigate the view
+const nav = VirtualViewFactory.createNavigator(view).expandAll().build();
+for await (const entry of nav.entriesForward()) {
+  if (entry.isCategory()) {
+    console.log(`${entry.getCategoryValue()}: Total $${entry.getColumnValue("salary")}`);
+  }
+}
 ```
 
 **Benefits:**
-- Intuitive: Natural way to organize documents
-- Efficient: Direct category lookups
-- Hierarchical: Supports nested organization
-- Familiar: Similar to file system organization
+- ✅ **Intuitive**: Natural way to organize documents
+- ✅ **Efficient**: Direct category lookups with sorted navigation
+- ✅ **Hierarchical**: Supports nested categories (use backslash: `"2024\\Q1\\January"`)
+- ✅ **Multi-Database**: Combine documents from multiple sources
+- ✅ **Incremental**: Efficient updates via `processChangesSince()`
+- ✅ **Totals**: Built-in SUM and AVERAGE for category rows
 
-**Challenges:**
-- Category changes require moving documents between categories
-- Need efficient data structures for category hierarchies
-- Handling null/undefined category values
-- Multi-category support (documents in multiple categories)
-
-**Open Source Options:**
-- **Custom Implementation**: Build category tree structures
-- **Trie Data Structures**: For efficient category path lookups
-- **B-Tree Indexes**: For sorted category traversal
+**Source:**
+- `src/indexing/virtualviews/` - Full TypeScript implementation
+- Inspired by [Domino JNA VirtualView](https://github.com/klehmann/domino-jna)
 
 ### 3. Full-Text Search with FlexSearch
 

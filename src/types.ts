@@ -447,11 +447,12 @@ export interface MindooTenantDirectory {
    * decrypted changes (append-only limitation).
    * 
    * @param username The username of the user to revoke (format: "CN=<username>/O=<tenantId>")
+   * @param requestDataWipe If true, the next time the user syncs the directory, the locally cached data on the user's machine will be wiped.
    * @param administrationPrivateKey The administration private key to sign the revocation (signing only)
    * @param administrationPrivateKeyPassword The password to decrypt the administration private key
    * @return A promise that resolves when the user is revoked
    */
-  revokeUser(username: string, administrationPrivateKey: EncryptedPrivateKey,
+  revokeUser(username: string, requestDataWipe: boolean, administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void>;
 
