@@ -275,4 +275,65 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // TODO: Implement actual validation against directory database
     return true;
   }
+
+  /**
+   * Get a user's public keys from the directory.
+   * Used for authentication (signature verification) and encryption (transport encryption).
+   * 
+   * @param username The username to look up (format: "CN=<username>/O=<tenantId>")
+   * @return The user's public keys, or null if user not found or has been revoked
+   */
+  async getUserPublicKeys(username: string): Promise<{
+    signingPublicKey: string;
+    encryptionPublicKey: string;
+  } | null> {
+    console.log(`[BaseMindooTenantDirectory] Getting public keys for username: ${username}`);
+    
+    // Find all active (non-revoked) grant access documents for this user
+    const activeDocs = await this.findGrantAccessDocuments(username);
+    
+    if (activeDocs.length === 0) {
+      console.log(`[BaseMindooTenantDirectory] No active grant access documents found for username: ${username}`);
+      return null;
+    }
+    
+    // Use the last active grant access document (most recent registration)
+    // In most cases there should only be one active grant access document per user
+    const doc = activeDocs[activeDocs.length - 1];
+    const data = doc.getData();
+    
+    const signingPublicKey = data.userSigningPublicKey;
+    const encryptionPublicKey = data.userEncryptionPublicKey;
+    
+    if (typeof signingPublicKey !== "string" || typeof encryptionPublicKey !== "string") {
+      console.error(`[BaseMindooTenantDirectory] Invalid key data in grant access document for username: ${username}`);
+      return null;
+    }
+    
+    console.log(`[BaseMindooTenantDirectory] Found public keys for username: ${username}`);
+    return {
+      signingPublicKey,
+      encryptionPublicKey,
+    };
+  }
+
+  /**
+   * Check if a user has been revoked.
+   * A user is considered revoked if they have no active (non-revoked) grant access documents.
+   * 
+   * @param username The username to check (format: "CN=<username>/O=<tenantId>")
+   * @return True if the user has been revoked, false if they have active access
+   */
+  async isUserRevoked(username: string): Promise<boolean> {
+    console.log(`[BaseMindooTenantDirectory] Checking if user is revoked: ${username}`);
+    
+    // Find all active grant access documents for this user
+    const activeDocs = await this.findGrantAccessDocuments(username);
+    
+    // User is revoked if they have no active grant access documents
+    const isRevoked = activeDocs.length === 0;
+    
+    console.log(`[BaseMindooTenantDirectory] User ${username} revoked: ${isRevoked}`);
+    return isRevoked;
+  }
 }
