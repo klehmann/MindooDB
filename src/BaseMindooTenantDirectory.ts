@@ -18,6 +18,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private static readonly REVOKE_ACCESS_SIGNED_FIELDS: string[] = [
     "form",
     "type",
+    "username",
     "revokeDocId",
     "adminSignatureFields",
   ];
@@ -210,6 +211,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
 
   async revokeUser(
     username: string,
+    requestDataWipe: boolean,
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void> {
@@ -247,8 +249,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "revokeaccess";
-        data.username = username; // Store for querying, but not part of signature
+        data.username = username;
         data.revokeDocId = revokeDocId;
+        data.requestDataWipe = requestDataWipe;
 
         data.adminSignatureFields = BaseMindooTenantDirectory.REVOKE_ACCESS_SIGNED_FIELDS;
 
