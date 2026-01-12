@@ -8,6 +8,8 @@ import {
   scopedDocIdKey,
   createScopedDocId,
   ORIGIN_VIRTUALVIEW,
+  ScopedDocId,
+  compareValues,
 } from "./types";
 
 /**
@@ -501,6 +503,83 @@ export class VirtualViewNavigator {
     return true;
   }
 
+  /**
+   * Get the entry at a specific position without moving the cursor
+   * 
+   * @param posStr Position string e.g. "1.2.3"
+   * @returns The entry at the position or null if not found
+   */
+  getPos(posStr: string): VirtualViewEntryData | null {
+    const pos = posStr.split(".").map(p => parseInt(p, 10));
+    return this.getPosArray(pos);
+  }
+
+  /**
+   * Get the entry at a specific position array without moving the cursor
+   * 
+   * @param pos Position array e.g. [1, 2, 3]
+   * @returns The entry at the position or null if not found
+   */
+  getPosArray(pos: number[]): VirtualViewEntryData | null {
+    // Save current state
+    const savedStack = this.currentEntryStack.map(info => ({
+      ...info,
+      childEntries: info.childEntries,
+    }));
+
+    // Navigate to position
+    const found = this.gotoPosArray(pos);
+    const entry = found ? this.getCurrentEntry() : null;
+
+    // Restore state
+    this.currentEntryStack = savedStack;
+
+    return entry;
+  }
+
+  // ===== Category Finding Methods =====
+
+  /**
+   * Find a category entry by path string (e.g., "Category1\\Category1.1")
+   * Navigates through the category tree from the top entry.
+   * 
+   * @param category Category path with backslash separators
+   * @returns The category entry or null if not found
+   */
+  findCategoryEntry(category: string): VirtualViewEntryData | null {
+    const categoryParts = category.split("\\");
+    return this.findCategoryEntryByParts(categoryParts);
+  }
+
+  /**
+   * Find a category entry by array of category parts
+   * Navigates through the category tree from the top entry.
+   * 
+   * @param categoryParts Array of category values e.g. ["Category1", "Category1.1"]
+   * @returns The category entry or null if not found
+   */
+  findCategoryEntryByParts(categoryParts: unknown[]): VirtualViewEntryData | null {
+    let currentEntry: VirtualViewEntryData | null = this.topEntry;
+
+    for (const part of categoryParts) {
+      if (!currentEntry) {
+        return null;
+      }
+
+      // Find matching subcategory
+      const matchingCategory = this.childCategoriesByKey(currentEntry, String(part), true, false)
+        .find(() => true); // Get first match
+
+      if (!matchingCategory) {
+        return null;
+      }
+
+      currentEntry = matchingCategory;
+    }
+
+    return currentEntry;
+  }
+
   // ===== Iteration Methods =====
 
   /**
@@ -508,6 +587,30 @@ export class VirtualViewNavigator {
    */
   async *entriesForward(selectedOnly: SelectedOnly = SelectedOnly.NO): AsyncGenerator<VirtualViewEntryData> {
     if (!this.gotoFirst()) {
+      return;
+    }
+
+    do {
+      const entry = this.getCurrentEntry();
+      if (entry) {
+        if (selectedOnly === SelectedOnly.NO || this.isSelected(entry.origin, entry.docId)) {
+          yield entry;
+        }
+      }
+    } while (selectedOnly === SelectedOnly.YES ? this.gotoNextSelected() : this.gotoNext());
+  }
+
+  /**
+   * Iterate forward through entries starting from a specific position
+   * 
+   * @param startPos Starting position string e.g. "1.2.3"
+   * @param selectedOnly Whether to only yield selected entries
+   */
+  async *entriesForwardFromPosition(
+    startPos: string,
+    selectedOnly: SelectedOnly = SelectedOnly.NO
+  ): AsyncGenerator<VirtualViewEntryData> {
+    if (!this.gotoPos(startPos)) {
       return;
     }
 
@@ -665,6 +768,13 @@ export class VirtualViewNavigator {
     return this.selectAll;
   }
 
+  /**
+   * Returns whether all entries are deselected by default
+   */
+  isDeselectAllByDefault(): boolean {
+    return !this.selectAll;
+  }
+
   // ===== Expand/Collapse Methods =====
 
   /**
@@ -713,6 +823,32 @@ export class VirtualViewNavigator {
    */
   collapsePos(posStr: string): this {
     const entry = this.getEntryAtPos(posStr);
+    if (entry) {
+      this.collapse(entry.origin, entry.docId);
+    }
+    return this;
+  }
+
+  /**
+   * Expand by position array
+   * 
+   * @param pos Position array e.g. [1, 2, 3]
+   */
+  expandPosArray(pos: number[]): this {
+    const entry = this.getPosArray(pos);
+    if (entry) {
+      this.expand(entry.origin, entry.docId);
+    }
+    return this;
+  }
+
+  /**
+   * Collapse by position array
+   * 
+   * @param pos Position array e.g. [1, 2, 3]
+   */
+  collapsePosArray(pos: number[]): this {
+    const entry = this.getPosArray(pos);
     if (entry) {
       this.collapse(entry.origin, entry.docId);
     }
@@ -772,7 +908,25 @@ export class VirtualViewNavigator {
       return true;
     }
 
-    const key = scopedDocIdKey(createScopedDocId(entry.origin, entry.docId));
+    return this.isExpandedByDocId(entry.origin, entry.docId);
+  }
+
+  /**
+   * Check if an entry is expanded by origin and docId
+   * Does not check expandLevel - only checks the expand/collapse state
+   * 
+   * @param origin Origin of the entry
+   * @param docId Document ID of the entry
+   * @returns true if expanded
+   */
+  isExpandedByDocId(origin: string, docId: string): boolean {
+    const key = scopedDocIdKey(createScopedDocId(origin, docId));
+    
+    // Check if this is the root
+    const root = this.view.getRoot();
+    if (root.docId === docId && root.origin === origin) {
+      return true;
+    }
     
     if (this.expandAllByDefault) {
       return !this.expandedOrCollapsedEntries.has(key);
@@ -840,5 +994,234 @@ export class VirtualViewNavigator {
     const entries = entry.getChildEntries();
     const filtered = entries.filter(e => this.isVisible(e));
     return descending ? filtered.reverse() : filtered;
+  }
+
+  // ===== Range/Key-based Child Queries =====
+
+  /**
+   * Get child documents within a key range (inclusive)
+   * 
+   * @param entry Parent entry
+   * @param startKey Start key value
+   * @param endKey End key value
+   * @param descending Whether to return in descending order
+   * @returns Filtered child documents within the range
+   */
+  childDocumentsBetween(
+    entry: VirtualViewEntryData,
+    startKey: unknown,
+    endKey: unknown,
+    descending: boolean = false
+  ): VirtualViewEntryData[] {
+    const docs = entry.getChildDocuments();
+    const filtered = docs.filter(e => {
+      if (!this.isVisible(e)) return false;
+      
+      const sortKey = e.getSortKey();
+      const firstValue = sortKey.values.length > 0 ? sortKey.values[0] : null;
+      
+      // Check if value is within range
+      const afterStart = compareValues(firstValue, startKey, false) >= 0;
+      const beforeEnd = compareValues(firstValue, endKey, false) <= 0;
+      
+      return afterStart && beforeEnd;
+    });
+    
+    return descending ? filtered.reverse() : filtered;
+  }
+
+  /**
+   * Get child documents by key (exact or prefix match)
+   * 
+   * @param entry Parent entry
+   * @param key Key value to search for
+   * @param isExact Whether to match exactly or by prefix
+   * @param descending Whether to return in descending order
+   * @returns Matching child documents
+   */
+  childDocumentsByKey(
+    entry: VirtualViewEntryData,
+    key: string,
+    isExact: boolean,
+    descending: boolean = false
+  ): VirtualViewEntryData[] {
+    if (isExact) {
+      return this.childDocumentsBetween(entry, key, key, descending);
+    }
+    
+    // Prefix match - use key to key + max char
+    const endKey = key + String.fromCharCode(0xFFFF);
+    return this.childDocumentsBetween(entry, key, endKey, descending);
+  }
+
+  /**
+   * Get child categories within a key range (inclusive)
+   * 
+   * @param entry Parent entry
+   * @param startKey Start key value
+   * @param endKey End key value
+   * @param descending Whether to return in descending order
+   * @returns Filtered child categories within the range
+   */
+  childCategoriesBetween(
+    entry: VirtualViewEntryData,
+    startKey: unknown,
+    endKey: unknown,
+    descending: boolean = false
+  ): VirtualViewEntryData[] {
+    const cats = entry.getChildCategories();
+    const filtered = cats.filter(e => {
+      if (!this.isVisible(e)) return false;
+      
+      const catValue = e.getCategoryValue();
+      
+      // Check if value is within range
+      const afterStart = compareValues(catValue, startKey, false) >= 0;
+      const beforeEnd = compareValues(catValue, endKey, false) <= 0;
+      
+      return afterStart && beforeEnd;
+    });
+    
+    return descending ? filtered.reverse() : filtered;
+  }
+
+  /**
+   * Get child categories by key (exact or prefix match)
+   * 
+   * @param entry Parent entry
+   * @param key Key value to search for
+   * @param isExact Whether to match exactly or by prefix
+   * @param descending Whether to return in descending order
+   * @returns Matching child categories
+   */
+  childCategoriesByKey(
+    entry: VirtualViewEntryData,
+    key: string,
+    isExact: boolean,
+    descending: boolean = false
+  ): VirtualViewEntryData[] {
+    if (isExact) {
+      return this.childCategoriesBetween(entry, key, key, descending);
+    }
+    
+    // Prefix match - use key to key + max char
+    const endKey = key + String.fromCharCode(0xFFFF);
+    return this.childCategoriesBetween(entry, key, endKey, descending);
+  }
+
+  // ===== Sorted Entry Lookup =====
+
+  /**
+   * Compare two position arrays for sorting
+   */
+  private static comparePositions(pos1: number[], pos2: number[]): number {
+    const len = Math.min(pos1.length, pos2.length);
+    for (let i = 0; i < len; i++) {
+      if (pos1[i] !== pos2[i]) {
+        return pos1[i] - pos2[i];
+      }
+    }
+    return pos1.length - pos2.length;
+  }
+
+  /**
+   * Get all occurrences of a document in the view, sorted by position
+   * 
+   * @param origin Origin of the document
+   * @param docId Document ID
+   * @returns Array of entries sorted by position
+   */
+  getSortedEntries(origin: string, docId: string): VirtualViewEntryData[] {
+    const entries = this.view.getEntries(origin, docId);
+    return entries
+      .filter(e => this.isVisible(e))
+      .sort((a, b) => VirtualViewNavigator.comparePositions(a.getPosition(), b.getPosition()));
+  }
+
+  /**
+   * Get all occurrences of multiple documents in the view, sorted by position
+   * 
+   * @param origin Origin of the documents
+   * @param docIds Set of document IDs
+   * @returns Array of entries sorted by position
+   */
+  getSortedEntriesMultiple(origin: string, docIds: Set<string>): VirtualViewEntryData[] {
+    const allEntries: VirtualViewEntryData[] = [];
+    
+    for (const docId of docIds) {
+      const entries = this.view.getEntries(origin, docId);
+      allEntries.push(...entries);
+    }
+    
+    return allEntries
+      .filter(e => this.isVisible(e))
+      .sort((a, b) => VirtualViewNavigator.comparePositions(a.getPosition(), b.getPosition()));
+  }
+
+  /**
+   * Get all occurrences of scoped document IDs in the view, sorted by position
+   * 
+   * @param scopedDocIds Set of scoped document IDs (origin + docId)
+   * @returns Array of entries sorted by position
+   */
+  getSortedEntriesScoped(scopedDocIds: Set<ScopedDocId>): VirtualViewEntryData[] {
+    const allEntries: VirtualViewEntryData[] = [];
+    
+    for (const scopedId of scopedDocIds) {
+      const entries = this.view.getEntries(scopedId.origin, scopedId.docId);
+      allEntries.push(...entries);
+    }
+    
+    return allEntries
+      .filter(e => this.isVisible(e))
+      .sort((a, b) => VirtualViewNavigator.comparePositions(a.getPosition(), b.getPosition()));
+  }
+
+  /**
+   * Get document IDs sorted by their position in the view
+   * 
+   * @param origin Origin of the documents
+   * @param docIds Set of document IDs
+   * @returns Array of document IDs sorted by their position in the view
+   */
+  getSortedDocIds(origin: string, docIds: Set<string>): string[] {
+    const sortedEntries = this.getSortedEntriesMultiple(origin, docIds);
+    
+    // Use a Set to track seen docIds and maintain order
+    const seen = new Set<string>();
+    const result: string[] = [];
+    
+    for (const entry of sortedEntries) {
+      if (!seen.has(entry.docId)) {
+        seen.add(entry.docId);
+        result.push(entry.docId);
+      }
+    }
+    
+    return result;
+  }
+
+  /**
+   * Get scoped document IDs sorted by their position in the view
+   * 
+   * @param scopedDocIds Set of scoped document IDs
+   * @returns Array of scoped document IDs sorted by their position in the view
+   */
+  getSortedDocIdsScoped(scopedDocIds: Set<ScopedDocId>): ScopedDocId[] {
+    const sortedEntries = this.getSortedEntriesScoped(scopedDocIds);
+    
+    // Use a Set to track seen docIds and maintain order
+    const seen = new Set<string>();
+    const result: ScopedDocId[] = [];
+    
+    for (const entry of sortedEntries) {
+      const key = scopedDocIdKey({ origin: entry.origin, docId: entry.docId });
+      if (!seen.has(key)) {
+        seen.add(key);
+        result.push({ origin: entry.origin, docId: entry.docId });
+      }
+    }
+    
+    return result;
   }
 }

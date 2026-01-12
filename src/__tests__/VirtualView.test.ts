@@ -10,6 +10,8 @@ import {
   CategorizationStyle,
   WithCategories,
   WithDocuments,
+  SelectedOnly,
+  ScopedDocId,
 } from "../indexing/virtualviews";
 
 describe("VirtualView", () => {
@@ -486,6 +488,282 @@ describe("VirtualView", () => {
       const entriesDb2 = view.getEntries("db2", "doc1");
       expect(entriesDb1).toHaveLength(1);
       expect(entriesDb2).toHaveLength(1);
+    });
+  });
+
+  describe("VirtualViewNavigator new methods", () => {
+    let view: VirtualView;
+    let nav: VirtualViewNavigator;
+
+    beforeEach(() => {
+      view = new VirtualView([
+        VirtualViewColumn.category("category", { sorting: ColumnSorting.ASCENDING }),
+        VirtualViewColumn.sorted("name", ColumnSorting.ASCENDING),
+      ]);
+
+      const change = new VirtualViewDataChange("test");
+      change.addEntry("doc1", { category: "A", name: "Alice" });
+      change.addEntry("doc2", { category: "A", name: "Bob" });
+      change.addEntry("doc3", { category: "B", name: "Charlie" });
+      change.addEntry("doc4", { category: "B", name: "David" });
+
+      view.applyChanges(change);
+
+      nav = new VirtualViewNavigator(
+        view,
+        view.getRoot(),
+        WithCategories.YES,
+        WithDocuments.YES
+      );
+      nav.expandAll();
+    });
+
+    describe("getPos / getPosArray", () => {
+      it("should get entry at position without moving cursor", () => {
+        // Navigate to a known position
+        nav.gotoPos("1");
+        const initialEntry = nav.getCurrentEntry();
+        
+        // Get entry at different position without moving cursor
+        const entryAt2 = nav.getPos("2");
+        expect(entryAt2).not.toBeNull();
+        expect(entryAt2?.getCategoryValue()).toBe("B");
+        
+        // Cursor should still be at original position
+        const currentEntry = nav.getCurrentEntry();
+        expect(currentEntry).toBe(initialEntry);
+      });
+
+      it("should return null for non-existent position", () => {
+        const entry = nav.getPos("99");
+        expect(entry).toBeNull();
+      });
+
+      it("should work with getPosArray", () => {
+        const entry = nav.getPosArray([1]);
+        expect(entry?.getCategoryValue()).toBe("A");
+      });
+    });
+
+    describe("findCategoryEntry", () => {
+      it("should find category by path string", () => {
+        const categoryA = nav.findCategoryEntry("A");
+        expect(categoryA).not.toBeNull();
+        expect(categoryA?.getCategoryValue()).toBe("A");
+      });
+
+      it("should return null for non-existent category", () => {
+        const category = nav.findCategoryEntry("NonExistent");
+        expect(category).toBeNull();
+      });
+    });
+
+    describe("findCategoryEntry with nested categories", () => {
+      it("should find nested categories by path", () => {
+        // Create a view with nested categories
+        const nestedView = new VirtualView([
+          VirtualViewColumn.category("category", { sorting: ColumnSorting.ASCENDING }),
+          VirtualViewColumn.sorted("name", ColumnSorting.ASCENDING),
+        ]);
+
+        const change = new VirtualViewDataChange("test");
+        change.addEntry("doc1", { category: "2024\\Q1", name: "Report 1" });
+        change.addEntry("doc2", { category: "2024\\Q2", name: "Report 2" });
+
+        nestedView.applyChanges(change);
+
+        const nestedNav = new VirtualViewNavigator(
+          nestedView,
+          nestedView.getRoot(),
+          WithCategories.YES,
+          WithDocuments.YES
+        );
+        nestedNav.expandAll();
+
+        // Find top-level category
+        const year2024 = nestedNav.findCategoryEntry("2024");
+        expect(year2024).not.toBeNull();
+        expect(year2024?.getCategoryValue()).toBe("2024");
+
+        // Find nested category
+        const q1 = nestedNav.findCategoryEntry("2024\\Q1");
+        expect(q1).not.toBeNull();
+        expect(q1?.getCategoryValue()).toBe("Q1");
+      });
+    });
+
+    describe("entriesForwardFromPosition", () => {
+      it("should iterate from a specific position", async () => {
+        const entries: VirtualViewEntryData[] = [];
+        
+        // Start from position 2 (category B)
+        for await (const entry of nav.entriesForwardFromPosition("2")) {
+          entries.push(entry);
+        }
+
+        // Should get category B and its 2 documents = 3 entries
+        expect(entries.length).toBe(3);
+        expect(entries[0].getCategoryValue()).toBe("B");
+        expect(entries[1].isDocument()).toBe(true);
+        expect(entries[2].isDocument()).toBe(true);
+      });
+
+      it("should return nothing for invalid position", async () => {
+        const entries: VirtualViewEntryData[] = [];
+        
+        for await (const entry of nav.entriesForwardFromPosition("99")) {
+          entries.push(entry);
+        }
+
+        expect(entries).toHaveLength(0);
+      });
+    });
+
+    describe("childDocumentsBetween / childDocumentsByKey", () => {
+      it("should filter child documents by key range", () => {
+        const categoryA = view.getRoot().getChildCategories()[0];
+        
+        // Get documents with names starting with "A" to "B"
+        const docs = nav.childDocumentsBetween(categoryA, "Alice", "Bob");
+        expect(docs).toHaveLength(2);
+      });
+
+      it("should filter child documents by exact key", () => {
+        const categoryA = view.getRoot().getChildCategories()[0];
+        
+        // Exact match
+        const docs = nav.childDocumentsByKey(categoryA, "Alice", true);
+        expect(docs).toHaveLength(1);
+        expect(docs[0].getColumnValue("name")).toBe("Alice");
+      });
+
+      it("should filter child documents by prefix", () => {
+        const categoryA = view.getRoot().getChildCategories()[0];
+        
+        // Prefix match - "A" should match "Alice"
+        const docs = nav.childDocumentsByKey(categoryA, "A", false);
+        expect(docs).toHaveLength(1);
+        expect(docs[0].getColumnValue("name")).toBe("Alice");
+      });
+    });
+
+    describe("childCategoriesBetween / childCategoriesByKey", () => {
+      it("should filter child categories by key range", () => {
+        const root = view.getRoot();
+        
+        // Get categories from "A" to "B"
+        const cats = nav.childCategoriesBetween(root, "A", "B");
+        expect(cats).toHaveLength(2);
+      });
+
+      it("should filter child categories by exact key", () => {
+        const root = view.getRoot();
+        
+        const cats = nav.childCategoriesByKey(root, "A", true);
+        expect(cats).toHaveLength(1);
+        expect(cats[0].getCategoryValue()).toBe("A");
+      });
+    });
+
+    describe("getSortedEntries", () => {
+      it("should get sorted entries for a document", () => {
+        const entries = nav.getSortedEntries("test", "doc1");
+        expect(entries).toHaveLength(1);
+        expect(entries[0].docId).toBe("doc1");
+      });
+
+      it("should get sorted entries for multiple documents", () => {
+        const docIds = new Set(["doc1", "doc3"]);
+        const entries = nav.getSortedEntriesMultiple("test", docIds);
+        
+        expect(entries).toHaveLength(2);
+        // Entries should be sorted by position (doc1 is in A, doc3 is in B)
+        expect(entries[0].docId).toBe("doc1");
+        expect(entries[1].docId).toBe("doc3");
+      });
+    });
+
+    describe("getSortedDocIds", () => {
+      it("should return doc IDs sorted by position", () => {
+        const docIds = new Set(["doc3", "doc1", "doc2"]);
+        const sorted = nav.getSortedDocIds("test", docIds);
+        
+        expect(sorted).toHaveLength(3);
+        // Should be sorted by position in view
+        expect(sorted[0]).toBe("doc1");
+        expect(sorted[1]).toBe("doc2");
+        expect(sorted[2]).toBe("doc3");
+      });
+    });
+
+    describe("getSortedDocIdsScoped", () => {
+      it("should return scoped doc IDs sorted by position", () => {
+        const scopedIds = new Set<ScopedDocId>([
+          { origin: "test", docId: "doc3" },
+          { origin: "test", docId: "doc1" },
+        ]);
+        const sorted = nav.getSortedDocIdsScoped(scopedIds);
+        
+        expect(sorted).toHaveLength(2);
+        expect(sorted[0].docId).toBe("doc1");
+        expect(sorted[1].docId).toBe("doc3");
+      });
+    });
+
+    describe("expandPosArray / collapsePosArray", () => {
+      it("should expand by position array", () => {
+        nav.collapseAll();
+        nav.expandPosArray([1]); // Expand category A
+        
+        nav.gotoPos("1");
+        const categoryA = nav.getCurrentEntry();
+        expect(nav.isExpanded(categoryA!)).toBe(true);
+      });
+
+      it("should collapse by position array", () => {
+        nav.expandAll();
+        nav.collapsePosArray([1]); // Collapse category A
+        
+        nav.gotoPos("1");
+        const categoryA = nav.getCurrentEntry();
+        expect(nav.isExpanded(categoryA!)).toBe(false);
+      });
+    });
+
+    describe("isExpandedByDocId", () => {
+      it("should check expansion state by docId", () => {
+        nav.collapseAll();
+        
+        // Get category A's docId
+        nav.gotoPos("1");
+        const categoryA = nav.getCurrentEntry();
+        const origin = categoryA!.origin;
+        const docId = categoryA!.docId;
+        
+        expect(nav.isExpandedByDocId(origin, docId)).toBe(false);
+        
+        nav.expand(origin, docId);
+        expect(nav.isExpandedByDocId(origin, docId)).toBe(true);
+      });
+    });
+
+    describe("isDeselectAllByDefault", () => {
+      it("should return true by default", () => {
+        expect(nav.isDeselectAllByDefault()).toBe(true);
+        expect(nav.isSelectAllByDefault()).toBe(false);
+      });
+
+      it("should return false after selectAll", () => {
+        nav.selectAllEntries();
+        expect(nav.isDeselectAllByDefault()).toBe(false);
+        expect(nav.isSelectAllByDefault()).toBe(true);
+      });
+
+      it("should return true after deselectAll", () => {
+        nav.selectAllEntries();
+        nav.deselectAllEntries();
+        expect(nav.isDeselectAllByDefault()).toBe(true);
+      });
     });
   });
 });
