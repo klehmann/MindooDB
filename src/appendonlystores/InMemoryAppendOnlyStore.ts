@@ -60,17 +60,17 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
    * @param haveChangeHashes The list of document IDs and change hashes we already have
    * @return A list of document IDs and change hashes that we don't have yet
    */
-  async findNewChanges(haveChangeHashes: MindooDocChangeHashes[]): Promise<MindooDocChangeHashes[]> {
+  async findNewChanges(haveChangeHashes: string[]): Promise<MindooDocChangeHashes[]> {
     // Create a Set of change hashes we already have for fast lookup
-    const haveHashes = new Set<string>();
-    for (const hashInfo of haveChangeHashes) {
-      haveHashes.add(hashInfo.changeHash);
+    const haveHashesAsSet = new Set<string>();
+    for (const hash of haveChangeHashes) {
+      haveHashesAsSet.add(hash);
     }
 
     // Find all changes we have that are not in the provided list
     const newChanges: MindooDocChangeHashes[] = [];
     for (const change of this.changes) {
-      if (!haveHashes.has(change.changeHash)) {
+      if (!haveHashesAsSet.has(change.changeHash)) {
         // Return only the hash metadata, not the full change
         const { payload, ...hashMetadata } = change;
         newChanges.push(hashMetadata);
@@ -103,74 +103,40 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
     return result;
   }
 
-  /**
-   * Get all change hashes that are stored in the store
-   *
-   * @return A list of change hashes
-   */
-  async getAllChangeHashes(): Promise<MindooDocChangeHashes[]> {
-    const result: MindooDocChangeHashes[] = [];
-
-    for (const change of this.changes) {
-      // Return only the hash metadata, not the full change
-      const { payload, ...hashMetadata } = change;
-      result.push(hashMetadata);
+  async findNewChangesForDoc(haveChangeHashes: string[], docId: string): Promise<MindooDocChangeHashes[]> {
+    // Create a Set of change hashes we already have for fast lookup
+    const haveHashesAsSet = new Set<string>();
+    for (const hash of haveChangeHashes) {
+      haveHashesAsSet.add(hash);
     }
 
-    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${result.length} change hashes`);
-    return result;
-  }
-
-  /**
-   * Get all change hashes for a document
-   *
-   * @param docId The ID of the document
-   * @param fromLastSnapshot Whether to start from the last snapshot (if there is any)
-   * @return A list of change hashes
-   */
-  async getAllChangeHashesForDoc(docId: string, fromLastSnapshot: boolean): Promise<MindooDocChangeHashes[]> {
+    // Get changes for this specific document
     const docChanges = this.docIdIndex.get(docId) || [];
 
-    if (docChanges.length === 0) {
-      console.log(`[InMemoryAppendOnlyStore:${this.dbId}] No changes found for doc ${docId}`);
-      return [];
-    }
-
-    // Sort by timestamp to ensure correct order
-    const sortedChanges = [...docChanges].sort((a, b) => a.createdAt - b.createdAt);
-
-    // If fromLastSnapshot is true, find the most recent snapshot and start from there
-    if (fromLastSnapshot) {
-      // Find the most recent snapshot
-      const snapshots = sortedChanges.filter(ch => ch.type === "snapshot");
-      if (snapshots.length > 0) {
-        // Sort snapshots by timestamp (newest first)
-        snapshots.sort((a, b) => b.createdAt - a.createdAt);
-        const lastSnapshot = snapshots[0];
-
-        // Return only changes after the last snapshot
-        const changesAfterSnapshot = sortedChanges.filter(
-          ch => ch.createdAt > lastSnapshot.createdAt
-        );
-
-        const result: MindooDocChangeHashes[] = changesAfterSnapshot.map(change => {
-          const { payload, ...hashMetadata } = change;
-          return hashMetadata;
-        });
-
-        console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${result.length} changes for doc ${docId} after snapshot`);
-        return result;
+    // Find all changes for this doc that are not in the provided list
+    const newChanges: MindooDocChangeHashes[] = [];
+    for (const change of docChanges) {
+      if (!haveHashesAsSet.has(change.changeHash)) {
+        // Return only the hash metadata, not the full change
+        const { payload, ...hashMetadata } = change;
+        newChanges.push(hashMetadata);
       }
     }
 
-    // Return all changes (without payload)
-    const result: MindooDocChangeHashes[] = sortedChanges.map(change => {
-      const { payload, ...hashMetadata } = change;
-      return hashMetadata;
-    });
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Found ${newChanges.length} new changes for doc ${docId} out of ${docChanges.length} total`);
+    return newChanges;
+  }
 
-    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${result.length} changes for doc ${docId}`);
-    return result;
+  /**
+   * Get all change hashes in the store.
+   * Used for synchronization to identify which changes we have.
+   *
+   * @return A list of all change hashes in the store
+   */
+  async getAllChangeHashes(): Promise<string[]> {
+    const hashes = this.changes.map(change => change.changeHash);
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${hashes.length} change hashes`);
+    return hashes;
   }
 }
 

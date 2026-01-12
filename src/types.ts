@@ -464,6 +464,26 @@ export interface MindooTenantDirectory {
    * @return True if the public key belongs to a trusted (registered and not revoked) user, false otherwise
    */
   validatePublicSigningKey(publicKey: string): Promise<boolean>;
+
+  /**
+   * Get a user's public keys from the directory.
+   * Used for authentication (signature verification) and encryption (transport encryption).
+   * 
+   * @param username The username to look up (format: "CN=<username>/O=<tenantId>")
+   * @return The user's public keys, or null if user not found or has been revoked
+   */
+  getUserPublicKeys(username: string): Promise<{
+    signingPublicKey: string;
+    encryptionPublicKey: string;
+  } | null>;
+
+  /**
+   * Check if a user has been revoked.
+   * 
+   * @param username The username to check (format: "CN=<username>/O=<tenantId>")
+   * @return True if the user has been revoked (all grant access documents have been revoked), false otherwise
+   */
+  isUserRevoked(username: string): Promise<boolean>;
 }
 
 /**

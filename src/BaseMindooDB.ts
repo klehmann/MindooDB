@@ -57,7 +57,7 @@ export class BaseMindooDB implements MindooDB {
   private docCache: Map<string, InternalDoc> = new Map();
   
   // Track which change hashes we've already processed
-  private processedChangeHashes: MindooDocChangeHashes[] = [];
+  private processedChangeHashes: string[] = [];
   
   // Monotonic counter for UUID7 generation (ensures uniqueness within same millisecond)
   private uuid7Counter: number = 0;
@@ -204,7 +204,7 @@ export class BaseMindooDB implements MindooDB {
     }
     
     // Append new change hashes to our processed list
-    this.processedChangeHashes.push(...newChangeHashes);
+    this.processedChangeHashes.push(...newChangeHashes.map(ch => ch.changeHash));
     
     console.log(`[BaseMindooDB] Synced ${newChangeHashes.length} new changes, index now has ${this.index.length} documents`);
   }
@@ -342,7 +342,7 @@ export class BaseMindooDB implements MindooDB {
     console.log(`[BaseMindooDB] Getting document ${docId} at timestamp ${timestamp}`);
     
     // Get all change hashes for this document
-    const allChangeHashes = await this.store.getAllChangeHashesForDoc(docId, false);
+    const allChangeHashes = await this.store.findNewChangesForDoc([], docId);
     
     // Filter changes up to the timestamp
     const relevantChanges = allChangeHashes
@@ -813,9 +813,10 @@ export class BaseMindooDB implements MindooDB {
     
     console.log(`[BaseMindooDB] ===== Starting to load document ${docId} from store =====`);
     
-    // Get all change hashes for this document (from last snapshot if available)
+    // Get all change hashes for this document
+    // TODO: Implement loading from last snapshot if available
     console.log(`[BaseMindooDB] Getting all change hashes for document ${docId}`);
-    const allChangeHashes = await this.store.getAllChangeHashesForDoc(docId, true);
+    const allChangeHashes = await this.store.findNewChangesForDoc([], docId);
     console.log(`[BaseMindooDB] Found ${allChangeHashes.length} total change hashes for document ${docId}`);
     
     if (allChangeHashes.length === 0) {

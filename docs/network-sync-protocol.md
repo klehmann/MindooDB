@@ -21,9 +21,10 @@ MindooDB's network synchronization protocol enables secure data exchange between
 │                         CLIENT                                   │
 │  ┌─────────────────────────────────────────────────────────┐     │
 │  │ ClientNetworkAppendOnlyStore                            │     │
-│  │  - Wraps local store for caching                        │     │
+│  │  - Pure remote proxy (no local caching)                 │     │
 │  │  - Handles authentication                               │     │
 │  │  - Decrypts received changes                            │     │
+│  │  - Forwards all operations to server                    │     │
 │  └────────────────────────┬────────────────────────────────┘     │
 │                           │                                      │
 │  ┌────────────────────────▼────────────────────────────────┐     │
@@ -42,6 +43,7 @@ MindooDB's network synchronization protocol enables secure data exchange between
 │  │  - Validates authentication tokens                      │     │
 │  │  - Encrypts changes with client's RSA key               │     │
 │  │  - Serves changes from local store                      │     │
+│  │  - Accepts pushed changes from clients                  │     │
 │  └────────────────────────┬────────────────────────────────┘     │
 │                           │                                      │
 │  ┌────────────────────────▼────────────────────────────────┐     │
@@ -57,6 +59,105 @@ MindooDB's network synchronization protocol enables secure data exchange between
 │  │  - Revocation status check                              │     │
 │  └─────────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────────┘
+```
+
+## Usage Patterns
+
+The `ClientNetworkAppendOnlyStore` acts as a pure remote proxy, enabling two distinct usage patterns:
+
+### 1. Direct Remote Usage
+
+When MindooDB is instantiated directly with `ClientNetworkAppendOnlyStore`, all read/write operations are transparently forwarded to the remote server:
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant MindooDB
+    participant ClientStore as ClientNetworkAppendOnlyStore
+    participant Server
+
+    App->>MindooDB: createDocument()
+    MindooDB->>ClientStore: append(change)
+    ClientStore->>Server: pushChanges(token, changes)
+    Server-->>ClientStore: OK
+
+    App->>MindooDB: syncStoreChanges()
+    MindooDB->>ClientStore: findNewChanges(hashes)
+    ClientStore->>Server: findNewChanges(token, hashes)
+    Server-->>ClientStore: newChangeHashes
+    MindooDB->>ClientStore: getChanges(hashes)
+    ClientStore->>Server: getChanges(token, hashes)
+    Server-->>ClientStore: encryptedChanges
+    Note over ClientStore: Decrypt RSA layer
+    ClientStore-->>MindooDB: decryptedChanges
+```
+
+### 2. Sync-Based Usage
+
+A local MindooDB (e.g., with `InMemoryAppendOnlyStore`) can sync with a remote store using `pullChangesFrom` and `pushChangesTo`:
+
+#### pushChangesTo (Local to Remote)
+
+The local DB queries the remote for what it has, then pushes what's missing:
+
+```mermaid
+sequenceDiagram
+    participant LocalDB as MindooDB_Local
+    participant LocalStore as InMemoryStore
+    participant RemoteStore as ClientNetworkStore
+    participant Server
+
+    LocalDB->>LocalStore: append(change)
+    Note over LocalDB: Work offline
+
+    LocalDB->>LocalDB: pushChangesTo(remoteStore)
+    LocalDB->>RemoteStore: getAllChangeHashes()
+    RemoteStore->>Server: getAllChangeHashes(token)
+    Server-->>RemoteStore: remoteHashes
+    RemoteStore-->>LocalDB: remoteHashes
+
+    LocalDB->>LocalStore: findNewChanges(remoteHashes)
+    LocalStore-->>LocalDB: newChangeHashes
+
+    LocalDB->>LocalStore: getChanges(newChangeHashes)
+    LocalStore-->>LocalDB: changes
+
+    loop For each change
+        LocalDB->>RemoteStore: append(change)
+        RemoteStore->>Server: pushChanges(token, change)
+        Server-->>RemoteStore: OK
+    end
+```
+
+#### pullChangesFrom (Remote to Local)
+
+The local DB tells the remote what it has, then fetches what's missing:
+
+```mermaid
+sequenceDiagram
+    participant LocalDB as MindooDB_Local
+    participant LocalStore as InMemoryStore
+    participant RemoteStore as ClientNetworkStore
+    participant Server
+
+    LocalDB->>LocalDB: pullChangesFrom(remoteStore)
+    LocalDB->>LocalStore: getAllChangeHashes()
+    LocalStore-->>LocalDB: localHashes
+
+    LocalDB->>RemoteStore: findNewChanges(localHashes)
+    RemoteStore->>Server: findNewChanges(token, localHashes)
+    Server-->>RemoteStore: newChangeHashes
+    RemoteStore-->>LocalDB: newChangeHashes
+
+    LocalDB->>RemoteStore: getChanges(newChangeHashes)
+    RemoteStore->>Server: getChanges(token, hashes)
+    Server-->>RemoteStore: encryptedChanges
+    Note over RemoteStore: Decrypt RSA layer
+    RemoteStore-->>LocalDB: decryptedChanges
+
+    loop For each change
+        LocalDB->>LocalStore: append(change)
+    end
 ```
 
 ## Authentication Protocol
@@ -334,6 +435,42 @@ Authorization: Bearer <jwt-token>
 }
 ```
 
+#### POST /sync/findNewChangesForDoc
+Find changes for a specific document that the client doesn't have (optimized version).
+
+**Headers:**
+```
+Authorization: Bearer <jwt-token>
+```
+
+**Request:**
+```json
+{
+  "tenantId": "tenant-123",
+  "dbId": "contacts",
+  "haveChangeHashes": ["hash1", "hash2"],
+  "docId": "doc-456"
+}
+```
+
+**Response:**
+```json
+{
+  "changes": [
+    {
+      "type": "change",
+      "docId": "doc-456",
+      "changeHash": "hash4",
+      "depsHashes": ["hash2"],
+      "createdAt": 1704067200000,
+      "createdByPublicKey": "-----BEGIN PUBLIC KEY-----...",
+      "decryptionKeyId": "default",
+      "signature": "base64-encoded-signature"
+    }
+  ]
+}
+```
+
 #### POST /sync/getChanges
 Get specific changes with RSA-encrypted payloads.
 
@@ -372,6 +509,61 @@ Authorization: Bearer <jwt-token>
       "rsaEncryptedPayload": "base64-encoded-encrypted-payload"
     }
   ]
+}
+```
+
+#### POST /sync/pushChanges
+Push changes from client to server.
+
+**Headers:**
+```
+Authorization: Bearer <jwt-token>
+```
+
+**Request:**
+```json
+{
+  "tenantId": "tenant-123",
+  "dbId": "contacts",
+  "changes": [
+    {
+      "type": "change",
+      "docId": "doc-456",
+      "changeHash": "hash5",
+      "depsHashes": ["hash4"],
+      "createdAt": 1704070800000,
+      "createdByPublicKey": "-----BEGIN PUBLIC KEY-----...",
+      "decryptionKeyId": "default",
+      "signature": "base64-encoded-signature",
+      "payload": "base64-encoded-payload"
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
+#### GET /sync/getAllChangeHashes
+Get all change hashes from the server (used for determining what to push).
+
+**Headers:**
+```
+Authorization: Bearer <jwt-token>
+```
+
+**Query Parameters:**
+- `tenantId`: The tenant ID
+- `dbId`: (optional) The database ID
+
+**Response:**
+```json
+{
+  "hashes": ["hash1", "hash2", "hash3", "hash4"]
 }
 ```
 

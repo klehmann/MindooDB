@@ -48,7 +48,16 @@ export interface AppendOnlyStore {
    * @param haveChangeHashes The list of document IDs and change hashes we already have
    * @return A list of document IDs and change hashes that we don't have yet
    */
-  findNewChanges(haveChangeHashes: MindooDocChangeHashes[]): Promise<MindooDocChangeHashes[]>;
+  findNewChanges(haveChangeHashes: string[]): Promise<MindooDocChangeHashes[]>;
+
+  /**
+   * Find changes in the store for a document that are not listed in the given list of change hashes
+   *
+   * @param haveChangeHashes The list of change hashes we already have
+   * @param docId The ID of the document
+   * @return A list of change hashes
+   */
+  findNewChangesForDoc(haveChangeHashes: string[], docId: string): Promise<MindooDocChangeHashes[]>;
 
   /**
    * Bulk method to get multiple changes given their hash infos
@@ -59,19 +68,11 @@ export interface AppendOnlyStore {
   getChanges(changeHashes: MindooDocChangeHashes[]): Promise<MindooDocChange[]>;
 
   /**
-   * Get all change hashes that are stored in the store
+   * Get all change hashes in the store.
+   * Used for synchronization to identify which changes we have.
    *
-   * @return A list of change hashes
-  */
-  getAllChangeHashes(): Promise<MindooDocChangeHashes[]>;
-
-  /**
-   * Get all change hashes for a document
-   *
-   * @param docId The ID of the document
-   * @param fromLastSnapshot Whether to start from the last snapshot (if there is any)
-   * @return A list of change hashes
+   * @return A list of all change hashes in the store
    */
-  getAllChangeHashesForDoc(docId: string, fromLastSnapshot: boolean): Promise<MindooDocChangeHashes[]>;
+  getAllChangeHashes(): Promise<string[]>;
 }
 
