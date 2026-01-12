@@ -282,8 +282,8 @@ describe("KeyBag", () => {
       await keyBag.deleteKey(keyId);
       expect(await keyBag.get(keyId)).toBeNull();
 
-      // Import it back
-      await keyBag.decryptAndImportKey(keyId, encryptedKey!, exportPassword);
+      // Import it back (encryptAndExportKey uses keyId as salt)
+      await keyBag.decryptAndImportKey(keyId, encryptedKey!, exportPassword, keyId);
 
       // Verify it matches
       const retrieved = await keyBag.get(keyId);
@@ -301,7 +301,8 @@ describe("KeyBag", () => {
       const encryptedKey = await keyBag.encryptAndExportKey(keyId, exportPassword);
       
       await keyBag.deleteKey(keyId);
-      await keyBag.decryptAndImportKey(keyId, encryptedKey!, exportPassword);
+      // encryptAndExportKey uses keyId as salt
+      await keyBag.decryptAndImportKey(keyId, encryptedKey!, exportPassword, keyId);
 
       const retrieved = await keyBag.get(keyId);
       expect(retrieved).toBeDefined();
@@ -528,7 +529,7 @@ describe("KeyBag", () => {
       // Rotate: export and re-import with new timestamp (exported keys use keyId as salt string)
       const exported = await keyBag.encryptAndExportKey(keyId, keyPassword);
       exported!.createdAt = 2000;
-      await keyBag.decryptAndImportKey(keyId, exported!, keyPassword); // Uses keyId by default
+      await keyBag.decryptAndImportKey(keyId, exported!, keyPassword, keyId); // encryptAndExportKey uses keyId as salt
 
       // Add another version directly (factory uses "default" as salt string)
       const encryptedKey2 = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
