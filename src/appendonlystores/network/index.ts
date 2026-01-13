@@ -8,11 +8,11 @@ export type {
   NetworkAuthTokenPayload,
   AuthChallenge,
   AuthResult,
-} from "./types";
-export { NetworkError, NetworkErrorType } from "./types";
+} from "../../core/appendonlystores/network/types";
+export { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 
 // Interfaces
-export type { NetworkTransport, NetworkTransportConfig } from "./NetworkTransport";
+export type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 
 // Client-side
 export { ClientNetworkAppendOnlyStore } from "./ClientNetworkAppendOnlyStore";
@@ -21,7 +21,7 @@ export { ClientNetworkAppendOnlyStore } from "./ClientNetworkAppendOnlyStore";
 export { ServerNetworkAppendOnlyStore } from "./ServerNetworkAppendOnlyStore";
 
 // Authentication
-export { AuthenticationService } from "./AuthenticationService";
+export { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 
 // Transport implementations
 export { HttpTransport } from "./HttpTransport";

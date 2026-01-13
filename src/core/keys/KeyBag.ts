@@ -1,5 +1,5 @@
 import { EncryptedPrivateKey } from "../types";
-import { CryptoAdapter, createCryptoAdapter } from "../crypto/CryptoAdapter";
+import { CryptoAdapter } from "../crypto/CryptoAdapter";
 
 /**
  * Internal structure for storing a key with optional creation timestamp.
@@ -27,15 +27,10 @@ export class KeyBag {
    * @param userEncryptionKeyPassword The password to decrypt the user encryption key
    * @param cryptoAdapter The crypto adapter to use for encryption and decryption
    */
-  constructor(userEncryptionKey: EncryptedPrivateKey, userEncryptionKeyPassword: string, cryptoAdapter?: CryptoAdapter) {
+  constructor(userEncryptionKey: EncryptedPrivateKey, userEncryptionKeyPassword: string, cryptoAdapter: CryptoAdapter) {
     this.userEncryptionKey = userEncryptionKey;
     this.userEncryptionKeyPassword = userEncryptionKeyPassword;
-    // Import createCryptoAdapter dynamically to avoid issues in browser environments
-    if (!cryptoAdapter) {
-      this.cryptoAdapter = createCryptoAdapter();
-    } else {
-      this.cryptoAdapter = cryptoAdapter;
-    }
+    this.cryptoAdapter = cryptoAdapter;
   }
 
   /**

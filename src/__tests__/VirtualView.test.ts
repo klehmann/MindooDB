@@ -12,7 +12,7 @@ import {
   WithDocuments,
   SelectedOnly,
   ScopedDocId,
-} from "../indexing/virtualviews";
+} from "../core/indexing/virtualviews";
 
 describe("VirtualView", () => {
   describe("VirtualViewColumn", () => {

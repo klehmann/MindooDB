@@ -1,7 +1,8 @@
-import { KeyBag } from "../keys/KeyBag";
-import { BaseMindooTenantFactory } from "../BaseMindooTenantFactory";
+import { KeyBag } from "../core/keys/KeyBag";
+import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
-import { PrivateUserId, EncryptedPrivateKey } from "../types";
+import { PrivateUserId, EncryptedPrivateKey } from "../core/types";
+import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("KeyBag", () => {
   let factory: BaseMindooTenantFactory;
@@ -12,14 +13,15 @@ describe("KeyBag", () => {
 
   beforeEach(async () => {
     storeFactory = new InMemoryAppendOnlyStoreFactory();
-    factory = new BaseMindooTenantFactory(storeFactory);
+    factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     currentUserPassword = "userpassword123";
     currentUser = await factory.createUserId("CN=testuser/O=testtenant", currentUserPassword);
     
     // Create KeyBag with user's encryption key
     keyBag = new KeyBag(
       currentUser.userEncryptionKeyPair.privateKey,
-      currentUserPassword
+      currentUserPassword,
+      factory.getCryptoAdapter()
     );
   }, 10000); // Increase timeout for crypto operations
 
@@ -415,7 +417,8 @@ describe("KeyBag", () => {
       // Create a new KeyBag and load into it
       const newKeyBag = new KeyBag(
         currentUser.userEncryptionKeyPair.privateKey,
-        currentUserPassword
+        currentUserPassword,
+        factory.getCryptoAdapter()
       );
       await newKeyBag.load(saved);
 
@@ -437,7 +440,8 @@ describe("KeyBag", () => {
       // Create a new KeyBag and load into it
       const newKeyBag = new KeyBag(
         currentUser.userEncryptionKeyPair.privateKey,
-        currentUserPassword
+        currentUserPassword,
+        factory.getCryptoAdapter()
       );
       await newKeyBag.load(saved);
 
@@ -458,7 +462,8 @@ describe("KeyBag", () => {
       const saved = await keyBag.save();
       const newKeyBag = new KeyBag(
         currentUser.userEncryptionKeyPair.privateKey,
-        currentUserPassword
+        currentUserPassword,
+        factory.getCryptoAdapter()
       );
       await newKeyBag.load(saved);
 
@@ -483,7 +488,8 @@ describe("KeyBag", () => {
       const saved = await keyBag.save();
       const newKeyBag = new KeyBag(
         currentUser.userEncryptionKeyPair.privateKey,
-        currentUserPassword
+        currentUserPassword,
+        factory.getCryptoAdapter()
       );
       await newKeyBag.load(saved);
 
@@ -509,7 +515,8 @@ describe("KeyBag", () => {
       // Try to load with wrong password
       const wrongPasswordKeyBag = new KeyBag(
         currentUser.userEncryptionKeyPair.privateKey,
-        "wrongpassword"
+        "wrongpassword",
+        factory.getCryptoAdapter()
       );
 
       await expect(wrongPasswordKeyBag.load(saved)).rejects.toThrow();
@@ -557,7 +564,8 @@ describe("KeyBag", () => {
       const saved = await keyBag.save();
       const newKeyBag = new KeyBag(
         currentUser.userEncryptionKeyPair.privateKey,
-        currentUserPassword
+        currentUserPassword,
+        factory.getCryptoAdapter()
       );
       await newKeyBag.load(saved);
 

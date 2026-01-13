@@ -1,14 +1,14 @@
-import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStore";
-import { NodeCryptoAdapter } from "../crypto/CryptoAdapter";
-import { RSAEncryption } from "../crypto/RSAEncryption";
-import { AuthenticationService } from "../appendonlystores/network/AuthenticationService";
+import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
+import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
+import { RSAEncryption } from "../core/crypto/RSAEncryption";
+import { AuthenticationService } from "../core/appendonlystores/network/AuthenticationService";
 import { ClientNetworkAppendOnlyStore } from "../appendonlystores/network/ClientNetworkAppendOnlyStore";
 import { ServerNetworkAppendOnlyStore } from "../appendonlystores/network/ServerNetworkAppendOnlyStore";
-import type { NetworkTransport } from "../appendonlystores/network/NetworkTransport";
-import type { NetworkEncryptedChange, AuthResult } from "../appendonlystores/network/types";
-import type { MindooDocChange, MindooDocChangeHashes, MindooTenantDirectory, EncryptedPrivateKey } from "../types";
-import type { PublicUserId } from "../userid";
-import type { AppendOnlyStore } from "../appendonlystores/types";
+import type { NetworkTransport } from "../core/appendonlystores/network/NetworkTransport";
+import type { NetworkEncryptedChange, AuthResult } from "../core/appendonlystores/network/types";
+import type { MindooDocChange, MindooDocChangeHashes, MindooTenantDirectory, EncryptedPrivateKey } from "../core/types";
+import type { PublicUserId } from "../core/userid";
+import type { AppendOnlyStore } from "../core/appendonlystores/types";
 
 /**
  * Mock NetworkTransport that connects directly to a ServerNetworkAppendOnlyStore

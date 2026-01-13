@@ -1,7 +1,8 @@
-import { BaseMindooTenantFactory } from "../BaseMindooTenantFactory";
+import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDoc, ProcessChangesCursor, SigningKeyPair } from "../types";
-import { KeyBag } from "../keys/KeyBag";
+import { PrivateUserId, MindooTenant, MindooDoc, ProcessChangesCursor, SigningKeyPair } from "../core/types";
+import { KeyBag } from "../core/keys/KeyBag";
+import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("granting tenant access", () => {
   let factory: BaseMindooTenantFactory;
@@ -19,7 +20,7 @@ describe("granting tenant access", () => {
 
   beforeEach(async () => {
     storeFactory = new InMemoryAppendOnlyStoreFactory();
-    factory = new BaseMindooTenantFactory(storeFactory);
+    factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     
     // Create admin user
     adminUserPassword = "adminpass123";
@@ -34,9 +35,11 @@ describe("granting tenant access", () => {
     const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
     
     // Create KeyBag for admin user
+    const cryptoAdapter = new NodeCryptoAdapter();
     adminKeyBag = new KeyBag(
       adminUser.userEncryptionKeyPair.privateKey,
-      adminUserPassword
+      adminUserPassword,
+      cryptoAdapter
     );
     
     // Create tenant using openTenantWithKeys with our admin signing key as the administration key

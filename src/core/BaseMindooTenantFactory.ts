@@ -8,7 +8,7 @@ import {
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
-import { CryptoAdapter, createCryptoAdapter } from "./crypto/CryptoAdapter";
+import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { KeyBag } from "./keys/KeyBag";
 
 /**
@@ -22,9 +22,13 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   private cryptoAdapter: CryptoAdapter;
   private storeFactory: AppendOnlyStoreFactory;
 
-  constructor(storeFactory: AppendOnlyStoreFactory, cryptoAdapter?: CryptoAdapter) {
+  constructor(storeFactory: AppendOnlyStoreFactory, cryptoAdapter: CryptoAdapter) {
     this.storeFactory = storeFactory;
-    this.cryptoAdapter = cryptoAdapter || createCryptoAdapter();
+    this.cryptoAdapter = cryptoAdapter;
+  }
+
+  getCryptoAdapter(): CryptoAdapter {
+    return this.cryptoAdapter;
   }
 
   /**

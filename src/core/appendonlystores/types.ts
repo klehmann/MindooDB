@@ -75,4 +75,3 @@ export interface AppendOnlyStore {
    */
   getAllChangeHashes(): Promise<string[]>;
 }
-

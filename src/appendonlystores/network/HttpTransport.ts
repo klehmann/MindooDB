@@ -1,7 +1,7 @@
-import type { MindooDocChange, MindooDocChangeHashes } from "../../types";
-import type { NetworkTransport, NetworkTransportConfig } from "./NetworkTransport";
-import type { NetworkEncryptedChange, AuthResult } from "./types";
-import { NetworkError, NetworkErrorType } from "./types";
+import type { MindooDocChange, MindooDocChangeHashes } from "../../core/types";
+import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
+import type { NetworkEncryptedChange, AuthResult } from "../../core/appendonlystores/network/types";
+import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 
 /**
  * HTTP implementation of the NetworkTransport interface.

@@ -149,4 +149,3 @@ export class InMemoryAppendOnlyStoreFactory implements AppendOnlyStoreFactory {
     return new InMemoryAppendOnlyStore(dbId);
   }
 }
-

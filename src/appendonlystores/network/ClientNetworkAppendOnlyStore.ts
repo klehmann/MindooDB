@@ -1,10 +1,10 @@
-import type { AppendOnlyStore } from "../types";
-import type { MindooDocChange, MindooDocChangeHashes } from "../../types";
-import type { CryptoAdapter } from "../../crypto/CryptoAdapter";
-import type { NetworkTransport } from "./NetworkTransport";
-import type { NetworkEncryptedChange } from "./types";
-import { NetworkError, NetworkErrorType } from "./types";
-import { RSAEncryption } from "../../crypto/RSAEncryption";
+import type { AppendOnlyStore } from "../../core/types";
+import type { MindooDocChange, MindooDocChangeHashes } from "../../core/types";
+import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
+import type { NetworkEncryptedChange } from "../../core/appendonlystores/network/types";
+import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
+import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 
 /**
  * Client-side network AppendOnlyStore that forwards all operations to a remote server.

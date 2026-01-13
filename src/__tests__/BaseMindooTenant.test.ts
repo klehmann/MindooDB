@@ -1,8 +1,9 @@
-import { BaseMindooTenantFactory } from "../BaseMindooTenantFactory";
-import { BaseMindooTenant } from "../BaseMindooTenant";
-import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
-import { PrivateUserId, MindooTenant } from "../types";
-import { KeyBag } from "../keys/KeyBag";
+import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
+import { BaseMindooTenant } from "../core/BaseMindooTenant";
+import { InMemoryAppendOnlyStoreFactory } from "../core/appendonlystores/InMemoryAppendOnlyStore";
+import { PrivateUserId, MindooTenant } from "../core/types";
+import { KeyBag } from "../core/keys/KeyBag";
+import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("BaseMindooTenant", () => {
   let factory: BaseMindooTenantFactory;
@@ -13,14 +14,15 @@ describe("BaseMindooTenant", () => {
 
   beforeEach(async () => {
     storeFactory = new InMemoryAppendOnlyStoreFactory();
-    factory = new BaseMindooTenantFactory(storeFactory);
+    factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     currentUserPassword = "userpassword123";
     currentUser = await factory.createUserId("CN=testuser/O=testtenant", currentUserPassword);
     
     // Create KeyBag with user's encryption key
     keyBag = new KeyBag(
       currentUser.userEncryptionKeyPair.privateKey,
-      currentUserPassword
+      currentUserPassword,
+      factory.getCryptoAdapter()
     );
   }, 10000); // Increase timeout for crypto operations
 

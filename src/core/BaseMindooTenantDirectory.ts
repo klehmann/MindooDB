@@ -3,7 +3,7 @@ import { BaseMindooTenant } from "./BaseMindooTenant";
 
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private tenant: BaseMindooTenant;
-  private directoryDB: MindooDB;
+  private directoryDB: MindooDB | null = null;
 
   // Centralized field lists for signing/verification
   private static readonly GRANT_ACCESS_SIGNED_FIELDS: string[] = [
@@ -40,8 +40,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     return bytes;
   }
 
-  async initialize(): Promise<void> {
-    this.directoryDB = await this.tenant.openDB("directory");
+  async getDirectoryDB(): Promise<MindooDB> {
+    if (!this.directoryDB) {
+      this.directoryDB = await this.tenant.openDB("directory");
+    }
+    return this.directoryDB;
   }
 
   async registerUser(
@@ -65,12 +68,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
 
     // Add user to directory database
     console.log(`[BaseMindooTenantDirectory] Creating document for user registration`);
-    const newDoc = await this.directoryDB.createDocument();
+    const directoryDB = await this.getDirectoryDB();
+    const newDoc = await directoryDB.createDocument();
     console.log(`[BaseMindooTenantDirectory] Document created: ${newDoc.getId()}`);
     
     try {
       // Set the document data fields, sign, and store signature all in one changeDoc call
-      await this.directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
+      await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "grantaccess";
@@ -105,7 +109,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     console.log(`[BaseMindooTenantDirectory] Finding grant access documents for username: ${username}`);
     
     // Sync changes to make sure everything is processed
-    await this.directoryDB.syncStoreChanges();
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
     
     // Cast to BaseMindooTenant to access protected methods
     const baseTenant = this.tenant as BaseMindooTenant;
@@ -131,7 +136,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const revokedDocIds = new Set<string>();
     
     // Use the generator-based iteration API for cleaner code
-    for await (const { doc } of this.directoryDB.iterateChangesSince(null, 100)) {
+    for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
       const data = doc.getData();
       
       // Check if this is a grant access document we're looking for
@@ -228,6 +233,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
 
     // Cast to BaseMindooTenant to access protected methods
     const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
 
     // Create SigningKeyPair for the administration key
     const adminSigningKeyPair: SigningKeyPair = {
@@ -242,10 +248,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     for (const grantAccessDoc of grantAccessDocs) {
       const revokeDocId = grantAccessDoc.getId();
 
-      const newDoc = await this.directoryDB.createDocument();
+      const newDoc = await directoryDB.createDocument();
       
       // Set the document data fields, sign, and store signature all in one changeDoc call
-      await this.directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
+      await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "revokeaccess";

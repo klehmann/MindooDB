@@ -567,7 +567,7 @@ export class VirtualViewNavigator {
       }
 
       // Find matching subcategory
-      const matchingCategory = this.childCategoriesByKey(currentEntry, String(part), true, false)
+      const matchingCategory: VirtualViewEntryData | undefined = this.childCategoriesByKey(currentEntry, String(part), true, false)
         .find(() => true); // Get first match
 
       if (!matchingCategory) {

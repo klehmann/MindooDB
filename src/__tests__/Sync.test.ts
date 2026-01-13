@@ -1,7 +1,8 @@
-import { BaseMindooTenantFactory } from "../BaseMindooTenantFactory";
+import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, SigningKeyPair, AppendOnlyStoreFactory, AppendOnlyStore, EncryptedPrivateKey } from "../types";
-import { KeyBag } from "../keys/KeyBag";
+import { PrivateUserId, MindooTenant, MindooDB, SigningKeyPair, AppendOnlyStoreFactory, AppendOnlyStore, EncryptedPrivateKey } from "../core/types";
+import { KeyBag } from "../core/keys/KeyBag";
+import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("sync test", () => {
   let storeFactory1: InMemoryAppendOnlyStoreFactory; // Store factory for user1
@@ -33,16 +34,18 @@ describe("sync test", () => {
     storeFactory1 = new InMemoryAppendOnlyStoreFactory();
     storeFactory2 = new InMemoryAppendOnlyStoreFactory();
     
+    const cryptoAdapter = new NodeCryptoAdapter();
     // Create separate factories for each user
-    factory1 = new BaseMindooTenantFactory(storeFactory1);
-    factory2 = new BaseMindooTenantFactory(storeFactory2);
+    factory1 = new BaseMindooTenantFactory(storeFactory1, cryptoAdapter);
+    factory2 = new BaseMindooTenantFactory(storeFactory2, cryptoAdapter);
     
     // Create user1 (admin user with access to admin key) using factory1
     user1Password = "user1pass123";
     user1 = await factory1.createUserId("CN=user1/O=testtenant", user1Password);
     user1KeyBag = new KeyBag(
       user1.userEncryptionKeyPair.privateKey,
-      user1Password
+      user1Password,
+      cryptoAdapter
     );
     
     // Create user2 (regular user) using factory2
@@ -50,7 +53,8 @@ describe("sync test", () => {
     user2 = await factory2.createUserId("CN=user2/O=testtenant", user2Password);
     user2KeyBag = new KeyBag(
       user2.userEncryptionKeyPair.privateKey,
-      user2Password
+      user2Password,
+      cryptoAdapter
     );
     
     // Create admin signing key pair using factory1 (both factories can create keys)

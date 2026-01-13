@@ -948,8 +948,9 @@ export class BaseMindooDB implements MindooDB {
         console.log(`[BaseMindooDB] Document state before applying change ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
         console.log(`[BaseMindooDB] Calling Automerge.applyChanges for change ${i + 1}/${changes.length} on document ${docId}`);
         console.log(`[BaseMindooDB] Decrypted payload length: ${decryptedPayload.length} bytes`);
-        const result = Automerge.applyChanges(doc!, [decryptedPayload]);
-        doc = Array.isArray(result) ? result[0] : result;
+        const currentDoc: Automerge.Doc<MindooDocPayload> = doc!;
+        const result = Automerge.applyChanges<MindooDocPayload>(currentDoc, [decryptedPayload]);
+        doc = result[0] as Automerge.Doc<MindooDocPayload>;
         console.log(`[BaseMindooDB] Successfully applied change ${i + 1}/${changes.length}`);
         console.log(`[BaseMindooDB] Document state after applying change ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
       } catch (error) {

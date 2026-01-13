@@ -1,6 +1,6 @@
-import { BaseMindooTenantFactory } from "../BaseMindooTenantFactory";
+import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
+import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
-import { PrivateUserId, PublicUserId, SigningKeyPair, EncryptionKeyPair, EncryptedPrivateKey } from "../types";
 
 describe("BaseMindooTenantFactory", () => {
   let factory: BaseMindooTenantFactory;
@@ -8,7 +8,7 @@ describe("BaseMindooTenantFactory", () => {
 
   beforeEach(() => {
     storeFactory = new InMemoryAppendOnlyStoreFactory();
-    factory = new BaseMindooTenantFactory(storeFactory);
+    factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
   });
 
   describe("createUserId", () => {
@@ -265,17 +265,17 @@ describe("BaseMindooTenantFactory", () => {
   });
 
   describe("factory instantiation", () => {
-    it("should instantiate with InMemoryAppendOnlyStoreFactory", () => {
+    it("should instantiate with InMemoryAppendOnlyStoreFactory and NodeCryptoAdapter", () => {
       const storeFactory = new InMemoryAppendOnlyStoreFactory();
-      const factory = new BaseMindooTenantFactory(storeFactory);
+      const factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
 
       expect(factory).toBeDefined();
       expect(factory).toBeInstanceOf(BaseMindooTenantFactory);
     });
 
-    it("should use default crypto adapter when not provided", async () => {
+    it("should be able to create keys with provided crypto adapter", async () => {
       const storeFactory = new InMemoryAppendOnlyStoreFactory();
-      const factory = new BaseMindooTenantFactory(storeFactory);
+      const factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
 
       expect(factory).toBeDefined();
       // Should be able to create keys without errors

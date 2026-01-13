@@ -387,15 +387,14 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   async openDirectory(): Promise<MindooTenantDirectory> {
-    const directory = new BaseMindooTenantDirectory(this);
-    await directory.initialize();
-    return directory;
+    return new BaseMindooTenantDirectory(this);
   }
 
   async openDB(id: string): Promise<MindooDB> {
     // Return cached database if it exists
-    if (this.databaseCache[id]) {
-      return this.databaseCache[id];
+    const cached = this.databaseCache.get(id);
+    if (cached) {
+      return cached;
     }
 
     // Create the database store using the factory
@@ -404,7 +403,7 @@ export class BaseMindooTenant implements MindooTenant {
     await db.initialize();
     
     // Cache the database for future use
-    this.databaseCache[id] = db;
+    this.databaseCache.set(id, db);
     return db;
   }
 

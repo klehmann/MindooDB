@@ -1,4 +1,4 @@
-import type { VirtualViewNavigator } from "./VirtualViewNavigator";
+import type { VirtualViewNavigator } from "../virtualviews/VirtualViewNavigator";
 import type { VirtualViewEntryData } from "./VirtualViewEntryData";
 
 /**
