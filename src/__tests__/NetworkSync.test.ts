@@ -421,8 +421,8 @@ describe("Network Sync", () => {
       const initialHashes = await serverStore.getAllChangeHashes();
       expect(initialHashes.length).toBe(0);
       
-      // Push a change via client store
-      const change = createMockChange("doc1", "hash1", 1000);
+      // Push a change via client store (must use trusted user's public key)
+      const change = createMockChange("doc1", "hash1", 1000, [], userSigningPublicKeyPem);
       await clientStore.append(change);
       
       // Server should now have the change
@@ -607,9 +607,9 @@ describe("Network Sync", () => {
     });
 
     test("should push changes from local to remote (simulates MindooDB.pushChangesTo)", async () => {
-      // Add changes to local
-      await localStore.append(createMockChange("doc1", "hash1", 1000));
-      await localStore.append(createMockChange("doc1", "hash2", 2000, ["hash1"]));
+      // Add changes to local (must use trusted user's public key)
+      await localStore.append(createMockChange("doc1", "hash1", 1000, [], userSigningPublicKeyPem));
+      await localStore.append(createMockChange("doc1", "hash2", 2000, ["hash1"], userSigningPublicKeyPem));
       
       // Server should be empty
       expect((await serverStore.getAllChangeHashes()).length).toBe(0);
@@ -637,11 +637,11 @@ describe("Network Sync", () => {
     });
 
     test("should handle bidirectional sync", async () => {
-      // Add some changes to server
-      await serverStore.append(createMockChange("doc1", "server-hash1", 1000));
+      // Add some changes to server (must use trusted user's public key)
+      await serverStore.append(createMockChange("doc1", "server-hash1", 1000, [], userSigningPublicKeyPem));
       
-      // Add some changes to local
-      await localStore.append(createMockChange("doc2", "local-hash1", 2000));
+      // Add some changes to local (must use trusted user's public key)
+      await localStore.append(createMockChange("doc2", "local-hash1", 2000, [], userSigningPublicKeyPem));
       
       // Pull from server to local
       const localHashes = await localStore.getAllChangeHashes();
@@ -708,7 +708,8 @@ function createMockChange(
   docId: string,
   changeHash: string,
   createdAt: number,
-  deps: string[] = []
+  deps: string[] = [],
+  createdByPublicKey: string = "mock-public-key"
 ): MindooDocChange {
   return {
     type: "change",
@@ -716,7 +717,7 @@ function createMockChange(
     changeHash,
     depsHashes: deps,
     createdAt,
-    createdByPublicKey: "mock-public-key",
+    createdByPublicKey,
     decryptionKeyId: "default",
     signature: new Uint8Array([1, 2, 3, 4]),
     payload: new Uint8Array([10, 20, 30, 40]),
