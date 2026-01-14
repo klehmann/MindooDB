@@ -23,6 +23,16 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     "adminSignatureFields",
   ];
 
+  private static readonly REQUEST_DOC_HISTORY_PURGE_SIGNED_FIELDS: string[] = [
+    "form",
+    "type",
+    "dbId",
+    "docId",
+    "reason",
+    "requestedAt",
+    "adminSignatureFields",
+  ];
+
   constructor(tenant: BaseMindooTenant) {
     this.tenant = tenant;
   }
@@ -341,5 +351,125 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     console.log(`[BaseMindooTenantDirectory] User ${username} revoked: ${isRevoked}`);
     return isRevoked;
+  }
+
+  async requestDocHistoryPurge(
+    dbId: string,
+    docId: string,
+    reason: string | undefined,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    console.log(`[BaseMindooTenantDirectory] Requesting purge for document: ${docId} in ${dbId}`);
+    
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    
+    const docSigner = this.tenant.createDocSignerFor(adminSigningKeyPair);
+    
+    const newDoc = await directoryDB.createDocument();
+    
+    await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
+      const data = doc.getData();
+      data.form = "useroperation";
+      data.type = "requestdochistorypurge";
+      data.dbId = dbId;
+      data.docId = docId;
+      if (reason) {
+        data.reason = reason;
+      }
+      data.requestedAt = Date.now();
+      
+      data.adminSignatureFields = BaseMindooTenantDirectory.REQUEST_DOC_HISTORY_PURGE_SIGNED_FIELDS;
+      
+      const signature = await docSigner.signItems(
+        doc,
+        BaseMindooTenantDirectory.REQUEST_DOC_HISTORY_PURGE_SIGNED_FIELDS,
+        administrationPrivateKeyPassword
+      );
+      data.adminSignature = baseTenant.uint8ArrayToBase64(signature);
+    });
+    
+    console.log(`[BaseMindooTenantDirectory] Created purge request for ${docId} in ${dbId}`);
+  }
+
+  async getRequestedDocHistoryPurges(): Promise<Array<{
+    dbId: string;
+    docId: string;
+    reason?: string;
+    requestedAt: number;
+    purgeRequestDocId: string;
+  }>> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const administrationPublicKey = baseTenant.getAdministrationPublicKey();
+    
+    const dummySigningKeyPair: SigningKeyPair = {
+      publicKey: administrationPublicKey,
+      privateKey: {
+        ciphertext: "",
+        iv: "",
+        tag: "",
+        salt: "",
+        iterations: 0,
+      },
+    };
+    const docSigner = this.tenant.createDocSignerFor(dummySigningKeyPair);
+    
+    const purgeRequests: Array<{
+      dbId: string;
+      docId: string;
+      reason?: string;
+      requestedAt: number;
+      purgeRequestDocId: string;
+    }> = [];
+    
+    for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      
+      if (data.form === "useroperation" && data.type === "requestdochistorypurge") {
+        // Verify signature
+        if (data.adminSignature && typeof data.adminSignature === "string" && 
+            data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
+          try {
+            const signature = this.base64ToUint8Array(data.adminSignature);
+            const isValid = await docSigner.verifyItems(
+              doc,
+              data.adminSignatureFields,
+              signature,
+              administrationPublicKey
+            );
+            
+            if (isValid) {
+              const dbId = data.dbId;
+              const docId = data.docId;
+              const reason = data.reason;
+              const requestedAt = data.requestedAt;
+              
+              if (typeof dbId === "string" && typeof docId === "string") {
+                purgeRequests.push({
+                  dbId: dbId,
+                  docId: docId,
+                  reason: typeof reason === "string" ? reason : undefined,
+                  requestedAt: typeof requestedAt === "number" ? requestedAt : Date.now(),
+                  purgeRequestDocId: doc.getId(),
+                });
+              }
+            }
+          } catch (error) {
+            console.error(`[BaseMindooTenantDirectory] Error verifying purge request signature:`, error);
+          }
+        }
+      }
+    }
+    
+    return purgeRequests;
   }
 }

@@ -41,9 +41,12 @@ class DatabaseSplitter {
   }
   
   async getDatabaseStats(db: MindooDB): Promise<any> {
-    const docs = await db.getAllDocuments();
+    let documentCount = 0;
+    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+      documentCount++;
+    }
     return {
-      documentCount: docs.length,
+      documentCount,
       size: await this.estimateSize(db),
       avgQueryTime: await this.measureQueryTime(db)
     };
@@ -191,17 +194,14 @@ class StorageManagement {
     archiveDate: Date,
     archiveDB: MindooDB
   ) {
-    const allDocs = await db.getAllDocuments();
-    const oldDocs = allDocs.filter(doc => 
-      doc.getData().createdAt < archiveDate.getTime()
-    );
-    
-    // Copy to archive
-    for (const doc of oldDocs) {
-      const changeHashes = await db.getStore()
-        .getAllChangeHashesForDoc(doc.getId());
-      const changes = await db.getStore()
-        .getChanges(changeHashes);
+    // Find old documents and copy to archive
+    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      if (data.createdAt && data.createdAt < archiveDate.getTime()) {
+        const changeHashes = await db.getStore()
+          .findNewChangesForDoc([], doc.getId());
+        const changes = await db.getStore()
+          .getChanges(changeHashes);
       
       for (const change of changes) {
         await archiveDB.getStore().append(change);

@@ -66,7 +66,11 @@ class ElectronicHealthRecord {
   
   async getPatientHistory(patientId: string): Promise<MindooDoc[]> {
     const db = await this.tenant.openDB(`patient-${patientId}`);
-    return await db.getAllDocuments();
+    const docs: MindooDoc[] = [];
+    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+      docs.push(doc);
+    }
+    return docs;
   }
 }
 ```
@@ -127,15 +131,15 @@ class MedicalDeviceData {
         const dbId = `device-${deviceId}-${year}${String(month).padStart(2, '0')}`;
         try {
           const db = await this.tenant.openDB(dbId);
-          const docs = await db.getAllDocuments();
           
-          // Filter by date range
-          const filtered = docs.filter(doc => {
-            const timestamp = doc.getData().timestamp;
-            return timestamp >= startDate.getTime() && timestamp <= endDate.getTime();
-          });
-          
-          results.push(...filtered);
+          // Filter by date range while iterating
+          for await (const { doc } of db.iterateChangesSince(null, 100)) {
+            const data = doc.getData();
+            const timestamp = data.timestamp;
+            if (timestamp >= startDate.getTime() && timestamp <= endDate.getTime()) {
+              results.push(doc);
+            }
+          }
         } catch (error) {
           // Database doesn't exist for this month
           continue;
@@ -310,11 +314,16 @@ class HealthcareAuditTrail {
   
   async getAccessHistory(patientId: string): Promise<MindooDoc[]> {
     const auditDB = await this.tenant.openDB("audit-logs");
-    const allLogs = await auditDB.getAllDocuments();
+    const matchingLogs: MindooDoc[] = [];
     
-    return allLogs.filter(doc => 
-      doc.getData().patientId === patientId
-    );
+    for await (const { doc } of auditDB.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      if (data.patientId === patientId) {
+        matchingLogs.push(doc);
+      }
+    }
+    
+    return matchingLogs;
   }
 }
 ```
@@ -337,18 +346,15 @@ class HealthcareDataRetention {
     const activeDB = await this.tenant.openDB(`patient-${patientId}`);
     const archiveDB = await this.tenant.openDB(`patient-${patientId}-archive`);
     
-    // Get all documents before archive date
-    const allDocs = await activeDB.getAllDocuments();
-    const oldDocs = allDocs.filter(doc => 
-      doc.getData().createdAt < archiveDate.getTime()
-    );
-    
-    // Copy to archive (read-only)
-    for (const doc of oldDocs) {
-      const changeHashes = await activeDB.getStore()
-        .getAllChangeHashesForDoc(doc.getId());
-      const changes = await activeDB.getStore()
-        .getChanges(changeHashes);
+    // Find old documents and copy to archive
+    for await (const { doc } of activeDB.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      if (data.createdAt && data.createdAt < archiveDate.getTime()) {
+        // Get all changes for this document
+        const changeHashes = await activeDB.getStore()
+          .findNewChangesForDoc([], doc.getId());
+        const changes = await activeDB.getStore()
+          .getChanges(changeHashes);
       
       for (const change of changes) {
         await archiveDB.getStore().append(change);

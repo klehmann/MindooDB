@@ -145,6 +145,20 @@ export class ClientNetworkAppendOnlyStore implements AppendOnlyStore {
   }
 
   /**
+   * Purge document history from the store.
+   * 
+   * Note: Network stores are proxies that forward operations to remote servers.
+   * Purging should be done on local stores after syncing data from remote stores.
+   * This method is a no-op for network stores.
+   * 
+   * @param docId The document ID whose change history should be purged
+   */
+  async purgeDocHistory(docId: string): Promise<void> {
+    console.warn(`[ClientNetworkAppendOnlyStore:${this.dbId}] purgeDocHistory() called on network store for doc ${docId}. Network stores do not support purging directly. Purge should be done on local stores after syncing from remote.`);
+    // No-op: Network stores forward to server, purging should be done on local stores
+  }
+
+  /**
    * Ensure we have a valid access token, authenticating if necessary.
    */
   private async ensureAuthenticated(): Promise<string> {

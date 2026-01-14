@@ -68,14 +68,15 @@ class SensorDataCollection {
         const dbId = `device-${deviceId}-${year}${String(month).padStart(2, '0')}`;
         try {
           const db = await this.tenant.openDB(dbId);
-          const docs = await db.getAllDocuments();
           
-          const filtered = docs.filter(doc => {
-            const timestamp = doc.getData().timestamp;
-            return timestamp >= startDate.getTime() && timestamp <= endDate.getTime();
-          });
-          
-          results.push(...filtered);
+          // Filter by date range while iterating
+          for await (const { doc } of db.iterateChangesSince(null, 100)) {
+            const data = doc.getData();
+            const timestamp = data.timestamp;
+            if (timestamp >= startDate.getTime() && timestamp <= endDate.getTime()) {
+              results.push(doc);
+            }
+          }
         } catch (error) {
           continue;
         }

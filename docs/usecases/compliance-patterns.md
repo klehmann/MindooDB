@@ -49,18 +49,25 @@ class GDPRCompliance {
   async deleteUserData(userId: string) {
     // Mark documents as deleted (append-only limitation)
     const db = await this.tenant.openDB("user-data");
-    const userDocs = await db.getAllDocuments().filter(doc => 
-      doc.getData().userId === userId
-    );
     
-    for (const doc of userDocs) {
+    // Iterate through all documents using iterateChangesSince
+    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      
+      // Skip if already deleted or doesn't belong to this user
+      if (data.deleted || data.userId !== userId) {
+        continue;
+      }
+      
+      // Mark as deleted and anonymize
       await db.changeDoc(doc, (d) => {
-        d.getData().deleted = true;
-        d.getData().deletedAt = Date.now();
-        d.getData().deletedForGDPR = true;
+        const data = d.getData();
+        data.deleted = true;
+        data.deletedAt = Date.now();
+        data.deletedForGDPR = true;
         // Anonymize sensitive data
-        d.getData().email = null;
-        d.getData().name = "Deleted User";
+        data.email = null;
+        data.name = "Deleted User";
       });
     }
     
@@ -72,16 +79,81 @@ class GDPRCompliance {
     const auditDB = await this.tenant.openDB("audit-logs");
     const logDoc = await auditDB.createDocument();
     await auditDB.changeDoc(logDoc, (d) => {
-      d.getData().type = "gdpr-deletion";
-      d.getData().userId = userId;
-      d.getData().timestamp = Date.now();
-      d.getData().reason = "Right to be forgotten";
+      const data = d.getData();
+      data.type = "gdpr-deletion";
+      data.userId = userId;
+      data.timestamp = Date.now();
+      data.reason = "Right to be forgotten";
     });
   }
 }
 ```
 
 **Note**: Append-only limitation means data cannot be truly deleted, but can be marked and anonymized.
+
+#### Document History Purge (Recommended)
+
+**Pattern**: Use directory-based purge requests to remove document change history from all client stores
+
+MindooDB provides a more complete solution for GDPR "right to be forgotten" through directory-based purge requests. Administrators can request that document change history be purged from all client stores, which clients process when they sync directory changes.
+
+**Architecture Flow**:
+
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant Directory as Directory DB
+    participant Client1
+    participant Client2
+    participant Store1 as Local Store 1
+    participant Store2 as Local Store 2
+
+    Admin->>Directory: requestDocHistoryPurge(dbId, docId, reason)
+    Directory->>Directory: Create signed purge request document
+    
+    Client1->>Directory: Sync directory changes
+    Directory->>Client1: Purge request document
+    Client1->>Client1: getRequestedDocHistoryPurges()
+    Client1->>Store1: purgeDocHistory(docId)
+    Store1->>Store1: Remove all changes for docId
+    
+    Client2->>Directory: Sync directory changes
+    Directory->>Client2: Purge request document
+    Client2->>Client2: getRequestedDocHistoryPurges()
+    Client2->>Store2: purgeDocHistory(docId)
+    Store2->>Store2: Remove all changes for docId
+```
+
+**Implementation**:
+
+```typescript
+// Administrator requests purge
+const directory = await tenant.openDirectory();
+await directory.requestDocHistoryPurge(
+  "user-data",
+  "doc-123",
+  "GDPR right to be forgotten",
+  adminPrivateKey,
+  adminPassword
+);
+
+// Clients process purge requests (typically after directory sync)
+const purgeRequests = await directory.getRequestedDocHistoryPurges();
+for (const request of purgeRequests) {
+  const db = await tenant.openDB(request.dbId);
+  const store = db.getStore();
+  await store.purgeDocHistory(request.docId);
+  console.log(`Purged document ${request.docId} from ${request.dbId}`);
+}
+```
+
+**Benefits**:
+- **Coordinated deletion**: Purge requests propagate to all clients via directory sync
+- **Cryptographically verified**: Admin signatures ensure only authorized purges
+- **Complete removal**: All change history is removed from local stores
+- **Audit trail**: Purge requests themselves are stored in the directory (append-only)
+
+**Note**: This breaks append-only semantics for the purged document's changes, but the purge request itself remains in the directory for audit purposes. Network stores (proxies) don't support purging directly - clients should purge local stores after syncing from remote.
 
 ### Data Portability
 
@@ -90,9 +162,15 @@ class GDPRCompliance {
 ```typescript
 async function exportUserData(userId: string): Promise<any> {
   const db = await this.tenant.openDB("user-data");
-  const userDocs = await db.getAllDocuments().filter(doc => 
-    doc.getData().userId === userId && !doc.getData().deleted
-  );
+  const userDocs: MindooDoc[] = [];
+  
+  // Iterate through all documents
+  for await (const { doc } of db.iterateChangesSince(null, 100)) {
+    const data = doc.getData();
+    if (data.userId === userId && !data.deleted) {
+      userDocs.push(doc);
+    }
+  }
   
   const exportData = {
     userId,
@@ -123,9 +201,10 @@ class HIPAACompliance {
     const db = await this.tenant.openDB("patient-records");
     const doc = await db.createEncryptedDocument(patientKeyId);
     await db.changeDoc(doc, (d) => {
-      Object.assign(d.getData(), patientData);
-      d.getData().type = "patient-record";
-      d.getData().createdAt = Date.now();
+      const data = d.getData();
+      Object.assign(data, patientData);
+      data.type = "patient-record";
+      data.createdAt = Date.now();
     });
     return doc;
   }
@@ -134,22 +213,29 @@ class HIPAACompliance {
     const auditDB = await this.tenant.openDB("audit-logs");
     const logDoc = await auditDB.createDocument();
     await auditDB.changeDoc(logDoc, (d) => {
-      d.getData().type = "hipaa-access-log";
-      d.getData().userId = userId;
-      d.getData().patientId = patientId;
-      d.getData().action = action;
-      d.getData().timestamp = Date.now();
-      d.getData().ipAddress = this.getClientIP();
+      const data = d.getData();
+      data.type = "hipaa-access-log";
+      data.userId = userId;
+      data.patientId = patientId;
+      data.action = action;
+      data.timestamp = Date.now();
+      data.ipAddress = this.getClientIP();
     });
   }
   
   async getAccessHistory(patientId: string): Promise<MindooDoc[]> {
     const auditDB = await this.tenant.openDB("audit-logs");
-    const allLogs = await auditDB.getAllDocuments();
-    return allLogs.filter(doc => 
-      doc.getData().patientId === patientId &&
-      doc.getData().type === "hipaa-access-log"
-    );
+    const matchingLogs: MindooDoc[] = [];
+    
+    // Iterate through all audit logs
+    for await (const { doc } of auditDB.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      if (data.patientId === patientId && data.type === "hipaa-access-log") {
+        matchingLogs.push(doc);
+      }
+    }
+    
+    return matchingLogs;
   }
 }
 ```
@@ -171,9 +257,10 @@ class SOXCompliance {
     const db = await this.tenant.openDB(dbId);
     const doc = await db.createDocument();
     await db.changeDoc(doc, (d) => {
-      Object.assign(d.getData(), transaction);
-      d.getData().type = "financial-transaction";
-      d.getData().timestamp = Date.now();
+      const data = d.getData();
+      Object.assign(data, transaction);
+      data.type = "financial-transaction";
+      data.timestamp = Date.now();
       // Immutable - never modify, only append corrections
     });
     
@@ -188,10 +275,11 @@ class SOXCompliance {
     const db = await this.tenant.openDB("transactions-current");
     const doc = await db.createDocument();
     await db.changeDoc(doc, (d) => {
-      d.getData().type = "correction";
-      d.getData().originalTransactionId = originalTransactionId;
-      Object.assign(d.getData(), correction);
-      d.getData().timestamp = Date.now();
+      const data = d.getData();
+      data.type = "correction";
+      data.originalTransactionId = originalTransactionId;
+      Object.assign(data, correction);
+      data.timestamp = Date.now();
     });
     
     await this.logTransaction(correction.id, "correction");
@@ -202,11 +290,12 @@ class SOXCompliance {
     const auditDB = await this.tenant.openDB("audit-logs");
     const logDoc = await auditDB.createDocument();
     await auditDB.changeDoc(logDoc, (d) => {
-      d.getData().type = "sox-audit-log";
-      d.getData().transactionId = transactionId;
-      d.getData().action = action;
-      d.getData().timestamp = Date.now();
-      d.getData().userId = this.getCurrentUserId();
+      const data = d.getData();
+      data.type = "sox-audit-log";
+      data.transactionId = transactionId;
+      data.action = action;
+      data.timestamp = Date.now();
+      data.userId = this.getCurrentUserId();
     });
   }
 }
@@ -226,13 +315,14 @@ class PCIDSSCompliance {
     const db = await this.tenant.openDB("payment-cards");
     const doc = await db.createEncryptedDocument(paymentKeyId);
     await db.changeDoc(doc, (d) => {
+      const data = d.getData();
       // Store only last 4 digits in metadata (for display)
-      d.getData().last4 = cardData.number.slice(-4);
-      d.getData().cardType = cardData.type;
+      data.last4 = cardData.number.slice(-4);
+      data.cardType = cardData.type;
       // Full card data encrypted in payload
-      d.getData().encryptedCardData = this.encryptCardData(cardData);
-      d.getData().type = "payment-card";
-      d.getData().createdAt = Date.now();
+      data.encryptedCardData = this.encryptCardData(cardData);
+      data.type = "payment-card";
+      data.createdAt = Date.now();
     });
     
     // Log storage
@@ -245,11 +335,12 @@ class PCIDSSCompliance {
     const auditDB = await this.tenant.openDB("audit-logs");
     const logDoc = await auditDB.createDocument();
     await auditDB.changeDoc(logDoc, (d) => {
-      d.getData().type = "pci-access-log";
-      d.getData().cardId = cardId;
-      d.getData().action = action;
-      d.getData().timestamp = Date.now();
-      d.getData().userId = this.getCurrentUserId();
+      const data = d.getData();
+      data.type = "pci-access-log";
+      data.cardId = cardId;
+      data.action = action;
+      data.timestamp = Date.now();
+      data.userId = this.getCurrentUserId();
     });
   }
 }
@@ -272,26 +363,38 @@ class ComplianceAuditTrail {
     const auditDB = await this.tenant.openDB("audit-logs");
     const logDoc = await auditDB.createDocument();
     await auditDB.changeDoc(logDoc, (d) => {
-      d.getData().type = "audit-log";
-      d.getData().entityType = entityType;
-      d.getData().entityId = entityId;
-      d.getData().action = action;
-      d.getData().details = details;
-      d.getData().userId = this.getCurrentUserId();
-      d.getData().timestamp = Date.now();
-      d.getData().ipAddress = this.getClientIP();
+      const data = d.getData();
+      data.type = "audit-log";
+      data.entityType = entityType;
+      data.entityId = entityId;
+      data.action = action;
+      data.details = details;
+      data.userId = this.getCurrentUserId();
+      data.timestamp = Date.now();
+      data.ipAddress = this.getClientIP();
     });
   }
   
   async getAuditTrail(entityType: string, entityId: string): Promise<MindooDoc[]> {
     const auditDB = await this.tenant.openDB("audit-logs");
-    const allLogs = await auditDB.getAllDocuments();
-    return allLogs.filter(doc => {
+    const matchingLogs: MindooDoc[] = [];
+    
+    // Iterate through all audit logs
+    for await (const { doc } of auditDB.iterateChangesSince(null, 100)) {
       const data = doc.getData();
-      return data.entityType === entityType && 
-             data.entityId === entityId &&
-             data.type === "audit-log";
-    }).sort((a, b) => a.getData().timestamp - b.getData().timestamp);
+      if (data.entityType === entityType && 
+          data.entityId === entityId &&
+          data.type === "audit-log") {
+        matchingLogs.push(doc);
+      }
+    }
+    
+    // Sort by timestamp
+    return matchingLogs.sort((a, b) => {
+      const aTime = a.getData().timestamp || 0;
+      const bTime = b.getData().timestamp || 0;
+      return aTime - bTime;
+    });
   }
 }
 ```
@@ -307,17 +410,24 @@ class DataRetention {
   async archiveOldData(retentionPeriod: number) {
     const cutoffDate = Date.now() - retentionPeriod;
     const db = await this.tenant.openDB("main");
-    const allDocs = await db.getAllDocuments();
+    const oldDocs: MindooDoc[] = [];
     
-    const oldDocs = allDocs.filter(doc => 
-      doc.getData().createdAt < cutoffDate
-    );
+    // Find old documents
+    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      if (data.createdAt && data.createdAt < cutoffDate) {
+        oldDocs.push(doc);
+      }
+    }
     
     // Move to archive database
     const archiveDB = await this.tenant.openDB("archive");
     for (const doc of oldDocs) {
+      // Note: getAllChangeHashesForDoc doesn't exist - would need to use
+      // store methods or track changes differently
+      // This is a simplified example
       const changeHashes = await db.getStore()
-        .getAllChangeHashesForDoc(doc.getId());
+        .findNewChangesForDoc([], doc.getId());
       const changes = await db.getStore()
         .getChanges(changeHashes);
       
@@ -345,23 +455,36 @@ class AccessLogging {
     const auditDB = await this.tenant.openDB("access-logs");
     const logDoc = await auditDB.createDocument();
     await auditDB.changeDoc(logDoc, (d) => {
-      d.getData().type = "access-log";
-      d.getData().resourceType = resourceType;
-      d.getData().resourceId = resourceId;
-      d.getData().action = action;
-      d.getData().userId = this.getCurrentUserId();
-      d.getData().timestamp = Date.now();
-      d.getData().ipAddress = this.getClientIP();
-      d.getData().userAgent = this.getUserAgent();
+      const data = d.getData();
+      data.type = "access-log";
+      data.resourceType = resourceType;
+      data.resourceId = resourceId;
+      data.action = action;
+      data.userId = this.getCurrentUserId();
+      data.timestamp = Date.now();
+      data.ipAddress = this.getClientIP();
+      data.userAgent = this.getUserAgent();
     });
   }
   
   async getAccessHistory(resourceId: string): Promise<MindooDoc[]> {
     const auditDB = await this.tenant.openDB("access-logs");
-    const allLogs = await auditDB.getAllDocuments();
-    return allLogs.filter(doc => 
-      doc.getData().resourceId === resourceId
-    ).sort((a, b) => a.getData().timestamp - b.getData().timestamp);
+    const matchingLogs: MindooDoc[] = [];
+    
+    // Iterate through all access logs
+    for await (const { doc } of auditDB.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      if (data.resourceId === resourceId) {
+        matchingLogs.push(doc);
+      }
+    }
+    
+    // Sort by timestamp
+    return matchingLogs.sort((a, b) => {
+      const aTime = a.getData().timestamp || 0;
+      const bTime = b.getData().timestamp || 0;
+      return aTime - bTime;
+    });
   }
 }
 ```

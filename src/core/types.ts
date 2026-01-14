@@ -484,6 +484,47 @@ export interface MindooTenantDirectory {
    * @return True if the user has been revoked (all grant access documents have been revoked), false otherwise
    */
   isUserRevoked(username: string): Promise<boolean>;
+
+  /**
+   * Requests that a document's change history be purged from all client stores.
+   * Creates a purge request record in the directory that clients will process when they
+   * sync directory changes. Clients receiving this directory update will purge all
+   * changes for the specified document from their local stores.
+   * 
+   * This is useful for GDPR compliance (right to be forgotten) and other scenarios
+   * where document data must be removed from all systems.
+   * 
+   * @param dbId The database ID containing the document
+   * @param docId The document ID whose change history should be purged
+   * @param reason Optional reason for the purge request (e.g., "GDPR right to be forgotten")
+   * @param administrationPrivateKey The administration private key to sign the request
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the purge request record is created
+   */
+  requestDocHistoryPurge(
+    dbId: string,
+    docId: string,
+    reason: string | undefined,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
+
+  /**
+   * Get all pending document history purge requests that clients should process.
+   * Returns purge requests with verified admin signatures that clients have not yet processed.
+   * 
+   * Clients should call this method periodically (e.g., after directory sync) and
+   * purge the requested documents from their local stores.
+   * 
+   * @return Array of purge request records with verified admin signatures
+   */
+  getRequestedDocHistoryPurges(): Promise<Array<{
+    dbId: string;
+    docId: string;
+    reason?: string;
+    requestedAt: number;
+    purgeRequestDocId: string;  // ID of the purge request document in directory
+  }>>;
 }
 
 /**

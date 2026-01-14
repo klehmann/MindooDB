@@ -130,28 +130,28 @@ async function incrementalBackup(
 
 ```typescript
 async function snapshotBackup(db: MindooDB) {
-  // Get all documents
-  const allDocs = await db.getAllDocuments();
-  
   const snapshots: Array<{docId: string, snapshot: Uint8Array}> = [];
   
-  for (const doc of allDocs) {
-    // Get snapshot for document
-    const snapshotHashes = await db.getStore().getAllChangeHashesForDoc(
-      doc.getId(),
-      true // fromLastSnapshot
+  // Iterate through all documents
+  for await (const { doc } of db.iterateChangesSince(null, 100)) {
+    // Get all changes for document (note: fromLastSnapshot parameter not available)
+    const changeHashes = await db.getStore().findNewChangesForDoc(
+      [],
+      doc.getId()
     );
     
-    // Get snapshot change
-    const snapshotChange = await db.getStore().getChanges(snapshotHashes);
-    const latestSnapshot = snapshotChange
+    // Get changes and find latest snapshot
+    const changes = await db.getStore().getChanges(changeHashes);
+    const latestSnapshot = changes
       .filter(c => c.type === "snapshot")
       .sort((a, b) => b.createdAt - a.createdAt)[0];
     
-    snapshots.push({
-      docId: doc.getId(),
-      snapshot: latestSnapshot.payload // Decrypted snapshot
-    });
+    if (latestSnapshot) {
+      snapshots.push({
+        docId: doc.getId(),
+        snapshot: latestSnapshot.payload // Decrypted snapshot
+      });
+    }
   }
   
   // Backup snapshots
@@ -461,13 +461,21 @@ async function testRestore(backupLocation: string) {
   await testDB.pullChangesFrom(backupStore);
   
   // Verify restored data
-  const docCount = await testDB.getAllDocuments().length;
+  let docCount = 0;
+  let sampleDoc: MindooDoc | null = null;
+  for await (const { doc } of testDB.iterateChangesSince(null, 100)) {
+    if (docCount === 0) {
+      sampleDoc = doc;
+    }
+    docCount++;
+  }
   console.log(`Restored ${docCount} documents`);
   
   // Test document access
-  const sampleDoc = await testDB.getAllDocuments()[0];
-  const data = sampleDoc.getData();
-  console.log("Sample document accessible:", !!data);
+  if (sampleDoc) {
+    const data = sampleDoc.getData();
+    console.log("Sample document accessible:", !!data);
+  }
   
   // Cleanup
   await cleanupTestEnvironment(testTenant);

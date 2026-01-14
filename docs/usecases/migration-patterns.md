@@ -268,10 +268,13 @@ class MigrationValidation {
   ): Promise<boolean> {
     // Count comparison
     const sourceCount = await sourceDB.count(entityType);
-    const targetDocs = await targetDB.getAllDocuments();
-    const targetCount = targetDocs.filter(d => 
-      d.getData().type === entityType
-    ).length;
+    let targetCount = 0;
+    for await (const { doc } of targetDB.iterateChangesSince(null, 100)) {
+      const data = doc.getData();
+      if (data.type === entityType) {
+        targetCount++;
+      }
+    }
     
     if (sourceCount !== targetCount) {
       console.error(`Count mismatch: ${sourceCount} vs ${targetCount}`);

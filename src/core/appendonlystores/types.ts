@@ -74,4 +74,17 @@ export interface AppendOnlyStore {
    * @return A list of all change hashes in the store
    */
   getAllChangeHashes(): Promise<string[]>;
+
+  /**
+   * Purge all change history for a specific document from the store.
+   * This breaks append-only semantics but is required for GDPR compliance.
+   * 
+   * After purging, all changes for the specified document will be removed
+   * from the store. This operation cannot be undone.
+   * 
+   * @param docId The document ID whose change history should be purged
+   * @return A promise that resolves when the purge is complete
+   * @throws Error if the store implementation does not support purging
+   */
+  purgeDocHistory(docId: string): Promise<void>;
 }

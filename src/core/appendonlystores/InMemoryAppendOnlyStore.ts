@@ -138,6 +138,45 @@ export class InMemoryAppendOnlyStore implements AppendOnlyStore {
     console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Returning ${hashes.length} change hashes`);
     return hashes;
   }
+
+  /**
+   * Purge all change history for a specific document from the store.
+   * This breaks append-only semantics but is required for GDPR compliance.
+   * 
+   * After purging, all changes for the specified document will be removed
+   * from the store. This operation cannot be undone.
+   * 
+   * @param docId The document ID whose change history should be purged
+   * @return A promise that resolves when the purge is complete
+   */
+  async purgeDocHistory(docId: string): Promise<void> {
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Purging change history for document: ${docId}`);
+    
+    // Get all changes for this document
+    const docChanges = this.docIdIndex.get(docId);
+    
+    if (!docChanges || docChanges.length === 0) {
+      console.log(`[InMemoryAppendOnlyStore:${this.dbId}] No changes found for document ${docId}, nothing to purge`);
+      return;
+    }
+    
+    // Remove each change from all indexes
+    for (const change of docChanges) {
+      // Remove from changeHashIndex
+      this.changeHashIndex.delete(change.changeHash);
+      
+      // Remove from changes array
+      const index = this.changes.indexOf(change);
+      if (index !== -1) {
+        this.changes.splice(index, 1);
+      }
+    }
+    
+    // Remove document from docIdIndex
+    this.docIdIndex.delete(docId);
+    
+    console.log(`[InMemoryAppendOnlyStore:${this.dbId}] Purged ${docChanges.length} changes for document ${docId}`);
+  }
 }
 
 /**
