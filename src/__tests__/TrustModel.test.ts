@@ -129,6 +129,87 @@ describe("Trust Model Security", () => {
       // (entries not signed by admin are filtered out by admin-only mode)
       // This is verified by the fact that the directory loaded successfully
     }, 30000);
+
+    it("should throw error when non-admin user tries to create document in directory", async () => {
+      // Get the directory DB (admin-only mode)
+      const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
+      
+      // Try to create a document without using the admin signing key
+      // This should fail because the current user (adminUser) is not the admin key
+      // The admin signing key is different from the admin user's signing key
+      await expect(directoryDB.createDocument()).rejects.toThrow(
+        "Admin-only database: only the admin key can modify data"
+      );
+    }, 30000);
+
+    it("should throw error when non-admin user tries to change document in directory", async () => {
+      // Get the directory DB (admin-only mode)
+      const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
+      
+      // First, create a document using the admin signing key (this should succeed)
+      const doc = await directoryDB.createDocumentWithSigningKey(
+        adminSigningKeyPair,
+        adminSigningKeyPassword
+      );
+      
+      // Now try to change the document without using the admin signing key
+      // This should fail
+      await expect(directoryDB.changeDoc(doc, (d) => {
+        d.getData().testField = "test value";
+      })).rejects.toThrow(
+        "Admin-only database: only the admin key can modify data"
+      );
+    }, 30000);
+
+    it("should throw error when non-admin user tries to delete document in directory", async () => {
+      // Get the directory DB (admin-only mode)
+      const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
+      
+      // First, create a document using the admin signing key (this should succeed)
+      const doc = await directoryDB.createDocumentWithSigningKey(
+        adminSigningKeyPair,
+        adminSigningKeyPassword
+      );
+      
+      // Now try to delete the document without using the admin signing key
+      // This should fail
+      await expect(directoryDB.deleteDocument(doc.getId())).rejects.toThrow(
+        "Admin-only database: only the admin key can modify data"
+      );
+    }, 30000);
+
+    it("should allow admin key to create, change, and delete documents in directory", async () => {
+      // Get the directory DB (admin-only mode)
+      const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
+      
+      // Create a document using the admin signing key - should succeed
+      const doc = await directoryDB.createDocumentWithSigningKey(
+        adminSigningKeyPair,
+        adminSigningKeyPassword
+      );
+      expect(doc.getId()).toBeDefined();
+      
+      // Change the document using the admin signing key - should succeed
+      await directoryDB.changeDocWithSigningKey(doc, (d) => {
+        d.getData().testField = "admin created this";
+      }, adminSigningKeyPair, adminSigningKeyPassword);
+      
+      // Verify the change was applied
+      const reloadedDoc = await directoryDB.getDocument(doc.getId());
+      expect(reloadedDoc.getData().testField).toBe("admin created this");
+      
+      // Delete the document using the admin signing key - should succeed
+      await directoryDB.deleteDocumentWithSigningKey(
+        doc.getId(),
+        adminSigningKeyPair,
+        adminSigningKeyPassword
+      );
+      
+      // Verify the document is deleted
+      await expect(directoryDB.getDocument(doc.getId())).rejects.toThrow(
+        `Document ${doc.getId()} has been deleted`
+      );
+    }, 30000);
   });
 
   describe("Untrusted User Changes Rejection", () => {

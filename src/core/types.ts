@@ -939,6 +939,22 @@ export interface MindooDB {
   deleteDocument(docId: string): Promise<void>;
 
   /**
+   * Delete a document using a specific signing key.
+   * This is like deleteDocument but allows signing with a different key than the current user's.
+   * Used for directory operations that must be signed with the administration key.
+   * 
+   * @param docId The ID of the document
+   * @param signingKeyPair The signing key pair to use for signing the deletion
+   * @param signingKeyPassword The password to decrypt the signing private key
+   * @return A promise that resolves when the document is deleted
+   */
+  deleteDocumentWithSigningKey(
+    docId: string,
+    signingKeyPair: SigningKeyPair,
+    signingKeyPassword: string
+  ): Promise<void>;
+
+  /**
    * Change a document. This internally produces a binary Automerge change
    * to the underlying Automerge document, signs it with the current user's signing key,
    * optionally encrypts it with the appropriate encryption key, and appends it to the attached AppendOnlyStore.

@@ -341,6 +341,17 @@ export class BaseMindooDB implements MindooDB {
     const keyId = decryptionKeyId;
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     
+    // Admin-only validation: only admin key can modify data in admin-only databases
+    if (this._isAdminOnlyDb) {
+      const adminPublicKey = this.getAdminPublicKey();
+      const signerPublicKey = useCustomSigningKey 
+        ? signingKeyPair!.publicKey 
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      if (signerPublicKey !== adminPublicKey) {
+        throw new Error("Admin-only database: only the admin key can modify data");
+      }
+    }
+    
     // Generate UUID7 for document ID
     const docId = uuidv7();
     
@@ -571,16 +582,46 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async deleteDocument(docId: string): Promise<void> {
-    console.log(`[BaseMindooDB] Deleting document ${docId}`);
+    return this.deleteDocInternal(docId);
+  }
+
+  async deleteDocumentWithSigningKey(
+    docId: string,
+    signingKeyPair: SigningKeyPair,
+    signingKeyPassword: string
+  ): Promise<void> {
+    return this.deleteDocInternal(docId, signingKeyPair, signingKeyPassword);
+  }
+
+  /**
+   * Internal method to delete a document.
+   * Handles both regular deletion (signed by current user) and
+   * deletion with a custom signing key (e.g., for directory operations).
+   */
+  private async deleteDocInternal(
+    docId: string,
+    signingKeyPair?: SigningKeyPair,
+    signingKeyPassword?: string
+  ): Promise<void> {
+    const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
+    console.log(`[BaseMindooDB] Deleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
+    
+    // Admin-only validation: only admin key can modify data in admin-only databases
+    if (this._isAdminOnlyDb) {
+      const adminPublicKey = this.getAdminPublicKey();
+      const signerPublicKey = useCustomSigningKey 
+        ? signingKeyPair!.publicKey 
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      if (signerPublicKey !== adminPublicKey) {
+        throw new Error("Admin-only database: only the admin key can modify data");
+      }
+    }
     
     // Get current document
     const internalDoc = await this.loadDocumentInternal(docId);
     if (!internalDoc || internalDoc.isDeleted) {
       throw new Error(`Document ${docId} not found or already deleted`);
     }
-    
-    // Get current user for signing
-    const currentUser = await this.tenant.getCurrentUserId();
     
     // Create deletion change
     // Note: We don't need to set _deleted in the Automerge document
@@ -612,9 +653,20 @@ export class BaseMindooDB implements MindooDB {
     // Resolve Automerge dependency hashes to entry IDs
     const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
 
-    // Sign the encrypted payload (this allows signature verification without decryption)
-    // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
-    const signature = await this.tenant.signPayload(encryptedPayload);
+    // Sign the encrypted payload - either with custom key or current user's key
+    let signature: Uint8Array;
+    let createdByPublicKey: string;
+    
+    if (useCustomSigningKey) {
+      console.log(`[BaseMindooDB] Signing deletion for document ${docId} with provided key`);
+      signature = await this.tenant.signPayloadWithKey(encryptedPayload, signingKeyPair!, signingKeyPassword!);
+      createdByPublicKey = signingKeyPair!.publicKey;
+    } else {
+      console.log(`[BaseMindooDB] Signing deletion for document ${docId} with current user's key`);
+      const currentUser = await this.tenant.getCurrentUserId();
+      signature = await this.tenant.signPayload(encryptedPayload);
+      createdByPublicKey = currentUser.userSigningPublicKey;
+    }
 
     // Create entry metadata with type "doc_delete" to mark this as a deletion entry in the store
     const entryMetadata: StoreEntryMetadata = {
@@ -624,7 +676,7 @@ export class BaseMindooDB implements MindooDB {
       docId,
       dependencyIds,
       createdAt: Date.now(),
-      createdByPublicKey: currentUser.userSigningPublicKey,
+      createdByPublicKey,
       decryptionKeyId: internalDoc.decryptionKeyId,
       signature,
       originalSize: changeBytes.length,
@@ -677,6 +729,17 @@ export class BaseMindooDB implements MindooDB {
     const docId = doc.getId();
     const useCustomKey = signingKeyPair && signingKeyPassword;
     console.log(`[BaseMindooDB] ===== ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'} called for document ${docId} =====`);
+    
+    // Admin-only validation: only admin key can modify data in admin-only databases
+    if (this._isAdminOnlyDb) {
+      const adminPublicKey = this.getAdminPublicKey();
+      const signerPublicKey = useCustomKey 
+        ? signingKeyPair!.publicKey 
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      if (signerPublicKey !== adminPublicKey) {
+        throw new Error("Admin-only database: only the admin key can modify data");
+      }
+    }
     
     // Get internal document from cache or load it
     let internalDoc = this.docCache.get(docId);
