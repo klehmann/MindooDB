@@ -4,6 +4,7 @@ import {
   MindooDB,
   ContentAddressedStoreFactory,
   OpenStoreOptions,
+  OpenDBOptions,
   MindooTenantFactory,
   MindooTenantDirectory,
   SigningKeyPair,
@@ -41,6 +42,7 @@ export class BaseMindooTenant implements MindooTenant {
   private keyBag: KeyBag;
   private storeFactory: ContentAddressedStoreFactory;
   private databaseCache: Map<string, MindooDB> = new Map();
+  private directoryCache: MindooTenantDirectory | null = null;
 
   // Cache for decrypted keys (to avoid repeated decryption)
   private decryptedTenantKeyCache?: Uint8Array;
@@ -319,6 +321,46 @@ export class BaseMindooTenant implements MindooTenant {
     return new Uint8Array(signature);
   }
 
+  async signPayloadWithKey(
+    payload: Uint8Array,
+    signingKeyPair: SigningKeyPair,
+    password: string
+  ): Promise<Uint8Array> {
+    console.log(`[BaseMindooTenant] Signing payload with provided key`);
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Decrypt the provided signing private key
+    const decryptedKeyBuffer = await this.decryptPrivateKey(
+      signingKeyPair.privateKey,
+      password,
+      "signing"
+    );
+
+    // Import the decrypted key as an Ed25519 private key
+    const signingKey = await subtle.importKey(
+      "pkcs8",
+      decryptedKeyBuffer,
+      {
+        name: "Ed25519",
+      },
+      false, // not extractable
+      ["sign"]
+    );
+
+    // Sign the payload
+    const signature = await subtle.sign(
+      {
+        name: "Ed25519",
+      },
+      signingKey,
+      payload.buffer as ArrayBuffer
+    );
+
+    console.log(`[BaseMindooTenant] Signed payload with provided key (signature: ${signature.byteLength} bytes)`);
+    return new Uint8Array(signature);
+  }
+
   async verifySignature(payload: Uint8Array, signature: Uint8Array, publicKey: string): Promise<boolean> {
     console.log(`[BaseMindooTenant] Verifying signature`);
 
@@ -388,19 +430,42 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   async openDirectory(): Promise<MindooTenantDirectory> {
-    return new BaseMindooTenantDirectory(this);
+    if (!this.directoryCache) {
+      this.directoryCache = new BaseMindooTenantDirectory(this);
+    }
+    return this.directoryCache;
   }
 
-  async openDB(id: string, options?: OpenStoreOptions): Promise<MindooDB> {
+  async openDB(id: string, options?: OpenDBOptions): Promise<MindooDB> {
+    // Enforce admin-only mode for directory database - this is a security invariant
+    // The directory database must only accept entries signed by the admin key
+    const effectiveOptions: OpenDBOptions = id === "directory"
+      ? { ...options, adminOnlyDb: true }
+      : options ?? {};
+    
     // Return cached database if it exists
     const cached = this.databaseCache.get(id);
     if (cached) {
+      // For directory DB, verify admin-only flag matches (defensive check)
+      if (id === "directory" && !cached.isAdminOnlyDb()) {
+        throw new Error("Directory database was cached without adminOnlyDb - this should never happen");
+      }
       return cached;
     }
 
+    // Extract store options and DB-specific options
+    const { adminOnlyDb, attachmentConfig, ...storeOptions } = effectiveOptions;
+    
     // Create the database stores using the factory
-    const { docStore, attachmentStore } = this.storeFactory.createStore(id, options);
-    const db = new BaseMindooDB(this, docStore, attachmentStore);
+    const { docStore, attachmentStore } = this.storeFactory.createStore(id, storeOptions);
+    
+    const db = new BaseMindooDB(
+      this, 
+      docStore, 
+      attachmentStore, 
+      attachmentConfig,
+      adminOnlyDb ?? false
+    );
     await db.initialize();
     
     // Cache the database for future use

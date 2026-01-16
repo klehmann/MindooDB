@@ -1,7 +1,7 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { BaseMindooTenant } from "../core/BaseMindooTenant";
 import { InMemoryContentAddressedStoreFactory } from "../core/appendonlystores/InMemoryContentAddressedStore";
-import { PrivateUserId, MindooTenant } from "../core/types";
+import { PrivateUserId, MindooTenant, SigningKeyPair } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -225,14 +225,15 @@ describe("BaseMindooTenant", () => {
 
   describe("signing and verification", () => {
     let tenant: MindooTenant;
+    let adminKeyPair: SigningKeyPair;
+    const administrationKeyPassword = "adminpass123";
 
     beforeEach(async () => {
       const tenantId = "test-tenant-signing";
-      const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
       // Create administration key pair first
-      const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+      adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
 
       tenant = await factory.createTenant(
         tenantId,
@@ -241,6 +242,15 @@ describe("BaseMindooTenant", () => {
         currentUser,
         currentUserPassword,
         keyBag
+      );
+
+      // Register the current user in the directory so their key is trusted
+      const directory = await tenant.openDirectory();
+      const publicUser = factory.toPublicUserId(currentUser);
+      await directory.registerUser(
+        publicUser,
+        adminKeyPair.privateKey,
+        administrationKeyPassword
       );
     });
 

@@ -12,6 +12,7 @@ import {
   ProcessChangesResult,
   AttachmentReference,
   AttachmentConfig,
+  SigningKeyPair,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import type { ContentAddressedStore } from "./appendonlystores/types";
@@ -65,6 +66,9 @@ export class BaseMindooDB implements MindooDB {
   private attachmentStore: ContentAddressedStore | undefined;
   private chunkSizeBytes: number;
   
+  // Admin-only mode: only entries signed by the admin key are loaded
+  private _isAdminOnlyDb: boolean;
+  
   // Internal index: sorted array of document entries, maintained in order by (lastModified, docId)
   // This allows efficient incremental processing without sorting on each call
   private index: Array<{ docId: string; lastModified: number; isDeleted: boolean }> = [];
@@ -86,12 +90,26 @@ export class BaseMindooDB implements MindooDB {
     tenant: BaseMindooTenant, 
     store: ContentAddressedStore, 
     attachmentStore?: ContentAddressedStore,
-    attachmentConfig?: AttachmentConfig
+    attachmentConfig?: AttachmentConfig,
+    adminOnlyDb: boolean = false
   ) {
     this.tenant = tenant;
     this.store = store;
     this.attachmentStore = attachmentStore;
     this.chunkSizeBytes = attachmentConfig?.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
+    this._isAdminOnlyDb = adminOnlyDb;
+  }
+  
+  /**
+   * Get the admin public key from the tenant.
+   * Only used when adminOnlyDb is true.
+   */
+  private getAdminPublicKey(): string {
+    return this.tenant.getAdministrationPublicKey();
+  }
+  
+  isAdminOnlyDb(): boolean {
+    return this._isAdminOnlyDb;
   }
 
   /**
@@ -299,18 +317,37 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async createEncryptedDocument(decryptionKeyId?: string): Promise<MindooDoc> {
-    const keyId = decryptionKeyId || "default";
+    return this.createDocumentInternal(decryptionKeyId || "default");
+  }
+
+  async createDocumentWithSigningKey(
+    signingKeyPair: SigningKeyPair,
+    signingKeyPassword: string,
+    decryptionKeyId?: string
+  ): Promise<MindooDoc> {
+    return this.createDocumentInternal(decryptionKeyId || "default", signingKeyPair, signingKeyPassword);
+  }
+  
+  /**
+   * Internal method to create a new document.
+   * Handles both regular document creation (signed by current user) and
+   * document creation with a custom signing key (e.g., for directory operations).
+   */
+  private async createDocumentInternal(
+    decryptionKeyId: string,
+    signingKeyPair?: SigningKeyPair,
+    signingKeyPassword?: string
+  ): Promise<MindooDoc> {
+    const keyId = decryptionKeyId;
+    const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     
     // Generate UUID7 for document ID
     const docId = uuidv7();
     
-    console.log(`[BaseMindooDB] Creating document ${docId} with key ${keyId}`);
+    console.log(`[BaseMindooDB] Creating document ${docId} with key ${keyId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
     
     // Create initial Automerge document
     const initialDoc = Automerge.init<MindooDocPayload>();
-    
-    // Get current user for signing
-    const currentUser = await this.tenant.getCurrentUserId();
     
     // Create the first change
     const now = Date.now();
@@ -365,10 +402,20 @@ export class BaseMindooDB implements MindooDB {
     // Resolve Automerge dependency hashes to entry IDs (empty for first change)
     const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
     
-    // Sign the encrypted payload (this allows signature verification without decryption)
-    // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
-    console.log(`[BaseMindooDB] Signing encrypted payload for document ${docId}`);
-    const signature = await this.tenant.signPayload(encryptedPayload);
+    // Sign the encrypted payload - either with custom key or current user's key
+    let signature: Uint8Array;
+    let createdByPublicKey: string;
+    
+    if (useCustomSigningKey) {
+      console.log(`[BaseMindooDB] Signing encrypted payload for document ${docId} with provided key`);
+      signature = await this.tenant.signPayloadWithKey(encryptedPayload, signingKeyPair!, signingKeyPassword!);
+      createdByPublicKey = signingKeyPair!.publicKey;
+    } else {
+      console.log(`[BaseMindooDB] Signing encrypted payload for document ${docId}`);
+      const currentUser = await this.tenant.getCurrentUserId();
+      signature = await this.tenant.signPayload(encryptedPayload);
+      createdByPublicKey = currentUser.userSigningPublicKey;
+    }
     console.log(`[BaseMindooDB] Signed payload, signature length: ${signature.length} bytes`);
 
     // Create entry metadata
@@ -379,7 +426,7 @@ export class BaseMindooDB implements MindooDB {
       docId,
       dependencyIds,
       createdAt: now,
-      createdByPublicKey: currentUser.userSigningPublicKey,
+      createdByPublicKey,
       decryptionKeyId: keyId,
       signature,
       originalSize: changeBytes.length,
@@ -453,6 +500,12 @@ export class BaseMindooDB implements MindooDB {
     // Apply changes in order
     let doc = Automerge.init<MindooDocPayload>();
     for (const entryData of entries) {
+      // Admin-only mode: only accept entries signed by the admin key
+      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+        console.warn(`[BaseMindooDB] Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
+        continue;
+      }
+      
       // Verify signature against the encrypted payload (no decryption needed)
       // We sign the encrypted payload, so anyone can verify signatures without decryption keys
       const isValid = await this.tenant.verifySignature(
@@ -603,8 +656,27 @@ export class BaseMindooDB implements MindooDB {
     doc: MindooDoc,
     changeFunc: (doc: MindooDoc) => void | Promise<void>
   ): Promise<void> {
+    return this.changeDocInternal(doc, changeFunc);
+  }
+
+  async changeDocWithSigningKey(
+    doc: MindooDoc,
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    signingKeyPair: SigningKeyPair,
+    signingKeyPassword: string
+  ): Promise<void> {
+    return this.changeDocInternal(doc, changeFunc, signingKeyPair, signingKeyPassword);
+  }
+
+  private async changeDocInternal(
+    doc: MindooDoc,
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    signingKeyPair?: SigningKeyPair,
+    signingKeyPassword?: string
+  ): Promise<void> {
     const docId = doc.getId();
-    console.log(`[BaseMindooDB] ===== changeDoc called for document ${docId} =====`);
+    const useCustomKey = signingKeyPair && signingKeyPassword;
+    console.log(`[BaseMindooDB] ===== ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'} called for document ${docId} =====`);
     
     // Get internal document from cache or load it
     let internalDoc = this.docCache.get(docId);
@@ -615,7 +687,7 @@ export class BaseMindooDB implements MindooDB {
         throw new Error(`Document ${docId} not found`);
       }
       internalDoc = loadedDoc;
-      console.log(`[BaseMindooDB] Successfully loaded document ${docId} from store for changeDoc`);
+      console.log(`[BaseMindooDB] Successfully loaded document ${docId} from store for ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'}`);
     } else {
       console.log(`[BaseMindooDB] Document ${docId} found in cache`);
     }
@@ -623,9 +695,6 @@ export class BaseMindooDB implements MindooDB {
     if (internalDoc.isDeleted) {
       throw new Error(`Document ${docId} has been deleted`);
     }
-    
-    // Get current user for signing
-    const currentUser = await this.tenant.getCurrentUserId();
     
     // Apply the change function
     const now = Date.now();
@@ -839,7 +908,7 @@ export class BaseMindooDB implements MindooDB {
       },
       
       getAttachment: async (attachmentId: string): Promise<Uint8Array> => {
-        return db.getAttachmentInternal(docId, attachmentId, internalDoc.decryptionKeyId);
+        return db.getAttachmentInternal(docId, attachmentId);
       },
       
       getAttachmentRange: async (
@@ -847,14 +916,14 @@ export class BaseMindooDB implements MindooDB {
         startByte: number,
         endByte: number
       ): Promise<Uint8Array> => {
-        return db.getAttachmentRangeInternal(docId, attachmentId, startByte, endByte, internalDoc.decryptionKeyId);
+        return db.getAttachmentRangeInternal(docId, attachmentId, startByte, endByte);
       },
       
       streamAttachment: (
         attachmentId: string,
         startOffset: number = 0
       ): AsyncGenerator<Uint8Array, void, unknown> => {
-        return db.streamAttachmentInternal(docId, attachmentId, startOffset, internalDoc.decryptionKeyId);
+        return db.streamAttachmentInternal(docId, attachmentId, startOffset);
       },
     };
     
@@ -945,9 +1014,18 @@ export class BaseMindooDB implements MindooDB {
     // Resolve Automerge dependency hashes to entry IDs
     const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
 
-    // Sign the encrypted payload (this allows signature verification without decryption)
-    // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
-    const signature = await this.tenant.signPayload(encryptedPayload);
+    // Sign the encrypted payload - use custom key if provided, otherwise current user's key
+    let signature: Uint8Array;
+    let createdByPublicKey: string;
+
+    if (useCustomKey) {
+      signature = await this.tenant.signPayloadWithKey(encryptedPayload, signingKeyPair, signingKeyPassword);
+      createdByPublicKey = signingKeyPair.publicKey;
+    } else {
+      const currentUser = await this.tenant.getCurrentUserId();
+      signature = await this.tenant.signPayload(encryptedPayload);
+      createdByPublicKey = currentUser.userSigningPublicKey;
+    }
 
     // Create entry metadata
     const entryMetadata: StoreEntryMetadata = {
@@ -957,7 +1035,7 @@ export class BaseMindooDB implements MindooDB {
       docId,
       dependencyIds,
       createdAt: Date.now(),
-      createdByPublicKey: currentUser.userSigningPublicKey,
+      createdByPublicKey,
       decryptionKeyId: internalDoc.decryptionKeyId,
       signature,
       originalSize: changeBytes.length,
@@ -982,7 +1060,7 @@ export class BaseMindooDB implements MindooDB {
     this.docCache.set(docId, internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted);
     
-    console.log(`[BaseMindooDB] Document ${docId} changed successfully`);
+    console.log(`[BaseMindooDB] Document ${docId} ${useCustomKey ? 'changed with custom signing key' : 'changed'} successfully`);
   }
 
   async processChangesSince(
@@ -1182,13 +1260,19 @@ export class BaseMindooDB implements MindooDB {
       if (snapshotEntries.length > 0) {
         const snapshotData = snapshotEntries[0];
         
-        // Verify signature against the encrypted snapshot (no decryption needed)
-        // We sign the encrypted payload, so anyone can verify signatures without decryption keys
-        const isValid = await this.tenant.verifySignature(
-          snapshotData.encryptedData,
-          snapshotData.signature,
-          snapshotData.createdByPublicKey
-        );
+        // Admin-only mode: only accept snapshots signed by admin
+        let isValid = false;
+        if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+          console.warn(`[BaseMindooDB] Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
+        } else {
+          // Verify signature against the encrypted snapshot (no decryption needed)
+          // We sign the encrypted payload, so anyone can verify signatures without decryption keys
+          isValid = await this.tenant.verifySignature(
+            snapshotData.encryptedData,
+            snapshotData.signature,
+            snapshotData.createdByPublicKey
+          );
+        }
         if (!isValid) {
           console.warn(`[BaseMindooDB] Invalid signature for snapshot ${snapshotData.id}, falling back to loading from scratch`);
           // Fall back to loading from scratch
@@ -1248,6 +1332,14 @@ export class BaseMindooDB implements MindooDB {
       console.log(`[BaseMindooDB] Entry createdAt: ${entryData.createdAt}`);
       console.log(`[BaseMindooDB] Entry dependencies: ${JSON.stringify(entryData.dependencyIds || [])}`);
       console.log(`[BaseMindooDB] Entry payload size: ${entryData.encryptedData.length} bytes`);
+      
+      // Admin-only mode: only accept entries signed by the admin key
+      // This prevents recursion and ensures security for the directory database
+      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+        console.warn(`[BaseMindooDB] Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
+        continue;
+      }
+      
       // Verify signature against the encrypted payload (no decryption needed)
       // We sign the encrypted payload, so anyone can verify signatures without decryption keys
       console.log(`[BaseMindooDB] Verifying signature for entry ${entryData.id}`);
@@ -1392,7 +1484,7 @@ export class BaseMindooDB implements MindooDB {
       },
       
       getAttachment: async (attachmentId: string): Promise<Uint8Array> => {
-        return db.getAttachmentInternal(docId, attachmentId, internalDoc.decryptionKeyId);
+        return db.getAttachmentInternal(docId, attachmentId);
       },
       
       getAttachmentRange: async (
@@ -1400,14 +1492,14 @@ export class BaseMindooDB implements MindooDB {
         startByte: number,
         endByte: number
       ): Promise<Uint8Array> => {
-        return db.getAttachmentRangeInternal(docId, attachmentId, startByte, endByte, internalDoc.decryptionKeyId);
+        return db.getAttachmentRangeInternal(docId, attachmentId, startByte, endByte);
       },
       
       streamAttachment: (
         attachmentId: string,
         startOffset: number = 0
       ): AsyncGenerator<Uint8Array, void, unknown> => {
-        return db.streamAttachmentInternal(docId, attachmentId, startOffset, internalDoc.decryptionKeyId);
+        return db.streamAttachmentInternal(docId, attachmentId, startOffset);
       },
     };
   }
@@ -1434,8 +1526,7 @@ export class BaseMindooDB implements MindooDB {
    */
   private async getAttachmentInternal(
     docId: string, 
-    attachmentId: string,
-    decryptionKeyId: string
+    attachmentId: string
   ): Promise<Uint8Array> {
     console.log(`[BaseMindooDB] Getting attachment ${attachmentId} from document ${docId}`);
     
@@ -1454,6 +1545,11 @@ export class BaseMindooDB implements MindooDB {
     let totalSize = 0;
     
     for (const chunk of chunks) {
+      // Admin-only mode: only accept chunks signed by the admin key
+      if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
+        throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
+      }
+      
       // Verify signature
       const isValid = await this.tenant.verifySignature(
         chunk.encryptedData,
@@ -1492,8 +1588,7 @@ export class BaseMindooDB implements MindooDB {
     docId: string,
     attachmentId: string,
     startByte: number,
-    endByte: number,
-    decryptionKeyId: string
+    endByte: number
   ): Promise<Uint8Array> {
     console.log(`[BaseMindooDB] Getting attachment ${attachmentId} range [${startByte}, ${endByte}) from document ${docId}`);
     
@@ -1524,6 +1619,11 @@ export class BaseMindooDB implements MindooDB {
     // Decrypt needed chunks
     const plaintextChunks: Uint8Array[] = [];
     for (const chunk of chunks) {
+      // Admin-only mode: only accept chunks signed by the admin key
+      if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
+        throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
+      }
+      
       // Verify signature
       const isValid = await this.tenant.verifySignature(
         chunk.encryptedData,
@@ -1570,8 +1670,7 @@ export class BaseMindooDB implements MindooDB {
   private async *streamAttachmentInternal(
     docId: string,
     attachmentId: string,
-    startOffset: number,
-    decryptionKeyId: string
+    startOffset: number
   ): AsyncGenerator<Uint8Array, void, unknown> {
     console.log(`[BaseMindooDB] Streaming attachment ${attachmentId} from offset ${startOffset}`);
     
@@ -1589,6 +1688,11 @@ export class BaseMindooDB implements MindooDB {
     // Stream chunks starting from startChunkIndex
     for (let i = startChunkIndex; i < allChunkIds.length; i++) {
       const [chunk] = await store.getEntries([allChunkIds[i]]);
+      
+      // Admin-only mode: only accept chunks signed by the admin key
+      if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
+        throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
+      }
       
       // Verify signature
       const isValid = await this.tenant.verifySignature(

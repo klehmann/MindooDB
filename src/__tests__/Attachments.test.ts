@@ -43,6 +43,15 @@ describe("Attachments", () => {
       keyBag
     );
 
+    // Register the current user in the directory
+    const directory = await tenant.openDirectory();
+    const publicUser = factory.toPublicUserId(currentUser);
+    await directory.registerUser(
+      publicUser,
+      adminSigningKeyPair.privateKey,
+      administrationKeyPassword
+    );
+
     // Open database
     db = await tenant.openDB("test-db");
   }, 30000); // Increase timeout for crypto operations

@@ -265,6 +265,22 @@ export interface MindooTenant {
   signPayload(payload: Uint8Array): Promise<Uint8Array>;
 
   /**
+   * Sign a payload with a specific signing key pair.
+   * This is used for operations that need to sign with a different key than the current user's,
+   * such as directory operations that must be signed with the administration key.
+   * 
+   * @param payload The payload to sign (binary data)
+   * @param signingKeyPair The signing key pair to use (Ed25519)
+   * @param password The password to decrypt the signing private key
+   * @return The signature (Ed25519 signature as Uint8Array)
+   */
+  signPayloadWithKey(
+    payload: Uint8Array,
+    signingKeyPair: SigningKeyPair,
+    password: string
+  ): Promise<Uint8Array>;
+
+  /**
    * Verify a signature for a payload with a public key.
    *
    * @param payload The payload to verify the signature for (binary data)
@@ -286,10 +302,10 @@ export interface MindooTenant {
    * Creates the database if it doesn't exist.
    *
    * @param id The ID of the database
-   * @param options Optional configuration passed to the store factory (e.g., preferLocal)
+   * @param options Optional configuration including store options and adminOnlyDb flag
    * @return The database instance
    */
-  openDB(id: string, options?: OpenStoreOptions): Promise<MindooDB>;
+  openDB(id: string, options?: OpenDBOptions): Promise<MindooDB>;
 
   /**
    * Creates a MindooDocSigner instance for signing and verifying document items.
@@ -806,6 +822,24 @@ export interface ProcessChangesResult {
   cursor: ProcessChangesCursor;
 }
 
+/**
+ * Options for opening a database
+ */
+export interface OpenDBOptions extends OpenStoreOptions {
+  /**
+   * If true, only entries signed by the administration key will be loaded.
+   * All other entries will be silently ignored.
+   * This is used for the directory database to prevent recursion and ensure security.
+   */
+  adminOnlyDb?: boolean;
+  
+  /**
+   * Configuration for attachment handling (chunk size, etc.)
+   * If not provided, defaults are used.
+   */
+  attachmentConfig?: AttachmentConfig;
+}
+
 export interface MindooDB {
 
   /**
@@ -814,6 +848,14 @@ export interface MindooDB {
    * @return The tenant
    */
   getTenant(): MindooTenant;
+
+  /**
+   * Check if this database is in admin-only mode.
+   * In admin-only mode, only entries signed by the administration key are loaded.
+   * 
+   * @return True if admin-only mode is enabled
+   */
+  isAdminOnlyDb(): boolean;
 
   /**
    * Get the content-addressed store that is used to store document changes for this database.
@@ -846,6 +888,22 @@ export interface MindooDB {
    * @return The new document
    */
   createEncryptedDocument(decryptionKeyId?: string): Promise<MindooDoc>;
+
+  /**
+   * Create a new document using a specific signing key.
+   * This is like createDocument but allows signing with a different key than the current user's.
+   * Used for directory operations that must be signed with the administration key.
+   * 
+   * @param signingKeyPair The signing key pair to use for signing the initial entry
+   * @param signingKeyPassword The password to decrypt the signing private key
+   * @param decryptionKeyId Optional key ID for encryption. If not provided, uses "default" (tenant key).
+   * @return The new document
+   */
+  createDocumentWithSigningKey(
+    signingKeyPair: SigningKeyPair,
+    signingKeyPassword: string,
+    decryptionKeyId?: string
+  ): Promise<MindooDoc>;
 
   /**
    * Get a document by its ID
@@ -901,6 +959,24 @@ export interface MindooDB {
   changeDoc(
     doc: MindooDoc,
     changeFunc: (doc: MindooDoc) => void | Promise<void>
+  ): Promise<void>;
+
+  /**
+   * Change a document using a specific signing key.
+   * This is like changeDoc but allows signing with a different key than the current user's.
+   * Used for directory operations that must be signed with the administration key.
+   * 
+   * @param doc The document to change
+   * @param changeFunc The function to change the document (can be async)
+   * @param signingKeyPair The signing key pair to use for signing the change
+   * @param signingKeyPassword The password to decrypt the signing private key
+   * @return A promise that resolves when the document is changed
+   */
+  changeDocWithSigningKey(
+    doc: MindooDoc,
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    signingKeyPair: SigningKeyPair,
+    signingKeyPassword: string
   ): Promise<void>;
 
   /**

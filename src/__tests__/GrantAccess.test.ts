@@ -57,6 +57,15 @@ describe("granting tenant access", () => {
     // Create regular user
     regularUserPassword = "regularpass123";
     regularUser = await factory.createUserId("CN=regularuser/O=testtenant", regularUserPassword);
+    
+    // Register the admin user in the directory so their key is trusted when verifying signatures
+    const directory = await tenant.openDirectory();
+    const publicAdminUser = factory.toPublicUserId(adminUser);
+    await directory.registerUser(
+      publicAdminUser,
+      adminSigningKeyPair.privateKey,
+      adminSigningKeyPassword
+    );
   }, 30000); // Increase timeout for crypto operations
 
   it("should find the document where access was granted using processChangesSince", async () => {

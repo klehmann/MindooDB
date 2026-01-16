@@ -197,6 +197,65 @@ MindooDB uses a **hybrid encryption model**:
 
 ### 6. Security Model
 
+**Trust Model and Chain of Trust:**
+
+MindooDB establishes trust through a hierarchical cryptographic model:
+
+1. **Root of Trust**: The administration public key and the directory database are the sources of truth for MindooDB. This is where the trust chain starts.
+
+2. **Trust Chain**:
+   - The **administrator** is trusted by virtue of possessing the administration private key
+   - The **administrator trusts users** by signing their registration in the directory database
+   - **Other users trust the administrator** and, by extension, all users the administrator has trusted
+   - Document changes from trusted users are accepted; changes from untrusted signers are rejected
+
+3. **Directory Database as Admin-Only**:
+   - The "directory" database (dbId="directory") is a special admin-only database
+   - **Only entries signed by the administration key are accepted and processed**
+   - Entries signed by any other key (even registered users) are silently ignored
+   - This prevents malicious users from tampering with the user registry
+   - This design eliminates recursion issues during signature verification (since admin key is always trusted without lookup)
+
+4. **Signature Verification Flow**:
+   - When loading entries from any database, each entry's signature is verified
+   - The signature's public key is validated against the directory to ensure the signer is trusted
+   - For the directory database itself, only the admin key is accepted (no directory lookup needed)
+   - For other databases, the signer must be a registered, non-revoked user in the directory
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Trust Hierarchy                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────────┐                                       │
+│   │  Administration Key │  ← Root of Trust                      │
+│   │  (Ed25519 Keypair)  │                                       │
+│   └──────────┬──────────┘                                       │
+│              │                                                  │
+│              │ signs                                            │
+│              ▼                                                  │
+│   ┌─────────────────────┐                                       │
+│   │  Directory Database │  ← Admin-only, source of truth        │
+│   │  (dbId="directory") │    for user registrations             │
+│   └──────────┬──────────┘                                       │
+│              │                                                  │
+│              │ contains                                         │
+│              ▼                                                  │
+│   ┌─────────────────────┐                                       │
+│   │  User Registrations │  ← Signed by admin key                │
+│   │  (grant/revoke)     │                                       │
+│   └──────────┬──────────┘                                       │
+│              │                                                  │
+│              │ trusts                                           │
+│              ▼                                                  │
+│   ┌─────────────────────┐                                       │
+│   │   Registered Users  │  ← Can sign documents in other DBs    │
+│   │   (signing keys)    │                                       │
+│   └─────────────────────┘                                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 **Signing:**
 - All document changes are signed with the user's signing key (Ed25519)
 - Signatures prove:
@@ -204,6 +263,7 @@ MindooDB uses a **hybrid encryption model**:
   - **Integrity**: The change has not been tampered with
 - Signatures are verified when changes are received from other peers
 - **Key Usage**: Signing keys are used **only for signing**, never for encryption
+- **Signature Validation**: When loading entries, the signer's public key is validated against the directory to ensure they are a trusted (registered and non-revoked) user
 
 **Encryption:**
 - Document payloads are encrypted before storage
@@ -221,10 +281,13 @@ MindooDB uses a **hybrid encryption model**:
 
 **Access Control:**
 - **Registration**: Only administrators can register new users (proven by administration signature)
+- **Directory Protection**: The directory database only accepts admin-signed entries
 - **Document Access**: Controlled by key distribution (users must have the encryption key)
+- **Signer Validation**: Document changes in non-directory databases are only accepted if signed by a trusted user
 - **Revocation**: Due to append-only nature, revocation prevents future access but not past access
   - Users who lose access cannot decrypt new changes
   - Previously decrypted changes remain accessible (append-only limitation)
+  - Revoked users' future changes are rejected (their signing key is no longer trusted)
 
 ## Data Flow
 

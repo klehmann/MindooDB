@@ -1,9 +1,18 @@
-import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, PublicUserId, SigningKeyPair } from "./types";
+import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, ProcessChangesCursor, PublicUserId, SigningKeyPair } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private tenant: BaseMindooTenant;
   private directoryDB: MindooDB | null = null;
+  
+  // Cache for trusted public keys: key -> isActive (true = granted, false = revoked)
+  // This cache is updated incrementally as changes are processed
+  // Note: No recursion guard needed because directory DB is admin-only,
+  // so loading entries doesn't trigger validatePublicSigningKey recursively
+  private trustedKeysCache: Map<string, boolean> = new Map();
+  private cacheLastCursor: ProcessChangesCursor | null = null;
+  // Mapping from grant document ID to public key (needed for revocation lookups)
+  private grantDocIdToPublicKey: Map<string, string> = new Map();
 
   // Centralized field lists for signing/verification
   private static readonly GRANT_ACCESS_SIGNED_FIELDS: string[] = [
@@ -52,7 +61,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
 
   async getDirectoryDB(): Promise<MindooDB> {
     if (!this.directoryDB) {
-      this.directoryDB = await this.tenant.openDB("directory");
+      // Open directory DB with admin-only flag (also enforced at tenant level)
+      this.directoryDB = await this.tenant.openDB("directory", { adminOnlyDb: true });
+      
+      // Defensive check: verify the DB was opened with admin-only mode
+      // This is a security invariant that must always hold
+      if (!this.directoryDB.isAdminOnlyDb()) {
+        throw new Error("Directory database must be opened with adminOnlyDb=true for security");
+      }
     }
     return this.directoryDB;
   }
@@ -79,12 +95,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // Add user to directory database
     console.log(`[BaseMindooTenantDirectory] Creating document for user registration`);
     const directoryDB = await this.getDirectoryDB();
-    const newDoc = await directoryDB.createDocument();
+    // Create document with admin signing key so the initial entry is trusted
+    const newDoc = await directoryDB.createDocumentWithSigningKey(
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword
+    );
     console.log(`[BaseMindooTenantDirectory] Document created: ${newDoc.getId()}`);
     
     try {
-      // Set the document data fields, sign, and store signature all in one changeDoc call
-      await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
+      // Set the document data fields, sign, and store signature all in one changeDocWithSigningKey call
+      // Using the admin signing key to sign the entry, so it's always trusted
+      await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "grantaccess";
@@ -101,9 +122,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
           administrationPrivateKeyPassword
         );
         data.adminSignature = baseTenant.uint8ArrayToBase64(signature);
-      });
+      }, adminSigningKeyPair, administrationPrivateKeyPassword);
     } catch (error) {
-      console.error(`[BaseMindooTenantDirectory] ERROR in changeDoc:`, error);
+      console.error(`[BaseMindooTenantDirectory] ERROR in changeDocWithSigningKey:`, error);
       console.error(`[BaseMindooTenantDirectory] Error type: ${error instanceof Error ? error.constructor.name : typeof error}`);
       console.error(`[BaseMindooTenantDirectory] Error message: ${error instanceof Error ? error.message : String(error)}`);
       if (error instanceof Error && error.stack) {
@@ -258,10 +279,15 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     for (const grantAccessDoc of grantAccessDocs) {
       const revokeDocId = grantAccessDoc.getId();
 
-      const newDoc = await directoryDB.createDocument();
+      // Create document with admin signing key so the initial entry is trusted
+      const newDoc = await directoryDB.createDocumentWithSigningKey(
+        adminSigningKeyPair,
+        administrationPrivateKeyPassword
+      );
       
-      // Set the document data fields, sign, and store signature all in one changeDoc call
-      await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
+      // Set the document data fields, sign, and store signature all in one changeDocWithSigningKey call
+      // Using the admin signing key to sign the entry, so it's always trusted
+      await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "revokeaccess";
@@ -278,7 +304,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
           administrationPrivateKeyPassword
         );
         data.adminSignature = baseTenant.uint8ArrayToBase64(signature);
-      });
+      }, adminSigningKeyPair, administrationPrivateKeyPassword);
 
       console.log(`[BaseMindooTenantDirectory] Created revocation document for grant access doc: ${revokeDocId}`);
     }
@@ -287,9 +313,135 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   async validatePublicSigningKey(publicKey: string): Promise<boolean> {
-    // Empty implementation returning true
-    // TODO: Implement actual validation against directory database
-    return true;
+    console.log(`[BaseMindooTenantDirectory] Validating public signing key`);
+    
+    // Cast to BaseMindooTenant to access protected methods
+    const baseTenant = this.tenant as BaseMindooTenant;
+    
+    // Get administration public key - this is always trusted as the root of trust
+    const administrationPublicKey = baseTenant.getAdministrationPublicKey();
+    
+    // The administration key is always trusted - it's the root of trust for the tenant
+    if (publicKey === administrationPublicKey) {
+      console.log(`[BaseMindooTenantDirectory] Public key is administration key, trusted`);
+      return true;
+    }
+    
+    // Check cache first - if we have a cached result, return it after ensuring we're up to date
+    // Sync changes to make sure everything is processed
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    
+    // Update cache with any new changes since last cursor
+    await this.updateTrustedKeysCache(directoryDB, administrationPublicKey);
+    
+    // Now check the cache
+    const cachedResult = this.trustedKeysCache.get(publicKey);
+    if (cachedResult !== undefined) {
+      console.log(`[BaseMindooTenantDirectory] Public key validation result (from cache): ${cachedResult}`);
+      return cachedResult;
+    }
+    
+    // Key not found in cache means it was never granted access
+    console.log(`[BaseMindooTenantDirectory] Public key not found in cache, returning false`);
+    return false;
+  }
+  
+  /**
+   * Update the trusted keys cache by processing new changes since the last cursor.
+   * This method is called incrementally to keep the cache up to date.
+   */
+  private async updateTrustedKeysCache(
+    directoryDB: MindooDB,
+    administrationPublicKey: string
+  ): Promise<void> {
+    // Create a docSigner for verification (we only need it for verifyItems, so we use a dummy SigningKeyPair)
+    // The private key won't be used for verification
+    const dummySigningKeyPair: SigningKeyPair = {
+      publicKey: administrationPublicKey,
+      privateKey: {
+        ciphertext: "",
+        iv: "",
+        tag: "",
+        salt: "",
+        iterations: 0,
+      },
+    };
+    const docSigner = this.tenant.createDocSignerFor(dummySigningKeyPair);
+    
+    // Process changes since last cursor
+    for await (const { doc, cursor } of directoryDB.iterateChangesSince(this.cacheLastCursor, 100)) {
+      const data = doc.getData();
+      
+      // Check if this is a grant access document
+      if (data.form === "useroperation" && 
+          data.type === "grantaccess" && 
+          data.userSigningPublicKey &&
+          typeof data.userSigningPublicKey === "string") {
+        // Verify the signature before including the document
+        if (data.adminSignature && typeof data.adminSignature === "string" && data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
+          try {
+            const signature = this.base64ToUint8Array(data.adminSignature);
+            const isValid = await docSigner.verifyItems(
+              doc,
+              data.adminSignatureFields,
+              signature,
+              administrationPublicKey
+            );
+            
+            if (isValid) {
+              const userPublicKey = data.userSigningPublicKey;
+              console.log(`[BaseMindooTenantDirectory] Cache: adding trusted key from grant access document`);
+              // Mark as active (true) unless already revoked
+              if (!this.trustedKeysCache.has(userPublicKey) || this.trustedKeysCache.get(userPublicKey) === true) {
+                this.trustedKeysCache.set(userPublicKey, true);
+              }
+              // Store mapping for future revocation lookups (persisted across iterations)
+              this.grantDocIdToPublicKey.set(doc.getId(), userPublicKey);
+            }
+          } catch (error) {
+            console.error(`[BaseMindooTenantDirectory] Cache: error verifying grant access document:`, error);
+          }
+        }
+      }
+      
+      // Check if this is a revoke access document
+      if (data.form === "useroperation" && 
+          data.type === "revokeaccess" &&
+          data.revokeDocId &&
+          typeof data.revokeDocId === "string") {
+        // Verify the signature before processing the revocation
+        if (data.adminSignature && typeof data.adminSignature === "string" && data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
+          try {
+            const signature = this.base64ToUint8Array(data.adminSignature);
+            const isValid = await docSigner.verifyItems(
+              doc,
+              data.adminSignatureFields,
+              signature,
+              administrationPublicKey
+            );
+            
+            if (isValid) {
+              const revokedDocId = data.revokeDocId;
+              // Find the public key for this grant doc ID and mark as revoked
+              // Use the persistent mapping that survives across iterations
+              const revokedPublicKey = this.grantDocIdToPublicKey.get(revokedDocId);
+              if (revokedPublicKey) {
+                console.log(`[BaseMindooTenantDirectory] Cache: revoking key for doc ${revokedDocId}`);
+                this.trustedKeysCache.set(revokedPublicKey, false);
+              } else {
+                console.warn(`[BaseMindooTenantDirectory] Cache: revocation for unknown grant doc ${revokedDocId}`);
+              }
+            }
+          } catch (error) {
+            console.error(`[BaseMindooTenantDirectory] Cache: error verifying revoke access document:`, error);
+          }
+        }
+      }
+      
+      // Update cursor after each document
+      this.cacheLastCursor = cursor;
+    }
   }
 
   /**
@@ -372,9 +524,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     const docSigner = this.tenant.createDocSignerFor(adminSigningKeyPair);
     
-    const newDoc = await directoryDB.createDocument();
+    // Create document with admin signing key so the initial entry is trusted
+    const newDoc = await directoryDB.createDocumentWithSigningKey(
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword
+    );
     
-    await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
+    // Using the admin signing key to sign the entry, so it's always trusted
+    await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
       const data = doc.getData();
       data.form = "useroperation";
       data.type = "requestdochistorypurge";
@@ -393,7 +550,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         administrationPrivateKeyPassword
       );
       data.adminSignature = baseTenant.uint8ArrayToBase64(signature);
-    });
+    }, adminSigningKeyPair, administrationPrivateKeyPassword);
     
     console.log(`[BaseMindooTenantDirectory] Created purge request for ${docId} in ${dbId}`);
   }
