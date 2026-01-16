@@ -10,9 +10,23 @@ import {
   MindooTenant,
   ProcessChangesCursor,
   ProcessChangesResult,
+  AttachmentReference,
+  AttachmentConfig,
 } from "./types";
+import { BaseMindooTenant } from "./BaseMindooTenant";
 import type { ContentAddressedStore } from "./appendonlystores/types";
-import { generateDocEntryId, computeContentHash, parseDocEntryId } from "./utils/idGeneration";
+import { 
+  generateDocEntryId, 
+  computeContentHash, 
+  parseDocEntryId,
+  generateAttachmentChunkId,
+  generateFileUuid7,
+} from "./utils/idGeneration";
+
+/**
+ * Default chunk size for attachments: 256KB
+ */
+const DEFAULT_CHUNK_SIZE_BYTES = 256 * 1024;
 
 /**
  * Internal representation of a document with its Automerge state
@@ -46,9 +60,10 @@ interface InternalDoc {
  * - Automerge.applyChanges(doc, changes) - verify method signature
  */
 export class BaseMindooDB implements MindooDB {
-  private tenant: MindooTenant;
+  private tenant: BaseMindooTenant;
   private store: ContentAddressedStore;
   private attachmentStore: ContentAddressedStore | undefined;
+  private chunkSizeBytes: number;
   
   // Internal index: sorted array of document entries, maintained in order by (lastModified, docId)
   // This allows efficient incremental processing without sorting on each call
@@ -67,10 +82,16 @@ export class BaseMindooDB implements MindooDB {
   // Used for resolving Automerge dependency hashes to entry IDs
   private automergeHashToEntryId: Map<string, Map<string, string>> = new Map(); // Map<docId, Map<automergeHash, entryId>>
 
-  constructor(tenant: MindooTenant, store: ContentAddressedStore, attachmentStore?: ContentAddressedStore) {
+  constructor(
+    tenant: BaseMindooTenant, 
+    store: ContentAddressedStore, 
+    attachmentStore?: ContentAddressedStore,
+    attachmentConfig?: AttachmentConfig
+  ) {
     this.tenant = tenant;
     this.store = store;
     this.attachmentStore = attachmentStore;
+    this.chunkSizeBytes = attachmentConfig?.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
   }
 
   /**
@@ -621,6 +642,25 @@ export class BaseMindooDB implements MindooDB {
     const pendingChanges = new Map<string, unknown>();
     const pendingDeletions = new Set<string>();
     
+    // Track pending attachment operations
+    const pendingAttachmentAdditions: AttachmentReference[] = [];
+    const pendingAttachmentRemovals = new Set<string>();
+    // Map of attachmentId -> {lastChunkId, sizeIncrease} for appends
+    const pendingAttachmentAppends = new Map<string, { lastChunkId: string; sizeIncrease: number }>();
+    
+    // Reference to db for closures
+    const db = this;
+    
+    // Guard flag to prevent operations after callback completes
+    // This ensures changes can only be made during the callback execution
+    let isCallbackActive = true;
+    
+    const throwIfCallbackInactive = (methodName: string) => {
+      if (!isCallbackActive) {
+        throw new Error(`${methodName}() cannot be called after changeDoc() callback has completed. Document changes can only be made within the callback.`);
+      }
+    };
+    
     // Create a document wrapper that collects changes
     const collectingDoc: MindooDoc = {
       getDatabase: () => this,
@@ -633,6 +673,7 @@ export class BaseMindooDB implements MindooDB {
         const currentData = internalDoc.doc as unknown as MindooDocPayload;
         return new Proxy(currentData, {
           set: (target, prop, value) => {
+            throwIfCallbackInactive('set property');
             if (typeof prop === 'string') {
               // If this property was marked for deletion, remove it from deletions
               pendingDeletions.delete(prop);
@@ -644,6 +685,7 @@ export class BaseMindooDB implements MindooDB {
             return true;
           },
           deleteProperty: (target, prop) => {
+            throwIfCallbackInactive('delete property');
             if (typeof prop === 'string') {
               // Mark for deletion
               pendingDeletions.add(prop);
@@ -677,11 +719,150 @@ export class BaseMindooDB implements MindooDB {
             return prop in target;
           }
         }) as MindooDocPayload;
-      }
+      },
+      
+      // ========== Attachment Write Methods (work in changeDoc context) ==========
+      
+      addAttachment: async (
+        fileData: Uint8Array,
+        fileName: string,
+        mimeType: string,
+        keyId?: string
+      ): Promise<AttachmentReference> => {
+        throwIfCallbackInactive('addAttachment');
+        const decryptionKeyId = keyId || internalDoc.decryptionKeyId;
+        const ref = await db.addAttachmentInternal(
+          docId,
+          fileData,
+          fileName,
+          mimeType,
+          decryptionKeyId,
+          now
+        );
+        pendingAttachmentAdditions.push(ref);
+        return ref;
+      },
+      
+      addAttachmentStream: async (
+        dataStream: AsyncIterable<Uint8Array>,
+        fileName: string,
+        mimeType: string,
+        keyId?: string
+      ): Promise<AttachmentReference> => {
+        throwIfCallbackInactive('addAttachmentStream');
+        const decryptionKeyId = keyId || internalDoc.decryptionKeyId;
+        const ref = await db.addAttachmentStreamInternal(
+          docId,
+          dataStream,
+          fileName,
+          mimeType,
+          decryptionKeyId,
+          now
+        );
+        pendingAttachmentAdditions.push(ref);
+        return ref;
+      },
+      
+      removeAttachment: async (attachmentId: string): Promise<void> => {
+        throwIfCallbackInactive('removeAttachment');
+        // Check if attachment exists (either in current doc or pending additions)
+        const payload = internalDoc.doc as unknown as MindooDocPayload;
+        const existingAttachments = (payload._attachments as AttachmentReference[]) || [];
+        const existsInDoc = existingAttachments.some(a => a.attachmentId === attachmentId);
+        const existsInPending = pendingAttachmentAdditions.some(a => a.attachmentId === attachmentId);
+        
+        if (!existsInDoc && !existsInPending) {
+          throw new Error(`Attachment ${attachmentId} not found in document ${docId}`);
+        }
+        
+        // If it was added in this same changeDoc call, just remove from pending
+        const pendingIndex = pendingAttachmentAdditions.findIndex(a => a.attachmentId === attachmentId);
+        if (pendingIndex >= 0) {
+          pendingAttachmentAdditions.splice(pendingIndex, 1);
+        } else {
+          // Mark for removal from existing attachments
+          pendingAttachmentRemovals.add(attachmentId);
+        }
+      },
+      
+      appendToAttachment: async (attachmentId: string, data: Uint8Array): Promise<void> => {
+        throwIfCallbackInactive('appendToAttachment');
+        // Find the attachment reference
+        const payload = internalDoc.doc as unknown as MindooDocPayload;
+        const existingAttachments = (payload._attachments as AttachmentReference[]) || [];
+        let ref = existingAttachments.find(a => a.attachmentId === attachmentId);
+        
+        // Also check pending additions
+        if (!ref) {
+          ref = pendingAttachmentAdditions.find(a => a.attachmentId === attachmentId);
+        }
+        
+        if (!ref) {
+          throw new Error(`Attachment ${attachmentId} not found in document ${docId}`);
+        }
+        
+        // Determine the previous lastChunkId (might have been updated by previous append in this changeDoc)
+        let prevLastChunkId = ref.lastChunkId;
+        const prevAppend = pendingAttachmentAppends.get(attachmentId);
+        if (prevAppend) {
+          prevLastChunkId = prevAppend.lastChunkId;
+        }
+        
+        // Append the data by creating new chunks
+        const { lastChunkId, sizeIncrease } = await db.appendToAttachmentInternal(
+          docId,
+          attachmentId,
+          ref.decryptionKeyId,
+          prevLastChunkId,
+          data,
+          now
+        );
+        
+        // Track the append
+        const existingAppend = pendingAttachmentAppends.get(attachmentId);
+        if (existingAppend) {
+          existingAppend.lastChunkId = lastChunkId;
+          existingAppend.sizeIncrease += sizeIncrease;
+        } else {
+          pendingAttachmentAppends.set(attachmentId, { lastChunkId, sizeIncrease });
+        }
+      },
+      
+      // ========== Attachment Read Methods (also work in changeDoc context) ==========
+      
+      getAttachments: (): AttachmentReference[] => {
+        const payload = internalDoc.doc as unknown as MindooDocPayload;
+        const existing = (payload._attachments as AttachmentReference[]) || [];
+        // Filter out removals and add pending additions
+        const filtered = existing.filter(a => !pendingAttachmentRemovals.has(a.attachmentId));
+        return [...filtered, ...pendingAttachmentAdditions];
+      },
+      
+      getAttachment: async (attachmentId: string): Promise<Uint8Array> => {
+        return db.getAttachmentInternal(docId, attachmentId, internalDoc.decryptionKeyId);
+      },
+      
+      getAttachmentRange: async (
+        attachmentId: string,
+        startByte: number,
+        endByte: number
+      ): Promise<Uint8Array> => {
+        return db.getAttachmentRangeInternal(docId, attachmentId, startByte, endByte, internalDoc.decryptionKeyId);
+      },
+      
+      streamAttachment: (
+        attachmentId: string,
+        startOffset: number = 0
+      ): AsyncGenerator<Uint8Array, void, unknown> => {
+        return db.streamAttachmentInternal(docId, attachmentId, startOffset, internalDoc.decryptionKeyId);
+      },
     };
     
     // Execute the async callback (this may do async operations like signing)
     await changeFunc(collectingDoc);
+    
+    // Deactivate the callback guard - no more changes can be made via collectingDoc
+    isCallbackActive = false;
     
     // Now apply the collected changes synchronously in Automerge.change()
     let newDoc: Automerge.Doc<MindooDocPayload>;
@@ -695,6 +876,37 @@ export class BaseMindooDB implements MindooDB {
         // Apply all pending deletions
         for (const key of pendingDeletions) {
           delete (automergeDoc as any)[key];
+        }
+        
+        // Apply pending attachment changes
+        if (pendingAttachmentAdditions.length > 0 || pendingAttachmentRemovals.size > 0 || pendingAttachmentAppends.size > 0) {
+          // Initialize _attachments array if needed
+          if (!automergeDoc._attachments) {
+            automergeDoc._attachments = [];
+          }
+          const attachments = automergeDoc._attachments as AttachmentReference[];
+          
+          // Remove attachments marked for removal
+          for (const attachmentId of pendingAttachmentRemovals) {
+            const index = attachments.findIndex(a => a.attachmentId === attachmentId);
+            if (index >= 0) {
+              attachments.splice(index, 1);
+            }
+          }
+          
+          // Apply appends (update lastChunkId and size)
+          for (const [attachmentId, { lastChunkId, sizeIncrease }] of pendingAttachmentAppends) {
+            const attachment = attachments.find(a => a.attachmentId === attachmentId);
+            if (attachment) {
+              attachment.lastChunkId = lastChunkId;
+              attachment.size += sizeIncrease;
+            }
+          }
+          
+          // Add new attachments
+          for (const ref of pendingAttachmentAdditions) {
+            attachments.push(ref);
+          }
         }
         
         // Update lastModified timestamp
@@ -1137,16 +1349,531 @@ export class BaseMindooDB implements MindooDB {
 
 
   /**
-   * Wrap an internal document in the MindooDoc interface
+   * Wrap an internal document in the MindooDoc interface.
+   * This is the read-only wrapper - write methods throw errors.
    */
   private wrapDocument(internalDoc: InternalDoc): MindooDoc {
+    const db = this;
+    const docId = internalDoc.id;
+    
     return {
-      getDatabase: () => this,
-      getId: () => internalDoc.id,
+      getDatabase: () => db,
+      getId: () => docId,
       getCreatedAt: () => internalDoc.createdAt,
       getLastModified: () => internalDoc.lastModified,
       isDeleted: () => internalDoc.isDeleted,
       getData: () => internalDoc.doc as unknown as MindooDocPayload,
+      
+      // ========== Attachment Write Methods ==========
+      // These throw errors in the read-only wrapper
+      
+      addAttachment: async () => {
+        throw new Error("addAttachment() can only be called within changeDoc() callback");
+      },
+      
+      addAttachmentStream: async () => {
+        throw new Error("addAttachmentStream() can only be called within changeDoc() callback");
+      },
+      
+      removeAttachment: async () => {
+        throw new Error("removeAttachment() can only be called within changeDoc() callback");
+      },
+      
+      appendToAttachment: async () => {
+        throw new Error("appendToAttachment() can only be called within changeDoc() callback");
+      },
+      
+      // ========== Attachment Read Methods ==========
+      // These work in the read-only wrapper
+      
+      getAttachments: (): AttachmentReference[] => {
+        const payload = internalDoc.doc as unknown as MindooDocPayload;
+        return (payload._attachments as AttachmentReference[]) || [];
+      },
+      
+      getAttachment: async (attachmentId: string): Promise<Uint8Array> => {
+        return db.getAttachmentInternal(docId, attachmentId, internalDoc.decryptionKeyId);
+      },
+      
+      getAttachmentRange: async (
+        attachmentId: string,
+        startByte: number,
+        endByte: number
+      ): Promise<Uint8Array> => {
+        return db.getAttachmentRangeInternal(docId, attachmentId, startByte, endByte, internalDoc.decryptionKeyId);
+      },
+      
+      streamAttachment: (
+        attachmentId: string,
+        startOffset: number = 0
+      ): AsyncGenerator<Uint8Array, void, unknown> => {
+        return db.streamAttachmentInternal(docId, attachmentId, startOffset, internalDoc.decryptionKeyId);
+      },
+    };
+  }
+
+  /**
+   * Get an attachment reference by ID from a document's _attachments array.
+   */
+  private getAttachmentRefInternal(docId: string, attachmentId: string): AttachmentReference {
+    const internalDoc = this.docCache.get(docId);
+    if (!internalDoc) {
+      throw new Error(`Document ${docId} not found in cache`);
+    }
+    const payload = internalDoc.doc as unknown as MindooDocPayload;
+    const attachments = (payload._attachments as AttachmentReference[]) || [];
+    const ref = attachments.find(a => a.attachmentId === attachmentId);
+    if (!ref) {
+      throw new Error(`Attachment ${attachmentId} not found in document ${docId}`);
+    }
+    return ref;
+  }
+
+  /**
+   * Internal method to fetch and concatenate all chunks for an attachment.
+   */
+  private async getAttachmentInternal(
+    docId: string, 
+    attachmentId: string,
+    decryptionKeyId: string
+  ): Promise<Uint8Array> {
+    console.log(`[BaseMindooDB] Getting attachment ${attachmentId} from document ${docId}`);
+    
+    const ref = this.getAttachmentRefInternal(docId, attachmentId);
+    const store = this.getEffectiveAttachmentStore();
+    
+    // Resolve dependency chain to get all chunk IDs in order (oldest first)
+    const chunkIds = await store.resolveDependencies(ref.lastChunkId, { includeStart: true });
+    console.log(`[BaseMindooDB] Resolved ${chunkIds.length} chunks for attachment ${attachmentId}`);
+    
+    // Fetch all chunks
+    const chunks = await store.getEntries(chunkIds);
+    
+    // Verify signatures, decrypt, and collect plaintext chunks
+    const plaintextChunks: Uint8Array[] = [];
+    let totalSize = 0;
+    
+    for (const chunk of chunks) {
+      // Verify signature
+      const isValid = await this.tenant.verifySignature(
+        chunk.encryptedData,
+        chunk.signature,
+        chunk.createdByPublicKey
+      );
+      if (!isValid) {
+        throw new Error(`Invalid signature for chunk ${chunk.id}`);
+      }
+      
+      // Decrypt
+      const plaintext = await this.tenant.decryptAttachmentPayload(
+        chunk.encryptedData,
+        chunk.decryptionKeyId
+      );
+      plaintextChunks.push(plaintext);
+      totalSize += plaintext.length;
+    }
+    
+    // Concatenate all chunks into final result
+    const result = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const chunk of plaintextChunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    console.log(`[BaseMindooDB] Retrieved attachment ${attachmentId}: ${result.length} bytes`);
+    return result;
+  }
+
+  /**
+   * Internal method to get a byte range from an attachment.
+   */
+  private async getAttachmentRangeInternal(
+    docId: string,
+    attachmentId: string,
+    startByte: number,
+    endByte: number,
+    decryptionKeyId: string
+  ): Promise<Uint8Array> {
+    console.log(`[BaseMindooDB] Getting attachment ${attachmentId} range [${startByte}, ${endByte}) from document ${docId}`);
+    
+    if (startByte < 0 || endByte <= startByte) {
+      throw new Error(`Invalid byte range: [${startByte}, ${endByte})`);
+    }
+    
+    const ref = this.getAttachmentRefInternal(docId, attachmentId);
+    
+    if (endByte > ref.size) {
+      throw new Error(`End byte ${endByte} exceeds attachment size ${ref.size}`);
+    }
+    
+    const store = this.getEffectiveAttachmentStore();
+    const chunkSize = this.chunkSizeBytes;
+    
+    // Calculate which chunks we need
+    const startChunkIndex = Math.floor(startByte / chunkSize);
+    const endChunkIndex = Math.floor((endByte - 1) / chunkSize);
+    
+    // Resolve dependency chain to get all chunk IDs
+    const allChunkIds = await store.resolveDependencies(ref.lastChunkId, { includeStart: true });
+    
+    // Get only the chunks we need
+    const neededChunkIds = allChunkIds.slice(startChunkIndex, endChunkIndex + 1);
+    const chunks = await store.getEntries(neededChunkIds);
+    
+    // Decrypt needed chunks
+    const plaintextChunks: Uint8Array[] = [];
+    for (const chunk of chunks) {
+      // Verify signature
+      const isValid = await this.tenant.verifySignature(
+        chunk.encryptedData,
+        chunk.signature,
+        chunk.createdByPublicKey
+      );
+      if (!isValid) {
+        throw new Error(`Invalid signature for chunk ${chunk.id}`);
+      }
+      
+      // Decrypt
+      const plaintext = await this.tenant.decryptAttachmentPayload(
+        chunk.encryptedData,
+        chunk.decryptionKeyId
+      );
+      plaintextChunks.push(plaintext);
+    }
+    
+    // Calculate offsets within the fetched chunks
+    const offsetInFirstChunk = startByte - (startChunkIndex * chunkSize);
+    const totalNeededBytes = endByte - startByte;
+    
+    // Extract the requested range
+    const result = new Uint8Array(totalNeededBytes);
+    let resultOffset = 0;
+    let bytesRemaining = totalNeededBytes;
+    
+    for (let i = 0; i < plaintextChunks.length && bytesRemaining > 0; i++) {
+      const chunk = plaintextChunks[i];
+      const chunkStart = i === 0 ? offsetInFirstChunk : 0;
+      const bytesToCopy = Math.min(chunk.length - chunkStart, bytesRemaining);
+      result.set(chunk.slice(chunkStart, chunkStart + bytesToCopy), resultOffset);
+      resultOffset += bytesToCopy;
+      bytesRemaining -= bytesToCopy;
+    }
+    
+    console.log(`[BaseMindooDB] Retrieved attachment ${attachmentId} range: ${result.length} bytes`);
+    return result;
+  }
+
+  /**
+   * Internal async generator to stream attachment data.
+   */
+  private async *streamAttachmentInternal(
+    docId: string,
+    attachmentId: string,
+    startOffset: number,
+    decryptionKeyId: string
+  ): AsyncGenerator<Uint8Array, void, unknown> {
+    console.log(`[BaseMindooDB] Streaming attachment ${attachmentId} from offset ${startOffset}`);
+    
+    const ref = this.getAttachmentRefInternal(docId, attachmentId);
+    const store = this.getEffectiveAttachmentStore();
+    const chunkSize = this.chunkSizeBytes;
+    
+    // Calculate starting chunk
+    const startChunkIndex = Math.floor(startOffset / chunkSize);
+    const offsetInStartChunk = startOffset % chunkSize;
+    
+    // Resolve dependency chain to get all chunk IDs
+    const allChunkIds = await store.resolveDependencies(ref.lastChunkId, { includeStart: true });
+    
+    // Stream chunks starting from startChunkIndex
+    for (let i = startChunkIndex; i < allChunkIds.length; i++) {
+      const [chunk] = await store.getEntries([allChunkIds[i]]);
+      
+      // Verify signature
+      const isValid = await this.tenant.verifySignature(
+        chunk.encryptedData,
+        chunk.signature,
+        chunk.createdByPublicKey
+      );
+      if (!isValid) {
+        throw new Error(`Invalid signature for chunk ${chunk.id}`);
+      }
+      
+      // Decrypt
+      const plaintext = await this.tenant.decryptAttachmentPayload(
+        chunk.encryptedData,
+        chunk.decryptionKeyId
+      );
+      
+      // For first chunk, skip bytes before startOffset
+      if (i === startChunkIndex && offsetInStartChunk > 0) {
+        yield plaintext.slice(offsetInStartChunk);
+      } else {
+        yield plaintext;
+      }
+    }
+    
+    console.log(`[BaseMindooDB] Finished streaming attachment ${attachmentId}`);
+  }
+
+  /**
+   * Get the effective attachment store (attachment store if configured, otherwise doc store).
+   */
+  private getEffectiveAttachmentStore(): ContentAddressedStore {
+    return this.attachmentStore || this.store;
+  }
+
+  /**
+   * Internal method to add an attachment by chunking the file and storing chunks.
+   */
+  private async addAttachmentInternal(
+    docId: string,
+    fileData: Uint8Array,
+    fileName: string,
+    mimeType: string,
+    decryptionKeyId: string,
+    createdAt: number
+  ): Promise<AttachmentReference> {
+    console.log(`[BaseMindooDB] Adding attachment to document ${docId}: ${fileName} (${fileData.length} bytes)`);
+    
+    const store = this.getEffectiveAttachmentStore();
+    const currentUser = await this.tenant.getCurrentUserId();
+    const attachmentId = generateFileUuid7();
+    
+    // Chunk the file
+    const chunks: StoreEntry[] = [];
+    let prevChunkId: string | null = null;
+    let lastChunkId: string = "";
+    
+    for (let offset = 0; offset < fileData.length; offset += this.chunkSizeBytes) {
+      const chunkData = fileData.slice(offset, Math.min(offset + this.chunkSizeBytes, fileData.length));
+      
+      // Encrypt chunk
+      const encryptedData = await this.tenant.encryptAttachmentPayload(chunkData, decryptionKeyId);
+      
+      // Compute content hash
+      const contentHash = await computeContentHash(encryptedData, this.getSubtle());
+      
+      // Generate chunk ID
+      const chunkId = generateAttachmentChunkId(docId, attachmentId);
+      lastChunkId = chunkId;
+      
+      // Sign the encrypted chunk
+      const signature = await this.tenant.signPayload(encryptedData);
+      
+      // Create chunk entry
+      const chunkEntry: StoreEntry = {
+        entryType: "attachment_chunk",
+        id: chunkId,
+        contentHash,
+        docId,
+        dependencyIds: prevChunkId ? [prevChunkId] : [],
+        createdAt,
+        createdByPublicKey: currentUser.userSigningPublicKey,
+        decryptionKeyId,
+        signature,
+        originalSize: chunkData.length,
+        encryptedSize: encryptedData.length,
+        encryptedData,
+      };
+      
+      chunks.push(chunkEntry);
+      prevChunkId = chunkId;
+    }
+    
+    // Store all chunks
+    await store.putEntries(chunks);
+    console.log(`[BaseMindooDB] Stored ${chunks.length} chunks for attachment ${attachmentId}`);
+    
+    // Create attachment reference
+    const ref: AttachmentReference = {
+      attachmentId,
+      fileName,
+      mimeType,
+      size: fileData.length,
+      lastChunkId,
+      decryptionKeyId,
+      createdAt,
+      createdBy: currentUser.userSigningPublicKey,
+    };
+    
+    return ref;
+  }
+
+  /**
+   * Internal method to add an attachment from a streaming data source.
+   * Memory efficient - processes data chunk by chunk without loading entire file into memory.
+   */
+  private async addAttachmentStreamInternal(
+    docId: string,
+    dataStream: AsyncIterable<Uint8Array>,
+    fileName: string,
+    mimeType: string,
+    decryptionKeyId: string,
+    createdAt: number
+  ): Promise<AttachmentReference> {
+    console.log(`[BaseMindooDB] Adding streaming attachment to document ${docId}: ${fileName}`);
+    
+    const store = this.getEffectiveAttachmentStore();
+    const currentUser = await this.tenant.getCurrentUserId();
+    const attachmentId = generateFileUuid7();
+    
+    // Buffer to accumulate incoming data until we have a full chunk
+    let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let totalSize = 0;
+    let prevChunkId: string | null = null;
+    let lastChunkId: string = "";
+    let chunkCount = 0;
+    
+    // Helper to concatenate Uint8Arrays
+    const concatArrays = (a: Uint8Array<ArrayBufferLike>, b: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBufferLike> => {
+      const result = new Uint8Array(a.length + b.length);
+      result.set(a, 0);
+      result.set(b, a.length);
+      return result;
+    };
+    
+    // Helper to store a chunk
+    const storeChunk = async (chunkData: Uint8Array): Promise<string> => {
+      // Encrypt chunk
+      const encryptedData = await this.tenant.encryptAttachmentPayload(chunkData, decryptionKeyId);
+      
+      // Compute content hash
+      const contentHash = await computeContentHash(encryptedData, this.getSubtle());
+      
+      // Generate chunk ID
+      const chunkId = generateAttachmentChunkId(docId, attachmentId);
+      
+      // Sign the encrypted chunk
+      const signature = await this.tenant.signPayload(encryptedData);
+      
+      // Create chunk entry
+      const chunkEntry: StoreEntry = {
+        entryType: "attachment_chunk",
+        id: chunkId,
+        contentHash,
+        docId,
+        dependencyIds: prevChunkId ? [prevChunkId] : [],
+        createdAt,
+        createdByPublicKey: currentUser.userSigningPublicKey,
+        decryptionKeyId,
+        signature,
+        originalSize: chunkData.length,
+        encryptedSize: encryptedData.length,
+        encryptedData,
+      };
+      
+      // Store immediately (streaming - don't buffer chunks in memory)
+      await store.putEntries([chunkEntry]);
+      chunkCount++;
+      
+      return chunkId;
+    };
+    
+    // Process incoming data stream
+    for await (const chunk of dataStream) {
+      // Add incoming data to buffer
+      buffer = concatArrays(buffer, chunk);
+      
+      // Process complete chunks
+      while (buffer.length >= this.chunkSizeBytes) {
+        const chunkData = buffer.slice(0, this.chunkSizeBytes);
+        buffer = buffer.slice(this.chunkSizeBytes);
+        
+        lastChunkId = await storeChunk(chunkData);
+        prevChunkId = lastChunkId;
+        totalSize += chunkData.length;
+      }
+    }
+    
+    // Store remaining data as final chunk (if any)
+    if (buffer.length > 0) {
+      lastChunkId = await storeChunk(buffer);
+      totalSize += buffer.length;
+    }
+    
+    console.log(`[BaseMindooDB] Stored ${chunkCount} chunks for streaming attachment ${attachmentId} (${totalSize} bytes)`);
+    
+    // Create attachment reference
+    const ref: AttachmentReference = {
+      attachmentId,
+      fileName,
+      mimeType,
+      size: totalSize,
+      lastChunkId,
+      decryptionKeyId,
+      createdAt,
+      createdBy: currentUser.userSigningPublicKey,
+    };
+    
+    return ref;
+  }
+
+  /**
+   * Internal method to append data to an existing attachment.
+   */
+  private async appendToAttachmentInternal(
+    docId: string,
+    attachmentId: string,
+    decryptionKeyId: string,
+    prevLastChunkId: string,
+    data: Uint8Array,
+    createdAt: number
+  ): Promise<{ lastChunkId: string; sizeIncrease: number }> {
+    console.log(`[BaseMindooDB] Appending ${data.length} bytes to attachment ${attachmentId}`);
+    
+    const store = this.getEffectiveAttachmentStore();
+    const currentUser = await this.tenant.getCurrentUserId();
+    
+    // Chunk the data
+    const chunks: StoreEntry[] = [];
+    let prevChunkId = prevLastChunkId;
+    let lastChunkId = prevLastChunkId;
+    
+    for (let offset = 0; offset < data.length; offset += this.chunkSizeBytes) {
+      const chunkData = data.slice(offset, Math.min(offset + this.chunkSizeBytes, data.length));
+      
+      // Encrypt chunk
+      const encryptedData = await this.tenant.encryptAttachmentPayload(chunkData, decryptionKeyId);
+      
+      // Compute content hash
+      const contentHash = await computeContentHash(encryptedData, this.getSubtle());
+      
+      // Generate chunk ID
+      const chunkId = generateAttachmentChunkId(docId, attachmentId);
+      lastChunkId = chunkId;
+      
+      // Sign the encrypted chunk
+      const signature = await this.tenant.signPayload(encryptedData);
+      
+      // Create chunk entry with dependency on previous chunk
+      const chunkEntry: StoreEntry = {
+        entryType: "attachment_chunk",
+        id: chunkId,
+        contentHash,
+        docId,
+        dependencyIds: [prevChunkId],
+        createdAt,
+        createdByPublicKey: currentUser.userSigningPublicKey,
+        decryptionKeyId,
+        signature,
+        originalSize: chunkData.length,
+        encryptedSize: encryptedData.length,
+        encryptedData,
+      };
+      
+      chunks.push(chunkEntry);
+      prevChunkId = chunkId;
+    }
+    
+    // Store all chunks
+    await store.putEntries(chunks);
+    console.log(`[BaseMindooDB] Appended ${chunks.length} chunks to attachment ${attachmentId}`);
+    
+    return {
+      lastChunkId,
+      sizeIncrease: data.length,
     };
   }
 

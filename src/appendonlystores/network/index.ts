@@ -14,11 +14,11 @@ export { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
 // Interfaces
 export type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 
-// Client-side (new names)
-export { ClientNetworkContentAddressedStore, ClientNetworkAppendOnlyStore } from "./ClientNetworkContentAddressedStore";
+// Client-side
+export { ClientNetworkContentAddressedStore } from "./ClientNetworkContentAddressedStore";
 
-// Server-side (new names)
-export { ServerNetworkContentAddressedStore, ServerNetworkAppendOnlyStore } from "./ServerNetworkContentAddressedStore";
+// Server-side
+export { ServerNetworkContentAddressedStore } from "./ServerNetworkContentAddressedStore";
 
 // Authentication
 export { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";

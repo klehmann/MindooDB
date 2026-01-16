@@ -2,7 +2,7 @@ import {
   MindooTenantFactory,
   MindooTenant,
   EncryptedPrivateKey,
-  AppendOnlyStoreFactory,
+  ContentAddressedStoreFactory,
   SigningKeyPair,
   EncryptionKeyPair,
 } from "./types";
@@ -20,9 +20,9 @@ import { KeyBag } from "./keys/KeyBag";
  */
 export class BaseMindooTenantFactory implements MindooTenantFactory {
   private cryptoAdapter: CryptoAdapter;
-  private storeFactory: AppendOnlyStoreFactory;
+  private storeFactory: ContentAddressedStoreFactory;
 
-  constructor(storeFactory: AppendOnlyStoreFactory, cryptoAdapter: CryptoAdapter) {
+  constructor(storeFactory: ContentAddressedStoreFactory, cryptoAdapter: CryptoAdapter) {
     this.storeFactory = storeFactory;
     this.cryptoAdapter = cryptoAdapter;
   }

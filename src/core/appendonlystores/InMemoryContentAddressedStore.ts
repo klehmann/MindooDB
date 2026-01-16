@@ -1,6 +1,8 @@
 import {
   ContentAddressedStore,
   ContentAddressedStoreFactory,
+  CreateStoreResult,
+  OpenStoreOptions,
 } from "./types";
 import type {
   StoreEntry,
@@ -330,13 +332,12 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
  * Each database gets its own isolated in-memory store.
  */
 export class InMemoryContentAddressedStoreFactory implements ContentAddressedStoreFactory {
-  createStore(dbId: string): ContentAddressedStore {
-    return new InMemoryContentAddressedStore(dbId);
+  createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
+    // For in-memory stores, we use a single store for both documents and attachments
+    // Note: options are ignored for in-memory stores but accepted for interface compatibility
+    return {
+      docStore: new InMemoryContentAddressedStore(dbId),
+      // attachmentStore not provided - will use docStore for attachments
+    };
   }
 }
-
-// Legacy exports for backward compatibility
-/** @deprecated Use InMemoryContentAddressedStore instead */
-export const InMemoryAppendOnlyStore = InMemoryContentAddressedStore;
-/** @deprecated Use InMemoryContentAddressedStoreFactory instead */
-export const InMemoryAppendOnlyStoreFactory = InMemoryContentAddressedStoreFactory;

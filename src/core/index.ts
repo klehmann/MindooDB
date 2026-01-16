@@ -29,9 +29,9 @@ export {
   computeContentHash,
 } from "./utils";
 
-// Content-addressed stores (renamed from append-only stores)
-export { ContentAddressedStore, ContentAddressedStoreFactory, AppendOnlyStore, AppendOnlyStoreFactory } from "./appendonlystores/types";
-export { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory, InMemoryAppendOnlyStore, InMemoryAppendOnlyStoreFactory } from "./appendonlystores/InMemoryContentAddressedStore";
+// Content-addressed stores
+export { ContentAddressedStore, ContentAddressedStoreFactory, CreateStoreResult, OpenStoreOptions } from "./appendonlystores/types";
+export { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory } from "./appendonlystores/InMemoryContentAddressedStore";
 
 // Network
 export { AuthenticationService } from "./appendonlystores/network/AuthenticationService";

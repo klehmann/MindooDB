@@ -399,6 +399,35 @@ Due to the append-only nature of the content-addressed store:
 - All changes are signed and timestamped
 - Cryptographic proofs of all operations
 
+## Document Attachments
+
+MindooDB supports file attachments associated with documents. See [attachments.md](./attachments.md) for detailed design documentation.
+
+### Key Features (Implemented)
+
+- **Attachment API on MindooDoc**: Methods for adding, removing, and retrieving attachments
+- **Chunked Storage**: Large files are split into 256KB chunks for efficient storage and streaming
+- **Deterministic Encryption**: Attachment chunks use deterministic IV derivation for tenant-wide deduplication
+- **Streaming Upload**: `addAttachmentStream()` accepts `AsyncIterable<Uint8Array>` for memory-efficient large file uploads
+- **Streaming Download**: `streamAttachment()` returns an `AsyncGenerator` for memory-efficient reading
+- **Random Access**: `getAttachmentRange()` fetches only the chunks needed for a byte range
+- **Append-Only Growth**: `appendToAttachment()` supports log files and growing data
+- **Two-Store Architecture**: Separate stores for documents and attachments enable flexible deployment
+
+### Attachment API
+
+Write methods (only within `changeDoc()` callback):
+- `addAttachment(fileData, fileName, mimeType)` - Add from in-memory data
+- `addAttachmentStream(dataStream, fileName, mimeType)` - Add from streaming source
+- `removeAttachment(attachmentId)` - Remove attachment reference
+- `appendToAttachment(attachmentId, data)` - Append to existing attachment
+
+Read methods (work anywhere):
+- `getAttachments()` - List all attachment references
+- `getAttachment(attachmentId)` - Get full content
+- `getAttachmentRange(attachmentId, start, end)` - Get byte range
+- `streamAttachment(attachmentId, offset?)` - Stream chunks
+
 ## Future Enhancements
 
 - **Forward Secrecy**: Key rotation that prevents decryption of future changes
@@ -406,10 +435,11 @@ Due to the append-only nature of the content-addressed store:
 - **Advanced Access Control**: Role-based access with key hierarchies
 - **Performance Optimizations**: More sophisticated snapshot strategies
 - **Network Protocols**: Optimized sync protocols for large-scale deployments
-- **Document Attachments**: 
-  - Support for file attachments to documents
-  - **Lazy Loading**: Attachments can be loaded on-demand from other parties (not all peers need to store all attachments)
-  - **Encrypted Chunks**: Attachment data is encrypted in chunks to enable random file access
-  - **Efficient Streaming**: Large attachments can be streamed and accessed without loading the entire file
-  - **Access Control**: Attachment encryption follows the same key model as documents (tenant key or named keys)
+- **Attachment Synchronization**: 
+  - Lazy loading of attachments from remote peers
+  - Two-phase sync (documents first, then referenced attachment chunks)
+  - Background sync for offline access
+- **Attachment Caching**:
+  - LRU/size-based local cache policies
+  - Transparent remote fetching for uncached chunks
 

@@ -344,7 +344,8 @@ describe("Network Sync", () => {
     beforeEach(async () => {
       // Create server store
       const storeFactory = new InMemoryContentAddressedStoreFactory();
-      serverStore = storeFactory.createStore("test-db");
+      const { docStore } = storeFactory.createStore("test-db");
+      serverStore = docStore;
       
       // Create mock directory
       mockDirectory = new MockTenantDirectory();
@@ -546,8 +547,10 @@ describe("Network Sync", () => {
     beforeEach(async () => {
       // Create stores
       const storeFactory = new InMemoryContentAddressedStoreFactory();
-      serverStore = storeFactory.createStore("test-db");
-      localStore = storeFactory.createStore("test-db");
+      const serverStoreResult = storeFactory.createStore("test-db");
+      const localStoreResult = storeFactory.createStore("test-db");
+      serverStore = serverStoreResult.docStore;
+      localStore = localStoreResult.docStore;
       
       // Create mock directory
       mockDirectory = new MockTenantDirectory();

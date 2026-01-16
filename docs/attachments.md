@@ -243,42 +243,62 @@ Each chunk is encrypted independently using AES-256-GCM with two modes:
 - **Streaming**: Use `resolveDependencies()` to traverse chunk chain
 - **Background Sync**: Optionally sync all chunks in background
 
-### MindooDB Attachment API
+### MindooDoc Attachment API
+
+Attachment methods are available on `MindooDoc`. **Write methods** (`addAttachment`, `addAttachmentStream`, `removeAttachment`, `appendToAttachment`) can only be called within the `MindooDB.changeDoc()` callback. **Read methods** (`getAttachment`, `getAttachmentRange`, `streamAttachment`, `getAttachments`) work anywhere.
 
 ```typescript
-interface MindooDB {
-  // Get the attachment store (may be same as doc store or separate)
-  getAttachmentStore(): ContentAddressedStore | undefined;
-
-  // Add an attachment to a document
+interface MindooDoc {
+  // ========== Write Methods (only within changeDoc callback) ==========
+  
+  // Add an attachment from in-memory data
   addAttachment(
-    doc: MindooDoc,
-    fileData: Uint8Array | File | Blob,
+    fileData: Uint8Array,
     fileName: string,
     mimeType: string,
     decryptionKeyId?: string
   ): Promise<AttachmentReference>;
 
-  // Get attachment data (fetches chunks, decrypts, assembles)
-  getAttachment(doc: MindooDoc, attachmentId: string): Promise<Uint8Array>;
+  // Add an attachment from a streaming source (memory efficient for large files)
+  // Works with ReadableStream, Node streams, async generators, etc.
+  addAttachmentStream(
+    dataStream: AsyncIterable<Uint8Array>,
+    fileName: string,
+    mimeType: string,
+    decryptionKeyId?: string
+  ): Promise<AttachmentReference>;
 
-  // Get a range of attachment data (random access)
+  // Remove an attachment (removes reference, chunks remain in store)
+  removeAttachment(attachmentId: string): Promise<void>;
+
+  // Append data to an existing attachment (for log files, etc.)
+  appendToAttachment(attachmentId: string, data: Uint8Array): Promise<void>;
+
+  // ========== Read Methods (work anywhere) ==========
+  
+  // Get all attachment references
+  getAttachments(): AttachmentReference[];
+
+  // Get full attachment content (fetches chunks, decrypts, assembles)
+  getAttachment(attachmentId: string): Promise<Uint8Array>;
+
+  // Get a byte range (random access, only fetches needed chunks)
   getAttachmentRange(
-    doc: MindooDoc,
     attachmentId: string,
     startByte: number,
     endByte: number
   ): Promise<Uint8Array>;
 
-  // Append data to an existing attachment
-  appendToAttachment(
-    doc: MindooDoc,
+  // Stream attachment data chunk by chunk (memory efficient)
+  streamAttachment(
     attachmentId: string,
-    data: Uint8Array
-  ): Promise<void>;
+    startOffset?: number
+  ): AsyncGenerator<Uint8Array, void, unknown>;
+}
 
-  // Remove an attachment from a document
-  removeAttachment(doc: MindooDoc, attachmentId: string): Promise<void>;
+interface MindooDB {
+  // Get the attachment store (may be same as doc store or separate)
+  getAttachmentStore(): ContentAddressedStore | undefined;
 }
 ```
 
@@ -319,10 +339,14 @@ The `ContentAddressedStore.purgeDocHistory(docId)` method enables:
 - [x] Implement structured ID generation utilities
 - [x] Add deterministic encryption for attachments
 
-#### Phase 2: Attachment Storage (Future)
-- [ ] Implement chunking and `attachment_chunk` entries
-- [ ] Add `addAttachment()` and `getAttachment()` to MindooDB
-- [ ] Store attachment references in documents
+#### Phase 2: Attachment Storage (COMPLETED)
+- [x] Implement chunking and `attachment_chunk` entries
+- [x] Add attachment methods to `MindooDoc` (within `changeDoc()` callback)
+- [x] Store attachment references in documents (`_attachments` array)
+- [x] Implement `addAttachment()` for in-memory data
+- [x] Implement `addAttachmentStream()` for streaming uploads
+- [x] Implement `getAttachment()`, `getAttachmentRange()`, `streamAttachment()`
+- [x] Implement `removeAttachment()` and `appendToAttachment()`
 
 #### Phase 3: Synchronization (Future)
 - [ ] Implement attachment chunk sync
@@ -336,9 +360,6 @@ The `ContentAddressedStore.purgeDocHistory(docId)` method enables:
 - [ ] Add transparent remote fetching
 
 #### Phase 5: Advanced Features (Future)
-- [ ] Append-only file growth
-- [ ] Random access (`getAttachmentRange()`)
-- [ ] Streaming support for large files
 - [ ] Content-defined chunking (variable-size)
 - [ ] Tiered storage (external storage migration)
 
@@ -351,36 +372,72 @@ const attachmentStore = attachmentStoreFactory.createStore("mydb-attachments");
 
 const db = new BaseMindooDB(tenant, docStore, attachmentStore);
 
-// Create a document
+// Create a document and add attachment in one changeDoc call
 const doc = await db.createDocument();
-await db.changeDoc(doc, (d) => {
+let attachmentRef: AttachmentReference;
+
+await db.changeDoc(doc, async (d) => {
   d.getData().title = "My Document";
+  
+  // Add attachment from in-memory data
+  const fileData = new Uint8Array([/* ... */]);
+  attachmentRef = await d.addAttachment(fileData, "report.pdf", "application/pdf");
 });
 
-// Add an attachment
-const fileData = new Uint8Array(/* ... */);
-const attachment = await db.addAttachment(
-  doc,
-  fileData,
-  "report.pdf",
-  "application/pdf"
-);
-console.log(`Attachment ID: ${attachment.attachmentId}`);
-console.log(`Last chunk ID: ${attachment.lastChunkId}`);
+console.log(`Attachment ID: ${attachmentRef.attachmentId}`);
+console.log(`Size: ${attachmentRef.size} bytes`);
 
-// Get attachment (automatically fetches missing chunks)
-const retrievedData = await db.getAttachment(doc, attachment.attachmentId);
+// Add attachment from a stream (memory efficient for large files)
+await db.changeDoc(doc, async (d) => {
+  // From fetch response
+  const response = await fetch('/large-file.pdf');
+  await d.addAttachmentStream(response.body!, "large.pdf", "application/pdf");
+  
+  // Or from a File input (browser)
+  // const file = inputElement.files[0];
+  // await d.addAttachmentStream(file.stream(), file.name, file.type);
+  
+  // Or from an async generator
+  // async function* generateData() { yield new Uint8Array([1,2,3]); }
+  // await d.addAttachmentStream(generateData(), "generated.bin", "application/octet-stream");
+});
 
-// Append to file (for log files, etc.)
-await db.appendToAttachment(doc, attachment.attachmentId, newData);
+// Read methods work outside changeDoc
+const reloadedDoc = await db.getDocument(doc.getId());
 
-// Get attachment range (random access)
-const range = await db.getAttachmentRange(
-  doc,
-  attachment.attachmentId,
+// List all attachments
+const attachments = reloadedDoc.getAttachments();
+console.log(`Document has ${attachments.length} attachments`);
+
+// Get full attachment content
+const data = await reloadedDoc.getAttachment(attachmentRef.attachmentId);
+
+// Get a byte range (random access, only fetches needed chunks)
+const firstMB = await reloadedDoc.getAttachmentRange(
+  attachmentRef.attachmentId,
   0,
-  1024 * 1024 // First 1MB
+  1024 * 1024  // First 1MB
 );
+
+// Stream attachment data (memory efficient for large files)
+for await (const chunk of reloadedDoc.streamAttachment(attachmentRef.attachmentId)) {
+  // Process chunk by chunk
+  console.log(`Received ${chunk.length} bytes`);
+}
+
+// Stream from an offset
+for await (const chunk of reloadedDoc.streamAttachment(attachmentRef.attachmentId, 1024 * 1024)) {
+  // Start from 1MB offset
+}
+
+// Modify attachments (must be within changeDoc)
+await db.changeDoc(reloadedDoc, async (d) => {
+  // Append data to an existing attachment (for log files)
+  await d.appendToAttachment(attachmentRef.attachmentId, new Uint8Array([4, 5, 6]));
+  
+  // Remove an attachment
+  await d.removeAttachment(attachmentRef.attachmentId);
+});
 ```
 
 ## Conclusion
@@ -393,9 +450,11 @@ The unified `ContentAddressedStore` approach provides:
 - **Separate id and contentHash**: No metadata collisions with deduplication
 - **Deterministic encryption**: Tenant-wide deduplication for attachments
 - **Append-only files**: Support for log files and growing data
+- **Streaming support**: Memory-efficient upload and download for large files
+- **Random access**: Efficient byte-range retrieval without loading entire files
 - **Security**: Per-chunk encryption using existing key model
 - **Synchronization**: Reuse proven sync patterns from document changes
 - **GDPR compliance**: Coordinated cleanup via `purgeDocHistory()`
 - **Future-proof**: Design allows migration to external storage
 
-The implementation is phased, with core infrastructure completed and attachment-specific features to be added incrementally.
+Core infrastructure (Phase 1) and attachment storage (Phase 2) are complete. Future phases will add synchronization, local caching, and advanced features.

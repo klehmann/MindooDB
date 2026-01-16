@@ -1,6 +1,6 @@
 import type { KeyBag } from "./keys/KeyBag";
 import type { PublicUserId, PrivateUserId } from "./userid";
-import type { ContentAddressedStore } from "./appendonlystores/types";
+import type { ContentAddressedStore, OpenStoreOptions } from "./appendonlystores/types";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 
@@ -282,12 +282,14 @@ export interface MindooTenant {
   openDirectory(): Promise<MindooTenantDirectory>;
 
   /**
-   * Opens a new database for this tenant
+   * Opens a database for this tenant.
+   * Creates the database if it doesn't exist.
    *
    * @param id The ID of the database
-   * @return The new database
+   * @param options Optional configuration passed to the store factory (e.g., preferLocal)
+   * @return The database instance
    */
-  openDB(id: string): Promise<MindooDB>;
+  openDB(id: string, options?: OpenStoreOptions): Promise<MindooDB>;
 
   /**
    * Creates a MindooDocSigner instance for signing and verifying document items.
@@ -308,7 +310,7 @@ export interface MindooTenant {
 }
 
 // Re-export ContentAddressedStore and ContentAddressedStoreFactory from appendonlystores
-export type { ContentAddressedStore, ContentAddressedStoreFactory, AppendOnlyStore, AppendOnlyStoreFactory } from "./appendonlystores/types";
+export type { ContentAddressedStore, ContentAddressedStoreFactory, CreateStoreResult, OpenStoreOptions } from "./appendonlystores/types";
 
 /**
  * The type of entry stored in the ContentAddressedStore.
@@ -423,6 +425,66 @@ export interface StoreEntry extends StoreEntryMetadata {
 }
 
 /**
+ * Reference to an attachment stored in the attachment store.
+ * This metadata is stored in the document's _attachments array.
+ */
+export interface AttachmentReference {
+  /**
+   * Unique identifier for this attachment instance (UUID7 format)
+   */
+  attachmentId: string;
+  
+  /**
+   * Original filename of the attachment
+   */
+  fileName: string;
+  
+  /**
+   * MIME type of the attachment (e.g., "application/pdf", "image/png")
+   */
+  mimeType: string;
+  
+  /**
+   * Total size of the attachment in bytes
+   */
+  size: number;
+  
+  /**
+   * Entry ID of the last chunk in the attachment store.
+   * Used for dependency resolution to traverse all chunks.
+   */
+  lastChunkId: string;
+  
+  /**
+   * The key ID used to encrypt attachment chunks.
+   * Same as the document's decryptionKeyId ("default" or named key).
+   */
+  decryptionKeyId: string;
+  
+  /**
+   * Timestamp when the attachment was added (milliseconds since Unix epoch)
+   */
+  createdAt: number;
+  
+  /**
+   * Public signing key of the user who created this attachment (Ed25519, PEM format)
+   */
+  createdBy: string;
+}
+
+/**
+ * Configuration for attachment handling in MindooDB.
+ */
+export interface AttachmentConfig {
+  /**
+   * Size of each attachment chunk in bytes.
+   * Larger chunks mean fewer entries but higher memory usage.
+   * Default: 256 * 1024 (256KB)
+   */
+  chunkSizeBytes?: number;
+}
+
+/**
  * A MindooDoc is a document that is stored in the MindooDB.
  * It's a wrapper around the Automerge document.
  */
@@ -471,6 +533,138 @@ export interface MindooDoc {
    * @return The payload of the document
    */
   getData(): MindooDocPayload;
+
+  // ========== Attachment Write Methods ==========
+  // These methods only work within the changeDoc() callback.
+  // Calling them outside of changeDoc() will throw an error.
+
+  /**
+   * Add an attachment to this document.
+   * This method only works within the changeDoc() callback.
+   * 
+   * @param fileData The binary data of the attachment
+   * @param fileName The original filename
+   * @param mimeType The MIME type (e.g., "application/pdf")
+   * @param decryptionKeyId Optional key ID for encryption. If not provided, uses the document's key.
+   * @return The attachment reference with metadata
+   * @throws Error if called outside of changeDoc() callback
+   */
+  addAttachment(
+    fileData: Uint8Array,
+    fileName: string,
+    mimeType: string,
+    decryptionKeyId?: string
+  ): Promise<AttachmentReference>;
+
+  /**
+   * Add an attachment from a streaming data source.
+   * This method only works within the changeDoc() callback.
+   * Memory efficient for large files - processes data chunk by chunk.
+   * 
+   * Accepts any AsyncIterable, including:
+   * - ReadableStream (from fetch, File.stream(), Blob.stream())
+   * - Node.js streams (via async iteration)
+   * - Custom async generators
+   * 
+   * @param dataStream An async iterable yielding Uint8Array chunks
+   * @param fileName The original filename
+   * @param mimeType The MIME type (e.g., "application/pdf")
+   * @param decryptionKeyId Optional key ID for encryption. If not provided, uses the document's key.
+   * @return The attachment reference with metadata
+   * @throws Error if called outside of changeDoc() callback
+   */
+  addAttachmentStream(
+    dataStream: AsyncIterable<Uint8Array>,
+    fileName: string,
+    mimeType: string,
+    decryptionKeyId?: string
+  ): Promise<AttachmentReference>;
+
+  /**
+   * Remove an attachment from this document.
+   * This method only works within the changeDoc() callback.
+   * Note: This removes the reference from the document but does not delete the chunks
+   * from the attachment store (append-only semantics).
+   * 
+   * @param attachmentId The ID of the attachment to remove
+   * @throws Error if called outside of changeDoc() callback or if attachment not found
+   */
+  removeAttachment(attachmentId: string): Promise<void>;
+
+  /**
+   * Append data to an existing attachment.
+   * This method only works within the changeDoc() callback.
+   * Useful for log files and other append-only data.
+   * 
+   * @param attachmentId The ID of the attachment to append to
+   * @param data The binary data to append
+   * @throws Error if called outside of changeDoc() callback or if attachment not found
+   */
+  appendToAttachment(attachmentId: string, data: Uint8Array): Promise<void>;
+
+  // ========== Attachment Read Methods ==========
+  // These methods work both inside and outside of changeDoc().
+
+  /**
+   * Get all attachment references for this document.
+   * 
+   * @return Array of attachment references
+   */
+  getAttachments(): AttachmentReference[];
+
+  /**
+   * Get the full content of an attachment.
+   * Fetches all chunks, verifies signatures, decrypts, and concatenates them.
+   * 
+   * @param attachmentId The ID of the attachment to retrieve
+   * @return The complete binary data of the attachment
+   * @throws Error if attachment not found or decryption fails
+   */
+  getAttachment(attachmentId: string): Promise<Uint8Array>;
+
+  /**
+   * Get a byte range from an attachment.
+   * Only fetches and decrypts the chunks needed for the requested range.
+   * Useful for random access to large files.
+   * 
+   * @param attachmentId The ID of the attachment
+   * @param startByte The starting byte offset (inclusive, 0-based)
+   * @param endByte The ending byte offset (exclusive)
+   * @return The binary data for the requested range
+   * @throws Error if attachment not found, range invalid, or decryption fails
+   */
+  getAttachmentRange(
+    attachmentId: string,
+    startByte: number,
+    endByte: number
+  ): Promise<Uint8Array>;
+
+  /**
+   * Stream attachment data starting from a given offset.
+   * Returns an AsyncGenerator that yields decrypted chunks one at a time.
+   * Memory-efficient for large files - only one chunk in memory at a time.
+   * 
+   * @param attachmentId The ID of the attachment to stream
+   * @param startOffset Optional byte offset to start streaming from (default: 0)
+   * @return AsyncGenerator yielding Uint8Array chunks
+   * @throws Error if attachment not found
+   * 
+   * @example
+   * // Stream from the beginning
+   * for await (const chunk of doc.streamAttachment(attachmentId)) {
+   *   await processChunk(chunk);
+   *   if (shouldStop) break; // Early termination supported
+   * }
+   * 
+   * // Seek to 1MB offset and stream
+   * for await (const chunk of doc.streamAttachment(attachmentId, 1024 * 1024)) {
+   *   await writeToOutput(chunk);
+   * }
+   */
+  streamAttachment(
+    attachmentId: string,
+    startOffset?: number
+  ): AsyncGenerator<Uint8Array, void, unknown>;
 }
 
 export interface MindooDocPayload {

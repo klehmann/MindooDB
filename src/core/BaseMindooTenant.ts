@@ -2,7 +2,8 @@ import {
   MindooTenant,
   EncryptedPrivateKey,
   MindooDB,
-  AppendOnlyStoreFactory,
+  ContentAddressedStoreFactory,
+  OpenStoreOptions,
   MindooTenantFactory,
   MindooTenantDirectory,
   SigningKeyPair,
@@ -38,7 +39,7 @@ export class BaseMindooTenant implements MindooTenant {
   private currentUserPassword: string; // Password to decrypt user's private keys
   protected cryptoAdapter: CryptoAdapter;
   private keyBag: KeyBag;
-  private storeFactory: AppendOnlyStoreFactory;
+  private storeFactory: ContentAddressedStoreFactory;
   private databaseCache: Map<string, MindooDB> = new Map();
 
   // Cache for decrypted keys (to avoid repeated decryption)
@@ -55,7 +56,7 @@ export class BaseMindooTenant implements MindooTenant {
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
-    storeFactory: AppendOnlyStoreFactory,
+    storeFactory: ContentAddressedStoreFactory,
     cryptoAdapter?: CryptoAdapter
   ) {
     this.factory = factory;
@@ -390,16 +391,16 @@ export class BaseMindooTenant implements MindooTenant {
     return new BaseMindooTenantDirectory(this);
   }
 
-  async openDB(id: string): Promise<MindooDB> {
+  async openDB(id: string, options?: OpenStoreOptions): Promise<MindooDB> {
     // Return cached database if it exists
     const cached = this.databaseCache.get(id);
     if (cached) {
       return cached;
     }
 
-    // Create the database store using the factory
-    const store = this.storeFactory.createStore(id);
-    const db = new BaseMindooDB(this, store);
+    // Create the database stores using the factory
+    const { docStore, attachmentStore } = this.storeFactory.createStore(id, options);
+    const db = new BaseMindooDB(this, docStore, attachmentStore);
     await db.initialize();
     
     // Cache the database for future use
@@ -710,7 +711,7 @@ export class BaseMindooTenant implements MindooTenant {
    * @param decryptionKeyId The key ID for encryption
    * @returns The encrypted payload with mode prefix
    */
-  protected async encryptAttachmentPayload(
+  async encryptAttachmentPayload(
     payload: Uint8Array,
     decryptionKeyId: string
   ): Promise<Uint8Array> {
@@ -785,7 +786,7 @@ export class BaseMindooTenant implements MindooTenant {
    * @param decryptionKeyId The key ID for decryption
    * @returns The decrypted plaintext
    */
-  protected async decryptAttachmentPayload(
+  async decryptAttachmentPayload(
     encryptedPayload: Uint8Array,
     decryptionKeyId: string
   ): Promise<Uint8Array> {

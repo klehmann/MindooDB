@@ -75,8 +75,8 @@ export function generateAttachmentChunkId(
   chunkUuid7?: string
 ): string {
   const chunkId = chunkUuid7 || uuidv7();
-  // Remove dashes from UUID before base62 encoding
-  const base62Chunk = base62Encode(chunkId.replace(/-/g, ''));
+  // base62Encode expects UUID with dashes
+  const base62Chunk = base62Encode(chunkId);
   return `${docId}_a_${fileUuid7}_${base62Chunk}`;
 }
 

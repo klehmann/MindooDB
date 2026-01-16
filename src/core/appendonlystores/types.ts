@@ -1,18 +1,56 @@
 import type { StoreEntry, StoreEntryMetadata } from "../types";
 
 /**
+ * Options for opening/creating a database store.
+ * Factory implementations can use these to customize store behavior.
+ * 
+ * This is an open interface that allows any implementation-specific options.
+ * Examples of options that implementations might support:
+ * - preferLocal: boolean - Prefer local storage over remote
+ * - cacheSize: number - Maximum cache size
+ * - syncMode: "eager" | "lazy" - Synchronization strategy
+ */
+export interface OpenStoreOptions {
+  [key: string]: unknown;
+}
+
+/**
+ * Result of creating stores for a database.
+ * Contains the document store and an optional separate attachment store.
+ */
+export interface CreateStoreResult {
+  /**
+   * The store for document changes (doc_create, doc_change, doc_snapshot, doc_delete).
+   * This is required.
+   */
+  docStore: ContentAddressedStore;
+  
+  /**
+   * Optional separate store for attachment chunks (attachment_chunk).
+   * If not provided, attachments are stored in the docStore.
+   * Having a separate store enables:
+   * - Different storage backends (e.g., local docs, cloud attachments)
+   * - Different caching/eviction policies
+   * - Cost optimization (cheaper storage for large attachments)
+   */
+  attachmentStore?: ContentAddressedStore;
+}
+
+/**
  * ContentAddressedStoreFactory creates ContentAddressedStore instances for a given database ID.
  * This allows different implementations to provide different storage backends
  * (e.g., in-memory, file-based, database-backed, cloud storage) while maintaining a consistent interface.
  */
 export interface ContentAddressedStoreFactory {
   /**
-   * Create a new ContentAddressedStore for the given database ID.
+   * Create stores for the given database ID.
+   * Returns a document store and optionally a separate attachment store.
    * 
    * @param dbId The ID of the database (e.g., "directory" for the tenant directory database)
-   * @return A new ContentAddressedStore instance for this database
+   * @param options Optional configuration for store creation (e.g., preferLocal, custom settings)
+   * @return An object containing the document store and optional attachment store
    */
-  createStore(dbId: string): ContentAddressedStore;
+  createStore(dbId: string, options?: OpenStoreOptions): CreateStoreResult;
 }
 
 /**
@@ -132,10 +170,3 @@ export interface ContentAddressedStore {
    */
   purgeDocHistory(docId: string): Promise<void>;
 }
-
-// Legacy type aliases for backward compatibility during migration
-// These will be removed in a future version
-/** @deprecated Use ContentAddressedStore instead */
-export type AppendOnlyStore = ContentAddressedStore;
-/** @deprecated Use ContentAddressedStoreFactory instead */
-export type AppendOnlyStoreFactory = ContentAddressedStoreFactory;

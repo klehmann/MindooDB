@@ -313,7 +313,3 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.tokenExpiry = 0;
   }
 }
-
-// Legacy export for backward compatibility
-/** @deprecated Use ClientNetworkContentAddressedStore instead */
-export const ClientNetworkAppendOnlyStore = ClientNetworkContentAddressedStore;

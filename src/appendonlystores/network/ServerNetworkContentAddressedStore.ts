@@ -337,7 +337,3 @@ export class ServerNetworkContentAddressedStore {
     return results;
   }
 }
-
-// Legacy export for backward compatibility
-/** @deprecated Use ServerNetworkContentAddressedStore instead */
-export const ServerNetworkAppendOnlyStore = ServerNetworkContentAddressedStore;
