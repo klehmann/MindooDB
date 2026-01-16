@@ -1,3 +1,4 @@
+import { v7 as uuidv7 } from "uuid";
 import type { CryptoAdapter } from "../../crypto/CryptoAdapter";
 import type { MindooTenantDirectory } from "../../types";
 import type {
@@ -81,7 +82,7 @@ export class AuthenticationService {
     }
     
     // Generate UUID v7 challenge
-    const challenge = this.generateUUID7();
+    const challenge = uuidv7();
     const now = Date.now();
     
     // Store challenge
@@ -218,50 +219,6 @@ export class AuthenticationService {
       console.error(`[AuthenticationService] Token validation error:`, error);
       return null;
     }
-  }
-
-  /**
-   * Generate a UUID v7 (time-ordered UUID).
-   * 
-   * Format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
-   * - First 48 bits: Unix timestamp in milliseconds
-   * - Next 4 bits: Version (7)
-   * - Next 12 bits: Random
-   * - Next 2 bits: Variant (binary 10)
-   * - Last 62 bits: Random
-   */
-  private generateUUID7(): string {
-    const timestamp = Date.now();
-    const randomBytes = this.cryptoAdapter.getRandomValues(new Uint8Array(10));
-    
-    // Build UUID bytes
-    const uuid = new Uint8Array(16);
-    
-    // Timestamp (48 bits = 6 bytes)
-    uuid[0] = (timestamp / 0x10000000000) & 0xff;
-    uuid[1] = (timestamp / 0x100000000) & 0xff;
-    uuid[2] = (timestamp / 0x1000000) & 0xff;
-    uuid[3] = (timestamp / 0x10000) & 0xff;
-    uuid[4] = (timestamp / 0x100) & 0xff;
-    uuid[5] = timestamp & 0xff;
-    
-    // Version (4 bits) + random (12 bits)
-    uuid[6] = 0x70 | (randomBytes[0] & 0x0f); // Version 7
-    uuid[7] = randomBytes[1];
-    
-    // Variant (2 bits) + random (62 bits)
-    uuid[8] = 0x80 | (randomBytes[2] & 0x3f); // Variant 10xx
-    uuid[9] = randomBytes[3];
-    uuid[10] = randomBytes[4];
-    uuid[11] = randomBytes[5];
-    uuid[12] = randomBytes[6];
-    uuid[13] = randomBytes[7];
-    uuid[14] = randomBytes[8];
-    uuid[15] = randomBytes[9];
-    
-    // Convert to hex string with dashes
-    const hex = Array.from(uuid, b => b.toString(16).padStart(2, "0")).join("");
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
   /**

@@ -1,22 +1,22 @@
-import type { MindooDocChangeHashes } from "../../types";
+import type { StoreEntryMetadata } from "../../types";
 
 /**
- * Network-encrypted change for secure transport over the network.
+ * Network-encrypted entry for secure transport over the network.
  * 
- * Extends MindooDocChangeHashes (metadata stays clear for routing/filtering)
- * but replaces the payload with an RSA-encrypted version.
+ * Extends StoreEntryMetadata (metadata stays clear for routing/filtering)
+ * but adds an RSA-encrypted version of the payload for transport security.
  * 
- * The metadata (docId, changeHash, etc.) is transmitted unencrypted to allow
+ * The metadata (docId, id, etc.) is transmitted unencrypted to allow
  * efficient filtering and routing without requiring decryption. The actual
  * payload data is RSA-encrypted with the recipient's public encryption key.
  */
-export interface NetworkEncryptedChange extends MindooDocChangeHashes {
+export interface NetworkEncryptedEntry extends StoreEntryMetadata {
   /**
    * The original symmetric-encrypted payload, wrapped in RSA encryption
    * for secure network transport.
    * 
    * Must be decrypted with the recipient's RSA private key to get the
-   * original MindooDocChange.payload (which is still encrypted with
+   * original StoreEntry.encryptedData (which is still encrypted with
    * the symmetric key).
    * 
    * This provides defense-in-depth: even if RSA is compromised, the

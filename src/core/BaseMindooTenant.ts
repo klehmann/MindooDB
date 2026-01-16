@@ -635,5 +635,207 @@ export class BaseMindooTenant implements MindooTenant {
     
     return bytes.buffer;
   }
+
+  // ============================================================================
+  // Attachment Encryption Methods
+  // ============================================================================
+
+  /**
+   * Encryption mode byte values for attachment payloads.
+   * 0x00 = Random IV (more secure, no deduplication)
+   * 0x01 = Deterministic IV (enables deduplication, reveals identical content)
+   */
+  protected static readonly ENCRYPTION_MODE_RANDOM = 0x00;
+  protected static readonly ENCRYPTION_MODE_DETERMINISTIC = 0x01;
+
+  /**
+   * Get the symmetric key for a given key ID.
+   * This is a protected helper method that can be used by subclasses.
+   * 
+   * @param decryptionKeyId The key ID ("default" or a named key ID)
+   * @returns The decrypted symmetric key bytes
+   */
+  protected async getSymmetricKey(decryptionKeyId: string): Promise<Uint8Array> {
+    if (decryptionKeyId === "default") {
+      // Use cached tenant encryption key if available
+      if (this.decryptedTenantKeyCache) {
+        return this.decryptedTenantKeyCache;
+      }
+      // Decrypt tenant encryption key
+      const decrypted = await this.decryptPrivateKey(
+        this.tenantEncryptionKey,
+        this.tenantEncryptionKeyPassword,
+        "default"
+      );
+      const symmetricKey = new Uint8Array(decrypted);
+      this.decryptedTenantKeyCache = symmetricKey;
+      return symmetricKey;
+    } else {
+      // Get the decrypted key from KeyBag
+      const decryptedKey = await this.keyBag.get(decryptionKeyId);
+      if (!decryptedKey) {
+        throw new Error(`Symmetric key not found: ${decryptionKeyId}`);
+      }
+      return decryptedKey;
+    }
+  }
+
+  /**
+   * Configuration method that determines whether to use deterministic encryption for attachments.
+   * Subclasses can override this to change the default behavior.
+   * 
+   * When true (default):
+   * - Same plaintext + same key = same ciphertext (enables deduplication)
+   * - Reveals when identical content is stored
+   * 
+   * When false:
+   * - Each encryption produces unique ciphertext
+   * - No deduplication possible
+   * - More secure for sensitive content
+   * 
+   * @returns True to use deterministic encryption, false for random IV
+   */
+  protected usesDeterministicAttachmentEncryption(): boolean {
+    return true; // Default: enable deduplication
+  }
+
+  /**
+   * Encrypt an attachment payload with the appropriate encryption mode.
+   * Uses mode prefix format: [mode byte][IV (12 bytes)][encrypted data + tag]
+   * 
+   * For deterministic mode (0x01), the IV is derived from SHA-256(plaintext)[:12]
+   * For random mode (0x00), the IV is randomly generated
+   * 
+   * @param payload The plaintext attachment data
+   * @param decryptionKeyId The key ID for encryption
+   * @returns The encrypted payload with mode prefix
+   */
+  protected async encryptAttachmentPayload(
+    payload: Uint8Array,
+    decryptionKeyId: string
+  ): Promise<Uint8Array> {
+    console.log(`[BaseMindooTenant] Encrypting attachment payload with key: ${decryptionKeyId}`);
+    
+    const symmetricKey = await this.getSymmetricKey(decryptionKeyId);
+    const subtle = this.cryptoAdapter.getSubtle();
+    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
+    
+    // Import the symmetric key
+    const keyArray = new Uint8Array(symmetricKey);
+    const cryptoKey = await subtle.importKey(
+      "raw",
+      keyArray.buffer,
+      { name: "AES-GCM" },
+      false,
+      ["encrypt"]
+    );
+
+    // Determine encryption mode and generate IV accordingly
+    const useDeterministic = this.usesDeterministicAttachmentEncryption();
+    const mode = useDeterministic 
+      ? BaseMindooTenant.ENCRYPTION_MODE_DETERMINISTIC 
+      : BaseMindooTenant.ENCRYPTION_MODE_RANDOM;
+    
+    let iv: Uint8Array;
+    if (useDeterministic) {
+      // Deterministic IV: derive from plaintext hash
+      // IV = SHA-256(plaintext)[:12]
+      const payloadBuffer = payload.buffer.slice(
+        payload.byteOffset, 
+        payload.byteOffset + payload.byteLength
+      ) as ArrayBuffer;
+      const hashBuffer = await subtle.digest("SHA-256", payloadBuffer);
+      iv = new Uint8Array(hashBuffer).slice(0, 12);
+      console.log(`[BaseMindooTenant] Using deterministic IV derived from content hash`);
+    } else {
+      // Random IV
+      iv = new Uint8Array(12);
+      randomValues(iv);
+      console.log(`[BaseMindooTenant] Using random IV`);
+    }
+
+    // Encrypt the payload
+    const payloadArray = new Uint8Array(payload);
+    const encrypted = await subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv as BufferSource,
+        tagLength: 128,
+      },
+      cryptoKey,
+      payloadArray
+    );
+
+    // Combine: mode byte (1) + IV (12) + encrypted data
+    const encryptedArray = new Uint8Array(encrypted);
+    const result = new Uint8Array(1 + 12 + encryptedArray.length);
+    result[0] = mode;
+    result.set(iv, 1);
+    result.set(encryptedArray, 13);
+
+    console.log(`[BaseMindooTenant] Encrypted attachment (mode=${mode}, ${payload.length} -> ${result.length} bytes)`);
+    return result;
+  }
+
+  /**
+   * Decrypt an attachment payload that was encrypted with encryptAttachmentPayload.
+   * Reads the mode prefix to determine which decryption method to use.
+   * 
+   * @param encryptedPayload The encrypted payload with mode prefix
+   * @param decryptionKeyId The key ID for decryption
+   * @returns The decrypted plaintext
+   */
+  protected async decryptAttachmentPayload(
+    encryptedPayload: Uint8Array,
+    decryptionKeyId: string
+  ): Promise<Uint8Array> {
+    console.log(`[BaseMindooTenant] Decrypting attachment payload with key: ${decryptionKeyId}`);
+    
+    if (encryptedPayload.length < 13) {
+      throw new Error("Invalid encrypted attachment payload: too short");
+    }
+
+    // Read mode byte
+    const mode = encryptedPayload[0];
+    if (mode !== BaseMindooTenant.ENCRYPTION_MODE_RANDOM && 
+        mode !== BaseMindooTenant.ENCRYPTION_MODE_DETERMINISTIC) {
+      throw new Error(`Invalid encryption mode: ${mode}`);
+    }
+    console.log(`[BaseMindooTenant] Decrypting attachment with mode=${mode}`);
+
+    // Extract IV (bytes 1-12)
+    const iv = encryptedPayload.slice(1, 13);
+    
+    // Extract ciphertext (bytes 13 onwards)
+    const ciphertext = encryptedPayload.slice(13);
+
+    const symmetricKey = await this.getSymmetricKey(decryptionKeyId);
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Import the symmetric key
+    const keyArray = new Uint8Array(symmetricKey);
+    const cryptoKey = await subtle.importKey(
+      "raw",
+      keyArray.buffer,
+      { name: "AES-GCM" },
+      false,
+      ["decrypt"]
+    );
+
+    // Decrypt
+    const decrypted = await subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: iv as BufferSource,
+        tagLength: 128,
+      },
+      cryptoKey,
+      ciphertext
+    );
+
+    const result = new Uint8Array(decrypted);
+    console.log(`[BaseMindooTenant] Decrypted attachment (${encryptedPayload.length} -> ${result.length} bytes)`);
+    return result;
+  }
 }
 

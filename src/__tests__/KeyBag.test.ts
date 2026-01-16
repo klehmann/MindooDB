@@ -1,18 +1,18 @@
 import { KeyBag } from "../core/keys/KeyBag";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
-import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
+import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { PrivateUserId, EncryptedPrivateKey } from "../core/types";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("KeyBag", () => {
   let factory: BaseMindooTenantFactory;
-  let storeFactory: InMemoryAppendOnlyStoreFactory;
+  let storeFactory: InMemoryContentAddressedStoreFactory;
   let currentUser: PrivateUserId;
   let currentUserPassword: string;
   let keyBag: KeyBag;
 
   beforeEach(async () => {
-    storeFactory = new InMemoryAppendOnlyStoreFactory();
+    storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     currentUserPassword = "userpassword123";
     currentUser = await factory.createUserId("CN=testuser/O=testtenant", currentUserPassword);

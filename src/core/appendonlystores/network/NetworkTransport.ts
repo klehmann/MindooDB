@@ -1,5 +1,5 @@
-import type { MindooDocChange, MindooDocChangeHashes } from "../../types";
-import type { NetworkEncryptedChange, AuthResult } from "./types";
+import type { StoreEntry, StoreEntryMetadata } from "../../types";
+import type { NetworkEncryptedEntry, AuthResult } from "./types";
 
 /**
  * Abstract interface for network communication in MindooDB sync.
@@ -12,12 +12,12 @@ import type { NetworkEncryptedChange, AuthResult } from "./types";
  * 1. Client calls requestChallenge(username) to get a challenge string
  * 2. Client signs the challenge with their private signing key
  * 3. Client calls authenticate(challenge, signature) to get a JWT token
- * 4. Client uses the token for subsequent findNewChanges() and getChanges() calls
+ * 4. Client uses the token for subsequent findNewEntries() and getEntries() calls
  * 
  * Security features:
  * - Challenge-response prevents replay attacks
  * - JWT tokens have expiration for session management
- * - Change payloads are RSA-encrypted with recipient's public key
+ * - Entry payloads are RSA-encrypted with recipient's public key
  */
 export interface NetworkTransport {
   /**
@@ -49,85 +49,121 @@ export interface NetworkTransport {
   authenticate(challenge: string, signature: Uint8Array): Promise<AuthResult>;
 
   /**
-   * Find changes that the remote has which we don't have locally.
+   * Find entries that the remote has which we don't have locally.
    * 
-   * This is used to identify which changes need to be synchronized.
-   * The returned MindooDocChangeHashes contain metadata only (no payload).
+   * This is used to identify which entries need to be synchronized.
+   * The returned StoreEntryMetadata contains metadata only (no encrypted payload).
    * 
    * @param token JWT access token from authenticate()
-   * @param haveChangeHashes List of change hashes we already have locally
-   * @returns List of change hashes that exist remotely but not locally
+   * @param haveIds List of entry IDs we already have locally
+   * @returns List of entry metadata for entries that exist remotely but not locally
    * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
    * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
    */
-  findNewChanges(
+  findNewEntries(
     token: string,
-    haveChangeHashes: string[]
-  ): Promise<MindooDocChangeHashes[]>;
+    haveIds: string[]
+  ): Promise<StoreEntryMetadata[]>;
 
   /**
-   * Find changes for a specific document that the remote has which we don't have locally.
+   * Find entries for a specific document that the remote has which we don't have locally.
    * 
-   * This is an optimized version of findNewChanges that only returns changes for a specific document.
+   * This is an optimized version of findNewEntries that only returns entries for a specific document.
    * 
    * @param token JWT access token from authenticate()
-   * @param haveChangeHashes List of change hashes we already have locally for this document
+   * @param haveIds List of entry IDs we already have locally for this document
    * @param docId The document ID to filter by
-   * @returns List of change hashes for the specified document that exist remotely but not locally
+   * @returns List of entry metadata for the specified document that exist remotely but not locally
    * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
    * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
    */
-  findNewChangesForDoc(
+  findNewEntriesForDoc(
     token: string,
-    haveChangeHashes: string[],
+    haveIds: string[],
     docId: string
-  ): Promise<MindooDocChangeHashes[]>;
+  ): Promise<StoreEntryMetadata[]>;
 
   /**
-   * Get changes from the remote store.
+   * Get entries from the remote store.
    * 
-   * The returned changes have their payloads RSA-encrypted with the
+   * The returned entries have their payloads RSA-encrypted with the
    * requesting user's public encryption key. The client must decrypt
    * these with their private key to get the original payload.
    * 
    * @param token JWT access token from authenticate()
-   * @param changeHashes The change hashes to retrieve
-   * @returns NetworkEncryptedChange[] with RSA-encrypted payloads
+   * @param ids The IDs of entries to retrieve
+   * @returns NetworkEncryptedEntry[] with RSA-encrypted payloads
    * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
    * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
    */
-  getChanges(
+  getEntries(
     token: string,
-    changeHashes: MindooDocChangeHashes[]
-  ): Promise<NetworkEncryptedChange[]>;
+    ids: string[]
+  ): Promise<NetworkEncryptedEntry[]>;
 
   /**
-   * Push changes to the remote store.
+   * Push entries to the remote store.
    * 
-   * This is used to send locally-created changes to the server for storage.
-   * The server will verify that the change was created by a trusted user
+   * This is used to send locally-created entries to the server for storage.
+   * The server will verify that the entry was created by a trusted user
    * (by checking the createdByPublicKey against the tenant directory).
    * 
    * @param token JWT access token from authenticate()
-   * @param changes The changes to push to the remote store
+   * @param entries The entries to push to the remote store
    * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
    * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
-   * @throws NetworkError with type INVALID_SIGNATURE if change signature verification fails
+   * @throws NetworkError with type INVALID_SIGNATURE if entry signature verification fails
    */
-  pushChanges(token: string, changes: MindooDocChange[]): Promise<void>;
+  putEntries(token: string, entries: StoreEntry[]): Promise<void>;
 
   /**
-   * Get all change hashes from the remote store.
+   * Check which of the provided IDs exist in the remote store.
    * 
-   * This is used for synchronization to identify which changes the remote has.
-   * Returns only the hashes (not the full changes) for efficiency.
+   * This is more efficient than getAllIds() when checking a small number of IDs,
+   * as it only transfers the IDs that exist rather than all IDs in the store.
    * 
    * @param token JWT access token from authenticate()
-   * @returns List of all change hashes in the remote store
+   * @param ids The IDs to check for existence
+   * @returns List of IDs that exist in the remote store (subset of input)
    * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
    * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
    */
-  getAllChangeHashes(token: string): Promise<string[]>;
+  hasEntries(token: string, ids: string[]): Promise<string[]>;
+
+  /**
+   * Get all entry IDs from the remote store.
+   * 
+   * This is used for synchronization to identify which entries the remote has.
+   * Returns only the IDs (not the full entries) for efficiency.
+   * 
+   * @param token JWT access token from authenticate()
+   * @returns List of all entry IDs in the remote store
+   * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
+   * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
+   */
+  getAllIds(token: string): Promise<string[]>;
+
+  /**
+   * Resolve the dependency chain starting from an entry ID.
+   * 
+   * Returns IDs in dependency order, traversing backward through dependencyIds.
+   * This is more efficient than client-side traversal as it avoids multiple round trips.
+   * 
+   * @param token JWT access token from authenticate()
+   * @param startId The entry ID to start traversal from
+   * @param options Optional traversal options:
+   *   - stopAtEntryType: Stop when encountering an entry of this type (e.g., "doc_snapshot")
+   *   - maxDepth: Maximum number of hops to traverse
+   *   - includeStart: Whether to include startId in the result (default: true)
+   * @returns List of entry IDs in dependency order (oldest first)
+   * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
+   * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
+   */
+  resolveDependencies(
+    token: string,
+    startId: string,
+    options?: Record<string, unknown>
+  ): Promise<string[]>;
 }
 
 /**

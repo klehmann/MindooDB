@@ -1,13 +1,13 @@
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
-import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
+import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 
 describe("BaseMindooTenantFactory", () => {
   let factory: BaseMindooTenantFactory;
-  let storeFactory: InMemoryAppendOnlyStoreFactory;
+  let storeFactory: InMemoryContentAddressedStoreFactory;
 
   beforeEach(() => {
-    storeFactory = new InMemoryAppendOnlyStoreFactory();
+    storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
   });
 
@@ -265,8 +265,8 @@ describe("BaseMindooTenantFactory", () => {
   });
 
   describe("factory instantiation", () => {
-    it("should instantiate with InMemoryAppendOnlyStoreFactory and NodeCryptoAdapter", () => {
-      const storeFactory = new InMemoryAppendOnlyStoreFactory();
+    it("should instantiate with InMemoryContentAddressedStoreFactory and NodeCryptoAdapter", () => {
+      const storeFactory = new InMemoryContentAddressedStoreFactory();
       const factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
 
       expect(factory).toBeDefined();
@@ -274,7 +274,7 @@ describe("BaseMindooTenantFactory", () => {
     });
 
     it("should be able to create keys with provided crypto adapter", async () => {
-      const storeFactory = new InMemoryAppendOnlyStoreFactory();
+      const storeFactory = new InMemoryContentAddressedStoreFactory();
       const factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
 
       expect(factory).toBeDefined();

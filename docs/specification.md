@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** designed for secure, distributed document storage and synchronization. The platform enables clients to create tenants locally and synchronize document changes across multiple clients and servers through append-only stores containing cryptographically signed and encrypted document histories.
+MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** designed for secure, distributed document storage and synchronization. The platform enables clients to create tenants locally and synchronize document changes across multiple clients and servers through content-addressed stores containing cryptographically signed and encrypted document histories.
 
 ## Core Principles
 
@@ -22,13 +22,14 @@ Tenants are created entirely on the client side:
 - Tenants can be synchronized across clients and servers without requiring a central registry
 - The tenant creator becomes the initial administrator
 
-### Append-Only Store Replication
+### Content-Addressed Store Replication
 
-Document changes are stored in **append-only stores** that enable efficient synchronization:
-- Changes are **never modified or deleted** (append-only semantics)
-- Synchronization works by comparing change hashes between peers
+Document changes and attachment chunks are stored in **content-addressed stores** that enable efficient synchronization:
+- Entries are **never modified or deleted** (append-only semantics)
+- Synchronization works by comparing content hashes between peers
 - Clients can sync with other clients (P2P) or servers (client-server)
 - The append-only structure ensures **cryptographic integrity** and **audit trails**
+- Store implementations can use the `entryType` field to optimize storage strategies
 
 ## Architecture Components
 
@@ -79,31 +80,90 @@ Each **MindooDB** contains multiple **documents**, where each document is an Aut
 - Changes are **encrypted** with either:
   - **Default encryption**: Tenant encryption key (all tenant members can decrypt)
   - **Named key encryption**: A named symmetric key shared offline (only users with that key can decrypt)
-- Changes are stored in the append-only store with metadata (document ID, change hash, dependencies, timestamp)
+- Changes are stored in the content-addressed store with metadata (document ID, change hash, dependencies, timestamp)
 - **Note**: Signing and encryption are separate operations using different keys (signing key for signatures, encryption keys for payload encryption)
 
-### 4. Append-Only Store
+### 4. Content-Addressed Store
 
-The **AppendOnlyStore** is the core synchronization mechanism:
+The **ContentAddressedStore** is the unified storage and synchronization mechanism for both Automerge document changes and attachment chunks.
 
 **Structure:**
-- Stores binary Automerge changes with signatures and encryption
-- Each change has a unique hash (Automerge change hash)
-- Changes are never modified or deleted (true append-only)
-- Changes are cryptographically chained to ensure tamperproofness (like a blockchain)
+- Stores signed and encrypted binary entries identified by content hash
+- Supports multiple entry types: document changes, snapshots, deletions, and attachment chunks
+- Entries are never modified or deleted (append-only semantics)
+- Entries are cryptographically chained to ensure tamperproofness (like a blockchain)
 - Concrete implementations can be built on trusted systems like ImmuDB for additional tamperproof guarantees
 
+**Entry Types:**
+- `doc_create` - Document creation (first Automerge change)
+- `doc_change` - Document modification (subsequent Automerge changes)
+- `doc_snapshot` - Automerge snapshot for performance optimization
+- `doc_delete` - Document deletion (tombstone entry)
+- `attachment_chunk` - File attachment chunk
+
+**Store Entry Structure:**
+```typescript
+interface StoreEntryMetadata {
+  entryType: StoreEntryType;      // Type of entry (doc_*, attachment_*)
+  hash: string;                   // Content hash (SHA-256 of encrypted data)
+  docId: string;                  // Associated document ID
+  dependencyHashes: string[];     // Predecessor entry hashes (for ordering)
+  createdAt: number;              // Timestamp (milliseconds since Unix epoch)
+  createdByPublicKey: string;     // Author's public signing key (Ed25519, PEM)
+  decryptionKeyId: string;        // Key ID for decryption ("default" or named)
+  signature: Uint8Array;          // Ed25519 signature over encrypted data
+  originalSize?: number;          // Original size before encryption (for attachments)
+}
+
+interface StoreEntry extends StoreEntryMetadata {
+  encryptedData: Uint8Array;      // Encrypted payload (IV/tag embedded)
+}
+```
+
+**Core Methods:**
+- `putEntries(entries)` - Store one or more entries (automatic deduplication)
+- `getEntries(hashes)` - Retrieve entries by their content hashes
+- `hasEntries(hashes)` - Check which hashes exist in the store
+- `findNewEntries(knownHashes)` - Find entries not in the provided list
+- `findNewEntriesForDoc(knownHashes, docId)` - Find new entries for a specific document
+- `getAllHashes()` - Get all entry hashes in the store
+- `resolveDependencies(startHash, options)` - Traverse dependency chain
+- `purgeDocHistory(docId)` - Remove all entries for a document (GDPR compliance)
+
+**Dependency Resolution:**
+The `resolveDependencies()` method enables traversing the DAG structure:
+- For documents: Load changes from a hash back to a snapshot
+- For attachments: Traverse from last chunk to first chunk
+- Supports options: `stopAtEntryType`, `maxDepth`, `includeStart`
+
 **Synchronization:**
-- Peers exchange lists of change hashes they have
-- Missing changes are requested and transferred
-- Changes can be verified by checking signatures
+- Peers exchange lists of entry hashes they have
+- Missing entries are requested and transferred
+- Entries can be verified by checking signatures
 - Supports client-client, client-server, and server-server synchronization
+
+**Two-Store Architecture:**
+MindooDB supports separate stores for documents and attachments:
+```typescript
+class MindooDB {
+  constructor(
+    tenant: MindooTenant,
+    docStore: ContentAddressedStore,
+    attachmentStore?: ContentAddressedStore
+  )
+}
+```
+This enables:
+- **Flexible deployment**: Different storage backends for docs vs attachments
+- **Cost optimization**: Keep docs local, store attachments in cloud
+- **Simple deployments**: Use single store for both when appropriate
 
 **Performance Optimization:**
 - **Snapshots**: Regular Automerge snapshots are generated for documents
 - When loading a document, only changes since the last snapshot need to be applied
 - This prevents having to replay the entire document history for each access
-- Snapshots are stored alongside changes in the append-only store
+- Snapshots are stored as `doc_snapshot` entries in the store
+- The `resolveDependencies()` method can stop at snapshots using `stopAtEntryType`
 
 ### 5. Encryption Model
 
@@ -153,7 +213,7 @@ MindooDB uses a **hybrid encryption model**:
 - **Key Usage**: Encryption keys are used **only for encryption/decryption**, never for signing
 
 **Tamperproofness:**
-- Changes in the append-only store are cryptographically chained (like a blockchain)
+- Entries in the content-addressed store are cryptographically chained (like a blockchain)
 - Each change references previous changes through dependency hashes
 - Any modification to a change would break the cryptographic chain
 - Concrete implementations can leverage trusted systems like **ImmuDB** for additional tamperproof guarantees at the storage layer
@@ -200,7 +260,7 @@ MindooDB uses a **hybrid encryption model**:
 
 1. Client calls `MindooDB.createDocument()` or `createEncryptedDocument(keyId)`
 2. If encrypted, the key ID is stored in document metadata
-3. First change is created and stored in append-only store
+3. First change is created and stored in content-addressed store
 4. Change is signed with user's signing key
 5. Change is encrypted with the specified key (or "default" tenant key)
 
@@ -213,31 +273,31 @@ MindooDB uses a **hybrid encryption model**:
    - Signs the change with user's signing key
    - Determines encryption key ID from document metadata (from first change)
    - Encrypts the change payload with the appropriate key
-   - Appends to append-only store
+   - Stores entry in content-addressed store
 
 ### Synchronizing Changes
 
-**Low-Level Synchronization (AppendOnlyStore):**
-1. Client A calls `AppendOnlyStore.findNewChanges()` with list of known change hashes
-2. Client B (or server) returns list of missing changes
-3. Client A calls `AppendOnlyStore.getChanges()` to fetch the actual changes
+**Low-Level Synchronization (ContentAddressedStore):**
+1. Client A calls `store.findNewEntries()` with list of known entry hashes
+2. Client B (or server) returns list of missing entry metadata
+3. Client A calls `store.getEntries()` to fetch the actual entries
 
 **High-Level Synchronization (MindooDB):**
-1. Client calls `MindooDB.syncStoreChanges()` to sync changes from the local append-only store
-   - This finds new changes using `findNewChanges()`
-   - Processes each change: verifies signature, decrypts payload, applies to Automerge document
+1. Client calls `MindooDB.syncStoreChanges()` to sync changes from the local content-addressed store
+   - This finds new entries using `findNewEntries()`
+   - Processes each entry: verifies signature, decrypts payload, applies to Automerge document
    - Updates internal index
 2. For remote synchronization:
-   - `MindooDB.pullChangesFrom(remoteStore)` - pulls changes from a remote store
-   - `MindooDB.pushChangesTo(remoteStore)` - pushes local changes to a remote store
+   - `MindooDB.pullChangesFrom(remoteStore)` - pulls entries from a remote store
+   - `MindooDB.pushChangesTo(remoteStore)` - pushes local entries to a remote store
 
-**Change Processing:**
-- For each change:
+**Entry Processing:**
+- For each entry:
   - Verify signature (prove authenticity and integrity)
   - Decrypt payload if encrypted (using appropriate key from KeyBag via `Tenant.decryptPayload()`)
-  - Apply change to Automerge document
+  - Apply change to Automerge document (for doc_* entry types)
 - Updated document state is available
-- **Internal Index Update**: The local MindooDB instance updates its internal index when documents actually change (after applying changes)
+- **Internal Index Update**: The local MindooDB instance updates its internal index when documents actually change (after applying entries)
 - The index tracks which documents have changed and when, enabling incremental operations on the database
 - `processChangesSince()` uses this index to efficiently find documents that changed since a given cursor
 - This enables external systems to efficiently query for document changes and update their own indexes incrementally
@@ -250,7 +310,7 @@ MindooDB uses a **hybrid encryption model**:
 4. Users add the key to their KeyBag using `KeyBag.decryptAndImportKey(keyId, encryptedKey, encryptedKeyPassword)`
 5. The KeyBag decrypts the key and stores it (the KeyBag itself is encrypted on disk using the user's encryption key password)
 6. The KeyBag can be saved/loaded using `KeyBag.save()` and `KeyBag.load()` methods (encrypts the KeyBag content and returns it as byte sequence)
-7. **Note**: Access discovery (scanning append-only stores when a new key is added) is a potential future enhancement but not currently implemented
+7. **Note**: Access discovery (scanning content-addressed stores when a new key is added) is a potential future enhancement but not currently implemented
 8. Users can now decrypt and access documents encrypted with that key ID using `Tenant.encryptPayload()` and `Tenant.decryptPayload()`
 
 ## Performance Considerations
@@ -266,21 +326,22 @@ To maintain acceptable database performance:
 
 **Snapshot Strategy:**
 - Snapshots are generated periodically (e.g., every N changes or time interval)
-- Snapshots are stored in the append-only store
+- Snapshots are stored as `doc_snapshot` entries in the content-addressed store
 - The system tracks which changes have been snapshotted
 - `getAllChangeHashesForDoc()` supports `fromLastSnapshot` parameter
 
-### Append-Only Store Efficiency
+### Content-Addressed Store Efficiency
 
-- Changes are identified by hash, enabling efficient duplicate detection
-- Bulk operations (`getChanges()`) reduce network round-trips
-- Change hashes are small, enabling efficient synchronization
-- Only missing changes are transferred during sync
+- Entries are identified by content hash, enabling automatic deduplication
+- Bulk operations (`getEntries()`, `putEntries()`) reduce network round-trips
+- Entry hashes are small, enabling efficient synchronization
+- Only missing entries are transferred during sync
+- Store implementations can optimize storage based on entry type
 
 ### Historical Analysis
 
 An important benefit of the append-only structure is the ability to **go back in time** and perform historical analysis:
-- All document changes are preserved in the append-only store
+- All document changes are preserved in the content-addressed store
 - Documents can be reconstructed to any point in time by applying changes up to a specific timestamp
 - This enables:
   - **Audit trails**: Complete history of who changed what and when
@@ -290,9 +351,9 @@ An important benefit of the append-only structure is the ability to **go back in
 
 ## Limitations and Trade-offs
 
-### Append-Only Revocation Limitation
+### Content-Addressed Store Revocation Limitation
 
-Due to the append-only nature of the store:
+Due to the append-only nature of the content-addressed store:
 - **Revoking user access** prevents them from decrypting future changes
 - **Previously decrypted changes** remain accessible to revoked users
 - This is a fundamental trade-off: audit trail and integrity vs. retroactive access control
@@ -334,7 +395,7 @@ Due to the append-only nature of the store:
 - No central server required for access control
 
 ### Audit-Compliant Systems
-- Append-only store provides complete audit trail
+- Content-addressed store provides complete audit trail
 - All changes are signed and timestamped
 - Cryptographic proofs of all operations
 

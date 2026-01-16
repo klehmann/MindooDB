@@ -1,15 +1,18 @@
 import * as Automerge from "@automerge/automerge";
+import { v7 as uuidv7 } from "uuid";
 import {
   MindooDB,
   MindooDoc,
   MindooDocPayload,
-  MindooDocChange,
-  MindooDocChangeHashes,
+  StoreEntry,
+  StoreEntryMetadata,
+  StoreEntryType,
   MindooTenant,
   ProcessChangesCursor,
   ProcessChangesResult,
 } from "./types";
-import type { AppendOnlyStore } from "./appendonlystores/types";
+import type { ContentAddressedStore } from "./appendonlystores/types";
+import { generateDocEntryId, computeContentHash, parseDocEntryId } from "./utils/idGeneration";
 
 /**
  * Internal representation of a document with its Automerge state
@@ -27,7 +30,7 @@ interface InternalDoc {
  * BaseMindooDB is a platform-agnostic implementation of MindooDB
  * that works in both browser and server environments.
  * 
- * It receives MindooTenant and AppendOnlyStore in the constructor,
+ * It receives MindooTenant and ContentAddressedStore in the constructor,
  * allowing platform-specific implementations of those interfaces.
  * 
  * Dependencies:
@@ -44,7 +47,8 @@ interface InternalDoc {
  */
 export class BaseMindooDB implements MindooDB {
   private tenant: MindooTenant;
-  private store: AppendOnlyStore;
+  private store: ContentAddressedStore;
+  private attachmentStore: ContentAddressedStore | undefined;
   
   // Internal index: sorted array of document entries, maintained in order by (lastModified, docId)
   // This allows efficient incremental processing without sorting on each call
@@ -56,16 +60,17 @@ export class BaseMindooDB implements MindooDB {
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
   
-  // Track which change hashes we've already processed
-  private processedChangeHashes: string[] = [];
+  // Track which entry IDs we've already processed
+  private processedEntryIds: string[] = [];
   
-  // Monotonic counter for UUID7 generation (ensures uniqueness within same millisecond)
-  private uuid7Counter: number = 0;
-  private uuid7LastTimestamp: number = 0;
+  // Index: automergeHash -> entryId for each document
+  // Used for resolving Automerge dependency hashes to entry IDs
+  private automergeHashToEntryId: Map<string, Map<string, string>> = new Map(); // Map<docId, Map<automergeHash, entryId>>
 
-  constructor(tenant: MindooTenant, store: AppendOnlyStore) {
+  constructor(tenant: MindooTenant, store: ContentAddressedStore, attachmentStore?: ContentAddressedStore) {
     this.tenant = tenant;
     this.store = store;
+    this.attachmentStore = attachmentStore;
   }
 
   /**
@@ -135,6 +140,53 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Register an automerge hash -> entry ID mapping for a document.
+   * This is used to resolve Automerge dependency hashes to entry IDs.
+   */
+  private registerAutomergeHashMapping(docId: string, automergeHash: string, entryId: string): void {
+    if (!this.automergeHashToEntryId.has(docId)) {
+      this.automergeHashToEntryId.set(docId, new Map());
+    }
+    this.automergeHashToEntryId.get(docId)!.set(automergeHash, entryId);
+  }
+
+  /**
+   * Get the entry ID for an automerge hash within a document.
+   * Returns null if not found.
+   */
+  private getEntryIdForAutomergeHash(docId: string, automergeHash: string): string | null {
+    const docIndex = this.automergeHashToEntryId.get(docId);
+    if (docIndex) {
+      return docIndex.get(automergeHash) || null;
+    }
+    return null;
+  }
+
+  /**
+   * Resolve Automerge dependency hashes to entry IDs for a document.
+   * Returns the entry IDs for the given automerge hashes.
+   */
+  private resolveAutomergeDepsToEntryIds(docId: string, automergeHashes: string[]): string[] {
+    const entryIds: string[] = [];
+    for (const hash of automergeHashes) {
+      const entryId = this.getEntryIdForAutomergeHash(docId, hash);
+      if (entryId) {
+        entryIds.push(entryId);
+      } else {
+        console.warn(`[BaseMindooDB] Could not resolve automerge hash ${hash} to entry ID for doc ${docId}`);
+      }
+    }
+    return entryIds;
+  }
+
+  /**
+   * Get the SubtleCrypto instance from the tenant's crypto adapter.
+   */
+  private getSubtle(): SubtleCrypto {
+    return this.tenant.getCryptoAdapter().getSubtle();
+  }
+
+  /**
    * Initialize the database instance.
    */
   async initialize(): Promise<void> {
@@ -143,43 +195,43 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Sync changes from the append-only store by finding new changes and processing them.
-   * This method can be called multiple times to incrementally sync new changes.
-   * On first call (when processedChangeHashes is empty), it will process all changes.
+   * Sync changes from the content-addressed store by finding new entries and processing them.
+   * This method can be called multiple times to incrementally sync new entries.
+   * On first call (when processedEntryIds is empty), it will process all entries.
    */
   async syncStoreChanges(): Promise<void> {
     console.log(`[BaseMindooDB] Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
-    console.log(`[BaseMindooDB] Already processed ${this.processedChangeHashes.length} change hashes`);
+    console.log(`[BaseMindooDB] Already processed ${this.processedEntryIds.length} entry IDs`);
     
-    // Find new changes that we haven't processed yet
-    const newChangeHashes = await this.store.findNewChanges(this.processedChangeHashes);
-    console.log(`[BaseMindooDB] Found ${newChangeHashes.length} new change hashes`);
+    // Find new entries that we haven't processed yet
+    const newEntryMetadata = await this.store.findNewEntries(this.processedEntryIds);
+    console.log(`[BaseMindooDB] Found ${newEntryMetadata.length} new entries`);
     
-    if (newChangeHashes.length === 0) {
-      console.log(`[BaseMindooDB] No new changes to process`);
+    if (newEntryMetadata.length === 0) {
+      console.log(`[BaseMindooDB] No new entries to process`);
       return;
     }
     
-    // Group new changes by document ID
-    const changesByDoc = new Map<string, MindooDocChangeHashes[]>();
-    for (const changeHash of newChangeHashes) {
-      if (!changesByDoc.has(changeHash.docId)) {
-        changesByDoc.set(changeHash.docId, []);
+    // Group new entries by document ID
+    const entriesByDoc = new Map<string, StoreEntryMetadata[]>();
+    for (const entryMeta of newEntryMetadata) {
+      if (!entriesByDoc.has(entryMeta.docId)) {
+        entriesByDoc.set(entryMeta.docId, []);
       }
-      changesByDoc.get(changeHash.docId)!.push(changeHash);
+      entriesByDoc.get(entryMeta.docId)!.push(entryMeta);
     }
     
-    // Process each document with new changes
+    // Process each document with new entries
     // Reload documents to apply all changes (including new ones)
-    console.log(`[BaseMindooDB] Processing ${changesByDoc.size} documents with new changes`);
-    for (const [docId, changeHashes] of changesByDoc) {
+    console.log(`[BaseMindooDB] Processing ${entriesByDoc.size} documents with new entries`);
+    for (const [docId, entryMetadataList] of entriesByDoc) {
       try {
-        console.log(`[BaseMindooDB] ===== Processing document ${docId} with ${changeHashes.length} new change(s) in syncStoreChanges =====`);
-        // Clear cache for this document so it gets reloaded with all changes
+        console.log(`[BaseMindooDB] ===== Processing document ${docId} with ${entryMetadataList.length} new entry(s) in syncStoreChanges =====`);
+        // Clear cache for this document so it gets reloaded with all entries
         this.docCache.delete(docId);
         console.log(`[BaseMindooDB] Cleared cache for document ${docId}`);
         
-        // Reload document (this will load all changes including new ones)
+        // Reload document (this will load all entries including new ones)
         console.log(`[BaseMindooDB] About to call loadDocumentInternal for document ${docId}`);
         const doc = await this.loadDocumentInternal(docId);
         console.log(`[BaseMindooDB] loadDocumentInternal returned for document ${docId}, result: ${doc ? 'success' : 'null'}`);
@@ -203,14 +255,18 @@ export class BaseMindooDB implements MindooDB {
       }
     }
     
-    // Append new change hashes to our processed list
-    this.processedChangeHashes.push(...newChangeHashes.map(ch => ch.changeHash));
+    // Append new entry IDs to our processed list
+    this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
     
-    console.log(`[BaseMindooDB] Synced ${newChangeHashes.length} new changes, index now has ${this.index.length} documents`);
+    console.log(`[BaseMindooDB] Synced ${newEntryMetadata.length} new entries, index now has ${this.index.length} documents`);
   }
 
-  getStore(): AppendOnlyStore {
+  getStore(): ContentAddressedStore {
     return this.store;
+  }
+
+  getAttachmentStore(): ContentAddressedStore | undefined {
+    return this.attachmentStore;
   }
 
   getTenant(): MindooTenant {
@@ -225,7 +281,7 @@ export class BaseMindooDB implements MindooDB {
     const keyId = decryptionKeyId || "default";
     
     // Generate UUID7 for document ID
-    const docId = this.generateUUID7();
+    const docId = uuidv7();
     
     console.log(`[BaseMindooDB] Creating document ${docId} with key ${keyId}`);
     
@@ -269,13 +325,24 @@ export class BaseMindooDB implements MindooDB {
       console.error(`[BaseMindooDB] Error decoding change for document ${docId}:`, error);
       throw error;
     }
-    const changeHash = decodedChange.hash;
-    const depsHashes: string[] = decodedChange.deps || []; // First change has no dependencies
+    const automergeHash = decodedChange.hash;
+    const automergeDepHashes: string[] = decodedChange.deps || []; // First change has no dependencies
     
     // Encrypt the change payload first
     console.log(`[BaseMindooDB] Encrypting change payload for document ${docId}`);
     const encryptedPayload = await this.tenant.encryptPayload(changeBytes, keyId);
     console.log(`[BaseMindooDB] Encrypted payload: ${changeBytes.length} -> ${encryptedPayload.length} bytes`);
+    
+    // Compute content hash from encrypted data
+    const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
+    console.log(`[BaseMindooDB] Computed content hash: ${contentHash.substring(0, 16)}...`);
+    
+    // Generate entry ID with blockchain-like chaining
+    const entryId = await generateDocEntryId(docId, automergeHash, automergeDepHashes, this.getSubtle());
+    console.log(`[BaseMindooDB] Generated entry ID: ${entryId}`);
+    
+    // Resolve Automerge dependency hashes to entry IDs (empty for first change)
+    const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
     
     // Sign the encrypted payload (this allows signature verification without decryption)
     // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
@@ -283,26 +350,32 @@ export class BaseMindooDB implements MindooDB {
     const signature = await this.tenant.signPayload(encryptedPayload);
     console.log(`[BaseMindooDB] Signed payload, signature length: ${signature.length} bytes`);
 
-    // Create change metadata
-    const changeMetadata: MindooDocChangeHashes = {
-      type: "create",
+    // Create entry metadata
+    const entryMetadata: StoreEntryMetadata = {
+      entryType: "doc_create",
+      id: entryId,
+      contentHash,
       docId,
-      changeHash,
-      depsHashes,
+      dependencyIds,
       createdAt: now,
       createdByPublicKey: currentUser.userSigningPublicKey,
       decryptionKeyId: keyId,
       signature,
+      originalSize: changeBytes.length,
+      encryptedSize: encryptedPayload.length,
     };
     
-    // Create full change object
-    const fullChange: MindooDocChange = {
-      ...changeMetadata,
-      payload: encryptedPayload,
+    // Create full entry object
+    const fullEntry: StoreEntry = {
+      ...entryMetadata,
+      encryptedData: encryptedPayload,
     };
     
-    // Append to store
-    await this.store.append(fullChange);
+    // Store entry
+    await this.store.putEntries([fullEntry]);
+    
+    // Register automerge hash -> entry ID mapping
+    this.registerAutomergeHashMapping(docId, automergeHash, entryId);
     
     // Create internal document representation
     const internalDoc: InternalDoc = {
@@ -341,58 +414,64 @@ export class BaseMindooDB implements MindooDB {
   async getDocumentAtTimestamp(docId: string, timestamp: number): Promise<MindooDoc | null> {
     console.log(`[BaseMindooDB] Getting document ${docId} at timestamp ${timestamp}`);
     
-    // Get all change hashes for this document
-    const allChangeHashes = await this.store.findNewChangesForDoc([], docId);
+    // Get all entry metadata for this document
+    const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
     
-    // Filter changes up to the timestamp
-    const relevantChanges = allChangeHashes
-      .filter(ch => ch.createdAt <= timestamp)
+    // Filter entries up to the timestamp
+    const relevantEntries = allEntryMetadata
+      .filter(em => em.createdAt <= timestamp)
       .sort((a, b) => a.createdAt - b.createdAt);
     
-    if (relevantChanges.length === 0) {
+    if (relevantEntries.length === 0) {
       return null; // Document didn't exist at that time
     }
     
-    // Load changes
-    const changes = await this.store.getChanges(relevantChanges);
+    // Load entries
+    const entries = await this.store.getEntries(relevantEntries.map(em => em.id));
     
     // Apply changes in order
     let doc = Automerge.init<MindooDocPayload>();
-    for (const changeData of changes) {
+    for (const entryData of entries) {
       // Verify signature against the encrypted payload (no decryption needed)
       // We sign the encrypted payload, so anyone can verify signatures without decryption keys
       const isValid = await this.tenant.verifySignature(
-        changeData.payload,
-        changeData.signature,
-        changeData.createdByPublicKey
+        entryData.encryptedData,
+        entryData.signature,
+        entryData.createdByPublicKey
       );
       if (!isValid) {
-        console.warn(`[BaseMindooDB] Invalid signature for change ${changeData.changeHash}, skipping`);
+        console.warn(`[BaseMindooDB] Invalid signature for entry ${entryData.id}, skipping`);
         continue;
       }
       
       // Decrypt payload (only after signature verification passes)
       const decryptedPayload = await this.tenant.decryptPayload(
-        changeData.payload,
-        changeData.decryptionKeyId
+        entryData.encryptedData,
+        entryData.decryptionKeyId
       );
-      
+
       // Apply change using loadIncremental - this is the recommended way for binary change data
       doc = Automerge.loadIncremental(doc, decryptedPayload);
+      
+      // Register the automerge hash -> entry ID mapping for future dependency resolution
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
     }
-    
+
     // Check if document was deleted at this timestamp
-    // Look for a "delete" type entry in the relevant changes
-    const hasDeleteEntry = relevantChanges.some(ch => ch.type === "delete" && ch.createdAt <= timestamp);
+    // Look for a "doc_delete" type entry in the relevant entries
+    const hasDeleteEntry = relevantEntries.some(em => em.entryType === "doc_delete" && em.createdAt <= timestamp);
     
     if (hasDeleteEntry) {
       return null; // Document was deleted at this time
     }
     
-    // Find the first change to get createdAt and decryptionKeyId
-    const firstChange = relevantChanges.length > 0 ? relevantChanges[0] : null;
-    const createdAt = firstChange ? firstChange.createdAt : timestamp;
-    const decryptionKeyId = firstChange ? firstChange.decryptionKeyId : "default";
+    // Find the first entry to get createdAt and decryptionKeyId
+    const firstEntry = relevantEntries.length > 0 ? relevantEntries[0] : null;
+    const createdAt = firstEntry ? firstEntry.createdAt : timestamp;
+    const decryptionKeyId = firstEntry ? firstEntry.decryptionKeyId : "default";
     
     const internalDoc: InternalDoc = {
       id: docId,
@@ -444,37 +523,52 @@ export class BaseMindooDB implements MindooDB {
     
     // Decode the change to get hash and dependencies
     const decodedChange = Automerge.decodeChange(changeBytes);
-    const changeHash = decodedChange.hash;
-    const depsHashes = decodedChange.deps || []; // Dependencies from the decoded change
-    
+    const automergeHash = decodedChange.hash;
+    const automergeDepHashes = decodedChange.deps || []; // Dependencies from the decoded change
+
     // Encrypt the change payload first
     const encryptedPayload = await this.tenant.encryptPayload(changeBytes, internalDoc.decryptionKeyId);
-    
+
+    // Compute content hash from encrypted data
+    const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
+
+    // Generate entry ID with blockchain-like chaining
+    const entryId = await generateDocEntryId(docId, automergeHash, automergeDepHashes, this.getSubtle());
+
+    // Resolve Automerge dependency hashes to entry IDs
+    const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
+
     // Sign the encrypted payload (this allows signature verification without decryption)
     // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
     const signature = await this.tenant.signPayload(encryptedPayload);
-    
-    // Create change metadata with type "delete" to mark this as a deletion entry in the append-only store
-    const changeMetadata: MindooDocChangeHashes = {
-      type: "delete",
+
+    // Create entry metadata with type "doc_delete" to mark this as a deletion entry in the store
+    const entryMetadata: StoreEntryMetadata = {
+      entryType: "doc_delete",
+      id: entryId,
+      contentHash,
       docId,
-      changeHash,
-      depsHashes,
+      dependencyIds,
       createdAt: Date.now(),
       createdByPublicKey: currentUser.userSigningPublicKey,
       decryptionKeyId: internalDoc.decryptionKeyId,
       signature,
+      originalSize: changeBytes.length,
+      encryptedSize: encryptedPayload.length,
     };
-    
-    // Create full change object
-    const fullChange: MindooDocChange = {
-      ...changeMetadata,
-      payload: encryptedPayload,
+
+    // Create full entry object
+    const fullEntry: StoreEntry = {
+      ...entryMetadata,
+      encryptedData: encryptedPayload,
     };
-    
-    // Append to store
-    await this.store.append(fullChange);
-    
+
+    // Store entry
+    await this.store.putEntries([fullEntry]);
+
+    // Register automerge hash -> entry ID mapping
+    this.registerAutomergeHashMapping(docId, automergeHash, entryId);
+
     // Update cache and index
     internalDoc.isDeleted = true;
     internalDoc.lastModified = Date.now();
@@ -623,37 +717,53 @@ export class BaseMindooDB implements MindooDB {
     
     // Decode the change to get hash and dependencies
     const decodedChange = Automerge.decodeChange(changeBytes);
-    const changeHash = decodedChange.hash;
-    const depsHashes = decodedChange.deps || []; // Dependencies from the decoded change
-    
+    const automergeHash = decodedChange.hash;
+    const automergeDepHashes = decodedChange.deps || []; // Dependencies from the decoded change
+
     // Encrypt the change payload first
     const encryptedPayload = await this.tenant.encryptPayload(changeBytes, internalDoc.decryptionKeyId);
-    
+
+    // Compute content hash from encrypted data
+    const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
+
+    // Generate entry ID with blockchain-like chaining
+    const entryId = await generateDocEntryId(docId, automergeHash, automergeDepHashes, this.getSubtle());
+    console.log(`[BaseMindooDB] Generated entry ID for change: ${entryId}`);
+
+    // Resolve Automerge dependency hashes to entry IDs
+    const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
+
     // Sign the encrypted payload (this allows signature verification without decryption)
     // This is important for E2E encryption: anyone can verify signatures without needing decryption keys
     const signature = await this.tenant.signPayload(encryptedPayload);
-    
-    // Create change metadata
-    const changeMetadata: MindooDocChangeHashes = {
-      type: "change",
+
+    // Create entry metadata
+    const entryMetadata: StoreEntryMetadata = {
+      entryType: "doc_change",
+      id: entryId,
+      contentHash,
       docId,
-      changeHash,
-      depsHashes,
+      dependencyIds,
       createdAt: Date.now(),
       createdByPublicKey: currentUser.userSigningPublicKey,
       decryptionKeyId: internalDoc.decryptionKeyId,
       signature,
+      originalSize: changeBytes.length,
+      encryptedSize: encryptedPayload.length,
     };
-    
-    // Create full change object
-    const fullChange: MindooDocChange = {
-      ...changeMetadata,
-      payload: encryptedPayload,
+
+    // Create full entry object
+    const fullEntry: StoreEntry = {
+      ...entryMetadata,
+      encryptedData: encryptedPayload,
     };
-    
-    // Append to store
-    await this.store.append(fullChange);
-    
+
+    // Store entry
+    await this.store.putEntries([fullEntry]);
+
+    // Register automerge hash -> entry ID mapping
+    this.registerAutomergeHashMapping(docId, automergeHash, entryId);
+
     // Update cache and index
     internalDoc.doc = newDoc;
     internalDoc.lastModified = Date.now();
@@ -802,7 +912,7 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Internal method to load a document from the append-only store
+   * Internal method to load a document from the content-addressed store
    */
   private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
     // Check cache first
@@ -813,72 +923,72 @@ export class BaseMindooDB implements MindooDB {
     
     console.log(`[BaseMindooDB] ===== Starting to load document ${docId} from store =====`);
     
-    // Get all change hashes for this document
+    // Get all entry metadata for this document
     // TODO: Implement loading from last snapshot if available
-    console.log(`[BaseMindooDB] Getting all change hashes for document ${docId}`);
-    const allChangeHashes = await this.store.findNewChangesForDoc([], docId);
-    console.log(`[BaseMindooDB] Found ${allChangeHashes.length} total change hashes for document ${docId}`);
+    console.log(`[BaseMindooDB] Getting all entry hashes for document ${docId}`);
+    const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
+    console.log(`[BaseMindooDB] Found ${allEntryMetadata.length} total entry hashes for document ${docId}`);
     
-    if (allChangeHashes.length === 0) {
-      console.log(`[BaseMindooDB] No change hashes found for document ${docId}, returning null`);
+    if (allEntryMetadata.length === 0) {
+      console.log(`[BaseMindooDB] No entry hashes found for document ${docId}, returning null`);
       return null;
     }
     
-    // Log all change types
-    const changeTypes = allChangeHashes.map(ch => `${ch.type}@${ch.createdAt}`).join(', ');
-    console.log(`[BaseMindooDB] Change types for ${docId}: ${changeTypes}`);
+    // Log all entry types
+    const entryTypes = allEntryMetadata.map(em => `${em.entryType}@${em.createdAt}`).join(', ');
+    console.log(`[BaseMindooDB] Entry types for ${docId}: ${entryTypes}`);
     
     // Find the most recent snapshot (if any)
-    const snapshots = allChangeHashes.filter(ch => ch.type === "snapshot");
+    const snapshots = allEntryMetadata.filter(em => em.entryType === "doc_snapshot");
     console.log(`[BaseMindooDB] Found ${snapshots.length} snapshot(s) for document ${docId}`);
     let startFromSnapshot = false;
-    let snapshotHash: MindooDocChangeHashes | null = null;
+    let snapshotMeta: StoreEntryMetadata | null = null;
     
     if (snapshots.length > 0) {
       // Use the most recent snapshot
       snapshots.sort((a, b) => b.createdAt - a.createdAt);
-      snapshotHash = snapshots[0];
+      snapshotMeta = snapshots[0];
       startFromSnapshot = true;
-      console.log(`[BaseMindooDB] Will start from snapshot ${snapshotHash.changeHash} created at ${snapshotHash.createdAt}`);
+      console.log(`[BaseMindooDB] Will start from snapshot ${snapshotMeta.id} created at ${snapshotMeta.createdAt}`);
     } else {
       console.log(`[BaseMindooDB] No snapshot found, will start from scratch`);
     }
     
-    // Get all changes (excluding snapshot entries - we'll handle delete separately)
-    // Include "create", "change", and "delete" types as they all contain Automerge changes to apply
-    const changesToLoad = startFromSnapshot
-      ? allChangeHashes.filter(ch => (ch.type === "create" || ch.type === "change" || ch.type === "delete") && ch.createdAt > snapshotHash!.createdAt)
-      : allChangeHashes.filter(ch => ch.type === "create" || ch.type === "change" || ch.type === "delete");
-    console.log(`[BaseMindooDB] Will load ${changesToLoad.length} changes for document ${docId} (after snapshot filter)`);
+    // Get all entries (excluding snapshot entries - we'll handle delete separately)
+    // Include "doc_create", "doc_change", and "doc_delete" types as they all contain Automerge changes to apply
+    const entriesToLoad = startFromSnapshot
+      ? allEntryMetadata.filter(em => (em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete") && em.createdAt > snapshotMeta!.createdAt)
+      : allEntryMetadata.filter(em => em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete");
+    console.log(`[BaseMindooDB] Will load ${entriesToLoad.length} entries for document ${docId} (after snapshot filter)`);
     
     // Load the snapshot first if we have one
     let doc: Automerge.Doc<MindooDocPayload> | undefined = undefined;
-    if (startFromSnapshot && snapshotHash) {
+    if (startFromSnapshot && snapshotMeta) {
       console.log(`[BaseMindooDB] Loading snapshot for document ${docId}`);
-      const snapshotChanges = await this.store.getChanges([snapshotHash]);
-      console.log(`[BaseMindooDB] Retrieved ${snapshotChanges.length} snapshot change(s) from store`);
-      if (snapshotChanges.length > 0) {
-        const snapshotData = snapshotChanges[0];
+      const snapshotEntries = await this.store.getEntries([snapshotMeta.id]);
+      console.log(`[BaseMindooDB] Retrieved ${snapshotEntries.length} snapshot entry(s) from store`);
+      if (snapshotEntries.length > 0) {
+        const snapshotData = snapshotEntries[0];
         
         // Verify signature against the encrypted snapshot (no decryption needed)
         // We sign the encrypted payload, so anyone can verify signatures without decryption keys
         const isValid = await this.tenant.verifySignature(
-          snapshotData.payload,
+          snapshotData.encryptedData,
           snapshotData.signature,
           snapshotData.createdByPublicKey
         );
         if (!isValid) {
-          console.warn(`[BaseMindooDB] Invalid signature for snapshot ${snapshotData.changeHash}, falling back to loading from scratch`);
+          console.warn(`[BaseMindooDB] Invalid signature for snapshot ${snapshotData.id}, falling back to loading from scratch`);
           // Fall back to loading from scratch
           startFromSnapshot = false;
         } else {
           console.log(`[BaseMindooDB] Snapshot signature valid, decrypting snapshot`);
           // Decrypt snapshot (only after signature verification passes)
           const decryptedSnapshot = await this.tenant.decryptPayload(
-            snapshotData.payload,
+            snapshotData.encryptedData,
             snapshotData.decryptionKeyId
           );
-          console.log(`[BaseMindooDB] Decrypted snapshot (${snapshotData.payload.length} -> ${decryptedSnapshot.length} bytes)`);
+          console.log(`[BaseMindooDB] Decrypted snapshot (${snapshotData.encryptedData.length} -> ${decryptedSnapshot.length} bytes)`);
           
           // Load snapshot using Automerge.load()
           // This deserializes a full document snapshot from binary data
@@ -886,10 +996,16 @@ export class BaseMindooDB implements MindooDB {
           console.log(`[BaseMindooDB] Loading snapshot into Automerge document`);
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
           console.log(`[BaseMindooDB] Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
+          
+          // Register the snapshot's automerge hash -> entry ID mapping
+          const parsed = parseDocEntryId(snapshotData.id);
+          if (parsed) {
+            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          }
         }
       }
     }
-    
+
     // If we don't have a snapshot, start from scratch
     if (!doc) {
       console.log(`[BaseMindooDB] Initializing new Automerge document for ${docId}`);
@@ -897,79 +1013,85 @@ export class BaseMindooDB implements MindooDB {
       console.log(`[BaseMindooDB] Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
     }
     
-    // Sort changes by timestamp
-    changesToLoad.sort((a, b) => a.createdAt - b.createdAt);
-    console.log(`[BaseMindooDB] Sorted ${changesToLoad.length} changes by timestamp for document ${docId}`);
+    // Sort entries by timestamp
+    entriesToLoad.sort((a, b) => a.createdAt - b.createdAt);
+    console.log(`[BaseMindooDB] Sorted ${entriesToLoad.length} entries by timestamp for document ${docId}`);
     
-    // Load and apply all changes
-    console.log(`[BaseMindooDB] Fetching ${changesToLoad.length} changes from store for document ${docId}`);
-    const changes = await this.store.getChanges(changesToLoad);
-    console.log(`[BaseMindooDB] Retrieved ${changes.length} changes from store for document ${docId}`);
-    console.log(`[BaseMindooDB] Loading document ${docId}: found ${changes.length} changes to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);
+    // Load and apply all entries
+    console.log(`[BaseMindooDB] Fetching ${entriesToLoad.length} entries from store for document ${docId}`);
+    const entries = await this.store.getEntries(entriesToLoad.map(em => em.id));
+    console.log(`[BaseMindooDB] Retrieved ${entries.length} entries from store for document ${docId}`);
+    console.log(`[BaseMindooDB] Loading document ${docId}: found ${entries.length} entries to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);
     
-    // Log current document state before applying changes
-    console.log(`[BaseMindooDB] Document state before applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+    // Log current document state before applying entries
+    console.log(`[BaseMindooDB] Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
     
-    // Verify signatures, decrypt, and apply changes one at a time
+    // Verify signatures, decrypt, and apply entries one at a time
     // This ensures dependencies are handled correctly by Automerge
-    for (let i = 0; i < changes.length; i++) {
-      const changeData = changes[i];
-      console.log(`[BaseMindooDB] ===== Processing change ${i + 1}/${changes.length} for document ${docId} =====`);
-      console.log(`[BaseMindooDB] Change hash: ${changeData.changeHash}`);
-      console.log(`[BaseMindooDB] Change type: ${changeData.type}`);
-      console.log(`[BaseMindooDB] Change createdAt: ${changeData.createdAt}`);
-      console.log(`[BaseMindooDB] Change dependencies: ${JSON.stringify(changeData.depsHashes || [])}`);
-      console.log(`[BaseMindooDB] Change payload size: ${changeData.payload.length} bytes`);
+    for (let i = 0; i < entries.length; i++) {
+      const entryData = entries[i];
+      console.log(`[BaseMindooDB] ===== Processing entry ${i + 1}/${entries.length} for document ${docId} =====`);
+      console.log(`[BaseMindooDB] Entry id: ${entryData.id}`);
+      console.log(`[BaseMindooDB] Entry type: ${entryData.entryType}`);
+      console.log(`[BaseMindooDB] Entry createdAt: ${entryData.createdAt}`);
+      console.log(`[BaseMindooDB] Entry dependencies: ${JSON.stringify(entryData.dependencyIds || [])}`);
+      console.log(`[BaseMindooDB] Entry payload size: ${entryData.encryptedData.length} bytes`);
       // Verify signature against the encrypted payload (no decryption needed)
       // We sign the encrypted payload, so anyone can verify signatures without decryption keys
-      console.log(`[BaseMindooDB] Verifying signature for change ${changeData.changeHash}`);
+      console.log(`[BaseMindooDB] Verifying signature for entry ${entryData.id}`);
       const isValid = await this.tenant.verifySignature(
-        changeData.payload,
-        changeData.signature,
-        changeData.createdByPublicKey
+        entryData.encryptedData,
+        entryData.signature,
+        entryData.createdByPublicKey
       );
       if (!isValid) {
-        console.warn(`[BaseMindooDB] Invalid signature for change ${changeData.changeHash}, skipping`);
+        console.warn(`[BaseMindooDB] Invalid signature for entry ${entryData.id}, skipping`);
         continue;
       }
-      console.log(`[BaseMindooDB] Signature valid for change ${changeData.changeHash}`);
+      console.log(`[BaseMindooDB] Signature valid for entry ${entryData.id}`);
       
       // Decrypt payload (only after signature verification passes)
-      console.log(`[BaseMindooDB] Decrypting payload for change ${changeData.changeHash} with key ${changeData.decryptionKeyId}`);
+      console.log(`[BaseMindooDB] Decrypting payload for entry ${entryData.id} with key ${entryData.decryptionKeyId}`);
       const decryptedPayload = await this.tenant.decryptPayload(
-        changeData.payload,
-        changeData.decryptionKeyId
+        entryData.encryptedData,
+        entryData.decryptionKeyId
       );
-      console.log(`[BaseMindooDB] Decrypted payload: ${changeData.payload.length} -> ${decryptedPayload.length} bytes`);
+      console.log(`[BaseMindooDB] Decrypted payload: ${entryData.encryptedData.length} -> ${decryptedPayload.length} bytes`);
       
       // Apply change using applyChanges with raw change bytes
       // applyChanges expects an array of Uint8Array (raw change bytes)
       try {
-        console.log(`[BaseMindooDB] Document state before applying change ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
-        console.log(`[BaseMindooDB] Calling Automerge.applyChanges for change ${i + 1}/${changes.length} on document ${docId}`);
+        console.log(`[BaseMindooDB] Document state before applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+        console.log(`[BaseMindooDB] Calling Automerge.applyChanges for entry ${i + 1}/${entries.length} on document ${docId}`);
         console.log(`[BaseMindooDB] Decrypted payload length: ${decryptedPayload.length} bytes`);
         const currentDoc: Automerge.Doc<MindooDocPayload> = doc!;
         const result = Automerge.applyChanges<MindooDocPayload>(currentDoc, [decryptedPayload]);
         doc = result[0] as Automerge.Doc<MindooDocPayload>;
-        console.log(`[BaseMindooDB] Successfully applied change ${i + 1}/${changes.length}`);
-        console.log(`[BaseMindooDB] Document state after applying change ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+        console.log(`[BaseMindooDB] Successfully applied entry ${i + 1}/${entries.length}`);
+        console.log(`[BaseMindooDB] Document state after applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+        
+        // Register the automerge hash -> entry ID mapping for future dependency resolution
+        const parsed = parseDocEntryId(entryData.id);
+        if (parsed) {
+          this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+        }
       } catch (error) {
-        console.error(`[BaseMindooDB] Error applying change ${changeData.changeHash} to document ${docId}:`, error);
-        console.error(`[BaseMindooDB] Change index: ${i + 1}/${changes.length}`);
-        console.error(`[BaseMindooDB] Change dependencies:`, changeData.depsHashes);
-        console.error(`[BaseMindooDB] Change type:`, changeData.type);
-        console.error(`[BaseMindooDB] Change createdAt:`, changeData.createdAt);
-        console.error(`[BaseMindooDB] Document state before change:`, {
+        console.error(`[BaseMindooDB] Error applying entry ${entryData.id} to document ${docId}:`, error);
+        console.error(`[BaseMindooDB] Entry index: ${i + 1}/${entries.length}`);
+        console.error(`[BaseMindooDB] Entry dependencies:`, entryData.dependencyIds);
+        console.error(`[BaseMindooDB] Entry type:`, entryData.entryType);
+        console.error(`[BaseMindooDB] Entry createdAt:`, entryData.createdAt);
+        console.error(`[BaseMindooDB] Document state before entry:`, {
           hasDoc: !!doc,
           docHeads: doc ? Automerge.getHeads(doc) : null,
         });
-        // Log previous change for debugging dependency issues
+        // Log previous entry for debugging dependency issues
         if (i > 0) {
-          const prevChange = changes[i - 1];
-          console.error(`[BaseMindooDB] Previous change:`, {
-            hash: prevChange.changeHash,
-            deps: prevChange.depsHashes,
-            type: prevChange.type,
+          const prevEntry = entries[i - 1];
+          console.error(`[BaseMindooDB] Previous entry:`, {
+            id: prevEntry.id,
+            deps: prevEntry.dependencyIds,
+            type: prevEntry.entryType,
           });
         }
         throw error;
@@ -977,23 +1099,23 @@ export class BaseMindooDB implements MindooDB {
     }
     
     // Extract metadata from document (doc is guaranteed to be defined at this point)
-    console.log(`[BaseMindooDB] All changes applied successfully for document ${docId}`);
+    console.log(`[BaseMindooDB] All entries applied successfully for document ${docId}`);
     console.log(`[BaseMindooDB] Final document heads: ${JSON.stringify(Automerge.getHeads(doc!))}`);
     const payload = doc! as unknown as MindooDocPayload;
     
-    // Check if document was deleted by looking for a "delete" type entry
-    const hasDeleteEntry = allChangeHashes.some(ch => ch.type === "delete");
+    // Check if document was deleted by looking for a "doc_delete" type entry
+    const hasDeleteEntry = allEntryMetadata.some(em => em.entryType === "doc_delete");
     const isDeleted = hasDeleteEntry;
     console.log(`[BaseMindooDB] Document ${docId} isDeleted: ${isDeleted}`);
     
     const decryptionKeyId = (payload._decryptionKeyId as string) || "default";
-    // Get lastModified from payload, or use the timestamp of the last change
-    const lastChange = changes.length > 0 ? changes[changes.length - 1] : null;
+    // Get lastModified from payload, or use the timestamp of the last entry
+    const lastEntry = entries.length > 0 ? entries[entries.length - 1] : null;
     const lastModified = (payload._lastModified as number) || 
-                         (lastChange ? lastChange.createdAt : Date.now());
-    // Get createdAt from the first change
-    const firstChange = allChangeHashes.length > 0 ? allChangeHashes[0] : null;
-    const createdAt = firstChange ? firstChange.createdAt : lastModified;
+                         (lastEntry ? lastEntry.createdAt : Date.now());
+    // Get createdAt from the first entry
+    const firstEntry = allEntryMetadata.length > 0 ? allEntryMetadata[0] : null;
+    const createdAt = firstEntry ? firstEntry.createdAt : lastModified;
     
     console.log(`[BaseMindooDB] Document ${docId} metadata: createdAt=${createdAt}, lastModified=${lastModified}, decryptionKeyId=${decryptionKeyId}`);
     
@@ -1029,185 +1151,94 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Generate a UUID7 identifier with monotonic counter for same-millisecond collisions
-   * 
-   * Platform-agnostic implementation that works in both browser and Node.js.
-   * Uses crypto.getRandomValues() when available, falls back to Math.random() otherwise.
-   * 
-   * UUID7 format: timestamp (48 bits) + random (74 bits) = 122 bits total
-   * Format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
-   * Where 7 indicates version 7, and y is one of 8, 9, A, or B
-   * 
-   * Note: Uses millisecond precision (Date.now()). For higher precision, consider
-   * using a proper UUID7 library that supports microsecond timestamps.
-   */
-  private generateUUID7(): string {
-    // Get millisecond timestamp (48 bits can represent ~8,925 years from Unix epoch)
-    const timestampMs = Date.now();
-    
-    // Handle monotonic counter for same-millisecond collisions
-    // This ensures uniqueness even when generating multiple UUIDs in the same millisecond
-    if (timestampMs === this.uuid7LastTimestamp) {
-      // Same millisecond - increment counter
-      this.uuid7Counter++;
-      // Counter is 12 bits max (0-4095), if it overflows, we wait for next millisecond
-      if (this.uuid7Counter >= 4096) {
-        // Wait until next millisecond (extremely rare - would require 4096+ UUIDs in 1ms)
-        while (Date.now() === timestampMs) {
-          // Busy wait - should be extremely rare
-        }
-        this.uuid7Counter = 0;
-        this.uuid7LastTimestamp = Date.now();
-      }
-    } else {
-      // New millisecond - reset counter
-      this.uuid7Counter = 0;
-      this.uuid7LastTimestamp = timestampMs;
-    }
-    
-    // Generate random bytes (10 bytes = 80 bits, we'll use 62 bits for random field)
-    const randomBytes = new Uint8Array(10);
-    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
-      crypto.getRandomValues(randomBytes);
-    } else {
-      // Fallback for environments without crypto.getRandomValues
-      // WARNING: Math.random() is not cryptographically secure and may have collisions
-      // For production use, ensure crypto.getRandomValues is available
-      for (let i = 0; i < randomBytes.length; i++) {
-        randomBytes[i] = Math.floor(Math.random() * 256);
-      }
-    }
-    
-    // Incorporate monotonic counter into the random field (first 12 bits)
-    // This ensures uniqueness within the same millisecond while maintaining time-ordering
-    // Counter is 12 bits (0-4095), stored in first 1.5 bytes of random field
-    const counterHigh = (this.uuid7Counter >> 8) & 0xFF;
-    const counterLow = this.uuid7Counter & 0xFF;
-    randomBytes[0] = counterHigh;
-    randomBytes[1] = (counterLow << 4) | (randomBytes[1] & 0x0F); // Preserve lower 4 bits for variant
-    
-    // Build UUID7 format: xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
-    // Timestamp (48 bits = 12 hex digits) - milliseconds since Unix epoch
-    const timestampHex = timestampMs.toString(16).padStart(12, "0");
-    
-    // Version 7 indicator (4 bits = 1 hex digit, value 7)
-    const version = "7";
-    
-    // Variant (2 bits = 1 hex digit, value 8, 9, A, or B)
-    const variant = (8 + (randomBytes[1] & 0x3)).toString(16).toUpperCase();
-    
-    // Random data (62 bits = 15 hex digits)
-    // First 12 bits are the counter, remaining 50 bits are random
-    const randomHex = Array.from(randomBytes)
-      .map(b => b.toString(16).padStart(2, "0"))
-      .join("")
-      .substring(0, 15);
-    
-    // Construct UUID7: timestamp (12) + version (1) + random (3) + variant (1) + random (12)
-    const uuid7 = [
-      timestampHex.substring(0, 8),
-      timestampHex.substring(8, 12),
-      version + randomHex.substring(0, 3),
-      variant + randomHex.substring(3, 6),
-      randomHex.substring(6, 18),
-    ].join("-");
-    
-    return uuid7;
-  }
-
-  /**
-   * Pull changes from a remote append-only store.
+   * Pull changes from a remote content-addressed store.
    * 
    * This method:
-   * 1. Finds changes in the remote store that we don't have locally
-   * 2. Retrieves those changes from the remote store
-   * 3. Appends them to our local store
-   * 4. Syncs the local store to process the new changes
+   * 1. Finds entries in the remote store that we don't have locally
+   * 2. Retrieves those entries from the remote store
+   * 3. Stores them in our local store
+   * 4. Syncs the local store to process the new entries
    *
-   * @param remoteStore The remote append-only store to pull changes from
+   * @param remoteStore The remote store to pull entries from
    * @return A promise that resolves when the pull is complete
    */
-  async pullChangesFrom(remoteStore: AppendOnlyStore): Promise<void> {
+  async pullChangesFrom(remoteStore: ContentAddressedStore): Promise<void> {
     if (this.store.getId() !== remoteStore.getId()) {
-      throw new Error(`[BaseMindooDB] Cannot pull changes from the incompatible store ${this.store.getId()}`);
+      throw new Error(`[BaseMindooDB] Cannot pull entries from the incompatible store ${this.store.getId()}`);
     }
 
-    console.log(`[BaseMindooDB] Pulling changes from remote store ${remoteStore.getId()}`);
+    console.log(`[BaseMindooDB] Pulling entries from remote store ${remoteStore.getId()}`);
     
-    // Get all change hashes we already have in our local store
-    const localChangeHashes = await this.store.getAllChangeHashes();
-    console.log(`[BaseMindooDB] Local store has ${localChangeHashes.length} change hashes`);
+    // Get all entry IDs we already have in our local store
+    const localEntryIds = await this.store.getAllIds();
+    console.log(`[BaseMindooDB] Local store has ${localEntryIds.length} entry IDs`);
     
-    // Find changes in the remote store that we don't have
-    const newChangeHashes = await remoteStore.findNewChanges(localChangeHashes);
-    console.log(`[BaseMindooDB] Found ${newChangeHashes.length} new changes in remote store`);
+    // Find entries in the remote store that we don't have
+    const newEntryMetadata = await remoteStore.findNewEntries(localEntryIds);
+    console.log(`[BaseMindooDB] Found ${newEntryMetadata.length} new entries in remote store`);
     
-    if (newChangeHashes.length === 0) {
-      console.log(`[BaseMindooDB] No new changes to pull`);
+    if (newEntryMetadata.length === 0) {
+      console.log(`[BaseMindooDB] No new entries to pull`);
       return;
     }
     
-    // Get the full changes from the remote store
-    const newChanges = await remoteStore.getChanges(newChangeHashes);
-    console.log(`[BaseMindooDB] Retrieved ${newChanges.length} changes from remote store`);
+    // Get the full entries from the remote store
+    const newEntries = await remoteStore.getEntries(newEntryMetadata.map(em => em.id));
+    console.log(`[BaseMindooDB] Retrieved ${newEntries.length} entries from remote store`);
     
-    // Append each change to our local store
-    // The append method handles deduplication (no-op if change already exists)
-    for (const change of newChanges) {
-      await this.store.append(change);
-    }
+    // Store all entries in our local store
+    // The putEntries method handles deduplication (no-op if entry already exists)
+    await this.store.putEntries(newEntries);
     
-    console.log(`[BaseMindooDB] Appended ${newChanges.length} changes to local store`);
+    console.log(`[BaseMindooDB] Stored ${newEntries.length} entries in local store`);
     
-    // Sync the local store to process the new changes
-    // This will update the index, cache, and processedChangeHashes
+    // Sync the local store to process the new entries
+    // This will update the index, cache, and processedEntryIds
     await this.syncStoreChanges();
     
-    console.log(`[BaseMindooDB] Pull complete, synced ${newChanges.length} changes`);
+    console.log(`[BaseMindooDB] Pull complete, synced ${newEntries.length} entries`);
   }
 
   /**
-   * Push changes to a remote append-only store.
+   * Push changes to a remote content-addressed store.
    * 
    * This method:
-   * 1. Finds changes in our local store that the remote doesn't have
-   * 2. Retrieves those changes from our local store
-   * 3. Appends them to the remote store
+   * 1. Finds entries in our local store that the remote doesn't have
+   * 2. Retrieves those entries from our local store
+   * 3. Stores them in the remote store
    *
-   * @param remoteStore The remote append-only store to push changes to
+   * @param remoteStore The remote store to push entries to
    * @return A promise that resolves when the push is complete
    */
-  async pushChangesTo(remoteStore: AppendOnlyStore): Promise<void> {
+  async pushChangesTo(remoteStore: ContentAddressedStore): Promise<void> {
     if (this.store.getId() !== remoteStore.getId()) {
-      throw new Error(`[BaseMindooDB] Cannot push changes to the incompatible store ${this.store.getId()}`);
+      throw new Error(`[BaseMindooDB] Cannot push entries to the incompatible store ${this.store.getId()}`);
     }
 
-    console.log(`[BaseMindooDB] Pushing changes to remote store ${remoteStore.getId()}`);
+    console.log(`[BaseMindooDB] Pushing entries to remote store ${remoteStore.getId()}`);
     
-    // Get all change hashes the remote store already has
-    const remoteChangeHashes = await remoteStore.getAllChangeHashes();
-    console.log(`[BaseMindooDB] Remote store has ${remoteChangeHashes.length} change hashes`);
+    // Get all entry IDs the remote store already has
+    const remoteEntryIds = await remoteStore.getAllIds();
+    console.log(`[BaseMindooDB] Remote store has ${remoteEntryIds.length} entry IDs`);
     
-    // Find changes in our local store that the remote doesn't have
-    const newChangeHashes = await this.store.findNewChanges(remoteChangeHashes);
-    console.log(`[BaseMindooDB] Found ${newChangeHashes.length} new changes to push`);
+    // Find entries in our local store that the remote doesn't have
+    const newEntryMetadata = await this.store.findNewEntries(remoteEntryIds);
+    console.log(`[BaseMindooDB] Found ${newEntryMetadata.length} new entries to push`);
     
-    if (newChangeHashes.length === 0) {
-      console.log(`[BaseMindooDB] No new changes to push`);
+    if (newEntryMetadata.length === 0) {
+      console.log(`[BaseMindooDB] No new entries to push`);
       return;
     }
     
-    // Get the full changes from our local store
-    const newChanges = await this.store.getChanges(newChangeHashes);
-    console.log(`[BaseMindooDB] Retrieved ${newChanges.length} changes from local store`);
+    // Get the full entries from our local store
+    const newEntries = await this.store.getEntries(newEntryMetadata.map(em => em.id));
+    console.log(`[BaseMindooDB] Retrieved ${newEntries.length} entries from local store`);
     
-    // Append each change to the remote store
-    // The append method handles deduplication (no-op if change already exists)
-    for (const change of newChanges) {
-      await remoteStore.append(change);
-    }
+    // Store all entries in the remote store
+    // The putEntries method handles deduplication (no-op if entry already exists)
+    await remoteStore.putEntries(newEntries);
     
-    console.log(`[BaseMindooDB] Pushed ${newChanges.length} changes to remote store`);
+    console.log(`[BaseMindooDB] Pushed ${newEntries.length} entries to remote store`);
   }
 }
 

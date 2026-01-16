@@ -1,6 +1,7 @@
 import type { KeyBag } from "./keys/KeyBag";
 import type { PublicUserId, PrivateUserId } from "./userid";
-import type { AppendOnlyStore } from "./appendonlystores/types";
+import type { ContentAddressedStore } from "./appendonlystores/types";
+import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 
 /**
@@ -296,79 +297,129 @@ export interface MindooTenant {
    * @return A MindooDocSigner instance configured with this tenant and the provided signing key
    */
   createDocSignerFor(signKey: SigningKeyPair): MindooDocSigner;
+
+  /**
+   * Get the crypto adapter for this tenant.
+   * The crypto adapter provides access to the Web Crypto API (SubtleCrypto).
+   * 
+   * @return The crypto adapter
+   */
+  getCryptoAdapter(): CryptoAdapter;
 }
 
-// Re-export AppendOnlyStore and AppendOnlyStoreFactory from appendonlystores
-export type { AppendOnlyStore, AppendOnlyStoreFactory } from "./appendonlystores/types";
+// Re-export ContentAddressedStore and ContentAddressedStoreFactory from appendonlystores
+export type { ContentAddressedStore, ContentAddressedStoreFactory, AppendOnlyStore, AppendOnlyStoreFactory } from "./appendonlystores/types";
 
 /**
- * This is the meta data for changes and snapshots that we store for the document in the append only store.
- * It does not contain the actual change/snapshot payload to save space during synchronization.
+ * The type of entry stored in the ContentAddressedStore.
+ * Entry types are prefixed to indicate their domain:
+ * - doc_* entries are for Automerge document operations
+ * - attachment_* entries are for file attachment storage
  */
-export interface MindooDocChangeHashes {
+export type StoreEntryType = 
+  | "doc_create"      // Document creation (first Automerge change)
+  | "doc_change"      // Document modification (subsequent Automerge changes)
+  | "doc_snapshot"    // Automerge snapshot for performance optimization
+  | "doc_delete"      // Document deletion (tombstone entry)
+  | "attachment_chunk"; // File attachment chunk
+
+/**
+ * Metadata for entries stored in the ContentAddressedStore.
+ * This contains all information except the actual encrypted payload,
+ * making it efficient for synchronization negotiations.
+ */
+export interface StoreEntryMetadata {
   /**
-   * The type of this entry: 
-   * - "create" for document creation
-   * - "change" for document changes
-   * - "snapshot" for document snapshots
-   * - "delete" for document deletion (tombstone entry)
+   * The type of this entry, indicating what kind of data it contains.
    */
-  type: "create" | "change" | "snapshot" | "delete";
+  entryType: StoreEntryType;
 
   /**
-   * The ID of the document that the change is for (UUID7 format)
-   *
-   * Example: "123e4567-e89b-12d3-a456-426614174000"
+   * Unique identifier for this entry (primary key in the store).
+   * - For doc_* entries: "<docId>_d_<depsFingerprint>_<automergeHash>"
+   * - For attachment_chunk: "<docId>_a_<fileUuid7>_<base62ChunkUuid7>"
+   * 
+   * The structured ID format enables:
+   * - Guaranteed uniqueness across documents
+   * - Efficient prefix-based queries
+   * - Debugging visibility into entry relationships
+   */
+  id: string;
+
+  /**
+   * SHA-256 hash of the encryptedData.
+   * Used for integrity verification and storage-level deduplication.
+   * Multiple entries can share the same contentHash (same bytes on disk).
+   */
+  contentHash: string;
+
+  /**
+   * The ID of the document this entry is associated with (UUID7 format).
+   * For attachment chunks, this links the chunk to its parent document.
    */
   docId: string;
 
   /**
-   * The Automerge hash of the change
-   *
-   * Example: "abc112112abc"
+   * IDs of entries this entry depends on.
+   * - For doc_* entries: Entry IDs of Automerge dependencies
+   * - For attachment_chunk: Previous chunk's entry ID (enables append-only file growth)
    */
-  changeHash: string;
+  dependencyIds: string[];
 
   /**
-   * The Automerge hashes of the dependencies of the change
-   *
-   * Example: ["defdef123123def", "ghi789789ghi"]
-   */
-  depsHashes: string[];
-
-  /**
-   * The timestamp of the change creation in milliseconds since the Unix epoch
+   * The timestamp when this entry was created (milliseconds since Unix epoch).
    */
   createdAt: number;
 
   /**
-   * The public signing key of the user who created this change (Ed25519, PEM format).
-   * Used for signature verification and audit trails in an end-to-end encrypted system.
-   * This is a cryptographic identifier that can be verified against signatures.
+   * The public signing key of the user who created this entry (Ed25519, PEM format).
+   * Used for signature verification and audit trails.
    */
   createdByPublicKey: string;
 
   /**
-   * The ID of the symmetric key used to encrypt this change.
+   * The ID of the symmetric key used to encrypt this entry.
    * "default" means tenant encryption key (all tenant members can decrypt).
    * Other IDs refer to named symmetric keys (only users with that key can decrypt).
-   * Always present if isEncrypted is true. If not specified, defaults to "default".
    */
   decryptionKeyId: string;
 
   /**
-   * The signature of the change (signed with the user's signing key)
+   * The signature of the entry (signed with the user's signing key over the encrypted data).
+   * This allows signature verification without decryption.
    */
   signature: Uint8Array;
+
+  /**
+   * Original size of the plaintext data before encryption (in bytes).
+   * For doc_* entries: size of the Automerge binary change/snapshot
+   * For attachment_chunk: size of the unencrypted chunk data
+   */
+  originalSize: number;
+
+  /**
+   * Size of the encrypted data (in bytes).
+   * This is the size that will be transferred over the network or stored on disk.
+   * Useful for download time estimation, storage space checks, and progress indicators.
+   */
+  encryptedSize: number;
 }
 
-export interface MindooDocChange extends MindooDocChangeHashes {
+/**
+ * A complete entry stored in the ContentAddressedStore.
+ * Extends StoreEntryMetadata with the actual encrypted payload.
+ */
+export interface StoreEntry extends StoreEntryMetadata {
   /**
-   * The binary payload data.
-   * - For type "change": Contains the binary Automerge change
-   * - For type "snapshot": Contains the binary Automerge snapshot
+   * The encrypted binary payload data.
+   * - For doc_create/doc_change: Encrypted Automerge change bytes
+   * - For doc_snapshot: Encrypted Automerge snapshot bytes
+   * - For doc_delete: Encrypted Automerge change bytes (may be empty change)
+   * - For attachment_chunk: Encrypted file chunk data
+   * 
+   * The IV and authentication tag are embedded within this data.
    */
-  payload: Uint8Array;
+  encryptedData: Uint8Array;
 }
 
 /**
@@ -571,11 +622,19 @@ export interface MindooDB {
   getTenant(): MindooTenant;
 
   /**
-   * Get the append-only store that is used to store the changes for this database.
+   * Get the content-addressed store that is used to store document changes for this database.
    *
-   * @return The append-only store
+   * @return The content-addressed store for documents
    */
-  getStore(): AppendOnlyStore;
+  getStore(): ContentAddressedStore;
+
+  /**
+   * Get the content-addressed store that is used to store attachment chunks for this database.
+   * Returns undefined if no attachment store was configured.
+   *
+   * @return The content-addressed store for attachments, or undefined if not configured
+   */
+  getAttachmentStore(): ContentAddressedStore | undefined;
 
   /**
    * Create a new document (unencrypted, uses tenant default encryption)
@@ -638,7 +697,7 @@ export interface MindooDB {
    * - Encryption uses the tenant encryption key or a named symmetric key (AES-256) - protects content
    *   Encryption/decryption is handled via tenant.encryptPayload() and tenant.decryptPayload()
    * 
-   * The encryption key ID is determined from the first change's decryptionKeyId (stored in MindooDocChangeHashes).
+   * The encryption key ID is determined from the first entry's decryptionKeyId (stored in StoreEntryMetadata).
    * If the document was created with a named key, all subsequent changes use that same key.
    * 
    * @param doc The document to change
@@ -710,18 +769,18 @@ export interface MindooDB {
   syncStoreChanges(): Promise<void>;
 
   /**
-   * Pull changes from a remote append-only store.
+   * Pull changes from a remote content-addressed store.
    *
-   * @param remoteStore The remote append-only store to pull changes from
+   * @param remoteStore The remote store to pull changes from
    * @return A promise that resolves when the pull is complete
    */
-  pullChangesFrom(remoteStore: AppendOnlyStore): Promise<void>;
+  pullChangesFrom(remoteStore: ContentAddressedStore): Promise<void>;
 
   /**
-   * Push changes to a remote append-only store.
+   * Push changes to a remote content-addressed store.
    *
-   * @param remoteStore The remote append-only store to push changes to
+   * @param remoteStore The remote store to push changes to
    * @return A promise that resolves when the push is complete
    */
-  pushChangesTo(remoteStore: AppendOnlyStore): Promise<void>;
+  pushChangesTo(remoteStore: ContentAddressedStore): Promise<void>;
 }

@@ -1,6 +1,6 @@
-import type { MindooDocChange, MindooDocChangeHashes } from "../../core/types";
+import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
-import type { NetworkEncryptedChange, AuthResult } from "../../core/appendonlystores/network/types";
+import type { NetworkEncryptedEntry, AuthResult } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 
 /**
@@ -12,10 +12,10 @@ import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
  * REST API endpoints:
  * - POST /auth/challenge - Request authentication challenge
  * - POST /auth/authenticate - Authenticate with signed challenge
- * - POST /sync/findNewChanges - Find changes we don't have
- * - POST /sync/getChanges - Get specific changes
- * - POST /sync/pushChanges - Push changes to the server
- * - GET /sync/getAllChangeHashes - Get all change hashes from the server
+ * - POST /sync/findNewEntries - Find entries we don't have
+ * - POST /sync/getEntries - Get specific entries
+ * - POST /sync/putEntries - Push entries to the server
+ * - GET /sync/getAllIds - Get all entry IDs from the server
  */
 export class HttpTransport implements NetworkTransport {
   private config: NetworkTransportConfig;
@@ -98,16 +98,16 @@ export class HttpTransport implements NetworkTransport {
   }
 
   /**
-   * Find changes that the remote has which we don't have locally.
+   * Find entries that the remote has which we don't have locally.
    */
-  async findNewChanges(
+  async findNewEntries(
     token: string,
-    haveChangeHashes: string[]
-  ): Promise<MindooDocChangeHashes[]> {
-    console.log(`[HttpTransport] Finding new changes, have ${haveChangeHashes.length} hashes`);
+    haveIds: string[]
+  ): Promise<StoreEntryMetadata[]> {
+    console.log(`[HttpTransport] Finding new entries, have ${haveIds.length} IDs`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/findNewChanges`,
+      `${this.baseUrl}/sync/findNewEntries`,
       {
         method: "POST",
         headers: {
@@ -117,35 +117,34 @@ export class HttpTransport implements NetworkTransport {
         body: JSON.stringify({
           tenantId: this.config.tenantId,
           dbId: this.config.dbId,
-          haveChangeHashes,
+          haveIds,
         }),
       }
     );
     
     const data = await response.json();
     
-    // Deserialize the signature Uint8Arrays
-    const changes: MindooDocChangeHashes[] = (data.changes || []).map((c: SerializedChangeHashes) => ({
-      ...c,
-      signature: this.base64ToUint8Array(c.signature),
-    }));
+    // Deserialize the entries
+    const entries: StoreEntryMetadata[] = (data.entries || []).map((e: SerializedEntryMetadata) => 
+      this.deserializeEntryMetadata(e)
+    );
     
-    console.log(`[HttpTransport] Found ${changes.length} new changes`);
-    return changes;
+    console.log(`[HttpTransport] Found ${entries.length} new entries`);
+    return entries;
   }
 
   /**
-   * Find changes for a specific document that the remote has which we don't have locally.
+   * Find entries for a specific document that the remote has which we don't have locally.
    */
-  async findNewChangesForDoc(
+  async findNewEntriesForDoc(
     token: string,
-    haveChangeHashes: string[],
+    haveIds: string[],
     docId: string
-  ): Promise<MindooDocChangeHashes[]> {
-    console.log(`[HttpTransport] Finding new changes for doc ${docId}, have ${haveChangeHashes.length} hashes`);
+  ): Promise<StoreEntryMetadata[]> {
+    console.log(`[HttpTransport] Finding new entries for doc ${docId}, have ${haveIds.length} IDs`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/findNewChangesForDoc`,
+      `${this.baseUrl}/sync/findNewEntriesForDoc`,
       {
         method: "POST",
         headers: {
@@ -155,7 +154,7 @@ export class HttpTransport implements NetworkTransport {
         body: JSON.stringify({
           tenantId: this.config.tenantId,
           dbId: this.config.dbId,
-          haveChangeHashes,
+          haveIds,
           docId,
         }),
       }
@@ -163,33 +162,26 @@ export class HttpTransport implements NetworkTransport {
     
     const data = await response.json();
     
-    // Deserialize the signature Uint8Arrays
-    const changes: MindooDocChangeHashes[] = (data.changes || []).map((c: SerializedChangeHashes) => ({
-      ...c,
-      signature: this.base64ToUint8Array(c.signature),
-    }));
+    // Deserialize the entries
+    const entries: StoreEntryMetadata[] = (data.entries || []).map((e: SerializedEntryMetadata) => 
+      this.deserializeEntryMetadata(e)
+    );
     
-    console.log(`[HttpTransport] Found ${changes.length} new changes for doc ${docId}`);
-    return changes;
+    console.log(`[HttpTransport] Found ${entries.length} new entries for doc ${docId}`);
+    return entries;
   }
 
   /**
-   * Get changes from the remote store.
+   * Get entries from the remote store.
    */
-  async getChanges(
+  async getEntries(
     token: string,
-    changeHashes: MindooDocChangeHashes[]
-  ): Promise<NetworkEncryptedChange[]> {
-    console.log(`[HttpTransport] Getting ${changeHashes.length} changes`);
-    
-    // Serialize the signature Uint8Arrays for transmission
-    const serializedHashes = changeHashes.map(c => ({
-      ...c,
-      signature: this.uint8ArrayToBase64(c.signature),
-    }));
+    ids: string[]
+  ): Promise<NetworkEncryptedEntry[]> {
+    console.log(`[HttpTransport] Getting ${ids.length} entries`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/getChanges`,
+      `${this.baseUrl}/sync/getEntries`,
       {
         method: "POST",
         headers: {
@@ -199,39 +191,34 @@ export class HttpTransport implements NetworkTransport {
         body: JSON.stringify({
           tenantId: this.config.tenantId,
           dbId: this.config.dbId,
-          changeHashes: serializedHashes,
+          ids,
         }),
       }
     );
     
     const data = await response.json();
     
-    // Deserialize the Uint8Arrays
-    const changes: NetworkEncryptedChange[] = (data.changes || []).map((c: SerializedEncryptedChange) => ({
-      ...c,
-      signature: this.base64ToUint8Array(c.signature),
-      rsaEncryptedPayload: this.base64ToUint8Array(c.rsaEncryptedPayload),
+    // Deserialize the encrypted entries
+    const entries: NetworkEncryptedEntry[] = (data.entries || []).map((e: SerializedNetworkEncryptedEntry) => ({
+      ...this.deserializeEntryMetadata(e),
+      rsaEncryptedPayload: this.base64ToUint8Array(e.rsaEncryptedPayload),
     }));
     
-    console.log(`[HttpTransport] Retrieved ${changes.length} encrypted changes`);
-    return changes;
+    console.log(`[HttpTransport] Retrieved ${entries.length} encrypted entries`);
+    return entries;
   }
 
   /**
-   * Push changes to the remote store.
+   * Push entries to the remote store.
    */
-  async pushChanges(token: string, changes: MindooDocChange[]): Promise<void> {
-    console.log(`[HttpTransport] Pushing ${changes.length} changes`);
+  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
+    console.log(`[HttpTransport] Pushing ${entries.length} entries`);
     
-    // Serialize the Uint8Arrays for transmission
-    const serializedChanges = changes.map(c => ({
-      ...c,
-      signature: this.uint8ArrayToBase64(c.signature),
-      payload: this.uint8ArrayToBase64(c.payload),
-    }));
+    // Serialize the entries for transmission
+    const serializedEntries = entries.map(e => this.serializeEntry(e));
     
     await this.fetchWithRetry(
-      `${this.baseUrl}/sync/pushChanges`,
+      `${this.baseUrl}/sync/putEntries`,
       {
         method: "POST",
         headers: {
@@ -241,22 +228,55 @@ export class HttpTransport implements NetworkTransport {
         body: JSON.stringify({
           tenantId: this.config.tenantId,
           dbId: this.config.dbId,
-          changes: serializedChanges,
+          entries: serializedEntries,
         }),
       }
     );
     
-    console.log(`[HttpTransport] Successfully pushed ${changes.length} changes`);
+    console.log(`[HttpTransport] Successfully pushed ${entries.length} entries`);
   }
 
   /**
-   * Get all change hashes from the remote store.
+   * Check which of the provided IDs exist in the remote store.
    */
-  async getAllChangeHashes(token: string): Promise<string[]> {
-    console.log(`[HttpTransport] Getting all change hashes`);
+  async hasEntries(token: string, ids: string[]): Promise<string[]> {
+    console.log(`[HttpTransport] Checking ${ids.length} entry IDs`);
+    
+    if (ids.length === 0) {
+      return [];
+    }
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/getAllChangeHashes?tenantId=${encodeURIComponent(this.config.tenantId)}${this.config.dbId ? `&dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
+      `${this.baseUrl}/sync/hasEntries`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          ids,
+        }),
+      }
+    );
+    
+    const data = await response.json();
+    const existingIds: string[] = data.ids || [];
+    
+    console.log(`[HttpTransport] Found ${existingIds.length} existing entries out of ${ids.length} checked`);
+    return existingIds;
+  }
+
+  /**
+   * Get all entry IDs from the remote store.
+   */
+  async getAllIds(token: string): Promise<string[]> {
+    console.log(`[HttpTransport] Getting all entry IDs`);
+    
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/getAllIds?tenantId=${encodeURIComponent(this.config.tenantId)}${this.config.dbId ? `&dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
       {
         method: "GET",
         headers: {
@@ -266,10 +286,44 @@ export class HttpTransport implements NetworkTransport {
     );
     
     const data = await response.json();
-    const hashes: string[] = data.hashes || [];
+    const ids: string[] = data.ids || [];
     
-    console.log(`[HttpTransport] Retrieved ${hashes.length} change hashes`);
-    return hashes;
+    console.log(`[HttpTransport] Retrieved ${ids.length} entry IDs`);
+    return ids;
+  }
+
+  /**
+   * Resolve the dependency chain starting from an entry ID.
+   */
+  async resolveDependencies(
+    token: string,
+    startId: string,
+    options?: Record<string, unknown>
+  ): Promise<string[]> {
+    console.log(`[HttpTransport] Resolving dependencies for ${startId}`);
+    
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/resolveDependencies`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          startId,
+          options,
+        }),
+      }
+    );
+    
+    const data = await response.json();
+    const ids: string[] = data.ids || [];
+    
+    console.log(`[HttpTransport] Resolved ${ids.length} dependencies`);
+    return ids;
   }
 
   /**
@@ -382,24 +436,75 @@ export class HttpTransport implements NetworkTransport {
     }
     return bytes;
   }
+
+  /**
+   * Serialize StoreEntryMetadata for network transmission.
+   */
+  private serializeEntryMetadata(metadata: StoreEntryMetadata): SerializedEntryMetadata {
+    return {
+      entryType: metadata.entryType,
+      id: metadata.id,
+      contentHash: metadata.contentHash,
+      docId: metadata.docId,
+      dependencyIds: metadata.dependencyIds,
+      createdAt: metadata.createdAt,
+      createdByPublicKey: metadata.createdByPublicKey,
+      decryptionKeyId: metadata.decryptionKeyId,
+      signature: this.uint8ArrayToBase64(metadata.signature),
+      originalSize: metadata.originalSize,
+      encryptedSize: metadata.encryptedSize,
+    };
+  }
+
+  /**
+   * Deserialize StoreEntryMetadata from network format.
+   */
+  private deserializeEntryMetadata(serialized: SerializedEntryMetadata): StoreEntryMetadata {
+    return {
+      entryType: serialized.entryType,
+      id: serialized.id,
+      contentHash: serialized.contentHash,
+      docId: serialized.docId,
+      dependencyIds: serialized.dependencyIds,
+      createdAt: serialized.createdAt,
+      createdByPublicKey: serialized.createdByPublicKey,
+      decryptionKeyId: serialized.decryptionKeyId,
+      signature: this.base64ToUint8Array(serialized.signature),
+      originalSize: serialized.originalSize,
+      encryptedSize: serialized.encryptedSize,
+    };
+  }
+
+  /**
+   * Serialize StoreEntry for network transmission.
+   */
+  private serializeEntry(entry: StoreEntry): SerializedEntry {
+    return {
+      ...this.serializeEntryMetadata(entry),
+      encryptedData: this.uint8ArrayToBase64(entry.encryptedData),
+    };
+  }
 }
 
 // Types for serialized network data (Uint8Array converted to base64)
-interface SerializedChangeHashes {
-  type: "create" | "change" | "snapshot" | "delete";
+interface SerializedEntryMetadata {
+  entryType: StoreEntryType;
+  id: string;
+  contentHash: string;
   docId: string;
-  changeHash: string;
-  depsHashes: string[];
+  dependencyIds: string[];
   createdAt: number;
   createdByPublicKey: string;
   decryptionKeyId: string;
   signature: string; // base64
+  originalSize: number;
+  encryptedSize: number;
 }
 
-interface SerializedChange extends SerializedChangeHashes {
-  payload: string; // base64
+interface SerializedEntry extends SerializedEntryMetadata {
+  encryptedData: string; // base64
 }
 
-interface SerializedEncryptedChange extends SerializedChangeHashes {
+interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string; // base64
 }

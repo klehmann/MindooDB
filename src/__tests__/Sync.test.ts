@@ -1,12 +1,12 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
-import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, SigningKeyPair, AppendOnlyStoreFactory, AppendOnlyStore, EncryptedPrivateKey } from "../core/types";
+import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
+import { PrivateUserId, MindooTenant, MindooDB, SigningKeyPair, ContentAddressedStoreFactory, ContentAddressedStore, EncryptedPrivateKey } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("sync test", () => {
-  let storeFactory1: InMemoryAppendOnlyStoreFactory; // Store factory for user1
-  let storeFactory2: InMemoryAppendOnlyStoreFactory; // Store factory for user2
+  let storeFactory1: InMemoryContentAddressedStoreFactory; // Store factory for user1
+  let storeFactory2: InMemoryContentAddressedStoreFactory; // Store factory for user2
   let factory1: BaseMindooTenantFactory; // Factory for user1
   let factory2: BaseMindooTenantFactory; // Factory for user2
   
@@ -31,8 +31,8 @@ describe("sync test", () => {
   beforeEach(async () => {
     // Create separate store factories for each user
     // This simulates two separate clients/servers that need to sync
-    storeFactory1 = new InMemoryAppendOnlyStoreFactory();
-    storeFactory2 = new InMemoryAppendOnlyStoreFactory();
+    storeFactory1 = new InMemoryContentAddressedStoreFactory();
+    storeFactory2 = new InMemoryContentAddressedStoreFactory();
     
     const cryptoAdapter = new NodeCryptoAdapter();
     // Create separate factories for each user

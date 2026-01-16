@@ -1,23 +1,23 @@
-import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
+import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { RSAEncryption } from "../core/crypto/RSAEncryption";
 import { AuthenticationService } from "../core/appendonlystores/network/AuthenticationService";
-import { ClientNetworkAppendOnlyStore } from "../appendonlystores/network/ClientNetworkAppendOnlyStore";
-import { ServerNetworkAppendOnlyStore } from "../appendonlystores/network/ServerNetworkAppendOnlyStore";
+import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
+import { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { NetworkTransport } from "../core/appendonlystores/network/NetworkTransport";
-import type { NetworkEncryptedChange, AuthResult } from "../core/appendonlystores/network/types";
-import type { MindooDocChange, MindooDocChangeHashes, MindooTenantDirectory, EncryptedPrivateKey } from "../core/types";
+import type { NetworkEncryptedEntry, AuthResult } from "../core/appendonlystores/network/types";
+import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, EncryptedPrivateKey } from "../core/types";
 import type { PublicUserId } from "../core/userid";
-import type { AppendOnlyStore } from "../core/appendonlystores/types";
+import type { ContentAddressedStore } from "../core/appendonlystores/types";
 
 /**
- * Mock NetworkTransport that connects directly to a ServerNetworkAppendOnlyStore
+ * Mock NetworkTransport that connects directly to a ServerNetworkContentAddressedStore
  * without actual network calls. Used for testing the client-server interaction.
  */
 class MockNetworkTransport implements NetworkTransport {
-  private server: ServerNetworkAppendOnlyStore;
+  private server: ServerNetworkContentAddressedStore;
 
-  constructor(server: ServerNetworkAppendOnlyStore) {
+  constructor(server: ServerNetworkContentAddressedStore) {
     this.server = server;
   }
 
@@ -29,24 +29,32 @@ class MockNetworkTransport implements NetworkTransport {
     return this.server.handleAuthenticate(challenge, signature);
   }
 
-  async findNewChanges(token: string, haveChangeHashes: string[]): Promise<MindooDocChangeHashes[]> {
-    return this.server.handleFindNewChanges(token, haveChangeHashes);
+  async findNewEntries(token: string, haveIds: string[]): Promise<StoreEntryMetadata[]> {
+    return this.server.handleFindNewEntries(token, haveIds);
   }
 
-  async findNewChangesForDoc(token: string, haveChangeHashes: string[], docId: string): Promise<MindooDocChangeHashes[]> {
-    return this.server.handleFindNewChangesForDoc(token, haveChangeHashes, docId);
+  async findNewEntriesForDoc(token: string, haveIds: string[], docId: string): Promise<StoreEntryMetadata[]> {
+    return this.server.handleFindNewEntriesForDoc(token, haveIds, docId);
   }
 
-  async getChanges(token: string, changeHashes: MindooDocChangeHashes[]): Promise<NetworkEncryptedChange[]> {
-    return this.server.handleGetChanges(token, changeHashes);
+  async getEntries(token: string, ids: string[]): Promise<NetworkEncryptedEntry[]> {
+    return this.server.handleGetEntries(token, ids);
   }
 
-  async pushChanges(token: string, changes: MindooDocChange[]): Promise<void> {
-    return this.server.handlePushChanges(token, changes);
+  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
+    return this.server.handlePutEntries(token, entries);
   }
 
-  async getAllChangeHashes(token: string): Promise<string[]> {
-    return this.server.handleGetAllChangeHashes(token);
+  async hasEntries(token: string, ids: string[]): Promise<string[]> {
+    return this.server.handleHasEntries(token, ids);
+  }
+
+  async getAllIds(token: string): Promise<string[]> {
+    return this.server.handleGetAllIds(token);
+  }
+
+  async resolveDependencies(token: string, startId: string, options?: Record<string, unknown>): Promise<string[]> {
+    return this.server.handleResolveDependencies(token, startId, options);
   }
 }
 
@@ -290,10 +298,10 @@ describe("Network Sync", () => {
     });
   });
 
-  describe("ClientNetworkAppendOnlyStore as Pure Remote Proxy", () => {
-    let serverStore: AppendOnlyStore;
-    let serverHandler: ServerNetworkAppendOnlyStore;
-    let clientStore: ClientNetworkAppendOnlyStore;
+  describe("ClientNetworkContentAddressedStore as Pure Remote Proxy", () => {
+    let serverStore: ContentAddressedStore;
+    let serverHandler: ServerNetworkContentAddressedStore;
+    let clientStore: ClientNetworkContentAddressedStore;
     let mockDirectory: MockTenantDirectory;
     let userSigningKeyPair: CryptoKeyPair;
     let userEncryptionKeyPair: CryptoKeyPair;
@@ -335,7 +343,7 @@ describe("Network Sync", () => {
 
     beforeEach(async () => {
       // Create server store
-      const storeFactory = new InMemoryAppendOnlyStoreFactory();
+      const storeFactory = new InMemoryContentAddressedStoreFactory();
       serverStore = storeFactory.createStore("test-db");
       
       // Create mock directory
@@ -350,7 +358,7 @@ describe("Network Sync", () => {
       );
       
       // Create server handler
-      serverHandler = new ServerNetworkAppendOnlyStore(
+      serverHandler = new ServerNetworkContentAddressedStore(
         serverStore,
         mockDirectory,
         authService,
@@ -361,7 +369,7 @@ describe("Network Sync", () => {
       const mockTransport = new MockNetworkTransport(serverHandler);
       
       // Create client store (no local store - pure remote proxy)
-      clientStore = new ClientNetworkAppendOnlyStore(
+      clientStore = new ClientNetworkContentAddressedStore(
         "test-db",
         mockTransport,
         cryptoAdapter,
@@ -371,74 +379,74 @@ describe("Network Sync", () => {
       );
     });
 
-    test("should find new changes from remote", async () => {
-      // Add changes to server store
-      const change1 = createMockChange("doc1", "hash1", 1000);
-      const change2 = createMockChange("doc1", "hash2", 2000, ["hash1"]);
-      await serverStore.append(change1);
-      await serverStore.append(change2);
+    test("should find new entries from remote", async () => {
+      // Add entries to server store
+      const entry1 = createMockEntry("doc1", "hash1", 1000);
+      const entry2 = createMockEntry("doc1", "hash2", 2000, ["hash1"]);
+      await serverStore.putEntries([entry1]);
+      await serverStore.putEntries([entry2]);
       
       // Query via client store
-      const newChanges = await clientStore.findNewChanges([]);
+      const newEntries = await clientStore.findNewEntries([]);
       
-      expect(newChanges.length).toBe(2);
-      expect(newChanges.map(c => c.changeHash)).toContain("hash1");
-      expect(newChanges.map(c => c.changeHash)).toContain("hash2");
+      expect(newEntries.length).toBe(2);
+      expect(newEntries.map((e: StoreEntryMetadata) => e.id)).toContain("hash1");
+      expect(newEntries.map((e: StoreEntryMetadata) => e.id)).toContain("hash2");
     });
 
-    test("should find new changes excluding already known hashes", async () => {
-      // Add changes to server store
-      const change1 = createMockChange("doc1", "hash1", 1000);
-      const change2 = createMockChange("doc1", "hash2", 2000, ["hash1"]);
-      await serverStore.append(change1);
-      await serverStore.append(change2);
+    test("should find new entries excluding already known hashes", async () => {
+      // Add entries to server store
+      const entry1 = createMockEntry("doc1", "hash1", 1000);
+      const entry2 = createMockEntry("doc1", "hash2", 2000, ["hash1"]);
+      await serverStore.putEntries([entry1]);
+      await serverStore.putEntries([entry2]);
       
       // Query with hash1 already known
-      const newChanges = await clientStore.findNewChanges(["hash1"]);
+      const newEntries = await clientStore.findNewEntries(["hash1"]);
       
-      expect(newChanges.length).toBe(1);
-      expect(newChanges[0].changeHash).toBe("hash2");
+      expect(newEntries.length).toBe(1);
+      expect(newEntries[0].id).toBe("hash2");
     });
 
-    test("should get changes and decrypt them", async () => {
-      // Add change to server store
-      const change = createMockChange("doc1", "hash1", 1000);
-      await serverStore.append(change);
+    test("should get entries and decrypt them", async () => {
+      // Add entry to server store
+      const entry = createMockEntry("doc1", "hash1", 1000);
+      await serverStore.putEntries([entry]);
       
-      // Find and get changes
-      const newChanges = await clientStore.findNewChanges([]);
-      const retrievedChanges = await clientStore.getChanges(newChanges);
+      // Find and get entries
+      const newEntries = await clientStore.findNewEntries([]);
+      const retrievedEntries = await clientStore.getEntries(newEntries.map((e: StoreEntryMetadata) => e.id));
       
-      expect(retrievedChanges.length).toBe(1);
-      expect(retrievedChanges[0].changeHash).toBe("hash1");
-      expect(retrievedChanges[0].docId).toBe("doc1");
+      expect(retrievedEntries.length).toBe(1);
+      expect(retrievedEntries[0].id).toBe("hash1");
+      expect(retrievedEntries[0].docId).toBe("doc1");
       // Payload should be decrypted
-      expect(retrievedChanges[0].payload).toEqual(change.payload);
+      expect(retrievedEntries[0].encryptedData).toEqual(entry.encryptedData);
     });
 
-    test("should push changes to remote", async () => {
+    test("should push entries to remote", async () => {
       // Server should be empty initially
-      const initialHashes = await serverStore.getAllChangeHashes();
+      const initialHashes = await serverStore.getAllIds();
       expect(initialHashes.length).toBe(0);
       
-      // Push a change via client store (must use trusted user's public key)
-      const change = createMockChange("doc1", "hash1", 1000, [], userSigningPublicKeyPem);
-      await clientStore.append(change);
+      // Push an entry via client store (must use trusted user's public key)
+      const entry = createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem);
+      await clientStore.putEntries([entry]);
       
-      // Server should now have the change
-      const finalHashes = await serverStore.getAllChangeHashes();
+      // Server should now have the entry
+      const finalHashes = await serverStore.getAllIds();
       expect(finalHashes.length).toBe(1);
       expect(finalHashes).toContain("hash1");
     });
 
-    test("should get all change hashes from remote", async () => {
-      // Add changes to server store
-      await serverStore.append(createMockChange("doc1", "hash1", 1000));
-      await serverStore.append(createMockChange("doc1", "hash2", 2000));
-      await serverStore.append(createMockChange("doc2", "hash3", 3000));
+    test("should get all entry hashes from remote", async () => {
+      // Add entries to server store
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000)]);
+      await serverStore.putEntries([createMockEntry("doc2", "hash3", 3000)]);
       
       // Query via client store
-      const allHashes = await clientStore.getAllChangeHashes();
+      const allHashes = await clientStore.getAllIds();
       
       expect(allHashes.length).toBe(3);
       expect(allHashes).toContain("hash1");
@@ -446,56 +454,56 @@ describe("Network Sync", () => {
       expect(allHashes).toContain("hash3");
     });
 
-    test("should find new changes for specific document", async () => {
-      // Add changes for multiple documents
-      await serverStore.append(createMockChange("doc1", "hash1", 1000));
-      await serverStore.append(createMockChange("doc2", "hash2", 2000));
-      await serverStore.append(createMockChange("doc1", "hash3", 3000));
+    test("should find new entries for specific document", async () => {
+      // Add entries for multiple documents
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+      await serverStore.putEntries([createMockEntry("doc2", "hash2", 2000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash3", 3000)]);
       
       // Query for doc1 only
-      const doc1Changes = await clientStore.findNewChangesForDoc([], "doc1");
+      const doc1Entries = await clientStore.findNewEntriesForDoc([], "doc1");
       
-      expect(doc1Changes.length).toBe(2);
-      expect(doc1Changes.map(c => c.changeHash)).toContain("hash1");
-      expect(doc1Changes.map(c => c.changeHash)).toContain("hash3");
+      expect(doc1Entries.length).toBe(2);
+      expect(doc1Entries.map((e: StoreEntryMetadata) => e.id)).toContain("hash1");
+      expect(doc1Entries.map((e: StoreEntryMetadata) => e.id)).toContain("hash3");
     });
 
     test("should cache authentication token", async () => {
-      // Add a change to server
-      await serverStore.append(createMockChange("doc1", "hash1", 1000));
+      // Add an entry to server
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
       
       // Multiple calls should reuse token
-      await clientStore.findNewChanges([]);
-      await clientStore.getAllChangeHashes();
-      await clientStore.findNewChanges([]);
+      await clientStore.findNewEntries([]);
+      await clientStore.getAllIds();
+      await clientStore.findNewEntries([]);
       
       // If token caching works, we shouldn't get authentication errors
     });
 
     test("should re-authenticate after token clear", async () => {
-      // Add changes
-      await serverStore.append(createMockChange("doc1", "hash1", 1000));
+      // Add entries
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
       
       // Query first time
-      await clientStore.findNewChanges([]);
+      await clientStore.findNewEntries([]);
       
       // Clear auth cache
       clientStore.clearAuthCache();
       
-      // Add more changes
-      await serverStore.append(createMockChange("doc1", "hash2", 2000, ["hash1"]));
+      // Add more entries
+      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"])]);
       
       // Query again - should re-authenticate
-      const changes = await clientStore.findNewChanges(["hash1"]);
-      expect(changes.length).toBe(1);
+      const entries = await clientStore.findNewEntries(["hash1"]);
+      expect(entries.length).toBe(1);
     });
   });
 
   describe("Sync-Based Usage (Local + Remote Stores)", () => {
-    let serverStore: AppendOnlyStore;
-    let localStore: AppendOnlyStore;
-    let serverHandler: ServerNetworkAppendOnlyStore;
-    let remoteStore: ClientNetworkAppendOnlyStore;
+    let serverStore: ContentAddressedStore;
+    let localStore: ContentAddressedStore;
+    let serverHandler: ServerNetworkContentAddressedStore;
+    let remoteStore: ClientNetworkContentAddressedStore;
     let mockDirectory: MockTenantDirectory;
     let userSigningKeyPair: CryptoKeyPair;
     let userEncryptionKeyPair: CryptoKeyPair;
@@ -537,7 +545,7 @@ describe("Network Sync", () => {
 
     beforeEach(async () => {
       // Create stores
-      const storeFactory = new InMemoryAppendOnlyStoreFactory();
+      const storeFactory = new InMemoryContentAddressedStoreFactory();
       serverStore = storeFactory.createStore("test-db");
       localStore = storeFactory.createStore("test-db");
       
@@ -553,7 +561,7 @@ describe("Network Sync", () => {
       );
       
       // Create server handler
-      serverHandler = new ServerNetworkAppendOnlyStore(
+      serverHandler = new ServerNetworkContentAddressedStore(
         serverStore,
         mockDirectory,
         authService,
@@ -563,8 +571,8 @@ describe("Network Sync", () => {
       // Create mock transport
       const mockTransport = new MockNetworkTransport(serverHandler);
       
-      // Create remote store (ClientNetworkAppendOnlyStore as pure remote proxy)
-      remoteStore = new ClientNetworkAppendOnlyStore(
+      // Create remote store (ClientNetworkContentAddressedStore as pure remote proxy)
+      remoteStore = new ClientNetworkContentAddressedStore(
         "test-db",
         mockTransport,
         cryptoAdapter,
@@ -574,94 +582,86 @@ describe("Network Sync", () => {
       );
     });
 
-    test("should pull changes from remote to local (simulates MindooDB.pullChangesFrom)", async () => {
-      // Add changes to server
-      await serverStore.append(createMockChange("doc1", "hash1", 1000));
-      await serverStore.append(createMockChange("doc1", "hash2", 2000, ["hash1"]));
-      await serverStore.append(createMockChange("doc2", "hash3", 3000));
+    test("should pull entries from remote to local (simulates MindooDB.pullChangesFrom)", async () => {
+      // Add entries to server
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"])]);
+      await serverStore.putEntries([createMockEntry("doc2", "hash3", 3000)]);
       
       // Local should be empty
-      expect((await localStore.getAllChangeHashes()).length).toBe(0);
+      expect((await localStore.getAllIds()).length).toBe(0);
       
       // Simulate MindooDB.pullChangesFrom logic:
       // 1. Get local hashes
-      const localHashes = await localStore.getAllChangeHashes();
+      const localHashes = await localStore.getAllIds();
       
-      // 2. Find new changes from remote
-      const newChangeHashes = await remoteStore.findNewChanges(localHashes);
+      // 2. Find new entries from remote
+      const newEntryMetadata = await remoteStore.findNewEntries(localHashes);
       
-      // 3. Get the changes from remote
-      const newChanges = await remoteStore.getChanges(newChangeHashes);
+      // 3. Get the entries from remote
+      const newEntries = await remoteStore.getEntries(newEntryMetadata.map((em: StoreEntryMetadata) => em.id));
       
-      // 4. Append to local
-      for (const change of newChanges) {
-        await localStore.append(change);
-      }
+      // 4. Put to local
+      await localStore.putEntries(newEntries);
       
-      // Local should now have all changes
-      const finalLocalHashes = await localStore.getAllChangeHashes();
+      // Local should now have all entries
+      const finalLocalHashes = await localStore.getAllIds();
       expect(finalLocalHashes.length).toBe(3);
       expect(finalLocalHashes).toContain("hash1");
       expect(finalLocalHashes).toContain("hash2");
       expect(finalLocalHashes).toContain("hash3");
     });
 
-    test("should push changes from local to remote (simulates MindooDB.pushChangesTo)", async () => {
-      // Add changes to local (must use trusted user's public key)
-      await localStore.append(createMockChange("doc1", "hash1", 1000, [], userSigningPublicKeyPem));
-      await localStore.append(createMockChange("doc1", "hash2", 2000, ["hash1"], userSigningPublicKeyPem));
+    test("should push entries from local to remote (simulates MindooDB.pushChangesTo)", async () => {
+      // Add entries to local (must use trusted user's public key)
+      await localStore.putEntries([createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem)]);
+      await localStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"], userSigningPublicKeyPem)]);
       
       // Server should be empty
-      expect((await serverStore.getAllChangeHashes()).length).toBe(0);
+      expect((await serverStore.getAllIds()).length).toBe(0);
       
       // Simulate MindooDB.pushChangesTo logic:
       // 1. Get remote hashes
-      const remoteHashes = await remoteStore.getAllChangeHashes();
+      const remoteHashes = await remoteStore.getAllIds();
       
-      // 2. Find new changes in local that remote doesn't have
-      const newChangeHashes = await localStore.findNewChanges(remoteHashes);
+      // 2. Find new entries in local that remote doesn't have
+      const newEntryMetadata = await localStore.findNewEntries(remoteHashes);
       
-      // 3. Get the changes from local
-      const newChanges = await localStore.getChanges(newChangeHashes);
+      // 3. Get the entries from local
+      const newEntries = await localStore.getEntries(newEntryMetadata.map(em => em.id));
       
       // 4. Push to remote
-      for (const change of newChanges) {
-        await remoteStore.append(change);
-      }
+      await remoteStore.putEntries(newEntries);
       
-      // Server should now have all changes
-      const finalServerHashes = await serverStore.getAllChangeHashes();
+      // Server should now have all entries
+      const finalServerHashes = await serverStore.getAllIds();
       expect(finalServerHashes.length).toBe(2);
       expect(finalServerHashes).toContain("hash1");
       expect(finalServerHashes).toContain("hash2");
     });
 
     test("should handle bidirectional sync", async () => {
-      // Add some changes to server (must use trusted user's public key)
-      await serverStore.append(createMockChange("doc1", "server-hash1", 1000, [], userSigningPublicKeyPem));
+      // Add some entries to server (must use trusted user's public key)
+      await serverStore.putEntries([createMockEntry("doc1", "server-hash1", 1000, [], userSigningPublicKeyPem)]);
       
-      // Add some changes to local (must use trusted user's public key)
-      await localStore.append(createMockChange("doc2", "local-hash1", 2000, [], userSigningPublicKeyPem));
+      // Add some entries to local (must use trusted user's public key)
+      await localStore.putEntries([createMockEntry("doc2", "local-hash1", 2000, [], userSigningPublicKeyPem)]);
       
       // Pull from server to local
-      const localHashes = await localStore.getAllChangeHashes();
-      const serverNewHashes = await remoteStore.findNewChanges(localHashes);
-      const serverNewChanges = await remoteStore.getChanges(serverNewHashes);
-      for (const change of serverNewChanges) {
-        await localStore.append(change);
-      }
+      const localHashes = await localStore.getAllIds();
+      const serverNewMeta = await remoteStore.findNewEntries(localHashes);
+      const serverNewEntries = await remoteStore.getEntries(serverNewMeta.map((em: StoreEntryMetadata) => em.id));
+      await localStore.putEntries(serverNewEntries);
       
       // Push from local to server
-      const remoteHashes = await remoteStore.getAllChangeHashes();
-      const localNewHashes = await localStore.findNewChanges(remoteHashes);
-      const localNewChanges = await localStore.getChanges(localNewHashes);
-      for (const change of localNewChanges) {
-        await remoteStore.append(change);
-      }
+      const remoteHashes = await remoteStore.getAllIds();
+      const localNewMeta = await localStore.findNewEntries(remoteHashes);
+      const localNewEntries = await localStore.getEntries(localNewMeta.map(em => em.id));
+      await remoteStore.putEntries(localNewEntries);
       
-      // Both should now have both changes
-      const finalLocalHashes = await localStore.getAllChangeHashes();
-      const finalServerHashes = await serverStore.getAllChangeHashes();
+      // Both should now have both entries
+      const finalLocalHashes = await localStore.getAllIds();
+      const finalServerHashes = await serverStore.getAllIds();
       
       expect(finalLocalHashes.length).toBe(2);
       expect(finalServerHashes.length).toBe(2);
@@ -672,22 +672,22 @@ describe("Network Sync", () => {
       expect(finalServerHashes).toContain("local-hash1");
     });
 
-    test("should only sync new changes (incremental sync)", async () => {
-      // Initial sync: add change to both
-      const change1 = createMockChange("doc1", "hash1", 1000);
-      await serverStore.append(change1);
-      await localStore.append(change1);
+    test("should only sync new entries (incremental sync)", async () => {
+      // Initial sync: add entry to both
+      const entry1 = createMockEntry("doc1", "hash1", 1000);
+      await serverStore.putEntries([entry1]);
+      await localStore.putEntries([entry1]);
       
-      // Add new change to server only
-      const change2 = createMockChange("doc1", "hash2", 2000, ["hash1"]);
-      await serverStore.append(change2);
+      // Add new entry to server only
+      const entry2 = createMockEntry("doc1", "hash2", 2000, ["hash1"]);
+      await serverStore.putEntries([entry2]);
       
-      // Pull should only get the new change
-      const localHashes = await localStore.getAllChangeHashes();
-      const newChangeHashes = await remoteStore.findNewChanges(localHashes);
+      // Pull should only get the new entry
+      const localHashes = await localStore.getAllIds();
+      const newEntryMeta = await remoteStore.findNewEntries(localHashes);
       
-      expect(newChangeHashes.length).toBe(1);
-      expect(newChangeHashes[0].changeHash).toBe("hash2");
+      expect(newEntryMeta.length).toBe(1);
+      expect(newEntryMeta[0].id).toBe("hash2");
     });
   });
 });
@@ -704,23 +704,29 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function createMockChange(
+function createMockEntry(
   docId: string,
-  changeHash: string,
+  id: string,
   createdAt: number,
   deps: string[] = [],
   createdByPublicKey: string = "mock-public-key"
-): MindooDocChange {
+): StoreEntry {
+  const encryptedData = new Uint8Array([10, 20, 30, 40]);
+  // Simple mock content hash for testing
+  const contentHash = `contenthash-${id}`;
   return {
-    type: "change",
+    entryType: "doc_change",
+    id,
+    contentHash,
     docId,
-    changeHash,
-    depsHashes: deps,
+    dependencyIds: deps,
     createdAt,
     createdByPublicKey,
     decryptionKeyId: "default",
     signature: new Uint8Array([1, 2, 3, 4]),
-    payload: new Uint8Array([10, 20, 30, 40]),
+    originalSize: 3, // Simulated original size
+    encryptedSize: encryptedData.length,
+    encryptedData,
   };
 }
 
@@ -791,5 +797,26 @@ class MockTenantDirectory implements MindooTenantDirectory {
       return true; // User doesn't exist = effectively revoked
     }
     return user.revoked;
+  }
+
+  // GDPR methods - not used in tests
+  async requestDocHistoryPurge(
+    _dbId: string,
+    _docId: string,
+    _reason: string | undefined,
+    _administrationPrivateKey: EncryptedPrivateKey,
+    _administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    // Not needed for tests
+  }
+
+  async getRequestedDocHistoryPurges(): Promise<Array<{
+    dbId: string;
+    docId: string;
+    reason?: string;
+    requestedAt: number;
+    purgeRequestDocId: string;
+  }>> {
+    return [];
   }
 }

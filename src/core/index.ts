@@ -14,15 +14,30 @@ export { MindooDocSigner } from "./crypto/MindooDocSigner";
 // Keys
 export { KeyBag } from "./keys/KeyBag";
 
-// Append-only stores
-export { AppendOnlyStore, AppendOnlyStoreFactory } from "./appendonlystores/types";
-export { InMemoryAppendOnlyStore, InMemoryAppendOnlyStoreFactory } from "./appendonlystores/InMemoryAppendOnlyStore";
+// Utilities
+export {
+  generateDocEntryId,
+  generateDepsFingerprint,
+  generateAttachmentChunkId,
+  generateFileUuid7,
+  generateChunkUuid7,
+  parseDocEntryId,
+  parseAttachmentChunkId,
+  isDocEntryId,
+  isAttachmentChunkId,
+  extractDocIdFromEntryId,
+  computeContentHash,
+} from "./utils";
+
+// Content-addressed stores (renamed from append-only stores)
+export { ContentAddressedStore, ContentAddressedStoreFactory, AppendOnlyStore, AppendOnlyStoreFactory } from "./appendonlystores/types";
+export { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory, InMemoryAppendOnlyStore, InMemoryAppendOnlyStoreFactory } from "./appendonlystores/InMemoryContentAddressedStore";
 
 // Network
 export { AuthenticationService } from "./appendonlystores/network/AuthenticationService";
 export { NetworkTransport, NetworkTransportConfig } from "./appendonlystores/network/NetworkTransport";
 export {
-  NetworkEncryptedChange,
+  NetworkEncryptedEntry,
   UserPublicKeys,
   NetworkAuthTokenPayload,
   AuthChallenge,

@@ -1,31 +1,41 @@
-import type { MindooDocChange, MindooDocChangeHashes } from "../types";
+import type { StoreEntry, StoreEntryMetadata } from "../types";
 
 /**
- * AppendOnlyStoreFactory creates AppendOnlyStore instances for a given database ID.
+ * ContentAddressedStoreFactory creates ContentAddressedStore instances for a given database ID.
  * This allows different implementations to provide different storage backends
- * (e.g., in-memory, file-based, database-backed) while maintaining a consistent interface.
+ * (e.g., in-memory, file-based, database-backed, cloud storage) while maintaining a consistent interface.
  */
-export interface AppendOnlyStoreFactory {
+export interface ContentAddressedStoreFactory {
   /**
-   * Create a new AppendOnlyStore for the given database ID.
+   * Create a new ContentAddressedStore for the given database ID.
    * 
    * @param dbId The ID of the database (e.g., "directory" for the tenant directory database)
-   * @return A new AppendOnlyStore instance for this database
+   * @return A new ContentAddressedStore instance for this database
    */
-  createStore(dbId: string): AppendOnlyStore;
+  createStore(dbId: string): ContentAddressedStore;
 }
 
 /**
- * An AppendOnlyStore is a store that is used to store signed and optionally encrypted
- * binary automerge changes to the documents in a MindooDB.
+ * A ContentAddressedStore is a store that stores signed and optionally encrypted
+ * binary entries. Each entry has:
+ * - A unique `id` (primary key for lookups)
+ * - A `contentHash` (SHA-256 of encrypted data, for deduplication)
  * 
- * The AppendOnlyStore is responsible for storing the changes and providing
- * methods to get changes by their hashes, find new changes and get all change hashes.
+ * The store supports both Automerge document changes and attachment chunks through
+ * a unified interface, with storage-level deduplication based on contentHash.
  * 
- * The append only structure makes synchronization of changes easy between peers (client-client,
- * client-server, server-server).
+ * The store is responsible for:
+ * - Storing entries with metadata indexed by id
+ * - Deduplicating encrypted bytes by contentHash (same content stored once)
+ * - Providing methods to retrieve entries by id
+ * - Finding new entries for synchronization
+ * - Resolving dependency chains (for traversing DAG structures)
+ * 
+ * The append-only structure makes synchronization easy between peers (client-client,
+ * client-server, server-server). Store implementations can optimize storage based on
+ * entry type (e.g., inline small doc changes, external storage for large attachment chunks).
  */
-export interface AppendOnlyStore {
+export interface ContentAddressedStore {
   /**
    * Get the ID of the store
    *
@@ -34,57 +44,98 @@ export interface AppendOnlyStore {
   getId(): string;
 
   /**
-   * Append a new change to the store. No-op if we already have this
-   * change in the store (based on the change ID).
+   * Store one or more entries. 
+   * - Metadata is stored by entry id (always unique)
+   * - Encrypted bytes are deduplicated by contentHash (same bytes stored once)
    *
-   * @param change The change to append
-   * @return A promise that resolves when the change is appended
+   * @param entries The entries to store
+   * @return A promise that resolves when all entries are stored
    */
-  append(change: MindooDocChange): Promise<void>;
+  putEntries(entries: StoreEntry[]): Promise<void>;
 
   /**
-   * Find changes in the store that are not listed in the given list of change hashes
+   * Get entries by their IDs.
+   * Returns only entries that exist in this store.
    *
-   * @param haveChangeHashes The list of document IDs and change hashes we already have
-   * @return A list of document IDs and change hashes that we don't have yet
+   * @param ids The IDs of the entries to fetch
+   * @return A list of entries (may be shorter than input if some don't exist)
    */
-  findNewChanges(haveChangeHashes: string[]): Promise<MindooDocChangeHashes[]>;
+  getEntries(ids: string[]): Promise<StoreEntry[]>;
 
   /**
-   * Find changes in the store for a document that are not listed in the given list of change hashes
+   * Check which IDs from the provided list exist in this store.
    *
-   * @param haveChangeHashes The list of change hashes we already have
+   * @param ids The IDs to check
+   * @return A list of IDs that exist in this store
+   */
+  hasEntries(ids: string[]): Promise<string[]>;
+
+  /**
+   * Find entries in the store that are not listed in the given list of IDs.
+   * Used for synchronization to identify which entries we have that the peer doesn't.
+   *
+   * @param knownIds The list of entry IDs we already have
+   * @return A list of entry metadata for entries we have that aren't in knownIds
+   */
+  findNewEntries(knownIds: string[]): Promise<StoreEntryMetadata[]>;
+
+  /**
+   * Find entries in the store for a specific document that are not listed in the given list of IDs.
+   *
+   * @param knownIds The list of entry IDs we already have
    * @param docId The ID of the document
-   * @return A list of change hashes
+   * @return A list of entry metadata for entries we have that aren't in knownIds
    */
-  findNewChangesForDoc(haveChangeHashes: string[], docId: string): Promise<MindooDocChangeHashes[]>;
+  findNewEntriesForDoc(knownIds: string[], docId: string): Promise<StoreEntryMetadata[]>;
 
   /**
-   * Bulk method to get multiple changes given their hash infos
+   * Get all entry IDs in the store.
+   * Used for synchronization to identify which entries we have.
    *
-   * @param changeHashes The hashes of the changes to fetch
-   * @return A list of changes with payload and signature
+   * @return A list of all entry IDs in the store
    */
-  getChanges(changeHashes: MindooDocChangeHashes[]): Promise<MindooDocChange[]>;
+  getAllIds(): Promise<string[]>;
 
   /**
-   * Get all change hashes in the store.
-   * Used for synchronization to identify which changes we have.
+   * Resolve the dependency chain starting from an entry ID.
+   * Returns IDs in dependency order, traversing backward through dependencyIds.
+   * 
+   * This is useful for:
+   * - Loading all chunks of an attachment (traverse from last to first chunk)
+   * - Finding all changes needed to reconstruct a document state
+   * - Stopping at snapshots when loading documents (use options.stopAtEntryType)
    *
-   * @return A list of all change hashes in the store
+   * @param startId The entry ID to start traversal from
+   * @param options Optional traversal options:
+   *   - stopAtEntryType: Stop when encountering an entry of this type (e.g., "doc_snapshot")
+   *   - maxDepth: Maximum number of hops to traverse
+   *   - includeStart: Whether to include startId in the result (default: true)
+   * @return A list of entry IDs in dependency order (oldest first by default)
    */
-  getAllChangeHashes(): Promise<string[]>;
+  resolveDependencies(
+    startId: string,
+    options?: Record<string, unknown>
+  ): Promise<string[]>;
 
   /**
-   * Purge all change history for a specific document from the store.
-   * This breaks append-only semantics but is required for GDPR compliance.
+   * Purge all entries for a specific document from the store.
+   * This breaks append-only semantics but is required for GDPR compliance
+   * (right to be forgotten).
    * 
-   * After purging, all changes for the specified document will be removed
-   * from the store. This operation cannot be undone.
+   * After purging, all entries for the specified document will be removed
+   * from the store. Content bytes that are no longer referenced by any
+   * entry should also be cleaned up.
    * 
-   * @param docId The document ID whose change history should be purged
+   * @param docId The document ID whose entries should be purged
    * @return A promise that resolves when the purge is complete
    * @throws Error if the store implementation does not support purging
    */
   purgeDocHistory(docId: string): Promise<void>;
 }
+
+// Legacy type aliases for backward compatibility during migration
+// These will be removed in a future version
+/** @deprecated Use ContentAddressedStore instead */
+export type AppendOnlyStore = ContentAddressedStore;
+/** @deprecated Use ContentAddressedStoreFactory instead */
+export type AppendOnlyStoreFactory = ContentAddressedStoreFactory;

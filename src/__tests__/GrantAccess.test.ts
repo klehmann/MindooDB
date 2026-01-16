@@ -1,12 +1,12 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
-import { InMemoryAppendOnlyStoreFactory } from "../appendonlystores/InMemoryAppendOnlyStoreFactory";
+import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { PrivateUserId, MindooTenant, MindooDoc, ProcessChangesCursor, SigningKeyPair } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("granting tenant access", () => {
   let factory: BaseMindooTenantFactory;
-  let storeFactory: InMemoryAppendOnlyStoreFactory;
+  let storeFactory: InMemoryContentAddressedStoreFactory;
   let adminUser: PrivateUserId;
   let adminUserPassword: string;
   let adminKeyBag: KeyBag;
@@ -19,7 +19,7 @@ describe("granting tenant access", () => {
   let regularUserPassword: string;
 
   beforeEach(async () => {
-    storeFactory = new InMemoryAppendOnlyStoreFactory();
+    storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     
     // Create admin user

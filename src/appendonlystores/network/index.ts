@@ -1,9 +1,9 @@
 // Network synchronization module for MindooDB
-// Provides secure network-based AppendOnlyStore implementations
+// Provides secure network-based ContentAddressedStore implementations
 
 // Types
 export type {
-  NetworkEncryptedChange,
+  NetworkEncryptedEntry,
   UserPublicKeys,
   NetworkAuthTokenPayload,
   AuthChallenge,
@@ -14,11 +14,11 @@ export { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
 // Interfaces
 export type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 
-// Client-side
-export { ClientNetworkAppendOnlyStore } from "./ClientNetworkAppendOnlyStore";
+// Client-side (new names)
+export { ClientNetworkContentAddressedStore, ClientNetworkAppendOnlyStore } from "./ClientNetworkContentAddressedStore";
 
-// Server-side
-export { ServerNetworkAppendOnlyStore } from "./ServerNetworkAppendOnlyStore";
+// Server-side (new names)
+export { ServerNetworkContentAddressedStore, ServerNetworkAppendOnlyStore } from "./ServerNetworkContentAddressedStore";
 
 // Authentication
 export { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
