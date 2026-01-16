@@ -786,6 +786,63 @@ export interface MindooTenantDirectory {
     requestedAt: number;
     purgeRequestDocId: string;  // ID of the purge request document in directory
   }>>;
+
+  /**
+   * Get the latest tenant-wide settings document from the directory.
+   * Returns null if no settings document exists.
+   * 
+   * Settings are synced to all clients via the directory database.
+   * 
+   * @return The latest tenant settings document, or null if none exists
+   */
+  getTenantSettings(): Promise<MindooDoc | null>;
+
+  /**
+   * Create or update tenant-wide settings.
+   * Automatically uses the cached settings document if it exists, or creates a new one.
+   * 
+   * Settings are signed with the administration key and synced to all clients.
+   * The `form` field is automatically set to "tenantsettings" after the callback.
+   * 
+   * @param changeFunc Function to modify the settings document
+   * @param administrationPrivateKey The administration private key to sign the settings
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the settings are updated
+   */
+  changeTenantSettings(
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
+
+  /**
+   * Get the latest database-specific settings document from the directory.
+   * Returns null if no settings document exists for the given database.
+   * 
+   * @param dbId The database ID to get settings for
+   * @return The latest DB settings document, or null if none exists
+   */
+  getDBSettings(dbId: string): Promise<MindooDoc | null>;
+
+  /**
+   * Create or update database-specific settings.
+   * Automatically uses the cached settings document for the given dbId if it exists, or creates a new one.
+   * 
+   * The `form` field is automatically set to "dbsettings" and `dbid` is set to the provided dbId
+   * after the callback to ensure they are always correct.
+   * 
+   * @param dbId The database ID these settings apply to
+   * @param changeFunc Function to modify the settings document
+   * @param administrationPrivateKey The administration private key to sign the settings
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the settings are updated
+   */
+  changeDBSettings(
+    dbId: string,
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
 }
 
 /**

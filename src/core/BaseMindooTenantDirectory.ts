@@ -14,6 +14,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   // Mapping from grant document ID to public key (needed for revocation lookups)
   private grantDocIdToPublicKey: Map<string, string> = new Map();
 
+  // Cache for settings documents
+  private tenantSettingsCache: MindooDoc | null = null;
+  private dbSettingsCache: Map<string, MindooDoc> = new Map();
+  private settingsCacheLastCursor: ProcessChangesCursor | null = null;
+
   // Centralized field lists for signing/verification
   private static readonly GRANT_ACCESS_SIGNED_FIELDS: string[] = [
     "form",
@@ -628,5 +633,149 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }
     
     return purgeRequests;
+  }
+
+  async getTenantSettings(): Promise<MindooDoc | null> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    
+    // Update cache if directory has new changes
+    await this.updateSettingsCache(directoryDB);
+    
+    return this.tenantSettingsCache;
+  }
+
+  async getDBSettings(dbId: string): Promise<MindooDoc | null> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    
+    // Update cache if directory has new changes
+    await this.updateSettingsCache(directoryDB);
+    
+    return this.dbSettingsCache.get(dbId) || null;
+  }
+
+  async changeTenantSettings(
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    
+    // Get cached settings doc or create new one
+    let settingsDoc = await this.getTenantSettings();
+    
+    if (!settingsDoc) {
+      // Create new document
+      settingsDoc = await directoryDB.createDocumentWithSigningKey(
+        adminSigningKeyPair,
+        administrationPrivateKeyPassword
+      );
+    }
+    
+    // Apply changes and ensure form field is correct
+    await directoryDB.changeDocWithSigningKey(
+      settingsDoc,
+      async (d: MindooDoc) => {
+        // Call user's change function
+        await changeFunc(d);
+        
+        // Ensure form field is always correct (overwrite if user changed it)
+        d.getData().form = "tenantsettings";
+      },
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword
+    );
+    
+    // Invalidate cache
+    this.tenantSettingsCache = null;
+    this.settingsCacheLastCursor = null;
+  }
+
+  async changeDBSettings(
+    dbId: string,
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    
+    // Get cached settings doc for this dbId or create new one
+    let settingsDoc = await this.getDBSettings(dbId);
+    
+    if (!settingsDoc) {
+      // Create new document
+      settingsDoc = await directoryDB.createDocumentWithSigningKey(
+        adminSigningKeyPair,
+        administrationPrivateKeyPassword
+      );
+    }
+    
+    // Apply changes and ensure form and dbid fields are correct
+    await directoryDB.changeDocWithSigningKey(
+      settingsDoc,
+      async (d: MindooDoc) => {
+        // Call user's change function
+        await changeFunc(d);
+        
+        // Ensure form and dbid fields are always correct (overwrite if user changed them)
+        const data = d.getData();
+        data.form = "dbsettings";
+        data.dbid = dbId;
+      },
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword
+    );
+    
+    // Invalidate cache for this dbId
+    this.dbSettingsCache.delete(dbId);
+    this.settingsCacheLastCursor = null;
+  }
+
+  private async updateSettingsCache(
+    directoryDB: MindooDB
+  ): Promise<void> {
+    // Determine starting cursor (null = process all, otherwise incremental)
+    const startCursor = this.settingsCacheLastCursor;
+    
+    // If processing from the beginning, clear caches first
+    if (startCursor === null) {
+      this.tenantSettingsCache = null;
+      this.dbSettingsCache.clear();
+    }
+    
+    // Process changes (documents are returned in order by lastModified, oldest to newest)
+    // Since they're in order, we can just overwrite the cache with each document we see
+    // The last one we see will be the latest
+    for await (const { doc, cursor } of directoryDB.iterateChangesSince(startCursor, 100)) {
+      const data = doc.getData();
+      
+      // Process tenant settings (no signature verification needed - Automerge handles merging)
+      if (data.form === "tenantsettings") {
+        // Just overwrite - last one seen will be the latest
+        this.tenantSettingsCache = doc;
+      }
+      
+      // Process DB settings (no signature verification needed - Automerge handles merging)
+      if (data.form === "dbsettings" && data.dbid && typeof data.dbid === "string") {
+        const dbId = data.dbid;
+        // Just overwrite - last one seen will be the latest
+        this.dbSettingsCache.set(dbId, doc);
+      }
+      
+      this.settingsCacheLastCursor = cursor;
+    }
   }
 }

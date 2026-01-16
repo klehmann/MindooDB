@@ -319,13 +319,29 @@ MindooDB establishes trust through a hierarchical cryptographic model:
 5. This adds the user to the special MindooDB named "directory", signed with the administration key to verify the user is trusted
 6. For users with revoked tenant access, administrators can call `MindooTenantDirectory.revokeUser()` to add a revocation record so that their changes are no longer trusted and ignored
 
+### Creating a Database
+
+1. Client calls `Tenant.openDB(id, options?)` with a database ID (string)
+2. System checks if the database is already cached in the tenant's database cache
+3. If not cached:
+   - Creates content-addressed stores for documents and optionally attachments using the store factory
+   - Creates a new `MindooDB` instance with the stores
+   - Initializes the database (sets up internal indexes)
+   - Caches the database instance for future use
+4. Special case: If `id === "directory"`, the database is automatically opened with `adminOnlyDb: true` to enforce admin-only write access
+5. Returns the `MindooDB` instance (cached or newly created)
+6. The database is now ready to store documents and can be used by any registered user in the tenant
+
 ### Creating a Document
 
 1. Client calls `MindooDB.createDocument()` or `createEncryptedDocument(keyId)`
-2. If encrypted, the key ID is stored in document metadata
-3. First change is created and stored in content-addressed store
-4. Change is signed with user's signing key
-5. Change is encrypted with the specified key (or "default" tenant key)
+2. `keyId` refers to a symmetric encryption key that the client has created locally and imported into his KeyBag.
+3. the special key ID `default` is the default value, encrypting the document with the tenant encryption key shared between all tenant users.
+3. The key ID is stored in document metadata
+4. First change is created and stored in content-addressed store
+5. Change is signed with user's signing key
+6. Change is encrypted with the specified key (or "default" tenant key)
+7. The key can be exported from the KeyBag, signed with a custom password and key / password can be shared with coworkers (see chapter "Key Distribution").
 
 ### Modifying a Document
 
@@ -364,6 +380,34 @@ MindooDB establishes trust through a hierarchical cryptographic model:
 - The index tracks which documents have changed and when, enabling incremental operations on the database
 - `processChangesSince()` uses this index to efficiently find documents that changed since a given cursor
 - This enables external systems to efficiently query for document changes and update their own indexes incrementally
+
+### Tenant and Database Settings
+
+Tenant-wide and database-specific settings are stored in the directory database as special documents with `form="tenantsettings"` and `form="dbsettings"` respectively. These settings are managed exclusively by administrators and are automatically synchronized to all clients.
+
+**Retrieving Settings:**
+1. Client calls `MindooTenantDirectory.getTenantSettings()` or `getDBSettings(dbId)`
+2. System synchronizes the directory database to ensure latest changes are available
+3. System updates internal settings cache by iterating through directory changes since last update
+4. For tenant settings: returns the latest document with `form="tenantsettings"` (or `null` if none exists)
+5. For DB settings: returns the latest document with `form="dbsettings"` and matching `dbid` field (or `null` if none exists)
+6. Settings are cached in memory for efficient access
+
+**Updating Settings:**
+1. Administrator calls `MindooTenantDirectory.changeTenantSettings(changeFunc, adminKey, adminPassword)` or `changeDBSettings(dbId, changeFunc, adminKey, adminPassword)`
+2. System retrieves the existing settings document from cache (or creates a new one if it doesn't exist)
+3. System applies the administrator's change function to the document
+4. System ensures the `form` field is set correctly (`"tenantsettings"` or `"dbsettings"`)
+5. For DB settings, system also ensures the `dbid` field matches the provided `dbId`
+6. System creates a new change entry signed with the administration key
+7. Change is stored in the directory database (admin-only, so only admin-signed entries are accepted)
+8. Settings cache is invalidated to force refresh on next access
+9. Settings are automatically synchronized to all clients through the normal directory sync process
+
+**Settings Document Structure:**
+- Tenant settings documents have `form="tenantsettings"` and can contain any tenant-wide configuration (e.g., `maxAttachmentSize`, `adminKeyRotationAnnouncement`)
+- Database settings documents have `form="dbsettings"` and `dbid=<databaseId>` and can contain database-specific configuration
+- Settings documents use Automerge for automatic conflict resolution when multiple administrators make concurrent changes
 
 ### Key Distribution
 
