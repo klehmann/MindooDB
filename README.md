@@ -38,7 +38,7 @@ Users are identified by cryptographic key pairs:
 - **Signing Key** (Ed25519): Signs document changes to prove authorship
 - **Encryption Key** (RSA-OAEP): Encrypts the KeyBag stored on disk
 - **Each client creates his its own secure private keys locally** - administrator only receives public key for tenant registration
-- Registered by administrators in the tenant's directory database
+- Registered by administrators in the tenant's directory database (signed with admin key for trust)
 - Registration is synced between clients and servers, giving the user distributed access to the tenant data via sync
 - Access can be revoked (prevents future changes and sync access to peers, but preserves audit trail)
 
