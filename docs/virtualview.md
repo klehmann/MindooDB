@@ -53,20 +53,20 @@ A VirtualView is an **in-memory tree structure** that organizes documents into c
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          VirtualView                                 │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐     │
-│  │ VirtualViewColumn│  │ VirtualViewColumn│  │ VirtualViewColumn│    │
-│  │ (Category: Dept) │  │ (Sort: Name)    │  │ (Total: Salary) │     │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘     │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                        Root Entry                              │  │
-│  │  ├── Category: Sales                                          │  │
-│  │  │   ├── Document: doc1 (origin: db1)                        │  │
-│  │  │   └── Document: doc2 (origin: db2)                        │  │
-│  │  └── Category: Engineering                                    │  │
-│  │      └── Document: doc3 (origin: db1)                        │  │
-│  └──────────────────────────────────────────────────────────────┘  │
+│                          VirtualView                                │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
+│  │ VirtualViewColumn│  │ VirtualViewColumn│  │ VirtualViewColumn│   │
+│  │ (Category: Dept) │  │ (Sort: Name)     │  │ (Total: Salary)  │   │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘   │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                        Root Entry                            │   │
+│  │  ├── Category: Sales                                         │   │
+│  │  │   ├── Document: doc1 (origin: db1)                        │   │
+│  │  │   └── Document: doc2 (origin: db2)                        │   │
+│  │  └── Category: Engineering                                   │   │
+│  │      └── Document: doc3 (origin: db1)                        │   │
+│  └──────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
          ▲                              ▲
          │                              │
