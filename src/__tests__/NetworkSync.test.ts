@@ -6,7 +6,7 @@ import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/
 import { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { NetworkTransport } from "../core/appendonlystores/network/NetworkTransport";
 import type { NetworkEncryptedEntry, AuthResult } from "../core/appendonlystores/network/types";
-import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, EncryptedPrivateKey } from "../core/types";
+import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, EncryptedPrivateKey, MindooDoc } from "../core/types";
 import type { PublicUserId } from "../core/userid";
 import type { ContentAddressedStore } from "../core/appendonlystores/types";
 
@@ -821,5 +821,31 @@ class MockTenantDirectory implements MindooTenantDirectory {
     purgeRequestDocId: string;
   }>> {
     return [];
+  }
+
+  // Tenant and DB settings methods - not used in tests
+  async getTenantSettings(): Promise<MindooDoc | null> {
+    return null;
+  }
+
+  async changeTenantSettings(
+    _changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    _administrationPrivateKey: EncryptedPrivateKey,
+    _administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    // Not needed for tests
+  }
+
+  async getDBSettings(_dbId: string): Promise<MindooDoc | null> {
+    return null;
+  }
+
+  async changeDBSettings(
+    _dbId: string,
+    _changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    _administrationPrivateKey: EncryptedPrivateKey,
+    _administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    // Not needed for tests
   }
 }

@@ -1,5 +1,5 @@
 {
-  "name": "mindoodb2",
+  "name": "mindoodb",
   "version": "1.0.0",
   "description": "End-to-End Encrypted, Offline-first Sync Database",
   "main": "./dist/node/index.js",
