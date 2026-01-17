@@ -67,7 +67,7 @@ Each **MindooDB** contains multiple **documents**:
 Documents can have **file attachments**:
 - Stored in unified content-addressed store (same infrastructure as document changes)
 - Attachment store and document store can be separated and have their own sync behavior (e.g., sync docs locally but keep attachments on the server or only cache recently used locally)
-- Chunked into 256KB pieces for efficient storage and streaming
+- Chunked into 256KB (default) pieces for efficient storage and streaming
 - **Deduplication**: Identical files stored once (tenant-wide deduplication with deterministic encryption)
 - **Encrypted**: Each chunk encrypted independently with same key as the document
 - **Streaming support**: Memory-efficient upload and download for large files
@@ -80,7 +80,7 @@ For detailed information on attachment storage and management, see the [Attachme
 - **Default encryption**: All documents encrypted with tenant key (all tenant members can decrypt)
 - **Named key encryption**: Documents encrypted with named symmetric keys (only users with the key can decrypt)
 - Keys distributed offline through secure channels (e.g., via encrypted email with password protection)
-- KeyBag stores named keys encrypted on disk using user's encryption key password
+- Local KeyBag stores named keys encrypted on disk using user's encryption key password
 
 ### Sync
 MindooDB supports **offline-first network synchronization**:
@@ -212,25 +212,6 @@ This ensures that revocation actually prevents future changes, even if a user tr
 - Keys distributed offline via secure channels
 - Key rotation supported (multiple versions per key ID)
 
-## Architecture Highlights
-
-### End-to-End Encrypted Model
-- No central authority for tenant creation or user management
-- All operations cryptographically verified
-- Trust established through cryptographic proofs, not server-side authentication
-
-### Hybrid Deployment
-- Works with local stores (in-memory, file-based)
-- Works with remote stores (server-backed implementations)
-- Works with mixed local / remote stores
-- Seamless synchronization between local and remote stores
-- Can be deployed as P2P, client-server, or hybrid
-
-### Performance Optimizations
-- **Snapshots**: Regular Automerge snapshots prevent replaying entire history
-- **Efficient sync**: Only missing changes are transferred
-- **Incremental processing**: Internal index tracks document changes for efficient queries
-
 ## Use Cases
 
 MindooDB is ideal for applications requiring strong security, offline operation, and collaborative features:
@@ -243,24 +224,13 @@ MindooDB is ideal for applications requiring strong security, offline operation,
 
 For comprehensive use case documentation, patterns, and industry-specific examples, see the [Use Cases Documentation](./docs/usecases/README.md).
 
-## Project Goals
-
-MindooDB is designed to provide **strong security guarantees** while maintaining practical usability:
-
-1. **End-to-End Encrypted Architecture**: No reliance on central authorities or trusted servers
-2. **Offline-First Operation**: System works when offline, syncs when connectivity is available
-3. **Cryptographic Integrity**: All operations provable through cryptography
-4. **Hybrid Deployment**: Seamless operation across local and remote stores
-5. **Revocation Protection**: Prevent revoked users from creating backdated changes
-6. **Complete Audit Trail**: Append-only structure preserves full history
-
 ## Documentation
 
 - [Full Specification](./docs/specification.md) - Complete architecture and design details
 
 ## License
 
-ISC
+Apache 2.0
 
 ## Author
 
