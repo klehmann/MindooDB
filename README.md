@@ -40,6 +40,17 @@ Users are identified by cryptographic key pairs:
 - Registered by administrators in the tenant's directory database
 - Access can be revoked (prevents future changes and sync access to peers, but preserves audit trail)
 
+### Databases
+Each **tenant** can contain multiple **MindooDB** instances (databases):
+- Created on-demand with `Tenant.openDB(id, options?)` (no pre-registration needed)
+- Each database is independent with its own document and attachment stores
+- **Flexible storage**: Document store and attachment store can be separate (e.g., local docs, remote attachments) or combined
+- **Special "directory" database**: Admin-only database for user registry and tenant/DB settings (only admin has write access)
+- **Multi-database patterns**: Enable data organization, sharding by time/category, and different access patterns
+- **Documents can be reorganized** by moving their complete audit history between stores
+- **Incremental database queries**: Efficiently fetch only new or changed documents since the last query, enabling fast updates and low-bandwidth sync.
+- **Virtual Views**: Instantly create powerful, spreadsheet-like views that categorize, sort, and aggregate documents—even across multiple tenants and databases
+
 ### Documents
 Each **MindooDB** contains multiple **documents**:
 - Implemented as Automerge CRDTs for collaborative editing
@@ -86,7 +97,7 @@ import {
   BaseMindooTenantFactory, 
   InMemoryAppendOnlyStoreFactory,
   KeyBag 
-} from "mindoodb2";
+} from "mindoodb";
 
 // Create a store factory (can be in-memory, file-based, or server-backed)
 const storeFactory = new InMemoryAppendOnlyStoreFactory();
