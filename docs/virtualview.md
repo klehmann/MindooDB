@@ -683,7 +683,3 @@ src/indexing/virtualviews/
 ├── IViewEntryAccessCheck.ts           # Access control interface
 └── VirtualViewFactory.ts              # Builder pattern
 ```
-
-## Acknowledgments
-
-This implementation is inspired by and adapted from **Karsten Lehmann's Domino JNA project** ([klehmann/domino-jna](https://github.com/klehmann/domino-jna)), which provides excellent patterns for building dynamic, in-memory views of document databases. The VirtualView concept from Domino JNA has been invaluable in shaping this TypeScript implementation for MindooDB.
