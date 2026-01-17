@@ -30,7 +30,7 @@ MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** for secure,
 A **tenant** represents an organization or group that shares access to documents:
 - Created entirely on the client side (no server registration needed)
 - Has a **tenant encryption key** (default encryption for all documents)
-- Has an **administration key** (for user registration and administrative operations by authorized persons)
+- Has an **administration key** (Ed25519 signing key for user registration and administrative operations by authorized administrators)
 - Contains one or more **MindooDB** instances (databases)
 
 ### Users
@@ -45,25 +45,26 @@ Each **tenant** can contain multiple **MindooDB** instances (databases):
 - Created on-demand with `Tenant.openDB(id, options?)` (no pre-registration needed)
 - Each database is independent with its own document and attachment stores
 - **Flexible storage**: Document store and attachment store can be separate (e.g., local docs, remote attachments) or combined
-- **Special "directory" database**: Admin-only database for user registry and tenant/DB settings (only admin has write access)
+- **Special "directory" database**: Mandatory admin-only database for user registry and tenant/DB settings (only administrators have write access)
 - **Multi-database patterns**: Enable data organization, sharding by time/category, and different access patterns
 - **Documents can be reorganized** by moving their complete audit history between stores
-- **Incremental database queries**: Efficiently fetch only new or changed documents since the last query, enabling fast updates and low-bandwidth sync.
+- **Incremental database queries**: Efficiently fetch only new or changed documents since the last query (using a timestamp based cursor), enabling fast updates and low-bandwidth sync.
 - **Virtual Views**: Instantly create powerful, spreadsheet-like views that categorize, sort, and aggregate documents—even across multiple tenants and databases
 
 For detailed information on Virtual Views, see the [VirtualView Documentation](./docs/virtualview.md).
 
 ### Documents
 Each **MindooDB** contains multiple **documents**:
-- Implemented as Automerge CRDTs for collaborative editing
+- **Powered by [Automerge](https://automerge.org/)**: Built on a proven, production-grade CRDT engine for collaborative editing — matured over years of real-world use
 - Every change is **signed** (proves authenticity) and **encrypted** (protects content)
 - Changes stored in append-only stores with complete history
+- **Frequent Automerge snapshot storage**: Prevent performance degradation by avoiding full history replay on load.
 - Support for time travel (reconstruct document state at any point in time)
 
 ### Attachments
 Documents can have **file attachments**:
 - Stored in unified content-addressed store (same infrastructure as document changes)
-- Attachment store and document store can be separated and have their own sync behavior, e.g. sync docs locally, but keep attachments on the server
+- Attachment store and document store can be separated and have their own sync behavior (e.g., sync docs locally but keep attachments on the server or only cache recently used locally)
 - Chunked into 256KB pieces for efficient storage and streaming
 - **Deduplication**: Identical files stored once (tenant-wide deduplication with deterministic encryption)
 - **Encrypted**: Each chunk encrypted independently with same key as the document
@@ -76,12 +77,13 @@ For detailed information on attachment storage and management, see the [Attachme
 ### Encryption Model
 - **Default encryption**: All documents encrypted with tenant key (all tenant members can decrypt)
 - **Named key encryption**: Documents encrypted with named symmetric keys (only users with the key can decrypt)
-- Keys distributed offline (e.g., via email with password protection)
+- Keys distributed offline through secure channels (e.g., via encrypted email with password protection)
 - KeyBag stores named keys encrypted on disk using user's encryption key password
 
 ### Sync
 MindooDB supports **offline-first network synchronization**:
 - **Simple sync protocol**: Clients and servers exchange only missing changes (incremental sync)
+- **Encrypted data is synced**: Clients and servers can sync encrypted data/attachment chunks even without decryption keys (useful for backup servers or intermediate nodes)
 - **Client-server sync**: Centralized server model for reliable data sharing
 - **Peer-to-peer ready**: Architecture prepared for direct client-to-client sync (no central server required)
 - **User revocation**: Revoked users lose network access immediately (no sync with peer clients and servers)
@@ -169,7 +171,7 @@ await db2.pullChangesFrom(store1);
 
 // User 2 can now see the document
 const allDocs = await db2.getAllDocumentIds();
-expect(allDocs.length).toBe(1);
+console.log(`Found ${allDocs.length} document(s)`); // Should be 1
 
 // User 2 modifies the document
 const doc2 = await db2.getDocument(allDocs[0]);
