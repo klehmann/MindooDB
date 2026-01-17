@@ -51,6 +51,8 @@ Each **tenant** can contain multiple **MindooDB** instances (databases):
 - **Incremental database queries**: Efficiently fetch only new or changed documents since the last query, enabling fast updates and low-bandwidth sync.
 - **Virtual Views**: Instantly create powerful, spreadsheet-like views that categorize, sort, and aggregate documents—even across multiple tenants and databases
 
+For detailed information on Virtual Views, see the [VirtualView Documentation](./docs/virtualview.md).
+
 ### Documents
 Each **MindooDB** contains multiple **documents**:
 - Implemented as Automerge CRDTs for collaborative editing
@@ -69,6 +71,8 @@ Documents can have **file attachments**:
 - **Random access**: Efficient byte-range retrieval without loading entire files
 - **Append-only growth**: Support for log files and growing data (append without copying existing chunks)
 
+For detailed information on attachment storage and management, see the [Attachments Documentation](./docs/attachments.md).
+
 ### Encryption Model
 - **Default encryption**: All documents encrypted with tenant key (all tenant members can decrypt)
 - **Named key encryption**: Documents encrypted with named symmetric keys (only users with the key can decrypt)
@@ -81,6 +85,8 @@ MindooDB supports **offline-first network synchronization**:
 - **Client-server sync**: Centralized server model for reliable data sharing
 - **Peer-to-peer ready**: Architecture prepared for direct client-to-client sync (no central server required)
 - **User revocation**: Revoked users lose network access immediately (no sync with peer clients and servers)
+
+For detailed information on peer-to-peer synchronization, see the [P2P Sync Documentation](./docs/p2psync.md).
 
 ## Quick Start
 
@@ -223,11 +229,15 @@ This ensures that revocation actually prevents future changes, even if a user tr
 
 ## Use Cases
 
+MindooDB is ideal for applications requiring strong security, offline operation, and collaborative features:
+
 - **Multi-Tenant SaaS**: Each customer is a tenant with encrypted documents
 - **Collaborative Editing**: Real-time collaboration with cryptographic proof of authorship
 - **Secure File Sharing**: Documents encrypted with named keys, distributed offline
 - **Audit-Compliant Systems**: Complete append-only audit trail with cryptographic proofs
 - **Offline-First Applications**: Create and modify documents without network connectivity
+
+For comprehensive use case documentation, patterns, and industry-specific examples, see the [Use Cases Documentation](./docs/usecases/README.md).
 
 ## Project Goals
 
@@ -243,7 +253,6 @@ MindooDB is designed to provide **strong security guarantees** while maintaining
 ## Documentation
 
 - [Full Specification](./docs/specification.md) - Complete architecture and design details
-- [Revocation Timestamp Protection](./docs/revocation-timestamp-protection.md) - Security analysis and solutions
 
 ## License
 
