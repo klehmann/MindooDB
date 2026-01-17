@@ -38,7 +38,7 @@ Users are identified by cryptographic key pairs:
 - **Signing Key** (Ed25519): Signs document changes to prove authorship
 - **Encryption Key** (RSA-OAEP): Encrypts the KeyBag stored on disk
 - Registered by administrators in the tenant's directory database
-- Access can be revoked (prevents future changes, but preserves audit trail)
+- Access can be revoked (prevents future changes and sync access to peers, but preserves audit trail)
 
 ### Documents
 Each **MindooDB** contains multiple **documents**:
@@ -47,18 +47,36 @@ Each **MindooDB** contains multiple **documents**:
 - Changes stored in append-only stores with complete history
 - Support for time travel (reconstruct document state at any point in time)
 
+### Attachments
+Documents can have **file attachments**:
+- Stored in unified content-addressed store (same infrastructure as document changes)
+- Attachment store and document store can be separated and have their own sync behavior, e.g. sync docs locally, but keep attachments on the server
+- Chunked into 256KB pieces for efficient storage and streaming
+- **Deduplication**: Identical files stored once (tenant-wide deduplication with deterministic encryption)
+- **Encrypted**: Each chunk encrypted independently with same key as the document
+- **Streaming support**: Memory-efficient upload and download for large files
+- **Random access**: Efficient byte-range retrieval without loading entire files
+- **Append-only growth**: Support for log files and growing data (append without copying existing chunks)
+
 ### Encryption Model
 - **Default encryption**: All documents encrypted with tenant key (all tenant members can decrypt)
 - **Named key encryption**: Documents encrypted with named symmetric keys (only users with the key can decrypt)
 - Keys distributed offline (e.g., via email with password protection)
 - KeyBag stores named keys encrypted on disk using user's encryption key password
 
+### Sync
+MindooDB supports **offline-first network synchronization**:
+- **Simple sync protocol**: Clients and servers exchange only missing changes (incremental sync)
+- **Client-server sync**: Centralized server model for reliable data sharing
+- **Peer-to-peer ready**: Architecture prepared for direct client-to-client sync (no central server required)
+- **User revocation**: Revoked users lose network access immediately (no sync with peer clients and servers)
+
 ## Quick Start
 
 ### Installation
 
 ```bash
-npm install mindoodb2
+npm install mindoodb
 ```
 
 ### Basic Usage
