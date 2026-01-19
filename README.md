@@ -2,6 +2,8 @@
 
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
+> ⚠️ **Alpha Software**: This project is in early development. APIs are subject to change without notice. Not recommended for production use yet. But working on it :-)
+
 MindooDB is an **End-to-End Encrypted, Offline-first Sync Database**. Your data is encrypted before it leaves the client—servers never see plaintext. Even with full infrastructure access, attackers can't read your documents.
 
 ## The Problem
