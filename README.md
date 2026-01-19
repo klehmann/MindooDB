@@ -2,95 +2,52 @@
 
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
-MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** for secure, distributed document storage and synchronization. Everything on the server side is encrypted—even if attackers gain access to your infrastructure, they can't read your data without the encryption keys that never leave your clients.
+MindooDB is an **End-to-End Encrypted, Offline-first Sync Database**. Your data is encrypted before it leaves the client—servers never see plaintext. Even with full infrastructure access, attackers can't read your documents.
 
-## Why MindooDB?
+## The Problem
 
-### 🛡️ End-to-End Encrypted Security
-- **No central authority required** - Tenants are created entirely on the client side
-- **Cryptographically verified** - All operations are signed and encrypted
-- **Server-side encryption** - Your hosting provider can't read your data, even if compromised
-- **Fine-grained access control** - Named encryption keys for sensitive documents
+Traditional databases trust the server. If your hosting provider is compromised, your data is exposed. Even "encrypted at rest" solutions decrypt data server-side for queries. **MindooDB takes a different approach**: encryption keys never leave your clients.
 
-### 🔄 Offline-First & Distributed
-- **Works offline** - Create and modify documents without network connectivity
-- **Peer-to-peer sync** - Synchronize between clients, servers, or any combination
-- **Append-only stores** - Complete audit trail with cryptographic integrity
-- **Automerge CRDTs** - Real-time collaborative editing with automatic conflict resolution
+## How It Works
 
-### 🔐 Cryptographic Guarantees
-- **Digital signatures** - Every change is signed, proving authorship and preventing tampering
-- **End-to-end encryption** - Documents encrypted with tenant keys or named symmetric keys
-- **Key management** - Secure key distribution and storage with password protection
-- **Tamperproof history** - Changes are cryptographically chained (like a blockchain)
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         Your Clients                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │
+│  │   Alice's   │  │    Bob's    │  │  Charlie's  │               │
+│  │   Device    │  │   Device    │  │   Device    │               │
+│  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │               │
+│  │ │  Keys   │ │  │ │  Keys   │ │  │ │  Keys   │ │ ← Keys stay   │
+│  │ │(private)│ │  │ │(private)│ │  │ │(private)│ │   on devices  │
+│  │ └─────────┘ │  │ └─────────┘ │  │ └─────────┘ │               │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │
+└─────────┼────────────────┼────────────────┼──────────────────────┘
+          │ encrypted      │ encrypted      │ encrypted
+          ▼                ▼                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                     Server (or P2P Peers)                        │
+│                                                                  │
+│   ┌─────────────────────────────────────────────────────────┐    │
+│   │           Encrypted Blobs (unreadable)                  │    │
+│   │     🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒             │    │
+│   └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│   Server can sync & store data, but CANNOT read it               │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-## Core Concepts
+**Sync happens through content-addressed stores**: clients exchange only the encrypted entries they're missing. Works peer-to-peer, client-server, or any combination.
 
-### Tenants
-A **tenant** represents an organization or group that shares access to documents:
-- Created entirely on the client side (no server registration needed)
-- Has a **tenant encryption key** (default encryption for all documents)
-- Has an **administration key** (Ed25519 signing key for user registration and administrative operations by authorized administrators)
-- Contains one or more **MindooDB** instances (databases)
+## Key Features
 
-### Users
-Users are identified by cryptographic key pairs:
-- **Signing Key** (Ed25519): Signs document changes to prove authorship
-- **Encryption Key** (RSA-OAEP): Encrypts the KeyBag stored on disk
-- **Each client creates his its own secure private keys locally** - administrator only receives public key for tenant registration
-- Registered by administrators in the tenant's directory database (signed with admin key for trust)
-- Registration is synced between clients and servers, giving the user distributed access to the tenant data via sync
-- Access can be revoked (prevents future changes and sync access to peers, but preserves audit trail)
-
-### Databases
-Each **tenant** can contain multiple **MindooDB** instances (databases):
-- Created on-demand with `Tenant.openDB(id, options?)` (no pre-registration needed)
-- Each database is independent with its own document and attachment stores
-- **Flexible storage**: Document store and attachment store can be separate (e.g., local docs, remote attachments) or combined
-- **Special "directory" database**: Mandatory admin-only database for user registry and tenant/DB settings (only administrators have write access)
-- **Multi-database patterns**: Enable data organization, sharding by time/category, and different access patterns
-- **Documents can be reorganized** by moving their complete audit history between stores
-- **Incremental database queries**: Efficiently fetch only new or changed documents since the last query (using a timestamp based cursor), enabling fast updates and low-bandwidth sync.
-- **Virtual Views**: Instantly create powerful, spreadsheet-like views that categorize, sort, and aggregate documents—even across multiple tenants and databases
-
-For detailed information on Virtual Views, see the [VirtualView Documentation](./docs/virtualview.md).
-
-### Documents
-Each **MindooDB** contains multiple **documents**:
-- **Powered by [Automerge](https://automerge.org/)**: Built on a proven, production-grade CRDT engine for collaborative editing — matured over years of real-world use
-- Every change is **signed** (proves authenticity) and **encrypted** (protects content)
-- Changes stored in append-only stores with complete history
-- **Frequent Automerge snapshot storage**: Prevent performance degradation by avoiding full history replay on load.
-- Support for time travel (reconstruct document state at any point in time)
-
-### Attachments
-Documents can have **file attachments**:
-- Stored in unified content-addressed store (same infrastructure as document changes)
-- Attachment store and document store can be separated and have their own sync behavior (e.g., sync docs locally but keep attachments on the server or only cache recently used locally)
-- Chunked into 256KB (default) pieces for efficient storage and streaming
-- **Deduplication**: Identical files stored once (tenant-wide deduplication with deterministic encryption)
-- **Encrypted**: Each chunk encrypted independently with same key as the document
-- **Streaming support**: Memory-efficient upload and download for large files
-- **Random access**: Efficient byte-range retrieval without loading entire files
-- **Append-only growth**: Support for log files and growing data (append without copying existing chunks)
-
-For detailed information on attachment storage and management, see the [Attachments Documentation](./docs/attachments.md).
-
-### Encryption Model
-- **Default encryption**: All documents encrypted with tenant key (all tenant members can decrypt)
-- **Named key encryption**: Documents encrypted with named symmetric keys (only users with the key can decrypt)
-- Keys distributed offline through secure channels (e.g., via encrypted email with password protection)
-- Local KeyBag stores named keys encrypted on disk using user's encryption key password
-
-### Sync
-MindooDB supports **offline-first network synchronization**:
-- **Simple sync protocol**: Clients and servers exchange only missing changes (incremental sync)
-- **Encrypted data is synced**: Clients and servers can sync encrypted data/attachment chunks even without decryption keys (useful for backup servers or intermediate nodes)
-- **Client-server sync**: Centralized server model for reliable data sharing
-- **Peer-to-peer ready**: Architecture prepared for direct client-to-client sync (no central server required)
-- **User revocation**: Revoked users lose network access immediately (no sync with peer clients and servers)
-
-For detailed information on peer-to-peer synchronization, see the [P2P Sync Documentation](./docs/p2psync.md).
+| Feature | What It Means |
+|---------|---------------|
+| 🛡️ **End-to-End Encrypted** | Data encrypted on client before sync. Servers can't decrypt. |
+| 📴 **Offline-First** | Create and edit documents without network. Sync when online. |
+| ✍️ **Signed Changes** | Every change is digitally signed. Proves authorship, prevents tampering. |
+| 🔗 **Tamperproof History** | Append-only, cryptographically chained. Like a blockchain for your docs. |
+| 🤝 **Real-time Collaboration** | Built on [Automerge](https://automerge.org/) CRDTs. Conflicts resolve automatically. |
+| 🔑 **Fine-grained Access** | Named encryption keys for sensitive documents. Share with specific users. |
 
 ## Quick Start
 
@@ -100,7 +57,7 @@ For detailed information on peer-to-peer synchronization, see the [P2P Sync Docu
 npm install mindoodb
 ```
 
-### Basic Usage
+### Create a Tenant and Start Working
 
 ```typescript
 import { 
@@ -109,124 +66,172 @@ import {
   KeyBag 
 } from "mindoodb";
 
-// Create a store factory (can be in-memory, file-based, or server-backed)
+// 1. Set up storage (in-memory for demo; use file/server-backed for production)
 const storeFactory = new InMemoryAppendOnlyStoreFactory();
 const factory = new BaseMindooTenantFactory(storeFactory);
 
-// Create a user
-const userPassword = "mypassword123";
-const user = await factory.createUserId("CN=alice/O=mycompany", userPassword);
-const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, userPassword);
+// 2. Create a user (generates signing + encryption key pairs)
+const user = await factory.createUserId("CN=alice/O=acme", "user-password");
+const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "user-password");
 
-// Create an admin signing key
-const adminPassword = "adminpass123";
-const adminKeyPair = await factory.createSigningKeyPair(adminPassword);
+// 3. Create admin keys (for managing users)
+const adminKeyPair = await factory.createSigningKeyPair("admin-password");
 
-// Create a tenant
-const tenantId = "my-tenant";
-const tenantEncryptionKeyPassword = "tenantkeypass123";
+// 4. Create a tenant (an organization that shares documents)
 const tenant = await factory.createTenant(
-  tenantId,
+  "acme-corp",
   adminKeyPair.publicKey,
-  tenantEncryptionKeyPassword,
+  "tenant-key-password",
   user,
-  userPassword,
+  "user-password",
   keyBag
 );
 
-// Open a database and create a document
-const contactsDB = await tenant.openDB("contacts");
-const contactDoc = await contactsDB.createDocument();
+// 5. Open a database and create documents
+const db = await tenant.openDB("contacts");
+const doc = await db.createDocument();
 
-// Modify the document
-await contactsDB.changeDoc(contactDoc, async (doc) => {
-  const data = doc.getData();
-  data.name = "John Doe";
-  data.email = "john.doe@example.com";
-  data.phone = "+1234567890";
+await db.changeDoc(doc, async (d) => {
+  d.getData().name = "John Doe";
+  d.getData().email = "john@example.com";
 });
 
-// Retrieve the document
-const allContacts = await contactsDB.getAllDocumentIds();
-const doc = await contactsDB.getDocument(allContacts[0]);
-console.log(doc.getData()); // { name: "John Doe", email: "john.doe@example.com", ... }
+// 6. Read it back
+const contacts = await db.getAllDocumentIds();
+const loaded = await db.getDocument(contacts[0]);
+console.log(loaded.getData()); // { name: "John Doe", email: "john@example.com" }
 ```
 
-### Synchronization Example
+### Sync Between Users
 
 ```typescript
-// User 1 creates a document
-const tenant1 = await factory1.createTenant(/* ... */);
-const db1 = await tenant1.openDB("contacts");
-const doc1 = await db1.createDocument();
-await db1.changeDoc(doc1, async (doc) => {
-  doc.getData().name = "John Doe";
-});
+// Alice creates a document
+const aliceDB = await aliceTenant.openDB("projects");
+const project = await aliceDB.createDocument();
+await aliceDB.changeDoc(project, (d) => { d.getData().title = "Secret Project"; });
 
-// User 2 opens the same tenant and pulls changes
-const tenant2 = await factory2.openTenantWithKeys(/* ... */);
-const db2 = await tenant2.openDB("contacts");
+// Bob pulls Alice's changes
+const bobDB = await bobTenant.openDB("projects");
+await bobDB.pullChangesFrom(aliceDB.getStore());
 
-// Pull changes from user 1's store
-const store1 = db1.getStore();
-await db2.pullChangesFrom(store1);
+// Bob edits the document
+const projectDoc = await bobDB.getDocument(project.id);
+await bobDB.changeDoc(projectDoc, (d) => { d.getData().status = "In Progress"; });
 
-// User 2 can now see the document
-const allDocs = await db2.getAllDocumentIds();
-console.log(`Found ${allDocs.length} document(s)`); // Should be 1
-
-// User 2 modifies the document
-const doc2 = await db2.getDocument(allDocs[0]);
-await db2.changeDoc(doc2, async (doc) => {
-  doc.getData().name = "John Smith";
-});
-
-// Push changes back to user 1
-await db2.pushChangesTo(store1);
-await db1.syncStoreChanges();
-
-// User 1 sees the updated document
-const updatedDoc = await db1.getDocument(allDocs[0]);
-console.log(updatedDoc.getData().name); // "John Smith"
+// Alice pulls Bob's changes
+await aliceDB.pullChangesFrom(bobDB.getStore());
+// Alice now sees: { title: "Secret Project", status: "In Progress" }
 ```
 
-## Security Features
+## Core Concepts
 
-### Revocation Protection
-MindooDB protects against revoked users creating backdated changes by manipulating their system clock. The system uses:
-- **Directory sequence numbers**: Cryptographically linked sequence numbers in directory operations
-- **Local monotonic counters**: Per-device counters that prevent relative backdating
-- **Cryptographic validation**: Both mechanisms are signed and verified
+### Tenants
+An organization or team that shares access. Created client-side—no server registration needed.
+- Has a **default encryption key** (a regular KeyBag key shared with all members)
+- Has an **admin key** (for registering/revoking users)
+- Contains multiple databases
 
-This ensures that revocation actually prevents future changes, even if a user tries to manipulate timestamps.
+### Users
+Identified by cryptographic key pairs, registered by an admin:
+- **Signing key** (Ed25519): Proves authorship of changes
+- **Encryption key** (RSA-OAEP): Protects local key storage
+- Keys generated locally; only public keys shared with admin
 
-### Append-Only Audit Trail
-- Changes are **never modified or deleted** (true append-only semantics)
-- Complete history preserved for compliance and audit requirements
-- Cryptographic chaining ensures tamperproofness
-- Time travel: reconstruct document state at any historical point
+### Databases
+Each tenant can have multiple databases, created on-demand:
+```typescript
+const contacts = await tenant.openDB("contacts");
+const invoices = await tenant.openDB("invoices");
+```
+A special **directory** database stores user registrations (admin-only).
 
-### Key Management
-- Single password unlocks all user keys (via key derivation with different salts)
-- Named symmetric keys stored in encrypted KeyBag
-- Keys distributed offline via secure channels
-- Key rotation supported (multiple versions per key ID)
+### Documents
+[Automerge](https://automerge.org/) CRDTs with full history:
+- Every change is signed and encrypted
+- Automatic conflict resolution for concurrent edits
+- Time travel: reconstruct any historical state of documents (e.g. run queries on historic data)
+
+### Attachments
+Files attached to documents:
+- Chunked (256KB) and encrypted
+- Streaming upload/download for large files
+- Deduplication across the tenant
+
+See: [Attachments Documentation](./docs/attachments.md)
+
+### Document Indexing
+MindooDB provides a flexible, **incremental indexing** facility:
+- **Cursor-based processing**: Only index documents that changed since the last run—no full rescans
+- **Pluggable indexers**: Add any indexer you need (fulltext search, aggregations, custom queries)
+- **Built-in [Virtual Views](./docs/virtualview.md)**: Spreadsheet-like views that categorize, sort, and aggregate documents
+- **Cross-boundary queries**: Virtual Views can span multiple databases, mix local and remote data, or even query across tenants
+
+```typescript
+// Incremental indexing: process only what's new
+let cursor = null;
+while (true) {
+  const { documents, cursor: newCursor } = await db.processChangesSince(cursor);
+  for (const doc of documents) {
+    if (doc.isDeleted()) {
+      mySearchIndex.remove(doc.id);
+    } else {
+      mySearchIndex.update(doc);  // Flexsearch, Lunr, or custom
+    }
+  }
+  cursor = newCursor;
+  await sleep(1000);
+}
+```
+
+### Encryption Model
+
+All encryption keys are stored in the **KeyBag**—a local, password-protected key store.
+
+| Key Type | Purpose | Who Has It |
+|----------|---------|------------|
+| **`default` key** | Used when no other key is specified | All tenant members |
+| **Named keys** | Fine-grained access for sensitive docs | Only users you share it with |
+
+Keys are distributed offline (email, phone, in-person). The `default` key is typically shared during onboarding; named keys are shared as needed for specific documents.
+
+## Security
+
+### Cryptographic Guarantees
+- **Signatures**: Ed25519 on every change—proves who wrote it
+- **Encryption**: AES-256-GCM—servers see only ciphertext
+- **Integrity**: Changes are hash-chained—tampering breaks the chain
+
+### User Revocation
+Revoked users:
+- ❌ Cannot sync with peers or servers
+- ❌ Cannot make new changes (signatures rejected)
+- ⚠️ Can still read previously-synced data (fundamental trade-off of E2E encryption)
+
+MindooDB includes **revocation timestamp protection** to prevent backdated changes from revoked users. See: [Revocation Protection](./docs/revocation-timestamp-protection.md)
+
+### Audit Trail
+Append-only storage means nothing is ever deleted:
+- Complete history of who changed what and when
+- Cryptographic proof of all operations
+- GDPR compliance via `purgeDocHistory()` when legally required
 
 ## Use Cases
 
-MindooDB is ideal for applications requiring strong security, offline operation, and collaborative features:
+- **Multi-Tenant SaaS**: Each customer isolated with encrypted data
+- **Collaborative Editing**: Real-time co-editing with signed changes
+- **Secure File Sharing**: Named keys for need-to-know access
+- **Audit-Critical Systems**: Tamperproof history meets compliance requirements
+- **Offline-First Apps**: Full functionality without network; sync when connected
 
-- **Multi-Tenant SaaS**: Each customer is a tenant with encrypted documents
-- **Collaborative Editing**: Real-time collaboration with cryptographic proof of authorship
-- **Secure File Sharing**: Documents encrypted with named keys, distributed offline
-- **Audit-Compliant Systems**: Complete append-only audit trail with cryptographic proofs
-- **Offline-First Applications**: Create and modify documents without network connectivity
-
-For comprehensive use case documentation, patterns, and industry-specific examples, see the [Use Cases Documentation](./docs/usecases/README.md).
+See: [Use Cases Documentation](./docs/usecases/README.md)
 
 ## Documentation
 
-- [Full Specification](./docs/specification.md) - Complete architecture and design details
+- [Architecture Specification](./docs/specification.md) — Full technical details
+- [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
+- [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
+- [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
+- [Attachments](./docs/attachments.md) — File storage and streaming
 
 ## License
 
@@ -238,5 +243,4 @@ Mindoo GmbH
 
 ---
 
-**Remember**: With MindooDB, your data is encrypted end-to-end. Even if your hosting service gets compromised, attackers can't read your documents without the encryption keys that stay on your clients. Sleep well! 😴🔒
-
+**Your data. Your keys. Your control.** With MindooDB, even a complete server breach doesn't expose your documents. Sleep well! 😴🔒
