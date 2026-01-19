@@ -15,6 +15,7 @@ import { KeyBag } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
+import { SymmetricKeyNotFoundError } from "./errors";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -145,7 +146,7 @@ export class BaseMindooTenant implements MindooTenant {
         // Get the decrypted key from KeyBag
         const decryptedKey = await this.keyBag.get(decryptionKeyId);
         if (!decryptedKey) {
-          throw new Error(`Symmetric key not found: ${decryptionKeyId}`);
+          throw new SymmetricKeyNotFoundError(decryptionKeyId);
         }
         symmetricKey = decryptedKey;
         console.log(`[BaseMindooTenant] Got named key, length: ${symmetricKey.length} bytes`);
@@ -269,7 +270,7 @@ export class BaseMindooTenant implements MindooTenant {
       // Get the decrypted key from KeyBag
       const decryptedKey = await this.keyBag.get(decryptionKeyId);
       if (!decryptedKey) {
-        throw new Error(`Symmetric key not found: ${decryptionKeyId}`);
+        throw new SymmetricKeyNotFoundError(decryptionKeyId);
       }
       symmetricKey = decryptedKey;
     }
@@ -740,7 +741,7 @@ export class BaseMindooTenant implements MindooTenant {
       // Get the decrypted key from KeyBag
       const decryptedKey = await this.keyBag.get(decryptionKeyId);
       if (!decryptedKey) {
-        throw new Error(`Symmetric key not found: ${decryptionKeyId}`);
+        throw new SymmetricKeyNotFoundError(decryptionKeyId);
       }
       return decryptedKey;
     }

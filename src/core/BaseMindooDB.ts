@@ -23,6 +23,7 @@ import {
   generateAttachmentChunkId,
   generateFileUuid7,
 } from "./utils/idGeneration";
+import { SymmetricKeyNotFoundError } from "./errors";
 
 /**
  * Default chunk size for attachments: 256KB
@@ -282,6 +283,14 @@ export class BaseMindooDB implements MindooDB {
           console.warn(`[BaseMindooDB] Document ${docId} returned null from loadDocumentInternal`);
         }
       } catch (error) {
+        // Handle missing symmetric key gracefully - skip documents we can't decrypt
+        if (error instanceof SymmetricKeyNotFoundError) {
+          console.log(`[BaseMindooDB] Skipping document ${docId} - missing key: ${error.keyId}`);
+          // Mark entry IDs as processed so we don't retry them
+          this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
+          continue; // Skip to next document
+        }
+        
         console.error(`[BaseMindooDB] ===== ERROR processing document ${docId} in syncStoreChanges =====`);
         console.error(`[BaseMindooDB] Error type: ${error instanceof Error ? error.constructor.name : typeof error}`);
         console.error(`[BaseMindooDB] Error message: ${error instanceof Error ? error.message : String(error)}`);

@@ -203,5 +203,162 @@ describe("sync test", () => {
     // Verify the lastModified timestamp has been updated
     expect(updatedContactDoc1.getLastModified()).toBeGreaterThan(contactDoc.getLastModified());
   });
+
+  it("should sync encrypted document through intermediate user who does not have the decryption key", async () => {
+    // This test verifies:
+    // 1. User1 creates a document encrypted with a named symmetric key
+    // 2. User1 shares the key only with User3 (not User2)
+    // 3. User2 syncs the encrypted entries (but can't read the document)
+    // 4. User3 syncs from User2 and can read the document
+    // 5. User3 modifies the document
+    // 6. Changes sync back through User2 to User1
+
+    const cryptoAdapter = new NodeCryptoAdapter();
+    
+    // Create 3 separate store factories (simulating 3 different clients)
+    const sf1 = new InMemoryContentAddressedStoreFactory();
+    const sf2 = new InMemoryContentAddressedStoreFactory();
+    const sf3 = new InMemoryContentAddressedStoreFactory();
+    
+    const f1 = new BaseMindooTenantFactory(sf1, cryptoAdapter);
+    const f2 = new BaseMindooTenantFactory(sf2, cryptoAdapter);
+    const f3 = new BaseMindooTenantFactory(sf3, cryptoAdapter);
+    
+    // Create 3 users
+    const u1Pass = "user1pass";
+    const u1 = await f1.createUserId("CN=user1/O=test", u1Pass);
+    const u1KeyBag = new KeyBag(u1.userEncryptionKeyPair.privateKey, u1Pass, cryptoAdapter);
+    
+    const u2Pass = "user2pass";
+    const u2 = await f2.createUserId("CN=user2/O=test", u2Pass);
+    const u2KeyBag = new KeyBag(u2.userEncryptionKeyPair.privateKey, u2Pass, cryptoAdapter);
+    
+    const u3Pass = "user3pass";
+    const u3 = await f3.createUserId("CN=user3/O=test", u3Pass);
+    const u3KeyBag = new KeyBag(u3.userEncryptionKeyPair.privateKey, u3Pass, cryptoAdapter);
+    
+    // Create admin key
+    const adminPass = "adminpass";
+    const adminKeyPair = await f1.createSigningKeyPair(adminPass);
+    
+    // Create tenant for user1
+    const tid = "named-key-sync-test";
+    const tenantKeyPass = "tenantpass";
+    const t1 = await f1.createTenant(tid, adminKeyPair.publicKey, tenantKeyPass, u1, u1Pass, u1KeyBag);
+    const tenantKey = t1.getTenantEncryptionKey();
+    
+    // Register all 3 users in the directory
+    const dir1 = await t1.openDirectory();
+    await dir1.registerUser(f1.toPublicUserId(u1), adminKeyPair.privateKey, adminPass);
+    await dir1.registerUser(f2.toPublicUserId(u2), adminKeyPair.privateKey, adminPass);
+    await dir1.registerUser(f3.toPublicUserId(u3), adminKeyPair.privateKey, adminPass);
+    
+    // User1 creates a named symmetric key (shared only with User3, NOT User2)
+    const namedKeyId = "secret-project-key";
+    const namedKeyPassword = "secretkeypass";
+    const namedEncryptedKey = await f1.createSymmetricEncryptedPrivateKey(namedKeyPassword);
+    
+    // Import the key into User1's KeyBag
+    await u1KeyBag.decryptAndImportKey(namedKeyId, namedEncryptedKey, namedKeyPassword);
+    
+    // Import the key into User3's KeyBag (User3 has the key, User2 does NOT)
+    await u3KeyBag.decryptAndImportKey(namedKeyId, namedEncryptedKey, namedKeyPassword);
+    
+    // User1 creates an encrypted document with the named key
+    const secretDB1 = await t1.openDB("secrets");
+    const secretDoc = await secretDB1.createEncryptedDocument(namedKeyId);
+    const secretDocId = secretDoc.getId();
+    
+    await secretDB1.changeDoc(secretDoc, async (doc) => {
+      const data = doc.getData();
+      data.title = "Project Alpha";
+      data.content = "This is confidential information";
+      data.createdBy = "user1";
+    });
+    
+    // Verify User1 can see the document
+    const allSecrets1 = await secretDB1.getAllDocumentIds();
+    expect(allSecrets1.length).toBe(1);
+    expect(allSecrets1[0]).toBe(secretDocId);
+    
+    // User2 sets up tenant (does NOT have the named key in their KeyBag)
+    const t2 = await f2.openTenantWithKeys(tid, tenantKey, tenantKeyPass, adminKeyPair.publicKey, u2, u2Pass, u2KeyBag);
+    const dir2 = await t2.openDB("directory");
+    const secretDB2 = await t2.openDB("secrets");
+    
+    // User2 syncs directory from User1
+    const dirStore1 = (await t1.openDB("directory")).getStore();
+    await dir2.pullChangesFrom(dirStore1);
+    
+    // User2 syncs secrets database from User1
+    // This should NOT throw - the encrypted entries are stored, but the document is skipped
+    const secretsStore1 = secretDB1.getStore();
+    await secretDB2.pullChangesFrom(secretsStore1);
+    
+    // User2 should NOT see the secret document (can't decrypt it)
+    const allSecrets2 = await secretDB2.getAllDocumentIds();
+    expect(allSecrets2.length).toBe(0);
+    
+    // But the entries ARE in User2's store (verify via store API)
+    const store2Ids = await secretDB2.getStore().getAllIds();
+    expect(store2Ids.length).toBeGreaterThan(0);
+    
+    // User3 sets up tenant (HAS the named key in their KeyBag)
+    const t3 = await f3.openTenantWithKeys(tid, tenantKey, tenantKeyPass, adminKeyPair.publicKey, u3, u3Pass, u3KeyBag);
+    const dir3 = await t3.openDB("directory");
+    const secretDB3 = await t3.openDB("secrets");
+    
+    // User3 syncs directory from User2
+    await dir3.pullChangesFrom(dir2.getStore());
+    
+    // User3 syncs secrets database from User2's store
+    await secretDB3.pullChangesFrom(secretDB2.getStore());
+    
+    // User3 SHOULD see the secret document (has the decryption key)
+    const allSecrets3 = await secretDB3.getAllDocumentIds();
+    expect(allSecrets3.length).toBe(1);
+    expect(allSecrets3[0]).toBe(secretDocId);
+    
+    // Verify User3 can read the document content
+    const secretDoc3 = await secretDB3.getDocument(secretDocId);
+    const secretData3 = secretDoc3.getData();
+    expect(secretData3.title).toBe("Project Alpha");
+    expect(secretData3.content).toBe("This is confidential information");
+    expect(secretData3.createdBy).toBe("user1");
+    
+    // User3 modifies the document
+    await secretDB3.changeDoc(secretDoc3, async (doc) => {
+      const data = doc.getData();
+      data.content = "Updated by User3";
+      data.modifiedBy = "user3";
+    });
+    
+    // Verify User3 sees the updated content
+    const updatedSecretDoc3 = await secretDB3.getDocument(secretDocId);
+    expect(updatedSecretDoc3.getData().content).toBe("Updated by User3");
+    expect(updatedSecretDoc3.getData().modifiedBy).toBe("user3");
+    
+    // User3 pushes changes to User2's store
+    await secretDB3.pushChangesTo(secretDB2.getStore());
+    
+    // User2 syncs (still can't see the document, but entries are updated)
+    await secretDB2.syncStoreChanges();
+    const allSecrets2AfterSync = await secretDB2.getAllDocumentIds();
+    expect(allSecrets2AfterSync.length).toBe(0); // Still can't decrypt
+    
+    // User2 pushes changes to User1's store
+    await secretDB2.pushChangesTo(secretsStore1);
+    
+    // User1 syncs to process the new changes
+    await secretDB1.syncStoreChanges();
+    
+    // User1 should see User3's changes
+    const finalSecretDoc1 = await secretDB1.getDocument(secretDocId);
+    const finalSecretData1 = finalSecretDoc1.getData();
+    expect(finalSecretData1.title).toBe("Project Alpha");
+    expect(finalSecretData1.content).toBe("Updated by User3");
+    expect(finalSecretData1.createdBy).toBe("user1");
+    expect(finalSecretData1.modifiedBy).toBe("user3");
+  }, 60000);
 });
 

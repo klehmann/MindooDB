@@ -14,6 +14,9 @@ export { MindooDocSigner } from "./crypto/MindooDocSigner";
 // Keys
 export { KeyBag } from "./keys/KeyBag";
 
+// Errors
+export { SymmetricKeyNotFoundError } from "./errors";
+
 // Utilities
 export {
   generateDocEntryId,
