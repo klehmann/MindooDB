@@ -2,7 +2,7 @@
 
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
-MindooDB is an end-to-end encrypted, offline-first sync database.
+MindooDB is an **end-to-end encrypted, offline-first sync database**.
 It lets apps collaborate and sync data without giving servers access to the contents.
 
 Even if someone has full access to your infrastructure — database dumps, backups, logs — all they get is ciphertext.
