@@ -136,6 +136,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Finding new entries from remote`);
     
     const token = await this.ensureAuthenticated();
+    //TODO improve this by using a bloom filter
     const newEntries = await this.transport.findNewEntries(token, knownIds);
     
     console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Found ${newEntries.length} new entries from remote`);
