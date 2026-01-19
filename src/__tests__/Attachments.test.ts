@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, SigningKeyPair, AttachmentReference } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, SigningKeyPair, AttachmentReference, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -27,9 +27,14 @@ describe("Attachments", () => {
       factory.getCryptoAdapter()
     );
 
-    // Create admin signing key pair
+    // Create admin key pairs
     const administrationKeyPassword = "adminpass123";
     adminSigningKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+    const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+    
+    // Create and add $publicinfos key to KeyBag
+    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+    await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
 
     // Create tenant
     const tenantId = "test-tenant-attachments";
@@ -37,6 +42,7 @@ describe("Attachments", () => {
     tenant = await factory.createTenant(
       tenantId,
       adminSigningKeyPair.publicKey,
+      adminEncKeyPair.publicKey,
       tenantEncryptionKeyPassword,
       currentUser,
       currentUserPassword,

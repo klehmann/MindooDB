@@ -1,8 +1,17 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, SigningKeyPair } from "../core/types";
+import { PrivateUserId, MindooTenant, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
+import { createHash } from "crypto";
+
+// Helper to compute username hash (same as in BaseMindooTenantDirectory)
+async function hashUsername(username: string): Promise<string> {
+  const normalizedUsername = username.toLowerCase();
+  const hash = createHash("sha256");
+  hash.update(normalizedUsername);
+  return hash.digest("hex");
+}
 
 describe("Group Management", () => {
   let factory: BaseMindooTenantFactory;
@@ -28,9 +37,15 @@ describe("Group Management", () => {
     adminSigningKeyPassword = "adminsigningpass123";
     adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
     
+    // Create admin encryption key pair (for encrypting usernames in directory)
+    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+    
     // Create tenant encryption key
     tenantEncryptionKeyPassword = "tenantkeypass123";
     const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
+    
+    // Create $publicinfos symmetric key (required for all servers/clients)
+    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -40,6 +55,9 @@ describe("Group Management", () => {
       cryptoAdapter
     );
     
+    // Add $publicinfos key to KeyBag
+    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
+    
     // Create tenant
     tenantId = "test-tenant-groups";
     tenant = await factory.openTenantWithKeys(
@@ -47,6 +65,7 @@ describe("Group Management", () => {
       tenantEncryptionKey,
       tenantEncryptionKeyPassword,
       adminSigningKeyPair.publicKey,
+      adminEncryptionKeyPair.publicKey,
       adminUser,
       adminUserPassword,
       adminKeyBag
@@ -87,8 +106,9 @@ describe("Group Management", () => {
       
       const members = await directory.getGroupMembers(groupName);
       expect(members).toHaveLength(2);
-      expect(members).toContain("CN=alice/O=testtenant");
-      expect(members).toContain("CN=bob/O=testtenant");
+      // getGroupMembers returns hashes now
+      expect(members).toContain(await hashUsername("CN=alice/O=testtenant"));
+      expect(members).toContain(await hashUsername("CN=bob/O=testtenant"));
     });
 
     it("should handle case-insensitive group names", async () => {
@@ -110,8 +130,10 @@ describe("Group Management", () => {
       const members1 = await directory.getGroupMembers(groupName2);
       const members2 = await directory.getGroupMembers(groupName3);
       
-      expect(members1).toContain(username);
-      expect(members2).toContain(username);
+      // getGroupMembers returns hashes now
+      const expectedHash = await hashUsername(username);
+      expect(members1).toContain(expectedHash);
+      expect(members2).toContain(expectedHash);
       expect(members1).toEqual(members2);
       
       // All should refer to same group
@@ -143,9 +165,10 @@ describe("Group Management", () => {
       
       const members = await directory.getGroupMembers(groupName);
       expect(members).toHaveLength(3);
-      expect(members).toContain("CN=alice/O=testtenant");
-      expect(members).toContain("CN=bob/O=testtenant");
-      expect(members).toContain("CN=charlie/O=testtenant");
+      // getGroupMembers returns hashes now
+      expect(members).toContain(await hashUsername("CN=alice/O=testtenant"));
+      expect(members).toContain(await hashUsername("CN=bob/O=testtenant"));
+      expect(members).toContain(await hashUsername("CN=charlie/O=testtenant"));
     });
 
     it("should not add duplicate users to group", async () => {
@@ -170,7 +193,8 @@ describe("Group Management", () => {
       
       const members = await directory.getGroupMembers(groupName);
       expect(members).toHaveLength(1);
-      expect(members).toContain(username);
+      // getGroupMembers returns hashes now
+      expect(members).toContain(await hashUsername(username));
     });
 
     it("should remove users from group", async () => {
@@ -196,9 +220,10 @@ describe("Group Management", () => {
       
       const members = await directory.getGroupMembers(groupName);
       expect(members).toHaveLength(2);
-      expect(members).toContain("CN=alice/O=testtenant");
-      expect(members).toContain("CN=charlie/O=testtenant");
-      expect(members).not.toContain("CN=bob/O=testtenant");
+      // getGroupMembers returns hashes now
+      expect(members).toContain(await hashUsername("CN=alice/O=testtenant"));
+      expect(members).toContain(await hashUsername("CN=charlie/O=testtenant"));
+      expect(members).not.toContain(await hashUsername("CN=bob/O=testtenant"));
     });
 
     it("should handle removing non-existent users gracefully", async () => {
@@ -224,7 +249,8 @@ describe("Group Management", () => {
       
       const members = await directory.getGroupMembers(groupName);
       expect(members).toHaveLength(1);
-      expect(members).toContain("CN=alice/O=testtenant");
+      // getGroupMembers returns hashes now
+      expect(members).toContain(await hashUsername("CN=alice/O=testtenant"));
     });
 
     it("should delete a group", async () => {
@@ -303,8 +329,9 @@ describe("Group Management", () => {
       );
       
       const engineeringMembers = await directory.getGroupMembers("engineering");
-      expect(engineeringMembers).toContain("developers");
-      expect(engineeringMembers).toContain("designers");
+      // getGroupMembers returns hashes now (even for nested group names)
+      expect(engineeringMembers).toContain(await hashUsername("developers"));
+      expect(engineeringMembers).toContain(await hashUsername("designers"));
     });
   });
 
@@ -498,7 +525,8 @@ describe("Group Management", () => {
       
       // Get members (should use cache)
       const members1 = await directory.getGroupMembers(groupName);
-      expect(members1).toContain(username);
+      // getGroupMembers returns hashes now
+      expect(members1).toContain(await hashUsername(username));
       
       // Add another user
       await directory.addUsersToGroup(
@@ -511,8 +539,8 @@ describe("Group Management", () => {
       // Get members again (cache should be updated)
       const members2 = await directory.getGroupMembers(groupName);
       expect(members2).toHaveLength(2);
-      expect(members2).toContain(username);
-      expect(members2).toContain("CN=bob/O=testtenant");
+      expect(members2).toContain(await hashUsername(username));
+      expect(members2).toContain(await hashUsername("CN=bob/O=testtenant"));
     });
 
     it("should update cache after removing users from group", async () => {
@@ -543,8 +571,9 @@ describe("Group Management", () => {
       // Verify cache updated
       const members2 = await directory.getGroupMembers(groupName);
       expect(members2).toHaveLength(1);
-      expect(members2).toContain("CN=bob/O=testtenant");
-      expect(members2).not.toContain("CN=alice/O=testtenant");
+      // getGroupMembers returns hashes now
+      expect(members2).toContain(await hashUsername("CN=bob/O=testtenant"));
+      expect(members2).not.toContain(await hashUsername("CN=alice/O=testtenant"));
     });
 
     it("should update cache after deleting group", async () => {
@@ -640,9 +669,10 @@ describe("Group Management", () => {
       // All members should be present
       const members = await directory.getGroupMembers(groupName);
       expect(members.length).toBeGreaterThanOrEqual(3);
-      expect(members).toContain("CN=alice/O=testtenant");
-      expect(members).toContain("CN=bob/O=testtenant");
-      expect(members).toContain("CN=charlie/O=testtenant");
+      // getGroupMembers returns hashes now
+      expect(members).toContain(await hashUsername("CN=alice/O=testtenant"));
+      expect(members).toContain(await hashUsername("CN=bob/O=testtenant"));
+      expect(members).toContain(await hashUsername("CN=charlie/O=testtenant"));
     });
   });
 });

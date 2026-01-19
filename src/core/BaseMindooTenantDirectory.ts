@@ -1,5 +1,6 @@
-import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, ProcessChangesCursor, PublicUserId, SigningKeyPair } from "./types";
+import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, ProcessChangesCursor, PublicUserId, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
+import { RSAEncryption } from "./crypto/RSAEncryption";
 
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private tenant: BaseMindooTenant;
@@ -19,7 +20,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
 
   // Cache for groups: key -> merged group data (key: lowercase groupName)
   // We store merged data separately to avoid mutating MindooDoc objects
-  private groupsCache: Map<string, { docId: string; members: string[] }> = new Map();
+  // members_hashes are used for lookups, members_encrypted only admin can decrypt
+  private groupsCache: Map<string, { docId: string; members_hashes: string[] }> = new Map();
 
   // Unified cache cursor for all document types
   private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
@@ -50,6 +52,30 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   ): Promise<void> {
     console.log(`[BaseMindooTenantDirectory] Registering user: ${userId.username}`);
 
+    // Check if user with same username (case-insensitive) already exists
+    const existingDocs = await this.findGrantAccessDocuments(userId.username);
+    if (existingDocs.length > 0) {
+      // Check if the keys match the existing registration
+      const existingDoc = existingDocs[existingDocs.length - 1]; // Use most recent
+      const existingData = existingDoc.getData();
+      
+      const keysMatch = 
+        existingData.userSigningPublicKey === userId.userSigningPublicKey &&
+        existingData.userEncryptionPublicKey === userId.userEncryptionPublicKey;
+      
+      if (keysMatch) {
+        // Same user with same keys - skip re-registration
+        console.log(`[BaseMindooTenantDirectory] User ${userId.username} already registered with same keys, skipping`);
+        return;
+      } else {
+        // Different keys for same username - this is an error
+        throw new Error(
+          `Cannot register user "${userId.username}": a user with the same username (case-insensitive) ` +
+          `is already registered with different keys`
+        );
+      }
+    }
+
     // Cast to BaseMindooTenant to access protected methods
     const baseTenant = this.tenant as BaseMindooTenant;
 
@@ -59,13 +85,20 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
+    // Compute username hash and encrypted username before creating the document
+    // (since the callback to changeDocWithSigningKey cannot be async for automerge reasons)
+    const usernameHash = await this.hashUsername(userId.username);
+    const usernameEncrypted = await this.encryptForAdmin(userId.username);
+
     // Add user to directory database
     console.log(`[BaseMindooTenantDirectory] Creating document for user registration`);
     const directoryDB = await this.getDirectoryDB();
     // Create document with admin signing key so the initial entry is trusted
+    // Use PUBLIC_INFOS_KEY_ID so servers can validate users without full tenant access
     const newDoc = await directoryDB.createDocumentWithSigningKey(
       adminSigningKeyPair,
-      administrationPrivateKeyPassword
+      administrationPrivateKeyPassword,
+      PUBLIC_INFOS_KEY_ID
     );
     console.log(`[BaseMindooTenantDirectory] Document created: ${newDoc.getId()}`);
     
@@ -75,7 +108,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "grantaccess";
-        data.username = userId.username;
+        data.username_hash = usernameHash;
+        data.username_encrypted = usernameEncrypted;
         data.userSigningPublicKey = userId.userSigningPublicKey;
         data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
@@ -102,6 +136,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // Update unified cache to ensure we have latest data
     await this.updateUnifiedCache();
     
+    // Compute the hash to search for
+    const targetHash = await this.hashUsername(username);
+    
     const matchingDocs: MindooDoc[] = [];
     const revokedDocIds = new Set<string>();
     
@@ -110,21 +147,21 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
       const data = doc.getData();
       
-      // Check if this is a grant access document we're looking for
+      // Check if this is a grant access document we're looking for (by username_hash)
       if (data.form === "useroperation" && 
           data.type === "grantaccess" && 
-          data.username === username) {
-        console.log(`[BaseMindooTenantDirectory] Found grant access document for username: ${username}`);
+          data.username_hash === targetHash) {
+        console.log(`[BaseMindooTenantDirectory] Found grant access document for username hash: ${targetHash}`);
               matchingDocs.push(doc);
       }
       
-      // Check if this is a revoke access document for the same username
+      // Check if this is a revoke access document for the same username (by username_hash)
       if (data.form === "useroperation" && 
           data.type === "revokeaccess" && 
-          data.username === username &&
+          data.username_hash === targetHash &&
           data.revokeDocId &&
           typeof data.revokeDocId === "string") {
-        console.log(`[BaseMindooTenantDirectory] Found revoke access document for username: ${username}, revoking doc ID: ${data.revokeDocId}`);
+        console.log(`[BaseMindooTenantDirectory] Found revoke access document for username hash: ${targetHash}, revoking doc ID: ${data.revokeDocId}`);
               revokedDocIds.add(data.revokeDocId);
       }
     }
@@ -168,14 +205,20 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
+    // Compute username hash and encrypted username before creating documents
+    const usernameHash = await this.hashUsername(username);
+    const usernameEncrypted = await this.encryptForAdmin(username);
+
     // Create revocation documents for each grant access document found
     for (const grantAccessDoc of grantAccessDocs) {
       const revokeDocId = grantAccessDoc.getId();
 
       // Create document with admin signing key so the initial entry is trusted
+      // Use PUBLIC_INFOS_KEY_ID so servers can validate users without full tenant access
       const newDoc = await directoryDB.createDocumentWithSigningKey(
         adminSigningKeyPair,
-        administrationPrivateKeyPassword
+        administrationPrivateKeyPassword,
+        PUBLIC_INFOS_KEY_ID
       );
       
       // Set the document data fields - changeDocWithSigningKey handles signing at entry level
@@ -183,7 +226,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "revokeaccess";
-        data.username = username;
+        data.username_hash = usernameHash;
+        data.username_encrypted = usernameEncrypted;
         data.revokeDocId = revokeDocId;
         data.requestDataWipe = requestDataWipe;
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
@@ -319,8 +363,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     // Merge group documents with the same name
     for (const [normalizedGroupName, docs] of groupDocsByName.entries()) {
-      // Collect all members from all documents with this group name
-      const allMembers = new Set<string>();
+      // Collect all member hashes from all documents with this group name
+      const allMembersHashes = new Set<string>();
       let latestDoc: MindooDoc | null = null;
       let isDeleted = false;
       
@@ -332,10 +376,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         if (doc.isDeleted() || data._deleted === true) {
           isDeleted = true;
         }
-        if (data.members && Array.isArray(data.members)) {
-          for (const member of data.members) {
-            if (typeof member === "string") {
-              allMembers.add(member);
+        // Use members_hashes for the cache (privacy-preserving lookups)
+        if (data.members_hashes && Array.isArray(data.members_hashes)) {
+          for (const memberHash of data.members_hashes) {
+            if (typeof memberHash === "string") {
+              allMembersHashes.add(memberHash);
             }
           }
         }
@@ -351,7 +396,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       if (latestDoc) {
         this.groupsCache.set(normalizedGroupName, {
           docId: latestDoc.getId(),
-          members: Array.from(allMembers),
+          members_hashes: Array.from(allMembersHashes),
         });
       }
     }
@@ -405,16 +450,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     await directoryDB.syncStoreChanges();
     await this.updateUnifiedCache();
     
-    // Generate username variants for matching
+    // Generate username variants for matching and compute their hashes
     const usernameVariants = this.generateUsernameVariants(username);
-    const usernameVariantsLower = new Set(usernameVariants.map(v => v.toLowerCase()));
+    // Hash all variants for comparison with members_hashes
+    const variantHashes = new Set(
+      await Promise.all(usernameVariants.map(v => this.hashUsername(v)))
+    );
     
-    // First pass: find all groups that directly contain the user or username variants
+    // First pass: find all groups that directly contain the user or username variants (by hash)
     const directGroups = new Set<string>();
     for (const [groupName, groupData] of this.groupsCache.entries()) {
-      for (const member of groupData.members) {
-        const memberLower = member.toLowerCase();
-        if (usernameVariantsLower.has(memberLower)) {
+      for (const memberHash of groupData.members_hashes) {
+        if (variantHashes.has(memberHash)) {
           directGroups.add(groupName);
           resultGroups.add(groupName);
           break;
@@ -423,6 +470,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }
     
     // Second pass: find parent groups (groups that contain the user's groups)
+    // Groups can be nested - a group name can be a member of another group
     // Keep iterating until no new groups are found
     let groupsToCheck = new Set(directGroups);
     const visitedGroups = new Set<string>(); // Track visited groups for cycle detection
@@ -438,18 +486,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         }
         visitedGroups.add(childGroup);
         
-        // Find all groups that contain this child group as a member
+        // Hash the child group name for comparison
+        const childGroupHash = await this.hashUsername(childGroup);
+        
+        // Find all groups that contain this child group as a member (by hash)
         for (const [parentGroupName, parentGroupData] of this.groupsCache.entries()) {
           if (resultGroups.has(parentGroupName)) {
             continue; // Already found this group
           }
           
-          for (const member of parentGroupData.members) {
-            if (member.toLowerCase() === childGroup) {
-              resultGroups.add(parentGroupName);
-              nextGroups.add(parentGroupName);
-              break;
-            }
+          if (parentGroupData.members_hashes.includes(childGroupHash)) {
+            resultGroups.add(parentGroupName);
+            nextGroups.add(parentGroupName);
           }
         }
       }
@@ -738,8 +786,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       return [];
     }
     
-    // Return a copy to prevent external modification of internal cache state
-    return [...groupData.members];
+    // Return member hashes (actual usernames are encrypted and only admin can decrypt)
+    // This allows checking membership via hash comparison
+    return [...groupData.members_hashes];
   }
 
   async addUsersToGroup(
@@ -758,6 +807,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
     
+    // Compute hashes and encrypted values for all new usernames
+    const newMembersHashes = await Promise.all(username.map(u => this.hashUsername(u)));
+    const newMembersEncrypted = await Promise.all(username.map(u => this.encryptForAdmin(u)));
+    
     // Get the actual document from the database (using cached docId if available)
     const cachedGroup = this.groupsCache.get(normalizedGroupName);
     let groupDoc: MindooDoc;
@@ -766,10 +819,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       // Load the actual document from the database
       groupDoc = await directoryDB.getDocument(cachedGroup.docId);
     } else {
-      // Create new document
+      // Create new document with PUBLIC_INFOS_KEY_ID for server access
       groupDoc = await directoryDB.createDocumentWithSigningKey(
         adminSigningKeyPair,
-        administrationPrivateKeyPassword
+        administrationPrivateKeyPassword,
+        PUBLIC_INFOS_KEY_ID
       );
     }
     
@@ -779,20 +833,30 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       async (d: MindooDoc) => {
         const data = d.getData();
         
-        // Initialize members array if it doesn't exist
-        if (!data.members || !Array.isArray(data.members)) {
-          data.members = [];
+        // Get existing arrays (copy them to avoid mutating in place)
+        const existingHashes: string[] = Array.isArray(data.members_hashes)
+          ? data.members_hashes.filter((h): h is string => typeof h === "string")
+          : [];
+        const existingEncrypted: string[] = Array.isArray(data.members_encrypted)
+          ? data.members_encrypted.filter((e): e is string => typeof e === "string")
+          : [];
+        
+        // Build new arrays with existing + new members (avoiding duplicates by hash)
+        const existingHashesSet = new Set(existingHashes);
+        const updatedHashes = [...existingHashes];
+        const updatedEncrypted = [...existingEncrypted];
+        
+        for (let i = 0; i < newMembersHashes.length; i++) {
+          if (!existingHashesSet.has(newMembersHashes[i])) {
+            updatedHashes.push(newMembersHashes[i]);
+            updatedEncrypted.push(newMembersEncrypted[i]);
+            existingHashesSet.add(newMembersHashes[i]);
+          }
         }
         
-        // Add users to members array (avoid duplicates)
-        const existingMembers = Array.isArray(data.members) 
-          ? data.members.filter((m): m is string => typeof m === "string")
-          : [];
-        const membersSet = new Set(existingMembers);
-        for (const user of username) {
-          membersSet.add(user);
-        }
-        data.members = Array.from(membersSet);
+        // Assign the complete arrays (this triggers the proxy's set handler)
+        data.members_hashes = updatedHashes;
+        data.members_encrypted = updatedEncrypted;
         
         // Ensure form, type, and groupName fields are always correct
         data.form = "group";
@@ -838,25 +902,33 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
     
-    // Remove users from members array
+    // Compute hashes of usernames to remove
+    const hashesToRemove = new Set(await Promise.all(username.map(u => this.hashUsername(u))));
+    
+    // Remove users from members arrays
     await directoryDB.changeDocWithSigningKey(
       groupDoc,
       async (d: MindooDoc) => {
         const data = d.getData();
         
-        if (!data.members || !Array.isArray(data.members)) {
+        if (!data.members_hashes || !Array.isArray(data.members_hashes) ||
+            !data.members_encrypted || !Array.isArray(data.members_encrypted)) {
           return;
         }
         
-        // Filter out users to remove
-        const usersToRemove = new Set(username);
-        const membersArray = data.members as unknown[];
-        data.members = membersArray.filter((m: unknown) => {
-          if (typeof m !== "string") {
-            return true; // Keep non-string members
+        // Filter out members whose hashes match the ones to remove
+        // Keep arrays in sync by filtering indices
+        const indicesToKeep: number[] = [];
+        const hashesArray = data.members_hashes as string[];
+        for (let i = 0; i < hashesArray.length; i++) {
+          if (!hashesToRemove.has(hashesArray[i])) {
+            indicesToKeep.push(i);
           }
-          return !usersToRemove.has(m);
-        });
+        }
+        
+        const encryptedArray = data.members_encrypted as string[];
+        data.members_hashes = indicesToKeep.map(i => hashesArray[i]);
+        data.members_encrypted = indicesToKeep.map(i => encryptedArray[i]);
         
         // Ensure form, type, and groupName fields are always correct
         data.form = "group";
@@ -924,5 +996,48 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }
     
     return Array.from(result);
+  }
+
+  /**
+   * Compute SHA-256 hash of lowercase username for lookups.
+   * This enables searching for users without exposing the actual username.
+   * 
+   * @param username The username to hash
+   * @return The hex-encoded SHA-256 hash of the lowercase username
+   */
+  private async hashUsername(username: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(username.toLowerCase());
+    const subtle = this.tenant.getCryptoAdapter().getSubtle();
+    const hashBuffer = await subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  /**
+   * Encrypt plaintext with admin's RSA public encryption key.
+   * Only the admin with the corresponding private key can decrypt.
+   * 
+   * @param plaintext The text to encrypt
+   * @return The base64-encoded encrypted data
+   */
+  private async encryptForAdmin(plaintext: string): Promise<string> {
+    const adminEncKey = this.tenant.getAdministrationEncryptionPublicKey();
+    const rsaEnc = new RSAEncryption(this.tenant.getCryptoAdapter());
+    const encoder = new TextEncoder();
+    const encrypted = await rsaEnc.encrypt(encoder.encode(plaintext), adminEncKey);
+    return this.uint8ArrayToBase64(encrypted);
+  }
+
+  /**
+   * Convert a Uint8Array to a base64 string.
+   */
+  private uint8ArrayToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
   }
 }

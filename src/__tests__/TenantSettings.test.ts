@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDoc, SigningKeyPair } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDoc, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -28,9 +28,15 @@ describe("Tenant and DB Settings", () => {
     adminSigningKeyPassword = "adminsigningpass123";
     adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
     
+    // Create admin encryption key pair (for encrypting usernames in directory)
+    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+    
     // Create tenant encryption key
     tenantEncryptionKeyPassword = "tenantkeypass123";
     const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
+    
+    // Create $publicinfos symmetric key (required for all servers/clients)
+    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -40,6 +46,9 @@ describe("Tenant and DB Settings", () => {
       cryptoAdapter
     );
     
+    // Add $publicinfos key to KeyBag
+    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
+    
     // Create tenant
     tenantId = "test-tenant-settings";
     tenant = await factory.openTenantWithKeys(
@@ -47,6 +56,7 @@ describe("Tenant and DB Settings", () => {
       tenantEncryptionKey,
       tenantEncryptionKeyPassword,
       adminSigningKeyPair.publicKey,
+      adminEncryptionKeyPair.publicKey,
       adminUser,
       adminUserPassword,
       adminKeyBag

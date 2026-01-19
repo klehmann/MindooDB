@@ -1,7 +1,7 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { BaseMindooTenant } from "../core/BaseMindooTenant";
 import { InMemoryContentAddressedStoreFactory } from "../core/appendonlystores/InMemoryContentAddressedStore";
-import { PrivateUserId, MindooTenant, SigningKeyPair } from "../core/types";
+import { PrivateUserId, MindooTenant, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -32,12 +32,18 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
-      // Create administration key pair first
+      // Create administration key pairs
       const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+      const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+      
+      // Create and add $publicinfos key to KeyBag
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
 
       const tenant = await factory.createTenant(
         tenantId,
         adminKeyPair.publicKey,
+        adminEncKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -54,12 +60,18 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
-      // Create administration key pair first
+      // Create administration key pairs
       const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+      const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+      
+      // Create and add $publicinfos key to KeyBag
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
 
       const tenant = await factory.createTenant(
         tenantId,
         adminKeyPair.publicKey,
+        adminEncKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -79,12 +91,18 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
-      // Create administration key pair first
+      // Create administration key pairs
       const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+      const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+      
+      // Create and add $publicinfos key to KeyBag
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
 
       tenant = await factory.createTenant(
         tenantId,
         adminKeyPair.publicKey,
+        adminEncKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -129,12 +147,18 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
-      // Create administration key pair first
+      // Create administration key pairs
       const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+      const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+      
+      // Create and add $publicinfos key to KeyBag
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
 
       tenant = await factory.createTenant(
         tenantId,
         adminKeyPair.publicKey,
+        adminEncKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -232,12 +256,18 @@ describe("BaseMindooTenant", () => {
       const tenantId = "test-tenant-signing";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
-      // Create administration key pair first
+      // Create administration key pairs
       adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+      const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+      
+      // Create and add $publicinfos key to KeyBag
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
 
       tenant = await factory.createTenant(
         tenantId,
         adminKeyPair.publicKey,
+        adminEncKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,
@@ -312,12 +342,18 @@ describe("BaseMindooTenant", () => {
       const administrationKeyPassword = "adminpass123";
       const tenantEncryptionKeyPassword = "tenantkeypass123";
 
-      // Create administration key pair first
+      // Create administration key pairs
       const adminKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
+      const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+      
+      // Create and add $publicinfos key to KeyBag
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
 
       tenant = await factory.createTenant(
         tenantId,
         adminKeyPair.publicKey,
+        adminEncKeyPair.publicKey,
         tenantEncryptionKeyPassword,
         currentUser,
         currentUserPassword,

@@ -37,8 +37,12 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    * The administration public key must be created beforehand using createSigningKeyPair()
    * and passed to this method.
    * 
+   * The administration encryption public key must be created using createEncryptionKeyPair()
+   * and is used to encrypt sensitive data in the directory that only admins can decrypt.
+   * 
    * @param tenantId The ID of the tenant
    * @param administrationPublicKey The administration public key (Ed25519, PEM format) created using createSigningKeyPair()
+   * @param administrationEncryptionPublicKey The administration encryption public key (RSA-OAEP, PEM format) created using createEncryptionKeyPair()
    * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption private key
    * @param currentUser The current user's private user ID (required for tenant operations)
    * @param currentUserPassword The password to decrypt the current user's private keys
@@ -48,6 +52,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   async createTenant(
     tenantId: string,
     administrationPublicKey: string,
+    administrationEncryptionPublicKey: string,
     tenantEncryptionKeyPassword: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
@@ -83,6 +88,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       encryptedTenantKey,
       tenantEncryptionKeyPassword,
       administrationPublicKey,
+      administrationEncryptionPublicKey,
       currentUser,
       currentUserPassword,
       keyBag
@@ -97,6 +103,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     tenantEncryptionPrivateKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
+    administrationEncryptionPublicKey: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
@@ -109,6 +116,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       tenantEncryptionPrivateKey,
       tenantEncryptionKeyPassword,
       administrationPublicKey,
+      administrationEncryptionPublicKey,
       currentUser,
       currentUserPassword,
       keyBag,

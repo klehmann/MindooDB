@@ -204,6 +204,45 @@ MindooDB uses a **hybrid encryption model**:
 - Users unlock their KeyBag with their password to access named keys
 - The KeyBag provides methods: `get(keyId)`, `set(keyId, key, createdAt)`, `listKeys()`, `save()`, `load()`
 
+### 5.1 Server Access Control ($publicinfos Key)
+
+MindooDB supports servers that store and replicate encrypted data **without having the ability to decrypt business data**. To enable access control verification without full tenant access, MindooDB uses a special encryption key: `$publicinfos`.
+
+**Motivation:**
+- Servers need to verify if a public signing key belongs to a trusted user before allowing operations
+- Without `$publicinfos`, servers would need the "default" tenant encryption key, which grants access to all business data
+- The `$publicinfos` key creates a **minimal-access tier** for servers
+
+**Key Characteristics:**
+- All servers and clients **must** have the `$publicinfos` key in their KeyBag
+- Distributed manually like other named keys (created via `createSymmetricEncryptedPrivateKey()`)
+- Used for directory documents that enable access control:
+  - User registration (`grantaccess`)
+  - User revocation (`revokeaccess`)
+  - Group membership (`group`)
+
+**Privacy-Preserving User Identity:**
+Access control documents store usernames in a privacy-preserving format:
+- `username_hash`: SHA-256 hash of the lowercase username (for lookups)
+- `username_encrypted`: Username encrypted with admin's RSA public encryption key
+
+This design allows:
+- Servers to validate signing keys **without knowing actual usernames**
+- Only administrators with the corresponding RSA private key can decrypt the actual username values
+- Username lookups work via hash comparison (case-insensitive)
+
+**Administration Encryption Key:**
+In addition to the administration signing key, tenants now require an administration encryption key pair:
+- Created via `createEncryptionKeyPair()` (RSA-OAEP)
+- Public key is passed to `createTenant()` / `openTenantWithKeys()`
+- Used for encrypting `username_encrypted` and `members_encrypted` fields
+- Only administrators with the private key can decrypt these values
+
+**The "default" key becomes optional:**
+- Servers only need `$publicinfos` for access control verification
+- Users need the "default" key only if accessing business data
+- Tenant settings and other administrative documents still use "default" encryption
+
 ### 6. Security Model
 
 **Trust Model and Chain of Trust:**
@@ -302,17 +341,22 @@ MindooDB establishes trust through a hierarchical cryptographic model:
 
 ### Creating a Tenant
 
-1. Client calls `TenantFactory.createTenant()` with:
+1. Client creates required keys beforehand:
+   - Administration signing key pair via `createSigningKeyPair()` (Ed25519)
+   - Administration encryption key pair via `createEncryptionKeyPair()` (RSA-OAEP)
+   - `$publicinfos` symmetric key via `createSymmetricEncryptedPrivateKey()`
+2. Client adds `$publicinfos` key to their KeyBag
+3. Client calls `TenantFactory.createTenant()` with:
    - Tenant ID
-   - Administration key password
+   - Administration signing public key (Ed25519, PEM format)
+   - Administration encryption public key (RSA-OAEP, PEM format)
    - Tenant encryption key password
    - Current user (PrivateUserId)
    - Current user password
-   - KeyBag instance
-2. System generates:
-   - Administration key pair (Ed25519)
-   - Tenant encryption key (AES-256, encrypted with password)
-3. Tenant is ready for use (tenant encryption key is used for "default" key ID)
+   - KeyBag instance (containing `$publicinfos` key)
+4. System generates:
+   - Tenant encryption key (AES-256, encrypted with password) - becomes the "default" key
+5. Tenant is ready for use
 
 ### Creating a User
 

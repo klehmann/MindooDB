@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, SigningKeyPair, MindooDB, MindooTenantDirectory } from "../core/types";
+import { PrivateUserId, MindooTenant, SigningKeyPair, MindooDB, MindooTenantDirectory, EncryptionKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooDB } from "../core/BaseMindooDB";
@@ -41,9 +41,17 @@ describe("Trust Model Security", () => {
     adminSigningKeyPassword = "adminsigningpass123";
     adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
     
+    // Create admin encryption key pair (for encrypting usernames in directory)
+    const adminEncryptionKeyPassword = "adminencpass123";
+    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair(adminEncryptionKeyPassword);
+    
     // Create tenant encryption key
     const tenantEncryptionKeyPassword = "tenantkeypass123";
     const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
+    
+    // Create $publicinfos symmetric key (required for all servers/clients)
+    const publicInfosKeyPassword = "publicinfospass123";
+    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey(publicInfosKeyPassword);
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -53,12 +61,16 @@ describe("Trust Model Security", () => {
       cryptoAdapter
     );
     
+    // Add $publicinfos key to KeyBag
+    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, publicInfosKeyPassword);
+    
     // Create tenant
     tenant = await factory.openTenantWithKeys(
       "trust-model-test-tenant",
       tenantEncryptionKey,
       tenantEncryptionKeyPassword,
       adminSigningKeyPair.publicKey,
+      adminEncryptionKeyPair.publicKey,
       adminUser,
       adminUserPassword,
       adminKeyBag
@@ -222,12 +234,16 @@ describe("Trust Model Security", () => {
       );
       
       const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey("tenantkeypass");
+      const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass");
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await untrustedUserKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
       
       const untrustedTenant = await factory.openTenantWithKeys(
         "trust-model-test-tenant", // Same tenant ID
         tenantEncryptionKey,
         "tenantkeypass",
         adminSigningKeyPair.publicKey,
+        adminEncryptionKeyPair.publicKey,
         untrustedUser, // Untrusted user as current user
         untrustedUserPassword,
         untrustedUserKeyBag
@@ -268,12 +284,16 @@ describe("Trust Model Security", () => {
       );
       
       const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey("tenantkeypass");
+      const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass");
+      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
+      await trustedUserKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
       
       const trustedTenant = await factory.openTenantWithKeys(
         "trust-model-test-tenant-2",
         tenantEncryptionKey,
         "tenantkeypass",
         adminSigningKeyPair.publicKey,
+        adminEncryptionKeyPair.publicKey,
         trustedUser,
         trustedUserPassword,
         trustedUserKeyBag

@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDoc, ProcessChangesCursor, SigningKeyPair } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDoc, ProcessChangesCursor, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -30,9 +30,15 @@ describe("granting tenant access", () => {
     adminSigningKeyPassword = "adminsigningpass123";
     adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
     
+    // Create admin encryption key pair (for encrypting usernames in directory)
+    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
+    
     // Create tenant encryption key
     tenantEncryptionKeyPassword = "tenantkeypass123";
     const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
+    
+    // Create $publicinfos symmetric key (required for all servers/clients)
+    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -42,6 +48,9 @@ describe("granting tenant access", () => {
       cryptoAdapter
     );
     
+    // Add $publicinfos key to KeyBag
+    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
+    
     // Create tenant using openTenantWithKeys with our admin signing key as the administration key
     tenantId = "test-tenant-process-changes";
     tenant = await factory.openTenantWithKeys(
@@ -49,6 +58,7 @@ describe("granting tenant access", () => {
       tenantEncryptionKey,
       tenantEncryptionKeyPassword,
       adminSigningKeyPair.publicKey, // Use admin signing key as administration public key
+      adminEncryptionKeyPair.publicKey, // Admin encryption key for directory username encryption
       adminUser,
       adminUserPassword,
       adminKeyBag
@@ -97,11 +107,12 @@ describe("granting tenant access", () => {
     expect(foundDocuments.length).toBeGreaterThan(0);
     
     // Find the document where access was granted
+    // Note: Since usernames are now hashed, we search by userSigningPublicKey
     const accessGrantDoc = foundDocuments.find(({ doc }) => {
       const data = doc.getData();
       return data.form === "useroperation" && 
              data.type === "grantaccess" && 
-             data.username === regularUser.username;
+             data.userSigningPublicKey === regularUser.userSigningKeyPair.publicKey;
     });
     
     // Verify we found the access grant document
@@ -112,7 +123,11 @@ describe("granting tenant access", () => {
     const docData = accessGrantDoc!.doc.getData();
     expect(docData.form).toBe("useroperation");
     expect(docData.type).toBe("grantaccess");
-    expect(docData.username).toBe(regularUser.username);
+    // Username is now stored as hash (username_hash) and encrypted (username_encrypted)
+    expect(docData.username_hash).toBeDefined();
+    expect(typeof docData.username_hash).toBe("string");
+    expect(docData.username_encrypted).toBeDefined();
+    expect(typeof docData.username_encrypted).toBe("string");
     expect(docData.userSigningPublicKey).toBe(regularUser.userSigningKeyPair.publicKey);
     expect(docData.userEncryptionPublicKey).toBe(regularUser.userEncryptionKeyPair.publicKey);
     

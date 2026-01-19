@@ -37,6 +37,7 @@ export class BaseMindooTenant implements MindooTenant {
   private tenantEncryptionKey: EncryptedPrivateKey;
   private tenantEncryptionKeyPassword: string; // Password to decrypt tenant encryption key
   private administrationPublicKey: string; // Administration public key (Ed25519, PEM format)
+  private administrationEncryptionPublicKey: string; // Administration encryption public key (RSA-OAEP, PEM format)
   private currentUser: PrivateUserId;
   private currentUserPassword: string; // Password to decrypt user's private keys
   protected cryptoAdapter: CryptoAdapter;
@@ -56,6 +57,7 @@ export class BaseMindooTenant implements MindooTenant {
     tenantEncryptionKey: EncryptedPrivateKey,
     tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
+    administrationEncryptionPublicKey: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
@@ -67,6 +69,7 @@ export class BaseMindooTenant implements MindooTenant {
     this.tenantEncryptionKey = tenantEncryptionKey;
     this.tenantEncryptionKeyPassword = tenantEncryptionKeyPassword;
     this.administrationPublicKey = administrationPublicKey;
+    this.administrationEncryptionPublicKey = administrationEncryptionPublicKey;
     this.currentUser = currentUser;
     this.currentUserPassword = currentUserPassword;
     this.keyBag = keyBag;
@@ -110,6 +113,17 @@ export class BaseMindooTenant implements MindooTenant {
    */
   getAdministrationPublicKey(): string {
     return this.administrationPublicKey;
+  }
+
+  /**
+   * Get the administration encryption public key for this tenant.
+   * Used for encrypting sensitive data in the directory that only admins can decrypt
+   * (e.g., usernames in access control documents).
+   * 
+   * @return The administration encryption public key (RSA-OAEP, PEM format)
+   */
+  getAdministrationEncryptionPublicKey(): string {
+    return this.administrationEncryptionPublicKey;
   }
 
   getTenantEncryptionKey(): EncryptedPrivateKey {
