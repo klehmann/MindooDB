@@ -58,6 +58,15 @@ Users are identified by cryptographic key pairs and registered in the tenant dir
 - Registration creates an **administration signature** (signed with administration key) proving the user has been granted access
 - User public keys are stored in the tenant's directory database
 
+**Group Membership:**
+- Administrators define tenant-wide group membership through `MindooTenantDirectory`
+- Groups are stored in the directory database as documents with `form="group"` and `type="group"`
+- Groups can contain usernames and other groups (nested groups), enabling hierarchical group structures
+- Group names are case-insensitive (normalized to lowercase)
+- When multiple group documents exist for the same group name (e.g., created on offline clients that later sync), their members are automatically merged
+- Groups are cached for efficient lookups
+- The `getUserNamesList()` method returns username variants (wildcards) and all groups the user belongs to, with recursive resolution of nested groups
+
 **Key Derivation:**
 - Both user private keys are encrypted with a single password
 - Key derivation function (KDF) uses different salts for each key:

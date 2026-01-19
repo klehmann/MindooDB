@@ -843,6 +843,75 @@ export interface MindooTenantDirectory {
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void>;
+
+  /**
+   * Get the names of all groups from the directory.
+   * 
+   * @return names
+   */
+  getGroups(): Promise<string[]>;
+
+  /**
+   * Looks up the members of a group by name.
+   * 
+   * @param groupName The name of the group to look up (case-insensitive, converted to lowercase)
+   * @return The members of the group
+   */
+  getGroupMembers(groupName: string): Promise<string[]>;
+
+  /**
+   * Deletes a group. Does nothing if the group does not exist.
+   * 
+   * @param groupName The name of the group to delete (case-insensitive, converted to lowercase)
+   * @param administrationPrivateKey The administration private key to sign the group
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the group is deleted
+   */
+  deleteGroup(groupName: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
+
+  /**
+   * For a given username, get the username, name variants (e.g. wildcards)
+   * and all groups the user is currently a member of (resolved recursively).
+   * For example: if the user is cn=john.doe/ou=team1/o=example.com, the result will be:
+   * 
+   * cn=john.doe/ou=team1/o=example.com , *\/ou=team1/o=example.com ,
+   * *\/o=example.com, group1, group2
+   * 
+   * @param username The username to get the names list for (case-insensitive comparison)
+   * @return A promise that resolves with the usernameslist
+   */
+  getUserNamesList(username: string): Promise<string[]>;
+
+  /**
+   * Adds users to a group. Does nothing if the users are already in the group.
+   * 
+   * @param groupName The name of the group to add users to (case-insensitive, converted to lowercase)
+   * @param username The usernames to add to the group
+   * @param administrationPrivateKey The administration private key to sign the group
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the users are added to the group
+   */
+  addUsersToGroup(groupName: string, username: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
+
+  /**
+   * Removes users from a group. Does nothing if the users are not in the group.
+   * 
+   * @param groupName The name of the group to remove users from (case-insensitive, converted to lowercase)
+   * @param username The usernames to remove from the group
+   * @param administrationPrivateKey The administration private key to sign the group
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @return A promise that resolves when the users are removed from the group
+   */
+  removeUsersFromGroup(groupName: string, username: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void>;
 }
 
 /**

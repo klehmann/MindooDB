@@ -623,11 +623,16 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`Document ${docId} not found or already deleted`);
     }
     
-    // Create deletion change
-    // Note: We don't need to set _deleted in the Automerge document
-    // Deletion is tracked via the "delete" type entry in the append-only store
+    // Create deletion change by clearing all fields from the document
+    // This ensures Automerge produces actual change bytes
+    // The deletion is also tracked via the "doc_delete" type entry in the append-only store
     const newDoc = Automerge.change(internalDoc.doc, (doc: MindooDocPayload) => {
-      // No changes needed - deletion is tracked by the "delete" type entry
+      // Remove all fields from the document
+      for (const key of Object.keys(doc)) {
+        delete (doc as Record<string, unknown>)[key];
+      }
+      // Mark as deleted for clarity
+      (doc as Record<string, unknown>)._deleted = true;
     });
     
     // Get the change bytes from the document
@@ -1511,13 +1516,33 @@ export class BaseMindooDB implements MindooDB {
     const db = this;
     const docId = internalDoc.id;
     
+    // Create a read-only proxy that throws on any modification attempts
+    const createReadOnlyProxy = (target: MindooDocPayload): MindooDocPayload => {
+      return new Proxy(target, {
+        set: (_target, prop) => {
+          throw new Error(`Cannot modify property '${String(prop)}' on read-only document. Use changeDoc() to modify documents.`);
+        },
+        deleteProperty: (_target, prop) => {
+          throw new Error(`Cannot delete property '${String(prop)}' on read-only document. Use changeDoc() to modify documents.`);
+        },
+        get: (target, prop) => {
+          const value = (target as Record<string | symbol, unknown>)[prop];
+          // Recursively wrap nested objects (but not arrays or special types)
+          if (value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array)) {
+            return createReadOnlyProxy(value as MindooDocPayload);
+          }
+          return value;
+        },
+      }) as MindooDocPayload;
+    };
+    
     return {
       getDatabase: () => db,
       getId: () => docId,
       getCreatedAt: () => internalDoc.createdAt,
       getLastModified: () => internalDoc.lastModified,
       isDeleted: () => internalDoc.isDeleted,
-      getData: () => internalDoc.doc as unknown as MindooDocPayload,
+      getData: () => createReadOnlyProxy(internalDoc.doc as unknown as MindooDocPayload),
       
       // ========== Attachment Write Methods ==========
       // These throw errors in the read-only wrapper

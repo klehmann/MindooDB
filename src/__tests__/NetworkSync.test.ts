@@ -848,4 +848,43 @@ class MockTenantDirectory implements MindooTenantDirectory {
   ): Promise<void> {
     // Not needed for tests
   }
+
+  // Group management methods - not used in tests
+  async getGroups(): Promise<string[]> {
+    return [];
+  }
+
+  async getGroupMembers(_groupName: string): Promise<string[]> {
+    return [];
+  }
+
+  async deleteGroup(
+    _groupName: string,
+    _administrationPrivateKey: EncryptedPrivateKey,
+    _administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    // Not needed for tests
+  }
+
+  async getUserNamesList(_username: string): Promise<string[]> {
+    return [];
+  }
+
+  async addUsersToGroup(
+    _groupName: string,
+    _username: string[],
+    _administrationPrivateKey: EncryptedPrivateKey,
+    _administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    // Not needed for tests
+  }
+
+  async removeUsersFromGroup(
+    _groupName: string,
+    _username: string[],
+    _administrationPrivateKey: EncryptedPrivateKey,
+    _administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    // Not needed for tests
+  }
 }

@@ -90,6 +90,45 @@ describe("Attachments", () => {
         .rejects.toThrow("addAttachment() can only be called within changeDoc() callback");
     }, 30000);
 
+    it("should throw error when getData() is modified outside changeDoc", async () => {
+      const doc = await db.createDocument();
+      
+      // Set initial data
+      await db.changeDoc(doc, (d) => {
+        d.getData().title = "Initial title";
+        d.getData().count = 5;
+      });
+      
+      // Get a fresh reference to the document
+      const readonlyDoc = await db.getDocument(doc.getId());
+      
+      // Attempting to modify getData() on a document outside of changeDoc should throw
+      expect(() => {
+        readonlyDoc.getData().title = "Modified title";
+      }).toThrow("Cannot modify property 'title' on read-only document. Use changeDoc() to modify documents.");
+      
+      // Deleting properties should also throw
+      expect(() => {
+        delete (readonlyDoc.getData() as Record<string, unknown>).title;
+      }).toThrow("Cannot delete property 'title' on read-only document. Use changeDoc() to modify documents.");
+      
+      // Nested object modifications should also throw
+      await db.changeDoc(readonlyDoc, (d) => {
+        d.getData().nested = { value: 42 };
+      });
+      
+      const docWithNested = await db.getDocument(doc.getId());
+      expect(() => {
+        (docWithNested.getData().nested as Record<string, unknown>).value = 100;
+      }).toThrow("Cannot modify property 'value' on read-only document. Use changeDoc() to modify documents.");
+      
+      // Verify the original data is unchanged
+      const finalDoc = await db.getDocument(doc.getId());
+      expect(finalDoc.getData().title).toBe("Initial title");
+      expect(finalDoc.getData().count).toBe(5);
+      expect((finalDoc.getData().nested as Record<string, unknown>).value).toBe(42);
+    }, 30000);
+
     it("should throw error when captured doc reference is used after callback completes", async () => {
       const doc = await db.createDocument();
       let capturedDoc: any;

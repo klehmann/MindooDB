@@ -116,49 +116,10 @@ describe("granting tenant access", () => {
     expect(docData.userSigningPublicKey).toBe(regularUser.userSigningKeyPair.publicKey);
     expect(docData.userEncryptionPublicKey).toBe(regularUser.userEncryptionKeyPair.publicKey);
     
-    // Verify signature fields are present
-    expect(docData.adminSignature).toBeDefined();
-    expect(typeof docData.adminSignature).toBe("string");
-    expect(docData.adminSignatureFields).toBeDefined();
-    expect(Array.isArray(docData.adminSignatureFields)).toBe(true);
-    
-    // Verify the signature fields match what should be signed
-    const expectedFields = ["form", "type", "username", "userSigningPublicKey", "userEncryptionPublicKey", "adminSignatureFields"];
-    expect(docData.adminSignatureFields).toEqual(expectedFields);
-    
-    // Verify the signature is valid
-    const administrationPublicKey = tenant.getAdministrationPublicKey();
-    
-    // Create a docSigner for verification
-    const dummySigningKeyPair: SigningKeyPair = {
-      publicKey: administrationPublicKey,
-      privateKey: {
-        ciphertext: "",
-        iv: "",
-        tag: "",
-        salt: "",
-        iterations: 0,
-      },
-    };
-    const docSigner = tenant.createDocSignerFor(dummySigningKeyPair);
-    
-    // Convert base64 signature to Uint8Array
-    const adminSignature = docData.adminSignature as string;
-    const binary = atob(adminSignature);
-    const signatureBytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      signatureBytes[i] = binary.charCodeAt(i);
-    }
-    
-    // Verify the signature
-    const adminSignatureFields = docData.adminSignatureFields as string[];
-    const isValid = await docSigner.verifyItems(
-      accessGrantDoc!.doc,
-      adminSignatureFields,
-      signatureBytes,
-      administrationPublicKey
-    );
-    expect(isValid).toBe(true);
+    // Note: Admin signature verification is now done at entry level via adminOnlyDb flag
+    // The directory database only accepts entries signed by the administration key.
+    // This means if the document exists, it was signed by the admin - no need for
+    // document-level adminSignature fields.
     
     // Verify the document ID and timestamps
     expect(accessGrantDoc!.doc.getId()).toBeDefined();

@@ -10,59 +10,24 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   // Note: No recursion guard needed because directory DB is admin-only,
   // so loading entries doesn't trigger validatePublicSigningKey recursively
   private trustedKeysCache: Map<string, boolean> = new Map();
-  private cacheLastCursor: ProcessChangesCursor | null = null;
   // Mapping from grant document ID to public key (needed for revocation lookups)
   private grantDocIdToPublicKey: Map<string, string> = new Map();
 
   // Cache for settings documents
   private tenantSettingsCache: MindooDoc | null = null;
   private dbSettingsCache: Map<string, MindooDoc> = new Map();
-  private settingsCacheLastCursor: ProcessChangesCursor | null = null;
 
-  // Centralized field lists for signing/verification
-  private static readonly GRANT_ACCESS_SIGNED_FIELDS: string[] = [
-    "form",
-    "type",
-    "username",
-    "userSigningPublicKey",
-    "userEncryptionPublicKey",
-    "adminSignatureFields",
-  ];
+  // Cache for groups: key -> merged group data (key: lowercase groupName)
+  // We store merged data separately to avoid mutating MindooDoc objects
+  private groupsCache: Map<string, { docId: string; members: string[] }> = new Map();
 
-  private static readonly REVOKE_ACCESS_SIGNED_FIELDS: string[] = [
-    "form",
-    "type",
-    "username",
-    "revokeDocId",
-    "adminSignatureFields",
-  ];
-
-  private static readonly REQUEST_DOC_HISTORY_PURGE_SIGNED_FIELDS: string[] = [
-    "form",
-    "type",
-    "dbId",
-    "docId",
-    "reason",
-    "requestedAt",
-    "adminSignatureFields",
-  ];
+  // Unified cache cursor for all document types
+  private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
 
   constructor(tenant: BaseMindooTenant) {
     this.tenant = tenant;
   }
 
-  /**
-   * Helper method to convert base64 string to Uint8Array.
-   * This is needed because base64ToUint8Array is protected in BaseMindooTenant.
-   */
-  private base64ToUint8Array(base64: string): Uint8Array {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  }
 
   async getDirectoryDB(): Promise<MindooDB> {
     if (!this.directoryDB) {
@@ -94,9 +59,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
-    // Create doc signer for administration key
-    const docSigner = this.tenant.createDocSignerFor(adminSigningKeyPair);
-
     // Add user to directory database
     console.log(`[BaseMindooTenantDirectory] Creating document for user registration`);
     const directoryDB = await this.getDirectoryDB();
@@ -108,8 +70,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     console.log(`[BaseMindooTenantDirectory] Document created: ${newDoc.getId()}`);
     
     try {
-      // Set the document data fields, sign, and store signature all in one changeDocWithSigningKey call
-      // Using the admin signing key to sign the entry, so it's always trusted
+      // Set the document data fields - changeDocWithSigningKey handles signing at entry level
       await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
@@ -117,16 +78,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.username = userId.username;
         data.userSigningPublicKey = userId.userSigningPublicKey;
         data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
-
-        data.adminSignatureFields = BaseMindooTenantDirectory.GRANT_ACCESS_SIGNED_FIELDS;
-
-        // Sign the document items and store the signature
-        const signature = await docSigner.signItems(
-          doc,
-          BaseMindooTenantDirectory.GRANT_ACCESS_SIGNED_FIELDS,
-          administrationPrivateKeyPassword
-        );
-        data.adminSignature = baseTenant.uint8ArrayToBase64(signature);
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
     } catch (error) {
       console.error(`[BaseMindooTenantDirectory] ERROR in changeDocWithSigningKey:`, error);
@@ -148,30 +99,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     
-    // Cast to BaseMindooTenant to access protected methods
-    const baseTenant = this.tenant as BaseMindooTenant;
-    
-    // Get administration public key for signature verification
-    const administrationPublicKey = baseTenant.getAdministrationPublicKey();
-    
-    // Create a docSigner for verification (we only need it for verifyItems, so we use a dummy SigningKeyPair)
-    // The private key won't be used for verification
-    const dummySigningKeyPair: SigningKeyPair = {
-      publicKey: administrationPublicKey,
-      privateKey: {
-        ciphertext: "",
-        iv: "",
-        tag: "",
-        salt: "",
-        iterations: 0,
-      },
-    };
-    const docSigner = this.tenant.createDocSignerFor(dummySigningKeyPair);
+    // Update unified cache to ensure we have latest data
+    await this.updateUnifiedCache();
     
     const matchingDocs: MindooDoc[] = [];
     const revokedDocIds = new Set<string>();
     
     // Use the generator-based iteration API for cleaner code
+    // No signature verification needed - DB already enforces admin-only
     for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
       const data = doc.getData();
       
@@ -179,30 +114,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       if (data.form === "useroperation" && 
           data.type === "grantaccess" && 
           data.username === username) {
-        // Verify the signature before including the document
-        if (data.adminSignature && typeof data.adminSignature === "string" && data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
-          try {
-            const signature = this.base64ToUint8Array(data.adminSignature);
-            const isValid = await docSigner.verifyItems(
-              doc,
-              data.adminSignatureFields,
-              signature,
-              administrationPublicKey
-            );
-            
-            if (isValid) {
-              console.log(`[BaseMindooTenantDirectory] Found valid grant access document for username: ${username}`);
+        console.log(`[BaseMindooTenantDirectory] Found grant access document for username: ${username}`);
               matchingDocs.push(doc);
-            } else {
-              console.warn(`[BaseMindooTenantDirectory] Found grant access document with invalid signature for username: ${username}, skipping`);
-            }
-          } catch (error) {
-            console.error(`[BaseMindooTenantDirectory] Error verifying grant access document signature:`, error);
-            // Skip documents with signature verification errors
-          }
-        } else {
-          console.warn(`[BaseMindooTenantDirectory] Found grant access document without signature for username: ${username}, skipping`);
-        }
       }
       
       // Check if this is a revoke access document for the same username
@@ -211,30 +124,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
           data.username === username &&
           data.revokeDocId &&
           typeof data.revokeDocId === "string") {
-        // Verify the signature before processing the revocation
-        if (data.adminSignature && typeof data.adminSignature === "string" && data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
-          try {
-            const signature = this.base64ToUint8Array(data.adminSignature);
-            const isValid = await docSigner.verifyItems(
-              doc,
-              data.adminSignatureFields,
-              signature,
-              administrationPublicKey
-            );
-            
-            if (isValid) {
-              console.log(`[BaseMindooTenantDirectory] Found valid revoke access document for username: ${username}, revoking doc ID: ${data.revokeDocId}`);
+        console.log(`[BaseMindooTenantDirectory] Found revoke access document for username: ${username}, revoking doc ID: ${data.revokeDocId}`);
               revokedDocIds.add(data.revokeDocId);
-            } else {
-              console.warn(`[BaseMindooTenantDirectory] Found revoke access document with invalid signature for username: ${username}, skipping`);
-            }
-          } catch (error) {
-            console.error(`[BaseMindooTenantDirectory] Error verifying revoke access document signature:`, error);
-            // Skip documents with signature verification errors
-          }
-        } else {
-          console.warn(`[BaseMindooTenantDirectory] Found revoke access document without signature for username: ${username}, skipping`);
-        }
       }
     }
     
@@ -277,9 +168,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
-    // Create doc signer for administration key
-    const docSigner = this.tenant.createDocSignerFor(adminSigningKeyPair);
-
     // Create revocation documents for each grant access document found
     for (const grantAccessDoc of grantAccessDocs) {
       const revokeDocId = grantAccessDoc.getId();
@@ -290,8 +178,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         administrationPrivateKeyPassword
       );
       
-      // Set the document data fields, sign, and store signature all in one changeDocWithSigningKey call
-      // Using the admin signing key to sign the entry, so it's always trusted
+      // Set the document data fields - changeDocWithSigningKey handles signing at entry level
       await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
@@ -299,16 +186,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.username = username;
         data.revokeDocId = revokeDocId;
         data.requestDataWipe = requestDataWipe;
-
-        data.adminSignatureFields = BaseMindooTenantDirectory.REVOKE_ACCESS_SIGNED_FIELDS;
-
-        // Sign the document items and store the signature
-        const signature = await docSigner.signItems(
-          doc,
-          BaseMindooTenantDirectory.REVOKE_ACCESS_SIGNED_FIELDS,
-          administrationPrivateKeyPassword
-        );
-        data.adminSignature = baseTenant.uint8ArrayToBase64(signature);
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
 
       console.log(`[BaseMindooTenantDirectory] Created revocation document for grant access doc: ${revokeDocId}`);
@@ -337,8 +214,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     
-    // Update cache with any new changes since last cursor
-    await this.updateTrustedKeysCache(directoryDB, administrationPublicKey);
+    // Update unified cache with any new changes since last cursor
+    await this.updateUnifiedCache();
     
     // Now check the cache
     const cachedResult = this.trustedKeysCache.get(publicKey);
@@ -353,48 +230,37 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
   
   /**
-   * Update the trusted keys cache by processing new changes since the last cursor.
-   * This method is called incrementally to keep the cache up to date.
+   * Update all caches (trusted keys, groups, settings) by processing new changes since the last cursor.
+   * This unified method processes all document types in a single loop for efficiency.
+   * No signature verification is needed since the DB already enforces admin-only access.
    */
-  private async updateTrustedKeysCache(
-    directoryDB: MindooDB,
-    administrationPublicKey: string
-  ): Promise<void> {
-    // Create a docSigner for verification (we only need it for verifyItems, so we use a dummy SigningKeyPair)
-    // The private key won't be used for verification
-    const dummySigningKeyPair: SigningKeyPair = {
-      publicKey: administrationPublicKey,
-      privateKey: {
-        ciphertext: "",
-        iv: "",
-        tag: "",
-        salt: "",
-        iterations: 0,
-      },
-    };
-    const docSigner = this.tenant.createDocSignerFor(dummySigningKeyPair);
+  private async updateUnifiedCache(): Promise<void> {
+    const directoryDB = await this.getDirectoryDB();
+    // Determine starting cursor (null = process all, otherwise incremental)
+    const startCursor = this.unifiedCacheLastCursor;
     
-    // Process changes since last cursor
-    for await (const { doc, cursor } of directoryDB.iterateChangesSince(this.cacheLastCursor, 100)) {
+    // If processing from the beginning, clear all caches first
+    if (startCursor === null) {
+      this.trustedKeysCache.clear();
+      this.grantDocIdToPublicKey.clear();
+      this.tenantSettingsCache = null;
+      this.dbSettingsCache.clear();
+      this.groupsCache.clear();
+    }
+    
+    // Track group documents by name for merging (handles offline sync scenarios)
+    const groupDocsByName: Map<string, MindooDoc[]> = new Map();
+    
+    // Process changes (documents are returned in order by lastModified, oldest to newest)
+    for await (const { doc, cursor } of directoryDB.iterateChangesSince(startCursor, 100)) {
       const data = doc.getData();
       
+      // Process user operation documents (grant/revoke access)
+      if (data.form === "useroperation") {
       // Check if this is a grant access document
-      if (data.form === "useroperation" && 
-          data.type === "grantaccess" && 
+        if (data.type === "grantaccess" && 
           data.userSigningPublicKey &&
           typeof data.userSigningPublicKey === "string") {
-        // Verify the signature before including the document
-        if (data.adminSignature && typeof data.adminSignature === "string" && data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
-          try {
-            const signature = this.base64ToUint8Array(data.adminSignature);
-            const isValid = await docSigner.verifyItems(
-              doc,
-              data.adminSignatureFields,
-              signature,
-              administrationPublicKey
-            );
-            
-            if (isValid) {
               const userPublicKey = data.userSigningPublicKey;
               console.log(`[BaseMindooTenantDirectory] Cache: adding trusted key from grant access document`);
               // Mark as active (true) unless already revoked
@@ -403,30 +269,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
               }
               // Store mapping for future revocation lookups (persisted across iterations)
               this.grantDocIdToPublicKey.set(doc.getId(), userPublicKey);
-            }
-          } catch (error) {
-            console.error(`[BaseMindooTenantDirectory] Cache: error verifying grant access document:`, error);
-          }
-        }
       }
       
       // Check if this is a revoke access document
-      if (data.form === "useroperation" && 
-          data.type === "revokeaccess" &&
+        if (data.type === "revokeaccess" &&
           data.revokeDocId &&
           typeof data.revokeDocId === "string") {
-        // Verify the signature before processing the revocation
-        if (data.adminSignature && typeof data.adminSignature === "string" && data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
-          try {
-            const signature = this.base64ToUint8Array(data.adminSignature);
-            const isValid = await docSigner.verifyItems(
-              doc,
-              data.adminSignatureFields,
-              signature,
-              administrationPublicKey
-            );
-            
-            if (isValid) {
               const revokedDocId = data.revokeDocId;
               // Find the public key for this grant doc ID and mark as revoked
               // Use the persistent mapping that survives across iterations
@@ -438,15 +286,178 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
                 console.warn(`[BaseMindooTenantDirectory] Cache: revocation for unknown grant doc ${revokedDocId}`);
               }
             }
-          } catch (error) {
-            console.error(`[BaseMindooTenantDirectory] Cache: error verifying revoke access document:`, error);
+      }
+      
+      // Process group documents
+      if (data.form === "group" && 
+          data.type === "group" &&
+          data.groupName &&
+          typeof data.groupName === "string") {
+        const normalizedGroupName = this.normalizeGroupName(data.groupName);
+        if (!groupDocsByName.has(normalizedGroupName)) {
+          groupDocsByName.set(normalizedGroupName, []);
+        }
+        groupDocsByName.get(normalizedGroupName)!.push(doc);
+      }
+      
+      // Process tenant settings (no signature verification needed - Automerge handles merging)
+      if (data.form === "tenantsettings") {
+        // Just overwrite - last one seen will be the latest
+        this.tenantSettingsCache = doc;
+      }
+      
+      // Process DB settings (no signature verification needed - Automerge handles merging)
+      if (data.form === "dbsettings" && data.dbid && typeof data.dbid === "string") {
+        const dbId = data.dbid;
+        // Just overwrite - last one seen will be the latest
+        this.dbSettingsCache.set(dbId, doc);
+      }
+      
+      // Update cursor after each document
+      this.unifiedCacheLastCursor = cursor;
+    }
+    
+    // Merge group documents with the same name
+    for (const [normalizedGroupName, docs] of groupDocsByName.entries()) {
+      // Collect all members from all documents with this group name
+      const allMembers = new Set<string>();
+      let latestDoc: MindooDoc | null = null;
+      let isDeleted = false;
+      
+      for (const doc of docs) {
+        const data = doc.getData();
+        // Track the latest document (by iteration order, which is by lastModified)
+        latestDoc = doc;
+        // Check if document is deleted (via isDeleted() or _deleted flag in data)
+        if (doc.isDeleted() || data._deleted === true) {
+          isDeleted = true;
+        }
+        if (data.members && Array.isArray(data.members)) {
+          for (const member of data.members) {
+            if (typeof member === "string") {
+              allMembers.add(member);
+            }
           }
         }
       }
       
-      // Update cursor after each document
-      this.cacheLastCursor = cursor;
+      // If latest version is deleted, remove from cache
+      if (isDeleted) {
+        this.groupsCache.delete(normalizedGroupName);
+        continue;
+      }
+      
+      // Store merged group data in cache (without mutating the MindooDoc)
+      if (latestDoc) {
+        this.groupsCache.set(normalizedGroupName, {
+          docId: latestDoc.getId(),
+          members: Array.from(allMembers),
+        });
+      }
     }
+  }
+  
+  /**
+   * Normalize group name to lowercase for case-insensitive comparison.
+   */
+  private normalizeGroupName(name: string): string {
+    return name.toLowerCase();
+  }
+
+  /**
+   * Generate username variants with wildcards for hierarchical matching.
+   * For example: "CN=john/OU=team1/O=example.com" becomes an array containing:
+   * - The original username
+   * - Wildcard variants like "*\/OU=team1/O=example.com", "*\/O=example.com", and "*"
+   */
+  private generateUsernameVariants(username: string): string[] {
+    const variants: string[] = [username]; // Start with original username
+    
+    // Parse the username format: CN=<name>/OU=<ou>/O=<org> (may have multiple OU components)
+    // Split by '/' to get components
+    const parts = username.split('/');
+    
+    // Generate variants by replacing prefixes with a single wildcard
+    // For "CN=john/OU=team1/O=example.com":
+    // - */OU=team1/O=example.com (skip CN)
+    // - */O=example.com (skip CN and OU)
+    for (let i = 1; i < parts.length; i++) {
+      const suffixParts = parts.slice(i);
+      variants.push('*/' + suffixParts.join('/'));
+    }
+    
+    // Always add the final wildcard
+    variants.push('*');
+    
+    return variants;
+  }
+
+  /**
+   * Recursively resolve all groups that contain the given username (directly or via nested groups).
+   * This resolves upwards: if user is in group A, and group A is in group B, then user is also in group B.
+   * Stops on cycles with a console warning.
+   */
+  private async resolveGroupsForUser(username: string): Promise<string[]> {
+    const resultGroups = new Set<string>();
+    
+    // Sync changes and update cache
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    
+    // Generate username variants for matching
+    const usernameVariants = this.generateUsernameVariants(username);
+    const usernameVariantsLower = new Set(usernameVariants.map(v => v.toLowerCase()));
+    
+    // First pass: find all groups that directly contain the user or username variants
+    const directGroups = new Set<string>();
+    for (const [groupName, groupData] of this.groupsCache.entries()) {
+      for (const member of groupData.members) {
+        const memberLower = member.toLowerCase();
+        if (usernameVariantsLower.has(memberLower)) {
+          directGroups.add(groupName);
+          resultGroups.add(groupName);
+          break;
+        }
+      }
+    }
+    
+    // Second pass: find parent groups (groups that contain the user's groups)
+    // Keep iterating until no new groups are found
+    let groupsToCheck = new Set(directGroups);
+    const visitedGroups = new Set<string>(); // Track visited groups for cycle detection
+    
+    while (groupsToCheck.size > 0) {
+      const nextGroups = new Set<string>();
+      
+      for (const childGroup of groupsToCheck) {
+        // Skip if already checked (cycle detection)
+        if (visitedGroups.has(childGroup)) {
+          console.warn(`[BaseMindooTenantDirectory] Cycle detected in group resolution: ${childGroup} already visited, stopping recursion`);
+          continue;
+        }
+        visitedGroups.add(childGroup);
+        
+        // Find all groups that contain this child group as a member
+        for (const [parentGroupName, parentGroupData] of this.groupsCache.entries()) {
+          if (resultGroups.has(parentGroupName)) {
+            continue; // Already found this group
+          }
+          
+          for (const member of parentGroupData.members) {
+            if (member.toLowerCase() === childGroup) {
+              resultGroups.add(parentGroupName);
+              nextGroups.add(parentGroupName);
+              break;
+            }
+          }
+        }
+      }
+      
+      groupsToCheck = nextGroups;
+    }
+    
+    return Array.from(resultGroups);
   }
 
   /**
@@ -527,15 +538,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
     
-    const docSigner = this.tenant.createDocSignerFor(adminSigningKeyPair);
-    
     // Create document with admin signing key so the initial entry is trusted
     const newDoc = await directoryDB.createDocumentWithSigningKey(
       adminSigningKeyPair,
       administrationPrivateKeyPassword
     );
     
-    // Using the admin signing key to sign the entry, so it's always trusted
+    // Set the document data fields - changeDocWithSigningKey handles signing at entry level
     await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
       const data = doc.getData();
       data.form = "useroperation";
@@ -546,15 +555,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.reason = reason;
       }
       data.requestedAt = Date.now();
-      
-      data.adminSignatureFields = BaseMindooTenantDirectory.REQUEST_DOC_HISTORY_PURGE_SIGNED_FIELDS;
-      
-      const signature = await docSigner.signItems(
-        doc,
-        BaseMindooTenantDirectory.REQUEST_DOC_HISTORY_PURGE_SIGNED_FIELDS,
-        administrationPrivateKeyPassword
-      );
-      data.adminSignature = baseTenant.uint8ArrayToBase64(signature);
     }, adminSigningKeyPair, administrationPrivateKeyPassword);
     
     console.log(`[BaseMindooTenantDirectory] Created purge request for ${docId} in ${dbId}`);
@@ -570,21 +570,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     
-    const baseTenant = this.tenant as BaseMindooTenant;
-    const administrationPublicKey = baseTenant.getAdministrationPublicKey();
-    
-    const dummySigningKeyPair: SigningKeyPair = {
-      publicKey: administrationPublicKey,
-      privateKey: {
-        ciphertext: "",
-        iv: "",
-        tag: "",
-        salt: "",
-        iterations: 0,
-      },
-    };
-    const docSigner = this.tenant.createDocSignerFor(dummySigningKeyPair);
-    
     const purgeRequests: Array<{
       dbId: string;
       docId: string;
@@ -593,23 +578,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       purgeRequestDocId: string;
     }> = [];
     
+    // No signature verification needed - DB already enforces admin-only
     for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
       const data = doc.getData();
       
       if (data.form === "useroperation" && data.type === "requestdochistorypurge") {
-        // Verify signature
-        if (data.adminSignature && typeof data.adminSignature === "string" && 
-            data.adminSignatureFields && Array.isArray(data.adminSignatureFields)) {
-          try {
-            const signature = this.base64ToUint8Array(data.adminSignature);
-            const isValid = await docSigner.verifyItems(
-              doc,
-              data.adminSignatureFields,
-              signature,
-              administrationPublicKey
-            );
-            
-            if (isValid) {
               const dbId = data.dbId;
               const docId = data.docId;
               const reason = data.reason;
@@ -623,11 +596,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
                   requestedAt: typeof requestedAt === "number" ? requestedAt : Date.now(),
                   purgeRequestDocId: doc.getId(),
                 });
-              }
-            }
-          } catch (error) {
-            console.error(`[BaseMindooTenantDirectory] Error verifying purge request signature:`, error);
-          }
         }
       }
     }
@@ -639,8 +607,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     
-    // Update cache if directory has new changes
-    await this.updateSettingsCache(directoryDB);
+    // Update unified cache if directory has new changes
+    await this.updateUnifiedCache();
     
     return this.tenantSettingsCache;
   }
@@ -649,8 +617,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     
-    // Update cache if directory has new changes
-    await this.updateSettingsCache(directoryDB);
+    // Update unified cache if directory has new changes
+    await this.updateUnifiedCache();
     
     return this.dbSettingsCache.get(dbId) || null;
   }
@@ -695,7 +663,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     // Invalidate cache
     this.tenantSettingsCache = null;
-    this.settingsCacheLastCursor = null;
+    this.unifiedCacheLastCursor = null;
   }
 
   async changeDBSettings(
@@ -741,41 +709,220 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     // Invalidate cache for this dbId
     this.dbSettingsCache.delete(dbId);
-    this.settingsCacheLastCursor = null;
+    this.unifiedCacheLastCursor = null;
   }
 
-  private async updateSettingsCache(
-    directoryDB: MindooDB
+  async getGroups(): Promise<string[]> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    
+    // Update unified cache to ensure we have latest data
+    await this.updateUnifiedCache();
+    
+    // Return array of group names (keys from groupsCache)
+    return Array.from(this.groupsCache.keys());
+  }
+
+  async getGroupMembers(groupName: string): Promise<string[]> {
+    const normalizedGroupName = this.normalizeGroupName(groupName);
+    
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    
+    // Update unified cache to ensure we have latest data
+    await this.updateUnifiedCache();
+    
+    // Look up group in cache
+    const groupData = this.groupsCache.get(normalizedGroupName);
+    if (!groupData) {
+      return [];
+    }
+    
+    // Return a copy to prevent external modification of internal cache state
+    return [...groupData.members];
+  }
+
+  async addUsersToGroup(
+    groupName: string,
+    username: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
   ): Promise<void> {
-    // Determine starting cursor (null = process all, otherwise incremental)
-    const startCursor = this.settingsCacheLastCursor;
+    const normalizedGroupName = this.normalizeGroupName(groupName);
     
-    // If processing from the beginning, clear caches first
-    if (startCursor === null) {
-      this.tenantSettingsCache = null;
-      this.dbSettingsCache.clear();
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    
+    // Get the actual document from the database (using cached docId if available)
+    const cachedGroup = this.groupsCache.get(normalizedGroupName);
+    let groupDoc: MindooDoc;
+    
+    if (cachedGroup) {
+      // Load the actual document from the database
+      groupDoc = await directoryDB.getDocument(cachedGroup.docId);
+    } else {
+      // Create new document
+      groupDoc = await directoryDB.createDocumentWithSigningKey(
+        adminSigningKeyPair,
+        administrationPrivateKeyPassword
+      );
     }
     
-    // Process changes (documents are returned in order by lastModified, oldest to newest)
-    // Since they're in order, we can just overwrite the cache with each document we see
-    // The last one we see will be the latest
-    for await (const { doc, cursor } of directoryDB.iterateChangesSince(startCursor, 100)) {
-      const data = doc.getData();
-      
-      // Process tenant settings (no signature verification needed - Automerge handles merging)
-      if (data.form === "tenantsettings") {
-        // Just overwrite - last one seen will be the latest
-        this.tenantSettingsCache = doc;
-      }
-      
-      // Process DB settings (no signature verification needed - Automerge handles merging)
-      if (data.form === "dbsettings" && data.dbid && typeof data.dbid === "string") {
-        const dbId = data.dbid;
-        // Just overwrite - last one seen will be the latest
-        this.dbSettingsCache.set(dbId, doc);
-      }
-      
-      this.settingsCacheLastCursor = cursor;
+    // Apply changes and ensure form, type, and groupName fields are correct
+    await directoryDB.changeDocWithSigningKey(
+      groupDoc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        
+        // Initialize members array if it doesn't exist
+        if (!data.members || !Array.isArray(data.members)) {
+          data.members = [];
+        }
+        
+        // Add users to members array (avoid duplicates)
+        const existingMembers = Array.isArray(data.members) 
+          ? data.members.filter((m): m is string => typeof m === "string")
+          : [];
+        const membersSet = new Set(existingMembers);
+        for (const user of username) {
+          membersSet.add(user);
+        }
+        data.members = Array.from(membersSet);
+        
+        // Ensure form, type, and groupName fields are always correct
+        data.form = "group";
+        data.type = "group";
+        data.groupName = normalizedGroupName;
+      },
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword
+    );
+    
+    // Invalidate cache for this group
+    this.groupsCache.delete(normalizedGroupName);
+    this.unifiedCacheLastCursor = null;
+  }
+
+  async removeUsersFromGroup(
+    groupName: string,
+    username: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    const normalizedGroupName = this.normalizeGroupName(groupName);
+    
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    
+    // Sync and update cache to get latest group
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    
+    // Get group from cache
+    const cachedGroup = this.groupsCache.get(normalizedGroupName);
+    if (!cachedGroup) {
+      // Group doesn't exist, nothing to do
+      return;
     }
+    
+    // Load the actual document from the database
+    const groupDoc = await directoryDB.getDocument(cachedGroup.docId);
+    
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    
+    // Remove users from members array
+    await directoryDB.changeDocWithSigningKey(
+      groupDoc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        
+        if (!data.members || !Array.isArray(data.members)) {
+          return;
+        }
+        
+        // Filter out users to remove
+        const usersToRemove = new Set(username);
+        const membersArray = data.members as unknown[];
+        data.members = membersArray.filter((m: unknown) => {
+          if (typeof m !== "string") {
+            return true; // Keep non-string members
+          }
+          return !usersToRemove.has(m);
+        });
+        
+        // Ensure form, type, and groupName fields are always correct
+        data.form = "group";
+        data.type = "group";
+        data.groupName = normalizedGroupName;
+      },
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword
+    );
+    
+    // Invalidate cache for this group
+    this.groupsCache.delete(normalizedGroupName);
+    this.unifiedCacheLastCursor = null;
+  }
+
+  async deleteGroup(
+    groupName: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string
+  ): Promise<void> {
+    const normalizedGroupName = this.normalizeGroupName(groupName);
+    
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    
+    // Sync and update cache to get latest group
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    
+    // Get group from cache
+    const cachedGroup = this.groupsCache.get(normalizedGroupName);
+    if (!cachedGroup) {
+      // Group doesn't exist, nothing to do
+      return;
+    }
+    
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    
+    // Delete the document using the proper API
+    await directoryDB.deleteDocumentWithSigningKey(
+      cachedGroup.docId,
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword
+    );
+    
+    // Remove from cache
+    this.groupsCache.delete(normalizedGroupName);
+    this.unifiedCacheLastCursor = null;
+  }
+
+  async getUserNamesList(username: string): Promise<string[]> {
+    // Generate username variants (wildcards)
+    const usernameVariants = this.generateUsernameVariants(username);
+    const result = new Set<string>(usernameVariants);
+    
+    // Find all groups containing the username (directly or via nested groups)
+    const groups = await this.resolveGroupsForUser(username);
+    
+    // Add all groups to result
+    for (const group of groups) {
+      result.add(group);
+    }
+    
+    return Array.from(result);
   }
 }
