@@ -2,9 +2,15 @@
 
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
-> ⚠️ **Alpha Software**: This project is in early development. APIs are subject to change without notice. Not recommended for production use yet. But working on it :-)
+MindooDB is an end-to-end encrypted, offline-first sync database.
+It lets apps collaborate and sync data without giving servers access to the contents.
 
-MindooDB is an **End-to-End Encrypted, Offline-first Sync Database**. Your data is encrypted before it leaves the client—servers never see plaintext. Even with full infrastructure access, attackers can't read your documents.
+Even if someone has full access to your infrastructure — database dumps, backups, logs — all they get is ciphertext.
+
+Your data is encrypted on the client before it ever touches a server. No plaintext. No server-side keys. No trust required.
+
+> ⚠️ **Alpha software**: This project is in early development and not yet recommended for production use. APIs may change without notice.
+
 
 ## The Problem
 
@@ -234,6 +240,14 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
 - [Attachments](./docs/attachments.md) — File storage and streaming
+
+## Support
+
+Need help, have questions, or want to request a feature? We're here to help! :-)
+
+- 🐛 **Bug Reports**: [Open an issue on GitHub](https://github.com/klehmann/mindoodb/issues)
+- 💬 **Questions & Discussions**: [GitHub Discussions](https://github.com/klehmann/mindoodb/discussions)
+- ✨ **Feature Requests**: [Create a feature request](https://github.com/klehmann/mindoodb/issues/new?template=feature_request.md)
 
 ## License
 
