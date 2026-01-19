@@ -8,31 +8,35 @@ MindooDB's append-only architecture and multi-database design enable powerful da
 
 ### Append-Only Nature
 
-MindooDB uses an **append-only store**, meaning:
-- Changes are never modified or deleted
-- Data grows over time
-- Complete history is preserved
-- This enables audit trails but requires growth management strategies
+MindooDB uses an **append-only store** where every document change is written as a new entry rather than modifying existing data. This fundamental design choice has important implications for data modeling.
+
+Changes in MindooDB are never modified or deleted from the underlying store. When you edit a document, a new change entry is appended that represents the modification. When you "delete" a document, a tombstone entry is appended marking it as deleted, but the original data and all changes remain in the store. This means that data naturally grows over time as documents are created and modified.
+
+The append-only architecture provides a complete, tamper-proof history of all changes—invaluable for audit trails, compliance, and debugging. However, it also requires thoughtful planning for growth management. Without a strategy, databases can grow indefinitely, eventually affecting performance.
 
 ### Multiple Databases Per Tenant
 
-A single `MindooTenant` can contain multiple `MindooDB` instances:
-- Each database is independent
-- Can have different access patterns
-- Can be sharded by time, category, or access level
-- Enables efficient data organization and management
+A single `MindooTenant` can contain multiple `MindooDB` instances, and this capability is central to effective data modeling in MindooDB.
+
+Each database operates independently with its own append-only store, document collection, and sync state. Different databases can have different access patterns—some frequently accessed, others archival. Databases can be sharded by time (yearly or monthly), by category (document type), or by access level (public, internal, confidential). This flexibility enables efficient data organization where you can optimize each database for its specific use case.
+
+Multiple databases also enable clean boundaries for backups, retention policies, and access control. You can archive an entire database when its data becomes historical, apply different encryption keys to different databases, or sync only specific databases with specific partners.
 
 ## Document Splitting Strategies
 
 ### When to Split
 
-Consider splitting into multiple databases when:
+Deciding when to split data across multiple databases requires balancing simplicity against scalability and organizational concerns.
 
-1. **Data Volume**: Single database becomes too large for efficient operations
-2. **Access Patterns**: Different document types have different access frequencies
-3. **Retention Policies**: Some data needs different retention or archival strategies
-4. **Performance**: Splitting improves query and sync performance
-5. **Security**: Different security levels require separate databases
+**Data volume** is often the first driver. When a single database becomes too large, operations like syncing, querying, and loading documents slow down noticeably. Splitting high-volume data across multiple databases keeps each one manageable.
+
+**Access patterns** matter significantly. If your application has documents that are accessed frequently (active projects, recent transactions) alongside documents that are rarely touched (completed projects, historical records), keeping them in the same database means the active subset is mixed with inactive data. Splitting allows you to optimize each database for its access patterns.
+
+**Retention policies** often require different treatment for different data. Financial records might need 7-year retention while operational logs might need 90-day retention. Separate databases make it easy to apply different policies—you can archive or even delete entire databases without affecting others.
+
+**Performance optimization** through splitting allows you to sync only the databases users need, reduce memory footprint, and improve query response times by limiting the scope of operations.
+
+**Security boundaries** sometimes require physical separation. Documents with different classification levels (public, internal, confidential) might need separate databases to ensure clear access control boundaries and simplify compliance audits.
 
 ### Splitting by Document Type
 
@@ -225,16 +229,33 @@ const betaTenant = await tenantFactory.openTenant("beta-inc-tenant-id");
 
 **Pattern**: Organizations share specific databases for collaboration
 
+When two organizations need to collaborate, they can synchronize a shared database between their tenants. This is accomplished by syncing the underlying content-addressed stores. Each organization maintains their own tenant with full control, but they share specific data through the synchronized database.
+
 **Example**: Partner Collaboration
 ```typescript
 // Each organization has its own tenant
 const orgATenant = await tenantFactory.openTenant("org-a");
 const orgBTenant = await tenantFactory.openTenant("org-b");
 
-// Shared collaboration database
-const sharedDB = await orgATenant.openDB("collaboration");
-// Org B syncs from Org A's shared database
-await orgBTenant.openDB("collaboration").pullChangesFrom(sharedDB.getStore());
+// Each organization opens their copy of the collaboration database
+const orgACollabDB = await orgATenant.openDB("collaboration");
+const orgBCollabDB = await orgBTenant.openDB("collaboration");
+
+// Sync happens at the store level
+// Org B gets changes from Org A's store
+const orgAStore = orgACollabDB.getStore();
+const orgBStore = orgBCollabDB.getStore();
+
+// Find new changes that Org B doesn't have
+const newHashes = await orgAStore.findNewChanges(await orgBStore.getAllChangeHashes());
+if (newHashes.length > 0) {
+  const newChanges = await orgAStore.getChanges(newHashes);
+  for (const change of newChanges) {
+    await orgBStore.append(change);
+  }
+  // Apply the synced changes to Org B's database
+  await orgBCollabDB.syncStoreChanges(newHashes);
+}
 ```
 
 **Benefits:**
@@ -249,11 +270,11 @@ await orgBTenant.openDB("collaboration").pullChangesFrom(sharedDB.getStore());
 
 ### Growth Characteristics
 
-Append-only stores grow continuously:
-- Every change is preserved
-- Deletions are marked but not removed
-- Complete history is maintained
-- Storage grows over time
+Understanding how append-only stores grow is essential for long-term application sustainability.
+
+Every change you make to a document creates a new entry in the store. If you modify a document 100 times, there are 100 change entries (plus potentially a snapshot for fast loading). When you delete a document, a tombstone entry marks it as deleted, but all the previous changes remain. The complete history is always maintained—this is a feature for audit trails, but it means storage grows continuously over time.
+
+The growth rate depends on your application's write patterns. A CRM system where contacts are edited occasionally grows slowly. A logging system recording thousands of events per hour grows rapidly. Understanding your growth rate helps you plan appropriate management strategies.
 
 ### Growth Management Strategies
 

@@ -67,9 +67,13 @@ class ElectronicHealthRecord {
   async getPatientHistory(patientId: string): Promise<MindooDoc[]> {
     const db = await this.tenant.openDB(`patient-${patientId}`);
     const docs: MindooDoc[] = [];
-    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+    
+    // Use processChangesSince to iterate through all documents
+    await db.processChangesSince(null, 100, (doc, cursor) => {
       docs.push(doc);
-    }
+      return true; // Continue iterating
+    });
+    
     return docs;
   }
 }
@@ -133,13 +137,14 @@ class MedicalDeviceData {
           const db = await this.tenant.openDB(dbId);
           
           // Filter by date range while iterating
-          for await (const { doc } of db.iterateChangesSince(null, 100)) {
+          await db.processChangesSince(null, 100, (doc, cursor) => {
             const data = doc.getData();
             const timestamp = data.timestamp;
             if (timestamp >= startDate.getTime() && timestamp <= endDate.getTime()) {
               results.push(doc);
             }
-          }
+            return true; // Continue iterating
+          });
         } catch (error) {
           // Database doesn't exist for this month
           continue;
@@ -185,7 +190,7 @@ class ResearchCollaboration {
       await this.distributeKeyToInstitution(institutionId, keyId, researchKey);
     }
     
-    // Create research document
+    // Create research document encrypted with the research key
     const localTenant = this.researchTenants.values().next().value;
     const db = await localTenant.openDB("research-data");
     const doc = await db.createEncryptedDocument(keyId);
@@ -193,6 +198,7 @@ class ResearchCollaboration {
       Object.assign(d.getData(), data);
       d.getData().type = "research-data";
       d.getData().sharedAt = Date.now();
+      d.getData().encryptionKeyId = keyId; // Track which key was used
     });
     
     // Sync to all institutions
@@ -214,8 +220,26 @@ class ResearchCollaboration {
     const dbA = await tenantA.openDB("research-data");
     const dbB = await tenantB.openDB("research-data");
     
-    await dbB.pullChangesFrom(dbA.getStore());
-    await dbA.pullChangesFrom(dbB.getStore());
+    // Sync at the store level
+    await this.syncStores(dbA, dbB);
+    await this.syncStores(dbB, dbA);
+  }
+  
+  private async syncStores(sourceDB: MindooDB, targetDB: MindooDB) {
+    const sourceStore = sourceDB.getStore();
+    const targetStore = targetDB.getStore();
+    
+    const newHashes = await sourceStore.findNewChanges(
+      await targetStore.getAllChangeHashes()
+    );
+    
+    if (newHashes.length > 0) {
+      const changes = await sourceStore.getChanges(newHashes);
+      for (const change of changes) {
+        await targetStore.append(change);
+      }
+      await targetDB.syncStoreChanges(newHashes);
+    }
   }
 }
 ```
@@ -236,10 +260,15 @@ class ResearchCollaboration {
 
 ### Role-Based Access
 
+Healthcare organizations have well-defined roles with different access levels. Doctors typically have the broadest access, nurses have access to care-related data, administrators handle operational data, and patients can access their own records.
+
 **Pattern**: Different access levels for different roles
 
 ```typescript
 class HealthcareAccessControl {
+  private tenant: MindooTenant;
+  
+  // Role hierarchy: higher roles include access to lower levels
   private roleToKeys: Map<string, string[]> = new Map([
     ["doctor", ["doctor-key", "nurse-key", "admin-key"]],
     ["nurse", ["nurse-key", "admin-key"]],
@@ -247,7 +276,7 @@ class HealthcareAccessControl {
     ["patient", ["patient-key"]]
   ]);
   
-  async grantRoleAccess(userId: string, role: string) {
+  async grantRoleAccess(userId: string, role: string): Promise<void> {
     const keysForRole = this.roleToKeys.get(role) || [];
     
     for (const keyId of keysForRole) {
@@ -262,8 +291,19 @@ class HealthcareAccessControl {
     await db.changeDoc(doc, (d) => {
       Object.assign(d.getData(), data);
       d.getData().accessLevel = role;
+      d.getData().encryptionKeyId = keyId;
     });
     return doc;
+  }
+  
+  private getKeyForRole(role: string): string {
+    // Return the most restrictive key for this role
+    const roleKeys = this.roleToKeys.get(role) || ["admin-key"];
+    return roleKeys[0];
+  }
+  
+  private async distributeKeyToUser(userId: string, keyId: string): Promise<void> {
+    // Implementation: securely distribute key to user through offline channel
   }
 }
 ```
@@ -316,12 +356,13 @@ class HealthcareAuditTrail {
     const auditDB = await this.tenant.openDB("audit-logs");
     const matchingLogs: MindooDoc[] = [];
     
-    for await (const { doc } of auditDB.iterateChangesSince(null, 100)) {
+    await auditDB.processChangesSince(null, 1000, (doc, cursor) => {
       const data = doc.getData();
       if (data.patientId === patientId) {
         matchingLogs.push(doc);
       }
-    }
+      return true; // Continue iterating
+    });
     
     return matchingLogs;
   }
@@ -347,7 +388,7 @@ class HealthcareDataRetention {
     const archiveDB = await this.tenant.openDB(`patient-${patientId}-archive`);
     
     // Find old documents and copy to archive
-    for await (const { doc } of activeDB.iterateChangesSince(null, 100)) {
+    await activeDB.processChangesSince(null, 100, async (doc, cursor) => {
       const data = doc.getData();
       if (data.createdAt && data.createdAt < archiveDate.getTime()) {
         // Get all changes for this document

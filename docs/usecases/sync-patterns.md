@@ -8,145 +8,288 @@ MindooDB supports multiple synchronization patterns: peer-to-peer (P2P), client-
 
 ### Sync Mechanisms
 
-MindooDB uses the `AppendOnlyStore` interface for synchronization:
-- **findNewChanges()**: Compare change hashes to find missing changes
-- **getChanges()**: Fetch actual change payloads
-- **append()**: Store changes locally (handles deduplication)
-- **pullChangesFrom()**: High-level method to pull from remote store
-- **pushChangesTo()**: High-level method to push to remote store
+MindooDB synchronization operates at the store level through the `ContentAddressedStore` interface. Understanding this interface is essential for implementing sync patterns.
+
+**findNewChanges(existingHashes)** compares your local change hashes against another set of hashes (typically from a remote store) to identify which changes are missing locally. This is the foundation of incremental sync—you only transfer what's actually needed.
+
+**getChanges(hashes)** retrieves the actual change payloads for a set of hashes. Once you know which changes are missing, this method fetches the encrypted change data.
+
+**append(entry)** stores a change locally. The store handles deduplication automatically—if a change with the same hash already exists, it's ignored rather than duplicated.
+
+**syncStoreChanges(newHashes)** on the `MindooDB` interface processes newly synced changes, updating the in-memory document cache and triggering any change callbacks.
+
+The typical sync flow is: (1) find new changes the local store is missing, (2) fetch those changes from the remote store, (3) append them to the local store, (4) notify the database to process the new changes.
 
 ### Sync Without Decryption
 
-A powerful feature: sync encrypted data without decryption keys:
-- Servers can mirror data they cannot read
-- Peers can backup each other's encrypted data
-- Perfect for disaster recovery
-- Maintains end-to-end encryption
+One of MindooDB's most powerful features is the ability to synchronize encrypted data without possessing the decryption keys.
+
+Because all changes are stored as encrypted entries with cryptographic hashes, a server or peer can store and forward these entries without ever reading the actual content. The server sees only encrypted bytes and hash identifiers. This enables several important patterns: servers can mirror data they cannot read, peers can back up each other's encrypted data, and disaster recovery systems can replicate entire databases while maintaining complete data privacy.
+
+This capability is fundamental to MindooDB's security model—it means you can use untrusted infrastructure for storage and synchronization while maintaining true end-to-end encryption.
 
 ## P2P Synchronization
 
 ### Direct Client-to-Client Sync
 
+Peer-to-peer synchronization allows two clients to exchange changes directly without routing through a server. This is ideal for local network scenarios, mobile device sync, or environments where server connectivity is unavailable.
+
 **Pattern**: Two clients sync directly without a server
 
 ```typescript
-// Client A and Client B want to sync
-const clientADB = await tenant.openDB("shared");
-const clientBDB = await tenant.openDB("shared");
+/**
+ * Utility function to sync changes from one store to another.
+ * Returns the number of new changes transferred.
+ */
+async function syncStores(
+  sourceStore: ContentAddressedStore,
+  targetStore: ContentAddressedStore,
+  targetDB: MindooDB
+): Promise<number> {
+  // Find changes that target is missing
+  const targetHashes = await targetStore.getAllChangeHashes();
+  const newHashes = await sourceStore.findNewChanges(targetHashes);
+  
+  if (newHashes.length === 0) {
+    return 0;
+  }
+  
+  // Transfer missing changes
+  const changes = await sourceStore.getChanges(newHashes);
+  for (const change of changes) {
+    await targetStore.append(change);
+  }
+  
+  // Notify database to process new changes
+  await targetDB.syncStoreChanges(newHashes);
+  
+  return newHashes.length;
+}
+
+// Client A and Client B want to sync their "shared" database
+const clientADB = await tenantA.openDB("shared");
+const clientBDB = await tenantB.openDB("shared");
+
+const storeA = clientADB.getStore();
+const storeB = clientBDB.getStore();
 
 // Client A pulls from Client B
-await clientADB.pullChangesFrom(clientBDB.getStore());
+const pulledByA = await syncStores(storeB, storeA, clientADB);
+console.log(`Client A received ${pulledByA} changes from Client B`);
 
 // Client B pulls from Client A
-await clientBDB.pullChangesFrom(clientADB.getStore());
+const pulledByB = await syncStores(storeA, storeB, clientBDB);
+console.log(`Client B received ${pulledByB} changes from Client A`);
 
 // Both clients now have all changes
-// Conflicts resolved by Automerge CRDTs
+// Any conflicts are automatically resolved by Automerge CRDTs
 ```
 
 **Benefits:**
-- No server required
-- Direct communication
-- Lower latency
-- Works offline (when peers are nearby)
+- No server required—clients communicate directly
+- Lower latency for local network scenarios
+- Works when peers are nearby but internet is unavailable
+- Complete privacy—no central server sees the data
 
 **Use Cases:**
-- Local network collaboration
-- Offline peer sync
-- Mobile device sync
-- Field operations
+- Local network collaboration in offices or conferences
+- Offline peer sync in the field
+- Mobile device sync over Bluetooth or local WiFi
+- Field operations in areas without internet
 
 ### P2P with Discovery
+
+In real-world P2P scenarios, you need a mechanism to discover available peers. This can use mDNS for local network discovery, Bluetooth for nearby devices, or a lightweight discovery server that only facilitates connections.
 
 **Pattern**: Discover peers and sync automatically
 
 ```typescript
 class P2PSyncManager {
-  private peers: Map<string, AppendOnlyStore> = new Map();
+  private peers: Map<string, ContentAddressedStore> = new Map();
   
-  async discoverPeers() {
-    // Use mDNS, Bluetooth, or manual discovery
+  async discoverPeers(): Promise<void> {
+    // Discovery mechanism depends on environment:
+    // - mDNS for local network (e.g., using Bonjour)
+    // - Bluetooth scanning for nearby mobile devices
+    // - WebRTC signaling server for web applications
     const discoveredPeers = await this.discoverLocalPeers();
     
     for (const peer of discoveredPeers) {
       this.peers.set(peer.id, peer.store);
+      console.log(`Discovered peer: ${peer.id}`);
     }
   }
   
-  async syncWithAllPeers(db: MindooDB) {
+  async syncWithAllPeers(db: MindooDB): Promise<void> {
+    const localStore = db.getStore();
+    
     for (const [peerId, peerStore] of this.peers) {
       try {
-        // Bidirectional sync
-        await db.pullChangesFrom(peerStore);
-        await db.pushChangesTo(peerStore);
+        console.log(`Syncing with peer: ${peerId}`);
+        
+        // Pull changes from peer
+        await syncStores(peerStore, localStore, db);
+        
+        // Push our changes to peer (requires peer to have a way to receive)
+        const ourNewHashes = await localStore.findNewChanges(
+          await peerStore.getAllChangeHashes()
+        );
+        
+        if (ourNewHashes.length > 0) {
+          const ourChanges = await localStore.getChanges(ourNewHashes);
+          for (const change of ourChanges) {
+            await peerStore.append(change);
+          }
+        }
+        
+        console.log(`Sync complete with ${peerId}`);
       } catch (error) {
         console.error(`Sync failed with ${peerId}:`, error);
+        // Continue with other peers even if one fails
       }
     }
+  }
+  
+  private async discoverLocalPeers(): Promise<Array<{ id: string; store: ContentAddressedStore }>> {
+    // Implementation depends on the discovery mechanism
+    // This is a placeholder for actual discovery logic
+    return [];
   }
 }
 ```
 
-**See**: [P2P Sync Documentation](../p2psync.md) for detailed implementation
+**See**: [P2P Sync Documentation](../p2psync.md) for detailed implementation guidance
 
 ## Client-Server Sync
 
 ### Centralized Server Pattern
 
+Client-server synchronization is the most common pattern for cloud-based applications. Multiple clients connect to a central server that stores the authoritative copy of the database. The server can mirror encrypted data without possessing decryption keys.
+
 **Pattern**: Multiple clients sync with a central server
 
 ```typescript
-// Server setup
+// Server-side: The server wraps a local store with network capabilities
+// See examples/server for a complete implementation
 const serverStore = new ServerNetworkAppendOnlyStore(
-  localStore,
-  authenticationService
+  localStore,           // The server's local storage
+  authenticationService // Validates client credentials
 );
 
-// Client setup
-const clientStore = new ClientNetworkAppendOnlyStore(
-  networkTransport,
+// Client-side: The client uses a network transport to communicate with the server
+const clientNetworkStore = new ClientNetworkAppendOnlyStore(
+  networkTransport,  // HTTP, WebSocket, or custom transport
   tenantId,
   dbId
 );
 
-// Client syncs with server
+// Client syncs with server using the standard sync pattern
 const clientDB = await tenant.openDB("main");
-await clientDB.pullChangesFrom(clientStore);
-await clientDB.pushChangesTo(clientStore);
+const localStore = clientDB.getStore();
+
+// Pull changes from server
+const serverHashes = await clientNetworkStore.getAllChangeHashes();
+const newFromServer = await clientNetworkStore.findNewChanges(
+  await localStore.getAllChangeHashes()
+);
+
+if (newFromServer.length > 0) {
+  const serverChanges = await clientNetworkStore.getChanges(newFromServer);
+  for (const change of serverChanges) {
+    await localStore.append(change);
+  }
+  await clientDB.syncStoreChanges(newFromServer);
+}
+
+// Push local changes to server
+const newForServer = await localStore.findNewChanges(serverHashes);
+if (newForServer.length > 0) {
+  const localChanges = await localStore.getChanges(newForServer);
+  for (const change of localChanges) {
+    await clientNetworkStore.append(change);
+  }
+}
 ```
 
 **Benefits:**
-- Centralized data storage
-- Always-available server
-- Easier to manage
-- Good for cloud deployments
+- Centralized data storage simplifies operations
+- Server is always available for sync (when online)
+- Easier to manage backups and monitoring
+- Good for cloud deployments and SaaS applications
 
 **Use Cases:**
-- Cloud-based applications
-- Mobile apps with backend
-- Web applications
-- Enterprise deployments
+- Cloud-based applications with mobile and web clients
+- Mobile apps with a backend API
+- Web applications requiring persistence
+- Enterprise deployments with centralized IT management
 
 ### Offline-First Client-Server
+
+The offline-first pattern ensures applications remain fully functional without network connectivity, syncing changes when connectivity returns.
 
 **Pattern**: Clients work offline, sync when connected
 
 ```typescript
 class OfflineFirstSync {
   private db: MindooDB;
-  private serverStore: AppendOnlyStore;
+  private serverStore: ContentAddressedStore;
   private isOnline: boolean = false;
+  private syncInProgress: boolean = false;
   
-  async start() {
-    // Check connectivity
+  constructor(db: MindooDB, serverStore: ContentAddressedStore) {
+    this.db = db;
+    this.serverStore = serverStore;
+  }
+  
+  async start(): Promise<void> {
+    // Check initial connectivity
     this.isOnline = await this.checkConnectivity();
     
     if (this.isOnline) {
       await this.sync();
     }
     
-    // Monitor connectivity
+    // Monitor connectivity changes
     this.monitorConnectivity();
+  }
+  
+  private async checkConnectivity(): Promise<boolean> {
+    try {
+      // Attempt to reach server
+      await this.serverStore.getAllChangeHashes();
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+  
+  private monitorConnectivity(): void {
+    // In a browser environment, use online/offline events
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', () => this.handleOnline());
+      window.addEventListener('offline', () => this.handleOffline());
+    }
+    
+    // Periodically check connectivity as backup
+    setInterval(async () => {
+      const wasOnline = this.isOnline;
+      this.isOnline = await this.checkConnectivity();
+      
+      if (!wasOnline && this.isOnline) {
+        await this.handleOnline();
+      }
+    }, 30000); // Check every 30 seconds
+  }
+  
+  private async handleOnline(): Promise<void> {
+    console.log('Connection restored, syncing...');
+    this.isOnline = true;
+    await this.sync();
+  }
+  
+  private handleOffline(): void {
+    console.log('Connection lost, working offline');
+    this.isOnline = false;
   }
   
   async sync() {

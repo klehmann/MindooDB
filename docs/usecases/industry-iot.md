@@ -70,13 +70,14 @@ class SensorDataCollection {
           const db = await this.tenant.openDB(dbId);
           
           // Filter by date range while iterating
-          for await (const { doc } of db.iterateChangesSince(null, 100)) {
+          await db.processChangesSince(null, 100, (doc, cursor) => {
             const data = doc.getData();
             const timestamp = data.timestamp;
             if (timestamp >= startDate.getTime() && timestamp <= endDate.getTime()) {
               results.push(doc);
             }
-          }
+            return true; // Continue iterating
+          });
         } catch (error) {
           continue;
         }
@@ -193,9 +194,20 @@ class EdgeToCloudSync {
     );
   }
   
-  async syncFromCloud() {
-    // Pull configuration and firmware updates
-    await this.edgeDB.pullChangesFrom(this.cloudStore);
+  async syncFromCloud(): Promise<void> {
+    // Pull configuration and firmware updates from cloud
+    const localStore = this.edgeDB.getStore();
+    const newHashes = await this.cloudStore.findNewChanges(
+      await localStore.getAllChangeHashes()
+    );
+    
+    if (newHashes.length > 0) {
+      const changes = await this.cloudStore.getChanges(newHashes);
+      for (const change of changes) {
+        await localStore.append(change);
+      }
+      await this.edgeDB.syncStoreChanges(newHashes);
+    }
   }
   
   async startPeriodicSync(interval: number = 60 * 60 * 1000) {

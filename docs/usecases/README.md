@@ -74,43 +74,35 @@ Real-world applications organized by industry:
 
 ### Append-Only Growth Management
 
-Since MindooDB uses an append-only store, data grows over time. Key strategies:
+MindooDB uses an append-only store where document changes are cryptographically chained together, ensuring complete audit trails and tamper-proof history. However, this architecture means that data accumulates over time and cannot be deleted from the primary store. To manage this growth effectively, you should plan your database strategy from the start.
 
-- **Time-Based Sharding**: Split databases by time periods (e.g., "crm2025", "crm2026")
-- **Category-Based Splitting**: Separate databases by document type or project
-- **Archive Old Data**: Move historical data to read-only archive databases
+**Time-based sharding** splits databases by time periods. For example, a CRM application might use databases named `crm2025` and `crm2026`, allowing old years to be archived or accessed less frequently. **Category-based splitting** organizes data by document type or project, such as `invoices`, `customers`, and `products` in separate databases. This approach simplifies access control and enables independent scaling. When data becomes historical, you can move it to read-only archive databases that are synced less frequently, reducing active storage requirements.
 
-See [Data Modeling Patterns](data-modeling-patterns.md) for details.
+See [Data Modeling Patterns](data-modeling-patterns.md) for comprehensive strategies.
 
 ### Incremental Data Transfer
 
-Use `processChangesSince()` to efficiently transfer only new changes:
+The `processChangesSince()` method enables efficient incremental synchronization by tracking which changes have already been processed. This is fundamental to MindooDB's scalability—instead of transferring entire databases, you transfer only what's new since the last sync operation.
 
-- **Cross-Tenant Sync**: Share subsets of data with partners
-- **Bidirectional Sync**: Keep multiple tenants synchronized
-- **Efficient Updates**: Only transfer what's changed
+This capability powers cross-tenant synchronization where organizations share controlled subsets of data with partners. It enables bidirectional sync that keeps multiple tenants or databases consistent. Most importantly, it ensures that sync operations remain fast even as databases grow large, because only new changes are transferred rather than the entire dataset.
 
-See [Cross-Tenant Collaboration](cross-tenant-collaboration.md) and [Sync Patterns](sync-patterns.md).
+See [Cross-Tenant Collaboration](cross-tenant-collaboration.md) and [Sync Patterns](sync-patterns.md) for detailed patterns.
 
 ### Document-Level Access Control
 
-Use named encryption keys for fine-grained access:
+While MindooDB encrypts all data by default with tenant-wide keys, named encryption keys provide fine-grained access control at the document level. When you create a document with a specific named key, only users who possess that key can decrypt and read the document's contents.
 
-- **Secure Key Distribution**: Share keys offline via secure channels
-- **Key Rotation**: Update keys without breaking access
-- **Tiered Access**: Different keys for different sensitivity levels
+Key distribution should happen through secure out-of-band channels—in-person exchanges, encrypted email, or secure file sharing—never through the MindooDB database itself. Keys can be rotated by creating new versions and re-encrypting documents, though the append-only nature means old versions encrypted with previous keys remain in the history. Organizations typically implement tiered access by using different named keys for different sensitivity levels, such as `public-key`, `internal-key`, and `confidential-key`.
 
-See [Access Control Patterns](access-control-patterns.md).
+See [Access Control Patterns](access-control-patterns.md) for implementation details.
 
 ### Simple Backups & Mirroring
 
-Append-only nature enables powerful backup strategies:
+The append-only architecture dramatically simplifies backup and disaster recovery. Since data is never modified in place, backing up a MindooDB database is as simple as copying the append-only store files. Incremental backups only need to copy new entries since the last backup, making them fast and storage-efficient.
 
-- **Simple Backups**: Copy entire append-only store
-- **Mirroring Without Keys**: Mirror encrypted data without decryption keys
-- **Disaster Recovery**: Restore from encrypted backups
+A powerful feature is the ability to mirror encrypted data without possessing the decryption keys. A backup server can store complete encrypted copies of all tenant data, enabling disaster recovery even though the server cannot read any of the actual content. This separation of concerns means you can use untrusted infrastructure for backups while maintaining complete data privacy.
 
-See [Backups and Recovery](backups-and-recovery.md).
+See [Backups and Recovery](backups-and-recovery.md) for comprehensive backup strategies.
 
 ## Related Documentation
 

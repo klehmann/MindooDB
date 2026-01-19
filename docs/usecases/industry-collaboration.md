@@ -256,9 +256,25 @@ await dbB.changeDoc(doc, (d) => {
   d.getData().content = "New Content";
 });
 
-// Sync both ways
-await dbB.pullChangesFrom(dbA.getStore());
-await dbA.pullChangesFrom(dbB.getStore());
+// Sync both ways using store-level operations
+const storeA = dbA.getStore();
+const storeB = dbB.getStore();
+
+// B pulls from A
+const newForB = await storeA.findNewChanges(await storeB.getAllChangeHashes());
+if (newForB.length > 0) {
+  const changes = await storeA.getChanges(newForB);
+  for (const c of changes) await storeB.append(c);
+  await dbB.syncStoreChanges(newForB);
+}
+
+// A pulls from B
+const newForA = await storeB.findNewChanges(await storeA.getAllChangeHashes());
+if (newForA.length > 0) {
+  const changes = await storeB.getChanges(newForA);
+  for (const c of changes) await storeA.append(c);
+  await dbA.syncStoreChanges(newForA);
+}
 
 // Both changes preserved
 // Automerge automatically merges
@@ -279,11 +295,12 @@ await dbA.pullChangesFrom(dbB.getStore());
 ```typescript
 class OfflineFirstEditor {
   private db: MindooDB;
-  private serverStore: AppendOnlyStore | null = null;
+  private serverStore: ContentAddressedStore | null = null;
   
-  async editDocument(docId: string, changes: (data: any) => void) {
-    // Always edit locally first
+  async editDocument(docId: string, changes: (data: any) => void): Promise<void> {
+    // Always edit locally first - works offline
     const doc = await this.db.getDocument(docId);
+    
     await this.db.changeDoc(doc, (d) => {
       changes(d.getData());
     });
@@ -291,21 +308,53 @@ class OfflineFirstEditor {
     // Try to sync if online
     if (this.serverStore) {
       try {
-        await this.db.pushChangesTo(this.serverStore);
+        await this.pushToServer();
       } catch (error) {
-        console.log("Offline - will sync later");
+        console.log("Offline - changes saved locally, will sync later");
       }
     }
   }
   
-  async syncWhenOnline() {
+  async syncWhenOnline(): Promise<void> {
     if (!this.serverStore) return;
     
     try {
-      await this.db.pullChangesFrom(this.serverStore);
-      await this.db.pushChangesTo(this.serverStore);
+      await this.pullFromServer();
+      await this.pushToServer();
     } catch (error) {
       console.error("Sync failed:", error);
+    }
+  }
+  
+  private async pullFromServer(): Promise<void> {
+    if (!this.serverStore) return;
+    
+    const localStore = this.db.getStore();
+    const newHashes = await this.serverStore.findNewChanges(
+      await localStore.getAllChangeHashes()
+    );
+    
+    if (newHashes.length > 0) {
+      const changes = await this.serverStore.getChanges(newHashes);
+      for (const change of changes) {
+        await localStore.append(change);
+      }
+      await this.db.syncStoreChanges(newHashes);
+    }
+  }
+  
+  private async pushToServer(): Promise<void> {
+    if (!this.serverStore) return;
+    
+    const localStore = this.db.getStore();
+    const serverHashes = await this.serverStore.getAllChangeHashes();
+    const newHashes = await localStore.findNewChanges(serverHashes);
+    
+    if (newHashes.length > 0) {
+      const changes = await localStore.getChanges(newHashes);
+      for (const change of changes) {
+        await this.serverStore.append(change);
+      }
     }
   }
 }

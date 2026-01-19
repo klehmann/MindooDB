@@ -133,7 +133,7 @@ async function snapshotBackup(db: MindooDB) {
   const snapshots: Array<{docId: string, snapshot: Uint8Array}> = [];
   
   // Iterate through all documents
-  for await (const { doc } of db.iterateChangesSince(null, 100)) {
+  await db.processChangesSince(null, 1000, (doc, cursor) => {
     // Get all changes for document (note: fromLastSnapshot parameter not available)
     const changeHashes = await db.getStore().findNewChangesForDoc(
       [],
@@ -185,7 +185,16 @@ The append-only store contains encrypted changes. These can be synced without de
 // Server B wants to mirror it
 
 // Server B pulls changes from Server A
-await serverBStore.pullChangesFrom(serverAStore);
+// Sync at store level
+const newHashes = await serverAStore.findNewChanges(
+  await serverBStore.getAllChangeHashes()
+);
+if (newHashes.length > 0) {
+  const changes = await serverAStore.getChanges(newHashes);
+  for (const change of changes) {
+    await serverBStore.append(change);
+  }
+}
 
 // Server B now has encrypted changes
 // But cannot decrypt them (no keys)
@@ -201,7 +210,17 @@ await serverBStore.pullChangesFrom(serverAStore);
 // Neither needs the other's keys
 
 // Peer A pushes to Peer B
-await peerADB.pushChangesTo(peerBStore);
+// Push changes from peerA to peerB at store level
+const peerAStore = peerADB.getStore();
+const pushHashes = await peerAStore.findNewChanges(
+  await peerBStore.getAllChangeHashes()
+);
+if (pushHashes.length > 0) {
+  const changes = await peerAStore.getChanges(pushHashes);
+  for (const change of changes) {
+    await peerBStore.append(change);
+  }
+}
 
 // Peer B now has encrypted backup of Peer A's data
 // Can restore if Peer A loses data
@@ -223,7 +242,17 @@ await peerADB.pushChangesTo(peerBStore);
 // Server provides backup storage (no keys)
 
 // Client pushes encrypted changes to server
-await clientDB.pushChangesTo(serverStore);
+// Push client changes to server at store level
+const clientStore = clientDB.getStore();
+const clientNewHashes = await clientStore.findNewChanges(
+  await serverStore.getAllChangeHashes()
+);
+if (clientNewHashes.length > 0) {
+  const changes = await clientStore.getChanges(clientNewHashes);
+  for (const change of changes) {
+    await serverStore.append(change);
+  }
+}
 
 // Server stores encrypted backup
 // Server cannot read the data
@@ -248,7 +277,16 @@ const primaryStore = await createServerStore("primary-dc");
 const backupStore = await createServerStore("backup-dc");
 
 // Replicate encrypted data
-await backupStore.pullChangesFrom(primaryStore);
+// Backup syncs from primary at store level
+const backupHashes = await primaryStore.findNewChanges(
+  await backupStore.getAllChangeHashes()
+);
+if (backupHashes.length > 0) {
+  const changes = await primaryStore.getChanges(backupHashes);
+  for (const change of changes) {
+    await backupStore.append(change);
+  }
+}
 
 // Backup DC has encrypted copy
 // Cannot decrypt (keys stored separately)
@@ -297,7 +335,18 @@ async function recoverData(
   const recoveredDB = await tenant.openDB("recovered");
   
   // Pull all changes from backup
-  await recoveredDB.pullChangesFrom(backupStore);
+  // Recover from backup at store level
+  const recoveredStore = recoveredDB.getStore();
+  const recoverHashes = await backupStore.findNewChanges(
+    await recoveredStore.getAllChangeHashes()
+  );
+  if (recoverHashes.length > 0) {
+    const changes = await backupStore.getChanges(recoverHashes);
+    for (const change of changes) {
+      await recoveredStore.append(change);
+    }
+    await recoveredDB.syncStoreChanges(recoverHashes);
+  }
   
   // Data is now recovered
   // Can decrypt because we have keys
@@ -324,7 +373,18 @@ async function completeDisasterRecovery(
   // Step 3: Recover data
   const backupStore = await createStoreFromBackup(backupLocation);
   const db = await tenant.openDB("main");
-  await db.pullChangesFrom(backupStore);
+  // Restore from backup at store level
+  const dbStore = db.getStore();
+  const restoreHashes = await backupStore.findNewChanges(
+    await dbStore.getAllChangeHashes()
+  );
+  if (restoreHashes.length > 0) {
+    const changes = await backupStore.getChanges(restoreHashes);
+    for (const change of changes) {
+      await dbStore.append(change);
+    }
+    await db.syncStoreChanges(restoreHashes);
+  }
   
   // Step 4: Verify recovery
   await verifyRecovery(db);
@@ -458,12 +518,23 @@ async function testRestore(backupLocation: string) {
   
   // Restore from backup
   const backupStore = await createStoreFromBackup(backupLocation);
-  await testDB.pullChangesFrom(backupStore);
+  // Restore to test DB at store level
+  const testStore = testDB.getStore();
+  const testHashes = await backupStore.findNewChanges(
+    await testStore.getAllChangeHashes()
+  );
+  if (testHashes.length > 0) {
+    const changes = await backupStore.getChanges(testHashes);
+    for (const change of changes) {
+      await testStore.append(change);
+    }
+    await testDB.syncStoreChanges(testHashes);
+  }
   
   // Verify restored data
   let docCount = 0;
   let sampleDoc: MindooDoc | null = null;
-  for await (const { doc } of testDB.iterateChangesSince(null, 100)) {
+  await testDB.processChangesSince(null, 1000, (doc, cursor) => {
     if (docCount === 0) {
       sampleDoc = doc;
     }

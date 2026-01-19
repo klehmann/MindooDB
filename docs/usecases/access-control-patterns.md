@@ -8,94 +8,198 @@ MindooDB provides fine-grained access control through **named encryption keys**.
 
 ### Default vs. Named Keys
 
-MindooDB supports two types of encryption:
+MindooDB uses two types of encryption keys to control who can access document content.
 
-1. **Default Encryption** (`decryptionKeyId: "default"`):
-   - Uses tenant encryption key
-   - All tenant members can decrypt
-   - Suitable for general tenant-wide documents
+**Default Encryption** uses the tenant's encryption key, which is a fresh AES-256 symmetric key generated when the tenant is created. This key is separate from the admin keys—the admin signing key (Ed25519) is used for signing operations, and the admin encryption key (RSA-OAEP) is used only for encrypting sensitive directory data like usernames. All members of a tenant who have the default key in their KeyBag can decrypt documents encrypted with it. This is suitable for general tenant-wide documents where all team members should have access.
 
-2. **Named Key Encryption** (`decryptionKeyId: "<keyId>"`):
-   - Uses a named symmetric key
-   - Only users with that key can decrypt
-   - Enables document-level access control
+**Named Key Encryption** uses separate symmetric keys that are identified by a key ID and stored in the user's KeyBag. Only users who possess a specific named key can decrypt documents encrypted with that key. This enables fine-grained, document-level access control. For example, a document encrypted with the key ID `"hr-confidential"` can only be read by users who have that specific key in their KeyBag.
+
+The key difference is distribution scope: default keys are available to all tenant members automatically, while named keys must be explicitly distributed to specific users through secure offline channels.
 
 ### Key Distribution Model
 
-Named keys are distributed **offline** via secure channels:
-- Keys are encrypted with a password
-- Password shared via secure channel (phone, in-person, etc.)
-- Users import keys into their KeyBag
-- KeyBag is encrypted on disk with user's encryption key password
+Named keys are distributed **offline** to maintain end-to-end encryption guarantees. The distribution process works as follows:
+
+First, an administrator creates a symmetric key and encrypts it with a strong password. The encrypted key data can then be transmitted through any channel—email, file sharing, or direct transfer—since it cannot be decrypted without the password.
+
+Second, the password is shared through a **separate, secure channel**—typically a phone call, in-person meeting, or secure messaging. This separation ensures that even if the encrypted key is intercepted, an attacker cannot decrypt it without the password from the other channel.
+
+Third, the user imports the key into their KeyBag by providing the encrypted key data and the password. The KeyBag itself is encrypted with the user's encryption key password, providing an additional layer of protection at rest.
+
+This offline distribution model is essential to MindooDB's security: named keys never pass through any server in decrypted form, and the distribution process cannot be compromised by a malicious or compromised server.
 
 ## Document-Level Access Control
 
 ### Basic Pattern
 
+Document-level access control in MindooDB works through named encryption keys. When you want to restrict access to a specific document, you ensure that only the intended recipients have the named key required to decrypt it.
+
 **Pattern**: Use named keys to control access to specific documents
 
 ```typescript
-// Create a named key for sensitive documents
-const sensitiveKey = await tenantFactory.createSymmetricEncryptedPrivateKey(
-  "secure-password-123"
-);
+// Administrator: Create and distribute a named key for sensitive documents
+const tenantFactory = tenant.getFactory();
+const keyPassword = generateSecurePassword();
+const encryptedKey = await tenantFactory.createSymmetricEncryptedPrivateKey(keyPassword);
 
-// Create document encrypted with named key
-const sensitiveDoc = await db.createEncryptedDocument("sensitive-data-key");
+// Import the key into the KeyBag with a meaningful ID
+const keyBag = tenant.getKeyBag();
+const keyId = "sensitive-data-key";
+const decryptedKeyBytes = await tenantFactory.decryptSymmetricKey(encryptedKey, keyPassword);
+keyBag.setKey(keyId, decryptedKeyBytes);
+
+// Now documents can be encrypted with this key
+// When the tenant encrypts/decrypts, it uses the specified key from the KeyBag
+const db = await tenant.openDB("documents");
+const sensitiveDoc = await db.createDocument();
 await db.changeDoc(sensitiveDoc, (d) => {
   d.getData().content = "Top secret information";
+  d.getData().encryptionKeyId = keyId; // Store which key was used for reference
 });
+
+// The document changes are encrypted using the tenant's encryptPayload method
+// which uses the named key from the KeyBag
 ```
 
 **Benefits:**
-- Only users with the key can decrypt
-- Server cannot read the data
-- Fine-grained per-document control
-- Works offline
+- Only users with the named key can decrypt the document
+- The server cannot read the data—it only sees encrypted bytes
+- Fine-grained per-document or per-document-type control
+- Works completely offline once keys are distributed
 
 ### Tiered Access Patterns
+
+Many organizations have data classification systems with multiple sensitivity levels. MindooDB supports this through a hierarchy of named keys, where users are granted keys based on their clearance level.
 
 **Pattern**: Different keys for different sensitivity levels
 
 ```typescript
-// Create keys for different security levels
-const publicKey = "default"; // Tenant key
-const internalKey = await tenantFactory.createSymmetricEncryptedPrivateKey("internal-pwd");
-const confidentialKey = await tenantFactory.createSymmetricEncryptedPrivateKey("confidential-pwd");
-const secretKey = await tenantFactory.createSymmetricEncryptedPrivateKey("secret-pwd");
+// Set up keys for different security levels
+// Public data uses the default tenant key - all members can access
+const publicKeyId = "default";
 
-// Create documents with appropriate keys
-const publicDoc = await db.createDocument(); // Uses default key
-const internalDoc = await db.createEncryptedDocument("internal-key");
-const confidentialDoc = await db.createEncryptedDocument("confidential-key");
-const secretDoc = await db.createEncryptedDocument("secret-key");
+// Higher classification levels use named keys with controlled distribution
+const internalKeyId = "internal-key";
+const confidentialKeyId = "confidential-key";
+const secretKeyId = "secret-key";
+
+// Administrator creates and imports keys (in practice, these are distributed separately)
+async function setupSecurityKeys(adminTenant: MindooTenant) {
+  const factory = adminTenant.getFactory();
+  const keyBag = adminTenant.getKeyBag();
+  
+  // Create keys for each level (store passwords securely for distribution)
+  for (const keyId of [internalKeyId, confidentialKeyId, secretKeyId]) {
+    const password = generateSecurePassword();
+    const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(password);
+    const keyBytes = await factory.decryptSymmetricKey(encryptedKey, password);
+    keyBag.setKey(keyId, keyBytes);
+    
+    // Store encrypted key and password securely for distribution to authorized users
+    await storeForDistribution(keyId, encryptedKey, password);
+  }
+}
+
+// When creating documents, use the appropriate key based on classification
+async function createClassifiedDocument(
+  db: MindooDB,
+  classification: 'public' | 'internal' | 'confidential' | 'secret',
+  content: any
+): Promise<MindooDoc> {
+  const keyId = {
+    public: "default",
+    internal: internalKeyId,
+    confidential: confidentialKeyId,
+    secret: secretKeyId
+  }[classification];
+  
+  const doc = await db.createEncryptedDocument(keyId);
+  await db.changeDoc(doc, (d) => {
+    Object.assign(d.getData(), content);
+    d.getData().classification = classification;
+    d.getData().encryptionKeyId = keyId;
+  });
+  
+  return doc;
+}
 ```
 
 **Use Cases:**
-- Government classification levels
-- Corporate data classification
-- Healthcare data sensitivity levels
-- Financial data tiers
+- Government classification levels (Unclassified, Confidential, Secret, Top Secret)
+- Corporate data classification (Public, Internal, Confidential, Restricted)
+- Healthcare data sensitivity levels (General, PHI, Sensitive PHI)
+- Financial data tiers (Public, Customer, Proprietary)
 
 ### Project-Based Access
+
+In project-based organizations, different teams work on isolated projects and should only access their own project data. Named keys provide natural boundaries between projects.
 
 **Pattern**: Separate keys for different projects
 
 ```typescript
-// Create keys per project
-const projectAlphaKey = await tenantFactory.createSymmetricEncryptedPrivateKey("alpha-pwd");
-const projectBetaKey = await tenantFactory.createSymmetricEncryptedPrivateKey("beta-pwd");
-
-// Documents encrypted with project-specific keys
-const alphaDoc = await db.createEncryptedDocument("project-alpha-key");
-const betaDoc = await db.createEncryptedDocument("project-beta-key");
+class ProjectKeyManager {
+  constructor(private tenant: MindooTenant) {}
+  
+  /**
+   * Creates a new project with its own encryption key.
+   * Returns the key ID and encrypted key for distribution.
+   */
+  async createProject(projectName: string): Promise<{
+    keyId: string;
+    encryptedKey: Uint8Array;
+    password: string;
+  }> {
+    const keyId = `project-${projectName}-key`;
+    const password = generateSecurePassword();
+    const factory = this.tenant.getFactory();
+    
+    // Create encrypted key for distribution
+    const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(password);
+    
+    // Import into creator's KeyBag
+    const keyBytes = await factory.decryptSymmetricKey(encryptedKey, password);
+    this.tenant.getKeyBag().setKey(keyId, keyBytes);
+    
+    return { keyId, encryptedKey, password };
+  }
+  
+  /**
+   * Grants a user access to a project by distributing the project key.
+   */
+  async grantProjectAccess(
+    userTenant: MindooTenant,
+    keyId: string,
+    encryptedKey: Uint8Array,
+    password: string
+  ): Promise<void> {
+    const factory = userTenant.getFactory();
+    const keyBytes = await factory.decryptSymmetricKey(encryptedKey, password);
+    userTenant.getKeyBag().setKey(keyId, keyBytes);
+  }
+  
+  /**
+   * Creates a document for a specific project.
+   */
+  async createProjectDocument(
+    projectKeyId: string,
+    data: any
+  ): Promise<MindooDoc> {
+    const db = await this.tenant.openDB("projects");
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (d) => {
+      Object.assign(d.getData(), data);
+      d.getData().projectKeyId = projectKeyId;
+    });
+    return doc;
+  }
+}
 ```
 
 **Benefits:**
-- Project isolation
-- Users only get keys for projects they're on
-- Easy to revoke project access (stop sharing key)
-- Clear access boundaries
+- Project data is cryptographically isolated
+- Users only get keys for projects they're assigned to
+- Revoking access is simple: stop distributing new key versions
+- Clear access boundaries that are enforced by encryption, not just access control lists
 
 ### Role-Based Key Distribution
 

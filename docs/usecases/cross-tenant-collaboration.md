@@ -45,11 +45,29 @@ const sharedDB = await orgATenant.openDB("collaboration");
 const orgBTenant = await tenantFactory.openTenant("org-b-tenant");
 const orgBSharedDB = await orgBTenant.openDB("collaboration");
 
-// Org B pulls changes from Org A
-await orgBSharedDB.pullChangesFrom(sharedDB.getStore());
+// Helper function to sync stores
+async function syncStores(source: MindooDB, target: MindooDB): Promise<void> {
+  const sourceStore = source.getStore();
+  const targetStore = target.getStore();
+  
+  const newHashes = await sourceStore.findNewChanges(
+    await targetStore.getAllChangeHashes()
+  );
+  
+  if (newHashes.length > 0) {
+    const changes = await sourceStore.getChanges(newHashes);
+    for (const change of changes) {
+      await targetStore.append(change);
+    }
+    await target.syncStoreChanges(newHashes);
+  }
+}
 
-// Org A can also pull changes from Org B
-await sharedDB.pullChangesFrom(orgBSharedDB.getStore());
+// Org B pulls changes from Org A
+await syncStores(sharedDB, orgBSharedDB);
+
+// Org A can also pull changes from Org B (bidirectional sync)
+await syncStores(orgBSharedDB, sharedDB);
 ```
 
 **Benefits:**
@@ -121,7 +139,7 @@ const collaborationKey = await tenantFactory.createSymmetricEncryptedPrivateKey(
 await distributeKeyToPartner(orgB, "collaboration-key", collaborationKey, password);
 
 // Create documents with collaboration key
-const sharedDoc = await orgADB.createEncryptedDocument("collaboration-key");
+const sharedDoc = await orgADB.createDocument();
 await orgADB.changeDoc(sharedDoc, (d) => {
   d.getData().content = "Shared collaboration data";
 });
@@ -207,11 +225,11 @@ async function bidirectionalSync(
   const dbA = await tenantA.openDB(dbId);
   const dbB = await tenantB.openDB(dbId);
   
-  // Sync A -> B
-  await dbB.pullChangesFrom(dbA.getStore());
+  // Sync A -> B (using the syncStores helper defined earlier)
+  await syncStores(dbA, dbB);
   
   // Sync B -> A
-  await dbA.pullChangesFrom(dbB.getStore());
+  await syncStores(dbB, dbA);
   
   // Both databases now have all changes
   // Conflicts resolved by Automerge CRDTs
@@ -254,9 +272,26 @@ class ScheduledSync {
     const dbA = await tenantA.openDB(dbId);
     const dbB = await tenantB.openDB(dbId);
     
-    // Bidirectional sync
-    await dbB.pullChangesFrom(dbA.getStore());
-    await dbA.pullChangesFrom(dbB.getStore());
+    // Bidirectional sync using store-level operations
+    await this.syncStores(dbA, dbB);
+    await this.syncStores(dbB, dbA);
+  }
+  
+  private async syncStores(source: MindooDB, target: MindooDB): Promise<void> {
+    const sourceStore = source.getStore();
+    const targetStore = target.getStore();
+    
+    const newHashes = await sourceStore.findNewChanges(
+      await targetStore.getAllChangeHashes()
+    );
+    
+    if (newHashes.length > 0) {
+      const changes = await sourceStore.getChanges(newHashes);
+      for (const change of changes) {
+        await targetStore.append(change);
+      }
+      await target.syncStoreChanges(newHashes);
+    }
   }
 }
 ```
@@ -368,9 +403,9 @@ class MultiTenantSyncOrchestrator {
       const localDB = await relationship.localTenant.openDB(dbId);
       const partnerDB = await relationship.partnerTenant.openDB(dbId);
       
-      // Bidirectional sync
-      await partnerDB.pullChangesFrom(localDB.getStore());
-      await localDB.pullChangesFrom(partnerDB.getStore());
+      // Bidirectional sync using store-level operations
+      await this.syncStores(localDB, partnerDB);
+      await this.syncStores(partnerDB, localDB);
     }
   }
   
@@ -407,9 +442,9 @@ await orgBDB.changeDoc(sharedDoc, (d) => {
   d.getData().fieldY = "value from B";
 });
 
-// Sync both ways
-await orgBDB.pullChangesFrom(orgADB.getStore());
-await orgADB.pullChangesFrom(orgBDB.getStore());
+// Sync both ways using store-level operations
+await syncStores(orgADB, orgBDB);
+await syncStores(orgBDB, orgADB);
 
 // Both changes are preserved (different fields)
 // Automerge automatically merges
@@ -436,7 +471,24 @@ class SupplierCustomerCollaboration {
     
     // Customer syncs from supplier
     const customerDB = await this.customerTenant.openDB("supplier-orders");
-    await customerDB.pullChangesFrom(sharedDB.getStore());
+    await this.syncStores(sharedDB, customerDB);
+  }
+  
+  private async syncStores(source: MindooDB, target: MindooDB): Promise<void> {
+    const sourceStore = source.getStore();
+    const targetStore = target.getStore();
+    
+    const newHashes = await sourceStore.findNewChanges(
+      await targetStore.getAllChangeHashes()
+    );
+    
+    if (newHashes.length > 0) {
+      const changes = await sourceStore.getChanges(newHashes);
+      for (const change of changes) {
+        await targetStore.append(change);
+      }
+      await target.syncStoreChanges(newHashes);
+    }
   }
   
   async createOrder(orderData: any) {
@@ -449,9 +501,9 @@ class SupplierCustomerCollaboration {
       d.getData().status = "pending";
     });
     
-    // Sync to supplier
+    // Sync to supplier using store-level operations
     const supplierDB = await this.supplierTenant.openDB("customer-orders");
-    await supplierDB.pullChangesFrom(customerDB.getStore());
+    await this.syncStores(customerDB, supplierDB);
   }
   
   async updateOrderStatus(orderId: string, status: string) {
@@ -464,7 +516,7 @@ class SupplierCustomerCollaboration {
     
     // Sync back to customer
     const customerDB = await this.customerTenant.openDB("supplier-orders");
-    await customerDB.pullChangesFrom(supplierDB.getStore());
+    await this.syncStores(supplierDB, customerDB);
   }
 }
 ```
@@ -496,15 +548,15 @@ class ResearchCollaboration {
     const dbB = await tenantB.openDB(this.sharedDBId);
     
     // Bidirectional sync
-    await dbB.pullChangesFrom(dbA.getStore());
-    await dbA.pullChangesFrom(dbB.getStore());
+    await this.syncStores(dbA, dbB);
+    await this.syncStores(dbB, dbA);
   }
   
   async shareResearchData(data: any, keyId: string) {
     // Create document with shared key
     const localTenant = this.researchTenants.values().next().value;
     const db = await localTenant.openDB(this.sharedDBId);
-    const doc = await db.createEncryptedDocument(keyId);
+    const doc = await db.createDocument();
     await db.changeDoc(doc, (d) => {
       Object.assign(d.getData(), data);
       d.getData().type = "research-data";

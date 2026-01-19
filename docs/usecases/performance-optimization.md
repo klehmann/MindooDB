@@ -42,7 +42,7 @@ class DatabaseSplitter {
   
   async getDatabaseStats(db: MindooDB): Promise<any> {
     let documentCount = 0;
-    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+    await db.processChangesSince(null, 100, (doc, cursor) => {
       documentCount++;
     }
     return {
@@ -195,7 +195,7 @@ class StorageManagement {
     archiveDB: MindooDB
   ) {
     // Find old documents and copy to archive
-    for await (const { doc } of db.iterateChangesSince(null, 100)) {
+    await db.processChangesSince(null, 100, (doc, cursor) => {
       const data = doc.getData();
       if (data.createdAt && data.createdAt < archiveDate.getTime()) {
         const changeHashes = await db.getStore()
@@ -249,7 +249,7 @@ class ViewBasedIndexing {
     for await (const entry of nav.entriesForward()) {
       if (entry.isDocument()) {
         // Get document from view
-        const doc = await this.getDocument(entry.docId);
+        const doc = await this.db.getDocument(entry.docId);
         results.push(doc);
       }
     }

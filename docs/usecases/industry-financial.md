@@ -64,13 +64,14 @@ class TransactionLedger {
         const db = await this.tenant.openDB(dbId);
         let transaction: MindooDoc | null = null;
         
-        for await (const { doc } of db.iterateChangesSince(null, 100)) {
+        await db.processChangesSince(null, 100, (doc, cursor) => {
           const data = doc.getData();
           if (data.transactionId === transactionId) {
             transaction = doc;
-            break;
+            return false; // Stop iterating
           }
-        }
+          return true; // Continue
+        });
         
         if (transaction) {
           await db.changeDoc(transaction, (d) => {
@@ -98,7 +99,7 @@ class TransactionLedger {
           const db = await this.tenant.openDB(dbId);
           
           // Filter by account and date range while iterating
-          for await (const { doc } of db.iterateChangesSince(null, 100)) {
+          await db.processChangesSince(null, 100, (doc, cursor) => {
             const data = doc.getData();
             const timestamp = data.timestamp;
             if ((data.fromAccount === accountId || data.toAccount === accountId) &&
@@ -106,7 +107,8 @@ class TransactionLedger {
                 timestamp <= endDate.getTime()) {
               results.push(doc);
             }
-          }
+            return true; // Continue iterating
+          });
         } catch (error) {
           continue;
         }
@@ -148,7 +150,7 @@ class MultiPartyAgreement {
       await this.distributeKeyToParty(partyId, agreementKeyId, agreementKey);
     }
     
-    // Create agreement document
+    // Create agreement document with the shared key
     const db = await this.tenant.openDB("agreements");
     const doc = await db.createEncryptedDocument(agreementKeyId);
     await db.changeDoc(doc, (d) => {
@@ -157,6 +159,7 @@ class MultiPartyAgreement {
       d.getData().parties = parties;
       d.getData().status = "draft";
       d.getData().createdAt = Date.now();
+      d.getData().encryptionKeyId = agreementKeyId;
     });
     
     return doc;
@@ -314,11 +317,12 @@ class TransactionAccessControl {
       await this.distributeKeyToUser(userId, transactionKeyId, transactionKey);
     }
     
-    // Create transaction
+    // Create transaction with the transaction-specific key
     const db = await this.tenant.openDB("transactions");
     const doc = await db.createEncryptedDocument(transactionKeyId);
     await db.changeDoc(doc, (d) => {
       Object.assign(d.getData(), transaction);
+      d.getData().encryptionKeyId = transactionKeyId;
     });
     
     return doc;
@@ -351,12 +355,13 @@ class FinancialAuditTrail {
     const auditDB = await this.tenant.openDB("audit-logs");
     const matchingLogs: MindooDoc[] = [];
     
-    for await (const { doc } of auditDB.iterateChangesSince(null, 100)) {
+    await auditDB.processChangesSince(null, 1000, (doc, cursor) => {
       const data = doc.getData();
       if (data.transactionId === transactionId) {
         matchingLogs.push(doc);
       }
-    }
+      return true; // Continue iterating
+    });
     
     // Sort by timestamp
     return matchingLogs.sort((a, b) => {
