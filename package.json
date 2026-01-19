@@ -38,5 +38,12 @@
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.6.0"
   },
-  "peerDependenciesMeta": {}
+  "peerDependenciesMeta": {},
+  {
+    "repository": {
+      "type": "git",
+      "url": "https://github.com/klehmann/mindoodb.git"
+    },
+    "keywords": ["database", "e2e-encryption", "offline-first", "sync", "crdt", "automerge"]
+  }  
 }
