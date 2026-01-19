@@ -1,6 +1,6 @@
 {
   "name": "mindoodb-example-server",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "private": true,
   "description": "Example MindooDB sync server with client-to-server and server-to-server sync support",
   "main": "dist/index.js",

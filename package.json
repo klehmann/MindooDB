@@ -1,10 +1,15 @@
 {
   "name": "mindoodb",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "End-to-End Encrypted, Offline-first Sync Database",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.js",
   "types": "./dist/core/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/klehmann/mindoodb.git"
+  },
+  "keywords": ["database", "e2e-encryption", "offline-first", "sync", "crdt", "automerge"],
   "exports": {
     ".": {
       "browser": "./dist/browser/index.js",
@@ -38,12 +43,5 @@
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.6.0"
   },
-  "peerDependenciesMeta": {},
-  {
-    "repository": {
-      "type": "git",
-      "url": "https://github.com/klehmann/mindoodb.git"
-    },
-    "keywords": ["database", "e2e-encryption", "offline-first", "sync", "crdt", "automerge"]
-  }  
+  "peerDependenciesMeta": {}
 }
