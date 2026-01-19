@@ -7,9 +7,16 @@
   "types": "./dist/core/index.d.ts",
   "repository": {
     "type": "git",
-    "url": "https://github.com/klehmann/mindoodb.git"
+    "url": "git+https://github.com/klehmann/mindoodb.git"
   },
-  "keywords": ["database", "e2e-encryption", "offline-first", "sync", "crdt", "automerge"],
+  "keywords": [
+    "database",
+    "e2e-encryption",
+    "offline-first",
+    "sync",
+    "crdt",
+    "automerge"
+  ],
   "exports": {
     ".": {
       "browser": "./dist/browser/index.js",
