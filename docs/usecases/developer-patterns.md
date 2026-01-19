@@ -521,8 +521,9 @@ class LocalDevelopment {
     for (let i = 0; i < 10; i++) {
       const doc = await db.createDocument();
       await db.changeDoc(doc, (d) => {
-        d.getData().testId = i;
-        d.getData().name = `Test ${i}`;
+        const data = d.getData();
+        data.testId = i;
+        data.name = `Test ${i}`;
       });
     }
   }

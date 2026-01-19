@@ -100,8 +100,9 @@ const db = await tenant.openDB("contacts");
 const doc = await db.createDocument();
 
 await db.changeDoc(doc, async (d) => {
-  d.getData().name = "John Doe";
-  d.getData().email = "john@example.com";
+  const data = d.getData();
+  data.name = "John Doe";
+  data.email = "john@example.com";
 });
 
 // 6. Read it back
