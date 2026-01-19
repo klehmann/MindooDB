@@ -1,4 +1,4 @@
-# MindooDB
+# MindooDB - Your Data. Your Control.
 
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
