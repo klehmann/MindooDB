@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB's architecture is already designed to support peer-to-peer (P2P) synchronization. The `AppendOnlyStore` interface provides a clean abstraction that allows different implementations—including network-backed stores that communicate with remote peers.
+MindooDB's architecture is already designed to support peer-to-peer (P2P) synchronization. The `ContentAddressedStore` interface provides a clean abstraction that allows different implementations—including network-backed stores that communicate with remote peers.
 
 This document outlines how to implement P2P sync for MindooDB, focusing on mobile applications (iOS/Android) using JavaScript/TypeScript.
 
@@ -10,18 +10,18 @@ This document outlines how to implement P2P sync for MindooDB, focusing on mobil
 
 ### Existing Architecture
 
-MindooDB's sync mechanism is already P2P-ready through the `AppendOnlyStore` interface:
+MindooDB's sync mechanism is already P2P-ready through the `ContentAddressedStore` interface:
 
-1. **Change Exchange**: Peers exchange lists of change hashes they have
-2. **Missing Changes**: Each peer identifies which changes they're missing
-3. **Change Transfer**: Missing changes are requested and transferred
-4. **Local Processing**: Changes are appended to the local store and processed
+1. **Entry Exchange**: Peers exchange lists of entry IDs they have
+2. **Missing Entries**: Each peer identifies which entries they're missing
+3. **Entry Transfer**: Missing entries are requested and transferred
+4. **Local Processing**: Entries are stored locally and processed
 
 The key methods that enable this are:
 
-- `findNewChanges(haveChangeHashes)`: Find changes the remote has that we don't
-- `getChanges(changeHashes)`: Fetch the actual change payloads
-- `append(change)`: Store changes locally (handles deduplication)
+- `findNewEntries(knownIds)`: Find entries the remote has that we don't
+- `getEntries(ids)`: Fetch the actual entry payloads
+- `putEntries(entries)`: Store entries locally (handles deduplication)
 
 ### High-Level Sync Flow
 
@@ -30,26 +30,26 @@ The key methods that enable this are:
 const dbA = await tenant.openDB("contacts");
 const dbB = await tenant.openDB("contacts");
 
-// Client A pulls changes from Client B
+// Client A pulls entries from Client B
 await dbA.pullChangesFrom(dbB.getStore());
 
-// Client B pulls changes from Client A
+// Client B pulls entries from Client A
 await dbB.pullChangesFrom(dbA.getStore());
 ```
 
 The `pullChangesFrom()` and `pushChangesTo()` methods in `BaseMindooDB` handle the complete sync flow:
 
-1. Compare change hashes between local and remote stores
-2. Identify missing changes
-3. Transfer missing changes
-4. Append to local store (with deduplication)
-5. Process changes to update document state
+1. Compare entry IDs between local and remote stores
+2. Identify missing entries
+3. Transfer missing entries
+4. Store in local store (with deduplication)
+5. Process entries to update document state
 
 ### Network-Backed Store Pattern
 
-To enable P2P sync, you need a `NetworkAppendOnlyStore` that:
+To enable P2P sync, you need a `NetworkContentAddressedStore` that:
 
-- Implements the `AppendOnlyStore` interface
+- Implements the `ContentAddressedStore` interface
 - Wraps a local store (for caching and offline operation)
 - Communicates with remote peers over the network
 - Handles connection management and error recovery
@@ -259,25 +259,25 @@ This provides the best user experience with automatic discovery when possible, a
 
 ## Implementation Architecture
 
-### NetworkAppendOnlyStore Pattern
+### NetworkContentAddressedStore Pattern
 
 The network-backed store wraps a local store and adds network communication:
 
 ```typescript
-// NetworkAppendOnlyStore.ts
-import { AppendOnlyStore } from './types';
-import { MindooDocChange, MindooDocChangeHashes } from '../types';
+// NetworkContentAddressedStore.ts
+import { ContentAddressedStore } from './types';
+import { StoreEntry, StoreEntryMetadata } from '../types';
 
 /**
- * Network-backed AppendOnlyStore that communicates with remote peers
+ * Network-backed ContentAddressedStore that communicates with remote peers
  * over WebRTC or other P2P protocols.
  */
-export class NetworkAppendOnlyStore implements AppendOnlyStore {
+export class NetworkContentAddressedStore implements ContentAddressedStore {
   private dbId: string;
-  private localStore: AppendOnlyStore; // Local cache
+  private localStore: ContentAddressedStore; // Local cache
   private peerConnection: PeerConnection; // WebRTC or other P2P connection
   
-  constructor(dbId: string, localStore: AppendOnlyStore, peerConnection: PeerConnection) {
+  constructor(dbId: string, localStore: ContentAddressedStore, peerConnection: PeerConnection) {
     this.dbId = dbId;
     this.localStore = localStore;
     this.peerConnection = peerConnection;
@@ -287,83 +287,122 @@ export class NetworkAppendOnlyStore implements AppendOnlyStore {
     return this.dbId;
   }
   
-  async append(change: MindooDocChange): Promise<void> {
-    // Always append locally first
-    await this.localStore.append(change);
+  async putEntries(entries: StoreEntry[]): Promise<void> {
+    // Always store locally first
+    await this.localStore.putEntries(entries);
     
     // Then send to remote peer (if connected)
     if (this.peerConnection.isConnected()) {
-      await this.peerConnection.send('append', change);
+      await this.peerConnection.send('putEntries', entries);
     }
   }
   
-  async findNewChanges(haveChangeHashes: MindooDocChangeHashes[]): Promise<MindooDocChangeHashes[]> {
+  async findNewEntries(knownIds: string[]): Promise<StoreEntryMetadata[]> {
     // Check local store first
-    const localNew = await this.localStore.findNewChanges(haveChangeHashes);
+    const localNew = await this.localStore.findNewEntries(knownIds);
     
     // Also check remote peer
     if (this.peerConnection.isConnected()) {
-      const remoteNew = await this.peerConnection.request('findNewChanges', haveChangeHashes);
-      // Merge and deduplicate
-      return this.mergeChangeHashes(localNew, remoteNew);
+      const remoteNew = await this.peerConnection.request('findNewEntries', knownIds);
+      // Merge and deduplicate by entry ID
+      return this.mergeEntryMetadata(localNew, remoteNew);
     }
     
     return localNew;
   }
   
-  async getChanges(changeHashes: MindooDocChangeHashes[]): Promise<MindooDocChange[]> {
+  async findNewEntriesForDoc(knownIds: string[], docId: string): Promise<StoreEntryMetadata[]> {
+    // Check local store first
+    const localNew = await this.localStore.findNewEntriesForDoc(knownIds, docId);
+    
+    // Also check remote peer
+    if (this.peerConnection.isConnected()) {
+      const remoteNew = await this.peerConnection.request('findNewEntriesForDoc', { knownIds, docId });
+      return this.mergeEntryMetadata(localNew, remoteNew);
+    }
+    
+    return localNew;
+  }
+  
+  async getEntries(ids: string[]): Promise<StoreEntry[]> {
     // Try local store first
-    const localChanges = await this.localStore.getChanges(changeHashes);
-    const localHashes = new Set(localChanges.map(c => c.changeHash));
+    const localEntries = await this.localStore.getEntries(ids);
+    const localIds = new Set(localEntries.map(e => e.id));
     
-    // Find missing changes
-    const missing = changeHashes.filter(ch => !localHashes.has(ch.changeHash));
+    // Find missing entries
+    const missingIds = ids.filter(id => !localIds.has(id));
     
-    if (missing.length > 0 && this.peerConnection.isConnected()) {
+    if (missingIds.length > 0 && this.peerConnection.isConnected()) {
       // Fetch from remote
-      const remoteChanges = await this.peerConnection.request('getChanges', missing);
+      const remoteEntries = await this.peerConnection.request('getEntries', missingIds);
       // Cache locally
-      for (const change of remoteChanges) {
-        await this.localStore.append(change);
-      }
-      return [...localChanges, ...remoteChanges];
+      await this.localStore.putEntries(remoteEntries);
+      return [...localEntries, ...remoteEntries];
     }
     
-    return localChanges;
+    return localEntries;
   }
   
-  async getAllChangeHashes(): Promise<MindooDocChangeHashes[]> {
+  async hasEntries(ids: string[]): Promise<string[]> {
+    // Check local store first
+    const localHas = await this.localStore.hasEntries(ids);
+    const localSet = new Set(localHas);
+    
+    // Check remote for any IDs we don't have locally
+    const notLocal = ids.filter(id => !localSet.has(id));
+    
+    if (notLocal.length > 0 && this.peerConnection.isConnected()) {
+      const remoteHas = await this.peerConnection.request('hasEntries', notLocal);
+      return [...localHas, ...remoteHas];
+    }
+    
+    return localHas;
+  }
+  
+  async getAllIds(): Promise<string[]> {
     // Merge local and remote
-    const local = await this.localStore.getAllChangeHashes();
+    const local = await this.localStore.getAllIds();
     
     if (this.peerConnection.isConnected()) {
-      const remote = await this.peerConnection.request('getAllChangeHashes', []);
-      return this.mergeChangeHashes(local, remote);
+      const remote = await this.peerConnection.request('getAllIds', []);
+      // Deduplicate
+      return [...new Set([...local, ...remote])];
     }
     
     return local;
   }
   
-  async getAllChangeHashesForDoc(docId: string, fromLastSnapshot: boolean): Promise<MindooDocChangeHashes[]> {
-    // Similar pattern - check local, then remote
-    const local = await this.localStore.getAllChangeHashesForDoc(docId, fromLastSnapshot);
-    
+  async resolveDependencies(
+    startId: string,
+    options?: Record<string, unknown>
+  ): Promise<string[]> {
+    // Prefer remote resolution (more efficient - single round trip)
     if (this.peerConnection.isConnected()) {
-      const remote = await this.peerConnection.request('getAllChangeHashesForDoc', [docId, fromLastSnapshot]);
-      return this.mergeChangeHashes(local, remote);
+      return await this.peerConnection.request('resolveDependencies', { startId, options });
     }
     
-    return local;
+    // Fall back to local resolution
+    return this.localStore.resolveDependencies(startId, options);
   }
   
-  private mergeChangeHashes(a: MindooDocChangeHashes[], b: MindooDocChangeHashes[]): MindooDocChangeHashes[] {
+  async purgeDocHistory(docId: string): Promise<void> {
+    // Purge locally
+    await this.localStore.purgeDocHistory(docId);
+    
+    // Request purge on remote (if connected)
+    if (this.peerConnection.isConnected()) {
+      await this.peerConnection.send('purgeDocHistory', docId);
+    }
+  }
+  
+  private mergeEntryMetadata(a: StoreEntryMetadata[], b: StoreEntryMetadata[]): StoreEntryMetadata[] {
     const seen = new Set<string>();
-    const result: MindooDocChangeHashes[] = [];
+    const result: StoreEntryMetadata[] = [];
     
-    for (const hash of [...a, ...b]) {
-      if (!seen.has(hash.changeHash)) {
-        seen.add(hash.changeHash);
-        result.push(hash);
+    for (const entry of [...a, ...b]) {
+      if (!seen.has(entry.id)) {
+        seen.add(entry.id);
+        result.push(entry);
       }
     }
     
@@ -395,12 +434,12 @@ The recommended pattern is to use a hybrid store that:
 
 1. **Always checks local first**: Fast, works offline
 2. **Falls back to network**: Fetches missing data from peers
-3. **Caches network data**: Stores fetched changes locally
+3. **Caches network data**: Stores fetched entries locally
 4. **Handles disconnections**: Gracefully degrades to local-only
 
 This provides:
 - **Offline-first**: Works without network
-- **Efficient sync**: Only transfers missing changes
+- **Efficient sync**: Only transfers missing entries
 - **Automatic caching**: Network data becomes local
 - **Resilient**: Handles network failures
 
@@ -424,23 +463,25 @@ This provides:
 
 1. **Set up React Native project** with TypeScript
 2. **Implement PeerConnection wrapper** around WebRTC
-3. **Implement NetworkAppendOnlyStore** that wraps local store
+3. **Implement NetworkContentAddressedStore** that wraps local store
 4. **Add mDNS discovery** for automatic peer finding
 5. **Use existing sync methods**: `pullChangesFrom()` / `pushChangesTo()`
 
-The key advantage: your existing `BaseMindooDB` code doesn't need to change—just swap in a `NetworkAppendOnlyStore` instead of `InMemoryAppendOnlyStore`.
+The key advantage: your existing `BaseMindooDB` code doesn't need to change—just swap in a `NetworkContentAddressedStore` instead of `InMemoryContentAddressedStore`.
 
 ## Protocol Design
 
 ### Message Types
 
-The network protocol needs to support the `AppendOnlyStore` operations:
+The network protocol needs to support the `ContentAddressedStore` operations:
 
-1. **findNewChanges**: Request missing changes
-2. **getChanges**: Fetch change payloads
-3. **getAllChangeHashes**: Get all change hashes
-4. **getAllChangeHashesForDoc**: Get changes for a document
-5. **append**: Push a new change (optional, for real-time sync)
+1. **findNewEntries**: Request missing entries
+2. **getEntries**: Fetch entry payloads
+3. **getAllIds**: Get all entry IDs
+4. **findNewEntriesForDoc**: Get entries for a specific document
+5. **putEntries**: Push new entries (optional, for real-time sync)
+6. **hasEntries**: Check which entry IDs exist
+7. **resolveDependencies**: Traverse entry dependency chains
 
 ### Message Format
 
@@ -459,14 +500,14 @@ interface NetworkMessage {
 1. **Discovery**: Find peers via mDNS or manual entry
 2. **Connection**: Establish WebRTC connection
 3. **Authentication**: Verify peer identity (optional, using tenant keys)
-4. **Sync**: Exchange changes using `AppendOnlyStore` methods
+4. **Sync**: Exchange entries using `ContentAddressedStore` methods
 5. **Maintenance**: Keep connection alive, handle reconnection
 
 ## Security Considerations
 
 ### Peer Authentication
 
-While MindooDB uses cryptographic signatures for change verification, you may want to verify peer identity:
+While MindooDB uses cryptographic signatures for entry verification, you may want to verify peer identity:
 
 - **Tenant-based**: Only sync with peers in the same tenant
 - **Key exchange**: Exchange public keys during connection
@@ -476,7 +517,7 @@ While MindooDB uses cryptographic signatures for change verification, you may wa
 
 - **WebRTC**: Encrypted by default (DTLS)
 - **Application layer**: Additional encryption if needed
-- **Change payloads**: Already encrypted by MindooDB
+- **Entry payloads**: Already encrypted by MindooDB
 
 ### Network Security
 
@@ -486,18 +527,18 @@ While MindooDB uses cryptographic signatures for change verification, you may wa
 
 ## Performance Considerations
 
-### Change Batching
+### Entry Batching
 
-For efficiency, batch multiple changes:
+For efficiency, batch multiple entries:
 
-- Send multiple change hashes in one request
-- Fetch multiple changes in one response
+- Send multiple entry IDs in one request
+- Fetch multiple entries in one response
 - Use compression for large payloads
 
 ### Incremental Sync
 
-- Only sync missing changes (already handled by `findNewChanges`)
-- Use snapshots to reduce change count
+- Only sync missing entries (already handled by `findNewEntries`)
+- Use snapshots to reduce entry count
 - Track sync state to avoid redundant transfers
 
 ### Connection Management
@@ -513,7 +554,7 @@ For efficiency, batch multiple changes:
 Extend to sync with multiple peers simultaneously:
 
 - **Mesh topology**: Each peer connects to multiple peers
-- **Change propagation**: Changes propagate through the mesh
+- **Entry propagation**: Entries propagate through the mesh
 - **Conflict resolution**: Already handled by Automerge CRDTs
 
 ### Relay Servers
@@ -534,13 +575,13 @@ Sync in the background without user interaction:
 
 ## Conclusion
 
-MindooDB's architecture is well-suited for P2P synchronization. The `AppendOnlyStore` interface provides a clean abstraction that allows network-backed implementations without changing the core database code.
+MindooDB's architecture is well-suited for P2P synchronization. The `ContentAddressedStore` interface provides a clean abstraction that allows network-backed implementations without changing the core database code.
 
 The recommended approach is:
 1. Use React Native for cross-platform mobile apps
 2. Implement WebRTC-based P2P networking
 3. Use mDNS for automatic peer discovery
-4. Create a `NetworkAppendOnlyStore` that wraps a local store
+4. Create a `NetworkContentAddressedStore` that wraps a local store
 5. Leverage existing sync methods (`pullChangesFrom`, `pushChangesTo`)
 
 This provides a solid foundation for P2P sync while maintaining the security and integrity guarantees of MindooDB.
