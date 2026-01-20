@@ -2,11 +2,11 @@
 
 ## Overview
 
-MindooDB provides an incremental change processing mechanism via `processChangesSince()` that enables efficient scanning of documents that have changed since a given cursor. This document explores various strategies for building dynamic indexes and query systems on top of MindooDB, inspired by proven approaches from other database systems.
+MindooDB provides an incremental change processing mechanism via `iterateChangesSince()` that enables efficient scanning of documents that have changed since a given cursor. This document explores various strategies for building dynamic indexes and query systems on top of MindooDB, inspired by proven approaches from other database systems.
 
-## The Foundation: `processChangesSince()`
+## The Foundation: `iterateChangesSince()`
 
-MindooDB maintains an internal index that tracks documents sorted by `(lastModified, docId)`, enabling efficient incremental processing. The `processChangesSince()` method:
+MindooDB maintains an internal index that tracks documents sorted by `(lastModified, docId)`, enabling efficient incremental processing. The `iterateChangesSince()` method (preferred) or `processChangesSince()` method:
 
 - Accepts a cursor `{ lastModified: number, docId: string }` to resume from a specific position
 - Processes documents in modification order (oldest first)
@@ -26,7 +26,7 @@ CouchDB uses JavaScript map/reduce functions to build views (indexes) that extra
 **Application to MindooDB:**
 - **Map Function**: User-defined function that takes a `MindooDoc` and emits `(key, value)` pairs
 - **Reduce Function** (optional): Aggregates values for the same key (e.g., count, sum, average)
-- **Incremental Updates**: Use `processChangesSince()` to process only changed documents since last index update
+- **Incremental Updates**: Use `iterateChangesSince()` to process only changed documents since last index update
 - **Persistent Index**: Store the emitted key-value pairs in a separate index structure
 
 **Example Use Case:**
@@ -63,7 +63,7 @@ The key to efficient incremental map/reduce is **caching map outputs** in the in
    - Index structure: `Map<docId, Array<{key, value}>>` - tracks what each document emitted
    - View index: `Map<key, Array<{docId, value}>>` - organizes by emitted keys
 
-2. **Document Updates**: When a document changes via `processChangesSince()`:
+2. **Document Updates**: When a document changes via `iterateChangesSince()`:
    - **Remove old entries**: Look up cached map outputs for the document, remove those key-value pairs from the view index
    - **Add new entries**: Run map function on the updated document, add new key-value pairs to the view index
    - **Update cache**: Replace cached map outputs with new ones
@@ -639,13 +639,13 @@ class IndexManager {
   
   async processChanges(cursor: ProcessChangesCursor | null) {
     // Process changes once
-    await db.processChangesSince(cursor, 100, async (doc, currentCursor) => {
+    for await (const { doc, cursor: currentCursor } of db.iterateChangesSince(cursor)) {
       // Update all indexes
       for (const [name, index] of this.indexes) {
         await index.update(doc);
       }
-      return currentCursor;
-    });
+      cursor = currentCursor;
+    }
   }
 }
 ```
@@ -725,11 +725,13 @@ Middle ground:
 3. **Cache reduce results**: `Map<key, reducedValue>` for fast queries
 4. **Incremental updates**: Use cached map outputs to efficiently add/remove entries
 
-**Why this works well with `processChangesSince()`:**
+**Why this works well with `iterateChangesSince()`:**
 
 ```typescript
 async function updateView(db: MindooDB, view: MapReduceView, cursor: ProcessChangesCursor | null) {
-  await db.processChangesSince(cursor, 100, async (doc, currentCursor) => {
+  for await (const { doc, cursor: currentCursor } of db.iterateChangesSince(cursor)) {
+    cursor = currentCursor;
+    
     if (doc.isDeleted()) {
       // Efficiently remove using cached map outputs
       await view.deleteDocument(doc.getId());
@@ -737,8 +739,7 @@ async function updateView(db: MindooDB, view: MapReduceView, cursor: ProcessChan
       // Efficiently update using cached map outputs
       await view.updateDocument(doc);
     }
-    return currentCursor;
-  });
+  }
 }
 ```
 

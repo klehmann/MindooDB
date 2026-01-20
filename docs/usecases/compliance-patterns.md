@@ -50,8 +50,8 @@ class GDPRCompliance {
     // Mark documents as deleted (append-only limitation)
     const db = await this.tenant.openDB("user-data");
     
-    // Iterate through all documents using processChangesSince
-    await db.processChangesSince(null, 100, (doc, cursor) => {
+    // Iterate through all documents using iterateChangesSince
+    for await (const { doc } of db.iterateChangesSince(null)) {
       const data = doc.getData();
       
       // Skip if already deleted or doesn't belong to this user
@@ -165,13 +165,12 @@ async function exportUserData(userId: string): Promise<any> {
   const userDocs: MindooDoc[] = [];
   
   // Iterate through all documents
-  await db.processChangesSince(null, 100, (doc, cursor) => {
+  for await (const { doc } of db.iterateChangesSince(null)) {
     const data = doc.getData();
     if (data.userId === userId && !data.deleted) {
       userDocs.push(doc);
     }
-    return true; // Continue iterating
-  });
+  }
   
   const exportData = {
     userId,
@@ -229,13 +228,12 @@ class HIPAACompliance {
     const matchingLogs: MindooDoc[] = [];
     
     // Iterate through all audit logs
-    await auditDB.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of auditDB.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.patientId === patientId && data.type === "hipaa-access-log") {
         matchingLogs.push(doc);
       }
-      return true; // Continue iterating
-    });
+    }
     
     return matchingLogs;
   }
@@ -382,14 +380,12 @@ class ComplianceAuditTrail {
     const matchingLogs: MindooDoc[] = [];
     
     // Iterate through all audit logs
-    await auditDB.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of auditDB.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.entityType === entityType && 
           data.entityId === entityId &&
           data.type === "audit-log") {
         matchingLogs.push(doc);
-      }
-      return true; // Continue iterating
       }
     }
     
@@ -417,13 +413,12 @@ class DataRetention {
     const oldDocs: MindooDoc[] = [];
     
     // Find old documents
-    await db.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of db.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.createdAt && data.createdAt < cutoffDate) {
         oldDocs.push(doc);
       }
-      return true; // Continue iterating
-    });
+    }
     
     // Move to archive database
     const archiveDB = await this.tenant.openDB("archive");
@@ -477,13 +472,12 @@ class AccessLogging {
     const matchingLogs: MindooDoc[] = [];
     
     // Iterate through all access logs
-    await auditDB.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of auditDB.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.resourceId === resourceId) {
         matchingLogs.push(doc);
       }
-      return true; // Continue iterating
-    });
+    }
     
     // Sort by timestamp
     return matchingLogs.sort((a, b) => {

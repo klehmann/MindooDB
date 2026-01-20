@@ -616,11 +616,10 @@ class MindooDBDebugging {
     console.log("=== Database Contents ===");
     
     let count = 0;
-    await db.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of db.iterateChangesSince(null)) {
       console.log(`${++count}. ID: ${doc.getId()}`);
       console.log(`   Data: ${JSON.stringify(doc.getData()).substring(0, 100)}...`);
-      return true; // Continue iterating
-    });
+    }
     
     console.log(`Total documents: ${count}`);
   }
@@ -727,14 +726,13 @@ class ContactService {
   async listContacts(filter?: { company?: string }): Promise<Contact[]> {
     const contacts: Contact[] = [];
     
-    await this.db.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of this.db.iterateChangesSince(null)) {
       const data = doc.getData();
-      if (data.type !== 'contact') return true;
-      if (filter?.company && data.company !== filter.company) return true;
+      if (data.type !== 'contact') continue;
+      if (filter?.company && data.company !== filter.company) continue;
       
       contacts.push(this.docToContact(doc));
-      return true; // Continue
-    });
+    }
     
     return contacts;
   }

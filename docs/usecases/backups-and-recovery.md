@@ -80,15 +80,11 @@ async function incrementalBackup(
   let currentCursor = lastBackupState.lastBackupCursor;
   
   // Process changes since last backup
-  currentCursor = await db.processChangesSince(
-    currentCursor,
-    1000, // Process in batches
-    (doc, cursor) => {
-      // Collect changes for backup
-      // In practice, you'd get the actual changes from the store
-      return true; // Continue processing
-    }
-  );
+  for await (const { cursor } of db.iterateChangesSince(currentCursor)) {
+    currentCursor = cursor;
+    // Collect changes for backup
+    // In practice, you'd get the actual changes from the store
+  }
   
   // Get actual changes from store
   const store = db.getStore();
@@ -133,7 +129,7 @@ async function snapshotBackup(db: MindooDB) {
   const snapshots: Array<{docId: string, snapshot: Uint8Array}> = [];
   
   // Iterate through all documents
-  await db.processChangesSince(null, 1000, (doc, cursor) => {
+  for await (const { doc } of db.iterateChangesSince(null)) {
     // Get all changes for document (note: fromLastSnapshot parameter not available)
     const changeHashes = await db.getStore().findNewChangesForDoc(
       [],
@@ -534,7 +530,7 @@ async function testRestore(backupLocation: string) {
   // Verify restored data
   let docCount = 0;
   let sampleDoc: MindooDoc | null = null;
-  await testDB.processChangesSince(null, 1000, (doc, cursor) => {
+  for await (const { doc } of testDB.iterateChangesSince(null)) {
     if (docCount === 0) {
       sampleDoc = doc;
     }

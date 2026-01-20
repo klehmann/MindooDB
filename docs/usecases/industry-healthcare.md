@@ -68,11 +68,10 @@ class ElectronicHealthRecord {
     const db = await this.tenant.openDB(`patient-${patientId}`);
     const docs: MindooDoc[] = [];
     
-    // Use processChangesSince to iterate through all documents
-    await db.processChangesSince(null, 100, (doc, cursor) => {
+    // Use iterateChangesSince to iterate through all documents
+    for await (const { doc } of db.iterateChangesSince(null)) {
       docs.push(doc);
-      return true; // Continue iterating
-    });
+    }
     
     return docs;
   }
@@ -137,14 +136,13 @@ class MedicalDeviceData {
           const db = await this.tenant.openDB(dbId);
           
           // Filter by date range while iterating
-          await db.processChangesSince(null, 100, (doc, cursor) => {
+          for await (const { doc } of db.iterateChangesSince(null)) {
             const data = doc.getData();
             const timestamp = data.timestamp;
             if (timestamp >= startDate.getTime() && timestamp <= endDate.getTime()) {
               results.push(doc);
             }
-            return true; // Continue iterating
-          });
+          }
         } catch (error) {
           // Database doesn't exist for this month
           continue;
@@ -356,13 +354,12 @@ class HealthcareAuditTrail {
     const auditDB = await this.tenant.openDB("audit-logs");
     const matchingLogs: MindooDoc[] = [];
     
-    await auditDB.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of auditDB.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.patientId === patientId) {
         matchingLogs.push(doc);
       }
-      return true; // Continue iterating
-    });
+    }
     
     return matchingLogs;
   }
@@ -388,7 +385,7 @@ class HealthcareDataRetention {
     const archiveDB = await this.tenant.openDB(`patient-${patientId}-archive`);
     
     // Find old documents and copy to archive
-    await activeDB.processChangesSince(null, 100, async (doc, cursor) => {
+    for await (const { doc } of activeDB.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.createdAt && data.createdAt < archiveDate.getTime()) {
         // Get all changes for this document
@@ -397,8 +394,9 @@ class HealthcareDataRetention {
         const changes = await activeDB.getStore()
           .getChanges(changeHashes);
       
-      for (const change of changes) {
-        await archiveDB.getStore().append(change);
+        for (const change of changes) {
+          await archiveDB.getStore().append(change);
+        }
       }
     }
   }

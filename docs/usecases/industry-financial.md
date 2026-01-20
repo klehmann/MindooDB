@@ -64,14 +64,13 @@ class TransactionLedger {
         const db = await this.tenant.openDB(dbId);
         let transaction: MindooDoc | null = null;
         
-        await db.processChangesSince(null, 100, (doc, cursor) => {
+        for await (const { doc } of db.iterateChangesSince(null)) {
           const data = doc.getData();
           if (data.transactionId === transactionId) {
             transaction = doc;
-            return false; // Stop iterating
+            break; // Stop iterating
           }
-          return true; // Continue
-        });
+        }
         
         if (transaction) {
           await db.changeDoc(transaction, (d) => {
@@ -99,7 +98,7 @@ class TransactionLedger {
           const db = await this.tenant.openDB(dbId);
           
           // Filter by account and date range while iterating
-          await db.processChangesSince(null, 100, (doc, cursor) => {
+          for await (const { doc } of db.iterateChangesSince(null)) {
             const data = doc.getData();
             const timestamp = data.timestamp;
             if ((data.fromAccount === accountId || data.toAccount === accountId) &&
@@ -107,8 +106,7 @@ class TransactionLedger {
                 timestamp <= endDate.getTime()) {
               results.push(doc);
             }
-            return true; // Continue iterating
-          });
+          }
         } catch (error) {
           continue;
         }
@@ -355,13 +353,12 @@ class FinancialAuditTrail {
     const auditDB = await this.tenant.openDB("audit-logs");
     const matchingLogs: MindooDoc[] = [];
     
-    await auditDB.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of auditDB.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.transactionId === transactionId) {
         matchingLogs.push(doc);
       }
-      return true; // Continue iterating
-    });
+    }
     
     // Sort by timestamp
     return matchingLogs.sort((a, b) => {

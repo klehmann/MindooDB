@@ -269,7 +269,7 @@ class MigrationValidation {
     // Count comparison
     const sourceCount = await sourceDB.count(entityType);
     let targetCount = 0;
-    await targetDB.processChangesSince(null, 1000, (doc, cursor) => {
+    for await (const { doc } of targetDB.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.type === entityType) {
         targetCount++;

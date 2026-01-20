@@ -90,25 +90,22 @@ async function syncFilteredData(
   let cursor: ProcessChangesCursor | null = null;
   
   // Process changes and filter
-  cursor = await sourceDB.processChangesSince(
-    cursor,
-    100,
-    async (doc, currentCursor) => {
-      if (filter(doc)) {
-        // Get change from store
-        const changeHashes = await sourceDB.getStore()
-          .getAllChangeHashesForDoc(doc.getId());
-        const changes = await sourceDB.getStore()
-          .getChanges(changeHashes);
-        
-        // Append filtered changes to target
-        for (const change of changes) {
-          await targetStore.append(change);
-        }
+  for await (const { doc, cursor: currentCursor } of sourceDB.iterateChangesSince(cursor)) {
+    cursor = currentCursor;
+    
+    if (filter(doc)) {
+      // Get change from store
+      const changeHashes = await sourceDB.getStore()
+        .getAllChangeHashesForDoc(doc.getId());
+      const changes = await sourceDB.getStore()
+        .getChanges(changeHashes);
+      
+      // Append filtered changes to target
+      for (const change of changes) {
+        await targetStore.append(change);
       }
-      return currentCursor;
     }
-  );
+  }
 }
 
 // Share only "public" documents
@@ -156,7 +153,7 @@ await orgADB.changeDoc(sharedDoc, (d) => {
 
 ## Incremental Data Transfer
 
-### Using processChangesSince()
+### Using iterateChangesSince()
 
 **Pattern**: Efficiently transfer only new changes
 
@@ -190,14 +187,10 @@ async function incrementalSync(
     await targetStore.append(change);
   }
   
-  // Update sync state
-  cursor = await sourceDB.processChangesSince(
-    cursor,
-    1, // Just to get latest cursor
-    (doc, currentCursor) => {
-      return false; // Stop after first to get cursor
-    }
-  );
+  // Update sync state - get latest cursor by iterating to the end
+  for await (const { cursor: currentCursor } of sourceDB.iterateChangesSince(cursor)) {
+    cursor = currentCursor;
+  }
   
   return {
     lastSyncCursor: cursor,
@@ -335,24 +328,21 @@ async function syncDocumentType(
 ) {
   let cursor: ProcessChangesCursor | null = null;
   
-  cursor = await sourceDB.processChangesSince(
-    cursor,
-    100,
-    async (doc, currentCursor) => {
-      if (doc.getData().type === documentType) {
-        // Sync this document type
-        const changeHashes = await sourceDB.getStore()
-          .getAllChangeHashesForDoc(doc.getId());
-        const changes = await sourceDB.getStore()
-          .getChanges(changeHashes);
-        
-        for (const change of changes) {
-          await targetStore.append(change);
-        }
+  for await (const { doc, cursor: currentCursor } of sourceDB.iterateChangesSince(cursor)) {
+    cursor = currentCursor;
+    
+    if (doc.getData().type === documentType) {
+      // Sync this document type
+      const changeHashes = await sourceDB.getStore()
+        .getAllChangeHashesForDoc(doc.getId());
+      const changes = await sourceDB.getStore()
+        .getChanges(changeHashes);
+      
+      for (const change of changes) {
+        await targetStore.append(change);
       }
-      return currentCursor;
     }
-  );
+  }
 }
 
 // Share only "orders" documents

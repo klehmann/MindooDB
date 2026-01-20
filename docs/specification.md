@@ -436,10 +436,17 @@ Automerge documents accumulate changes over time. Snapshots prevent performance 
 
 ```typescript
 // First query: get all documents
-const { documents, cursor } = await db.processChangesSince(null);
+let cursor: ProcessChangesCursor | null = null;
+for await (const { doc, cursor: currentCursor } of db.iterateChangesSince(cursor)) {
+  // Process document
+  cursor = currentCursor; // Save cursor for resuming
+}
 
 // Subsequent queries: only changed documents
-const { documents: changed, cursor: newCursor } = await db.processChangesSince(cursor);
+for await (const { doc, cursor: currentCursor } of db.iterateChangesSince(cursor)) {
+  // Process changed documents
+  cursor = currentCursor;
+}
 ```
 
 ---

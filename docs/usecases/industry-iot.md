@@ -70,14 +70,13 @@ class SensorDataCollection {
           const db = await this.tenant.openDB(dbId);
           
           // Filter by date range while iterating
-          await db.processChangesSince(null, 100, (doc, cursor) => {
+          for await (const { doc } of db.iterateChangesSince(null)) {
             const data = doc.getData();
             const timestamp = data.timestamp;
             if (timestamp >= startDate.getTime() && timestamp <= endDate.getTime()) {
               results.push(doc);
             }
-            return true; // Continue iterating
-          });
+          }
         } catch (error) {
           continue;
         }
@@ -184,14 +183,10 @@ class EdgeToCloudSync {
       await this.cloudStore.append(change);
     }
     
-    // Update sync cursor
-    this.lastSyncCursor = await this.edgeDB.processChangesSince(
-      this.lastSyncCursor,
-      1,
-      (doc, cursor) => {
-        return false; // Just get cursor
-      }
-    );
+    // Update sync cursor - iterate to the end to get latest cursor
+    for await (const { cursor } of this.edgeDB.iterateChangesSince(this.lastSyncCursor)) {
+      this.lastSyncCursor = cursor;
+    }
   }
   
   async syncFromCloud(): Promise<void> {

@@ -1156,39 +1156,40 @@ export interface MindooDB {
    * Documents are returned in modification order (oldest first).
    * The callback will receive new documents, changes and deletions.
    * 
+   * Deleted documents are included in the iteration so external indexes can be updated.
+   * Check `doc.isDeleted()` in the callback to handle deletions appropriately.
+   * 
    * The callback can return `false` to stop processing early. If the callback throws an error
    * or if there's an error processing a document, the loop will stop and the error will be propagated.
    *
    * @param cursor The cursor to start processing changes from. Use `null` or `{ lastModified: 0, docId: "" }` to start from the beginning.
    * @param limit The maximum number of changes to process (for pagination)
-   * @param callback The function to call for each change. Receives the document and its cursor position. Return `false` to stop processing, or `true`/`undefined` to continue.
+   * @param callback The function to call for each change. Receives the document and its cursor position. Return `false` to stop processing, or `true`/`undefined` to continue. Check `doc.isDeleted()` to handle deleted documents.
    * @return The cursor of the last change processed, can be used to continue processing from this position
    */
   processChangesSince(cursor: ProcessChangesCursor | null, limit: number, callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void): Promise<ProcessChangesCursor>;
 
   /**
    * Iterate over documents that changed since a given cursor using an async generator.
-   * This provides a cleaner iteration pattern compared to the callback-based processChangesSince.
    * 
    * Documents are returned in modification order (oldest first).
-   * The generator automatically handles pagination internally.
+   * Documents are yielded one at a time, allowing early termination via `break` after each document.
    * 
    * Example usage:
    * ```typescript
-   * for await (const { doc, cursor } of db.iterateChangesSince(null, 100)) {
+   * for await (const { doc, cursor } of db.iterateChangesSince(null)) {
    *   const data = doc.getData();
    *   if (data.type === "target") {
    *     // Process document
-   *     break; // Stop iteration early if needed
+   *     break; // Stop iteration early if needed - works after each document
    *   }
    * }
    * ```
    *
    * @param cursor The cursor to start processing changes from. Use `null` to start from the beginning.
-   * @param pageSize The number of documents to process per page (for internal pagination). Defaults to 100.
-   * @return An async generator that yields ProcessChangesResult objects containing the document and its cursor
+   * @return An async generator that yields ProcessChangesResult objects containing the document and its cursor. Each document is yielded immediately after loading, enabling early termination.
    */
-  iterateChangesSince(cursor: ProcessChangesCursor | null, pageSize?: number): AsyncGenerator<ProcessChangesResult, void, unknown>;
+  iterateChangesSince(cursor: ProcessChangesCursor | null): AsyncGenerator<ProcessChangesResult, void, unknown>;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.

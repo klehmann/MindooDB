@@ -1189,15 +1189,22 @@ export class BaseMindooDB implements MindooDB {
     for (let i = startIndex; i < this.index.length && processedCount < limit; i++) {
       const entry = this.index[i];
       
-      // Skip deleted documents (they're still in index for tracking, but shouldn't be processed)
-      if (entry.isDeleted) {
-        continue;
-      }
-      
       try {
-        console.log(`[BaseMindooDB] Processing document ${entry.docId} from index (lastModified: ${entry.lastModified})`);
-        const doc = await this.getDocument(entry.docId);
-        console.log(`[BaseMindooDB] Successfully loaded document ${entry.docId}`);
+        console.log(`[BaseMindooDB] Processing document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
+        
+        // Load document using loadDocumentInternal to handle deleted documents
+        // getDocument() throws for deleted documents, but we need to yield them
+        // so external indexes can be updated
+        const internalDoc = await this.loadDocumentInternal(entry.docId);
+        
+        if (!internalDoc) {
+          console.warn(`[BaseMindooDB] Document ${entry.docId} not found, skipping`);
+          continue;
+        }
+        
+        // Wrap the document (works for both deleted and non-deleted documents)
+        const doc = this.wrapDocument(internalDoc);
+        console.log(`[BaseMindooDB] Successfully loaded document ${entry.docId} (isDeleted: ${doc.isDeleted()})`);
         
         // Create cursor for current document
         const currentCursor: ProcessChangesCursor = {
@@ -1228,51 +1235,80 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async *iterateChangesSince(
-    cursor: ProcessChangesCursor | null,
-    pageSize: number = 100
+    cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
-    console.log(`[BaseMindooDB] Starting iteration from cursor ${JSON.stringify(cursor)} (pageSize: ${pageSize})`);
+    // Default to initial cursor if null is provided
+    const actualCursor: ProcessChangesCursor = cursor ?? { lastModified: 0, docId: "" };
+    console.log(`[BaseMindooDB] Starting iteration from cursor ${JSON.stringify(actualCursor)}`);
     
-    let currentCursor: ProcessChangesCursor | null = cursor;
-    
-    while (true) {
-      // Collect documents from this page
-      const pageResults: ProcessChangesResult[] = [];
-      let documentsProcessed = 0;
+    // Find starting position using binary search
+    // We want to find the first entry that is greater than the cursor
+    let startIndex = 0;
+    if (this.index.length > 0) {
+      let left = 0;
+      let right = this.index.length - 1;
       
-      // Process one page of changes
-      const returnedCursor = await this.processChangesSince(
-        currentCursor,
-        pageSize,
-        (doc: MindooDoc, docCursor: ProcessChangesCursor) => {
-          documentsProcessed++;
-          pageResults.push({ doc, cursor: docCursor });
-          // Always continue processing the page
-          return true;
+      while (left <= right) {
+        const mid = Math.floor((left + right) / 2);
+        const entry = this.index[mid];
+        const cmp = this.compareIndexEntries(
+          { docId: actualCursor.docId, lastModified: actualCursor.lastModified },
+          entry
+        );
+        
+        if (cmp < 0) {
+          right = mid - 1;
+          startIndex = mid;
+        } else {
+          left = mid + 1;
+          startIndex = mid + 1;
         }
-      );
-      
-      // Yield all documents from this page
-      for (const result of pageResults) {
-        yield result;
       }
       
-      // If we processed fewer documents than the page size, we've reached the end
-      if (documentsProcessed < pageSize) {
-        console.log(`[BaseMindooDB] Reached end of documents, processed ${documentsProcessed} in last page`);
-        break;
+      // If we found an exact match, start from the next entry
+      if (startIndex < this.index.length) {
+        const entry = this.index[startIndex];
+        if (entry.lastModified === actualCursor.lastModified && entry.docId === actualCursor.docId) {
+          startIndex++;
+        }
       }
+    }
+    
+    // Iterate through the index and yield documents one at a time
+    for (let i = startIndex; i < this.index.length; i++) {
+      const entry = this.index[i];
       
-      // If the cursor didn't advance, we've reached the end
-      if (currentCursor !== null && 
-          returnedCursor.lastModified === currentCursor.lastModified && 
-          returnedCursor.docId === currentCursor.docId) {
-        console.log(`[BaseMindooDB] Cursor did not advance, reached end of documents`);
-        break;
+      try {
+        console.log(`[BaseMindooDB] Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
+        
+        // Load document using loadDocumentInternal to handle deleted documents
+        // getDocument() throws for deleted documents, but we need to yield them
+        // so external indexes can be updated
+        const internalDoc = await this.loadDocumentInternal(entry.docId);
+        
+        if (!internalDoc) {
+          console.warn(`[BaseMindooDB] Document ${entry.docId} not found, skipping`);
+          continue;
+        }
+        
+        // Wrap the document (works for both deleted and non-deleted documents)
+        const doc = this.wrapDocument(internalDoc);
+        console.log(`[BaseMindooDB] Successfully loaded document ${entry.docId} (isDeleted: ${doc.isDeleted()})`);
+        
+        // Create cursor for current document
+        const currentCursor: ProcessChangesCursor = {
+          lastModified: entry.lastModified,
+          docId: entry.docId,
+        };
+        
+        // Yield immediately - this allows the caller to break early after each document
+        // Deleted documents are included so external indexes can handle deletions
+        yield { doc, cursor: currentCursor };
+      } catch (error) {
+        console.error(`[BaseMindooDB] Error processing document ${entry.docId}:`, error);
+        // Stop processing on error
+        throw error;
       }
-      
-      // Continue with the next page using the returned cursor
-      currentCursor = returnedCursor;
     }
     
     console.log(`[BaseMindooDB] Iteration completed`);

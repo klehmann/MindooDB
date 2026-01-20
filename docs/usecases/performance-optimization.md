@@ -42,7 +42,7 @@ class DatabaseSplitter {
   
   async getDatabaseStats(db: MindooDB): Promise<any> {
     let documentCount = 0;
-    await db.processChangesSince(null, 100, (doc, cursor) => {
+    for await (const { doc } of db.iterateChangesSince(null)) {
       documentCount++;
     }
     return {
@@ -195,7 +195,7 @@ class StorageManagement {
     archiveDB: MindooDB
   ) {
     // Find old documents and copy to archive
-    await db.processChangesSince(null, 100, (doc, cursor) => {
+    for await (const { doc } of db.iterateChangesSince(null)) {
       const data = doc.getData();
       if (data.createdAt && data.createdAt < archiveDate.getTime()) {
         const changeHashes = await db.getStore()
@@ -203,8 +203,9 @@ class StorageManagement {
         const changes = await db.getStore()
           .getChanges(changeHashes);
       
-      for (const change of changes) {
-        await archiveDB.getStore().append(change);
+        for (const change of changes) {
+          await archiveDB.getStore().append(change);
+        }
       }
     }
   }
@@ -261,7 +262,7 @@ class ViewBasedIndexing {
 
 ### Custom Indexes
 
-**Pattern**: Build custom indexes using processChangesSince
+**Pattern**: Build custom indexes using iterateChangesSince
 
 ```typescript
 class CustomIndex {
@@ -270,20 +271,16 @@ class CustomIndex {
   async buildIndex(db: MindooDB) {
     let cursor: ProcessChangesCursor | null = null;
     
-    cursor = await db.processChangesSince(
-      cursor,
-      100,
-      async (doc, currentCursor) => {
-        // Index by status
-        const status = doc.getData().status;
-        if (!this.index.has(status)) {
-          this.index.set(status, []);
-        }
-        this.index.get(status)!.push(doc.getId());
-        
-        return currentCursor;
+    for await (const { doc, cursor: currentCursor } of db.iterateChangesSince(cursor)) {
+      cursor = currentCursor;
+      
+      // Index by status
+      const status = doc.getData().status;
+      if (!this.index.has(status)) {
+        this.index.set(status, []);
       }
-    );
+      this.index.get(status)!.push(doc.getId());
+    }
   }
   
   async queryByStatus(status: string): Promise<string[]> {

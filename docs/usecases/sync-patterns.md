@@ -443,7 +443,7 @@ await peerBDB.pullChangesFrom(peerADB.getStore());
 
 ## Incremental Sync
 
-### Using processChangesSince()
+### Using iterateChangesSince()
 
 **Pattern**: Efficiently sync only new changes
 
@@ -476,14 +476,11 @@ async function incrementalSync(
     await targetStore.append(change);
   }
   
-  // Update sync state
-  const cursor = await sourceDB.processChangesSince(
-    lastSyncState.lastSyncCursor,
-    1,
-    (doc, currentCursor) => {
-      return false; // Just get cursor
-    }
-  );
+  // Update sync state - iterate to the end to get latest cursor
+  let cursor = lastSyncState.lastSyncCursor;
+  for await (const { cursor: currentCursor } of sourceDB.iterateChangesSince(cursor)) {
+    cursor = currentCursor;
+  }
   
   return {
     lastSyncCursor: cursor,
