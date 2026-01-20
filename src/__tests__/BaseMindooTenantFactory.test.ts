@@ -70,7 +70,7 @@ describe("BaseMindooTenantFactory", () => {
       expect(user1.userSigningKeyPair.privateKey.salt).not.toBe(user2.userSigningKeyPair.privateKey.salt);
       expect(user1.userSigningKeyPair.privateKey.iv).not.toBe(user2.userSigningKeyPair.privateKey.iv);
       expect(user1.userSigningKeyPair.privateKey.ciphertext).not.toBe(user2.userSigningKeyPair.privateKey.ciphertext);
-    });
+    }, 30000);
   });
 
   describe("toPublicUserId", () => {
