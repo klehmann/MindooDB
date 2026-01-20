@@ -1,6 +1,6 @@
 {
   "name": "mindoodb",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "End-to-End Encrypted, Offline-first Sync Database",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.js",
