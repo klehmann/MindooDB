@@ -1,6 +1,7 @@
 import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, ProcessChangesCursor, PublicUserId, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { RSAEncryption } from "./crypto/RSAEncryption";
+import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private tenant: BaseMindooTenant;
@@ -25,9 +26,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
 
   // Unified cache cursor for all document types
   private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
+  private logger: Logger;
 
-  constructor(tenant: BaseMindooTenant) {
+  constructor(tenant: BaseMindooTenant, logger?: Logger) {
     this.tenant = tenant;
+    // Create logger if not provided (for backward compatibility)
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), "BaseMindooTenantDirectory", true);
   }
 
 
@@ -50,7 +56,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void> {
-    console.log(`[BaseMindooTenantDirectory] Registering user: ${userId.username}`);
+    this.logger.info(`Registering user: ${userId.username}`);
 
     // Check if user with same username (case-insensitive) already exists
     const existingDocs = await this.findGrantAccessDocuments(userId.username);
@@ -65,7 +71,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       
       if (keysMatch) {
         // Same user with same keys - skip re-registration
-        console.log(`[BaseMindooTenantDirectory] User ${userId.username} already registered with same keys, skipping`);
+        this.logger.debug(`User ${userId.username} already registered with same keys, skipping`);
         return;
       } else {
         // Different keys for same username - this is an error
@@ -91,7 +97,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const usernameEncrypted = await this.encryptForAdmin(userId.username);
 
     // Add user to directory database
-    console.log(`[BaseMindooTenantDirectory] Creating document for user registration`);
+    this.logger.debug(`Creating document for user registration`);
     const directoryDB = await this.getDirectoryDB();
     // Create document with admin signing key so the initial entry is trusted
     // Use PUBLIC_INFOS_KEY_ID so servers can validate users without full tenant access
@@ -100,7 +106,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       administrationPrivateKeyPassword,
       PUBLIC_INFOS_KEY_ID
     );
-    console.log(`[BaseMindooTenantDirectory] Document created: ${newDoc.getId()}`);
+    this.logger.debug(`Document created: ${newDoc.getId()}`);
     
     try {
       // Set the document data fields - changeDocWithSigningKey handles signing at entry level
@@ -114,20 +120,15 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
     } catch (error) {
-      console.error(`[BaseMindooTenantDirectory] ERROR in changeDocWithSigningKey:`, error);
-      console.error(`[BaseMindooTenantDirectory] Error type: ${error instanceof Error ? error.constructor.name : typeof error}`);
-      console.error(`[BaseMindooTenantDirectory] Error message: ${error instanceof Error ? error.message : String(error)}`);
-      if (error instanceof Error && error.stack) {
-        console.error(`[BaseMindooTenantDirectory] Error stack: ${error.stack}`);
-      }
+      this.logger.error(`ERROR in changeDocWithSigningKey:`, error);
       throw error;
     }
     
-    console.log(`[BaseMindooTenantDirectory] Registered user: ${userId.username}`);
+    this.logger.info(`Registered user: ${userId.username}`);
   }
 
   async findGrantAccessDocuments(username: string): Promise<MindooDoc[]> {
-    console.log(`[BaseMindooTenantDirectory] Finding grant access documents for username: ${username}`);
+    this.logger.debug(`Finding grant access documents for username: ${username}`);
     
     // Sync changes to make sure everything is processed
     const directoryDB = await this.getDirectoryDB();
@@ -151,7 +152,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       if (data.form === "useroperation" && 
           data.type === "grantaccess" && 
           data.username_hash === targetHash) {
-        console.log(`[BaseMindooTenantDirectory] Found grant access document for username hash: ${targetHash}`);
+        this.logger.debug(`Found grant access document for username hash: ${targetHash}`);
               matchingDocs.push(doc);
       }
       
@@ -161,7 +162,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
           data.username_hash === targetHash &&
           data.revokeDocId &&
           typeof data.revokeDocId === "string") {
-        console.log(`[BaseMindooTenantDirectory] Found revoke access document for username hash: ${targetHash}, revoking doc ID: ${data.revokeDocId}`);
+        this.logger.debug(`Found revoke access document for username hash: ${targetHash}, revoking doc ID: ${data.revokeDocId}`);
               revokedDocIds.add(data.revokeDocId);
       }
     }
@@ -170,9 +171,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const activeDocs = matchingDocs.filter(doc => !revokedDocIds.has(doc.getId()));
     
     if (activeDocs.length === 0) {
-      console.log(`[BaseMindooTenantDirectory] No active grant access documents found for username: ${username} (found ${matchingDocs.length} total, ${revokedDocIds.size} revoked)`);
+      this.logger.debug(`No active grant access documents found for username: ${username} (found ${matchingDocs.length} total, ${revokedDocIds.size} revoked)`);
     } else {
-      console.log(`[BaseMindooTenantDirectory] Found ${activeDocs.length} active grant access document(s) for username: ${username} (${matchingDocs.length} total, ${revokedDocIds.size} revoked)`);
+      this.logger.debug(`Found ${activeDocs.length} active grant access document(s) for username: ${username} (${matchingDocs.length} total, ${revokedDocIds.size} revoked)`);
     }
     
     return activeDocs;
@@ -184,14 +185,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void> {
-    console.log(`[BaseMindooTenantDirectory] Revoking user: ${username}`);
+    this.logger.info(`Revoking user: ${username}`);
 
     // Find all grant access documents for this user
     const grantAccessDocs = await this.findGrantAccessDocuments(username);
     
     // If no grant access documents found, exit early
     if (grantAccessDocs.length === 0) {
-      console.log(`[BaseMindooTenantDirectory] No grant access documents found for ${username}, exiting revocation`);
+      this.logger.debug(`No grant access documents found for ${username}, exiting revocation`);
       return;
     }
 
@@ -232,14 +233,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.requestDataWipe = requestDataWipe;
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
 
-      console.log(`[BaseMindooTenantDirectory] Created revocation document for grant access doc: ${revokeDocId}`);
+      this.logger.debug(`Created revocation document for grant access doc: ${revokeDocId}`);
     }
     
-    console.log(`[BaseMindooTenantDirectory] Revoked user: ${username} (created ${grantAccessDocs.length} revocation document(s))`);
+    this.logger.info(`Revoked user: ${username} (created ${grantAccessDocs.length} revocation document(s))`);
   }
 
   async validatePublicSigningKey(publicKey: string): Promise<boolean> {
-    console.log(`[BaseMindooTenantDirectory] Validating public signing key`);
+    this.logger.debug(`Validating public signing key`);
     
     // Cast to BaseMindooTenant to access protected methods
     const baseTenant = this.tenant as BaseMindooTenant;
@@ -249,7 +250,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     // The administration key is always trusted - it's the root of trust for the tenant
     if (publicKey === administrationPublicKey) {
-      console.log(`[BaseMindooTenantDirectory] Public key is administration key, trusted`);
+      this.logger.debug(`Public key is administration key, trusted`);
       return true;
     }
     
@@ -264,12 +265,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // Now check the cache
     const cachedResult = this.trustedKeysCache.get(publicKey);
     if (cachedResult !== undefined) {
-      console.log(`[BaseMindooTenantDirectory] Public key validation result (from cache): ${cachedResult}`);
+      this.logger.debug(`Public key validation result (from cache): ${cachedResult}`);
       return cachedResult;
     }
     
     // Key not found in cache means it was never granted access
-    console.log(`[BaseMindooTenantDirectory] Public key not found in cache, returning false`);
+    this.logger.debug(`Public key not found in cache, returning false`);
     return false;
   }
   
@@ -306,7 +307,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
           data.userSigningPublicKey &&
           typeof data.userSigningPublicKey === "string") {
               const userPublicKey = data.userSigningPublicKey;
-              console.log(`[BaseMindooTenantDirectory] Cache: adding trusted key from grant access document`);
+              this.logger.debug(`Cache: adding trusted key from grant access document`);
               // Mark as active (true) unless already revoked
               if (!this.trustedKeysCache.has(userPublicKey) || this.trustedKeysCache.get(userPublicKey) === true) {
                 this.trustedKeysCache.set(userPublicKey, true);
@@ -324,10 +325,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
               // Use the persistent mapping that survives across iterations
               const revokedPublicKey = this.grantDocIdToPublicKey.get(revokedDocId);
               if (revokedPublicKey) {
-                console.log(`[BaseMindooTenantDirectory] Cache: revoking key for doc ${revokedDocId}`);
+                this.logger.debug(`Cache: revoking key for doc ${revokedDocId}`);
                 this.trustedKeysCache.set(revokedPublicKey, false);
               } else {
-                console.warn(`[BaseMindooTenantDirectory] Cache: revocation for unknown grant doc ${revokedDocId}`);
+                this.logger.warn(`Cache: revocation for unknown grant doc ${revokedDocId}`);
               }
             }
       }
@@ -481,7 +482,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       for (const childGroup of groupsToCheck) {
         // Skip if already checked (cycle detection)
         if (visitedGroups.has(childGroup)) {
-          console.warn(`[BaseMindooTenantDirectory] Cycle detected in group resolution: ${childGroup} already visited, stopping recursion`);
+          this.logger.warn(`Cycle detected in group resolution: ${childGroup} already visited, stopping recursion`);
           continue;
         }
         visitedGroups.add(childGroup);
@@ -519,13 +520,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     signingPublicKey: string;
     encryptionPublicKey: string;
   } | null> {
-    console.log(`[BaseMindooTenantDirectory] Getting public keys for username: ${username}`);
+    this.logger.debug(`Getting public keys for username: ${username}`);
     
     // Find all active (non-revoked) grant access documents for this user
     const activeDocs = await this.findGrantAccessDocuments(username);
     
     if (activeDocs.length === 0) {
-      console.log(`[BaseMindooTenantDirectory] No active grant access documents found for username: ${username}`);
+      this.logger.debug(`No active grant access documents found for username: ${username}`);
       return null;
     }
     
@@ -538,11 +539,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const encryptionPublicKey = data.userEncryptionPublicKey;
     
     if (typeof signingPublicKey !== "string" || typeof encryptionPublicKey !== "string") {
-      console.error(`[BaseMindooTenantDirectory] Invalid key data in grant access document for username: ${username}`);
+      this.logger.error(`Invalid key data in grant access document for username: ${username}`);
       return null;
     }
     
-    console.log(`[BaseMindooTenantDirectory] Found public keys for username: ${username}`);
+    this.logger.debug(`Found public keys for username: ${username}`);
     return {
       signingPublicKey,
       encryptionPublicKey,
@@ -557,7 +558,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
    * @return True if the user has been revoked, false if they have active access
    */
   async isUserRevoked(username: string): Promise<boolean> {
-    console.log(`[BaseMindooTenantDirectory] Checking if user is revoked: ${username}`);
+    this.logger.debug(`Checking if user is revoked: ${username}`);
     
     // Find all active grant access documents for this user
     const activeDocs = await this.findGrantAccessDocuments(username);
@@ -565,7 +566,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // User is revoked if they have no active grant access documents
     const isRevoked = activeDocs.length === 0;
     
-    console.log(`[BaseMindooTenantDirectory] User ${username} revoked: ${isRevoked}`);
+    this.logger.debug(`User ${username} revoked: ${isRevoked}`);
     return isRevoked;
   }
 
@@ -576,7 +577,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void> {
-    console.log(`[BaseMindooTenantDirectory] Requesting purge for document: ${docId} in ${dbId}`);
+    this.logger.info(`Requesting purge for document: ${docId} in ${dbId}`);
     
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
@@ -605,7 +606,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       data.requestedAt = Date.now();
     }, adminSigningKeyPair, administrationPrivateKeyPassword);
     
-    console.log(`[BaseMindooTenantDirectory] Created purge request for ${docId} in ${dbId}`);
+    this.logger.info(`Created purge request for ${docId} in ${dbId}`);
   }
 
   async getRequestedDocHistoryPurges(): Promise<Array<{

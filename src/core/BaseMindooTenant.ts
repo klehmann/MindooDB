@@ -16,6 +16,7 @@ import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { SymmetricKeyNotFoundError } from "./errors";
+import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -50,6 +51,7 @@ export class BaseMindooTenant implements MindooTenant {
   private decryptedTenantKeyCache?: Uint8Array;
   private decryptedUserSigningKeyCache?: CryptoKey;
   private decryptedUserEncryptionKeyCache?: CryptoKey;
+  private logger: Logger;
 
   constructor(
     factory: MindooTenantFactory,
@@ -62,7 +64,8 @@ export class BaseMindooTenant implements MindooTenant {
     currentUserPassword: string,
     keyBag: KeyBag,
     storeFactory: ContentAddressedStoreFactory,
-    cryptoAdapter?: CryptoAdapter
+    cryptoAdapter?: CryptoAdapter,
+    logger?: Logger
   ) {
     this.factory = factory;
     this.tenantId = tenantId;
@@ -81,16 +84,20 @@ export class BaseMindooTenant implements MindooTenant {
     } else {
       this.cryptoAdapter = cryptoAdapter;
     }
+    // Create logger if not provided (for backward compatibility)
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), `Tenant:${tenantId}`, true);
   }
 
   /**
    * Initialize the tenant.
    */
   async initialize(): Promise<void> {
-    console.log(`[BaseMindooTenant] Initializing tenant ${this.tenantId}`);
+    this.logger.info(`Initializing tenant ${this.tenantId}`);
     // KeyBag is already loaded by the caller before passing it to the constructor
     const keyCount = (await this.keyBag.listKeys()).length;
-    console.log(`[BaseMindooTenant] Tenant initialized with ${keyCount} keys in KeyBag`);
+    this.logger.info(`Tenant initialized with ${keyCount} keys in KeyBag`);
   }
 
   getCryptoAdapter(): CryptoAdapter {
@@ -131,20 +138,20 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   async encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
-    console.log(`[BaseMindooTenant] Encrypting payload with key: ${decryptionKeyId}`);
-    console.log(`[BaseMindooTenant] Payload size: ${payload.length} bytes`);
+    this.logger.debug(`Encrypting payload with key: ${decryptionKeyId}`);
+    this.logger.debug(`Payload size: ${payload.length} bytes`);
 
     // Get the symmetric key for this key ID
     let symmetricKey: Uint8Array;
     try {
       if (decryptionKeyId === "default") {
-        console.log(`[BaseMindooTenant] Using default key (tenant encryption key)`);
+        this.logger.debug(`Using default key (tenant encryption key)`);
         // Use cached tenant encryption key if available
         if (this.decryptedTenantKeyCache) {
           symmetricKey = this.decryptedTenantKeyCache;
-          console.log(`[BaseMindooTenant] Using cached tenant key, length: ${symmetricKey.length} bytes`);
+          this.logger.debug(`Using cached tenant key, length: ${symmetricKey.length} bytes`);
         } else {
-          console.log(`[BaseMindooTenant] Decrypting tenant encryption key`);
+          this.logger.debug(`Decrypting tenant encryption key`);
           // Decrypt tenant encryption key
           const decrypted = await this.decryptPrivateKey(
             this.tenantEncryptionKey,
@@ -153,36 +160,36 @@ export class BaseMindooTenant implements MindooTenant {
           );
           symmetricKey = new Uint8Array(decrypted);
           this.decryptedTenantKeyCache = symmetricKey;
-          console.log(`[BaseMindooTenant] Decrypted tenant key, length: ${symmetricKey.length} bytes`);
+          this.logger.debug(`Decrypted tenant key, length: ${symmetricKey.length} bytes`);
         }
       } else {
-        console.log(`[BaseMindooTenant] Getting named key from KeyBag: ${decryptionKeyId}`);
+        this.logger.debug(`Getting named key from KeyBag: ${decryptionKeyId}`);
         // Get the decrypted key from KeyBag
         const decryptedKey = await this.keyBag.get(decryptionKeyId);
         if (!decryptedKey) {
           throw new SymmetricKeyNotFoundError(decryptionKeyId);
         }
         symmetricKey = decryptedKey;
-        console.log(`[BaseMindooTenant] Got named key, length: ${symmetricKey.length} bytes`);
+        this.logger.debug(`Got named key, length: ${symmetricKey.length} bytes`);
       }
     } catch (error) {
-      console.error(`[BaseMindooTenant] Error getting symmetric key:`, error);
+      this.logger.error(`Error getting symmetric key:`, error);
       throw error;
     }
     
-    console.log(`[BaseMindooTenant] Got symmetric key, length: ${symmetricKey.length} bytes`);
+    this.logger.debug(`Got symmetric key, length: ${symmetricKey.length} bytes`);
     
     const subtle = this.cryptoAdapter.getSubtle();
     // Bind getRandomValues to maintain 'this' context
     const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
 
     // Import the symmetric key
-    console.log(`[BaseMindooTenant] Importing symmetric key for AES-GCM`);
+    this.logger.debug(`Importing symmetric key for AES-GCM`);
     let cryptoKey: CryptoKey;
     try {
       // Create a new Uint8Array to ensure we have a proper ArrayBuffer
       const keyArray = new Uint8Array(symmetricKey);
-      console.log(`[BaseMindooTenant] Key buffer size: ${keyArray.buffer.byteLength} bytes`);
+      this.logger.debug(`Key buffer size: ${keyArray.buffer.byteLength} bytes`);
       cryptoKey = await subtle.importKey(
         "raw",
         keyArray.buffer,
@@ -190,35 +197,35 @@ export class BaseMindooTenant implements MindooTenant {
         false, // not extractable
         ["encrypt"]
       );
-      console.log(`[BaseMindooTenant] Successfully imported key`);
+      this.logger.debug(`Successfully imported key`);
     } catch (error) {
-      console.error(`[BaseMindooTenant] Error importing key:`, error);
-      console.error(`[BaseMindooTenant] Key length: ${symmetricKey.length}, expected: 32 bytes for AES-256`);
+      this.logger.error(`Error importing key:`, error);
+      this.logger.error(`Key length: ${symmetricKey.length}, expected: 32 bytes for AES-256`);
       throw error;
     }
 
     // Generate IV (12 bytes for AES-GCM)
-    console.log(`[BaseMindooTenant] Generating IV`);
+    this.logger.debug(`Generating IV`);
     let iv: Uint8Array;
     try {
       const ivArray = new Uint8Array(12);
       randomValues(ivArray);
       iv = new Uint8Array(ivArray.buffer, ivArray.byteOffset, ivArray.byteLength);
-      console.log(`[BaseMindooTenant] Generated IV: ${iv.length} bytes`);
+      this.logger.debug(`Generated IV: ${iv.length} bytes`);
     } catch (error) {
-      console.error(`[BaseMindooTenant] Error generating IV:`, error);
+      this.logger.error(`Error generating IV:`, error);
       throw error;
     }
 
     // Encrypt the payload
-    console.log(`[BaseMindooTenant] Encrypting payload with AES-GCM`);
-    console.log(`[BaseMindooTenant] Payload buffer size: ${payload.buffer.byteLength} bytes`);
-    console.log(`[BaseMindooTenant] Payload byteOffset: ${payload.byteOffset}, byteLength: ${payload.byteLength}`);
+    this.logger.debug(`Encrypting payload with AES-GCM`);
+    this.logger.debug(`Payload buffer size: ${payload.buffer.byteLength} bytes`);
+    this.logger.debug(`Payload byteOffset: ${payload.byteOffset}, byteLength: ${payload.byteLength}`);
     let encrypted: ArrayBuffer;
     try {
       // Create a new Uint8Array to ensure we have a proper ArrayBuffer
       const payloadArray = new Uint8Array(payload);
-      console.log(`[BaseMindooTenant] Using payload array: ${payloadArray.length} bytes`);
+      this.logger.debug(`Using payload array: ${payloadArray.length} bytes`);
       encrypted = await subtle.encrypt(
         {
           name: "AES-GCM",
@@ -228,10 +235,10 @@ export class BaseMindooTenant implements MindooTenant {
         cryptoKey,
         payloadArray
       );
-      console.log(`[BaseMindooTenant] Successfully encrypted payload, encrypted size: ${encrypted.byteLength} bytes`);
+      this.logger.debug(`Successfully encrypted payload, encrypted size: ${encrypted.byteLength} bytes`);
     } catch (error) {
-      console.error(`[BaseMindooTenant] Error encrypting payload:`, error);
-      console.error(`[BaseMindooTenant] Error details:`, {
+      this.logger.error(`Error encrypting payload:`, error);
+      this.logger.error(`Error details:`, {
         errorName: error instanceof Error ? error.name : typeof error,
         errorMessage: error instanceof Error ? error.message : String(error),
         payloadLength: payload.length,
@@ -243,18 +250,18 @@ export class BaseMindooTenant implements MindooTenant {
 
     // Combine IV and encrypted data
     // Format: IV (12 bytes) + encrypted data (includes authentication tag)
-    console.log(`[BaseMindooTenant] Combining IV and encrypted data`);
+    this.logger.debug(`Combining IV and encrypted data`);
     const encryptedArray = new Uint8Array(encrypted);
     const result = new Uint8Array(12 + encryptedArray.length);
     result.set(iv, 0);
     result.set(encryptedArray, 12);
 
-    console.log(`[BaseMindooTenant] Encrypted payload (${payload.length} -> ${result.length} bytes)`);
+    this.logger.debug(`Encrypted payload (${payload.length} -> ${result.length} bytes)`);
     return result;
   }
 
   async decryptPayload(encryptedPayload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
-    console.log(`[BaseMindooTenant] Decrypting payload with key: ${decryptionKeyId}`);
+    this.logger.debug(`Decrypting payload with key: ${decryptionKeyId}`);
 
     if (encryptedPayload.length < 12) {
       throw new Error("Encrypted payload too short (missing IV)");
@@ -311,12 +318,12 @@ export class BaseMindooTenant implements MindooTenant {
       encryptedData.buffer as ArrayBuffer
     );
 
-    console.log(`[BaseMindooTenant] Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
+    this.logger.debug(`Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
     return new Uint8Array(decrypted);
   }
 
   async signPayload(payload: Uint8Array): Promise<Uint8Array> {
-    console.log(`[BaseMindooTenant] Signing payload`);
+    this.logger.debug(`Signing payload`);
 
     // Get the current user's signing private key (decrypted)
     const signingKey = await this.getDecryptedSigningKey();
@@ -332,7 +339,7 @@ export class BaseMindooTenant implements MindooTenant {
       payload.buffer as ArrayBuffer
     );
 
-    console.log(`[BaseMindooTenant] Signed payload (signature: ${signature.byteLength} bytes)`);
+    this.logger.debug(`Signed payload (signature: ${signature.byteLength} bytes)`);
     return new Uint8Array(signature);
   }
 
@@ -341,7 +348,7 @@ export class BaseMindooTenant implements MindooTenant {
     signingKeyPair: SigningKeyPair,
     password: string
   ): Promise<Uint8Array> {
-    console.log(`[BaseMindooTenant] Signing payload with provided key`);
+    this.logger.debug(`Signing payload with provided key`);
 
     const subtle = this.cryptoAdapter.getSubtle();
 
@@ -372,17 +379,17 @@ export class BaseMindooTenant implements MindooTenant {
       payload.buffer as ArrayBuffer
     );
 
-    console.log(`[BaseMindooTenant] Signed payload with provided key (signature: ${signature.byteLength} bytes)`);
+    this.logger.debug(`Signed payload with provided key (signature: ${signature.byteLength} bytes)`);
     return new Uint8Array(signature);
   }
 
   async verifySignature(payload: Uint8Array, signature: Uint8Array, publicKey: string): Promise<boolean> {
-    console.log(`[BaseMindooTenant] Verifying signature`);
+    this.logger.debug(`Verifying signature`);
 
     const directory = await this.openDirectory();
     const isTrusted = await directory.validatePublicSigningKey(publicKey);
     if (!isTrusted) {
-      console.warn(`[BaseMindooTenant] Public key not trusted: ${publicKey}`);
+      this.logger.warn(`Public key not trusted: ${publicKey}`);
       return false;
     }
 
@@ -412,12 +419,12 @@ export class BaseMindooTenant implements MindooTenant {
       payload.buffer as ArrayBuffer
     );
 
-    console.log(`[BaseMindooTenant] Signature verification result: ${isValid}`);
+    this.logger.info(`Signature verification result: ${isValid}`);
     return isValid;
   }
 
   async validatePublicSigningKey(publicKey: string): Promise<boolean> {
-    console.log(`[BaseMindooTenant] Validating public signing key`);
+    this.logger.info(`Validating public signing key`);
 
     // Load the directory database to check if this key belongs to a trusted user
     const directoryDB = await this.openDB("directory");
@@ -446,7 +453,8 @@ export class BaseMindooTenant implements MindooTenant {
 
   async openDirectory(): Promise<MindooTenantDirectory> {
     if (!this.directoryCache) {
-      this.directoryCache = new BaseMindooTenantDirectory(this);
+      const directoryLogger = this.logger.createChild("Directory");
+      this.directoryCache = new BaseMindooTenantDirectory(this, directoryLogger);
     }
     return this.directoryCache;
   }
@@ -474,12 +482,14 @@ export class BaseMindooTenant implements MindooTenant {
     // Create the database stores using the factory
     const { docStore, attachmentStore } = this.storeFactory.createStore(id, storeOptions);
     
+    const dbLogger = this.logger.createChild("BaseMindooDB");
     const db = new BaseMindooDB(
       this, 
       docStore, 
       attachmentStore, 
       attachmentConfig,
-      adminOnlyDb ?? false
+      adminOnlyDb ?? false,
+      dbLogger
     );
     await db.initialize();
     
@@ -489,8 +499,9 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   createDocSignerFor(signKey: SigningKeyPair): MindooDocSigner {
-    console.log(`[BaseMindooTenant] Creating MindooDocSigner for signing key pair`);
-    return new MindooDocSigner(this, signKey);
+    this.logger.debug(`Creating MindooDocSigner for signing key pair`);
+    const signerLogger = this.logger.createChild("MindooDocSigner");
+    return new MindooDocSigner(this, signKey, signerLogger);
   }
 
   /**
@@ -541,14 +552,14 @@ export class BaseMindooTenant implements MindooTenant {
     password: string,
     saltString: string
   ): Promise<ArrayBuffer> {
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Starting decryption with saltString: ${saltString}`);
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Password length: ${password.length}`);
-    console.log(`[BaseMindooTenant] decryptPrivateKey: EncryptedKey iterations: ${encryptedKey.iterations}`);
+    this.logger.debug(`decryptPrivateKey: Starting decryption with saltString: ${saltString}`);
+    this.logger.debug(`decryptPrivateKey: Password length: ${password.length}`);
+    this.logger.debug(`decryptPrivateKey: EncryptedKey iterations: ${encryptedKey.iterations}`);
     
     const subtle = this.cryptoAdapter.getSubtle();
 
     // Decode base64 strings
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Decoding base64 strings`);
+    this.logger.debug(`decryptPrivateKey: Decoding base64 strings`);
     let ciphertext: Uint8Array;
     let iv: Uint8Array;
     let tag: Uint8Array;
@@ -558,9 +569,9 @@ export class BaseMindooTenant implements MindooTenant {
       iv = this.base64ToUint8Array(encryptedKey.iv);
       tag = this.base64ToUint8Array(encryptedKey.tag);
       saltBytes = this.base64ToUint8Array(encryptedKey.salt);
-      console.log(`[BaseMindooTenant] decryptPrivateKey: Decoded - ciphertext: ${ciphertext.length} bytes, iv: ${iv.length} bytes, tag: ${tag.length} bytes, salt: ${saltBytes.length} bytes`);
+      this.logger.debug(`decryptPrivateKey: Decoded - ciphertext: ${ciphertext.length} bytes, iv: ${iv.length} bytes, tag: ${tag.length} bytes, salt: ${saltBytes.length} bytes`);
     } catch (error) {
-      console.error(`[BaseMindooTenant] decryptPrivateKey: Error decoding base64:`, error);
+      this.logger.error(`decryptPrivateKey: Error decoding base64:`, error);
       throw error;
     }
 
@@ -568,14 +579,14 @@ export class BaseMindooTenant implements MindooTenant {
     // Combine the stored salt bytes with the salt string for additional security
     // This ensures different key types (signing, encryption, etc.) use different derived keys
     // even if they share the same password
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Combining salt with saltString`);
+    this.logger.debug(`decryptPrivateKey: Combining salt with saltString`);
     const saltStringBytes = new TextEncoder().encode(saltString);
     const combinedSalt = new Uint8Array(saltBytes.length + saltStringBytes.length);
     combinedSalt.set(saltBytes);
     combinedSalt.set(saltStringBytes, saltBytes.length);
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Combined salt length: ${combinedSalt.length} bytes`);
+    this.logger.debug(`decryptPrivateKey: Combined salt length: ${combinedSalt.length} bytes`);
 
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Importing password key for PBKDF2`);
+    this.logger.debug(`decryptPrivateKey: Importing password key for PBKDF2`);
     let passwordKey: CryptoKey;
     try {
       passwordKey = await subtle.importKey(
@@ -585,13 +596,13 @@ export class BaseMindooTenant implements MindooTenant {
         false,
         ["deriveBits", "deriveKey"]
       );
-      console.log(`[BaseMindooTenant] decryptPrivateKey: Successfully imported password key`);
+      this.logger.debug(`decryptPrivateKey: Successfully imported password key`);
     } catch (error) {
-      console.error(`[BaseMindooTenant] decryptPrivateKey: Error importing password key:`, error);
+      this.logger.error(`decryptPrivateKey: Error importing password key:`, error);
       throw error;
     }
 
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Deriving key with PBKDF2 (iterations: ${encryptedKey.iterations})`);
+    this.logger.debug(`decryptPrivateKey: Deriving key with PBKDF2 (iterations: ${encryptedKey.iterations})`);
     let derivedKey: CryptoKey;
     try {
       derivedKey = await subtle.deriveKey(
@@ -609,30 +620,30 @@ export class BaseMindooTenant implements MindooTenant {
         false,
         ["decrypt"]
       );
-      console.log(`[BaseMindooTenant] decryptPrivateKey: Successfully derived key`);
+      this.logger.debug(`decryptPrivateKey: Successfully derived key`);
     } catch (error) {
-      console.error(`[BaseMindooTenant] decryptPrivateKey: Error deriving key:`, error);
+      this.logger.error(`decryptPrivateKey: Error deriving key:`, error);
       throw error;
     }
 
     // Combine ciphertext and tag (GCM authentication tag is separate)
     // AES-GCM expects the tag to be appended to the ciphertext
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Combining ciphertext and tag`);
+    this.logger.debug(`decryptPrivateKey: Combining ciphertext and tag`);
     const encryptedData = new Uint8Array(ciphertext.length + tag.length);
     encryptedData.set(ciphertext);
     encryptedData.set(tag, ciphertext.length);
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Combined encrypted data length: ${encryptedData.length} bytes`);
+    this.logger.debug(`decryptPrivateKey: Combined encrypted data length: ${encryptedData.length} bytes`);
 
     // Decrypt the private key
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Decrypting with AES-GCM`);
-    console.log(`[BaseMindooTenant] decryptPrivateKey: IV length: ${iv.length} bytes (expected: 12 for AES-GCM)`);
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Tag length: ${tag.length} bytes (expected: 16 for 128-bit tag)`);
-    console.log(`[BaseMindooTenant] decryptPrivateKey: Ciphertext length: ${ciphertext.length} bytes`);
+    this.logger.debug(`decryptPrivateKey: Decrypting with AES-GCM`);
+    this.logger.debug(`decryptPrivateKey: IV length: ${iv.length} bytes (expected: 12 for AES-GCM)`);
+    this.logger.debug(`decryptPrivateKey: Tag length: ${tag.length} bytes (expected: 16 for 128-bit tag)`);
+    this.logger.debug(`decryptPrivateKey: Ciphertext length: ${ciphertext.length} bytes`);
     let decrypted: ArrayBuffer;
     try {
       // Create a new ArrayBuffer to ensure we have the correct buffer without any offset issues
       const encryptedBuffer = new Uint8Array(encryptedData).buffer;
-      console.log(`[BaseMindooTenant] decryptPrivateKey: Encrypted buffer size: ${encryptedBuffer.byteLength} bytes`);
+      this.logger.debug(`decryptPrivateKey: Encrypted buffer size: ${encryptedBuffer.byteLength} bytes`);
       
       decrypted = await subtle.decrypt(
         {
@@ -643,10 +654,10 @@ export class BaseMindooTenant implements MindooTenant {
         derivedKey,
         encryptedBuffer
       );
-      console.log(`[BaseMindooTenant] decryptPrivateKey: Successfully decrypted, result length: ${decrypted.byteLength} bytes`);
+      this.logger.debug(`decryptPrivateKey: Successfully decrypted, result length: ${decrypted.byteLength} bytes`);
     } catch (error) {
-      console.error(`[BaseMindooTenant] decryptPrivateKey: Error during decryption:`, error);
-      console.error(`[BaseMindooTenant] decryptPrivateKey: Error details:`, {
+      this.logger.error(`decryptPrivateKey: Error during decryption:`, error);
+      this.logger.error(`decryptPrivateKey: Error details:`, {
         errorName: error instanceof Error ? error.name : typeof error,
         errorMessage: error instanceof Error ? error.message : String(error),
         ivLength: iv.length,
@@ -795,7 +806,7 @@ export class BaseMindooTenant implements MindooTenant {
     payload: Uint8Array,
     decryptionKeyId: string
   ): Promise<Uint8Array> {
-    console.log(`[BaseMindooTenant] Encrypting attachment payload with key: ${decryptionKeyId}`);
+    this.logger.debug(`Encrypting attachment payload with key: ${decryptionKeyId}`);
     
     const symmetricKey = await this.getSymmetricKey(decryptionKeyId);
     const subtle = this.cryptoAdapter.getSubtle();
@@ -827,12 +838,12 @@ export class BaseMindooTenant implements MindooTenant {
       ) as ArrayBuffer;
       const hashBuffer = await subtle.digest("SHA-256", payloadBuffer);
       iv = new Uint8Array(hashBuffer).slice(0, 12);
-      console.log(`[BaseMindooTenant] Using deterministic IV derived from content hash`);
+      this.logger.debug(`Using deterministic IV derived from content hash`);
     } else {
       // Random IV
       iv = new Uint8Array(12);
       randomValues(iv);
-      console.log(`[BaseMindooTenant] Using random IV`);
+      this.logger.debug(`Using random IV`);
     }
 
     // Encrypt the payload
@@ -854,7 +865,7 @@ export class BaseMindooTenant implements MindooTenant {
     result.set(iv, 1);
     result.set(encryptedArray, 13);
 
-    console.log(`[BaseMindooTenant] Encrypted attachment (mode=${mode}, ${payload.length} -> ${result.length} bytes)`);
+    this.logger.debug(`Encrypted attachment (mode=${mode}, ${payload.length} -> ${result.length} bytes)`);
     return result;
   }
 
@@ -870,7 +881,7 @@ export class BaseMindooTenant implements MindooTenant {
     encryptedPayload: Uint8Array,
     decryptionKeyId: string
   ): Promise<Uint8Array> {
-    console.log(`[BaseMindooTenant] Decrypting attachment payload with key: ${decryptionKeyId}`);
+    this.logger.debug(`Decrypting attachment payload with key: ${decryptionKeyId}`);
     
     if (encryptedPayload.length < 13) {
       throw new Error("Invalid encrypted attachment payload: too short");
@@ -882,7 +893,7 @@ export class BaseMindooTenant implements MindooTenant {
         mode !== BaseMindooTenant.ENCRYPTION_MODE_DETERMINISTIC) {
       throw new Error(`Invalid encryption mode: ${mode}`);
     }
-    console.log(`[BaseMindooTenant] Decrypting attachment with mode=${mode}`);
+    this.logger.debug(`Decrypting attachment with mode=${mode}`);
 
     // Extract IV (bytes 1-12)
     const iv = encryptedPayload.slice(1, 13);
@@ -915,7 +926,7 @@ export class BaseMindooTenant implements MindooTenant {
     );
 
     const result = new Uint8Array(decrypted);
-    console.log(`[BaseMindooTenant] Decrypted attachment (${encryptedPayload.length} -> ${result.length} bytes)`);
+    this.logger.debug(`Decrypted attachment (${encryptedPayload.length} -> ${result.length} bytes)`);
     return result;
   }
 }

@@ -5,6 +5,7 @@ import type { NetworkEncryptedEntry, NetworkAuthTokenPayload } from "../../core/
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 
 /**
  * Server-side network handler for ContentAddressedStore operations.
@@ -24,6 +25,7 @@ export class ServerNetworkContentAddressedStore {
   private authService: AuthenticationService;
   private rsaEncryption: RSAEncryption;
   private cryptoAdapter: CryptoAdapter;
+  private logger: Logger;
 
   /**
    * Create a new ServerNetworkContentAddressedStore.
@@ -32,18 +34,24 @@ export class ServerNetworkContentAddressedStore {
    * @param directory The tenant directory for user lookup
    * @param authService The authentication service for token validation
    * @param cryptoAdapter The crypto adapter for encryption
+   * @param logger Optional logger instance
    */
   constructor(
     localStore: ContentAddressedStore,
     directory: MindooTenantDirectory,
     authService: AuthenticationService,
-    cryptoAdapter: CryptoAdapter
+    cryptoAdapter: CryptoAdapter,
+    logger?: Logger
   ) {
     this.localStore = localStore;
     this.directory = directory;
     this.authService = authService;
     this.cryptoAdapter = cryptoAdapter;
-    this.rsaEncryption = new RSAEncryption(cryptoAdapter);
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), `ServerNetworkStore:${localStore.getId()}`, true);
+    const rsaLogger = this.logger.createChild("RSAEncryption");
+    this.rsaEncryption = new RSAEncryption(cryptoAdapter, rsaLogger);
   }
 
   /**
@@ -60,7 +68,7 @@ export class ServerNetworkContentAddressedStore {
    * @returns The challenge string
    */
   async handleChallengeRequest(username: string): Promise<string> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling challenge request for user: ${username}`);
+    this.logger.debug(`Handling challenge request for user: ${username}`);
     return this.authService.generateChallenge(username);
   }
 
@@ -76,7 +84,7 @@ export class ServerNetworkContentAddressedStore {
     token?: string;
     error?: string;
   }> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling authentication for challenge: ${challenge}`);
+    this.logger.debug(`Handling authentication for challenge: ${challenge}`);
     return this.authService.authenticate(challenge, signature);
   }
 
@@ -91,15 +99,15 @@ export class ServerNetworkContentAddressedStore {
     token: string,
     knownIds: string[]
   ): Promise<StoreEntryMetadata[]> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling findNewEntries request`);
+    this.logger.debug(`Handling findNewEntries request`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
-    console.log(`[ServerNetworkContentAddressedStore] Token validated for user: ${tokenPayload.sub}`);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
     // Find new entries
     const newEntries = await this.localStore.findNewEntries(knownIds);
-    console.log(`[ServerNetworkContentAddressedStore] Found ${newEntries.length} new entries`);
+    this.logger.debug(`Found ${newEntries.length} new entries`);
     
     return newEntries;
   }
@@ -118,15 +126,15 @@ export class ServerNetworkContentAddressedStore {
     knownIds: string[],
     docId: string
   ): Promise<StoreEntryMetadata[]> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling findNewEntriesForDoc request for doc ${docId}`);
+    this.logger.debug(`Handling findNewEntriesForDoc request for doc ${docId}`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
-    console.log(`[ServerNetworkContentAddressedStore] Token validated for user: ${tokenPayload.sub}`);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
     // Find new entries for the specific document
     const newEntries = await this.localStore.findNewEntriesForDoc(knownIds, docId);
-    console.log(`[ServerNetworkContentAddressedStore] Found ${newEntries.length} new entries for doc ${docId}`);
+    this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
     
     return newEntries;
   }
@@ -143,12 +151,12 @@ export class ServerNetworkContentAddressedStore {
     token: string,
     ids: string[]
   ): Promise<NetworkEncryptedEntry[]> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling getEntries request for ${ids.length} entries`);
+    this.logger.debug(`Handling getEntries request for ${ids.length} entries`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
     const username = tokenPayload.sub;
-    console.log(`[ServerNetworkContentAddressedStore] Token validated for user: ${username}`);
+    this.logger.debug(`Token validated for user: ${username}`);
     
     // Get user's public encryption key
     const userKeys = await this.directory.getUserPublicKeys(username);
@@ -159,11 +167,11 @@ export class ServerNetworkContentAddressedStore {
       );
     }
     
-    console.log(`[ServerNetworkContentAddressedStore] Retrieved encryption key for user: ${username}`);
+    this.logger.debug(`Retrieved encryption key for user: ${username}`);
     
     // Get the entries from local store
     const entries = await this.localStore.getEntries(ids);
-    console.log(`[ServerNetworkContentAddressedStore] Retrieved ${entries.length} entries from local store`);
+    this.logger.debug(`Retrieved ${entries.length} entries from local store`);
     
     // Encrypt each entry with the user's RSA public key
     const encryptedEntries = await this.encryptEntriesForUser(
@@ -171,7 +179,7 @@ export class ServerNetworkContentAddressedStore {
       userKeys.encryptionPublicKey
     );
     
-    console.log(`[ServerNetworkContentAddressedStore] Encrypted ${encryptedEntries.length} entries for user: ${username}`);
+    this.logger.debug(`Encrypted ${encryptedEntries.length} entries for user: ${username}`);
     return encryptedEntries;
   }
 
@@ -182,11 +190,11 @@ export class ServerNetworkContentAddressedStore {
    * @param entries The entries to store
    */
   async handlePutEntries(token: string, entries: StoreEntry[]): Promise<void> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling putEntries request for ${entries.length} entries`);
+    this.logger.debug(`Handling putEntries request for ${entries.length} entries`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
-    console.log(`[ServerNetworkContentAddressedStore] Token validated for user: ${tokenPayload.sub}`);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
     // Process each entry
     for (const entry of entries) {
@@ -202,7 +210,7 @@ export class ServerNetworkContentAddressedStore {
     
     // Store all entries
     await this.localStore.putEntries(entries);
-    console.log(`[ServerNetworkContentAddressedStore] Successfully stored ${entries.length} entries`);
+    this.logger.debug(`Successfully stored ${entries.length} entries`);
   }
 
   /**
@@ -214,15 +222,15 @@ export class ServerNetworkContentAddressedStore {
    * @returns List of IDs that exist in the store
    */
   async handleHasEntries(token: string, ids: string[]): Promise<string[]> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling hasEntries request for ${ids.length} IDs`);
+    this.logger.debug(`Handling hasEntries request for ${ids.length} IDs`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
-    console.log(`[ServerNetworkContentAddressedStore] Token validated for user: ${tokenPayload.sub}`);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
     // Check which IDs exist in local store
     const existingIds = await this.localStore.hasEntries(ids);
-    console.log(`[ServerNetworkContentAddressedStore] Found ${existingIds.length} existing entries out of ${ids.length} checked`);
+    this.logger.debug(`Found ${existingIds.length} existing entries out of ${ids.length} checked`);
     
     return existingIds;
   }
@@ -235,15 +243,15 @@ export class ServerNetworkContentAddressedStore {
    * @returns List of all entry IDs in the store
    */
   async handleGetAllIds(token: string): Promise<string[]> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling getAllIds request`);
+    this.logger.debug(`Handling getAllIds request`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
-    console.log(`[ServerNetworkContentAddressedStore] Token validated for user: ${tokenPayload.sub}`);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
     // Get all entry IDs from local store
     const allIds = await this.localStore.getAllIds();
-    console.log(`[ServerNetworkContentAddressedStore] Returning ${allIds.length} entry IDs`);
+    this.logger.debug(`Returning ${allIds.length} entry IDs`);
     
     return allIds;
   }
@@ -262,15 +270,15 @@ export class ServerNetworkContentAddressedStore {
     startId: string,
     options?: Record<string, unknown>
   ): Promise<string[]> {
-    console.log(`[ServerNetworkContentAddressedStore] Handling resolveDependencies request for ${startId}`);
+    this.logger.debug(`Handling resolveDependencies request for ${startId}`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
-    console.log(`[ServerNetworkContentAddressedStore] Token validated for user: ${tokenPayload.sub}`);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
     // Resolve dependencies in local store
     const resolvedIds = await this.localStore.resolveDependencies(startId, options);
-    console.log(`[ServerNetworkContentAddressedStore] Resolved ${resolvedIds.length} dependencies`);
+    this.logger.debug(`Resolved ${resolvedIds.length} dependencies`);
     
     return resolvedIds;
   }

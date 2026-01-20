@@ -1,4 +1,5 @@
 import type { CryptoAdapter } from "./CryptoAdapter";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
 /**
  * RSA Encryption utilities for network transport security.
@@ -12,9 +13,13 @@ import type { CryptoAdapter } from "./CryptoAdapter";
  */
 export class RSAEncryption {
   private cryptoAdapter: CryptoAdapter;
+  private logger: Logger;
 
-  constructor(cryptoAdapter: CryptoAdapter) {
+  constructor(cryptoAdapter: CryptoAdapter, logger?: Logger) {
     this.cryptoAdapter = cryptoAdapter;
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), "RSAEncryption", true);
   }
 
   /**
@@ -24,7 +29,7 @@ export class RSAEncryption {
    * @returns The imported CryptoKey for encryption
    */
   async importPublicKey(pemKey: string): Promise<CryptoKey> {
-    console.log(`[RSAEncryption] Importing RSA public key`);
+    this.logger.debug(`Importing RSA public key`);
     
     // Remove PEM headers and decode base64
     const pemContents = pemKey
@@ -47,7 +52,7 @@ export class RSAEncryption {
       ["encrypt"]
     );
     
-    console.log(`[RSAEncryption] Successfully imported RSA public key`);
+    this.logger.debug(`Successfully imported RSA public key`);
     return cryptoKey;
   }
 
@@ -58,7 +63,7 @@ export class RSAEncryption {
    * @returns The imported CryptoKey for decryption
    */
   async importPrivateKey(pemKey: string): Promise<CryptoKey> {
-    console.log(`[RSAEncryption] Importing RSA private key`);
+    this.logger.debug(`Importing RSA private key`);
     
     // Remove PEM headers and decode base64
     const pemContents = pemKey
@@ -81,7 +86,7 @@ export class RSAEncryption {
       ["decrypt"]
     );
     
-    console.log(`[RSAEncryption] Successfully imported RSA private key`);
+    this.logger.debug(`Successfully imported RSA private key`);
     return cryptoKey;
   }
 
@@ -101,7 +106,7 @@ export class RSAEncryption {
     data: Uint8Array,
     publicKey: CryptoKey | string
   ): Promise<Uint8Array> {
-    console.log(`[RSAEncryption] Encrypting ${data.length} bytes`);
+    this.logger.debug(`Encrypting ${data.length} bytes`);
     
     // Import key if it's a PEM string
     const cryptoKey = typeof publicKey === "string" 
@@ -164,7 +169,7 @@ export class RSAEncryption {
     // Write encrypted data
     result.set(encryptedDataBytes, 2 + encryptedKeyBytes.length + iv.length);
     
-    console.log(`[RSAEncryption] Encrypted to ${result.length} bytes (hybrid encryption)`);
+    this.logger.debug(`Encrypted to ${result.length} bytes (hybrid encryption)`);
     return result;
   }
 
@@ -182,7 +187,7 @@ export class RSAEncryption {
     encryptedData: Uint8Array,
     privateKey: CryptoKey | string
   ): Promise<Uint8Array> {
-    console.log(`[RSAEncryption] Decrypting ${encryptedData.length} bytes`);
+    this.logger.debug(`Decrypting ${encryptedData.length} bytes`);
     
     // Import key if it's a PEM string
     const cryptoKey = typeof privateKey === "string"
@@ -225,7 +230,7 @@ export class RSAEncryption {
     );
     
     const result = new Uint8Array(decryptedData);
-    console.log(`[RSAEncryption] Decrypted to ${result.length} bytes`);
+    this.logger.debug(`Decrypted to ${result.length} bytes`);
     return result;
   }
 

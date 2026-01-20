@@ -7,6 +7,7 @@ import type {
   NetworkAuthTokenPayload,
 } from "./types";
 import { NetworkError, NetworkErrorType } from "./types";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../../logging";
 
 /**
  * Authentication service for network sync operations.
@@ -37,6 +38,7 @@ export class AuthenticationService {
   // Configuration
   private challengeExpirationMs: number;
   private tokenExpirationMs: number;
+  private logger: Logger;
 
   constructor(
     cryptoAdapter: CryptoAdapter,
@@ -46,6 +48,7 @@ export class AuthenticationService {
       jwtSecret?: Uint8Array;
       challengeExpirationMs?: number;
       tokenExpirationMs?: number;
+      logger?: Logger;
     }
   ) {
     this.cryptoAdapter = cryptoAdapter;
@@ -58,6 +61,9 @@ export class AuthenticationService {
     // Default: 5 minutes for challenge, 1 hour for token
     this.challengeExpirationMs = options?.challengeExpirationMs || 5 * 60 * 1000;
     this.tokenExpirationMs = options?.tokenExpirationMs || 60 * 60 * 1000;
+    this.logger =
+      options?.logger ||
+      new MindooLogger(getDefaultLogLevel(), `AuthenticationService:${tenantId}`, true);
   }
 
   /**
@@ -68,7 +74,7 @@ export class AuthenticationService {
    * @throws NetworkError if user not found or revoked
    */
   async generateChallenge(username: string): Promise<string> {
-    console.log(`[AuthenticationService] Generating challenge for user: ${username}`);
+    this.logger.debug(`Generating challenge for user: ${username}`);
     
     // Check if user exists and is not revoked
     const userKeys = await this.directory.getUserPublicKeys(username);
@@ -99,7 +105,7 @@ export class AuthenticationService {
     // Clean up expired challenges periodically
     this.cleanupExpiredChallenges();
     
-    console.log(`[AuthenticationService] Generated challenge for user ${username}: ${challenge}`);
+    this.logger.debug(`Generated challenge for user ${username}: ${challenge}`);
     return challenge;
   }
 
@@ -111,12 +117,12 @@ export class AuthenticationService {
    * @returns AuthResult with success status and JWT token
    */
   async authenticate(challenge: string, signature: Uint8Array): Promise<AuthResult> {
-    console.log(`[AuthenticationService] Authenticating challenge: ${challenge}`);
+    this.logger.debug(`Authenticating challenge: ${challenge}`);
     
     // Get and validate challenge
     const authChallenge = this.challenges.get(challenge);
     if (!authChallenge) {
-      console.log(`[AuthenticationService] Challenge not found: ${challenge}`);
+      this.logger.debug(`Challenge not found: ${challenge}`);
       return {
         success: false,
         error: "Challenge not found or expired",
@@ -125,7 +131,7 @@ export class AuthenticationService {
     
     // Check if challenge is expired
     if (Date.now() > authChallenge.expiresAt) {
-      console.log(`[AuthenticationService] Challenge expired: ${challenge}`);
+      this.logger.debug(`Challenge expired: ${challenge}`);
       this.challenges.delete(challenge);
       return {
         success: false,
@@ -135,7 +141,7 @@ export class AuthenticationService {
     
     // Check if challenge was already used
     if (authChallenge.used) {
-      console.log(`[AuthenticationService] Challenge already used: ${challenge}`);
+      this.logger.debug(`Challenge already used: ${challenge}`);
       return {
         success: false,
         error: "Challenge already used",
@@ -150,7 +156,7 @@ export class AuthenticationService {
     // Get user's public signing key
     const userKeys = await this.directory.getUserPublicKeys(username);
     if (!userKeys) {
-      console.log(`[AuthenticationService] User not found or revoked: ${username}`);
+      this.logger.debug(`User not found or revoked: ${username}`);
       return {
         success: false,
         error: "User not found or revoked",
@@ -165,7 +171,7 @@ export class AuthenticationService {
     );
     
     if (!isValid) {
-      console.log(`[AuthenticationService] Invalid signature for user: ${username}`);
+      this.logger.debug(`Invalid signature for user: ${username}`);
       return {
         success: false,
         error: "Invalid signature",
@@ -175,7 +181,7 @@ export class AuthenticationService {
     // Generate JWT token
     const token = await this.generateToken(username);
     
-    console.log(`[AuthenticationService] Authentication successful for user: ${username}`);
+    this.logger.info(`Authentication successful for user: ${username}`);
     return {
       success: true,
       token,
@@ -189,34 +195,34 @@ export class AuthenticationService {
    * @returns The token payload if valid, null otherwise
    */
   async validateToken(token: string): Promise<NetworkAuthTokenPayload | null> {
-    console.log(`[AuthenticationService] Validating token`);
+    this.logger.debug(`Validating token`);
     
     try {
       const payload = await this.verifyToken(token);
       
       if (!payload) {
-        console.log(`[AuthenticationService] Invalid token signature`);
+        this.logger.debug(`Invalid token signature`);
         return null;
       }
       
       // Check expiration
       const now = Math.floor(Date.now() / 1000);
       if (payload.exp < now) {
-        console.log(`[AuthenticationService] Token expired`);
+        this.logger.debug(`Token expired`);
         return null;
       }
       
       // Check if user is still valid (not revoked)
       const isRevoked = await this.directory.isUserRevoked(payload.sub);
       if (isRevoked) {
-        console.log(`[AuthenticationService] User revoked: ${payload.sub}`);
+        this.logger.debug(`User revoked: ${payload.sub}`);
         return null;
       }
       
-      console.log(`[AuthenticationService] Token valid for user: ${payload.sub}`);
+      this.logger.debug(`Token valid for user: ${payload.sub}`);
       return payload;
     } catch (error) {
-      console.error(`[AuthenticationService] Token validation error:`, error);
+      this.logger.error(`Token validation error:`, error);
       return null;
     }
   }
@@ -259,7 +265,7 @@ export class AuthenticationService {
       
       return isValid;
     } catch (error) {
-      console.error(`[AuthenticationService] Signature verification error:`, error);
+      this.logger.error(`Signature verification error:`, error);
       return false;
     }
   }
@@ -343,7 +349,7 @@ export class AuthenticationService {
       
       return payload;
     } catch (error) {
-      console.error(`[AuthenticationService] Token verification error:`, error);
+      this.logger.error(`Token verification error:`, error);
       return null;
     }
   }

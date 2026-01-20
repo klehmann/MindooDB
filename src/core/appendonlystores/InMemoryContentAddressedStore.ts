@@ -8,6 +8,7 @@ import type {
   StoreEntry,
   StoreEntryMetadata,
 } from "../types";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
 /**
  * A simple in-memory implementation of ContentAddressedStore for testing purposes.
@@ -30,9 +31,13 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   
   /** Index for finding entries by docId (for efficient doc queries) */
   private docIndex: Map<string, Set<string>> = new Map(); // docId -> Set<entryId>
+  private logger: Logger;
 
-  constructor(dbId: string) {
+  constructor(dbId: string, logger?: Logger) {
     this.dbId = dbId;
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), `InMemoryStore:${dbId}`, true);
   }
 
   getId(): string {
@@ -51,7 +56,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     for (const entry of entries) {
       // Check if we already have this entry by id (no-op if exists)
       if (this.entries.has(entry.id)) {
-        console.log(`[InMemoryContentAddressedStore:${this.dbId}] Entry ${entry.id} already exists, skipping`);
+        this.logger.debug(`Entry ${entry.id} already exists, skipping`);
         continue;
       }
 
@@ -64,9 +69,9 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       // Store bytes by contentHash (deduplication happens here)
       if (!this.contentStore.has(entry.contentHash)) {
         this.contentStore.set(entry.contentHash, encryptedData);
-        console.log(`[InMemoryContentAddressedStore:${this.dbId}] Stored content for hash ${entry.contentHash.substring(0, 8)}...`);
+        this.logger.debug(`Stored content for hash ${entry.contentHash.substring(0, 8)}...`);
       } else {
-        console.log(`[InMemoryContentAddressedStore:${this.dbId}] Content ${entry.contentHash.substring(0, 8)}... already exists (deduplicated)`);
+        this.logger.debug(`Content ${entry.contentHash.substring(0, 8)}... already exists (deduplicated)`);
       }
 
       // Update document index
@@ -75,7 +80,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       }
       this.docIndex.get(entry.docId)!.add(entry.id);
 
-      console.log(`[InMemoryContentAddressedStore:${this.dbId}] Stored entry ${entry.id} for doc ${entry.docId}`);
+      this.logger.debug(`Stored entry ${entry.id} for doc ${entry.docId}`);
     }
   }
 
@@ -96,14 +101,14 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
         if (encryptedData) {
           result.push({ ...metadata, encryptedData });
         } else {
-          console.warn(`[InMemoryContentAddressedStore:${this.dbId}] Content ${metadata.contentHash} not found for entry ${id}`);
+          this.logger.warn(`Content ${metadata.contentHash} not found for entry ${id}`);
         }
       } else {
-        console.warn(`[InMemoryContentAddressedStore:${this.dbId}] Entry ${id} not found`);
+        this.logger.warn(`Entry ${id} not found`);
       }
     }
 
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Retrieved ${result.length} entries out of ${ids.length} requested`);
+    this.logger.debug(`Retrieved ${result.length} entries out of ${ids.length} requested`);
     return result;
   }
 
@@ -120,7 +125,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
         existing.push(id);
       }
     }
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Found ${existing.length} existing entries out of ${ids.length} checked`);
+    this.logger.debug(`Found ${existing.length} existing entries out of ${ids.length} checked`);
     return existing;
   }
 
@@ -143,7 +148,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       }
     }
 
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Found ${newEntries.length} new entries out of ${this.entries.size} total`);
+    this.logger.debug(`Found ${newEntries.length} new entries out of ${this.entries.size} total`);
     return newEntries;
   }
 
@@ -172,7 +177,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       }
     }
 
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Found ${newEntries.length} new entries for doc ${docId} out of ${docEntryIds.size} total`);
+    this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId} out of ${docEntryIds.size} total`);
     return newEntries;
   }
 
@@ -184,7 +189,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
    */
   async getAllIds(): Promise<string[]> {
     const ids = Array.from(this.entries.keys());
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Returning ${ids.length} entry IDs`);
+    this.logger.debug(`Returning ${ids.length} entry IDs`);
     return ids;
   }
 
@@ -228,7 +233,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       // Get the entry metadata
       const entry = this.entries.get(id);
       if (!entry) {
-        console.warn(`[InMemoryContentAddressedStore:${this.dbId}] Entry ${id} not found during dependency resolution`);
+        this.logger.warn(`Entry ${id} not found during dependency resolution`);
         continue;
       }
 
@@ -255,7 +260,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     // Reverse to get oldest first (we traversed from newest to oldest)
     result.reverse();
 
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Resolved ${result.length} dependencies for ${startId}`);
+    this.logger.debug(`Resolved ${result.length} dependencies for ${startId}`);
     return result;
   }
 
@@ -271,13 +276,13 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
    * @return A promise that resolves when the purge is complete
    */
   async purgeDocHistory(docId: string): Promise<void> {
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Purging entry history for document: ${docId}`);
+    this.logger.info(`Purging entry history for document: ${docId}`);
     
     // Get all entry IDs for this document
     const docEntryIds = this.docIndex.get(docId);
     
     if (!docEntryIds || docEntryIds.size === 0) {
-      console.log(`[InMemoryContentAddressedStore:${this.dbId}] No entries found for document ${docId}, nothing to purge`);
+      this.logger.debug(`No entries found for document ${docId}, nothing to purge`);
       return;
     }
     
@@ -307,11 +312,11 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       }
       if (!isReferenced) {
         this.contentStore.delete(contentHash);
-        console.log(`[InMemoryContentAddressedStore:${this.dbId}] Cleaned up orphaned content ${contentHash.substring(0, 8)}...`);
+        this.logger.debug(`Cleaned up orphaned content ${contentHash.substring(0, 8)}...`);
       }
     }
     
-    console.log(`[InMemoryContentAddressedStore:${this.dbId}] Purged ${docEntryIds.size} entries for document ${docId}`);
+    this.logger.info(`Purged ${docEntryIds.size} entries for document ${docId}`);
   }
   
   /**

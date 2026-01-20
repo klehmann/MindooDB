@@ -5,6 +5,7 @@ import type { NetworkTransport } from "../../core/appendonlystores/network/Netwo
 import type { NetworkEncryptedEntry } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 
 /**
  * Client-side network ContentAddressedStore that forwards all operations to a remote server.
@@ -32,6 +33,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   // Cached access token
   private accessToken: string | null = null;
   private tokenExpiry: number = 0;
+  private logger: Logger;
 
   /**
    * Create a new ClientNetworkContentAddressedStore.
@@ -42,6 +44,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @param username The username for authentication
    * @param signingKey The user's private signing key (for signing challenges)
    * @param privateEncryptionKey The user's private RSA key (for decrypting received entries)
+   * @param logger Optional logger instance
    */
   constructor(
     dbId: string,
@@ -49,15 +52,20 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     cryptoAdapter: CryptoAdapter,
     username: string,
     signingKey: CryptoKey,
-    privateEncryptionKey: CryptoKey | string
+    privateEncryptionKey: CryptoKey | string,
+    logger?: Logger
   ) {
     this.dbId = dbId;
     this.transport = transport;
     this.cryptoAdapter = cryptoAdapter;
-    this.rsaEncryption = new RSAEncryption(cryptoAdapter);
     this.username = username;
     this.signingKey = signingKey;
     this.privateEncryptionKey = privateEncryptionKey;
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), `ClientNetworkStore:${dbId}`, true);
+    const rsaLogger = this.logger.createChild("RSAEncryption");
+    this.rsaEncryption = new RSAEncryption(cryptoAdapter, rsaLogger);
   }
 
   getId(): string {
@@ -73,12 +81,12 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       return;
     }
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Pushing ${entries.length} entries to remote`);
+    this.logger.debug(`Pushing ${entries.length} entries to remote`);
     
     const token = await this.ensureAuthenticated();
     await this.transport.putEntries(token, entries);
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Successfully pushed ${entries.length} entries`);
+    this.logger.debug(`Successfully pushed ${entries.length} entries`);
   }
 
   /**
@@ -88,7 +96,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @returns The entries with decrypted payloads
    */
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Getting ${ids.length} entries from remote`);
+    this.logger.debug(`Getting ${ids.length} entries from remote`);
     
     if (ids.length === 0) {
       return [];
@@ -97,11 +105,11 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     const token = await this.ensureAuthenticated();
     
     const encryptedEntries = await this.transport.getEntries(token, ids);
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Received ${encryptedEntries.length} encrypted entries from remote`);
+    this.logger.debug(`Received ${encryptedEntries.length} encrypted entries from remote`);
     
     // Decrypt the RSA layer for each entry
     const entries = await this.decryptNetworkEntries(encryptedEntries);
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Decrypted ${entries.length} entries`);
+    this.logger.debug(`Decrypted ${entries.length} entries`);
     
     return entries;
   }
@@ -113,7 +121,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @returns List of IDs that exist in the remote store
    */
   async hasEntries(ids: string[]): Promise<string[]> {
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Checking ${ids.length} IDs in remote`);
+    this.logger.debug(`Checking ${ids.length} IDs in remote`);
     
     if (ids.length === 0) {
       return [];
@@ -121,7 +129,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     
     const token = await this.ensureAuthenticated();
     const existingIds = await this.transport.hasEntries(token, ids);
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Found ${existingIds.length} existing entries`);
+    this.logger.debug(`Found ${existingIds.length} existing entries`);
     
     return existingIds;
   }
@@ -133,13 +141,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @returns List of new entry metadata from the remote store
    */
   async findNewEntries(knownIds: string[]): Promise<StoreEntryMetadata[]> {
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Finding new entries from remote`);
+    this.logger.debug(`Finding new entries from remote`);
     
     const token = await this.ensureAuthenticated();
     //TODO improve this by using a bloom filter
     const newEntries = await this.transport.findNewEntries(token, knownIds);
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Found ${newEntries.length} new entries from remote`);
+    this.logger.debug(`Found ${newEntries.length} new entries from remote`);
     return newEntries;
   }
 
@@ -147,12 +155,12 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * Find new entries for a specific document from the remote store.
    */
   async findNewEntriesForDoc(knownIds: string[], docId: string): Promise<StoreEntryMetadata[]> {
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Finding new entries for doc ${docId} from remote`);
+    this.logger.debug(`Finding new entries for doc ${docId} from remote`);
     
     const token = await this.ensureAuthenticated();
     const newEntries = await this.transport.findNewEntriesForDoc(token, knownIds, docId);
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Found ${newEntries.length} new entries for doc ${docId}`);
+    this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
     return newEntries;
   }
 
@@ -161,12 +169,12 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * Used for synchronization to identify which entries the remote has.
    */
   async getAllIds(): Promise<string[]> {
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Getting all entry IDs from remote`);
+    this.logger.debug(`Getting all entry IDs from remote`);
     
     const token = await this.ensureAuthenticated();
     const allIds = await this.transport.getAllIds(token);
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Remote has ${allIds.length} entry IDs`);
+    this.logger.debug(`Remote has ${allIds.length} entry IDs`);
     return allIds;
   }
 
@@ -179,12 +187,12 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     startId: string,
     options?: Record<string, unknown>
   ): Promise<string[]> {
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Resolving dependencies for ${startId}`);
+    this.logger.debug(`Resolving dependencies for ${startId}`);
     
     const token = await this.ensureAuthenticated();
     const resolvedIds = await this.transport.resolveDependencies(token, startId, options);
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Resolved ${resolvedIds.length} dependencies`);
+    this.logger.debug(`Resolved ${resolvedIds.length} dependencies`);
     return resolvedIds;
   }
 
@@ -198,7 +206,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @param docId The document ID whose entry history should be purged
    */
   async purgeDocHistory(docId: string): Promise<void> {
-    console.warn(`[ClientNetworkContentAddressedStore:${this.dbId}] purgeDocHistory() called on network store for doc ${docId}. Network stores do not support purging directly. Purge should be done on local stores after syncing from remote.`);
+    this.logger.warn(`purgeDocHistory() called on network store for doc ${docId}. Network stores do not support purging directly. Purge should be done on local stores after syncing from remote.`);
     // No-op: Network stores forward to server, purging should be done on local stores
   }
 
@@ -213,15 +221,15 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       return this.accessToken;
     }
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Authenticating user: ${this.username}`);
+    this.logger.debug(`Authenticating user: ${this.username}`);
     
     // Request a challenge
     const challenge = await this.transport.requestChallenge(this.username);
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Received challenge: ${challenge}`);
+    this.logger.debug(`Received challenge: ${challenge}`);
     
     // Sign the challenge
     const signature = await this.signChallenge(challenge);
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Signed challenge`);
+    this.logger.debug(`Signed challenge`);
     
     // Authenticate
     const result = await this.transport.authenticate(challenge, signature);
@@ -247,7 +255,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       this.tokenExpiry = now + 3600000;
     }
     
-    console.log(`[ClientNetworkContentAddressedStore:${this.dbId}] Authentication successful`);
+    this.logger.debug(`Authentication successful`);
     return this.accessToken;
   }
 

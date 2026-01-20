@@ -1,5 +1,6 @@
 import { EncryptedPrivateKey } from "../types";
 import { CryptoAdapter } from "../crypto/CryptoAdapter";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
 /**
  * Internal structure for storing a key with optional creation timestamp.
@@ -19,6 +20,7 @@ export class KeyBag {
   private userEncryptionKeyPassword: string;
   private keys: Map<string, KeyEntry[]> = new Map();
   private cryptoAdapter: CryptoAdapter;
+  private logger: Logger;
 
   /**
    * Creates a new KeyBag instance.
@@ -26,11 +28,15 @@ export class KeyBag {
    * @param userEncryptionKey The encrypted user encryption key
    * @param userEncryptionKeyPassword The password to decrypt the user encryption key
    * @param cryptoAdapter The crypto adapter to use for encryption and decryption
+   * @param logger Optional logger instance
    */
-  constructor(userEncryptionKey: EncryptedPrivateKey, userEncryptionKeyPassword: string, cryptoAdapter: CryptoAdapter) {
+  constructor(userEncryptionKey: EncryptedPrivateKey, userEncryptionKeyPassword: string, cryptoAdapter: CryptoAdapter, logger?: Logger) {
     this.userEncryptionKey = userEncryptionKey;
     this.userEncryptionKeyPassword = userEncryptionKeyPassword;
     this.cryptoAdapter = cryptoAdapter;
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), "KeyBag", true);
   }
 
   /**
@@ -181,7 +187,7 @@ export class KeyBag {
    * @return A promise that resolves to the encrypted binary data (Uint8Array)
    */
   async save(): Promise<Uint8Array> {
-    console.log(`[KeyBag] Saving key bag with ${this.keys.size} keys`);
+    this.logger.debug(`Saving key bag with ${this.keys.size} keys`);
     
     // Serialize the map to JSON and convert to Uint8Array
     // Convert Uint8Array values to base64 strings for JSON serialization
@@ -267,7 +273,7 @@ export class KeyBag {
     result.set(tag, 12);
     result.set(ciphertext, 12 + 16);
     
-    console.log(`[KeyBag] Saved key bag (${plaintext.length} -> ${result.length} bytes)`);
+    this.logger.debug(`Saved key bag (${plaintext.length} -> ${result.length} bytes)`);
     return result;
   }
 
@@ -278,7 +284,7 @@ export class KeyBag {
    * @return A promise that resolves when the keys are loaded
    */
   async load(encryptedData: Uint8Array): Promise<void> {
-    console.log(`[KeyBag] Loading key bag`);
+    this.logger.debug(`Loading key bag`);
     
     if (encryptedData.length < 28) {
       throw new Error("Encrypted data too short (missing IV and tag)");
@@ -361,7 +367,7 @@ export class KeyBag {
       ])
     );
     
-    console.log(`[KeyBag] Loaded key bag (${encryptedData.length} -> ${this.keys.size} keys)`);
+    this.logger.debug(`Loaded key bag (${encryptedData.length} -> ${this.keys.size} keys)`);
   }
 
   /**

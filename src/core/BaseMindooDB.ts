@@ -24,6 +24,7 @@ import {
   generateFileUuid7,
 } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
+import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 
 /**
  * Default chunk size for attachments: 256KB
@@ -86,19 +87,25 @@ export class BaseMindooDB implements MindooDB {
   // Index: automergeHash -> entryId for each document
   // Used for resolving Automerge dependency hashes to entry IDs
   private automergeHashToEntryId: Map<string, Map<string, string>> = new Map(); // Map<docId, Map<automergeHash, entryId>>
+  private logger: Logger;
 
   constructor(
     tenant: BaseMindooTenant, 
     store: ContentAddressedStore, 
     attachmentStore?: ContentAddressedStore,
     attachmentConfig?: AttachmentConfig,
-    adminOnlyDb: boolean = false
+    adminOnlyDb: boolean = false,
+    logger?: Logger
   ) {
     this.tenant = tenant;
     this.store = store;
     this.attachmentStore = attachmentStore;
     this.chunkSizeBytes = attachmentConfig?.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
     this._isAdminOnlyDb = adminOnlyDb;
+    // Create logger if not provided (for backward compatibility)
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), "BaseMindooDB", true);
   }
   
   /**
@@ -213,7 +220,7 @@ export class BaseMindooDB implements MindooDB {
       if (entryId) {
         entryIds.push(entryId);
       } else {
-        console.warn(`[BaseMindooDB] Could not resolve automerge hash ${hash} to entry ID for doc ${docId}`);
+        this.logger.warn(`Could not resolve automerge hash ${hash} to entry ID for doc ${docId}`);
       }
     }
     return entryIds;
@@ -230,7 +237,7 @@ export class BaseMindooDB implements MindooDB {
    * Initialize the database instance.
    */
   async initialize(): Promise<void> {
-    console.log(`[BaseMindooDB] Initializing database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
+    this.logger.info(`Initializing database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
     await this.syncStoreChanges();
   }
 
@@ -240,15 +247,15 @@ export class BaseMindooDB implements MindooDB {
    * On first call (when processedEntryIds is empty), it will process all entries.
    */
   async syncStoreChanges(): Promise<void> {
-    console.log(`[BaseMindooDB] Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
-    console.log(`[BaseMindooDB] Already processed ${this.processedEntryIds.length} entry IDs`);
+    this.logger.debug(`Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
+    this.logger.debug(`Already processed ${this.processedEntryIds.length} entry IDs`);
     
     // Find new entries that we haven't processed yet
     const newEntryMetadata = await this.store.findNewEntries(this.processedEntryIds);
-    console.log(`[BaseMindooDB] Found ${newEntryMetadata.length} new entries`);
+    this.logger.debug(`Found ${newEntryMetadata.length} new entries`);
     
     if (newEntryMetadata.length === 0) {
-      console.log(`[BaseMindooDB] No new entries to process`);
+      this.logger.debug(`No new entries to process`);
       return;
     }
     
@@ -263,42 +270,36 @@ export class BaseMindooDB implements MindooDB {
     
     // Process each document with new entries
     // Reload documents to apply all changes (including new ones)
-    console.log(`[BaseMindooDB] Processing ${entriesByDoc.size} documents with new entries`);
+    this.logger.debug(`Processing ${entriesByDoc.size} documents with new entries`);
     for (const [docId, entryMetadataList] of entriesByDoc) {
       try {
-        console.log(`[BaseMindooDB] ===== Processing document ${docId} with ${entryMetadataList.length} new entry(s) in syncStoreChanges =====`);
+        this.logger.debug(`===== Processing document ${docId} with ${entryMetadataList.length} new entry(s) in syncStoreChanges =====`);
         // Clear cache for this document so it gets reloaded with all entries
         this.docCache.delete(docId);
-        console.log(`[BaseMindooDB] Cleared cache for document ${docId}`);
+        this.logger.debug(`Cleared cache for document ${docId}`);
         
         // Reload document (this will load all entries including new ones)
-        console.log(`[BaseMindooDB] About to call loadDocumentInternal for document ${docId}`);
+        this.logger.debug(`About to call loadDocumentInternal for document ${docId}`);
         const doc = await this.loadDocumentInternal(docId);
-        console.log(`[BaseMindooDB] loadDocumentInternal returned for document ${docId}, result: ${doc ? 'success' : 'null'}`);
+        this.logger.debug(`loadDocumentInternal returned for document ${docId}, result: ${doc ? 'success' : 'null'}`);
         if (doc) {
-          console.log(`[BaseMindooDB] Successfully reloaded document ${docId}, updating index`);
+          this.logger.debug(`Successfully reloaded document ${docId}, updating index`);
           this.updateIndex(docId, doc.lastModified, doc.isDeleted);
-          console.log(`[BaseMindooDB] Updated index for document ${docId} (lastModified: ${doc.lastModified}, isDeleted: ${doc.isDeleted})`);
+          this.logger.debug(`Updated index for document ${docId} (lastModified: ${doc.lastModified}, isDeleted: ${doc.isDeleted})`);
         } else {
-          console.warn(`[BaseMindooDB] Document ${docId} returned null from loadDocumentInternal`);
+          this.logger.warn(`Document ${docId} returned null from loadDocumentInternal`);
         }
       } catch (error) {
         // Handle missing symmetric key gracefully - skip documents we can't decrypt
         if (error instanceof SymmetricKeyNotFoundError) {
-          console.log(`[BaseMindooDB] Skipping document ${docId} - missing key: ${error.keyId}`);
+          this.logger.debug(`Skipping document ${docId} - missing key: ${error.keyId}`);
           // Mark entry IDs as processed so we don't retry them
           this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
           continue; // Skip to next document
         }
         
-        console.error(`[BaseMindooDB] ===== ERROR processing document ${docId} in syncStoreChanges =====`);
-        console.error(`[BaseMindooDB] Error type: ${error instanceof Error ? error.constructor.name : typeof error}`);
-        console.error(`[BaseMindooDB] Error message: ${error instanceof Error ? error.message : String(error)}`);
-        if (error instanceof Error && error.stack) {
-          console.error(`[BaseMindooDB] Error stack: ${error.stack}`);
-        }
+        this.logger.error(`===== ERROR processing document ${docId} in syncStoreChanges =====`, error);
         // Re-throw the error so we can see what's happening in the test
-        console.error(`[BaseMindooDB] Re-throwing error for document ${docId}`);
         throw error;
       }
     }
@@ -306,7 +307,7 @@ export class BaseMindooDB implements MindooDB {
     // Append new entry IDs to our processed list
     this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
     
-    console.log(`[BaseMindooDB] Synced ${newEntryMetadata.length} new entries, index now has ${this.index.length} documents`);
+    this.logger.debug(`Synced ${newEntryMetadata.length} new entries, index now has ${this.index.length} documents`);
   }
 
   getStore(): ContentAddressedStore {
@@ -364,14 +365,14 @@ export class BaseMindooDB implements MindooDB {
     // Generate UUID7 for document ID
     const docId = uuidv7();
     
-    console.log(`[BaseMindooDB] Creating document ${docId} with key ${keyId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
+    this.logger.debug(`Creating document ${docId} with key ${keyId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
     
     // Create initial Automerge document
     const initialDoc = Automerge.init<MindooDocPayload>();
     
     // Create the first change
     const now = Date.now();
-    console.log(`[BaseMindooDB] Creating initial Automerge change for document ${docId}`);
+    this.logger.debug(`Creating initial Automerge change for document ${docId}`);
     let newDoc: Automerge.Doc<MindooDocPayload>;
     try {
       newDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
@@ -379,45 +380,45 @@ export class BaseMindooDB implements MindooDB {
         // We need to modify the document to ensure a change is created
         doc._attachments = [];
       });
-      console.log(`[BaseMindooDB] Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      this.logger.debug(`Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
-      console.error(`[BaseMindooDB] Error in Automerge.change for document ${docId}:`, error);
+      this.logger.error(`Error in Automerge.change for document ${docId}:`, error);
       throw error;
     }
     
     // Get the change bytes from the document
-    console.log(`[BaseMindooDB] Getting change bytes from document ${docId}`);
+    this.logger.debug(`Getting change bytes from document ${docId}`);
     const changeBytes = Automerge.getLastLocalChange(newDoc);
     if (!changeBytes) {
       throw new Error("Failed to get change bytes from Automerge document");
     }
-    console.log(`[BaseMindooDB] Got change bytes: ${changeBytes.length} bytes`);
+    this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
     
     // Decode the change to get hash and dependencies
-    console.log(`[BaseMindooDB] Decoding change to get hash and dependencies`);
+    this.logger.debug(`Decoding change to get hash and dependencies`);
     let decodedChange: any;
     try {
       decodedChange = Automerge.decodeChange(changeBytes);
-      console.log(`[BaseMindooDB] Successfully decoded change, hash: ${decodedChange.hash}, deps: ${decodedChange.deps?.length || 0}`);
+      this.logger.debug(`Successfully decoded change, hash: ${decodedChange.hash}, deps: ${decodedChange.deps?.length || 0}`);
     } catch (error) {
-      console.error(`[BaseMindooDB] Error decoding change for document ${docId}:`, error);
+      this.logger.error(`Error decoding change for document ${docId}:`, error);
       throw error;
     }
     const automergeHash = decodedChange.hash;
     const automergeDepHashes: string[] = decodedChange.deps || []; // First change has no dependencies
     
     // Encrypt the change payload first
-    console.log(`[BaseMindooDB] Encrypting change payload for document ${docId}`);
+    this.logger.debug(`Encrypting change payload for document ${docId}`);
     const encryptedPayload = await this.tenant.encryptPayload(changeBytes, keyId);
-    console.log(`[BaseMindooDB] Encrypted payload: ${changeBytes.length} -> ${encryptedPayload.length} bytes`);
+    this.logger.debug(`Encrypted payload: ${changeBytes.length} -> ${encryptedPayload.length} bytes`);
     
     // Compute content hash from encrypted data
     const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
-    console.log(`[BaseMindooDB] Computed content hash: ${contentHash.substring(0, 16)}...`);
+    this.logger.debug(`Computed content hash: ${contentHash.substring(0, 16)}...`);
     
     // Generate entry ID with blockchain-like chaining
     const entryId = await generateDocEntryId(docId, automergeHash, automergeDepHashes, this.getSubtle());
-    console.log(`[BaseMindooDB] Generated entry ID: ${entryId}`);
+    this.logger.debug(`Generated entry ID: ${entryId}`);
     
     // Resolve Automerge dependency hashes to entry IDs (empty for first change)
     const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
@@ -427,16 +428,16 @@ export class BaseMindooDB implements MindooDB {
     let createdByPublicKey: string;
     
     if (useCustomSigningKey) {
-      console.log(`[BaseMindooDB] Signing encrypted payload for document ${docId} with provided key`);
+      this.logger.debug(`Signing encrypted payload for document ${docId} with provided key`);
       signature = await this.tenant.signPayloadWithKey(encryptedPayload, signingKeyPair!, signingKeyPassword!);
       createdByPublicKey = signingKeyPair!.publicKey;
     } else {
-      console.log(`[BaseMindooDB] Signing encrypted payload for document ${docId}`);
+      this.logger.debug(`Signing encrypted payload for document ${docId}`);
       const currentUser = await this.tenant.getCurrentUserId();
       signature = await this.tenant.signPayload(encryptedPayload);
       createdByPublicKey = currentUser.userSigningPublicKey;
     }
-    console.log(`[BaseMindooDB] Signed payload, signature length: ${signature.length} bytes`);
+    this.logger.debug(`Signed payload, signature length: ${signature.length} bytes`);
 
     // Create entry metadata
     const entryMetadata: StoreEntryMetadata = {
@@ -479,8 +480,8 @@ export class BaseMindooDB implements MindooDB {
     this.docCache.set(docId, internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, false);
     
-    console.log(`[BaseMindooDB] Document ${docId} created successfully`);
-    console.log(`[BaseMindooDB] Document ${docId} cached and indexed (lastModified: ${internalDoc.lastModified})`);
+    this.logger.info(`Document ${docId} created successfully`);
+    this.logger.debug(`Document ${docId} cached and indexed (lastModified: ${internalDoc.lastModified})`);
     
     return this.wrapDocument(internalDoc);
   }
@@ -500,7 +501,7 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async getDocumentAtTimestamp(docId: string, timestamp: number): Promise<MindooDoc | null> {
-    console.log(`[BaseMindooDB] Getting document ${docId} at timestamp ${timestamp}`);
+    this.logger.debug(`Getting document ${docId} at timestamp ${timestamp}`);
     
     // Get all entry metadata for this document
     const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
@@ -522,7 +523,7 @@ export class BaseMindooDB implements MindooDB {
     for (const entryData of entries) {
       // Admin-only mode: only accept entries signed by the admin key
       if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
-        console.warn(`[BaseMindooDB] Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
+        this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
       
@@ -534,7 +535,7 @@ export class BaseMindooDB implements MindooDB {
         entryData.createdByPublicKey
       );
       if (!isValid) {
-        console.warn(`[BaseMindooDB] Invalid signature for entry ${entryData.id}, skipping`);
+        this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
         continue;
       }
       
@@ -613,7 +614,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
-    console.log(`[BaseMindooDB] Deleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
+    this.logger.debug(`Deleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
     
     // Admin-only validation: only admin key can modify data in admin-only databases
     if (this._isAdminOnlyDb) {
@@ -672,11 +673,11 @@ export class BaseMindooDB implements MindooDB {
     let createdByPublicKey: string;
     
     if (useCustomSigningKey) {
-      console.log(`[BaseMindooDB] Signing deletion for document ${docId} with provided key`);
+      this.logger.debug(`Signing deletion for document ${docId} with provided key`);
       signature = await this.tenant.signPayloadWithKey(encryptedPayload, signingKeyPair!, signingKeyPassword!);
       createdByPublicKey = signingKeyPair!.publicKey;
     } else {
-      console.log(`[BaseMindooDB] Signing deletion for document ${docId} with current user's key`);
+      this.logger.debug(`Signing deletion for document ${docId} with current user's key`);
       const currentUser = await this.tenant.getCurrentUserId();
       signature = await this.tenant.signPayload(encryptedPayload);
       createdByPublicKey = currentUser.userSigningPublicKey;
@@ -715,7 +716,7 @@ export class BaseMindooDB implements MindooDB {
     this.docCache.set(docId, internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, true);
     
-    console.log(`[BaseMindooDB] Document ${docId} deleted successfully`);
+    this.logger.info(`Document ${docId} deleted successfully`);
   }
 
   async changeDoc(
@@ -742,7 +743,7 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<void> {
     const docId = doc.getId();
     const useCustomKey = signingKeyPair && signingKeyPassword;
-    console.log(`[BaseMindooDB] ===== ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'} called for document ${docId} =====`);
+    this.logger.debug(`===== ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'} called for document ${docId} =====`);
     
     // Admin-only validation: only admin key can modify data in admin-only databases
     if (this._isAdminOnlyDb) {
@@ -758,15 +759,15 @@ export class BaseMindooDB implements MindooDB {
     // Get internal document from cache or load it
     let internalDoc = this.docCache.get(docId);
     if (!internalDoc) {
-      console.log(`[BaseMindooDB] Document ${docId} not in cache, loading from store`);
+      this.logger.debug(`Document ${docId} not in cache, loading from store`);
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
         throw new Error(`Document ${docId} not found`);
       }
       internalDoc = loadedDoc;
-      console.log(`[BaseMindooDB] Successfully loaded document ${docId} from store for ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'}`);
+      this.logger.debug(`Successfully loaded document ${docId} from store for ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'}`);
     } else {
-      console.log(`[BaseMindooDB] Document ${docId} found in cache`);
+      this.logger.debug(`Document ${docId} found in cache`);
     }
     
     if (internalDoc.isDeleted) {
@@ -775,8 +776,8 @@ export class BaseMindooDB implements MindooDB {
     
     // Apply the change function
     const now = Date.now();
-    console.log(`[BaseMindooDB] Applying change function to document ${docId}`);
-    console.log(`[BaseMindooDB] Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
+    this.logger.debug(`Applying change function to document ${docId}`);
+    this.logger.debug(`Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
     
     // For async callbacks, we need to handle document modifications carefully.
     // Automerge.change() requires synchronous modifications, so we'll:
@@ -1058,20 +1059,20 @@ export class BaseMindooDB implements MindooDB {
         // Update lastModified timestamp
         automergeDoc._lastModified = now;
       });
-      console.log(`[BaseMindooDB] Successfully applied change function, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      this.logger.debug(`Successfully applied change function, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
-      console.error(`[BaseMindooDB] Error in Automerge.change for document ${docId}:`, error);
+      this.logger.error(`Error in Automerge.change for document ${docId}:`, error);
       throw error;
     }
     
     // Get the change bytes from the document
-    console.log(`[BaseMindooDB] Getting change bytes from document ${docId}`);
+    this.logger.debug(`Getting change bytes from document ${docId}`);
     const changeBytes = Automerge.getLastLocalChange(newDoc);
     if (!changeBytes) {
       //TODO decide if we just exit here or throw an error
       throw new Error("Failed to get change bytes from Automerge document");
     }
-    console.log(`[BaseMindooDB] Got change bytes: ${changeBytes.length} bytes`);
+    this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
     
     // Decode the change to get hash and dependencies
     const decodedChange = Automerge.decodeChange(changeBytes);
@@ -1086,7 +1087,7 @@ export class BaseMindooDB implements MindooDB {
 
     // Generate entry ID with blockchain-like chaining
     const entryId = await generateDocEntryId(docId, automergeHash, automergeDepHashes, this.getSubtle());
-    console.log(`[BaseMindooDB] Generated entry ID for change: ${entryId}`);
+    this.logger.debug(`Generated entry ID for change: ${entryId}`);
 
     // Resolve Automerge dependency hashes to entry IDs
     const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
@@ -1137,7 +1138,7 @@ export class BaseMindooDB implements MindooDB {
     this.docCache.set(docId, internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted);
     
-    console.log(`[BaseMindooDB] Document ${docId} ${useCustomKey ? 'changed with custom signing key' : 'changed'} successfully`);
+    this.logger.info(`Document ${docId} ${useCustomKey ? 'changed with custom signing key' : 'changed'} successfully`);
   }
 
   async *iterateChangesSince(
@@ -1145,7 +1146,7 @@ export class BaseMindooDB implements MindooDB {
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
     // Default to initial cursor if null is provided
     const actualCursor: ProcessChangesCursor = cursor ?? { lastModified: 0, docId: "" };
-    console.log(`[BaseMindooDB] Starting iteration from cursor ${JSON.stringify(actualCursor)}`);
+    this.logger.debug(`Starting iteration from cursor ${JSON.stringify(actualCursor)}`);
     
     // Find starting position using binary search
     // We want to find the first entry that is greater than the cursor
@@ -1185,7 +1186,7 @@ export class BaseMindooDB implements MindooDB {
       const entry = this.index[i];
       
       try {
-        console.log(`[BaseMindooDB] Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
+        this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
         
         // Load document using loadDocumentInternal to handle deleted documents
         // getDocument() throws for deleted documents, but we need to yield them
@@ -1193,13 +1194,13 @@ export class BaseMindooDB implements MindooDB {
         const internalDoc = await this.loadDocumentInternal(entry.docId);
         
         if (!internalDoc) {
-          console.warn(`[BaseMindooDB] Document ${entry.docId} not found, skipping`);
+          this.logger.warn(`Document ${entry.docId} not found, skipping`);
           continue;
         }
         
         // Wrap the document (works for both deleted and non-deleted documents)
         const doc = this.wrapDocument(internalDoc);
-        console.log(`[BaseMindooDB] Successfully loaded document ${entry.docId} (isDeleted: ${doc.isDeleted()})`);
+        this.logger.debug(`Successfully loaded document ${entry.docId} (isDeleted: ${doc.isDeleted()})`);
         
         // Create cursor for current document
         const currentCursor: ProcessChangesCursor = {
@@ -1211,13 +1212,13 @@ export class BaseMindooDB implements MindooDB {
         // Deleted documents are included so external indexes can handle deletions
         yield { doc, cursor: currentCursor };
       } catch (error) {
-        console.error(`[BaseMindooDB] Error processing document ${entry.docId}:`, error);
+        this.logger.error(`Error processing document ${entry.docId}:`, error);
         // Stop processing on error
         throw error;
       }
     }
     
-    console.log(`[BaseMindooDB] Iteration completed`);
+    this.logger.debug(`Iteration completed`);
   }
 
   /**
@@ -1226,30 +1227,30 @@ export class BaseMindooDB implements MindooDB {
   private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
     // Check cache first
     if (this.docCache.has(docId)) {
-      console.log(`[BaseMindooDB] Document ${docId} found in cache, returning cached version`);
+      this.logger.debug(`Document ${docId} found in cache, returning cached version`);
       return this.docCache.get(docId)!;
     }
     
-    console.log(`[BaseMindooDB] ===== Starting to load document ${docId} from store =====`);
+    this.logger.debug(`===== Starting to load document ${docId} from store =====`);
     
     // Get all entry metadata for this document
     // TODO: Implement loading from last snapshot if available
-    console.log(`[BaseMindooDB] Getting all entry hashes for document ${docId}`);
+    this.logger.debug(`Getting all entry hashes for document ${docId}`);
     const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
-    console.log(`[BaseMindooDB] Found ${allEntryMetadata.length} total entry hashes for document ${docId}`);
+    this.logger.debug(`Found ${allEntryMetadata.length} total entry hashes for document ${docId}`);
     
     if (allEntryMetadata.length === 0) {
-      console.log(`[BaseMindooDB] No entry hashes found for document ${docId}, returning null`);
+      this.logger.debug(`No entry hashes found for document ${docId}, returning null`);
       return null;
     }
     
     // Log all entry types
     const entryTypes = allEntryMetadata.map(em => `${em.entryType}@${em.createdAt}`).join(', ');
-    console.log(`[BaseMindooDB] Entry types for ${docId}: ${entryTypes}`);
+    this.logger.debug(`Entry types for ${docId}: ${entryTypes}`);
     
     // Find the most recent snapshot (if any)
     const snapshots = allEntryMetadata.filter(em => em.entryType === "doc_snapshot");
-    console.log(`[BaseMindooDB] Found ${snapshots.length} snapshot(s) for document ${docId}`);
+    this.logger.debug(`Found ${snapshots.length} snapshot(s) for document ${docId}`);
     let startFromSnapshot = false;
     let snapshotMeta: StoreEntryMetadata | null = null;
     
@@ -1258,9 +1259,9 @@ export class BaseMindooDB implements MindooDB {
       snapshots.sort((a, b) => b.createdAt - a.createdAt);
       snapshotMeta = snapshots[0];
       startFromSnapshot = true;
-      console.log(`[BaseMindooDB] Will start from snapshot ${snapshotMeta.id} created at ${snapshotMeta.createdAt}`);
+      this.logger.debug(`Will start from snapshot ${snapshotMeta.id} created at ${snapshotMeta.createdAt}`);
     } else {
-      console.log(`[BaseMindooDB] No snapshot found, will start from scratch`);
+      this.logger.debug(`No snapshot found, will start from scratch`);
     }
     
     // Get all entries (excluding snapshot entries - we'll handle delete separately)
@@ -1268,21 +1269,21 @@ export class BaseMindooDB implements MindooDB {
     const entriesToLoad = startFromSnapshot
       ? allEntryMetadata.filter(em => (em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete") && em.createdAt > snapshotMeta!.createdAt)
       : allEntryMetadata.filter(em => em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete");
-    console.log(`[BaseMindooDB] Will load ${entriesToLoad.length} entries for document ${docId} (after snapshot filter)`);
+    this.logger.debug(`Will load ${entriesToLoad.length} entries for document ${docId} (after snapshot filter)`);
     
     // Load the snapshot first if we have one
     let doc: Automerge.Doc<MindooDocPayload> | undefined = undefined;
     if (startFromSnapshot && snapshotMeta) {
-      console.log(`[BaseMindooDB] Loading snapshot for document ${docId}`);
+      this.logger.debug(`Loading snapshot for document ${docId}`);
       const snapshotEntries = await this.store.getEntries([snapshotMeta.id]);
-      console.log(`[BaseMindooDB] Retrieved ${snapshotEntries.length} snapshot entry(s) from store`);
+      this.logger.debug(`Retrieved ${snapshotEntries.length} snapshot entry(s) from store`);
       if (snapshotEntries.length > 0) {
         const snapshotData = snapshotEntries[0];
         
         // Admin-only mode: only accept snapshots signed by admin
         let isValid = false;
         if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
-          console.warn(`[BaseMindooDB] Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
+          this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
           // Verify signature against the encrypted snapshot (no decryption needed)
           // We sign the encrypted payload, so anyone can verify signatures without decryption keys
@@ -1293,24 +1294,24 @@ export class BaseMindooDB implements MindooDB {
           );
         }
         if (!isValid) {
-          console.warn(`[BaseMindooDB] Invalid signature for snapshot ${snapshotData.id}, falling back to loading from scratch`);
+          this.logger.warn(`Invalid signature for snapshot ${snapshotData.id}, falling back to loading from scratch`);
           // Fall back to loading from scratch
           startFromSnapshot = false;
         } else {
-          console.log(`[BaseMindooDB] Snapshot signature valid, decrypting snapshot`);
+          this.logger.debug(`Snapshot signature valid, decrypting snapshot`);
           // Decrypt snapshot (only after signature verification passes)
           const decryptedSnapshot = await this.tenant.decryptPayload(
             snapshotData.encryptedData,
             snapshotData.decryptionKeyId
           );
-          console.log(`[BaseMindooDB] Decrypted snapshot (${snapshotData.encryptedData.length} -> ${decryptedSnapshot.length} bytes)`);
+          this.logger.debug(`Decrypted snapshot (${snapshotData.encryptedData.length} -> ${decryptedSnapshot.length} bytes)`);
           
           // Load snapshot using Automerge.load()
           // This deserializes a full document snapshot from binary data
           // According to Automerge docs: load() is equivalent to init() followed by loadIncremental()
-          console.log(`[BaseMindooDB] Loading snapshot into Automerge document`);
+          this.logger.debug(`Loading snapshot into Automerge document`);
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
-          console.log(`[BaseMindooDB] Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
+          this.logger.debug(`Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
           
           // Register the snapshot's automerge hash -> entry ID mapping
           const parsed = parseDocEntryId(snapshotData.id);
@@ -1323,75 +1324,75 @@ export class BaseMindooDB implements MindooDB {
 
     // If we don't have a snapshot, start from scratch
     if (!doc) {
-      console.log(`[BaseMindooDB] Initializing new Automerge document for ${docId}`);
+      this.logger.debug(`Initializing new Automerge document for ${docId}`);
       doc = Automerge.init<MindooDocPayload>();
-      console.log(`[BaseMindooDB] Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
+      this.logger.debug(`Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
     }
     
     // Sort entries by timestamp
     entriesToLoad.sort((a, b) => a.createdAt - b.createdAt);
-    console.log(`[BaseMindooDB] Sorted ${entriesToLoad.length} entries by timestamp for document ${docId}`);
+    this.logger.debug(`Sorted ${entriesToLoad.length} entries by timestamp for document ${docId}`);
     
     // Load and apply all entries
-    console.log(`[BaseMindooDB] Fetching ${entriesToLoad.length} entries from store for document ${docId}`);
+    this.logger.debug(`Fetching ${entriesToLoad.length} entries from store for document ${docId}`);
     const entries = await this.store.getEntries(entriesToLoad.map(em => em.id));
-    console.log(`[BaseMindooDB] Retrieved ${entries.length} entries from store for document ${docId}`);
-    console.log(`[BaseMindooDB] Loading document ${docId}: found ${entries.length} entries to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);
+    this.logger.debug(`Retrieved ${entries.length} entries from store for document ${docId}`);
+    this.logger.debug(`Loading document ${docId}: found ${entries.length} entries to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);
     
     // Log current document state before applying entries
-    console.log(`[BaseMindooDB] Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+    this.logger.debug(`Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
     
     // Verify signatures, decrypt, and apply entries one at a time
     // This ensures dependencies are handled correctly by Automerge
     for (let i = 0; i < entries.length; i++) {
       const entryData = entries[i];
-      console.log(`[BaseMindooDB] ===== Processing entry ${i + 1}/${entries.length} for document ${docId} =====`);
-      console.log(`[BaseMindooDB] Entry id: ${entryData.id}`);
-      console.log(`[BaseMindooDB] Entry type: ${entryData.entryType}`);
-      console.log(`[BaseMindooDB] Entry createdAt: ${entryData.createdAt}`);
-      console.log(`[BaseMindooDB] Entry dependencies: ${JSON.stringify(entryData.dependencyIds || [])}`);
-      console.log(`[BaseMindooDB] Entry payload size: ${entryData.encryptedData.length} bytes`);
+      this.logger.debug(`===== Processing entry ${i + 1}/${entries.length} for document ${docId} =====`);
+      this.logger.debug(`Entry id: ${entryData.id}`);
+      this.logger.debug(`Entry type: ${entryData.entryType}`);
+      this.logger.debug(`Entry createdAt: ${entryData.createdAt}`);
+      this.logger.debug(`Entry dependencies: ${JSON.stringify(entryData.dependencyIds || [])}`);
+      this.logger.debug(`Entry payload size: ${entryData.encryptedData.length} bytes`);
       
       // Admin-only mode: only accept entries signed by the admin key
       // This prevents recursion and ensures security for the directory database
       if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
-        console.warn(`[BaseMindooDB] Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
+        this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
       
       // Verify signature against the encrypted payload (no decryption needed)
       // We sign the encrypted payload, so anyone can verify signatures without decryption keys
-      console.log(`[BaseMindooDB] Verifying signature for entry ${entryData.id}`);
+      this.logger.debug(`Verifying signature for entry ${entryData.id}`);
       const isValid = await this.tenant.verifySignature(
         entryData.encryptedData,
         entryData.signature,
         entryData.createdByPublicKey
       );
       if (!isValid) {
-        console.warn(`[BaseMindooDB] Invalid signature for entry ${entryData.id}, skipping`);
+        this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
         continue;
       }
-      console.log(`[BaseMindooDB] Signature valid for entry ${entryData.id}`);
+      this.logger.debug(`Signature valid for entry ${entryData.id}`);
       
       // Decrypt payload (only after signature verification passes)
-      console.log(`[BaseMindooDB] Decrypting payload for entry ${entryData.id} with key ${entryData.decryptionKeyId}`);
+      this.logger.debug(`Decrypting payload for entry ${entryData.id} with key ${entryData.decryptionKeyId}`);
       const decryptedPayload = await this.tenant.decryptPayload(
         entryData.encryptedData,
         entryData.decryptionKeyId
       );
-      console.log(`[BaseMindooDB] Decrypted payload: ${entryData.encryptedData.length} -> ${decryptedPayload.length} bytes`);
+      this.logger.debug(`Decrypted payload: ${entryData.encryptedData.length} -> ${decryptedPayload.length} bytes`);
       
       // Apply change using applyChanges with raw change bytes
       // applyChanges expects an array of Uint8Array (raw change bytes)
       try {
-        console.log(`[BaseMindooDB] Document state before applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
-        console.log(`[BaseMindooDB] Calling Automerge.applyChanges for entry ${i + 1}/${entries.length} on document ${docId}`);
-        console.log(`[BaseMindooDB] Decrypted payload length: ${decryptedPayload.length} bytes`);
+        this.logger.debug(`Document state before applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+        this.logger.debug(`Calling Automerge.applyChanges for entry ${i + 1}/${entries.length} on document ${docId}`);
+        this.logger.debug(`Decrypted payload length: ${decryptedPayload.length} bytes`);
         const currentDoc: Automerge.Doc<MindooDocPayload> = doc!;
         const result = Automerge.applyChanges<MindooDocPayload>(currentDoc, [decryptedPayload]);
         doc = result[0] as Automerge.Doc<MindooDocPayload>;
-        console.log(`[BaseMindooDB] Successfully applied entry ${i + 1}/${entries.length}`);
-        console.log(`[BaseMindooDB] Document state after applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+        this.logger.debug(`Successfully applied entry ${i + 1}/${entries.length}`);
+        this.logger.debug(`Document state after applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
         
         // Register the automerge hash -> entry ID mapping for future dependency resolution
         const parsed = parseDocEntryId(entryData.id);
@@ -1399,19 +1400,19 @@ export class BaseMindooDB implements MindooDB {
           this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
         }
       } catch (error) {
-        console.error(`[BaseMindooDB] Error applying entry ${entryData.id} to document ${docId}:`, error);
-        console.error(`[BaseMindooDB] Entry index: ${i + 1}/${entries.length}`);
-        console.error(`[BaseMindooDB] Entry dependencies:`, entryData.dependencyIds);
-        console.error(`[BaseMindooDB] Entry type:`, entryData.entryType);
-        console.error(`[BaseMindooDB] Entry createdAt:`, entryData.createdAt);
-        console.error(`[BaseMindooDB] Document state before entry:`, {
+        this.logger.error(`Error applying entry ${entryData.id} to document ${docId}:`, error);
+        this.logger.error(`Entry index: ${i + 1}/${entries.length}`);
+        this.logger.error(`Entry dependencies:`, entryData.dependencyIds);
+        this.logger.error(`Entry type:`, entryData.entryType);
+        this.logger.error(`Entry createdAt:`, entryData.createdAt);
+        this.logger.error(`Document state before entry:`, {
           hasDoc: !!doc,
           docHeads: doc ? Automerge.getHeads(doc) : null,
         });
         // Log previous entry for debugging dependency issues
         if (i > 0) {
           const prevEntry = entries[i - 1];
-          console.error(`[BaseMindooDB] Previous entry:`, {
+          this.logger.error(`Previous entry:`, {
             id: prevEntry.id,
             deps: prevEntry.dependencyIds,
             type: prevEntry.entryType,
@@ -1422,14 +1423,14 @@ export class BaseMindooDB implements MindooDB {
     }
     
     // Extract metadata from document (doc is guaranteed to be defined at this point)
-    console.log(`[BaseMindooDB] All entries applied successfully for document ${docId}`);
-    console.log(`[BaseMindooDB] Final document heads: ${JSON.stringify(Automerge.getHeads(doc!))}`);
+    this.logger.debug(`All entries applied successfully for document ${docId}`);
+    this.logger.debug(`Final document heads: ${JSON.stringify(Automerge.getHeads(doc!))}`);
     const payload = doc! as unknown as MindooDocPayload;
     
     // Check if document was deleted by looking for a "doc_delete" type entry
     const hasDeleteEntry = allEntryMetadata.some(em => em.entryType === "doc_delete");
     const isDeleted = hasDeleteEntry;
-    console.log(`[BaseMindooDB] Document ${docId} isDeleted: ${isDeleted}`);
+    this.logger.debug(`Document ${docId} isDeleted: ${isDeleted}`);
     
     const decryptionKeyId = (payload._decryptionKeyId as string) || "default";
     // Get lastModified from payload, or use the timestamp of the last entry
@@ -1440,7 +1441,7 @@ export class BaseMindooDB implements MindooDB {
     const firstEntry = allEntryMetadata.length > 0 ? allEntryMetadata[0] : null;
     const createdAt = firstEntry ? firstEntry.createdAt : lastModified;
     
-    console.log(`[BaseMindooDB] Document ${docId} metadata: createdAt=${createdAt}, lastModified=${lastModified}, decryptionKeyId=${decryptionKeyId}`);
+    this.logger.debug(`Document ${docId} metadata: createdAt=${createdAt}, lastModified=${lastModified}, decryptionKeyId=${decryptionKeyId}`);
     
     const internalDoc: InternalDoc = {
       id: docId,
@@ -1453,7 +1454,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Update cache
     this.docCache.set(docId, internalDoc);
-    console.log(`[BaseMindooDB] ===== Successfully loaded document ${docId} and cached it =====`);
+    this.logger.debug(`===== Successfully loaded document ${docId} and cached it =====`);
     
     return internalDoc;
   }
@@ -1567,14 +1568,14 @@ export class BaseMindooDB implements MindooDB {
     docId: string, 
     attachmentId: string
   ): Promise<Uint8Array> {
-    console.log(`[BaseMindooDB] Getting attachment ${attachmentId} from document ${docId}`);
+    this.logger.debug(`Getting attachment ${attachmentId} from document ${docId}`);
     
     const ref = this.getAttachmentRefInternal(docId, attachmentId);
     const store = this.getEffectiveAttachmentStore();
     
     // Resolve dependency chain to get all chunk IDs in order (oldest first)
     const chunkIds = await store.resolveDependencies(ref.lastChunkId, { includeStart: true });
-    console.log(`[BaseMindooDB] Resolved ${chunkIds.length} chunks for attachment ${attachmentId}`);
+    this.logger.debug(`Resolved ${chunkIds.length} chunks for attachment ${attachmentId}`);
     
     // Fetch all chunks
     const chunks = await store.getEntries(chunkIds);
@@ -1616,7 +1617,7 @@ export class BaseMindooDB implements MindooDB {
       offset += chunk.length;
     }
     
-    console.log(`[BaseMindooDB] Retrieved attachment ${attachmentId}: ${result.length} bytes`);
+    this.logger.debug(`Retrieved attachment ${attachmentId}: ${result.length} bytes`);
     return result;
   }
 
@@ -1629,7 +1630,7 @@ export class BaseMindooDB implements MindooDB {
     startByte: number,
     endByte: number
   ): Promise<Uint8Array> {
-    console.log(`[BaseMindooDB] Getting attachment ${attachmentId} range [${startByte}, ${endByte}) from document ${docId}`);
+    this.logger.debug(`Getting attachment ${attachmentId} range [${startByte}, ${endByte}) from document ${docId}`);
     
     if (startByte < 0 || endByte <= startByte) {
       throw new Error(`Invalid byte range: [${startByte}, ${endByte})`);
@@ -1699,7 +1700,7 @@ export class BaseMindooDB implements MindooDB {
       bytesRemaining -= bytesToCopy;
     }
     
-    console.log(`[BaseMindooDB] Retrieved attachment ${attachmentId} range: ${result.length} bytes`);
+    this.logger.debug(`Retrieved attachment ${attachmentId} range: ${result.length} bytes`);
     return result;
   }
 
@@ -1711,7 +1712,7 @@ export class BaseMindooDB implements MindooDB {
     attachmentId: string,
     startOffset: number
   ): AsyncGenerator<Uint8Array, void, unknown> {
-    console.log(`[BaseMindooDB] Streaming attachment ${attachmentId} from offset ${startOffset}`);
+    this.logger.debug(`Streaming attachment ${attachmentId} from offset ${startOffset}`);
     
     const ref = this.getAttachmentRefInternal(docId, attachmentId);
     const store = this.getEffectiveAttachmentStore();
@@ -1757,7 +1758,7 @@ export class BaseMindooDB implements MindooDB {
       }
     }
     
-    console.log(`[BaseMindooDB] Finished streaming attachment ${attachmentId}`);
+    this.logger.debug(`Finished streaming attachment ${attachmentId}`);
   }
 
   /**
@@ -1778,7 +1779,7 @@ export class BaseMindooDB implements MindooDB {
     decryptionKeyId: string,
     createdAt: number
   ): Promise<AttachmentReference> {
-    console.log(`[BaseMindooDB] Adding attachment to document ${docId}: ${fileName} (${fileData.length} bytes)`);
+    this.logger.debug(`Adding attachment to document ${docId}: ${fileName} (${fileData.length} bytes)`);
     
     const store = this.getEffectiveAttachmentStore();
     const currentUser = await this.tenant.getCurrentUserId();
@@ -1827,7 +1828,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Store all chunks
     await store.putEntries(chunks);
-    console.log(`[BaseMindooDB] Stored ${chunks.length} chunks for attachment ${attachmentId}`);
+    this.logger.debug(`Stored ${chunks.length} chunks for attachment ${attachmentId}`);
     
     // Create attachment reference
     const ref: AttachmentReference = {
@@ -1856,7 +1857,7 @@ export class BaseMindooDB implements MindooDB {
     decryptionKeyId: string,
     createdAt: number
   ): Promise<AttachmentReference> {
-    console.log(`[BaseMindooDB] Adding streaming attachment to document ${docId}: ${fileName}`);
+    this.logger.debug(`Adding streaming attachment to document ${docId}: ${fileName}`);
     
     const store = this.getEffectiveAttachmentStore();
     const currentUser = await this.tenant.getCurrentUserId();
@@ -1936,7 +1937,7 @@ export class BaseMindooDB implements MindooDB {
       totalSize += buffer.length;
     }
     
-    console.log(`[BaseMindooDB] Stored ${chunkCount} chunks for streaming attachment ${attachmentId} (${totalSize} bytes)`);
+    this.logger.debug(`Stored ${chunkCount} chunks for streaming attachment ${attachmentId} (${totalSize} bytes)`);
     
     // Create attachment reference
     const ref: AttachmentReference = {
@@ -1964,7 +1965,7 @@ export class BaseMindooDB implements MindooDB {
     data: Uint8Array,
     createdAt: number
   ): Promise<{ lastChunkId: string; sizeIncrease: number }> {
-    console.log(`[BaseMindooDB] Appending ${data.length} bytes to attachment ${attachmentId}`);
+    this.logger.debug(`Appending ${data.length} bytes to attachment ${attachmentId}`);
     
     const store = this.getEffectiveAttachmentStore();
     const currentUser = await this.tenant.getCurrentUserId();
@@ -2012,7 +2013,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Store all chunks
     await store.putEntries(chunks);
-    console.log(`[BaseMindooDB] Appended ${chunks.length} chunks to attachment ${attachmentId}`);
+    this.logger.debug(`Appended ${chunks.length} chunks to attachment ${attachmentId}`);
     
     return {
       lastChunkId,
@@ -2037,36 +2038,36 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`[BaseMindooDB] Cannot pull entries from the incompatible store ${this.store.getId()}`);
     }
 
-    console.log(`[BaseMindooDB] Pulling entries from remote store ${remoteStore.getId()}`);
+    this.logger.info(`Pulling entries from remote store ${remoteStore.getId()}`);
     
     // Get all entry IDs we already have in our local store
     const localEntryIds = await this.store.getAllIds();
-    console.log(`[BaseMindooDB] Local store has ${localEntryIds.length} entry IDs`);
+    this.logger.debug(`Local store has ${localEntryIds.length} entry IDs`);
     
     // Find entries in the remote store that we don't have
     const newEntryMetadata = await remoteStore.findNewEntries(localEntryIds);
-    console.log(`[BaseMindooDB] Found ${newEntryMetadata.length} new entries in remote store`);
+    this.logger.debug(`Found ${newEntryMetadata.length} new entries in remote store`);
     
     if (newEntryMetadata.length === 0) {
-      console.log(`[BaseMindooDB] No new entries to pull`);
+      this.logger.debug(`No new entries to pull`);
       return;
     }
     
     // Get the full entries from the remote store
     const newEntries = await remoteStore.getEntries(newEntryMetadata.map(em => em.id));
-    console.log(`[BaseMindooDB] Retrieved ${newEntries.length} entries from remote store`);
+    this.logger.debug(`Retrieved ${newEntries.length} entries from remote store`);
     
     // Store all entries in our local store
     // The putEntries method handles deduplication (no-op if entry already exists)
     await this.store.putEntries(newEntries);
     
-    console.log(`[BaseMindooDB] Stored ${newEntries.length} entries in local store`);
+    this.logger.debug(`Stored ${newEntries.length} entries in local store`);
     
     // Sync the local store to process the new entries
     // This will update the index, cache, and processedEntryIds
     await this.syncStoreChanges();
     
-    console.log(`[BaseMindooDB] Pull complete, synced ${newEntries.length} entries`);
+    this.logger.info(`Pull complete, synced ${newEntries.length} entries`);
   }
 
   /**
@@ -2085,30 +2086,30 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`[BaseMindooDB] Cannot push entries to the incompatible store ${this.store.getId()}`);
     }
 
-    console.log(`[BaseMindooDB] Pushing entries to remote store ${remoteStore.getId()}`);
+    this.logger.info(`Pushing entries to remote store ${remoteStore.getId()}`);
     
     // Get all entry IDs the remote store already has
     const remoteEntryIds = await remoteStore.getAllIds();
-    console.log(`[BaseMindooDB] Remote store has ${remoteEntryIds.length} entry IDs`);
+    this.logger.debug(`Remote store has ${remoteEntryIds.length} entry IDs`);
     
     // Find entries in our local store that the remote doesn't have
     const newEntryMetadata = await this.store.findNewEntries(remoteEntryIds);
-    console.log(`[BaseMindooDB] Found ${newEntryMetadata.length} new entries to push`);
+    this.logger.debug(`Found ${newEntryMetadata.length} new entries to push`);
     
     if (newEntryMetadata.length === 0) {
-      console.log(`[BaseMindooDB] No new entries to push`);
+      this.logger.debug(`No new entries to push`);
       return;
     }
     
     // Get the full entries from our local store
     const newEntries = await this.store.getEntries(newEntryMetadata.map(em => em.id));
-    console.log(`[BaseMindooDB] Retrieved ${newEntries.length} entries from local store`);
+    this.logger.debug(`Retrieved ${newEntries.length} entries from local store`);
     
     // Store all entries in the remote store
     // The putEntries method handles deduplication (no-op if entry already exists)
     await remoteStore.putEntries(newEntries);
     
-    console.log(`[BaseMindooDB] Pushed ${newEntries.length} entries to remote store`);
+    this.logger.info(`Pushed ${newEntries.length} entries to remote store`);
   }
 }
 

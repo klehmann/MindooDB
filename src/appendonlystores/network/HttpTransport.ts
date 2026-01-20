@@ -2,6 +2,7 @@ import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type { NetworkEncryptedEntry, AuthResult } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 
 /**
  * HTTP implementation of the NetworkTransport interface.
@@ -20,8 +21,9 @@ import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
 export class HttpTransport implements NetworkTransport {
   private config: NetworkTransportConfig;
   private baseUrl: string;
+  private logger: Logger;
 
-  constructor(config: NetworkTransportConfig) {
+  constructor(config: NetworkTransportConfig, logger?: Logger) {
     this.config = {
       timeout: 30000,
       retryAttempts: 3,
@@ -35,13 +37,16 @@ export class HttpTransport implements NetworkTransport {
     
     // Ensure baseUrl doesn't end with /
     this.baseUrl = config.baseUrl.replace(/\/$/, "");
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), "HttpTransport", true);
   }
 
   /**
    * Request a challenge string for authentication.
    */
   async requestChallenge(username: string): Promise<string> {
-    console.log(`[HttpTransport] Requesting challenge for user: ${username}`);
+    this.logger.debug(`Requesting challenge for user: ${username}`);
     
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/auth/challenge`,
@@ -63,7 +68,7 @@ export class HttpTransport implements NetworkTransport {
       );
     }
     
-    console.log(`[HttpTransport] Received challenge: ${data.challenge}`);
+    this.logger.debug(`Received challenge: ${data.challenge}`);
     return data.challenge;
   }
 
@@ -71,7 +76,7 @@ export class HttpTransport implements NetworkTransport {
    * Authenticate by providing a signed challenge.
    */
   async authenticate(challenge: string, signature: Uint8Array): Promise<AuthResult> {
-    console.log(`[HttpTransport] Authenticating with challenge: ${challenge}`);
+    this.logger.debug(`Authenticating with challenge: ${challenge}`);
     
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/auth/authenticate`,
@@ -89,7 +94,7 @@ export class HttpTransport implements NetworkTransport {
     
     const data = await response.json();
     
-    console.log(`[HttpTransport] Authentication result: ${data.success ? "success" : "failed"}`);
+    this.logger.debug(`Authentication result: ${data.success ? "success" : "failed"}`);
     return {
       success: data.success,
       token: data.token,
@@ -104,7 +109,7 @@ export class HttpTransport implements NetworkTransport {
     token: string,
     haveIds: string[]
   ): Promise<StoreEntryMetadata[]> {
-    console.log(`[HttpTransport] Finding new entries, have ${haveIds.length} IDs`);
+    this.logger.debug(`Finding new entries, have ${haveIds.length} IDs`);
     
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/sync/findNewEntries`,
@@ -129,7 +134,7 @@ export class HttpTransport implements NetworkTransport {
       this.deserializeEntryMetadata(e)
     );
     
-    console.log(`[HttpTransport] Found ${entries.length} new entries`);
+    this.logger.debug(`Found ${entries.length} new entries`);
     return entries;
   }
 
@@ -141,7 +146,7 @@ export class HttpTransport implements NetworkTransport {
     haveIds: string[],
     docId: string
   ): Promise<StoreEntryMetadata[]> {
-    console.log(`[HttpTransport] Finding new entries for doc ${docId}, have ${haveIds.length} IDs`);
+    this.logger.debug(`Finding new entries for doc ${docId}, have ${haveIds.length} IDs`);
     
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/sync/findNewEntriesForDoc`,
@@ -167,7 +172,7 @@ export class HttpTransport implements NetworkTransport {
       this.deserializeEntryMetadata(e)
     );
     
-    console.log(`[HttpTransport] Found ${entries.length} new entries for doc ${docId}`);
+    this.logger.debug(`Found ${entries.length} new entries for doc ${docId}`);
     return entries;
   }
 
@@ -178,7 +183,7 @@ export class HttpTransport implements NetworkTransport {
     token: string,
     ids: string[]
   ): Promise<NetworkEncryptedEntry[]> {
-    console.log(`[HttpTransport] Getting ${ids.length} entries`);
+    this.logger.debug(`Getting ${ids.length} entries`);
     
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/sync/getEntries`,
@@ -204,7 +209,7 @@ export class HttpTransport implements NetworkTransport {
       rsaEncryptedPayload: this.base64ToUint8Array(e.rsaEncryptedPayload),
     }));
     
-    console.log(`[HttpTransport] Retrieved ${entries.length} encrypted entries`);
+    this.logger.debug(`Retrieved ${entries.length} encrypted entries`);
     return entries;
   }
 
@@ -212,7 +217,7 @@ export class HttpTransport implements NetworkTransport {
    * Push entries to the remote store.
    */
   async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
-    console.log(`[HttpTransport] Pushing ${entries.length} entries`);
+    this.logger.debug(`Pushing ${entries.length} entries`);
     
     // Serialize the entries for transmission
     const serializedEntries = entries.map(e => this.serializeEntry(e));
@@ -233,14 +238,14 @@ export class HttpTransport implements NetworkTransport {
       }
     );
     
-    console.log(`[HttpTransport] Successfully pushed ${entries.length} entries`);
+    this.logger.debug(`Successfully pushed ${entries.length} entries`);
   }
 
   /**
    * Check which of the provided IDs exist in the remote store.
    */
   async hasEntries(token: string, ids: string[]): Promise<string[]> {
-    console.log(`[HttpTransport] Checking ${ids.length} entry IDs`);
+    this.logger.debug(`Checking ${ids.length} entry IDs`);
     
     if (ids.length === 0) {
       return [];
@@ -265,7 +270,7 @@ export class HttpTransport implements NetworkTransport {
     const data = await response.json();
     const existingIds: string[] = data.ids || [];
     
-    console.log(`[HttpTransport] Found ${existingIds.length} existing entries out of ${ids.length} checked`);
+    this.logger.debug(`Found ${existingIds.length} existing entries out of ${ids.length} checked`);
     return existingIds;
   }
 
@@ -273,7 +278,7 @@ export class HttpTransport implements NetworkTransport {
    * Get all entry IDs from the remote store.
    */
   async getAllIds(token: string): Promise<string[]> {
-    console.log(`[HttpTransport] Getting all entry IDs`);
+    this.logger.debug(`Getting all entry IDs`);
     
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/sync/getAllIds?tenantId=${encodeURIComponent(this.config.tenantId)}${this.config.dbId ? `&dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
@@ -288,7 +293,7 @@ export class HttpTransport implements NetworkTransport {
     const data = await response.json();
     const ids: string[] = data.ids || [];
     
-    console.log(`[HttpTransport] Retrieved ${ids.length} entry IDs`);
+    this.logger.debug(`Retrieved ${ids.length} entry IDs`);
     return ids;
   }
 
@@ -300,7 +305,7 @@ export class HttpTransport implements NetworkTransport {
     startId: string,
     options?: Record<string, unknown>
   ): Promise<string[]> {
-    console.log(`[HttpTransport] Resolving dependencies for ${startId}`);
+    this.logger.debug(`Resolving dependencies for ${startId}`);
     
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/sync/resolveDependencies`,
@@ -322,7 +327,7 @@ export class HttpTransport implements NetworkTransport {
     const data = await response.json();
     const ids: string[] = data.ids || [];
     
-    console.log(`[HttpTransport] Resolved ${ids.length} dependencies`);
+    this.logger.debug(`Resolved ${ids.length} dependencies`);
     return ids;
   }
 
@@ -397,9 +402,9 @@ export class HttpTransport implements NetworkTransport {
         
         // Check if it's an abort error (timeout)
         if ((error as Error).name === "AbortError") {
-          console.warn(`[HttpTransport] Request timeout, attempt ${attempt + 1}/${attempts}`);
+          this.logger.warn(`Request timeout, attempt ${attempt + 1}/${attempts}`);
         } else {
-          console.warn(`[HttpTransport] Request failed, attempt ${attempt + 1}/${attempts}:`, error);
+          this.logger.warn(`Request failed, attempt ${attempt + 1}/${attempts}:`, error);
         }
         
         // Wait before retrying (exponential backoff)

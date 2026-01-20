@@ -1,5 +1,6 @@
 import { MindooDoc, SigningKeyPair, MindooDocPayload } from "../types";
 import { BaseMindooTenant } from "../BaseMindooTenant";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
 /**
  * MindooDocSigner provides functionality to create and verify combined signatures
@@ -66,10 +67,14 @@ import { BaseMindooTenant } from "../BaseMindooTenant";
 export class MindooDocSigner {
   private tenant: BaseMindooTenant;
   private signKey: SigningKeyPair;
+  private logger: Logger;
 
-  constructor(tenant: BaseMindooTenant, signKey: SigningKeyPair) {
+  constructor(tenant: BaseMindooTenant, signKey: SigningKeyPair, logger?: Logger) {
     this.tenant = tenant;
     this.signKey = signKey;
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), "MindooDocSigner", true);
   }
 
   /**
@@ -146,7 +151,7 @@ export class MindooDocSigner {
     
     // Create canonical JSON representation
     const canonicalJSON = this.createCanonicalJSON(docPayload, items);
-    console.log(`[MindooDocSigner] Canonical JSON for signing: ${canonicalJSON}`);
+    this.logger.debug(`Canonical JSON for signing: ${canonicalJSON}`);
     
     // Convert to bytes (UTF-8 encoding)
     const encoder = new TextEncoder();
@@ -181,7 +186,7 @@ export class MindooDocSigner {
       payloadBytes.buffer as ArrayBuffer
     );
     
-    console.log(`[MindooDocSigner] Signed ${items.length} items (signature: ${signature.byteLength} bytes)`);
+    this.logger.debug(`Signed ${items.length} items (signature: ${signature.byteLength} bytes)`);
     return new Uint8Array(signature);
   }
 
@@ -204,7 +209,7 @@ export class MindooDocSigner {
     
     // Create the same canonical JSON representation
     const canonicalJSON = this.createCanonicalJSON(docPayload, items);
-    console.log(`[MindooDocSigner] Canonical JSON for verification: ${canonicalJSON}`);
+    this.logger.debug(`Canonical JSON for verification: ${canonicalJSON}`);
     
     // Convert to bytes (UTF-8 encoding)
     const encoder = new TextEncoder();
@@ -236,7 +241,7 @@ export class MindooDocSigner {
       payloadBytes.buffer as ArrayBuffer
     );
     
-    console.log(`[MindooDocSigner] Signature verification: ${isValid ? "valid" : "invalid"}`);
+    this.logger.debug(`Signature verification: ${isValid ? "valid" : "invalid"}`);
     return isValid;
   }
 

@@ -10,6 +10,7 @@ import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { KeyBag } from "./keys/KeyBag";
+import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 
 /**
  * BaseTenantFactory is a platform-agnostic implementation of TenantFactory
@@ -21,10 +22,19 @@ import { KeyBag } from "./keys/KeyBag";
 export class BaseMindooTenantFactory implements MindooTenantFactory {
   private cryptoAdapter: CryptoAdapter;
   private storeFactory: ContentAddressedStoreFactory;
+  private logger: Logger;
 
-  constructor(storeFactory: ContentAddressedStoreFactory, cryptoAdapter: CryptoAdapter) {
+  constructor(
+    storeFactory: ContentAddressedStoreFactory,
+    cryptoAdapter: CryptoAdapter,
+    logger?: Logger
+  ) {
     this.storeFactory = storeFactory;
     this.cryptoAdapter = cryptoAdapter;
+    // Create root logger if not provided (for backward compatibility)
+    this.logger =
+      logger ||
+      new MindooLogger(getDefaultLogLevel(), "MindooTenantFactory", true);
   }
 
   getCryptoAdapter(): CryptoAdapter {
@@ -58,7 +68,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     currentUserPassword: string,
     keyBag: KeyBag
   ): Promise<MindooTenant> {
-    console.log(`[BaseTenantFactory] Creating tenant: ${tenantId}`);
+    this.logger.info(`Creating tenant: ${tenantId}`);
 
     const subtle = this.cryptoAdapter.getSubtle();
 
@@ -108,8 +118,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     currentUserPassword: string,
     keyBag: KeyBag,
   ): Promise<MindooTenant> {
-    console.log(`[BaseTenantFactory] Opening tenant: ${tenantId}`);
+    this.logger.info(`Opening tenant: ${tenantId}`);
 
+    const tenantLogger = this.logger.createChild(`Tenant:${tenantId}`);
     const tenant = new BaseMindooTenant(
       this,
       tenantId,
@@ -121,7 +132,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       currentUserPassword,
       keyBag,
       this.storeFactory,
-      this.cryptoAdapter
+      this.cryptoAdapter,
+      tenantLogger
     );
 
     // Initialize the tenant
@@ -134,7 +146,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    * Creates a new user with separate signing and encryption key pairs.
    */
   async createUserId(username: string, password: string): Promise<PrivateUserId> {
-    console.log(`[BaseTenantFactory] Creating user ID: ${username}`);
+    this.logger.debug(`Creating user ID: ${username}`);
 
     const subtle = this.cryptoAdapter.getSubtle();
 
@@ -207,7 +219,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       },
     };
 
-    console.log(`[BaseTenantFactory] Created user ID: ${username}`);
+    this.logger.debug(`Created user ID: ${username}`);
     return privateUserId;
   }
 
@@ -229,7 +241,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    * for signature verification by other users.
    */
   async createSigningKeyPair(password: string): Promise<SigningKeyPair> {
-    console.log(`[BaseTenantFactory] Creating signing key pair`);
+    this.logger.debug(`Creating signing key pair`);
 
     const subtle = this.cryptoAdapter.getSubtle();
 
@@ -253,7 +265,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     // Encrypt the key material using the shared helper
     const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "signing");
 
-    console.log(`[BaseTenantFactory] Created signing key pair`);
+    this.logger.debug(`Created signing key pair`);
     return {
       publicKey,
       privateKey: encryptedKey,
@@ -266,7 +278,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    * For user-to-user encryption where only the recipient can decrypt, use createEncryptionKeyPair() instead.
    */
   async createSymmetricEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey> {
-    console.log(`[BaseTenantFactory] Creating encrypted symmetric key`);
+    this.logger.debug(`Creating encrypted symmetric key`);
 
     const subtle = this.cryptoAdapter.getSubtle();
 
@@ -288,7 +300,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     // Use "default" as the salt string to match how tenant encryption keys are decrypted
     const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "default");
 
-    console.log(`[BaseTenantFactory] Created encrypted symmetric key`);
+    this.logger.debug(`Created encrypted symmetric key`);
     return encryptedKey;
   }
 
@@ -300,7 +312,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    * and only User B (with the private key) can decrypt it.
    */
   async createEncryptionKeyPair(password: string): Promise<EncryptionKeyPair> {
-    console.log(`[BaseTenantFactory] Creating encryption key pair`);
+    this.logger.debug(`Creating encryption key pair`);
 
     const subtle = this.cryptoAdapter.getSubtle();
 
@@ -329,7 +341,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     // Use "encryption" as the salt string (same as user encryption keys)
     const encryptedKey = await this.encryptPrivateKey(privateKeyBytes, password, "encryption");
 
-    console.log(`[BaseTenantFactory] Created encryption key pair`);
+    this.logger.debug(`Created encryption key pair`);
     return {
       publicKey,
       privateKey: encryptedKey,
