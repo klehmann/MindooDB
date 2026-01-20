@@ -13,6 +13,7 @@ import {
   AttachmentReference,
   AttachmentConfig,
   SigningKeyPair,
+  PerformanceCallback,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import type { ContentAddressedStore } from "./appendonlystores/types";
@@ -88,6 +89,11 @@ export class BaseMindooDB implements MindooDB {
   // Used for resolving Automerge dependency hashes to entry IDs
   private automergeHashToEntryId: Map<string, Map<string, string>> = new Map(); // Map<docId, Map<automergeHash, entryId>>
   private logger: Logger;
+  private performanceCallback?: PerformanceCallback;
+  
+  // Cache for imported public keys (CryptoKey objects) to avoid re-importing the same key
+  // Map<publicKeyPEM, CryptoKey>
+  private publicKeyCache: Map<string, CryptoKey> = new Map();
 
   constructor(
     tenant: BaseMindooTenant, 
@@ -95,7 +101,8 @@ export class BaseMindooDB implements MindooDB {
     attachmentStore?: ContentAddressedStore,
     attachmentConfig?: AttachmentConfig,
     adminOnlyDb: boolean = false,
-    logger?: Logger
+    logger?: Logger,
+    performanceCallback?: PerformanceCallback
   ) {
     this.tenant = tenant;
     this.store = store;
@@ -106,6 +113,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), "BaseMindooDB", true);
+    this.performanceCallback = performanceCallback;
   }
   
   /**
@@ -118,6 +126,66 @@ export class BaseMindooDB implements MindooDB {
   
   isAdminOnlyDb(): boolean {
     return this._isAdminOnlyDb;
+  }
+
+  /**
+   * Get or import a CryptoKey for signature verification, with caching.
+   * This avoids re-importing the same public key multiple times.
+   */
+  private async getOrImportPublicKey(publicKey: string): Promise<CryptoKey | null> {
+    // Check cache first
+    if (this.publicKeyCache.has(publicKey)) {
+      return this.publicKeyCache.get(publicKey)!;
+    }
+
+    // Validate the public key is trusted
+    const directory = await this.tenant.openDirectory();
+    const isTrusted = await directory.validatePublicSigningKey(publicKey);
+    if (!isTrusted) {
+      this.logger.warn(`Public key not trusted: ${publicKey}`);
+      return null;
+    }
+
+    // Import the key
+    const subtle = this.tenant.getCryptoAdapter().getSubtle();
+    const publicKeyBuffer = this.tenant.pemToArrayBuffer(publicKey);
+    
+    const cryptoKey = await subtle.importKey(
+      "spki",
+      publicKeyBuffer,
+      {
+        name: "Ed25519",
+      },
+      false, // not extractable
+      ["verify"]
+    );
+
+    // Cache the imported key
+    this.publicKeyCache.set(publicKey, cryptoKey);
+    return cryptoKey;
+  }
+
+  /**
+   * Verify a signature using a pre-imported CryptoKey.
+   * This bypasses the key import step for better performance when keys are cached.
+   */
+  private async verifySignatureWithKey(
+    cryptoKey: CryptoKey,
+    payload: Uint8Array,
+    signature: Uint8Array
+  ): Promise<boolean> {
+    const subtle = this.tenant.getCryptoAdapter().getSubtle();
+    
+    const isValid = await subtle.verify(
+      {
+        name: "Ed25519",
+      },
+      cryptoKey,
+      signature.buffer as ArrayBuffer,
+      payload.buffer as ArrayBuffer
+    );
+
+    return isValid;
   }
 
   /**
@@ -140,26 +208,37 @@ export class BaseMindooDB implements MindooDB {
    * When a document changes, it's removed from its current position and inserted
    * at the correct sorted position to maintain order by (lastModified, docId).
    * 
+   * Optimized to only update lookup map for entries that actually moved.
+   * 
    * @param docId The document ID
    * @param lastModified The new last modified timestamp
    * @param isDeleted Whether the document is deleted
    */
   private updateIndex(docId: string, lastModified: number, isDeleted: boolean): void {
-    // Remove existing entry if present
+    const newEntry = { docId, lastModified, isDeleted };
     const existingIndex = this.indexLookup.get(docId);
+    
+    // Check if the entry already exists and hasn't changed position
     if (existingIndex !== undefined) {
-      // Remove from array
+      const existingEntry = this.index[existingIndex];
+      // If position hasn't changed (same lastModified and docId), no update needed
+      if (existingEntry.lastModified === lastModified && existingEntry.isDeleted === isDeleted) {
+        return; // No change needed
+      }
+      
+      // Remove from current position
       this.index.splice(existingIndex, 1);
-      // Update lookup map for all entries after the removed one
-      for (let i = existingIndex; i < this.index.length; i++) {
+      
+      // Update lookup map for entries that moved (only those after the removed position)
+      // We'll update the full range after insertion to be safe
+      const minAffectedIndex = Math.min(existingIndex, this.index.length);
+      for (let i = minAffectedIndex; i < this.index.length; i++) {
         this.indexLookup.set(this.index[i].docId, i);
       }
-      // Remove the entry from lookup
       this.indexLookup.delete(docId);
     }
     
     // Find insertion point using binary search to maintain sorted order
-    const newEntry = { docId, lastModified, isDeleted };
     let insertIndex = this.index.length; // Default to end
     
     // Binary search for insertion point
@@ -180,7 +259,8 @@ export class BaseMindooDB implements MindooDB {
     // Insert at the correct position
     this.index.splice(insertIndex, 0, newEntry);
     
-    // Update lookup map for all entries from insertion point onwards
+    // Update lookup map for entries from insertion point onwards
+    // Only update entries that actually moved (from insertIndex to end)
     for (let i = insertIndex; i < this.index.length; i++) {
       this.indexLookup.set(this.index[i].docId, i);
     }
@@ -269,25 +349,53 @@ export class BaseMindooDB implements MindooDB {
     }
     
     // Process each document with new entries
-    // Reload documents to apply all changes (including new ones)
+    // Use incremental cache updates when possible
+    // Process documents in parallel with concurrency limit
     this.logger.debug(`Processing ${entriesByDoc.size} documents with new entries`);
-    for (const [docId, entryMetadataList] of entriesByDoc) {
+    
+    // Helper function to process a single document
+    const processDocument = async (docId: string, entryMetadataList: StoreEntryMetadata[]): Promise<void> => {
       try {
         this.logger.debug(`===== Processing document ${docId} with ${entryMetadataList.length} new entry(s) in syncStoreChanges =====`);
-        // Clear cache for this document so it gets reloaded with all entries
-        this.docCache.delete(docId);
-        this.logger.debug(`Cleared cache for document ${docId}`);
         
-        // Reload document (this will load all entries including new ones)
-        this.logger.debug(`About to call loadDocumentInternal for document ${docId}`);
-        const doc = await this.loadDocumentInternal(docId);
-        this.logger.debug(`loadDocumentInternal returned for document ${docId}, result: ${doc ? 'success' : 'null'}`);
-        if (doc) {
-          this.logger.debug(`Successfully reloaded document ${docId}, updating index`);
-          this.updateIndex(docId, doc.lastModified, doc.isDeleted);
-          this.logger.debug(`Updated index for document ${docId} (lastModified: ${doc.lastModified}, isDeleted: ${doc.isDeleted})`);
+        // Check if document is cached
+        const cachedDoc = this.docCache.get(docId);
+        
+        let updatedDoc: InternalDoc | null = null;
+        
+        if (cachedDoc) {
+          // Document is cached - try incremental update
+          this.logger.debug(`Document ${docId} found in cache, attempting incremental update`);
+          try {
+            updatedDoc = await this.applyNewEntriesToCachedDocument(cachedDoc, entryMetadataList);
+            if (updatedDoc) {
+              this.logger.debug(`Successfully updated cached document ${docId} incrementally`);
+              // Only update index if document actually changed
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted);
+              this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted})`);
+            } else {
+              this.logger.debug(`Document ${docId} unchanged after applying new entries, skipping index update`);
+            }
+          } catch (error) {
+            // If incremental update fails, fall back to full reload
+            this.logger.warn(`Incremental update failed for document ${docId}, falling back to full reload:`, error);
+            this.docCache.delete(docId);
+            updatedDoc = await this.loadDocumentInternal(docId);
+            if (updatedDoc) {
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted);
+            }
+          }
         } else {
-          this.logger.warn(`Document ${docId} returned null from loadDocumentInternal`);
+          // Document not cached - load from scratch
+          this.logger.debug(`Document ${docId} not in cache, loading from store`);
+          updatedDoc = await this.loadDocumentInternal(docId);
+          if (updatedDoc) {
+            this.logger.debug(`Successfully loaded document ${docId}, updating index`);
+            this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted);
+            this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted})`);
+          } else {
+            this.logger.warn(`Document ${docId} returned null from loadDocumentInternal`);
+          }
         }
       } catch (error) {
         // Handle missing symmetric key gracefully - skip documents we can't decrypt
@@ -295,12 +403,38 @@ export class BaseMindooDB implements MindooDB {
           this.logger.debug(`Skipping document ${docId} - missing key: ${error.keyId}`);
           // Mark entry IDs as processed so we don't retry them
           this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
-          continue; // Skip to next document
+          return; // Skip this document
         }
         
         this.logger.error(`===== ERROR processing document ${docId} in syncStoreChanges =====`, error);
         // Re-throw the error so we can see what's happening in the test
         throw error;
+      }
+    };
+    
+    // Process documents in parallel with concurrency limit (default: 10)
+    const maxConcurrency = 10;
+    const documentEntries = Array.from(entriesByDoc.entries());
+    
+    // Process in batches to limit concurrency
+    const results: PromiseSettledResult<void>[] = [];
+    for (let i = 0; i < documentEntries.length; i += maxConcurrency) {
+      const batch = documentEntries.slice(i, i + maxConcurrency);
+      const batchResults = await Promise.allSettled(
+        batch.map(([docId, entryMetadataList]) => processDocument(docId, entryMetadataList))
+      );
+      results.push(...batchResults);
+    }
+    
+    // Check for errors (excluding SymmetricKeyNotFoundError which is handled gracefully)
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (result.status === 'rejected') {
+        const error = result.reason;
+        if (!(error instanceof SymmetricKeyNotFoundError)) {
+          // Re-throw non-key errors
+          throw error;
+        }
       }
     }
     
@@ -1181,17 +1315,46 @@ export class BaseMindooDB implements MindooDB {
       }
     }
     
+    // Pre-check which documents are in cache to optimize iteration
+    const uncachedDocIds: string[] = [];
+    for (let i = startIndex; i < this.index.length; i++) {
+      const entry = this.index[i];
+      if (!this.docCache.has(entry.docId)) {
+        uncachedDocIds.push(entry.docId);
+      }
+    }
+    
+    // Prefetch uncached documents in batches (if any)
+    if (uncachedDocIds.length > 0) {
+      this.logger.debug(`Prefetching ${uncachedDocIds.length} uncached documents for iteration`);
+      const prefetchBatchSize = 10;
+      for (let i = 0; i < uncachedDocIds.length; i += prefetchBatchSize) {
+        const batch = uncachedDocIds.slice(i, i + prefetchBatchSize);
+        await Promise.all(
+          batch.map(docId => this.loadDocumentInternal(docId).catch(err => {
+            this.logger.warn(`Failed to prefetch document ${docId}:`, err);
+            return null;
+          }))
+        );
+      }
+    }
+    
     // Iterate through the index and yield documents one at a time
+    // Documents should now be in cache from prefetching
     for (let i = startIndex; i < this.index.length; i++) {
       const entry = this.index[i];
       
       try {
         this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
         
-        // Load document using loadDocumentInternal to handle deleted documents
-        // getDocument() throws for deleted documents, but we need to yield them
-        // so external indexes can be updated
-        const internalDoc = await this.loadDocumentInternal(entry.docId);
+        // Check cache first (should be there after prefetching)
+        let internalDoc: InternalDoc | null = this.docCache.get(entry.docId) || null;
+        
+        if (!internalDoc) {
+          // Fallback to loading if not in cache (shouldn't happen after prefetching)
+          this.logger.debug(`Document ${entry.docId} not in cache, loading from store`);
+          internalDoc = await this.loadDocumentInternal(entry.docId);
+        }
         
         if (!internalDoc) {
           this.logger.warn(`Document ${entry.docId} not found, skipping`);
@@ -1219,6 +1382,178 @@ export class BaseMindooDB implements MindooDB {
     }
     
     this.logger.debug(`Iteration completed`);
+  }
+
+  /**
+   * Incrementally update a cached document with new entries.
+   * Returns the updated document, or null if document wasn't actually changed.
+   */
+  private async applyNewEntriesToCachedDocument(
+    cachedDoc: InternalDoc,
+    newEntryMetadata: StoreEntryMetadata[]
+  ): Promise<InternalDoc | null> {
+    const docId = cachedDoc.id;
+    
+    if (newEntryMetadata.length === 0) {
+      this.logger.debug(`No new entries for cached document ${docId}`);
+      return null; // No changes
+    }
+    
+    this.logger.debug(`Applying ${newEntryMetadata.length} new entries to cached document ${docId}`);
+    
+    // Get current document heads to check if it changes
+    const headsBefore = Automerge.getHeads(cachedDoc.doc);
+    
+    // Filter entries to only include change entries (exclude snapshots)
+    const entriesToApply = newEntryMetadata.filter(
+      em => em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete"
+    );
+    
+    if (entriesToApply.length === 0) {
+      this.logger.debug(`No change entries to apply for document ${docId}`);
+      return null; // No changes
+    }
+    
+    // Sort entries by timestamp
+    entriesToApply.sort((a, b) => a.createdAt - b.createdAt);
+    
+    // Load entries from store
+    const entries = await this.store.getEntries(entriesToApply.map(em => em.id));
+    
+    // Filter entries for admin-only mode first
+    const validEntries = entries.filter(entryData => {
+      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+        this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
+        return false;
+      }
+      return true;
+    });
+    
+    if (validEntries.length === 0) {
+      this.logger.debug(`No valid entries to process for cached document ${docId}`);
+      return null;
+    }
+    
+    // Batch signature verification with key caching
+    // Group entries by public key to import each key only once
+    const entriesByPublicKey = new Map<string, StoreEntry[]>();
+    for (const entryData of validEntries) {
+      if (!entriesByPublicKey.has(entryData.createdByPublicKey)) {
+        entriesByPublicKey.set(entryData.createdByPublicKey, []);
+      }
+      entriesByPublicKey.get(entryData.createdByPublicKey)!.push(entryData);
+    }
+
+    // Import all unique public keys in parallel (with caching)
+    const keyImportResults = await Promise.all(
+      Array.from(entriesByPublicKey.keys()).map(async (publicKey) => {
+        const cryptoKey = await this.getOrImportPublicKey(publicKey);
+        return { publicKey, cryptoKey };
+      })
+    );
+
+    // Create a map of public key -> CryptoKey for quick lookup
+    const keyMap = new Map<string, CryptoKey>();
+    for (const { publicKey, cryptoKey } of keyImportResults) {
+      if (cryptoKey) {
+        keyMap.set(publicKey, cryptoKey);
+      }
+    }
+
+    // Verify all signatures in parallel using cached keys
+    const signatureVerificationResults = await Promise.all(
+      validEntries.map(async (entryData) => {
+        const cryptoKey = keyMap.get(entryData.createdByPublicKey);
+        if (!cryptoKey) {
+          // Key was not trusted or failed to import
+          return { entryData, isValid: false };
+        }
+        
+        const isValid = await this.verifySignatureWithKey(
+          cryptoKey,
+          entryData.encryptedData,
+          entryData.signature
+        );
+        return { entryData, isValid };
+      })
+    );
+    
+    // Filter out entries with invalid signatures
+    const verifiedEntries = signatureVerificationResults
+      .filter(({ isValid }) => isValid)
+      .map(({ entryData }) => entryData);
+    
+    if (verifiedEntries.length === 0) {
+      this.logger.debug(`No entries with valid signatures for cached document ${docId}`);
+      return null;
+    }
+    
+    // Parallel decryption - decrypt all entries concurrently
+    const decryptionResults = await Promise.all(
+      verifiedEntries.map(async (entryData) => {
+        const decryptedPayload = await this.tenant.decryptPayload(
+          entryData.encryptedData,
+          entryData.decryptionKeyId
+        );
+        return { entryData, decryptedPayload };
+      })
+    );
+    
+    // Collect change bytes and register automerge hash mappings
+    const changeBytes: Uint8Array[] = [];
+    for (const { entryData, decryptedPayload } of decryptionResults) {
+      changeBytes.push(decryptedPayload);
+      
+      // Register automerge hash -> entry ID mapping
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
+    }
+    
+    if (changeBytes.length === 0) {
+      this.logger.debug(`No valid change bytes to apply for document ${docId}`);
+      return null; // No changes
+    }
+    
+    // Apply all changes at once (Automerge handles dependency ordering)
+    const result = Automerge.applyChanges<MindooDocPayload>(cachedDoc.doc, changeBytes);
+    const updatedDoc = result[0] as Automerge.Doc<MindooDocPayload>;
+    
+    // Check if document actually changed
+    const headsAfter = Automerge.getHeads(updatedDoc);
+    const headsChanged = JSON.stringify(headsBefore) !== JSON.stringify(headsAfter);
+    
+    if (!headsChanged) {
+      this.logger.debug(`Document ${docId} heads unchanged after applying new entries`);
+      return null; // Document didn't actually change
+    }
+    
+    this.logger.debug(`Document ${docId} changed: heads before=${JSON.stringify(headsBefore)}, after=${JSON.stringify(headsAfter)}`);
+    
+    // Update metadata
+    const payload = updatedDoc as unknown as MindooDocPayload;
+    const lastEntry = entries[entries.length - 1];
+    const lastModified = (payload._lastModified as number) || 
+                         (lastEntry ? lastEntry.createdAt : cachedDoc.lastModified);
+    
+    // Check if document was deleted
+    const hasDeleteEntry = newEntryMetadata.some(em => em.entryType === "doc_delete");
+    const isDeleted = hasDeleteEntry || cachedDoc.isDeleted;
+    
+    const updatedInternalDoc: InternalDoc = {
+      id: docId,
+      doc: updatedDoc,
+      createdAt: cachedDoc.createdAt,
+      lastModified,
+      decryptionKeyId: cachedDoc.decryptionKeyId,
+      isDeleted,
+    };
+    
+    // Update cache
+    this.docCache.set(docId, updatedInternalDoc);
+    
+    return updatedInternalDoc;
   }
 
   /**
@@ -1342,83 +1677,115 @@ export class BaseMindooDB implements MindooDB {
     // Log current document state before applying entries
     this.logger.debug(`Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
     
-    // Verify signatures, decrypt, and apply entries one at a time
-    // This ensures dependencies are handled correctly by Automerge
-    for (let i = 0; i < entries.length; i++) {
-      const entryData = entries[i];
-      this.logger.debug(`===== Processing entry ${i + 1}/${entries.length} for document ${docId} =====`);
-      this.logger.debug(`Entry id: ${entryData.id}`);
-      this.logger.debug(`Entry type: ${entryData.entryType}`);
-      this.logger.debug(`Entry createdAt: ${entryData.createdAt}`);
-      this.logger.debug(`Entry dependencies: ${JSON.stringify(entryData.dependencyIds || [])}`);
-      this.logger.debug(`Entry payload size: ${entryData.encryptedData.length} bytes`);
-      
-      // Admin-only mode: only accept entries signed by the admin key
-      // This prevents recursion and ensures security for the directory database
+    // Filter entries for admin-only mode first
+    const validEntries = entries.filter(entryData => {
       if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
-        continue;
+        return false;
       }
-      
-      // Verify signature against the encrypted payload (no decryption needed)
-      // We sign the encrypted payload, so anyone can verify signatures without decryption keys
-      this.logger.debug(`Verifying signature for entry ${entryData.id}`);
-      const isValid = await this.tenant.verifySignature(
-        entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey
-      );
-      if (!isValid) {
-        this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
-        continue;
+      return true;
+    });
+    
+    if (validEntries.length === 0) {
+      this.logger.debug(`No valid entries to process for document ${docId}`);
+    } else {
+      // Batch signature verification with key caching
+      // Group entries by public key to import each key only once
+      this.logger.debug(`Verifying ${validEntries.length} signatures in parallel with key caching`);
+      const entriesByPublicKey = new Map<string, StoreEntry[]>();
+      for (const entryData of validEntries) {
+        if (!entriesByPublicKey.has(entryData.createdByPublicKey)) {
+          entriesByPublicKey.set(entryData.createdByPublicKey, []);
+        }
+        entriesByPublicKey.get(entryData.createdByPublicKey)!.push(entryData);
       }
-      this.logger.debug(`Signature valid for entry ${entryData.id}`);
-      
-      // Decrypt payload (only after signature verification passes)
-      this.logger.debug(`Decrypting payload for entry ${entryData.id} with key ${entryData.decryptionKeyId}`);
-      const decryptedPayload = await this.tenant.decryptPayload(
-        entryData.encryptedData,
-        entryData.decryptionKeyId
+
+      // Import all unique public keys in parallel (with caching)
+      const keyImportResults = await Promise.all(
+        Array.from(entriesByPublicKey.keys()).map(async (publicKey) => {
+          const cryptoKey = await this.getOrImportPublicKey(publicKey);
+          return { publicKey, cryptoKey };
+        })
       );
-      this.logger.debug(`Decrypted payload: ${entryData.encryptedData.length} -> ${decryptedPayload.length} bytes`);
+
+      // Create a map of public key -> CryptoKey for quick lookup
+      const keyMap = new Map<string, CryptoKey>();
+      for (const { publicKey, cryptoKey } of keyImportResults) {
+        if (cryptoKey) {
+          keyMap.set(publicKey, cryptoKey);
+        }
+      }
+
+      // Verify all signatures in parallel using cached keys
+      const signatureVerificationResults = await Promise.all(
+        validEntries.map(async (entryData) => {
+          const cryptoKey = keyMap.get(entryData.createdByPublicKey);
+          if (!cryptoKey) {
+            // Key was not trusted or failed to import
+            return { entryData, isValid: false };
+          }
+          
+          const isValid = await this.verifySignatureWithKey(
+            cryptoKey,
+            entryData.encryptedData,
+            entryData.signature
+          );
+          return { entryData, isValid };
+        })
+      );
       
-      // Apply change using applyChanges with raw change bytes
-      // applyChanges expects an array of Uint8Array (raw change bytes)
-      try {
-        this.logger.debug(`Document state before applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
-        this.logger.debug(`Calling Automerge.applyChanges for entry ${i + 1}/${entries.length} on document ${docId}`);
-        this.logger.debug(`Decrypted payload length: ${decryptedPayload.length} bytes`);
-        const currentDoc: Automerge.Doc<MindooDocPayload> = doc!;
-        const result = Automerge.applyChanges<MindooDocPayload>(currentDoc, [decryptedPayload]);
-        doc = result[0] as Automerge.Doc<MindooDocPayload>;
-        this.logger.debug(`Successfully applied entry ${i + 1}/${entries.length}`);
-        this.logger.debug(`Document state after applying entry ${i + 1}: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+      // Filter out entries with invalid signatures
+      const verifiedEntries = signatureVerificationResults
+        .filter(({ isValid }) => {
+          if (!isValid) {
+            this.logger.warn(`Invalid signature for entry, skipping`);
+          }
+          return isValid;
+        })
+        .map(({ entryData }) => entryData);
+      
+      if (verifiedEntries.length === 0) {
+        this.logger.debug(`No entries with valid signatures for document ${docId}`);
+      } else {
+        // Parallel decryption - decrypt all entries concurrently
+        // Automerge handles dependency buffering internally, so we can decrypt all in parallel
+        this.logger.debug(`Decrypting ${verifiedEntries.length} entries in parallel`);
+        const decryptionResults = await Promise.all(
+          verifiedEntries.map(async (entryData) => {
+            const decryptedPayload = await this.tenant.decryptPayload(
+              entryData.encryptedData,
+              entryData.decryptionKeyId
+            );
+            return { entryData, decryptedPayload };
+          })
+        );
         
-        // Register the automerge hash -> entry ID mapping for future dependency resolution
-        const parsed = parseDocEntryId(entryData.id);
-        if (parsed) {
-          this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+        // Collect change bytes and register automerge hash mappings
+        const changeBytes: Uint8Array[] = [];
+        for (const { entryData, decryptedPayload } of decryptionResults) {
+          changeBytes.push(decryptedPayload);
+          
+          // Register the automerge hash -> entry ID mapping for future dependency resolution
+          const parsed = parseDocEntryId(entryData.id);
+          if (parsed) {
+            this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+          }
         }
-      } catch (error) {
-        this.logger.error(`Error applying entry ${entryData.id} to document ${docId}:`, error);
-        this.logger.error(`Entry index: ${i + 1}/${entries.length}`);
-        this.logger.error(`Entry dependencies:`, entryData.dependencyIds);
-        this.logger.error(`Entry type:`, entryData.entryType);
-        this.logger.error(`Entry createdAt:`, entryData.createdAt);
-        this.logger.error(`Document state before entry:`, {
-          hasDoc: !!doc,
-          docHeads: doc ? Automerge.getHeads(doc) : null,
-        });
-        // Log previous entry for debugging dependency issues
-        if (i > 0) {
-          const prevEntry = entries[i - 1];
-          this.logger.error(`Previous entry:`, {
-            id: prevEntry.id,
-            deps: prevEntry.dependencyIds,
-            type: prevEntry.entryType,
-          });
+        
+        // Batch apply all changes at once - Automerge handles dependency ordering
+        if (changeBytes.length > 0) {
+          this.logger.debug(`Applying ${changeBytes.length} changes to document ${docId} using batch applyChanges`);
+          try {
+            const result = Automerge.applyChanges<MindooDocPayload>(doc!, changeBytes);
+            doc = result[0] as Automerge.Doc<MindooDocPayload>;
+            this.logger.debug(`Successfully applied ${changeBytes.length} changes to document ${docId}`);
+            this.logger.debug(`Document state after applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+          } catch (error) {
+            this.logger.error(`Error applying changes to document ${docId}:`, error);
+            this.logger.error(`Number of changes: ${changeBytes.length}`);
+            throw error;
+          }
         }
-        throw error;
       }
     }
     

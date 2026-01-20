@@ -990,6 +990,45 @@ export interface OpenDBOptions extends OpenStoreOptions {
   attachmentConfig?: AttachmentConfig;
 }
 
+/**
+ * Optional performance callback interface for tracking operation timing.
+ * Used for profiling and performance analysis.
+ */
+export interface PerformanceCallback {
+  /**
+   * Called when a document is loaded, with timing breakdown.
+   */
+  onDocumentLoad?: (metrics: {
+    docId: string;
+    cacheHit: boolean;
+    cacheCheckTime: number;
+    storeQueryTime: number;
+    entryLoadTime: number;
+    signatureVerificationTime: number;
+    decryptionTime: number;
+    automergeTime: number;
+    totalTime: number;
+  }) => void;
+
+  /**
+   * Called when the index is updated.
+   */
+  onIndexUpdate?: (metrics: {
+    docId: string;
+    operation: 'insert' | 'update' | 'remove';
+    time: number;
+  }) => void;
+
+  /**
+   * Called during sync operations.
+   */
+  onSyncOperation?: (metrics: {
+    operation: 'findNewEntries' | 'processDocument' | 'updateIndex';
+    time: number;
+    details?: Record<string, any>;
+  }) => void;
+}
+
 export interface MindooDB {
 
   /**
