@@ -6,7 +6,7 @@ import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/
 import { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { NetworkTransport } from "../core/appendonlystores/network/NetworkTransport";
 import type { NetworkEncryptedEntry, AuthResult } from "../core/appendonlystores/network/types";
-import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, EncryptedPrivateKey, MindooDoc } from "../core/types";
+import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, EncryptedPrivateKey, MindooDoc, StoreEntryType } from "../core/types";
 import type { PublicUserId } from "../core/userid";
 import type { ContentAddressedStore } from "../core/appendonlystores/types";
 
@@ -35,6 +35,15 @@ class MockNetworkTransport implements NetworkTransport {
 
   async findNewEntriesForDoc(token: string, haveIds: string[], docId: string): Promise<StoreEntryMetadata[]> {
     return this.server.handleFindNewEntriesForDoc(token, haveIds, docId);
+  }
+
+  async findEntries(
+    token: string,
+    type: StoreEntryType,
+    creationDateFrom: number | null,
+    creationDateUntil: number | null
+  ): Promise<StoreEntryMetadata[]> {
+    return this.server.handleFindEntries(token, type, creationDateFrom, creationDateUntil);
   }
 
   async getEntries(token: string, ids: string[]): Promise<NetworkEncryptedEntry[]> {
