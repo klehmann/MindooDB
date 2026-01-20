@@ -854,6 +854,57 @@ export class BaseMindooDB implements MindooDB {
     return docIds;
   }
 
+  async getAllDocumentIdsAtTimestamp(timestamp: number): Promise<string[]> {
+    // Efficiently query for doc_create and doc_delete entries before the timestamp
+    const [creates, deletes] = await Promise.all([
+      this.store.findEntries("doc_create", null, timestamp),
+      this.store.findEntries("doc_delete", null, timestamp)
+    ]);
+    
+    // Build sets of docIds for efficient lookup
+    const createdDocIds = new Set<string>();
+    const deletedDocIds = new Set<string>();
+    
+    // Track earliest create time for each doc
+    const createTimes = new Map<string, number>();
+    for (const entry of creates) {
+      const existingTime = createTimes.get(entry.docId);
+      if (!existingTime || entry.createdAt < existingTime) {
+        createTimes.set(entry.docId, entry.createdAt);
+        createdDocIds.add(entry.docId);
+      }
+    }
+    
+    // Track earliest delete time for each doc
+    const deleteTimes = new Map<string, number>();
+    for (const entry of deletes) {
+      const existingTime = deleteTimes.get(entry.docId);
+      if (!existingTime || entry.createdAt < existingTime) {
+        deleteTimes.set(entry.docId, entry.createdAt);
+        deletedDocIds.add(entry.docId);
+      }
+    }
+    
+    // Find documents that existed at the timestamp
+    const docIds: string[] = [];
+    
+    for (const docId of createdDocIds) {
+      const createTime = createTimes.get(docId)!;
+      const deleteTime = deleteTimes.get(docId);
+      
+      // Document exists at timestamp if:
+      // 1. It was created before the timestamp
+      // 2. Either it was never deleted, or it was deleted after the timestamp
+      if (createTime < timestamp) {
+        if (!deleteTime || deleteTime > timestamp) {
+          docIds.push(docId);
+        }
+      }
+    }
+    
+    return docIds;
+  }
+
   async deleteDocument(docId: string): Promise<void> {
     return this.deleteDocInternal(docId);
   }

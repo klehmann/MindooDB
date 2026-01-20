@@ -1,5 +1,5 @@
 import type { ContentAddressedStore } from "../../core/types";
-import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory } from "../../core/types";
+import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, StoreEntryType } from "../../core/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { NetworkEncryptedEntry, NetworkAuthTokenPayload } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
@@ -137,6 +137,38 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
     
     return newEntries;
+  }
+
+  /**
+   * Handle a findEntries request from a client.
+   * 
+   * @param token The JWT access token
+   * @param type The entry type to filter by
+   * @param creationDateFrom Optional start timestamp (inclusive)
+   * @param creationDateUntil Optional end timestamp (exclusive)
+   * @returns List of entry metadata matching the criteria
+   */
+  async handleFindEntries(
+    token: string,
+    type: StoreEntryType,
+    creationDateFrom: number | null,
+    creationDateUntil: number | null
+  ): Promise<StoreEntryMetadata[]> {
+    this.logger.debug(`Handling findEntries request for type ${type}`);
+    
+    // Validate token
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+    
+    // Find entries
+    const entries = await this.localStore.findEntries(
+      type,
+      creationDateFrom,
+      creationDateUntil
+    );
+    this.logger.debug(`Found ${entries.length} entries`);
+    
+    return entries;
   }
 
   /**

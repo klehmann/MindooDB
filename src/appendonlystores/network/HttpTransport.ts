@@ -177,6 +177,46 @@ export class HttpTransport implements NetworkTransport {
   }
 
   /**
+   * Find entries by type and creation date range from the remote store.
+   */
+  async findEntries(
+    token: string,
+    type: StoreEntryType,
+    creationDateFrom: number | null,
+    creationDateUntil: number | null
+  ): Promise<StoreEntryMetadata[]> {
+    this.logger.debug(`Finding entries of type ${type} in date range`);
+    
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/findEntries`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          type,
+          creationDateFrom,
+          creationDateUntil,
+        }),
+      }
+    );
+    
+    const data = await response.json();
+    
+    // Deserialize the entries
+    const entries: StoreEntryMetadata[] = (data.entries || []).map((e: SerializedEntryMetadata) => 
+      this.deserializeEntryMetadata(e)
+    );
+    
+    this.logger.debug(`Found ${entries.length} entries`);
+    return entries;
+  }
+
+  /**
    * Get entries from the remote store.
    */
   async getEntries(

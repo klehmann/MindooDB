@@ -1,4 +1,4 @@
-import type { StoreEntry, StoreEntryMetadata } from "../../types";
+import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../types";
 import type { NetworkEncryptedEntry, AuthResult } from "./types";
 
 /**
@@ -81,6 +81,26 @@ export interface NetworkTransport {
     token: string,
     haveIds: string[],
     docId: string
+  ): Promise<StoreEntryMetadata[]>;
+
+  /**
+   * Find entries by type and creation date range from the remote store.
+   * 
+   * This enables efficient server-side filtering for time-travel queries.
+   * 
+   * @param token JWT access token from authenticate()
+   * @param type The entry type to filter by
+   * @param creationDateFrom Optional start timestamp (inclusive). If null, no lower bound.
+   * @param creationDateUntil Optional end timestamp (exclusive). If null, no upper bound.
+   * @returns List of entry metadata matching the criteria
+   * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
+   * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
+   */
+  findEntries(
+    token: string,
+    type: StoreEntryType,
+    creationDateFrom: number | null,
+    creationDateUntil: number | null
   ): Promise<StoreEntryMetadata[]>;
 
   /**

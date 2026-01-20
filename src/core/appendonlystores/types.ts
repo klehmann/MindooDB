@@ -1,4 +1,4 @@
-import type { StoreEntry, StoreEntryMetadata } from "../types";
+import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../types";
 
 /**
  * Options for opening/creating a database store.
@@ -125,6 +125,24 @@ export interface ContentAddressedStore {
    * @return A list of entry metadata for entries we have that aren't in knownIds
    */
   findNewEntriesForDoc(knownIds: string[], docId: string): Promise<StoreEntryMetadata[]>;
+
+  /**
+   * Find entries by type and creation date range.
+   * 
+   * This method allows efficient filtering of entries at the store level,
+   * which is especially important for network stores where server-side filtering
+   * reduces data transfer.
+   * 
+   * @param type The entry type to filter by (e.g., "doc_create", "doc_delete")
+   * @param creationDateFrom Optional start timestamp (inclusive). If null, no lower bound.
+   * @param creationDateUntil Optional end timestamp (exclusive). If null, no upper bound.
+   * @return A list of entry metadata matching the criteria
+   */
+  findEntries(
+    type: StoreEntryType,
+    creationDateFrom: number | null,
+    creationDateUntil: number | null
+  ): Promise<StoreEntryMetadata[]>;
 
   /**
    * Get all entry IDs in the store.

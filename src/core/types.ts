@@ -1165,6 +1165,20 @@ export interface MindooDB {
   getAllDocumentIds(): Promise<string[]>;
 
   /**
+   * Get all document IDs that existed at a specific timestamp.
+   * 
+   * This method efficiently queries the content-addressed store to find
+   * documents that existed at the given point in time. A document is considered
+   * to exist at a timestamp if:
+   * - It has a doc_create entry with createdAt < timestamp
+   * - Either it has no doc_delete entry, or its doc_delete entry has createdAt > timestamp
+   * 
+   * @param timestamp The timestamp to query (milliseconds since Unix epoch)
+   * @return A promise that resolves to a list of document IDs that existed at the specified timestamp
+   */
+  getAllDocumentIdsAtTimestamp(timestamp: number): Promise<string[]>;
+
+  /**
    * Delete a document by its ID
    *
    * @param docId The ID of the document

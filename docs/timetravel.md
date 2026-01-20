@@ -6,10 +6,11 @@ MindooDB provides time travel functionality that allows you to retrieve document
 
 ## Features
 
-MindooDB offers two main time travel capabilities:
+MindooDB offers three main time travel capabilities:
 
 1. **`getDocumentAtTimestamp()`** - Retrieve a document snapshot at a specific point in time
-2. **`iterateDocumentHistory()`** - Traverse all changes to a document chronologically
+2. **`getAllDocumentIdsAtTimestamp()`** - Get all document IDs that existed at a specific point in time
+3. **`iterateDocumentHistory()`** - Traverse all changes to a document chronologically
 
 Both methods work with MindooDB's append-only storage architecture, which maintains a complete history of all document changes.
 
@@ -242,6 +243,125 @@ console.log(beforeDelete.getData().status); // "active"
 console.log(beforeDelete.isDeleted()); // false
 ```
 
+## getAllDocumentIdsAtTimestamp()
+
+Get all document IDs that existed at a specific point in time. This method efficiently queries the content-addressed store to find documents that existed at the given timestamp without loading document content.
+
+### Method Signature
+
+```typescript
+getAllDocumentIdsAtTimestamp(timestamp: number): Promise<string[]>
+```
+
+### Parameters
+
+- `timestamp`: The timestamp to query (milliseconds since Unix epoch)
+
+### Returns
+
+- `Promise<string[]>`: A list of document IDs that existed at the specified timestamp. A document is considered to exist at a timestamp if:
+  - It has a `doc_create` entry with `createdAt < timestamp`
+  - Either it has no `doc_delete` entry, or its `doc_delete` entry has `createdAt > timestamp`
+
+### Example Usage
+
+```typescript
+// Create multiple documents at different times
+const doc1 = await db.createDocument();
+const doc1Id = doc1.getId();
+const time1 = Date.now();
+
+await new Promise(resolve => setTimeout(resolve, 10));
+
+const doc2 = await db.createDocument();
+const doc2Id = doc2.getId();
+const time2 = Date.now();
+
+await new Promise(resolve => setTimeout(resolve, 10));
+
+const doc3 = await db.createDocument();
+const doc3Id = doc3.getId();
+const time3 = Date.now();
+
+// At time1, only doc1 should exist
+const idsAtTime1 = await db.getAllDocumentIdsAtTimestamp(time1);
+console.log(idsAtTime1); // [doc1Id]
+
+// At time2, doc1 and doc2 should exist
+const idsAtTime2 = await db.getAllDocumentIdsAtTimestamp(time2);
+console.log(idsAtTime2); // [doc1Id, doc2Id]
+
+// At time3, all three should exist
+const idsAtTime3 = await db.getAllDocumentIdsAtTimestamp(time3);
+console.log(idsAtTime3); // [doc1Id, doc2Id, doc3Id]
+```
+
+### Handling Deleted Documents
+
+Deleted documents are excluded from the result:
+
+```typescript
+const doc1 = await db.createDocument();
+const doc1Id = doc1.getId();
+const createTime = Date.now();
+
+await new Promise(resolve => setTimeout(resolve, 10));
+
+await db.deleteDocument(doc1Id);
+const deleteTime = Date.now();
+
+// Before deletion, document exists
+const idsBeforeDelete = await db.getAllDocumentIdsAtTimestamp(createTime + 5);
+console.log(idsBeforeDelete); // [doc1Id]
+
+// At or after deletion time, document does not exist
+const idsAtDelete = await db.getAllDocumentIdsAtTimestamp(deleteTime);
+console.log(idsAtDelete); // []
+
+const idsAfterDelete = await db.getAllDocumentIdsAtTimestamp(deleteTime + 1000);
+console.log(idsAfterDelete); // []
+```
+
+### Performance
+
+This method is optimized for efficiency:
+
+- **Server-side filtering**: For network stores, filtering happens on the server, reducing data transfer
+- **No document loading**: Only queries metadata, avoiding the cost of loading document content
+- **Parallel queries**: Uses parallel queries for `doc_create` and `doc_delete` entries
+- **Efficient for large stores**: Scales well even with many documents
+
+### Use Cases
+
+**Find all documents that existed at a specific time**:
+
+```typescript
+// Get all document IDs that existed at a specific timestamp
+const timestamp = new Date("2024-01-01").getTime();
+const docIds = await db.getAllDocumentIdsAtTimestamp(timestamp);
+
+// Load the documents if needed
+const docs = await Promise.all(
+  docIds.map(id => db.getDocumentAtTimestamp(id, timestamp))
+);
+```
+
+**Compare document sets at different times**:
+
+```typescript
+const time1 = new Date("2024-01-01").getTime();
+const time2 = new Date("2024-06-01").getTime();
+
+const idsAtTime1 = await db.getAllDocumentIdsAtTimestamp(time1);
+const idsAtTime2 = await db.getAllDocumentIdsAtTimestamp(time2);
+
+// Find documents created between time1 and time2
+const createdBetween = idsAtTime2.filter(id => !idsAtTime1.includes(id));
+
+// Find documents deleted between time1 and time2
+const deletedBetween = idsAtTime1.filter(id => !idsAtTime2.includes(id));
+```
+
 ## Use Cases
 
 ### Audit Trails
@@ -285,6 +405,24 @@ console.log("Changes:", diff(firstVersion, lastVersion));
 
 Find documents that existed at a specific time:
 
+**Option 1: Using getAllDocumentIdsAtTimestamp() (Recommended)**:
+
+```typescript
+async function findDocumentsAtTime(db: MindooDB, timestamp: number): Promise<MindooDoc[]> {
+  // Efficiently get all document IDs that existed at the timestamp
+  const docIds = await db.getAllDocumentIdsAtTimestamp(timestamp);
+  
+  // Load the documents
+  const docs = await Promise.all(
+    docIds.map(id => db.getDocumentAtTimestamp(id, timestamp))
+  );
+  
+  return docs.filter(doc => doc !== null) as MindooDoc[];
+}
+```
+
+**Option 2: Manual iteration (for comparison)**:
+
 ```typescript
 async function findDocumentsAtTime(db: MindooDB, timestamp: number): Promise<MindooDoc[]> {
   const allDocIds = await db.getAllDocumentIds();
@@ -300,6 +438,8 @@ async function findDocumentsAtTime(db: MindooDB, timestamp: number): Promise<Min
   return docsAtTime;
 }
 ```
+
+The first option is more efficient, especially for network stores, as it filters at the store level before loading documents.
 
 ### Undo/Redo Functionality
 

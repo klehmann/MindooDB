@@ -7,6 +7,7 @@ import {
 import type {
   StoreEntry,
   StoreEntryMetadata,
+  StoreEntryType,
 } from "../types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
@@ -179,6 +180,38 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
 
     this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId} out of ${docEntryIds.size} total`);
     return newEntries;
+  }
+
+  /**
+   * Find entries by type and creation date range.
+   */
+  async findEntries(
+    type: StoreEntryType,
+    creationDateFrom: number | null,
+    creationDateUntil: number | null
+  ): Promise<StoreEntryMetadata[]> {
+    const results: StoreEntryMetadata[] = [];
+    
+    for (const [id, metadata] of this.entries) {
+      // Filter by type
+      if (metadata.entryType !== type) {
+        continue;
+      }
+      
+      // Filter by creation date range
+      if (creationDateFrom !== null && metadata.createdAt < creationDateFrom) {
+        continue;
+      }
+      
+      if (creationDateUntil !== null && metadata.createdAt >= creationDateUntil) {
+        continue;
+      }
+      
+      results.push(metadata);
+    }
+    
+    this.logger.debug(`Found ${results.length} entries of type ${type} in date range`);
+    return results;
   }
 
   /**

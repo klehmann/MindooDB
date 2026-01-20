@@ -256,4 +256,95 @@ describe("TimeTravel", () => {
       expect(history[history.length - 2].isDeleted()).toBe(false);
     });
   });
+
+  describe("getAllDocumentIdsAtTimestamp", () => {
+    test("should return documents that existed at timestamp", async () => {
+      // Create multiple documents at different times
+      const doc1 = await db.createDocument();
+      const doc1Id = doc1.getId();
+      const time1 = Date.now();
+      
+      await new Promise(resolve => setTimeout(resolve, 10));
+      
+      const doc2 = await db.createDocument();
+      const doc2Id = doc2.getId();
+      const time2 = Date.now();
+      
+      await new Promise(resolve => setTimeout(resolve, 10));
+      
+      const doc3 = await db.createDocument();
+      const doc3Id = doc3.getId();
+      const time3 = Date.now();
+      
+      // At time1, only doc1 should exist
+      const idsAtTime1 = await db.getAllDocumentIdsAtTimestamp(time1);
+      expect(idsAtTime1).toContain(doc1Id);
+      expect(idsAtTime1).not.toContain(doc2Id);
+      expect(idsAtTime1).not.toContain(doc3Id);
+      
+      // At time2, doc1 and doc2 should exist
+      const idsAtTime2 = await db.getAllDocumentIdsAtTimestamp(time2);
+      expect(idsAtTime2).toContain(doc1Id);
+      expect(idsAtTime2).toContain(doc2Id);
+      expect(idsAtTime2).not.toContain(doc3Id);
+      
+      // At time3, all three should exist
+      const idsAtTime3 = await db.getAllDocumentIdsAtTimestamp(time3);
+      expect(idsAtTime3).toContain(doc1Id);
+      expect(idsAtTime3).toContain(doc2Id);
+      expect(idsAtTime3).toContain(doc3Id);
+    });
+    
+    test("should exclude deleted documents after deletion timestamp", async () => {
+      const doc1 = await db.createDocument();
+      const doc1Id = doc1.getId();
+      const createTime = Date.now();
+      
+      await new Promise(resolve => setTimeout(resolve, 10));
+      
+      await db.deleteDocument(doc1Id);
+      const deleteTime = Date.now();
+      
+      // Before deletion, document should exist
+      const idsBeforeDelete = await db.getAllDocumentIdsAtTimestamp(createTime + 5);
+      expect(idsBeforeDelete).toContain(doc1Id);
+      
+      // At deletion time, document should not exist
+      const idsAtDelete = await db.getAllDocumentIdsAtTimestamp(deleteTime);
+      expect(idsAtDelete).not.toContain(doc1Id);
+      
+      // After deletion, document should not exist
+      const idsAfterDelete = await db.getAllDocumentIdsAtTimestamp(deleteTime + 1000);
+      expect(idsAfterDelete).not.toContain(doc1Id);
+    });
+    
+    test("should return empty array for timestamp before any documents", async () => {
+      const doc1 = await db.createDocument();
+      const createTime = Date.now();
+      
+      const idsBeforeCreation = await db.getAllDocumentIdsAtTimestamp(createTime - 1000);
+      expect(idsBeforeCreation).toEqual([]);
+    });
+    
+    test("should handle documents with multiple creates and deletes", async () => {
+      // This test would require creating a document, deleting it, then recreating it
+      // which may not be directly supported, but tests the logic for multiple entries
+      const doc1 = await db.createDocument();
+      const doc1Id = doc1.getId();
+      const createTime = Date.now();
+      
+      await new Promise(resolve => setTimeout(resolve, 10));
+      
+      await db.deleteDocument(doc1Id);
+      const deleteTime = Date.now();
+      
+      // At a time between create and delete, document should exist
+      const idsBetween = await db.getAllDocumentIdsAtTimestamp(createTime + 5);
+      expect(idsBetween).toContain(doc1Id);
+      
+      // After delete, document should not exist
+      const idsAfter = await db.getAllDocumentIdsAtTimestamp(deleteTime + 5);
+      expect(idsAfter).not.toContain(doc1Id);
+    });
+  });
 });

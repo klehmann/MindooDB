@@ -1,5 +1,5 @@
 import type { ContentAddressedStore } from "../../core/types";
-import type { StoreEntry, StoreEntryMetadata } from "../../core/types";
+import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
 import type { NetworkEncryptedEntry } from "../../core/appendonlystores/network/types";
@@ -162,6 +162,28 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     
     this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
     return newEntries;
+  }
+
+  /**
+   * Find entries by type and creation date range from the remote store.
+   */
+  async findEntries(
+    type: StoreEntryType,
+    creationDateFrom: number | null,
+    creationDateUntil: number | null
+  ): Promise<StoreEntryMetadata[]> {
+    this.logger.debug(`Finding entries of type ${type} from remote`);
+    
+    const token = await this.ensureAuthenticated();
+    const entries = await this.transport.findEntries(
+      token,
+      type,
+      creationDateFrom,
+      creationDateUntil
+    );
+    
+    this.logger.debug(`Found ${entries.length} entries of type ${type}`);
+    return entries;
   }
 
   /**

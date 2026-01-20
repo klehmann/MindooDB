@@ -255,6 +255,7 @@ export class MindooDBServer {
     // Sync routes
     router.post("/sync/findNewEntries", this.handleFindNewEntries.bind(this));
     router.post("/sync/findNewEntriesForDoc", this.handleFindNewEntriesForDoc.bind(this));
+    router.post("/sync/findEntries", this.handleFindEntries.bind(this));
     router.post("/sync/getEntries", this.handleGetEntries.bind(this));
     router.post("/sync/putEntries", this.handlePutEntries.bind(this));
     router.post("/sync/hasEntries", this.handleHasEntries.bind(this));
@@ -341,6 +342,32 @@ export class MindooDBServer {
 
       const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
       const entries = await serverStore.handleFindNewEntriesForDoc(token, haveIds || [], docId);
+
+      res.json({
+        entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
+      });
+    } catch (error) {
+      this.handleNetworkError(error, res);
+    }
+  }
+
+  private async handleFindEntries(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId, type, creationDateFrom, creationDateUntil } = req.body;
+
+      if (!dbId) {
+        res.status(400).json({ error: "dbId is required" });
+        return;
+      }
+
+      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const entries = await serverStore.handleFindEntries(
+        token,
+        type,
+        creationDateFrom ?? null,
+        creationDateUntil ?? null
+      );
 
       res.json({
         entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
