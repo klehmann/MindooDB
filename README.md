@@ -158,7 +158,7 @@ A special **directory** database stores user registrations (admin-only).
 [Automerge](https://automerge.org/) CRDTs with full history:
 - Every change is signed and encrypted
 - Automatic conflict resolution for concurrent edits
-- Time travel: reconstruct any historical state of documents (e.g. run queries on historic data)
+- Time travel: reconstruct any historical state of documents (e.g. run queries on historic data) — see [Time Travel Documentation](./docs/timetravel.md)
 
 ### Attachments
 Files attached to documents:
@@ -238,6 +238,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Architecture Specification](./docs/specification.md) — Full technical details
 - [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
+- [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
 - [Attachments](./docs/attachments.md) — File storage and streaming
 

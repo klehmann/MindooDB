@@ -10,6 +10,7 @@ import {
   MindooTenant,
   ProcessChangesCursor,
   ProcessChangesResult,
+  DocumentHistoryResult,
   AttachmentReference,
   AttachmentConfig,
   SigningKeyPair,
@@ -691,27 +692,155 @@ export class BaseMindooDB implements MindooDB {
 
     // Check if document was deleted at this timestamp
     // Look for a "doc_delete" type entry in the relevant entries
-    const hasDeleteEntry = relevantEntries.some(em => em.entryType === "doc_delete" && em.createdAt <= timestamp);
-    
-    if (hasDeleteEntry) {
-      return null; // Document was deleted at this time
-    }
+    const deleteEntry = relevantEntries.find(em => em.entryType === "doc_delete" && em.createdAt <= timestamp);
+    const isDeleted = deleteEntry !== undefined;
     
     // Find the first entry to get createdAt and decryptionKeyId
     const firstEntry = relevantEntries.length > 0 ? relevantEntries[0] : null;
     const createdAt = firstEntry ? firstEntry.createdAt : timestamp;
     const decryptionKeyId = firstEntry ? firstEntry.decryptionKeyId : "default";
     
+    // Use delete entry timestamp as lastModified if deleted, otherwise use the requested timestamp
+    const lastModified = isDeleted && deleteEntry ? deleteEntry.createdAt : timestamp;
+    
     const internalDoc: InternalDoc = {
       id: docId,
       doc,
       createdAt,
-      lastModified: timestamp,
+      lastModified,
       decryptionKeyId,
-      isDeleted: false,
+      isDeleted,
     };
     
     return this.wrapDocument(internalDoc);
+  }
+
+  async *iterateDocumentHistory(docId: string): AsyncGenerator<DocumentHistoryResult, void, unknown> {
+    this.logger.debug(`Iterating document history for ${docId}`);
+    
+    // Get all entry metadata for this document
+    const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
+    
+    // Filter to only doc_create, doc_change, and doc_delete entries (exclude snapshots)
+    const relevantEntries = allEntryMetadata
+      .filter(em => em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete")
+      .sort((a, b) => a.createdAt - b.createdAt);
+    
+    if (relevantEntries.length === 0) {
+      return; // Document has no history
+    }
+    
+    // Load all entries
+    const entries = await this.store.getEntries(relevantEntries.map(em => em.id));
+    
+    // Build a map for quick lookup
+    const entryMap = new Map(entries.map(e => [e.id, e]));
+    
+    // Apply changes in order
+    let currentDoc: Automerge.Doc<MindooDocPayload> | null = null;
+    let createdAt: number | null = null;
+    let decryptionKeyId: string = "default";
+    
+    for (const entryMetadata of relevantEntries) {
+      const entryData = entryMap.get(entryMetadata.id);
+      if (!entryData) {
+        this.logger.warn(`Entry ${entryMetadata.id} not found in store, skipping`);
+        continue;
+      }
+      
+      // Admin-only mode: only accept entries signed by the admin key
+      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+        this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
+        continue;
+      }
+      
+      // Verify signature
+      const isValid = await this.tenant.verifySignature(
+        entryData.encryptedData,
+        entryData.signature,
+        entryData.createdByPublicKey
+      );
+      if (!isValid) {
+        this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
+        continue;
+      }
+      
+      // Decrypt payload
+      const decryptedPayload = await this.tenant.decryptPayload(
+        entryData.encryptedData,
+        entryData.decryptionKeyId
+      );
+      
+      // Initialize document if this is the first entry (doc_create)
+      const isFirstEntry = currentDoc === null;
+      if (isFirstEntry) {
+        if (entryMetadata.entryType !== "doc_create") {
+          this.logger.warn(`First entry is not doc_create, skipping`);
+          continue;
+        }
+        currentDoc = Automerge.init<MindooDocPayload>();
+        createdAt = entryMetadata.createdAt;
+        decryptionKeyId = entryMetadata.decryptionKeyId;
+      }
+      
+      // Check document heads before applying change (for non-first entries)
+      const headsBefore = isFirstEntry ? null : (currentDoc ? Automerge.getHeads(currentDoc) : null);
+      
+      // Apply change using loadIncremental
+      if (currentDoc === null) {
+        throw new Error("currentDoc should not be null at this point");
+      }
+      currentDoc = Automerge.loadIncremental(currentDoc, decryptedPayload);
+      
+      // Check if document actually changed by comparing heads
+      // For first entry (doc_create), always yield since it's the initial creation
+      // For delete entries, always yield
+      // For other entries, only yield if heads changed
+      let shouldYield = false;
+      if (isFirstEntry || entryMetadata.entryType === "doc_delete") {
+        shouldYield = true;
+      } else {
+        const headsAfter = Automerge.getHeads(currentDoc);
+        const headsChanged = headsBefore !== null && JSON.stringify(headsBefore) !== JSON.stringify(headsAfter);
+        shouldYield = headsChanged;
+      }
+      
+      // Register automerge hash mapping
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
+      
+      // Only yield if document actually changed (or if this is create/delete entry)
+      if (shouldYield) {
+        // Clone the document to ensure independence
+        const clonedDoc = Automerge.clone(currentDoc);
+        
+        // Create internal doc representation
+        const internalDoc: InternalDoc = {
+          id: docId,
+          doc: clonedDoc,
+          createdAt: createdAt!,
+          lastModified: entryMetadata.createdAt,
+          decryptionKeyId,
+          isDeleted: entryMetadata.entryType === "doc_delete",
+        };
+        
+        // Wrap and yield (including delete entries)
+        const wrappedDoc = this.wrapDocument(internalDoc);
+        
+        yield {
+          doc: wrappedDoc,
+          changeCreatedAt: entryMetadata.createdAt,
+          changeCreatedByPublicKey: entryMetadata.createdByPublicKey,
+        };
+      }
+      
+      // Stop after delete entry (document is deleted, no more changes)
+      if (entryMetadata.entryType === "doc_delete") {
+        break;
+      }
+    }
   }
 
   async getAllDocumentIds(): Promise<string[]> {

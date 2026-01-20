@@ -973,6 +973,27 @@ export interface ProcessChangesResult {
 }
 
 /**
+ * Result yielded by the iterateDocumentHistory generator.
+ */
+export interface DocumentHistoryResult {
+  /**
+   * The document state after applying this change.
+   * Each document is an independent clone, safe to store in arrays.
+   */
+  doc: MindooDoc;
+  
+  /**
+   * The timestamp when this change was created (milliseconds since Unix epoch).
+   */
+  changeCreatedAt: number;
+  
+  /**
+   * The public signing key of the user who created this change (Ed25519, PEM format).
+   */
+  changeCreatedByPublicKey: string;
+}
+
+/**
  * Options for opening a database
  */
 export interface OpenDBOptions extends OpenStoreOptions {
@@ -1108,9 +1129,33 @@ export interface MindooDB {
    *
    * @param docId The ID of the document
    * @param timestamp The timestamp to reconstruct the document at (milliseconds since Unix epoch)
-   * @return The document at the specified timestamp, or null if the document didn't exist at that time
+   * @return The document at the specified timestamp, or null if the document didn't exist at that time.
+   *         If the document was deleted at or before the timestamp, returns a document with isDeleted() === true.
    */
   getDocumentAtTimestamp(docId: string, timestamp: number): Promise<MindooDoc | null>;
+
+  /**
+   * Iterate through the history of a document from its origin to the latest version.
+   * Traverses changes in chronological order (oldest to newest), applying each change and yielding the document state.
+   * 
+   * Each yielded document is an independent clone, safe to store in arrays or modify.
+   * 
+   * Documents are yielded in chronological order from oldest to newest (origin to latest version).
+   * 
+   * Example usage:
+   * ```typescript
+   * for await (const { doc, changeCreatedAt, changeCreatedByPublicKey } of db.iterateDocumentHistory(docId)) {
+   *   const data = doc.getData();
+   *   console.log(`Document at ${new Date(changeCreatedAt)}:`, data);
+   *   // Store doc in array - each is independent
+   *   history.push(doc);
+   * }
+   * ```
+   *
+   * @param docId The ID of the document to traverse
+   * @return An async generator that yields DocumentHistoryResult objects containing the document state and change metadata, in chronological order from oldest to newest
+   */
+  iterateDocumentHistory(docId: string): AsyncGenerator<DocumentHistoryResult, void, unknown>;
 
   /**
    * Get all document IDs in this database.
