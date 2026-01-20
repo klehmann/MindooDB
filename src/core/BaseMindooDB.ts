@@ -1516,8 +1516,13 @@ export class BaseMindooDB implements MindooDB {
       return null; // No changes
     }
     
+    // Clone the cached document to avoid "outdated document" error
+    // This happens when the document has been wrapped and returned to the user
+    // Automerge marks documents as outdated when they're accessed, preventing direct mutation
+    const clonedDoc = Automerge.clone(cachedDoc.doc);
+    
     // Apply all changes at once (Automerge handles dependency ordering)
-    const result = Automerge.applyChanges<MindooDocPayload>(cachedDoc.doc, changeBytes);
+    const result = Automerge.applyChanges<MindooDocPayload>(clonedDoc, changeBytes);
     const updatedDoc = result[0] as Automerge.Doc<MindooDocPayload>;
     
     // Check if document actually changed
