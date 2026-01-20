@@ -78,7 +78,7 @@ describe("granting tenant access", () => {
     );
   }, 30000); // Increase timeout for crypto operations
 
-  it("should find the document where access was granted using processChangesSince", async () => {
+  it("should find the document where access was granted using iterateChangesSince", async () => {
     // Grant access to the regular user (register them)
     const directory = await tenant.openDirectory();
     const publicRegularUser = factory.toPublicUserId(regularUser);
@@ -99,7 +99,7 @@ describe("granting tenant access", () => {
     const initialCursor: ProcessChangesCursor | null = null;
     const foundDocuments: Array<{ doc: MindooDoc; cursor: ProcessChangesCursor }> = [];
     
-    for await (const { doc, cursor } of directoryDB.iterateChangesSince(initialCursor, 100)) {
+    for await (const { doc, cursor } of directoryDB.iterateChangesSince(initialCursor)) {
       foundDocuments.push({ doc, cursor });
     }
     

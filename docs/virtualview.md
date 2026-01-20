@@ -14,7 +14,7 @@ The VirtualView system is inspired by and adapted from **Karsten Lehmann's Domin
 - Navigate hierarchically through the view structure
 
 This concept has been ported to TypeScript for the MindooDB ecosystem, adapting the architecture to use:
-- MindooDB's `processChangesSince()` for incremental updates
+- MindooDB's `iterateChangesSince()` for incremental updates
 - TypeScript functions instead of Domino formula language
 - Simple callback-based access control instead of Domino ACLs
 
@@ -45,7 +45,7 @@ A VirtualView is an **in-memory tree structure** that organizes documents into c
 | **Totals** | Compute SUM or AVERAGE aggregations on category rows |
 | **Multi-Database** | Combine documents from multiple MindooDB instances (different "origins") |
 | **Multi-Tenant** | Span views across different MindooTenants for cross-tenant reporting |
-| **Incremental Updates** | Efficiently update views using `processChangesSince()` |
+| **Incremental Updates** | Efficiently update views using `iterateChangesSince()` |
 | **Navigation** | Traverse the view hierarchy with expand/collapse and selection support |
 | **Access Control** | Filter visible entries via callback-based access checks |
 
@@ -429,7 +429,7 @@ const secureNav = VirtualViewFactory.createNavigator(view)
 
 ## Incremental Updates
 
-VirtualView uses `MindooDB.processChangesSince()` for efficient incremental updates:
+VirtualView uses `MindooDB.iterateChangesSince()` for efficient incremental updates:
 
 ```typescript
 // Initial build

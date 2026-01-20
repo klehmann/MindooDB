@@ -6,7 +6,7 @@ MindooDB provides an incremental change processing mechanism via `iterateChanges
 
 ## The Foundation: `iterateChangesSince()`
 
-MindooDB maintains an internal index that tracks documents sorted by `(lastModified, docId)`, enabling efficient incremental processing. The `iterateChangesSince()` method (preferred) or `processChangesSince()` method:
+MindooDB maintains an internal index that tracks documents sorted by `(lastModified, docId)`, enabling efficient incremental processing. The `iterateChangesSince()` method:
 
 - Accepts a cursor `{ lastModified: number, docId: string }` to resume from a specific position
 - Processes documents in modification order (oldest first)
@@ -322,7 +322,7 @@ CouchDB doesn't explicitly "cache" map outputs in a separate structure. Instead,
 We can learn from CouchDB's approach:
 - **Use B-tree or similar structure** for the view index (organized by keys)
 - **Store document ID with map outputs** to enable efficient removal
-- **Track document sequence numbers** (or use `processChangesSince()` cursors) to identify changes
+- **Track document sequence numbers** (or use `iterateChangesSince()` cursors) to identify changes
 - **Pre-compute reduce values** in internal nodes for fast queries
 - **Require associative/commutative reduce functions** for incremental updates
 
@@ -349,7 +349,7 @@ MindooDB includes a full **VirtualView** implementation, inspired by and adapted
 - **VirtualViewColumn**: Define columns for categorization, sorting, display, and totals
 - **VirtualViewEntryData**: Tree nodes representing categories or documents
 - **VirtualViewNavigator**: Hierarchical navigation with expand/collapse and selection
-- **MindooDBVirtualViewDataProvider**: Incremental updates via `processChangesSince()`
+- **MindooDBVirtualViewDataProvider**: Incremental updates via `iterateChangesSince()`
 - **Multi-Database Views**: Combine documents from multiple MindooDB instances
 - **Multi-Tenant Views**: Span views across different MindooTenants
 - **Category Totals**: Built-in SUM and AVERAGE aggregations
@@ -381,7 +381,7 @@ for await (const entry of nav.entriesForward()) {
 - ✅ **Efficient**: Direct category lookups with sorted navigation
 - ✅ **Hierarchical**: Supports nested categories (use backslash: `"2024\\Q1\\January"`)
 - ✅ **Multi-Database**: Combine documents from multiple sources
-- ✅ **Incremental**: Efficient updates via `processChangesSince()`
+- ✅ **Incremental**: Efficient updates via `iterateChangesSince()`
 - ✅ **Totals**: Built-in SUM and AVERAGE for category rows
 
 **Source:**
@@ -395,7 +395,7 @@ FlexSearch is a high-performance, memory-efficient full-text search library that
 
 **Application to MindooDB:**
 - **Index Creation**: Create FlexSearch indexes for text fields in documents
-- **Incremental Updates**: Use `processChangesSince()` to add/update/remove documents from indexes
+- **Incremental Updates**: Use `iterateChangesSince()` to add/update/remove documents from indexes
 - **Multiple Indexes**: Support separate indexes for different fields or document types
 - **Query Interface**: Provide search API that queries FlexSearch indexes
 
@@ -448,7 +448,7 @@ Create indexes on specific document fields, similar to traditional database inde
   - **B-Tree**: For sorted queries, ranges, comparisons
   - **Hash**: For exact lookups
   - **Composite**: Multiple fields (e.g., `[data.category, data.priority]`)
-- **Incremental Updates**: Update indexes as documents change via `processChangesSince()`
+- **Incremental Updates**: Update indexes as documents change via `iterateChangesSince()`
 
 **Example Use Case:**
 ```typescript
@@ -489,7 +489,7 @@ Materialized views are pre-computed query results stored as tables/indexes that 
 
 **Application to MindooDB:**
 - **View Definition**: Define views as queries over documents (e.g., "all active tasks grouped by project")
-- **Incremental Updates**: Use `processChangesSince()` to update views incrementally
+- **Incremental Updates**: Use `iterateChangesSince()` to update views incrementally
 - **Query Interface**: Query the materialized view instead of scanning all documents
 - **Multiple Views**: Support multiple views for different query patterns
 
@@ -827,7 +827,7 @@ Based on the analysis, a **hybrid approach** combining multiple strategies is re
 **Phase 1: Foundation**
 - Build index manager infrastructure
 - Implement FlexSearch integration
-- Support incremental updates via `processChangesSince()`
+- Support incremental updates via `iterateChangesSince()`
 - Basic index persistence
 
 **Phase 2: Map/Reduce**
@@ -847,7 +847,7 @@ Based on the analysis, a **hybrid approach** combining multiple strategies is re
 
 ## Conclusion
 
-MindooDB's `processChangesSince()` mechanism provides an excellent foundation for building dynamic, incremental indexes. The recommended approach is to:
+MindooDB's `iterateChangesSince()` mechanism provides an excellent foundation for building dynamic, incremental indexes. The recommended approach is to:
 
 1. Start with **FlexSearch** for full-text search (proven, incremental, performant)
 2. Add **map/reduce** capabilities for flexible, user-defined indexes

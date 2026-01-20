@@ -183,7 +183,7 @@ describe("$publicinfos Key System", () => {
       
       // Find the grantaccess document
       let grantAccessDoc: MindooDoc | null = null;
-      for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+      for await (const { doc } of directoryDB.iterateChangesSince(null)) {
         const data = doc.getData();
         if (data.form === "useroperation" && 
             data.type === "grantaccess" &&
@@ -252,7 +252,7 @@ describe("$publicinfos Key System", () => {
       await directoryDB.syncStoreChanges();
       
       let firstHash: string | null = null;
-      for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+      for await (const { doc } of directoryDB.iterateChangesSince(null)) {
         const data = doc.getData();
         if (data.form === "useroperation" && 
             data.type === "grantaccess" &&
@@ -282,7 +282,7 @@ describe("$publicinfos Key System", () => {
       await directoryDB.syncStoreChanges();
       
       const hashes: string[] = [];
-      for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+      for await (const { doc } of directoryDB.iterateChangesSince(null)) {
         const data = doc.getData();
         if (data.form === "useroperation" && 
             data.type === "grantaccess" &&
@@ -384,7 +384,7 @@ describe("$publicinfos Key System", () => {
       await directoryDB.syncStoreChanges();
       
       let grantAccessCount = 0;
-      for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+      for await (const { doc } of directoryDB.iterateChangesSince(null)) {
         const data = doc.getData();
         if (data.form === "useroperation" && data.type === "grantaccess") {
           grantAccessCount++;
@@ -440,7 +440,7 @@ describe("$publicinfos Key System", () => {
       await directoryDB.syncStoreChanges();
       
       let groupDoc: MindooDoc | null = null;
-      for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+      for await (const { doc } of directoryDB.iterateChangesSince(null)) {
         const data = doc.getData();
         if (data.form === "group" && data.type === "group" && data.groupName === groupName) {
           groupDoc = doc;

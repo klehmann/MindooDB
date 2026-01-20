@@ -14,7 +14,7 @@ MindooDB's architecture enables several unique patterns:
 - **Offline-First**: Create and modify documents without network connectivity
 - **Append-Only Store**: Complete audit trail with cryptographic integrity
 - **Multi-Tenant Collaboration**: Share data across organizations with fine-grained access control
-- **Incremental Sync**: Efficient data transfer using `processChangesSince()`
+- **Incremental Sync**: Efficient data transfer using `iterateChangesSince()`
 - **Cross-Boundary Views**: Aggregate data across databases and tenants
 - **Simple Backups**: Append-only nature enables easy backup and disaster recovery
 
@@ -82,7 +82,7 @@ See [Data Modeling Patterns](data-modeling-patterns.md) for comprehensive strate
 
 ### Incremental Data Transfer
 
-The `processChangesSince()` method enables efficient incremental synchronization by tracking which changes have already been processed. This is fundamental to MindooDB's scalability—instead of transferring entire databases, you transfer only what's new since the last sync operation.
+The `iterateChangesSince()` method enables efficient incremental synchronization by tracking which changes have already been processed. This is fundamental to MindooDB's scalability—instead of transferring entire databases, you transfer only what's new since the last sync operation.
 
 This capability powers cross-tenant synchronization where organizations share controlled subsets of data with partners. It enables bidirectional sync that keeps multiple tenants or databases consistent. Most importantly, it ensures that sync operations remain fast even as databases grow large, because only new changes are transferred rather than the entire dataset.
 

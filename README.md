@@ -179,15 +179,14 @@ MindooDB provides a flexible, **incremental indexing** facility:
 // Incremental indexing: process only what's new
 let cursor = null;
 while (true) {
-  const { documents, cursor: newCursor } = await db.processChangesSince(cursor);
-  for (const doc of documents) {
+  for await (const { doc, cursor: newCursor } of db.iterateChangesSince(cursor)) {
     if (doc.isDeleted()) {
-      mySearchIndex.remove(doc.id);
+      mySearchIndex.remove(doc.getId());
     } else {
       mySearchIndex.update(doc);  // Flexsearch, Lunr, or custom
     }
+    cursor = newCursor;
   }
-  cursor = newCursor;
   await sleep(1000);
 }
 ```

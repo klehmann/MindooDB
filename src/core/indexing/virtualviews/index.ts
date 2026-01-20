@@ -5,7 +5,7 @@
  * - VirtualView: Main class for creating categorized, sorted views
  * - VirtualViewColumn: Column definitions with sorting, categories, and totals
  * - VirtualViewNavigator: Navigation through the view tree structure
- * - MindooDBVirtualViewDataProvider: Data provider using MindooDB.processChangesSince
+ * - MindooDBVirtualViewDataProvider: Data provider using MindooDB.iterateChangesSince
  * - VirtualViewFactory: Builder pattern for easy view construction
  * 
  * Example usage:

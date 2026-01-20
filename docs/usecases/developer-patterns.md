@@ -271,24 +271,6 @@ class MindooDBMock implements Partial<MindooDB> {
     this.documents.delete(doc.getId());
   }
   
-  // Add processChangesSince for iteration testing
-  async processChangesSince(
-    cursor: any,
-    maxChanges: number,
-    callback: (doc: MockDoc, cursor: any) => boolean
-  ): Promise<{ cursor: any; hasMore: boolean }> {
-    const docs = Array.from(this.documents.values());
-    let processed = 0;
-    
-    for (const doc of docs) {
-      if (processed >= maxChanges) break;
-      const shouldContinue = callback(doc, { position: processed });
-      if (!shouldContinue) break;
-      processed++;
-    }
-    
-    return { cursor: { position: processed }, hasMore: processed < docs.size };
-  }
 }
 
 class MockDoc implements Partial<MindooDoc> {

@@ -316,7 +316,7 @@ class OfflineEdgeDevice {
 ### 2. Incremental Sync
 
 - Only sync new changes
-- Use `processChangesSince()` for efficiency
+- Use `iterateChangesSince()` for efficiency
 - Batch changes when possible
 - Handle sync failures gracefully
 

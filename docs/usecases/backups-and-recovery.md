@@ -9,7 +9,7 @@ MindooDB's append-only architecture provides unique advantages for backup and di
 ### Append-Only Benefits
 
 1. **Simple Backups**: Copy entire append-only store for complete backup
-2. **Incremental Backups**: Use `processChangesSince()` for efficient incremental backups
+2. **Incremental Backups**: Use `iterateChangesSince()` for efficient incremental backups
 3. **Point-in-Time Recovery**: Reconstruct state at any point in history
 4. **Mirroring Without Keys**: Mirror encrypted data without needing decryption keys
 5. **Cryptographic Integrity**: Verify backup integrity using change hashes

@@ -1146,30 +1146,6 @@ export interface MindooDB {
   ): Promise<void>;
 
   /**
-   * Each MindooDB maintains an internal index that tracks documents and their latest state,
-   * sorted by their last modified timestamp (then by document ID for uniqueness).
-   * The index is updated when documents actually change (after applying changes),
-   * enabling incremental operations on the database.
-   * 
-   * This method uses the internal index to efficiently find and process documents that changed
-   * since a given cursor, useful for incremental processing of changes.
-   * Documents are returned in modification order (oldest first).
-   * The callback will receive new documents, changes and deletions.
-   * 
-   * Deleted documents are included in the iteration so external indexes can be updated.
-   * Check `doc.isDeleted()` in the callback to handle deletions appropriately.
-   * 
-   * The callback can return `false` to stop processing early. If the callback throws an error
-   * or if there's an error processing a document, the loop will stop and the error will be propagated.
-   *
-   * @param cursor The cursor to start processing changes from. Use `null` or `{ lastModified: 0, docId: "" }` to start from the beginning.
-   * @param limit The maximum number of changes to process (for pagination)
-   * @param callback The function to call for each change. Receives the document and its cursor position. Return `false` to stop processing, or `true`/`undefined` to continue. Check `doc.isDeleted()` to handle deleted documents.
-   * @return The cursor of the last change processed, can be used to continue processing from this position
-   */
-  processChangesSince(cursor: ProcessChangesCursor | null, limit: number, callback: (change: MindooDoc, currentCursor: ProcessChangesCursor) => boolean | void): Promise<ProcessChangesCursor>;
-
-  /**
    * Iterate over documents that changed since a given cursor using an async generator.
    * 
    * Documents are returned in modification order (oldest first).

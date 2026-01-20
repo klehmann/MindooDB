@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB enables secure collaboration across organizational boundaries through controlled data sharing between tenants. This document explores patterns for sharing subsets of data with external partners, using `processChangesSince()` for efficient incremental sync, and managing multi-tenant relationships.
+MindooDB enables secure collaboration across organizational boundaries through controlled data sharing between tenants. This document explores patterns for sharing subsets of data with external partners, using `iterateChangesSince()` for efficient incremental sync, and managing multi-tenant relationships.
 
 ## Key Concepts
 
@@ -24,7 +24,7 @@ Tenants can share specific databases or documents:
 
 ### Incremental Sync
 
-Use `processChangesSince()` for efficient data transfer:
+Use `iterateChangesSince()` for efficient data transfer:
 - Only transfer new changes
 - Bidirectional sync support
 - Efficient for large datasets

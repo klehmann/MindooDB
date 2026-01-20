@@ -144,7 +144,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     // Use the generator-based iteration API for cleaner code
     // No signature verification needed - DB already enforces admin-only
-    for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+    for await (const { doc } of directoryDB.iterateChangesSince(null)) {
       const data = doc.getData();
       
       // Check if this is a grant access document we're looking for (by username_hash)
@@ -296,7 +296,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const groupDocsByName: Map<string, MindooDoc[]> = new Map();
     
     // Process changes (documents are returned in order by lastModified, oldest to newest)
-    for await (const { doc, cursor } of directoryDB.iterateChangesSince(startCursor, 100)) {
+    for await (const { doc, cursor } of directoryDB.iterateChangesSince(startCursor)) {
       const data = doc.getData();
       
       // Process user operation documents (grant/revoke access)
@@ -627,7 +627,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }> = [];
     
     // No signature verification needed - DB already enforces admin-only
-    for await (const { doc } of directoryDB.iterateChangesSince(null, 100)) {
+    for await (const { doc } of directoryDB.iterateChangesSince(null)) {
       const data = doc.getData();
       
       if (data.form === "useroperation" && data.type === "requestdochistorypurge") {

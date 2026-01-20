@@ -90,7 +90,7 @@ IoT and edge computing environments present unique challenges: devices operate i
 
 **Offline operation** allows edge devices to continue collecting and storing data even when network connectivity is unavailable. A sensor in a remote agricultural field or an industrial monitor in a factory continues recording readings locally, with automatic synchronization when connectivity returns.
 
-**Bandwidth optimization** through incremental synchronization ensures that only new data is transmitted. This is crucial for IoT deployments where cellular data costs are significant or satellite bandwidth is limited. The `processChangesSince()` API tracks exactly what has been synchronized, minimizing redundant data transfer.
+**Bandwidth optimization** through incremental synchronization ensures that only new data is transmitted. This is crucial for IoT deployments where cellular data costs are significant or satellite bandwidth is limited. The `iterateChangesSince()` API tracks exactly what has been synchronized, minimizing redundant data transfer.
 
 **Device security** is enhanced because even if a physical device is stolen or compromised, the encrypted data stored on it remains protected. An attacker who gains physical access to an edge device sees only encrypted bytes, not the actual sensor readings or device configurations.
 

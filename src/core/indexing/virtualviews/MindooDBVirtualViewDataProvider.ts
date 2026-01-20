@@ -24,7 +24,7 @@ export interface MindooDBVirtualViewDataProviderOptions {
 
 /**
  * Data provider that reads documents from a MindooDB and provides them
- * to a VirtualView. Uses processChangesSince for incremental updates.
+ * to a VirtualView. Uses iterateChangesSince for incremental updates.
  */
 export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider {
   private readonly origin: string;
@@ -62,7 +62,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     const columns = this.view.getColumns();
 
     // Process documents using iterateChangesSince for incremental updates
-    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, this.pageSize)) {
+    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor)) {
       const docId = doc.getId();
       const isDeleted = doc.isDeleted();
       

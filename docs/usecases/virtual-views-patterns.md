@@ -12,7 +12,7 @@ VirtualView can aggregate documents from:
 - **Multiple Databases**: Within the same tenant
 - **Multiple Tenants**: Across different organizations
 - **Different Origins**: Each data source has an origin identifier
-- **Real-Time Updates**: Incremental updates via `processChangesSince()`
+- **Real-Time Updates**: Incremental updates via `iterateChangesSince()`
 
 ### Cross-Boundary Views
 
@@ -269,7 +269,7 @@ class RoleBasedViewAccess {
 
 ### Incremental Updates
 
-VirtualView uses `processChangesSince()` for efficient updates:
+VirtualView uses `iterateChangesSince()` for efficient updates:
 
 ```typescript
 // Initial view creation
