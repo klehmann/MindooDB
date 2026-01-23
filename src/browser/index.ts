@@ -4,5 +4,10 @@
 // Re-export all core exports
 export * from "../core";
 
+// Re-export Base* classes that aren't in core/index
+export { BaseMindooDB } from "../core/BaseMindooDB";
+export { BaseMindooTenant } from "../core/BaseMindooTenant";
+export { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
+
 // Browser-specific crypto adapter
 export { BrowserCryptoAdapter, createCryptoAdapter } from "./crypto/BrowserCryptoAdapter";
