@@ -41,9 +41,10 @@ MindooDB's network synchronization protocol enables secure data exchange between
 │  ┌─────────────────────────────────────────────────────────┐     │
 │  │ ServerNetworkAppendOnlyStore                            │     │
 │  │  - Validates authentication tokens                      │     │
-│  │  - Encrypts changes with client's RSA key               │     │
+│  │  - Encrypts changes with client's public RSA key        │     │
+│  │    from its local directory                             │     │
 │  │  - Serves changes from local store                      │     │
-│  │  - Accepts pushed changes from clients                  │     │
+│  │  - Accepts pushed changes from trusted clients          │     │
 │  └────────────────────────┬────────────────────────────────┘     │
 │                           │                                      │
 │  ┌────────────────────────▼────────────────────────────────┐     │
@@ -219,6 +220,7 @@ Client                                          Server
 
 1. Client sends list of change hashes it already has
 2. Server returns list of change hashes client doesn't have (metadata only)
+   (more advanced comparion, e.g. via bloom filter is planned)
 
 ```
 Client                                          Server
@@ -333,7 +335,7 @@ Revoked User                                    Server
 1. Admin revokes user on any client/server
 2. Revocation document is synced to all peers
 3. Each peer's directory now shows user as revoked
-4. All sync requests from that user are rejected
+4. All sync requests from that user are rejected (even in peer-to-peer scenarios)
 
 ### Key Point: No Future Data Access
 
@@ -341,7 +343,8 @@ Once revoked:
 - User cannot authenticate to request new challenges
 - Existing tokens are invalidated on next validation
 - User cannot receive new document changes
-- Previously synced data remains on user's device (append-only limitation)
+- Previously synced data remains on user's device
+  Planned feature: device wipe on first connect after revocation
 
 ## REST API Endpoints
 
