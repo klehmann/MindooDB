@@ -6,12 +6,13 @@ VirtualView is a powerful indexing system that creates hierarchical, sorted view
 
 ## Origin and Inspiration
 
-The VirtualView system is inspired by and adapted from **Karsten Lehmann's Domino JNA project** ([GitHub: klehmann/domino-jna](https://github.com/klehmann/domino-jna)), which provides a high-performance Java API for HCL Notes/Domino. The Domino JNA VirtualView implementation demonstrated how to create dynamic, in-memory views that can:
+The VirtualView system is inspired by and adapted from **Karsten Lehmann's Domino JNA project** ([GitHub: klehmann/domino-jna](https://github.com/klehmann/domino-jna)), which provides a high-performance Java API for HCL Notes/Domino. The Domino JNA VirtualView implementation demonstrated how to create dynamic views that can:
 
 - Combine documents from multiple databases
 - Apply custom categorization and sorting
 - Compute category totals (SUM, AVERAGE)
 - Navigate hierarchically through the view structure
+- Exact key and range lookups
 
 This concept has been ported to TypeScript for the MindooDB ecosystem, adapting the architecture to use:
 - MindooDB's `iterateChangesSince()` for incremental updates
@@ -185,7 +186,7 @@ const unifiedCatalog = await VirtualViewFactory.createView()
 
 ## Multi-Tenant Views
 
-VirtualView can span across different MindooTenants, enabling powerful cross-tenant analytics and reporting scenarios.
+VirtualView can span across different MindooTenants, enabling powerful cross-tenant analytics and reporting scenarios (e.g. two organisations have their own tenant and share data in a third one).
 
 ### Example: Cross-Tenant Reporting Dashboard
 
@@ -628,7 +629,8 @@ enum SelectedOnly { YES = "yes", NO = "no" }
 
 ### Memory Usage
 
-VirtualView maintains an in-memory tree structure. For large document sets:
+VirtualView maintains an in-memory tree structure (on-disk storage is planned).
+For large document sets:
 - Each entry consumes memory for column values and tree pointers
 - Category entries are shared across documents with the same category value
 - Consider limiting the number of columns to reduce per-entry memory
@@ -641,7 +643,7 @@ VirtualView maintains an in-memory tree structure. For large document sets:
 
 ### Large Views
 
-For very large views (millions of documents):
+For very large views:
 - Consider filtering to reduce document count
 - Use incremental updates rather than full rebuilds
 - Consider multiple smaller views instead of one large view
