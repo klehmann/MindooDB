@@ -163,6 +163,7 @@ The design supports appending content to files without copying existing data:
 3. To append: Create new chunks pointing back to the previous last chunk
 4. Update document metadata with new `lastChunkId` and `size`
 5. Use `resolveDependencies()` to traverse from last to first chunk for reading
+6. Earlier document revisions return attachment data up to their `lastChunkId`
 
 This is ideal for log files and other append-only data.
 
