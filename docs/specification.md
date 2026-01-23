@@ -105,18 +105,33 @@ Each document is an [Automerge](https://automerge.org/) CRDT stored in a content
 **Change Storage:**
 
 ```typescript
-interface StoreEntry {
+interface StoreEntryMetadata {
   entryType: StoreEntryType;      // doc_create | doc_change | doc_snapshot | doc_delete | attachment_chunk
-  hash: string;                   // SHA-256 of encrypted data
+  id: string;                     // Entry identity (primary key; used in APIs/sync/dependency graphs)
+  contentHash: string;            // SHA-256(encryptedData) for payload deduplication/integrity (not the entry ID)
   docId: string;                  // Document ID
-  dependencyHashes: string[];     // Predecessor entries (DAG ordering)
+  dependencyIds: string[];        // Parent entry IDs (DAG/chaining)
   createdAt: number;              // Unix timestamp (ms)
   createdByPublicKey: string;     // Author's Ed25519 public key (PEM)
   decryptionKeyId: string;        // "default" or named key ID
   signature: Uint8Array;          // Ed25519 signature over encrypted data
+  originalSize: number;           // Plaintext size before encryption (bytes)
+  encryptedSize: number;          // Encrypted payload size (bytes)
+}
+
+interface StoreEntry extends StoreEntryMetadata {
   encryptedData: Uint8Array;      // Encrypted payload (IV/tag embedded)
 }
 ```
+
+**Store entry ID formats:**
+- **Document entries** (`doc_create|doc_change|doc_snapshot|doc_delete`): `<docId>_d_<depsFingerprint>_<automergeHash>`
+  - `depsFingerprint`: first 8 hex chars of SHA-256 over the **sorted Automerge dependency hashes** joined by commas; `"0"` if there are no dependencies.
+  - **Parent linkage**:
+    - `depsFingerprint` commits the *set* of Automerge deps into the ID (hash-of-dep-set)
+    - `dependencyIds` carries the actual parent entry IDs
+- **Attachment chunks** (`attachment_chunk`): `<docId>_a_<fileUuid7>_<base62ChunkUuid7>`
+  - `dependencyIds` is `[prevChunkId]` (or `[]` for the first chunk), forming a chain suitable for `resolveDependencies()`.
 
 **Performance Optimization:**
 - **Snapshots** generated periodically to avoid replaying full history
@@ -130,7 +145,7 @@ interface StoreEntry {
 The unified storage and sync mechanism for document changes and attachment chunks.
 
 **Characteristics:**
-- Entries identified by content hash (SHA-256)
+- Entries identified by structured **entry IDs** (`id`) with payload deduplication via `contentHash` (SHA-256 of `encryptedData`)
 - **Append-only**: entries never modified or deleted
 - **Cryptographically chained**: like a blockchain for integrity
 - Automatic deduplication
@@ -147,21 +162,30 @@ The unified storage and sync mechanism for document changes and attachment chunk
 **Core API:**
 
 ```typescript
+interface ResolveOptions {
+  stopAtEntryType?: StoreEntryType; // e.g. "doc_snapshot"
+  maxDepth?: number;
+  includeStart?: boolean;           // default true
+}
+
 interface ContentAddressedStore {
+  getId(): string;
+
   // Write
   putEntries(entries: StoreEntry[]): Promise<void>;
   
   // Read
-  getEntries(hashes: string[]): Promise<StoreEntry[]>;
-  hasEntries(hashes: string[]): Promise<Map<string, boolean>>;
-  getAllHashes(): Promise<string[]>;
+  getEntries(ids: string[]): Promise<StoreEntry[]>;
+  hasEntries(ids: string[]): Promise<string[]>;
+  getAllIds(): Promise<string[]>;
   
   // Sync
-  findNewEntries(knownHashes: string[]): Promise<StoreEntryMetadata[]>;
-  findNewEntriesForDoc(knownHashes: string[], docId: string): Promise<StoreEntryMetadata[]>;
+  findNewEntries(knownIds: string[]): Promise<StoreEntryMetadata[]>;
+  findNewEntriesForDoc(knownIds: string[], docId: string): Promise<StoreEntryMetadata[]>;
+  findEntries(type: StoreEntryType, creationDateFrom: number | null, creationDateUntil: number | null): Promise<StoreEntryMetadata[]>;
   
   // DAG traversal
-  resolveDependencies(startHash: string, options?: ResolveOptions): Promise<StoreEntry[]>;
+  resolveDependencies(startId: string, options?: ResolveOptions): Promise<string[]>;
   
   // GDPR
   purgeDocHistory(docId: string): Promise<void>;
@@ -348,8 +372,9 @@ console.log(loaded.getData());
 
 **Low-level (store-to-store):**
 ```typescript
-const missing = await remoteStore.findNewEntries(localHashes);
-const entries = await remoteStore.getEntries(missing.map(m => m.hash));
+const localIds = await localStore.getAllIds();
+const missing = await remoteStore.findNewEntries(localIds);
+const entries = await remoteStore.getEntries(missing.map(m => m.id));
 await localStore.putEntries(entries);
 ```
 
@@ -429,7 +454,7 @@ Automerge documents accumulate changes over time. Snapshots prevent performance 
 ### Incremental Sync
 
 - `findNewEntries()` returns only entries the requester doesn't have
-- Small hash comparison enables efficient sync over slow connections
+- Small ID list comparison enables efficient sync over slow connections
 - Bulk operations (`getEntries`, `putEntries`) reduce round-trips
 
 ### Incremental Queries
