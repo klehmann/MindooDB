@@ -10,13 +10,14 @@ MindooDB maintains an internal index that tracks documents sorted by `(lastModif
 
 - Accepts a cursor `{ lastModified: number, docId: string }` to resume from a specific position
 - Processes documents in modification order (oldest first)
-- Supports pagination via a `limit` parameter
-- Returns the cursor of the last processed document for continuation
-- Handles deleted documents (they remain in the index but are skipped during processing)
+- Supports consumer-driven batching: as an async generator, you can stop iterating at any time and resume later from the last cursor you observed
+- Returns (or exposes) the cursor of the each processed document for continuation
+- Handles deleted documents (they remain in the index and are marked with `MindooDoc.idDeleted()==true`, useful to remove them from external indexes)
 
 This mechanism provides the foundation for building persistent indexes that can be incrementally updated as documents change, without requiring full database scans.
 
 ## Indexing Approaches
+The following sections discuss various indexing approaches for NoSQL databases. We currently have implemented the `Virtual Views` API.
 
 ### 1. Map/Reduce (CouchDB-inspired)
 
@@ -341,7 +342,7 @@ We can learn from CouchDB's approach:
 > **📚 See [VirtualView Documentation](./virtualview.md) for comprehensive documentation, API reference, and examples.**
 
 **Concept:**
-Lotus Notes/Domino uses categorized views that group documents into hierarchical categories based on field values. Categories can be nested, and documents appear under their category paths.
+HCL Notes/Domino uses categorized views that group documents into hierarchical categories based on field values. Categories can be nested, and documents appear under their category paths.
 
 **Implementation:**
 MindooDB includes a full **VirtualView** implementation, inspired by and adapted from **Karsten Lehmann's Domino JNA project** ([klehmann/domino-jna](https://github.com/klehmann/domino-jna)). This provides:
@@ -391,7 +392,7 @@ for await (const entry of nav.entriesForward()) {
 ### 3. Full-Text Search with FlexSearch
 
 **Concept:**
-FlexSearch is a high-performance, memory-efficient full-text search library that supports incremental indexing and real-time search.
+[FlexSearch](https://github.com/nextapps-de/flexsearch) is a high-performance, memory-efficient full-text search library that supports incremental indexing and real-time search.
 
 **Application to MindooDB:**
 - **Index Creation**: Create FlexSearch indexes for text fields in documents
