@@ -202,7 +202,7 @@ const db = new MindooDB(tenant, docStore, attachmentStore);
 Use cases:
 - Keep docs local, attachments in cloud
 - Different sync strategies per store type
-- Single store for simple deployments
+- Or use the same store for simple deployments
 
 ---
 
