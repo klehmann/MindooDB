@@ -344,7 +344,7 @@ Once revoked:
 - Existing tokens are invalidated on next validation
 - User cannot receive new document changes
 - Previously synced data remains on user's device
-  Planned feature: device wipe on first connect after revocation
+- Planned feature: device wipe on first connect after revocation
 
 ## REST API Endpoints
 
