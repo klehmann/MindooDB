@@ -44,7 +44,7 @@ Traditional databases trust the server. If your hosting provider is compromised,
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Sync happens through content-addressed stores**: clients exchange only the encrypted entries they're missing. Works peer-to-peer, client-server, or any combination.
+**Sync happens through content-addressed stores**: clients exchange only the encrypted entries they're missing. Works peer-to-peer, client-server, or any combination - for documents and attached files.
 
 ## Key Features
 
@@ -200,20 +200,20 @@ All encryption keys are stored in the **KeyBag**—a local, password-protected k
 | **`default` key** | Used when no other key is specified | All tenant members |
 | **Named keys** | Fine-grained access for sensitive docs | Only users you share it with |
 
-Keys are distributed offline (email, phone, in-person). The `default` key is typically shared during onboarding; named keys are shared as needed for specific documents.
+Keys are distributed offline (e.g. password protected via email or a shared drive). The `default` key is typically shared during onboarding; named keys are shared as needed for specific documents.
 
 ## Security
 
 ### Cryptographic Guarantees
-- **Signatures**: Ed25519 on every change—proves who wrote it
-- **Encryption**: AES-256-GCM—servers see only ciphertext
-- **Integrity**: Changes are hash-chained—tampering breaks the chain
+- **Signatures**: Ed25519 on every change - proves who wrote it
+- **Encryption**: AES-256-GCM - servers see only ciphertext
+- **Integrity**: Changes are hash-chained - tampering breaks the chain
 
 ### User Revocation
 Revoked users:
 - ❌ Cannot sync with peers or servers
 - ❌ Cannot make new changes (signatures rejected)
-- ⚠️ Can still read previously-synced data (fundamental trade-off of E2E encryption)
+- ⚠️ Can currently read previously-synced local data (planned: data wipe on first connect after revocation)
 
 MindooDB includes **revocation timestamp protection** to prevent backdated changes from revoked users. See: [Revocation Protection](./docs/revocation-timestamp-protection.md)
 
@@ -244,7 +244,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 
 ## Support
 
-Need help, have questions, or want to request a feature? We're here to help! :-)
+Need commercial support, have questions, or want to request a feature? We're here to help! :-)
 
 - 🐛 **Bug Reports**: [Open an issue on GitHub](https://github.com/klehmann/mindoodb/issues)
 - 💬 **Questions & Discussions**: [GitHub Discussions](https://github.com/klehmann/mindoodb/discussions)
