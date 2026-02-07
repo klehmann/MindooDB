@@ -58,9 +58,11 @@ npx patch-package
 
 #### What the patch fixes
 
-**`react-native-quick-crypto+1.0.7.patch`** — Fixes two critical bugs:
-1. **NULL pointer crash** in `randomFillSync` C++ code when ArrayBuffer is detached by WASM memory growth
-2. **Memory corruption** where TypeScript wrapper incorrectly uses full ArrayBuffer size instead of TypedArray view range, causing random bytes to overwrite WASM heap
+**`react-native-quick-crypto+1.0.7.patch`** — Fixes two bugs in the crypto library:
+1. **NULL pointer crash** in `randomFillSync` C++ code when ArrayBuffer is detached (e.g., by garbage collection)
+2. **Incorrect buffer size** in TypeScript wrapper - uses full ArrayBuffer size instead of TypedArray view's `byteOffset`/`byteLength`
+
+These are generic bugs in react-native-quick-crypto that affect any usage, not specific to MindooDB.
 
 See `patches/PATCHES.md` for technical details.
 
@@ -259,11 +261,13 @@ Native Rust Automerge v0.7.3 (compiled into your app)
 
 ### Why Patches Are Needed
 
-**`react-native-quick-crypto` patch** - Fixes critical bugs in the crypto library:
-1. NULL pointer check in C++ to prevent SIGSEGV crashes
-2. Correct TypedArray byte range handling to prevent WASM memory corruption
+**`react-native-quick-crypto` patch** - Fixes generic bugs in the crypto library:
+1. **NULL pointer check** in C++ to prevent SIGSEGV crashes when ArrayBuffer is detached
+2. **Correct TypedArray handling** - Uses view's `byteOffset`/`byteLength` instead of underlying ArrayBuffer size
 
-The old **`react-native` JSC patch** is **no longer needed** - native Automerge doesn't use ArrayBuffer returns from NitroModules.
+These are defensive fixes that improve the library's robustness for all users.
+
+**Note:** The old `react-native` JSC patch for `createArrayBuffer()` is **no longer needed** with native Automerge.
 
 ### Crypto Adapter
 
@@ -420,7 +424,7 @@ See [Data Indexing](./dataindexing.md) and [Virtual Views](./virtualview.md) for
 
 ## Troubleshooting
 
-### "randomFillSync" crash or "Out of bounds memory access"
+### "randomFillSync" crash or SIGSEGV in native code
 
 The `react-native-quick-crypto` patch hasn't been applied. Run:
 
