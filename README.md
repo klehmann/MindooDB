@@ -65,6 +65,8 @@ Traditional databases trust the server. If your hosting provider is compromised,
 npm install mindoodb
 ```
 
+> 📱 **React Native / Expo?** See the [React Native setup guide](./docs/reactnative.md) for mobile-specific instructions with native performance.
+
 ### Create a Tenant and Start Working
 
 ```typescript
@@ -223,6 +225,13 @@ Append-only storage means nothing is ever deleted:
 - Cryptographic proof of all operations
 - GDPR compliance via `purgeDocHistory()` when legally required
 
+## Supported Platforms
+
+- ✅ **Node.js** - Server-side and desktop apps
+- ✅ **Web Browsers** - Progressive web apps with Web Crypto API
+- ✅ **React Native / Expo** - iOS and Android with native Automerge (Rust via JSI)
+- ✅ **Electron** - Cross-platform desktop apps
+
 ## Use Cases
 
 - **Multi-Tenant SaaS**: Each customer isolated with encrypted data
@@ -230,6 +239,7 @@ Append-only storage means nothing is ever deleted:
 - **Secure File Sharing**: Named keys for need-to-know access
 - **Audit-Critical Systems**: Tamperproof history meets compliance requirements
 - **Offline-First Apps**: Full functionality without network; sync when connected
+- **Mobile Apps**: End-to-end encrypted sync with native performance
 
 See: [Use Cases Documentation](./docs/usecases/README.md)
 
