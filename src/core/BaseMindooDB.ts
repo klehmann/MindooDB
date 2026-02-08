@@ -1141,8 +1141,6 @@ export class BaseMindooDB implements MindooDB {
           set: (target, prop, value) => {
             throwIfCallbackInactive('set property');
             if (typeof prop === 'string') {
-              // Debug: log what value we're collecting
-              console.log(`[changeDoc proxy SET] prop="${prop}" value type=${typeof value} value=`, value);
               // If this property was marked for deletion, remove it from deletions
               pendingDeletions.delete(prop);
               // Track the change
@@ -1338,7 +1336,6 @@ export class BaseMindooDB implements MindooDB {
       newDoc = Automerge.change(internalDoc.doc, (automergeDoc: MindooDocPayload) => {
         // Apply all pending changes (sets/updates)
         for (const [key, value] of pendingChanges) {
-          console.log(`[Automerge.change] Setting key="${key}" value type=${typeof value} value=`, value);
           (automergeDoc as any)[key] = value;
         }
         
@@ -2046,7 +2043,6 @@ export class BaseMindooDB implements MindooDB {
     }
 
     // Fallback: direct access (for WASM or if native fails)
-    console.log('[MindooDB] Falling back to direct document access');
     const result: Record<string, any> = {};
     const keys = Object.keys(doc);
 
