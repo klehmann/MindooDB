@@ -2031,10 +2031,8 @@ export class BaseMindooDB implements MindooDB {
 
     if (meta && meta.handle && typeof meta.handle.materialize === 'function') {
       // Use native materialize() which properly converts Text objects to strings
-      console.log('[MindooDB] Using native Automerge materialize()');
       try {
         const materialized = meta.handle.materialize('/');
-        console.log('[MindooDB] Materialized document:', Object.keys(materialized));
         return materialized as MindooDocPayload;
       } catch (error) {
         console.error('[MindooDB] Failed to materialize document:', error);
