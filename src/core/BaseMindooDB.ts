@@ -1,4 +1,9 @@
-import * as Automerge from "@automerge/automerge";
+// Import platform-appropriate Automerge implementation
+// React Native: native Rust (react-native-automerge-generated)
+// Browser/Node.js: WASM (@automerge/automerge/slim)
+import { Automerge } from "./automerge-adapter";
+// Import types from WASM package (types are compatible across implementations)
+import type * as AutomergeTypes from "@automerge/automerge/slim";
 import { v7 as uuidv7 } from "uuid";
 import {
   MindooDB,
@@ -38,7 +43,7 @@ const DEFAULT_CHUNK_SIZE_BYTES = 256 * 1024;
  */
 interface InternalDoc {
   id: string;
-  doc: Automerge.Doc<MindooDocPayload>;
+  doc: AutomergeTypes.Doc<MindooDocPayload>;
   createdAt: number;
   lastModified: number;
   decryptionKeyId: string;
@@ -508,7 +513,7 @@ export class BaseMindooDB implements MindooDB {
     // Create the first change
     const now = Date.now();
     this.logger.debug(`Creating initial Automerge change for document ${docId}`);
-    let newDoc: Automerge.Doc<MindooDocPayload>;
+    let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
     try {
       newDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
         // Store metadata in the document payload
@@ -737,7 +742,7 @@ export class BaseMindooDB implements MindooDB {
     const entryMap = new Map(entries.map(e => [e.id, e]));
     
     // Apply changes in order
-    let currentDoc: Automerge.Doc<MindooDocPayload> | null = null;
+    let currentDoc: AutomergeTypes.Doc<MindooDocPayload> | null = null;
     let createdAt: number | null = null;
     let decryptionKeyId: string = "default";
     
@@ -1136,12 +1141,14 @@ export class BaseMindooDB implements MindooDB {
           set: (target, prop, value) => {
             throwIfCallbackInactive('set property');
             if (typeof prop === 'string') {
+              // Debug: log what value we're collecting
+              console.log(`[changeDoc proxy SET] prop="${prop}" value type=${typeof value} value=`, value);
               // If this property was marked for deletion, remove it from deletions
               pendingDeletions.delete(prop);
               // Track the change
               pendingChanges.set(prop, value);
-              // Also set on the target for immediate access
-              (target as any)[prop] = value;
+              // NOTE: Don't set on target immediately - Automerge requires changes
+              // to be made inside Automerge.change(). Pending changes are applied later.
             }
             return true;
           },
@@ -1152,8 +1159,8 @@ export class BaseMindooDB implements MindooDB {
               pendingDeletions.add(prop);
               // Remove from pending changes if it was there
               pendingChanges.delete(prop);
-              // Also delete from the target for immediate access
-              delete (target as any)[prop];
+              // NOTE: Don't delete from target immediately - Automerge requires changes
+              // to be made inside Automerge.change(). Pending deletions are applied later.
             }
             return true;
           },
@@ -1326,11 +1333,12 @@ export class BaseMindooDB implements MindooDB {
     isCallbackActive = false;
     
     // Now apply the collected changes synchronously in Automerge.change()
-    let newDoc: Automerge.Doc<MindooDocPayload>;
+    let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
     try {
       newDoc = Automerge.change(internalDoc.doc, (automergeDoc: MindooDocPayload) => {
         // Apply all pending changes (sets/updates)
         for (const [key, value] of pendingChanges) {
+          console.log(`[Automerge.change] Setting key="${key}" value type=${typeof value} value=`, value);
           (automergeDoc as any)[key] = value;
         }
         
@@ -1703,7 +1711,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Apply all changes at once (Automerge handles dependency ordering)
     const result = Automerge.applyChanges<MindooDocPayload>(clonedDoc, changeBytes);
-    const updatedDoc = result[0] as Automerge.Doc<MindooDocPayload>;
+    const updatedDoc = result[0] as AutomergeTypes.Doc<MindooDocPayload>;
     
     // Check if document actually changed
     const headsAfter = Automerge.getHeads(updatedDoc);
@@ -1792,7 +1800,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Will load ${entriesToLoad.length} entries for document ${docId} (after snapshot filter)`);
     
     // Load the snapshot first if we have one
-    let doc: Automerge.Doc<MindooDocPayload> | undefined = undefined;
+    let doc: AutomergeTypes.Doc<MindooDocPayload> | undefined = undefined;
     if (startFromSnapshot && snapshotMeta) {
       this.logger.debug(`Loading snapshot for document ${docId}`);
       const snapshotEntries = await this.store.getEntries([snapshotMeta.id]);
@@ -1962,7 +1970,7 @@ export class BaseMindooDB implements MindooDB {
           this.logger.debug(`Applying ${changeBytes.length} changes to document ${docId} using batch applyChanges`);
           try {
             const result = Automerge.applyChanges<MindooDocPayload>(doc!, changeBytes);
-            doc = result[0] as Automerge.Doc<MindooDocPayload>;
+            doc = result[0] as AutomergeTypes.Doc<MindooDocPayload>;
             this.logger.debug(`Successfully applied ${changeBytes.length} changes to document ${docId}`);
             this.logger.debug(`Document state after applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
           } catch (error) {
@@ -2013,13 +2021,62 @@ export class BaseMindooDB implements MindooDB {
 
 
   /**
+   * Convert an Automerge document to a plain JS object, converting Text objects to strings.
+   * If using native Automerge (react-native-automerge-generated), this uses the native
+   * materialize() method which properly converts Text objects to strings.
+   * Falls back to direct access if native backend is not available.
+   */
+  private convertAutomergeToJS(doc: AutomergeTypes.Doc<MindooDocPayload>): MindooDocPayload {
+    // Check if this document has a native Automerge handle attached
+    // The native implementation attaches metadata with Symbol.for('_am_meta')
+    const STATE = Symbol.for('_am_meta');
+    const meta = (doc as any)[STATE];
+
+    if (meta && meta.handle && typeof meta.handle.materialize === 'function') {
+      // Use native materialize() which properly converts Text objects to strings
+      console.log('[MindooDB] Using native Automerge materialize()');
+      try {
+        const materialized = meta.handle.materialize('/');
+        console.log('[MindooDB] Materialized document:', Object.keys(materialized));
+        return materialized as MindooDocPayload;
+      } catch (error) {
+        console.error('[MindooDB] Failed to materialize document:', error);
+        // Fall through to direct access
+      }
+    }
+
+    // Fallback: direct access (for WASM or if native fails)
+    console.log('[MindooDB] Falling back to direct document access');
+    const result: Record<string, any> = {};
+    const keys = Object.keys(doc);
+
+    for (const key of keys) {
+      const value = (doc as any)[key];
+      if (value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array)) {
+        result[key] = this.convertAutomergeToJS(value as AutomergeTypes.Doc<MindooDocPayload>);
+      } else if (Array.isArray(value)) {
+        result[key] = value.map(item => {
+          if (item !== null && typeof item === 'object' && !Array.isArray(item) && !(item instanceof Uint8Array)) {
+            return this.convertAutomergeToJS(item as AutomergeTypes.Doc<MindooDocPayload>);
+          }
+          return item;
+        });
+      } else {
+        result[key] = value;
+      }
+    }
+
+    return result as MindooDocPayload;
+  }
+
+  /**
    * Wrap an internal document in the MindooDoc interface.
    * This is the read-only wrapper - write methods throw errors.
    */
   private wrapDocument(internalDoc: InternalDoc): MindooDoc {
     const db = this;
     const docId = internalDoc.id;
-    
+
     // Create a read-only proxy that throws on any modification attempts
     const createReadOnlyProxy = (target: MindooDocPayload): MindooDocPayload => {
       return new Proxy(target, {
@@ -2039,14 +2096,18 @@ export class BaseMindooDB implements MindooDB {
         },
       }) as MindooDocPayload;
     };
-    
+
     return {
       getDatabase: () => db,
       getId: () => docId,
       getCreatedAt: () => internalDoc.createdAt,
       getLastModified: () => internalDoc.lastModified,
       isDeleted: () => internalDoc.isDeleted,
-      getData: () => createReadOnlyProxy(internalDoc.doc as unknown as MindooDocPayload),
+      getData: () => {
+        // Convert Automerge document to plain JS object, converting Text objects to strings
+        const jsDoc = this.convertAutomergeToJS(internalDoc.doc);
+        return createReadOnlyProxy(jsDoc);
+      },
       
       // ========== Attachment Write Methods ==========
       // These throw errors in the read-only wrapper

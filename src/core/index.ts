@@ -6,6 +6,11 @@ export * from "./types";
 // User ID types
 export { PublicUserId, PrivateUserId } from "./userid";
 
+// Base classes
+export { BaseMindooDB } from "./BaseMindooDB";
+export { BaseMindooTenant } from "./BaseMindooTenant";
+export { BaseMindooTenantFactory } from "./BaseMindooTenantFactory";
+
 // Crypto
 export { CryptoAdapter } from "./crypto/CryptoAdapter";
 export { RSAEncryption } from "./crypto/RSAEncryption";
@@ -48,3 +53,28 @@ export {
   NetworkErrorType,
   NetworkError,
 } from "./appendonlystores/network/types";
+
+// Indexing - Virtual Views
+export {
+  VirtualView,
+  VirtualViewFactory,
+  VirtualViewBuilder,
+  VirtualViewNavigatorBuilder,
+  VirtualViewColumn,
+  VirtualViewNavigator,
+  VirtualViewEntryData,
+  VirtualViewDataChange,
+  MindooDBVirtualViewDataProvider,
+  ColumnSorting,
+  TotalMode,
+  CategorizationStyle,
+  WithCategories,
+  WithDocuments,
+  SelectedOnly,
+  type VirtualViewColumnOptions,
+  type IVirtualViewDataProvider,
+  type MindooDBVirtualViewDataProviderOptions,
+  type ScopedDocId,
+  type ColumnValueFunction,
+  type DocumentFilterFunction,
+} from "./indexing/virtualviews";
