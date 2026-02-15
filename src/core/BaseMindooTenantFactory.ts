@@ -9,6 +9,7 @@ import {
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
+import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbkdf2Iterations";
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 
@@ -180,7 +181,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log('[createUserId] Step 3: ✓ Signing private key exported in', Date.now() - exportSigningPrivateStart, 'ms');
 
     // Encrypt signing private key with password (salt: "signing")
-    console.log('[createUserId] Step 4: Encrypting signing private key (PBKDF2 with 310k iterations)...');
+    const pbkdf2Iterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    console.log(`[createUserId] Step 4: Encrypting signing private key (PBKDF2 with ${pbkdf2Iterations} iterations)...`);
     const encryptSigningStart = Date.now();
     const encryptedSigningKey = await this.encryptPrivateKey(
       signingPrivateKeyBytes,
@@ -223,7 +225,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log('[createUserId] Step 7: ✓ Encryption private key exported in', Date.now() - exportEncryptionPrivateStart, 'ms');
 
     // Encrypt encryption private key with password (salt: "encryption")
-    console.log('[createUserId] Step 8: Encrypting encryption private key (PBKDF2 with 310k iterations)...');
+    console.log(`[createUserId] Step 8: Encrypting encryption private key (PBKDF2 with ${pbkdf2Iterations} iterations)...`);
     const encryptEncryptionStart = Date.now();
     const encryptedEncryptionKey = await this.encryptPrivateKey(
       encryptionPrivateKeyBytes,
@@ -428,8 +430,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     );
     console.log('[encryptPrivateKey] ✓ Password key imported in', Date.now() - importKeyStart, 'ms');
 
-    const iterations = 310000; // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
-    console.log(`[encryptPrivateKey] Deriving key with PBKDF2 (${iterations} iterations - this may take 2-5 seconds in JS)...`);
+    const iterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    console.log(`[encryptPrivateKey] Deriving key with PBKDF2 (${iterations} iterations)...`);
     const deriveKeyStart = Date.now();
     const derivedKey = await subtle.deriveKey(
       {

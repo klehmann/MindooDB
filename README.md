@@ -67,6 +67,19 @@ npm install mindoodb
 
 > 📱 **React Native / Expo?** See the [React Native setup guide](./docs/reactnative.md) for mobile-specific instructions with native performance.
 
+### Pick Your Runtime
+
+| Runtime | Fastest start | Recommended path |
+|---------|---------------|------------------|
+| Node.js | Use `mindoodb` directly in a Node script | [Getting Started](./docs/getting-started.md#nodejs) |
+| Web | Import from `mindoodb/browser` | [Getting Started](./docs/getting-started.md#web-browser) |
+| React Native / Expo | Run `npx mindoodb setup-react-native` in your app root | [React Native Guide](./docs/reactnative.md) |
+
+### React Native Recommendation
+
+- Use **native Automerge** (`react-native-automerge-generated`) and native crypto for production.
+- Treat Expo Go / JS fallback as a convenience path for prototyping, not the default production runtime.
+
 ### Create a Tenant and Start Working
 
 ```typescript
@@ -245,12 +258,56 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 
 ## Documentation
 
+- [Getting Started](./docs/getting-started.md) — Fast setup for Node.js, Web, and React Native
+- [Example Snippets](./docs/examples/README.md) — Copy-paste Todo starters for all runtimes
 - [Architecture Specification](./docs/specification.md) — Full technical details
+- [React Native Guide](./docs/reactnative.md) — Native Automerge setup and troubleshooting
 - [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
 - [Attachments](./docs/attachments.md) — File storage and streaming
+
+## Testing
+
+Run tests from the command line:
+
+```bash
+# Node.js unit/integration tests (Jest)
+npm test
+
+# Install Chromium once for browser tests
+npm run test:browser:install
+
+# Real browser runtime tests (Playwright + headless Chromium)
+npm run test:browser
+
+# Run Node + browser lanes
+npm run test:all
+```
+
+### Test coverage by environment
+
+| Environment | Command | What is covered today |
+|-------------|---------|------------------------|
+| Node.js | `npm test` | Full Jest suite for core APIs (documents, sync logic, indexing, virtual views, settings, trust model, attachments, etc.) |
+| Browser | `npm run test:browser` | Real Chromium runtime via Playwright, including browser entrypoint usage, document lifecycle, real HTTP sync endpoint flows, and browser Virtual View update behavior |
+| React Native / Expo | `npm test -- ReactNativeCrypto.test.ts` | Crypto adapter behavior in Jest (uses `src/__mocks__/expo-standard-web-crypto.ts`), not a device/simulator E2E run |
+
+### Browser sync test behavior
+
+- Browser tests run in headless Chromium and execute MindooDB browser code in a real page runtime.
+- During test setup, an ephemeral HTTP server is started automatically and exposes the real sync endpoints.
+- Sync assertions use real HTTP requests against that temporary endpoint (no mocked transport for sync tests).
+- The server binds to an OS-assigned free port and is shut down after the suite completes.
+
+### Current parity status
+
+- The package exports and core API shape are aligned across Node.js, browser, and React Native entrypoints.
+- Node and browser now have executable CLI lanes with runtime validation.
+- React Native coverage is currently adapter-focused in Jest and does not yet validate full app-level behavior inside a real React Native runtime.
+- For high confidence in three-environment parity, add a React Native integration lane (Expo/Detox or RN test app) that exercises document lifecycle, sync, and virtual view updates on device/simulator.
+- For Expo Go / JS fallback scenarios, PBKDF2 iterations can be tuned at runtime; native RN builds should keep strong defaults.
 
 ## Support
 

@@ -20,6 +20,28 @@ Perfect for: secure messaging apps, collaborative tools, offline-capable product
 
 ## Quick Start
 
+### 0. Fastest setup (recommended)
+
+If you already have an Expo / React Native app, run:
+
+```bash
+npx mindoodb setup-react-native
+```
+
+This setup helper copies required patch files, configures `patch-package`, installs missing dependencies (including `react-native-automerge-generated`), and prints the Metro snippet you need.
+
+Then continue with the initialization steps below.
+
+> Recommended for real apps: run on an Expo dev build or production build with native modules enabled, not Expo Go.
+
+### Runtime support matrix
+
+| Runtime | Status | Recommendation |
+|---------|--------|----------------|
+| React Native dev build / production (Hermes + native modules) | Fully supported | Use native Automerge + `react-native-quick-crypto` |
+| React Native with JSC | Supported with bundled patch flow | Prefer Hermes unless you have a strict JSC requirement |
+| Expo Go | Limited fallback mode | Use only for prototyping; not recommended for production performance |
+
 ### 1. Install Dependencies
 
 ```bash
@@ -32,11 +54,11 @@ npm install --save-dev patch-package
 
 ### 2. Copy Patches
 
-MindooDB requires one patch to fix bugs in `react-native-quick-crypto`:
+MindooDB's known-good React Native setup currently uses two patches:
 
 ```bash
 mkdir -p patches
-cp node_modules/mindoodb/patches/react-native-quick-crypto+*.patch patches/
+cp node_modules/mindoodb/patches/react-native*.patch patches/
 cp node_modules/mindoodb/patches/PATCHES.md patches/
 ```
 
@@ -56,15 +78,19 @@ Then apply the patches:
 npx patch-package
 ```
 
-#### What the patch fixes
+#### What the patches fix
 
-**`react-native-quick-crypto+1.0.7.patch`** — Fixes two bugs in the crypto library:
+**`react-native+0.76.9.patch`**
+- Implements JSC `createArrayBuffer()` to prevent `Hash.digest(...): Not implemented` in affected runtime paths.
+
+**`react-native-quick-crypto+1.0.7.patch`**
+- Fixes two bugs in the crypto library:
 1. **NULL pointer crash** in `randomFillSync` C++ code when ArrayBuffer is detached (e.g., by garbage collection)
 2. **Incorrect buffer size** in TypeScript wrapper - uses full ArrayBuffer size instead of TypedArray view's `byteOffset`/`byteLength`
 
 These are generic bugs in react-native-quick-crypto that affect any usage, not specific to MindooDB.
 
-See `patches/PATCHES.md` for technical details.
+See `node_modules/mindoodb/patches/PATCHES.md` for technical details and upstream status.
 
 ### 3. Add Polyfills
 
@@ -156,6 +182,27 @@ npx expo run:ios
 npx expo prebuild --clean
 npx expo run:android
 ```
+
+### Optional: tune PBKDF2 iterations for Expo Go fallback
+
+MindooDB defaults to strong PBKDF2 settings (`310000` iterations).  
+For Expo Go or JavaScript-only fallback where this is too slow, you can set a lower runtime override:
+
+```ts
+// Example: set before creating users/keys
+(globalThis as any).__MINDOODB_PBKDF2_ITERATIONS = 120000;
+```
+
+Or in Node-like environments:
+
+```bash
+MINDOODB_PBKDF2_ITERATIONS=120000
+```
+
+Notes:
+- A safety floor is enforced (`60000` minimum).
+- This should be used only for fallback/dev scenarios.
+- Native crypto path should keep the stronger default whenever possible.
 
 ## Usage Example
 
@@ -257,7 +304,7 @@ Native Rust Automerge v0.7.3 (compiled into your app)
 - ✅ **Native performance** - Direct Rust calls via JSI, ~10x faster than WASM
 - ✅ **Smaller bundle** - No 2MB WASM blob
 - ✅ **Android support** - WASM-based Automerge had Android issues
-- ✅ **Simpler setup** - No Metro resolver hacks or WASM initialization
+- ✅ **Simpler setup** - No WASM initialization path
 
 ### Why Patches Are Needed
 
@@ -267,7 +314,8 @@ Native Rust Automerge v0.7.3 (compiled into your app)
 
 These are defensive fixes that improve the library's robustness for all users.
 
-**Note:** The old `react-native` JSC patch for `createArrayBuffer()` is **no longer needed** with native Automerge.
+**`react-native` JSC patch** - Implements `createArrayBuffer()` in JSC runtime.
+This matters in JSC runtime paths involving NitroModules returning ArrayBuffer to JS. Hermes users are typically unaffected, but keeping the patch in the known-good setup avoids runtime-specific surprises.
 
 ### Crypto Adapter
 

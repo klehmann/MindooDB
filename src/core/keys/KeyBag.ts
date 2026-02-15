@@ -1,5 +1,6 @@
 import { EncryptedPrivateKey } from "../types";
 import { CryptoAdapter } from "../crypto/CryptoAdapter";
+import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "../crypto/pbkdf2Iterations";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
 /**
@@ -227,12 +228,17 @@ export class KeyBag {
       ["deriveKey"]
     );
     
+    const keyBagIterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    if (keyBagIterations !== DEFAULT_PBKDF2_ITERATIONS) {
+      this.logger.warn(`Using overridden PBKDF2 iterations for KeyBag.save(): ${keyBagIterations}`);
+    }
+
     // Derive AES-GCM key using PBKDF2
     const derivedKey = await subtle.deriveKey(
       {
         name: "PBKDF2",
         salt: combinedSalt,
-        iterations: 310000, // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
+        iterations: keyBagIterations,
         hash: "SHA-256",
       },
       passwordKey,
@@ -317,12 +323,17 @@ export class KeyBag {
       ["deriveKey"]
     );
     
+    const keyBagIterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    if (keyBagIterations !== DEFAULT_PBKDF2_ITERATIONS) {
+      this.logger.warn(`Using overridden PBKDF2 iterations for KeyBag.load(): ${keyBagIterations}`);
+    }
+
     // Derive AES-GCM key using PBKDF2 (same parameters as encryption)
     const derivedKey = await subtle.deriveKey(
       {
         name: "PBKDF2",
         salt: combinedSalt,
-        iterations: 310000, // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
+        iterations: keyBagIterations,
         hash: "SHA-256",
       },
       passwordKey,
@@ -483,7 +494,10 @@ export class KeyBag {
       ["deriveBits", "deriveKey"]
     );
 
-    const iterations = 310000; // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
+    const iterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    if (iterations !== DEFAULT_PBKDF2_ITERATIONS) {
+      this.logger.warn(`Using overridden PBKDF2 iterations for KeyBag.encryptPrivateKey(): ${iterations}`);
+    }
     const derivedKey = await subtle.deriveKey(
       {
         name: "PBKDF2",
