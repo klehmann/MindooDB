@@ -147,10 +147,15 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    */
   async createUserId(username: string, password: string): Promise<PrivateUserId> {
     this.logger.debug(`Creating user ID: ${username}`);
+    console.log('[createUserId] Starting createUserId for:', username);
+    const startTime = Date.now();
 
     const subtle = this.cryptoAdapter.getSubtle();
+    console.log('[createUserId] Got subtle crypto API');
 
     // Generate signing key pair (Ed25519)
+    console.log('[createUserId] Step 1: Generating Ed25519 signing key pair...');
+    const signingKeyPairStart = Date.now();
     const signingKeyPair = await subtle.generateKey(
       {
         name: "Ed25519",
@@ -158,24 +163,36 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       true, // extractable
       ["sign", "verify"]
     );
+    console.log('[createUserId] Step 1: ✓ Ed25519 signing key pair generated in', Date.now() - signingKeyPairStart, 'ms');
 
     // Export signing public key (PEM format)
+    console.log('[createUserId] Step 2: Exporting signing public key...');
+    const exportSigningPublicStart = Date.now();
     const signingPublicKeyBuffer = await subtle.exportKey("spki", signingKeyPair.publicKey);
     const signingPublicKey = this.arrayBufferToPEM(signingPublicKeyBuffer, "PUBLIC KEY");
+    console.log('[createUserId] Step 2: ✓ Signing public key exported in', Date.now() - exportSigningPublicStart, 'ms');
 
     // Export signing private key
+    console.log('[createUserId] Step 3: Exporting signing private key...');
+    const exportSigningPrivateStart = Date.now();
     const signingPrivateKeyBuffer = await subtle.exportKey("pkcs8", signingKeyPair.privateKey);
     const signingPrivateKeyBytes = new Uint8Array(signingPrivateKeyBuffer);
+    console.log('[createUserId] Step 3: ✓ Signing private key exported in', Date.now() - exportSigningPrivateStart, 'ms');
 
     // Encrypt signing private key with password (salt: "signing")
+    console.log('[createUserId] Step 4: Encrypting signing private key (PBKDF2 with 310k iterations)...');
+    const encryptSigningStart = Date.now();
     const encryptedSigningKey = await this.encryptPrivateKey(
       signingPrivateKeyBytes,
       password,
       "signing"
     );
+    console.log('[createUserId] Step 4: ✓ Signing private key encrypted in', Date.now() - encryptSigningStart, 'ms');
 
     // Generate encryption key pair (RSA-OAEP, 3072 bits for state-of-the-art security)
     // NIST recommends 3072-bit RSA for new applications (security through 2030+)
+    console.log('[createUserId] Step 5: Generating RSA-3072 encryption key pair (this may take 10-30 seconds in JS)...');
+    const rsaKeyGenStart = Date.now();
     const encryptionKeyPair = await subtle.generateKey(
       {
         name: "RSA-OAEP",
@@ -186,26 +203,37 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       true, // extractable
       ["encrypt", "decrypt"]
     );
+    console.log('[createUserId] Step 5: ✓ RSA-3072 encryption key pair generated in', Date.now() - rsaKeyGenStart, 'ms');
 
     // Export encryption public key (PEM format)
+    console.log('[createUserId] Step 6: Exporting encryption public key...');
+    const exportEncryptionPublicStart = Date.now();
     const encryptionPublicKeyBuffer = await subtle.exportKey("spki", encryptionKeyPair.publicKey);
     const encryptionPublicKey = this.arrayBufferToPEM(encryptionPublicKeyBuffer, "PUBLIC KEY");
+    console.log('[createUserId] Step 6: ✓ Encryption public key exported in', Date.now() - exportEncryptionPublicStart, 'ms');
 
     // Export encryption private key
+    console.log('[createUserId] Step 7: Exporting encryption private key...');
+    const exportEncryptionPrivateStart = Date.now();
     const encryptionPrivateKeyBuffer = await subtle.exportKey(
       "pkcs8",
       encryptionKeyPair.privateKey
     );
     const encryptionPrivateKeyBytes = new Uint8Array(encryptionPrivateKeyBuffer);
+    console.log('[createUserId] Step 7: ✓ Encryption private key exported in', Date.now() - exportEncryptionPrivateStart, 'ms');
 
     // Encrypt encryption private key with password (salt: "encryption")
+    console.log('[createUserId] Step 8: Encrypting encryption private key (PBKDF2 with 310k iterations)...');
+    const encryptEncryptionStart = Date.now();
     const encryptedEncryptionKey = await this.encryptPrivateKey(
       encryptionPrivateKeyBytes,
       password,
       "encryption"
     );
+    console.log('[createUserId] Step 8: ✓ Encryption private key encrypted in', Date.now() - encryptEncryptionStart, 'ms');
 
     // Create PrivateUserId
+    console.log('[createUserId] Step 9: Creating PrivateUserId object...');
     const privateUserId: PrivateUserId = {
       username,
       administrationSignature: "", // Will be set when user is registered by an admin
@@ -219,6 +247,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       },
     };
 
+    const totalTime = Date.now() - startTime;
+    console.log('[createUserId] ✓ User ID created successfully in', totalTime, 'ms total');
     this.logger.debug(`Created user ID: ${username}`);
     return privateUserId;
   }
@@ -362,11 +392,15 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     password: string,
     saltString: string
   ): Promise<EncryptedPrivateKey> {
+    console.log(`[encryptPrivateKey] Starting encryption with salt: "${saltString}", key size: ${privateKeyBytes.length} bytes`);
+    const startTime = Date.now();
+    
     const subtle = this.cryptoAdapter.getSubtle();
     // Bind getRandomValues to maintain 'this' context
     const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
 
     // Generate random salt and IV
+    console.log('[encryptPrivateKey] Generating random salt and IV...');
     const saltArray = new Uint8Array(16); // 16 bytes salt
     randomValues(saltArray);
     const salt = new Uint8Array(saltArray);
@@ -374,6 +408,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     const ivArray = new Uint8Array(12); // 12 bytes for AES-GCM
     randomValues(ivArray);
     const iv = new Uint8Array(ivArray);
+    console.log('[encryptPrivateKey] ✓ Salt and IV generated');
 
     // Combine salt with saltString for key derivation (same as decryption)
     const saltStringBytes = new TextEncoder().encode(saltString);
@@ -382,6 +417,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     combinedSalt.set(saltStringBytes, salt.length);
 
     // Derive encryption key from password using PBKDF2
+    console.log('[encryptPrivateKey] Importing password key...');
+    const importKeyStart = Date.now();
     const passwordKey = await subtle.importKey(
       "raw",
       new TextEncoder().encode(password),
@@ -389,8 +426,11 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       false,
       ["deriveBits", "deriveKey"]
     );
+    console.log('[encryptPrivateKey] ✓ Password key imported in', Date.now() - importKeyStart, 'ms');
 
     const iterations = 310000; // OWASP-recommended PBKDF2 iterations for PBKDF2-SHA256
+    console.log(`[encryptPrivateKey] Deriving key with PBKDF2 (${iterations} iterations - this may take 2-5 seconds in JS)...`);
+    const deriveKeyStart = Date.now();
     const derivedKey = await subtle.deriveKey(
       {
         name: "PBKDF2",
@@ -406,8 +446,11 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       false,
       ["encrypt"]
     );
+    console.log('[encryptPrivateKey] ✓ Key derived in', Date.now() - deriveKeyStart, 'ms');
 
     // Encrypt the private key
+    console.log('[encryptPrivateKey] Encrypting private key data...');
+    const encryptStart = Date.now();
     const encrypted = await subtle.encrypt(
       {
         name: "AES-GCM",
@@ -417,6 +460,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       derivedKey,
       privateKeyBytes.buffer as ArrayBuffer
     );
+    console.log('[encryptPrivateKey] ✓ Private key encrypted in', Date.now() - encryptStart, 'ms');
 
     // Extract ciphertext and tag from encrypted data
     // AES-GCM appends the tag at the end
@@ -434,6 +478,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       iterations: iterations,
     };
 
+    const totalTime = Date.now() - startTime;
+    console.log(`[encryptPrivateKey] ✓ Encryption completed in ${totalTime}ms total`);
     return encryptedKey;
   }
 

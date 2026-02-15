@@ -1,0 +1,34 @@
+diff --git a/node_modules/react-native/ReactCommon/jsc/JSCRuntime.cpp b/node_modules/react-native/ReactCommon/jsc/JSCRuntime.cpp
+index e63260a..b806880 100644
+--- a/node_modules/react-native/ReactCommon/jsc/JSCRuntime.cpp
++++ b/node_modules/react-native/ReactCommon/jsc/JSCRuntime.cpp
+@@ -1120,7 +1120,28 @@ jsi::Array JSCRuntime::createArray(size_t length) {
+ 
+ jsi::ArrayBuffer JSCRuntime::createArrayBuffer(
+     std::shared_ptr<jsi::MutableBuffer> buffer) {
+-  throw std::logic_error("Not implemented");
++  JSValueRef exc = nullptr;
++  // Move the shared_ptr into heap storage so it survives until JSC deallocates
++  // the ArrayBuffer. The deallocator callback deletes it when the JS GC
++  // collects the ArrayBuffer object.
++  auto* pointerHolder =
++      new std::shared_ptr<jsi::MutableBuffer>(std::move(buffer));
++  JSObjectRef obj = JSObjectMakeArrayBufferWithBytesNoCopy(
++      ctx_,
++      (*pointerHolder)->data(),
++      (*pointerHolder)->size(),
++      [](void* /*bytes*/, void* deallocatorContext) {
++        delete static_cast<std::shared_ptr<jsi::MutableBuffer>*>(
++            deallocatorContext);
++      },
++      pointerHolder,
++      &exc);
++  if (!obj) {
++    // Clean up on failure before throwing
++    delete pointerHolder;
++    checkException(exc);
++  }
++  return createObject(obj).getArrayBuffer(*this);
+ }
+ 
+ size_t JSCRuntime::size(const jsi::Array& arr) {

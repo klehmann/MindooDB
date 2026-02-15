@@ -4,6 +4,7 @@
   "description": "End-to-End Encrypted, Offline-first Sync Database",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.js",
+  "react-native": "./dist/reactnative/index.js",
   "types": "./dist/core/index.d.ts",
   "repository": {
     "type": "git",
@@ -15,22 +16,32 @@
     "offline-first",
     "sync",
     "crdt",
-    "automerge"
+    "automerge",
+    "react-native",
+    "expo"
   ],
   "exports": {
     ".": {
+      "react-native": "./dist/reactnative/index.js",
       "browser": "./dist/browser/index.js",
       "node": "./dist/node/index.js",
       "default": "./dist/node/index.js"
     },
     "./core": "./dist/core/index.js",
     "./browser": "./dist/browser/index.js",
-    "./node": "./dist/node/index.js"
+    "./node": "./dist/node/index.js",
+    "./reactnative": "./dist/reactnative/index.js"
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "patches",
+    "scripts",
+    "templates"
   ],
+  "bin": {
+    "mindoodb": "./scripts/cli.js"
+  },
   "scripts": {
     "build": "tsc",
     "test": "jest",
@@ -47,12 +58,38 @@
     "@types/express": "^4.17.21",
     "@types/jest": "^29.5.12",
     "@types/node": "^20.11.0",
+    "@types/node-forge": "^1.3.14",
     "@types/uuid": "^10.0.0",
     "express": "^4.18.2",
     "jest": "^29.7.0",
+    "node-forge": "^1.3.1",
     "ts-jest": "^29.1.2",
     "ts-node-dev": "^2.0.0",
+    "tweetnacl": "^1.0.3",
     "typescript": "^5.6.0"
   },
-  "peerDependenciesMeta": {}
+  "peerDependencies": {
+    "expo-standard-web-crypto": "^3.0.0",
+    "node-forge": "^1.3.1",
+    "react-native-automerge-generated": "^0.1.0",
+    "react-native-quick-crypto": "^1.0.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "peerDependenciesMeta": {
+    "react-native-automerge-generated": {
+      "optional": true
+    },
+    "react-native-quick-crypto": {
+      "optional": true
+    },
+    "expo-standard-web-crypto": {
+      "optional": true
+    },
+    "node-forge": {
+      "optional": true
+    },
+    "tweetnacl": {
+      "optional": true
+    }
+  }
 }

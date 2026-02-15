@@ -1170,7 +1170,7 @@ export interface MindooDB {
    * This method efficiently queries the content-addressed store to find
    * documents that existed at the given point in time. A document is considered
    * to exist at a timestamp if:
-   * - It has a doc_create entry with createdAt < timestamp
+   * - It has a doc_create entry with createdAt <= timestamp
    * - Either it has no doc_delete entry, or its doc_delete entry has createdAt > timestamp
    * 
    * @param timestamp The timestamp to query (milliseconds since Unix epoch)

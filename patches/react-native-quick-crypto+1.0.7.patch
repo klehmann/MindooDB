@@ -1,0 +1,42 @@
+diff --git a/node_modules/react-native-quick-crypto/cpp/random/HybridRandom.cpp b/node_modules/react-native-quick-crypto/cpp/random/HybridRandom.cpp
+index b1a132c..e48eb06 100644
+--- a/node_modules/react-native-quick-crypto/cpp/random/HybridRandom.cpp
++++ b/node_modules/react-native-quick-crypto/cpp/random/HybridRandom.cpp
+@@ -39,6 +39,9 @@ std::shared_ptr<ArrayBuffer> HybridRandom::randomFillSync(const std::shared_ptr<
+   size_t size = checkSize(dSize);
+   size_t offset = checkOffset(dSize, dOffset);
+   uint8_t* data = buffer.get()->data();
++  if (!data) {
++    throw std::runtime_error("randomFillSync: ArrayBuffer data pointer is null (buffer may have been detached or garbage collected)");
++  }
+   if (RAND_bytes(data + offset, (int)size) != 1) {
+     throw std::runtime_error("error calling RAND_bytes: " + std::to_string(ERR_get_error()));
+   }
+diff --git a/node_modules/react-native-quick-crypto/src/random.ts b/node_modules/react-native-quick-crypto/src/random.ts
+index 4066c5a..753da81 100644
+--- a/node_modules/react-native-quick-crypto/src/random.ts
++++ b/node_modules/react-native-quick-crypto/src/random.ts
+@@ -73,9 +73,20 @@ export function randomFillSync<T extends ABV>(
+ 
+ export function randomFillSync(buffer: ABV, offset: number = 0, size?: number) {
+   getNative();
+-  buffer = abvToArrayBuffer(buffer);
+-  const res = random.randomFillSync(buffer, offset, size ?? buffer.byteLength);
+-  buffer = res;
++  // Preserve the view's byte range before extracting the underlying ArrayBuffer.
++  // This is critical when buffer is a TypedArray view into a larger buffer
++  // (e.g. WebAssembly.Memory) — we must only fill the view's portion, not the
++  // entire underlying buffer.
++  const viewByteOffset = ArrayBuffer.isView(buffer) ? buffer.byteOffset : 0;
++  const viewByteLength = ArrayBuffer.isView(buffer) ? buffer.byteLength : buffer.byteLength;
++  const fillSize = size ?? viewByteLength;
++  // Create an owned ArrayBuffer so native code is not dependent on the original
++  // buffer reference staying valid (WASM memory growth can detach ArrayBuffers).
++  const owned = new ArrayBuffer(fillSize);
++  const res = random.randomFillSync(owned, 0, fillSize);
++  // Copy the random bytes back into the caller's buffer at the correct position
++  const src = abvToArrayBuffer(buffer);
++  new Uint8Array(src, viewByteOffset + offset, fillSize).set(new Uint8Array(res));
+   return buffer;
+ }
+ 

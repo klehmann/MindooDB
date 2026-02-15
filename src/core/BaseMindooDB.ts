@@ -860,10 +860,16 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async getAllDocumentIdsAtTimestamp(timestamp: number): Promise<string[]> {
+    // findEntries() uses an exclusive upper bound (createdAt < creationDateUntil).
+    // Query up to timestamp + 1 so entries created exactly at `timestamp` are included
+    // for the strict checks below (createTime < timestamp, deleteTime > timestamp).
+    const upperBoundExclusive =
+      timestamp === Number.MAX_SAFE_INTEGER ? timestamp : timestamp + 1;
+
     // Efficiently query for doc_create and doc_delete entries before the timestamp
     const [creates, deletes] = await Promise.all([
-      this.store.findEntries("doc_create", null, timestamp),
-      this.store.findEntries("doc_delete", null, timestamp)
+      this.store.findEntries("doc_create", null, upperBoundExclusive),
+      this.store.findEntries("doc_delete", null, upperBoundExclusive)
     ]);
     
     // Build sets of docIds for efficient lookup
@@ -898,9 +904,9 @@ export class BaseMindooDB implements MindooDB {
       const deleteTime = deleteTimes.get(docId);
       
       // Document exists at timestamp if:
-      // 1. It was created before the timestamp
+      // 1. It was created at or before the timestamp
       // 2. Either it was never deleted, or it was deleted after the timestamp
-      if (createTime < timestamp) {
+      if (createTime <= timestamp) {
         if (!deleteTime || deleteTime > timestamp) {
           docIds.push(docId);
         }

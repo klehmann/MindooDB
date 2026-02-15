@@ -2,12 +2,12 @@
  * Platform-specific Automerge adapter for MindooDB
  *
  * - React Native: Uses react-native-automerge-generated (native Rust via UniFFI)
- * - Browser/Node.js: Uses @automerge/automerge/slim (WASM)
+ * - Browser/Node.js: Uses @automerge/automerge (WASM)
  *
  * Both implementations now provide the same WASM-compatible API.
  */
 
-import * as AutomergeWasm from "@automerge/automerge/slim";
+import * as AutomergeWasm from "@automerge/automerge";
 
 // Type for the unified Automerge API
 type AutomergeAPI = typeof AutomergeWasm;
