@@ -221,7 +221,7 @@ class SchemaMapping {
 class GradualMigration {
   async phase1_Setup() {
     // Phase 1: Set up MindooDB infrastructure
-    const tenant = await this.createTenant();
+    const tenant = await this.openTenant();
     const dbs = await this.createDatabases();
     return { tenant, dbs };
   }

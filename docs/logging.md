@@ -171,7 +171,7 @@ import { BaseMindooTenantFactory } from '@mindoodb/core';
 const factory = new BaseMindooTenantFactory(storeFactory, cryptoAdapter);
 
 // All internal logging uses the logger
-const tenant = await factory.createTenant(tenantId, userKeys);
+const tenant = await factory.openTenant(tenantId, adminSigningPublicKey, adminEncryptionPublicKey, currentUser, currentUserPassword, keyBag);
 ```
 
 ### Custom Logger

@@ -35,8 +35,6 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 export class BaseMindooTenant implements MindooTenant {
   private factory: MindooTenantFactory;
   private tenantId: string;
-  private tenantEncryptionKey: EncryptedPrivateKey;
-  private tenantEncryptionKeyPassword: string; // Password to decrypt tenant encryption key
   private administrationPublicKey: string; // Administration public key (Ed25519, PEM format)
   private administrationEncryptionPublicKey: string; // Administration encryption public key (RSA-OAEP, PEM format)
   private currentUser: PrivateUserId;
@@ -56,8 +54,6 @@ export class BaseMindooTenant implements MindooTenant {
   constructor(
     factory: MindooTenantFactory,
     tenantId: string,
-    tenantEncryptionKey: EncryptedPrivateKey,
-    tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
     administrationEncryptionPublicKey: string,
     currentUser: PrivateUserId,
@@ -69,8 +65,6 @@ export class BaseMindooTenant implements MindooTenant {
   ) {
     this.factory = factory;
     this.tenantId = tenantId;
-    this.tenantEncryptionKey = tenantEncryptionKey;
-    this.tenantEncryptionKeyPassword = tenantEncryptionKeyPassword;
     this.administrationPublicKey = administrationPublicKey;
     this.administrationEncryptionPublicKey = administrationEncryptionPublicKey;
     this.currentUser = currentUser;
@@ -133,10 +127,6 @@ export class BaseMindooTenant implements MindooTenant {
     return this.administrationEncryptionPublicKey;
   }
 
-  getTenantEncryptionKey(): EncryptedPrivateKey {
-    return this.tenantEncryptionKey;
-  }
-
   async encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
     this.logger.debug(`Encrypting payload with key: ${decryptionKeyId}`);
     this.logger.debug(`Payload size: ${payload.length} bytes`);
@@ -151,21 +141,19 @@ export class BaseMindooTenant implements MindooTenant {
           symmetricKey = this.decryptedTenantKeyCache;
           this.logger.debug(`Using cached tenant key, length: ${symmetricKey.length} bytes`);
         } else {
-          this.logger.debug(`Decrypting tenant encryption key`);
-          // Decrypt tenant encryption key
-          const decrypted = await this.decryptPrivateKey(
-            this.tenantEncryptionKey,
-            this.tenantEncryptionKeyPassword,
-            "default"
-          );
-          symmetricKey = new Uint8Array(decrypted);
+          this.logger.debug(`Resolving tenant encryption key from KeyBag`);
+          const tenantKey = await this.keyBag.get("tenant", this.tenantId);
+          if (!tenantKey) {
+            throw new SymmetricKeyNotFoundError(`tenant:${this.tenantId}`);
+          }
+          symmetricKey = tenantKey;
           this.decryptedTenantKeyCache = symmetricKey;
-          this.logger.debug(`Decrypted tenant key, length: ${symmetricKey.length} bytes`);
+          this.logger.debug(`Loaded tenant key from KeyBag, length: ${symmetricKey.length} bytes`);
         }
       } else {
         this.logger.debug(`Getting named key from KeyBag: ${decryptionKeyId}`);
         // Get the decrypted key from KeyBag
-        const decryptedKey = await this.keyBag.get(decryptionKeyId);
+        const decryptedKey = await this.keyBag.get("doc", decryptionKeyId);
         if (!decryptedKey) {
           throw new SymmetricKeyNotFoundError(decryptionKeyId);
         }
@@ -278,18 +266,16 @@ export class BaseMindooTenant implements MindooTenant {
       if (this.decryptedTenantKeyCache) {
         symmetricKey = this.decryptedTenantKeyCache;
       } else {
-        // Decrypt tenant encryption key
-        const decrypted = await this.decryptPrivateKey(
-          this.tenantEncryptionKey,
-          this.tenantEncryptionKeyPassword,
-          "default"
-        );
-        symmetricKey = new Uint8Array(decrypted);
+        const tenantKey = await this.keyBag.get("tenant", this.tenantId);
+        if (!tenantKey) {
+          throw new SymmetricKeyNotFoundError(`tenant:${this.tenantId}`);
+        }
+        symmetricKey = tenantKey;
         this.decryptedTenantKeyCache = symmetricKey;
       }
     } else {
       // Get the decrypted key from KeyBag
-      const decryptedKey = await this.keyBag.get(decryptionKeyId);
+      const decryptedKey = await this.keyBag.get("doc", decryptionKeyId);
       if (!decryptedKey) {
         throw new SymmetricKeyNotFoundError(decryptionKeyId);
       }
@@ -445,7 +431,6 @@ export class BaseMindooTenant implements MindooTenant {
     // Convert PrivateUserId to PublicUserId
     return {
       username: this.currentUser.username,
-      administrationSignature: this.currentUser.administrationSignature,
       userSigningPublicKey: this.currentUser.userSigningKeyPair.publicKey,
       userEncryptionPublicKey: this.currentUser.userEncryptionKeyPair.publicKey,
     };
@@ -753,18 +738,16 @@ export class BaseMindooTenant implements MindooTenant {
       if (this.decryptedTenantKeyCache) {
         return this.decryptedTenantKeyCache;
       }
-      // Decrypt tenant encryption key
-      const decrypted = await this.decryptPrivateKey(
-        this.tenantEncryptionKey,
-        this.tenantEncryptionKeyPassword,
-        "default"
-      );
-      const symmetricKey = new Uint8Array(decrypted);
+      const tenantKey = await this.keyBag.get("tenant", this.tenantId);
+      if (!tenantKey) {
+        throw new SymmetricKeyNotFoundError(`tenant:${this.tenantId}`);
+      }
+      const symmetricKey = tenantKey;
       this.decryptedTenantKeyCache = symmetricKey;
       return symmetricKey;
     } else {
       // Get the decrypted key from KeyBag
-      const decryptedKey = await this.keyBag.get(decryptionKeyId);
+      const decryptedKey = await this.keyBag.get("doc", decryptionKeyId);
       if (!decryptedKey) {
         throw new SymmetricKeyNotFoundError(decryptionKeyId);
       }

@@ -227,11 +227,8 @@ const factory = new BaseMindooTenantFactory(storeFactory, cryptoAdapter);
 const password = 'user-password';
 const user = await factory.createUserId('CN=alice/O=myorg', password);
 
-// 3. Create admin and tenant keys
-const signingKeyPair = await factory.createSigningKeyPair('signing-pw');
-const encryptionKeyPair = await factory.createEncryptionKeyPair('enc-pw');
-const tenantKey = await factory.createSymmetricEncryptedPrivateKey('tenant-pw');
-const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey('pi-pw');
+// 3. Create admin user (signing + encryption keys used for tenant administration)
+const adminUser = await factory.createUserId('CN=admin/O=myorg', 'admin-pw');
 
 // 4. Set up key bag (stores decrypted keys locally)
 const keyBag = new KeyBag(
@@ -239,14 +236,14 @@ const keyBag = new KeyBag(
   password,
   cryptoAdapter
 );
-await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, 'pi-pw');
+await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+await keyBag.createTenantKey('my-tenant');
 
 // 5. Open tenant
-const tenant = await factory.openTenantWithKeys(
+const tenant = await factory.openTenant(
   'my-tenant',
-  tenantKey, 'tenant-pw',
-  signingKeyPair.publicKey,
-  encryptionKeyPair.publicKey,
+  adminUser.userSigningKeyPair.publicKey,
+  adminUser.userEncryptionKeyPair.publicKey,
   user, password, keyBag
 );
 
@@ -254,7 +251,7 @@ const tenant = await factory.openTenantWithKeys(
 const directory = await tenant.openDirectory();
 await directory.registerUser(
   factory.toPublicUserId(user),
-  signingKeyPair.privateKey, 'signing-pw'
+  adminUser.userSigningKeyPair.privateKey, 'admin-pw'
 );
 
 // 7. Create and modify documents

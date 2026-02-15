@@ -69,7 +69,8 @@ Users are identified by cryptographic key pairs and registered in the tenant dir
 Both private keys are encrypted with a single password using KDF with different salts:
 - Signing key: salt = `"signing"`
 - Encryption key: salt = `"encryption"`
-- Named symmetric keys: salt = `"symmetric"`
+- Tenant symmetric keys: salt = `"tenant:v1:${tenantId}"`
+- Document symmetric keys: salt = `"doc:v1:${keyId}"`
 
 **Registration Flow:**
 1. User generates keys locally
@@ -224,17 +225,20 @@ Documents encrypted with named symmetric keys for restricted access:
 
 ### Key Distribution Flow
 
-1. Admin creates named key: `createSymmetricEncryptedPrivateKey(password)`
+1. Admin creates named key: `createDocEncryptionKey(keyId, password)`
 2. Encrypted key sent to authorized users (email, shared folder)
 3. Password communicated via secure channel (phone, in-person)
-4. User imports: `keyBag.decryptAndImportKey(keyId, encryptedKey, password)`
+4. User imports: `keyBag.decryptAndImportKey("doc", keyId, encryptedKey, password)`
 5. User can now decrypt documents using that key
 
 ### KeyBag
 
-Local storage for named keys:
+Canonical local storage for tenant and document symmetric keys:
 - Encrypted on disk using user's encryption key password (PBKDF2)
-- API: `get(keyId)`, `set(keyId, key, createdAt)`, `listKeys()`, `save()`, `load()`
+- Typed API: `get(type, id)`, `set(type, id, key, createdAt)`, `decryptAndImportKey(type, id, encryptedKey, password)`, `encryptAndExportKey(type, id, password)`
+- Type/id pairs:
+  - tenant default key: `("tenant", tenantId)`
+  - named document key: `("doc", keyId)`
 
 ### Server Access Control ($publicinfos Key)
 
@@ -315,20 +319,18 @@ This allows servers to validate signing keys **without knowing actual usernames*
 ### Creating a Tenant
 
 ```typescript
-// 1. Create required keys
-const adminSigningKey = await factory.createSigningKeyPair(adminPassword);
-const adminEncryptionKey = await factory.createEncryptionKeyPair(adminPassword);
-const publicinfosKey = await factory.createSymmetricEncryptedPrivateKey(keyPassword);
+// 1. Create admin user (signing + encryption keys used for tenant administration)
+const adminUser = await factory.createUserId("CN=admin/O=acme", adminPassword);
 
-// 2. Add $publicinfos to KeyBag
-keyBag.decryptAndImportKey("$publicinfos", publicinfosKey, keyPassword);
+// 2. Create required keys in KeyBag (tenant key + $publicinfos)
+await keyBag.createTenantKey(tenantId);
+await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
 
-// 3. Create tenant
-const tenant = await factory.createTenant(
+// 3. Open tenant
+const tenant = await factory.openTenant(
   tenantId,
-  adminSigningKey.publicKey,      // Ed25519
-  adminEncryptionKey.publicKey,   // RSA-OAEP  
-  tenantKeyPassword,
+  adminUser.userSigningKeyPair.publicKey,      // Ed25519
+  adminUser.userEncryptionKeyPair.publicKey,   // RSA-OAEP
   user,
   userPassword,
   keyBag

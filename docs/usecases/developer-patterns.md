@@ -490,7 +490,7 @@ class DatabaseMonitoring {
 class LocalDevelopment {
   async setupLocalEnvironment() {
     // Use in-memory stores for fast development
-    const storeFactory = new InMemoryAppendOnlyStoreFactory();
+    const storeFactory = new InMemoryContentAddressedStoreFactory();
     const tenant = await this.createTenantWithFactory(storeFactory);
     
     return tenant;

@@ -23,6 +23,7 @@ test.describe("MindooDB browser runtime", () => {
         BaseMindooTenantFactory,
         InMemoryContentAddressedStoreFactory,
         KeyBag,
+        PUBLIC_INFOS_KEY_ID,
         createCryptoAdapter,
       } = browserModule;
 
@@ -31,15 +32,16 @@ test.describe("MindooDB browser runtime", () => {
       const factory = new BaseMindooTenantFactory(storeFactory, cryptoAdapter);
 
       const user = await factory.createUserId("CN=browser-local-user/O=mindoo", "user-password");
+      const adminUser = await factory.createUserId("CN=admin/O=mindoo", "admin-password");
       const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "user-password");
-      const adminSigning = await factory.createSigningKeyPair("admin-password");
-      const adminEncryption = await factory.createEncryptionKeyPair("admin-password");
 
-      const tenant = await factory.createTenant(
-        "browser-local-tenant",
-        adminSigning.publicKey,
-        adminEncryption.publicKey,
-        "tenant-password",
+      const tenantId = "browser-local-tenant";
+      await keyBag.createTenantKey(tenantId);
+      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      const tenant = await factory.openTenant(
+        tenantId,
+        adminUser.userSigningKeyPair.publicKey,
+        adminUser.userEncryptionKeyPair.publicKey,
         user,
         "user-password",
         keyBag

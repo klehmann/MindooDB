@@ -5,6 +5,7 @@ import {
   ContentAddressedStoreFactory,
   SigningKeyPair,
   EncryptionKeyPair,
+  PUBLIC_INFOS_KEY_ID,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
@@ -43,90 +44,67 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   }
 
   /**
-   * Create a new tenant from scratch with a new tenant encryption key.
-   * 
-   * The administration public key must be created beforehand using createSigningKeyPair()
-   * and passed to this method.
-   * 
-   * The administration encryption public key must be created using createEncryptionKeyPair()
-   * and is used to encrypt sensitive data in the directory that only admins can decrypt.
-   * 
-   * @param tenantId The ID of the tenant
-   * @param administrationPublicKey The administration public key (Ed25519, PEM format) created using createSigningKeyPair()
-   * @param administrationEncryptionPublicKey The administration encryption public key (RSA-OAEP, PEM format) created using createEncryptionKeyPair()
-   * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption private key
-   * @param currentUser The current user's private user ID (required for tenant operations)
-   * @param currentUserPassword The password to decrypt the current user's private keys
-   * @param keyBag The KeyBag instance for storing and loading named encrypted keys
-   * @return The new tenant
+   * Opens an existing tenant.
    */
-  async createTenant(
+  async openTenant(
     tenantId: string,
-    administrationPublicKey: string,
-    administrationEncryptionPublicKey: string,
-    tenantEncryptionKeyPassword: string,
-    currentUser: PrivateUserId,
-    currentUserPassword: string,
-    keyBag: KeyBag
-  ): Promise<MindooTenant> {
-    this.logger.info(`Creating tenant: ${tenantId}`);
-
-    const subtle = this.cryptoAdapter.getSubtle();
-
-    // Generate tenant encryption key (AES-256)
-    const tenantEncryptionKey = await subtle.generateKey(
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      true, // extractable
-      ["encrypt", "decrypt"]
-    );
-
-    // Export the tenant encryption key material
-    const tenantKeyMaterial = await subtle.exportKey("raw", tenantEncryptionKey);
-    const tenantKeyBytes = new Uint8Array(tenantKeyMaterial);
-
-    // Encrypt the tenant encryption key with password
-    const encryptedTenantKey = await this.encryptPrivateKey(
-      tenantKeyBytes,
-      tenantEncryptionKeyPassword,
-      "default"
-    );
-
-    return this.openTenantWithKeys(
-      tenantId,
-      encryptedTenantKey,
-      tenantEncryptionKeyPassword,
-      administrationPublicKey,
-      administrationEncryptionPublicKey,
-      currentUser,
-      currentUserPassword,
-      keyBag
-    );
-  }
-
-  /**
-   * Opens an existing tenant with previously created keys.
-   */
-  async openTenantWithKeys(
-    tenantId: string,
-    tenantEncryptionPrivateKey: EncryptedPrivateKey,
-    tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
     administrationEncryptionPublicKey: string,
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
+  ): Promise<MindooTenant>;
+  async openTenant(
+    tenantId: string,
+    currentUser: PrivateUserId,
+    currentUserPassword: string,
+    keyBag: KeyBag,
+  ): Promise<MindooTenant>;
+  async openTenant(
+    tenantId: string,
+    arg2: string | PrivateUserId,
+    arg3: string | PrivateUserId,
+    arg4: string | PrivateUserId | KeyBag,
+    arg5?: PrivateUserId | string | KeyBag,
+    arg6?: string | KeyBag,
+    arg7?: KeyBag,
   ): Promise<MindooTenant> {
     this.logger.info(`Opening tenant: ${tenantId}`);
+
+    let administrationPublicKey: string;
+    let administrationEncryptionPublicKey: string;
+    let currentUser: PrivateUserId;
+    let currentUserPassword: string;
+    let keyBag: KeyBag;
+
+    if (typeof arg2 === "string") {
+      administrationPublicKey = arg2;
+      administrationEncryptionPublicKey = arg3 as string;
+      currentUser = arg4 as PrivateUserId;
+      currentUserPassword = arg5 as string;
+      keyBag = arg6 as KeyBag;
+    } else {
+      // Backward-compatible short form for internal tests
+      currentUser = arg2;
+      currentUserPassword = arg3 as string;
+      keyBag = arg4 as KeyBag;
+      administrationPublicKey = currentUser.userSigningKeyPair.publicKey;
+      administrationEncryptionPublicKey = currentUser.userEncryptionKeyPair.publicKey;
+    }
+
+    if (administrationPublicKey === currentUser.userSigningKeyPair.publicKey) {
+      throw new Error(
+        "Invalid openTenant configuration: currentUser must not be the administration identity. " +
+          "Use a regular user for tenant operations and keep admin credentials for privileged directory operations only."
+      );
+    }
+
+    await this.assertRequiredKeysInKeyBag(tenantId, keyBag);
 
     const tenantLogger = this.logger.createChild(`Tenant:${tenantId}`);
     const tenant = new BaseMindooTenant(
       this,
       tenantId,
-      tenantEncryptionPrivateKey,
-      tenantEncryptionKeyPassword,
       administrationPublicKey,
       administrationEncryptionPublicKey,
       currentUser,
@@ -238,7 +216,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log('[createUserId] Step 9: Creating PrivateUserId object...');
     const privateUserId: PrivateUserId = {
       username,
-      administrationSignature: "", // Will be set when user is registered by an admin
       userSigningKeyPair: {
         publicKey: signingPublicKey,
         privateKey: encryptedSigningKey,
@@ -261,7 +238,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   toPublicUserId(privateUserId: PrivateUserId): PublicUserId {
     return {
       username: privateUserId.username,
-      administrationSignature: privateUserId.administrationSignature,
       userSigningPublicKey: privateUserId.userSigningKeyPair.publicKey,
       userEncryptionPublicKey: privateUserId.userEncryptionKeyPair.publicKey,
     };
@@ -302,38 +278,6 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       publicKey,
       privateKey: encryptedKey,
     };
-  }
-
-  /**
-   * Creates a new encrypted symmetric key (AES-256) for document encryption.
-   * Symmetric keys are shared secrets - anyone with the key can both encrypt and decrypt.
-   * For user-to-user encryption where only the recipient can decrypt, use createEncryptionKeyPair() instead.
-   */
-  async createSymmetricEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey> {
-    this.logger.debug(`Creating encrypted symmetric key`);
-
-    const subtle = this.cryptoAdapter.getSubtle();
-
-    // Generate a new AES-256 key
-    const key = await subtle.generateKey(
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      true, // extractable
-      ["encrypt", "decrypt"]
-    );
-
-    // Export the key material
-    const keyMaterial = await subtle.exportKey("raw", key);
-    const keyBytes = new Uint8Array(keyMaterial);
-
-    // Encrypt the key material using the shared helper
-    // Use "default" as the salt string to match how tenant encryption keys are decrypted
-    const encryptedKey = await this.encryptPrivateKey(keyBytes, password, "default");
-
-    this.logger.debug(`Created encrypted symmetric key`);
-    return encryptedKey;
   }
 
   /**
@@ -483,6 +427,24 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     const totalTime = Date.now() - startTime;
     console.log(`[encryptPrivateKey] ✓ Encryption completed in ${totalTime}ms total`);
     return encryptedKey;
+  }
+
+  private async assertRequiredKeysInKeyBag(tenantId: string, keyBag: KeyBag): Promise<void> {
+    const tenantKey = await keyBag.get("tenant", tenantId);
+    if (!tenantKey) {
+      throw new Error(
+        `Missing required tenant key in KeyBag for tenant "${tenantId}". ` +
+          `Create/import it first with keyBag.createTenantKey("${tenantId}") or keyBag.decryptAndImportKey("tenant", "${tenantId}", encryptedTenantKey, password).`
+      );
+    }
+
+    const publicInfosKey = await keyBag.get("doc", PUBLIC_INFOS_KEY_ID);
+    if (!publicInfosKey) {
+      throw new Error(
+        `Missing required directory access key in KeyBag: ("doc", "${PUBLIC_INFOS_KEY_ID}"). ` +
+          `Create/import it first with keyBag.createDocKey("${PUBLIC_INFOS_KEY_ID}") or keyBag.decryptAndImportKey("doc", "${PUBLIC_INFOS_KEY_ID}", encryptedPublicInfosKey, password).`
+      );
+    }
   }
 
   /**

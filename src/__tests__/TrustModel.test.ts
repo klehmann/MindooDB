@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, SigningKeyPair, MindooDB, MindooTenantDirectory, EncryptionKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDB, MindooTenantDirectory, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooDB } from "../core/BaseMindooDB";
@@ -20,8 +20,6 @@ describe("Trust Model Security", () => {
   let adminUser: PrivateUserId;
   let adminUserPassword: string;
   let adminKeyBag: KeyBag;
-  let adminSigningKeyPair: SigningKeyPair;
-  let adminSigningKeyPassword: string;
   let tenant: MindooTenant;
   let directory: MindooTenantDirectory;
   let trustedUser: PrivateUserId;
@@ -33,25 +31,12 @@ describe("Trust Model Security", () => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     
-    // Create admin user
+    // Create admin user (signing + encryption keys used for tenant administration)
     adminUserPassword = "adminpass123";
     adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
     
-    // Create admin signing key pair (administration key)
-    adminSigningKeyPassword = "adminsigningpass123";
-    adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
-    
-    // Create admin encryption key pair (for encrypting usernames in directory)
-    const adminEncryptionKeyPassword = "adminencpass123";
-    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair(adminEncryptionKeyPassword);
-    
     // Create tenant encryption key
-    const tenantEncryptionKeyPassword = "tenantkeypass123";
-    const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
-    
-    // Create $publicinfos symmetric key (required for all servers/clients)
-    const publicInfosKeyPassword = "publicinfospass123";
-    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey(publicInfosKeyPassword);
+    const tenantId = "trust-model-test-tenant";
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -61,20 +46,15 @@ describe("Trust Model Security", () => {
       cryptoAdapter
     );
     
-    // Add $publicinfos key to KeyBag
-    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, publicInfosKeyPassword);
-    
-    // Create tenant
-    tenant = await factory.openTenantWithKeys(
-      "trust-model-test-tenant",
-      tenantEncryptionKey,
-      tenantEncryptionKeyPassword,
-      adminSigningKeyPair.publicKey,
-      adminEncryptionKeyPair.publicKey,
-      adminUser,
-      adminUserPassword,
-      adminKeyBag
-    );
+    await adminKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await adminKeyBag.createTenantKey(tenantId);
+
+    const currentUser = await factory.createUserId("CN=currentuser/O=testtenant", "currentpass123");
+    const currentUserKeyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "currentpass123", cryptoAdapter);
+    await currentUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+    await currentUserKeyBag.set("tenant", tenantId, (await adminKeyBag.get("tenant", tenantId))!);
+
+    tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "currentpass123", currentUserKeyBag);
     
     // Open directory
     directory = await tenant.openDirectory();
@@ -83,8 +63,8 @@ describe("Trust Model Security", () => {
     const publicAdminUser = factory.toPublicUserId(adminUser);
     await directory.registerUser(
       publicAdminUser,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
     
     // Create and register a trusted user
@@ -93,8 +73,8 @@ describe("Trust Model Security", () => {
     const publicTrustedUser = factory.toPublicUserId(trustedUser);
     await directory.registerUser(
       publicTrustedUser,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
     
     // Create an untrusted user (NOT registered in directory)
@@ -143,30 +123,62 @@ describe("Trust Model Security", () => {
     }, 30000);
 
     it("should throw error when non-admin user tries to create document in directory", async () => {
-      // Get the directory DB (admin-only mode)
-      const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
+      // Open tenant with trustedUser as current user (admin keys from adminUser, but operating as trustedUser)
+      const trustedUserKeyBag = new KeyBag(
+        trustedUser.userEncryptionKeyPair.privateKey,
+        trustedUserPassword,
+        new NodeCryptoAdapter()
+      );
+      await trustedUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+      await trustedUserKeyBag.set("tenant", "trust-model-test-tenant", (await adminKeyBag.get("tenant", "trust-model-test-tenant"))!);
+      const tenantAsTrustedUser = await factory.openTenant(
+        "trust-model-test-tenant",
+        adminUser.userSigningKeyPair.publicKey,
+        adminUser.userEncryptionKeyPair.publicKey,
+        trustedUser,
+        trustedUserPassword,
+        trustedUserKeyBag
+      );
+      const directoryDB = await tenantAsTrustedUser.openDB("directory") as BaseMindooDB;
       
-      // Try to create a document without using the admin signing key
-      // This should fail because the current user (adminUser) is not the admin key
-      // The admin signing key is different from the admin user's signing key
+      // Try to create a document - should fail because current user (trustedUser) is not the admin
       await expect(directoryDB.createDocument()).rejects.toThrow(
         "Admin-only database: only the admin key can modify data"
       );
     }, 30000);
 
     it("should throw error when non-admin user tries to change document in directory", async () => {
-      // Get the directory DB (admin-only mode)
       const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
       
       // First, create a document using the admin signing key (this should succeed)
       const doc = await directoryDB.createDocumentWithSigningKey(
-        adminSigningKeyPair,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair,
+        adminUserPassword
       );
       
-      // Now try to change the document without using the admin signing key
-      // This should fail
-      await expect(directoryDB.changeDoc(doc, (d) => {
+      // Open tenant with trustedUser as current user for the change attempt
+      const trustedUserKeyBag = new KeyBag(
+        trustedUser.userEncryptionKeyPair.privateKey,
+        trustedUserPassword,
+        new NodeCryptoAdapter()
+      );
+      await trustedUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+      await trustedUserKeyBag.set("tenant", "trust-model-test-tenant", (await adminKeyBag.get("tenant", "trust-model-test-tenant"))!);
+      const tenantAsTrustedUser = await factory.openTenant(
+        "trust-model-test-tenant",
+        adminUser.userSigningKeyPair.publicKey,
+        adminUser.userEncryptionKeyPair.publicKey,
+        trustedUser,
+        trustedUserPassword,
+        trustedUserKeyBag
+      );
+      const directoryDBAsTrusted = await tenantAsTrustedUser.openDB("directory") as BaseMindooDB;
+      // Pull directory data from admin's store so we have the doc
+      await directoryDBAsTrusted.pullChangesFrom(directoryDB.getStore());
+      const docAsTrusted = await directoryDBAsTrusted.getDocument(doc.getId());
+      
+      // Try to change without admin signing key - should fail
+      await expect(directoryDBAsTrusted.changeDoc(docAsTrusted, (d) => {
         d.getData().testField = "test value";
       })).rejects.toThrow(
         "Admin-only database: only the admin key can modify data"
@@ -174,18 +186,36 @@ describe("Trust Model Security", () => {
     }, 30000);
 
     it("should throw error when non-admin user tries to delete document in directory", async () => {
-      // Get the directory DB (admin-only mode)
       const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
       
       // First, create a document using the admin signing key (this should succeed)
       const doc = await directoryDB.createDocumentWithSigningKey(
-        adminSigningKeyPair,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair,
+        adminUserPassword
       );
       
-      // Now try to delete the document without using the admin signing key
-      // This should fail
-      await expect(directoryDB.deleteDocument(doc.getId())).rejects.toThrow(
+      // Open tenant with trustedUser as current user for the delete attempt
+      const trustedUserKeyBag = new KeyBag(
+        trustedUser.userEncryptionKeyPair.privateKey,
+        trustedUserPassword,
+        new NodeCryptoAdapter()
+      );
+      await trustedUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+      await trustedUserKeyBag.set("tenant", "trust-model-test-tenant", (await adminKeyBag.get("tenant", "trust-model-test-tenant"))!);
+      const tenantAsTrustedUser = await factory.openTenant(
+        "trust-model-test-tenant",
+        adminUser.userSigningKeyPair.publicKey,
+        adminUser.userEncryptionKeyPair.publicKey,
+        trustedUser,
+        trustedUserPassword,
+        trustedUserKeyBag
+      );
+      const directoryDBAsTrusted = await tenantAsTrustedUser.openDB("directory") as BaseMindooDB;
+      // Pull directory data from admin's store so we have the doc
+      await directoryDBAsTrusted.pullChangesFrom(directoryDB.getStore());
+      
+      // Try to delete without admin signing key - should fail
+      await expect(directoryDBAsTrusted.deleteDocument(doc.getId())).rejects.toThrow(
         "Admin-only database: only the admin key can modify data"
       );
     }, 30000);
@@ -196,15 +226,15 @@ describe("Trust Model Security", () => {
       
       // Create a document using the admin signing key - should succeed
       const doc = await directoryDB.createDocumentWithSigningKey(
-        adminSigningKeyPair,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair,
+        adminUserPassword
       );
       expect(doc.getId()).toBeDefined();
       
       // Change the document using the admin signing key - should succeed
       await directoryDB.changeDocWithSigningKey(doc, (d) => {
         d.getData().testField = "admin created this";
-      }, adminSigningKeyPair, adminSigningKeyPassword);
+      }, adminUser.userSigningKeyPair, adminUserPassword);
       
       // Verify the change was applied
       const reloadedDoc = await directoryDB.getDocument(doc.getId());
@@ -213,8 +243,8 @@ describe("Trust Model Security", () => {
       // Delete the document using the admin signing key - should succeed
       await directoryDB.deleteDocumentWithSigningKey(
         doc.getId(),
-        adminSigningKeyPair,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair,
+        adminUserPassword
       );
       
       // Verify the document is deleted
@@ -233,21 +263,11 @@ describe("Trust Model Security", () => {
         new NodeCryptoAdapter()
       );
       
-      const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey("tenantkeypass");
-      const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass");
-      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
-      await untrustedUserKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
-      
-      const untrustedTenant = await factory.openTenantWithKeys(
-        "trust-model-test-tenant", // Same tenant ID
-        tenantEncryptionKey,
-        "tenantkeypass",
-        adminSigningKeyPair.publicKey,
-        adminEncryptionKeyPair.publicKey,
-        untrustedUser, // Untrusted user as current user
-        untrustedUserPassword,
-        untrustedUserKeyBag
-      );
+      const untrustedTenantId = "trust-model-test-tenant";
+      await untrustedUserKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await untrustedUserKeyBag.createTenantKey(untrustedTenantId);
+      const untrustedTenant = await factory.openTenant(untrustedTenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, untrustedUser, // Untrusted user as current user
+        untrustedUserPassword, untrustedUserKeyBag);
       
       // Open the same store (different tenant instance, same underlying store)
       // Note: In a real scenario, the stores would be shared via sync
@@ -283,29 +303,18 @@ describe("Trust Model Security", () => {
         new NodeCryptoAdapter()
       );
       
-      const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey("tenantkeypass");
-      const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass");
-      const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
-      await trustedUserKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
-      
-      const trustedTenant = await factory.openTenantWithKeys(
-        "trust-model-test-tenant-2",
-        tenantEncryptionKey,
-        "tenantkeypass",
-        adminSigningKeyPair.publicKey,
-        adminEncryptionKeyPair.publicKey,
-        trustedUser,
-        trustedUserPassword,
-        trustedUserKeyBag
-      );
+      const trustedTenantId = "trust-model-test-tenant-2";
+      await trustedUserKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await trustedUserKeyBag.createTenantKey(trustedTenantId);
+      const trustedTenant = await factory.openTenant(trustedTenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, trustedUser, trustedUserPassword, trustedUserKeyBag);
       
       // Register the trusted user in this tenant's directory too
       const trustedDirectory = await trustedTenant.openDirectory();
       const publicTrustedUser = factory.toPublicUserId(trustedUser);
       await trustedDirectory.registerUser(
         publicTrustedUser,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const trustedDB = await trustedTenant.openDB("trusted-db");
@@ -339,8 +348,8 @@ describe("Trust Model Security", () => {
       // Register the user
       await directory.registerUser(
         publicRevokedUser,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify they are initially trusted
@@ -353,8 +362,8 @@ describe("Trust Model Security", () => {
       await directory.revokeUser(
         publicRevokedUser.username,
         false, // requestDataWipe
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify they are no longer trusted
@@ -368,7 +377,7 @@ describe("Trust Model Security", () => {
   describe("Trust Chain Validation", () => {
     it("should always trust the administration key", async () => {
       const isAdminKeyValid = await directory.validatePublicSigningKey(
-        adminSigningKeyPair.publicKey
+        adminUser.userSigningKeyPair.publicKey
       );
       
       expect(isAdminKeyValid).toBe(true);

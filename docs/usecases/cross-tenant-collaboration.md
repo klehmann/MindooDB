@@ -128,7 +128,7 @@ await syncFilteredData(
 
 ```typescript
 // Create collaboration key
-const collaborationKey = await tenantFactory.createSymmetricEncryptedPrivateKey(
+const collaborationKey = await tenantFactory.createDocEncryptionKey(
   "collab-password-xyz"
 );
 
@@ -297,7 +297,7 @@ class ScheduledSync {
 
 ```typescript
 // Organization A creates limited-access tenant
-const limitedTenant = await tenantFactory.createTenant({
+const limitedTenant = await tenantFactory.openTenant({
   tenantId: "limited-collab-tenant",
   // Different encryption key than main tenant
   tenantEncryptionKeyPassword: "different-password"

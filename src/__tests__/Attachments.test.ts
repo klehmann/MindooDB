@@ -1,66 +1,40 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, SigningKeyPair, AttachmentReference, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, AttachmentReference, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("Attachments", () => {
   let factory: BaseMindooTenantFactory;
   let storeFactory: InMemoryContentAddressedStoreFactory;
+  let adminUser: PrivateUserId;
+  let adminUserPassword: string;
   let currentUser: PrivateUserId;
   let currentUserPassword: string;
   let keyBag: KeyBag;
   let tenant: MindooTenant;
   let db: MindooDB;
-  let adminSigningKeyPair: SigningKeyPair;
 
   beforeEach(async () => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
+    adminUserPassword = "adminpass123";
+    adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
     currentUserPassword = "userpassword123";
     currentUser = await factory.createUserId("CN=testuser/O=testtenant", currentUserPassword);
-    
-    // Create KeyBag with user's encryption key
-    keyBag = new KeyBag(
-      currentUser.userEncryptionKeyPair.privateKey,
-      currentUserPassword,
-      factory.getCryptoAdapter()
-    );
+    keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, currentUserPassword, factory.getCryptoAdapter());
 
-    // Create admin key pairs
-    const administrationKeyPassword = "adminpass123";
-    adminSigningKeyPair = await factory.createSigningKeyPair(administrationKeyPassword);
-    const adminEncKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
-    
-    // Create and add $publicinfos key to KeyBag
-    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass");
-    await keyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass");
-
-    // Create tenant
+    await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
     const tenantId = "test-tenant-attachments";
-    const tenantEncryptionKeyPassword = "tenantkeypass123";
-    tenant = await factory.createTenant(
-      tenantId,
-      adminSigningKeyPair.publicKey,
-      adminEncKeyPair.publicKey,
-      tenantEncryptionKeyPassword,
-      currentUser,
-      currentUserPassword,
-      keyBag
-    );
+    await keyBag.createTenantKey(tenantId);
+    tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
 
-    // Register the current user in the directory
     const directory = await tenant.openDirectory();
     const publicUser = factory.toPublicUserId(currentUser);
-    await directory.registerUser(
-      publicUser,
-      adminSigningKeyPair.privateKey,
-      administrationKeyPassword
-    );
+    await directory.registerUser(publicUser, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
 
-    // Open database
     db = await tenant.openDB("test-db");
-  }, 30000); // Increase timeout for crypto operations
+  }, 30000);
 
   describe("addAttachment", () => {
     it("should add attachment within changeDoc", async () => {

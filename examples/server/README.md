@@ -191,23 +191,25 @@ Required for server-to-server sync. Contains the server's identity:
 // On the client (admin)
 const factory = new BaseMindooTenantFactory(cryptoAdapter, storeFactory);
 
-// Create admin keys
-const adminSigningKey = await factory.createSigningKeyPair("admin-password");
-const adminEncryptionKey = await factory.createEncryptionKeyPair("admin-password");
+// Create admin user (signing + encryption keys used for tenant administration)
+const adminUser = await factory.createUserId("CN=admin/O=my-tenant", "admin-password");
 
 // Create user
-const user = await factory.createUserId("alice", "alice-password");
+const userPassword = "alice-password";
+const user = await factory.createUserId("CN=alice/O=my-tenant", userPassword);
 const publicUser = factory.toPublicUserId(user);
 
 // Create tenant locally
-const keyBag = new KeyBag(cryptoAdapter);
-const tenant = await factory.createTenant(
-  "my-tenant",
-  adminSigningKey.publicKey,
-  adminEncryptionKey.publicKey,
-  "tenant-key-password",
+const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, userPassword, cryptoAdapter);
+const tenantId = "my-tenant";
+await keyBag.createTenantKey(tenantId);
+await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+const tenant = await factory.openTenant(
+  tenantId,
+  adminUser.userSigningKeyPair.publicKey,
+  adminUser.userEncryptionKeyPair.publicKey,
   user,
-  "alice-password",
+  userPassword,
   keyBag
 );
 ```
@@ -221,12 +223,12 @@ await fetch("http://localhost:3000/admin/register-tenant", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     tenantId: "my-tenant",
-    adminSigningPublicKey: adminSigningKey.publicKey,
-    adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+    adminSigningPublicKey: adminUser.userSigningKeyPair.publicKey,
+    adminEncryptionPublicKey: adminUser.userEncryptionKeyPair.publicKey,
     users: [{
       username: publicUser.username,
-      signingPublicKey: publicUser.signingPublicKey,
-      encryptionPublicKey: publicUser.encryptionPublicKey,
+      signingPublicKey: publicUser.userSigningPublicKey,
+      encryptionPublicKey: publicUser.userEncryptionPublicKey,
     }],
   }),
 });

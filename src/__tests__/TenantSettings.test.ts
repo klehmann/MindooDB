@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDoc, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDoc, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -10,33 +10,16 @@ describe("Tenant and DB Settings", () => {
   let adminUser: PrivateUserId;
   let adminUserPassword: string;
   let adminKeyBag: KeyBag;
-  let adminSigningKeyPair: SigningKeyPair;
-  let adminSigningKeyPassword: string;
   let tenant: MindooTenant;
   let tenantId: string;
-  let tenantEncryptionKeyPassword: string;
 
   beforeEach(async () => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     
-    // Create admin user
+    // Create admin user (signing + encryption keys used for tenant administration)
     adminUserPassword = "adminpass123";
     adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
-    
-    // Create admin signing key pair (administration key)
-    adminSigningKeyPassword = "adminsigningpass123";
-    adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
-    
-    // Create admin encryption key pair (for encrypting usernames in directory)
-    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
-    
-    // Create tenant encryption key
-    tenantEncryptionKeyPassword = "tenantkeypass123";
-    const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
-    
-    // Create $publicinfos symmetric key (required for all servers/clients)
-    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -46,29 +29,22 @@ describe("Tenant and DB Settings", () => {
       cryptoAdapter
     );
     
-    // Add $publicinfos key to KeyBag
-    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
-    
-    // Create tenant
     tenantId = "test-tenant-settings";
-    tenant = await factory.openTenantWithKeys(
-      tenantId,
-      tenantEncryptionKey,
-      tenantEncryptionKeyPassword,
-      adminSigningKeyPair.publicKey,
-      adminEncryptionKeyPair.publicKey,
-      adminUser,
-      adminUserPassword,
-      adminKeyBag
-    );
+    await adminKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await adminKeyBag.createTenantKey(tenantId);
+    const currentUser = await factory.createUserId("CN=currentuser/O=testtenant", "currentpass123");
+    const currentUserKeyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "currentpass123", cryptoAdapter);
+    await currentUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+    await currentUserKeyBag.set("tenant", tenantId, (await adminKeyBag.get("tenant", tenantId))!);
+    tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "currentpass123", currentUserKeyBag);
     
     // Register the admin user in the directory so their key is trusted
     const directory = await tenant.openDirectory();
     const publicAdminUser = factory.toPublicUserId(adminUser);
     await directory.registerUser(
       publicAdminUser,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
   }, 30000);
 
@@ -90,8 +66,8 @@ describe("Tenant and DB Settings", () => {
           data.maxTotalAttachmentSize = 10 * 1024 * 1024 * 1024; // 10GB
           data.tokenExpirationMinutes = 15;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const settings = await directory.getTenantSettings();
@@ -113,8 +89,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxAttachmentSizePerFile = 50 * 1024 * 1024; // 50MB
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const firstSettings = await directory.getTenantSettings();
@@ -127,8 +103,8 @@ describe("Tenant and DB Settings", () => {
           data.maxAttachmentSizePerFile = 200 * 1024 * 1024; // 200MB
           data.maxTotalAttachmentSize = 20 * 1024 * 1024 * 1024; // 20GB
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const updatedSettings = await directory.getTenantSettings();
@@ -151,8 +127,8 @@ describe("Tenant and DB Settings", () => {
           data.form = "wrongform"; // Try to change it
           data.maxAttachmentSizePerFile = 100 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const settings = await directory.getTenantSettings();
@@ -172,8 +148,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxAttachmentSizePerFile = 100 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Get settings multiple times - should use cache
@@ -206,8 +182,8 @@ describe("Tenant and DB Settings", () => {
           data.maxDocuments = 10000;
           data.maxChangesPerDocument = 100000;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const settings = await directory.getDBSettings(testDbId);
@@ -231,8 +207,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxDocumentSize = 1 * 1024 * 1024; // 1MB
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const firstSettings = await directory.getDBSettings(testDbId);
@@ -246,8 +222,8 @@ describe("Tenant and DB Settings", () => {
           data.maxDocumentSize = 10 * 1024 * 1024; // 10MB
           data.maxDocuments = 50000;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const updatedSettings = await directory.getDBSettings(testDbId);
@@ -273,8 +249,8 @@ describe("Tenant and DB Settings", () => {
           data.dbid = "wrong-db-id"; // Try to change it
           data.maxDocumentSize = 5 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const settings = await directory.getDBSettings(testDbId);
@@ -298,8 +274,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxDocumentSize = 1 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Create settings for second DB
@@ -309,8 +285,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxDocumentSize = 2 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const settings1 = await directory.getDBSettings(dbId1);
@@ -336,8 +312,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxDocumentSize = 5 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Get settings multiple times - should use cache
@@ -359,8 +335,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxAttachmentSizePerFile = 100 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Get settings (populates cache)
@@ -374,8 +350,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxAttachmentSizePerFile = 200 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Get settings again - should reflect updated value
@@ -394,8 +370,8 @@ describe("Tenant and DB Settings", () => {
           data.maxAttachmentSizePerFile = 100 * 1024 * 1024;
           data.maxTotalAttachmentSize = 10 * 1024 * 1024 * 1024;
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const settingsDoc = await directory.getTenantSettings();
@@ -408,8 +384,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.maxAttachmentSizePerFile = 150 * 1024 * 1024; // Update field 1
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       await directory.changeTenantSettings(
@@ -417,8 +393,8 @@ describe("Tenant and DB Settings", () => {
           const data = doc.getData();
           data.tokenExpirationMinutes = 30; // Update different field
         },
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Both changes should be merged

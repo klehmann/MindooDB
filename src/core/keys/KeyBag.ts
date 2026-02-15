@@ -1,4 +1,5 @@
 import { EncryptedPrivateKey } from "../types";
+import { KeyType, buildKeyDerivationSalt, buildScopedKeyId } from "./KeyContext";
 import { CryptoAdapter } from "../crypto/CryptoAdapter";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "../crypto/pbkdf2Iterations";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
@@ -47,8 +48,9 @@ export class KeyBag {
    * @param keyId The ID of the key to read
    * @return The exported key, or null if not found
    */
-  async get(keyId: string): Promise<Uint8Array | null> {
-    const keyEntries = this.keys.get(keyId);
+  async get(type: KeyType, id: string): Promise<Uint8Array | null> {
+    const scopedKeyId = buildScopedKeyId(type, id);
+    const keyEntries = this.keys.get(scopedKeyId);
     if (!keyEntries || keyEntries.length === 0) {
       return null;
     }
@@ -70,8 +72,9 @@ export class KeyBag {
    * @param keyId The ID of the keys to read
    * @return Array of keys sorted by createdAt (newest first), or empty array if not found
    */
-  async getAllKeys(keyId: string): Promise<Uint8Array[]> {
-    const keyEntries = this.keys.get(keyId);
+  async getAllKeys(type: KeyType, id: string): Promise<Uint8Array[]> {
+    const scopedKeyId = buildScopedKeyId(type, id);
+    const keyEntries = this.keys.get(scopedKeyId);
     if (!keyEntries || keyEntries.length === 0) {
       return [];
     }
@@ -94,51 +97,69 @@ export class KeyBag {
    * @param key The key bytes
    * @param createdAt Optional creation timestamp (milliseconds since Unix epoch)
    */
-  async set(keyId: string, key: Uint8Array, createdAt?: number): Promise<void> {
-    const keyEntries = this.keys.get(keyId) || [];
+  async set(type: KeyType, id: string, key: Uint8Array, createdAt?: number): Promise<void> {
+    const scopedKeyId = buildScopedKeyId(type, id);
+    const keyEntries = this.keys.get(scopedKeyId) || [];
     keyEntries.push({ key, createdAt });
-    this.keys.set(keyId, keyEntries);
+    this.keys.set(scopedKeyId, keyEntries);
+  }
+
+  /**
+   * Creates a new tenant symmetric key (AES-256) and stores it directly in this KeyBag.
+   * This avoids temporary password-wrapped key blobs when the key is only needed locally.
+   */
+  async createTenantKey(tenantId: string, createdAt?: number): Promise<void> {
+    await this.createAndStoreSymmetricKey("tenant", tenantId, createdAt);
+  }
+
+  /**
+   * Creates a new document symmetric key (AES-256) and stores it directly in this KeyBag.
+   * This avoids temporary password-wrapped key blobs when the key is only needed locally.
+   */
+  async createDocKey(keyId: string, createdAt?: number): Promise<void> {
+    await this.createAndStoreSymmetricKey("doc", keyId, createdAt);
   }
 
   /**
    * Decrypts an encrypted private key with the given password and imports it into the key bag.
    * Adds the key to the array of keys for this keyId (supports key rotation).
    * 
-   * @param keyId The ID to store the decrypted key under
+   * @param type The key type ("tenant" | "doc")
+   * @param id The key identifier (tenantId or doc keyId)
    * @param key The encrypted private key to decrypt
    * @param password The password to decrypt the key
-   * @param saltString Optional salt string for key derivation. Defaults to "default".
-   *                   Use "default" for keys created by createSymmetricEncryptedPrivateKey.
-   *                   Keys exported via encryptAndExportKey use keyId as salt, so pass keyId explicitly.
    * @return A promise that resolves when the key is decrypted and stored
    */
-  async decryptAndImportKey(keyId: string, key: EncryptedPrivateKey, password: string, saltString?: string): Promise<void> {
-    const salt = saltString ?? "default";
+  async decryptAndImportKey(type: KeyType, id: string, key: EncryptedPrivateKey, password: string): Promise<void> {
+    const salt = buildKeyDerivationSalt(type, id);
+    const scopedKeyId = buildScopedKeyId(type, id);
     const decryptedKeyBytes = await this.decryptPrivateKey(key, password, salt);
-    const keyEntries = this.keys.get(keyId) || [];
+    const keyEntries = this.keys.get(scopedKeyId) || [];
     keyEntries.push({ 
       key: new Uint8Array(decryptedKeyBytes),
       createdAt: key.createdAt 
     });
-    this.keys.set(keyId, keyEntries);
+    this.keys.set(scopedKeyId, keyEntries);
   }
 
   /**
    * Encrypts a key from the key bag with the given password and exports it as an EncryptedPrivateKey.
    * Returns the newest key (based on createdAt) or the first key if no timestamps are available.
    * 
-   * @param keyId The ID of the key to encrypt and export
+   * @param type The key type ("tenant" | "doc")
+   * @param id The key identifier (tenantId or doc keyId)
    * @param password The password to encrypt the key with
    * @return A promise that resolves to the encrypted private key, or null if the key is not found
    */
-  async encryptAndExportKey(keyId: string, password: string): Promise<EncryptedPrivateKey | null> {
-    const key = await this.get(keyId);
+  async encryptAndExportKey(type: KeyType, id: string, password: string): Promise<EncryptedPrivateKey | null> {
+    const scopedKeyId = buildScopedKeyId(type, id);
+    const key = await this.get(type, id);
     if (!key) {
       return null;
     }
     
     // Get the createdAt timestamp from the newest key entry
-    const keyEntries = this.keys.get(keyId);
+    const keyEntries = this.keys.get(scopedKeyId);
     if (!keyEntries || keyEntries.length === 0) {
       return null;
     }
@@ -153,7 +174,11 @@ export class KeyBag {
     const createdAt = sorted[0].createdAt;
     
     // Encrypt the key using the same pattern as decryptPrivateKey
-    const encryptedKey = await this.encryptPrivateKey(key, password, keyId);
+    const encryptedKey = await this.encryptPrivateKey(
+      key,
+      password,
+      buildKeyDerivationSalt(type, id)
+    );
     
     // Include the createdAt timestamp if available
     if (createdAt !== undefined) {
@@ -166,11 +191,12 @@ export class KeyBag {
   /**
    * Deletes all keys for a given keyId from the key bag.
    * 
-   * @param keyId The ID of the keys to delete
+   * @param type The key type ("tenant" | "doc")
+   * @param id The key identifier (tenantId or doc keyId)
    * @return A promise that resolves when the keys are deleted
    */
-  async deleteKey(keyId: string): Promise<void> {
-    this.keys.delete(keyId);
+  async deleteKey(type: KeyType, id: string): Promise<void> {
+    this.keys.delete(buildScopedKeyId(type, id));
   }
 
   /**
@@ -180,6 +206,32 @@ export class KeyBag {
    */
   async listKeys(): Promise<string[]> {
     return Array.from(this.keys.keys());
+  }
+
+  /**
+   * Creates an in-memory clone of this KeyBag.
+   * The clone contains deep-copied key material and independent key maps.
+   */
+  clone(): KeyBag {
+    const clonedUserEncryptionKey: EncryptedPrivateKey = { ...this.userEncryptionKey };
+    const cloned = new KeyBag(
+      clonedUserEncryptionKey,
+      this.userEncryptionKeyPassword,
+      this.cryptoAdapter,
+      this.logger
+    );
+
+    cloned.keys = new Map(
+      Array.from(this.keys.entries()).map(([scopedKeyId, entries]) => [
+        scopedKeyId,
+        entries.map((entry) => ({
+          key: new Uint8Array(entry.key),
+          createdAt: entry.createdAt,
+        })),
+      ])
+    );
+
+    return cloned;
   }
 
   /**
@@ -450,6 +502,27 @@ export class KeyBag {
     );
 
     return decrypted;
+  }
+
+  /**
+   * Generates a new AES-256 key and stores raw key bytes in KeyBag.
+   */
+  private async createAndStoreSymmetricKey(
+    type: KeyType,
+    id: string,
+    createdAt?: number
+  ): Promise<void> {
+    const subtle = this.cryptoAdapter.getSubtle();
+    const key = await subtle.generateKey(
+      {
+        name: "AES-GCM",
+        length: 256,
+      },
+      true,
+      ["encrypt", "decrypt"]
+    );
+    const keyMaterial = await subtle.exportKey("raw", key);
+    await this.set(type, id, new Uint8Array(keyMaterial), createdAt);
   }
 
   /**

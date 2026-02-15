@@ -40,7 +40,7 @@ Document-level access control in MindooDB works through named encryption keys. W
 // Administrator: Create and distribute a named key for sensitive documents
 const tenantFactory = tenant.getFactory();
 const keyPassword = generateSecurePassword();
-const encryptedKey = await tenantFactory.createSymmetricEncryptedPrivateKey(keyPassword);
+const encryptedKey = await tenantFactory.createDocEncryptionKey(keyPassword);
 
 // Import the key into the KeyBag with a meaningful ID
 const keyBag = tenant.getKeyBag();
@@ -91,7 +91,7 @@ async function setupSecurityKeys(adminTenant: MindooTenant) {
   // Create keys for each level (store passwords securely for distribution)
   for (const keyId of [internalKeyId, confidentialKeyId, secretKeyId]) {
     const password = generateSecurePassword();
-    const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(password);
+    const encryptedKey = await factory.createDocEncryptionKey(keyId, password);
     const keyBytes = await factory.decryptSymmetricKey(encryptedKey, password);
     keyBag.setKey(keyId, keyBytes);
     
@@ -154,7 +154,7 @@ class ProjectKeyManager {
     const factory = this.tenant.getFactory();
     
     // Create encrypted key for distribution
-    const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(password);
+    const encryptedKey = await factory.createDocEncryptionKey(keyId, password);
     
     // Import into creator's KeyBag
     const keyBytes = await factory.decryptSymmetricKey(encryptedKey, password);
@@ -243,7 +243,7 @@ async function distributeKeysForRole(user: User, role: string) {
 
 ```typescript
 // Administrator creates and exports key
-const encryptedKey = await tenantFactory.createSymmetricEncryptedPrivateKey(
+const encryptedKey = await tenantFactory.createDocEncryptionKey(
   "secure-password-xyz"
 );
 
@@ -304,7 +304,7 @@ await userKeyBag.decryptAndImportKey(
 
 ```typescript
 // Administrator
-const encryptedKey = await tenantFactory.createSymmetricEncryptedPrivateKey(
+const encryptedKey = await tenantFactory.createDocEncryptionKey(
   generateStrongPassword()
 );
 
@@ -369,7 +369,7 @@ const decrypted = await tenant.decryptPayload(
 ```typescript
 async function rotateKey(keyId: string, tenant: MindooTenant) {
   // 1. Create new key version
-  const newEncryptedKey = await tenantFactory.createSymmetricEncryptedPrivateKey(
+  const newEncryptedKey = await tenantFactory.createDocEncryptionKey(
     generateNewPassword()
   );
   
@@ -444,7 +444,7 @@ const confidentialDoc = await db.createEncryptedDocument("confidential-key");
 
 ```typescript
 // Create temporary key with expiration
-const tempKey = await tenantFactory.createSymmetricEncryptedPrivateKey(
+const tempKey = await tenantFactory.createDocEncryptionKey(
   generateTemporaryPassword()
 );
 
@@ -535,7 +535,7 @@ class ProjectAccessManager {
   async createProject(projectName: string, adminPassword: string): Promise<string> {
     // Create project-specific key
     const projectKeyId = `project-${projectName}-key`;
-    const encryptedKey = await this.tenant.getFactory().createSymmetricEncryptedPrivateKey(
+    const encryptedKey = await this.tenant.getFactory().createDocEncryptionKey(
       adminPassword
     );
     

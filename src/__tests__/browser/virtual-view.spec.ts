@@ -23,6 +23,7 @@ test.describe("MindooDB browser virtual view", () => {
         BaseMindooTenantFactory,
         InMemoryContentAddressedStoreFactory,
         KeyBag,
+        PUBLIC_INFOS_KEY_ID,
         createCryptoAdapter,
         VirtualViewFactory,
         ColumnSorting,
@@ -33,15 +34,16 @@ test.describe("MindooDB browser virtual view", () => {
       const factory = new BaseMindooTenantFactory(storeFactory, cryptoAdapter);
 
       const user = await factory.createUserId("CN=virtual-view-user/O=mindoo", "user-password");
+      const adminUser = await factory.createUserId("CN=admin/O=mindoo", "admin-password");
       const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "user-password");
-      const adminSigning = await factory.createSigningKeyPair("admin-password");
-      const adminEncryption = await factory.createEncryptionKeyPair("admin-password");
 
-      const tenant = await factory.createTenant(
-        "virtual-view-tenant",
-        adminSigning.publicKey,
-        adminEncryption.publicKey,
-        "tenant-password",
+      const tenantId = "virtual-view-tenant";
+      await keyBag.createTenantKey(tenantId);
+      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      const tenant = await factory.openTenant(
+        tenantId,
+        adminUser.userSigningKeyPair.publicKey,
+        adminUser.userEncryptionKeyPair.publicKey,
         user,
         "user-password",
         keyBag

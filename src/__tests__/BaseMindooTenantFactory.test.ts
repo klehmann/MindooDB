@@ -1,6 +1,7 @@
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
+import { KeyBag } from "../core/keys/KeyBag";
 
 describe("BaseMindooTenantFactory", () => {
   let factory: BaseMindooTenantFactory;
@@ -20,7 +21,6 @@ describe("BaseMindooTenantFactory", () => {
 
       expect(privateUserId).toBeDefined();
       expect(privateUserId.username).toBe(username);
-      expect(privateUserId.administrationSignature).toBe("");
       expect(privateUserId.userSigningKeyPair).toBeDefined();
       expect(privateUserId.userSigningKeyPair.publicKey).toBeDefined();
       expect(privateUserId.userSigningKeyPair.privateKey).toBeDefined();
@@ -77,16 +77,13 @@ describe("BaseMindooTenantFactory", () => {
     it("should convert private user ID to public user ID", async () => {
       const username = "CN=testuser/O=testtenant";
       const password = "testpassword123";
-      const adminSignature = "test-admin-signature";
 
       const privateUserId = await factory.createUserId(username, password);
-      privateUserId.administrationSignature = adminSignature;
 
       const publicUserId = factory.toPublicUserId(privateUserId);
 
       expect(publicUserId).toBeDefined();
       expect(publicUserId.username).toBe(username);
-      expect(publicUserId.administrationSignature).toBe(adminSignature);
       expect(publicUserId.userSigningPublicKey).toBe(privateUserId.userSigningKeyPair.publicKey);
       expect(publicUserId.userEncryptionPublicKey).toBe(privateUserId.userEncryptionKeyPair.publicKey);
 
@@ -103,9 +100,61 @@ describe("BaseMindooTenantFactory", () => {
       const publicUserId = factory.toPublicUserId(privateUserId);
 
       expect(publicUserId.username).toBe(privateUserId.username);
-      expect(publicUserId.administrationSignature).toBe(privateUserId.administrationSignature);
       expect(publicUserId.userSigningPublicKey).toBe(privateUserId.userSigningKeyPair.publicKey);
       expect(publicUserId.userEncryptionPublicKey).toBe(privateUserId.userEncryptionKeyPair.publicKey);
+    });
+  });
+
+  describe("openTenant", () => {
+    it("should reject opening tenant with admin identity as current user", async () => {
+      const tenantId = "tenant-open-guard";
+      const adminPassword = "admin-password";
+      const adminUser = await factory.createUserId("CN=admin/O=testtenant", adminPassword);
+      const keyBag = new KeyBag(
+        adminUser.userEncryptionKeyPair.privateKey,
+        adminPassword,
+        new NodeCryptoAdapter()
+      );
+      await keyBag.createTenantKey(tenantId);
+      await keyBag.createDocKey("$publicinfos");
+
+      await expect(
+        factory.openTenant(
+          tenantId,
+          adminUser.userSigningKeyPair.publicKey,
+          adminUser.userEncryptionKeyPair.publicKey,
+          adminUser,
+          adminPassword,
+          keyBag
+        )
+      ).rejects.toThrow("currentUser must not be the administration identity");
+    });
+
+    it("should prevent opening databases when admin identity is used as current user", async () => {
+      const tenantId = "tenant-open-db-guard";
+      const adminPassword = "admin-password";
+      const adminUser = await factory.createUserId("CN=admin/O=testtenant", adminPassword);
+      const keyBag = new KeyBag(
+        adminUser.userEncryptionKeyPair.privateKey,
+        adminPassword,
+        new NodeCryptoAdapter()
+      );
+      await keyBag.createTenantKey(tenantId);
+      await keyBag.createDocKey("$publicinfos");
+
+      await expect(
+        (async () => {
+          const tenant = await factory.openTenant(
+            tenantId,
+            adminUser.userSigningKeyPair.publicKey,
+            adminUser.userEncryptionKeyPair.publicKey,
+            adminUser,
+            adminPassword,
+            keyBag
+          );
+          await tenant.openDB("should-not-open");
+        })()
+      ).rejects.toThrow("currentUser must not be the administration identity");
     });
   });
 
@@ -156,49 +205,30 @@ describe("BaseMindooTenantFactory", () => {
     });
   });
 
-  describe("createSymmetricEncryptedPrivateKey", () => {
-    it("should create an encrypted symmetric key (AES-256)", async () => {
-      const password = "testpassword123";
+  describe("KeyBag symmetric key creation", () => {
+    it("should create and store a document key (AES-256)", async () => {
+      const user = await factory.createUserId("CN=testuser/O=testtenant", "testpassword123");
+      const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "testpassword123", new NodeCryptoAdapter());
 
-      const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(password);
+      await keyBag.createDocKey("test-doc-key");
+      const key = await keyBag.get("doc", "test-doc-key");
 
-      expect(encryptedKey).toBeDefined();
-      expect(encryptedKey.ciphertext).toBeDefined();
-      expect(encryptedKey.iv).toBeDefined();
-      expect(encryptedKey.tag).toBeDefined();
-      expect(encryptedKey.salt).toBeDefined();
-      expect(encryptedKey.iterations).toBe(310000);
+      expect(key).toBeDefined();
+      expect(key!.length).toBe(32);
     });
 
-    it("should create different encrypted keys on each call", async () => {
-      const password = "testpassword123";
+    it("should create different key material on each call", async () => {
+      const user = await factory.createUserId("CN=testuser/O=testtenant", "testpassword123");
+      const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "testpassword123", new NodeCryptoAdapter());
 
-      const key1 = await factory.createSymmetricEncryptedPrivateKey(password);
-      const key2 = await factory.createSymmetricEncryptedPrivateKey(password);
+      await keyBag.createDocKey("test-doc-key");
+      const key1 = await keyBag.get("doc", "test-doc-key");
+      await keyBag.createDocKey("test-doc-key");
+      const allKeys = await keyBag.getAllKeys("doc", "test-doc-key");
 
-      // Even with the same password, encrypted keys should be different due to random salt/IV
-      expect(key1.salt).not.toBe(key2.salt);
-      expect(key1.iv).not.toBe(key2.iv);
-      expect(key1.ciphertext).not.toBe(key2.ciphertext);
-    });
-
-    it("should create valid encrypted key structure", async () => {
-      const password = "testpassword123";
-      const encryptedKey = await factory.createSymmetricEncryptedPrivateKey(password);
-
-      // Verify all required fields are present and non-empty
-      expect(encryptedKey.ciphertext.length).toBeGreaterThan(0);
-      expect(encryptedKey.iv.length).toBeGreaterThan(0);
-      expect(encryptedKey.tag.length).toBeGreaterThan(0);
-      expect(encryptedKey.salt.length).toBeGreaterThan(0);
-      expect(encryptedKey.iterations).toBe(310000);
-
-      // Verify base64 format (basic check - should not contain spaces or invalid chars)
-      const base64Regex = /^[A-Za-z0-9+/=]+$/;
-      expect(encryptedKey.ciphertext).toMatch(base64Regex);
-      expect(encryptedKey.iv).toMatch(base64Regex);
-      expect(encryptedKey.tag).toMatch(base64Regex);
-      expect(encryptedKey.salt).toMatch(base64Regex);
+      expect(key1).toBeDefined();
+      expect(allKeys.length).toBe(2);
+      expect(allKeys[0]).not.toEqual(allKeys[1]);
     });
   });
 

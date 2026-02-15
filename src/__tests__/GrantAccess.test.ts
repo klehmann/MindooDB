@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDoc, ProcessChangesCursor, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDoc, ProcessChangesCursor, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -10,11 +10,8 @@ describe("granting tenant access", () => {
   let adminUser: PrivateUserId;
   let adminUserPassword: string;
   let adminKeyBag: KeyBag;
-  let adminSigningKeyPair: SigningKeyPair;
-  let adminSigningKeyPassword: string;
   let tenant: MindooTenant;
   let tenantId: string;
-  let tenantEncryptionKeyPassword: string;
   let regularUser: PrivateUserId;
   let regularUserPassword: string;
 
@@ -22,23 +19,12 @@ describe("granting tenant access", () => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     
-    // Create admin user
+    // Create admin user (signing + encryption keys used for tenant administration)
     adminUserPassword = "adminpass123";
     adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
     
-    // Create admin signing key pair (this is the "admin signing id")
-    adminSigningKeyPassword = "adminsigningpass123";
-    adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
-    
-    // Create admin encryption key pair (for encrypting usernames in directory)
-    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
-    
     // Create tenant encryption key
-    tenantEncryptionKeyPassword = "tenantkeypass123";
-    const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
-    
-    // Create $publicinfos symmetric key (required for all servers/clients)
-    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
+    tenantId = "test-tenant-process-changes";
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -48,21 +34,15 @@ describe("granting tenant access", () => {
       cryptoAdapter
     );
     
-    // Add $publicinfos key to KeyBag
-    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
-    
-    // Create tenant using openTenantWithKeys with our admin signing key as the administration key
-    tenantId = "test-tenant-process-changes";
-    tenant = await factory.openTenantWithKeys(
-      tenantId,
-      tenantEncryptionKey,
-      tenantEncryptionKeyPassword,
-      adminSigningKeyPair.publicKey, // Use admin signing key as administration public key
-      adminEncryptionKeyPair.publicKey, // Admin encryption key for directory username encryption
-      adminUser,
-      adminUserPassword,
-      adminKeyBag
-    );
+    await adminKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await adminKeyBag.createTenantKey(tenantId);
+
+    const currentUser = await factory.createUserId("CN=currentuser/O=testtenant", "currentpass123");
+    const currentUserKeyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "currentpass123", cryptoAdapter);
+    await currentUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+    await currentUserKeyBag.set("tenant", tenantId, (await adminKeyBag.get("tenant", tenantId))!);
+
+    tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "currentpass123", currentUserKeyBag);
     
     // Create regular user
     regularUserPassword = "regularpass123";
@@ -73,8 +53,8 @@ describe("granting tenant access", () => {
     const publicAdminUser = factory.toPublicUserId(adminUser);
     await directory.registerUser(
       publicAdminUser,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
   }, 30000); // Increase timeout for crypto operations
 
@@ -85,8 +65,8 @@ describe("granting tenant access", () => {
     
     await directory.registerUser(
       publicRegularUser,
-      adminSigningKeyPair.privateKey, // Use admin signing key as administration private key
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
     
     // Get the directory database

@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { MindooDB, MindooDoc, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { MindooDB, MindooDoc, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -11,8 +11,8 @@ describe("TimeTravel", () => {
   let db: MindooDB;
   let user: any;
   let userPassword: string;
-  let adminSigningKeyPair: SigningKeyPair;
-  let adminSigningKeyPassword: string;
+  let adminUser: any;
+  let adminUserPassword: string;
 
   beforeEach(async () => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
@@ -27,18 +27,16 @@ describe("TimeTravel", () => {
       cryptoAdapter
     );
     
-    adminSigningKeyPassword = "adminsigningpass123";
-    adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
+    adminUserPassword = "adminpass123";
+    adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
+    await userKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
     
-    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
-    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
-    await userKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
-    
-    tenant = await factory.createTenant(
-      "test-tenant",
-      adminSigningKeyPair.publicKey,
-      adminEncryptionKeyPair.publicKey,
-      "tenantkeypass123",
+    const tenantId = "test-tenant";
+    await userKeyBag.createTenantKey(tenantId);
+    tenant = await factory.openTenant(
+      tenantId,
+      adminUser.userSigningKeyPair.publicKey,
+      adminUser.userEncryptionKeyPair.publicKey,
       user,
       userPassword,
       userKeyBag
@@ -49,8 +47,8 @@ describe("TimeTravel", () => {
     const publicUser = factory.toPublicUserId(user);
     await directory.registerUser(
       publicUser,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
     
     db = await tenant.openDB("test-db");

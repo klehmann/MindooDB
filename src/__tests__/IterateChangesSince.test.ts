@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ProcessChangesCursor, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ProcessChangesCursor, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -9,67 +9,36 @@ describe("iterateChangesSince", () => {
   let storeFactory: InMemoryContentAddressedStoreFactory;
   let adminUser: PrivateUserId;
   let adminUserPassword: string;
+  let currentUser: PrivateUserId;
+  let currentUserPassword: string;
   let adminKeyBag: KeyBag;
-  let adminSigningKeyPair: SigningKeyPair;
-  let adminSigningKeyPassword: string;
+  let currentUserKeyBag: KeyBag;
   let tenant: MindooTenant;
   let tenantId: string;
-  let tenantEncryptionKeyPassword: string;
 
   beforeEach(async () => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     
-    // Create admin user
     adminUserPassword = "adminpass123";
     adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
+    currentUserPassword = "currentpass123";
+    currentUser = await factory.createUserId("CN=currentuser/O=testtenant", currentUserPassword);
     
-    // Create admin signing key pair
-    adminSigningKeyPassword = "adminsigningpass123";
-    adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
-    
-    // Create admin encryption key pair
-    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
-    
-    // Create tenant encryption key
-    tenantEncryptionKeyPassword = "tenantkeypass123";
-    const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
-    
-    // Create $publicinfos symmetric key
-    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
-    
-    // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
-    adminKeyBag = new KeyBag(
-      adminUser.userEncryptionKeyPair.privateKey,
-      adminUserPassword,
-      cryptoAdapter
-    );
+    adminKeyBag = new KeyBag(adminUser.userEncryptionKeyPair.privateKey, adminUserPassword, cryptoAdapter);
+    currentUserKeyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, currentUserPassword, cryptoAdapter);
     
-    // Add $publicinfos key to KeyBag
-    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
-    
-    // Create tenant
     tenantId = "test-tenant-iterate-changes";
-    tenant = await factory.openTenantWithKeys(
-      tenantId,
-      tenantEncryptionKey,
-      tenantEncryptionKeyPassword,
-      adminSigningKeyPair.publicKey,
-      adminEncryptionKeyPair.publicKey,
-      adminUser,
-      adminUserPassword,
-      adminKeyBag
-    );
+    await adminKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await adminKeyBag.createTenantKey(tenantId);
+    await currentUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+    await currentUserKeyBag.set("tenant", tenantId, (await adminKeyBag.get("tenant", tenantId))!);
+    tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, currentUserKeyBag);
     
-    // Register the admin user in the directory
     const directory = await tenant.openDirectory();
     const publicAdminUser = factory.toPublicUserId(adminUser);
-    await directory.registerUser(
-      publicAdminUser,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
-    );
+    await directory.registerUser(publicAdminUser, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
   }, 30000);
 
   describe("large document set", () => {

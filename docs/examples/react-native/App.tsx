@@ -20,19 +20,17 @@ export default function App() {
       const factory = new BaseMindooTenantFactory(storeFactory, cryptoAdapter);
 
       const user = await factory.createUserId("CN=rn-todo-user/O=demo", "user-password");
+      const adminUser = await factory.createUserId("CN=admin/O=demo", "admin-password");
       const keyBag = new KeyBag(
         user.userEncryptionKeyPair.privateKey,
         "user-password",
         cryptoAdapter
       );
-      const adminSigning = await factory.createSigningKeyPair("admin-password");
-      const adminEncryption = await factory.createEncryptionKeyPair("admin-password");
 
-      const tenant = await factory.createTenant(
+      const tenant = await factory.openTenant(
         "rn-todo-tenant",
-        adminSigning.publicKey,
-        adminEncryption.publicKey,
-        "tenant-password",
+        adminUser.userSigningKeyPair.publicKey,
+        adminUser.userEncryptionKeyPair.publicKey,
         user,
         "user-password",
         keyBag

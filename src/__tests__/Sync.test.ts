@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, SigningKeyPair, ContentAddressedStoreFactory, ContentAddressedStore, EncryptedPrivateKey, PUBLIC_INFOS_KEY_ID, EncryptionKeyPair } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ContentAddressedStoreFactory, ContentAddressedStore, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -18,15 +18,12 @@ describe("sync test", () => {
   let user2Password: string;
   let user2KeyBag: KeyBag;
   
-  let adminSigningKeyPair: SigningKeyPair;
-  let adminSigningKeyPassword: string;
+  let adminUser: PrivateUserId;
+  let adminUserPassword: string;
   
   let tenantId: string;
-  let tenantEncryptionKeyPassword: string;
-  let tenantEncryptionKey: EncryptedPrivateKey; // Store the tenant encryption key so user2 can use the same one
-  let adminEncryptionKeyPair: EncryptionKeyPair; // Store admin encryption key for user2 to use
-  let publicInfosKey: EncryptedPrivateKey; // Store $publicinfos key for user2 to use
-  let publicInfosKeyPassword: string;
+  let tenantEncryptionKey: Uint8Array; // Store the tenant key bytes so user2 can use the same one
+  let publicInfosKey: Uint8Array; // Store $publicinfos key bytes for user2 to use
   
   let tenant1: MindooTenant; // Tenant instance for user1
   let tenant2: MindooTenant; // Tenant instance for user2
@@ -60,34 +57,27 @@ describe("sync test", () => {
       cryptoAdapter
     );
     
-    // Create admin signing key pair using factory1 (both factories can create keys)
-    adminSigningKeyPassword = "adminsigningpass123";
-    adminSigningKeyPair = await factory1.createSigningKeyPair(adminSigningKeyPassword);
-    
-    // Create admin encryption key pair (for encrypting usernames in directory)
-    adminEncryptionKeyPair = await factory1.createEncryptionKeyPair("adminencpass123");
+    // Create admin user (signing + encryption keys used for tenant administration)
+    adminUserPassword = "adminpass123";
+    adminUser = await factory1.createUserId("CN=admin/O=testtenant", adminUserPassword);
     
     // Create $publicinfos symmetric key (required for all servers/clients)
-    publicInfosKeyPassword = "publicinfospass123";
-    publicInfosKey = await factory1.createSymmetricEncryptedPrivateKey(publicInfosKeyPassword);
-    
-    // Add $publicinfos key to user1 KeyBag
-    await user1KeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, publicInfosKeyPassword);
+    await user1KeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    publicInfosKey = (await user1KeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!;
     
     // Create tenant encryption key (store it so user2 can use the same one)
-    tenantEncryptionKeyPassword = "tenantkeypass123";
-    
     // Create tenant for user1 using factory1
     tenantId = "test-tenant-sync";
-    tenant1 = await factory1.createTenant(tenantId,
-      adminSigningKeyPair.publicKey,
-      adminEncryptionKeyPair.publicKey,
-      tenantEncryptionKeyPassword,
+    await user1KeyBag.createTenantKey(tenantId);
+    tenantEncryptionKey = (await user1KeyBag.get("tenant", tenantId))!;
+    tenant1 = await factory1.openTenant(
+      tenantId,
+      adminUser.userSigningKeyPair.publicKey,
+      adminUser.userEncryptionKeyPair.publicKey,
       user1,
       user1Password,
       user1KeyBag
     );
-    tenantEncryptionKey = tenant1.getTenantEncryptionKey();
   }, 30000);
 
   it("should sync data from first user to second user using pullChangesFrom", async () => {
@@ -99,15 +89,15 @@ describe("sync test", () => {
     // Register user1
     await directory1.registerUser(
       publicUser1,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
     
     // Register user2
     await directory1.registerUser(
       publicUser2,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
     
     // Step 2: User1 opens "contacts" database and creates one contact document
@@ -130,18 +120,10 @@ describe("sync test", () => {
     // User2 uses factory2 which has its own separate store factory
     
     // Add $publicinfos key to user2 KeyBag
-    await user2KeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, publicInfosKeyPassword);
+    await user2KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
+    await user2KeyBag.set("tenant", tenantId, tenantEncryptionKey);
     
-    tenant2 = await factory2.openTenantWithKeys(
-      tenantId,
-      tenantEncryptionKey,
-      tenantEncryptionKeyPassword,
-      adminSigningKeyPair.publicKey,
-      adminEncryptionKeyPair.publicKey,
-      user2,
-      user2Password,
-      user2KeyBag
-    );
+    tenant2 = await factory2.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, user2, user2Password, user2KeyBag);
     
     // Step 4: User2 opens "directory" and "contacts" databases (which are empty by default)
     const directory2 = await tenant2.openDB("directory");    
@@ -256,49 +238,51 @@ describe("sync test", () => {
     const u3 = await f3.createUserId("CN=user3/O=test", u3Pass);
     const u3KeyBag = new KeyBag(u3.userEncryptionKeyPair.privateKey, u3Pass, cryptoAdapter);
     
-    // Create admin keys
+    // Create admin user (signing + encryption keys used for tenant administration)
     const adminPass = "adminpass";
-    const adminKeyPair = await f1.createSigningKeyPair(adminPass);
-    const adminEncKeyPair = await f1.createEncryptionKeyPair("adminencpass");
+    const adminUser = await f1.createUserId("CN=admin/O=test", adminPass);
     
     // Create $publicinfos symmetric key (required for all users)
-    const pubInfosPass = "publicinfospass";
-    const pubInfosKey = await f1.createSymmetricEncryptedPrivateKey(pubInfosPass);
+    await u1KeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    const pubInfosKey = (await u1KeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!;
     
     // Add $publicinfos key to all KeyBags
-    await u1KeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, pubInfosKey, pubInfosPass);
-    await u2KeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, pubInfosKey, pubInfosPass);
-    await u3KeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, pubInfosKey, pubInfosPass);
+    await u2KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, pubInfosKey);
+    await u3KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, pubInfosKey);
     
     // Create tenant for user1
     const tid = "named-key-sync-test";
-    const tenantKeyPass = "tenantpass";
-    const t1 = await f1.createTenant(tid, adminKeyPair.publicKey, adminEncKeyPair.publicKey, tenantKeyPass, u1, u1Pass, u1KeyBag);
-    const tenantKey = t1.getTenantEncryptionKey();
+    await u1KeyBag.createTenantKey(tid);
+    const tenantKey = (await u1KeyBag.get("tenant", tid))!;
+    const t1 = await f1.openTenant(
+      tid,
+      adminUser.userSigningKeyPair.publicKey,
+      adminUser.userEncryptionKeyPair.publicKey,
+      u1,
+      u1Pass,
+      u1KeyBag
+    );
     
     // Register all 3 users in the directory
     const dir1 = await t1.openDirectory();
-    await dir1.registerUser(f1.toPublicUserId(u1), adminKeyPair.privateKey, adminPass);
-    await dir1.registerUser(f2.toPublicUserId(u2), adminKeyPair.privateKey, adminPass);
-    await dir1.registerUser(f3.toPublicUserId(u3), adminKeyPair.privateKey, adminPass);
+    await dir1.registerUser(f1.toPublicUserId(u1), adminUser.userSigningKeyPair.privateKey, adminPass);
+    await dir1.registerUser(f2.toPublicUserId(u2), adminUser.userSigningKeyPair.privateKey, adminPass);
+    await dir1.registerUser(f3.toPublicUserId(u3), adminUser.userSigningKeyPair.privateKey, adminPass);
     
     // User1 creates a named symmetric key (shared only with User3, NOT User2)
     const namedKeyId = "secret-project-key";
-    const namedKeyPassword = "secretkeypass";
-    const namedEncryptedKey = await f1.createSymmetricEncryptedPrivateKey(namedKeyPassword);
-    
-    // Import the key into User1's KeyBag
-    await u1KeyBag.decryptAndImportKey(namedKeyId, namedEncryptedKey, namedKeyPassword);
-    
+    await u1KeyBag.createDocKey(namedKeyId);
+    const namedKey = (await u1KeyBag.get("doc", namedKeyId))!;
+
     // Import the key into User3's KeyBag (User3 has the key, User2 does NOT)
-    await u3KeyBag.decryptAndImportKey(namedKeyId, namedEncryptedKey, namedKeyPassword);
+    await u3KeyBag.set("doc", namedKeyId, namedKey);
     
     // User1 creates an encrypted document with the named key
     const secretDB1 = await t1.openDB("secrets");
     const secretDoc = await secretDB1.createEncryptedDocument(namedKeyId);
     const secretDocId = secretDoc.getId();
     
-    await secretDB1.changeDoc(secretDoc, async (doc) => {
+    await secretDB1.changeDoc(secretDoc, async (doc: MindooDoc) => {
       const data = doc.getData();
       data.title = "Project Alpha";
       data.content = "This is confidential information";
@@ -311,7 +295,8 @@ describe("sync test", () => {
     expect(allSecrets1[0]).toBe(secretDocId);
     
     // User2 sets up tenant (does NOT have the named key in their KeyBag)
-    const t2 = await f2.openTenantWithKeys(tid, tenantKey, tenantKeyPass, adminKeyPair.publicKey, adminEncKeyPair.publicKey, u2, u2Pass, u2KeyBag);
+    await u2KeyBag.set("tenant", tid, tenantKey);
+    const t2 = await f2.openTenant(tid, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, u2, u2Pass, u2KeyBag);
     const dir2 = await t2.openDB("directory");
     const secretDB2 = await t2.openDB("secrets");
     
@@ -333,7 +318,8 @@ describe("sync test", () => {
     expect(store2Ids.length).toBeGreaterThan(0);
     
     // User3 sets up tenant (HAS the named key in their KeyBag)
-    const t3 = await f3.openTenantWithKeys(tid, tenantKey, tenantKeyPass, adminKeyPair.publicKey, adminEncKeyPair.publicKey, u3, u3Pass, u3KeyBag);
+    await u3KeyBag.set("tenant", tid, tenantKey);
+    const t3 = await f3.openTenant(tid, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, u3, u3Pass, u3KeyBag);
     const dir3 = await t3.openDB("directory");
     const secretDB3 = await t3.openDB("secrets");
     
@@ -356,7 +342,7 @@ describe("sync test", () => {
     expect(secretData3.createdBy).toBe("user1");
     
     // User3 modifies the document
-    await secretDB3.changeDoc(secretDoc3, async (doc) => {
+    await secretDB3.changeDoc(secretDoc3, async (doc: MindooDoc) => {
       const data = doc.getData();
       data.content = "Updated by User3";
       data.modifiedBy = "user3";

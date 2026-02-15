@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { PrivateUserId, MindooTenant, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { createHash } from "crypto";
@@ -19,33 +19,16 @@ describe("Group Management", () => {
   let adminUser: PrivateUserId;
   let adminUserPassword: string;
   let adminKeyBag: KeyBag;
-  let adminSigningKeyPair: SigningKeyPair;
-  let adminSigningKeyPassword: string;
   let tenant: MindooTenant;
   let tenantId: string;
-  let tenantEncryptionKeyPassword: string;
 
   beforeEach(async () => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
     factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
     
-    // Create admin user
+    // Create admin user (signing + encryption keys used for tenant administration)
     adminUserPassword = "adminpass123";
     adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
-    
-    // Create admin signing key pair (administration key)
-    adminSigningKeyPassword = "adminsigningpass123";
-    adminSigningKeyPair = await factory.createSigningKeyPair(adminSigningKeyPassword);
-    
-    // Create admin encryption key pair (for encrypting usernames in directory)
-    const adminEncryptionKeyPair = await factory.createEncryptionKeyPair("adminencpass123");
-    
-    // Create tenant encryption key
-    tenantEncryptionKeyPassword = "tenantkeypass123";
-    const tenantEncryptionKey = await factory.createSymmetricEncryptedPrivateKey(tenantEncryptionKeyPassword);
-    
-    // Create $publicinfos symmetric key (required for all servers/clients)
-    const publicInfosKey = await factory.createSymmetricEncryptedPrivateKey("publicinfospass123");
     
     // Create KeyBag for admin user
     const cryptoAdapter = new NodeCryptoAdapter();
@@ -55,29 +38,22 @@ describe("Group Management", () => {
       cryptoAdapter
     );
     
-    // Add $publicinfos key to KeyBag
-    await adminKeyBag.decryptAndImportKey(PUBLIC_INFOS_KEY_ID, publicInfosKey, "publicinfospass123");
-    
-    // Create tenant
     tenantId = "test-tenant-groups";
-    tenant = await factory.openTenantWithKeys(
-      tenantId,
-      tenantEncryptionKey,
-      tenantEncryptionKeyPassword,
-      adminSigningKeyPair.publicKey,
-      adminEncryptionKeyPair.publicKey,
-      adminUser,
-      adminUserPassword,
-      adminKeyBag
-    );
+    await adminKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await adminKeyBag.createTenantKey(tenantId);
+    const currentUser = await factory.createUserId("CN=currentuser/O=testtenant", "currentpass123");
+    const currentUserKeyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "currentpass123", cryptoAdapter);
+    await currentUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+    await currentUserKeyBag.set("tenant", tenantId, (await adminKeyBag.get("tenant", tenantId))!);
+    tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "currentpass123", currentUserKeyBag);
     
     // Register the admin user in the directory so their key is trusted
     const directory = await tenant.openDirectory();
     const publicAdminUser = factory.toPublicUserId(adminUser);
     await directory.registerUser(
       publicAdminUser,
-      adminSigningKeyPair.privateKey,
-      adminSigningKeyPassword
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword
     );
   }, 30000);
 
@@ -97,8 +73,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         usernames,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const groups = await directory.getGroups();
@@ -122,8 +98,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName1,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Access with different case
@@ -151,16 +127,16 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         initialUsers,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Add more users
       await directory.addUsersToGroup(
         groupName,
         additionalUsers,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const members = await directory.getGroupMembers(groupName);
@@ -180,15 +156,15 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       await directory.addUsersToGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const members = await directory.getGroupMembers(groupName);
@@ -206,16 +182,16 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         users,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Remove one user
       await directory.removeUsersFromGroup(
         groupName,
         ["CN=bob/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const members = await directory.getGroupMembers(groupName);
@@ -235,16 +211,16 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         users,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Try to remove non-existent user
       await directory.removeUsersFromGroup(
         groupName,
         ["CN=nonexistent/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const members = await directory.getGroupMembers(groupName);
@@ -262,8 +238,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         users,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify group exists
@@ -273,8 +249,8 @@ describe("Group Management", () => {
       // Delete group
       await directory.deleteGroup(
         groupName,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify group is gone
@@ -291,8 +267,8 @@ describe("Group Management", () => {
       // Try to delete non-existent group
       await directory.deleteGroup(
         "nonexistent",
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Should not throw error
@@ -309,23 +285,23 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         "developers",
         ["CN=alice/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       await directory.addUsersToGroup(
         "designers",
         ["CN=bob/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Create parent group containing child groups
       await directory.addUsersToGroup(
         "engineering",
         ["developers", "designers"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const engineeringMembers = await directory.getGroupMembers("engineering");
@@ -358,8 +334,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const namesList = await directory.getUserNamesList(username);
@@ -377,15 +353,15 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         "developers",
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       await directory.addUsersToGroup(
         "engineering",
         ["developers"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const namesList = await directory.getUserNamesList(username);
@@ -408,8 +384,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Get updated names list (should include group)
@@ -426,8 +402,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify user is in group
@@ -438,8 +414,8 @@ describe("Group Management", () => {
       await directory.removeUsersFromGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify user is no longer in group
@@ -455,22 +431,22 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         "team-alpha",
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       await directory.addUsersToGroup(
         "engineering-dept",
         ["team-alpha"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       await directory.addUsersToGroup(
         "tech-division",
         ["engineering-dept"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       const namesList = await directory.getUserNamesList(username);
@@ -489,15 +465,15 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         "group1",
         [username, "group2"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       await directory.addUsersToGroup(
         "group2",
         ["group1"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Should not throw error, should handle cycle gracefully
@@ -519,8 +495,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Get members (should use cache)
@@ -532,8 +508,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         ["CN=bob/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Get members again (cache should be updated)
@@ -552,8 +528,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         users,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify initial state
@@ -564,8 +540,8 @@ describe("Group Management", () => {
       await directory.removeUsersFromGroup(
         groupName,
         ["CN=alice/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify cache updated
@@ -584,8 +560,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         ["CN=alice/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify group exists
@@ -595,8 +571,8 @@ describe("Group Management", () => {
       // Delete group
       await directory.deleteGroup(
         groupName,
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Verify cache updated
@@ -617,8 +593,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Should immediately reflect change
@@ -629,8 +605,8 @@ describe("Group Management", () => {
       await directory.removeUsersFromGroup(
         groupName,
         [username],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // Should immediately reflect change
@@ -649,8 +625,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         ["CN=alice/O=testtenant", "CN=bob/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // In a real scenario, this would be a separate document created on another client
@@ -662,8 +638,8 @@ describe("Group Management", () => {
       await directory.addUsersToGroup(
         groupName,
         ["CN=charlie/O=testtenant"],
-        adminSigningKeyPair.privateKey,
-        adminSigningKeyPassword
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
       );
       
       // All members should be present

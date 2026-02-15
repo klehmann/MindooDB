@@ -85,32 +85,38 @@ npm install mindoodb
 ```typescript
 import { 
   BaseMindooTenantFactory, 
-  InMemoryAppendOnlyStoreFactory,
-  KeyBag 
+  InMemoryContentAddressedStoreFactory,
+  KeyBag,
+  PUBLIC_INFOS_KEY_ID
 } from "mindoodb";
 
 // 1. Set up storage (in-memory for demo; use file/server-backed for production)
-const storeFactory = new InMemoryAppendOnlyStoreFactory();
+const storeFactory = new InMemoryContentAddressedStoreFactory();
 const factory = new BaseMindooTenantFactory(storeFactory);
 
 // 2. Create a user (generates signing + encryption key pairs)
 const user = await factory.createUserId("CN=alice/O=acme", "user-password");
 const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "user-password");
 
-// 3. Create admin keys (for managing users)
-const adminKeyPair = await factory.createSigningKeyPair("admin-password");
+// 3. Create admin user (signing + encryption keys used for tenant administration)
+const adminUser = await factory.createUserId("CN=admin/O=acme", "admin-password");
 
-// 4. Create a tenant (an organization that shares documents)
-const tenant = await factory.createTenant(
-  "acme-corp",
-  adminKeyPair.publicKey,
-  "tenant-key-password",
+// 4. Create required tenant keys directly in KeyBag (canonical key source)
+const tenantId = "acme-corp";
+await keyBag.createTenantKey(tenantId);
+await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+
+// 5. Open tenant
+const tenant = await factory.openTenant(
+  tenantId,
+  adminUser.userSigningKeyPair.publicKey,
+  adminUser.userEncryptionKeyPair.publicKey,
   user,
   "user-password",
   keyBag
 );
 
-// 5. Open a database and create documents
+// 6. Open a database and create documents
 const db = await tenant.openDB("contacts");
 const doc = await db.createDocument();
 
@@ -120,7 +126,7 @@ await db.changeDoc(doc, async (d) => {
   data.email = "john@example.com";
 });
 
-// 6. Read it back
+// 7. Read it back
 const contacts = await db.getAllDocumentIds();
 const loaded = await db.getDocument(contacts[0]);
 console.log(loaded.getData()); // { name: "John Doe", email: "john@example.com" }

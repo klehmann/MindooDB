@@ -1,4 +1,5 @@
 import type { KeyBag } from "./keys/KeyBag";
+import type { KeyType } from "./keys/KeyContext";
 import type { PublicUserId, PrivateUserId } from "./userid";
 import type { ContentAddressedStore, OpenStoreOptions } from "./appendonlystores/types";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
@@ -8,6 +9,8 @@ import { MindooDocSigner } from "./crypto/MindooDocSigner";
  * Well-known key ID for access control documents (grantaccess, revokeaccess, groups).
  * All servers and clients MUST have this key in their KeyBag to verify user access.
  * This enables servers to validate users without having full tenant data access.
+ * 
+ * KeyBag location: type "doc", id PUBLIC_INFOS_KEY_ID.
  */
 export const PUBLIC_INFOS_KEY_ID = "$publicinfos";
 
@@ -67,6 +70,7 @@ export interface EncryptionKeyPair {
 
 // Re-export PublicUserId and PrivateUserId from userid module
 export type { PublicUserId, PrivateUserId };
+export type { KeyType };
 
 /**
  * A TenantFactory is a factory for creating and managing tenants.
@@ -74,55 +78,21 @@ export type { PublicUserId, PrivateUserId };
 export interface MindooTenantFactory {
 
   /**
-   * Create a new tenant with a new tenant encryption key.
-   * 
-   * The tenant encryption key is used as the default document encryption key
-   * (so that all data within the tenant is secure by default).
-   * 
-   * The administration public key must be created beforehand using createSigningKeyPair()
-   * and passed to this method. The administration key is used for administrative operations
-   * within the tenant, such as adding new users to the tenant.
-   * 
-   * The administration encryption public key must be created using createEncryptionKeyPair()
-   * and is used to encrypt sensitive data in the directory that only admins can decrypt
-   * (e.g., usernames in access control documents).
-   *
-   * @param tenantId The ID of the tenant
-   * @param administrationPublicKey The administration public key (Ed25519, PEM format) created using createSigningKeyPair()
-   * @param administrationEncryptionPublicKey The administration encryption public key (RSA-OAEP, PEM format) created using createEncryptionKeyPair()
-   * @param tenantEncryptionKeyPassword The password to be set to decrypt the tenant encryption private key
-   * @param currentUser The current user's private user ID (required for tenant operations)
-   * @param currentUserPassword The password to decrypt the current user's private keys
-   * @param keyBag The KeyBag instance for storing and loading named encrypted keys
-   * @return The new tenant
-   */
-  createTenant(
-    tenantId: string,
-    administrationPublicKey: string,
-    administrationEncryptionPublicKey: string,
-    tenantEncryptionKeyPassword: string,
-    currentUser: PrivateUserId,
-    currentUserPassword: string,
-    keyBag: KeyBag
-  ): Promise<MindooTenant>;
-
-  /**
-   * Opens an existing tenant with previously created keys.
+   * Opens an existing tenant.
    * 
    * @param tenantId The ID of the tenant
-   * @param tenantEncryptionPrivateKey The tenant encryption key (AES-256, encrypted)
-   * @param tenantEncryptionKeyPassword The password to decrypt the tenant encryption key
    * @param administrationPublicKey The administration public key (Ed25519, PEM format)
    * @param administrationEncryptionPublicKey The administration encryption public key (RSA-OAEP, PEM format)
    * @param currentUser The current user's private user ID (required for tenant operations)
    * @param currentUserPassword The password to decrypt the current user's private keys
-   * @param keyBag The KeyBag instance for storing and loading named encrypted keys
+   * @param keyBag The KeyBag instance for storing and loading tenant/doc keys.
+   *               Must contain:
+   *               - tenant key under type "tenant" and id tenantId
+   *               - $publicinfos key under type "doc" and id PUBLIC_INFOS_KEY_ID
    * @return The tenant
    */
-  openTenantWithKeys(
+  openTenant(
     tenantId: string,
-    tenantEncryptionPrivateKey: EncryptedPrivateKey,
-    tenantEncryptionKeyPassword: string,
     administrationPublicKey: string,
     administrationEncryptionPublicKey: string,
     currentUser: PrivateUserId,
@@ -156,19 +126,6 @@ export interface MindooTenantFactory {
    * @return The signing key pair containing both public key (PEM format) and encrypted private key (Ed25519)
    */
   createSigningKeyPair(password: string): Promise<SigningKeyPair>;
-
-  /**
-   * Creates a new encrypted symmetric key (AES-256) for document encryption.
-   * The key is encrypted with the provided password and can be distributed to authorized users.
-   * Use KeyBag.decryptAndImportKey() to store the returned key in the user's KeyBag.
-   * 
-   * Symmetric keys are shared secrets - anyone with the key can both encrypt and decrypt.
-   * For user-to-user encryption where only the recipient can decrypt, use createEncryptionKeyPair() instead.
-   * 
-   * @param password The password to encrypt the symmetric key with (mandatory)
-   * @return The encrypted symmetric key that can be distributed to authorized users
-   */
-  createSymmetricEncryptedPrivateKey(password: string): Promise<EncryptedPrivateKey>;
 
   /**
    * Creates a new asymmetric encryption key pair (RSA-OAEP) for user-to-user encryption.
@@ -225,16 +182,6 @@ export interface MindooTenant {
    * @return The administration encryption public key (RSA-OAEP, PEM format)
    */
   getAdministrationEncryptionPublicKey(): string;
-
-  /**
-   * Returns the encryption key used to encrypt all communication in this tenant
-   * (e.g. the document changesets).
-   * 
-   * Note: This is a symmetric key (AES-256) used ONLY for encryption/decryption, not for signing.
-   * 
-   * @return The tenant encryption key (AES-256, encrypted)
-   */
-  getTenantEncryptionKey(): EncryptedPrivateKey;
 
   /**
    * Encrypt a payload using the symmetric key identified by decryptionKeyId.
