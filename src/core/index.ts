@@ -19,6 +19,15 @@ export { MindooDocSigner } from "./crypto/MindooDocSigner";
 // Keys
 export { KeyBag } from "./keys/KeyBag";
 
+// URI
+export {
+  encodeMindooURI,
+  decodeMindooURI,
+  isMindooURI,
+  type MindooURIType,
+  type DecodedMindooURI,
+} from "./uri/MindooURI";
+
 // Errors
 export { SymmetricKeyNotFoundError } from "./errors";
 

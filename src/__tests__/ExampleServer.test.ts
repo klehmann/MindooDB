@@ -396,6 +396,40 @@ describe("MindooDB Example Server", () => {
     });
   });
 
+  describe("Dynamic User Registration", () => {
+    // Note: Dynamic user registration via /admin/tenants/:tenantId/users has been removed.
+    // Users are now managed via the admin-signed MindooTenantDirectory.
+    // The server reads trusted users from the directory DB (when publicInfosKey is available)
+    // or falls back to config.json users[] for testing.
+  });
+
+  describe("publishToServer convenience method", () => {
+    test("should register a tenant via publishToServer", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, cryptoAdapter);
+
+      // Create a tenant with the convenience API
+      const result = await localFactory.createTenant({
+        tenantId: "publish-test",
+        adminName: "cn=admin/o=publish-test",
+        adminPassword: "admin-pass",
+        userName: "cn=user1/o=publish-test",
+        userPassword: "user-pass",
+      });
+
+      // Publish to server
+      await result.tenant.publishToServer(baseUrl, {
+        registerUsers: [localFactory.toPublicUserId(result.appUser)],
+      });
+
+      // Verify the tenant was registered
+      const { status, body } = await httpRequest(`${baseUrl}/admin/tenants`);
+      expect(status).toBe(200);
+      const tenants = (body as { tenants: string[] }).tenants;
+      expect(tenants).toContain("publish-test");
+    }, 60000);
+  });
+
   describe("Tenant Not Found", () => {
     test("should return 404 for non-existent tenant", async () => {
       const { status, body } = await httpRequest(

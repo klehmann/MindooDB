@@ -6,6 +6,13 @@ import {
   SigningKeyPair,
   EncryptionKeyPair,
   PUBLIC_INFOS_KEY_ID,
+  CreateTenantOptions,
+  CreateTenantResult,
+  JoinRequest,
+  JoinResponse,
+  JoinTenantOptions,
+  JoinTenantResult,
+  OpenTenantOptions,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
@@ -13,6 +20,7 @@ import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbkdf2Iterations";
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
+import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
 
 /**
  * BaseTenantFactory is a platform-agnostic implementation of TenantFactory
@@ -53,6 +61,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
+    options?: OpenTenantOptions,
   ): Promise<MindooTenant>;
   async openTenant(
     tenantId: string,
@@ -65,9 +74,10 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     arg2: string | PrivateUserId,
     arg3: string | PrivateUserId,
     arg4: string | PrivateUserId | KeyBag,
-    arg5?: PrivateUserId | string | KeyBag,
-    arg6?: string | KeyBag,
-    arg7?: KeyBag,
+    arg5?: PrivateUserId | string | KeyBag | OpenTenantOptions,
+    arg6?: string | KeyBag | OpenTenantOptions,
+    arg7?: KeyBag | OpenTenantOptions,
+    arg8?: OpenTenantOptions,
   ): Promise<MindooTenant> {
     this.logger.info(`Opening tenant: ${tenantId}`);
 
@@ -76,6 +86,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     let currentUser: PrivateUserId;
     let currentUserPassword: string;
     let keyBag: KeyBag;
+    let options: OpenTenantOptions | undefined;
 
     if (typeof arg2 === "string") {
       administrationPublicKey = arg2;
@@ -83,6 +94,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       currentUser = arg4 as PrivateUserId;
       currentUserPassword = arg5 as string;
       keyBag = arg6 as KeyBag;
+      options = arg7 as OpenTenantOptions | undefined;
     } else {
       // Backward-compatible short form for internal tests
       currentUser = arg2;
@@ -112,7 +124,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       keyBag,
       this.storeFactory,
       this.cryptoAdapter,
-      tenantLogger
+      tenantLogger,
+      options?.additionalTrustedKeys
     );
 
     // Initialize the tenant
@@ -324,6 +337,137 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     };
   }
 
+  // ==================== Convenience Methods ====================
+
+  /**
+   * Create a new tenant with a single call.
+   */
+  async createTenant(options: CreateTenantOptions): Promise<CreateTenantResult> {
+    this.logger.info(`Creating tenant: ${options.tenantId}`);
+    console.log(`[createTenant] Creating tenant "${options.tenantId}" with admin "${options.adminName}" and user "${options.userName}"`);
+
+    // 1. Create admin and app user identities
+    const adminUser = await this.createUserId(options.adminName, options.adminPassword);
+    const appUser = await this.createUserId(options.userName, options.userPassword);
+
+    // 2. Create KeyBag with required keys
+    const keyBag = new KeyBag(
+      appUser.userEncryptionKeyPair.privateKey,
+      options.userPassword,
+      this.cryptoAdapter,
+      this.logger.createChild("KeyBag")
+    );
+    await keyBag.createTenantKey(options.tenantId);
+    await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+
+    // 3. Open tenant
+    const tenant = await this.openTenant(
+      options.tenantId,
+      adminUser.userSigningKeyPair.publicKey,
+      adminUser.userEncryptionKeyPair.publicKey,
+      appUser,
+      options.userPassword,
+      keyBag
+    );
+
+    // 4. Register the app user in the directory
+    const directory = await tenant.openDirectory();
+    await directory.registerUser(
+      this.toPublicUserId(appUser),
+      adminUser.userSigningKeyPair.privateKey,
+      options.adminPassword
+    );
+
+    console.log(`[createTenant] ✓ Tenant "${options.tenantId}" created successfully`);
+    this.logger.info(`Tenant "${options.tenantId}" created successfully`);
+
+    return { tenant, adminUser, appUser, keyBag };
+  }
+
+  /**
+   * Create a join request from a user's private identity.
+   */
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object" }): JoinRequest;
+  createJoinRequest(user: PrivateUserId, options: { format: "uri" }): string;
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri" }): JoinRequest | string {
+    const publicUser = this.toPublicUserId(user);
+
+    const joinRequest: JoinRequest = {
+      v: 1,
+      username: publicUser.username,
+      signingPublicKey: publicUser.userSigningPublicKey,
+      encryptionPublicKey: publicUser.userEncryptionPublicKey,
+    };
+
+    if (options?.format === "uri") {
+      return encodeMindooURI("join-request", joinRequest as unknown as Record<string, unknown>);
+    }
+
+    return joinRequest;
+  }
+
+  /**
+   * Join a tenant using a join response from an admin.
+   */
+  async joinTenant(joinResponse: JoinResponse | string, options: JoinTenantOptions): Promise<JoinTenantResult> {
+    // Parse the join response if it's a URI string
+    let response: JoinResponse;
+    if (typeof joinResponse === "string") {
+      if (!isMindooURI(joinResponse)) {
+        throw new Error("Invalid join response: expected a JoinResponse object or a mdb://join-response/... URI string");
+      }
+      const decoded = decodeMindooURI<JoinResponse>(joinResponse);
+      if (decoded.type !== "join-response") {
+        throw new Error(`Invalid URI type: expected "join-response", got "${decoded.type}"`);
+      }
+      response = decoded.payload;
+    } else {
+      response = joinResponse;
+    }
+
+    console.log(`[joinTenant] Joining tenant "${response.tenantId}"`);
+    this.logger.info(`Joining tenant: ${response.tenantId}`);
+
+    // 1. Create a new KeyBag for this user
+    const keyBag = new KeyBag(
+      options.user.userEncryptionKeyPair.privateKey,
+      options.password,
+      this.cryptoAdapter,
+      this.logger.createChild("KeyBag")
+    );
+
+    // 2. Import the encrypted tenant key
+    await keyBag.decryptAndImportKey(
+      "tenant",
+      response.tenantId,
+      response.encryptedTenantKey,
+      options.sharePassword
+    );
+
+    // 3. Import the encrypted $publicinfos key
+    await keyBag.decryptAndImportKey(
+      "doc",
+      PUBLIC_INFOS_KEY_ID,
+      response.encryptedPublicInfosKey,
+      options.sharePassword
+    );
+
+    // 4. Open the tenant
+    const tenant = await this.openTenant(
+      response.tenantId,
+      response.adminSigningPublicKey,
+      response.adminEncryptionPublicKey,
+      options.user,
+      options.password,
+      keyBag
+    );
+
+    console.log(`[joinTenant] ✓ Joined tenant "${response.tenantId}" successfully`);
+    this.logger.info(`Joined tenant "${response.tenantId}" successfully`);
+
+    return { tenant, keyBag };
+  }
+
   /**
    * Internal method to encrypt a private key using password-based key derivation.
    * This is the reverse of BaseMindooTenant.decryptPrivateKey().
@@ -430,13 +574,11 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   }
 
   private async assertRequiredKeysInKeyBag(tenantId: string, keyBag: KeyBag): Promise<void> {
-    const tenantKey = await keyBag.get("tenant", tenantId);
-    if (!tenantKey) {
-      throw new Error(
-        `Missing required tenant key in KeyBag for tenant "${tenantId}". ` +
-          `Create/import it first with keyBag.createTenantKey("${tenantId}") or keyBag.decryptAndImportKey("tenant", "${tenantId}", encryptedTenantKey, password).`
-      );
-    }
+    // Note: The tenant key (type "tenant", id tenantId) is NOT checked here.
+    // It is only needed when decrypting regular database payloads (decryptionKeyId "default").
+    // Server-side tenants that only need directory access can operate without it.
+    // If it is missing and code tries to decrypt regular data, a clear
+    // SymmetricKeyNotFoundError will be thrown at the point of use.
 
     const publicInfosKey = await keyBag.get("doc", PUBLIC_INFOS_KEY_ID);
     if (!publicInfosKey) {

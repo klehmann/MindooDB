@@ -253,6 +253,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       this.logger.debug(`Public key is administration key, trusted`);
       return true;
     }
+
+    // Check additional trusted keys (e.g. server-to-server sync identities)
+    // These are configured out-of-band and checked before the directory DB
+    const additionalTrustedKeys = baseTenant.getAdditionalTrustedKeys();
+    if (additionalTrustedKeys) {
+      const additionalResult = additionalTrustedKeys.get(publicKey);
+      if (additionalResult !== undefined) {
+        this.logger.debug(`Public key validation result (from additionalTrustedKeys): ${additionalResult}`);
+        return additionalResult;
+      }
+    }
     
     // Check cache first - if we have a cached result, return it after ensuring we're up to date
     // Sync changes to make sure everything is processed

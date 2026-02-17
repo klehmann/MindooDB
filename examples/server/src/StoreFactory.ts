@@ -2,26 +2,29 @@
  * Factory for creating content-addressed stores based on configuration.
  */
 
-import { InMemoryContentAddressedStore } from "../../../src/core/appendonlystores/InMemoryContentAddressedStore";
-import type { ContentAddressedStore } from "../../../src/core/types";
+import { InMemoryContentAddressedStore } from "mindoodb/core/appendonlystores/InMemoryContentAddressedStore";
+import { BasicOnDiskContentAddressedStore } from "mindoodb/node/appendonlystores/BasicOnDiskContentAddressedStore";
+import type { ContentAddressedStore } from "mindoodb/core/types";
 import type { StoreType, TenantConfig } from "./types";
 
 /**
  * Factory for creating ContentAddressedStore instances based on configuration.
  * 
- * Currently only supports "inmemory" stores. The "file" store type is reserved
- * for future implementation.
+ * Supports "inmemory" stores (volatile, for testing) and "file" stores
+ * (persistent, backed by BasicOnDiskContentAddressedStore).
  */
 export class StoreFactory {
   private config: TenantConfig;
   private tenantId: string;
+  private dataDir: string;
   
   /** Cache of created stores: Map<"tenantId:dbId", store> */
   private stores: Map<string, ContentAddressedStore> = new Map();
 
-  constructor(tenantId: string, config: TenantConfig) {
+  constructor(tenantId: string, config: TenantConfig, dataDir?: string) {
     this.tenantId = tenantId;
     this.config = config;
+    this.dataDir = dataDir || ".";
   }
 
   /**
@@ -74,9 +77,10 @@ export class StoreFactory {
       case "inmemory":
         return new InMemoryContentAddressedStore(dbId);
       
-      case "file":
-        // TODO: Implement file-based store
-        throw new Error(`File-based store not yet implemented for ${this.tenantId}/${dbId}`);
+      case "file": {
+        const basePath = `${this.dataDir}/${this.tenantId}/stores`;
+        return new BasicOnDiskContentAddressedStore(dbId, undefined, { basePath });
+      }
       
       default:
         throw new Error(`Unknown store type: ${storeType}`);

@@ -2,7 +2,7 @@
  * Types for the MindooDB Example Server
  */
 
-import type { EncryptedPrivateKey } from "../../../src/core/types";
+import type { EncryptedPrivateKey } from "mindoodb/core/types";
 
 /**
  * Store type for content-addressed stores.
@@ -31,6 +31,8 @@ export interface RemoteServerConfig {
   url: string;
   /** This server's username on the remote server */
   username: string;
+  /** Ed25519 signing public key (PEM) of the remote server, used to trust inbound sync requests */
+  signingPublicKey?: string;
   /** Optional: automatic sync interval in milliseconds */
   syncIntervalMs?: number;
   /** Optional: specific databases to sync (default: all) */
@@ -55,12 +57,15 @@ export interface TenantConfig {
   /** RSA-OAEP public key in PEM format for encrypting admin-only data */
   adminEncryptionPublicKey: string;
   
-  /** Default store type for new databases (default: "inmemory") */
+  /** Base64-encoded $publicinfos AES-256 symmetric key for reading the directory DB */
+  publicInfosKey?: string;
+
+  /** Default store type for new databases (default: "file") */
   defaultStoreType?: StoreType;
   /** Per-database store configuration overrides */
   databaseStores?: Record<string, DatabaseStoreConfig>;
   
-  /** Registered users (clients and other servers) */
+  /** Registered users (clients and other servers) — bootstrap/test fallback */
   users?: UserConfig[];
   
   /** Remote servers to sync with (for server-to-server sync) */
@@ -97,9 +102,11 @@ export interface RegisterTenantRequest {
   adminSigningPublicKey: string;
   /** RSA-OAEP public key in PEM format */
   adminEncryptionPublicKey: string;
-  /** Default store type (default: "inmemory") */
+  /** Base64-encoded $publicinfos AES-256 symmetric key for reading the directory DB */
+  publicInfosKey?: string;
+  /** Default store type (default: "file") */
   defaultStoreType?: StoreType;
-  /** Initial users to register */
+  /** Initial users to register (for testing/bootstrapping only) */
   users?: UserConfig[];
 }
 

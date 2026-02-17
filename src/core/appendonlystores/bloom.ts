@@ -37,6 +37,25 @@
 
 import type { StoreIdBloomSummary } from "./types";
 
+/** Cross-platform Uint8Array -> base64 string. */
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/** Cross-platform base64 string -> Uint8Array. */
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 /** Default probability of a false positive (1 %). */
 const DEFAULT_FALSE_POSITIVE_RATE = 0.01;
 
@@ -178,7 +197,7 @@ export function createIdBloomSummary(ids: string[], falsePositiveRate: number = 
     bitCount,
     hashCount,
     salt: DEFAULT_SALT,
-    bitsetBase64: Buffer.from(bitset).toString("base64"),
+    bitsetBase64: uint8ArrayToBase64(bitset),
   };
 }
 
@@ -213,7 +232,7 @@ export function bloomMightContainId(summary: StoreIdBloomSummary, id: string): b
   if (summary.version !== "bloom-v1") {
     return true;
   }
-  const bitset = new Uint8Array(Buffer.from(summary.bitsetBase64, "base64"));
+  const bitset = base64ToUint8Array(summary.bitsetBase64);
   const indexes = bloomIndexes(id, summary.bitCount, summary.hashCount, summary.salt);
   for (const idx of indexes) {
     if (!getBit(bitset, idx)) {

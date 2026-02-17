@@ -5,10 +5,10 @@
  * using the same HttpTransport protocol that clients use.
  */
 
-import { HttpTransport } from "../../../src/appendonlystores/network/HttpTransport";
-import { ClientNetworkContentAddressedStore } from "../../../src/appendonlystores/network/ClientNetworkContentAddressedStore";
-import type { ContentAddressedStore, EncryptedPrivateKey } from "../../../src/core/types";
-import type { CryptoAdapter } from "../../../src/core/crypto/CryptoAdapter";
+import { HttpTransport } from "mindoodb/appendonlystores/network/HttpTransport";
+import { ClientNetworkContentAddressedStore } from "mindoodb/appendonlystores/network/ClientNetworkContentAddressedStore";
+import type { ContentAddressedStore, EncryptedPrivateKey } from "mindoodb/core/types";
+import type { CryptoAdapter } from "mindoodb/core/crypto/CryptoAdapter";
 import type { RemoteServerConfig, ServerKeysConfig } from "./types";
 
 /**
@@ -34,7 +34,7 @@ export class ServerSync {
   private tenantId: string;
   private serverKeys: ServerKeysConfig;
   private keyPassword: string;
-  private localStoreFactory: (dbId: string) => ContentAddressedStore;
+  private localStoreFactory: (dbId: string) => ContentAddressedStore | Promise<ContentAddressedStore>;
   
   // Cached crypto keys
   private signingKey: CryptoKey | null = null;
@@ -54,7 +54,7 @@ export class ServerSync {
     tenantId: string,
     serverKeys: ServerKeysConfig,
     keyPassword: string,
-    localStoreFactory: (dbId: string) => ContentAddressedStore
+    localStoreFactory: (dbId: string) => ContentAddressedStore | Promise<ContentAddressedStore>
   ) {
     this.cryptoAdapter = cryptoAdapter;
     this.tenantId = tenantId;
@@ -146,7 +146,7 @@ export class ServerSync {
     );
 
     // Get local store
-    const localStore = this.localStoreFactory(dbId);
+    const localStore = await this.localStoreFactory(dbId);
 
     // Pull from remote (get entries we don't have)
     const localIds = await localStore.getAllIds();

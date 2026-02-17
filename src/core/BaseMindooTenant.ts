@@ -2,12 +2,18 @@ import {
   MindooTenant,
   EncryptedPrivateKey,
   MindooDB,
+  ContentAddressedStore,
   ContentAddressedStoreFactory,
   OpenStoreOptions,
   OpenDBOptions,
   MindooTenantFactory,
   MindooTenantDirectory,
   SigningKeyPair,
+  JoinRequest,
+  JoinResponse,
+  ApproveJoinRequestOptions,
+  PublishToServerOptions,
+  PUBLIC_INFOS_KEY_ID,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
@@ -17,6 +23,7 @@ import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -51,6 +58,18 @@ export class BaseMindooTenant implements MindooTenant {
   private decryptedUserEncryptionKeyCache?: CryptoKey;
   private logger: Logger;
 
+  /**
+   * Optional map of additional trusted signing public keys.
+   * Keys in this map are checked BEFORE the MindooTenantDirectory when validating
+   * public signing keys. This is useful for server-to-server sync where
+   * trusted server identities are configured out-of-band (e.g. server-env.json)
+   * rather than registered in the directory database.
+   *
+   * Map key: signing public key (Ed25519, PEM format)
+   * Map value: true if trusted, false if explicitly revoked
+   */
+  private additionalTrustedKeys?: ReadonlyMap<string, boolean>;
+
   constructor(
     factory: MindooTenantFactory,
     tenantId: string,
@@ -61,7 +80,8 @@ export class BaseMindooTenant implements MindooTenant {
     keyBag: KeyBag,
     storeFactory: ContentAddressedStoreFactory,
     cryptoAdapter?: CryptoAdapter,
-    logger?: Logger
+    logger?: Logger,
+    additionalTrustedKeys?: ReadonlyMap<string, boolean>
   ) {
     this.factory = factory;
     this.tenantId = tenantId;
@@ -71,6 +91,7 @@ export class BaseMindooTenant implements MindooTenant {
     this.currentUserPassword = currentUserPassword;
     this.keyBag = keyBag;
     this.storeFactory = storeFactory;
+    this.additionalTrustedKeys = additionalTrustedKeys;
     // Import createCryptoAdapter dynamically to avoid issues in browser environments
     if (!cryptoAdapter) {
       const { createCryptoAdapter } = require("./crypto/CryptoAdapter");
@@ -436,6 +457,14 @@ export class BaseMindooTenant implements MindooTenant {
     };
   }
 
+  /**
+   * Get the additional trusted signing keys map, if configured.
+   * Used by BaseMindooTenantDirectory to check keys before the directory DB.
+   */
+  getAdditionalTrustedKeys(): ReadonlyMap<string, boolean> | undefined {
+    return this.additionalTrustedKeys;
+  }
+
   async openDirectory(): Promise<MindooTenantDirectory> {
     if (!this.directoryCache) {
       const directoryLogger = this.logger.createChild("Directory");
@@ -489,10 +518,200 @@ export class BaseMindooTenant implements MindooTenant {
     return new MindooDocSigner(this, signKey, signerLogger);
   }
 
+  // ==================== Convenience Methods ====================
+
+  /**
+   * Approve a join request and produce a join response.
+   */
+  async approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions & { format: "uri" }): Promise<string>;
+  async approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions): Promise<JoinResponse>;
+  async approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions): Promise<JoinResponse | string> {
+    // Parse the join request if it's a URI string
+    let request: JoinRequest;
+    if (typeof joinRequest === "string") {
+      if (!isMindooURI(joinRequest)) {
+        throw new Error("Invalid join request: expected a JoinRequest object or a mdb://join-request/... URI string");
+      }
+      const decoded = decodeMindooURI<JoinRequest>(joinRequest);
+      if (decoded.type !== "join-request") {
+        throw new Error(`Invalid URI type: expected "join-request", got "${decoded.type}"`);
+      }
+      request = decoded.payload;
+    } else {
+      request = joinRequest;
+    }
+
+    console.log(`[approveJoinRequest] Approving join request for user "${request.username}"`);
+    this.logger.info(`Approving join request for user: ${request.username}`);
+
+    // 1. Register the user in the directory
+    const directory = await this.openDirectory();
+    const publicUserId: PublicUserId = {
+      username: request.username,
+      userSigningPublicKey: request.signingPublicKey,
+      userEncryptionPublicKey: request.encryptionPublicKey,
+    };
+    await directory.registerUser(
+      publicUserId,
+      options.adminSigningKey,
+      options.adminPassword
+    );
+
+    // 2. Export the tenant key encrypted with the share password
+    const encryptedTenantKey = await this.keyBag.encryptAndExportKey(
+      "tenant",
+      this.tenantId,
+      options.sharePassword
+    );
+    if (!encryptedTenantKey) {
+      throw new Error(`Failed to export tenant key for tenant "${this.tenantId}"`);
+    }
+
+    // 3. Export the $publicinfos key encrypted with the share password
+    const encryptedPublicInfosKey = await this.keyBag.encryptAndExportKey(
+      "doc",
+      PUBLIC_INFOS_KEY_ID,
+      options.sharePassword
+    );
+    if (!encryptedPublicInfosKey) {
+      throw new Error(`Failed to export $publicinfos key`);
+    }
+
+    // 4. Build the join response
+    const joinResponse: JoinResponse = {
+      v: 1,
+      tenantId: this.tenantId,
+      adminSigningPublicKey: this.administrationPublicKey,
+      adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
+      encryptedTenantKey,
+      encryptedPublicInfosKey,
+    };
+
+    if (options.serverUrl) {
+      joinResponse.serverUrl = options.serverUrl;
+    }
+
+    console.log(`[approveJoinRequest] ✓ Join request approved for user "${request.username}"`);
+    this.logger.info(`Join request approved for user: ${request.username}`);
+
+    // Return as URI string or object depending on format option
+    if (options.format === "uri") {
+      return encodeMindooURI("join-response", joinResponse as unknown as Record<string, unknown>);
+    }
+
+    return joinResponse;
+  }
+
+  /**
+   * Publish (register) this tenant on a MindooDB server.
+   */
+  async publishToServer(serverUrl: string, options?: PublishToServerOptions): Promise<void> {
+    console.log(`[publishToServer] Publishing tenant "${this.tenantId}" to server: ${serverUrl}`);
+    this.logger.info(`Publishing tenant "${this.tenantId}" to server: ${serverUrl}`);
+
+    // Export the $publicinfos key so the server can read the directory DB
+    const publicInfosKeyBytes = await this.keyBag.get("doc", PUBLIC_INFOS_KEY_ID);
+    if (!publicInfosKeyBytes) {
+      throw new Error(`Cannot publish to server: $publicinfos key not found in KeyBag`);
+    }
+    const publicInfosKeyBase64 = this.uint8ArrayToBase64(publicInfosKeyBytes);
+
+    // Build the registration request
+    const requestBody: Record<string, unknown> = {
+      tenantId: this.tenantId,
+      adminSigningPublicKey: this.administrationPublicKey,
+      adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
+      publicInfosKey: publicInfosKeyBase64,
+    };
+
+    // Add users if provided
+    if (options?.registerUsers && options.registerUsers.length > 0) {
+      requestBody.users = options.registerUsers.map((u) => ({
+        username: u.username,
+        signingPublicKey: u.userSigningPublicKey,
+        encryptionPublicKey: u.userEncryptionPublicKey,
+      }));
+    }
+
+    // Build headers
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (options?.adminApiKey) {
+      headers["x-api-key"] = options.adminApiKey;
+    }
+
+    // POST to the server's admin register-tenant endpoint
+    const url = `${serverUrl.replace(/\/$/, "")}/admin/register-tenant`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(
+        `Failed to publish tenant to server (HTTP ${response.status}): ${errorBody}`
+      );
+    }
+
+    console.log(`[publishToServer] ✓ Tenant "${this.tenantId}" published to server successfully`);
+    this.logger.info(`Tenant "${this.tenantId}" published to server successfully`);
+  }
+
+  /**
+   * Create a remote store connected to a MindooDB server, ready for sync.
+   */
+  async connectToServer(serverUrl: string, dbId: string): Promise<ContentAddressedStore> {
+    console.log(`[connectToServer] Connecting to server: ${serverUrl}, db: ${dbId}`);
+    this.logger.info(`Connecting to server: ${serverUrl}, db: ${dbId}`);
+
+    // Lazy-import network modules to avoid circular dependencies and keep core lightweight
+    const { HttpTransport } = await import("../appendonlystores/network/HttpTransport.js");
+    const { ClientNetworkContentAddressedStore } = await import(
+      "../appendonlystores/network/ClientNetworkContentAddressedStore.js"
+    );
+
+    // Create the HTTP transport
+    const baseUrl = `${serverUrl.replace(/\/$/, "")}/${this.tenantId}`;
+    const transport = new HttpTransport(
+      {
+        baseUrl,
+        tenantId: this.tenantId,
+        dbId,
+      },
+      this.logger.createChild("HttpTransport")
+    );
+
+    // Get the current user's decrypted signing key
+    const signingKey = await this.getDecryptedSigningKey();
+
+    // Get the current user's decrypted RSA encryption private key (for decrypting entries)
+    const decryptedEncryptionKey = await this.getDecryptedEncryptionKey();
+
+    // Create the client network store
+    const store = new ClientNetworkContentAddressedStore(
+      dbId,
+      transport,
+      this.cryptoAdapter,
+      this.currentUser.username,
+      signingKey,
+      decryptedEncryptionKey,
+      this.logger.createChild(`ClientNetworkStore:${dbId}`)
+    );
+
+    console.log(`[connectToServer] ✓ Connected to server for db "${dbId}"`);
+    this.logger.info(`Connected to server for db "${dbId}"`);
+
+    return store;
+  }
+
   /**
    * Internal method to get the decrypted signing key for the current user.
+   * Protected so that connectToServer() helper and subclasses can access it.
    */
-  private async getDecryptedSigningKey(): Promise<CryptoKey> {
+  protected async getDecryptedSigningKey(): Promise<CryptoKey> {
     // Use cached signing key if available
     if (this.decryptedUserSigningKeyCache) {
       return this.decryptedUserSigningKeyCache;
@@ -519,6 +738,38 @@ export class BaseMindooTenant implements MindooTenant {
     );
 
     this.decryptedUserSigningKeyCache = cryptoKey;
+    return cryptoKey;
+  }
+
+  /**
+   * Internal method to get the decrypted RSA encryption private key for the current user.
+   * Used by connectToServer() to create the network store.
+   */
+  private async getDecryptedEncryptionKey(): Promise<CryptoKey> {
+    if (this.decryptedUserEncryptionKeyCache) {
+      return this.decryptedUserEncryptionKeyCache;
+    }
+
+    const decryptedKeyBuffer = await this.decryptPrivateKey(
+      this.currentUser.userEncryptionKeyPair.privateKey,
+      this.currentUserPassword,
+      "encryption"
+    );
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    const cryptoKey = await subtle.importKey(
+      "pkcs8",
+      decryptedKeyBuffer,
+      {
+        name: "RSA-OAEP",
+        hash: "SHA-256",
+      },
+      false,
+      ["decrypt"]
+    );
+
+    this.decryptedUserEncryptionKeyCache = cryptoKey;
     return cryptoKey;
   }
 

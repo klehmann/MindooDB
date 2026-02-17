@@ -160,7 +160,7 @@ async function main(): Promise<void> {
       
       for (const tenantId of tenants) {
         try {
-          const tenant = tenantManager.getTenant(tenantId);
+          const tenant = await tenantManager.getTenant(tenantId);
           const config = tenant.context.config;
           const serverKeys = tenant.context.serverKeys;
           
@@ -170,7 +170,7 @@ async function main(): Promise<void> {
               tenantId,
               serverKeys,
               serverKeyPassword,
-              (dbId) => tenantManager.getStore(tenantId, dbId)
+              async (dbId) => tenantManager.getStore(tenantId, dbId)
             );
             
             const stopSync = startPeriodicSync(serverSync, config.remoteServers);

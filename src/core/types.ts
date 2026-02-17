@@ -72,6 +72,148 @@ export interface EncryptionKeyPair {
 export type { PublicUserId, PrivateUserId };
 export type { KeyType };
 
+// ==================== Tenant Options ====================
+
+/**
+ * Options for opening a tenant.
+ */
+export interface OpenTenantOptions {
+  /**
+   * Optional map of additional trusted signing public keys.
+   * Keys in this map are checked BEFORE the MindooTenantDirectory when
+   * validating public signing keys during signature verification.
+   *
+   * Use case: server-to-server sync where trusted server identities are
+   * configured out-of-band (e.g. server-env.json) rather than registered
+   * in the directory database.
+   *
+   * Map key: signing public key (Ed25519, PEM format)
+   * Map value: true if trusted, false if explicitly revoked
+   */
+  additionalTrustedKeys?: ReadonlyMap<string, boolean>;
+}
+
+// ==================== Join Flow Types ====================
+
+/**
+ * Options for creating a new tenant with a single convenience call.
+ */
+export interface CreateTenantOptions {
+  /** Tenant identifier (e.g. "acme") */
+  tenantId: string;
+  /** Distinguished name for the admin user (e.g. "cn=admin/o=acme") */
+  adminName: string;
+  /** Password for the admin user's private keys */
+  adminPassword: string;
+  /** Distinguished name for the regular app user (e.g. "cn=alice/o=acme") */
+  userName: string;
+  /** Password for the regular user's private keys */
+  userPassword: string;
+}
+
+/**
+ * Result of creating a new tenant via createTenant().
+ */
+export interface CreateTenantResult {
+  /** The opened tenant, ready to use */
+  tenant: MindooTenant;
+  /** The admin user's private identity (contains signing + encryption key pairs) */
+  adminUser: PrivateUserId;
+  /** The regular app user's private identity */
+  appUser: PrivateUserId;
+  /** The KeyBag containing tenant and $publicinfos keys */
+  keyBag: KeyBag;
+}
+
+/**
+ * A join request is created by a new user who wants to join a tenant.
+ * It contains only public information and is safe to share via any channel.
+ * 
+ * Can be serialized to a mdb://join-request/... URI for out-of-band exchange.
+ */
+export interface JoinRequest {
+  /** Protocol version (always 1 for now) */
+  v: 1;
+  /** The username the user wants to be registered as (e.g. "cn=user2/o=acme") */
+  username: string;
+  /** Ed25519 public signing key (PEM format) */
+  signingPublicKey: string;
+  /** RSA-OAEP public encryption key (PEM format) */
+  encryptionPublicKey: string;
+}
+
+/**
+ * Options for approving a join request.
+ */
+export interface ApproveJoinRequestOptions {
+  /** The admin's encrypted private signing key */
+  adminSigningKey: EncryptedPrivateKey;
+  /** The password to decrypt the admin signing key */
+  adminPassword: string;
+  /** A shared password for encrypting the exported keys. Must be communicated out-of-band (e.g. phone). */
+  sharePassword: string;
+  /** Optional server URL to include in the response so the joining user knows where to sync */
+  serverUrl?: string;
+  /** If "uri", approveJoinRequest returns a mdb://join-response/... URI string instead of an object */
+  format?: "object" | "uri";
+}
+
+/**
+ * A join response is created by the admin after approving a join request.
+ * It contains encrypted symmetric keys and tenant metadata needed to join.
+ * 
+ * Can be serialized to a mdb://join-response/... URI for out-of-band exchange.
+ * The encrypted keys can only be unlocked with the sharePassword communicated separately.
+ */
+export interface JoinResponse {
+  /** Protocol version (always 1 for now) */
+  v: 1;
+  /** Tenant identifier */
+  tenantId: string;
+  /** Admin's public signing key (Ed25519, PEM) — needed to open the tenant */
+  adminSigningPublicKey: string;
+  /** Admin's public encryption key (RSA-OAEP, PEM) — needed to open the tenant */
+  adminEncryptionPublicKey: string;
+  /** Optional server URL for sync */
+  serverUrl?: string;
+  /** Tenant symmetric key, encrypted with the sharePassword */
+  encryptedTenantKey: EncryptedPrivateKey;
+  /** $publicinfos symmetric key, encrypted with the sharePassword */
+  encryptedPublicInfosKey: EncryptedPrivateKey;
+}
+
+/**
+ * Options for joining a tenant with a join response.
+ */
+export interface JoinTenantOptions {
+  /** The user's locally-generated private identity (keys never leave this device) */
+  user: PrivateUserId;
+  /** The password for the user's private keys */
+  password: string;
+  /** The shared password used to decrypt the keys in the join response */
+  sharePassword: string;
+}
+
+/**
+ * Result of joining a tenant via joinTenant().
+ */
+export interface JoinTenantResult {
+  /** The opened tenant, ready to use */
+  tenant: MindooTenant;
+  /** The KeyBag containing the imported tenant and $publicinfos keys */
+  keyBag: KeyBag;
+}
+
+/**
+ * Options for publishing a tenant to a server.
+ */
+export interface PublishToServerOptions {
+  /** Optional API key for the server's admin endpoints */
+  adminApiKey?: string;
+  /** Optional users to register on the server at the same time */
+  registerUsers?: PublicUserId[];
+}
+
 /**
  * A TenantFactory is a factory for creating and managing tenants.
  */
@@ -87,8 +229,9 @@ export interface MindooTenantFactory {
    * @param currentUserPassword The password to decrypt the current user's private keys
    * @param keyBag The KeyBag instance for storing and loading tenant/doc keys.
    *               Must contain:
-   *               - tenant key under type "tenant" and id tenantId
    *               - $publicinfos key under type "doc" and id PUBLIC_INFOS_KEY_ID
+   *               Optionally (required for decrypting regular database payloads):
+   *               - tenant key under type "tenant" and id tenantId
    * @return The tenant
    */
   openTenant(
@@ -98,6 +241,7 @@ export interface MindooTenantFactory {
     currentUser: PrivateUserId,
     currentUserPassword: string,
     keyBag: KeyBag,
+    options?: OpenTenantOptions,
   ): Promise<MindooTenant>;
 
   /**
@@ -139,6 +283,46 @@ export interface MindooTenantFactory {
    * @return The encryption key pair containing both public key (PEM format) and encrypted private key (RSA-OAEP)
    */
   createEncryptionKeyPair(password: string): Promise<EncryptionKeyPair>;
+
+  // ==================== Convenience Methods ====================
+
+  /**
+   * Create a new tenant with a single call. This orchestrates:
+   * 1. Creating the admin user identity
+   * 2. Creating the regular app user identity
+   * 3. Creating a KeyBag with tenant key and $publicinfos key
+   * 4. Opening the tenant
+   * 5. Registering the app user in the directory
+   *
+   * @param options Tenant creation options
+   * @return The created tenant, admin user, app user, and KeyBag
+   */
+  createTenant(options: CreateTenantOptions): Promise<CreateTenantResult>;
+
+  /**
+   * Create a join request from a user's private identity.
+   * The join request contains only public keys and is safe to share via any channel.
+   *
+   * @param user The user's private identity (only public keys are extracted)
+   * @param options Optional. Set format to "uri" to get a mdb://join-request/... URI string.
+   * @return A JoinRequest object or a mdb://join-request/... URI string
+   */
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object" }): JoinRequest;
+  createJoinRequest(user: PrivateUserId, options: { format: "uri" }): string;
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri" }): JoinRequest | string;
+
+  /**
+   * Join a tenant using a join response from an admin.
+   * This orchestrates:
+   * 1. Parsing the join response (object or mdb:// URI string)
+   * 2. Creating a new KeyBag and importing the encrypted keys
+   * 3. Opening the tenant with the admin public keys from the response
+   *
+   * @param joinResponse A JoinResponse object or a mdb://join-response/... URI string
+   * @param options Options including the user's identity, password, and the shared password
+   * @return The opened tenant and KeyBag
+   */
+  joinTenant(joinResponse: JoinResponse | string, options: JoinTenantOptions): Promise<JoinTenantResult>;
 }
 
 /**
@@ -294,6 +478,46 @@ export interface MindooTenant {
    * @return The crypto adapter
    */
   getCryptoAdapter(): CryptoAdapter;
+
+  // ==================== Convenience Methods ====================
+
+  /**
+   * Approve a join request and produce a join response.
+   * This orchestrates:
+   * 1. Parsing the join request (object or mdb:// URI string)
+   * 2. Registering the user in the tenant directory
+   * 3. Exporting the tenant key and $publicinfos key, encrypted with the sharePassword
+   * 4. Packaging everything into a JoinResponse
+   *
+   * @param joinRequest A JoinRequest object or a mdb://join-request/... URI string
+   * @param options Options including admin key, share password, and optional server URL
+   * @return A JoinResponse object, or a mdb://join-response/... URI string if format is "uri"
+   */
+  approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions & { format: "uri" }): Promise<string>;
+  approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions): Promise<JoinResponse>;
+
+  /**
+   * Publish (register) this tenant on a MindooDB server.
+   * Sends an HTTP POST to the server's /admin/register-tenant endpoint
+   * with the admin public keys and optional initial users.
+   *
+   * @param serverUrl The base URL of the MindooDB server (e.g. "http://localhost:3000")
+   * @param options Optional API key and users to register
+   */
+  publishToServer(serverUrl: string, options?: PublishToServerOptions): Promise<void>;
+
+  /**
+   * Create a remote store connected to a MindooDB server, ready for sync.
+   * This orchestrates:
+   * 1. Creating an HttpTransport pointed at the server
+   * 2. Creating a ClientNetworkContentAddressedStore with the current user's keys
+   * 3. Returning the store for use with pullChangesFrom/pushChangesTo
+   *
+   * @param serverUrl The base URL of the MindooDB server (e.g. "http://localhost:3000")
+   * @param dbId The database ID to connect to (e.g. "todos")
+   * @return A ContentAddressedStore connected to the remote server
+   */
+  connectToServer(serverUrl: string, dbId: string): Promise<ContentAddressedStore>;
 }
 
 // Re-export ContentAddressedStore and ContentAddressedStoreFactory from appendonlystores

@@ -11,9 +11,9 @@ import type {
   StoreScanFilters,
   StoreIdBloomSummary,
   StoreCompactionStatus,
-} from "../../../src/core/types";
-import type { NetworkSyncCapabilities } from "../../../src/core/appendonlystores/network/types";
-import { NetworkError, NetworkErrorType } from "../../../src/core/appendonlystores/network/types";
+} from "mindoodb/core/types";
+import type { NetworkSyncCapabilities } from "mindoodb/core/appendonlystores/network/types";
+import { NetworkError, NetworkErrorType } from "mindoodb/core/appendonlystores/network/types";
 
 import { TenantManager } from "./TenantManager";
 import type {
@@ -292,7 +292,7 @@ export class MindooDBServer {
         return;
       }
 
-      const authService = this.tenantManager.getAuthService(req.tenantId!);
+      const authService = await this.tenantManager.getAuthService(req.tenantId!);
       const challenge = await authService.generateChallenge(username);
 
       res.json({ challenge });
@@ -310,7 +310,7 @@ export class MindooDBServer {
         return;
       }
 
-      const authService = this.tenantManager.getAuthService(req.tenantId!);
+      const authService = await this.tenantManager.getAuthService(req.tenantId!);
       const signatureBytes = this.base64ToUint8Array(signature);
       const result = await authService.authenticate(challenge, signatureBytes);
 
@@ -332,7 +332,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const entries = await serverStore.handleFindNewEntries(token, haveIds || []);
 
       res.json({
@@ -353,7 +353,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const entries = await serverStore.handleFindNewEntriesForDoc(token, haveIds || [], docId);
 
       res.json({
@@ -374,7 +374,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const entries = await serverStore.handleFindEntries(
         token,
         type,
@@ -405,7 +405,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const result = await serverStore.handleScanEntriesSince(
         token,
         cursor ?? null,
@@ -433,7 +433,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const summary = await serverStore.handleGetIdBloomSummary(token);
       res.json({ summary: summary as StoreIdBloomSummary });
     } catch (error) {
@@ -445,7 +445,7 @@ export class MindooDBServer {
     try {
       const token = this.extractToken(req);
       const dbId = (req.query.dbId as string) || "directory";
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const capabilities = await serverStore.handleGetCapabilities(token);
       res.json({ capabilities: capabilities as NetworkSyncCapabilities });
     } catch (error) {
@@ -463,7 +463,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const status = await serverStore.handleGetCompactionStatus(token);
       res.json({ status: status as StoreCompactionStatus });
     } catch (error) {
@@ -481,7 +481,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const entries = await serverStore.handleGetEntries(token, ids || []);
 
       res.json({
@@ -505,7 +505,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const deserializedEntries = (entries || []).map((e: SerializedEntry) =>
         this.deserializeEntry(e)
       );
@@ -528,7 +528,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const existingIds = await serverStore.handleHasEntries(token, ids || []);
 
       res.json({ ids: existingIds });
@@ -542,7 +542,7 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const dbId = (req.query.dbId as string) || "directory";
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const ids = await serverStore.handleGetAllIds(token);
 
       res.json({ ids });
@@ -561,7 +561,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const ids = await serverStore.handleResolveDependencies(token, startId, options);
 
       res.json({ ids });
