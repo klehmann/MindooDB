@@ -1,11 +1,24 @@
 import type { ContentAddressedStore } from "../../core/types";
-import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
+import type {
+  StoreEntry,
+  StoreEntryMetadata,
+  StoreEntryType,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
+  StoreCompactionStatus,
+} from "../../core/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
-import type { NetworkEncryptedEntry } from "../../core/appendonlystores/network/types";
+import type {
+  NetworkEncryptedEntry,
+  NetworkSyncCapabilities,
+} from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
+import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 
 /**
  * Client-side network ContentAddressedStore that forwards all operations to a remote server.
@@ -34,6 +47,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   private accessToken: string | null = null;
   private tokenExpiry: number = 0;
   private logger: Logger;
+  private capabilitiesCache: NetworkSyncCapabilities | null = null;
 
   /**
    * Create a new ClientNetworkContentAddressedStore.
@@ -201,6 +215,111 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   }
 
   /**
+   * Cursor-based metadata scan from the remote store.
+   * Uses transport-native scan support when available, with a compatibility fallback.
+   */
+  async scanEntriesSince(
+    cursor: StoreScanCursor | null,
+    limit: number = Number.MAX_SAFE_INTEGER,
+    filters?: StoreScanFilters
+  ): Promise<StoreScanResult> {
+    const token = await this.ensureAuthenticated();
+    const capabilities = await this.getCapabilities();
+    if (capabilities.supportsCursorScan && this.transport.scanEntriesSince) {
+      return this.transport.scanEntriesSince(token, cursor, limit, filters);
+    }
+
+    // Compatibility fallback: fetch metadata via legacy endpoint and paginate client-side.
+    const all = await this.findNewEntries([]);
+    const filtered = all
+      .filter((meta) => {
+        if (filters?.docId && meta.docId !== filters.docId) {
+          return false;
+        }
+        if (filters?.entryTypes && filters.entryTypes.length > 0 && !filters.entryTypes.includes(meta.entryType)) {
+          return false;
+        }
+        if (filters?.creationDateFrom !== undefined && filters.creationDateFrom !== null && meta.createdAt < filters.creationDateFrom) {
+          return false;
+        }
+        if (filters?.creationDateUntil !== undefined && filters.creationDateUntil !== null && meta.createdAt >= filters.creationDateUntil) {
+          return false;
+        }
+        return true;
+      })
+      .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt));
+
+    const startIndex =
+      cursor === null
+        ? 0
+        : filtered.findIndex((meta) => meta.createdAt > cursor.createdAt || (meta.createdAt === cursor.createdAt && meta.id > cursor.id));
+
+    if (startIndex === -1) {
+      return { entries: [], nextCursor: cursor, hasMore: false };
+    }
+
+    const page = filtered.slice(startIndex, startIndex + limit);
+    const last = page.length > 0 ? page[page.length - 1] : null;
+    return {
+      entries: page,
+      nextCursor: last ? { createdAt: last.createdAt, id: last.id } : cursor,
+      hasMore: startIndex + page.length < filtered.length,
+    };
+  }
+
+  async getIdBloomSummary(): Promise<StoreIdBloomSummary> {
+    const token = await this.ensureAuthenticated();
+    const capabilities = await this.getCapabilities();
+    if (capabilities.supportsIdBloomSummary && this.transport.getIdBloomSummary) {
+      return this.transport.getIdBloomSummary(token);
+    }
+
+    // Compatibility fallback for older transports.
+    const ids = await this.getAllIds();
+    return createIdBloomSummary(ids);
+  }
+
+  async getCapabilities(): Promise<NetworkSyncCapabilities> {
+    if (this.capabilitiesCache) {
+      return this.capabilitiesCache;
+    }
+    const token = await this.ensureAuthenticated();
+    if (this.transport.getCapabilities) {
+      this.capabilitiesCache = await this.transport.getCapabilities(token);
+      return this.capabilitiesCache;
+    }
+    this.capabilitiesCache = {
+      protocolVersion: "sync-v1",
+      supportsCursorScan: false,
+      supportsIdBloomSummary: false,
+      supportsCompactionStatus: false,
+    };
+    return this.capabilitiesCache;
+  }
+
+  async getCompactionStatus(): Promise<StoreCompactionStatus> {
+    const token = await this.ensureAuthenticated();
+    const capabilities = await this.getCapabilities();
+    if (capabilities.supportsCompactionStatus && this.transport.getCompactionStatus) {
+      return this.transport.getCompactionStatus(token);
+    }
+    // Compatibility fallback for older transports.
+    return {
+      enabled: false,
+      compactionMinFiles: 0,
+      compactionMaxBytes: 0,
+      totalCompactions: 0,
+      totalCompactedFiles: 0,
+      totalCompactedBytes: 0,
+      totalCompactionDurationMs: 0,
+      lastCompactionAt: null,
+      lastCompactedFiles: 0,
+      lastCompactedBytes: 0,
+      lastCompactionDurationMs: 0,
+    };
+  }
+
+  /**
    * Resolve dependencies for an entry.
    * 
    * Delegates to the remote server for efficient server-side traversal.
@@ -342,5 +461,6 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   clearAuthCache(): void {
     this.accessToken = null;
     this.tokenExpiry = 0;
+    this.capabilitiesCache = null;
   }
 }

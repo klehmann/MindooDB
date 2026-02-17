@@ -3,7 +3,14 @@ import {
   ContentAddressedStoreFactory,
   CreateStoreResult,
   OpenStoreOptions,
+  StoreIndexBuildStatus,
+  AwaitIndexReadyOptions,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
 } from "./types";
+import { createIdBloomSummary } from "./bloom";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -32,13 +39,22 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   
   /** Index for finding entries by docId (for efficient doc queries) */
   private docIndex: Map<string, Set<string>> = new Map(); // docId -> Set<entryId>
+  
+  /** Cached sorted entries for efficient cursor-based scanning (invalidated on mutation) */
+  private sortedEntriesCache: StoreEntryMetadata[] | null = null;
+  
+  /** Reference count per contentHash for O(1) orphan detection during purge */
+  private contentRefCount: Map<string, number> = new Map();
+  
   private logger: Logger;
+  private readonly indexingEnabled: boolean;
 
-  constructor(dbId: string, logger?: Logger) {
+  constructor(dbId: string, logger?: Logger, options?: OpenStoreOptions) {
     this.dbId = dbId;
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), `InMemoryStore:${dbId}`, true);
+    this.indexingEnabled = options?.indexingEnabled !== false;
   }
 
   getId(): string {
@@ -81,8 +97,17 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       }
       this.docIndex.get(entry.docId)!.add(entry.id);
 
+      // Update content reference count for efficient orphan cleanup
+      this.contentRefCount.set(
+        entry.contentHash,
+        (this.contentRefCount.get(entry.contentHash) || 0) + 1
+      );
+
       this.logger.debug(`Stored entry ${entry.id} for doc ${entry.docId}`);
     }
+
+    // Invalidate sorted entries cache since new entries were added
+    this.sortedEntriesCache = null;
   }
 
   /**
@@ -227,6 +252,131 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   }
 
   /**
+   * Return all entries sorted by (createdAt ASC, id ASC).
+   * Result is cached and invalidated on mutation for amortized O(1) access.
+   */
+  private getSortedEntries(): StoreEntryMetadata[] {
+    if (!this.sortedEntriesCache) {
+      this.sortedEntriesCache = Array.from(this.entries.values())
+        .sort((a, b) =>
+          a.createdAt === b.createdAt
+            ? a.id.localeCompare(b.id)
+            : a.createdAt - b.createdAt
+        );
+    }
+    return this.sortedEntriesCache;
+  }
+
+  /**
+   * Binary search for the index of the first entry strictly after `cursor`
+   * in the sorted (createdAt, id) order.
+   * Returns sorted.length when no entry comes after the cursor.
+   */
+  private binarySearchAfterCursor(
+    sorted: StoreEntryMetadata[],
+    cursor: StoreScanCursor
+  ): number {
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const m = sorted[mid];
+      if (
+        m.createdAt < cursor.createdAt ||
+        (m.createdAt === cursor.createdAt && m.id <= cursor.id)
+      ) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  /** Test whether an entry passes the given scan filters. */
+  private matchesScanFilters(
+    meta: StoreEntryMetadata,
+    filters?: StoreScanFilters
+  ): boolean {
+    if (filters?.docId && meta.docId !== filters.docId) {
+      return false;
+    }
+    if (
+      filters?.entryTypes &&
+      filters.entryTypes.length > 0 &&
+      !filters.entryTypes.includes(meta.entryType)
+    ) {
+      return false;
+    }
+    if (
+      filters?.creationDateFrom !== undefined &&
+      filters.creationDateFrom !== null &&
+      meta.createdAt < filters.creationDateFrom
+    ) {
+      return false;
+    }
+    if (
+      filters?.creationDateUntil !== undefined &&
+      filters.creationDateUntil !== null &&
+      meta.createdAt >= filters.creationDateUntil
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Cursor-based metadata scan for high-volume synchronization.
+   * Ordering: createdAt ASC, id ASC.
+   *
+   * Uses a cached sorted index with binary search for O(log n) cursor
+   * lookup instead of re-sorting all entries on every call.
+   */
+  async scanEntriesSince(
+    cursor: StoreScanCursor | null,
+    limit: number = Number.MAX_SAFE_INTEGER,
+    filters?: StoreScanFilters
+  ): Promise<StoreScanResult> {
+    const sorted = this.getSortedEntries();
+    const startIdx =
+      cursor === null
+        ? 0
+        : this.binarySearchAfterCursor(sorted, cursor);
+
+    // Single forward pass: collect up to `limit` matching entries
+    const page: StoreEntryMetadata[] = [];
+    let i = startIdx;
+    for (; i < sorted.length && page.length < limit; i++) {
+      if (this.matchesScanFilters(sorted[i], filters)) {
+        page.push(sorted[i]);
+      }
+    }
+
+    // Probe for one more matching entry to determine hasMore
+    let hasMore = false;
+    for (; i < sorted.length; i++) {
+      if (this.matchesScanFilters(sorted[i], filters)) {
+        hasMore = true;
+        break;
+      }
+    }
+
+    const last = page.length > 0 ? page[page.length - 1] : null;
+    return {
+      entries: page,
+      nextCursor: last
+        ? { createdAt: last.createdAt, id: last.id }
+        : cursor,
+      hasMore,
+    };
+  }
+
+  async getIdBloomSummary(): Promise<StoreIdBloomSummary> {
+    const ids = await this.getAllIds();
+    return createIdBloomSummary(ids);
+  }
+
+  /**
    * Resolve the dependency chain starting from an entry ID.
    * Returns IDs in dependency order (oldest first), traversing backward through dependencyIds.
    *
@@ -248,9 +398,10 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     const result: string[] = [];
     const visited = new Set<string>();
     const queue: Array<{ id: string; depth: number }> = [{ id: startId, depth: 0 }];
+    let queueIdx = 0;
 
-    while (queue.length > 0) {
-      const { id, depth } = queue.shift()!;
+    while (queueIdx < queue.length) {
+      const { id, depth } = queue[queueIdx++];
 
       // Skip if already visited
       if (visited.has(id)) {
@@ -319,14 +470,22 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       return;
     }
     
-    // Collect contentHashes that might become orphaned
-    const contentHashesToCheck = new Set<string>();
-    
-    // Remove each entry
+    // Remove each entry and decrement content reference counts
     for (const id of docEntryIds) {
       const metadata = this.entries.get(id);
       if (metadata) {
-        contentHashesToCheck.add(metadata.contentHash);
+        // Decrement ref count; clean up content when no longer referenced
+        const newCount =
+          (this.contentRefCount.get(metadata.contentHash) || 1) - 1;
+        if (newCount <= 0) {
+          this.contentStore.delete(metadata.contentHash);
+          this.contentRefCount.delete(metadata.contentHash);
+          this.logger.debug(
+            `Cleaned up orphaned content ${metadata.contentHash.substring(0, 8)}...`
+          );
+        } else {
+          this.contentRefCount.set(metadata.contentHash, newCount);
+        }
         this.entries.delete(id);
       }
     }
@@ -334,20 +493,8 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     // Remove document from docIndex
     this.docIndex.delete(docId);
     
-    // Clean up orphaned content (no remaining entries reference it)
-    for (const contentHash of contentHashesToCheck) {
-      let isReferenced = false;
-      for (const [, meta] of this.entries) {
-        if (meta.contentHash === contentHash) {
-          isReferenced = true;
-          break;
-        }
-      }
-      if (!isReferenced) {
-        this.contentStore.delete(contentHash);
-        this.logger.debug(`Cleaned up orphaned content ${contentHash.substring(0, 8)}...`);
-      }
-    }
+    // Invalidate sorted entries cache
+    this.sortedEntriesCache = null;
     
     this.logger.info(`Purged ${docEntryIds.size} entries for document ${docId}`);
   }
@@ -363,6 +510,40 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       docCount: this.docIndex.size,
     };
   }
+
+  /**
+   * Clear all local in-memory data.
+   * Useful for test setups that need deterministic clean state behavior.
+   */
+  async clearAllLocalData(): Promise<void> {
+    this.entries.clear();
+    this.contentStore.clear();
+    this.docIndex.clear();
+    this.contentRefCount.clear();
+    this.sortedEntriesCache = null;
+  }
+
+  /**
+   * In-memory stores are always ready immediately.
+   */
+  async awaitIndexReady(_options?: AwaitIndexReadyOptions): Promise<StoreIndexBuildStatus> {
+    return {
+      phase: "ready",
+      indexingEnabled: this.indexingEnabled,
+      progress01: 1,
+    };
+  }
+
+  /**
+   * In-memory stores are always ready immediately.
+   */
+  getIndexBuildStatus(): StoreIndexBuildStatus {
+    return {
+      phase: "ready",
+      indexingEnabled: this.indexingEnabled,
+      progress01: 1,
+    };
+  }
 }
 
 /**
@@ -370,11 +551,16 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
  * Each database gets its own isolated in-memory store.
  */
 export class InMemoryContentAddressedStoreFactory implements ContentAddressedStoreFactory {
-  createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
+  createStore(dbId: string, options?: OpenStoreOptions): CreateStoreResult {
     // For in-memory stores, we use a single store for both documents and attachments
     // Note: options are ignored for in-memory stores but accepted for interface compatibility
+    const store = new InMemoryContentAddressedStore(dbId, undefined, options);
+    if (options?.clearLocalDataOnStartup) {
+      // Initialize in a deterministic clean state for parity with persistent stores.
+      void store.clearAllLocalData();
+    }
     return {
-      docStore: new InMemoryContentAddressedStore(dbId),
+      docStore: store,
       // attachmentStore not provided - will use docStore for attachments
     };
   }
