@@ -11,3 +11,7 @@ export { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 
 // Browser-specific crypto adapter
 export { BrowserCryptoAdapter, createCryptoAdapter } from "./crypto/BrowserCryptoAdapter";
+
+// Browser-specific IndexedDB content-addressed store
+export { IndexedDBContentAddressedStore } from "./appendonlystores/IndexedDBContentAddressedStore";
+export { IndexedDBContentAddressedStoreFactory } from "./appendonlystores/IndexedDBContentAddressedStoreFactory";
