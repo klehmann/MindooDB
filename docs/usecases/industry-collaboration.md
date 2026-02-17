@@ -2,7 +2,7 @@
 
 ## Overview
 
-Collaborative workspaces require real-time collaboration, offline editing, version control, and fine-grained access control. MindooDB's Automerge CRDTs, offline-first architecture, and document-level encryption make it ideal for collaborative applications.
+Collaborative workspaces require real-time collaboration, offline editing, version control, and fine-grained access control. MindooDB's Automerge CRDTs, offline-first architecture, and document-level encryption make it well-suited for collaborative applications.
 
 ## Key Requirements
 
@@ -399,7 +399,7 @@ class OfflineFirstEditor {
 
 ## Conclusion
 
-MindooDB is ideal for collaborative workspaces:
+MindooDB is well-suited for collaborative workspaces:
 
 1. **Real-Time Collaboration** via Automerge CRDTs
 2. **Offline Editing** with automatic sync

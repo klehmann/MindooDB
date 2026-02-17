@@ -2,7 +2,7 @@
 
 ## Overview
 
-Financial services require immutable audit trails, regulatory compliance, and secure multi-party agreements. MindooDB's append-only architecture, end-to-end encryption, and cryptographic integrity make it ideal for financial applications.
+Financial services require immutable audit trails, regulatory compliance, and secure multi-party agreements. MindooDB's append-only architecture, end-to-end encryption, and cryptographic integrity provide strong technical foundations for financial applications. However, SOX and PCI-DSS compliance require additional organizational controls, internal procedures, and external audits beyond what any database can provide.
 
 ## Key Requirements
 
@@ -11,7 +11,7 @@ Financial services require immutable audit trails, regulatory compliance, and se
 - **SOX**: Sarbanes-Oxley Act - financial audit requirements
 - **PCI-DSS**: Payment Card Industry Data Security Standard
 - **Immutable Records**: Complete transaction history
-- **Audit Trails**: Who did what and when
+- **Audit Trails**: Who changed what and when (writes are signed; read-access logging is application-level)
 - **Data Retention**: Long-term storage requirements
 
 ### Financial-Specific Needs
@@ -125,8 +125,8 @@ class TransactionLedger {
 - **Efficient Queries**: Time-based sharding enables fast queries
 
 **Benefits:**
-- Immutable audit trail
-- SOX compliance
+- Immutable, signed audit trail
+- Supports SOX's record-keeping requirements
 - Complete transaction history
 - Efficient archival
 
@@ -379,12 +379,12 @@ class FinancialAuditTrail {
 - Create new transactions for corrections
 - Maintain complete history
 
-### 2. Regulatory Compliance
+### 2. Supporting Regulatory Requirements
 
-- Complete audit trails
-- SOX-compliant record keeping
-- PCI-DSS data protection
-- Regular compliance reporting
+- Signed write audit trail (built-in) supports SOX record-keeping
+- End-to-end encryption supports PCI-DSS data protection
+- Application-level read-access logging (you build) for comprehensive audit
+- Note: SOX/PCI-DSS also require organizational controls, internal procedures, and external audits
 
 ### 3. Multi-Party Agreements
 
@@ -410,12 +410,12 @@ class FinancialAuditTrail {
 
 ## Conclusion
 
-MindooDB is well-suited for financial services:
+MindooDB provides strong technical foundations for financial services:
 
-1. **Immutable Audit Trails** through append-only architecture
-2. **Regulatory Compliance** with SOX and PCI-DSS patterns
-3. **Multi-Party Agreements** with secure collaboration
-4. **Complete Transaction History** for audit requirements
-5. **Secure Access Control** for financial data
+1. **Immutable Audit Trails** — append-only, signed, hash-chained write history (built-in)
+2. **SOX Technical Controls** — immutable records and cryptographic integrity support SOX requirements
+3. **Multi-Party Agreements** — encrypted, signed collaboration across organizations
+4. **Complete Transaction History** — time travel and tamper-evident records for auditors
+5. **Encryption-Based Access Control** — named keys for financial data isolation
 
-By following these patterns, financial institutions can build secure, compliant systems that meet regulatory requirements while enabling efficient operations.
+By combining MindooDB's built-in capabilities with application-level patterns, financial institutions can address key technical requirements of SOX and PCI-DSS. Full regulatory compliance also requires organizational controls, internal procedures, and external audits that are outside MindooDB's scope.

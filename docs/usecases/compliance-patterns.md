@@ -2,7 +2,9 @@
 
 ## Overview
 
-Regulatory compliance requires complete audit trails, data protection, access controls, and retention policies. MindooDB's append-only architecture, end-to-end encryption, and cryptographic integrity make it ideal for meeting compliance requirements.
+Regulatory compliance requires complete audit trails, data protection, access controls, and retention policies. MindooDB's append-only architecture, end-to-end encryption, and cryptographic integrity provide strong technical building blocks that support compliance efforts. However, compliance is an organizational responsibility — MindooDB addresses the data-layer technical controls, not the full scope of any regulatory framework.
+
+> **Important:** The patterns in this document show how to use MindooDB's built-in capabilities and how to build additional application-level controls on top. MindooDB provides **write-level audit trails** (every change is cryptographically signed), **encryption-based access control** (named keys), and **coordinated data erasure** (directory-propagated purge requests). **Read-access logging**, **consent management**, and **role-based access control** are application-level concerns that you implement using MindooDB as a foundation.
 
 ## Key Regulations
 
@@ -42,7 +44,7 @@ Regulatory compliance requires complete audit trails, data protection, access co
 
 ### Right to Be Forgotten
 
-**Pattern**: Mark data as deleted while preserving audit trail
+**Pattern A (Soft delete)**: Mark data as deleted while preserving audit trail. Use this when you need to anonymize data but keep the document structure for referential integrity.
 
 ```typescript
 class GDPRCompliance {
@@ -89,13 +91,13 @@ class GDPRCompliance {
 }
 ```
 
-**Note**: Append-only limitation means data cannot be truly deleted, but can be marked and anonymized.
+**Note**: This pattern anonymizes data within the CRDT but does not remove the underlying change history from the store. For stronger erasure, use Pattern B below.
 
-#### Document History Purge (Recommended)
+#### Document History Purge (Recommended for GDPR)
 
-**Pattern**: Use directory-based purge requests to remove document change history from all client stores
+**Pattern B (Coordinated erasure)**: Use directory-based purge requests to remove document change history from all synced clients.
 
-MindooDB provides a more complete solution for GDPR "right to be forgotten" through directory-based purge requests. Administrators can request that document change history be purged from all client stores, which clients process when they sync directory changes.
+MindooDB provides a coordinated erasure mechanism for GDPR "right to be forgotten" through directory-based purge requests. Administrators create a signed purge request in the directory database, which propagates to all clients during their next directory sync. Clients then execute the purge locally.
 
 **Architecture Flow**:
 
@@ -153,7 +155,11 @@ for (const request of purgeRequests) {
 - **Complete removal**: All change history is removed from local stores
 - **Audit trail**: Purge requests themselves are stored in the directory (append-only)
 
-**Note**: This breaks append-only semantics for the purged document's changes, but the purge request itself remains in the directory for audit purposes. Network stores (proxies) don't support purging directly - clients should purge local stores after syncing from remote.
+**Caveats**:
+- This breaks append-only semantics for the purged document's changes, but the purge request itself remains in the directory for audit purposes.
+- Purge requests reach clients on their **next directory sync** — devices that never reconnect will retain the data.
+- Network stores (proxies) don't support purging directly — clients should purge local stores after syncing from remote.
+- For full GDPR compliance, your organization should track which devices have processed purge requests and have a process for handling devices that remain offline.
 
 ### Data Portability
 
@@ -305,6 +311,8 @@ class SOXCompliance {
 
 ### Payment Card Data Protection
 
+> **Important:** PCI-DSS generally advises against storing cardholder data unless absolutely necessary. If you must store it, PCI-DSS requires a comprehensive set of controls beyond encryption (network segmentation, vulnerability management, monitoring, etc.). The pattern below shows how MindooDB's encryption and named keys can protect sensitive data — but this alone does not achieve PCI-DSS compliance.
+
 **Pattern**: Encrypt payment data with restricted access
 
 ```typescript
@@ -439,11 +447,13 @@ class DataRetention {
 }
 ```
 
-## Access Logging
+## Access Logging (Application-Level)
 
 ### Who Accessed What and When
 
-**Pattern**: Complete access logging
+**Pattern**: Application-level read-access logging built on MindooDB
+
+> **Note:** MindooDB automatically provides a **write audit trail** — every change is Ed25519-signed, proving who wrote what and when. However, **read-access logging** (tracking who viewed a document) is not built-in and must be implemented at the application level. The pattern below shows how to build this on top of MindooDB.
 
 ```typescript
 class AccessLogging {
@@ -527,12 +537,13 @@ class AccessLogging {
 
 ## Conclusion
 
-MindooDB supports compliance through:
+MindooDB provides technical building blocks that support compliance efforts:
 
-1. **Complete Audit Trails** via append-only architecture
-2. **Data Protection** through end-to-end encryption
-3. **Access Controls** with fine-grained permissions
-4. **Immutable Records** for financial compliance
-5. **Access Logging** for all compliance requirements
+1. **Write Audit Trail** — every change is Ed25519-signed, append-only, and hash-chained (built-in)
+2. **Data Protection** — end-to-end encryption with AES-256-GCM (built-in)
+3. **Encryption-Based Access Control** — named keys for fine-grained data isolation (built-in)
+4. **Coordinated Data Erasure** — directory-propagated purge requests for GDPR (built-in)
+5. **Immutable Records** — append-only architecture for financial compliance (built-in)
+6. **Read-Access Logging** — application-level pattern shown above (you build)
 
-By following these patterns, organizations can meet regulatory requirements while maintaining data security and integrity.
+By combining MindooDB's built-in capabilities with the application-level patterns in this document, organizations can address key technical requirements of regulatory frameworks. Full compliance requires additional organizational, administrative, and procedural controls that are outside MindooDB's scope.

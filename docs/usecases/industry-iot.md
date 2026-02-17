@@ -2,7 +2,7 @@
 
 ## Overview
 
-IoT and edge computing require efficient data collection, offline operation, bandwidth optimization, and device management. MindooDB's offline-first architecture, incremental sync, and time-series data patterns make it ideal for IoT applications.
+IoT and edge computing require efficient data collection, offline operation, bandwidth optimization, and device management. MindooDB's offline-first architecture, incremental sync, and time-series data patterns make it well-suited for IoT applications.
 
 ## Key Requirements
 
@@ -342,7 +342,7 @@ class OfflineEdgeDevice {
 
 ## Conclusion
 
-MindooDB is ideal for IoT and edge computing:
+MindooDB is well-suited for IoT and edge computing:
 
 1. **Offline Operation** for edge device independence
 2. **Bandwidth Optimization** through incremental sync

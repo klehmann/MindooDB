@@ -2,14 +2,14 @@
 
 ## Overview
 
-Healthcare organizations require strict data protection, complete audit trails, and secure collaboration across institutions. MindooDB's end-to-end encryption, append-only architecture, and fine-grained access control make it ideal for healthcare applications.
+Healthcare organizations require strict data protection, complete audit trails, and secure collaboration across institutions. MindooDB's end-to-end encryption, append-only architecture, and fine-grained access control provide strong technical foundations for healthcare applications. However, HIPAA compliance requires additional organizational, administrative, and physical safeguards beyond what any database can provide.
 
 ## Key Requirements
 
 ### Regulatory Compliance
 
 - **HIPAA**: Health Insurance Portability and Accountability Act
-- **Complete Audit Trails**: Who accessed what and when
+- **Audit Trails**: Who changed what and when (writes are signed; read-access logging is application-level)
 - **Data Encryption**: End-to-end encryption for patient data
 - **Access Control**: Fine-grained permissions for different roles
 - **Data Retention**: Long-term storage requirements
@@ -88,7 +88,7 @@ class ElectronicHealthRecord {
 - Complete patient history
 - Tamper-proof records
 - Fine-grained access control
-- HIPAA-compliant audit trails
+- Signed write audit trail that supports HIPAA requirements (read-access logging is application-level)
 
 ### Medical Device Data Collection
 
@@ -251,8 +251,8 @@ class ResearchCollaboration {
 **Benefits:**
 - Secure multi-institutional collaboration
 - Fine-grained access control
-- Complete audit trails
-- HIPAA-compliant data sharing
+- Signed write audit trail
+- Encrypted data sharing that supports HIPAA's technical safeguards
 
 ## Access Control Patterns
 
@@ -331,9 +331,11 @@ class PatientControlledAccess {
 
 ## Audit Trails
 
-### Complete Access Logging
+### Application-Level Access Logging
 
-**Pattern**: Log all access to patient data
+**Pattern**: Log all access to patient data at the application level
+
+> **Note:** MindooDB automatically provides a **write audit trail** — every change is Ed25519-signed. The pattern below shows how to build **read-access logging** on top, which HIPAA requires for tracking who viewed patient data.
 
 ```typescript
 class HealthcareAuditTrail {
@@ -367,8 +369,8 @@ class HealthcareAuditTrail {
 ```
 
 **Benefits:**
-- Complete audit trail
-- HIPAA compliance
+- Combined write (built-in) and read (application-level) audit trail
+- Supports HIPAA's audit requirements
 - Security monitoring
 - Accountability
 
@@ -412,12 +414,13 @@ class HealthcareDataRetention {
 - Log all access
 - Encrypt with patient-specific keys
 
-### 2. HIPAA Compliance
+### 2. Supporting HIPAA Requirements
 
-- Complete audit trails
-- End-to-end encryption
-- Access controls
-- Data retention policies
+- Signed write audit trail (built-in) + read-access logging (application-level)
+- End-to-end encryption (technical safeguard)
+- Named key access controls (technical safeguard)
+- Data retention policies (organizational responsibility)
+- Note: HIPAA also requires BAAs, administrative safeguards, and physical security
 
 ### 3. Multi-Institutional Collaboration
 
@@ -443,12 +446,12 @@ class HealthcareDataRetention {
 
 ## Conclusion
 
-MindooDB is well-suited for healthcare applications:
+MindooDB provides strong technical foundations for healthcare applications:
 
-1. **HIPAA Compliance** through end-to-end encryption and audit trails
-2. **Patient Privacy** via fine-grained access control
-3. **Multi-Institutional Collaboration** with secure data sharing
-4. **Offline Operation** for field and remote operations
-5. **Complete Audit Trails** for regulatory compliance
+1. **HIPAA Technical Safeguards** — end-to-end encryption and signed write audit trails address key HIPAA technical requirements
+2. **Patient Privacy** — fine-grained access control via named keys
+3. **Multi-Institutional Collaboration** — encrypted data sharing across organizations
+4. **Offline Operation** — for field and remote clinics
+5. **Signed Write History** — built-in authorship proof; read-access logging is application-level
 
-By following these patterns, healthcare organizations can build secure, compliant systems that protect patient data while enabling collaboration and innovation.
+By combining MindooDB's built-in capabilities with application-level patterns (read-access logging, consent tracking), healthcare organizations can address HIPAA's technical safeguard requirements. Full HIPAA compliance also requires administrative safeguards, physical safeguards, BAAs, and organizational policies that are outside MindooDB's scope.
