@@ -2,7 +2,7 @@
 
 ## Why This Document Exists
 
-The network synchronization protocol (see `docs/network-sync-protocol.md`) describes how a client synchronizes encrypted entries with a server. But MindooDB's architecture was not designed for client-server alone. The same protocol, the same entry format, and the same `ContentAddressedStore` interface that power server sync also enable peer-to-peer communication, multi-hop relay chains, and network topologies where data flows through nodes that cannot read it.
+The network synchronization protocol (see [network-sync-protocol.md](network-sync-protocol.md)) describes how a client synchronizes encrypted entries with a server. But MindooDB's architecture was not designed for client-server alone. The same protocol, the same entry format, and the same `ContentAddressedStore` interface that power server sync also enable peer-to-peer communication, multi-hop relay chains, and network topologies where data flows through nodes that cannot read it.
 
 This document explains the design decisions that make these advanced topologies possible, walks through the most useful patterns, and discusses when each one is the right choice.
 
@@ -48,7 +48,7 @@ In the simplest deployment, a client has a local store (on disk or in memory) an
 
 The server's `ServerNetworkContentAddressedStore` validates the client's JWT token, looks up entries in its local store, RSA-encrypts the payloads for the requesting client, and returns them. The client decrypts the RSA layer and stores the entries locally.
 
-This is covered in detail in `docs/network-sync-protocol.md`. The rest of this document builds on this foundation.
+This is covered in detail in [network-sync-protocol.md](network-sync-protocol.md). The rest of this document builds on this foundation.
 
 ---
 
@@ -249,6 +249,6 @@ All of these topologies use the same sync protocol, the same entry format, and t
 
 ## 12) Related Documents
 
-- Network sync protocol: `docs/network-sync-protocol.md`
-- On-disk store: `docs/on-disk-content-addressed-store.md`
-- Main system spec: `docs/specification.md`
+- Network sync protocol: [network-sync-protocol.md](network-sync-protocol.md)
+- On-disk store: [on-disk-content-addressed-store.md](on-disk-content-addressed-store.md)
+- Main system spec: [specification.md](specification.md)
