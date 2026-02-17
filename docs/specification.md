@@ -169,6 +169,34 @@ interface ResolveOptions {
   includeStart?: boolean;           // default true
 }
 
+interface OpenStoreOptions {
+  clearLocalDataOnStartup?: boolean; // test bootstrap: wipe local data before init
+  basePath?: string;                 // persistent stores only (node on-disk, future adapters)
+  indexingEnabled?: boolean;         // true by default; false forces scan-based mode
+  metadataSegmentCompactionMinFiles?: number; // default 32; <= 0 disables compaction
+  metadataSegmentCompactionMaxBytes?: number; // default disabled; <= 0 disables byte trigger
+}
+
+interface StoreIndexBuildStatus {
+  phase: "idle" | "building" | "ready";
+  indexingEnabled: boolean;
+  progress01: number;
+}
+
+interface StoreCompactionStatus {
+  enabled: boolean;
+  compactionMinFiles: number;
+  compactionMaxBytes: number;
+  totalCompactions: number;
+  totalCompactedFiles: number;
+  totalCompactedBytes: number;
+  totalCompactionDurationMs: number;
+  lastCompactionAt: number | null;
+  lastCompactedFiles: number;
+  lastCompactedBytes: number;
+  lastCompactionDurationMs: number;
+}
+
 interface ContentAddressedStore {
   getId(): string;
 
@@ -190,7 +218,114 @@ interface ContentAddressedStore {
   
   // GDPR
   purgeDocHistory(docId: string): Promise<void>;
+
+  // Optional local lifecycle
+  clearAllLocalData?(): Promise<void>;
+
+  // Optional indexing readiness
+  awaitIndexReady?(options?: { timeoutMs?: number }): Promise<StoreIndexBuildStatus>;
+  getIndexBuildStatus?(): StoreIndexBuildStatus;
+  getCompactionStatus?(): Promise<StoreCompactionStatus>;
 }
+```
+
+### Startup Reset and Index Readiness
+
+To support deterministic integration tests and benchmark baselines, local persistent stores can
+be configured with `clearLocalDataOnStartup: true`. This wipes only local persisted state for that
+store instance before it becomes readable/writable.
+
+`awaitIndexReady()` allows callers to block until indexes are available, while still permitting
+implementations to do fast startup plus background index build. `indexingEnabled: false` forces
+scan-based behavior so tests can validate correctness in both indexed and non-indexed modes.
+
+For process-crash resilience, persistent stores use atomic temp-file rename for metadata/content
+writes and maintain index state as an appendable metadata-segment stream plus optional snapshot
+compaction. On startup, stores replay segments, verify coverage against entry files, and if index
+state is stale or inconsistent (for example, crash between entry write and segment/snapshot
+persist), they rebuild index state from entry files before serving reads.
+
+To keep startup replay cost bounded, stores SHOULD compact segment logs after a configurable
+threshold (for example segment-count or total-bytes), by writing a fresh snapshot and deleting only
+segments known to be represented in that snapshot.
+
+### Stress and Soak Validation Matrix
+
+The Node.js on-disk store includes an opt-in stress matrix to validate durability, recovery, and
+high-volume behavior beyond regular unit tests:
+
+- `npm run test:stress` runs stress scenarios with moderate load.
+- `npm run test:soak` runs long soak scenarios with larger volumes/timeouts.
+
+Covered scenarios:
+
+1. High-volume append + restart + cursor scan consistency.
+2. Concurrent writer instances against one store path.
+3. Fault-injection loop (stale snapshot and stale-segment corruption) with restart recovery checks.
+
+These tests are intentionally opt-in so regular CI remains fast, while release hardening can run the
+full matrix before shipping.
+
+For a full implementation deep-dive of the Node.js persistent store (on-disk structure, write and
+recovery flow, compaction, and performance characteristics), see:
+`docs/on-disk-content-addressed-store.md`.
+
+```mermaid
+sequenceDiagram
+  participant TestRunner
+  participant StoreFactory
+  participant LocalStore
+  participant DiskData
+  participant IndexBuilder
+
+  TestRunner->>StoreFactory: createStore(dbId, { clearLocalDataOnStartup: true, indexingEnabled: true })
+  StoreFactory->>LocalStore: initialize()
+  LocalStore->>DiskData: remove persisted files for dbId
+  LocalStore->>DiskData: create fresh store directories
+  LocalStore->>IndexBuilder: start index build
+  TestRunner->>LocalStore: awaitIndexReady()
+  IndexBuilder-->>LocalStore: ready
+  LocalStore-->>TestRunner: { phase: "ready", progress01: 1 }
+```
+
+### Sync Capability Negotiation and Bloom Optimization
+
+MindooDB sync endpoints can advertise feature support via `GET /sync/capabilities`.
+Clients use this to select the fastest compatible path:
+
+- `supportsCursorScan`: use cursor-based metadata paging (`scanEntriesSince`)
+- `supportsIdBloomSummary`: pre-filter IDs via Bloom summary before exact `hasEntries` checks
+- `supportsCompactionStatus`: fetch remote compaction telemetry (`getCompactionStatus`) for observability
+
+Bloom summaries are an optimization only. Final transfer planning still runs exact existence checks,
+so correctness does not depend on probabilistic matching.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant Server
+
+  Client->>Server: GET /sync/capabilities
+  Server-->>Client: { protocolVersion: "sync-v2", supportsCursorScan, supportsIdBloomSummary, supportsCompactionStatus }
+  alt supportsCursorScan
+    Client->>Server: scanEntriesSince(cursor, limit)
+    Server-->>Client: page(entries, nextCursor, hasMore)
+  else legacy fallback
+    Client->>Server: findNewEntries(haveIds)
+    Server-->>Client: entries
+  end
+  alt supportsIdBloomSummary
+    Client->>Server: getIdBloomSummary()
+    Server-->>Client: bloomSummary
+    Note over Client: Bloom says "definitely missing" vs "maybe present"
+  end
+  alt supportsCompactionStatus
+    Client->>Server: getCompactionStatus()
+    Server-->>Client: compactionStatus
+  end
+  Client->>Server: hasEntries(maybePresentIds)
+  Server-->>Client: exactExistingIds
+  Client->>Server: getEntries(missingIds)
 ```
 
 **Two-Store Architecture:**
@@ -204,6 +339,7 @@ Use cases:
 - Keep docs local, attachments in cloud
 - Different sync strategies per store type
 - Or use the same store for simple deployments
+- Future backends can implement the same store contract (e.g. IndexedDB in browsers)
 
 ---
 
