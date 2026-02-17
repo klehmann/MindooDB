@@ -72,12 +72,18 @@ Both private keys are encrypted with a single password using KDF with different 
 - Tenant symmetric keys: salt = `"tenant:v1:${tenantId}"`
 - Document symmetric keys: salt = `"doc:v1:${keyId}"`
 
-**Registration Flow:**
-1. User generates keys locally
-2. User sends public keys to administrator
-3. Administrator registers user in directory (signed with admin key)
-4. Registration syncs to all clients/servers
-5. User can now make changes that will be trusted
+**Registration Flow (Join Request / Response):**
+
+New users join a tenant through a three-step handshake that ensures private keys never leave the originating device:
+
+1. User generates keys locally with `createUserId` and creates a join request containing only public keys (`createJoinRequest`)
+2. User sends the join request to the administrator via any channel (it contains no secrets)
+3. Administrator approves the request (`approveJoinRequest`), which registers the user in the directory (signed with admin key) and produces a join response containing encrypted symmetric keys
+4. Administrator sends the join response and communicates the one-time share password through a separate secure channel
+5. User decrypts the keys and opens the tenant (`joinTenant`)
+6. Registration syncs to all clients/servers; user can now make trusted changes
+
+See [Section 7: Data Flows](#7-data-flows) for complete code examples.
 
 **Revocation:**
 Administrators call `revokeUser()` to add a revocation record. Revoked users:
@@ -454,38 +460,78 @@ This allows servers to validate signing keys **without knowing actual usernames*
 
 ### Creating a Tenant
 
-```typescript
-// 1. Create admin user (signing + encryption keys used for tenant administration)
-const adminUser = await factory.createUserId("CN=admin/O=acme", adminPassword);
-
-// 2. Create required keys in KeyBag (tenant key + $publicinfos)
-await keyBag.createTenantKey(tenantId);
-await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
-
-// 3. Open tenant
-const tenant = await factory.openTenant(
-  tenantId,
-  adminUser.userSigningKeyPair.publicKey,      // Ed25519
-  adminUser.userEncryptionKeyPair.publicKey,   // RSA-OAEP
-  user,
-  userPassword,
-  keyBag
-);
-```
-
-### Creating a User
+The `createTenant` convenience method orchestrates the full tenant bootstrap in a single call. It generates the admin and user identities, creates the KeyBag with all required symmetric keys, opens the tenant, and registers the user in the directory.
 
 ```typescript
-// 1. User generates keys locally
-const user = await factory.createUserId("CN=bob/O=acme", password);
-
-// 2. User sends public ID to admin
-const publicUserId = factory.toPublicUserId(user);
-
-// 3. Admin registers user in directory
-const directory = await tenant.openDirectory(adminKey, adminPassword);
-await directory.registerUser(publicUserId, adminKey, adminPassword);
+const { tenant, adminUser, appUser, keyBag } = await factory.createTenant({
+  tenantId: "acme",
+  adminName: "cn=admin/o=acme",
+  adminPassword: "admin-pw",
+  userName: "cn=alice/o=acme",
+  userPassword: "alice-pw",
+});
 ```
+
+Under the hood, this performs five steps:
+
+1. Creates the admin identity (Ed25519 signing key + RSA-OAEP encryption key)
+2. Creates the regular user identity (same key types)
+3. Creates a KeyBag containing the tenant key (AES-256) and the `$publicinfos` key (AES-256)
+4. Opens the tenant using the admin's public keys and the user's private identity
+5. Registers the regular user in the admin-signed directory database
+
+For advanced use cases where you need finer control over each step, `openTenant` remains available and accepts individual keys and a pre-configured KeyBag directly.
+
+### Publishing to a Server
+
+Once a tenant is created locally, it can be registered on a MindooDB sync server. The server receives only public keys and the `$publicinfos` key — never private keys or plaintext content.
+
+```typescript
+await tenant.publishToServer("https://sync.example.com", {
+  registerUsers: [factory.toPublicUserId(appUser)],
+});
+```
+
+The server uses the `$publicinfos` key to read the directory database and validate incoming sync requests. Pre-registering users is optional but allows them to sync immediately.
+
+### Inviting a User (Join Request / Response)
+
+MindooDB uses a three-step handshake to invite new users. The new user generates keys locally (private keys never leave the device), shares a join request containing only public keys, and the admin responds with encrypted symmetric keys protected by a one-time password.
+
+**Step 1 — New user creates a join request:**
+
+```typescript
+const bob = await factory.createUserId("cn=bob/o=acme", "bob-pw");
+const joinRequest = factory.createJoinRequest(bob, { format: "uri" });
+// → "mdb://join-request/eyJ2IjoxLCJ1c2Vy..."
+```
+
+**Step 2 — Admin approves and creates a join response:**
+
+```typescript
+const joinResponse = await tenant.approveJoinRequest(joinRequest, {
+  adminSigningKey: adminUser.userSigningKeyPair.privateKey,
+  adminPassword: "admin-pw",
+  sharePassword: "one-time-secret",
+  serverUrl: "https://sync.example.com",
+  format: "uri",
+});
+// → "mdb://join-response/eyJ2IjoxLCJ0ZW5h..."
+```
+
+This registers the new user in the directory and encrypts the tenant key and `$publicinfos` key with the `sharePassword`. The admin sends the join response URI through any channel (email, chat, QR code) and communicates the share password separately through a secure channel (phone, in person).
+
+**Step 3 — New user joins the tenant:**
+
+```typescript
+const { tenant: bobTenant } = await factory.joinTenant(joinResponse, {
+  user: bob,
+  password: "bob-pw",
+  sharePassword: "one-time-secret",
+});
+```
+
+The `mdb://` URIs are base64url-encoded JSON payloads with a version field for forward compatibility. The join request contains `{ v, username, signingPublicKey, encryptionPublicKey }`. The join response contains `{ v, tenantId, adminSigningPublicKey, adminEncryptionPublicKey, serverUrl, encryptedTenantKey, encryptedPublicInfosKey }`.
 
 ### Document Lifecycle
 
@@ -508,24 +554,28 @@ console.log(loaded.getData());
 
 ### Synchronization
 
-**Low-level (store-to-store):**
+Connecting to a server creates a remote store that handles authentication, encryption, and capability negotiation automatically:
+
+```typescript
+const remote = await tenant.connectToServer("https://sync.example.com", "todos");
+
+// Push local changes to the server
+await db.pushChangesTo(remote);
+
+// Pull remote changes into the local store
+await db.pullChangesFrom(remote);
+
+// Merge pulled changes into in-memory documents
+await db.syncStoreChanges();
+```
+
+For advanced scenarios, the low-level store-to-store API is also available:
+
 ```typescript
 const localIds = await localStore.getAllIds();
 const missing = await remoteStore.findNewEntries(localIds);
 const entries = await remoteStore.getEntries(missing.map(m => m.id));
 await localStore.putEntries(entries);
-```
-
-**High-level (MindooDB):**
-```typescript
-// Pull changes from remote
-await db.pullChangesFrom(remoteStore);
-
-// Push changes to remote
-await db.pushChangesTo(remoteStore);
-
-// Sync local store changes into memory
-await db.syncStoreChanges();
 ```
 
 ### Settings Management
@@ -657,6 +707,7 @@ Multiple keys per user (signing, encryption, named symmetric keys) require:
 
 ## 12. Future Enhancements
 
+- **Session Persistence API**: Single-call `exportSession` / `restoreSession` to persist and restore user identity, KeyBag, and tenant metadata as one encrypted blob
 - **Forward Secrecy**: Key rotation preventing future decryption
 - **Key Escrow**: Secure key recovery mechanisms
 - **Advanced Access Control**: Role-based access with key hierarchies
