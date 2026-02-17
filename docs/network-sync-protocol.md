@@ -445,6 +445,5 @@ Response:
 
 ## 8) Related Documents
 
-- Main system spec: `docs/specification.md`
-- On-disk store deep dive: `docs/on-disk-content-addressed-store.md`
-- Audience outline for this doc: `docs/network-sync-protocol-audience-outline.md`
+- Main system spec: [specification.md](specification.md)
+- On-disk store deep dive: [on-disk-content-addressed-store.md](on-disk-content-addressed-store.md)
