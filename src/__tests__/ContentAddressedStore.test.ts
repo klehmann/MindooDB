@@ -1,5 +1,6 @@
 import { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory } from "../core/appendonlystores/InMemoryContentAddressedStore";
 import { StoreEntry, StoreEntryMetadata } from "../core/types";
+import { bloomMightContainId } from "../core/appendonlystores/bloom";
 
 describe("InMemoryContentAddressedStore", () => {
   let store: InMemoryContentAddressedStore;
@@ -130,6 +131,54 @@ describe("InMemoryContentAddressedStore", () => {
       const newEntries = await store.findNewEntries(["id1"]);
       expect(newEntries.length).toBe(1);
       expect(newEntries[0].id).toBe("id2");
+    });
+  });
+
+  describe("cursor-based scan", () => {
+    test("should scan entries in stable order with cursor pagination", async () => {
+      const now = Date.now();
+      const entry1 = createTestEntry("doc1", "id1", "c1");
+      const entry2 = createTestEntry("doc1", "id2", "c2");
+      const entry3 = createTestEntry("doc2", "id3", "c3");
+      entry1.createdAt = now;
+      entry2.createdAt = now + 1;
+      entry3.createdAt = now + 2;
+      await store.putEntries([entry1, entry2, entry3]);
+
+      const page1 = await store.scanEntriesSince!(null, 2);
+      expect(page1.entries.map((e) => e.id)).toEqual(["id1", "id2"]);
+      expect(page1.hasMore).toBe(true);
+
+      const page2 = await store.scanEntriesSince!(page1.nextCursor, 2);
+      expect(page2.entries.map((e) => e.id)).toEqual(["id3"]);
+      expect(page2.hasMore).toBe(false);
+    });
+
+    test("should support doc filter in cursor scan", async () => {
+      await store.putEntries([
+        createTestEntry("docA", "id1", "c1"),
+        createTestEntry("docB", "id2", "c2"),
+        createTestEntry("docA", "id3", "c3"),
+      ]);
+
+      const scanned = await store.scanEntriesSince!(null, 100, { docId: "docA" });
+      expect(scanned.entries.length).toBe(2);
+      expect(scanned.entries.every((e) => e.docId === "docA")).toBe(true);
+    });
+  });
+
+  describe("bloom summary", () => {
+    test("should include known IDs in bloom summary", async () => {
+      await store.putEntries([
+        createTestEntry("doc1", "id1", "c1"),
+        createTestEntry("doc2", "id2", "c2"),
+      ]);
+
+      const summary = await store.getIdBloomSummary!();
+      expect(summary.version).toBe("bloom-v1");
+      expect(summary.totalIds).toBe(2);
+      expect(bloomMightContainId(summary, "id1")).toBe(true);
+      expect(bloomMightContainId(summary, "id2")).toBe(true);
     });
   });
 

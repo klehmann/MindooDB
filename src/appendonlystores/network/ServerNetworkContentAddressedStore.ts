@@ -1,7 +1,22 @@
 import type { ContentAddressedStore } from "../../core/types";
-import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, StoreEntryType } from "../../core/types";
+import type {
+  StoreEntry,
+  StoreEntryMetadata,
+  MindooTenantDirectory,
+  StoreEntryType,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
+  StoreCompactionStatus,
+} from "../../core/types";
+import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
-import type { NetworkEncryptedEntry, NetworkAuthTokenPayload } from "../../core/appendonlystores/network/types";
+import type {
+  NetworkEncryptedEntry,
+  NetworkAuthTokenPayload,
+  NetworkSyncCapabilities,
+} from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
@@ -169,6 +184,124 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Found ${entries.length} entries`);
     
     return entries;
+  }
+
+  /**
+   * Handle a cursor-based scanEntriesSince request from a client.
+   * Uses local store native support when available, with legacy fallback.
+   */
+  async handleScanEntriesSince(
+    token: string,
+    cursor: StoreScanCursor | null,
+    limit?: number,
+    filters?: StoreScanFilters
+  ): Promise<StoreScanResult> {
+    this.logger.debug(`Handling scanEntriesSince request`);
+
+    // Validate token
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+
+    if (this.localStore.scanEntriesSince) {
+      return this.localStore.scanEntriesSince(cursor, limit, filters);
+    }
+
+    // Fallback: emulate cursor scan using existing metadata query.
+    const all = filters?.docId
+      ? await this.localStore.findNewEntriesForDoc([], filters.docId)
+      : await this.localStore.findNewEntries([]);
+    const sorted = all
+      .filter((meta) => {
+        if (filters?.entryTypes && filters.entryTypes.length > 0 && !filters.entryTypes.includes(meta.entryType)) {
+          return false;
+        }
+        if (filters?.creationDateFrom !== undefined && filters.creationDateFrom !== null && meta.createdAt < filters.creationDateFrom) {
+          return false;
+        }
+        if (filters?.creationDateUntil !== undefined && filters.creationDateUntil !== null && meta.createdAt >= filters.creationDateUntil) {
+          return false;
+        }
+        return true;
+      })
+      .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt));
+
+    const max = limit ?? Number.MAX_SAFE_INTEGER;
+    const startIndex =
+      cursor === null
+        ? 0
+        : sorted.findIndex((meta) => meta.createdAt > cursor.createdAt || (meta.createdAt === cursor.createdAt && meta.id > cursor.id));
+
+    if (startIndex === -1) {
+      return { entries: [], nextCursor: cursor, hasMore: false };
+    }
+
+    const page = sorted.slice(startIndex, startIndex + max);
+    const last = page.length > 0 ? page[page.length - 1] : null;
+    return {
+      entries: page,
+      nextCursor: last ? { createdAt: last.createdAt, id: last.id } : cursor,
+      hasMore: startIndex + page.length < sorted.length,
+    };
+  }
+
+  /**
+   * Handle a getIdBloomSummary request from a client.
+   */
+  async handleGetIdBloomSummary(token: string): Promise<StoreIdBloomSummary> {
+    this.logger.debug(`Handling getIdBloomSummary request`);
+
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+
+    if (this.localStore.getIdBloomSummary) {
+      return this.localStore.getIdBloomSummary();
+    }
+
+    const ids = await this.localStore.getAllIds();
+    return createIdBloomSummary(ids);
+  }
+
+  /**
+   * Handle sync capability negotiation.
+   */
+  async handleGetCapabilities(token: string): Promise<NetworkSyncCapabilities> {
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+
+    return {
+      protocolVersion: "sync-v2",
+      supportsCursorScan: typeof this.localStore.scanEntriesSince === "function",
+      supportsIdBloomSummary: typeof this.localStore.getIdBloomSummary === "function",
+      supportsCompactionStatus: typeof this.localStore.getCompactionStatus === "function",
+    };
+  }
+
+  /**
+   * Handle a getCompactionStatus request from a client.
+   */
+  async handleGetCompactionStatus(token: string): Promise<StoreCompactionStatus> {
+    this.logger.debug(`Handling getCompactionStatus request`);
+
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+
+    if (this.localStore.getCompactionStatus) {
+      return this.localStore.getCompactionStatus();
+    }
+
+    return {
+      enabled: false,
+      compactionMinFiles: 0,
+      compactionMaxBytes: 0,
+      totalCompactions: 0,
+      totalCompactedFiles: 0,
+      totalCompactedBytes: 0,
+      totalCompactionDurationMs: 0,
+      lastCompactionAt: null,
+      lastCompactedFiles: 0,
+      lastCompactedBytes: 0,
+      lastCompactionDurationMs: 0,
+    };
   }
 
   /**

@@ -124,6 +124,17 @@ export interface AuthResult {
 }
 
 /**
+ * Advertised sync capabilities for transport-level feature negotiation.
+ * Used by clients to choose fast paths while preserving compatibility.
+ */
+export interface NetworkSyncCapabilities {
+  protocolVersion: string;
+  supportsCursorScan: boolean;
+  supportsIdBloomSummary: boolean;
+  supportsCompactionStatus: boolean;
+}
+
+/**
  * Network transport error types for error handling.
  */
 export enum NetworkErrorType {

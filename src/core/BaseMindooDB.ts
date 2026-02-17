@@ -22,7 +22,13 @@ import {
   PerformanceCallback,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
-import type { ContentAddressedStore } from "./appendonlystores/types";
+import type {
+  ContentAddressedStore,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreIdBloomSummary,
+} from "./appendonlystores/types";
+import { bloomMightContainId } from "./appendonlystores/bloom";
 import { 
   generateDocEntryId, 
   computeContentHash, 
@@ -90,6 +96,7 @@ export class BaseMindooDB implements MindooDB {
   
   // Track which entry IDs we've already processed
   private processedEntryIds: string[] = [];
+  private processedEntryCursor: StoreScanCursor | null = null;
   
   // Index: automergeHash -> entryId for each document
   // Used for resolving Automerge dependency hashes to entry IDs
@@ -337,7 +344,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Already processed ${this.processedEntryIds.length} entry IDs`);
     
     // Find new entries that we haven't processed yet
-    const newEntryMetadata = await this.store.findNewEntries(this.processedEntryIds);
+    const newEntryMetadata = await this.getNewEntryMetadataForSync();
     this.logger.debug(`Found ${newEntryMetadata.length} new entries`);
     
     if (newEntryMetadata.length === 0) {
@@ -448,6 +455,124 @@ export class BaseMindooDB implements MindooDB {
     this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
     
     this.logger.debug(`Synced ${newEntryMetadata.length} new entries, index now has ${this.index.length} documents`);
+  }
+
+  private supportsCursorScan(store: ContentAddressedStore): boolean {
+    return typeof store.scanEntriesSince === "function";
+  }
+
+  private async scanAllMetadata(
+    store: ContentAddressedStore,
+    filters?: StoreScanFilters
+  ): Promise<StoreEntryMetadata[]> {
+    if (!this.supportsCursorScan(store)) {
+      if (filters?.docId) {
+        return store.findNewEntriesForDoc([], filters.docId);
+      }
+      return store.findNewEntries([]);
+    }
+
+    const all: StoreEntryMetadata[] = [];
+    let cursor: StoreScanCursor | null = null;
+
+    while (true) {
+      const page = await store.scanEntriesSince!(cursor, 1000, filters);
+      all.push(...page.entries);
+      cursor = page.nextCursor;
+      if (!page.hasMore) {
+        break;
+      }
+    }
+
+    return all;
+  }
+
+  private async getNewEntryMetadataForSync(): Promise<StoreEntryMetadata[]> {
+    if (!this.supportsCursorScan(this.store)) {
+      return this.store.findNewEntries(this.processedEntryIds);
+    }
+
+    const allNew: StoreEntryMetadata[] = [];
+    let cursor = this.processedEntryCursor;
+
+    while (true) {
+      const page = await this.store.scanEntriesSince!(cursor, 1000);
+      allNew.push(...page.entries);
+      cursor = page.nextCursor;
+      if (!page.hasMore) {
+        break;
+      }
+    }
+
+    this.processedEntryCursor = cursor;
+    return allNew;
+  }
+
+  private async syncEntriesFromStore(
+    sourceStore: ContentAddressedStore,
+    targetStore: ContentAddressedStore
+  ): Promise<number> {
+    let transferred = 0;
+    let targetBloom: StoreIdBloomSummary | null = null;
+    if (typeof targetStore.getIdBloomSummary === "function") {
+      try {
+        targetBloom = await targetStore.getIdBloomSummary();
+      } catch (error) {
+        this.logger.warn("Failed to get bloom summary from target store, falling back to exact checks", error);
+      }
+    }
+
+    if (this.supportsCursorScan(sourceStore)) {
+      let cursor: StoreScanCursor | null = null;
+      while (true) {
+        const page = await sourceStore.scanEntriesSince!(cursor, 1000);
+        if (page.entries.length > 0) {
+          const ids = page.entries.map((m) => m.id);
+          let definitelyMissing: string[] = [];
+          let maybeExisting: string[] = ids;
+
+          if (targetBloom) {
+            definitelyMissing = [];
+            maybeExisting = [];
+            for (const id of ids) {
+              if (bloomMightContainId(targetBloom, id)) {
+                maybeExisting.push(id);
+              } else {
+                definitelyMissing.push(id);
+              }
+            }
+          }
+
+          let missingIds = definitelyMissing;
+          if (maybeExisting.length > 0) {
+            const existing = await targetStore.hasEntries(maybeExisting);
+            const existingSet = new Set(existing);
+            const maybeMissing = maybeExisting.filter((id) => !existingSet.has(id));
+            missingIds = missingIds.concat(maybeMissing);
+          }
+
+          if (missingIds.length > 0) {
+            const missingEntries = await sourceStore.getEntries(missingIds);
+            await targetStore.putEntries(missingEntries);
+            transferred += missingEntries.length;
+          }
+        }
+        cursor = page.nextCursor;
+        if (!page.hasMore) {
+          break;
+        }
+      }
+      return transferred;
+    }
+
+    const targetIds = await targetStore.getAllIds();
+    const sourceNewMetadata = await sourceStore.findNewEntries(targetIds);
+    if (sourceNewMetadata.length === 0) {
+      return 0;
+    }
+    const sourceEntries = await sourceStore.getEntries(sourceNewMetadata.map((m) => m.id));
+    await targetStore.putEntries(sourceEntries);
+    return sourceEntries.length;
   }
 
   getStore(): ContentAddressedStore {
@@ -644,7 +769,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Getting document ${docId} at timestamp ${timestamp}`);
     
     // Get all entry metadata for this document
-    const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
     
     // Filter entries up to the timestamp
     const relevantEntries = allEntryMetadata
@@ -724,7 +849,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Iterating document history for ${docId}`);
     
     // Get all entry metadata for this document
-    const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
     
     // Filter to only doc_create, doc_change, and doc_delete entries (exclude snapshots)
     const relevantEntries = allEntryMetadata
@@ -1767,7 +1892,7 @@ export class BaseMindooDB implements MindooDB {
     // Get all entry metadata for this document
     // TODO: Implement loading from last snapshot if available
     this.logger.debug(`Getting all entry hashes for document ${docId}`);
-    const allEntryMetadata = await this.store.findNewEntriesForDoc([], docId);
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
     this.logger.debug(`Found ${allEntryMetadata.length} total entry hashes for document ${docId}`);
     
     if (allEntryMetadata.length === 0) {
@@ -2653,34 +2778,19 @@ export class BaseMindooDB implements MindooDB {
 
     this.logger.info(`Pulling entries from remote store ${remoteStore.getId()}`);
     
-    // Get all entry IDs we already have in our local store
-    const localEntryIds = await this.store.getAllIds();
-    this.logger.debug(`Local store has ${localEntryIds.length} entry IDs`);
-    
-    // Find entries in the remote store that we don't have
-    const newEntryMetadata = await remoteStore.findNewEntries(localEntryIds);
-    this.logger.debug(`Found ${newEntryMetadata.length} new entries in remote store`);
-    
-    if (newEntryMetadata.length === 0) {
+    const transferred = await this.syncEntriesFromStore(remoteStore, this.store);
+    this.logger.debug(`Transferred ${transferred} entries from remote store`);
+
+    if (transferred === 0) {
       this.logger.debug(`No new entries to pull`);
       return;
     }
-    
-    // Get the full entries from the remote store
-    const newEntries = await remoteStore.getEntries(newEntryMetadata.map(em => em.id));
-    this.logger.debug(`Retrieved ${newEntries.length} entries from remote store`);
-    
-    // Store all entries in our local store
-    // The putEntries method handles deduplication (no-op if entry already exists)
-    await this.store.putEntries(newEntries);
-    
-    this.logger.debug(`Stored ${newEntries.length} entries in local store`);
     
     // Sync the local store to process the new entries
     // This will update the index, cache, and processedEntryIds
     await this.syncStoreChanges();
     
-    this.logger.info(`Pull complete, synced ${newEntries.length} entries`);
+    this.logger.info(`Pull complete, synced ${transferred} entries`);
   }
 
   /**
@@ -2701,28 +2811,15 @@ export class BaseMindooDB implements MindooDB {
 
     this.logger.info(`Pushing entries to remote store ${remoteStore.getId()}`);
     
-    // Get all entry IDs the remote store already has
-    const remoteEntryIds = await remoteStore.getAllIds();
-    this.logger.debug(`Remote store has ${remoteEntryIds.length} entry IDs`);
-    
-    // Find entries in our local store that the remote doesn't have
-    const newEntryMetadata = await this.store.findNewEntries(remoteEntryIds);
-    this.logger.debug(`Found ${newEntryMetadata.length} new entries to push`);
-    
-    if (newEntryMetadata.length === 0) {
+    const transferred = await this.syncEntriesFromStore(this.store, remoteStore);
+    this.logger.debug(`Transferred ${transferred} entries to remote store`);
+
+    if (transferred === 0) {
       this.logger.debug(`No new entries to push`);
       return;
     }
-    
-    // Get the full entries from our local store
-    const newEntries = await this.store.getEntries(newEntryMetadata.map(em => em.id));
-    this.logger.debug(`Retrieved ${newEntries.length} entries from local store`);
-    
-    // Store all entries in the remote store
-    // The putEntries method handles deduplication (no-op if entry already exists)
-    await remoteStore.putEntries(newEntries);
-    
-    this.logger.info(`Pushed ${newEntries.length} entries to remote store`);
+
+    this.logger.info(`Pushed ${transferred} entries to remote store`);
   }
 }
 

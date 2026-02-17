@@ -38,7 +38,17 @@ export {
 } from "./utils";
 
 // Content-addressed stores
-export { ContentAddressedStore, ContentAddressedStoreFactory, CreateStoreResult, OpenStoreOptions } from "./appendonlystores/types";
+export {
+  ContentAddressedStore,
+  ContentAddressedStoreFactory,
+  CreateStoreResult,
+  OpenStoreOptions,
+  StoreCompactionStatus,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
+} from "./appendonlystores/types";
 export { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory } from "./appendonlystores/InMemoryContentAddressedStore";
 
 // Network
@@ -50,6 +60,7 @@ export {
   NetworkAuthTokenPayload,
   AuthChallenge,
   AuthResult,
+  NetworkSyncCapabilities,
   NetworkErrorType,
   NetworkError,
 } from "./appendonlystores/network/types";

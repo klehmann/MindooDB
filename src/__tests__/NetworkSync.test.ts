@@ -5,8 +5,21 @@ import { AuthenticationService } from "../core/appendonlystores/network/Authenti
 import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
 import { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { NetworkTransport } from "../core/appendonlystores/network/NetworkTransport";
-import type { NetworkEncryptedEntry, AuthResult } from "../core/appendonlystores/network/types";
-import type { StoreEntry, StoreEntryMetadata, MindooTenantDirectory, EncryptedPrivateKey, MindooDoc, StoreEntryType } from "../core/types";
+import type { NetworkEncryptedEntry, AuthResult, NetworkSyncCapabilities } from "../core/appendonlystores/network/types";
+import type {
+  StoreEntry,
+  StoreEntryMetadata,
+  MindooTenantDirectory,
+  EncryptedPrivateKey,
+  MindooDoc,
+  StoreEntryType,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
+  StoreCompactionStatus,
+} from "../core/types";
+import { bloomMightContainId } from "../core/appendonlystores/bloom";
 import type { PublicUserId } from "../core/userid";
 import type { ContentAddressedStore } from "../core/appendonlystores/types";
 
@@ -64,6 +77,27 @@ class MockNetworkTransport implements NetworkTransport {
 
   async resolveDependencies(token: string, startId: string, options?: Record<string, unknown>): Promise<string[]> {
     return this.server.handleResolveDependencies(token, startId, options);
+  }
+
+  async scanEntriesSince(
+    token: string,
+    cursor: StoreScanCursor | null,
+    limit?: number,
+    filters?: StoreScanFilters
+  ): Promise<StoreScanResult> {
+    return this.server.handleScanEntriesSince(token, cursor, limit, filters);
+  }
+
+  async getIdBloomSummary(token: string): Promise<StoreIdBloomSummary> {
+    return this.server.handleGetIdBloomSummary(token);
+  }
+
+  async getCapabilities(token: string): Promise<NetworkSyncCapabilities> {
+    return this.server.handleGetCapabilities(token);
+  }
+
+  async getCompactionStatus(token: string): Promise<StoreCompactionStatus> {
+    return this.server.handleGetCompactionStatus(token);
   }
 }
 
@@ -462,6 +496,69 @@ describe("Network Sync", () => {
       expect(allHashes).toContain("hash1");
       expect(allHashes).toContain("hash2");
       expect(allHashes).toContain("hash3");
+    });
+
+    test("should scan entries via cursor from remote", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000)]);
+      await serverStore.putEntries([createMockEntry("doc2", "hash3", 3000)]);
+
+      const page1 = await clientStore.scanEntriesSince!(null, 2);
+      expect(page1.entries.length).toBe(2);
+      expect(page1.hasMore).toBe(true);
+
+      const page2 = await clientStore.scanEntriesSince!(page1.nextCursor, 2);
+      expect(page2.entries.length).toBe(1);
+      expect(page2.hasMore).toBe(false);
+    });
+
+    test("should get bloom summary from remote", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000)]);
+
+      const summary = await clientStore.getIdBloomSummary!();
+      expect(summary.version).toBe("bloom-v1");
+      expect(summary.totalIds).toBe(2);
+      expect(bloomMightContainId(summary, "hash1")).toBe(true);
+      expect(bloomMightContainId(summary, "hash2")).toBe(true);
+    });
+
+    test("should negotiate capabilities from remote", async () => {
+      const caps = await clientStore.getCapabilities();
+      expect(caps.protocolVersion).toBe("sync-v2");
+      expect(caps.supportsCursorScan).toBe(true);
+      expect(caps.supportsIdBloomSummary).toBe(true);
+      expect(caps.supportsCompactionStatus).toBe(false);
+    });
+
+    test("should return fallback compaction status when remote does not expose it", async () => {
+      const status = await clientStore.getCompactionStatus!();
+      expect(status.enabled).toBe(false);
+      expect(status.totalCompactions).toBe(0);
+      expect(status.lastCompactionAt).toBeNull();
+    });
+
+    test("should fetch compaction status from remote when supported", async () => {
+      const expected: StoreCompactionStatus = {
+        enabled: true,
+        compactionMinFiles: 32,
+        compactionMaxBytes: 2048,
+        totalCompactions: 3,
+        totalCompactedFiles: 77,
+        totalCompactedBytes: 100_000,
+        totalCompactionDurationMs: 55,
+        lastCompactionAt: Date.now(),
+        lastCompactedFiles: 10,
+        lastCompactedBytes: 12_000,
+        lastCompactionDurationMs: 8,
+      };
+      (serverStore as ContentAddressedStore).getCompactionStatus = async () => expected;
+      clientStore.clearAuthCache();
+
+      const caps = await clientStore.getCapabilities();
+      expect(caps.supportsCompactionStatus).toBe(true);
+      const status = await clientStore.getCompactionStatus!();
+      expect(status).toEqual(expected);
     });
 
     test("should find new entries for specific document", async () => {

@@ -3,7 +3,16 @@
  */
 
 import express, { Request, Response, NextFunction, Router } from "express";
-import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../../src/core/types";
+import type {
+  StoreEntry,
+  StoreEntryMetadata,
+  StoreEntryType,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreIdBloomSummary,
+  StoreCompactionStatus,
+} from "../../../src/core/types";
+import type { NetworkSyncCapabilities } from "../../../src/core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../../src/core/appendonlystores/network/types";
 
 import { TenantManager } from "./TenantManager";
@@ -256,6 +265,10 @@ export class MindooDBServer {
     router.post("/sync/findNewEntries", this.handleFindNewEntries.bind(this));
     router.post("/sync/findNewEntriesForDoc", this.handleFindNewEntriesForDoc.bind(this));
     router.post("/sync/findEntries", this.handleFindEntries.bind(this));
+    router.post("/sync/scanEntriesSince", this.handleScanEntriesSince.bind(this));
+    router.post("/sync/getIdBloomSummary", this.handleGetIdBloomSummary.bind(this));
+    router.post("/sync/getCompactionStatus", this.handleGetCompactionStatus.bind(this));
+    router.get("/sync/capabilities", this.handleGetCapabilities.bind(this));
     router.post("/sync/getEntries", this.handleGetEntries.bind(this));
     router.post("/sync/putEntries", this.handlePutEntries.bind(this));
     router.post("/sync/hasEntries", this.handleHasEntries.bind(this));
@@ -372,6 +385,87 @@ export class MindooDBServer {
       res.json({
         entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
       });
+    } catch (error) {
+      this.handleNetworkError(error, res);
+    }
+  }
+
+  private async handleScanEntriesSince(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId, cursor, limit, filters } = req.body as {
+        dbId?: string;
+        cursor?: StoreScanCursor | null;
+        limit?: number;
+        filters?: StoreScanFilters;
+      };
+
+      if (!dbId) {
+        res.status(400).json({ error: "dbId is required" });
+        return;
+      }
+
+      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const result = await serverStore.handleScanEntriesSince(
+        token,
+        cursor ?? null,
+        limit,
+        filters
+      );
+
+      res.json({
+        entries: result.entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
+        nextCursor: result.nextCursor,
+        hasMore: result.hasMore,
+      });
+    } catch (error) {
+      this.handleNetworkError(error, res);
+    }
+  }
+
+  private async handleGetIdBloomSummary(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId } = req.body as { dbId?: string };
+
+      if (!dbId) {
+        res.status(400).json({ error: "dbId is required" });
+        return;
+      }
+
+      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const summary = await serverStore.handleGetIdBloomSummary(token);
+      res.json({ summary: summary as StoreIdBloomSummary });
+    } catch (error) {
+      this.handleNetworkError(error, res);
+    }
+  }
+
+  private async handleGetCapabilities(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const dbId = (req.query.dbId as string) || "directory";
+      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const capabilities = await serverStore.handleGetCapabilities(token);
+      res.json({ capabilities: capabilities as NetworkSyncCapabilities });
+    } catch (error) {
+      this.handleNetworkError(error, res);
+    }
+  }
+
+  private async handleGetCompactionStatus(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId } = req.body as { dbId?: string };
+
+      if (!dbId) {
+        res.status(400).json({ error: "dbId is required" });
+        return;
+      }
+
+      const serverStore = this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const status = await serverStore.handleGetCompactionStatus(token);
+      res.json({ status: status as StoreCompactionStatus });
     } catch (error) {
       this.handleNetworkError(error, res);
     }

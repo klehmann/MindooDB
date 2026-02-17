@@ -1,5 +1,14 @@
-import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../types";
-import type { NetworkEncryptedEntry, AuthResult } from "./types";
+import type {
+  StoreEntry,
+  StoreEntryMetadata,
+  StoreEntryType,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
+  StoreCompactionStatus,
+} from "../../types";
+import type { NetworkEncryptedEntry, AuthResult, NetworkSyncCapabilities } from "./types";
 
 /**
  * Abstract interface for network communication in MindooDB sync.
@@ -47,6 +56,12 @@ export interface NetworkTransport {
    * @throws NetworkError with type USER_REVOKED if user has been revoked
    */
   authenticate(challenge: string, signature: Uint8Array): Promise<AuthResult>;
+
+  /**
+   * Get advertised sync capabilities from the remote endpoint.
+   * Optional for backward compatibility.
+   */
+  getCapabilities?(token: string): Promise<NetworkSyncCapabilities>;
 
   /**
    * Find entries that the remote has which we don't have locally.
@@ -102,6 +117,29 @@ export interface NetworkTransport {
     creationDateFrom: number | null,
     creationDateUntil: number | null
   ): Promise<StoreEntryMetadata[]>;
+
+  /**
+   * Cursor-based metadata scan from remote store.
+   *
+   * Optional transport capability. Implementations that do not support this
+   * can omit it; callers should fall back to findNewEntries/getAllIds paths.
+   */
+  scanEntriesSince?(
+    token: string,
+    cursor: StoreScanCursor | null,
+    limit?: number,
+    filters?: StoreScanFilters
+  ): Promise<StoreScanResult>;
+
+  /**
+   * Optional probabilistic ID summary for sync optimization.
+   */
+  getIdBloomSummary?(token: string): Promise<StoreIdBloomSummary>;
+
+  /**
+   * Optional compaction observability for remote store monitoring.
+   */
+  getCompactionStatus?(token: string): Promise<StoreCompactionStatus>;
 
   /**
    * Get entries from the remote store.

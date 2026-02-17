@@ -1,6 +1,19 @@
-import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
+import type {
+  StoreEntry,
+  StoreEntryMetadata,
+  StoreEntryType,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
+  StoreCompactionStatus,
+} from "../../core/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
-import type { NetworkEncryptedEntry, AuthResult } from "../../core/appendonlystores/network/types";
+import type {
+  NetworkEncryptedEntry,
+  AuthResult,
+  NetworkSyncCapabilities,
+} from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 
@@ -14,6 +27,7 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
  * - POST /auth/challenge - Request authentication challenge
  * - POST /auth/authenticate - Authenticate with signed challenge
  * - POST /sync/findNewEntries - Find entries we don't have
+ * - POST /sync/getCompactionStatus - Get remote compaction metrics
  * - POST /sync/getEntries - Get specific entries
  * - POST /sync/putEntries - Push entries to the server
  * - GET /sync/getAllIds - Get all entry IDs from the server
@@ -100,6 +114,34 @@ export class HttpTransport implements NetworkTransport {
       token: data.token,
       error: data.error,
     };
+  }
+
+  async getCapabilities(token: string): Promise<NetworkSyncCapabilities> {
+    try {
+      const response = await this.fetchWithRetry(
+        `${this.baseUrl}/sync/capabilities${this.config.dbId ? `?dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
+        {
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+          },
+        }
+      );
+      const data = await response.json();
+      const capabilities = data.capabilities as NetworkSyncCapabilities | undefined;
+      if (!capabilities) {
+        throw new Error("Missing capabilities payload");
+      }
+      return capabilities;
+    } catch {
+      // Backward-compat fallback for older servers.
+      return {
+        protocolVersion: "sync-v1",
+        supportsCursorScan: false,
+        supportsIdBloomSummary: false,
+        supportsCompactionStatus: false,
+      };
+    }
   }
 
   /**
@@ -214,6 +256,90 @@ export class HttpTransport implements NetworkTransport {
     
     this.logger.debug(`Found ${entries.length} entries`);
     return entries;
+  }
+
+  /**
+   * Cursor-based metadata scan.
+   */
+  async scanEntriesSince(
+    token: string,
+    cursor: StoreScanCursor | null,
+    limit: number = Number.MAX_SAFE_INTEGER,
+    filters?: StoreScanFilters
+  ): Promise<StoreScanResult> {
+    this.logger.debug(`Scanning entries since cursor`);
+
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/scanEntriesSince`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          cursor,
+          limit,
+          filters,
+        }),
+      }
+    );
+
+    const data = await response.json();
+    const entries: StoreEntryMetadata[] = (data.entries || []).map((e: SerializedEntryMetadata) =>
+      this.deserializeEntryMetadata(e)
+    );
+
+    return {
+      entries,
+      nextCursor: data.nextCursor ?? null,
+      hasMore: data.hasMore === true,
+    };
+  }
+
+  /**
+   * Get probabilistic ID summary from remote store.
+   */
+  async getIdBloomSummary(token: string): Promise<StoreIdBloomSummary> {
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/getIdBloomSummary`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+        }),
+      }
+    );
+
+    const data = await response.json();
+    return data.summary as StoreIdBloomSummary;
+  }
+
+  async getCompactionStatus(token: string): Promise<StoreCompactionStatus> {
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/getCompactionStatus`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+        }),
+      }
+    );
+
+    const data = await response.json();
+    return data.status as StoreCompactionStatus;
   }
 
   /**

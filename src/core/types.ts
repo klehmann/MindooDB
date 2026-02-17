@@ -297,7 +297,17 @@ export interface MindooTenant {
 }
 
 // Re-export ContentAddressedStore and ContentAddressedStoreFactory from appendonlystores
-export type { ContentAddressedStore, ContentAddressedStoreFactory, CreateStoreResult, OpenStoreOptions } from "./appendonlystores/types";
+export type {
+  ContentAddressedStore,
+  ContentAddressedStoreFactory,
+  CreateStoreResult,
+  OpenStoreOptions,
+  StoreCompactionStatus,
+  StoreScanCursor,
+  StoreScanFilters,
+  StoreScanResult,
+  StoreIdBloomSummary,
+} from "./appendonlystores/types";
 
 /**
  * The type of entry stored in the ContentAddressedStore.

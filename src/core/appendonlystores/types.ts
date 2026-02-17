@@ -11,7 +11,111 @@ import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../types";
  * - syncMode: "eager" | "lazy" - Synchronization strategy
  */
 export interface OpenStoreOptions {
+  /**
+   * If true, local persisted data is cleared during store initialization.
+   * Useful for deterministic test setups that need a clean slate.
+   */
+  clearLocalDataOnStartup?: boolean;
+
+  /**
+   * Optional base path for persistent store implementations.
+   * In-memory and remote stores can ignore this option.
+   */
+  basePath?: string;
+
+  /**
+   * Controls whether store-level indexing is enabled.
+   * Implementations may fall back to scan-based behavior when false.
+   */
+  indexingEnabled?: boolean;
+
+  /**
+   * Minimum number of metadata segment files before compaction runs.
+   * Applies to append-only on-disk stores. Use 0 or negative to disable.
+   */
+  metadataSegmentCompactionMinFiles?: number;
+
+  /**
+   * Maximum total bytes of metadata segment files before compaction runs.
+   * Applies to append-only on-disk stores. Use 0 or negative to disable.
+   */
+  metadataSegmentCompactionMaxBytes?: number;
+
   [key: string]: unknown;
+}
+
+/**
+ * Represents index build state for stores that support indexing.
+ */
+export interface StoreIndexBuildStatus {
+  phase: "idle" | "building" | "ready";
+  indexingEnabled: boolean;
+  progress01: number;
+}
+
+/**
+ * Optional compaction status for stores using appendable index segments.
+ */
+export interface StoreCompactionStatus {
+  enabled: boolean;
+  compactionMinFiles: number;
+  compactionMaxBytes: number;
+  totalCompactions: number;
+  totalCompactedFiles: number;
+  totalCompactedBytes: number;
+  totalCompactionDurationMs: number;
+  lastCompactionAt: number | null;
+  lastCompactedFiles: number;
+  lastCompactedBytes: number;
+  lastCompactionDurationMs: number;
+}
+
+/**
+ * Options for waiting on index readiness.
+ */
+export interface AwaitIndexReadyOptions {
+  timeoutMs?: number;
+}
+
+/**
+ * Cursor used by cursor-based store scans.
+ * Entries are ordered by (createdAt, id) ascending.
+ */
+export interface StoreScanCursor {
+  createdAt: number;
+  id: string;
+}
+
+/**
+ * Optional filters for cursor-based metadata scans.
+ */
+export interface StoreScanFilters {
+  docId?: string;
+  entryTypes?: StoreEntryType[];
+  creationDateFrom?: number | null;
+  creationDateUntil?: number | null;
+}
+
+/**
+ * Result payload for cursor-based metadata scans.
+ */
+export interface StoreScanResult {
+  entries: StoreEntryMetadata[];
+  nextCursor: StoreScanCursor | null;
+  hasMore: boolean;
+}
+
+/**
+ * Bloom filter summary over entry IDs for sync optimization.
+ * Can be exchanged between stores/transports to reduce hasEntries checks.
+ */
+export interface StoreIdBloomSummary {
+  version: "bloom-v1";
+  totalIds: number;
+  bitCount: number;
+  hashCount: number;
+  salt: string;
+  bitsetBase64: string;
 }
 
 /**
@@ -153,6 +257,25 @@ export interface ContentAddressedStore {
   getAllIds(): Promise<string[]>;
 
   /**
+   * Cursor-based metadata scan.
+   * Preferred for large stores to avoid known-id set exchange.
+   *
+   * Ordering is deterministic: (createdAt ASC, id ASC).
+   * Returned entries are strictly after `cursor`.
+   */
+  scanEntriesSince?(
+    cursor: StoreScanCursor | null,
+    limit?: number,
+    filters?: StoreScanFilters
+  ): Promise<StoreScanResult>;
+
+  /**
+   * Optional probabilistic summary over entry IDs for sync optimization.
+   * Callers must still perform exact reconciliation for correctness.
+   */
+  getIdBloomSummary?(): Promise<StoreIdBloomSummary>;
+
+  /**
    * Resolve the dependency chain starting from an entry ID.
    * Returns IDs in dependency order, traversing backward through dependencyIds.
    * 
@@ -187,4 +310,26 @@ export interface ContentAddressedStore {
    * @throws Error if the store implementation does not support purging
    */
   purgeDocHistory(docId: string): Promise<void>;
+
+  /**
+   * Optional lifecycle hook for stores that persist local data.
+   * Implementations should delete all local store data and reset in-memory state.
+   */
+  clearAllLocalData?(): Promise<void>;
+
+  /**
+   * Optional readiness API for stores with background index creation.
+   * Stores without indexing should resolve immediately with ready status.
+   */
+  awaitIndexReady?(options?: AwaitIndexReadyOptions): Promise<StoreIndexBuildStatus>;
+
+  /**
+   * Optional status API for index build progress.
+   */
+  getIndexBuildStatus?(): StoreIndexBuildStatus;
+
+  /**
+   * Optional status API for metadata-segment compaction observability.
+   */
+  getCompactionStatus?(): Promise<StoreCompactionStatus>;
 }

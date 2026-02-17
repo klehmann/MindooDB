@@ -8,6 +8,7 @@ export type {
   NetworkAuthTokenPayload,
   AuthChallenge,
   AuthResult,
+  NetworkSyncCapabilities,
 } from "../../core/appendonlystores/network/types";
 export { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 
