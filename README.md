@@ -86,37 +86,22 @@ npm install mindoodb
 import { 
   BaseMindooTenantFactory, 
   InMemoryContentAddressedStoreFactory,
-  KeyBag,
-  PUBLIC_INFOS_KEY_ID
 } from "mindoodb";
 
 // 1. Set up storage (in-memory for demo; use file/server-backed for production)
 const storeFactory = new InMemoryContentAddressedStoreFactory();
 const factory = new BaseMindooTenantFactory(storeFactory);
 
-// 2. Create a user (generates signing + encryption key pairs)
-const user = await factory.createUserId("CN=alice/O=acme", "user-password");
-const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "user-password");
+// 2. Create tenant (generates all keys, opens tenant, registers user — single call)
+const { tenant, adminUser, appUser, keyBag } = await factory.createTenant({
+  tenantId: "acme-corp",
+  adminName: "cn=admin/o=acme",
+  adminPassword: "admin-password",
+  userName: "cn=alice/o=acme",
+  userPassword: "user-password",
+});
 
-// 3. Create admin user (signing + encryption keys used for tenant administration)
-const adminUser = await factory.createUserId("CN=admin/O=acme", "admin-password");
-
-// 4. Create required tenant keys directly in KeyBag (canonical key source)
-const tenantId = "acme-corp";
-await keyBag.createTenantKey(tenantId);
-await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
-
-// 5. Open tenant
-const tenant = await factory.openTenant(
-  tenantId,
-  adminUser.userSigningKeyPair.publicKey,
-  adminUser.userEncryptionKeyPair.publicKey,
-  user,
-  "user-password",
-  keyBag
-);
-
-// 6. Open a database and create documents
+// 3. Open a database and create documents
 const db = await tenant.openDB("contacts");
 const doc = await db.createDocument();
 
@@ -126,7 +111,7 @@ await db.changeDoc(doc, async (d) => {
   data.email = "john@example.com";
 });
 
-// 7. Read it back
+// 4. Read it back
 const contacts = await db.getAllDocumentIds();
 const loaded = await db.getDocument(contacts[0]);
 console.log(loaded.getData()); // { name: "John Doe", email: "john@example.com" }
