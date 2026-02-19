@@ -20,7 +20,7 @@ This is not an accidental side effect. It is a deliberate architectural choice: 
 
 ## 2) The Interface That Enables Composition
 
-At the center of MindooDB's flexibility is the `ContentAddressedStore` interface. Every store — whether backed by local disk, in-memory data, or a remote network connection — implements this same interface. The sync methods `pullChangesFrom()` and `pushChangesTo()` accept any `ContentAddressedStore`, which means they work identically regardless of whether the other side is a local store, a remote server, or another client connected over WebRTC.
+At the center of MindooDB's flexibility is the `ContentAddressedStore` interface. Every store — whether backed by local disk, in-memory data, or a remote network connection — implements this same interface. The sync methods `pullChangesFrom()` and `pushChangesTo()` accept any `ContentAddressedStore` or `MindooDB` instance (in which case the store is resolved automatically via `getStore()`). This means they work identically regardless of whether the other side is a local store, a remote server, another client connected over WebRTC, or another `MindooDB` database instance directly.
 
 Two components make network composition possible:
 

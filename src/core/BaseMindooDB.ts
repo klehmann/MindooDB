@@ -20,6 +20,8 @@ import {
   AttachmentConfig,
   SigningKeyPair,
   PerformanceCallback,
+  SyncOptions,
+  SyncResult,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import type {
@@ -718,9 +720,14 @@ export class BaseMindooDB implements MindooDB {
 
   private async syncEntriesFromStore(
     sourceStore: ContentAddressedStore,
-    targetStore: ContentAddressedStore
-  ): Promise<number> {
+    targetStore: ContentAddressedStore,
+    options?: SyncOptions
+  ): Promise<{ transferred: number; cancelled: boolean }> {
     let transferred = 0;
+    let scanned = 0;
+    const onProgress = options?.onProgress;
+    const pageSize = options?.pageSize ?? 1000;
+
     let targetBloom: StoreIdBloomSummary | null = null;
     if (typeof targetStore.getIdBloomSummary === "function") {
       try {
@@ -730,10 +737,28 @@ export class BaseMindooDB implements MindooDB {
       }
     }
 
+    const totalSourceEstimate = targetBloom?.totalIds;
+
     if (this.supportsCursorScan(sourceStore)) {
+      onProgress?.({
+        phase: 'preparing',
+        message: 'Preparing to sync entries...',
+        transferredEntries: 0,
+        scannedEntries: 0,
+        totalSourceEntries: totalSourceEstimate,
+      });
+
       let cursor: StoreScanCursor | null = null;
+      let currentPage = 0;
       while (true) {
-        const page = await sourceStore.scanEntriesSince!(cursor, 1000);
+        if (options?.signal?.aborted) {
+          return { transferred, cancelled: true };
+        }
+
+        const page = await sourceStore.scanEntriesSince!(cursor, pageSize);
+        currentPage++;
+        scanned += page.entries.length;
+
         if (page.entries.length > 0) {
           const ids = page.entries.map((m) => m.id);
           let definitelyMissing: string[] = [];
@@ -765,22 +790,61 @@ export class BaseMindooDB implements MindooDB {
             transferred += missingEntries.length;
           }
         }
+
+        onProgress?.({
+          phase: 'transferring',
+          message: `Transferred ${transferred} entries (page ${currentPage}, scanned ${scanned})`,
+          transferredEntries: transferred,
+          scannedEntries: scanned,
+          totalSourceEntries: totalSourceEstimate,
+          currentPage,
+        });
+
         cursor = page.nextCursor;
         if (!page.hasMore) {
           break;
         }
       }
-      return transferred;
+      return { transferred, cancelled: false };
     }
+
+    onProgress?.({
+      phase: 'preparing',
+      message: 'Finding new entries...',
+      transferredEntries: 0,
+      scannedEntries: 0,
+    });
 
     const targetIds = await targetStore.getAllIds();
     const sourceNewMetadata = await sourceStore.findNewEntries(targetIds);
     if (sourceNewMetadata.length === 0) {
-      return 0;
+      return { transferred: 0, cancelled: false };
     }
+
+    if (options?.signal?.aborted) {
+      return { transferred: 0, cancelled: true };
+    }
+
+    onProgress?.({
+      phase: 'transferring',
+      message: `Transferring ${sourceNewMetadata.length} entries...`,
+      transferredEntries: 0,
+      scannedEntries: sourceNewMetadata.length,
+      totalSourceEntries: sourceNewMetadata.length,
+    });
+
     const sourceEntries = await sourceStore.getEntries(sourceNewMetadata.map((m) => m.id));
     await targetStore.putEntries(sourceEntries);
-    return sourceEntries.length;
+
+    onProgress?.({
+      phase: 'transferring',
+      message: `Transferred ${sourceEntries.length} entries`,
+      transferredEntries: sourceEntries.length,
+      scannedEntries: sourceNewMetadata.length,
+      totalSourceEntries: sourceNewMetadata.length,
+    });
+
+    return { transferred: sourceEntries.length, cancelled: false };
   }
 
   getStore(): ContentAddressedStore {
@@ -2993,9 +3057,10 @@ export class BaseMindooDB implements MindooDB {
    * 4. Syncs the local store to process the new entries
    *
    * @param remote The remote store or MindooDB instance to pull entries from
-   * @return A promise that resolves when the pull is complete
+   * @param options Optional sync options for progress tracking, paging, and cancellation
+   * @return A promise that resolves with the sync result
    */
-  async pullChangesFrom(remote: ContentAddressedStore | MindooDB): Promise<void> {
+  async pullChangesFrom(remote: ContentAddressedStore | MindooDB, options?: SyncOptions): Promise<SyncResult> {
     const remoteStore = this.resolveStore(remote);
 
     if (this.store.getId() !== remoteStore.getId()) {
@@ -3004,19 +3069,40 @@ export class BaseMindooDB implements MindooDB {
 
     this.logger.info(`Pulling entries from remote store ${remoteStore.getId()}`);
     
-    const transferred = await this.syncEntriesFromStore(remoteStore, this.store);
-    this.logger.debug(`Transferred ${transferred} entries from remote store`);
+    const syncResult = await this.syncEntriesFromStore(remoteStore, this.store, options);
+    this.logger.debug(`Transferred ${syncResult.transferred} entries from remote store`);
 
-    if (transferred === 0) {
+    if (syncResult.cancelled) {
+      this.logger.info(`Pull cancelled after transferring ${syncResult.transferred} entries`);
+      return { transferredEntries: syncResult.transferred, cancelled: true };
+    }
+
+    if (syncResult.transferred === 0) {
       this.logger.debug(`No new entries to pull`);
-      return;
+      return { transferredEntries: 0, cancelled: false };
     }
     
+    options?.onProgress?.({
+      phase: 'processing',
+      message: `Processing ${syncResult.transferred} new entries...`,
+      transferredEntries: syncResult.transferred,
+      scannedEntries: syncResult.transferred,
+    });
+
     // Sync the local store to process the new entries
     // This will update the index, cache, and processedEntryIds
     await this.syncStoreChanges();
     
-    this.logger.info(`Pull complete, synced ${transferred} entries`);
+    this.logger.info(`Pull complete, synced ${syncResult.transferred} entries`);
+
+    options?.onProgress?.({
+      phase: 'complete',
+      message: `Pull complete: ${syncResult.transferred} entries synced`,
+      transferredEntries: syncResult.transferred,
+      scannedEntries: syncResult.transferred,
+    });
+
+    return { transferredEntries: syncResult.transferred, cancelled: false };
   }
 
   /**
@@ -3028,9 +3114,10 @@ export class BaseMindooDB implements MindooDB {
    * 3. Stores them in the remote store
    *
    * @param remote The remote store or MindooDB instance to push entries to
-   * @return A promise that resolves when the push is complete
+   * @param options Optional sync options for progress tracking, paging, and cancellation
+   * @return A promise that resolves with the sync result
    */
-  async pushChangesTo(remote: ContentAddressedStore | MindooDB): Promise<void> {
+  async pushChangesTo(remote: ContentAddressedStore | MindooDB, options?: SyncOptions): Promise<SyncResult> {
     const remoteStore = this.resolveStore(remote);
 
     if (this.store.getId() !== remoteStore.getId()) {
@@ -3039,15 +3126,28 @@ export class BaseMindooDB implements MindooDB {
 
     this.logger.info(`Pushing entries to remote store ${remoteStore.getId()}`);
     
-    const transferred = await this.syncEntriesFromStore(this.store, remoteStore);
-    this.logger.debug(`Transferred ${transferred} entries to remote store`);
+    const syncResult = await this.syncEntriesFromStore(this.store, remoteStore, options);
+    this.logger.debug(`Transferred ${syncResult.transferred} entries to remote store`);
 
-    if (transferred === 0) {
-      this.logger.debug(`No new entries to push`);
-      return;
+    if (syncResult.cancelled) {
+      this.logger.info(`Push cancelled after transferring ${syncResult.transferred} entries`);
+      return { transferredEntries: syncResult.transferred, cancelled: true };
     }
 
-    this.logger.info(`Pushed ${transferred} entries to remote store`);
+    if (syncResult.transferred === 0) {
+      this.logger.debug(`No new entries to push`);
+    } else {
+      this.logger.info(`Pushed ${syncResult.transferred} entries to remote store`);
+    }
+
+    options?.onProgress?.({
+      phase: 'complete',
+      message: `Push complete: ${syncResult.transferred} entries transferred`,
+      transferredEntries: syncResult.transferred,
+      scannedEntries: syncResult.transferred,
+    });
+
+    return { transferredEntries: syncResult.transferred, cancelled: false };
   }
 }
 

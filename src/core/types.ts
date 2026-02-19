@@ -1231,6 +1231,35 @@ export interface PerformanceCallback {
   }) => void;
 }
 
+/**
+ * Progress information emitted during pull/push sync operations.
+ */
+export interface SyncProgress {
+  phase: 'preparing' | 'transferring' | 'processing' | 'complete';
+  message: string;
+  transferredEntries: number;
+  scannedEntries: number;
+  totalSourceEntries?: number;
+  currentPage?: number;
+}
+
+/**
+ * Options for pull/push sync operations.
+ */
+export interface SyncOptions {
+  onProgress?: (progress: SyncProgress) => void;
+  pageSize?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Result returned by pull/push sync operations.
+ */
+export interface SyncResult {
+  transferredEntries: number;
+  cancelled: boolean;
+}
+
 export interface MindooDB {
 
   /**
@@ -1464,15 +1493,17 @@ export interface MindooDB {
    * Pull changes from a remote content-addressed store or another MindooDB instance.
    *
    * @param remote The remote store or MindooDB instance to pull changes from
-   * @return A promise that resolves when the pull is complete
+   * @param options Optional sync options for progress tracking, paging, and cancellation
+   * @return A promise that resolves with the sync result
    */
-  pullChangesFrom(remote: ContentAddressedStore | MindooDB): Promise<void>;
+  pullChangesFrom(remote: ContentAddressedStore | MindooDB, options?: SyncOptions): Promise<SyncResult>;
 
   /**
    * Push changes to a remote content-addressed store or another MindooDB instance.
    *
    * @param remote The remote store or MindooDB instance to push changes to
-   * @return A promise that resolves when the push is complete
+   * @param options Optional sync options for progress tracking, paging, and cancellation
+   * @return A promise that resolves with the sync result
    */
-  pushChangesTo(remote: ContentAddressedStore | MindooDB): Promise<void>;
+  pushChangesTo(remote: ContentAddressedStore | MindooDB, options?: SyncOptions): Promise<SyncResult>;
 }

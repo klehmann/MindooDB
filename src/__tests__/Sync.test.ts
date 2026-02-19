@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ContentAddressedStoreFactory, ContentAddressedStore, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ContentAddressedStoreFactory, ContentAddressedStore, PUBLIC_INFOS_KEY_ID, SyncProgress } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -375,5 +375,123 @@ describe("sync test", () => {
     expect(finalSecretData1.createdBy).toBe("user1");
     expect(finalSecretData1.modifiedBy).toBe("user3");
   }, 60000);
+
+  async function setupTenant2AndPull() {
+    const directory1 = await tenant1.openDirectory();
+    const publicUser1 = factory1.toPublicUserId(user1);
+    const publicUser2 = factory2.toPublicUserId(user2);
+    await directory1.registerUser(publicUser1, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
+    await directory1.registerUser(publicUser2, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
+
+    await user2KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
+    await user2KeyBag.set("tenant", tenantId, tenantEncryptionKey);
+    tenant2 = await factory2.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, user2, user2Password, user2KeyBag);
+
+    const directory2 = await tenant2.openDB("directory");
+    const directoryStore1 = (await tenant1.openDB("directory")).getStore();
+    await directory2.pullChangesFrom(directoryStore1);
+
+    return { directory1, directory2 };
+  }
+
+  it("pullChangesFrom should return SyncResult with transferred count", async () => {
+    await setupTenant2AndPull();
+
+    const contactsDB1 = await tenant1.openDB("contacts");
+    const contactDoc = await contactsDB1.createDocument();
+    await contactsDB1.changeDoc(contactDoc, async (doc) => {
+      const data = doc.getData();
+      data.name = "Test Contact";
+    });
+
+    const contactsDB2 = await tenant2.openDB("contacts");
+    const contactsStore1 = contactsDB1.getStore();
+
+    const result = await contactsDB2.pullChangesFrom(contactsStore1);
+    expect(result.transferredEntries).toBeGreaterThan(0);
+    expect(result.cancelled).toBe(false);
+
+    const result2 = await contactsDB2.pullChangesFrom(contactsStore1);
+    expect(result2.transferredEntries).toBe(0);
+    expect(result2.cancelled).toBe(false);
+  });
+
+  it("pullChangesFrom should emit progress callbacks", async () => {
+    await setupTenant2AndPull();
+
+    const contactsDB1 = await tenant1.openDB("contacts");
+    const contactDoc = await contactsDB1.createDocument();
+    await contactsDB1.changeDoc(contactDoc, async (doc) => {
+      const data = doc.getData();
+      data.name = "Progress Test";
+    });
+
+    const contactsDB2 = await tenant2.openDB("contacts");
+    const contactsStore1 = contactsDB1.getStore();
+
+    const progressEvents: SyncProgress[] = [];
+    const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+      onProgress: (progress) => progressEvents.push({ ...progress }),
+    });
+
+    expect(result.transferredEntries).toBeGreaterThan(0);
+    expect(progressEvents.length).toBeGreaterThan(0);
+
+    const phases = progressEvents.map((e) => e.phase);
+    expect(phases).toContain('transferring');
+    expect(phases).toContain('complete');
+
+    const lastEvent = progressEvents[progressEvents.length - 1];
+    expect(lastEvent.phase).toBe('complete');
+    expect(lastEvent.transferredEntries).toBeGreaterThan(0);
+  });
+
+  it("pullChangesFrom should support cancellation via AbortSignal", async () => {
+    await setupTenant2AndPull();
+
+    const contactsDB1 = await tenant1.openDB("contacts");
+    for (let i = 0; i < 5; i++) {
+      const doc = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(doc, async (d) => {
+        const data = d.getData();
+        data.name = `Contact ${i}`;
+      });
+    }
+
+    const contactsDB2 = await tenant2.openDB("contacts");
+    const contactsStore1 = contactsDB1.getStore();
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+      signal: controller.signal,
+    });
+
+    expect(result.cancelled).toBe(true);
+  });
+
+  it("should accept a MindooDB instance instead of a store", async () => {
+    await setupTenant2AndPull();
+
+    const contactsDB1 = await tenant1.openDB("contacts");
+    const contactDoc = await contactsDB1.createDocument();
+    await contactsDB1.changeDoc(contactDoc, async (doc) => {
+      const data = doc.getData();
+      data.name = "MindooDB Sync Test";
+    });
+
+    const contactsDB2 = await tenant2.openDB("contacts");
+
+    const result = await contactsDB2.pullChangesFrom(contactsDB1);
+    expect(result.transferredEntries).toBeGreaterThan(0);
+    expect(result.cancelled).toBe(false);
+
+    const allContacts2 = await contactsDB2.getAllDocumentIds();
+    expect(allContacts2.length).toBe(1);
+
+    const contactDoc2 = await contactsDB2.getDocument(allContacts2[0]);
+    expect(contactDoc2.getData().name).toBe("MindooDB Sync Test");
+  });
 });
 
