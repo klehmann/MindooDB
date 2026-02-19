@@ -24,6 +24,9 @@ import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
+import type { LocalCacheStore } from "./cache/LocalCacheStore";
+import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
+import { CacheManager } from "./cache/CacheManager";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -58,6 +61,9 @@ export class BaseMindooTenant implements MindooTenant {
   private decryptedUserEncryptionKeyCache?: CryptoKey;
   private logger: Logger;
 
+  // Local cache support
+  private cacheManager: CacheManager | null = null;
+
   /**
    * Optional map of additional trusted signing public keys.
    * Keys in this map are checked BEFORE the MindooTenantDirectory when validating
@@ -81,7 +87,8 @@ export class BaseMindooTenant implements MindooTenant {
     storeFactory: ContentAddressedStoreFactory,
     cryptoAdapter?: CryptoAdapter,
     logger?: Logger,
-    additionalTrustedKeys?: ReadonlyMap<string, boolean>
+    additionalTrustedKeys?: ReadonlyMap<string, boolean>,
+    localCacheStore?: LocalCacheStore,
   ) {
     this.factory = factory;
     this.tenantId = tenantId;
@@ -103,6 +110,21 @@ export class BaseMindooTenant implements MindooTenant {
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), `Tenant:${tenantId}`, true);
+
+    // Set up cache if a local cache store is provided
+    if (localCacheStore) {
+      const encryptedStore = new EncryptedLocalCacheStore(
+        localCacheStore,
+        currentUserPassword,
+        this.cryptoAdapter,
+        this.logger.createChild("EncryptedCache"),
+      );
+      this.cacheManager = new CacheManager(
+        encryptedStore,
+        undefined,
+        this.logger.createChild("CacheManager"),
+      );
+    }
   }
 
   /**
@@ -113,6 +135,24 @@ export class BaseMindooTenant implements MindooTenant {
     // KeyBag is already loaded by the caller before passing it to the constructor
     const keyCount = (await this.keyBag.listKeys()).length;
     this.logger.info(`Tenant initialized with ${keyCount} keys in KeyBag`);
+  }
+
+  /**
+   * Get the CacheManager for this tenant (null if caching is disabled).
+   */
+  getCacheManager(): CacheManager | null {
+    return this.cacheManager;
+  }
+
+  /**
+   * Flush and dispose the cache manager.
+   * Should be called when the tenant is being closed.
+   */
+  async disposeCacheManager(): Promise<void> {
+    if (this.cacheManager) {
+      await this.cacheManager.dispose();
+      this.cacheManager = null;
+    }
   }
 
   getCryptoAdapter(): CryptoAdapter {
@@ -505,6 +545,9 @@ export class BaseMindooTenant implements MindooTenant {
       adminOnlyDb ?? false,
       dbLogger
     );
+    if (this.cacheManager) {
+      db.setCacheManager(this.cacheManager);
+    }
     await db.initialize();
     
     // Cache the database for future use

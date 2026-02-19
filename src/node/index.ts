@@ -12,3 +12,6 @@ export {
   BasicOnDiskContentAddressedStore,
   BasicOnDiskContentAddressedStoreFactory,
 } from "./appendonlystores/BasicOnDiskContentAddressedStore";
+
+// Node.js-specific cache store
+export { FileSystemLocalCacheStore } from "./cache/FileSystemLocalCacheStore";

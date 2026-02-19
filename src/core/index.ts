@@ -31,6 +31,12 @@ export {
 // Errors
 export { SymmetricKeyNotFoundError } from "./errors";
 
+// Cache
+export type { LocalCacheStore } from "./cache/LocalCacheStore";
+export { InMemoryLocalCacheStore } from "./cache/LocalCacheStore";
+export { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
+export { CacheManager, type ICacheable, type CacheManagerOptions } from "./cache/CacheManager";
+
 // Utilities
 export {
   generateDocEntryId,

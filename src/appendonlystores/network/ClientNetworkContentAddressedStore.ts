@@ -86,6 +86,11 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     return this.dbId;
   }
 
+  getCacheIdentity(): string {
+    const transportId = this.transport.getIdentity?.() ?? "unknown";
+    return `net:${transportId}/${this.dbId}`;
+  }
+
   /**
    * Store entries to the remote store.
    * The entries are pushed to the server immediately.

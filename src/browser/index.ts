@@ -15,3 +15,6 @@ export { BrowserCryptoAdapter, createCryptoAdapter } from "./crypto/BrowserCrypt
 // Browser-specific IndexedDB content-addressed store
 export { IndexedDBContentAddressedStore } from "./appendonlystores/IndexedDBContentAddressedStore";
 export { IndexedDBContentAddressedStoreFactory } from "./appendonlystores/IndexedDBContentAddressedStoreFactory";
+
+// Browser-specific cache store
+export { IndexedDBLocalCacheStore } from "./cache/IndexedDBLocalCacheStore";

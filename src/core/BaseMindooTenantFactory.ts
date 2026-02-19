@@ -21,6 +21,7 @@ import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbk
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
+import type { LocalCacheStore } from "./cache/LocalCacheStore";
 
 /**
  * BaseTenantFactory is a platform-agnostic implementation of TenantFactory
@@ -33,18 +34,25 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   private cryptoAdapter: CryptoAdapter;
   private storeFactory: ContentAddressedStoreFactory;
   private logger: Logger;
+  private localCacheStore?: LocalCacheStore;
 
   constructor(
     storeFactory: ContentAddressedStoreFactory,
     cryptoAdapter: CryptoAdapter,
-    logger?: Logger
+    logger?: Logger,
+    localCacheStore?: LocalCacheStore,
   ) {
     this.storeFactory = storeFactory;
     this.cryptoAdapter = cryptoAdapter;
+    this.localCacheStore = localCacheStore;
     // Create root logger if not provided (for backward compatibility)
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), "MindooTenantFactory", true);
+  }
+
+  getLocalCacheStore(): LocalCacheStore | undefined {
+    return this.localCacheStore;
   }
 
   getCryptoAdapter(): CryptoAdapter {
@@ -125,7 +133,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       this.storeFactory,
       this.cryptoAdapter,
       tenantLogger,
-      options?.additionalTrustedKeys
+      options?.additionalTrustedKeys,
+      this.localCacheStore,
     );
 
     // Initialize the tenant

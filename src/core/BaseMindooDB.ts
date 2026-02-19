@@ -38,6 +38,9 @@ import {
 } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import type { LocalCacheStore } from "./cache/LocalCacheStore";
+import type { ICacheable } from "./cache/CacheManager";
+import type { CacheManager } from "./cache/CacheManager";
 
 /**
  * Default chunk size for attachments: 256KB
@@ -108,6 +111,12 @@ export class BaseMindooDB implements MindooDB {
   // Map<publicKeyPEM, CryptoKey>
   private publicKeyCache: Map<string, CryptoKey> = new Map();
 
+  // Local cache support
+  private cacheManager: CacheManager | null = null;
+  private cachePrefix: string | null = null;
+  private dirtyDocIds: Set<string> = new Set();
+  private cacheMetaDirty: boolean = false;
+
   constructor(
     tenant: BaseMindooTenant, 
     store: ContentAddressedStore, 
@@ -139,6 +148,190 @@ export class BaseMindooDB implements MindooDB {
   
   isAdminOnlyDb(): boolean {
     return this._isAdminOnlyDb;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Local cache support (ICacheable)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Attach a CacheManager so this DB participates in periodic cache flushing.
+   */
+  setCacheManager(cacheManager: CacheManager): void {
+    this.cacheManager = cacheManager;
+    const cacheIdentity = this.store.getCacheIdentity?.() ?? this.store.getId();
+    this.cachePrefix = `${this.tenant.getId()}/${cacheIdentity}`;
+    cacheManager.register(this as unknown as ICacheable);
+  }
+
+  getCachePrefix(): string {
+    return this.cachePrefix ?? `${this.tenant.getId()}/${this.store.getId()}`;
+  }
+
+  hasDirtyState(): boolean {
+    return this.dirtyDocIds.size > 0 || this.cacheMetaDirty;
+  }
+
+  clearDirty(): void {
+    this.dirtyDocIds.clear();
+    this.cacheMetaDirty = false;
+  }
+
+  private markDocDirty(docId: string): void {
+    this.dirtyDocIds.add(docId);
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
+  /**
+   * Flush dirty documents and metadata to the cache store.
+   */
+  async flushToCache(store: LocalCacheStore): Promise<number> {
+    const prefix = this.getCachePrefix();
+    let written = 0;
+
+    for (const docId of this.dirtyDocIds) {
+      const internal = this.docCache.get(docId);
+      if (!internal) continue;
+
+      const amBinary = Automerge.save(internal.doc);
+      const header = JSON.stringify({
+        id: internal.id,
+        createdAt: internal.createdAt,
+        lastModified: internal.lastModified,
+        decryptionKeyId: internal.decryptionKeyId,
+        isDeleted: internal.isDeleted,
+      });
+      const headerBytes = new TextEncoder().encode(header);
+
+      // Format: 4-byte header length (big-endian) + header JSON + Automerge binary
+      const value = new Uint8Array(4 + headerBytes.length + amBinary.length);
+      const view = new DataView(value.buffer);
+      view.setUint32(0, headerBytes.length, false);
+      value.set(headerBytes, 4);
+      value.set(amBinary, 4 + headerBytes.length);
+
+      await store.put("doc", `${prefix}/${docId}`, value);
+      written++;
+    }
+
+    // Write metadata checkpoint
+    const meta = this.exportMetadataCheckpoint();
+    await store.put("db-meta", prefix, meta);
+    written++;
+
+    return written;
+  }
+
+  private exportMetadataCheckpoint(): Uint8Array {
+    const checkpoint: Record<string, unknown> = {
+      version: 1,
+      processedEntryCursor: this.processedEntryCursor,
+      index: this.index,
+    };
+
+    // Serialize automergeHashToEntryId: Map<string, Map<string,string>> -> nested object
+    const hashMap: Record<string, Record<string, string>> = {};
+    for (const [docId, inner] of this.automergeHashToEntryId) {
+      hashMap[docId] = Object.fromEntries(inner);
+    }
+    checkpoint.automergeHashToEntryId = hashMap;
+
+    // For stores without cursor scan, include processedEntryIds
+    if (!this.supportsCursorScan(this.store)) {
+      checkpoint.processedEntryIds = this.processedEntryIds;
+    }
+
+    return new TextEncoder().encode(JSON.stringify(checkpoint));
+  }
+
+  /**
+   * Attempt to restore state from cache. Returns true on success.
+   */
+  async restoreFromCache(store: LocalCacheStore): Promise<boolean> {
+    const prefix = this.getCachePrefix();
+
+    try {
+      // 1. Load metadata checkpoint
+      const metaBytes = await store.get("db-meta", prefix);
+      if (!metaBytes) {
+        this.logger.debug("No cache metadata found, will do full rebuild");
+        return false;
+      }
+
+      const checkpoint = JSON.parse(new TextDecoder().decode(metaBytes));
+      if (checkpoint.version !== 1) {
+        this.logger.warn(`Unknown cache version ${checkpoint.version}, ignoring cache`);
+        return false;
+      }
+
+      // 2. Restore metadata
+      this.processedEntryCursor = checkpoint.processedEntryCursor ?? null;
+      this.index = checkpoint.index ?? [];
+      if (checkpoint.processedEntryIds) {
+        this.processedEntryIds = checkpoint.processedEntryIds;
+      }
+
+      // Rebuild indexLookup from index
+      this.indexLookup.clear();
+      for (let i = 0; i < this.index.length; i++) {
+        this.indexLookup.set(this.index[i].docId, i);
+      }
+
+      // Restore automergeHashToEntryId
+      if (checkpoint.automergeHashToEntryId) {
+        this.automergeHashToEntryId.clear();
+        for (const [docId, inner] of Object.entries(checkpoint.automergeHashToEntryId as Record<string, Record<string, string>>)) {
+          this.automergeHashToEntryId.set(docId, new Map(Object.entries(inner)));
+        }
+      }
+
+      // 3. Load cached documents
+      const docIds = await store.list("doc");
+      const docPrefix = `${prefix}/`;
+      let restoredDocs = 0;
+
+      for (const id of docIds) {
+        if (!id.startsWith(docPrefix)) continue;
+        const docId = id.slice(docPrefix.length);
+
+        const docBytes = await store.get("doc", id);
+        if (!docBytes) continue;
+
+        try {
+          const internal = this.deserializeDoc(docBytes);
+          this.docCache.set(docId, internal);
+          restoredDocs++;
+        } catch (e) {
+          this.logger.warn(`Failed to restore cached doc ${docId}, will reload from store: ${e}`);
+        }
+      }
+
+      this.logger.info(`Restored ${restoredDocs} documents from cache for ${prefix}`);
+      return true;
+    } catch (e) {
+      this.logger.warn(`Cache restore failed, will do full rebuild: ${e}`);
+      return false;
+    }
+  }
+
+  private deserializeDoc(value: Uint8Array): InternalDoc {
+    const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+    const headerLen = view.getUint32(0, false);
+    const headerBytes = value.slice(4, 4 + headerLen);
+    const amBinary = value.slice(4 + headerLen);
+
+    const header = JSON.parse(new TextDecoder().decode(headerBytes));
+    const doc = Automerge.load<MindooDocPayload>(amBinary);
+
+    return {
+      id: header.id,
+      doc,
+      createdAt: header.createdAt,
+      lastModified: header.lastModified,
+      decryptionKeyId: header.decryptionKeyId,
+      isDeleted: header.isDeleted,
+    };
   }
 
   /**
@@ -328,9 +521,22 @@ export class BaseMindooDB implements MindooDB {
 
   /**
    * Initialize the database instance.
+   * If a cache store is available, attempts to restore from cache first,
+   * then processes only the delta. Falls back to full rebuild on cache miss.
    */
   async initialize(): Promise<void> {
     this.logger.info(`Initializing database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
+
+    const cacheStore = this.cacheManager?.getStore();
+    if (cacheStore) {
+      const restored = await this.restoreFromCache(cacheStore);
+      if (restored) {
+        this.logger.info("Restored from cache, processing delta only");
+        await this.syncStoreChanges();
+        return;
+      }
+    }
+
     await this.syncStoreChanges();
   }
 
@@ -453,6 +659,8 @@ export class BaseMindooDB implements MindooDB {
     
     // Append new entry IDs to our processed list
     this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
     
     this.logger.debug(`Synced ${newEntryMetadata.length} new entries, index now has ${this.index.length} documents`);
   }
@@ -744,6 +952,7 @@ export class BaseMindooDB implements MindooDB {
     // Update cache and index
     this.docCache.set(docId, internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, false);
+    this.markDocDirty(docId);
     
     this.logger.info(`Document ${docId} created successfully`);
     this.logger.debug(`Document ${docId} cached and indexed (lastModified: ${internalDoc.lastModified})`);
@@ -1165,6 +1374,7 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.lastModified = Date.now();
     this.docCache.set(docId, internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, true);
+    this.markDocDirty(docId);
     
     this.logger.info(`Document ${docId} deleted successfully`);
   }
@@ -1587,6 +1797,7 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.lastModified = Date.now();
     this.docCache.set(docId, internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted);
+    this.markDocDirty(docId);
     
     this.logger.info(`Document ${docId} ${useCustomKey ? 'changed with custom signing key' : 'changed'} successfully`);
   }
@@ -1873,6 +2084,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Update cache
     this.docCache.set(docId, updatedInternalDoc);
+    this.markDocDirty(docId);
     
     return updatedInternalDoc;
   }
@@ -2142,6 +2354,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Update cache
     this.docCache.set(docId, internalDoc);
+    this.markDocDirty(docId);
     this.logger.debug(`===== Successfully loaded document ${docId} and cached it =====`);
     
     return internalDoc;

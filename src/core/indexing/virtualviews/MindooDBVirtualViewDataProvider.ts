@@ -145,4 +145,23 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
   getKnownDocCount(): number {
     return this.knownDocIds.size;
   }
+
+  // ---------------------------------------------------------------------------
+  // Cache serialization
+  // ---------------------------------------------------------------------------
+
+  exportCacheState(): unknown {
+    return {
+      cursor: this.cursor,
+      knownDocIds: Array.from(this.knownDocIds),
+    };
+  }
+
+  importCacheState(state: unknown): void {
+    const s = state as { cursor?: ProcessChangesCursor | null; knownDocIds?: string[] };
+    this.cursor = s.cursor ?? null;
+    if (s.knownDocIds) {
+      this.knownDocIds = new Set(s.knownDocIds);
+    }
+  }
 }

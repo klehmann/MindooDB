@@ -1014,6 +1014,10 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     return this.dbId;
   }
 
+  getCacheIdentity(): string {
+    return `disk:${this.storeRoot}`;
+  }
+
   /**
    * Persist one or more entries to disk.
    *

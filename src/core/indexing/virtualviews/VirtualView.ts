@@ -12,6 +12,9 @@ import {
   scopedDocIdKey,
   createScopedDocId,
 } from "./types";
+import type { LocalCacheStore } from "../../cache/LocalCacheStore";
+import type { ICacheable } from "../../cache/CacheManager";
+import type { CacheManager } from "../../cache/CacheManager";
 
 /**
  * VirtualView creates a hierarchical, sorted view of documents from one or more MindooDB instances.
@@ -62,6 +65,12 @@ export class VirtualView {
   
   /** Last index update timestamp */
   private lastIndexUpdateTime: number | null = null;
+
+  // Local cache support
+  private cacheManager: CacheManager | null = null;
+  private viewCacheId: string | null = null;
+  private viewCacheVersion: string | null = null;
+  private isDirty: boolean = false;
 
   constructor(columns: VirtualViewColumn[]) {
     this.columns = [...columns];
@@ -325,6 +334,7 @@ export class VirtualView {
 
     if (indexChanged) {
       this.lastIndexUpdateTime = Date.now();
+      this.markViewDirty();
     }
   }
 
@@ -682,5 +692,221 @@ export class VirtualView {
   getEntries(origin: string, docId: string): VirtualViewEntryData[] {
     const scopedKey = scopedDocIdKey(createScopedDocId(origin, docId));
     return this.entriesByDocId.get(scopedKey) ?? [];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Local cache support (ICacheable)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Configure caching for this VirtualView and attempt to restore from cache.
+   *
+   * @param cacheManager The CacheManager to register with
+   * @param viewId       Stable identifier for this view
+   * @param version      Schema/config version for cache invalidation
+   * @returns `true` if the view was successfully restored from cache
+   */
+  async setCacheManager(cacheManager: CacheManager, viewId: string, version: string): Promise<boolean> {
+    this.cacheManager = cacheManager;
+    this.viewCacheId = viewId;
+    this.viewCacheVersion = version;
+    cacheManager.register(this as unknown as ICacheable);
+    return this.restoreFromCache(cacheManager.getStore());
+  }
+
+  getCachePrefix(): string {
+    return `${this.viewCacheId ?? "unknown"}/${this.viewCacheVersion ?? "0"}`;
+  }
+
+  hasDirtyState(): boolean {
+    return this.isDirty;
+  }
+
+  clearDirty(): void {
+    this.isDirty = false;
+  }
+
+  /**
+   * Export the view state to the cache store.
+   */
+  async flushToCache(store: LocalCacheStore): Promise<number> {
+    const state = this.exportCacheState();
+    await store.put("vv", this.getCachePrefix(), state);
+    return 1;
+  }
+
+  /**
+   * Serialize the entire tree structure for caching (version 2).
+   * Each node stores its sort key, column values, counts, totals,
+   * and children — so restoration is O(n) without re-sorting.
+   */
+  private exportCacheState(): Uint8Array {
+    const root = this.getRoot();
+
+    const providerStates: Record<string, unknown> = {};
+    for (const [origin, provider] of this.dataProviderByOrigin) {
+      if ("exportCacheState" in provider && typeof (provider as any).exportCacheState === "function") {
+        providerStates[origin] = (provider as any).exportCacheState();
+      }
+    }
+
+    const snapshot = {
+      version: 2,
+      categoryIdCounter: this.categoryIdCounter,
+      categorizationStyle: this.categorizationStyle,
+      docOrderDescending: [...this.docOrderDescending],
+      providerStates,
+      tree: this.serializeNode(root),
+    };
+
+    return new TextEncoder().encode(JSON.stringify(snapshot));
+  }
+
+  private serializeNode(entry: VirtualViewEntryData): unknown {
+    const sk = entry.getSortKey();
+    const comp = entry.getChildrenComparator();
+
+    const children = entry.getChildEntries();
+    const serializedChildren = children.map(c => this.serializeNode(c));
+
+    const node: Record<string, unknown> = {
+      o: entry.origin,
+      d: entry.docId,
+      sk: { c: sk.isCategory, v: [...sk.values], o: sk.origin, d: sk.docId },
+      cv: entry.getColumnValues(),
+      il: entry.getIndentLevels(),
+      si: entry.getSiblingIndex(),
+      cod: comp.getCategoryOrderDescending(),
+      cnt: [
+        entry.getChildCount(),
+        entry.getChildCategoryCount(),
+        entry.getChildDocumentCount(),
+        entry.getDescendantCount(),
+        entry.getDescendantDocumentCount(),
+        entry.getDescendantCategoryCount(),
+      ],
+      ch: serializedChildren,
+    };
+
+    const tv = entry.getTotalValues();
+    if (tv && Object.keys(tv).length > 0) {
+      node.tv = tv;
+    }
+
+    return node;
+  }
+
+  /**
+   * Attempt to restore the view from cache. Returns true on success.
+   */
+  async restoreFromCache(store: LocalCacheStore): Promise<boolean> {
+    if (!this.viewCacheId || !this.viewCacheVersion) return false;
+
+    try {
+      const bytes = await store.get("vv", this.getCachePrefix());
+      if (!bytes) return false;
+
+      const snapshot = JSON.parse(new TextDecoder().decode(bytes));
+
+      if (snapshot.version === 2) {
+        return this.restoreFromTreeSnapshot(snapshot);
+      }
+
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Restore the full tree structure directly from a version-2 snapshot.
+   * O(n) — no re-sorting, no category re-creation, no count recalculation.
+   */
+  private restoreFromTreeSnapshot(snapshot: any): boolean {
+    this.categoryIdCounter = snapshot.categoryIdCounter ?? 4;
+
+    if (snapshot.categorizationStyle) {
+      this.categorizationStyle = snapshot.categorizationStyle as CategorizationStyle;
+    }
+
+    const docOrderDesc: boolean[] = snapshot.docOrderDescending ?? [...this.docOrderDescending];
+
+    if (snapshot.providerStates) {
+      for (const [origin, state] of Object.entries(snapshot.providerStates)) {
+        const provider = this.dataProviderByOrigin.get(origin);
+        if (provider && "importCacheState" in provider && typeof (provider as any).importCacheState === "function") {
+          (provider as any).importCacheState(state);
+        }
+      }
+    }
+
+    const treeData = snapshot.tree;
+    if (!treeData) return false;
+
+    this.rootEntry = this.deserializeNode(treeData, null, docOrderDesc);
+    this.indexBuilt = true;
+    return true;
+  }
+
+  private deserializeNode(
+    data: any,
+    parent: VirtualViewEntryData | null,
+    docOrderDesc: boolean[],
+  ): VirtualViewEntryData {
+    const sk = ViewEntrySortKey.createSortKey(
+      data.sk.c,
+      data.sk.v,
+      data.sk.o,
+      data.sk.d,
+    );
+    const comparator = new ViewEntrySortKeyComparator(
+      this.categorizationStyle,
+      data.cod,
+      docOrderDesc,
+    );
+
+    const entry = new VirtualViewEntryData(
+      this,
+      parent,
+      data.o,
+      data.d,
+      sk,
+      comparator,
+    );
+    entry.setColumnValues(data.cv ?? {});
+    entry.setIndentLevels(data.il ?? 0);
+    entry.setSiblingIndex(data.si ?? 0);
+
+    if (data.tv) {
+      entry._restoreTotalValues(data.tv);
+    }
+
+    const cnt: number[] = data.cnt ?? [0, 0, 0, 0, 0, 0];
+    entry._restoreCounts(cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5]);
+
+    const scopedKey = scopedDocIdKey(createScopedDocId(data.o, data.d));
+    const existing = this.entriesByDocId.get(scopedKey);
+    if (existing) {
+      existing.push(entry);
+    } else {
+      this.entriesByDocId.set(scopedKey, [entry]);
+    }
+
+    if (data.ch) {
+      for (const childData of data.ch) {
+        const child = this.deserializeNode(childData, entry, docOrderDesc);
+        entry._addRestoredChild(child);
+      }
+    }
+
+    return entry;
+  }
+
+  /**
+   * Mark the view as dirty (call after applyChanges).
+   */
+  private markViewDirty(): void {
+    this.isDirty = true;
+    this.cacheManager?.markDirty();
   }
 }

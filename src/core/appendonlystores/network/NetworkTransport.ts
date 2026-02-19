@@ -30,6 +30,13 @@ import type { NetworkEncryptedEntry, AuthResult, NetworkSyncCapabilities } from 
  */
 export interface NetworkTransport {
   /**
+   * Optional stable identifier for this transport (e.g. the server URL).
+   * Used for local cache scoping so the same DB opened against different
+   * servers produces different cache entries.
+   */
+  getIdentity?(): string;
+
+  /**
    * Request a challenge string for authentication.
    * 
    * The server generates a unique challenge (UUID v7) that the client

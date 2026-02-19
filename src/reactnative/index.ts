@@ -13,3 +13,6 @@ export { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 export { ReactNativeCryptoAdapter, createCryptoAdapter } from "./crypto/ReactNativeCryptoAdapter";
 export { ExpoGoCryptoAdapter } from "./crypto/ExpoGoCryptoAdapter";
 export { QuickCryptoAdapter, isQuickCryptoAvailable } from "./crypto/QuickCryptoAdapter";
+
+// React Native-specific cache store
+export { MMKVLocalCacheStore, type MMKVInterface, type AsyncStorageInterface } from "./cache/MMKVLocalCacheStore";

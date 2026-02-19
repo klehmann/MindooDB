@@ -332,4 +332,17 @@ export interface ContentAddressedStore {
    * Optional status API for metadata-segment compaction observability.
    */
   getCompactionStatus?(): Promise<StoreCompactionStatus>;
+
+  /**
+   * Optional unique fingerprint for local cache scoping.
+   * Must be stable across restarts and unique per store backend/location.
+   *
+   * Examples:
+   * - On-disk store: "disk:/data/myapp/contacts"
+   * - IndexedDB store: "idb:default/contacts"
+   * - Network store: "net:https://sync.example.com/contacts"
+   *
+   * If not implemented, BaseMindooDB falls back to getId().
+   */
+  getCacheIdentity?(): string;
 }

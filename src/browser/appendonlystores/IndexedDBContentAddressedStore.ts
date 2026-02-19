@@ -369,6 +369,10 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     return this.storeId;
   }
 
+  getCacheIdentity(): string {
+    return `idb:${this.idbName}`;
+  }
+
   async putEntries(entries: StoreEntry[]): Promise<void> {
     if (entries.length === 0) return;
 

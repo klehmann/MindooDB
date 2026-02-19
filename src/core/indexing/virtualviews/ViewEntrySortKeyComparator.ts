@@ -34,6 +34,10 @@ export class ViewEntrySortKeyComparator {
     this.docOrderPerColumnDescending = Object.freeze([...docOrderPerColumnDescending]);
   }
 
+  getCategoryOrderDescending(): boolean {
+    return this.categoryOrderDescending;
+  }
+
   /**
    * Compare two sort keys for ordering
    * 

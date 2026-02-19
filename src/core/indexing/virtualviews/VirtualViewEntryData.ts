@@ -418,11 +418,46 @@ export class VirtualViewEntryData {
     return this.totalValues.get(key) ?? null;
   }
 
+  getTotalValues(): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const [key, value] of this.totalValues) {
+      result[key] = value;
+    }
+    return result;
+  }
+
   // Invalidate caches when structure changes
   invalidatePositionCache(): void {
     this._position = null;
     this._positionStr = null;
     this._level = null;
+  }
+
+  /** @internal Add a pre-built child during cache restoration (bypasses incremental count tracking). */
+  _addRestoredChild(entry: VirtualViewEntryData): void {
+    this.childEntriesBySortKey.set(entry.getSortKey().toKey(), entry);
+    this.sortedChildrenCache = null;
+  }
+
+  /** @internal Set count values directly during cache restoration. */
+  _restoreCounts(
+    cc: number, ccc: number, cdc: number,
+    dc: number, ddc: number, dcc: number,
+  ): void {
+    this._childCount = cc;
+    this._childCategoryCount = ccc;
+    this._childDocumentCount = cdc;
+    this._descendantCount = dc;
+    this._descendantDocumentCount = ddc;
+    this._descendantCategoryCount = dcc;
+  }
+
+  /** @internal Set total values directly during cache restoration. */
+  _restoreTotalValues(totals: Record<string, number>): void {
+    this.totalValues.clear();
+    for (const [key, value] of Object.entries(totals)) {
+      this.totalValues.set(key, value);
+    }
   }
 
   toString(): string {

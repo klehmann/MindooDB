@@ -56,6 +56,10 @@ export class HttpTransport implements NetworkTransport {
       new MindooLogger(getDefaultLogLevel(), "HttpTransport", true);
   }
 
+  getIdentity(): string {
+    return this.baseUrl;
+  }
+
   /**
    * Request a challenge string for authentication.
    */
