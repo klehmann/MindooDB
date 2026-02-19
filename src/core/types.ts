@@ -1461,18 +1461,18 @@ export interface MindooDB {
   syncStoreChanges(): Promise<void>;
 
   /**
-   * Pull changes from a remote content-addressed store.
+   * Pull changes from a remote content-addressed store or another MindooDB instance.
    *
-   * @param remoteStore The remote store to pull changes from
+   * @param remote The remote store or MindooDB instance to pull changes from
    * @return A promise that resolves when the pull is complete
    */
-  pullChangesFrom(remoteStore: ContentAddressedStore): Promise<void>;
+  pullChangesFrom(remote: ContentAddressedStore | MindooDB): Promise<void>;
 
   /**
-   * Push changes to a remote content-addressed store.
+   * Push changes to a remote content-addressed store or another MindooDB instance.
    *
-   * @param remoteStore The remote store to push changes to
+   * @param remote The remote store or MindooDB instance to push changes to
    * @return A promise that resolves when the push is complete
    */
-  pushChangesTo(remoteStore: ContentAddressedStore): Promise<void>;
+  pushChangesTo(remote: ContentAddressedStore | MindooDB): Promise<void>;
 }

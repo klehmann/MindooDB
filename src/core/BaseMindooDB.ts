@@ -2973,7 +2973,18 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Pull changes from a remote content-addressed store.
+   * Resolve a sync target to a ContentAddressedStore.
+   * Accepts either a raw store or a MindooDB instance (calls getStore()).
+   */
+  private resolveStore(remote: ContentAddressedStore | MindooDB): ContentAddressedStore {
+    if ('getStore' in remote && typeof (remote as MindooDB).getStore === 'function') {
+      return (remote as MindooDB).getStore();
+    }
+    return remote as ContentAddressedStore;
+  }
+
+  /**
+   * Pull changes from a remote content-addressed store or another MindooDB instance.
    * 
    * This method:
    * 1. Finds entries in the remote store that we don't have locally
@@ -2981,10 +2992,12 @@ export class BaseMindooDB implements MindooDB {
    * 3. Stores them in our local store
    * 4. Syncs the local store to process the new entries
    *
-   * @param remoteStore The remote store to pull entries from
+   * @param remote The remote store or MindooDB instance to pull entries from
    * @return A promise that resolves when the pull is complete
    */
-  async pullChangesFrom(remoteStore: ContentAddressedStore): Promise<void> {
+  async pullChangesFrom(remote: ContentAddressedStore | MindooDB): Promise<void> {
+    const remoteStore = this.resolveStore(remote);
+
     if (this.store.getId() !== remoteStore.getId()) {
       throw new Error(`[BaseMindooDB] Cannot pull entries from the incompatible store ${this.store.getId()}`);
     }
@@ -3007,17 +3020,19 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Push changes to a remote content-addressed store.
+   * Push changes to a remote content-addressed store or another MindooDB instance.
    * 
    * This method:
    * 1. Finds entries in our local store that the remote doesn't have
    * 2. Retrieves those entries from our local store
    * 3. Stores them in the remote store
    *
-   * @param remoteStore The remote store to push entries to
+   * @param remote The remote store or MindooDB instance to push entries to
    * @return A promise that resolves when the push is complete
    */
-  async pushChangesTo(remoteStore: ContentAddressedStore): Promise<void> {
+  async pushChangesTo(remote: ContentAddressedStore | MindooDB): Promise<void> {
+    const remoteStore = this.resolveStore(remote);
+
     if (this.store.getId() !== remoteStore.getId()) {
       throw new Error(`[BaseMindooDB] Cannot push entries to the incompatible store ${this.store.getId()}`);
     }
