@@ -11,6 +11,9 @@ Your data is encrypted on the client before it ever touches a server. No plainte
 
 > ⚠️ **Alpha software**: This project is in early development and not yet recommended for production use. APIs may change without notice.
 
+Use AI to explore this repository:
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/klehmann/MindooDB)
 
 ## The Problem
 
