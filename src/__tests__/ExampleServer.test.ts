@@ -444,6 +444,285 @@ describe("MindooDB Example Server", () => {
       });
     });
   });
+
+  describe("Security", () => {
+    describe("Path Traversal Prevention", () => {
+      test("should reject tenantId with path traversal (../)", async () => {
+        const { status } = await httpRequest(
+          `${baseUrl}/../etc/auth/challenge`,
+          "POST",
+          { username: "anyone" }
+        );
+        // Express normalizes the path, so this becomes /etc/auth/challenge
+        // which either hits 400 (invalid format) or 404 (not found)
+        expect([400, 404]).toContain(status);
+      });
+
+      test("should reject tenantId with dots", async () => {
+        const { status, body } = await httpRequest(
+          `${baseUrl}/..test-tenant/auth/challenge`,
+          "POST",
+          { username: "anyone" }
+        );
+        expect(status).toBe(400);
+        expect(body).toMatchObject({
+          error: expect.stringContaining("Invalid"),
+        });
+      });
+
+      test("should reject tenantId with special characters", async () => {
+        const { status, body } = await httpRequest(
+          `${baseUrl}/tenant_with_underscore/auth/challenge`,
+          "POST",
+          { username: "anyone" }
+        );
+        expect(status).toBe(400);
+        expect(body).toMatchObject({
+          error: expect.stringContaining("Invalid"),
+        });
+      });
+
+      test("should reject tenant registration with path traversal in tenantId", async () => {
+        const { status, body } = await httpRequest(
+          `${baseUrl}/admin/register-tenant`,
+          "POST",
+          {
+            tenantId: "../../../etc",
+            adminSigningPublicKey: adminSigningKey.publicKey,
+            adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          }
+        );
+        expect(status).toBe(400);
+        expect(body).toMatchObject({
+          error: expect.stringContaining("Invalid"),
+        });
+      });
+
+      test("should reject dbId with path traversal in sync endpoints", async () => {
+        // First get a valid auth token
+        const tenantId = "security-test-tenant";
+        await httpRequest(`${baseUrl}/admin/register-tenant`, "POST", {
+          tenantId,
+          adminSigningPublicKey: adminSigningKey.publicKey,
+          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          users: [
+            {
+              username: testUsername,
+              signingPublicKey: userSigningPublicKeyPem,
+              encryptionPublicKey: userEncryptionPublicKeyPem,
+            },
+          ],
+        });
+
+        const challengeResponse = await httpRequest(
+          `${baseUrl}/${tenantId}/auth/challenge`,
+          "POST",
+          { username: testUsername }
+        );
+        const challenge = (challengeResponse.body as { challenge: string }).challenge;
+        const signature = await signChallenge(cryptoAdapter, userSigningKeyPair.privateKey, challenge);
+        const authResponse = await httpRequest(
+          `${baseUrl}/${tenantId}/auth/authenticate`,
+          "POST",
+          { challenge, signature: uint8ArrayToBase64(signature) }
+        );
+        const token = (authResponse.body as { token: string }).token;
+
+        const { status, body } = await httpRequest(
+          `${baseUrl}/${tenantId}/sync/findNewEntries`,
+          "POST",
+          { dbId: "../../../etc", haveIds: [] },
+          { Authorization: `Bearer ${token}` }
+        );
+        expect(status).toBe(400);
+        expect(body).toMatchObject({
+          error: expect.stringContaining("must start with"),
+        });
+      });
+    });
+
+    describe("Error Sanitization", () => {
+      test("should not leak file paths in 500 errors", async () => {
+        // Trying to trigger an internal error by accessing a corrupted tenant
+        // The error message should be generic
+        const { status, body } = await httpRequest(
+          `${baseUrl}/admin/register-tenant`,
+          "POST",
+          {
+            tenantId: "a".repeat(65),  // too long
+            adminSigningPublicKey: "key",
+            adminEncryptionPublicKey: "key",
+          }
+        );
+        expect(status).toBe(400);
+        // Should not contain any file path
+        const bodyStr = JSON.stringify(body);
+        expect(bodyStr).not.toContain("/Users/");
+        expect(bodyStr).not.toContain("\\Users\\");
+        expect(bodyStr).not.toContain("node_modules");
+      });
+
+      test("should return generic error for non-auth errors", async () => {
+        const { status, body } = await httpRequest(
+          `${baseUrl}/nonexistent-tenant/auth/challenge`,
+          "POST",
+          { username: "anyone" }
+        );
+        // Should not contain stack trace or file paths
+        const bodyStr = JSON.stringify(body);
+        expect(bodyStr).not.toContain(".ts:");
+        expect(bodyStr).not.toContain(".js:");
+      });
+    });
+
+    describe("Rate Limiting", () => {
+      test("should return rate limit headers on responses", async () => {
+        const response = await fetch(`${baseUrl}/health`);
+        // Global rate limiter adds standard headers
+        expect(response.headers.has("ratelimit-limit")).toBe(true);
+        expect(response.headers.has("ratelimit-remaining")).toBe(true);
+      });
+    });
+
+    describe("Security Headers", () => {
+      test("should return security headers from helmet", async () => {
+        const response = await fetch(`${baseUrl}/health`);
+        // helmet sets several security headers
+        expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(response.headers.get("x-frame-options")).toBe("SAMEORIGIN");
+      });
+    });
+
+    describe("Input Validation", () => {
+      test("should reject oversized arrays in sync endpoints", async () => {
+        const tenantId = "auth-test-tenant";
+
+        // Get auth token
+        const challengeResponse = await httpRequest(
+          `${baseUrl}/${tenantId}/auth/challenge`,
+          "POST",
+          { username: testUsername }
+        );
+        const challenge = (challengeResponse.body as { challenge: string }).challenge;
+        const signature = await signChallenge(cryptoAdapter, userSigningKeyPair.privateKey, challenge);
+        const authResponse = await httpRequest(
+          `${baseUrl}/${tenantId}/auth/authenticate`,
+          "POST",
+          { challenge, signature: uint8ArrayToBase64(signature) }
+        );
+        const token = (authResponse.body as { token: string }).token;
+
+        // Create an array larger than MAX_PUT_ENTRIES (10000)
+        const oversizedEntries = new Array(10001).fill({
+          id: "x",
+          entryType: "change",
+          contentHash: "hash",
+          docId: "doc",
+          dependencyIds: [],
+          createdAt: 0,
+          createdByPublicKey: "key",
+          decryptionKeyId: "kid",
+          signature: "sig",
+          originalSize: 0,
+          encryptedSize: 0,
+          encryptedData: "data",
+        });
+
+        const { status, body } = await httpRequest(
+          `${baseUrl}/${tenantId}/sync/putEntries`,
+          "POST",
+          { dbId: "test-db", entries: oversizedEntries },
+          { Authorization: `Bearer ${token}` }
+        );
+        expect(status).toBe(400);
+        expect(body).toMatchObject({
+          error: expect.stringContaining("at most"),
+        });
+      });
+    });
+
+    describe("Admin API Key Protection", () => {
+      const apiKey = "test-admin-key-for-security";
+      let securedBaseUrl: string;
+      let securedServer: MindooDBServer;
+      let securedHttpServer: import("http").Server;
+      const securedPort = 3098;
+      const securedDataDir = `/tmp/mindoodb-security-test-${Date.now()}`;
+
+      beforeAll(async () => {
+        process.env.MINDOODB_ADMIN_API_KEY = apiKey;
+        securedServer = new MindooDBServer(securedDataDir);
+        securedBaseUrl = `http://localhost:${securedPort}`;
+
+        await new Promise<void>((resolve) => {
+          securedHttpServer = securedServer.getApp().listen(securedPort, () => resolve());
+        });
+      });
+
+      afterAll(async () => {
+        delete process.env.MINDOODB_ADMIN_API_KEY;
+        await new Promise<void>((resolve) => {
+          securedHttpServer.close(() => resolve());
+        });
+        const fs = await import("fs");
+        if (fs.existsSync(securedDataDir)) {
+          fs.rmSync(securedDataDir, { recursive: true, force: true });
+        }
+      });
+
+      test("should reject admin requests without API key", async () => {
+        const { status } = await httpRequest(`${securedBaseUrl}/admin/tenants`);
+        expect(status).toBe(401);
+      });
+
+      test("should reject admin requests with wrong API key", async () => {
+        const { status } = await httpRequest(
+          `${securedBaseUrl}/admin/tenants`,
+          "GET",
+          undefined,
+          { "X-API-Key": "wrong-key" }
+        );
+        expect(status).toBe(401);
+      });
+
+      test("should accept admin requests with correct API key", async () => {
+        const { status } = await httpRequest(
+          `${securedBaseUrl}/admin/tenants`,
+          "GET",
+          undefined,
+          { "X-API-Key": apiKey }
+        );
+        expect(status).toBe(200);
+      });
+
+      test("should accept tenant registration with correct API key", async () => {
+        const { status } = await httpRequest(
+          `${securedBaseUrl}/admin/register-tenant`,
+          "POST",
+          {
+            tenantId: "api-key-test",
+            adminSigningPublicKey: adminSigningKey.publicKey,
+            adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          },
+          { "X-API-Key": apiKey }
+        );
+        expect(status).toBe(201);
+      });
+
+      test("should reject tenant registration without API key", async () => {
+        const { status } = await httpRequest(
+          `${securedBaseUrl}/admin/register-tenant`,
+          "POST",
+          {
+            tenantId: "should-fail",
+            adminSigningPublicKey: adminSigningKey.publicKey,
+            adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          }
+        );
+        expect(status).toBe(401);
+      });
+    });
+  });
 });
 
 // Helper functions

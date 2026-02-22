@@ -19,7 +19,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from "fs";
 import { join } from "path";
-import { randomBytes } from "crypto";
+import { randomBytes, timingSafeEqual } from "crypto";
 
 import { NodeCryptoAdapter } from "mindoodb/node/crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "mindoodb/core/appendonlystores/network/AuthenticationService";
@@ -337,7 +337,10 @@ export class TenantManager {
    * Returns true if the key exists and the tenantId satisfies the prefix constraint.
    */
   validateTenantCreationKey(apiKey: string, tenantId: string): boolean {
-    const key = this.tenantCreationKeys.find((k) => k.apiKey === apiKey);
+    const key = this.tenantCreationKeys.find((k) => {
+      if (k.apiKey.length !== apiKey.length) return false;
+      return timingSafeEqual(Buffer.from(k.apiKey), Buffer.from(apiKey));
+    });
     if (!key) return false;
     if (key.tenantIdPrefix) {
       return tenantId.toLowerCase().startsWith(key.tenantIdPrefix.toLowerCase());

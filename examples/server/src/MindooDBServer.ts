@@ -1,14 +1,20 @@
 /**
  * MindooDB Example Server - Express HTTP server implementing the sync API.
  *
- * Features:
- * - Client-to-server sync via authenticated endpoints
- * - Server-to-server sync via global server identity + trusted servers
- * - Tiered admin auth: full admin key, delegated tenant creation keys
- * - Runtime management of trusted servers and tenant creation keys
+ * Security features:
+ * - Input validation on all identifiers (path traversal prevention)
+ * - Tiered admin auth with constant-time key comparison
+ * - Rate limiting per endpoint tier
+ * - Security headers (helmet) and CORS
+ * - Error sanitization (no internal details leaked)
+ * - Request size limits and timeouts
  */
 
 import express, { Request, Response, NextFunction, Router } from "express";
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import { timingSafeEqual } from "crypto";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -28,6 +34,19 @@ import type {
   ListTenantsResponse,
   TrustedServer,
 } from "./types";
+import {
+  validateIdentifier,
+  validateUsername,
+  validateArraySize,
+  validateStringLength,
+  ValidationError,
+  MAX_HAVE_IDS,
+  MAX_ENTRY_IDS,
+  MAX_PUT_ENTRIES,
+  MAX_PEM_KEY_LENGTH,
+  MAX_SIGNATURE_LENGTH,
+  MAX_CHALLENGE_LENGTH,
+} from "./validation";
 
 declare global {
   namespace Express {
@@ -59,6 +78,13 @@ interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string;
 }
 
+// ==================== Helpers ====================
+
+function safeCompare(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 export class MindooDBServer {
   private app: express.Application;
   private tenantManager: TenantManager;
@@ -68,6 +94,11 @@ export class MindooDBServer {
     this.app = express();
     this.tenantManager = new TenantManager(dataDir, serverPassword);
     this.adminApiKey = process.env.MINDOODB_ADMIN_API_KEY;
+
+    if (!this.adminApiKey) {
+      console.log(`[MindooDBServer] WARNING: MINDOODB_ADMIN_API_KEY not set. Admin endpoints are UNPROTECTED.`);
+      console.log(`[MindooDBServer] WARNING: Set MINDOODB_ADMIN_API_KEY environment variable for production use.`);
+    }
 
     this.setupMiddleware();
     this.setupRoutes();
@@ -82,7 +113,7 @@ export class MindooDBServer {
   }
 
   listen(port: number): void {
-    this.app.listen(port, () => {
+    const server = this.app.listen(port, () => {
       console.log(`[MindooDBServer] Listening on port ${port}`);
       if (this.adminApiKey) {
         console.log(`[MindooDBServer] Admin endpoints protected by API key`);
@@ -90,11 +121,35 @@ export class MindooDBServer {
         console.log(`[MindooDBServer] Admin endpoints OPEN (no API key set)`);
       }
     });
+
+    server.setTimeout(30_000);
   }
 
   private setupMiddleware(): void {
-    this.app.use(express.json({ limit: "50mb" }));
+    // Security headers
+    this.app.use(helmet());
 
+    // CORS
+    const corsOrigin = process.env.MINDOODB_CORS_ORIGIN;
+    this.app.use(cors({
+      origin: corsOrigin || false,
+      methods: ["GET", "POST", "DELETE"],
+      allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+    }));
+
+    // Global rate limit
+    this.app.use(rateLimit({
+      windowMs: 60_000,
+      max: 500,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many requests, please try again later" },
+    }));
+
+    // JSON body parsing with reduced size limit
+    this.app.use(express.json({ limit: "5mb" }));
+
+    // Request logging
     this.app.use((req: Request, res: Response, next: NextFunction) => {
       console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
       next();
@@ -106,10 +161,18 @@ export class MindooDBServer {
       res.json({ status: "ok", timestamp: Date.now() });
     });
 
-    // Admin routes with tiered auth
+    // Admin routes with tiered auth and rate limiting
+    const adminRateLimit = rateLimit({
+      windowMs: 60_000,
+      max: 30,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many admin requests, please try again later" },
+    });
+
     const adminRouter = Router();
     this.setupAdminRoutes(adminRouter);
-    this.app.use("/admin", adminRouter);
+    this.app.use("/admin", adminRateLimit, adminRouter);
 
     // Tenant-scoped routes
     this.app.use("/:tenantId", this.tenantMiddleware.bind(this), this.createTenantRouter());
@@ -119,17 +182,13 @@ export class MindooDBServer {
 
   // ==================== Auth Middleware ====================
 
-  /**
-   * Requires the full admin API key. Used for trusted servers, tenant
-   * creation keys, listing/deleting tenants.
-   */
   private adminOnlyMiddleware(req: Request, res: Response, next: NextFunction): void {
     if (!this.adminApiKey) {
       return next();
     }
 
     const providedKey = req.headers["x-api-key"] as string | undefined;
-    if (providedKey !== this.adminApiKey) {
+    if (!providedKey || !safeCompare(providedKey, this.adminApiKey)) {
       res.status(401).json({ error: "Invalid or missing admin API key" });
       return;
     }
@@ -137,11 +196,6 @@ export class MindooDBServer {
     next();
   }
 
-  /**
-   * Accepts EITHER the admin API key OR a valid tenant creation key.
-   * When a tenant creation key is used, the tenantId in the request body
-   * is validated against the key's prefix constraint.
-   */
   private tenantCreationMiddleware(req: Request, res: Response, next: NextFunction): void {
     if (!this.adminApiKey) {
       return next();
@@ -153,12 +207,10 @@ export class MindooDBServer {
       return;
     }
 
-    // Full admin key: allow everything
-    if (providedKey === this.adminApiKey) {
+    if (safeCompare(providedKey, this.adminApiKey)) {
       return next();
     }
 
-    // Check tenant creation keys
     const tenantId = req.body?.tenantId;
     if (!tenantId) {
       res.status(400).json({ error: "tenantId is required" });
@@ -173,26 +225,32 @@ export class MindooDBServer {
   }
 
   private tenantMiddleware(req: Request, res: Response, next: NextFunction): void {
-    const tenantId = req.params.tenantId?.toLowerCase();
+    const rawTenantId = req.params.tenantId?.toLowerCase();
 
-    if (!tenantId) {
+    if (!rawTenantId) {
       res.status(400).json({ error: "Tenant ID required" });
       return;
     }
 
-    if (!this.tenantManager.tenantExists(tenantId)) {
-      res.status(404).json({ error: `Tenant ${tenantId} not found` });
+    try {
+      validateIdentifier(rawTenantId, "tenantId");
+    } catch {
+      res.status(400).json({ error: "Invalid tenant ID format" });
       return;
     }
 
-    req.tenantId = tenantId;
+    if (!this.tenantManager.tenantExists(rawTenantId)) {
+      res.status(404).json({ error: "Tenant not found" });
+      return;
+    }
+
+    req.tenantId = rawTenantId;
     next();
   }
 
   // ==================== Admin Routes ====================
 
   private setupAdminRoutes(router: Router): void {
-    // Tenant registration uses tenantCreationMiddleware (admin key OR tenant creation key)
     router.post(
       "/register-tenant",
       this.tenantCreationMiddleware.bind(this),
@@ -204,6 +262,14 @@ export class MindooDBServer {
             res.status(400).json({ error: "tenantId is required" });
             return;
           }
+
+          try {
+            validateIdentifier(request.tenantId.toLowerCase(), "tenantId");
+          } catch {
+            res.status(400).json({ error: "Invalid tenantId format" });
+            return;
+          }
+
           if (!request.adminSigningPublicKey) {
             res.status(400).json({ error: "adminSigningPublicKey is required" });
             return;
@@ -212,6 +278,9 @@ export class MindooDBServer {
             res.status(400).json({ error: "adminEncryptionPublicKey is required" });
             return;
           }
+
+          validateStringLength(request.adminSigningPublicKey, MAX_PEM_KEY_LENGTH, "adminSigningPublicKey");
+          validateStringLength(request.adminEncryptionPublicKey, MAX_PEM_KEY_LENGTH, "adminEncryptionPublicKey");
 
           if (this.tenantManager.tenantExists(request.tenantId)) {
             res.status(409).json({ error: `Tenant ${request.tenantId} already exists` });
@@ -228,16 +297,18 @@ export class MindooDBServer {
 
           res.status(201).json(response);
         } catch (error) {
+          if (error instanceof ValidationError) {
+            res.status(400).json({ error: error.message });
+            return;
+          }
           console.error("[MindooDBServer] Error registering tenant:", error);
           res.status(500).json({ error: "Failed to register tenant" });
         }
       },
     );
 
-    // All other admin endpoints require the full admin API key
     const adminOnly = this.adminOnlyMiddleware.bind(this);
 
-    // Tenant listing and removal
     router.get("/tenants", adminOnly, (req: Request, res: Response) => {
       try {
         const tenants = this.tenantManager.listTenants();
@@ -253,8 +324,15 @@ export class MindooDBServer {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
 
+        try {
+          validateIdentifier(tenantId, "tenantId");
+        } catch {
+          res.status(400).json({ error: "Invalid tenantId format" });
+          return;
+        }
+
         if (!this.tenantManager.tenantExists(tenantId)) {
-          res.status(404).json({ error: `Tenant ${tenantId} not found` });
+          res.status(404).json({ error: "Tenant not found" });
           return;
         }
 
@@ -285,11 +363,19 @@ export class MindooDBServer {
           return;
         }
 
+        validateStringLength(name, 256, "name");
+        validateStringLength(signingPublicKey, MAX_PEM_KEY_LENGTH, "signingPublicKey");
+        validateStringLength(encryptionPublicKey, MAX_PEM_KEY_LENGTH, "encryptionPublicKey");
+
         const server: TrustedServer = { name, signingPublicKey, encryptionPublicKey };
         this.tenantManager.addTrustedServer(server);
 
         res.status(201).json({ success: true, message: `Trusted server "${name}" added` });
       } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
         if (error instanceof Error && error.message.includes("already exists")) {
           res.status(409).json({ error: error.message });
           return;
@@ -302,15 +388,22 @@ export class MindooDBServer {
     router.delete("/trusted-servers/:serverName", adminOnly, (req: Request, res: Response) => {
       try {
         const serverName = req.params.serverName;
+
+        validateStringLength(serverName, 256, "serverName");
+
         const removed = this.tenantManager.removeTrustedServer(serverName);
 
         if (!removed) {
-          res.status(404).json({ error: `Trusted server "${serverName}" not found` });
+          res.status(404).json({ error: "Trusted server not found" });
           return;
         }
 
         res.json({ success: true, message: `Trusted server "${serverName}" removed` });
       } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
         console.error("[MindooDBServer] Error removing trusted server:", error);
         res.status(500).json({ error: "Failed to remove trusted server" });
       }
@@ -341,6 +434,11 @@ export class MindooDBServer {
           return;
         }
 
+        validateStringLength(name, 64, "name");
+        if (tenantIdPrefix) {
+          validateStringLength(tenantIdPrefix, 64, "tenantIdPrefix");
+        }
+
         const key = this.tenantManager.addTenantCreationKey(name, tenantIdPrefix);
 
         res.status(201).json({
@@ -351,6 +449,10 @@ export class MindooDBServer {
           createdAt: key.createdAt,
         });
       } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
         if (error instanceof Error && error.message.includes("already exists")) {
           res.status(409).json({ error: error.message });
           return;
@@ -363,15 +465,22 @@ export class MindooDBServer {
     router.delete("/tenant-api-keys/:name", adminOnly, (req: Request, res: Response) => {
       try {
         const name = req.params.name;
+
+        validateStringLength(name, 64, "name");
+
         const removed = this.tenantManager.removeTenantCreationKey(name);
 
         if (!removed) {
-          res.status(404).json({ error: `Tenant creation key "${name}" not found` });
+          res.status(404).json({ error: "Tenant creation key not found" });
           return;
         }
 
         res.json({ success: true, message: `Tenant creation key "${name}" removed` });
       } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
         console.error("[MindooDBServer] Error removing tenant creation key:", error);
         res.status(500).json({ error: "Failed to remove tenant creation key" });
       }
@@ -383,25 +492,49 @@ export class MindooDBServer {
   private createTenantRouter(): Router {
     const router = Router({ mergeParams: true });
 
-    router.post("/auth/challenge", this.handleChallenge.bind(this));
-    router.post("/auth/authenticate", this.handleAuthenticate.bind(this));
+    // Auth endpoints get stricter rate limiting
+    const authRateLimit = rateLimit({
+      windowMs: 60_000,
+      max: 20,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many authentication attempts, please try again later" },
+    });
 
-    router.post("/sync/findNewEntries", this.handleFindNewEntries.bind(this));
-    router.post("/sync/findNewEntriesForDoc", this.handleFindNewEntriesForDoc.bind(this));
-    router.post("/sync/findEntries", this.handleFindEntries.bind(this));
-    router.post("/sync/scanEntriesSince", this.handleScanEntriesSince.bind(this));
-    router.post("/sync/getIdBloomSummary", this.handleGetIdBloomSummary.bind(this));
-    router.post("/sync/getCompactionStatus", this.handleGetCompactionStatus.bind(this));
-    router.get("/sync/capabilities", this.handleGetCapabilities.bind(this));
-    router.post("/sync/getEntries", this.handleGetEntries.bind(this));
-    router.post("/sync/putEntries", this.handlePutEntries.bind(this));
-    router.post("/sync/hasEntries", this.handleHasEntries.bind(this));
-    router.get("/sync/getAllIds", this.handleGetAllIds.bind(this));
-    router.post("/sync/resolveDependencies", this.handleResolveDependencies.bind(this));
+    // Sync endpoints get a higher limit
+    const syncRateLimit = rateLimit({
+      windowMs: 60_000,
+      max: 200,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many sync requests, please try again later" },
+    });
+
+    router.post("/auth/challenge", authRateLimit, this.handleChallenge.bind(this));
+    router.post("/auth/authenticate", authRateLimit, this.handleAuthenticate.bind(this));
+
+    router.post("/sync/findNewEntries", syncRateLimit, this.handleFindNewEntries.bind(this));
+    router.post("/sync/findNewEntriesForDoc", syncRateLimit, this.handleFindNewEntriesForDoc.bind(this));
+    router.post("/sync/findEntries", syncRateLimit, this.handleFindEntries.bind(this));
+    router.post("/sync/scanEntriesSince", syncRateLimit, this.handleScanEntriesSince.bind(this));
+    router.post("/sync/getIdBloomSummary", syncRateLimit, this.handleGetIdBloomSummary.bind(this));
+    router.post("/sync/getCompactionStatus", syncRateLimit, this.handleGetCompactionStatus.bind(this));
+    router.get("/sync/capabilities", syncRateLimit, this.handleGetCapabilities.bind(this));
+    router.post("/sync/getEntries", syncRateLimit, this.handleGetEntries.bind(this));
+    router.post("/sync/putEntries", syncRateLimit, this.handlePutEntries.bind(this));
+    router.post("/sync/hasEntries", syncRateLimit, this.handleHasEntries.bind(this));
+    router.get("/sync/getAllIds", syncRateLimit, this.handleGetAllIds.bind(this));
+    router.post("/sync/resolveDependencies", syncRateLimit, this.handleResolveDependencies.bind(this));
 
     router.post("/admin/trigger-sync", this.handleTriggerSync.bind(this));
 
     return router;
+  }
+
+  // ==================== Validation Helpers ====================
+
+  private validateDbId(dbId: unknown): string {
+    return validateIdentifier(dbId, "dbId");
   }
 
   // ==================== Auth Handlers ====================
@@ -410,17 +543,14 @@ export class MindooDBServer {
     try {
       const { username } = req.body;
 
-      if (!username) {
-        res.status(400).json({ error: "username is required" });
-        return;
-      }
+      validateUsername(username);
 
       const authService = await this.tenantManager.getAuthService(req.tenantId!);
       const challenge = await authService.generateChallenge(username);
 
       res.json({ challenge });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -433,13 +563,16 @@ export class MindooDBServer {
         return;
       }
 
+      validateStringLength(challenge, MAX_CHALLENGE_LENGTH, "challenge");
+      validateStringLength(signature, MAX_SIGNATURE_LENGTH, "signature");
+
       const authService = await this.tenantManager.getAuthService(req.tenantId!);
       const signatureBytes = this.base64ToUint8Array(signature);
       const result = await authService.authenticate(challenge, signatureBytes);
 
       res.json(result);
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -450,19 +583,17 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId, haveIds } = req.body;
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
+      validateArraySize(haveIds, MAX_HAVE_IDS, "haveIds");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const entries = await serverStore.handleFindNewEntries(token, haveIds || []);
 
       res.json({
         entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
       });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -471,19 +602,21 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId, haveIds, docId } = req.body;
 
-      if (!dbId || !docId) {
-        res.status(400).json({ error: "dbId and docId are required" });
+      const validDbId = this.validateDbId(dbId);
+      if (!docId) {
+        res.status(400).json({ error: "docId is required" });
         return;
       }
+      validateArraySize(haveIds, MAX_HAVE_IDS, "haveIds");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const entries = await serverStore.handleFindNewEntriesForDoc(token, haveIds || [], docId);
 
       res.json({
         entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
       });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -492,12 +625,9 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId, type, creationDateFrom, creationDateUntil } = req.body;
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const entries = await serverStore.handleFindEntries(
         token,
         type,
@@ -509,7 +639,7 @@ export class MindooDBServer {
         entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
       });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -523,12 +653,9 @@ export class MindooDBServer {
         filters?: StoreScanFilters;
       };
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const result = await serverStore.handleScanEntriesSince(
         token,
         cursor ?? null,
@@ -542,7 +669,7 @@ export class MindooDBServer {
         hasMore: result.hasMore,
       });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -551,28 +678,26 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId } = req.body as { dbId?: string };
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const summary = await serverStore.handleGetIdBloomSummary(token);
       res.json({ summary: summary as StoreIdBloomSummary });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
   private async handleGetCapabilities(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
-      const dbId = (req.query.dbId as string) || "directory";
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const rawDbId = (req.query.dbId as string) || "directory";
+      const validDbId = this.validateDbId(rawDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const capabilities = await serverStore.handleGetCapabilities(token);
       res.json({ capabilities: capabilities as NetworkSyncCapabilities });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -581,16 +706,13 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId } = req.body as { dbId?: string };
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const status = await serverStore.handleGetCompactionStatus(token);
       res.json({ status: status as StoreCompactionStatus });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -599,12 +721,10 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId, ids } = req.body;
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
+      validateArraySize(ids, MAX_ENTRY_IDS, "ids");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const entries = await serverStore.handleGetEntries(token, ids || []);
 
       res.json({
@@ -614,7 +734,7 @@ export class MindooDBServer {
         })),
       });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -623,12 +743,10 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId, entries } = req.body;
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
+      validateArraySize(entries, MAX_PUT_ENTRIES, "entries");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const deserializedEntries = (entries || []).map((e: SerializedEntry) =>
         this.deserializeEntry(e),
       );
@@ -637,7 +755,7 @@ export class MindooDBServer {
 
       res.json({ success: true });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -646,31 +764,30 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId, ids } = req.body;
 
-      if (!dbId) {
-        res.status(400).json({ error: "dbId is required" });
-        return;
-      }
+      const validDbId = this.validateDbId(dbId);
+      validateArraySize(ids, MAX_ENTRY_IDS, "ids");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const existingIds = await serverStore.handleHasEntries(token, ids || []);
 
       res.json({ ids: existingIds });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
   private async handleGetAllIds(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
-      const dbId = (req.query.dbId as string) || "directory";
+      const rawDbId = (req.query.dbId as string) || "directory";
+      const validDbId = this.validateDbId(rawDbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const ids = await serverStore.handleGetAllIds(token);
 
       res.json({ ids });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -679,17 +796,18 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const { dbId, startId, options } = req.body;
 
-      if (!dbId || !startId) {
-        res.status(400).json({ error: "dbId and startId are required" });
+      const validDbId = this.validateDbId(dbId);
+      if (!startId) {
+        res.status(400).json({ error: "startId is required" });
         return;
       }
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
       const ids = await serverStore.handleResolveDependencies(token, startId, options);
 
       res.json({ ids });
     } catch (error) {
-      this.handleNetworkError(error, res);
+      this.handleRequestError(error, res);
     }
   }
 
@@ -709,18 +827,26 @@ export class MindooDBServer {
     return auth.substring(7);
   }
 
-  private handleNetworkError(error: unknown, res: Response): void {
-    console.error("[MindooDBServer] Request error:", error);
+  /**
+   * Unified error handler. Returns known auth/validation errors with their
+   * messages; everything else gets a generic "Internal server error" to
+   * prevent leaking implementation details.
+   */
+  private handleRequestError(error: unknown, res: Response): void {
+    if (error instanceof ValidationError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
 
     if (error instanceof Error && error.name === "NetworkError") {
       const networkError = error as NetworkError;
       const status = this.getStatusForErrorType(networkError.type);
       res.status(status).json({ error: networkError.message });
-    } else if (error instanceof Error) {
-      res.status(500).json({ error: error.message });
-    } else {
-      res.status(500).json({ error: "Internal server error" });
+      return;
     }
+
+    console.error("[MindooDBServer] Request error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 
   private getStatusForErrorType(type: string): number {
