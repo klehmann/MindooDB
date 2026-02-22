@@ -12,7 +12,8 @@
 
 import express, { Request, Response, NextFunction, Router } from "express";
 import https from "https";
-import { readFileSync } from "fs";
+import path from "path";
+import { readFileSync, existsSync } from "fs";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -38,6 +39,7 @@ import type {
 } from "./types";
 import {
   validateIdentifier,
+  validateTenantId,
   validateUsername,
   validateArraySize,
   validateStringLength,
@@ -91,11 +93,13 @@ export class MindooDBServer {
   private app: express.Application;
   private tenantManager: TenantManager;
   private adminApiKey: string | undefined;
+  private readonly staticDir: string | undefined;
 
-  constructor(dataDir: string, serverPassword?: string) {
+  constructor(dataDir: string, serverPassword?: string, staticDir?: string) {
     this.app = express();
     this.tenantManager = new TenantManager(dataDir, serverPassword);
     this.adminApiKey = process.env.MINDOODB_ADMIN_API_KEY;
+    this.staticDir = staticDir;
 
     if (!this.adminApiKey) {
       console.log(`[MindooDBServer] WARNING: MINDOODB_ADMIN_API_KEY not set. Admin endpoints are UNPROTECTED.`);
@@ -177,9 +181,31 @@ export class MindooDBServer {
   }
 
   private setupRoutes(): void {
+    // Root redirect: forward GET / to /statics/index.html if available
+    this.app.get("/", (req: Request, res: Response) => {
+      if (this.staticDir && existsSync(path.join(this.staticDir, "index.html"))) {
+        res.redirect(302, "/statics/index.html");
+      } else {
+        res.status(404).json({ error: "Not found" });
+      }
+    });
+
     this.app.get("/health", (req, res) => {
       res.json({ status: "ok", timestamp: Date.now() });
     });
+
+    // Static file serving (if configured)
+    if (this.staticDir) {
+      const resolvedStaticDir = path.resolve(this.staticDir);
+      this.app.use("/statics", (req: Request, res: Response, next: NextFunction) => {
+        if (req.path.includes("..")) {
+          res.status(400).json({ error: "Invalid path" });
+          return;
+        }
+        next();
+      }, express.static(resolvedStaticDir, { dotfiles: "deny", etag: true }));
+      console.log(`[MindooDBServer] Serving static files from ${resolvedStaticDir} at /statics/`);
+    }
 
     // Admin routes with tiered auth and rate limiting
     const adminRateLimit = rateLimit({
@@ -284,9 +310,9 @@ export class MindooDBServer {
           }
 
           try {
-            validateIdentifier(request.tenantId.toLowerCase(), "tenantId");
-          } catch {
-            res.status(400).json({ error: "Invalid tenantId format" });
+            validateTenantId(request.tenantId.toLowerCase());
+          } catch (validationError) {
+            res.status(400).json({ error: validationError instanceof ValidationError ? validationError.message : "Invalid tenantId format" });
             return;
           }
 

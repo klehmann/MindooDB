@@ -10,6 +10,7 @@
  *   -d, --data-dir <path>   Data directory path (default: ./data)
  *   -p, --port <port>       Server port (default: 3000)
  *   -s, --auto-sync         Enable automatic sync with remote servers
+ *   -w, --static-dir <path> Serve static files from this directory at /statics/
  *   --tls-cert <path>       Path to TLS certificate file (PEM)
  *   --tls-key <path>        Path to TLS private key file (PEM)
  *   -h, --help              Show this help message
@@ -29,6 +30,7 @@ interface CliOptions {
   autoSync: boolean;
   tlsCert?: string;
   tlsKey?: string;
+  staticDir?: string;
   help: boolean;
 }
 
@@ -86,6 +88,14 @@ function parseArgs(args: string[]): CliOptions {
         }
         break;
 
+      case "-w":
+      case "--static-dir":
+        if (nextArg) {
+          options.staticDir = nextArg;
+          i++;
+        }
+        break;
+
       case "-h":
       case "--help":
         options.help = true;
@@ -114,6 +124,7 @@ Options:
   -d, --data-dir <path>   Data directory path (default: ./data)
   -p, --port <port>       Server port (default: 3000)
   -s, --auto-sync         Enable automatic sync with remote servers
+  -w, --static-dir <path> Serve static files at /statics/ (e.g. bootstrap UI)
   --tls-cert <path>       Path to TLS certificate file (PEM format)
   --tls-key <path>        Path to TLS private key file (PEM format)
   -h, --help              Show this help message
@@ -137,6 +148,9 @@ Examples:
   # Start server with API key protection
   MINDOODB_ADMIN_API_KEY=my-secret-key npx ts-node src/index.ts
 
+  # Start server with static files (e.g. bootstrap UI for distributed web apps)
+  npx ts-node src/index.ts -w ./webapp-bootstrap
+
   # Start server with TLS (HTTPS)
   npx ts-node src/index.ts --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem -p 443
 `);
@@ -157,6 +171,7 @@ async function main(): Promise<void> {
   console.log(`Data directory: ${options.dataDir}`);
   console.log(`Port: ${options.port}`);
   console.log(`Auto-sync: ${options.autoSync ? "enabled" : "disabled"}`);
+  console.log(`Static dir: ${options.staticDir || "not set"}`);
   console.log(`TLS: ${options.tlsCert ? "enabled" : "disabled"}`);
 
   if ((options.tlsCert && !options.tlsKey) || (!options.tlsCert && options.tlsKey)) {
@@ -172,7 +187,7 @@ async function main(): Promise<void> {
   console.log("=".repeat(60));
 
   // Create and start the server
-  const server = new MindooDBServer(options.dataDir, serverPassword);
+  const server = new MindooDBServer(options.dataDir, serverPassword, options.staticDir);
 
   // If auto-sync is enabled and we have server identity, start periodic sync
   if (options.autoSync) {

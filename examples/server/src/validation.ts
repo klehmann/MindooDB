@@ -78,6 +78,24 @@ export function validateStringLength(value: unknown, maxLength: number, fieldNam
   }
 }
 
+/**
+ * Tenant IDs that are reserved because they collide with server route prefixes.
+ */
+export const RESERVED_TENANT_NAMES = new Set(["admin", "health", "statics"]);
+
+/**
+ * Validates a tenant ID: must pass identifier rules and must not be a reserved name.
+ */
+export function validateTenantId(value: unknown): string {
+  const id = validateIdentifier(value, "tenantId");
+  if (RESERVED_TENANT_NAMES.has(id)) {
+    throw new ValidationError(
+      `tenantId "${id}" is reserved and cannot be used`,
+    );
+  }
+  return id;
+}
+
 export class ValidationError extends Error {
   constructor(message: string) {
     super(message);
