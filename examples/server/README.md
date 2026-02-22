@@ -1,102 +1,105 @@
 # MindooDB Example Server
 
-A minimal Node.js/Express server that implements the MindooDB sync API, enabling:
-- **Client-to-server sync**: Clients can push/pull entries to/from the server
-- **Server-to-server sync**: Servers can synchronize with each other
-- **Tenant registration via HTTP**: Create tenants without manual file editing
+A Node.js/Express server implementing the MindooDB sync API with:
+
+- **Client-to-server sync** — clients push/pull encrypted entries
+- **Server-to-server mirroring** — servers relay ciphertext without decryption
+- **Tiered admin access** — full admin keys and delegated tenant creation keys
+- **Multi-tenant** — each tenant is isolated with its own config, keybag, and stores
 
 ## Prerequisites
 
 - Node.js 20 or later
 - The MindooDB library must be built first (run `npm run build` in the root directory)
 
-## Installation
-
-```bash
-cd examples/server
-npm install
-```
-
 ## Quick Start
 
-### 1. Build the MindooDB library
-
 ```bash
-# From the root mindoodb directory
+# 1. Build MindooDB (from the root directory)
 nvm use 20
 npm install
 npm run build
-```
 
-### 2. Start the server
-
-```bash
-# From examples/server directory
+# 2. Install server dependencies
 cd examples/server
-npm run dev
+npm install
+
+# 3. Initialize server identity (one-time setup)
+MINDOODB_SERVER_PASSWORD=your-secret npm run init -- --name server1
+
+# 4. Start the server
+MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 ```
 
-Or with specific options:
+## CLI Reference
 
-```bash
-npm run dev -- -d ./data -p 3000
-```
-
-### 3. Register a tenant via HTTP
-
-```bash
-curl -X POST http://localhost:3000/admin/register-tenant \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenantId": "my-tenant",
-    "adminSigningPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-    "adminEncryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-    "users": [
-      {
-        "username": "alice",
-        "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-        "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
-      }
-    ]
-  }'
-```
-
-## CLI Options
+### `npm run dev` — Start the server
 
 | Option | Alias | Description | Default |
 |--------|-------|-------------|---------|
 | `--data-dir` | `-d` | Data directory path | `./data` |
 | `--port` | `-p` | Server port | `3000` |
 | `--auto-sync` | `-s` | Enable automatic sync with remote servers | disabled |
-| `--help` | `-h` | Show help message | - |
+| `--help` | `-h` | Show help message | — |
+
+### `npm run init` — Initialize server identity
+
+| Option | Alias | Description | Default |
+|--------|-------|-------------|---------|
+| `--name` | `-n` | Server name (e.g., "server1") | **required** |
+| `--data-dir` | `-d` | Data directory path | `./data` |
+| `--force` | `-f` | Overwrite existing identity | — |
+| `--help` | `-h` | Show help message | — |
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MINDOODB_SERVER_KEY_PASSWORD` | If server-keys.json exists | Password to decrypt server private keys |
+| `MINDOODB_SERVER_PASSWORD` | If server-identity.json exists | Password to decrypt server identity and per-tenant keybags |
 | `MINDOODB_ADMIN_API_KEY` | No | If set, protects admin endpoints with API key |
 
-### Example: Protected Admin Endpoints
+## Data Directory Layout
 
-```bash
-export MINDOODB_ADMIN_API_KEY="my-secret-key"
-npm run dev
-
-# Now admin endpoints require X-API-Key header
-curl -X GET http://localhost:3000/admin/tenants \
-  -H "X-API-Key: my-secret-key"
+```
+data/
+├── server-identity.json       # Global server identity (PrivateUserId)
+├── trusted-servers.json       # Public keys of trusted remote servers
+├── tenant-api-keys.json       # Delegated tenant creation API keys
+├── acme/
+│   ├── config.json            # Tenant configuration
+│   └── stores/                # Content-addressed store data
+└── other-tenant/
+    ├── config.json
+    └── stores/
 ```
 
 ## API Reference
 
 ### Admin Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/admin/register-tenant` | Register a new tenant |
-| `GET` | `/admin/tenants` | List all registered tenants |
-| `DELETE` | `/admin/tenants/:tenantId` | Remove a tenant |
+#### Tenant Management
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/admin/register-tenant` | Admin key or tenant creation key | Register a new tenant |
+| `GET` | `/admin/tenants` | Admin key only | List all registered tenants |
+| `DELETE` | `/admin/tenants/:tenantId` | Admin key only | Remove a tenant |
+
+#### Trusted Server Management
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/admin/trusted-servers` | Admin key only | List trusted servers |
+| `POST` | `/admin/trusted-servers` | Admin key only | Add a trusted server |
+| `DELETE` | `/admin/trusted-servers/:serverName` | Admin key only | Remove a trusted server |
+
+#### Tenant Creation Key Management
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/admin/tenant-api-keys` | Admin key only | List tenant creation keys (masked) |
+| `POST` | `/admin/tenant-api-keys` | Admin key only | Create a tenant creation key |
+| `DELETE` | `/admin/tenant-api-keys/:name` | Admin key only | Revoke a tenant creation key |
 
 ### Authentication Endpoints
 
@@ -116,6 +119,10 @@ curl -X GET http://localhost:3000/admin/tenants \
 | `POST` | `/:tenantId/sync/hasEntries` | Check which entry IDs exist |
 | `GET` | `/:tenantId/sync/getAllIds` | Get all entry IDs |
 | `POST` | `/:tenantId/sync/resolveDependencies` | Resolve dependency chain |
+| `POST` | `/:tenantId/sync/findEntries` | Find entries by type/date |
+| `POST` | `/:tenantId/sync/scanEntriesSince` | Cursor-based entry scanning |
+| `POST` | `/:tenantId/sync/getIdBloomSummary` | Get Bloom filter summary |
+| `GET` | `/:tenantId/sync/capabilities` | Get server capabilities |
 
 ### Health Check
 
@@ -123,31 +130,127 @@ curl -X GET http://localhost:3000/admin/tenants \
 |--------|----------|-------------|
 | `GET` | `/health` | Server health status |
 
-## Configuration Files
+## Tiered Authentication
 
-### Tenant Configuration (`<dataDir>/<tenantId>/config.json`)
+The server uses three levels of authentication:
+
+1. **Admin API key** (`MINDOODB_ADMIN_API_KEY`) — full access to all admin endpoints. Set via environment variable, passed in the `X-API-Key` header.
+
+2. **Tenant creation key** — can only create tenants via `POST /admin/register-tenant`. Optionally restricted to a tenant ID prefix. Created by an admin via `POST /admin/tenant-api-keys`. Passed in the `X-API-Key` header.
+
+3. **User JWT token** — per-tenant sync access via Ed25519 challenge-response. Users are authenticated against the tenant's directory (admin-signed) or the config.json fallback.
+
+## Walkthrough: Single Server Setup
+
+### 1. Initialize the server
+
+```bash
+MINDOODB_SERVER_PASSWORD=secret npm run init -- --name server1 --data-dir ./data
+```
+
+This creates `server-identity.json`, `trusted-servers.json`, and `tenant-api-keys.json` in the data directory, and prints the server's public keys.
+
+### 2. Start the server
+
+```bash
+MINDOODB_SERVER_PASSWORD=secret npm run dev -- -d ./data -p 3000
+```
+
+### 3. Client creates a tenant and publishes to server
+
+```typescript
+import { BaseMindooTenantFactory, InMemoryContentAddressedStoreFactory } from "mindoodb";
+
+const factory = new BaseMindooTenantFactory(new InMemoryContentAddressedStoreFactory());
+const result = await factory.createTenant({
+  tenantId: "acme",
+  adminName: "cn=admin/o=acme",
+  adminPassword: "admin-pass",
+  userName: "cn=alice/o=acme",
+  userPassword: "alice-pass",
+});
+
+// Register tenant on server (sends admin keys + $publicinfos key)
+await result.tenant.publishToServer("http://localhost:3000", {
+  registerUsers: [factory.toPublicUserId(result.appUser)],
+});
+```
+
+### 4. Client syncs data
+
+```typescript
+// Create a remote store for the "main" database
+const remoteStore = await result.tenant.connectToServer(
+  "http://localhost:3000",
+  "main",
+);
+
+const db = await result.tenant.openDB("main");
+
+// Push local changes to server
+await db.pushChangesTo(remoteStore);
+
+// Pull server changes to local
+await db.pullChangesFrom(remoteStore);
+await db.syncStoreChanges();
+```
+
+## Walkthrough: Multi-Server Mirroring
+
+### 1. Initialize both servers
+
+```bash
+# Server 1
+MINDOODB_SERVER_PASSWORD=secret1 npm run init -- --name server1 --data-dir ./data1
+
+# Server 2
+MINDOODB_SERVER_PASSWORD=secret2 npm run init -- --name server2 --data-dir ./data2
+```
+
+Both commands print the server's public keys.
+
+### 2. Exchange public keys via admin API
+
+```bash
+# Tell server1 to trust server2
+curl -X POST http://server1:3000/admin/trusted-servers \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $ADMIN_KEY" \
+  -d '{
+    "name": "CN=server2",
+    "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+    "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+  }'
+
+# Tell server2 to trust server1
+curl -X POST http://server2:3000/admin/trusted-servers \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $ADMIN_KEY" \
+  -d '{
+    "name": "CN=server1",
+    "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+    "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+  }'
+```
+
+Trust changes take effect immediately — no restart required.
+
+### 3. Publish tenant to both servers
+
+```typescript
+await tenant.publishToServer("http://server1:3000");
+await tenant.publishToServer("http://server2:3000");
+```
+
+### 4. Configure remote servers in tenant config
+
+Add `remoteServers` to `data1/acme/config.json` on server 1:
 
 ```json
 {
-  "adminSigningPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-  "adminEncryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-  "defaultStoreType": "inmemory",
-  "databaseStores": {
-    "special-db": {
-      "storeType": "file"
-    }
-  },
-  "users": [
-    {
-      "username": "alice",
-      "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-      "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
-    }
-  ],
   "remoteServers": [
     {
-      "url": "https://other-server.example.com",
-      "username": "this-server-username",
+      "url": "http://server2:3000",
       "syncIntervalMs": 60000,
       "databases": ["directory", "main"]
     }
@@ -155,181 +258,133 @@ curl -X GET http://localhost:3000/admin/tenants \
 }
 ```
 
-### Server Keys (`<dataDir>/<tenantId>/server-keys.json`)
+And vice versa on server 2.
 
-Required for server-to-server sync. Contains the server's identity:
-
-```json
-{
-  "username": "server-primary",
-  "signingPrivateKey": {
-    "ciphertext": "...",
-    "iv": "...",
-    "tag": "...",
-    "salt": "...",
-    "iterations": 100000
-  },
-  "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-  "encryptionPrivateKey": {
-    "ciphertext": "...",
-    "iv": "...",
-    "tag": "...",
-    "salt": "...",
-    "iterations": 100000
-  },
-  "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
-}
-```
-
-**Important**: The password to decrypt the private keys must be provided via the `MINDOODB_SERVER_KEY_PASSWORD` environment variable.
-
-## Typical Workflow
-
-### 1. Client Creates Tenant Locally
-
-```typescript
-// On the client (admin)
-const factory = new BaseMindooTenantFactory(cryptoAdapter, storeFactory);
-
-// Create admin user (signing + encryption keys used for tenant administration)
-const adminUser = await factory.createUserId("CN=admin/O=my-tenant", "admin-password");
-
-// Create user
-const userPassword = "alice-password";
-const user = await factory.createUserId("CN=alice/O=my-tenant", userPassword);
-const publicUser = factory.toPublicUserId(user);
-
-// Create tenant locally
-const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, userPassword, cryptoAdapter);
-const tenantId = "my-tenant";
-await keyBag.createTenantKey(tenantId);
-await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
-const tenant = await factory.openTenant(
-  tenantId,
-  adminUser.userSigningKeyPair.publicKey,
-  adminUser.userEncryptionKeyPair.publicKey,
-  user,
-  userPassword,
-  keyBag
-);
-```
-
-### 2. Register Tenant on Server
-
-```typescript
-// Register tenant on the server
-await fetch("http://localhost:3000/admin/register-tenant", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    tenantId: "my-tenant",
-    adminSigningPublicKey: adminUser.userSigningKeyPair.publicKey,
-    adminEncryptionPublicKey: adminUser.userEncryptionKeyPair.publicKey,
-    users: [{
-      username: publicUser.username,
-      signingPublicKey: publicUser.userSigningPublicKey,
-      encryptionPublicKey: publicUser.userEncryptionPublicKey,
-    }],
-  }),
-});
-```
-
-### 3. Client Syncs with Server
-
-```typescript
-// Create HttpTransport
-const transport = new HttpTransport({
-  baseUrl: "http://localhost:3000",
-  tenantId: "my-tenant",
-  dbId: "directory",
-});
-
-// Create client store
-const clientStore = new ClientNetworkContentAddressedStore(
-  "directory",
-  transport,
-  cryptoAdapter,
-  publicUser.username,
-  signingKey,      // decrypted signing key
-  encryptionKey,   // decrypted encryption key
-);
-
-// open database with local data
-const db = await tenant.openDB("main");
-// Sync: push local changes to server
-await db.pushChangesTo(clientStore);
-
-// Sync: pull server changes to local
-await db.pullChangesFrom(clientStore);
-```
-
-## Server-to-Server Sync
-
-### Setup
-
-1. Generate server keys using MindooDB factory methods:
-
-```typescript
-const factory = new BaseMindooTenantFactory(cryptoAdapter, storeFactory);
-const signingKey = await factory.createSigningKeyPair("server-password");
-const encryptionKey = await factory.createEncryptionKeyPair("server-password");
-
-// Save to server-keys.json
-const serverKeys = {
-  username: "server-primary",
-  signingPrivateKey: signingKey.privateKey,
-  signingPublicKey: signingKey.publicKey,
-  encryptionPrivateKey: encryptionKey.privateKey,
-  encryptionPublicKey: encryptionKey.publicKey,
-};
-```
-
-2. Register this server as a user on the remote server's config.json:
-
-```json
-{
-  "users": [
-    {
-      "username": "server-primary",
-      "signingPublicKey": "...",
-      "encryptionPublicKey": "..."
-    }
-  ]
-}
-```
-
-3. Configure remote servers in this server's config.json:
-
-```json
-{
-  "remoteServers": [
-    {
-      "url": "https://remote-server.example.com",
-      "username": "server-primary",
-      "syncIntervalMs": 60000
-    }
-  ]
-}
-```
-
-4. Start the server with auto-sync:
+### 5. Start servers with auto-sync
 
 ```bash
-# Option 1: Inline environment variable (single line)
-MINDOODB_SERVER_KEY_PASSWORD=server-password npm run dev -- -s
-
-# Option 2: Export first, then run
-export MINDOODB_SERVER_KEY_PASSWORD=server-password
-npm run dev -- -s
+MINDOODB_SERVER_PASSWORD=secret1 npm run dev -- -d ./data1 -s
 ```
 
-## Directory Structure
+The servers will periodically sync all configured tenant databases, relaying encrypted entries without decrypting them.
 
+## Walkthrough: Delegated Tenant Creation
+
+### 1. Admin creates a tenant creation key
+
+```bash
+curl -X POST http://localhost:3000/admin/tenant-api-keys \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $ADMIN_KEY" \
+  -d '{"name": "acme-corp", "tenantIdPrefix": "acme-"}'
 ```
-data/
-└── my-tenant/
-    ├── config.json         # Tenant configuration
-    └── server-keys.json    # Server identity (optional)
+
+Response:
+```json
+{
+  "success": true,
+  "name": "acme-corp",
+  "apiKey": "mdb_tk_a1b2c3d4...",
+  "tenantIdPrefix": "acme-"
+}
+```
+
+### 2. Share the key with the customer
+
+The customer uses this key when publishing their tenant:
+
+```typescript
+await tenant.publishToServer("http://localhost:3000", {
+  adminApiKey: "mdb_tk_a1b2c3d4...",
+  registerUsers: [factory.toPublicUserId(appUser)],
+});
+```
+
+### 3. Prefix enforcement
+
+- `tenantId: "acme-prod"` — allowed (matches prefix `acme-`)
+- `tenantId: "other-org"` — rejected with 403
+
+## Configuration File Formats
+
+### `server-identity.json` (global)
+
+Generated by `npm run init`. Contains a `PrivateUserId` with encrypted private keys:
+
+```json
+{
+  "username": "CN=server1",
+  "userSigningKeyPair": {
+    "publicKey": "-----BEGIN PUBLIC KEY-----\n...",
+    "privateKey": {
+      "ciphertext": "...",
+      "iv": "...",
+      "tag": "...",
+      "salt": "...",
+      "iterations": 100000
+    }
+  },
+  "userEncryptionKeyPair": {
+    "publicKey": "-----BEGIN PUBLIC KEY-----\n...",
+    "privateKey": {
+      "ciphertext": "...",
+      "iv": "...",
+      "tag": "...",
+      "salt": "...",
+      "iterations": 100000
+    }
+  }
+}
+```
+
+### `trusted-servers.json` (global)
+
+```json
+[
+  {
+    "name": "CN=server2",
+    "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
+    "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n..."
+  }
+]
+```
+
+### `tenant-api-keys.json` (global)
+
+```json
+[
+  {
+    "apiKey": "mdb_tk_a1b2c3...",
+    "name": "acme-corp",
+    "tenantIdPrefix": "acme-",
+    "createdAt": 1708617600000
+  }
+]
+```
+
+### `<tenantId>/config.json`
+
+```json
+{
+  "adminSigningPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
+  "adminEncryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
+  "publicInfosKey": "base64-encoded-aes-key",
+  "defaultStoreType": "file",
+  "users": [
+    {
+      "username": "alice",
+      "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
+      "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n..."
+    }
+  ],
+  "remoteServers": [
+    {
+      "url": "https://server2.example.com",
+      "syncIntervalMs": 60000,
+      "databases": ["directory", "main"]
+    }
+  ]
+}
 ```
 
 ## Development

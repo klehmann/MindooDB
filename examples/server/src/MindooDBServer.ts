@@ -1,5 +1,11 @@
 /**
  * MindooDB Example Server - Express HTTP server implementing the sync API.
+ *
+ * Features:
+ * - Client-to-server sync via authenticated endpoints
+ * - Server-to-server sync via global server identity + trusted servers
+ * - Tiered admin auth: full admin key, delegated tenant creation keys
+ * - Runtime management of trusted servers and tenant creation keys
  */
 
 import express, { Request, Response, NextFunction, Router } from "express";
@@ -20,10 +26,9 @@ import type {
   RegisterTenantRequest,
   RegisterTenantResponse,
   ListTenantsResponse,
-  ENV_VARS,
+  TrustedServer,
 } from "./types";
 
-// Extend Express Request to include tenant context
 declare global {
   namespace Express {
     interface Request {
@@ -32,9 +37,6 @@ declare global {
   }
 }
 
-/**
- * Serialized entry metadata for JSON transport (Uint8Array -> base64).
- */
 interface SerializedEntryMetadata {
   entryType: StoreEntryType;
   id: string;
@@ -44,60 +46,41 @@ interface SerializedEntryMetadata {
   createdAt: number;
   createdByPublicKey: string;
   decryptionKeyId: string;
-  signature: string; // base64
+  signature: string;
   originalSize: number;
   encryptedSize: number;
 }
 
-/**
- * Serialized full entry for JSON transport.
- */
 interface SerializedEntry extends SerializedEntryMetadata {
-  encryptedData: string; // base64
+  encryptedData: string;
 }
 
-/**
- * Serialized network encrypted entry.
- */
 interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
-  rsaEncryptedPayload: string; // base64
+  rsaEncryptedPayload: string;
 }
 
-/**
- * MindooDBServer is the main Express server that implements
- * the HTTP endpoints for client-to-server and server-to-server sync.
- */
 export class MindooDBServer {
   private app: express.Application;
   private tenantManager: TenantManager;
   private adminApiKey: string | undefined;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, serverPassword?: string) {
     this.app = express();
-    this.tenantManager = new TenantManager(dataDir);
+    this.tenantManager = new TenantManager(dataDir, serverPassword);
     this.adminApiKey = process.env.MINDOODB_ADMIN_API_KEY;
 
     this.setupMiddleware();
     this.setupRoutes();
   }
 
-  /**
-   * Get the Express application for testing or custom configuration.
-   */
   getApp(): express.Application {
     return this.app;
   }
 
-  /**
-   * Get the tenant manager for direct access.
-   */
   getTenantManager(): TenantManager {
     return this.tenantManager;
   }
 
-  /**
-   * Start listening on the specified port.
-   */
   listen(port: number): void {
     this.app.listen(port, () => {
       console.log(`[MindooDBServer] Listening on port ${port}`);
@@ -110,10 +93,8 @@ export class MindooDBServer {
   }
 
   private setupMiddleware(): void {
-    // Parse JSON bodies up to 50MB (for sync payloads)
     this.app.use(express.json({ limit: "50mb" }));
 
-    // Request logging
     this.app.use((req: Request, res: Response, next: NextFunction) => {
       console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
       next();
@@ -121,35 +102,35 @@ export class MindooDBServer {
   }
 
   private setupRoutes(): void {
-    // Health check (must be before tenant routes to avoid being caught by /:tenantId)
     this.app.get("/health", (req, res) => {
       res.json({ status: "ok", timestamp: Date.now() });
     });
 
-    // Admin routes (optional API key protection)
+    // Admin routes with tiered auth
     const adminRouter = Router();
     this.setupAdminRoutes(adminRouter);
-    this.app.use("/admin", this.adminAuthMiddleware.bind(this), adminRouter);
+    this.app.use("/admin", adminRouter);
 
     // Tenant-scoped routes
     this.app.use("/:tenantId", this.tenantMiddleware.bind(this), this.createTenantRouter());
 
-    // Error handler
     this.app.use(this.errorHandler.bind(this));
   }
 
+  // ==================== Auth Middleware ====================
+
   /**
-   * Middleware to check admin API key (if configured).
+   * Requires the full admin API key. Used for trusted servers, tenant
+   * creation keys, listing/deleting tenants.
    */
-  private adminAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+  private adminOnlyMiddleware(req: Request, res: Response, next: NextFunction): void {
     if (!this.adminApiKey) {
-      // No API key configured - endpoints are open
       return next();
     }
 
-    const providedKey = req.headers["x-api-key"];
+    const providedKey = req.headers["x-api-key"] as string | undefined;
     if (providedKey !== this.adminApiKey) {
-      res.status(401).json({ error: "Invalid or missing API key" });
+      res.status(401).json({ error: "Invalid or missing admin API key" });
       return;
     }
 
@@ -157,8 +138,40 @@ export class MindooDBServer {
   }
 
   /**
-   * Middleware to validate and normalize tenant ID.
+   * Accepts EITHER the admin API key OR a valid tenant creation key.
+   * When a tenant creation key is used, the tenantId in the request body
+   * is validated against the key's prefix constraint.
    */
+  private tenantCreationMiddleware(req: Request, res: Response, next: NextFunction): void {
+    if (!this.adminApiKey) {
+      return next();
+    }
+
+    const providedKey = req.headers["x-api-key"] as string | undefined;
+    if (!providedKey) {
+      res.status(401).json({ error: "API key required" });
+      return;
+    }
+
+    // Full admin key: allow everything
+    if (providedKey === this.adminApiKey) {
+      return next();
+    }
+
+    // Check tenant creation keys
+    const tenantId = req.body?.tenantId;
+    if (!tenantId) {
+      res.status(400).json({ error: "tenantId is required" });
+      return;
+    }
+
+    if (this.tenantManager.validateTenantCreationKey(providedKey, tenantId)) {
+      return next();
+    }
+
+    res.status(403).json({ error: "API key not authorized for this tenant ID" });
+  }
+
   private tenantMiddleware(req: Request, res: Response, next: NextFunction): void {
     const tenantId = req.params.tenantId?.toLowerCase();
 
@@ -176,52 +189,56 @@ export class MindooDBServer {
     next();
   }
 
-  /**
-   * Setup admin routes.
-   */
+  // ==================== Admin Routes ====================
+
   private setupAdminRoutes(router: Router): void {
-    // Register a new tenant
-    router.post("/register-tenant", (req: Request, res: Response) => {
-      try {
-        const request: RegisterTenantRequest = req.body;
+    // Tenant registration uses tenantCreationMiddleware (admin key OR tenant creation key)
+    router.post(
+      "/register-tenant",
+      this.tenantCreationMiddleware.bind(this),
+      (req: Request, res: Response) => {
+        try {
+          const request: RegisterTenantRequest = req.body;
 
-        // Validate required fields
-        if (!request.tenantId) {
-          res.status(400).json({ error: "tenantId is required" });
-          return;
+          if (!request.tenantId) {
+            res.status(400).json({ error: "tenantId is required" });
+            return;
+          }
+          if (!request.adminSigningPublicKey) {
+            res.status(400).json({ error: "adminSigningPublicKey is required" });
+            return;
+          }
+          if (!request.adminEncryptionPublicKey) {
+            res.status(400).json({ error: "adminEncryptionPublicKey is required" });
+            return;
+          }
+
+          if (this.tenantManager.tenantExists(request.tenantId)) {
+            res.status(409).json({ error: `Tenant ${request.tenantId} already exists` });
+            return;
+          }
+
+          const context = this.tenantManager.registerTenant(request);
+
+          const response: RegisterTenantResponse = {
+            success: true,
+            tenantId: context.tenantId,
+            message: `Tenant ${context.tenantId} registered successfully`,
+          };
+
+          res.status(201).json(response);
+        } catch (error) {
+          console.error("[MindooDBServer] Error registering tenant:", error);
+          res.status(500).json({ error: "Failed to register tenant" });
         }
-        if (!request.adminSigningPublicKey) {
-          res.status(400).json({ error: "adminSigningPublicKey is required" });
-          return;
-        }
-        if (!request.adminEncryptionPublicKey) {
-          res.status(400).json({ error: "adminEncryptionPublicKey is required" });
-          return;
-        }
+      },
+    );
 
-        // Check if tenant already exists
-        if (this.tenantManager.tenantExists(request.tenantId)) {
-          res.status(409).json({ error: `Tenant ${request.tenantId} already exists` });
-          return;
-        }
+    // All other admin endpoints require the full admin API key
+    const adminOnly = this.adminOnlyMiddleware.bind(this);
 
-        const context = this.tenantManager.registerTenant(request);
-
-        const response: RegisterTenantResponse = {
-          success: true,
-          tenantId: context.tenantId,
-          message: `Tenant ${context.tenantId} registered successfully`,
-        };
-
-        res.status(201).json(response);
-      } catch (error) {
-        console.error("[MindooDBServer] Error registering tenant:", error);
-        res.status(500).json({ error: "Failed to register tenant" });
-      }
-    });
-
-    // List all tenants
-    router.get("/tenants", (req: Request, res: Response) => {
+    // Tenant listing and removal
+    router.get("/tenants", adminOnly, (req: Request, res: Response) => {
       try {
         const tenants = this.tenantManager.listTenants();
         const response: ListTenantsResponse = { tenants };
@@ -232,8 +249,7 @@ export class MindooDBServer {
       }
     });
 
-    // Remove a tenant
-    router.delete("/tenants/:tenantId", (req: Request, res: Response) => {
+    router.delete("/tenants/:tenantId", adminOnly, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
 
@@ -249,19 +265,127 @@ export class MindooDBServer {
         res.status(500).json({ error: "Failed to remove tenant" });
       }
     });
+
+    // Trusted server management
+    router.get("/trusted-servers", adminOnly, (req: Request, res: Response) => {
+      try {
+        res.json({ servers: this.tenantManager.listTrustedServers() });
+      } catch (error) {
+        console.error("[MindooDBServer] Error listing trusted servers:", error);
+        res.status(500).json({ error: "Failed to list trusted servers" });
+      }
+    });
+
+    router.post("/trusted-servers", adminOnly, (req: Request, res: Response) => {
+      try {
+        const { name, signingPublicKey, encryptionPublicKey } = req.body;
+
+        if (!name || !signingPublicKey || !encryptionPublicKey) {
+          res.status(400).json({ error: "name, signingPublicKey, and encryptionPublicKey are required" });
+          return;
+        }
+
+        const server: TrustedServer = { name, signingPublicKey, encryptionPublicKey };
+        this.tenantManager.addTrustedServer(server);
+
+        res.status(201).json({ success: true, message: `Trusted server "${name}" added` });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("already exists")) {
+          res.status(409).json({ error: error.message });
+          return;
+        }
+        console.error("[MindooDBServer] Error adding trusted server:", error);
+        res.status(500).json({ error: "Failed to add trusted server" });
+      }
+    });
+
+    router.delete("/trusted-servers/:serverName", adminOnly, (req: Request, res: Response) => {
+      try {
+        const serverName = req.params.serverName;
+        const removed = this.tenantManager.removeTrustedServer(serverName);
+
+        if (!removed) {
+          res.status(404).json({ error: `Trusted server "${serverName}" not found` });
+          return;
+        }
+
+        res.json({ success: true, message: `Trusted server "${serverName}" removed` });
+      } catch (error) {
+        console.error("[MindooDBServer] Error removing trusted server:", error);
+        res.status(500).json({ error: "Failed to remove trusted server" });
+      }
+    });
+
+    // Tenant creation key management
+    router.get("/tenant-api-keys", adminOnly, (req: Request, res: Response) => {
+      try {
+        const keys = this.tenantManager.listTenantCreationKeys().map((k) => ({
+          name: k.name,
+          tenantIdPrefix: k.tenantIdPrefix,
+          createdAt: k.createdAt,
+          apiKeyPreview: k.apiKey.substring(0, 12) + "...",
+        }));
+        res.json({ keys });
+      } catch (error) {
+        console.error("[MindooDBServer] Error listing tenant creation keys:", error);
+        res.status(500).json({ error: "Failed to list tenant creation keys" });
+      }
+    });
+
+    router.post("/tenant-api-keys", adminOnly, (req: Request, res: Response) => {
+      try {
+        const { name, tenantIdPrefix } = req.body;
+
+        if (!name) {
+          res.status(400).json({ error: "name is required" });
+          return;
+        }
+
+        const key = this.tenantManager.addTenantCreationKey(name, tenantIdPrefix);
+
+        res.status(201).json({
+          success: true,
+          name: key.name,
+          apiKey: key.apiKey,
+          tenantIdPrefix: key.tenantIdPrefix,
+          createdAt: key.createdAt,
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("already exists")) {
+          res.status(409).json({ error: error.message });
+          return;
+        }
+        console.error("[MindooDBServer] Error creating tenant creation key:", error);
+        res.status(500).json({ error: "Failed to create tenant creation key" });
+      }
+    });
+
+    router.delete("/tenant-api-keys/:name", adminOnly, (req: Request, res: Response) => {
+      try {
+        const name = req.params.name;
+        const removed = this.tenantManager.removeTenantCreationKey(name);
+
+        if (!removed) {
+          res.status(404).json({ error: `Tenant creation key "${name}" not found` });
+          return;
+        }
+
+        res.json({ success: true, message: `Tenant creation key "${name}" removed` });
+      } catch (error) {
+        console.error("[MindooDBServer] Error removing tenant creation key:", error);
+        res.status(500).json({ error: "Failed to remove tenant creation key" });
+      }
+    });
   }
 
-  /**
-   * Create router for tenant-scoped routes.
-   */
+  // ==================== Tenant Routes ====================
+
   private createTenantRouter(): Router {
     const router = Router({ mergeParams: true });
 
-    // Auth routes
     router.post("/auth/challenge", this.handleChallenge.bind(this));
     router.post("/auth/authenticate", this.handleAuthenticate.bind(this));
 
-    // Sync routes
     router.post("/sync/findNewEntries", this.handleFindNewEntries.bind(this));
     router.post("/sync/findNewEntriesForDoc", this.handleFindNewEntriesForDoc.bind(this));
     router.post("/sync/findEntries", this.handleFindEntries.bind(this));
@@ -275,7 +399,6 @@ export class MindooDBServer {
     router.get("/sync/getAllIds", this.handleGetAllIds.bind(this));
     router.post("/sync/resolveDependencies", this.handleResolveDependencies.bind(this));
 
-    // Management routes
     router.post("/admin/trigger-sync", this.handleTriggerSync.bind(this));
 
     return router;
@@ -379,7 +502,7 @@ export class MindooDBServer {
         token,
         type,
         creationDateFrom ?? null,
-        creationDateUntil ?? null
+        creationDateUntil ?? null,
       );
 
       res.json({
@@ -410,7 +533,7 @@ export class MindooDBServer {
         token,
         cursor ?? null,
         limit,
-        filters
+        filters,
       );
 
       res.json({
@@ -507,7 +630,7 @@ export class MindooDBServer {
 
       const serverStore = await this.tenantManager.getServerStore(req.tenantId!, dbId);
       const deserializedEntries = (entries || []).map((e: SerializedEntry) =>
-        this.deserializeEntry(e)
+        this.deserializeEntry(e),
       );
 
       await serverStore.handlePutEntries(token, deserializedEntries);
@@ -573,7 +696,6 @@ export class MindooDBServer {
   // ==================== Management Handlers ====================
 
   private async handleTriggerSync(req: Request, res: Response): Promise<void> {
-    // TODO: Implement server-to-server sync trigger
     res.json({ success: true, message: "Sync triggered (not yet implemented)" });
   }
 

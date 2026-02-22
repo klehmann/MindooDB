@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 /**
  * MindooDB Example Server - Entry Point
- * 
+ *
  * Usage:
  *   npx ts-node src/index.ts [options]
  *   node dist/index.js [options]
- * 
+ *
  * Options:
  *   -d, --data-dir <path>   Data directory path (default: ./data)
  *   -p, --port <port>       Server port (default: 3000)
  *   -s, --auto-sync         Enable automatic sync with remote servers
  *   -h, --help              Show this help message
- * 
+ *
  * Environment variables:
- *   MINDOODB_SERVER_KEY_PASSWORD   Password to decrypt server private keys
- *   MINDOODB_ADMIN_API_KEY         API key to protect admin endpoints (optional)
+ *   MINDOODB_SERVER_PASSWORD   Password to decrypt server identity private keys
+ *   MINDOODB_ADMIN_API_KEY     API key to protect admin endpoints (optional)
  */
 
 import { MindooDBServer } from "./MindooDBServer";
@@ -99,10 +99,10 @@ Options:
   -h, --help              Show this help message
 
 Environment variables:
-  MINDOODB_SERVER_KEY_PASSWORD   Password to decrypt server private keys
-                                 (required if server-keys.json exists)
-  MINDOODB_ADMIN_API_KEY         API key to protect admin endpoints (optional)
-                                 If not set, admin endpoints are open
+  MINDOODB_SERVER_PASSWORD   Password to decrypt server identity private keys
+                             (required if server-identity.json exists)
+  MINDOODB_ADMIN_API_KEY     API key to protect admin endpoints (optional)
+                             If not set, admin endpoints are open
 
 Examples:
   # Start server with default settings
@@ -112,7 +112,7 @@ Examples:
   npx ts-node src/index.ts -d /var/lib/mindoodb -p 8080
 
   # Start server with auto-sync enabled
-  MINDOODB_SERVER_KEY_PASSWORD=secret npx ts-node src/index.ts -s
+  MINDOODB_SERVER_PASSWORD=secret npx ts-node src/index.ts -s
 
   # Start server with API key protection
   MINDOODB_ADMIN_API_KEY=my-secret-key npx ts-node src/index.ts
@@ -134,60 +134,63 @@ async function main(): Promise<void> {
   console.log(`Data directory: ${options.dataDir}`);
   console.log(`Port: ${options.port}`);
   console.log(`Auto-sync: ${options.autoSync ? "enabled" : "disabled"}`);
-  
-  // Check environment variables
-  const serverKeyPassword = process.env[ENV_VARS.SERVER_KEY_PASSWORD];
+
+  const serverPassword = process.env[ENV_VARS.SERVER_PASSWORD];
   const adminApiKey = process.env[ENV_VARS.ADMIN_API_KEY];
-  
+
   console.log(`Admin API key: ${adminApiKey ? "configured" : "not set (endpoints open)"}`);
-  console.log(`Server key password: ${serverKeyPassword ? "configured" : "not set"}`);
+  console.log(`Server password: ${serverPassword ? "configured" : "not set"}`);
   console.log("=".repeat(60));
 
   // Create and start the server
-  const server = new MindooDBServer(options.dataDir);
-  
-  // If auto-sync is enabled and we have server keys, start periodic sync
+  const server = new MindooDBServer(options.dataDir, serverPassword);
+
+  // If auto-sync is enabled and we have server identity, start periodic sync
   if (options.autoSync) {
-    if (!serverKeyPassword) {
+    const tenantManager = server.getTenantManager();
+    const serverIdentity = tenantManager.getServerIdentity();
+
+    if (!serverIdentity) {
       console.warn(
-        "[Main] Auto-sync enabled but MINDOODB_SERVER_KEY_PASSWORD not set. " +
-        "Server-to-server sync will not work."
+        "[Main] Auto-sync enabled but no server-identity.json found. " +
+        "Run 'npm run init' to create a server identity.",
+      );
+    } else if (!serverPassword) {
+      console.warn(
+        "[Main] Auto-sync enabled but MINDOODB_SERVER_PASSWORD not set. " +
+        "Server-to-server sync will not work.",
       );
     } else {
-      // Start auto-sync for each tenant that has remote servers configured
-      const tenantManager = server.getTenantManager();
       const tenants = tenantManager.listTenants();
-      
+
       for (const tenantId of tenants) {
         try {
           const tenant = await tenantManager.getTenant(tenantId);
           const config = tenant.context.config;
-          const serverKeys = tenant.context.serverKeys;
-          
-          if (config.remoteServers && config.remoteServers.length > 0 && serverKeys) {
+
+          if (config.remoteServers && config.remoteServers.length > 0) {
             const serverSync = new ServerSync(
               tenantManager.getCryptoAdapter(),
               tenantId,
-              serverKeys,
-              serverKeyPassword,
-              async (dbId) => tenantManager.getStore(tenantId, dbId)
+              serverIdentity,
+              serverPassword,
+              async (dbId) => tenantManager.getStore(tenantId, dbId),
             );
-            
+
             const stopSync = startPeriodicSync(serverSync, config.remoteServers);
-            
-            // Handle graceful shutdown
+
             process.on("SIGINT", () => {
               console.log("\n[Main] Shutting down...");
               stopSync();
               process.exit(0);
             });
-            
+
             process.on("SIGTERM", () => {
               console.log("\n[Main] Shutting down...");
               stopSync();
               process.exit(0);
             });
-            
+
             console.log(`[Main] Started auto-sync for tenant ${tenantId}`);
           }
         } catch (error) {
@@ -201,7 +204,6 @@ async function main(): Promise<void> {
   server.listen(options.port);
 }
 
-// Run main
 main().catch((error) => {
   console.error("Fatal error:", error);
   process.exit(1);

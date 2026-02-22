@@ -1,19 +1,17 @@
 /**
  * ServerSync handles server-to-server synchronization.
- * 
- * This module enables a server to act as a client and sync with remote servers
- * using the same HttpTransport protocol that clients use.
+ *
+ * Uses the global server identity (PrivateUserId) to authenticate with
+ * remote servers via the same HttpTransport protocol that clients use.
  */
 
 import { HttpTransport } from "mindoodb/appendonlystores/network/HttpTransport";
 import { ClientNetworkContentAddressedStore } from "mindoodb/appendonlystores/network/ClientNetworkContentAddressedStore";
 import type { ContentAddressedStore, EncryptedPrivateKey } from "mindoodb/core/types";
 import type { CryptoAdapter } from "mindoodb/core/crypto/CryptoAdapter";
-import type { RemoteServerConfig, ServerKeysConfig } from "./types";
+import type { PrivateUserId } from "mindoodb/core/userid";
+import type { RemoteServerConfig } from "./types";
 
-/**
- * Result of a sync operation.
- */
 export interface SyncResult {
   success: boolean;
   remoteUrl: string;
@@ -24,62 +22,42 @@ export interface SyncResult {
 }
 
 /**
- * ServerSync manages synchronization with remote servers.
- * 
- * It uses the server's identity (from server-keys.json) to authenticate
- * with remote servers and sync content-addressed store entries.
+ * ServerSync manages synchronization with remote servers using the
+ * global server identity for authentication.
  */
 export class ServerSync {
   private cryptoAdapter: CryptoAdapter;
   private tenantId: string;
-  private serverKeys: ServerKeysConfig;
+  private serverIdentity: PrivateUserId;
   private keyPassword: string;
   private localStoreFactory: (dbId: string) => ContentAddressedStore | Promise<ContentAddressedStore>;
-  
-  // Cached crypto keys
+
   private signingKey: CryptoKey | null = null;
   private encryptionKey: CryptoKey | null = null;
 
-  /**
-   * Create a new ServerSync instance.
-   * 
-   * @param cryptoAdapter The crypto adapter for key operations
-   * @param tenantId The tenant identifier
-   * @param serverKeys The server's key configuration
-   * @param keyPassword The password to decrypt server private keys
-   * @param localStoreFactory Factory function to get local stores by dbId
-   */
   constructor(
     cryptoAdapter: CryptoAdapter,
     tenantId: string,
-    serverKeys: ServerKeysConfig,
+    serverIdentity: PrivateUserId,
     keyPassword: string,
-    localStoreFactory: (dbId: string) => ContentAddressedStore | Promise<ContentAddressedStore>
+    localStoreFactory: (dbId: string) => ContentAddressedStore | Promise<ContentAddressedStore>,
   ) {
     this.cryptoAdapter = cryptoAdapter;
     this.tenantId = tenantId;
-    this.serverKeys = serverKeys;
+    this.serverIdentity = serverIdentity;
     this.keyPassword = keyPassword;
     this.localStoreFactory = localStoreFactory;
   }
 
-  /**
-   * Sync with a single remote server.
-   * 
-   * @param remoteConfig The remote server configuration
-   * @param databases Optional list of databases to sync (default: sync all)
-   * @returns Results for each database synced
-   */
   async syncWithRemote(
     remoteConfig: RemoteServerConfig,
-    databases?: string[]
+    databases?: string[],
   ): Promise<SyncResult[]> {
     const results: SyncResult[] = [];
     const dbsToSync = databases || remoteConfig.databases || ["directory"];
 
     console.log(`[ServerSync] Starting sync with ${remoteConfig.url} for tenant ${this.tenantId}`);
 
-    // Ensure keys are loaded
     await this.ensureKeysLoaded();
 
     for (const dbId of dbsToSync) {
@@ -102,12 +80,6 @@ export class ServerSync {
     return results;
   }
 
-  /**
-   * Sync all configured remote servers.
-   * 
-   * @param remoteServers List of remote server configurations
-   * @returns Results for all syncs
-   */
   async syncAllRemotes(remoteServers: RemoteServerConfig[]): Promise<SyncResult[]> {
     const allResults: SyncResult[] = [];
 
@@ -119,55 +91,49 @@ export class ServerSync {
     return allResults;
   }
 
-  /**
-   * Sync a single database with a remote server.
-   */
   private async syncDatabase(
     remoteConfig: RemoteServerConfig,
-    dbId: string
+    dbId: string,
   ): Promise<SyncResult> {
     console.log(`[ServerSync] Syncing database ${dbId} with ${remoteConfig.url}`);
 
-    // Create transport for this remote
     const transport = new HttpTransport({
       baseUrl: remoteConfig.url,
       tenantId: this.tenantId,
       dbId: dbId,
     });
 
-    // Create client store for the remote
     const remoteStore = new ClientNetworkContentAddressedStore(
       dbId,
       transport,
       this.cryptoAdapter,
-      remoteConfig.username,
+      this.serverIdentity.username,
       this.signingKey!,
-      this.encryptionKey!
+      this.encryptionKey!,
     );
 
-    // Get local store
     const localStore = await this.localStoreFactory(dbId);
 
-    // Pull from remote (get entries we don't have)
+    // Pull from remote
     const localIds = await localStore.getAllIds();
     const newFromRemote = await remoteStore.findNewEntries(localIds);
-    
+
     let entriesPulled = 0;
     if (newFromRemote.length > 0) {
-      const newEntryIds = newFromRemote.map(e => e.id);
+      const newEntryIds = newFromRemote.map((e) => e.id);
       const entries = await remoteStore.getEntries(newEntryIds);
       await localStore.putEntries(entries);
       entriesPulled = entries.length;
       console.log(`[ServerSync] Pulled ${entriesPulled} entries from remote for ${dbId}`);
     }
 
-    // Push to remote (send entries they don't have)
+    // Push to remote
     const remoteIds = await remoteStore.getAllIds();
     const newForRemote = await localStore.findNewEntries(remoteIds);
-    
+
     let entriesPushed = 0;
     if (newForRemote.length > 0) {
-      const entryIds = newForRemote.map(e => e.id);
+      const entryIds = newForRemote.map((e) => e.id);
       const entries = await localStore.getEntries(entryIds);
       await remoteStore.putEntries(entries);
       entriesPushed = entries.length;
@@ -183,48 +149,39 @@ export class ServerSync {
     };
   }
 
-  /**
-   * Ensure the server's crypto keys are loaded and decrypted.
-   */
   private async ensureKeysLoaded(): Promise<void> {
     if (this.signingKey && this.encryptionKey) {
       return;
     }
 
-    console.log(`[ServerSync] Loading server keys for ${this.serverKeys.username}`);
+    console.log(`[ServerSync] Loading server keys for ${this.serverIdentity.username}`);
 
-    // Import the signing key
     this.signingKey = await this.decryptAndImportSigningKey(
-      this.serverKeys.signingPrivateKey,
-      this.keyPassword
+      this.serverIdentity.userSigningKeyPair.privateKey as unknown as EncryptedPrivateKey,
+      this.keyPassword,
     );
 
-    // Import the encryption key
     this.encryptionKey = await this.decryptAndImportEncryptionKey(
-      this.serverKeys.encryptionPrivateKey,
-      this.keyPassword
+      this.serverIdentity.userEncryptionKeyPair.privateKey as unknown as EncryptedPrivateKey,
+      this.keyPassword,
     );
 
     console.log(`[ServerSync] Server keys loaded successfully`);
   }
 
-  /**
-   * Decrypt and import an Ed25519 signing key.
-   */
   private async decryptAndImportSigningKey(
     encryptedKey: EncryptedPrivateKey,
-    password: string
+    password: string,
   ): Promise<CryptoKey> {
     const subtle = this.cryptoAdapter.getSubtle();
 
-    // Derive the decryption key from password
     const salt = this.base64ToUint8Array(encryptedKey.salt);
     const keyMaterial = await subtle.importKey(
       "raw",
       new TextEncoder().encode(password),
       "PBKDF2",
       false,
-      ["deriveBits", "deriveKey"]
+      ["deriveBits", "deriveKey"],
     );
 
     const decryptionKey = await subtle.deriveKey(
@@ -237,15 +194,13 @@ export class ServerSync {
       keyMaterial,
       { name: "AES-GCM", length: 256 },
       false,
-      ["decrypt"]
+      ["decrypt"],
     );
 
-    // Decrypt the private key
     const iv = this.base64ToUint8Array(encryptedKey.iv);
     const ciphertext = this.base64ToUint8Array(encryptedKey.ciphertext);
     const tag = this.base64ToUint8Array(encryptedKey.tag);
 
-    // Combine ciphertext and tag for AES-GCM
     const combined = new Uint8Array(ciphertext.length + tag.length);
     combined.set(ciphertext);
     combined.set(tag, ciphertext.length);
@@ -253,38 +208,33 @@ export class ServerSync {
     const decrypted = await subtle.decrypt(
       { name: "AES-GCM", iv: iv },
       decryptionKey,
-      combined
+      combined,
     );
 
-    // Import as Ed25519 private key
     const signingKey = await subtle.importKey(
       "pkcs8",
       decrypted,
       { name: "Ed25519" },
       false,
-      ["sign"]
+      ["sign"],
     );
 
     return signingKey;
   }
 
-  /**
-   * Decrypt and import an RSA-OAEP encryption key.
-   */
   private async decryptAndImportEncryptionKey(
     encryptedKey: EncryptedPrivateKey,
-    password: string
+    password: string,
   ): Promise<CryptoKey> {
     const subtle = this.cryptoAdapter.getSubtle();
 
-    // Derive the decryption key from password
     const salt = this.base64ToUint8Array(encryptedKey.salt);
     const keyMaterial = await subtle.importKey(
       "raw",
       new TextEncoder().encode(password),
       "PBKDF2",
       false,
-      ["deriveBits", "deriveKey"]
+      ["deriveBits", "deriveKey"],
     );
 
     const decryptionKey = await subtle.deriveKey(
@@ -297,15 +247,13 @@ export class ServerSync {
       keyMaterial,
       { name: "AES-GCM", length: 256 },
       false,
-      ["decrypt"]
+      ["decrypt"],
     );
 
-    // Decrypt the private key
     const iv = this.base64ToUint8Array(encryptedKey.iv);
     const ciphertext = this.base64ToUint8Array(encryptedKey.ciphertext);
     const tag = this.base64ToUint8Array(encryptedKey.tag);
 
-    // Combine ciphertext and tag for AES-GCM
     const combined = new Uint8Array(ciphertext.length + tag.length);
     combined.set(ciphertext);
     combined.set(tag, ciphertext.length);
@@ -313,10 +261,9 @@ export class ServerSync {
     const decrypted = await subtle.decrypt(
       { name: "AES-GCM", iv: iv },
       decryptionKey,
-      combined
+      combined,
     );
 
-    // Import as RSA-OAEP private key
     const encryptionKey = await subtle.importKey(
       "pkcs8",
       decrypted,
@@ -325,30 +272,22 @@ export class ServerSync {
         hash: "SHA-256",
       },
       false,
-      ["decrypt"]
+      ["decrypt"],
     );
 
     return encryptionKey;
   }
 
-  private base64ToUint8Array(base64: string): Uint8Array {
-    const binary = Buffer.from(base64, "base64");
-    return new Uint8Array(binary);
+  private base64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
+    const buf = Buffer.from(base64, "base64");
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
   }
 }
 
-/**
- * Start a periodic sync with remote servers.
- * 
- * @param serverSync The ServerSync instance
- * @param remoteServers List of remote server configurations
- * @param defaultIntervalMs Default sync interval if not specified per-server
- * @returns A function to stop the periodic sync
- */
 export function startPeriodicSync(
   serverSync: ServerSync,
   remoteServers: RemoteServerConfig[],
-  defaultIntervalMs: number = 60000
+  defaultIntervalMs: number = 60000,
 ): () => void {
   const timers: NodeJS.Timeout[] = [];
 
@@ -362,11 +301,11 @@ export function startPeriodicSync(
           if (result.success) {
             console.log(
               `[PeriodicSync] Synced ${result.database} with ${result.remoteUrl}: ` +
-              `pushed ${result.entriesPushed}, pulled ${result.entriesPulled}`
+              `pushed ${result.entriesPushed}, pulled ${result.entriesPulled}`,
             );
           } else {
             console.error(
-              `[PeriodicSync] Failed to sync ${result.database} with ${result.remoteUrl}: ${result.error}`
+              `[PeriodicSync] Failed to sync ${result.database} with ${result.remoteUrl}: ${result.error}`,
             );
           }
         }
@@ -379,7 +318,6 @@ export function startPeriodicSync(
     console.log(`[PeriodicSync] Started sync with ${remoteConfig.url} every ${interval}ms`);
   }
 
-  // Return stop function
   return () => {
     for (const timer of timers) {
       clearInterval(timer);

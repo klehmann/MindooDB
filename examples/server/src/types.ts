@@ -2,11 +2,8 @@
  * Types for the MindooDB Example Server
  */
 
-import type { EncryptedPrivateKey } from "mindoodb/core/types";
-
 /**
  * Store type for content-addressed stores.
- * Currently only "inmemory" is implemented; "file" is reserved for future use.
  */
 export type StoreType = "inmemory" | "file";
 
@@ -24,15 +21,41 @@ export interface UserConfig {
 }
 
 /**
- * Configuration for a remote server to sync with.
+ * A remote server trusted for server-to-server sync.
+ * Stored globally in <dataDir>/trusted-servers.json.
+ */
+export interface TrustedServer {
+  /** Server name (e.g., "CN=server2") */
+  name: string;
+  /** Ed25519 public key in PEM format */
+  signingPublicKey: string;
+  /** RSA-OAEP public key in PEM format */
+  encryptionPublicKey: string;
+}
+
+/**
+ * A delegated API key that allows creating tenants.
+ * Stored globally in <dataDir>/tenant-api-keys.json.
+ */
+export interface TenantCreationKey {
+  /** The secret API key value (prefixed with "mdb_tk_") */
+  apiKey: string;
+  /** Human-readable label (e.g., "acme-corp") */
+  name: string;
+  /** If set, only allows creating tenants with IDs starting with this prefix */
+  tenantIdPrefix?: string;
+  /** Creation timestamp */
+  createdAt: number;
+}
+
+/**
+ * Configuration for a remote server to sync with (per-tenant).
+ * The server authenticates using its global identity (from server-identity.json).
+ * The remote server's public keys are looked up from trusted-servers.json.
  */
 export interface RemoteServerConfig {
   /** Base URL of the remote server (e.g., "https://eu-west.example.com") */
   url: string;
-  /** This server's username on the remote server */
-  username: string;
-  /** Ed25519 signing public key (PEM) of the remote server, used to trust inbound sync requests */
-  signingPublicKey?: string;
   /** Optional: automatic sync interval in milliseconds */
   syncIntervalMs?: number;
   /** Optional: specific databases to sync (default: all) */
@@ -48,7 +71,7 @@ export interface DatabaseStoreConfig {
 
 /**
  * Tenant configuration stored in <dataDir>/<tenantId>/config.json
- * 
+ *
  * The tenantId is NOT stored here - it's derived from the directory name.
  */
 export interface TenantConfig {
@@ -56,7 +79,7 @@ export interface TenantConfig {
   adminSigningPublicKey: string;
   /** RSA-OAEP public key in PEM format for encrypting admin-only data */
   adminEncryptionPublicKey: string;
-  
+
   /** Base64-encoded $publicinfos AES-256 symmetric key for reading the directory DB */
   publicInfosKey?: string;
 
@@ -64,32 +87,12 @@ export interface TenantConfig {
   defaultStoreType?: StoreType;
   /** Per-database store configuration overrides */
   databaseStores?: Record<string, DatabaseStoreConfig>;
-  
+
   /** Registered users (clients and other servers) — bootstrap/test fallback */
   users?: UserConfig[];
-  
+
   /** Remote servers to sync with (for server-to-server sync) */
   remoteServers?: RemoteServerConfig[];
-}
-
-/**
- * Server keys configuration stored in <dataDir>/<tenantId>/server-keys.json
- * 
- * Contains the server's identity for authenticating with remote servers.
- * The password to decrypt the private keys is NOT stored here - it must
- * be provided via the MINDOODB_SERVER_KEY_PASSWORD environment variable.
- */
-export interface ServerKeysConfig {
-  /** This server's username identity */
-  username: string;
-  /** Encrypted Ed25519 private signing key */
-  signingPrivateKey: EncryptedPrivateKey;
-  /** Ed25519 public signing key in PEM format */
-  signingPublicKey: string;
-  /** Encrypted RSA-OAEP private encryption key */
-  encryptionPrivateKey: EncryptedPrivateKey;
-  /** RSA-OAEP public encryption key in PEM format */
-  encryptionPublicKey: string;
 }
 
 /**
@@ -134,16 +137,14 @@ export interface TenantContext {
   tenantId: string;
   /** Loaded tenant configuration */
   config: TenantConfig;
-  /** Server keys (if server-keys.json exists) */
-  serverKeys?: ServerKeysConfig;
 }
 
 /**
  * Environment variables used by the server.
  */
 export const ENV_VARS = {
-  /** Password to decrypt server private keys */
-  SERVER_KEY_PASSWORD: "MINDOODB_SERVER_KEY_PASSWORD",
-  /** Optional API key to protect admin endpoints */
+  /** Password to decrypt server identity private keys and per-tenant keybags */
+  SERVER_PASSWORD: "MINDOODB_SERVER_PASSWORD",
+  /** Optional API key to protect admin endpoints (full access) */
   ADMIN_API_KEY: "MINDOODB_ADMIN_API_KEY",
 } as const;

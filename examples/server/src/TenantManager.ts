@@ -1,6 +1,9 @@
 /**
  * TenantManager handles loading, caching, and registration of tenants.
  *
+ * Uses a global server identity (one per server, not per tenant) for
+ * authenticating with remote servers and opening tenant directories.
+ *
  * When a tenant has a $publicinfos key (sent during publishToServer), the
  * manager creates a real BaseMindooTenant for directory reading. User
  * authentication is then validated against the admin-signed directory DB
@@ -8,10 +11,15 @@
  *
  * When no $publicinfos key is available, a SimpleMindooDirectory backed
  * by config.json users[] is used as a fallback (useful for tests).
+ *
+ * A CompositeMindooDirectory wraps whichever directory source is used and
+ * also checks the global trusted-servers list, enabling server-to-server
+ * auth without servers being in each tenant's user directory.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from "fs";
 import { join } from "path";
+import { randomBytes } from "crypto";
 
 import { NodeCryptoAdapter } from "mindoodb/node/crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "mindoodb/core/appendonlystores/network/AuthenticationService";
@@ -33,42 +41,30 @@ import type { PrivateUserId } from "mindoodb/core/userid";
 import { StoreFactory } from "./StoreFactory";
 import type {
   TenantConfig,
-  ServerKeysConfig,
   TenantContext,
   RegisterTenantRequest,
   UserConfig,
+  TrustedServer,
+  TenantCreationKey,
 } from "./types";
 
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
 
-/**
- * Internal structure for a fully loaded tenant with all services.
- */
 interface LoadedTenant {
   context: TenantContext;
   storeFactory: StoreFactory;
   authService: AuthenticationService;
-  /** Real directory (from BaseMindooTenantDirectory) or config-based fallback */
   directory: MindooTenantDirectory;
-  /** Real MindooTenant instance (when publicInfosKey available, for directory reading) */
   mindooTenant?: MindooTenant;
   serverStores: Map<string, ServerNetworkContentAddressedStore>;
 }
 
 // ---------------------------------------------------------------------------
-// StoreFactoryAdapter — bridges StoreFactory to ContentAddressedStoreFactory
+// StoreFactoryAdapter
 // ---------------------------------------------------------------------------
 
-/**
- * Adapter that wraps the server's StoreFactory to implement the
- * ContentAddressedStoreFactory interface required by BaseMindooTenantFactory.
- *
- * This ensures BaseMindooTenant uses the same underlying stores as the
- * ServerNetworkContentAddressedStore — so directory entries that arrive
- * via client sync are immediately visible to BaseMindooTenantDirectory.
- */
 class StoreFactoryAdapter implements ContentAddressedStoreFactory {
   constructor(private storeFactory: StoreFactory) {}
   createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
@@ -80,12 +76,6 @@ class StoreFactoryAdapter implements ContentAddressedStoreFactory {
 // SimpleMindooDirectory — config-based fallback
 // ---------------------------------------------------------------------------
 
-/**
- * Simplified directory implementation for fallback/testing.
- *
- * Used when a tenant has no $publicinfos key (i.e. the admin did not send it
- * during publishToServer). Falls back to the users[] array in config.json.
- */
 class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
   "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey"
 > {
@@ -141,11 +131,64 @@ class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
 }
 
 // ---------------------------------------------------------------------------
-// Server identity helpers
+// CompositeMindooDirectory — wraps tenant directory + trusted servers
 // ---------------------------------------------------------------------------
 
-const SERVER_IDENTITY_FILE = "server-identity.json";
-const SERVER_IDENTITY_PASSWORD = "server-internal-key";
+/**
+ * Wraps a per-tenant directory (real or config-based) and also checks
+ * the global trusted-servers list. Holds a reference to the array so
+ * runtime changes via the admin API are immediately visible.
+ */
+class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
+  "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey"
+> {
+  constructor(
+    private inner: Pick<MindooTenantDirectory,
+      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">,
+    private trustedServers: TrustedServer[],
+  ) {}
+
+  async getUserPublicKeys(username: string): Promise<{
+    signingPublicKey: string;
+    encryptionPublicKey: string;
+  } | null> {
+    const result = await this.inner.getUserPublicKeys(username);
+    if (result) return result;
+
+    const normalizedUsername = username.toLowerCase();
+    for (const server of this.trustedServers) {
+      if (server.name.toLowerCase() === normalizedUsername) {
+        return {
+          signingPublicKey: server.signingPublicKey,
+          encryptionPublicKey: server.encryptionPublicKey,
+        };
+      }
+    }
+    return null;
+  }
+
+  async isUserRevoked(username: string): Promise<boolean> {
+    const normalizedUsername = username.toLowerCase();
+    for (const server of this.trustedServers) {
+      if (server.name.toLowerCase() === normalizedUsername) {
+        return false;
+      }
+    }
+    return this.inner.isUserRevoked(username);
+  }
+
+  async validatePublicSigningKey(publicKey: string): Promise<boolean> {
+    const innerResult = await this.inner.validatePublicSigningKey(publicKey);
+    if (innerResult) return true;
+
+    for (const server of this.trustedServers) {
+      if (server.signingPublicKey === publicKey) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // TenantManager
@@ -153,30 +196,164 @@ const SERVER_IDENTITY_PASSWORD = "server-internal-key";
 
 /**
  * TenantManager is responsible for:
+ * - Loading the global server identity and trusted servers
  * - Loading tenant configurations from disk
  * - Caching loaded tenants
  * - Registering new tenants
  * - Managing tenant stores and authentication services
  * - Creating a real MindooDB tenant for directory reading (when keys available)
+ * - Runtime management of trusted servers and tenant creation keys
  */
 export class TenantManager {
   private dataDir: string;
+  private serverPassword: string | undefined;
   private cryptoAdapter: NodeCryptoAdapter;
   private loadedTenants: Map<string, LoadedTenant> = new Map();
 
-  constructor(dataDir: string) {
+  private serverIdentity: PrivateUserId | null = null;
+  private trustedServers: TrustedServer[] = [];
+  private tenantCreationKeys: TenantCreationKey[] = [];
+
+  constructor(dataDir: string, serverPassword?: string) {
     this.dataDir = dataDir;
+    this.serverPassword = serverPassword;
     this.cryptoAdapter = new NodeCryptoAdapter();
 
     if (!existsSync(dataDir)) {
       mkdirSync(dataDir, { recursive: true });
       console.log(`[TenantManager] Created data directory: ${dataDir}`);
     }
+
+    // Load global server identity
+    const identityPath = join(dataDir, "server-identity.json");
+    if (existsSync(identityPath)) {
+      this.serverIdentity = JSON.parse(readFileSync(identityPath, "utf-8"));
+      console.log(`[TenantManager] Loaded server identity: ${this.serverIdentity!.username}`);
+    } else {
+      console.log(`[TenantManager] No server-identity.json found (run "npm run init" to create one)`);
+    }
+
+    // Load trusted servers
+    const trustedPath = join(dataDir, "trusted-servers.json");
+    if (existsSync(trustedPath)) {
+      this.trustedServers = JSON.parse(readFileSync(trustedPath, "utf-8"));
+      console.log(`[TenantManager] Loaded ${this.trustedServers.length} trusted server(s)`);
+    }
+
+    // Load tenant creation keys
+    const keysPath = join(dataDir, "tenant-api-keys.json");
+    if (existsSync(keysPath)) {
+      this.tenantCreationKeys = JSON.parse(readFileSync(keysPath, "utf-8"));
+      console.log(`[TenantManager] Loaded ${this.tenantCreationKeys.length} tenant creation key(s)`);
+    }
+  }
+
+  // =======================================================================
+  // Server identity
+  // =======================================================================
+
+  getServerIdentity(): PrivateUserId | null {
+    return this.serverIdentity;
+  }
+
+  // =======================================================================
+  // Trusted server management
+  // =======================================================================
+
+  listTrustedServers(): TrustedServer[] {
+    return [...this.trustedServers];
+  }
+
+  addTrustedServer(server: TrustedServer): void {
+    const existing = this.trustedServers.find(
+      (s) => s.name.toLowerCase() === server.name.toLowerCase(),
+    );
+    if (existing) {
+      throw new Error(`Trusted server "${server.name}" already exists`);
+    }
+    this.trustedServers.push(server);
+    this.persistTrustedServers();
+    console.log(`[TenantManager] Added trusted server: ${server.name}`);
+  }
+
+  removeTrustedServer(name: string): boolean {
+    const idx = this.trustedServers.findIndex(
+      (s) => s.name.toLowerCase() === name.toLowerCase(),
+    );
+    if (idx === -1) return false;
+    this.trustedServers.splice(idx, 1);
+    this.persistTrustedServers();
+    console.log(`[TenantManager] Removed trusted server: ${name}`);
+    return true;
+  }
+
+  private persistTrustedServers(): void {
+    const filePath = join(this.dataDir, "trusted-servers.json");
+    writeFileSync(filePath, JSON.stringify(this.trustedServers, null, 2), "utf-8");
+  }
+
+  // =======================================================================
+  // Tenant creation key management
+  // =======================================================================
+
+  listTenantCreationKeys(): TenantCreationKey[] {
+    return this.tenantCreationKeys.map((k) => ({ ...k }));
+  }
+
+  addTenantCreationKey(name: string, tenantIdPrefix?: string): TenantCreationKey {
+    const existing = this.tenantCreationKeys.find(
+      (k) => k.name.toLowerCase() === name.toLowerCase(),
+    );
+    if (existing) {
+      throw new Error(`Tenant creation key "${name}" already exists`);
+    }
+
+    const key: TenantCreationKey = {
+      apiKey: "mdb_tk_" + randomBytes(32).toString("hex"),
+      name,
+      tenantIdPrefix,
+      createdAt: Date.now(),
+    };
+
+    this.tenantCreationKeys.push(key);
+    this.persistTenantCreationKeys();
+    console.log(`[TenantManager] Created tenant creation key: ${name}${tenantIdPrefix ? ` (prefix: ${tenantIdPrefix})` : ""}`);
+    return key;
+  }
+
+  removeTenantCreationKey(name: string): boolean {
+    const idx = this.tenantCreationKeys.findIndex(
+      (k) => k.name.toLowerCase() === name.toLowerCase(),
+    );
+    if (idx === -1) return false;
+    this.tenantCreationKeys.splice(idx, 1);
+    this.persistTenantCreationKeys();
+    console.log(`[TenantManager] Removed tenant creation key: ${name}`);
+    return true;
   }
 
   /**
-   * Register a new tenant by creating its directory and config.json.
+   * Validate a tenant creation API key against a tenantId.
+   * Returns true if the key exists and the tenantId satisfies the prefix constraint.
    */
+  validateTenantCreationKey(apiKey: string, tenantId: string): boolean {
+    const key = this.tenantCreationKeys.find((k) => k.apiKey === apiKey);
+    if (!key) return false;
+    if (key.tenantIdPrefix) {
+      return tenantId.toLowerCase().startsWith(key.tenantIdPrefix.toLowerCase());
+    }
+    return true;
+  }
+
+  private persistTenantCreationKeys(): void {
+    const filePath = join(this.dataDir, "tenant-api-keys.json");
+    writeFileSync(filePath, JSON.stringify(this.tenantCreationKeys, null, 2), "utf-8");
+  }
+
+  // =======================================================================
+  // Tenant management
+  // =======================================================================
+
   registerTenant(request: RegisterTenantRequest): TenantContext {
     const tenantId = request.tenantId.toLowerCase();
     const tenantDir = join(this.dataDir, tenantId);
@@ -203,10 +380,6 @@ export class TenantManager {
     return { tenantId, config };
   }
 
-  /**
-   * Get or load a tenant by ID.
-   * Creates a real BaseMindooTenant for directory reading when keys are available.
-   */
   async getTenant(tenantId: string): Promise<LoadedTenant> {
     const normalizedId = tenantId.toLowerCase();
 
@@ -221,9 +394,6 @@ export class TenantManager {
     return loaded;
   }
 
-  /**
-   * Check if a tenant exists.
-   */
   tenantExists(tenantId: string): boolean {
     const normalizedId = tenantId.toLowerCase();
     const tenantDir = join(this.dataDir, normalizedId);
@@ -231,9 +401,6 @@ export class TenantManager {
     return existsSync(configPath);
   }
 
-  /**
-   * List all registered tenant IDs.
-   */
   listTenants(): string[] {
     if (!existsSync(this.dataDir)) {
       return [];
@@ -243,10 +410,10 @@ export class TenantManager {
     const tenants: string[] = [];
 
     for (const entry of entries) {
-      const tenantDir = join(this.dataDir, entry);
-      const configPath = join(tenantDir, "config.json");
+      const entryPath = join(this.dataDir, entry);
+      const configPath = join(entryPath, "config.json");
 
-      if (statSync(tenantDir).isDirectory() && existsSync(configPath)) {
+      if (statSync(entryPath).isDirectory() && existsSync(configPath)) {
         tenants.push(entry);
       }
     }
@@ -254,9 +421,6 @@ export class TenantManager {
     return tenants.sort();
   }
 
-  /**
-   * Remove a tenant and all its data.
-   */
   removeTenant(tenantId: string): void {
     const normalizedId = tenantId.toLowerCase();
     const tenantDir = join(this.dataDir, normalizedId);
@@ -271,14 +435,10 @@ export class TenantManager {
     console.log(`[TenantManager] Removed tenant: ${normalizedId}`);
   }
 
-  /**
-   * Get a ServerNetworkContentAddressedStore for a specific database.
-   */
   async getServerStore(tenantId: string, dbId: string): Promise<ServerNetworkContentAddressedStore> {
     const tenant = await this.getTenant(tenantId);
 
-    const cacheKey = dbId;
-    const cached = tenant.serverStores.get(cacheKey);
+    const cached = tenant.serverStores.get(dbId);
     if (cached) {
       return cached;
     }
@@ -288,49 +448,44 @@ export class TenantManager {
       localStore,
       tenant.directory as unknown as MindooTenantDirectory,
       tenant.authService,
-      this.cryptoAdapter
+      this.cryptoAdapter,
     );
 
-    tenant.serverStores.set(cacheKey, serverStore);
+    tenant.serverStores.set(dbId, serverStore);
     console.log(`[TenantManager] Created server store for ${tenantId}/${dbId}`);
 
     return serverStore;
   }
 
-  /**
-   * Get the underlying ContentAddressedStore for a database.
-   */
   async getStore(tenantId: string, dbId: string): Promise<ContentAddressedStore> {
     const tenant = await this.getTenant(tenantId);
     return tenant.storeFactory.getStore(dbId);
   }
 
-  /**
-   * Get the authentication service for a tenant.
-   */
   async getAuthService(tenantId: string): Promise<AuthenticationService> {
     const tenant = await this.getTenant(tenantId);
     return tenant.authService;
   }
 
-  /**
-   * Get the crypto adapter.
-   */
   getCryptoAdapter(): NodeCryptoAdapter {
     return this.cryptoAdapter;
+  }
+
+  async reloadTenant(tenantId: string): Promise<LoadedTenant> {
+    const normalizedId = tenantId.toLowerCase();
+    this.loadedTenants.delete(normalizedId);
+    return this.getTenant(normalizedId);
+  }
+
+  clearCache(): void {
+    this.loadedTenants.clear();
+    console.log(`[TenantManager] Cleared tenant cache`);
   }
 
   // -----------------------------------------------------------------------
   // Private helpers
   // -----------------------------------------------------------------------
 
-  /**
-   * Load a tenant from disk.
-   *
-   * When the config contains a publicInfosKey, a real BaseMindooTenant is
-   * created for directory-based user authentication. Otherwise, falls back
-   * to the SimpleMindooDirectory (config.json users[] array).
-   */
   private async loadTenant(tenantId: string): Promise<LoadedTenant> {
     const tenantDir = join(this.dataDir, tenantId);
     const configPath = join(tenantDir, "config.json");
@@ -342,41 +497,43 @@ export class TenantManager {
     const configJson = readFileSync(configPath, "utf-8");
     const config: TenantConfig = JSON.parse(configJson);
 
-    // Load server keys if they exist
-    let serverKeys: ServerKeysConfig | undefined;
-    const serverKeysPath = join(tenantDir, "server-keys.json");
-    if (existsSync(serverKeysPath)) {
-      const serverKeysJson = readFileSync(serverKeysPath, "utf-8");
-      serverKeys = JSON.parse(serverKeysJson);
-      console.log(`[TenantManager] Loaded server keys for tenant ${tenantId}`);
-    }
-
-    const context: TenantContext = { tenantId, config, serverKeys };
+    const context: TenantContext = { tenantId, config };
     const storeFactory = new StoreFactory(tenantId, config, this.dataDir);
 
-    // Try to create a real MindooDB directory
-    let directory: MindooTenantDirectory;
+    // Build the inner directory (real or config-based fallback)
+    let innerDirectory: Pick<MindooTenantDirectory,
+      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">;
     let mindooTenant: MindooTenant | undefined;
 
-    if (config.publicInfosKey) {
+    if (config.publicInfosKey && this.serverIdentity && this.serverPassword) {
       try {
         const result = await this.createDirectoryTenant(tenantId, config, storeFactory);
         mindooTenant = result.tenant;
-        directory = await mindooTenant.openDirectory();
+        innerDirectory = await mindooTenant.openDirectory();
         console.log(`[TenantManager] Loaded tenant ${tenantId} with real directory`);
       } catch (error) {
         console.error(`[TenantManager] Failed to create real directory for ${tenantId}, falling back to config:`, error);
-        directory = new SimpleMindooDirectory(config) as unknown as MindooTenantDirectory;
+        innerDirectory = new SimpleMindooDirectory(config);
       }
     } else {
-      console.log(`[TenantManager] No publicInfosKey for ${tenantId}, using config-based directory`);
-      directory = new SimpleMindooDirectory(config) as unknown as MindooTenantDirectory;
+      if (config.publicInfosKey && !this.serverIdentity) {
+        console.log(`[TenantManager] Tenant ${tenantId} has publicInfosKey but no server identity; using config-based directory`);
+      } else {
+        console.log(`[TenantManager] No publicInfosKey for ${tenantId}, using config-based directory`);
+      }
+      innerDirectory = new SimpleMindooDirectory(config);
     }
+
+    // Wrap with CompositeMindooDirectory so trusted servers are also recognized
+    const directory = new CompositeMindooDirectory(
+      innerDirectory,
+      this.trustedServers,
+    ) as unknown as MindooTenantDirectory;
 
     const authService = new AuthenticationService(
       this.cryptoAdapter,
       directory,
-      tenantId
+      tenantId,
     );
 
     console.log(`[TenantManager] Loaded tenant: ${tenantId}`);
@@ -392,11 +549,8 @@ export class TenantManager {
   }
 
   /**
-   * Create a real BaseMindooTenant for directory reading.
-   *
-   * The server needs its own identity (PrivateUserId) to instantiate a tenant.
-   * This identity must be created externally (e.g. via a setup CLI) and placed
-   * at <dataDir>/<tenantId>/server-identity.json before the server starts.
+   * Create a real BaseMindooTenant for directory reading using the global
+   * server identity.
    */
   private async createDirectoryTenant(
     tenantId: string,
@@ -406,88 +560,37 @@ export class TenantManager {
     const storeFactoryAdapter = new StoreFactoryAdapter(storeFactory);
     const factory = new BaseMindooTenantFactory(storeFactoryAdapter, this.cryptoAdapter);
 
-    // Load the server identity (must be created externally before first use)
-    const serverUser = await this.getServerIdentity(tenantId);
+    const serverUser = this.serverIdentity!;
 
     // Create a KeyBag using the server user's encryption key
     const keyBag = new KeyBag(
       serverUser.userEncryptionKeyPair.privateKey,
-      SERVER_IDENTITY_PASSWORD,
+      this.serverPassword!,
       this.cryptoAdapter,
     );
-    // Import the $publicinfos key as raw bytes
     const publicInfosKeyBytes = Buffer.from(config.publicInfosKey!, "base64");
     await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, new Uint8Array(publicInfosKeyBytes));
 
-    // Collect trusted remote server signing keys for server-to-server sync
+    // Collect trusted server signing keys for additionalTrustedKeys
     const openOptions: OpenTenantOptions = {};
-    if (config.remoteServers && config.remoteServers.length > 0) {
+    if (this.trustedServers.length > 0) {
       const trustedKeys = new Map<string, boolean>();
-      for (const remote of config.remoteServers) {
-        if (remote.signingPublicKey) {
-          trustedKeys.set(remote.signingPublicKey, true);
-          console.log(`[TenantManager] Trusting remote server key for ${tenantId}: ${remote.url}`);
-        }
+      for (const server of this.trustedServers) {
+        trustedKeys.set(server.signingPublicKey, true);
       }
-      if (trustedKeys.size > 0) {
-        openOptions.additionalTrustedKeys = trustedKeys;
-      }
+      openOptions.additionalTrustedKeys = trustedKeys;
     }
 
-    // Open the tenant in directory-only mode (no tenant key needed)
     const tenant = await factory.openTenant(
       tenantId,
       config.adminSigningPublicKey,
       config.adminEncryptionPublicKey,
       serverUser,
-      SERVER_IDENTITY_PASSWORD,
+      this.serverPassword!,
       keyBag,
       openOptions,
     );
 
     return { tenant };
-  }
-
-  /**
-   * Load the server identity for a tenant from <dataDir>/<tenantId>/server-identity.json.
-   *
-   * The identity must be created externally (e.g. via a setup CLI) so that its
-   * public key can be shared with remote servers before they attempt to sync.
-   */
-  private async getServerIdentity(
-    tenantId: string,
-  ): Promise<PrivateUserId> {
-    const tenantDir = join(this.dataDir, tenantId);
-    const identityPath = join(tenantDir, SERVER_IDENTITY_FILE);
-
-    if (!existsSync(identityPath)) {
-      throw new Error(
-        `Server identity not found for tenant "${tenantId}". ` +
-        `Expected file: ${identityPath}\n` +
-        `Create the server identity first (e.g. via a setup script) and place it at that path. ` +
-        `The identity's public key must be shared with remote servers so they can trust this server.`
-      );
-    }
-
-    const json = readFileSync(identityPath, "utf-8");
-    console.log(`[TenantManager] Loaded server identity for tenant ${tenantId}`);
-    return JSON.parse(json) as PrivateUserId;
-  }
-
-  /**
-   * Reload a tenant's configuration from disk.
-   */
-  async reloadTenant(tenantId: string): Promise<LoadedTenant> {
-    const normalizedId = tenantId.toLowerCase();
-    this.loadedTenants.delete(normalizedId);
-    return this.getTenant(normalizedId);
-  }
-
-  /**
-   * Clear all cached tenants.
-   */
-  clearCache(): void {
-    this.loadedTenants.clear();
-    console.log(`[TenantManager] Cleared tenant cache`);
   }
 }
