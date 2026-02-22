@@ -10,6 +10,8 @@
  *   -d, --data-dir <path>   Data directory path (default: ./data)
  *   -p, --port <port>       Server port (default: 3000)
  *   -s, --auto-sync         Enable automatic sync with remote servers
+ *   --tls-cert <path>       Path to TLS certificate file (PEM)
+ *   --tls-key <path>        Path to TLS private key file (PEM)
  *   -h, --help              Show this help message
  *
  * Environment variables:
@@ -25,6 +27,8 @@ interface CliOptions {
   dataDir: string;
   port: number;
   autoSync: boolean;
+  tlsCert?: string;
+  tlsKey?: string;
   help: boolean;
 }
 
@@ -68,6 +72,20 @@ function parseArgs(args: string[]): CliOptions {
         options.autoSync = true;
         break;
 
+      case "--tls-cert":
+        if (nextArg) {
+          options.tlsCert = nextArg;
+          i++;
+        }
+        break;
+
+      case "--tls-key":
+        if (nextArg) {
+          options.tlsKey = nextArg;
+          i++;
+        }
+        break;
+
       case "-h":
       case "--help":
         options.help = true;
@@ -96,6 +114,8 @@ Options:
   -d, --data-dir <path>   Data directory path (default: ./data)
   -p, --port <port>       Server port (default: 3000)
   -s, --auto-sync         Enable automatic sync with remote servers
+  --tls-cert <path>       Path to TLS certificate file (PEM format)
+  --tls-key <path>        Path to TLS private key file (PEM format)
   -h, --help              Show this help message
 
 Environment variables:
@@ -116,6 +136,9 @@ Examples:
 
   # Start server with API key protection
   MINDOODB_ADMIN_API_KEY=my-secret-key npx ts-node src/index.ts
+
+  # Start server with TLS (HTTPS)
+  npx ts-node src/index.ts --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem -p 443
 `);
 }
 
@@ -134,6 +157,12 @@ async function main(): Promise<void> {
   console.log(`Data directory: ${options.dataDir}`);
   console.log(`Port: ${options.port}`);
   console.log(`Auto-sync: ${options.autoSync ? "enabled" : "disabled"}`);
+  console.log(`TLS: ${options.tlsCert ? "enabled" : "disabled"}`);
+
+  if ((options.tlsCert && !options.tlsKey) || (!options.tlsCert && options.tlsKey)) {
+    console.error("Error: --tls-cert and --tls-key must both be provided");
+    process.exit(1);
+  }
 
   const serverPassword = process.env[ENV_VARS.SERVER_PASSWORD];
   const adminApiKey = process.env[ENV_VARS.ADMIN_API_KEY];
@@ -201,7 +230,11 @@ async function main(): Promise<void> {
   }
 
   // Start listening
-  server.listen(options.port);
+  if (options.tlsCert && options.tlsKey) {
+    server.listenTls(options.port, options.tlsCert, options.tlsKey);
+  } else {
+    server.listen(options.port);
+  }
 }
 
 main().catch((error) => {

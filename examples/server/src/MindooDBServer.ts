@@ -11,6 +11,8 @@
  */
 
 import express, { Request, Response, NextFunction, Router } from "express";
+import https from "https";
+import { readFileSync } from "fs";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -115,14 +117,32 @@ export class MindooDBServer {
   listen(port: number): void {
     const server = this.app.listen(port, () => {
       console.log(`[MindooDBServer] Listening on port ${port}`);
-      if (this.adminApiKey) {
-        console.log(`[MindooDBServer] Admin endpoints protected by API key`);
-      } else {
-        console.log(`[MindooDBServer] Admin endpoints OPEN (no API key set)`);
-      }
+      this.logAdminKeyStatus();
     });
 
     server.setTimeout(30_000);
+  }
+
+  listenTls(port: number, certPath: string, keyPath: string): void {
+    const tlsOptions = {
+      cert: readFileSync(certPath),
+      key: readFileSync(keyPath),
+    };
+    const server = https.createServer(tlsOptions, this.app);
+    server.listen(port, () => {
+      console.log(`[MindooDBServer] Listening on HTTPS port ${port}`);
+      this.logAdminKeyStatus();
+    });
+
+    server.setTimeout(30_000);
+  }
+
+  private logAdminKeyStatus(): void {
+    if (this.adminApiKey) {
+      console.log(`[MindooDBServer] Admin endpoints protected by API key`);
+    } else {
+      console.log(`[MindooDBServer] Admin endpoints OPEN (no API key set)`);
+    }
   }
 
   private setupMiddleware(): void {

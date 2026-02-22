@@ -40,6 +40,8 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 | `--data-dir` | `-d` | Data directory path | `./data` |
 | `--port` | `-p` | Server port | `3000` |
 | `--auto-sync` | `-s` | Enable automatic sync with remote servers | disabled |
+| `--tls-cert` | — | Path to TLS certificate file (PEM) | — |
+| `--tls-key` | — | Path to TLS private key file (PEM) | — |
 | `--help` | `-h` | Show help message | — |
 
 ### `npm run init` — Initialize server identity
@@ -403,9 +405,73 @@ The server includes the following hardening measures:
 
 For production deployments, also consider:
 
-- Running behind a reverse proxy (nginx, Caddy) with TLS termination
+- Enabling TLS (see below) or running behind a reverse proxy (nginx, Caddy) with TLS termination
 - Setting `MINDOODB_ADMIN_API_KEY` (the server warns on startup if not set)
 - Using a process manager (PM2, systemd) for automatic restarts
+
+## TLS / HTTPS
+
+The server supports TLS directly via `--tls-cert` and `--tls-key` flags. No additional dependencies are required.
+
+### Starting with TLS
+
+```bash
+MINDOODB_SERVER_PASSWORD=secret npm run dev -- \
+  --tls-cert /etc/letsencrypt/live/sync.example.com/fullchain.pem \
+  --tls-key /etc/letsencrypt/live/sync.example.com/privkey.pem \
+  -p 443
+```
+
+Both flags must be provided together. The certificate file should be the full chain (PEM format).
+
+### Free certificates with Let's Encrypt
+
+#### Method A: Standalone (HTTP-01)
+
+Certbot briefly binds port 80 to prove domain ownership. Best when port 80 is available.
+
+```bash
+# Install certbot (Ubuntu/Debian)
+sudo apt install certbot
+
+# Obtain certificate
+sudo certbot certonly --standalone -d sync.example.com
+```
+
+Auto-renewal is handled by certbot's systemd timer, which runs automatically on most Linux distributions. After renewal, restart the server to pick up the new certificate.
+
+#### Method B: DNS (DNS-01)
+
+Prove ownership via a DNS TXT record. No port 80 required -- works behind firewalls and on non-standard ports.
+
+**Automated (recommended for production)** -- use a DNS provider plugin so renewal is fully unattended:
+
+```bash
+# Example with Cloudflare
+sudo apt install certbot python3-certbot-dns-cloudflare
+
+# Create credentials file
+cat > /etc/letsencrypt/cloudflare.ini << EOF
+dns_cloudflare_api_token = your-cloudflare-api-token
+EOF
+chmod 600 /etc/letsencrypt/cloudflare.ini
+
+# Obtain certificate
+sudo certbot certonly --dns-cloudflare \
+  --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+  -d sync.example.com
+```
+
+With a DNS plugin, certbot creates and removes the TXT record via the provider's API automatically. The systemd timer handles renewal with zero manual intervention.
+
+**Manual (testing only)** -- requires updating the DNS TXT record by hand every 90 days:
+
+```bash
+sudo certbot certonly --manual --preferred-challenges dns -d sync.example.com
+# Certbot will ask you to create: _acme-challenge.sync.example.com TXT "..."
+```
+
+Available DNS plugins include Cloudflare, Route53, Google Cloud DNS, DigitalOcean, Linode, and OVH. See the [certbot documentation](https://eff-certbot.readthedocs.io/en/latest/using.html#dns-plugins) for the full list.
 
 ## Development
 
