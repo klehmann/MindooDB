@@ -501,6 +501,56 @@ sudo certbot certonly --manual --preferred-challenges dns -d sync.example.com
 
 Available DNS plugins include Cloudflare, Route53, Google Cloud DNS, DigitalOcean, Linode, and OVH. See the [certbot documentation](https://eff-certbot.readthedocs.io/en/latest/using.html#dns-plugins) for the full list.
 
+## Docker
+
+The server ships with a multi-stage `Dockerfile` that produces a minimal Alpine-based image (~180 MB). The build context must be the **repository root** so that the mindoodb library can be compiled inside the image.
+
+### Build the image
+
+```bash
+# From the repository root
+docker build -f examples/server/Dockerfile -t mindoodb-server .
+```
+
+### Initialize server identity
+
+The identity is stored inside the data directory, so point the container at a local `./data` folder. The init script requires overriding the default entrypoint:
+
+```bash
+docker run --rm \
+  -v "$(pwd)/data:/data" \
+  -e MINDOODB_SERVER_PASSWORD=your-secret \
+  --entrypoint node \
+  mindoodb-server dist/init.js --data-dir /data --name server1
+```
+
+### Run the server
+
+```bash
+docker run -d --name mindoodb \
+  -v "$(pwd)/data:/data" \
+  -p 3000:3000 \
+  -e MINDOODB_SERVER_PASSWORD=your-secret \
+  -e MINDOODB_ADMIN_API_KEY=your-admin-key \
+  mindoodb-server
+```
+
+Additional CLI flags can be appended after the image name:
+
+```bash
+docker run -d --name mindoodb \
+  -v "$(pwd)/data:/data" \
+  -p 8443:8443 \
+  -e MINDOODB_SERVER_PASSWORD=your-secret \
+  mindoodb-server --port 8443 --auto-sync
+```
+
+### Verify
+
+```bash
+curl http://localhost:3000/health
+```
+
 ## Development
 
 ### Build
