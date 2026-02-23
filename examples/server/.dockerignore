@@ -1,0 +1,9 @@
+node_modules
+dist
+examples/server/node_modules
+examples/server/dist
+.git
+.cursor
+test-results
+coverage
+*.tsbuildinfo
