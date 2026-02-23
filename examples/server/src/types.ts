@@ -63,6 +63,15 @@ export interface RemoteServerConfig {
 }
 
 /**
+ * RemoteServerConfig with a required name, used when managing sync servers
+ * via the admin API. The name identifies the server for updates and deletes.
+ */
+export interface NamedRemoteServerConfig extends RemoteServerConfig {
+  /** Server name matching the trusted-servers identity (e.g., "CN=server2") */
+  name: string;
+}
+
+/**
  * Per-database store configuration.
  */
 export interface DatabaseStoreConfig {
@@ -147,4 +156,11 @@ export const ENV_VARS = {
   SERVER_PASSWORD: "MINDOODB_SERVER_PASSWORD",
   /** Optional API key to protect admin endpoints (full access) */
   ADMIN_API_KEY: "MINDOODB_ADMIN_API_KEY",
+  /**
+   * Comma-separated list of IPs or CIDRs allowed to access admin endpoints.
+   * Default: localhost only (127.0.0.1, ::1).
+   * Set to "*" to allow all IPs.
+   * Examples: "10.0.0.0/8,192.168.1.0/24" or "10.0.0.5,10.0.0.6"
+   */
+  ADMIN_ALLOWED_IPS: "MINDOODB_ADMIN_ALLOWED_IPS",
 } as const;

@@ -494,7 +494,7 @@ describe("MindooDB Example Server", () => {
         );
         expect(status).toBe(400);
         expect(body).toMatchObject({
-          error: expect.stringContaining("Invalid"),
+          error: expect.stringContaining("must start with"),
         });
       });
 
@@ -641,6 +641,16 @@ describe("MindooDB Example Server", () => {
       });
     });
 
+    describe("Server Info Endpoint", () => {
+      test("should return 503 when server has no identity", async () => {
+        const { status, body } = await httpRequest(`${baseUrl}/.well-known/mindoodb-server-info`);
+        expect(status).toBe(503);
+        expect(body).toMatchObject({
+          error: expect.stringContaining("not initialized"),
+        });
+      });
+    });
+
     describe("Admin API Key Protection", () => {
       const apiKey = "test-admin-key-for-security";
       let securedBaseUrl: string;
@@ -721,6 +731,464 @@ describe("MindooDB Example Server", () => {
         );
         expect(status).toBe(401);
       });
+    });
+  });
+});
+
+describe("Server Network Management", () => {
+  let server: MindooDBServer;
+  let httpServer: Server;
+  let baseUrl: string;
+  let cryptoAdapter: NodeCryptoAdapter;
+  let factory: BaseMindooTenantFactory;
+  const testPort = 3097;
+  const testDataDir = `/tmp/mindoodb-network-test-${Date.now()}`;
+
+  beforeAll(async () => {
+    cryptoAdapter = new NodeCryptoAdapter();
+    factory = new BaseMindooTenantFactory(
+      new InMemoryContentAddressedStoreFactory(),
+      cryptoAdapter
+    );
+
+    // Generate and write a server identity so the well-known endpoint returns 200
+    const fs = await import("fs");
+    const path = await import("path");
+    if (!fs.existsSync(testDataDir)) {
+      fs.mkdirSync(testDataDir, { recursive: true });
+    }
+    const identity = await factory.createUserId("CN=test-network-server", "test-password");
+    fs.writeFileSync(
+      path.join(testDataDir, "server-identity.json"),
+      JSON.stringify(identity, null, 2),
+      "utf-8"
+    );
+    fs.writeFileSync(path.join(testDataDir, "trusted-servers.json"), "[]", "utf-8");
+    fs.writeFileSync(path.join(testDataDir, "tenant-api-keys.json"), "[]", "utf-8");
+
+    server = new MindooDBServer(testDataDir, "test-password");
+    baseUrl = `http://localhost:${testPort}`;
+
+    await new Promise<void>((resolve) => {
+      httpServer = server.getApp().listen(testPort, () => resolve());
+    });
+
+    // Register a tenant for sync server tests
+    const adminSigningKey = await factory.createSigningKeyPair("admin-password");
+    const adminEncryptionKey = await factory.createEncryptionKeyPair("admin-password");
+    await httpRequest(`${baseUrl}/admin/register-tenant`, "POST", {
+      tenantId: "network-test-tenant",
+      adminSigningPublicKey: adminSigningKey.publicKey,
+      adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+    });
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => {
+      httpServer.close(() => resolve());
+    });
+    const fs = await import("fs");
+    if (fs.existsSync(testDataDir)) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+    }
+  });
+
+  describe("Well-known server info endpoint", () => {
+    test("should return server info with name and public keys", async () => {
+      const { status, body } = await httpRequest(`${baseUrl}/.well-known/mindoodb-server-info`);
+      expect(status).toBe(200);
+      const info = body as { name: string; signingPublicKey: string; encryptionPublicKey: string };
+      expect(info.name).toBe("CN=test-network-server");
+      expect(info.signingPublicKey).toContain("-----BEGIN PUBLIC KEY-----");
+      expect(info.encryptionPublicKey).toContain("-----BEGIN PUBLIC KEY-----");
+    });
+
+    test("returned keys should match the server identity", async () => {
+      const { body } = await httpRequest(`${baseUrl}/.well-known/mindoodb-server-info`);
+      const info = body as { name: string; signingPublicKey: string; encryptionPublicKey: string };
+
+      const tenantManager = server.getTenantManager();
+      const identity = tenantManager.getServerIdentity()!;
+      expect(info.signingPublicKey).toBe(identity.userSigningKeyPair.publicKey);
+      expect(info.encryptionPublicKey).toBe(identity.userEncryptionKeyPair.publicKey);
+    });
+  });
+
+  describe("Per-tenant sync server API", () => {
+    const tenantId = "network-test-tenant";
+
+    test("GET should return empty array for tenant with no sync servers", async () => {
+      const { status, body } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`
+      );
+      expect(status).toBe(200);
+      expect((body as { servers: unknown[] }).servers).toEqual([]);
+    });
+
+    test("POST should add a sync server", async () => {
+      const { status, body } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`,
+        "POST",
+        {
+          name: "CN=remote-server-1",
+          url: "https://s1.example.com",
+          syncIntervalMs: 60000,
+          databases: ["directory", "main"],
+        }
+      );
+      expect(status).toBe(201);
+      expect(body).toMatchObject({ success: true });
+    });
+
+    test("GET should return the added sync server", async () => {
+      const { status, body } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`
+      );
+      expect(status).toBe(200);
+      const servers = (body as { servers: any[] }).servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0]).toMatchObject({
+        name: "CN=remote-server-1",
+        url: "https://s1.example.com",
+        syncIntervalMs: 60000,
+        databases: ["directory", "main"],
+      });
+    });
+
+    test("POST with same name should update the existing entry", async () => {
+      const { status } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`,
+        "POST",
+        {
+          name: "CN=remote-server-1",
+          url: "https://s1-updated.example.com",
+          syncIntervalMs: 30000,
+          databases: ["directory"],
+        }
+      );
+      expect(status).toBe(201);
+
+      const { body } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`
+      );
+      const servers = (body as { servers: any[] }).servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].url).toBe("https://s1-updated.example.com");
+      expect(servers[0].syncIntervalMs).toBe(30000);
+      expect(servers[0].databases).toEqual(["directory"]);
+    });
+
+    test("POST should reject request without databases", async () => {
+      const { status, body } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`,
+        "POST",
+        {
+          name: "CN=no-dbs",
+          url: "https://s2.example.com",
+        }
+      );
+      expect(status).toBe(400);
+      expect(body).toMatchObject({
+        error: expect.stringContaining("databases"),
+      });
+    });
+
+    test("DELETE should remove a sync server", async () => {
+      // Add a second server first
+      await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`,
+        "POST",
+        {
+          name: "CN=to-delete",
+          url: "https://delete-me.example.com",
+          databases: ["main"],
+        }
+      );
+
+      const { status, body } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers/${encodeURIComponent("CN=to-delete")}`,
+        "DELETE"
+      );
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ success: true });
+
+      // Verify it's gone
+      const { body: listBody } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers`
+      );
+      const names = (listBody as { servers: any[] }).servers.map((s: any) => s.name);
+      expect(names).not.toContain("CN=to-delete");
+    });
+
+    test("DELETE should return 404 for non-existent server name", async () => {
+      const { status, body } = await httpRequest(
+        `${baseUrl}/admin/tenants/${tenantId}/sync-servers/${encodeURIComponent("CN=does-not-exist")}`,
+        "DELETE"
+      );
+      expect(status).toBe(404);
+      expect(body).toMatchObject({
+        error: expect.stringContaining("not found"),
+      });
+    });
+
+    test("all endpoints should return 404 for non-existent tenant", async () => {
+      const fakeTenant = "nonexistent-tenant";
+
+      const getResult = await httpRequest(
+        `${baseUrl}/admin/tenants/${fakeTenant}/sync-servers`
+      );
+      expect(getResult.status).toBe(404);
+
+      const postResult = await httpRequest(
+        `${baseUrl}/admin/tenants/${fakeTenant}/sync-servers`,
+        "POST",
+        { name: "CN=x", url: "https://x.example.com", databases: ["main"] }
+      );
+      expect(postResult.status).toBe(404);
+
+      const deleteResult = await httpRequest(
+        `${baseUrl}/admin/tenants/${fakeTenant}/sync-servers/${encodeURIComponent("CN=x")}`,
+        "DELETE"
+      );
+      expect(deleteResult.status).toBe(404);
+    });
+  });
+
+  describe("Sync server API key protection", () => {
+    const apiKey = "network-admin-key";
+    let securedServer: MindooDBServer;
+    let securedHttpServer: Server;
+    let securedBaseUrl: string;
+    const securedPort = 3096;
+    const securedDataDir = `/tmp/mindoodb-network-secured-${Date.now()}`;
+
+    beforeAll(async () => {
+      const fs = await import("fs");
+      const path = await import("path");
+      if (!fs.existsSync(securedDataDir)) {
+        fs.mkdirSync(securedDataDir, { recursive: true });
+      }
+      fs.writeFileSync(path.join(securedDataDir, "trusted-servers.json"), "[]", "utf-8");
+      fs.writeFileSync(path.join(securedDataDir, "tenant-api-keys.json"), "[]", "utf-8");
+
+      process.env.MINDOODB_ADMIN_API_KEY = apiKey;
+      securedServer = new MindooDBServer(securedDataDir);
+      securedBaseUrl = `http://localhost:${securedPort}`;
+
+      await new Promise<void>((resolve) => {
+        securedHttpServer = securedServer.getApp().listen(securedPort, () => resolve());
+      });
+
+      // Register a tenant (with API key)
+      const adminSigningKey = await factory.createSigningKeyPair("pw");
+      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
+      await httpRequest(
+        `${securedBaseUrl}/admin/register-tenant`,
+        "POST",
+        {
+          tenantId: "secured-tenant",
+          adminSigningPublicKey: adminSigningKey.publicKey,
+          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+        },
+        { "X-API-Key": apiKey }
+      );
+    });
+
+    afterAll(async () => {
+      delete process.env.MINDOODB_ADMIN_API_KEY;
+      await new Promise<void>((resolve) => {
+        securedHttpServer.close(() => resolve());
+      });
+      const fs = await import("fs");
+      if (fs.existsSync(securedDataDir)) {
+        fs.rmSync(securedDataDir, { recursive: true, force: true });
+      }
+    });
+
+    test("should reject sync server GET without API key", async () => {
+      const { status } = await httpRequest(
+        `${securedBaseUrl}/admin/tenants/secured-tenant/sync-servers`
+      );
+      expect(status).toBe(401);
+    });
+
+    test("should accept sync server GET with correct API key", async () => {
+      const { status } = await httpRequest(
+        `${securedBaseUrl}/admin/tenants/secured-tenant/sync-servers`,
+        "GET",
+        undefined,
+        { "X-API-Key": apiKey }
+      );
+      expect(status).toBe(200);
+    });
+
+    test("should reject sync server POST without API key", async () => {
+      const { status } = await httpRequest(
+        `${securedBaseUrl}/admin/tenants/secured-tenant/sync-servers`,
+        "POST",
+        {
+          name: "CN=x",
+          url: "https://x.example.com",
+          databases: ["main"],
+        }
+      );
+      expect(status).toBe(401);
+    });
+  });
+});
+
+describe("Admin IP Allowlist", () => {
+  describe("default (localhost only)", () => {
+    test("should allow admin requests from localhost", async () => {
+      // The main test server in the "MindooDB Example Server" suite
+      // already validates this — admin endpoints work from localhost.
+      // This test creates a fresh server to confirm the default behavior.
+      const dataDir = `/tmp/mindoodb-ip-default-${Date.now()}`;
+      const fs = await import("fs");
+      const pathMod = await import("path");
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(pathMod.join(dataDir, "trusted-servers.json"), "[]", "utf-8");
+      fs.writeFileSync(pathMod.join(dataDir, "tenant-api-keys.json"), "[]", "utf-8");
+
+      delete process.env.MINDOODB_ADMIN_ALLOWED_IPS;
+      const srv = new MindooDBServer(dataDir);
+      const port = 3094;
+
+      const httpSrv = await new Promise<Server>((resolve) => {
+        const s = srv.getApp().listen(port, () => resolve(s));
+      });
+
+      try {
+        const { status } = await httpRequest(`http://localhost:${port}/admin/tenants`);
+        expect(status).toBe(200);
+      } finally {
+        await new Promise<void>((r) => httpSrv.close(() => r()));
+        fs.rmSync(dataDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("restricted to non-localhost IP", () => {
+    let restrictedServer: MindooDBServer;
+    let restrictedHttpServer: Server;
+    const restrictedPort = 3093;
+    const restrictedDataDir = `/tmp/mindoodb-ip-restricted-${Date.now()}`;
+
+    beforeAll(async () => {
+      const fs = await import("fs");
+      const pathMod = await import("path");
+      fs.mkdirSync(restrictedDataDir, { recursive: true });
+      fs.writeFileSync(pathMod.join(restrictedDataDir, "trusted-servers.json"), "[]", "utf-8");
+      fs.writeFileSync(pathMod.join(restrictedDataDir, "tenant-api-keys.json"), "[]", "utf-8");
+
+      process.env.MINDOODB_ADMIN_ALLOWED_IPS = "10.99.99.1";
+      restrictedServer = new MindooDBServer(restrictedDataDir);
+
+      await new Promise<void>((resolve) => {
+        restrictedHttpServer = restrictedServer.getApp().listen(restrictedPort, () => resolve());
+      });
+    });
+
+    afterAll(async () => {
+      delete process.env.MINDOODB_ADMIN_ALLOWED_IPS;
+      await new Promise<void>((resolve) => {
+        restrictedHttpServer.close(() => resolve());
+      });
+      const fs = await import("fs");
+      if (fs.existsSync(restrictedDataDir)) {
+        fs.rmSync(restrictedDataDir, { recursive: true, force: true });
+      }
+    });
+
+    test("should block admin requests from localhost when restricted to other IP", async () => {
+      const { status, body } = await httpRequest(
+        `http://localhost:${restrictedPort}/admin/tenants`
+      );
+      expect(status).toBe(403);
+      expect(body).toMatchObject({ error: "Forbidden" });
+    });
+
+    test("should still allow non-admin endpoints from any IP", async () => {
+      const { status } = await httpRequest(`http://localhost:${restrictedPort}/health`);
+      expect(status).toBe(200);
+    });
+  });
+
+  describe("wildcard (*)", () => {
+    let wildcardServer: MindooDBServer;
+    let wildcardHttpServer: Server;
+    const wildcardPort = 3092;
+    const wildcardDataDir = `/tmp/mindoodb-ip-wildcard-${Date.now()}`;
+
+    beforeAll(async () => {
+      const fs = await import("fs");
+      const pathMod = await import("path");
+      fs.mkdirSync(wildcardDataDir, { recursive: true });
+      fs.writeFileSync(pathMod.join(wildcardDataDir, "trusted-servers.json"), "[]", "utf-8");
+      fs.writeFileSync(pathMod.join(wildcardDataDir, "tenant-api-keys.json"), "[]", "utf-8");
+
+      process.env.MINDOODB_ADMIN_ALLOWED_IPS = "*";
+      wildcardServer = new MindooDBServer(wildcardDataDir);
+
+      await new Promise<void>((resolve) => {
+        wildcardHttpServer = wildcardServer.getApp().listen(wildcardPort, () => resolve());
+      });
+    });
+
+    afterAll(async () => {
+      delete process.env.MINDOODB_ADMIN_ALLOWED_IPS;
+      await new Promise<void>((resolve) => {
+        wildcardHttpServer.close(() => resolve());
+      });
+      const fs = await import("fs");
+      if (fs.existsSync(wildcardDataDir)) {
+        fs.rmSync(wildcardDataDir, { recursive: true, force: true });
+      }
+    });
+
+    test("should allow admin requests from any IP when set to *", async () => {
+      const { status } = await httpRequest(`http://localhost:${wildcardPort}/admin/tenants`);
+      expect(status).toBe(200);
+    });
+  });
+
+  describe("CIDR matching", () => {
+    let cidrServer: MindooDBServer;
+    let cidrHttpServer: Server;
+    const cidrPort = 3091;
+    const cidrDataDir = `/tmp/mindoodb-ip-cidr-${Date.now()}`;
+
+    beforeAll(async () => {
+      const fs = await import("fs");
+      const pathMod = await import("path");
+      fs.mkdirSync(cidrDataDir, { recursive: true });
+      fs.writeFileSync(pathMod.join(cidrDataDir, "trusted-servers.json"), "[]", "utf-8");
+      fs.writeFileSync(pathMod.join(cidrDataDir, "tenant-api-keys.json"), "[]", "utf-8");
+
+      // 127.0.0.0/8 covers all 127.x.x.x addresses including 127.0.0.1
+      process.env.MINDOODB_ADMIN_ALLOWED_IPS = "127.0.0.0/8";
+      cidrServer = new MindooDBServer(cidrDataDir);
+
+      await new Promise<void>((resolve) => {
+        cidrHttpServer = cidrServer.getApp().listen(cidrPort, () => resolve());
+      });
+    });
+
+    afterAll(async () => {
+      delete process.env.MINDOODB_ADMIN_ALLOWED_IPS;
+      await new Promise<void>((resolve) => {
+        cidrHttpServer.close(() => resolve());
+      });
+      const fs = await import("fs");
+      if (fs.existsSync(cidrDataDir)) {
+        fs.rmSync(cidrDataDir, { recursive: true, force: true });
+      }
+    });
+
+    test("should allow admin requests when client IP matches CIDR range", async () => {
+      // Use 127.0.0.1 explicitly to force IPv4 (localhost may resolve to ::1)
+      const { status } = await httpRequest(`http://127.0.0.1:${cidrPort}/admin/tenants`);
+      expect(status).toBe(200);
     });
   });
 });

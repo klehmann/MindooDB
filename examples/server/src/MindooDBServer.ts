@@ -36,6 +36,7 @@ import type {
   RegisterTenantResponse,
   ListTenantsResponse,
   TrustedServer,
+  NamedRemoteServerConfig,
 } from "./types";
 import {
   validateIdentifier,
@@ -82,6 +83,50 @@ interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string;
 }
 
+// ==================== IP Allowlist Helpers ====================
+
+const LOCALHOST_ALLOWLIST = ["127.0.0.1", "::1"];
+
+function normalizeIp(ip: string): string {
+  if (ip.startsWith("::ffff:")) return ip.substring(7);
+  return ip;
+}
+
+function ipv4ToNumber(ip: string): number {
+  const parts = ip.split(".").map(Number);
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+}
+
+function matchesEntry(clientIp: string, entry: string): boolean {
+  if (entry === "*") return true;
+
+  const normIp = normalizeIp(clientIp);
+  const normEntry = normalizeIp(entry);
+
+  if (!normEntry.includes("/")) return normIp === normEntry;
+
+  const [network, prefixStr] = normEntry.split("/");
+  const prefix = parseInt(prefixStr, 10);
+  if (isNaN(prefix) || prefix < 0 || prefix > 32) return false;
+
+  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+  return (ipv4ToNumber(normIp) & mask) === (ipv4ToNumber(network) & mask);
+}
+
+function isIpAllowed(clientIp: string, allowList: string[]): boolean {
+  for (const entry of allowList) {
+    if (matchesEntry(clientIp, entry)) return true;
+  }
+  return false;
+}
+
+function parseAdminAllowedIps(): string[] {
+  const raw = process.env.MINDOODB_ADMIN_ALLOWED_IPS;
+  if (!raw) return LOCALHOST_ALLOWLIST;
+  if (raw.trim() === "*") return ["*"];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 // ==================== Helpers ====================
 
 function safeCompare(a: string, b: string): boolean {
@@ -94,16 +139,24 @@ export class MindooDBServer {
   private tenantManager: TenantManager;
   private adminApiKey: string | undefined;
   private readonly staticDir: string | undefined;
+  private readonly adminIpAllowList: string[];
 
   constructor(dataDir: string, serverPassword?: string, staticDir?: string) {
     this.app = express();
     this.tenantManager = new TenantManager(dataDir, serverPassword);
     this.adminApiKey = process.env.MINDOODB_ADMIN_API_KEY;
     this.staticDir = staticDir;
+    this.adminIpAllowList = parseAdminAllowedIps();
 
     if (!this.adminApiKey) {
       console.log(`[MindooDBServer] WARNING: MINDOODB_ADMIN_API_KEY not set. Admin endpoints are UNPROTECTED.`);
       console.log(`[MindooDBServer] WARNING: Set MINDOODB_ADMIN_API_KEY environment variable for production use.`);
+    }
+
+    if (this.adminIpAllowList.includes("*")) {
+      console.log(`[MindooDBServer] Admin IP allowlist: all IPs allowed`);
+    } else {
+      console.log(`[MindooDBServer] Admin IP allowlist: ${this.adminIpAllowList.join(", ")}`);
     }
 
     this.setupMiddleware();
@@ -194,6 +247,15 @@ export class MindooDBServer {
       res.json({ status: "ok", timestamp: Date.now() });
     });
 
+    this.app.get("/.well-known/mindoodb-server-info", (req, res) => {
+      const info = this.tenantManager.getServerPublicInfo();
+      if (!info) {
+        res.status(503).json({ error: "Server identity not initialized" });
+        return;
+      }
+      res.json(info);
+    });
+
     // Static file serving (if configured)
     if (this.staticDir) {
       const resolvedStaticDir = path.resolve(this.staticDir);
@@ -207,7 +269,17 @@ export class MindooDBServer {
       console.log(`[MindooDBServer] Serving static files from ${resolvedStaticDir} at /statics/`);
     }
 
-    // Admin routes with tiered auth and rate limiting
+    // Admin routes with IP filtering, tiered auth, and rate limiting
+    const adminIpFilter = (req: Request, res: Response, next: NextFunction): void => {
+      const clientIp = req.ip || req.socket.remoteAddress || "";
+      if (!isIpAllowed(clientIp, this.adminIpAllowList)) {
+        console.log(`[MindooDBServer] Admin request blocked from ${clientIp}`);
+        res.status(403).json({ error: "Forbidden" });
+        return;
+      }
+      next();
+    };
+
     const adminRateLimit = rateLimit({
       windowMs: 60_000,
       max: 30,
@@ -218,7 +290,7 @@ export class MindooDBServer {
 
     const adminRouter = Router();
     this.setupAdminRoutes(adminRouter);
-    this.app.use("/admin", adminRateLimit, adminRouter);
+    this.app.use("/admin", adminIpFilter, adminRateLimit, adminRouter);
 
     // Tenant-scoped routes
     this.app.use("/:tenantId", this.tenantMiddleware.bind(this), this.createTenantRouter());
@@ -529,6 +601,99 @@ export class MindooDBServer {
         }
         console.error("[MindooDBServer] Error removing tenant creation key:", error);
         res.status(500).json({ error: "Failed to remove tenant creation key" });
+      }
+    });
+
+    // Per-tenant sync server management
+    router.get("/tenants/:tenantId/sync-servers", adminOnly, (req: Request, res: Response) => {
+      try {
+        const tenantId = req.params.tenantId.toLowerCase();
+        try { validateIdentifier(tenantId, "tenantId"); } catch {
+          res.status(400).json({ error: "Invalid tenantId format" });
+          return;
+        }
+        if (!this.tenantManager.tenantExists(tenantId)) {
+          res.status(404).json({ error: "Tenant not found" });
+          return;
+        }
+        const servers = this.tenantManager.getTenantSyncServers(tenantId);
+        res.json({ servers });
+      } catch (error) {
+        console.error("[MindooDBServer] Error listing sync servers:", error);
+        res.status(500).json({ error: "Failed to list sync servers" });
+      }
+    });
+
+    router.post("/tenants/:tenantId/sync-servers", adminOnly, (req: Request, res: Response) => {
+      try {
+        const tenantId = req.params.tenantId.toLowerCase();
+        try { validateIdentifier(tenantId, "tenantId"); } catch {
+          res.status(400).json({ error: "Invalid tenantId format" });
+          return;
+        }
+        if (!this.tenantManager.tenantExists(tenantId)) {
+          res.status(404).json({ error: "Tenant not found" });
+          return;
+        }
+
+        const { name, url, syncIntervalMs, databases } = req.body;
+        if (!name || !url) {
+          res.status(400).json({ error: "name and url are required" });
+          return;
+        }
+        if (!databases || !Array.isArray(databases) || databases.length === 0) {
+          res.status(400).json({ error: "databases array is required and must not be empty" });
+          return;
+        }
+
+        validateStringLength(name, 256, "name");
+        validateStringLength(url, 2048, "url");
+
+        const config: NamedRemoteServerConfig = { name, url, databases };
+        if (syncIntervalMs !== undefined) {
+          config.syncIntervalMs = syncIntervalMs;
+        }
+
+        this.tenantManager.addTenantSyncServer(tenantId, config);
+        res.status(201).json({ success: true, message: `Sync server "${name}" configured for tenant ${tenantId}` });
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
+        console.error("[MindooDBServer] Error adding sync server:", error);
+        res.status(500).json({ error: "Failed to add sync server" });
+      }
+    });
+
+    router.delete("/tenants/:tenantId/sync-servers/:serverName", adminOnly, (req: Request, res: Response) => {
+      try {
+        const tenantId = req.params.tenantId.toLowerCase();
+        try { validateIdentifier(tenantId, "tenantId"); } catch {
+          res.status(400).json({ error: "Invalid tenantId format" });
+          return;
+        }
+        if (!this.tenantManager.tenantExists(tenantId)) {
+          res.status(404).json({ error: "Tenant not found" });
+          return;
+        }
+
+        const serverName = decodeURIComponent(req.params.serverName);
+        validateStringLength(serverName, 256, "serverName");
+
+        const removed = this.tenantManager.removeTenantSyncServer(tenantId, serverName);
+        if (!removed) {
+          res.status(404).json({ error: "Sync server not found" });
+          return;
+        }
+        res.json({ success: true, message: `Sync server "${serverName}" removed from tenant ${tenantId}` });
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
+        console.error("[MindooDBServer] Error removing sync server:", error);
+        res.status(500).json({ error: "Failed to remove sync server" });
       }
     });
   }

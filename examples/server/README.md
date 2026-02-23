@@ -54,12 +54,22 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 | `--force` | `-f` | Overwrite existing identity | — |
 | `--help` | `-h` | Show help message | — |
 
+### `npm run add-to-network` — Add a server to the network
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--new-server` | URL of the server being added | **required** |
+| `--servers` | Comma-separated URLs of existing servers | **required** |
+| `--api-key` | Admin API key (shared by all servers) | **required** |
+| `--help` | Show help message | — |
+
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MINDOODB_SERVER_PASSWORD` | If server-identity.json exists | Password to decrypt server identity and per-tenant keybags |
 | `MINDOODB_ADMIN_API_KEY` | Recommended | If set, protects admin endpoints with API key. **Warning logged on startup if not set.** |
+| `MINDOODB_ADMIN_ALLOWED_IPS` | No | Comma-separated IPs/CIDRs allowed to access admin endpoints. Default: **localhost only** (`127.0.0.1`, `::1`). Set to `*` to allow all IPs. |
 | `MINDOODB_CORS_ORIGIN` | No | Allowed CORS origin (e.g., `https://app.example.com`). If not set, CORS is disabled. |
 
 ## Data Directory Layout
@@ -128,11 +138,20 @@ data/
 | `POST` | `/:tenantId/sync/getIdBloomSummary` | Get Bloom filter summary |
 | `GET` | `/:tenantId/sync/capabilities` | Get server capabilities |
 
-### Health Check
+#### Per-Tenant Sync Server Management
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/admin/tenants/:tenantId/sync-servers` | Admin key only | List sync servers for a tenant |
+| `POST` | `/admin/tenants/:tenantId/sync-servers` | Admin key only | Add or update a sync server |
+| `DELETE` | `/admin/tenants/:tenantId/sync-servers/:serverName` | Admin key only | Remove a sync server |
+
+### Server Info & Health
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Server health status |
+| `GET` | `/.well-known/mindoodb-server-info` | Server name and public keys (unauthenticated) |
 
 ## Tiered Authentication
 
@@ -309,6 +328,124 @@ await tenant.publishToServer("http://localhost:3000", {
 - `tenantId: "acme-prod"` — allowed (matches prefix `acme-`)
 - `tenantId: "other-org"` — rejected with 403
 
+## Network Management
+
+This section covers adding servers to a MindooDB network and configuring per-tenant sync.
+
+### Server discovery endpoint
+
+Every initialized server exposes its public identity at a well-known URL:
+
+```bash
+curl https://server1.example.com/.well-known/mindoodb-server-info
+```
+
+Response:
+
+```json
+{
+  "name": "CN=server1",
+  "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+  "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+}
+```
+
+This eliminates the need to manually copy public keys between servers.
+
+### Adding a server to the network
+
+The `add-to-network` CLI automates mutual trust exchange when adding a new server. It fetches each server's public keys via the well-known endpoint and registers them on every other server.
+
+```bash
+# 1. Initialize the new server
+MINDOODB_SERVER_PASSWORD=secret4 npm run init -- --name server4 --data-dir ./data4
+
+# 2. Start it
+MINDOODB_SERVER_PASSWORD=secret4 npm run dev -- -d ./data4 -p 3003 &
+
+# 3. Add it to the existing network
+npm run add-to-network -- \
+  --new-server http://localhost:3003 \
+  --servers http://localhost:3000,http://localhost:3001,http://localhost:3002 \
+  --api-key $ADMIN_KEY
+```
+
+The CLI will:
+
+1. Fetch server4's public keys from `/.well-known/mindoodb-server-info`
+2. For each existing server, fetch its public keys and exchange trust in both directions
+3. Print a summary showing how many servers were successfully configured
+
+If a server pair is already trusted, the CLI skips that pair instead of failing.
+
+### Configuring per-tenant sync
+
+After trust is established, configure which tenants each server syncs by using the admin API. This gives full control over sync topology — not every server needs to sync every tenant.
+
+**Add a sync server for a tenant:**
+
+```bash
+curl -X POST http://server1:3000/admin/tenants/acme/sync-servers \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $ADMIN_KEY" \
+  -d '{
+    "name": "CN=server2",
+    "url": "http://server2:3000",
+    "syncIntervalMs": 60000,
+    "databases": ["directory", "main"]
+  }'
+```
+
+The `databases` field is required and controls which databases are synced with the remote server. The `name` field identifies the remote server (must match the trusted server name). If a server with the same name already exists for the tenant, it is updated.
+
+**List sync servers for a tenant:**
+
+```bash
+curl http://server1:3000/admin/tenants/acme/sync-servers \
+  -H "X-API-Key: $ADMIN_KEY"
+```
+
+**Remove a sync server from a tenant:**
+
+```bash
+curl -X DELETE http://server1:3000/admin/tenants/acme/sync-servers/CN%3Dserver2 \
+  -H "X-API-Key: $ADMIN_KEY"
+```
+
+Note: the server name in the URL must be percent-encoded (e.g., `CN%3Dserver2` for `CN=server2`).
+
+### Complete workflow: new server joins and starts syncing
+
+```bash
+# Step 1: Init and start the new server
+MINDOODB_SERVER_PASSWORD=secret npm run init -- --name server3 --data-dir ./data3
+MINDOODB_SERVER_PASSWORD=secret npm run dev -- -d ./data3 -p 3002 &
+
+# Step 2: Add to network (establishes trust with all existing servers)
+npm run add-to-network -- \
+  --new-server http://localhost:3002 \
+  --servers http://localhost:3000,http://localhost:3001 \
+  --api-key $ADMIN_KEY
+
+# Step 3: Register the tenant on the new server (if not already published)
+# (Usually done by the tenant admin via publishToServer)
+
+# Step 4: Configure sync for specific tenants
+curl -X POST http://localhost:3002/admin/tenants/acme/sync-servers \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $ADMIN_KEY" \
+  -d '{"name":"CN=server1","url":"http://localhost:3000","syncIntervalMs":60000,"databases":["directory","main"]}'
+
+curl -X POST http://localhost:3000/admin/tenants/acme/sync-servers \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $ADMIN_KEY" \
+  -d '{"name":"CN=server3","url":"http://localhost:3002","syncIntervalMs":60000,"databases":["directory","main"]}'
+
+# Step 5: Restart servers with --auto-sync to activate periodic sync
+```
+
+Sync config changes take effect on the next server restart or when auto-sync timers are restarted.
+
 ## Configuration File Formats
 
 ### `server-identity.json` (global)
@@ -383,6 +520,7 @@ Generated by `npm run init`. Contains a `PrivateUserId` with encrypted private k
   ],
   "remoteServers": [
     {
+      "name": "CN=server2",
       "url": "https://server2.example.com",
       "syncIntervalMs": 60000,
       "databases": ["directory", "main"]
@@ -403,11 +541,13 @@ The server includes the following hardening measures:
 - **Error sanitization** -- internal errors never leak file paths or stack traces to clients. Only known auth/validation errors return specific messages.
 - **Request size limits** -- JSON body limited to 5MB. Array sizes capped (100k IDs, 10k entries for putEntries).
 - **Connection timeouts** -- idle connections are closed after 30 seconds.
+- **Admin IP allowlist** -- admin endpoints are restricted to localhost by default. Set `MINDOODB_ADMIN_ALLOWED_IPS` to a comma-separated list of IPs or CIDRs (e.g., `10.0.0.0/8,192.168.1.0/24`) to allow specific networks, or `*` to allow all. IPv4-mapped IPv6 addresses (e.g., `::ffff:127.0.0.1`) are normalized automatically. When behind a reverse proxy, configure Express's `trust proxy` setting so that `req.ip` reflects the real client IP.
 
 For production deployments, also consider:
 
 - Enabling TLS (see below) or running behind a reverse proxy (nginx, Caddy) with TLS termination
 - Setting `MINDOODB_ADMIN_API_KEY` (the server warns on startup if not set)
+- Reviewing the `MINDOODB_ADMIN_ALLOWED_IPS` setting (defaults to localhost only)
 - Using a process manager (PM2, systemd) for automatic restarts
 
 ## Static File Serving

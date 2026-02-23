@@ -130,10 +130,13 @@ Options:
   -h, --help              Show this help message
 
 Environment variables:
-  MINDOODB_SERVER_PASSWORD   Password to decrypt server identity private keys
-                             (required if server-identity.json exists)
-  MINDOODB_ADMIN_API_KEY     API key to protect admin endpoints (optional)
-                             If not set, admin endpoints are open
+  MINDOODB_SERVER_PASSWORD     Password to decrypt server identity private keys
+                               (required if server-identity.json exists)
+  MINDOODB_ADMIN_API_KEY       API key to protect admin endpoints (optional)
+                               If not set, admin endpoints are open
+  MINDOODB_ADMIN_ALLOWED_IPS   Comma-separated IPs/CIDRs allowed to access admin
+                               endpoints (default: localhost only). Set to "*" to
+                               allow all IPs. Example: "10.0.0.0/8,192.168.1.5"
 
 Examples:
   # Start server with default settings
@@ -183,6 +186,7 @@ async function main(): Promise<void> {
   const adminApiKey = process.env[ENV_VARS.ADMIN_API_KEY];
 
   console.log(`Admin API key: ${adminApiKey ? "configured" : "not set (endpoints open)"}`);
+  console.log(`Admin IP allowlist: ${process.env.MINDOODB_ADMIN_ALLOWED_IPS || "localhost only (default)"}`);
   console.log(`Server password: ${serverPassword ? "configured" : "not set"}`);
   console.log("=".repeat(60));
 

@@ -46,6 +46,7 @@ import type {
   UserConfig,
   TrustedServer,
   TenantCreationKey,
+  NamedRemoteServerConfig,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -256,6 +257,15 @@ export class TenantManager {
     return this.serverIdentity;
   }
 
+  getServerPublicInfo(): TrustedServer | null {
+    if (!this.serverIdentity) return null;
+    return {
+      name: this.serverIdentity.username,
+      signingPublicKey: this.serverIdentity.userSigningKeyPair.publicKey as string,
+      encryptionPublicKey: this.serverIdentity.userEncryptionKeyPair.publicKey as string,
+    };
+  }
+
   // =======================================================================
   // Trusted server management
   // =======================================================================
@@ -437,6 +447,72 @@ export class TenantManager {
 
     console.log(`[TenantManager] Removed tenant: ${normalizedId}`);
   }
+
+  // =======================================================================
+  // Per-tenant sync server management
+  // =======================================================================
+
+  getTenantSyncServers(tenantId: string): NamedRemoteServerConfig[] {
+    const normalizedId = tenantId.toLowerCase();
+    const configPath = join(this.dataDir, normalizedId, "config.json");
+    if (!existsSync(configPath)) {
+      throw new Error(`Tenant ${normalizedId} not found`);
+    }
+    const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+    return (config.remoteServers || []) as NamedRemoteServerConfig[];
+  }
+
+  addTenantSyncServer(tenantId: string, server: NamedRemoteServerConfig): void {
+    const normalizedId = tenantId.toLowerCase();
+    const configPath = join(this.dataDir, normalizedId, "config.json");
+    if (!existsSync(configPath)) {
+      throw new Error(`Tenant ${normalizedId} not found`);
+    }
+    const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+    const servers = (config.remoteServers || []) as NamedRemoteServerConfig[];
+
+    const idx = servers.findIndex(
+      (s) => s.name?.toLowerCase() === server.name.toLowerCase(),
+    );
+    if (idx >= 0) {
+      servers[idx] = server;
+      console.log(`[TenantManager] Updated sync server "${server.name}" for tenant ${normalizedId}`);
+    } else {
+      servers.push(server);
+      console.log(`[TenantManager] Added sync server "${server.name}" for tenant ${normalizedId}`);
+    }
+    config.remoteServers = servers;
+    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+
+    this.loadedTenants.delete(normalizedId);
+  }
+
+  removeTenantSyncServer(tenantId: string, serverName: string): boolean {
+    const normalizedId = tenantId.toLowerCase();
+    const configPath = join(this.dataDir, normalizedId, "config.json");
+    if (!existsSync(configPath)) {
+      throw new Error(`Tenant ${normalizedId} not found`);
+    }
+    const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+    const servers = (config.remoteServers || []) as NamedRemoteServerConfig[];
+
+    const idx = servers.findIndex(
+      (s) => s.name?.toLowerCase() === serverName.toLowerCase(),
+    );
+    if (idx === -1) return false;
+
+    servers.splice(idx, 1);
+    config.remoteServers = servers;
+    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+
+    this.loadedTenants.delete(normalizedId);
+    console.log(`[TenantManager] Removed sync server "${serverName}" from tenant ${normalizedId}`);
+    return true;
+  }
+
+  // =======================================================================
+  // Server stores
+  // =======================================================================
 
   async getServerStore(tenantId: string, dbId: string): Promise<ServerNetworkContentAddressedStore> {
     const tenant = await this.getTenant(tenantId);
