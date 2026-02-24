@@ -1020,6 +1020,25 @@ export class BaseMindooTenant implements MindooTenant {
   protected static readonly ENCRYPTION_MODE_DETERMINISTIC = 0x01;
 
   /**
+   * Check whether the symmetric key for the given key ID is available in the KeyBag.
+   * This is a lightweight probe that does not perform any crypto operations.
+   * 
+   * @param decryptionKeyId The key ID ("default" or a named key ID)
+   * @returns true if the key can be resolved, false otherwise
+   */
+  async hasDecryptionKey(decryptionKeyId: string): Promise<boolean> {
+    try {
+      await this.getSymmetricKey(decryptionKeyId);
+      return true;
+    } catch (error) {
+      if (error instanceof SymmetricKeyNotFoundError) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Get the symmetric key for a given key ID.
    * This is a protected helper method that can be used by subclasses.
    * 

@@ -99,6 +99,22 @@ class MockNetworkTransport implements NetworkTransport {
   async getCompactionStatus(token: string): Promise<StoreCompactionStatus> {
     return this.server.handleGetCompactionStatus(token);
   }
+
+  async planDocumentMaterialization(
+    token: string,
+    docId: string,
+    options?: { includeDiagnostics?: boolean }
+  ) {
+    return this.server.handlePlanDocumentMaterialization(token, docId, options);
+  }
+
+  async planDocumentMaterializationBatch(
+    token: string,
+    docIds: string[],
+    options?: { includeDiagnostics?: boolean }
+  ) {
+    return this.server.handlePlanDocumentMaterializationBatch(token, docIds, options);
+  }
 }
 
 describe("Network Sync", () => {
@@ -525,10 +541,12 @@ describe("Network Sync", () => {
 
     test("should negotiate capabilities from remote", async () => {
       const caps = await clientStore.getCapabilities();
-      expect(caps.protocolVersion).toBe("sync-v2");
+      expect(caps.protocolVersion).toBe("sync-v3");
       expect(caps.supportsCursorScan).toBe(true);
       expect(caps.supportsIdBloomSummary).toBe(true);
       expect(caps.supportsCompactionStatus).toBe(false);
+      expect(caps.supportsMaterializationPlanning).toBe(true);
+      expect(caps.supportsBatchMaterializationPlanning).toBe(true);
     });
 
     test("should return fallback compaction status when remote does not expose it", async () => {
@@ -536,6 +554,20 @@ describe("Network Sync", () => {
       expect(status.enabled).toBe(false);
       expect(status.totalCompactions).toBe(0);
       expect(status.lastCompactionAt).toBeNull();
+    });
+
+    test("should fetch materialization plans from remote", async () => {
+      const create = createMockEntry("doc-plan", "plan-a", 1000, [], "doc_create");
+      const change = createMockEntry("doc-plan", "plan-b", 2000, ["plan-a"], "doc_change");
+      await serverStore.putEntries([create, change]);
+
+      const single = await clientStore.planDocumentMaterialization("doc-plan");
+      expect(single.docId).toBe("doc-plan");
+      expect(single.entryIdsToApply).toEqual(["plan-a", "plan-b"]);
+
+      const batch = await clientStore.planDocumentMaterializationBatch(["doc-plan"]);
+      expect(batch.plans.length).toBe(1);
+      expect(batch.plans[0].entryIdsToApply).toEqual(["plan-a", "plan-b"]);
     });
 
     test("should fetch compaction status from remote when supported", async () => {

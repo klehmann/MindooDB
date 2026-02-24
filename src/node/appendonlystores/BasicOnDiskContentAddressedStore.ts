@@ -46,6 +46,9 @@ import {
   ContentAddressedStore,
   ContentAddressedStoreFactory,
   CreateStoreResult,
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
   OpenStoreOptions,
   StoreIndexBuildStatus,
   StoreCompactionStatus,
@@ -56,6 +59,7 @@ import {
   StoreIdBloomSummary,
 } from "../../core/appendonlystores/types";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
+import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
 import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 
@@ -1334,6 +1338,33 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     await this.ensureInitialized();
     const ids = await this.getAllIds();
     return createIdBloomSummary(ids);
+  }
+
+  async planDocumentMaterialization(
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan> {
+    await this.ensureInitialized();
+    let entries: StoreEntryMetadata[] = [];
+    if (this.indexingEnabled) {
+      const ids = this.docIndex.get(docId) || new Set<string>();
+      entries = Array.from(ids)
+        .map((id) => this.entries.get(id))
+        .filter((m): m is StoreEntryMetadata => m !== undefined);
+    } else {
+      const all = await this.listAllMetadata();
+      entries = all.filter((m) => m.docId === docId);
+    }
+    return computeDocumentMaterializationPlan(docId, entries, options);
+  }
+
+  async planDocumentMaterializationBatch(
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan> {
+    await this.ensureInitialized();
+    const all = await this.listAllMetadata();
+    return computeBatchMaterializationPlan(all, docIds, options);
   }
 
   /**

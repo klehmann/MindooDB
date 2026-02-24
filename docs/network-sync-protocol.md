@@ -25,13 +25,15 @@ This is called **metadata-first reconciliation**. Rather than streaming all data
 
 The fundamental sync unit is a `StoreEntry`. Each entry has an `id`, belongs to a `docId`, carries a `contentHash` for deduplication, and includes cryptographic metadata (who created it, when, and a signature proving authenticity). Entries can represent document changes, snapshots, or attachment chunks — the sync protocol treats them all the same way.
 
-### Two sync modes, one data model
+### Three sync modes, one data model
 
-MindooDB offers two sync flows that share the same entry model and endpoint set:
+MindooDB offers three sync flows that share the same entry model and endpoint set:
 
 **Baseline sync** is the simplest path. The client sends its known entry IDs to the server, the server responds with metadata for entries the client is missing, and the client fetches those entries. This works well for small-to-medium datasets and is the recommended starting point for any new integration.
 
 **Optimized sync** adds two techniques for larger datasets. First, cursor-based scanning lets the client page through remote metadata incrementally instead of sending a potentially huge list of known IDs. Second, a Bloom filter summary lets the client quickly classify remote IDs as "definitely not present locally" or "maybe present" — reducing the number of exact existence checks needed. These optimizations are negotiated at runtime through capability discovery, so a client built for optimized sync still works correctly against a server that only supports baseline.
+
+**Dense sync** transfers only the entries needed to reconstruct the latest state of each document rather than the full history. The client asks the server for a batch materialization plan that identifies the best snapshot and the minimal set of uncovered change entries per document. Historical entries that are already superseded by a snapshot are skipped, and attachment chunks are deferred for on-demand fetching. This mode is activated by passing `mode: "dense"` in `SyncOptions` and is especially valuable for initial device setup over bandwidth-constrained connections. See [db-open-and-sync-optimization.md](db-open-and-sync-optimization.md) for details on the underlying planner algorithm.
 
 ### Security is not optional
 
@@ -96,8 +98,10 @@ Before starting sync, the client calls `GET /sync/capabilities` to learn what th
 - `supportsCursorScan` — whether `scanEntriesSince` is available for incremental metadata paging
 - `supportsIdBloomSummary` — whether `getIdBloomSummary` is available for probabilistic set comparison
 - `supportsCompactionStatus` — whether `getCompactionStatus` is available for operational monitoring
+- `supportsMaterializationPlanning` — whether `planDocumentMaterialization` is available for causal replay planning
+- `supportsBatchMaterializationPlanning` — whether `planDocumentMaterializationBatch` is available for batch planning (required for dense sync)
 
-If this endpoint is unavailable (e.g., the server is an older version), the client should assume no optional features are supported and use the baseline flow.
+If this endpoint is unavailable (e.g., the server is an older version), the client should assume no optional features are supported and use the baseline flow. Clients that require dense sync must check for `supportsBatchMaterializationPlanning`; if the server does not report this capability, the client should fall back to full sync or raise a clear error.
 
 ### 3.3 Step 3: Find out what is missing
 
@@ -174,14 +178,16 @@ Before starting a sync session, the client queries `GET /sync/capabilities?dbId=
 
 ```typescript
 interface NetworkSyncCapabilities {
-  protocolVersion: string;           // e.g. "sync-v2"
-  supportsCursorScan: boolean;       // scanEntriesSince available
-  supportsIdBloomSummary: boolean;   // getIdBloomSummary available
-  supportsCompactionStatus: boolean; // getCompactionStatus available
+  protocolVersion: string;                      // e.g. "sync-v3"
+  supportsCursorScan: boolean;                  // scanEntriesSince available
+  supportsIdBloomSummary: boolean;              // getIdBloomSummary available
+  supportsCompactionStatus: boolean;            // getCompactionStatus available
+  supportsMaterializationPlanning: boolean;     // planDocumentMaterialization available
+  supportsBatchMaterializationPlanning: boolean; // planDocumentMaterializationBatch available
 }
 ```
 
-If the endpoint is unreachable or returns an error, the client falls back to conservative defaults where all optional features are disabled. This ensures that a client built for optimized sync still works correctly against any server, regardless of version.
+If the endpoint is unreachable or returns an error, the client falls back to conservative defaults where all optional features are disabled. This ensures that a client built for optimized or dense sync still works correctly against any server, regardless of version.
 
 ### 5.2 Reconciliation invariants
 
@@ -262,6 +268,8 @@ interface StoreEntryMetadata {
   contentHash: string;
   docId: string;
   dependencyIds: string[];
+  snapshotHeadHashes?: string[];    // Automerge head hashes covered by a doc_snapshot
+  snapshotHeadEntryIds?: string[];  // Entry IDs corresponding to those heads (for metadata-only planning)
   createdAt: number;
   createdByPublicKey: string;
   decryptionKeyId: string;
@@ -270,6 +278,8 @@ interface StoreEntryMetadata {
   encryptedSize: number;
 }
 ```
+
+The optional `snapshotHeadHashes` and `snapshotHeadEntryIds` fields are present only on `doc_snapshot` entries. They record which Automerge heads the snapshot covers so the materialization planner can evaluate snapshot coverage without decrypting the payload.
 
 **NetworkEncryptedEntry** — a full entry as returned by `getEntries`, including the RSA-encrypted payload.
 
@@ -344,6 +354,8 @@ All `/sync/*` endpoints require `Authorization: Bearer <jwt>`.
 | `POST` | `/sync/putEntries` | Push entries from client to server |
 | `GET` | `/sync/getAllIds` | Fetch all entry IDs from the server |
 | `POST` | `/sync/resolveDependencies` | Ask the server to traverse entry dependency chains |
+| `POST` | `/sync/planDocumentMaterialization` | Compute causal materialization plan for a single document |
+| `POST` | `/sync/planDocumentMaterializationBatch` | Compute materialization plans for multiple documents in one call |
 | `POST` | `/sync/getCompactionStatus` | Retrieve on-disk store compaction metrics |
 
 ### 7.3 Request/response examples
@@ -447,3 +459,5 @@ Response:
 
 - Main system spec: [specification.md](specification.md)
 - On-disk store deep dive: [on-disk-content-addressed-store.md](on-disk-content-addressed-store.md)
+- DB open, dense sync, and materialization planner: [db-open-and-sync-optimization.md](db-open-and-sync-optimization.md)
+- Peer-to-peer and advanced topologies: [p2psync.md](p2psync.md)

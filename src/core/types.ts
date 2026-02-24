@@ -531,6 +531,10 @@ export type {
   StoreScanFilters,
   StoreScanResult,
   StoreIdBloomSummary,
+  MaterializationPlanOptions,
+  MaterializationPlanDiagnostics,
+  DocumentMaterializationPlan,
+  DocumentMaterializationBatchPlan,
 } from "./appendonlystores/types";
 
 /**
@@ -588,6 +592,20 @@ export interface StoreEntryMetadata {
    * - For attachment_chunk: Previous chunk's entry ID (enables append-only file growth)
    */
   dependencyIds: string[];
+
+  /**
+   * Optional causal coverage heads for snapshot entries.
+   * For `doc_snapshot`, this lists the Automerge head hashes represented by the snapshot.
+   * For other entry types this should be undefined.
+   */
+  snapshotHeadHashes?: string[];
+
+  /**
+   * Optional entry IDs corresponding to the snapshot heads.
+   * This allows stores to plan replay using metadata only, without decrypting payloads.
+   * For non-snapshot entries this should be undefined.
+   */
+  snapshotHeadEntryIds?: string[];
 
   /**
    * The timestamp when this entry was created (milliseconds since Unix epoch).
@@ -1126,13 +1144,20 @@ export interface MindooTenantDirectory {
  */
 export interface ProcessChangesCursor {
   /**
+   * Monotonic changefeed sequence number assigned by BaseMindooDB.
+   * This is the primary cursor field for deterministic, gap-free iteration.
+   */
+  changeSeq?: number;
+  /**
    * The timestamp of the last processed change (milliseconds since Unix epoch)
+   * Legacy compatibility field. New code should use `changeSeq`.
    */
   lastModified: number;
   
   /**
    * The document ID of the last processed change.
    * Used to break ties when multiple documents have the same timestamp.
+   * Legacy compatibility field. New code should use `changeSeq`.
    */
   docId: string;
 }
@@ -1235,7 +1260,7 @@ export interface PerformanceCallback {
  * Progress information emitted during pull/push sync operations.
  */
 export interface SyncProgress {
-  phase: 'preparing' | 'transferring' | 'processing' | 'complete';
+  phase: 'preparing' | 'planning' | 'transferring' | 'processing' | 'complete';
   message: string;
   transferredEntries: number;
   scannedEntries: number;
@@ -1244,12 +1269,31 @@ export interface SyncProgress {
 }
 
 /**
+ * Sync mode controls how much data is transferred between stores.
+ *
+ * - `"full"` (default) transfers every entry the target is missing.
+ * - `"dense"` uses the batch materialization planner to transfer only the
+ *   entries needed to reconstruct the latest state of each document (best
+ *   snapshot + uncovered changes + lifecycle bookkeeping).  Historical
+ *   entries superseded by a snapshot are skipped, and attachment chunks are
+ *   deferred.
+ */
+export type SyncMode = "full" | "dense";
+
+/**
  * Options for pull/push sync operations.
  */
 export interface SyncOptions {
   onProgress?: (progress: SyncProgress) => void;
   pageSize?: number;
   signal?: AbortSignal;
+  /**
+   * Transfer strategy.  Defaults to `"full"`.
+   *
+   * Use `"dense"` for bandwidth-constrained scenarios (initial mobile setup,
+   * metered connections) where only the current document state is needed.
+   */
+  mode?: SyncMode;
 }
 
 /**

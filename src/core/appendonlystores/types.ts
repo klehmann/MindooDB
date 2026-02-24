@@ -119,6 +119,70 @@ export interface StoreIdBloomSummary {
 }
 
 /**
+ * Options for causal document materialization planning.
+ * The planner computes which snapshot (if any) should be used and which
+ * change entries still need to be applied to reconstruct the latest state.
+ */
+export interface MaterializationPlanOptions {
+  /**
+   * If true, include planner diagnostics to aid debugging and tuning.
+   */
+  includeDiagnostics?: boolean;
+}
+
+/**
+ * Debug and observability details for materialization planning.
+ */
+export interface MaterializationPlanDiagnostics {
+  /**
+   * Current tip entries for the document (entries with no descendants in the
+   * doc graph among change/create/delete entries).
+   */
+  headEntryIds: string[];
+  /**
+   * Number of latest-state entries causally covered by the selected snapshot.
+   */
+  coveredLatestEntryCount: number;
+  /**
+   * Number of latest-state entries not covered by the selected snapshot.
+   */
+  uncoveredLatestEntryCount: number;
+}
+
+/**
+ * Store-level causal replay plan for one document.
+ */
+export interface DocumentMaterializationPlan {
+  /**
+   * Document ID this plan is for.
+   */
+  docId: string;
+  /**
+   * Snapshot entry to load first (if present).
+   */
+  snapshotEntryId: string | null;
+  /**
+   * Change entry IDs to apply after the snapshot (or from empty doc if no snapshot).
+   * The order is dependency-first (oldest first).
+   */
+  entryIdsToApply: string[];
+  /**
+   * Optional debug details.
+   */
+  diagnostics?: MaterializationPlanDiagnostics;
+}
+
+/**
+ * Batched materialization planning result.
+ */
+export interface DocumentMaterializationBatchPlan {
+  /**
+   * Per-document plans.
+   */
+  plans: DocumentMaterializationPlan[];
+}
+
+/**
  * Result of creating stores for a database.
  * Contains the document store and an optional separate attachment store.
  */
@@ -274,6 +338,25 @@ export interface ContentAddressedStore {
    * Callers must still perform exact reconciliation for correctness.
    */
   getIdBloomSummary?(): Promise<StoreIdBloomSummary>;
+
+  /**
+   * Plan causal materialization for a single document.
+   * This allows callers to fetch only required entries instead of scanning/applying
+   * full history every time.
+   */
+  planDocumentMaterialization(
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan>;
+
+  /**
+   * Plan causal materialization for multiple documents in one call.
+   * Batch planning is important for high-latency network stores to reduce round trips.
+   */
+  planDocumentMaterializationBatch(
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan>;
 
   /**
    * Resolve the dependency chain starting from an entry ID.

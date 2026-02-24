@@ -8,6 +8,11 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "../../types";
+import type {
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
+} from "../types";
 import type { NetworkEncryptedEntry, AuthResult, NetworkSyncCapabilities } from "./types";
 
 /**
@@ -147,6 +152,24 @@ export interface NetworkTransport {
    * Optional compaction observability for remote store monitoring.
    */
   getCompactionStatus?(token: string): Promise<StoreCompactionStatus>;
+
+  /**
+   * Compute a causal materialization plan for one document on the remote store.
+   */
+  planDocumentMaterialization?(
+    token: string,
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan>;
+
+  /**
+   * Compute causal materialization plans for multiple documents on the remote store.
+   */
+  planDocumentMaterializationBatch?(
+    token: string,
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan>;
 
   /**
    * Get entries from the remote store.

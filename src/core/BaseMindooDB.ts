@@ -48,6 +48,8 @@ import type { CacheManager } from "./cache/CacheManager";
  * Default chunk size for attachments: 256KB
  */
 const DEFAULT_CHUNK_SIZE_BYTES = 256 * 1024;
+const SNAPSHOT_MIN_CHANGES = 100;
+const SNAPSHOT_COOLDOWN_MS = 10 * 60 * 1000;
 
 /**
  * Internal representation of a document with its Automerge state
@@ -89,12 +91,13 @@ export class BaseMindooDB implements MindooDB {
   // Admin-only mode: only entries signed by the admin key are loaded
   private _isAdminOnlyDb: boolean;
   
-  // Internal index: sorted array of document entries, maintained in order by (lastModified, docId)
-  // This allows efficient incremental processing without sorting on each call
-  private index: Array<{ docId: string; lastModified: number; isDeleted: boolean }> = [];
+  // Internal changefeed index: sorted by (changeSeq, docId) for deterministic iteration.
+  // lastModified remains available for UX metadata but is not the primary cursor key.
+  private index: Array<{ docId: string; changeSeq: number; lastModified: number; isDeleted: boolean }> = [];
   
   // Lookup map for O(1) access to index entries by docId
   private indexLookup: Map<string, number> = new Map(); // Map<docId, arrayIndex>
+  private nextChangeSeq: number = 1;
   
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
@@ -230,6 +233,7 @@ export class BaseMindooDB implements MindooDB {
       version: 1,
       processedEntryCursor: this.processedEntryCursor,
       index: this.index,
+      nextChangeSeq: this.nextChangeSeq,
     };
 
     // Serialize automergeHashToEntryId: Map<string, Map<string,string>> -> nested object
@@ -270,6 +274,7 @@ export class BaseMindooDB implements MindooDB {
       // 2. Restore metadata
       this.processedEntryCursor = checkpoint.processedEntryCursor ?? null;
       this.index = checkpoint.index ?? [];
+      this.nextChangeSeq = checkpoint.nextChangeSeq ?? 1;
       if (checkpoint.processedEntryIds) {
         this.processedEntryIds = checkpoint.processedEntryIds;
       }
@@ -277,7 +282,13 @@ export class BaseMindooDB implements MindooDB {
       // Rebuild indexLookup from index
       this.indexLookup.clear();
       for (let i = 0; i < this.index.length; i++) {
+        if (typeof this.index[i].changeSeq !== "number") {
+          this.index[i].changeSeq = i + 1;
+        }
         this.indexLookup.set(this.index[i].docId, i);
+      }
+      if (this.index.length > 0 && this.nextChangeSeq <= this.index.length) {
+        this.nextChangeSeq = Math.max(...this.index.map(e => e.changeSeq)) + 1;
       }
 
       // Restore automergeHashToEntryId
@@ -399,22 +410,22 @@ export class BaseMindooDB implements MindooDB {
   /**
    * Compare two index entries for sorting.
    * Returns negative if a < b, positive if a > b, 0 if equal.
-   * Sorts by lastModified first, then by docId for uniqueness.
+   * Sorts by deterministic changeSeq first, then by docId for uniqueness.
    */
   private compareIndexEntries(
-    a: { docId: string; lastModified: number },
-    b: { docId: string; lastModified: number }
+    a: { docId: string; changeSeq: number },
+    b: { docId: string; changeSeq: number }
   ): number {
-    if (a.lastModified !== b.lastModified) {
-      return a.lastModified - b.lastModified;
+    if (a.changeSeq !== b.changeSeq) {
+      return a.changeSeq - b.changeSeq;
     }
     return a.docId.localeCompare(b.docId);
   }
 
   /**
    * Update the index entry for a document.
-   * When a document changes, it's removed from its current position and inserted
-   * at the correct sorted position to maintain order by (lastModified, docId).
+   * When a document changes, it gets a new monotonic sequence and is moved to
+   * maintain order by (changeSeq, docId).
    * 
    * Optimized to only update lookup map for entries that actually moved.
    * 
@@ -423,13 +434,14 @@ export class BaseMindooDB implements MindooDB {
    * @param isDeleted Whether the document is deleted
    */
   private updateIndex(docId: string, lastModified: number, isDeleted: boolean): void {
-    const newEntry = { docId, lastModified, isDeleted };
+    const assignedSeq = this.nextChangeSeq;
+    const newEntry = { docId, changeSeq: assignedSeq, lastModified, isDeleted };
     const existingIndex = this.indexLookup.get(docId);
     
     // Check if the entry already exists and hasn't changed position
     if (existingIndex !== undefined) {
       const existingEntry = this.index[existingIndex];
-      // If position hasn't changed (same lastModified and docId), no update needed
+      // If only metadata flags stayed identical and caller replays same state, skip.
       if (existingEntry.lastModified === lastModified && existingEntry.isDeleted === isDeleted) {
         return; // No change needed
       }
@@ -466,6 +478,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Insert at the correct position
     this.index.splice(insertIndex, 0, newEntry);
+    this.nextChangeSeq = assignedSeq + 1;
     
     // Update lookup map for entries from insertion point onwards
     // Only update entries that actually moved (from insertIndex to end)
@@ -607,15 +620,38 @@ export class BaseMindooDB implements MindooDB {
             }
           }
         } else {
-          // Document not cached - load from scratch
-          this.logger.debug(`Document ${docId} not in cache, loading from store`);
-          updatedDoc = await this.loadDocumentInternal(docId);
-          if (updatedDoc) {
-            this.logger.debug(`Successfully loaded document ${docId}, updating index`);
-            this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted);
-            this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted})`);
+          // Metadata-first startup: avoid full materialization for uncached docs.
+          // Index based on doc-lifecycle entries (create/change/delete) plus
+          // doc_snapshot which may be the sole entry after a dense sync.
+          // Attachment-only batches should not trigger document index updates.
+          const docLifecycleEntries = entryMetadataList.filter(
+            (e) =>
+              e.entryType === "doc_create" ||
+              e.entryType === "doc_change" ||
+              e.entryType === "doc_delete" ||
+              e.entryType === "doc_snapshot",
+          );
+          if (docLifecycleEntries.length === 0) {
+            this.logger.debug(
+              `Skipping metadata-first index for doc ${docId} — no document lifecycle entries (${entryMetadataList.length} attachment/other entries only)`,
+            );
           } else {
-            this.logger.warn(`Document ${docId} returned null from loadDocumentInternal`);
+            // Before indexing, verify the user has the decryption key so that
+            // documents the user cannot access do not appear in getAllDocumentIds.
+            const representativeEntry = docLifecycleEntries[0];
+            const keyAvailable = await this.tenant.hasDecryptionKey(representativeEntry.decryptionKeyId);
+            if (!keyAvailable) {
+              this.logger.debug(
+                `Skipping metadata-first index for doc ${docId} — decryption key "${representativeEntry.decryptionKeyId}" not available`,
+              );
+            } else {
+              const lastModified = Math.max(...docLifecycleEntries.map((e) => e.createdAt));
+              const isDeleted = docLifecycleEntries.some((e) => e.entryType === "doc_delete");
+              this.updateIndex(docId, lastModified, isDeleted);
+              this.logger.debug(
+                `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted})`,
+              );
+            }
           }
         }
       } catch (error) {
@@ -633,30 +669,19 @@ export class BaseMindooDB implements MindooDB {
       }
     };
     
-    // Process documents in parallel with concurrency limit (default: 10)
-    const maxConcurrency = 10;
-    const documentEntries = Array.from(entriesByDoc.entries());
-    
-    // Process in batches to limit concurrency
-    const results: PromiseSettledResult<void>[] = [];
-    for (let i = 0; i < documentEntries.length; i += maxConcurrency) {
-      const batch = documentEntries.slice(i, i + maxConcurrency);
-      const batchResults = await Promise.allSettled(
-        batch.map(([docId, entryMetadataList]) => processDocument(docId, entryMetadataList))
-      );
-      results.push(...batchResults);
-    }
-    
-    // Check for errors (excluding SymmetricKeyNotFoundError which is handled gracefully)
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i];
-      if (result.status === 'rejected') {
-        const error = result.reason;
-        if (!(error instanceof SymmetricKeyNotFoundError)) {
-          // Re-throw non-key errors
-          throw error;
+    const documentEntries = Array.from(entriesByDoc.entries())
+      .sort((a, b) => {
+        const aMinCreatedAt = Math.min(...a[1].map((e) => e.createdAt));
+        const bMinCreatedAt = Math.min(...b[1].map((e) => e.createdAt));
+        if (aMinCreatedAt !== bMinCreatedAt) {
+          return aMinCreatedAt - bMinCreatedAt;
         }
-      }
+        return a[0].localeCompare(b[0]);
+      });
+
+    // Deterministic sequential processing ensures stable changefeed ordering.
+    for (const [docId, entryMetadataList] of documentEntries) {
+      await processDocument(docId, entryMetadataList);
     }
     
     // Append new entry IDs to our processed list
@@ -718,25 +743,73 @@ export class BaseMindooDB implements MindooDB {
     return allNew;
   }
 
+  /**
+   * Fetch the target store's bloom filter summary, returning null if
+   * unsupported or on error (callers fall back to exact checks).
+   */
+  private async getTargetBloomSummary(
+    targetStore: ContentAddressedStore,
+  ): Promise<StoreIdBloomSummary | null> {
+    if (typeof targetStore.getIdBloomSummary !== "function") {
+      return null;
+    }
+    try {
+      return await targetStore.getIdBloomSummary();
+    } catch (error) {
+      this.logger.warn("Failed to get bloom summary from target store, falling back to exact checks", error);
+      return null;
+    }
+  }
+
+  /**
+   * From a list of candidate IDs, return only those the target store is
+   * missing.  Uses bloom-filter pre-screening when available, then falls
+   * back to exact `hasEntries` for the uncertain set.
+   */
+  private async filterMissingIds(
+    targetStore: ContentAddressedStore,
+    candidateIds: string[],
+    bloom: StoreIdBloomSummary | null,
+  ): Promise<string[]> {
+    let definitelyMissing: string[] = [];
+    let maybeExisting: string[] = candidateIds;
+
+    if (bloom) {
+      definitelyMissing = [];
+      maybeExisting = [];
+      for (const id of candidateIds) {
+        if (bloomMightContainId(bloom, id)) {
+          maybeExisting.push(id);
+        } else {
+          definitelyMissing.push(id);
+        }
+      }
+    }
+
+    let missingIds = definitelyMissing;
+    if (maybeExisting.length > 0) {
+      const existing = await targetStore.hasEntries(maybeExisting);
+      const existingSet = new Set(existing);
+      missingIds = missingIds.concat(maybeExisting.filter((id) => !existingSet.has(id)));
+    }
+    return missingIds;
+  }
+
   private async syncEntriesFromStore(
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions
   ): Promise<{ transferred: number; cancelled: boolean }> {
+    if (options?.mode === "dense") {
+      return this.syncEntriesFromStoreDense(sourceStore, targetStore, options);
+    }
+
     let transferred = 0;
     let scanned = 0;
     const onProgress = options?.onProgress;
     const pageSize = options?.pageSize ?? 1000;
 
-    let targetBloom: StoreIdBloomSummary | null = null;
-    if (typeof targetStore.getIdBloomSummary === "function") {
-      try {
-        targetBloom = await targetStore.getIdBloomSummary();
-      } catch (error) {
-        this.logger.warn("Failed to get bloom summary from target store, falling back to exact checks", error);
-      }
-    }
-
+    const targetBloom = await this.getTargetBloomSummary(targetStore);
     const totalSourceEstimate = targetBloom?.totalIds;
 
     if (this.supportsCursorScan(sourceStore)) {
@@ -761,28 +834,7 @@ export class BaseMindooDB implements MindooDB {
 
         if (page.entries.length > 0) {
           const ids = page.entries.map((m) => m.id);
-          let definitelyMissing: string[] = [];
-          let maybeExisting: string[] = ids;
-
-          if (targetBloom) {
-            definitelyMissing = [];
-            maybeExisting = [];
-            for (const id of ids) {
-              if (bloomMightContainId(targetBloom, id)) {
-                maybeExisting.push(id);
-              } else {
-                definitelyMissing.push(id);
-              }
-            }
-          }
-
-          let missingIds = definitelyMissing;
-          if (maybeExisting.length > 0) {
-            const existing = await targetStore.hasEntries(maybeExisting);
-            const existingSet = new Set(existing);
-            const maybeMissing = maybeExisting.filter((id) => !existingSet.has(id));
-            missingIds = missingIds.concat(maybeMissing);
-          }
+          const missingIds = await this.filterMissingIds(targetStore, ids, targetBloom);
 
           if (missingIds.length > 0) {
             const missingEntries = await sourceStore.getEntries(missingIds);
@@ -845,6 +897,137 @@ export class BaseMindooDB implements MindooDB {
     });
 
     return { transferred: sourceEntries.length, cancelled: false };
+  }
+
+  /**
+   * Dense sync: transfer only the entries required to reconstruct the latest
+   * state of each document, using the batch materialization planner to skip
+   * historical entries already superseded by snapshots.
+   *
+   * Algorithm:
+   * 1. Discover all documents on the source via `doc_create` metadata.
+   * 2. Also fetch `doc_delete` metadata so deletion markers are transferred.
+   * 3. Ask the source's batch planner for the optimal replay set per document.
+   * 4. Merge all entry IDs: doc_create + doc_delete + snapshot + uncovered changes.
+   * 5. Filter out IDs the target already has (bloom + exact check).
+   * 6. Transfer only the missing entries.
+   *
+   * Attachment chunks are intentionally skipped — they are not part of the
+   * Automerge document DAG and can be fetched on demand when accessed.
+   */
+  private async syncEntriesFromStoreDense(
+    sourceStore: ContentAddressedStore,
+    targetStore: ContentAddressedStore,
+    options?: SyncOptions,
+  ): Promise<{ transferred: number; cancelled: boolean }> {
+    const onProgress = options?.onProgress;
+
+    onProgress?.({
+      phase: "preparing",
+      message: "Dense sync: discovering documents on source...",
+      transferredEntries: 0,
+      scannedEntries: 0,
+    });
+
+    if (options?.signal?.aborted) {
+      return { transferred: 0, cancelled: true };
+    }
+
+    // ── Phase 1: discover documents ──────────────────────────────────
+    const docCreateEntries = await sourceStore.findEntries("doc_create", null, null);
+    const docDeleteEntries = await sourceStore.findEntries("doc_delete", null, null);
+    const docIds = [...new Set(docCreateEntries.map((e) => e.docId))];
+
+    this.logger.info(`Dense sync: found ${docIds.length} documents on source`);
+
+    if (docIds.length === 0) {
+      return { transferred: 0, cancelled: false };
+    }
+
+    if (options?.signal?.aborted) {
+      return { transferred: 0, cancelled: true };
+    }
+
+    // ── Phase 2: batch plan on source ────────────────────────────────
+    onProgress?.({
+      phase: "planning",
+      message: `Dense sync: computing materialization plans for ${docIds.length} documents...`,
+      transferredEntries: 0,
+      scannedEntries: docIds.length,
+    });
+
+    const batchPlan = await sourceStore.planDocumentMaterializationBatch(docIds);
+
+    // ── Phase 3: collect needed entry IDs ────────────────────────────
+    const neededIds = new Set<string>();
+
+    for (const entry of docCreateEntries) {
+      neededIds.add(entry.id);
+    }
+    for (const entry of docDeleteEntries) {
+      neededIds.add(entry.id);
+    }
+    for (const plan of batchPlan.plans) {
+      if (plan.snapshotEntryId) {
+        neededIds.add(plan.snapshotEntryId);
+      }
+      for (const id of plan.entryIdsToApply) {
+        neededIds.add(id);
+      }
+    }
+
+    this.logger.info(
+      `Dense sync: planner identified ${neededIds.size} required entries ` +
+      `(from ${docIds.length} documents)`,
+    );
+
+    if (options?.signal?.aborted) {
+      return { transferred: 0, cancelled: true };
+    }
+
+    // ── Phase 4: filter out entries the target already has ───────────
+    const allNeededArray = Array.from(neededIds);
+    const targetBloom = await this.getTargetBloomSummary(targetStore);
+    const missingIds = await this.filterMissingIds(targetStore, allNeededArray, targetBloom);
+
+    this.logger.info(
+      `Dense sync: ${missingIds.length} entries to transfer ` +
+      `(${allNeededArray.length - missingIds.length} already present)`,
+    );
+
+    if (missingIds.length === 0) {
+      return { transferred: 0, cancelled: false };
+    }
+
+    if (options?.signal?.aborted) {
+      return { transferred: 0, cancelled: true };
+    }
+
+    // ── Phase 5: transfer missing entries in pages ───────────────────
+    const pageSize = options?.pageSize ?? 500;
+    let transferred = 0;
+
+    for (let offset = 0; offset < missingIds.length; offset += pageSize) {
+      if (options?.signal?.aborted) {
+        return { transferred, cancelled: true };
+      }
+
+      const batch = missingIds.slice(offset, offset + pageSize);
+      const entries = await sourceStore.getEntries(batch);
+      await targetStore.putEntries(entries);
+      transferred += entries.length;
+
+      onProgress?.({
+        phase: "transferring",
+        message: `Dense sync: transferred ${transferred}/${missingIds.length} entries`,
+        transferredEntries: transferred,
+        scannedEntries: allNeededArray.length,
+        totalSourceEntries: allNeededArray.length,
+      });
+    }
+
+    this.logger.info(`Dense sync complete: transferred ${transferred} entries`);
+    return { transferred, cancelled: false };
   }
 
   getStore(): ContentAddressedStore {
@@ -1864,30 +2047,123 @@ export class BaseMindooDB implements MindooDB {
     this.markDocDirty(docId);
     
     this.logger.info(`Document ${docId} ${useCustomKey ? 'changed with custom signing key' : 'changed'} successfully`);
+
+    // Snapshot creation runs as a best-effort background optimization.
+    await this.maybeWriteSnapshotForDocument(
+      internalDoc,
+      useCustomKey
+        ? { signingKeyPair, signingKeyPassword, createdByPublicKey }
+        : { createdByPublicKey },
+    );
+  }
+
+  /**
+   * Best-effort snapshot scheduling and writing.
+   * A snapshot is written only when enough replay history has accumulated and
+   * a cooldown window has elapsed, to avoid snapshot churn on hot documents.
+   */
+  private async maybeWriteSnapshotForDocument(
+    internalDoc: InternalDoc,
+    options: {
+      signingKeyPair?: SigningKeyPair;
+      signingKeyPassword?: string;
+      createdByPublicKey: string;
+    },
+  ): Promise<void> {
+    const docId = internalDoc.id;
+    try {
+      const allMetadata = await this.scanAllMetadata(this.store, { docId });
+      const replayEntries = allMetadata.filter(
+        (em) => em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete",
+      );
+      const snapshots = allMetadata
+        .filter((em) => em.entryType === "doc_snapshot")
+        .sort((a, b) => b.createdAt - a.createdAt);
+      const latestSnapshot = snapshots[0] || null;
+      const latestSnapshotAt = latestSnapshot?.createdAt ?? 0;
+      const changesSinceSnapshot = replayEntries.filter((em) => em.createdAt > latestSnapshotAt).length;
+      if (changesSinceSnapshot < SNAPSHOT_MIN_CHANGES) {
+        return;
+      }
+      if (latestSnapshot && Date.now() - latestSnapshot.createdAt < SNAPSHOT_COOLDOWN_MS) {
+        return;
+      }
+
+      const headHashes = Automerge.getHeads(internalDoc.doc);
+      const headEntryIds = this.resolveAutomergeDepsToEntryIds(docId, headHashes);
+      const snapshotBytes = Automerge.save(internalDoc.doc);
+      const encryptedPayload = await this.tenant.encryptPayload(snapshotBytes, internalDoc.decryptionKeyId);
+      const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
+      const pseudoSnapshotHash = `snapshot-${uuidv7()}`;
+      const entryId = await generateDocEntryId(docId, pseudoSnapshotHash, headHashes, this.getSubtle());
+
+      let signature: Uint8Array;
+      if (options.signingKeyPair && options.signingKeyPassword) {
+        signature = await this.tenant.signPayloadWithKey(
+          encryptedPayload,
+          options.signingKeyPair,
+          options.signingKeyPassword,
+        );
+      } else {
+        signature = await this.tenant.signPayload(encryptedPayload);
+      }
+
+      const snapshotEntry: StoreEntry = {
+        entryType: "doc_snapshot",
+        id: entryId,
+        contentHash,
+        docId,
+        dependencyIds: headEntryIds,
+        createdAt: Date.now(),
+        createdByPublicKey: options.createdByPublicKey,
+        decryptionKeyId: internalDoc.decryptionKeyId,
+        snapshotHeadHashes: headHashes,
+        snapshotHeadEntryIds: headEntryIds,
+        signature,
+        originalSize: snapshotBytes.length,
+        encryptedSize: encryptedPayload.length,
+        encryptedData: encryptedPayload,
+      };
+
+      await this.store.putEntries([snapshotEntry]);
+      this.logger.debug(
+        `Created snapshot for document ${docId} with ${headHashes.length} heads and ${changesSinceSnapshot} changes since previous snapshot`,
+      );
+    } catch (error) {
+      this.logger.warn(`Failed to create snapshot for document ${docId}, continuing without snapshot`, error);
+    }
   }
 
   async *iterateChangesSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
-    // Default to initial cursor if null is provided
-    const actualCursor: ProcessChangesCursor = cursor ?? { lastModified: 0, docId: "" };
+    // Default to initial cursor if null is provided.
+    // Prefer deterministic sequence-based cursoring; keep legacy fallback compatibility.
+    const actualCursor: ProcessChangesCursor = cursor ?? { changeSeq: 0, lastModified: 0, docId: "" };
     this.logger.debug(`Starting iteration from cursor ${JSON.stringify(actualCursor)}`);
-    
+
+    // Use a stable snapshot of the index for this generator run so concurrent
+    // updates do not reorder/skip entries while iterating.
+    const indexSnapshot = [...this.index];
+
     // Find starting position using binary search
-    // We want to find the first entry that is greater than the cursor
+    // We want to find the first entry that is greater than the cursor.
     let startIndex = 0;
-    if (this.index.length > 0) {
+    if (indexSnapshot.length > 0) {
+      const cursorSeq =
+        typeof actualCursor.changeSeq === "number"
+          ? actualCursor.changeSeq
+          : 0;
+
       let left = 0;
-      let right = this.index.length - 1;
-      
+      let right = indexSnapshot.length - 1;
+
       while (left <= right) {
         const mid = Math.floor((left + right) / 2);
-        const entry = this.index[mid];
-        const cmp = this.compareIndexEntries(
-          { docId: actualCursor.docId, lastModified: actualCursor.lastModified },
-          entry
-        );
-        
+        const entry = indexSnapshot[mid];
+        const cursorComparable = { docId: actualCursor.docId, changeSeq: cursorSeq };
+        const cmp = this.compareIndexEntries(cursorComparable, entry);
+
         if (cmp < 0) {
           right = mid - 1;
           startIndex = mid;
@@ -1897,19 +2173,19 @@ export class BaseMindooDB implements MindooDB {
         }
       }
       
-      // If we found an exact match, start from the next entry
-      if (startIndex < this.index.length) {
-        const entry = this.index[startIndex];
-        if (entry.lastModified === actualCursor.lastModified && entry.docId === actualCursor.docId) {
+      // If we found an exact match, start from the next entry.
+      if (startIndex < indexSnapshot.length) {
+        const entry = indexSnapshot[startIndex];
+        if (entry.changeSeq === cursorSeq && entry.docId === actualCursor.docId) {
           startIndex++;
         }
       }
     }
-    
+
     // Pre-check which documents are in cache to optimize iteration
     const uncachedDocIds: string[] = [];
-    for (let i = startIndex; i < this.index.length; i++) {
-      const entry = this.index[i];
+    for (let i = startIndex; i < indexSnapshot.length; i++) {
+      const entry = indexSnapshot[i];
       if (!this.docCache.has(entry.docId)) {
         uncachedDocIds.push(entry.docId);
       }
@@ -1930,10 +2206,10 @@ export class BaseMindooDB implements MindooDB {
       }
     }
     
-    // Iterate through the index and yield documents one at a time
+    // Iterate through the stable snapshot and yield documents one at a time.
     // Documents should now be in cache from prefetching
-    for (let i = startIndex; i < this.index.length; i++) {
-      const entry = this.index[i];
+    for (let i = startIndex; i < indexSnapshot.length; i++) {
+      const entry = indexSnapshot[i];
       
       try {
         this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
@@ -1958,6 +2234,7 @@ export class BaseMindooDB implements MindooDB {
         
         // Create cursor for current document
         const currentCursor: ProcessChangesCursor = {
+          changeSeq: entry.changeSeq,
           lastModified: entry.lastModified,
           docId: entry.docId,
         };
@@ -2180,28 +2457,27 @@ export class BaseMindooDB implements MindooDB {
     const entryTypes = allEntryMetadata.map(em => `${em.entryType}@${em.createdAt}`).join(', ');
     this.logger.debug(`Entry types for ${docId}: ${entryTypes}`);
     
-    // Find the most recent snapshot (if any)
-    const snapshots = allEntryMetadata.filter(em => em.entryType === "doc_snapshot");
-    this.logger.debug(`Found ${snapshots.length} snapshot(s) for document ${docId}`);
-    let startFromSnapshot = false;
-    let snapshotMeta: StoreEntryMetadata | null = null;
-    
-    if (snapshots.length > 0) {
-      // Use the most recent snapshot
-      snapshots.sort((a, b) => b.createdAt - a.createdAt);
-      snapshotMeta = snapshots[0];
-      startFromSnapshot = true;
-      this.logger.debug(`Will start from snapshot ${snapshotMeta.id} created at ${snapshotMeta.createdAt}`);
-    } else {
-      this.logger.debug(`No snapshot found, will start from scratch`);
+    const metadataById = new Map(allEntryMetadata.map((meta) => [meta.id, meta]));
+    const materializationPlan = await this.store.planDocumentMaterialization(docId, { includeDiagnostics: true });
+    let startFromSnapshot = materializationPlan.snapshotEntryId !== null;
+    const snapshotMeta = materializationPlan.snapshotEntryId
+      ? (metadataById.get(materializationPlan.snapshotEntryId) || null)
+      : null;
+    if (startFromSnapshot && !snapshotMeta) {
+      this.logger.warn(`Planner referenced snapshot ${materializationPlan.snapshotEntryId} not found in metadata for ${docId}; falling back to replay without snapshot`);
+      startFromSnapshot = false;
     }
-    
-    // Get all entries (excluding snapshot entries - we'll handle delete separately)
-    // Include "doc_create", "doc_change", and "doc_delete" types as they all contain Automerge changes to apply
-    const entriesToLoad = startFromSnapshot
-      ? allEntryMetadata.filter(em => (em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete") && em.createdAt > snapshotMeta!.createdAt)
-      : allEntryMetadata.filter(em => em.entryType === "doc_create" || em.entryType === "doc_change" || em.entryType === "doc_delete");
-    this.logger.debug(`Will load ${entriesToLoad.length} entries for document ${docId} (after snapshot filter)`);
+    if (startFromSnapshot && snapshotMeta) {
+      this.logger.debug(`Planner selected snapshot ${snapshotMeta.id} for ${docId}`);
+    } else {
+      this.logger.debug(`Planner did not select a snapshot for ${docId}`);
+    }
+    const entriesToLoad = materializationPlan.entryIdsToApply
+      .map((id) => metadataById.get(id))
+      .filter((m): m is StoreEntryMetadata => m !== undefined);
+    this.logger.debug(
+      `Planner returned ${entriesToLoad.length} replay entries for ${docId}; diagnostics=${JSON.stringify(materializationPlan.diagnostics || {})}`,
+    );
     
     // Load the snapshot first if we have one
     let doc: AutomergeTypes.Doc<MindooDocPayload> | undefined = undefined;
@@ -2260,10 +2536,6 @@ export class BaseMindooDB implements MindooDB {
       doc = Automerge.init<MindooDocPayload>();
       this.logger.debug(`Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
     }
-    
-    // Sort entries by timestamp
-    entriesToLoad.sort((a, b) => a.createdAt - b.createdAt);
-    this.logger.debug(`Sorted ${entriesToLoad.length} entries by timestamp for document ${docId}`);
     
     // Load and apply all entries
     this.logger.debug(`Fetching ${entriesToLoad.length} entries from store for document ${docId}`);
@@ -2396,7 +2668,10 @@ export class BaseMindooDB implements MindooDB {
     const isDeleted = hasDeleteEntry;
     this.logger.debug(`Document ${docId} isDeleted: ${isDeleted}`);
     
-    const decryptionKeyId = (payload._decryptionKeyId as string) || "default";
+    // The authoritative decryptionKeyId comes from the doc_create entry's metadata,
+    // not from the Automerge payload (which does not store encryption metadata).
+    const createEntry = allEntryMetadata.find(em => em.entryType === "doc_create");
+    const decryptionKeyId = createEntry ? createEntry.decryptionKeyId : "default";
     // Get lastModified from payload, or use the timestamp of the last entry
     const lastEntry = entries.length > 0 ? entries[entries.length - 1] : null;
     const lastModified = (payload._lastModified as number) || 

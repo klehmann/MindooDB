@@ -10,6 +10,11 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "../../core/types";
+import type {
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
+} from "../../core/appendonlystores/types";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type {
@@ -269,10 +274,14 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
 
     return {
-      protocolVersion: "sync-v2",
+      protocolVersion: "sync-v3",
       supportsCursorScan: typeof this.localStore.scanEntriesSince === "function",
       supportsIdBloomSummary: typeof this.localStore.getIdBloomSummary === "function",
       supportsCompactionStatus: typeof this.localStore.getCompactionStatus === "function",
+      supportsMaterializationPlanning:
+        typeof this.localStore.planDocumentMaterialization === "function",
+      supportsBatchMaterializationPlanning:
+        typeof this.localStore.planDocumentMaterializationBatch === "function",
     };
   }
 
@@ -448,6 +457,26 @@ export class ServerNetworkContentAddressedStore {
     return resolvedIds;
   }
 
+  async handlePlanDocumentMaterialization(
+    token: string,
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan> {
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+    return this.localStore.planDocumentMaterialization(docId, options);
+  }
+
+  async handlePlanDocumentMaterializationBatch(
+    token: string,
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan> {
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+    return this.localStore.planDocumentMaterializationBatch(docIds, options);
+  }
+
   /**
    * Validate a JWT token and return the payload.
    * 
@@ -498,6 +527,8 @@ export class ServerNetworkContentAddressedStore {
         createdAt: entry.createdAt,
         createdByPublicKey: entry.createdByPublicKey,
         decryptionKeyId: entry.decryptionKeyId,
+        snapshotHeadHashes: entry.snapshotHeadHashes,
+        snapshotHeadEntryIds: entry.snapshotHeadEntryIds,
         signature: entry.signature,
         originalSize: entry.originalSize,
         encryptedSize: entry.encryptedSize,

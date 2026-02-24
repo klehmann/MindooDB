@@ -251,4 +251,5 @@ All of these topologies use the same sync protocol, the same entry format, and t
 
 - Network sync protocol: [network-sync-protocol.md](network-sync-protocol.md)
 - On-disk store: [on-disk-content-addressed-store.md](on-disk-content-addressed-store.md)
+- DB open, dense sync, and materialization planner: [db-open-and-sync-optimization.md](db-open-and-sync-optimization.md)
 - Main system spec: [specification.md](specification.md)

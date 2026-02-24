@@ -27,6 +27,8 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "mindoodb/core/types";
+import type {
+} from "mindoodb/core/appendonlystores/types";
 import type { NetworkSyncCapabilities } from "mindoodb/core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "mindoodb/core/appendonlystores/network/types";
 
@@ -73,6 +75,20 @@ interface SerializedEntryMetadata {
   signature: string;
   originalSize: number;
   encryptedSize: number;
+}
+
+interface MaterializationPlanOptions {
+  includeDiagnostics?: boolean;
+}
+
+interface DocumentMaterializationPlan {
+  docId: string;
+  snapshotEntryId: string | null;
+  entryIdsToApply: string[];
+}
+
+interface DocumentMaterializationBatchPlan {
+  plans: DocumentMaterializationPlan[];
 }
 
 interface SerializedEntry extends SerializedEntryMetadata {
@@ -736,6 +752,8 @@ export class MindooDBServer {
     router.post("/sync/hasEntries", syncRateLimit, this.handleHasEntries.bind(this));
     router.get("/sync/getAllIds", syncRateLimit, this.handleGetAllIds.bind(this));
     router.post("/sync/resolveDependencies", syncRateLimit, this.handleResolveDependencies.bind(this));
+    router.post("/sync/planDocumentMaterialization", syncRateLimit, this.handlePlanDocumentMaterialization.bind(this));
+    router.post("/sync/planDocumentMaterializationBatch", syncRateLimit, this.handlePlanDocumentMaterializationBatch.bind(this));
 
     router.post("/admin/trigger-sync", this.handleTriggerSync.bind(this));
 
@@ -1017,6 +1035,45 @@ export class MindooDBServer {
       const ids = await serverStore.handleResolveDependencies(token, startId, options);
 
       res.json({ ids });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
+  private async handlePlanDocumentMaterialization(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId, docId, options } = req.body as {
+        dbId?: string;
+        docId?: string;
+        options?: MaterializationPlanOptions;
+      };
+      const validDbId = this.validateDbId(dbId);
+      if (!docId) {
+        res.status(400).json({ error: "docId is required" });
+        return;
+      }
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const plan = await (serverStore as any).handlePlanDocumentMaterialization(token, docId, options);
+      res.json({ plan: plan as DocumentMaterializationPlan });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
+  private async handlePlanDocumentMaterializationBatch(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId, docIds, options } = req.body as {
+        dbId?: string;
+        docIds?: string[];
+        options?: MaterializationPlanOptions;
+      };
+      const validDbId = this.validateDbId(dbId);
+      validateArraySize(docIds, MAX_HAVE_IDS, "docIds");
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const batchPlan = await (serverStore as any).handlePlanDocumentMaterializationBatch(token, docIds || [], options);
+      res.json({ batchPlan: batchPlan as DocumentMaterializationBatchPlan });
     } catch (error) {
       this.handleRequestError(error, res);
     }

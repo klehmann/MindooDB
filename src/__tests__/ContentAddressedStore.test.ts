@@ -239,6 +239,36 @@ describe("InMemoryContentAddressedStore", () => {
       expect(deps).toEqual(["id2", "id3"]); // Stops at snapshot, includes it
     });
   });
+
+  describe("materialization planning", () => {
+    test("should select snapshot by causal coverage and replay only uncovered entries", async () => {
+      const a = createTestEntry("doc1", "a", "ca", [], "doc_create");
+      const b = createTestEntry("doc1", "b", "cb", ["a"], "doc_change");
+      const c = createTestEntry("doc1", "c", "cc", ["a"], "doc_change");
+      const d = createTestEntry("doc1", "d", "cd", ["b", "c"], "doc_change");
+      const s = createTestEntry("doc1", "s", "cs", ["b"], "doc_snapshot");
+      s.snapshotHeadEntryIds = ["b"];
+      s.snapshotHeadHashes = ["hb"];
+
+      await store.putEntries([a, b, c, d, s]);
+      const plan = await store.planDocumentMaterialization("doc1", { includeDiagnostics: true });
+
+      expect(plan.snapshotEntryId).toBe("s");
+      expect(plan.entryIdsToApply).toEqual(["c", "d"]);
+      expect(plan.diagnostics?.uncoveredLatestEntryCount).toBe(2);
+    });
+
+    test("should provide batch plans for multiple docs", async () => {
+      const e1 = createTestEntry("doc1", "d1a", "h1", [], "doc_create");
+      const e2 = createTestEntry("doc2", "d2a", "h2", [], "doc_create");
+      await store.putEntries([e1, e2]);
+
+      const batch = await store.planDocumentMaterializationBatch(["doc1", "doc2"]);
+      expect(batch.plans.length).toBe(2);
+      expect(batch.plans.find((p) => p.docId === "doc1")?.entryIdsToApply).toEqual(["d1a"]);
+      expect(batch.plans.find((p) => p.docId === "doc2")?.entryIdsToApply).toEqual(["d2a"]);
+    });
+  });
 });
 
 // Helper function to create test entries

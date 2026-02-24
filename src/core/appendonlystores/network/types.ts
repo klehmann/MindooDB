@@ -132,6 +132,8 @@ export interface NetworkSyncCapabilities {
   supportsCursorScan: boolean;
   supportsIdBloomSummary: boolean;
   supportsCompactionStatus: boolean;
+  supportsMaterializationPlanning: boolean;
+  supportsBatchMaterializationPlanning: boolean;
 }
 
 /**

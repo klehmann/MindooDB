@@ -9,6 +9,11 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "../../core/types";
+import type {
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
+} from "../../core/appendonlystores/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
@@ -298,6 +303,8 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       supportsCursorScan: false,
       supportsIdBloomSummary: false,
       supportsCompactionStatus: false,
+      supportsMaterializationPlanning: false,
+      supportsBatchMaterializationPlanning: false,
     };
     return this.capabilitiesCache;
   }
@@ -322,6 +329,30 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       lastCompactedBytes: 0,
       lastCompactionDurationMs: 0,
     };
+  }
+
+  async planDocumentMaterialization(
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan> {
+    const token = await this.ensureAuthenticated();
+    const capabilities = await this.getCapabilities();
+    if (!capabilities.supportsMaterializationPlanning || !this.transport.planDocumentMaterialization) {
+      throw new Error("Remote server does not support required materialization planning protocol");
+    }
+    return this.transport.planDocumentMaterialization(token, docId, options);
+  }
+
+  async planDocumentMaterializationBatch(
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan> {
+    const token = await this.ensureAuthenticated();
+    const capabilities = await this.getCapabilities();
+    if (!capabilities.supportsBatchMaterializationPlanning || !this.transport.planDocumentMaterializationBatch) {
+      throw new Error("Remote server does not support required batch materialization planning protocol");
+    }
+    return this.transport.planDocumentMaterializationBatch(token, docIds, options);
   }
 
   /**
@@ -447,6 +478,8 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         createdAt: enc.createdAt,
         createdByPublicKey: enc.createdByPublicKey,
         decryptionKeyId: enc.decryptionKeyId,
+        snapshotHeadHashes: enc.snapshotHeadHashes,
+        snapshotHeadEntryIds: enc.snapshotHeadEntryIds,
         signature: enc.signature,
         originalSize: enc.originalSize,
         encryptedSize: enc.encryptedSize,

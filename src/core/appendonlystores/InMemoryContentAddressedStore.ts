@@ -2,6 +2,9 @@ import {
   ContentAddressedStore,
   ContentAddressedStoreFactory,
   CreateStoreResult,
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
   OpenStoreOptions,
   StoreIndexBuildStatus,
   AwaitIndexReadyOptions,
@@ -11,6 +14,7 @@ import {
   StoreIdBloomSummary,
 } from "./types";
 import { createIdBloomSummary } from "./bloom";
+import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "./MaterializationPlanner";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -374,6 +378,35 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   async getIdBloomSummary(): Promise<StoreIdBloomSummary> {
     const ids = await this.getAllIds();
     return createIdBloomSummary(ids);
+  }
+
+  async planDocumentMaterialization(
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan> {
+    const entries: StoreEntryMetadata[] = [];
+    const ids = this.docIndex.get(docId);
+    if (ids) {
+      for (const id of ids) {
+        const meta = this.entries.get(id);
+        if (meta) {
+          entries.push(meta);
+        }
+      }
+    }
+    return computeDocumentMaterializationPlan(docId, entries, options);
+  }
+
+  async planDocumentMaterializationBatch(
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan> {
+    // Reuse a single metadata pass for deterministic planning.
+    const allEntries: StoreEntryMetadata[] = [];
+    for (const [, meta] of this.entries) {
+      allEntries.push(meta);
+    }
+    return computeBatchMaterializationPlan(allEntries, docIds, options);
   }
 
   /**

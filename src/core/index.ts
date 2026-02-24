@@ -63,6 +63,10 @@ export {
   StoreScanFilters,
   StoreScanResult,
   StoreIdBloomSummary,
+  MaterializationPlanOptions,
+  MaterializationPlanDiagnostics,
+  DocumentMaterializationPlan,
+  DocumentMaterializationBatchPlan,
 } from "./appendonlystores/types";
 export { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory } from "./appendonlystores/InMemoryContentAddressedStore";
 

@@ -17,6 +17,9 @@
 
 import type {
   ContentAddressedStore,
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
   StoreIndexBuildStatus,
   AwaitIndexReadyOptions,
   StoreScanCursor,
@@ -25,6 +28,7 @@ import type {
   StoreIdBloomSummary,
   OpenStoreOptions,
 } from "../../core/appendonlystores/types";
+import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -736,6 +740,25 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     await txToPromise(writeTx);
 
     return summary;
+  }
+
+  async planDocumentMaterialization(
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan> {
+    const entries = await this.findNewEntriesForDoc([], docId);
+    return computeDocumentMaterializationPlan(docId, entries, options);
+  }
+
+  async planDocumentMaterializationBatch(
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan> {
+    const db = await this.ensureOpen();
+    const tx = db.transaction(ENTRIES_STORE, "readonly");
+    const entriesOS = tx.objectStore(ENTRIES_STORE);
+    const all = (await reqToPromise(entriesOS.getAll())) as StoreEntryMetadata[];
+    return computeBatchMaterializationPlan(all, docIds, options);
   }
 
   async resolveDependencies(

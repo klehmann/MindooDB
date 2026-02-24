@@ -8,6 +8,11 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "../../core/types";
+import type {
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
+} from "../../core/appendonlystores/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
@@ -144,6 +149,8 @@ export class HttpTransport implements NetworkTransport {
         supportsCursorScan: false,
         supportsIdBloomSummary: false,
         supportsCompactionStatus: false,
+        supportsMaterializationPlanning: false,
+        supportsBatchMaterializationPlanning: false,
       };
     }
   }
@@ -344,6 +351,56 @@ export class HttpTransport implements NetworkTransport {
 
     const data = await response.json();
     return data.status as StoreCompactionStatus;
+  }
+
+  async planDocumentMaterialization(
+    token: string,
+    docId: string,
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationPlan> {
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/planDocumentMaterialization`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          docId,
+          options,
+        }),
+      }
+    );
+    const data = await response.json();
+    return data.plan as DocumentMaterializationPlan;
+  }
+
+  async planDocumentMaterializationBatch(
+    token: string,
+    docIds: string[],
+    options?: MaterializationPlanOptions
+  ): Promise<DocumentMaterializationBatchPlan> {
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/planDocumentMaterializationBatch`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          docIds,
+          options,
+        }),
+      }
+    );
+    const data = await response.json();
+    return data.batchPlan as DocumentMaterializationBatchPlan;
   }
 
   /**
@@ -625,6 +682,8 @@ export class HttpTransport implements NetworkTransport {
       createdAt: metadata.createdAt,
       createdByPublicKey: metadata.createdByPublicKey,
       decryptionKeyId: metadata.decryptionKeyId,
+      snapshotHeadHashes: metadata.snapshotHeadHashes,
+      snapshotHeadEntryIds: metadata.snapshotHeadEntryIds,
       signature: this.uint8ArrayToBase64(metadata.signature),
       originalSize: metadata.originalSize,
       encryptedSize: metadata.encryptedSize,
@@ -644,6 +703,8 @@ export class HttpTransport implements NetworkTransport {
       createdAt: serialized.createdAt,
       createdByPublicKey: serialized.createdByPublicKey,
       decryptionKeyId: serialized.decryptionKeyId,
+      snapshotHeadHashes: serialized.snapshotHeadHashes,
+      snapshotHeadEntryIds: serialized.snapshotHeadEntryIds,
       signature: this.base64ToUint8Array(serialized.signature),
       originalSize: serialized.originalSize,
       encryptedSize: serialized.encryptedSize,
@@ -671,6 +732,8 @@ interface SerializedEntryMetadata {
   createdAt: number;
   createdByPublicKey: string;
   decryptionKeyId: string;
+  snapshotHeadHashes?: string[];
+  snapshotHeadEntryIds?: string[];
   signature: string; // base64
   originalSize: number;
   encryptedSize: number;
