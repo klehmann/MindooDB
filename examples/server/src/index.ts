@@ -8,7 +8,7 @@
  *
  * Options:
  *   -d, --data-dir <path>   Data directory path (default: ./data)
- *   -p, --port <port>       Server port (default: 3000)
+ *   -p, --port <port>       Server port (default: 1661)
  *   -s, --auto-sync         Enable automatic sync with remote servers
  *   -w, --static-dir <path> Serve static files from this directory at /statics/
  *   --tls-cert <path>       Path to TLS certificate file (PEM)
@@ -37,7 +37,7 @@ interface CliOptions {
 function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     dataDir: "./data",
-    port: 3000,
+    port: 1661,
     autoSync: false,
     help: false,
   };
@@ -122,7 +122,7 @@ Usage:
 
 Options:
   -d, --data-dir <path>   Data directory path (default: ./data)
-  -p, --port <port>       Server port (default: 3000)
+  -p, --port <port>       Server port (default: 1661)
   -s, --auto-sync         Enable automatic sync with remote servers
   -w, --static-dir <path> Serve static files at /statics/ (e.g. bootstrap UI)
   --tls-cert <path>       Path to TLS certificate file (PEM format)

@@ -50,7 +50,7 @@ COPY --from=builder --chown=app:app /build/examples/server/package.json ./
 
 USER app
 
-EXPOSE 3000
+EXPOSE 1661
 VOLUME /data
 
 ENTRYPOINT ["node", "dist/index.js", "--data-dir", "/data"]

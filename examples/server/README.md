@@ -38,7 +38,7 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 | Option | Alias | Description | Default |
 |--------|-------|-------------|---------|
 | `--data-dir` | `-d` | Data directory path | `./data` |
-| `--port` | `-p` | Server port | `3000` |
+| `--port` | `-p` | Server port | `1661` |
 | `--auto-sync` | `-s` | Enable automatic sync with remote servers | disabled |
 | `--static-dir` | `-w` | Serve static files at `/statics/` (e.g. bootstrap UI) | — |
 | `--tls-cert` | — | Path to TLS certificate file (PEM) | — |
@@ -176,7 +176,7 @@ This creates `server-identity.json`, `trusted-servers.json`, and `tenant-api-key
 ### 2. Start the server
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run dev -- -d ./data -p 3000
+MINDOODB_SERVER_PASSWORD=secret npm run dev -- -d ./data -p 1661
 ```
 
 ### 3. Client creates a tenant and publishes to server
@@ -194,7 +194,7 @@ const result = await factory.createTenant({
 });
 
 // Register tenant on server (sends admin keys + $publicinfos key)
-await result.tenant.publishToServer("http://localhost:3000", {
+await result.tenant.publishToServer("http://localhost:1661", {
   registerUsers: [factory.toPublicUserId(result.appUser)],
 });
 ```
@@ -204,7 +204,7 @@ await result.tenant.publishToServer("http://localhost:3000", {
 ```typescript
 // Create a remote store for the "main" database
 const remoteStore = await result.tenant.connectToServer(
-  "http://localhost:3000",
+  "http://localhost:1661",
   "main",
 );
 
@@ -296,7 +296,7 @@ The servers will periodically sync all configured tenant databases, relaying enc
 ### 1. Admin creates a tenant creation key
 
 ```bash
-curl -X POST http://localhost:3000/admin/tenant-api-keys \
+curl -X POST http://localhost:1661/admin/tenant-api-keys \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $ADMIN_KEY" \
   -d '{"name": "acme-corp", "tenantIdPrefix": "acme-"}'
@@ -317,7 +317,7 @@ Response:
 The customer uses this key when publishing their tenant:
 
 ```typescript
-await tenant.publishToServer("http://localhost:3000", {
+await tenant.publishToServer("http://localhost:1661", {
   adminApiKey: "mdb_tk_a1b2c3d4...",
   registerUsers: [factory.toPublicUserId(appUser)],
 });
@@ -366,7 +366,7 @@ MINDOODB_SERVER_PASSWORD=secret4 npm run dev -- -d ./data4 -p 3003 &
 # 3. Add it to the existing network
 npm run add-to-network -- \
   --new-server http://localhost:3003 \
-  --servers http://localhost:3000,http://localhost:3001,http://localhost:3002 \
+  --servers http://localhost:1661,http://localhost:3001,http://localhost:3002 \
   --api-key $ADMIN_KEY
 ```
 
@@ -424,7 +424,7 @@ MINDOODB_SERVER_PASSWORD=secret npm run dev -- -d ./data3 -p 3002 &
 # Step 2: Add to network (establishes trust with all existing servers)
 npm run add-to-network -- \
   --new-server http://localhost:3002 \
-  --servers http://localhost:3000,http://localhost:3001 \
+  --servers http://localhost:1661,http://localhost:3001 \
   --api-key $ADMIN_KEY
 
 # Step 3: Register the tenant on the new server (if not already published)
@@ -434,9 +434,9 @@ npm run add-to-network -- \
 curl -X POST http://localhost:3002/admin/tenants/acme/sync-servers \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $ADMIN_KEY" \
-  -d '{"name":"CN=server1","url":"http://localhost:3000","syncIntervalMs":60000,"databases":["directory","main"]}'
+  -d '{"name":"CN=server1","url":"http://localhost:1661","syncIntervalMs":60000,"databases":["directory","main"]}'
 
-curl -X POST http://localhost:3000/admin/tenants/acme/sync-servers \
+curl -X POST http://localhost:1661/admin/tenants/acme/sync-servers \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $ADMIN_KEY" \
   -d '{"name":"CN=server3","url":"http://localhost:3002","syncIntervalMs":60000,"databases":["directory","main"]}'
@@ -669,7 +669,7 @@ docker run --rm \
 ```bash
 docker run -d --name mindoodb \
   -v "$(pwd)/data:/data" \
-  -p 3000:3000 \
+  -p 1661:1661 \
   -e MINDOODB_SERVER_PASSWORD=your-secret \
   -e MINDOODB_ADMIN_API_KEY=your-admin-key \
   mindoodb-server
@@ -688,7 +688,7 @@ docker run -d --name mindoodb \
 ### Verify
 
 ```bash
-curl http://localhost:3000/health
+curl http://localhost:1661/health
 ```
 
 ## Development
@@ -708,7 +708,7 @@ npm run dev
 ### Run built version
 
 ```bash
-npm start -- -d ./data -p 3000
+npm start -- -d ./data -p 1661
 ```
 
 ## Testing
