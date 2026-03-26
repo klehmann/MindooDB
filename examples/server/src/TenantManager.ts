@@ -143,20 +143,43 @@ class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
 class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
   "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey"
 > {
+  private readonly adminUsernameNormalized: string | null;
+
   constructor(
     private inner: Pick<MindooTenantDirectory,
       "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">,
     private trustedServers: TrustedServer[],
-  ) {}
+    private adminBootstrapIdentity?: {
+      username: string;
+      signingPublicKey: string;
+      encryptionPublicKey: string;
+    },
+  ) {
+    this.adminUsernameNormalized = adminBootstrapIdentity?.username.toLowerCase() ?? null;
+  }
 
   async getUserPublicKeys(username: string): Promise<{
     signingPublicKey: string;
     encryptionPublicKey: string;
   } | null> {
+    const normalizedUsername = username.toLowerCase();
+
+    // Bootstrap special-case: allow configured admin identity to authenticate
+    // even before directory grantaccess docs are present on the server.
+    if (
+      this.adminBootstrapIdentity &&
+      this.adminUsernameNormalized &&
+      normalizedUsername === this.adminUsernameNormalized
+    ) {
+      return {
+        signingPublicKey: this.adminBootstrapIdentity.signingPublicKey,
+        encryptionPublicKey: this.adminBootstrapIdentity.encryptionPublicKey,
+      };
+    }
+
     const result = await this.inner.getUserPublicKeys(username);
     if (result) return result;
 
-    const normalizedUsername = username.toLowerCase();
     for (const server of this.trustedServers) {
       if (server.name.toLowerCase() === normalizedUsername) {
         return {
@@ -170,6 +193,11 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
 
   async isUserRevoked(username: string): Promise<boolean> {
     const normalizedUsername = username.toLowerCase();
+
+    if (this.adminUsernameNormalized && normalizedUsername === this.adminUsernameNormalized) {
+      return false;
+    }
+
     for (const server of this.trustedServers) {
       if (server.name.toLowerCase() === normalizedUsername) {
         return false;
@@ -179,6 +207,10 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
   }
 
   async validatePublicSigningKey(publicKey: string): Promise<boolean> {
+    if (this.adminBootstrapIdentity && this.adminBootstrapIdentity.signingPublicKey === publicKey) {
+      return true;
+    }
+
     const innerResult = await this.inner.validatePublicSigningKey(publicKey);
     if (innerResult) return true;
 
@@ -378,6 +410,7 @@ export class TenantManager {
     mkdirSync(tenantDir, { recursive: true });
 
     const config: TenantConfig = {
+      adminUsername: request.adminUsername,
       adminSigningPublicKey: request.adminSigningPublicKey,
       adminEncryptionPublicKey: request.adminEncryptionPublicKey,
       publicInfosKey: request.publicInfosKey,
@@ -607,6 +640,13 @@ export class TenantManager {
     const directory = new CompositeMindooDirectory(
       innerDirectory,
       this.trustedServers,
+      config.adminUsername
+        ? {
+            username: config.adminUsername,
+            signingPublicKey: config.adminSigningPublicKey,
+            encryptionPublicKey: config.adminEncryptionPublicKey,
+          }
+        : undefined,
     ) as unknown as MindooTenantDirectory;
 
     const authService = new AuthenticationService(

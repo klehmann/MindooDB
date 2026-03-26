@@ -428,6 +428,93 @@ describe("MindooDB Example Server", () => {
       const tenants = (body as { tenants: string[] }).tenants;
       expect(tenants).toContain("publish-test");
     }, 60000);
+
+    test("should allow bootstrap directory push with admin networkAuthOverride", async () => {
+      // Purpose: verify bootstrap-deadlock resolution by proving that only a
+      // per-sync admin override can perform the first directory grant push.
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, cryptoAdapter);
+
+      // Isolate this scenario in its own server instance/data dir so it can
+      // control bootstrap state without affecting other tests.
+      const isolatedDataDir = `/tmp/mindoodb-bootstrap-${Date.now()}`;
+      const isolatedPort = 3107;
+      const isolatedBaseUrl = `http://localhost:${isolatedPort}`;
+      const isolatedServerPassword = "server-bootstrap-pass";
+      const isolatedServerUsername = "CN=server-bootstrap";
+
+      const fs = await import("fs");
+      fs.mkdirSync(isolatedDataDir, { recursive: true });
+
+      const serverIdentity = await localFactory.createUserId(
+        isolatedServerUsername,
+        isolatedServerPassword
+      );
+      fs.writeFileSync(
+        `${isolatedDataDir}/server-identity.json`,
+        JSON.stringify(serverIdentity, null, 2),
+        "utf-8"
+      );
+      fs.writeFileSync(`${isolatedDataDir}/trusted-servers.json`, "[]", "utf-8");
+      fs.writeFileSync(`${isolatedDataDir}/tenant-api-keys.json`, "[]", "utf-8");
+
+      // Start a dedicated server that has a real server identity/password,
+      // matching the runtime requirements for directory-backed auth.
+      const isolatedServer = new MindooDBServer(isolatedDataDir, isolatedServerPassword);
+      const isolatedHttpServer = await new Promise<Server>((resolve) => {
+        const s = isolatedServer.getApp().listen(isolatedPort, () => resolve(s));
+      });
+
+      try {
+        const tenantId = `bootstrap-${Date.now()}`;
+        const adminName = `cn=admin/o=${tenantId}`;
+        const userName = `cn=user1/o=${tenantId}`;
+
+        const result = await localFactory.createTenant({
+          tenantId,
+          adminName,
+          adminPassword: "admin-pass",
+          userName,
+          userPassword: "user-pass",
+        });
+
+        await result.tenant.publishToServer(isolatedBaseUrl, {
+          adminUsername: result.adminUser.username,
+        });
+
+        const directoryDb = await result.tenant.openDB("directory");
+        const remoteDirectory = await result.tenant.connectToServer(isolatedBaseUrl, "directory");
+
+        // Baseline: default app-user auth cannot bootstrap directory grants yet.
+        await expect(directoryDb.pushChangesTo(remoteDirectory)).rejects.toThrow(
+          /revoked|not found/i
+        );
+
+        // Bootstrap path: authenticate as admin for this one sync operation.
+        await expect(
+          directoryDb.pushChangesTo(remoteDirectory, {
+            networkAuthOverride: {
+              user: result.adminUser,
+              password: "admin-pass",
+            },
+          })
+        ).resolves.toMatchObject({ cancelled: false });
+
+        // After bootstrap grants are in place, normal app-user sync should work.
+        const db = await result.tenant.openDB("main");
+        const remoteMain = await result.tenant.connectToServer(isolatedBaseUrl, "main");
+        const doc = await db.createDocument();
+        await db.changeDoc(doc, (d) => {
+          d.getData().title = "bootstrap-check";
+        });
+
+        await expect(db.pushChangesTo(remoteMain)).resolves.toMatchObject({ cancelled: false });
+      } finally {
+        // Always tear down isolated resources, even if assertions fail.
+        await new Promise<void>((resolve) => isolatedHttpServer.close(() => resolve()));
+        fs.rmSync(isolatedDataDir, { recursive: true, force: true });
+      }
+    }, 120000);
   });
 
   describe("Tenant Not Found", () => {

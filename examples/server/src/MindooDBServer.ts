@@ -412,6 +412,9 @@ export class MindooDBServer {
             res.status(400).json({ error: "adminEncryptionPublicKey is required" });
             return;
           }
+          if (request.adminUsername !== undefined) {
+            validateUsername(request.adminUsername);
+          }
 
           validateStringLength(request.adminSigningPublicKey, MAX_PEM_KEY_LENGTH, "adminSigningPublicKey");
           validateStringLength(request.adminEncryptionPublicKey, MAX_PEM_KEY_LENGTH, "adminEncryptionPublicKey");

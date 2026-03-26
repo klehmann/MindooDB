@@ -72,9 +72,26 @@ If you want to pre-register users on the server at the same time (so they can sy
 
 ```javascript
 await tenant.publishToServer("https://sync.example.com", {
+  adminUsername: adminUser.username,
   registerUsers: [factory.toPublicUserId(appUser)],
 });
 ```
+
+If you intentionally skip `registerUsers` and rely on directory grant docs for first-time bootstrap, set `adminUsername` on publish and use a one-off auth override when pushing the `directory` database:
+
+```javascript
+const remoteDirectory = await tenant.connectToServer("https://sync.example.com", "directory");
+const directoryDb = await tenant.openDB("directory");
+
+await directoryDb.pushChangesTo(remoteDirectory, {
+  networkAuthOverride: {
+    user: adminUser,
+    password: "strong-admin-password",
+  },
+});
+```
+
+This lets the admin authenticate and push initial `grantaccess` documents before the server has any directory entries for regular users.
 
 > **For decision makers:** This is the extent of server-side setup. There are no server-side user accounts to manage, no passwords to store on the server, no session databases. The server is a relay for encrypted blobs. If the server is breached, the attacker gets ciphertext and public keys — no plaintext data, no private keys, no usernames.
 

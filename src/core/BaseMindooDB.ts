@@ -19,6 +19,7 @@ import {
   AttachmentReference,
   AttachmentConfig,
   SigningKeyPair,
+  EncryptedPrivateKey,
   PerformanceCallback,
   SyncOptions,
   SyncResult,
@@ -3323,6 +3324,90 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Apply a temporary network-auth identity override for a single sync call.
+   *
+   * Purpose:
+   * - Allows per-call authentication as a different user (for example admin bootstrap)
+   *   without changing the tenant's default connected user.
+   * - Returns a cleanup callback so caller can always restore default auth state in `finally`.
+   */
+  private async applyNetworkAuthOverrideForSync(
+    remoteStore: ContentAddressedStore,
+    options?: SyncOptions
+  ): Promise<() => void> {
+    // Per-call override: use an alternate identity (for example, admin bootstrap)
+    // only for this sync operation.
+    const override = options?.networkAuthOverride;
+    if (!override) {
+      // No override requested: return a no-op cleanup callback for unified call sites.
+      return () => {};
+    }
+
+    const overrideCapableStore = remoteStore as ContentAddressedStore & {
+      setSyncAuthOverride?: (override: {
+        username: string;
+        signingKey: CryptoKey;
+        privateEncryptionKey?: CryptoKey | string;
+      } | null) => void;
+      clearSyncAuthOverride?: () => void;
+    };
+
+    if (typeof overrideCapableStore.setSyncAuthOverride !== "function") {
+      // Local/in-memory stores do not support network auth override; keep default auth.
+      this.logger.warn("networkAuthOverride was provided, but remote store does not support auth override");
+      return () => {};
+    }
+
+    const subtle = this.tenant.getCryptoAdapter().getSubtle();
+
+    // Decrypt and import override signing key (Ed25519) for challenge signing.
+    const signingKeyBuffer = await this.tenant.decryptPrivateKey(
+      override.user.userSigningKeyPair.privateKey as EncryptedPrivateKey,
+      override.password,
+      "signing"
+    );
+    const signingKey = await subtle.importKey(
+      "pkcs8",
+      signingKeyBuffer,
+      { name: "Ed25519" },
+      false,
+      ["sign"]
+    );
+
+    // Decrypt and import override encryption key (RSA-OAEP) so encrypted network
+    // entries can be decrypted with the same override identity.
+    const encryptionKeyBuffer = await this.tenant.decryptPrivateKey(
+      override.user.userEncryptionKeyPair.privateKey as EncryptedPrivateKey,
+      override.password,
+      "encryption"
+    );
+    const encryptionKey = await subtle.importKey(
+      "pkcs8",
+      encryptionKeyBuffer,
+      { name: "RSA-OAEP", hash: "SHA-256" },
+      false,
+      ["decrypt"]
+    );
+
+    // Activate temporary override on the remote store.
+    overrideCapableStore.setSyncAuthOverride({
+      username: override.user.username,
+      signingKey,
+      privateEncryptionKey: encryptionKey,
+    });
+
+    // Return cleanup callback so caller can always restore normal auth in finally.
+    return () => {
+      if (typeof overrideCapableStore.clearSyncAuthOverride === "function") {
+        overrideCapableStore.clearSyncAuthOverride();
+      } else {
+        // Backward-compatible fallback if explicit clear API is not implemented.
+        overrideCapableStore.setSyncAuthOverride?.(null);
+      }
+    };
+  }
+
+  /**
    * Pull changes from a remote content-addressed store or another MindooDB instance.
    * 
    * This method:
@@ -3343,41 +3428,45 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.logger.info(`Pulling entries from remote store ${remoteStore.getId()}`);
-    
-    const syncResult = await this.syncEntriesFromStore(remoteStore, this.store, options);
-    this.logger.debug(`Transferred ${syncResult.transferred} entries from remote store`);
+    const restoreAuthOverride = await this.applyNetworkAuthOverrideForSync(remoteStore, options);
+    try {
+      const syncResult = await this.syncEntriesFromStore(remoteStore, this.store, options);
+      this.logger.debug(`Transferred ${syncResult.transferred} entries from remote store`);
 
-    if (syncResult.cancelled) {
-      this.logger.info(`Pull cancelled after transferring ${syncResult.transferred} entries`);
-      return { transferredEntries: syncResult.transferred, cancelled: true };
+      if (syncResult.cancelled) {
+        this.logger.info(`Pull cancelled after transferring ${syncResult.transferred} entries`);
+        return { transferredEntries: syncResult.transferred, cancelled: true };
+      }
+
+      if (syncResult.transferred === 0) {
+        this.logger.debug(`No new entries to pull`);
+        return { transferredEntries: 0, cancelled: false };
+      }
+      
+      options?.onProgress?.({
+        phase: 'processing',
+        message: `Processing ${syncResult.transferred} new entries...`,
+        transferredEntries: syncResult.transferred,
+        scannedEntries: syncResult.transferred,
+      });
+
+      // Sync the local store to process the new entries
+      // This will update the index, cache, and processedEntryIds
+      await this.syncStoreChanges();
+      
+      this.logger.info(`Pull complete, synced ${syncResult.transferred} entries`);
+
+      options?.onProgress?.({
+        phase: 'complete',
+        message: `Pull complete: ${syncResult.transferred} entries synced`,
+        transferredEntries: syncResult.transferred,
+        scannedEntries: syncResult.transferred,
+      });
+
+      return { transferredEntries: syncResult.transferred, cancelled: false };
+    } finally {
+      restoreAuthOverride();
     }
-
-    if (syncResult.transferred === 0) {
-      this.logger.debug(`No new entries to pull`);
-      return { transferredEntries: 0, cancelled: false };
-    }
-    
-    options?.onProgress?.({
-      phase: 'processing',
-      message: `Processing ${syncResult.transferred} new entries...`,
-      transferredEntries: syncResult.transferred,
-      scannedEntries: syncResult.transferred,
-    });
-
-    // Sync the local store to process the new entries
-    // This will update the index, cache, and processedEntryIds
-    await this.syncStoreChanges();
-    
-    this.logger.info(`Pull complete, synced ${syncResult.transferred} entries`);
-
-    options?.onProgress?.({
-      phase: 'complete',
-      message: `Pull complete: ${syncResult.transferred} entries synced`,
-      transferredEntries: syncResult.transferred,
-      scannedEntries: syncResult.transferred,
-    });
-
-    return { transferredEntries: syncResult.transferred, cancelled: false };
   }
 
   /**
@@ -3400,29 +3489,33 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.logger.info(`Pushing entries to remote store ${remoteStore.getId()}`);
-    
-    const syncResult = await this.syncEntriesFromStore(this.store, remoteStore, options);
-    this.logger.debug(`Transferred ${syncResult.transferred} entries to remote store`);
+    const restoreAuthOverride = await this.applyNetworkAuthOverrideForSync(remoteStore, options);
+    try {
+      const syncResult = await this.syncEntriesFromStore(this.store, remoteStore, options);
+      this.logger.debug(`Transferred ${syncResult.transferred} entries to remote store`);
 
-    if (syncResult.cancelled) {
-      this.logger.info(`Push cancelled after transferring ${syncResult.transferred} entries`);
-      return { transferredEntries: syncResult.transferred, cancelled: true };
+      if (syncResult.cancelled) {
+        this.logger.info(`Push cancelled after transferring ${syncResult.transferred} entries`);
+        return { transferredEntries: syncResult.transferred, cancelled: true };
+      }
+
+      if (syncResult.transferred === 0) {
+        this.logger.debug(`No new entries to push`);
+      } else {
+        this.logger.info(`Pushed ${syncResult.transferred} entries to remote store`);
+      }
+
+      options?.onProgress?.({
+        phase: 'complete',
+        message: `Push complete: ${syncResult.transferred} entries transferred`,
+        transferredEntries: syncResult.transferred,
+        scannedEntries: syncResult.transferred,
+      });
+
+      return { transferredEntries: syncResult.transferred, cancelled: false };
+    } finally {
+      restoreAuthOverride();
     }
-
-    if (syncResult.transferred === 0) {
-      this.logger.debug(`No new entries to push`);
-    } else {
-      this.logger.info(`Pushed ${syncResult.transferred} entries to remote store`);
-    }
-
-    options?.onProgress?.({
-      phase: 'complete',
-      message: `Push complete: ${syncResult.transferred} entries transferred`,
-      transferredEntries: syncResult.transferred,
-      scannedEntries: syncResult.transferred,
-    });
-
-    return { transferredEntries: syncResult.transferred, cancelled: false };
   }
 }
 

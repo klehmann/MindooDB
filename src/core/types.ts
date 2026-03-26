@@ -210,6 +210,8 @@ export interface JoinTenantResult {
 export interface PublishToServerOptions {
   /** Optional API key for the server's admin endpoints */
   adminApiKey?: string;
+  /** Optional admin username for bootstrap handshake on the server */
+  adminUsername?: string;
   /** Optional users to register on the server at the same time */
   registerUsers?: PublicUserId[];
 }
@@ -1287,6 +1289,16 @@ export interface SyncOptions {
   onProgress?: (progress: SyncProgress) => void;
   pageSize?: number;
   signal?: AbortSignal;
+  /**
+   * Optional network auth override for this sync call.
+   *
+   * Useful for bootstrap scenarios where a specific user identity (for example
+   * an admin identity) must be used for the challenge/response handshake.
+   */
+  networkAuthOverride?: {
+    user: PrivateUserId;
+    password: string;
+  };
   /**
    * Transfer strategy.  Defaults to `"full"`.
    *

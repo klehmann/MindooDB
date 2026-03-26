@@ -84,6 +84,8 @@ export interface DatabaseStoreConfig {
  * The tenantId is NOT stored here - it's derived from the directory name.
  */
 export interface TenantConfig {
+  /** Admin username used for bootstrap authentication (e.g., "cn=admin/o=acme") */
+  adminUsername?: string;
   /** Ed25519 public key in PEM format for verifying admin signatures */
   adminSigningPublicKey: string;
   /** RSA-OAEP public key in PEM format for encrypting admin-only data */
@@ -110,6 +112,8 @@ export interface TenantConfig {
 export interface RegisterTenantRequest {
   /** Tenant identifier (lowercase, becomes directory name) */
   tenantId: string;
+  /** Admin username used for bootstrap authentication */
+  adminUsername?: string;
   /** Ed25519 public key in PEM format */
   adminSigningPublicKey: string;
   /** RSA-OAEP public key in PEM format */

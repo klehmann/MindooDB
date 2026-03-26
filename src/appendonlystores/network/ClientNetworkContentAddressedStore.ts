@@ -53,6 +53,11 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   private tokenExpiry: number = 0;
   private logger: Logger;
   private capabilitiesCache: NetworkSyncCapabilities | null = null;
+  private syncAuthOverride: {
+    username: string;
+    signingKey: CryptoKey;
+    privateEncryptionKey?: CryptoKey | string;
+  } | null = null;
 
   /**
    * Create a new ClientNetworkContentAddressedStore.
@@ -398,14 +403,15 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       return this.accessToken;
     }
     
-    this.logger.debug(`Authenticating user: ${this.username}`);
+    const authUsername = this.getActiveAuthUsername();
+    this.logger.debug(`Authenticating user: ${authUsername}`);
     
     // Request a challenge
-    const challenge = await this.transport.requestChallenge(this.username);
+    const challenge = await this.transport.requestChallenge(authUsername);
     this.logger.debug(`Received challenge: ${challenge}`);
     
     // Sign the challenge
-    const signature = await this.signChallenge(challenge);
+    const signature = await this.signChallengeWithKey(challenge, this.getActiveSigningKey());
     this.logger.debug(`Signed challenge`);
     
     // Authenticate
@@ -440,12 +446,16 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * Sign a challenge with the user's private signing key.
    */
   private async signChallenge(challenge: string): Promise<Uint8Array> {
+    return this.signChallengeWithKey(challenge, this.signingKey);
+  }
+
+  private async signChallengeWithKey(challenge: string, signingKey: CryptoKey): Promise<Uint8Array> {
     const subtle = this.cryptoAdapter.getSubtle();
     const messageBytes = new TextEncoder().encode(challenge);
     
     const signature = await subtle.sign(
       { name: "Ed25519" },
-      this.signingKey,
+      signingKey,
       messageBytes
     );
     
@@ -465,7 +475,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       // Decrypt the RSA layer to get the original symmetric-encrypted payload
       const encryptedData = await this.rsaEncryption.decrypt(
         enc.rsaEncryptedPayload,
-        this.privateEncryptionKey
+        this.getActivePrivateEncryptionKey()
       );
       
       // Create the full StoreEntry using metadata from the network entry
@@ -500,5 +510,40 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.accessToken = null;
     this.tokenExpiry = 0;
     this.capabilitiesCache = null;
+  }
+
+  /**
+   * Set or clear a temporary per-sync authentication override.
+   * Intended for bootstrap scenarios (for example authenticating as admin).
+   */
+  setSyncAuthOverride(
+    override: {
+      username: string;
+      signingKey: CryptoKey;
+      privateEncryptionKey?: CryptoKey | string;
+    } | null
+  ): void {
+    this.syncAuthOverride = override;
+    // Changing auth identity requires token refresh.
+    this.clearAuthCache();
+  }
+
+  clearSyncAuthOverride(): void {
+    if (this.syncAuthOverride) {
+      this.syncAuthOverride = null;
+      this.clearAuthCache();
+    }
+  }
+
+  private getActiveAuthUsername(): string {
+    return this.syncAuthOverride?.username ?? this.username;
+  }
+
+  private getActiveSigningKey(): CryptoKey {
+    return this.syncAuthOverride?.signingKey ?? this.signingKey;
+  }
+
+  private getActivePrivateEncryptionKey(): CryptoKey | string {
+    return this.syncAuthOverride?.privateEncryptionKey ?? this.privateEncryptionKey;
   }
 }

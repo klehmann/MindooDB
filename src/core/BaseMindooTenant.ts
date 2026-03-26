@@ -666,6 +666,9 @@ export class BaseMindooTenant implements MindooTenant {
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
       publicInfosKey: publicInfosKeyBase64,
     };
+    if (options?.adminUsername) {
+      requestBody.adminUsername = options.adminUsername;
+    }
 
     // Add users if provided
     if (options?.registerUsers && options.registerUsers.length > 0) {
