@@ -36,6 +36,10 @@ describe("Attachments", () => {
     db = await tenant.openDB("test-db");
   }, 30000);
 
+  afterEach(async () => {
+    await (tenant as any).disposeCacheManager?.();
+  });
+
   describe("addAttachment", () => {
     it("should add attachment within changeDoc", async () => {
       // Create a document

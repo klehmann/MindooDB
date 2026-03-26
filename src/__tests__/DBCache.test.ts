@@ -54,6 +54,10 @@ describe("BaseMindooDB cache integration", () => {
     tenant = result.tenant;
   }, 30000);
 
+  afterEach(async () => {
+    await (tenant as any).disposeCacheManager?.();
+  });
+
   /**
    * Simulate an app restart: dispose the tenant's cache manager (flush + stop timer),
    * then clear the tenant's internal DB cache so openDB creates a fresh BaseMindooDB.
