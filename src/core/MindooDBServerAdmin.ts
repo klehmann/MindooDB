@@ -46,6 +46,15 @@ interface SyncServerConfig {
   databases: string[];
 }
 
+export interface SystemAdminPrincipal {
+  username: string;
+  publicsignkey: string;
+}
+
+export interface ServerConfig {
+  capabilities: Record<string, SystemAdminPrincipal[]>;
+}
+
 interface RegisterTenantBody {
   adminSigningPublicKey: string;
   adminEncryptionPublicKey: string;
@@ -224,6 +233,20 @@ export class MindooDBServerAdmin {
       "POST",
       `/system/tenants/${encodeURIComponent(tenantId)}/trigger-sync`,
     );
+  }
+
+  // =========================================================================
+  // Runtime config management
+  // =========================================================================
+
+  async getConfig(): Promise<ServerConfig> {
+    return await this.authenticatedRequest("GET", "/system/config");
+  }
+
+  async updateConfig(
+    config: ServerConfig,
+  ): Promise<{ success: boolean; message?: string }> {
+    return await this.authenticatedRequest("PUT", "/system/config", config);
   }
 
   // =========================================================================

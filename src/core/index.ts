@@ -88,6 +88,8 @@ export {
   NetworkErrorType,
   NetworkError,
 } from "./appendonlystores/network/types";
+export { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
+export { HttpTransport } from "../appendonlystores/network/HttpTransport";
 
 // Indexing - Virtual Views
 export {

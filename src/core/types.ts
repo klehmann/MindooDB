@@ -1052,6 +1052,15 @@ export interface MindooTenantDirectory {
   getDBSettings(dbId: string): Promise<MindooDoc | null>;
 
   /**
+   * Returns the database IDs currently known to the directory.
+   *
+   * This is intended for admin tooling and overview UIs. The result always includes
+   * `"directory"` and will also include `"main"` as the conventional default app DB.
+   * Additional DBs are discovered from `dbsettings` documents stored in the directory.
+   */
+  listKnownDBIds(): Promise<string[]>;
+
+  /**
    * Create or update database-specific settings.
    * Automatically uses the cached settings document for the given dbId if it exists, or creates a new one.
    * 

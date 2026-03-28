@@ -18,3 +18,7 @@ export { IndexedDBContentAddressedStoreFactory } from "./appendonlystores/Indexe
 
 // Browser-specific cache store
 export { IndexedDBLocalCacheStore } from "./cache/IndexedDBLocalCacheStore";
+
+// Network helpers used by browser sync clients
+export { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
+export { HttpTransport } from "../appendonlystores/network/HttpTransport";

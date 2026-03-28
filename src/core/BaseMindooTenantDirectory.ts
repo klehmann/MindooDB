@@ -683,6 +683,20 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     return this.dbSettingsCache.get(dbId) || null;
   }
 
+  async listKnownDBIds(): Promise<string[]> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+
+    await this.updateUnifiedCache();
+
+    const known = new Set<string>(["directory", "main"]);
+    for (const dbId of this.dbSettingsCache.keys()) {
+      known.add(dbId);
+    }
+
+    return Array.from(known).sort();
+  }
+
   async changeTenantSettings(
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
     administrationPrivateKey: EncryptedPrivateKey,
