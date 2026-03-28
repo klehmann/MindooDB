@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * MindooDB Server Init - One-time setup that generates the server identity.
+ * MindooDB Server Init - One-time setup that generates the server identity
+ * and optionally creates a first system admin keypair.
  *
  * Usage:
- *   npx ts-node src/init.ts --name <serverName> [options]
+ *   npx ts-node src/serverinit.ts --name <serverName> [options]
  *
  * Options:
  *   -n, --name <name>       Server name (e.g., "server1") -- required
  *   -d, --data-dir <path>   Data directory path (default: ./data)
  *   -f, --force             Overwrite existing server-identity.json
+ *   --skip-admin            Skip system admin keypair generation
  *   -h, --help              Show this help message
  *
  * Environment variables:
@@ -25,11 +27,13 @@ import { BaseMindooTenantFactory } from "mindoodb/core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "mindoodb/appendonlystores/InMemoryContentAddressedStoreFactory";
 
 import { ENV_VARS } from "./types";
+import type { ServerConfig } from "./types";
 
 interface InitOptions {
   name: string;
   dataDir: string;
   force: boolean;
+  skipAdmin: boolean;
   help: boolean;
 }
 
@@ -38,6 +42,7 @@ function parseArgs(args: string[]): InitOptions {
     name: "",
     dataDir: "./data",
     force: false,
+    skipAdmin: false,
     help: false,
   };
 
@@ -67,6 +72,10 @@ function parseArgs(args: string[]): InitOptions {
         options.force = true;
         break;
 
+      case "--skip-admin":
+        options.skipAdmin = true;
+        break;
+
       case "-h":
       case "--help":
         options.help = true;
@@ -85,15 +94,16 @@ function parseArgs(args: string[]): InitOptions {
 
 function showHelp(): void {
   console.log(`
-MindooDB Server Init - Generate server identity
+MindooDB Server Init - Generate server identity and (optionally) a system admin
 
 Usage:
-  npx ts-node src/init.ts --name <serverName> [options]
+  npx ts-node src/serverinit.ts --name <serverName> [options]
 
 Options:
   -n, --name <name>       Server name (e.g., "server1") -- required
   -d, --data-dir <path>   Data directory path (default: ./data)
   -f, --force             Overwrite existing server-identity.json
+  --skip-admin            Skip interactive system admin keypair generation
   -h, --help              Show this help message
 
 Environment variables:
@@ -101,25 +111,24 @@ Environment variables:
                             If not set, the user is prompted interactively.
 
 Examples:
-  # Interactive (prompts for password):
-  npx ts-node src/init.ts --name server1
+  # Interactive (prompts for password and system admin setup):
+  npx ts-node src/serverinit.ts --name server1
 
-  # Non-interactive (password from env var):
-  MINDOODB_SERVER_PASSWORD=secret npx ts-node src/init.ts --name server1 --data-dir ./data
+  # Non-interactive (password from env var, skip admin):
+  MINDOODB_SERVER_PASSWORD=secret npx ts-node src/serverinit.ts --name server1 --skip-admin
 `);
 }
 
-async function promptPassword(): Promise<string> {
-  const rl = createInterface({
+function createReadline(): ReturnType<typeof createInterface> {
+  return createInterface({
     input: process.stdin,
     output: process.stderr,
   });
+}
 
+async function promptLine(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise((resolve) => {
-    rl.question("Enter password to encrypt server identity: ", (answer) => {
-      rl.close();
-      resolve(answer);
-    });
+    rl.question(question, (answer) => resolve(answer));
   });
 }
 
@@ -140,6 +149,7 @@ async function main(): Promise<void> {
   const identityPath = join(options.dataDir, "server-identity.json");
   const trustedServersPath = join(options.dataDir, "trusted-servers.json");
   const tenantApiKeysPath = join(options.dataDir, "tenant-api-keys.json");
+  const configPath = join(options.dataDir, "config.json");
 
   if (existsSync(identityPath) && !options.force) {
     console.error(`Error: ${identityPath} already exists. Use --force to overwrite.`);
@@ -149,7 +159,9 @@ async function main(): Promise<void> {
   // Get password from env var or prompt
   let password = process.env[ENV_VARS.SERVER_PASSWORD];
   if (!password) {
-    password = await promptPassword();
+    const rl = createReadline();
+    password = await promptLine(rl, "Enter password to encrypt server identity: ");
+    rl.close();
   }
   if (!password) {
     console.error("Error: password is required.");
@@ -203,14 +215,121 @@ async function main(): Promise<void> {
   console.log(`\nServer name: ${serverUsername}`);
   console.log(`\nSigning public key (Ed25519):\n${identity.userSigningKeyPair.publicKey}`);
   console.log(`\nEncryption public key (RSA-OAEP):\n${identity.userEncryptionKeyPair.publicKey}`);
-  console.log("\n" + "=".repeat(60));
-  console.log("\nTo trust this server on another server, POST to /admin/trusted-servers:");
-  console.log(JSON.stringify({
-    name: serverUsername,
-    signingPublicKey: identity.userSigningKeyPair.publicKey,
-    encryptionPublicKey: identity.userEncryptionKeyPair.publicKey,
-  }, null, 2));
   console.log("=".repeat(60));
+
+  // System admin keypair generation
+  if (!options.skipAdmin) {
+    await generateSystemAdmin(factory, options.dataDir, configPath);
+  } else {
+    writeDefaultConfig(configPath);
+    console.log(`\nSkipped system admin generation (--skip-admin).`);
+  }
+
+  console.log("\n" + "=".repeat(60));
+  console.log("NEXT STEPS:");
+  console.log("=".repeat(60));
+  console.log("1. Start the server:");
+  console.log(`   MINDOODB_SERVER_PASSWORD=<password> node dist/server.js -d ${options.dataDir}`);
+  console.log("2. Edit config.json to configure system admin capabilities");
+  console.log("3. Use MindooDBServerAdmin or publishToServer to manage tenants");
+  console.log("=".repeat(60));
+}
+
+async function generateSystemAdmin(
+  factory: BaseMindooTenantFactory,
+  dataDir: string,
+  configPath: string,
+): Promise<void> {
+  const rl = createReadline();
+
+  const answer = await promptLine(rl, "\nCreate a system admin now? (y/N) ");
+  if (answer.toLowerCase() !== "y") {
+    rl.close();
+    writeDefaultConfig(configPath);
+    console.log("Skipped system admin generation.");
+    return;
+  }
+
+  const adminUsername = await promptLine(rl, "System admin username (e.g. cn=sysadmin/o=myorg): ");
+  if (!adminUsername.trim()) {
+    rl.close();
+    console.error("Error: username cannot be empty.");
+    writeDefaultConfig(configPath);
+    return;
+  }
+
+  const adminPassword = await promptLine(rl, "Password to protect the system admin private key: ");
+  if (!adminPassword) {
+    rl.close();
+    console.error("Error: password cannot be empty.");
+    writeDefaultConfig(configPath);
+    return;
+  }
+
+  const adminPasswordConfirm = await promptLine(rl, "Confirm password: ");
+  rl.close();
+
+  if (adminPassword !== adminPasswordConfirm) {
+    console.error("Error: passwords do not match.");
+    writeDefaultConfig(configPath);
+    return;
+  }
+
+  console.log(`\nGenerating system admin keypair for "${adminUsername}"...`);
+  console.log("(This may take a few seconds for RSA key generation)\n");
+
+  const adminIdentity = await factory.createUserId(adminUsername, adminPassword);
+
+  // Save the password-encrypted private key to a separate identity file
+  const safeFilename = adminUsername
+    .replace(/[^a-zA-Z0-9_=-]/g, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+  const identityFilePath = join(dataDir, `system-admin-${safeFilename}.identity.json`);
+  writeFileSync(identityFilePath, JSON.stringify(adminIdentity, null, 2), "utf-8");
+  console.log(`System admin identity (password-encrypted) written to: ${identityFilePath}`);
+
+  // Write config.json with the admin's public key
+  const config: ServerConfig = {
+    capabilities: {
+      "ALL:/system/*": [
+        {
+          username: adminUsername,
+          publicsignkey: adminIdentity.userSigningKeyPair.publicKey as string,
+        },
+      ],
+    },
+  };
+  writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+  console.log(`Config written to: ${configPath}`);
+
+  console.log("\n" + "=".repeat(60));
+  console.log("SYSTEM ADMIN CREATED:");
+  console.log("=".repeat(60));
+  console.log(`Username: ${adminUsername}`);
+  console.log(`Identity file: ${identityFilePath}`);
+  console.log(`Config: ${configPath}`);
+  console.log("\nThe identity file contains the password-encrypted private key.");
+  console.log("The raw private key is never stored on disk.");
+  console.log("You will need the password when using MindooDBServerAdmin or publishToServer.");
+  console.log("=".repeat(60));
+}
+
+function writeDefaultConfig(configPath: string): void {
+  if (existsSync(configPath)) return;
+
+  const config: ServerConfig = {
+    capabilities: {
+      "ALL:/system/*": [
+        {
+          username: "<INSERT_USERNAME>",
+          publicsignkey: "<INSERT_SIGNING_PUBLIC_KEY>",
+        },
+      ],
+    },
+  };
+  writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+  console.log(`Default config.json (with placeholder) written to: ${configPath}`);
 }
 
 main().catch((error) => {

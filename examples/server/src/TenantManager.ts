@@ -467,6 +467,33 @@ export class TenantManager {
     return tenants.sort();
   }
 
+  /**
+   * Update operator-owned fields of an existing tenant configuration.
+   * Only the fields present in `updates` are overwritten.
+   */
+  updateTenantConfig(
+    tenantId: string,
+    updates: Partial<Pick<TenantConfig, "defaultStoreType" | "remoteServers">>,
+  ): void {
+    const normalizedId = tenantId.toLowerCase();
+    const configPath = join(this.dataDir, normalizedId, "config.json");
+    if (!existsSync(configPath)) {
+      throw new Error(`Tenant ${normalizedId} not found`);
+    }
+    const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+
+    if (updates.defaultStoreType !== undefined) {
+      config.defaultStoreType = updates.defaultStoreType;
+    }
+    if (updates.remoteServers !== undefined) {
+      config.remoteServers = updates.remoteServers;
+    }
+
+    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+    this.loadedTenants.delete(normalizedId);
+    console.log(`[TenantManager] Updated tenant config: ${normalizedId}`);
+  }
+
   removeTenant(tenantId: string): void {
     const normalizedId = tenantId.toLowerCase();
     const tenantDir = join(this.dataDir, normalizedId);

@@ -53,5 +53,5 @@ USER app
 EXPOSE 1661
 VOLUME /data
 
-ENTRYPOINT ["node", "dist/index.js", "--data-dir", "/data"]
+ENTRYPOINT ["node", "dist/server.js", "--data-dir", "/data"]
 CMD []

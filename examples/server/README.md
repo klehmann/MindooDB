@@ -4,7 +4,7 @@ A Node.js/Express server implementing the MindooDB sync API with:
 
 - **Client-to-server sync** — clients push/pull encrypted entries
 - **Server-to-server mirroring** — servers relay ciphertext without decryption
-- **Tiered admin access** — full admin keys and delegated tenant creation keys
+- **Capabilities-based system admin security** — challenge/response auth with JWT and fine-grained route authorization
 - **Multi-tenant** — each tenant is isolated with its own config, keybag, and stores
 
 ## Prerequisites
@@ -33,7 +33,7 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 
 ## CLI Reference
 
-### `npm run dev` — Start the server
+### `npm run dev` / `npm start` — Start the server
 
 | Option | Alias | Description | Default |
 |--------|-------|-------------|---------|
@@ -60,7 +60,6 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 |--------|-------------|---------|
 | `--new-server` | URL of the server being added | **required** |
 | `--servers` | Comma-separated URLs of existing servers | **required** |
-| `--api-key` | Admin API key (shared by all servers) | **required** |
 | `--help` | Show help message | — |
 
 ## Environment Variables
@@ -68,20 +67,23 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MINDOODB_SERVER_PASSWORD` | If server-identity.json exists | Password to decrypt server identity and per-tenant keybags |
-| `MINDOODB_ADMIN_API_KEY` | Recommended | If set, protects admin endpoints with API key. **Warning logged on startup if not set.** |
-| `MINDOODB_ADMIN_ALLOWED_IPS` | No | Comma-separated IPs/CIDRs allowed to access admin endpoints. Default: **localhost only** (`127.0.0.1`, `::1`). Set to `*` to allow all IPs. |
 | `MINDOODB_CORS_ORIGIN` | No | Allowed CORS origin (e.g., `https://app.example.com`). If not set, CORS is disabled. |
+| `MINDOODB_ADMIN_ALLOWED_IPS` | No | Optional comma-separated client IPs/CIDRs allowed to call **`/system/*`** (all system admin routes, including `/system/auth/*`). If unset or `*`, any source IP may reach `/system/*` (JWT + `config.json` capabilities still apply). Example: `127.0.0.1,::1,172.23.248.0/24`. Behind a reverse proxy, configure Express `trust proxy` so `req.ip` is the real client. |
+
+> **Note:** The old `MINDOODB_ADMIN_API_KEY` variable has been removed. System admin **authorization** is enforced by `config.json` capabilities and JWTs. **`MINDOODB_ADMIN_ALLOWED_IPS`** is an optional **network** layer for `/system/*` only. See [Server Security](../../docs/server-security.md).
 
 ## Data Directory Layout
 
 ```
 data/
-├── server-identity.json       # Global server identity (PrivateUserId)
-├── trusted-servers.json       # Public keys of trusted remote servers
-├── tenant-api-keys.json       # Delegated tenant creation API keys
+├── server-identity.json                       # Global server identity (PrivateUserId)
+├── config.json                                # Capabilities-based system admin config
+├── trusted-servers.json                       # Public keys of trusted remote servers
+├── tenant-api-keys.json                       # Delegated tenant creation API keys
+├── system-admin-cn-sysadmin-o-myorg.identity.json  # System admin identity (password-encrypted)
 ├── acme/
-│   ├── config.json            # Tenant configuration
-│   └── stores/                # Content-addressed store data
+│   ├── config.json                            # Tenant configuration
+│   └── stores/                                # Content-addressed store data
 └── other-tenant/
     ├── config.json
     └── stores/
@@ -89,31 +91,42 @@ data/
 
 ## API Reference
 
-### Admin Endpoints
+### System Admin Endpoints (`/system/*`)
+
+All system admin endpoints require a JWT obtained via challenge/response authentication.
+See [Server Security](../../docs/server-security.md) for full details.
+
+#### Authentication
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/system/auth/challenge` | None | Request a challenge (body: `{ username, publicsignkey }`) |
+| `POST` | `/system/auth/authenticate` | None | Submit signed challenge |
 
 #### Tenant Management
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `POST` | `/admin/register-tenant` | Admin key or tenant creation key | Register a new tenant |
-| `GET` | `/admin/tenants` | Admin key only | List all registered tenants |
-| `DELETE` | `/admin/tenants/:tenantId` | Admin key only | Remove a tenant |
+| `POST` | `/system/tenants/:tenantId` | JWT | Create a tenant |
+| `GET` | `/system/tenants` | JWT | List all registered tenants |
+| `PUT` | `/system/tenants/:tenantId` | JWT | Update tenant config |
+| `DELETE` | `/system/tenants/:tenantId` | JWT | Remove a tenant |
 
 #### Trusted Server Management
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/admin/trusted-servers` | Admin key only | List trusted servers |
-| `POST` | `/admin/trusted-servers` | Admin key only | Add a trusted server |
-| `DELETE` | `/admin/trusted-servers/:serverName` | Admin key only | Remove a trusted server |
+| `GET` | `/system/trusted-servers` | JWT | List trusted servers |
+| `POST` | `/system/trusted-servers` | JWT | Add a trusted server |
+| `DELETE` | `/system/trusted-servers/:serverName` | JWT | Remove a trusted server |
 
 #### Tenant Creation Key Management
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/admin/tenant-api-keys` | Admin key only | List tenant creation keys (masked) |
-| `POST` | `/admin/tenant-api-keys` | Admin key only | Create a tenant creation key |
-| `DELETE` | `/admin/tenant-api-keys/:name` | Admin key only | Revoke a tenant creation key |
+| `GET` | `/system/tenant-api-keys` | JWT | List tenant creation keys (masked) |
+| `POST` | `/system/tenant-api-keys` | JWT | Create a tenant creation key |
+| `DELETE` | `/system/tenant-api-keys/:name` | JWT | Revoke a tenant creation key |
 
 ### Authentication Endpoints
 
@@ -142,9 +155,17 @@ data/
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/admin/tenants/:tenantId/sync-servers` | Admin key only | List sync servers for a tenant |
-| `POST` | `/admin/tenants/:tenantId/sync-servers` | Admin key only | Add or update a sync server |
-| `DELETE` | `/admin/tenants/:tenantId/sync-servers/:serverName` | Admin key only | Remove a sync server |
+| `GET` | `/system/tenants/:tenantId/sync-servers` | JWT | List sync servers for a tenant |
+| `POST` | `/system/tenants/:tenantId/sync-servers` | JWT | Add or update a sync server |
+| `DELETE` | `/system/tenants/:tenantId/sync-servers/:serverName` | JWT | Remove a sync server |
+| `POST` | `/system/tenants/:tenantId/trigger-sync` | JWT | Trigger sync for a tenant |
+
+#### Server Config Management
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/system/config` | JWT | Read the current server config |
+| `PUT` | `/system/config` | JWT | Replace the server config (no restart needed) |
 
 ### Server Info & Health
 
@@ -155,13 +176,11 @@ data/
 
 ## Tiered Authentication
 
-The server uses three levels of authentication:
+1. **System admin** — `config.json` capabilities + Ed25519 challenge/response + short-lived JWT for `/system/*`. Optional **`MINDOODB_ADMIN_ALLOWED_IPS`** restricts which client IPs may use the `/system/*` HTTP surface.
 
-1. **Admin API key** (`MINDOODB_ADMIN_API_KEY`) — full access to all admin endpoints. Set via environment variable, passed in the `X-API-Key` header.
+2. **Tenant creation key** — delegated keys stored in `tenant-api-keys.json` (managed via `/system/tenant-api-keys`). Intended for limited tenant registration; see server implementation for current enforcement.
 
-2. **Tenant creation key** — can only create tenants via `POST /admin/register-tenant`. Optionally restricted to a tenant ID prefix. Created by an admin via `POST /admin/tenant-api-keys`. Passed in the `X-API-Key` header.
-
-3. **User JWT token** — per-tenant sync access via Ed25519 challenge-response. Users are authenticated against the tenant's directory (admin-signed) or the config.json fallback.
+3. **User JWT** — per-tenant sync via Ed25519 challenge-response. Users are authenticated against the tenant directory (admin-signed).
 
 ## Walkthrough: Single Server Setup
 
@@ -540,17 +559,16 @@ The server includes the following hardening measures:
 - **Rate limiting** -- tiered per-IP rate limits: auth endpoints (20/min), admin endpoints (30/min), sync endpoints (200/min), global fallback (500/min). Returns `429 Too Many Requests` when exceeded.
 - **Security headers** -- `helmet` middleware sets X-Content-Type-Options, X-Frame-Options, Content-Security-Policy, Strict-Transport-Security, and others.
 - **CORS** -- disabled by default. Set `MINDOODB_CORS_ORIGIN` to allow a specific origin.
-- **Constant-time key comparison** -- API keys are compared using `crypto.timingSafeEqual()` to prevent timing attacks.
+- **Constant-time key comparison** -- tenant creation API keys are compared using `crypto.timingSafeEqual()` where applicable.
 - **Error sanitization** -- internal errors never leak file paths or stack traces to clients. Only known auth/validation errors return specific messages.
 - **Request size limits** -- JSON body limited to 5MB. Array sizes capped (100k IDs, 10k entries for putEntries).
 - **Connection timeouts** -- idle connections are closed after 30 seconds.
-- **Admin IP allowlist** -- admin endpoints are restricted to localhost by default. Set `MINDOODB_ADMIN_ALLOWED_IPS` to a comma-separated list of IPs or CIDRs (e.g., `10.0.0.0/8,192.168.1.0/24`) to allow specific networks, or `*` to allow all. IPv4-mapped IPv6 addresses (e.g., `::ffff:127.0.0.1`) are normalized automatically. When behind a reverse proxy, configure Express's `trust proxy` setting so that `req.ip` reflects the real client IP.
+- **Optional `/system/*` IP allowlist** — set `MINDOODB_ADMIN_ALLOWED_IPS` to a comma-separated list of IPs or IPv4 CIDRs (e.g., `127.0.0.1,::1,10.0.0.0/8`) to restrict which client addresses may call **any** `/system/*` route (including auth). If unset or `*`, there is no IP restriction at this layer. IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is normalized. Behind a reverse proxy, configure Express `trust proxy` so `req.ip` is accurate.
 
 For production deployments, also consider:
 
 - Enabling TLS (see below) or running behind a reverse proxy (nginx, Caddy) with TLS termination
-- Setting `MINDOODB_ADMIN_API_KEY` (the server warns on startup if not set)
-- Reviewing the `MINDOODB_ADMIN_ALLOWED_IPS` setting (defaults to localhost only)
+- Setting `MINDOODB_ADMIN_ALLOWED_IPS` if `/system/*` should only be reachable from operator networks
 - Using a process manager (PM2, systemd) for automatic restarts
 
 ## Static File Serving
@@ -664,7 +682,7 @@ docker run --rm \
   -v "$(pwd)/data:/data" \
   -e MINDOODB_SERVER_PASSWORD=your-secret \
   --entrypoint node \
-  mindoodb-server dist/init.js --data-dir /data --name server1
+  mindoodb-server dist/serverinit.js --data-dir /data --name server1
 ```
 
 ### Run the server
@@ -674,9 +692,10 @@ docker run -d --name mindoodb \
   -v "$(pwd)/data:/data" \
   -p 1661:1661 \
   -e MINDOODB_SERVER_PASSWORD=your-secret \
-  -e MINDOODB_ADMIN_API_KEY=your-admin-key \
   mindoodb-server
 ```
+
+Optional: restrict `/system/*` to specific networks, e.g. `-e MINDOODB_ADMIN_ALLOWED_IPS=127.0.0.1,10.0.0.0/8`.
 
 Additional CLI flags can be appended after the image name:
 

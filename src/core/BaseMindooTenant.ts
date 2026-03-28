@@ -647,10 +647,16 @@ export class BaseMindooTenant implements MindooTenant {
 
   /**
    * Publish (register) this tenant on a MindooDB server.
+   *
+   * When `systemAdminUser` + `systemAdminPassword` are provided the method
+   * performs a challenge/response handshake against `/system/auth/*` to
+   * obtain a JWT, then calls `POST /system/tenants/:tenantId`.
    */
   async publishToServer(serverUrl: string, options?: PublishToServerOptions): Promise<void> {
     console.log(`[publishToServer] Publishing tenant "${this.tenantId}" to server: ${serverUrl}`);
     this.logger.info(`Publishing tenant "${this.tenantId}" to server: ${serverUrl}`);
+
+    const baseUrl = serverUrl.replace(/\/$/, "");
 
     // Export the $publicinfos key so the server can read the directory DB
     const publicInfosKeyBytes = await this.keyBag.get("doc", PUBLIC_INFOS_KEY_ID);
@@ -659,9 +665,8 @@ export class BaseMindooTenant implements MindooTenant {
     }
     const publicInfosKeyBase64 = this.uint8ArrayToBase64(publicInfosKeyBytes);
 
-    // Build the registration request
+    // Build the registration request body
     const requestBody: Record<string, unknown> = {
-      tenantId: this.tenantId,
       adminSigningPublicKey: this.administrationPublicKey,
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
       publicInfosKey: publicInfosKeyBase64,
@@ -679,16 +684,22 @@ export class BaseMindooTenant implements MindooTenant {
       }));
     }
 
-    // Build headers
+    // Authenticate as system admin via challenge/response
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
-    if (options?.adminApiKey) {
-      headers["x-api-key"] = options.adminApiKey;
+
+    if (options?.systemAdminUser && options?.systemAdminPassword) {
+      const token = await this.authenticateAsSystemAdmin(
+        baseUrl,
+        options.systemAdminUser,
+        options.systemAdminPassword,
+      );
+      headers["Authorization"] = `Bearer ${token}`;
     }
 
-    // POST to the server's admin register-tenant endpoint
-    const url = `${serverUrl.replace(/\/$/, "")}/admin/register-tenant`;
+    // POST to /system/tenants/:tenantId
+    const url = `${baseUrl}/system/tenants/${encodeURIComponent(this.tenantId)}`;
     const response = await fetch(url, {
       method: "POST",
       headers,
@@ -704,6 +715,86 @@ export class BaseMindooTenant implements MindooTenant {
 
     console.log(`[publishToServer] ✓ Tenant "${this.tenantId}" published to server successfully`);
     this.logger.info(`Tenant "${this.tenantId}" published to server successfully`);
+  }
+
+  /**
+   * Perform system admin challenge/response auth and return a JWT token.
+   */
+  private async authenticateAsSystemAdmin(
+    baseUrl: string,
+    adminUser: PrivateUserId,
+    adminPassword: string,
+  ): Promise<string> {
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Decrypt the admin's signing private key
+    const signingKeyBuffer = await this.decryptPrivateKey(
+      adminUser.userSigningKeyPair.privateKey as EncryptedPrivateKey,
+      adminPassword,
+      "signing",
+    );
+    const signingKey = await subtle.importKey(
+      "pkcs8",
+      signingKeyBuffer,
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+
+    // Step 1: Request challenge from server
+    const challengeRes = await fetch(`${baseUrl}/system/auth/challenge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: adminUser.username,
+        publicsignkey: adminUser.userSigningKeyPair.publicKey,
+      }),
+    });
+
+    if (!challengeRes.ok) {
+      const errorBody = await challengeRes.text();
+      throw new Error(
+        `System admin challenge failed (HTTP ${challengeRes.status}): ${errorBody}`,
+      );
+    }
+
+    const { challenge } = (await challengeRes.json()) as { challenge: string };
+
+    // Step 2: Sign the challenge
+    const messageBytes = new TextEncoder().encode(challenge);
+    const signatureBuffer = await subtle.sign(
+      { name: "Ed25519" },
+      signingKey,
+      messageBytes,
+    );
+    const signatureBase64 = this.uint8ArrayToBase64(new Uint8Array(signatureBuffer));
+
+    // Step 3: Authenticate
+    const authRes = await fetch(`${baseUrl}/system/auth/authenticate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challenge, signature: signatureBase64 }),
+    });
+
+    if (!authRes.ok) {
+      const errorBody = await authRes.text();
+      throw new Error(
+        `System admin authentication failed (HTTP ${authRes.status}): ${errorBody}`,
+      );
+    }
+
+    const result = (await authRes.json()) as {
+      success: boolean;
+      token?: string;
+      error?: string;
+    };
+    if (!result.success || !result.token) {
+      throw new Error(
+        `System admin authentication failed: ${result.error || "unknown error"}`,
+      );
+    }
+
+    return result.token;
   }
 
   /**

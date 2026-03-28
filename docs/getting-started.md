@@ -62,17 +62,31 @@ The admin identity is kept separate from the regular user identity by design. Ad
 
 Now that the tenant exists locally, you register it on a MindooDB sync server. The server stores only encrypted data and the admin's public keys — it never receives private keys or plaintext content.
 
+Publishing requires a **system admin** identity. The server operator creates this during `init` (see [Server Security](./server-security.md) for the full setup). Your application needs the system admin's encrypted identity file and its password:
+
 ```javascript
-await tenant.publishToServer("https://sync.example.com");
+import { readFileSync } from "fs";
+
+const systemAdminIdentity = JSON.parse(
+  readFileSync("system-admin-sysadmin.identity.json", "utf-8")
+);
+
+await tenant.publishToServer("https://sync.example.com", {
+  adminUsername: adminUser.username,
+  systemAdminUser: systemAdminIdentity,
+  systemAdminPassword: "system-admin-password",
+});
 ```
 
-This sends the admin's public signing key, public encryption key, and the `$publicinfos` key to the server's registration endpoint. The server uses the `$publicinfos` key to read the directory database and validate incoming sync requests against the admin-signed user registry.
+This authenticates as the system admin (challenge/response with Ed25519 signature), then registers the tenant on the server. The server receives the admin's public signing key, public encryption key, and the `$publicinfos` key — it uses the `$publicinfos` key to read the directory database and validate incoming sync requests against the admin-signed user registry.
 
-If you want to pre-register users on the server at the same time (so they can sync immediately after joining), you can pass them as an option:
+If you want to pre-register users on the server at the same time (so they can sync immediately after joining), pass them as an option:
 
 ```javascript
 await tenant.publishToServer("https://sync.example.com", {
   adminUsername: adminUser.username,
+  systemAdminUser: systemAdminIdentity,
+  systemAdminPassword: "system-admin-password",
   registerUsers: [factory.toPublicUserId(appUser)],
 });
 ```
@@ -91,7 +105,7 @@ await directoryDb.pushChangesTo(remoteDirectory, {
 });
 ```
 
-This lets the admin authenticate and push initial `grantaccess` documents before the server has any directory entries for regular users.
+This lets the tenant admin authenticate and push initial `grantaccess` documents before the server has any directory entries for regular users.
 
 > **For decision makers:** This is the extent of server-side setup. There are no server-side user accounts to manage, no passwords to store on the server, no session databases. The server is a relay for encrypted blobs. If the server is breached, the attacker gets ciphertext and public keys — no plaintext data, no private keys, no usernames.
 
@@ -406,6 +420,7 @@ MindooDB detects and uses this native backend automatically on React Native. Aft
 
 With the basic setup complete, there are several directions to explore depending on your needs:
 
+- **[Server Security](./server-security.md)** — System admin setup, capabilities-based authorization, `config.json` reference, and key rotation.
 - **[Architecture Specification](./specification.md)** — Deep dive into the cryptographic model, store architecture, and security guarantees.
 - **[Network Sync Protocol](./network-sync-protocol.md)** — Full endpoint contracts, capability negotiation, and performance optimization (bloom filters, cursor-based sync).
 - **[Attachments](./attachments.md)** — Chunked, encrypted file attachments with streaming support.

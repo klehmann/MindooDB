@@ -81,7 +81,7 @@ export function validateStringLength(value: unknown, maxLength: number, fieldNam
 /**
  * Tenant IDs that are reserved because they collide with server route prefixes.
  */
-export const RESERVED_TENANT_NAMES = new Set(["admin", "health", "statics"]);
+export const RESERVED_TENANT_NAMES = new Set(["admin", "system", "health", "statics"]);
 
 /**
  * Validates a tenant ID: must pass identifier rules and must not be a reserved name.

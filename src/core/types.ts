@@ -208,8 +208,10 @@ export interface JoinTenantResult {
  * Options for publishing a tenant to a server.
  */
 export interface PublishToServerOptions {
-  /** Optional API key for the server's admin endpoints */
-  adminApiKey?: string;
+  /** System admin identity (PrivateUserId) for challenge/response auth. */
+  systemAdminUser?: PrivateUserId;
+  /** Password to decrypt systemAdminUser's private keys. */
+  systemAdminPassword?: string;
   /** Optional admin username for bootstrap handshake on the server */
   adminUsername?: string;
   /** Optional users to register on the server at the same time */

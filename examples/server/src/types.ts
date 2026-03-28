@@ -152,19 +152,41 @@ export interface TenantContext {
   config: TenantConfig;
 }
 
+// =========================================================================
+// System admin config types (config.json)
+// =========================================================================
+
+/**
+ * A principal entry in a capability rule.
+ * Identifies a system admin by both username and public signing key.
+ */
+export interface SystemAdminPrincipal {
+  username: string;
+  publicsignkey: string;
+}
+
+/**
+ * Server-level configuration loaded from config.json.
+ *
+ * The `capabilities` map controls which system admins can call which
+ * endpoints. Keys are `METHOD:PATHPATTERN` rules (e.g. `ALL:/system/*`,
+ * `POST:/system/tenants/company-*`). Values are arrays of principals
+ * allowed to call matching routes.
+ */
+export interface ServerConfig {
+  capabilities: Record<string, SystemAdminPrincipal[]>;
+}
+
 /**
  * Environment variables used by the server.
  */
 export const ENV_VARS = {
   /** Password to decrypt server identity private keys and per-tenant keybags */
   SERVER_PASSWORD: "MINDOODB_SERVER_PASSWORD",
-  /** Optional API key to protect admin endpoints (full access) */
-  ADMIN_API_KEY: "MINDOODB_ADMIN_API_KEY",
   /**
-   * Comma-separated list of IPs or CIDRs allowed to access admin endpoints.
-   * Default: localhost only (127.0.0.1, ::1).
-   * Set to "*" to allow all IPs.
-   * Examples: "10.0.0.0/8,192.168.1.0/24" or "10.0.0.5,10.0.0.6"
+   * Optional comma-separated allowlist for /system/* (system admin HTTP surface).
+   * If unset or `*`, any client IP may call /system/* (JWT + capabilities still required).
+   * Example: `127.0.0.1,::1,10.0.0.0/8`
    */
   ADMIN_ALLOWED_IPS: "MINDOODB_ADMIN_ALLOWED_IPS",
 } as const;

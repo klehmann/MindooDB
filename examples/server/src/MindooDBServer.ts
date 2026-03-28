@@ -1,9 +1,11 @@
 /**
- * MindooDB Example Server - Express HTTP server implementing the sync API.
+ * MindooDB Server - Express HTTP server implementing the sync API.
  *
  * Security features:
+ * - Capabilities-based system admin authorization via config.json
+ * - Challenge/response (Ed25519) authentication for /system/* endpoints
+ * - JWT-based session management for system admins
  * - Input validation on all identifiers (path traversal prevention)
- * - Tiered admin auth with constant-time key comparison
  * - Rate limiting per endpoint tier
  * - Security headers (helmet) and CORS
  * - Error sanitization (no internal details leaked)
@@ -17,7 +19,6 @@ import { readFileSync, existsSync } from "fs";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { timingSafeEqual } from "crypto";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -33,6 +34,15 @@ import type { NetworkSyncCapabilities } from "mindoodb/core/appendonlystores/net
 import { NetworkError, NetworkErrorType } from "mindoodb/core/appendonlystores/network/types";
 
 import { TenantManager } from "./TenantManager";
+import { CapabilityMatcher } from "./CapabilityMatcher";
+import { SystemAdminAuthService } from "./SystemAdminAuth";
+import { validateServerConfig, backupConfig, writeConfig } from "./config";
+import {
+  isSystemIpAllowListDisabled,
+  readSystemIpAllowListFromEnv,
+  systemIpAllowlistMiddleware,
+} from "./SystemIpAllowlist";
+import type { ServerConfig } from "./types";
 import type {
   RegisterTenantRequest,
   RegisterTenantResponse,
@@ -59,6 +69,7 @@ declare global {
   namespace Express {
     interface Request {
       tenantId?: string;
+      systemAdmin?: { username: string; publicsignkey: string };
     }
   }
 }
@@ -99,80 +110,44 @@ interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string;
 }
 
-// ==================== IP Allowlist Helpers ====================
-
-const LOCALHOST_ALLOWLIST = ["127.0.0.1", "::1"];
-
-function normalizeIp(ip: string): string {
-  if (ip.startsWith("::ffff:")) return ip.substring(7);
-  return ip;
-}
-
-function ipv4ToNumber(ip: string): number {
-  const parts = ip.split(".").map(Number);
-  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
-}
-
-function matchesEntry(clientIp: string, entry: string): boolean {
-  if (entry === "*") return true;
-
-  const normIp = normalizeIp(clientIp);
-  const normEntry = normalizeIp(entry);
-
-  if (!normEntry.includes("/")) return normIp === normEntry;
-
-  const [network, prefixStr] = normEntry.split("/");
-  const prefix = parseInt(prefixStr, 10);
-  if (isNaN(prefix) || prefix < 0 || prefix > 32) return false;
-
-  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
-  return (ipv4ToNumber(normIp) & mask) === (ipv4ToNumber(network) & mask);
-}
-
-function isIpAllowed(clientIp: string, allowList: string[]): boolean {
-  for (const entry of allowList) {
-    if (matchesEntry(clientIp, entry)) return true;
-  }
-  return false;
-}
-
-function parseAdminAllowedIps(): string[] {
-  const raw = process.env.MINDOODB_ADMIN_ALLOWED_IPS;
-  if (!raw) return LOCALHOST_ALLOWLIST;
-  if (raw.trim() === "*") return ["*"];
-  return raw.split(",").map((s) => s.trim()).filter(Boolean);
-}
-
-// ==================== Helpers ====================
-
-function safeCompare(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-}
-
 export class MindooDBServer {
   private app: express.Application;
   private tenantManager: TenantManager;
-  private adminApiKey: string | undefined;
+  private capabilityMatcher: CapabilityMatcher;
+  private systemAdminAuth: SystemAdminAuthService;
   private readonly staticDir: string | undefined;
-  private readonly adminIpAllowList: string[];
+  private serverConfig: ServerConfig;
+  private configPath: string;
 
-  constructor(dataDir: string, serverPassword?: string, staticDir?: string) {
+  constructor(
+    dataDir: string,
+    serverPassword?: string,
+    staticDir?: string,
+    config?: ServerConfig,
+    configPath?: string,
+  ) {
     this.app = express();
     this.tenantManager = new TenantManager(dataDir, serverPassword);
-    this.adminApiKey = process.env.MINDOODB_ADMIN_API_KEY;
     this.staticDir = staticDir;
-    this.adminIpAllowList = parseAdminAllowedIps();
+    this.configPath = configPath ?? path.join(dataDir, "config.json");
 
-    if (!this.adminApiKey) {
-      console.log(`[MindooDBServer] WARNING: MINDOODB_ADMIN_API_KEY not set. Admin endpoints are UNPROTECTED.`);
-      console.log(`[MindooDBServer] WARNING: Set MINDOODB_ADMIN_API_KEY environment variable for production use.`);
-    }
+    this.serverConfig = config ?? { capabilities: {} };
+    this.capabilityMatcher = new CapabilityMatcher(this.serverConfig);
 
-    if (this.adminIpAllowList.includes("*")) {
-      console.log(`[MindooDBServer] Admin IP allowlist: all IPs allowed`);
+    const cryptoAdapter = this.tenantManager.getCryptoAdapter();
+    this.systemAdminAuth = new SystemAdminAuthService(
+      cryptoAdapter,
+      this.serverConfig,
+    );
+
+    const principalCount = Object.values(this.serverConfig.capabilities).reduce(
+      (sum, arr) => sum + arr.length,
+      0,
+    );
+    if (principalCount === 0) {
+      console.log(`[MindooDBServer] WARNING: No system admin principals configured. All /system/* endpoints are locked down.`);
     } else {
-      console.log(`[MindooDBServer] Admin IP allowlist: ${this.adminIpAllowList.join(", ")}`);
+      console.log(`[MindooDBServer] System admin auth configured with ${principalCount} principal(s)`);
     }
 
     this.setupMiddleware();
@@ -187,10 +162,27 @@ export class MindooDBServer {
     return this.tenantManager;
   }
 
+  getSystemAdminAuth(): SystemAdminAuthService {
+    return this.systemAdminAuth;
+  }
+
+  getServerConfig(): ServerConfig {
+    return this.serverConfig;
+  }
+
+  getConfigPath(): string {
+    return this.configPath;
+  }
+
+  reloadConfig(newConfig: ServerConfig): void {
+    this.serverConfig = newConfig;
+    this.capabilityMatcher.reload(newConfig);
+    this.systemAdminAuth.reloadPrincipals(newConfig);
+  }
+
   listen(port: number): void {
     const server = this.app.listen(port, () => {
       console.log(`[MindooDBServer] Listening on port ${port}`);
-      this.logAdminKeyStatus();
     });
 
     server.setTimeout(30_000);
@@ -204,33 +196,21 @@ export class MindooDBServer {
     const server = https.createServer(tlsOptions, this.app);
     server.listen(port, () => {
       console.log(`[MindooDBServer] Listening on HTTPS port ${port}`);
-      this.logAdminKeyStatus();
     });
 
     server.setTimeout(30_000);
   }
 
-  private logAdminKeyStatus(): void {
-    if (this.adminApiKey) {
-      console.log(`[MindooDBServer] Admin endpoints protected by API key`);
-    } else {
-      console.log(`[MindooDBServer] Admin endpoints OPEN (no API key set)`);
-    }
-  }
-
   private setupMiddleware(): void {
-    // Security headers
     this.app.use(helmet());
 
-    // CORS
     const corsOrigin = process.env.MINDOODB_CORS_ORIGIN;
     this.app.use(cors({
       origin: corsOrigin || false,
-      methods: ["GET", "POST", "DELETE"],
-      allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+      methods: ["GET", "POST", "PUT", "DELETE"],
+      allowedHeaders: ["Content-Type", "Authorization"],
     }));
 
-    // Global rate limit
     this.app.use(rateLimit({
       windowMs: 60_000,
       max: 500,
@@ -239,10 +219,8 @@ export class MindooDBServer {
       message: { error: "Too many requests, please try again later" },
     }));
 
-    // JSON body parsing with reduced size limit
     this.app.use(express.json({ limit: "5mb" }));
 
-    // Request logging
     this.app.use((req: Request, res: Response, next: NextFunction) => {
       console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
       next();
@@ -250,7 +228,7 @@ export class MindooDBServer {
   }
 
   private setupRoutes(): void {
-    // Root redirect: forward GET / to /statics/index.html if available
+    // Root redirect
     this.app.get("/", (req: Request, res: Response) => {
       if (this.staticDir && existsSync(path.join(this.staticDir, "index.html"))) {
         res.redirect(302, "/statics/index.html");
@@ -272,7 +250,7 @@ export class MindooDBServer {
       res.json(info);
     });
 
-    // Static file serving (if configured)
+    // Static file serving
     if (this.staticDir) {
       const resolvedStaticDir = path.resolve(this.staticDir);
       this.app.use("/statics", (req: Request, res: Response, next: NextFunction) => {
@@ -285,28 +263,30 @@ export class MindooDBServer {
       console.log(`[MindooDBServer] Serving static files from ${resolvedStaticDir} at /statics/`);
     }
 
-    // Admin routes with IP filtering, tiered auth, and rate limiting
-    const adminIpFilter = (req: Request, res: Response, next: NextFunction): void => {
-      const clientIp = req.ip || req.socket.remoteAddress || "";
-      if (!isIpAllowed(clientIp, this.adminIpAllowList)) {
-        console.log(`[MindooDBServer] Admin request blocked from ${clientIp}`);
-        res.status(403).json({ error: "Forbidden" });
-        return;
-      }
-      next();
-    };
+    // System admin routes (replaces former /admin/*)
+    const systemIpRaw = readSystemIpAllowListFromEnv();
+    if (!isSystemIpAllowListDisabled(systemIpRaw)) {
+      console.log(
+        `[MindooDBServer] MINDOODB_ADMIN_ALLOWED_IPS is set — /system/* limited to: ${systemIpRaw}`,
+      );
+    }
 
-    const adminRateLimit = rateLimit({
+    const systemRateLimit = rateLimit({
       windowMs: 60_000,
       max: 30,
       standardHeaders: true,
       legacyHeaders: false,
-      message: { error: "Too many admin requests, please try again later" },
+      message: { error: "Too many system requests, please try again later" },
     });
 
-    const adminRouter = Router();
-    this.setupAdminRoutes(adminRouter);
-    this.app.use("/admin", adminIpFilter, adminRateLimit, adminRouter);
+    const systemRouter = Router();
+    this.setupSystemRoutes(systemRouter);
+    this.app.use(
+      "/system",
+      systemIpAllowlistMiddleware,
+      systemRateLimit,
+      systemRouter,
+    );
 
     // Tenant-scoped routes
     this.app.use("/:tenantId", this.tenantMiddleware.bind(this), this.createTenantRouter());
@@ -314,49 +294,56 @@ export class MindooDBServer {
     this.app.use(this.errorHandler.bind(this));
   }
 
-  // ==================== Auth Middleware ====================
+  // ==================== System Admin Auth Middleware ====================
 
-  private adminOnlyMiddleware(req: Request, res: Response, next: NextFunction): void {
-    if (!this.adminApiKey) {
-      return next();
-    }
-
-    const providedKey = req.headers["x-api-key"] as string | undefined;
-    if (!providedKey || !safeCompare(providedKey, this.adminApiKey)) {
-      res.status(401).json({ error: "Invalid or missing admin API key" });
+  /**
+   * JWT-based middleware for /system/* routes (excluding /system/auth/*).
+   * Extracts and validates the bearer token, then checks capabilities
+   * for the current (method, path, username, publicsignkey).
+   */
+  private async systemAdminMiddleware(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Missing or invalid Authorization header" });
       return;
     }
 
+    const token = auth.substring(7);
+    const payload = await this.systemAdminAuth.validateToken(token);
+    if (!payload) {
+      res.status(401).json({ error: "Invalid or expired token" });
+      return;
+    }
+
+    // The original request path relative to the /system mount is in req.path,
+    // but we need the full path for capability matching.
+    const fullPath = `/system${req.path}`;
+    const method = req.method.toUpperCase();
+
+    if (
+      !this.capabilityMatcher.isAuthorized(
+        method,
+        fullPath,
+        payload.sub,
+        payload.publicsignkey,
+      )
+    ) {
+      res.status(403).json({ error: "Forbidden: insufficient capabilities" });
+      return;
+    }
+
+    req.systemAdmin = {
+      username: payload.sub,
+      publicsignkey: payload.publicsignkey,
+    };
     next();
   }
 
-  private tenantCreationMiddleware(req: Request, res: Response, next: NextFunction): void {
-    if (!this.adminApiKey) {
-      return next();
-    }
-
-    const providedKey = req.headers["x-api-key"] as string | undefined;
-    if (!providedKey) {
-      res.status(401).json({ error: "API key required" });
-      return;
-    }
-
-    if (safeCompare(providedKey, this.adminApiKey)) {
-      return next();
-    }
-
-    const tenantId = req.body?.tenantId;
-    if (!tenantId) {
-      res.status(400).json({ error: "tenantId is required" });
-      return;
-    }
-
-    if (this.tenantManager.validateTenantCreationKey(providedKey, tenantId)) {
-      return next();
-    }
-
-    res.status(403).json({ error: "API key not authorized for this tenant ID" });
-  }
+  // ==================== Tenant Middleware ====================
 
   private tenantMiddleware(req: Request, res: Response, next: NextFunction): void {
     const rawTenantId = req.params.tenantId?.toLowerCase();
@@ -382,71 +369,26 @@ export class MindooDBServer {
     next();
   }
 
-  // ==================== Admin Routes ====================
+  // ==================== System Routes ====================
 
-  private setupAdminRoutes(router: Router): void {
-    router.post(
-      "/register-tenant",
-      this.tenantCreationMiddleware.bind(this),
-      (req: Request, res: Response) => {
-        try {
-          const request: RegisterTenantRequest = req.body;
+  private setupSystemRoutes(router: Router): void {
+    // Auth endpoints — no JWT required (these *produce* JWTs)
+    const authRateLimit = rateLimit({
+      windowMs: 60_000,
+      max: 20,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many authentication attempts, please try again later" },
+    });
 
-          if (!request.tenantId) {
-            res.status(400).json({ error: "tenantId is required" });
-            return;
-          }
+    router.post("/auth/challenge", authRateLimit, this.handleSystemChallenge.bind(this));
+    router.post("/auth/authenticate", authRateLimit, this.handleSystemAuthenticate.bind(this));
 
-          try {
-            validateTenantId(request.tenantId.toLowerCase());
-          } catch (validationError) {
-            res.status(400).json({ error: validationError instanceof ValidationError ? validationError.message : "Invalid tenantId format" });
-            return;
-          }
+    // All other /system/* routes require JWT + capability check
+    const authMiddleware = this.systemAdminMiddleware.bind(this);
 
-          if (!request.adminSigningPublicKey) {
-            res.status(400).json({ error: "adminSigningPublicKey is required" });
-            return;
-          }
-          if (!request.adminEncryptionPublicKey) {
-            res.status(400).json({ error: "adminEncryptionPublicKey is required" });
-            return;
-          }
-          if (request.adminUsername !== undefined) {
-            validateUsername(request.adminUsername);
-          }
-
-          validateStringLength(request.adminSigningPublicKey, MAX_PEM_KEY_LENGTH, "adminSigningPublicKey");
-          validateStringLength(request.adminEncryptionPublicKey, MAX_PEM_KEY_LENGTH, "adminEncryptionPublicKey");
-
-          if (this.tenantManager.tenantExists(request.tenantId)) {
-            res.status(409).json({ error: `Tenant ${request.tenantId} already exists` });
-            return;
-          }
-
-          const context = this.tenantManager.registerTenant(request);
-
-          const response: RegisterTenantResponse = {
-            success: true,
-            tenantId: context.tenantId,
-            message: `Tenant ${context.tenantId} registered successfully`,
-          };
-
-          res.status(201).json(response);
-        } catch (error) {
-          if (error instanceof ValidationError) {
-            res.status(400).json({ error: error.message });
-            return;
-          }
-          console.error("[MindooDBServer] Error registering tenant:", error);
-          res.status(500).json({ error: "Failed to register tenant" });
-        }
-      },
-    );
-
-    const adminOnly = this.adminOnlyMiddleware.bind(this);
-
-    router.get("/tenants", adminOnly, (req: Request, res: Response) => {
+    // Tenant CRUD
+    router.get("/tenants", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenants = this.tenantManager.listTenants();
         const response: ListTenantsResponse = { tenants };
@@ -457,7 +399,93 @@ export class MindooDBServer {
       }
     });
 
-    router.delete("/tenants/:tenantId", adminOnly, (req: Request, res: Response) => {
+    router.post("/tenants/:tenantId", authMiddleware, (req: Request, res: Response) => {
+      try {
+        const tenantId = req.params.tenantId.toLowerCase();
+
+        try {
+          validateTenantId(tenantId);
+        } catch (validationError) {
+          res.status(400).json({
+            error: validationError instanceof ValidationError
+              ? validationError.message
+              : "Invalid tenantId format",
+          });
+          return;
+        }
+
+        const request: RegisterTenantRequest = {
+          ...req.body,
+          tenantId,
+        };
+
+        if (!request.adminSigningPublicKey) {
+          res.status(400).json({ error: "adminSigningPublicKey is required" });
+          return;
+        }
+        if (!request.adminEncryptionPublicKey) {
+          res.status(400).json({ error: "adminEncryptionPublicKey is required" });
+          return;
+        }
+        if (request.adminUsername !== undefined) {
+          validateUsername(request.adminUsername);
+        }
+
+        validateStringLength(request.adminSigningPublicKey, MAX_PEM_KEY_LENGTH, "adminSigningPublicKey");
+        validateStringLength(request.adminEncryptionPublicKey, MAX_PEM_KEY_LENGTH, "adminEncryptionPublicKey");
+
+        if (this.tenantManager.tenantExists(tenantId)) {
+          res.status(409).json({ error: `Tenant ${tenantId} already exists` });
+          return;
+        }
+
+        const context = this.tenantManager.registerTenant(request);
+
+        const response: RegisterTenantResponse = {
+          success: true,
+          tenantId: context.tenantId,
+          message: `Tenant ${context.tenantId} registered successfully`,
+        };
+
+        res.status(201).json(response);
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
+        console.error("[MindooDBServer] Error registering tenant:", error);
+        res.status(500).json({ error: "Failed to register tenant" });
+      }
+    });
+
+    router.put("/tenants/:tenantId", authMiddleware, (req: Request, res: Response) => {
+      try {
+        const tenantId = req.params.tenantId.toLowerCase();
+        try {
+          validateIdentifier(tenantId, "tenantId");
+        } catch {
+          res.status(400).json({ error: "Invalid tenantId format" });
+          return;
+        }
+
+        if (!this.tenantManager.tenantExists(tenantId)) {
+          res.status(404).json({ error: "Tenant not found" });
+          return;
+        }
+
+        this.tenantManager.updateTenantConfig(tenantId, req.body);
+        res.json({ success: true, message: `Tenant ${tenantId} updated` });
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
+        console.error("[MindooDBServer] Error updating tenant:", error);
+        res.status(500).json({ error: "Failed to update tenant" });
+      }
+    });
+
+    router.delete("/tenants/:tenantId", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
 
@@ -482,7 +510,7 @@ export class MindooDBServer {
     });
 
     // Trusted server management
-    router.get("/trusted-servers", adminOnly, (req: Request, res: Response) => {
+    router.get("/trusted-servers", authMiddleware, (req: Request, res: Response) => {
       try {
         res.json({ servers: this.tenantManager.listTrustedServers() });
       } catch (error) {
@@ -491,7 +519,7 @@ export class MindooDBServer {
       }
     });
 
-    router.post("/trusted-servers", adminOnly, (req: Request, res: Response) => {
+    router.post("/trusted-servers", authMiddleware, (req: Request, res: Response) => {
       try {
         const { name, signingPublicKey, encryptionPublicKey } = req.body;
 
@@ -522,14 +550,12 @@ export class MindooDBServer {
       }
     });
 
-    router.delete("/trusted-servers/:serverName", adminOnly, (req: Request, res: Response) => {
+    router.delete("/trusted-servers/:serverName", authMiddleware, (req: Request, res: Response) => {
       try {
         const serverName = req.params.serverName;
-
         validateStringLength(serverName, 256, "serverName");
 
         const removed = this.tenantManager.removeTrustedServer(serverName);
-
         if (!removed) {
           res.status(404).json({ error: "Trusted server not found" });
           return;
@@ -547,7 +573,7 @@ export class MindooDBServer {
     });
 
     // Tenant creation key management
-    router.get("/tenant-api-keys", adminOnly, (req: Request, res: Response) => {
+    router.get("/tenant-api-keys", authMiddleware, (req: Request, res: Response) => {
       try {
         const keys = this.tenantManager.listTenantCreationKeys().map((k) => ({
           name: k.name,
@@ -562,7 +588,7 @@ export class MindooDBServer {
       }
     });
 
-    router.post("/tenant-api-keys", adminOnly, (req: Request, res: Response) => {
+    router.post("/tenant-api-keys", authMiddleware, (req: Request, res: Response) => {
       try {
         const { name, tenantIdPrefix } = req.body;
 
@@ -599,14 +625,12 @@ export class MindooDBServer {
       }
     });
 
-    router.delete("/tenant-api-keys/:name", adminOnly, (req: Request, res: Response) => {
+    router.delete("/tenant-api-keys/:name", authMiddleware, (req: Request, res: Response) => {
       try {
         const name = req.params.name;
-
         validateStringLength(name, 64, "name");
 
         const removed = this.tenantManager.removeTenantCreationKey(name);
-
         if (!removed) {
           res.status(404).json({ error: "Tenant creation key not found" });
           return;
@@ -624,7 +648,7 @@ export class MindooDBServer {
     });
 
     // Per-tenant sync server management
-    router.get("/tenants/:tenantId/sync-servers", adminOnly, (req: Request, res: Response) => {
+    router.get("/tenants/:tenantId/sync-servers", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
         try { validateIdentifier(tenantId, "tenantId"); } catch {
@@ -643,7 +667,7 @@ export class MindooDBServer {
       }
     });
 
-    router.post("/tenants/:tenantId/sync-servers", adminOnly, (req: Request, res: Response) => {
+    router.post("/tenants/:tenantId/sync-servers", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
         try { validateIdentifier(tenantId, "tenantId"); } catch {
@@ -685,7 +709,7 @@ export class MindooDBServer {
       }
     });
 
-    router.delete("/tenants/:tenantId/sync-servers/:serverName", adminOnly, (req: Request, res: Response) => {
+    router.delete("/tenants/:tenantId/sync-servers/:serverName", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
         try { validateIdentifier(tenantId, "tenantId"); } catch {
@@ -715,6 +739,137 @@ export class MindooDBServer {
         res.status(500).json({ error: "Failed to remove sync server" });
       }
     });
+
+    // Per-tenant trigger-sync (moved from /:tenantId/admin/trigger-sync)
+    router.post("/tenants/:tenantId/trigger-sync", authMiddleware, this.handleTriggerSync.bind(this));
+
+    // Runtime config management
+    router.get("/config", authMiddleware, (req: Request, res: Response) => {
+      res.json(this.serverConfig);
+    });
+
+    router.put("/config", authMiddleware, this.handleUpdateConfig.bind(this));
+  }
+
+  // ==================== System Auth Handlers ====================
+
+  private async handleSystemChallenge(req: Request, res: Response): Promise<void> {
+    try {
+      const { username, publicsignkey } = req.body;
+
+      if (!username || typeof username !== "string") {
+        res.status(400).json({ error: "username is required" });
+        return;
+      }
+      if (!publicsignkey || typeof publicsignkey !== "string") {
+        res.status(400).json({ error: "publicsignkey is required" });
+        return;
+      }
+
+      validateUsername(username);
+      validateStringLength(publicsignkey, MAX_PEM_KEY_LENGTH, "publicsignkey");
+
+      const challenge = await this.systemAdminAuth.generateChallenge(
+        username,
+        publicsignkey,
+      );
+      res.json({ challenge });
+    } catch (error) {
+      if (error instanceof Error && error.message === "Unknown system admin principal") {
+        res.status(404).json({ error: "System admin principal not found" });
+        return;
+      }
+      if (error instanceof ValidationError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      console.error("[MindooDBServer] System challenge error:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+
+  private async handleSystemAuthenticate(req: Request, res: Response): Promise<void> {
+    try {
+      const { challenge, signature } = req.body;
+
+      if (!challenge || !signature) {
+        res.status(400).json({ error: "challenge and signature are required" });
+        return;
+      }
+
+      validateStringLength(challenge, MAX_CHALLENGE_LENGTH, "challenge");
+      validateStringLength(signature, MAX_SIGNATURE_LENGTH, "signature");
+
+      const signatureBytes = this.base64ToUint8Array(signature);
+      const result = await this.systemAdminAuth.authenticate(challenge, signatureBytes);
+      res.json(result);
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      console.error("[MindooDBServer] System authenticate error:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+
+  // ==================== Config Update Handler ====================
+
+  private async handleUpdateConfig(req: Request, res: Response): Promise<void> {
+    try {
+      let newConfig: ServerConfig;
+      try {
+        newConfig = validateServerConfig(req.body, "request body");
+      } catch (err) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : "Invalid config format",
+        });
+        return;
+      }
+
+      // Self-lockout protection: verify the calling admin retains PUT /system/config access
+      const callingAdmin = req.systemAdmin!;
+      const proposedMatcher = new CapabilityMatcher(newConfig);
+      if (
+        !proposedMatcher.isAuthorized(
+          "PUT",
+          "/system/config",
+          callingAdmin.username,
+          callingAdmin.publicsignkey,
+        )
+      ) {
+        res.status(400).json({
+          error: "This change would remove your own access to PUT /system/config",
+        });
+        return;
+      }
+
+      // Backup the current config before overwriting
+      const { existsSync: fsExists } = await import("fs");
+      let backupFile: string | null = null;
+      if (fsExists(this.configPath)) {
+        backupFile = backupConfig(this.configPath);
+      }
+
+      // Persist new config to disk
+      writeConfig(this.configPath, newConfig);
+
+      // Hot-swap in-memory state
+      this.reloadConfig(newConfig);
+
+      console.log(
+        `[MindooDBServer] Config updated by ${callingAdmin.username}` +
+          (backupFile ? ` (backup: ${backupFile})` : ""),
+      );
+
+      res.json({
+        success: true,
+        ...(backupFile ? { backupFile } : {}),
+      });
+    } catch (error) {
+      console.error("[MindooDBServer] Error updating config:", error);
+      res.status(500).json({ error: "Failed to update config" });
+    }
   }
 
   // ==================== Tenant Routes ====================
@@ -758,8 +913,6 @@ export class MindooDBServer {
     router.post("/sync/planDocumentMaterialization", syncRateLimit, this.handlePlanDocumentMaterialization.bind(this));
     router.post("/sync/planDocumentMaterializationBatch", syncRateLimit, this.handlePlanDocumentMaterializationBatch.bind(this));
 
-    router.post("/admin/trigger-sync", this.handleTriggerSync.bind(this));
-
     return router;
   }
 
@@ -769,7 +922,7 @@ export class MindooDBServer {
     return validateIdentifier(dbId, "dbId");
   }
 
-  // ==================== Auth Handlers ====================
+  // ==================== Tenant Auth Handlers ====================
 
   private async handleChallenge(req: Request, res: Response): Promise<void> {
     try {
@@ -1098,11 +1251,6 @@ export class MindooDBServer {
     return auth.substring(7);
   }
 
-  /**
-   * Unified error handler. Returns known auth/validation errors with their
-   * messages; everything else gets a generic "Internal server error" to
-   * prevent leaking implementation details.
-   */
   private handleRequestError(error: unknown, res: Response): void {
     if (error instanceof ValidationError) {
       res.status(400).json({ error: error.message });

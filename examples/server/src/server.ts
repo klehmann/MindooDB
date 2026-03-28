@@ -3,8 +3,8 @@
  * MindooDB Example Server - Entry Point
  *
  * Usage:
- *   npx ts-node src/index.ts [options]
- *   node dist/index.js [options]
+ *   npx ts-node src/server.ts [options]
+ *   node dist/server.js [options]
  *
  * Options:
  *   -d, --data-dir <path>   Data directory path (default: ./data)
@@ -17,11 +17,11 @@
  *
  * Environment variables:
  *   MINDOODB_SERVER_PASSWORD   Password to decrypt server identity private keys
- *   MINDOODB_ADMIN_API_KEY     API key to protect admin endpoints (optional)
  */
 
 import { MindooDBServer } from "./MindooDBServer";
 import { ServerSync, startPeriodicSync } from "./ServerSync";
+import { loadServerConfig, resolveConfigPath } from "./config";
 import { ENV_VARS } from "./types";
 
 interface CliOptions {
@@ -31,6 +31,7 @@ interface CliOptions {
   tlsCert?: string;
   tlsKey?: string;
   staticDir?: string;
+  configPath?: string;
   help: boolean;
 }
 
@@ -96,6 +97,13 @@ function parseArgs(args: string[]): CliOptions {
         }
         break;
 
+      case "--config":
+        if (nextArg) {
+          options.configPath = nextArg;
+          i++;
+        }
+        break;
+
       case "-h":
       case "--help":
         options.help = true;
@@ -117,14 +125,15 @@ function showHelp(): void {
 MindooDB Example Server
 
 Usage:
-  npx ts-node src/index.ts [options]
-  node dist/index.js [options]
+  npx ts-node src/server.ts [options]
+  node dist/server.js [options]
 
 Options:
   -d, --data-dir <path>   Data directory path (default: ./data)
   -p, --port <port>       Server port (default: 1661)
   -s, --auto-sync         Enable automatic sync with remote servers
   -w, --static-dir <path> Serve static files at /statics/ (e.g. bootstrap UI)
+  --config <path>         Path to config.json (default: <dataDir>/config.json)
   --tls-cert <path>       Path to TLS certificate file (PEM format)
   --tls-key <path>        Path to TLS private key file (PEM format)
   -h, --help              Show this help message
@@ -132,30 +141,25 @@ Options:
 Environment variables:
   MINDOODB_SERVER_PASSWORD     Password to decrypt server identity private keys
                                (required if server-identity.json exists)
-  MINDOODB_ADMIN_API_KEY       API key to protect admin endpoints (optional)
-                               If not set, admin endpoints are open
-  MINDOODB_ADMIN_ALLOWED_IPS   Comma-separated IPs/CIDRs allowed to access admin
-                               endpoints (default: localhost only). Set to "*" to
-                               allow all IPs. Example: "10.0.0.0/8,192.168.1.5"
 
 Examples:
   # Start server with default settings
-  npx ts-node src/index.ts
+  npx ts-node src/server.ts
 
   # Start server with custom data directory and port
-  npx ts-node src/index.ts -d /var/lib/mindoodb -p 8080
+  npx ts-node src/server.ts -d /var/lib/mindoodb -p 8080
 
   # Start server with auto-sync enabled
-  MINDOODB_SERVER_PASSWORD=secret npx ts-node src/index.ts -s
+  MINDOODB_SERVER_PASSWORD=secret npx ts-node src/server.ts -s
 
-  # Start server with API key protection
-  MINDOODB_ADMIN_API_KEY=my-secret-key npx ts-node src/index.ts
+  # Start server with explicit config file
+  npx ts-node src/server.ts --config /etc/mindoodb/config.json
 
   # Start server with static files (e.g. bootstrap UI for distributed web apps)
-  npx ts-node src/index.ts -w ./webapp-bootstrap
+  npx ts-node src/server.ts -w ./webapp-bootstrap
 
   # Start server with TLS (HTTPS)
-  npx ts-node src/index.ts --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem -p 443
+  npx ts-node src/server.ts --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem -p 443
 `);
 }
 
@@ -183,15 +187,17 @@ async function main(): Promise<void> {
   }
 
   const serverPassword = process.env[ENV_VARS.SERVER_PASSWORD];
-  const adminApiKey = process.env[ENV_VARS.ADMIN_API_KEY];
 
-  console.log(`Admin API key: ${adminApiKey ? "configured" : "not set (endpoints open)"}`);
-  console.log(`Admin IP allowlist: ${process.env.MINDOODB_ADMIN_ALLOWED_IPS || "localhost only (default)"}`);
+  console.log(`Config: ${options.configPath || "<dataDir>/config.json"}`);
   console.log(`Server password: ${serverPassword ? "configured" : "not set"}`);
   console.log("=".repeat(60));
 
+  // Load server config (capabilities-based system admin authorization)
+  const configPath = resolveConfigPath(options.dataDir, options.configPath);
+  const serverConfig = loadServerConfig(options.dataDir, options.configPath);
+
   // Create and start the server
-  const server = new MindooDBServer(options.dataDir, serverPassword, options.staticDir);
+  const server = new MindooDBServer(options.dataDir, serverPassword, options.staticDir, serverConfig, configPath);
 
   // If auto-sync is enabled and we have server identity, start periodic sync
   if (options.autoSync) {

@@ -11,6 +11,11 @@ export { BaseMindooDB } from "./BaseMindooDB";
 export { BaseMindooTenant } from "./BaseMindooTenant";
 export { BaseMindooTenantFactory } from "./BaseMindooTenantFactory";
 
+export {
+  MindooDBServerAdmin,
+  type MindooDBServerAdminOptions,
+} from "./MindooDBServerAdmin";
+
 // Crypto
 export { CryptoAdapter } from "./crypto/CryptoAdapter";
 export { RSAEncryption } from "./crypto/RSAEncryption";
