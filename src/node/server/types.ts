@@ -184,6 +184,12 @@ export const ENV_VARS = {
   /** Password to decrypt server identity private keys and per-tenant keybags */
   SERVER_PASSWORD: "MINDOODB_SERVER_PASSWORD",
   /**
+   * Path to a file whose contents are the server password (trimmed). If set, used
+   * instead of {@link ENV_VARS.SERVER_PASSWORD}. Prefer in Docker so the secret is
+   * not stored in the container environment block.
+   */
+  SERVER_PASSWORD_FILE: "MINDOODB_SERVER_PASSWORD_FILE",
+  /**
    * Optional comma-separated allowlist for /system/* (system admin HTTP surface).
    * If unset or `*`, any client IP may call /system/* (JWT + capabilities still required).
    * Example: `127.0.0.1,::1,10.0.0.0/8`

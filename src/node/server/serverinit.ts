@@ -14,8 +14,8 @@
  *   -h, --help              Show this help message
  *
  * Environment variables:
- *   MINDOODB_SERVER_PASSWORD  Password to encrypt the server identity.
- *                             If not set, the user is prompted interactively.
+ *   MINDOODB_SERVER_PASSWORD / MINDOODB_SERVER_PASSWORD_FILE — encrypt server identity.
+ *   If neither is set, the user is prompted interactively.
  */
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
@@ -26,6 +26,7 @@ import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../../appendonlystores/InMemoryContentAddressedStoreFactory";
 
+import { resolveServerPassword } from "./resolveServerPassword";
 import { ENV_VARS } from "./types";
 import type { ServerConfig } from "./types";
 
@@ -107,15 +108,15 @@ Options:
   -h, --help              Show this help message
 
 Environment variables:
-  MINDOODB_SERVER_PASSWORD  Password to encrypt the server identity.
-                            If not set, the user is prompted interactively.
+  MINDOODB_SERVER_PASSWORD or MINDOODB_SERVER_PASSWORD_FILE — encrypt server identity.
+  If neither is set, the user is prompted interactively.
 
 Examples:
   # Interactive (prompts for password and system admin setup):
   npx ts-node src/serverinit.ts --name server1
 
-  # Non-interactive (password from env var, skip admin):
-  MINDOODB_SERVER_PASSWORD=secret npx ts-node src/serverinit.ts --name server1 --skip-admin
+  # Non-interactive (password from file, skip admin):
+  MINDOODB_SERVER_PASSWORD_FILE=./.server-password npx ts-node src/serverinit.ts --name server1 --skip-admin
 `);
 }
 
@@ -156,8 +157,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Get password from env var or prompt
-  let password = process.env[ENV_VARS.SERVER_PASSWORD];
+  // Get password from env / file or prompt
+  let password = resolveServerPassword();
   if (!password) {
     const rl = createReadline();
     password = await promptLine(rl, "Enter password to encrypt server identity: ");
@@ -229,7 +230,10 @@ async function main(): Promise<void> {
   console.log("NEXT STEPS:");
   console.log("=".repeat(60));
   console.log("1. Start the server:");
-  console.log(`   MINDOODB_SERVER_PASSWORD=<password> node dist/node/server/server.js -d ${options.dataDir}`);
+  console.log(
+    `   ${ENV_VARS.SERVER_PASSWORD_FILE}=<path> or ${ENV_VARS.SERVER_PASSWORD}=<password> ` +
+      `node dist/node/server/server.js -d ${options.dataDir}`,
+  );
   console.log("2. Edit config.json to configure system admin capabilities");
   console.log("3. Use MindooDBServerAdmin or publishToServer to manage tenants");
   console.log("=".repeat(60));

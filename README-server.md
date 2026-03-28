@@ -22,17 +22,22 @@ The **`curl`** examples below use **`$SYSTEM_ADMIN_JWT`** as a placeholder for t
 
 ## Quick Start
 
+Prefer **`MINDOODB_SERVER_PASSWORD_FILE`** (path to a file containing the password) over **`MINDOODB_SERVER_PASSWORD`** so the plaintext secret is not stored in the process environment block (visible via `docker inspect`, `/proc/<pid>/environ`, etc.). For **`server:add-to-network`**, use **`--password-file`** instead of **`MINDOODB_SYSTEM_ADMIN_PASSWORD`** when you can.
+
 ```bash
 # 1. Build MindooDB (from the root directory)
 nvm use 20
 npm install
 npm run build
 
-# 2. Initialize server identity (one-time setup, from repo root)
-MINDOODB_SERVER_PASSWORD=your-secret npm run server:init -- --name server1
+# 2. Store the server password in a file (one-time)
+echo -n 'your-secret' > ./.server-password && chmod 600 ./.server-password
 
-# 3. Start the server
-MINDOODB_SERVER_PASSWORD=your-secret npm run server:start
+# 3. Initialize server identity (one-time setup, from repo root)
+MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:init -- --name server1
+
+# 4. Start the server
+MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:start
 ```
 
 `npm run server:dev` runs the TypeScript entry with `ts-node-dev` (same flags as in the table below).
@@ -66,13 +71,19 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run server:start
 |--------|-------------|---------|
 | `--new-server` | URL of the server being added | **required** |
 | `--servers` | Comma-separated URLs of existing servers | **required** |
+| `--identity` | Path to system admin `*.identity.json` (`PrivateUserId`) | **required** |
+| `--password-file` | File containing the system admin password (optional if env or TTY) | — |
 | `--help` | Show help message | — |
+
+Password resolution: `MINDOODB_SYSTEM_ADMIN_PASSWORD`, then `--password-file`, then a hidden prompt on an interactive TTY. The **same** identity must be authorized in each server’s `config.json` for every URL you pass.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MINDOODB_SERVER_PASSWORD` | If server-identity.json exists | Password to decrypt server identity and per-tenant keybags |
+| `MINDOODB_SERVER_PASSWORD` | If server-identity.json exists and `MINDOODB_SERVER_PASSWORD_FILE` is unset | Password to decrypt server identity and per-tenant keybags |
+| `MINDOODB_SERVER_PASSWORD_FILE` | No | Path to a file whose contents are the server password (trimmed). If set, **used instead of** `MINDOODB_SERVER_PASSWORD`. Prefer for Docker: env only holds the path, not the secret. |
+| `MINDOODB_SYSTEM_ADMIN_PASSWORD` | No | For `server:add-to-network`: password for `--identity` (if not using `--password-file` or interactive prompt). May be visible in `ps` on shared hosts. |
 | `MINDOODB_CORS_ORIGIN` | No | Allowed CORS origin (e.g., `https://app.example.com`). If not set, CORS is disabled. |
 | `MINDOODB_ADMIN_ALLOWED_IPS` | No | Optional comma-separated client IPs/CIDRs allowed to call **`/system/*`** (all system admin routes, including `/system/auth/*`). If unset or `*`, any source IP may reach `/system/*` (JWT + `config.json` capabilities still apply). Example: `127.0.0.1,::1,172.23.248.0/24`. Behind a reverse proxy, configure Express `trust proxy` so `req.ip` is the real client. |
 
@@ -193,7 +204,8 @@ See [Server Security](docs/server-security.md) for full details.
 ### 1. Initialize the server
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run server:init -- --name server1 --data-dir ./data
+mkdir -p ./data && echo -n 'secret' > ./data/.server-password && chmod 600 ./data/.server-password
+MINDOODB_SERVER_PASSWORD_FILE=./data/.server-password npm run server:init -- --name server1 --data-dir ./data
 ```
 
 This creates `server-identity.json`, `trusted-servers.json`, and `tenant-api-keys.json` in the data directory, and prints the server's public keys.
@@ -201,7 +213,7 @@ This creates `server-identity.json`, `trusted-servers.json`, and `tenant-api-key
 ### 2. Start the server
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- -d ./data -p 1661
+MINDOODB_SERVER_PASSWORD_FILE=./data/.server-password npm run server:dev -- -d ./data -p 1661
 ```
 
 ### 3. Client creates a tenant and publishes to server
@@ -250,10 +262,12 @@ await db.syncStoreChanges();
 
 ```bash
 # Server 1
-MINDOODB_SERVER_PASSWORD=secret1 npm run server:init -- --name server1 --data-dir ./data1
+mkdir -p ./data1 && echo -n 'secret1' > ./data1/.server-password && chmod 600 ./data1/.server-password
+MINDOODB_SERVER_PASSWORD_FILE=./data1/.server-password npm run server:init -- --name server1 --data-dir ./data1
 
 # Server 2
-MINDOODB_SERVER_PASSWORD=secret2 npm run server:init -- --name server2 --data-dir ./data2
+mkdir -p ./data2 && echo -n 'secret2' > ./data2/.server-password && chmod 600 ./data2/.server-password
+MINDOODB_SERVER_PASSWORD_FILE=./data2/.server-password npm run server:init -- --name server2 --data-dir ./data2
 ```
 
 Both commands print the server's public keys.
@@ -312,7 +326,7 @@ And vice versa on server 2.
 ### 5. Start servers with auto-sync
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret1 npm run server:dev -- -d ./data1 -s
+MINDOODB_SERVER_PASSWORD_FILE=./data1/.server-password npm run server:dev -- -d ./data1 -s
 ```
 
 The servers will periodically sync all configured tenant databases, relaying encrypted entries without decrypting them.
@@ -381,23 +395,26 @@ This eliminates the need to manually copy public keys between servers.
 
 ### Adding a server to the network
 
-The `add-to-network` CLI automates mutual trust exchange when adding a new server. It fetches each server's public keys via the well-known endpoint and registers them on every other server.
+The `add-to-network` CLI automates mutual trust exchange when adding a new server. It calls **`POST /system/trusted-servers`** on each side (JWT from challenge/response using your system admin identity). It fetches each server's public keys from `/.well-known/mindoodb-server-info`.
+
+**Secrets:** Prefer **`--password-file`** for the system admin password (and **`MINDOODB_SERVER_PASSWORD_FILE`** for the server identity) so secrets are not placed in the process environment. Use **`MINDOODB_SYSTEM_ADMIN_PASSWORD`** only when you must script without files. A leading space before the command or `HISTCONTROL=ignorespace` reduces shell-history leakage for typed passwords.
 
 ```bash
 # 1. Initialize the new server
-MINDOODB_SERVER_PASSWORD=secret4 npm run server:init -- --name server4 --data-dir ./data4
+mkdir -p ./data4 && echo -n 'secret4' > ./data4/.server-password && chmod 600 ./data4/.server-password
+MINDOODB_SERVER_PASSWORD_FILE=./data4/.server-password npm run server:init -- --name server4 --data-dir ./data4
 
 # 2. Start it
-MINDOODB_SERVER_PASSWORD=secret4 npm run server:dev -- -d ./data4 -p 3003 &
+MINDOODB_SERVER_PASSWORD_FILE=./data4/.server-password npm run server:dev -- -d ./data4 -p 3003 &
 
-# 3. Add it to the existing network
+# 3. Add it to the existing network (same system admin identity on every server)
+echo -n 'admin-pass' > ./.admin-password && chmod 600 ./.admin-password
 npm run server:add-to-network -- \
   --new-server http://localhost:3003 \
   --servers http://localhost:1661,http://localhost:3001,http://localhost:3002 \
-  --api-key $ADMIN_KEY
+  --identity ./data1/system-admin-cn-sysadmin-o-myorg.identity.json \
+  --password-file ./.admin-password
 ```
-
-> **Note:** `server:add-to-network` still uses `--api-key` and legacy `/admin/*` URLs internally. That does **not** match the current `/system/*` + JWT server. Until that CLI is updated, establish mutual trust with **`MindooDBServerAdmin`** (e.g. `addTrustedServer` / `listTrustedServers`) or with **`curl`** to `/system/trusted-servers` as in the walkthrough above.
 
 The CLI will:
 
@@ -446,15 +463,18 @@ Note: the server name in the URL must be percent-encoded (e.g., `CN%3Dserver2` f
 ### Complete workflow: new server joins and starts syncing
 
 ```bash
-# Step 1: Init and start the new server
-MINDOODB_SERVER_PASSWORD=secret npm run server:init -- --name server3 --data-dir ./data3
-MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- -d ./data3 -p 3002 &
+# Step 1: Init and start the new server (password from file, not env)
+echo -n 'secret' > ./data3/.server-password && chmod 600 ./data3/.server-password
+MINDOODB_SERVER_PASSWORD_FILE=./data3/.server-password npm run server:init -- --name server3 --data-dir ./data3
+MINDOODB_SERVER_PASSWORD_FILE=./data3/.server-password npm run server:dev -- -d ./data3 -p 3002 &
 
 # Step 2: Add to network (establishes trust with all existing servers)
+echo -n 'admin-pass' > ./.admin-password && chmod 600 ./.admin-password
 npm run server:add-to-network -- \
   --new-server http://localhost:3002 \
   --servers http://localhost:1661,http://localhost:3001 \
-  --api-key $ADMIN_KEY
+  --identity ./data1/system-admin-cn-sysadmin-o-myorg.identity.json \
+  --password-file ./.admin-password
 
 # Step 3: Register the tenant on the new server (if not already published)
 # (Usually done by the tenant admin via publishToServer)
@@ -591,7 +611,7 @@ The server can serve static files from a local directory, which is useful for ho
 ### Usage
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- --static-dir ./webapp-bootstrap
+MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:dev -- --static-dir ./webapp-bootstrap
 ```
 
 The static directory might contain a minimal bootstrap page that registers a service worker and triggers the initial MindooDB sync for a distributed web application:
@@ -613,7 +633,7 @@ The server supports TLS directly via `--tls-cert` and `--tls-key` flags. No addi
 ### Starting with TLS
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- \
+MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:dev -- \
   --tls-cert /etc/letsencrypt/live/sync.example.com/fullchain.pem \
   --tls-key /etc/letsencrypt/live/sync.example.com/privkey.pem \
   -p 443
@@ -683,12 +703,14 @@ docker build -f src/node/server/Dockerfile -t mindoodb-server .
 
 ### Initialize server identity
 
-The identity is stored inside the data directory, so point the container at a local `./data` folder. The init script requires overriding the default entrypoint:
+The identity is stored inside the data directory, so point the container at a local `./data` folder. The init script requires overriding the default entrypoint. Prefer a **mounted password file** so the secret is not passed as `-e MINDOODB_SERVER_PASSWORD=...`:
 
 ```bash
+echo -n 'your-secret' > ./server-password && chmod 600 ./server-password
 docker run --rm \
   -v "$(pwd)/data:/data" \
-  -e MINDOODB_SERVER_PASSWORD=your-secret \
+  -v "$(pwd)/server-password:/run/secrets/server_password:ro" \
+  -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_password \
   --entrypoint node \
   mindoodb-server dist/node/server/serverinit.js --data-dir /data --name server1
 ```
@@ -698,8 +720,9 @@ docker run --rm \
 ```bash
 docker run -d --name mindoodb \
   -v "$(pwd)/data:/data" \
+  -v "$(pwd)/server-password:/run/secrets/server_password:ro" \
+  -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_password \
   -p 1661:1661 \
-  -e MINDOODB_SERVER_PASSWORD=your-secret \
   mindoodb-server
 ```
 
@@ -710,8 +733,9 @@ Additional CLI flags can be appended after the image name:
 ```bash
 docker run -d --name mindoodb \
   -v "$(pwd)/data:/data" \
+  -v "$(pwd)/server-password:/run/secrets/server_password:ro" \
+  -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_password \
   -p 8443:8443 \
-  -e MINDOODB_SERVER_PASSWORD=your-secret \
   mindoodb-server --port 8443 --auto-sync
 ```
 
@@ -734,13 +758,13 @@ npm run build
 ### Run in development mode
 
 ```bash
-MINDOODB_SERVER_PASSWORD=your-secret npm run server:dev -- -d ./data -p 1661
+MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:dev -- -d ./data -p 1661
 ```
 
 ### Run built version
 
 ```bash
-MINDOODB_SERVER_PASSWORD=your-secret npm run server:start -- -d ./data -p 1661
+MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:start -- -d ./data -p 1661
 ```
 
 ## Testing

@@ -16,6 +16,20 @@ MindooDB Server uses a **capabilities-based system admin model** to control acce
 
 Independently of JWTs and `config.json`, you can set **`MINDOODB_ADMIN_ALLOWED_IPS`** to a comma-separated list of client IPs and IPv4 CIDRs. When set, only those addresses may invoke **`/system/*`** (including `/system/auth/challenge` and `/system/auth/authenticate`). Use `*` or leave unset for no IP filter. This complements cryptographic auth: it limits who can even attempt the system-admin HTTP surface. Behind a reverse proxy, configure Express **`trust proxy`** so `req.ip` reflects the real client.
 
+### Server password: env vs file (`MINDOODB_SERVER_PASSWORD_FILE`)
+
+The server identity password can be supplied as **`MINDOODB_SERVER_PASSWORD`** or, preferably, read from a path in **`MINDOODB_SERVER_PASSWORD_FILE`**. Using a file means the **plaintext password does not appear in the process environment** (which tools like `docker inspect` and `/proc/<pid>/environ` expose). The process still holds the secret in memory after reading.
+
+### Docker “secrets” — what they are and whether they help
+
+**Docker Swarm secrets** (`docker secret create`, then referenced under `secrets:` in a **stack** / **swarm service** definition) are blobs stored **encrypted at rest on Swarm managers** and delivered to running tasks as **files**, usually under **`/run/secrets/<name>`**. They are **not** passed as `-e` values. That matches how MindooDB expects a password when you set **`MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/your_secret_name`**: the container only needs an env var with the **path**, not the secret string.
+
+**Docker Compose** can declare `secrets:` with a `file:` source (or Swarm-backed secrets when deploying to a swarm). The container still sees a **mounted file**, same integration pattern.
+
+**Plain `docker run` (no Swarm)** has no separate “secret” API: the equivalent is a **read-only bind mount** of a host file into e.g. `/run/secrets/server_password` plus **`MINDOODB_SERVER_PASSWORD_FILE`** — as in [README-server](../README-server.md) Docker examples. Functionally this is the same **file-based** delivery Swarm secrets use at runtime; Swarm adds **cluster storage, rotation workflows, and RB** around who can create secrets.
+
+**Summary:** Docker secrets (in the Swarm sense) **help** by keeping the password **out of the image, build args, and container env block**, while still giving you a predictable file path for **`MINDOODB_SERVER_PASSWORD_FILE`**. They do **not** stop a **root** user inside the container from reading the mounted file or inspecting process memory.
+
 ## Quick Start
 
 ### 1. Initialize the server

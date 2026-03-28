@@ -2,27 +2,24 @@
 /**
  * MindooDB Add-to-Network CLI
  *
- * Automates adding a new server to an existing network of MindooDB servers
- * by exchanging trust (public keys) between all parties.
+ * Exchanges trusted-server public keys between a new server and existing servers
+ * using `/system/trusted-servers` with JWT auth (same system admin identity on each server).
  *
- * Usage:
- *   npx ts-node src/add-to-network.ts [options]
- *
- * Options:
- *   --new-server <url>        URL of the server being added (required)
- *   --servers <url,url,...>    Comma-separated URLs of existing servers (required)
- *   --api-key <key>           Admin API key shared by all servers (required)
- *   -h, --help                Show this help message
+ * Password: MINDOODB_SYSTEM_ADMIN_PASSWORD, --password-file, or TTY prompt (hidden).
  */
 
-import http from "http";
-import https from "https";
-import { URL } from "url";
+import { readFileSync } from "fs";
+import { MindooDBServerAdmin } from "../../core/MindooDBServerAdmin";
+import type { PrivateUserId } from "../../core/userid";
+import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
+
+const ENV_PASSWORD = "MINDOODB_SYSTEM_ADMIN_PASSWORD";
 
 interface CliOptions {
   newServer: string;
   servers: string[];
-  apiKey: string;
+  identityPath: string;
+  passwordFile: string;
   help: boolean;
 }
 
@@ -32,11 +29,13 @@ interface ServerInfo {
   encryptionPublicKey: string;
 }
 
-function parseArgs(args: string[]): CliOptions {
+/** Exported for tests. */
+export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     newServer: "",
     servers: [],
-    apiKey: "",
+    identityPath: "",
+    passwordFile: "",
     help: false,
   };
 
@@ -46,7 +45,10 @@ function parseArgs(args: string[]): CliOptions {
 
     switch (arg) {
       case "--new-server":
-        if (nextArg) { options.newServer = nextArg.replace(/\/+$/, ""); i++; }
+        if (nextArg) {
+          options.newServer = nextArg.replace(/\/+$/, "");
+          i++;
+        }
         break;
       case "--servers":
         if (nextArg) {
@@ -54,8 +56,17 @@ function parseArgs(args: string[]): CliOptions {
           i++;
         }
         break;
-      case "--api-key":
-        if (nextArg) { options.apiKey = nextArg; i++; }
+      case "--identity":
+        if (nextArg) {
+          options.identityPath = nextArg;
+          i++;
+        }
+        break;
+      case "--password-file":
+        if (nextArg) {
+          options.passwordFile = nextArg;
+          i++;
+        }
         break;
       case "-h":
       case "--help":
@@ -77,81 +88,107 @@ function showHelp(): void {
 MindooDB Add-to-Network
 
 Adds a new server to an existing network by exchanging trust between all servers.
+Uses /system/trusted-servers with JWT (same system admin identity must be authorized on every server).
 
 Usage:
-  npx ts-node src/add-to-network.ts [options]
+  npm run server:add-to-network -- [options]
 
 Options:
-  --new-server <url>        URL of the server being added (required)
+  --new-server <url>         URL of the server being added (required)
   --servers <url,url,...>    Comma-separated URLs of existing servers (required)
-  --api-key <key>           Admin API key shared by all servers (required)
-  -h, --help                Show this help message
+  --identity <path>          System admin *.identity.json (PrivateUserId) (required)
+  --password-file <path>     Read password from file (optional if env or TTY)
+  -h, --help                 Show this help message
+
+Password (first match wins):
+  ${ENV_PASSWORD}   environment variable
+  --password-file     file containing one line (trimmed)
+  TTY               hidden prompt on interactive terminal
 
 Example:
-  npx ts-node src/add-to-network.ts \\
+  npm run server:add-to-network -- \\
     --new-server https://server4.example.com \\
-    --servers https://s1.example.com,https://s2.example.com,https://s3.example.com \\
-    --api-key my-admin-key
+    --servers https://s1.example.com,https://s2.example.com \\
+    --identity ./system-admin.identity.json
 `);
 }
 
-function httpRequest(
-  url: string,
-  method: "GET" | "POST",
-  body?: object,
-  apiKey?: string,
-): Promise<{ status: number; body: any }> {
+function loadIdentity(path: string): PrivateUserId {
+  const raw = readFileSync(path, "utf8");
+  const parsed = JSON.parse(raw) as PrivateUserId;
+  if (!parsed?.username || !parsed?.userSigningKeyPair?.publicKey) {
+    throw new Error(`Invalid identity file: ${path}`);
+  }
+  return parsed;
+}
+
+async function resolvePassword(passwordFile: string): Promise<string> {
+  const fromEnv = process.env[ENV_PASSWORD];
+  if (fromEnv !== undefined && fromEnv.length > 0) {
+    return fromEnv;
+  }
+  if (passwordFile) {
+    return readFileSync(passwordFile, "utf8").replace(/\r?\n$/, "");
+  }
+  if (process.stdin.isTTY) {
+    return readPasswordHidden("System admin password: ");
+  }
+  console.error(
+    `Error: Set ${ENV_PASSWORD}, use --password-file, or run from an interactive terminal.`,
+  );
+  process.exit(1);
+}
+
+/** Hidden password on TTY (no echo). */
+function readPasswordHidden(prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const transport = parsed.protocol === "https:" ? https : http;
-
-    const headers: Record<string, string> = {};
-    if (apiKey) headers["X-API-Key"] = apiKey;
-    if (body) headers["Content-Type"] = "application/json";
-
-    const payload = body ? JSON.stringify(body) : undefined;
-    if (payload) headers["Content-Length"] = Buffer.byteLength(payload).toString();
-
-    const req = transport.request(
-      {
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method,
-        headers,
-        rejectUnauthorized: true,
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-        res.on("end", () => {
-          try {
-            resolve({ status: res.statusCode || 0, body: JSON.parse(data) });
-          } catch {
-            resolve({ status: res.statusCode || 0, body: data });
-          }
-        });
-      },
-    );
-
-    req.on("error", reject);
-    if (payload) req.write(payload);
-    req.end();
+    const stdin = process.stdin;
+    const stdout = process.stdout;
+    if (!stdin.isTTY) {
+      reject(new Error("Internal: readPasswordHidden without TTY"));
+      return;
+    }
+    stdout.write(prompt);
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    let pass = "";
+    const onData = (key: string) => {
+      if (key === "\n" || key === "\r" || key === "\u0004") {
+        stdin.setRawMode(false);
+        stdin.removeListener("data", onData);
+        stdin.pause();
+        stdout.write("\n");
+        resolve(pass);
+        return;
+      }
+      if (key === "\u0003") {
+        stdin.setRawMode(false);
+        process.exit(130);
+      }
+      if (key === "\u007f" || key === "\b") {
+        pass = pass.slice(0, -1);
+        return;
+      }
+      if (key.length === 1) pass += key;
+    };
+    stdin.on("data", onData);
   });
 }
 
 async function fetchServerInfo(serverUrl: string): Promise<ServerInfo> {
   const url = `${serverUrl}/.well-known/mindoodb-server-info`;
   console.log(`  Fetching server info from ${url}`);
-  const response = await httpRequest(url, "GET");
+  const response = await fetch(url);
+  const body = await response.json().catch(() => ({}));
 
-  if (response.status !== 200) {
+  if (!response.ok) {
     throw new Error(
-      `Failed to fetch server info from ${serverUrl}: HTTP ${response.status} — ${JSON.stringify(response.body)}`,
+      `Failed to fetch server info from ${serverUrl}: HTTP ${response.status} — ${JSON.stringify(body)}`,
     );
   }
 
-  const info = response.body as ServerInfo;
+  const info = body as ServerInfo;
   if (!info.name || !info.signingPublicKey || !info.encryptionPublicKey) {
     throw new Error(`Invalid server info response from ${serverUrl}`);
   }
@@ -159,22 +196,40 @@ async function fetchServerInfo(serverUrl: string): Promise<ServerInfo> {
   return info;
 }
 
+function createAdmin(
+  baseUrl: string,
+  identity: PrivateUserId,
+  password: string,
+): MindooDBServerAdmin {
+  return new MindooDBServerAdmin({
+    serverUrl: baseUrl,
+    systemAdminUser: identity,
+    systemAdminPassword: password,
+    cryptoAdapter: new NodeCryptoAdapter(),
+  });
+}
+
 async function addTrustedServer(
   targetUrl: string,
   serverInfo: ServerInfo,
-  apiKey: string,
+  identity: PrivateUserId,
+  password: string,
 ): Promise<void> {
-  const url = `${targetUrl}/admin/trusted-servers`;
-  const response = await httpRequest(url, "POST", serverInfo, apiKey);
-
-  if (response.status === 201) {
+  const admin = createAdmin(targetUrl, identity, password);
+  try {
+    await admin.addTrustedServer({
+      name: serverInfo.name,
+      signingPublicKey: serverInfo.signingPublicKey,
+      encryptionPublicKey: serverInfo.encryptionPublicKey,
+    });
     console.log(`  Added "${serverInfo.name}" to ${targetUrl}`);
-  } else if (response.status === 409) {
-    console.log(`  "${serverInfo.name}" already trusted on ${targetUrl} (skipped)`);
-  } else {
-    throw new Error(
-      `Failed to add "${serverInfo.name}" to ${targetUrl}: HTTP ${response.status} — ${JSON.stringify(response.body)}`,
-    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("409") || /already exists/i.test(msg)) {
+      console.log(`  "${serverInfo.name}" already trusted on ${targetUrl} (skipped)`);
+      return;
+    }
+    throw e;
   }
 }
 
@@ -195,24 +250,30 @@ async function main(): Promise<void> {
     console.error("Error: --servers is required. Use --help for usage.");
     process.exit(1);
   }
-  if (!options.apiKey) {
-    console.error("Error: --api-key is required. Use --help for usage.");
+  if (!options.identityPath) {
+    console.error("Error: --identity is required. Use --help for usage.");
+    process.exit(1);
+  }
+
+  const identity = loadIdentity(options.identityPath);
+  const password = await resolvePassword(options.passwordFile);
+  if (!password) {
+    console.error("Error: system admin password is empty.");
     process.exit(1);
   }
 
   console.log("=".repeat(60));
   console.log("MindooDB Add-to-Network");
   console.log("=".repeat(60));
-  console.log(`New server:      ${options.newServer}`);
+  console.log(`New server:       ${options.newServer}`);
   console.log(`Existing servers: ${options.servers.join(", ")}`);
+  console.log(`Identity:         ${options.identityPath}`);
   console.log("=".repeat(60));
 
-  // Step 1: Fetch the new server's public info
   console.log("\n[1/3] Fetching new server identity...");
   const newServerInfo = await fetchServerInfo(options.newServer);
   console.log(`  Server name: ${newServerInfo.name}\n`);
 
-  // Step 2: For each existing server, exchange trust
   console.log("[2/3] Exchanging trust with existing servers...");
   let successCount = 0;
   const errors: string[] = [];
@@ -221,15 +282,11 @@ async function main(): Promise<void> {
     try {
       console.log(`\n  --- ${existingUrl} ---`);
 
-      // Fetch existing server's info
       const existingInfo = await fetchServerInfo(existingUrl);
       console.log(`  Server name: ${existingInfo.name}`);
 
-      // Add new server to existing server
-      await addTrustedServer(existingUrl, newServerInfo, options.apiKey);
-
-      // Add existing server to new server
-      await addTrustedServer(options.newServer, existingInfo, options.apiKey);
+      await addTrustedServer(existingUrl, newServerInfo, identity, password);
+      await addTrustedServer(options.newServer, existingInfo, identity, password);
 
       successCount++;
     } catch (error) {
@@ -239,7 +296,6 @@ async function main(): Promise<void> {
     }
   }
 
-  // Step 3: Summary
   console.log("\n" + "=".repeat(60));
   console.log("[3/3] Summary");
   console.log("=".repeat(60));
@@ -254,10 +310,20 @@ async function main(): Promise<void> {
   }
 
   console.log(`\n${newServerInfo.name} is now part of the network.`);
-  console.log("Next step: configure per-tenant sync via POST /admin/tenants/:tenantId/sync-servers");
+  console.log(
+    "Next step: configure per-tenant sync via POST /system/tenants/:tenantId/sync-servers (see README-server.md).",
+  );
 }
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+function isDirectExecution(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return /[/\\]add-to-network\.(ts|js|mjs|cjs)$/.test(entry);
+}
+
+if (isDirectExecution()) {
+  main().catch((error) => {
+    console.error("Fatal error:", error);
+    process.exit(1);
+  });
+}

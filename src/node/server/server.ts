@@ -16,12 +16,13 @@
  *   -h, --help              Show this help message
  *
  * Environment variables:
- *   MINDOODB_SERVER_PASSWORD   Password to decrypt server identity private keys
+ *   MINDOODB_SERVER_PASSWORD / MINDOODB_SERVER_PASSWORD_FILE — server identity password
  */
 
 import { MindooDBServer } from "./MindooDBServer";
 import { ServerSync, startPeriodicSync } from "./ServerSync";
 import { loadServerConfig, resolveConfigPath } from "./config";
+import { resolveServerPassword } from "./resolveServerPassword";
 import { ENV_VARS } from "./types";
 
 interface CliOptions {
@@ -139,7 +140,7 @@ Options:
   -h, --help              Show this help message
 
 Environment variables:
-  MINDOODB_SERVER_PASSWORD     Password to decrypt server identity private keys
+  MINDOODB_SERVER_PASSWORD or MINDOODB_SERVER_PASSWORD_FILE — decrypt server identity
                                (required if server-identity.json exists)
 
 Examples:
@@ -150,7 +151,7 @@ Examples:
   npm run server:dev -- -d /var/lib/mindoodb -p 8080
 
   # Start server with auto-sync enabled
-  MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- -s
+  MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:dev -- -s
 
   # Start server with explicit config file
   npm run server:dev -- --config /etc/mindoodb/config.json
@@ -186,7 +187,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const serverPassword = process.env[ENV_VARS.SERVER_PASSWORD];
+  const serverPassword = resolveServerPassword();
 
   console.log(`Config: ${options.configPath || "<dataDir>/config.json"}`);
   console.log(`Server password: ${serverPassword ? "configured" : "not set"}`);
@@ -211,7 +212,8 @@ async function main(): Promise<void> {
       );
     } else if (!serverPassword) {
       console.warn(
-        "[Main] Auto-sync enabled but MINDOODB_SERVER_PASSWORD not set. " +
+        "[Main] Auto-sync enabled but no server password (set " +
+        `${ENV_VARS.SERVER_PASSWORD} or ${ENV_VARS.SERVER_PASSWORD_FILE}). ` +
         "Server-to-server sync will not work.",
       );
     } else {
