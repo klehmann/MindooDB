@@ -1,4 +1,6 @@
-# MindooDB Example Server
+# MindooDB reference server
+
+Node.js/Express sources: `src/node/server/`. Docker: `src/node/server/Dockerfile`.
 
 A Node.js/Express server implementing the MindooDB sync API with:
 
@@ -12,6 +14,12 @@ A Node.js/Express server implementing the MindooDB sync API with:
 - Node.js 20 or later
 - The MindooDB library must be built first (run `npm run build` in the root directory)
 
+## System admin API (`/system/*`)
+
+Server administration uses **`/system/...`** routes (the old **`/admin/...`** paths are gone). Authenticate with a JWT from **`POST /system/auth/challenge`** and **`POST /system/auth/authenticate`**, then send **`Authorization: Bearer <token>`** on later requests. Full flow and capabilities are in [Server Security](docs/server-security.md). In Node you can use **`MindooDBServerAdmin`** (with your `CryptoAdapter`) instead of raw `curl`.
+
+The **`curl`** examples below use **`$SYSTEM_ADMIN_JWT`** as a placeholder for that token.
+
 ## Quick Start
 
 ```bash
@@ -20,20 +28,18 @@ nvm use 20
 npm install
 npm run build
 
-# 2. Install server dependencies
-cd examples/server
-npm install
+# 2. Initialize server identity (one-time setup, from repo root)
+MINDOODB_SERVER_PASSWORD=your-secret npm run server:init -- --name server1
 
-# 3. Initialize server identity (one-time setup)
-MINDOODB_SERVER_PASSWORD=your-secret npm run init -- --name server1
-
-# 4. Start the server
-MINDOODB_SERVER_PASSWORD=your-secret npm run dev
+# 3. Start the server
+MINDOODB_SERVER_PASSWORD=your-secret npm run server:start
 ```
+
+`npm run server:dev` runs the TypeScript entry with `ts-node-dev` (same flags as in the table below).
 
 ## CLI Reference
 
-### `npm run dev` / `npm start` — Start the server
+### `npm run server:dev` / `npm run server:start` — Start the server
 
 | Option | Alias | Description | Default |
 |--------|-------|-------------|---------|
@@ -45,7 +51,7 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 | `--tls-key` | — | Path to TLS private key file (PEM) | — |
 | `--help` | `-h` | Show help message | — |
 
-### `npm run init` — Initialize server identity
+### `npm run server:init` — Initialize server identity
 
 | Option | Alias | Description | Default |
 |--------|-------|-------------|---------|
@@ -54,7 +60,7 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 | `--force` | `-f` | Overwrite existing identity | — |
 | `--help` | `-h` | Show help message | — |
 
-### `npm run add-to-network` — Add a server to the network
+### `npm run server:add-to-network` — Add a server to the network
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -70,7 +76,7 @@ MINDOODB_SERVER_PASSWORD=your-secret npm run dev
 | `MINDOODB_CORS_ORIGIN` | No | Allowed CORS origin (e.g., `https://app.example.com`). If not set, CORS is disabled. |
 | `MINDOODB_ADMIN_ALLOWED_IPS` | No | Optional comma-separated client IPs/CIDRs allowed to call **`/system/*`** (all system admin routes, including `/system/auth/*`). If unset or `*`, any source IP may reach `/system/*` (JWT + `config.json` capabilities still apply). Example: `127.0.0.1,::1,172.23.248.0/24`. Behind a reverse proxy, configure Express `trust proxy` so `req.ip` is the real client. |
 
-> **Note:** The old `MINDOODB_ADMIN_API_KEY` variable has been removed. System admin **authorization** is enforced by `config.json` capabilities and JWTs. **`MINDOODB_ADMIN_ALLOWED_IPS`** is an optional **network** layer for `/system/*` only. See [Server Security](../../docs/server-security.md).
+> **Note:** The old `MINDOODB_ADMIN_API_KEY` variable has been removed. System admin **authorization** is enforced by `config.json` capabilities and JWTs. **`MINDOODB_ADMIN_ALLOWED_IPS`** is an optional **network** layer for `/system/*` only. See [Server Security](docs/server-security.md).
 
 ## Data Directory Layout
 
@@ -94,7 +100,7 @@ data/
 ### System Admin Endpoints (`/system/*`)
 
 All system admin endpoints require a JWT obtained via challenge/response authentication.
-See [Server Security](../../docs/server-security.md) for full details.
+See [Server Security](docs/server-security.md) for full details.
 
 #### Authentication
 
@@ -187,7 +193,7 @@ See [Server Security](../../docs/server-security.md) for full details.
 ### 1. Initialize the server
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run init -- --name server1 --data-dir ./data
+MINDOODB_SERVER_PASSWORD=secret npm run server:init -- --name server1 --data-dir ./data
 ```
 
 This creates `server-identity.json`, `trusted-servers.json`, and `tenant-api-keys.json` in the data directory, and prints the server's public keys.
@@ -195,7 +201,7 @@ This creates `server-identity.json`, `trusted-servers.json`, and `tenant-api-key
 ### 2. Start the server
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run dev -- -d ./data -p 1661
+MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- -d ./data -p 1661
 ```
 
 ### 3. Client creates a tenant and publishes to server
@@ -244,21 +250,21 @@ await db.syncStoreChanges();
 
 ```bash
 # Server 1
-MINDOODB_SERVER_PASSWORD=secret1 npm run init -- --name server1 --data-dir ./data1
+MINDOODB_SERVER_PASSWORD=secret1 npm run server:init -- --name server1 --data-dir ./data1
 
 # Server 2
-MINDOODB_SERVER_PASSWORD=secret2 npm run init -- --name server2 --data-dir ./data2
+MINDOODB_SERVER_PASSWORD=secret2 npm run server:init -- --name server2 --data-dir ./data2
 ```
 
 Both commands print the server's public keys.
 
-### 2. Exchange public keys via admin API
+### 2. Exchange public keys via the system admin API
 
 ```bash
 # Tell server1 to trust server2
-curl -X POST http://server1:3000/admin/trusted-servers \
+curl -X POST http://server1:3000/system/trusted-servers \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $ADMIN_KEY" \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
   -d '{
     "name": "CN=server2",
     "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
@@ -266,9 +272,9 @@ curl -X POST http://server1:3000/admin/trusted-servers \
   }'
 
 # Tell server2 to trust server1
-curl -X POST http://server2:3000/admin/trusted-servers \
+curl -X POST http://server2:3000/system/trusted-servers \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $ADMIN_KEY" \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
   -d '{
     "name": "CN=server1",
     "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
@@ -306,7 +312,7 @@ And vice versa on server 2.
 ### 5. Start servers with auto-sync
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret1 npm run dev -- -d ./data1 -s
+MINDOODB_SERVER_PASSWORD=secret1 npm run server:dev -- -d ./data1 -s
 ```
 
 The servers will periodically sync all configured tenant databases, relaying encrypted entries without decrypting them.
@@ -316,9 +322,9 @@ The servers will periodically sync all configured tenant databases, relaying enc
 ### 1. Admin creates a tenant creation key
 
 ```bash
-curl -X POST http://localhost:1661/admin/tenant-api-keys \
+curl -X POST http://localhost:1661/system/tenant-api-keys \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $ADMIN_KEY" \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
   -d '{"name": "acme-corp", "tenantIdPrefix": "acme-"}'
 ```
 
@@ -379,17 +385,19 @@ The `add-to-network` CLI automates mutual trust exchange when adding a new serve
 
 ```bash
 # 1. Initialize the new server
-MINDOODB_SERVER_PASSWORD=secret4 npm run init -- --name server4 --data-dir ./data4
+MINDOODB_SERVER_PASSWORD=secret4 npm run server:init -- --name server4 --data-dir ./data4
 
 # 2. Start it
-MINDOODB_SERVER_PASSWORD=secret4 npm run dev -- -d ./data4 -p 3003 &
+MINDOODB_SERVER_PASSWORD=secret4 npm run server:dev -- -d ./data4 -p 3003 &
 
 # 3. Add it to the existing network
-npm run add-to-network -- \
+npm run server:add-to-network -- \
   --new-server http://localhost:3003 \
   --servers http://localhost:1661,http://localhost:3001,http://localhost:3002 \
   --api-key $ADMIN_KEY
 ```
+
+> **Note:** `server:add-to-network` still uses `--api-key` and legacy `/admin/*` URLs internally. That does **not** match the current `/system/*` + JWT server. Until that CLI is updated, establish mutual trust with **`MindooDBServerAdmin`** (e.g. `addTrustedServer` / `listTrustedServers`) or with **`curl`** to `/system/trusted-servers` as in the walkthrough above.
 
 The CLI will:
 
@@ -406,9 +414,9 @@ After trust is established, configure which tenants each server syncs by using t
 **Add a sync server for a tenant:**
 
 ```bash
-curl -X POST http://server1:3000/admin/tenants/acme/sync-servers \
+curl -X POST http://server1:3000/system/tenants/acme/sync-servers \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $ADMIN_KEY" \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
   -d '{
     "name": "CN=server2",
     "url": "http://server2:3000",
@@ -422,15 +430,15 @@ The `databases` field is required and controls which databases are synced with t
 **List sync servers for a tenant:**
 
 ```bash
-curl http://server1:3000/admin/tenants/acme/sync-servers \
-  -H "X-API-Key: $ADMIN_KEY"
+curl http://server1:3000/system/tenants/acme/sync-servers \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT"
 ```
 
 **Remove a sync server from a tenant:**
 
 ```bash
-curl -X DELETE http://server1:3000/admin/tenants/acme/sync-servers/CN%3Dserver2 \
-  -H "X-API-Key: $ADMIN_KEY"
+curl -X DELETE http://server1:3000/system/tenants/acme/sync-servers/CN%3Dserver2 \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT"
 ```
 
 Note: the server name in the URL must be percent-encoded (e.g., `CN%3Dserver2` for `CN=server2`).
@@ -439,11 +447,11 @@ Note: the server name in the URL must be percent-encoded (e.g., `CN%3Dserver2` f
 
 ```bash
 # Step 1: Init and start the new server
-MINDOODB_SERVER_PASSWORD=secret npm run init -- --name server3 --data-dir ./data3
-MINDOODB_SERVER_PASSWORD=secret npm run dev -- -d ./data3 -p 3002 &
+MINDOODB_SERVER_PASSWORD=secret npm run server:init -- --name server3 --data-dir ./data3
+MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- -d ./data3 -p 3002 &
 
 # Step 2: Add to network (establishes trust with all existing servers)
-npm run add-to-network -- \
+npm run server:add-to-network -- \
   --new-server http://localhost:3002 \
   --servers http://localhost:1661,http://localhost:3001 \
   --api-key $ADMIN_KEY
@@ -452,14 +460,14 @@ npm run add-to-network -- \
 # (Usually done by the tenant admin via publishToServer)
 
 # Step 4: Configure sync for specific tenants
-curl -X POST http://localhost:3002/admin/tenants/acme/sync-servers \
+curl -X POST http://localhost:3002/system/tenants/acme/sync-servers \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $ADMIN_KEY" \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
   -d '{"name":"CN=server1","url":"http://localhost:1661","syncIntervalMs":60000,"databases":["directory","main"]}'
 
-curl -X POST http://localhost:1661/admin/tenants/acme/sync-servers \
+curl -X POST http://localhost:1661/system/tenants/acme/sync-servers \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $ADMIN_KEY" \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
   -d '{"name":"CN=server3","url":"http://localhost:3002","syncIntervalMs":60000,"databases":["directory","main"]}'
 
 # Step 5: Restart servers with --auto-sync to activate periodic sync
@@ -471,7 +479,7 @@ Sync config changes take effect on the next server restart or when auto-sync tim
 
 ### `server-identity.json` (global)
 
-Generated by `npm run init`. Contains a `PrivateUserId` with encrypted private keys:
+Generated by `npm run server:init`. Contains a `PrivateUserId` with encrypted private keys:
 
 ```json
 {
@@ -573,7 +581,7 @@ For production deployments, also consider:
 
 ## Static File Serving
 
-The server can serve static files from a local directory, which is useful for hosting a bootstrap UI for [distributed web applications](../../docs/distributed-webapps.md). When `--static-dir` is provided, two additional routes are available:
+The server can serve static files from a local directory, which is useful for hosting a bootstrap UI for [distributed web applications](docs/distributed-webapps.md). When `--static-dir` is provided, two additional routes are available:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -583,7 +591,7 @@ The server can serve static files from a local directory, which is useful for ho
 ### Usage
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run dev -- --static-dir ./webapp-bootstrap
+MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- --static-dir ./webapp-bootstrap
 ```
 
 The static directory might contain a minimal bootstrap page that registers a service worker and triggers the initial MindooDB sync for a distributed web application:
@@ -605,7 +613,7 @@ The server supports TLS directly via `--tls-cert` and `--tls-key` flags. No addi
 ### Starting with TLS
 
 ```bash
-MINDOODB_SERVER_PASSWORD=secret npm run dev -- \
+MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- \
   --tls-cert /etc/letsencrypt/live/sync.example.com/fullchain.pem \
   --tls-key /etc/letsencrypt/live/sync.example.com/privkey.pem \
   -p 443
@@ -664,13 +672,13 @@ Available DNS plugins include Cloudflare, Route53, Google Cloud DNS, DigitalOcea
 
 ## Docker
 
-The server ships with a multi-stage `Dockerfile` that produces a minimal Alpine-based image (~180 MB). The build context must be the **repository root** so that the mindoodb library can be compiled inside the image.
+The server ships with a multi-stage `Dockerfile` under `src/node/server/` that produces a minimal Alpine-based image. The build context must be the **repository root** so the library and server compile together.
 
 ### Build the image
 
 ```bash
 # From the repository root
-docker build -f examples/server/Dockerfile -t mindoodb-server .
+docker build -f src/node/server/Dockerfile -t mindoodb-server .
 ```
 
 ### Initialize server identity
@@ -682,7 +690,7 @@ docker run --rm \
   -v "$(pwd)/data:/data" \
   -e MINDOODB_SERVER_PASSWORD=your-secret \
   --entrypoint node \
-  mindoodb-server dist/serverinit.js --data-dir /data --name server1
+  mindoodb-server dist/node/server/serverinit.js --data-dir /data --name server1
 ```
 
 ### Run the server
@@ -715,6 +723,8 @@ curl http://localhost:1661/health
 
 ## Development
 
+From the **repository root** (where `README-server.md` lives):
+
 ### Build
 
 ```bash
@@ -724,13 +734,13 @@ npm run build
 ### Run in development mode
 
 ```bash
-npm run dev
+MINDOODB_SERVER_PASSWORD=your-secret npm run server:dev -- -d ./data -p 1661
 ```
 
 ### Run built version
 
 ```bash
-npm start -- -d ./data -p 1661
+MINDOODB_SERVER_PASSWORD=your-secret npm run server:start -- -d ./data -p 1661
 ```
 
 ## Testing

@@ -170,7 +170,7 @@ Client-server synchronization is the most common pattern for cloud-based applica
 
 ```typescript
 // Server-side: The server wraps a local store with network capabilities
-// See examples/server for a complete implementation
+// See README-server.md / src/node/server for the reference HTTP server
 const serverStore = new ServerNetworkAppendOnlyStore(
   localStore,           // The server's local storage
   authenticationService // Validates client credentials

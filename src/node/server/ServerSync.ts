@@ -5,11 +5,11 @@
  * remote servers via the same HttpTransport protocol that clients use.
  */
 
-import { HttpTransport } from "mindoodb/appendonlystores/network/HttpTransport";
-import { ClientNetworkContentAddressedStore } from "mindoodb/appendonlystores/network/ClientNetworkContentAddressedStore";
-import type { ContentAddressedStore, EncryptedPrivateKey } from "mindoodb/core/types";
-import type { CryptoAdapter } from "mindoodb/core/crypto/CryptoAdapter";
-import type { PrivateUserId } from "mindoodb/core/userid";
+import { HttpTransport } from "../../appendonlystores/network/HttpTransport";
+import { ClientNetworkContentAddressedStore } from "../../appendonlystores/network/ClientNetworkContentAddressedStore";
+import type { ContentAddressedStore, EncryptedPrivateKey } from "../../core/types";
+import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import type { PrivateUserId } from "../../core/userid";
 import type { RemoteServerConfig } from "./types";
 
 export interface SyncResult {

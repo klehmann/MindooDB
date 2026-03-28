@@ -22,9 +22,9 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
 import { createInterface } from "readline";
 
-import { NodeCryptoAdapter } from "mindoodb/node/crypto/NodeCryptoAdapter";
-import { BaseMindooTenantFactory } from "mindoodb/core/BaseMindooTenantFactory";
-import { InMemoryContentAddressedStoreFactory } from "mindoodb/appendonlystores/InMemoryContentAddressedStoreFactory";
+import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
+import { BaseMindooTenantFactory } from "../../core/BaseMindooTenantFactory";
+import { InMemoryContentAddressedStoreFactory } from "../../appendonlystores/InMemoryContentAddressedStoreFactory";
 
 import { ENV_VARS } from "./types";
 import type { ServerConfig } from "./types";
@@ -229,7 +229,7 @@ async function main(): Promise<void> {
   console.log("NEXT STEPS:");
   console.log("=".repeat(60));
   console.log("1. Start the server:");
-  console.log(`   MINDOODB_SERVER_PASSWORD=<password> node dist/server.js -d ${options.dataDir}`);
+  console.log(`   MINDOODB_SERVER_PASSWORD=<password> node dist/node/server/server.js -d ${options.dataDir}`);
   console.log("2. Edit config.json to configure system admin capabilities");
   console.log("3. Use MindooDBServerAdmin or publishToServer to manage tenants");
   console.log("=".repeat(60));

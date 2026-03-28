@@ -2,9 +2,9 @@
  * Factory for creating content-addressed stores based on configuration.
  */
 
-import { InMemoryContentAddressedStore } from "mindoodb/core/appendonlystores/InMemoryContentAddressedStore";
-import { BasicOnDiskContentAddressedStore } from "mindoodb/node/appendonlystores/BasicOnDiskContentAddressedStore";
-import type { ContentAddressedStore } from "mindoodb/core/types";
+import { InMemoryContentAddressedStore } from "../../core/appendonlystores/InMemoryContentAddressedStore";
+import { BasicOnDiskContentAddressedStore } from "../appendonlystores/BasicOnDiskContentAddressedStore";
+import type { ContentAddressedStore } from "../../core/types";
 import type { StoreType, TenantConfig } from "./types";
 
 /**

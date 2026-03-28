@@ -3,8 +3,8 @@
  * MindooDB Example Server - Entry Point
  *
  * Usage:
- *   npx ts-node src/server.ts [options]
- *   node dist/server.js [options]
+ *   npm run server:dev -- [options]   (from repo root)
+ *   node dist/node/server/server.js [options]
  *
  * Options:
  *   -d, --data-dir <path>   Data directory path (default: ./data)
@@ -125,8 +125,8 @@ function showHelp(): void {
 MindooDB Example Server
 
 Usage:
-  npx ts-node src/server.ts [options]
-  node dist/server.js [options]
+  npm run server:dev -- [options]    (from repo root)
+  node dist/node/server/server.js [options]
 
 Options:
   -d, --data-dir <path>   Data directory path (default: ./data)
@@ -144,22 +144,22 @@ Environment variables:
 
 Examples:
   # Start server with default settings
-  npx ts-node src/server.ts
+  npm run server:dev
 
   # Start server with custom data directory and port
-  npx ts-node src/server.ts -d /var/lib/mindoodb -p 8080
+  npm run server:dev -- -d /var/lib/mindoodb -p 8080
 
   # Start server with auto-sync enabled
-  MINDOODB_SERVER_PASSWORD=secret npx ts-node src/server.ts -s
+  MINDOODB_SERVER_PASSWORD=secret npm run server:dev -- -s
 
   # Start server with explicit config file
-  npx ts-node src/server.ts --config /etc/mindoodb/config.json
+  npm run server:dev -- --config /etc/mindoodb/config.json
 
   # Start server with static files (e.g. bootstrap UI for distributed web apps)
-  npx ts-node src/server.ts -w ./webapp-bootstrap
+  npm run server:dev -- -w ./webapp-bootstrap
 
   # Start server with TLS (HTTPS)
-  npx ts-node src/server.ts --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem -p 443
+  npm run server:dev -- --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem -p 443
 `);
 }
 

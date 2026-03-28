@@ -14,10 +14,10 @@ import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import type { SigningKeyPair, EncryptionKeyPair } from "../core/types";
 import type { PrivateUserId } from "../core/userid";
-import type { ServerConfig } from "../../examples/server/src/types";
+import type { ServerConfig } from "../node/server/types";
 
 // Import from example server
-import { MindooDBServer } from "../../examples/server/src/MindooDBServer";
+import { MindooDBServer } from "../node/server/MindooDBServer";
 
 // Helper to make HTTP requests
 async function httpRequest(

@@ -27,11 +27,11 @@ import type {
   StoreScanFilters,
   StoreIdBloomSummary,
   StoreCompactionStatus,
-} from "mindoodb/core/types";
+} from "../../core/types";
 import type {
-} from "mindoodb/core/appendonlystores/types";
-import type { NetworkSyncCapabilities } from "mindoodb/core/appendonlystores/network/types";
-import { NetworkError, NetworkErrorType } from "mindoodb/core/appendonlystores/network/types";
+} from "../../core/appendonlystores/types";
+import type { NetworkSyncCapabilities } from "../../core/appendonlystores/network/types";
+import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 
 import { TenantManager } from "./TenantManager";
 import { CapabilityMatcher } from "./CapabilityMatcher";

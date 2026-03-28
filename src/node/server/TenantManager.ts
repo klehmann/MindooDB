@@ -21,11 +21,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync
 import { join } from "path";
 import { randomBytes, timingSafeEqual } from "crypto";
 
-import { NodeCryptoAdapter } from "mindoodb/node/crypto/NodeCryptoAdapter";
-import { AuthenticationService } from "mindoodb/core/appendonlystores/network/AuthenticationService";
-import { ServerNetworkContentAddressedStore } from "mindoodb/appendonlystores/network/ServerNetworkContentAddressedStore";
-import { BaseMindooTenantFactory } from "mindoodb/core/BaseMindooTenantFactory";
-import { KeyBag } from "mindoodb/core/keys/KeyBag";
+import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
+import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
+import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import { BaseMindooTenantFactory } from "../../core/BaseMindooTenantFactory";
+import { KeyBag } from "../../core/keys/KeyBag";
 import type {
   MindooTenant,
   MindooTenantDirectory,
@@ -34,9 +34,9 @@ import type {
   CreateStoreResult,
   OpenStoreOptions,
   OpenTenantOptions,
-} from "mindoodb/core/types";
-import { PUBLIC_INFOS_KEY_ID } from "mindoodb/core/types";
-import type { PrivateUserId } from "mindoodb/core/userid";
+} from "../../core/types";
+import { PUBLIC_INFOS_KEY_ID } from "../../core/types";
+import type { PrivateUserId } from "../../core/userid";
 
 import { StoreFactory } from "./StoreFactory";
 import type {

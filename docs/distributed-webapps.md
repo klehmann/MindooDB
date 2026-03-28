@@ -163,7 +163,7 @@ The bootstrap page performs the following sequence:
 
 On the reload, the service worker intercepts the request for `/index.html` and serves it from IndexedDB instead of from the server. From this point forward, the application runs entirely from local data.
 
-For the configuration of the `/statics/` endpoint (path traversal protection, dotfile handling, reserved tenant names), see the [server README](../examples/server/README.md#static-file-serving).
+For the configuration of the `/statics/` endpoint (path traversal protection, dotfile handling, reserved tenant names), see the [reference server README](../README-server.md#static-file-serving).
 
 ---
 
@@ -341,4 +341,4 @@ The most significant difference is the security model. CouchApps and traditional
 - [Browser IndexedDB Store](browser-indexeddb-store.md) -- IndexedDB persistence, virtual views, and PWA integration
 - [Attachments](attachments.md) -- Chunked, encrypted file attachments with streaming support
 - [Network Sync Protocol](network-sync-protocol.md) -- Endpoint contracts, capability negotiation, and sync optimization
-- [Server README](../examples/server/README.md) -- Server setup, static file serving, and `/statics/` configuration
+- [Reference server README](../README-server.md) — Server setup, static file serving, and `/statics/` configuration

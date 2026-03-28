@@ -1,7 +1,7 @@
 import {
   isClientIpAllowedForSystemList,
   isSystemIpAllowListDisabled,
-} from "../../examples/server/src/SystemIpAllowlist";
+} from "../node/server/SystemIpAllowlist";
 
 describe("SystemIpAllowlist", () => {
   test("isSystemIpAllowListDisabled", () => {

@@ -9,7 +9,7 @@
  */
 
 import { v7 as uuidv7 } from "uuid";
-import type { CryptoAdapter } from "mindoodb/core/crypto/CryptoAdapter";
+import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
 import { extractAllPrincipals } from "./config";
 

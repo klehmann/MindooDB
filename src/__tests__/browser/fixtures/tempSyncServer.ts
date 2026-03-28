@@ -7,7 +7,7 @@ import { build } from "esbuild";
 import { writeFileSync } from "fs";
 
 import { NodeCryptoAdapter } from "../../../node/crypto/NodeCryptoAdapter";
-import { MindooDBServer } from "../../../../examples/server/src/MindooDBServer";
+import { MindooDBServer } from "../../../node/server/MindooDBServer";
 
 export interface BrowserSyncServerContext {
   baseUrl: string;

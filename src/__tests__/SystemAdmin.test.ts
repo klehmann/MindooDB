@@ -16,8 +16,8 @@ import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { MindooDBServerAdmin } from "../core/MindooDBServerAdmin";
 import type { PrivateUserId } from "../core/userid";
-import type { ServerConfig } from "../../examples/server/src/types";
-import { MindooDBServer } from "../../examples/server/src/MindooDBServer";
+import type { ServerConfig } from "../node/server/types";
+import { MindooDBServer } from "../node/server/MindooDBServer";
 
 async function httpRequest(
   url: string,

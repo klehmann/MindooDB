@@ -2,8 +2,8 @@
  * Unit tests for the capability matching engine.
  */
 
-import { CapabilityMatcher } from "../../examples/server/src/CapabilityMatcher";
-import type { ServerConfig } from "../../examples/server/src/types";
+import { CapabilityMatcher } from "../node/server/CapabilityMatcher";
+import type { ServerConfig } from "../node/server/types";
 
 describe("CapabilityMatcher", () => {
   const key1 = "-----BEGIN PUBLIC KEY-----\nKEY1\n-----END PUBLIC KEY-----";

@@ -22,7 +22,7 @@ Independently of JWTs and `config.json`, you can set **`MINDOODB_ADMIN_ALLOWED_I
 
 ```bash
 MINDOODB_SERVER_PASSWORD=your-secure-password \
-  node dist/serverinit.js --name server1 --data-dir /var/lib/mindoodb
+  node dist/node/server/serverinit.js --name server1 --data-dir /var/lib/mindoodb
 ```
 
 When prompted, create a system admin. This generates:
@@ -34,7 +34,7 @@ When prompted, create a system admin. This generates:
 
 ```bash
 MINDOODB_SERVER_PASSWORD=your-secure-password \
-  node dist/server.js --data-dir /var/lib/mindoodb
+  node dist/node/server/server.js --data-dir /var/lib/mindoodb
 ```
 
 ### 3. Use MindooDBServerAdmin to manage the server
