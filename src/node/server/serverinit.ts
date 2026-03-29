@@ -133,6 +133,55 @@ async function promptLine(rl: ReturnType<typeof createInterface>, question: stri
   });
 }
 
+async function promptHiddenLine(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const stderr = process.stderr;
+    let value = "";
+
+    stderr.write(question);
+
+    const onData = (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+
+      if (text === "\u0003") {
+        stderr.write("\n");
+        cleanup();
+        process.kill(process.pid, "SIGINT");
+        return;
+      }
+
+      if (text === "\r" || text === "\n") {
+        stderr.write("\n");
+        cleanup();
+        resolve(value);
+        return;
+      }
+
+      if (text === "\u007f" || text === "\b") {
+        value = value.slice(0, -1);
+        return;
+      }
+
+      value += text.replace(/[\r\n]/g, "");
+    };
+
+    const cleanup = () => {
+      stdin.off("data", onData);
+      if (stdin.isTTY) {
+        stdin.setRawMode(false);
+      }
+      stdin.pause();
+    };
+
+    if (stdin.isTTY) {
+      stdin.setRawMode(true);
+    }
+    stdin.resume();
+    stdin.on("data", onData);
+  });
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const options = parseArgs(args);
@@ -257,7 +306,7 @@ async function generateSystemAdmin(
     return;
   }
 
-  const adminPassword = await promptLine(rl, "Password to protect the system admin private key: ");
+  const adminPassword = await promptHiddenLine("Password to protect the system admin private key: ");
   if (!adminPassword) {
     rl.close();
     console.error("Error: password cannot be empty.");
@@ -265,7 +314,7 @@ async function generateSystemAdmin(
     return;
   }
 
-  const adminPasswordConfirm = await promptLine(rl, "Confirm password: ");
+  const adminPasswordConfirm = await promptHiddenLine("Confirm password: ");
   rl.close();
 
   if (adminPassword !== adminPasswordConfirm) {
