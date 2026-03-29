@@ -20,6 +20,7 @@
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
+import { execFileSync } from "child_process";
 import { createInterface } from "readline";
 
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
@@ -134,52 +135,32 @@ async function promptLine(rl: ReturnType<typeof createInterface>, question: stri
 }
 
 async function promptHiddenLine(question: string): Promise<string> {
-  return new Promise((resolve) => {
-    const stdin = process.stdin;
-    const stderr = process.stderr;
-    let value = "";
-
-    stderr.write(question);
-
-    const onData = (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-
-      if (text === "\u0003") {
-        stderr.write("\n");
-        cleanup();
-        process.kill(process.pid, "SIGINT");
-        return;
+  const rl = createReadline();
+  const restoreEcho = () => {
+    if (process.stdin.isTTY) {
+      try {
+        execFileSync("stty", ["echo"], { stdio: ["inherit", "inherit", "inherit"] });
+      } catch {
+        // Best effort only; avoid masking the original prompt result.
       }
-
-      if (text === "\r" || text === "\n") {
-        stderr.write("\n");
-        cleanup();
-        resolve(value);
-        return;
-      }
-
-      if (text === "\u007f" || text === "\b") {
-        value = value.slice(0, -1);
-        return;
-      }
-
-      value += text.replace(/[\r\n]/g, "");
-    };
-
-    const cleanup = () => {
-      stdin.off("data", onData);
-      if (stdin.isTTY) {
-        stdin.setRawMode(false);
-      }
-      stdin.pause();
-    };
-
-    if (stdin.isTTY) {
-      stdin.setRawMode(true);
     }
-    stdin.resume();
-    stdin.on("data", onData);
-  });
+  };
+
+  if (!process.stdin.isTTY) {
+    const answer = await promptLine(rl, question);
+    rl.close();
+    return answer;
+  }
+
+  try {
+    execFileSync("stty", ["-echo"], { stdio: ["inherit", "inherit", "inherit"] });
+    const answer = await promptLine(rl, question);
+    process.stderr.write("\n");
+    return answer;
+  } finally {
+    restoreEcho();
+    rl.close();
+  }
 }
 
 async function main(): Promise<void> {
@@ -208,9 +189,7 @@ async function main(): Promise<void> {
   // Get password from env / file or prompt
   let password = resolveServerPassword();
   if (!password) {
-    const rl = createReadline();
-    password = await promptLine(rl, "Enter password to encrypt server identity: ");
-    rl.close();
+    password = await promptHiddenLine("Enter password to encrypt server identity: ");
   }
   if (!password) {
     console.error("Error: password is required.");
