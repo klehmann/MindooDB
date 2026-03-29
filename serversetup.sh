@@ -160,6 +160,7 @@ docker run --rm -it \
   -v "$DATA_MOUNT" \
   -v "$PASSWORD_MOUNT" \
   -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_unlock \
+  -e MINDOODB_SKIP_NEXT_STEPS=1 \
   --entrypoint node \
   "$DOCKER_IMAGE" dist/node/server/serverinit.js --data-dir /data --name "$SERVER_NAME" $FORCE_FLAG
 

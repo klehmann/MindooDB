@@ -219,17 +219,19 @@ async function main(): Promise<void> {
     console.log(`\nSkipped system admin generation (--skip-admin).`);
   }
 
-  console.log("\n" + "=".repeat(60));
-  console.log("NEXT STEPS:");
-  console.log("=".repeat(60));
-  console.log("1. Start the server:");
-  console.log(
-    `   ${ENV_VARS.SERVER_PASSWORD_FILE}=<path> or ${ENV_VARS.SERVER_PASSWORD}=<password> ` +
-      `node dist/node/server/server.js -d ${options.dataDir}`,
-  );
-  console.log("2. Edit config.json to configure system admin capabilities");
-  console.log("3. Use MindooDBServerAdmin or publishToServer to manage tenants");
-  console.log("=".repeat(60));
+  if (!process.env.MINDOODB_SKIP_NEXT_STEPS) {
+    console.log("\n" + "=".repeat(60));
+    console.log("NEXT STEPS:");
+    console.log("=".repeat(60));
+    console.log("1. Start the server:");
+    console.log(
+      `   ${ENV_VARS.SERVER_PASSWORD_FILE}=<path> or ${ENV_VARS.SERVER_PASSWORD}=<password> ` +
+        `node dist/node/server/server.js -d ${options.dataDir}`,
+    );
+    console.log("2. Edit config.json to configure system admin capabilities");
+    console.log("3. Use MindooDBServerAdmin or publishToServer to manage tenants");
+    console.log("=".repeat(60));
+  }
 }
 
 async function generateSystemAdmin(
