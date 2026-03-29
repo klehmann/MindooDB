@@ -1,0 +1,31 @@
+# MindooDB Server — Docker Compose
+#
+# Default paths (relative to the repository root):
+#   data directory:  ../mindoodb-data/server
+#   password file:   ../mindoodb-data/.server_unlock
+#
+# Run `bash serversetup.sh` first to build the image, create the data directory,
+# and initialise the server identity. serversetup.sh also writes a
+# docker-compose.override.yml with the current host uid/gid, selected bind
+# address, and SELinux relabeling options when needed.
+#
+# Usage:
+#   docker compose up -d        # start
+#   docker compose down          # stop
+#   docker compose logs -f       # follow logs
+#   docker compose up -d --build # rebuild image and restart
+
+services:
+  mindoodb:
+    image: mindoodb-server
+    build:
+      context: .
+      dockerfile: src/node/server/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - ../mindoodb-data/server:/data
+      - ../mindoodb-data/.server_unlock:/run/secrets/server_unlock:ro
+    environment:
+      MINDOODB_SERVER_PASSWORD_FILE: /run/secrets/server_unlock
+    ports:
+      - "0.0.0.0:1661:1661"
