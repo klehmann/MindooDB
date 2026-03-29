@@ -35,7 +35,7 @@ export interface TrustedServer {
 
 /**
  * Configuration for a remote server to sync with (per-tenant).
- * The server authenticates using its global identity (from server-identity.json).
+ * The server authenticates using its global identity (from server.identity.json).
  * The remote server's public keys are looked up from trusted-servers.json.
  */
 export interface RemoteServerConfig {

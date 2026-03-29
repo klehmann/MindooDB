@@ -40,7 +40,7 @@ MINDOODB_SERVER_PASSWORD=your-secure-password \
 ```
 
 When prompted, create a system admin. This generates:
-- `server-identity.json` — the server's keypair (encrypted)
+- `server.identity.json` — the server's keypair (encrypted)
 - `config.json` — capabilities configuration with the admin's public key
 - `system-admin-<username>.identity.json` — the admin's keypair (password-encrypted)
 

@@ -120,7 +120,7 @@ if [[ "$BIND_ADDR" != "0.0.0.0" && "$BIND_ADDR" != "127.0.0.1" ]]; then
 fi
 SERVER_DATA="$DATA_DIR/server"
 PASSWORD_FILE="$DATA_DIR/.server_unlock"
-IDENTITY_FILE="$SERVER_DATA/server-identity.json"
+IDENTITY_FILE="$SERVER_DATA/server.identity.json"
 
 echo ""
 info "Server name:    $SERVER_NAME"

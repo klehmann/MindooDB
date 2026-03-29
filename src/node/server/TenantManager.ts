@@ -255,12 +255,12 @@ export class TenantManager {
     }
 
     // Load global server identity
-    const identityPath = join(dataDir, "server-identity.json");
+    const identityPath = join(dataDir, "server.identity.json");
     if (existsSync(identityPath)) {
       this.serverIdentity = JSON.parse(readFileSync(identityPath, "utf-8"));
       console.log(`[TenantManager] Loaded server identity: ${this.serverIdentity!.username}`);
     } else {
-      console.log(`[TenantManager] No server-identity.json found (run "npm run init" to create one)`);
+      console.log(`[TenantManager] No server.identity.json found (run "npm run init" to create one)`);
     }
 
     // Load trusted servers

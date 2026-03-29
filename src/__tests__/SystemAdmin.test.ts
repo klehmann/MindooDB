@@ -87,7 +87,7 @@ async function createTestSetup(
 
   const serverIdentity = await factory.createUserId("CN=test-sysadmin-server", "test-password");
   fs.writeFileSync(
-    path.join(dataDir, "server-identity.json"),
+    path.join(dataDir, "server.identity.json"),
     JSON.stringify(serverIdentity, null, 2),
     "utf-8",
   );
@@ -804,7 +804,7 @@ describe("System Admin Security", () => {
 
       const serverIdentity = await factory.createUserId("CN=config-test-server", "test-password");
       fs.writeFileSync(
-        path.join(dataDir, "server-identity.json"),
+        path.join(dataDir, "server.identity.json"),
         JSON.stringify(serverIdentity, null, 2),
         "utf-8",
       );

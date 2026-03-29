@@ -546,7 +546,7 @@ describe("MindooDB Example Server", () => {
         isolatedServerPassword
       );
       fs.writeFileSync(
-        `${isolatedDataDir}/server-identity.json`,
+        `${isolatedDataDir}/server.identity.json`,
         JSON.stringify(serverIdentity, null, 2),
         "utf-8"
       );
@@ -867,7 +867,7 @@ describe("Server Network Management", () => {
     }
     const identity = await factory.createUserId("CN=test-network-server", "test-password");
     fs.writeFileSync(
-      path.join(testDataDir, "server-identity.json"),
+      path.join(testDataDir, "server.identity.json"),
       JSON.stringify(identity, null, 2),
       "utf-8"
     );

@@ -141,7 +141,7 @@ Options:
 
 Environment variables:
   MINDOODB_SERVER_PASSWORD or MINDOODB_SERVER_PASSWORD_FILE — decrypt server identity
-                               (required if server-identity.json exists)
+                               (required if server.identity.json exists)
 
 Examples:
   # Start server with default settings
@@ -207,7 +207,7 @@ async function main(): Promise<void> {
 
     if (!serverIdentity) {
       console.warn(
-        "[Main] Auto-sync enabled but no server-identity.json found. " +
+        "[Main] Auto-sync enabled but no server.identity.json found. " +
         "Run 'npm run init' to create a server identity.",
       );
     } else if (!serverPassword) {

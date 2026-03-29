@@ -9,7 +9,7 @@
  * Options:
  *   -n, --name <name>       Server name (e.g., "server1") -- required
  *   -d, --data-dir <path>   Data directory path (default: ./data)
- *   -f, --force             Overwrite existing server-identity.json
+ *   -f, --force             Overwrite existing server.identity.json
  *   --skip-admin            Skip system admin keypair generation
  *   -h, --help              Show this help message
  *
@@ -104,7 +104,7 @@ Usage:
 Options:
   -n, --name <name>       Server name (e.g., "server1") -- required
   -d, --data-dir <path>   Data directory path (default: ./data)
-  -f, --force             Overwrite existing server-identity.json
+  -f, --force             Overwrite existing server.identity.json
   --skip-admin            Skip interactive system admin keypair generation
   -h, --help              Show this help message
 
@@ -192,7 +192,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const identityPath = join(options.dataDir, "server-identity.json");
+  const identityPath = join(options.dataDir, "server.identity.json");
   const trustedServersPath = join(options.dataDir, "trusted-servers.json");
   const configPath = join(options.dataDir, "config.json");
 
@@ -235,7 +235,7 @@ async function main(): Promise<void> {
 
   const identity = await factory.createUserId(serverUsername, password);
 
-  // Write server-identity.json
+  // Write server.identity.json
   writeFileSync(identityPath, JSON.stringify(identity, null, 2), "utf-8");
   console.log(`\nServer identity written to: ${identityPath}`);
 
