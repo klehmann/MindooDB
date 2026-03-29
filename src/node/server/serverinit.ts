@@ -149,7 +149,6 @@ async function main(): Promise<void> {
 
   const identityPath = join(options.dataDir, "server-identity.json");
   const trustedServersPath = join(options.dataDir, "trusted-servers.json");
-  const tenantApiKeysPath = join(options.dataDir, "tenant-api-keys.json");
   const configPath = join(options.dataDir, "config.json");
 
   if (existsSync(identityPath) && !options.force) {
@@ -201,12 +200,6 @@ async function main(): Promise<void> {
   if (!existsSync(trustedServersPath)) {
     writeFileSync(trustedServersPath, "[]", "utf-8");
     console.log(`Created empty trusted-servers.json: ${trustedServersPath}`);
-  }
-
-  // Create tenant-api-keys.json if it doesn't exist
-  if (!existsSync(tenantApiKeysPath)) {
-    writeFileSync(tenantApiKeysPath, "[]", "utf-8");
-    console.log(`Created empty tenant-api-keys.json: ${tenantApiKeysPath}`);
   }
 
   // Print public keys for sharing with other servers

@@ -34,21 +34,6 @@ export interface TrustedServer {
 }
 
 /**
- * A delegated API key that allows creating tenants.
- * Stored globally in <dataDir>/tenant-api-keys.json.
- */
-export interface TenantCreationKey {
-  /** The secret API key value (prefixed with "mdb_tk_") */
-  apiKey: string;
-  /** Human-readable label (e.g., "acme-corp") */
-  name: string;
-  /** If set, only allows creating tenants with IDs starting with this prefix */
-  tenantIdPrefix?: string;
-  /** Creation timestamp */
-  createdAt: number;
-}
-
-/**
  * Configuration for a remote server to sync with (per-tenant).
  * The server authenticates using its global identity (from server-identity.json).
  * The remote server's public keys are looked up from trusted-servers.json.

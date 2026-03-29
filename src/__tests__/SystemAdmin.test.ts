@@ -7,7 +7,6 @@
  * - Tenant CRUD routes
  * - publishToServer with new auth
  * - MindooDBServerAdmin wrapper
- * - Migration: all /admin/* routes return 404
  */
 
 import { Server } from "http";
@@ -85,7 +84,6 @@ async function createTestSetup(
   const dataDir = `/tmp/mindoodb-sysadmin-test-${Date.now()}-${port}`;
   fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(path.join(dataDir, "trusted-servers.json"), "[]", "utf-8");
-  fs.writeFileSync(path.join(dataDir, "tenant-api-keys.json"), "[]", "utf-8");
 
   const serverIdentity = await factory.createUserId("CN=test-sysadmin-server", "test-password");
   fs.writeFileSync(
@@ -741,25 +739,6 @@ describe("System Admin Security", () => {
       expect(removeResult.success).toBe(true);
     });
 
-    test("should manage tenant creation keys", async () => {
-      const admin = new MindooDBServerAdmin({
-        serverUrl: setup.baseUrl,
-        systemAdminUser: setup.adminUser,
-        systemAdminPassword: "admin-pass",
-        cryptoAdapter,
-      });
-
-      const key = await admin.createTenantCreationKey("test-key", "test-prefix-");
-      expect(key.success).toBe(true);
-      expect(key.apiKey).toBeDefined();
-
-      const keys = await admin.listTenantCreationKeys();
-      expect(keys.some((k) => k.name === "test-key")).toBe(true);
-
-      const removeResult = await admin.removeTenantCreationKey("test-key");
-      expect(removeResult.success).toBe(true);
-    });
-
     test("should manage tenant sync servers", async () => {
       const admin = new MindooDBServerAdmin({
         serverUrl: setup.baseUrl,
@@ -808,76 +787,6 @@ describe("System Admin Security", () => {
   });
 
   // =========================================================================
-  // Migration: all /admin/* routes return 404
-  // =========================================================================
-
-  describe("Migration: /admin/* routes return 404", () => {
-    let setup: TestSetup;
-    const port = 4006;
-
-    beforeAll(async () => {
-      setup = await createTestSetup(port, cryptoAdapter, factory);
-    });
-
-    afterAll(async () => {
-      await teardownTestSetup(setup);
-    });
-
-    test("POST /admin/register-tenant returns 404", async () => {
-      const { status } = await httpRequest(
-        `${setup.baseUrl}/admin/register-tenant`,
-        "POST",
-        { tenantId: "test" },
-      );
-      expect(status).toBe(404);
-    });
-
-    test("GET /admin/tenants returns 404", async () => {
-      const { status } = await httpRequest(`${setup.baseUrl}/admin/tenants`);
-      expect(status).toBe(404);
-    });
-
-    test("GET /admin/trusted-servers returns 404", async () => {
-      const { status } = await httpRequest(`${setup.baseUrl}/admin/trusted-servers`);
-      expect(status).toBe(404);
-    });
-
-    test("GET /admin/tenant-api-keys returns 404", async () => {
-      const { status } = await httpRequest(`${setup.baseUrl}/admin/tenant-api-keys`);
-      expect(status).toBe(404);
-    });
-
-    test("/:tenantId/admin/trigger-sync returns 404", async () => {
-      // Create a tenant to test against
-      const token = await getSystemAdminToken(
-        setup.baseUrl,
-        setup.adminUser,
-        "admin-pass",
-        cryptoAdapter,
-        factory,
-      );
-      const adminSigningKey = await factory.createSigningKeyPair("pw");
-      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
-      await httpRequest(
-        `${setup.baseUrl}/system/tenants/trigger-test`,
-        "POST",
-        {
-          adminSigningPublicKey: adminSigningKey.publicKey,
-          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
-        },
-        { Authorization: `Bearer ${token}` },
-      );
-
-      // Old path should 404
-      const { status } = await httpRequest(
-        `${setup.baseUrl}/trigger-test/admin/trigger-sync`,
-        "POST",
-      );
-      expect(status).toBe(404);
-    });
-  });
-
-  // =========================================================================
   // Runtime config update (GET/PUT /system/config)
   // =========================================================================
 
@@ -892,7 +801,6 @@ describe("System Admin Security", () => {
       dataDir = `/tmp/mindoodb-config-update-test-${Date.now()}`;
       fs.mkdirSync(dataDir, { recursive: true });
       fs.writeFileSync(path.join(dataDir, "trusted-servers.json"), "[]", "utf-8");
-      fs.writeFileSync(path.join(dataDir, "tenant-api-keys.json"), "[]", "utf-8");
 
       const serverIdentity = await factory.createUserId("CN=config-test-server", "test-password");
       fs.writeFileSync(

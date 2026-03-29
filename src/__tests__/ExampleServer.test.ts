@@ -551,7 +551,6 @@ describe("MindooDB Example Server", () => {
         "utf-8"
       );
       fs.writeFileSync(`${isolatedDataDir}/trusted-servers.json`, "[]", "utf-8");
-      fs.writeFileSync(`${isolatedDataDir}/tenant-api-keys.json`, "[]", "utf-8");
 
       // Create isolated system admin
       const isolatedSystemAdmin = await localFactory.createUserId(
@@ -873,7 +872,6 @@ describe("Server Network Management", () => {
       "utf-8"
     );
     fs.writeFileSync(path.join(testDataDir, "trusted-servers.json"), "[]", "utf-8");
-    fs.writeFileSync(path.join(testDataDir, "tenant-api-keys.json"), "[]", "utf-8");
 
     systemAdmin = await factory.createUserId("cn=netadmin/o=test", "netadmin-pass");
 

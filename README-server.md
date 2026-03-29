@@ -11,36 +11,71 @@ A Node.js/Express server implementing the MindooDB sync API with:
 
 ## Prerequisites
 
-- Node.js 20 or later
-- The MindooDB library must be built first (run `npm run build` in the root directory)
+- **Docker** — the recommended way to build and run the server
+- Node.js 20 or later (only needed for local development without Docker)
+
+## Quick Start
+
+The fastest way to get a server running is the interactive setup script. It prompts for a server name, password, data directory, and bind address, then builds the Docker image and initialises the server identity (including optional system admin creation):
+
+```bash
+# 1. Clone and enter the repo
+git clone https://github.com/klehmann/MindooDB.git && cd MindooDB
+
+# 2. Run the interactive setup
+bash setup.sh
+
+# 3. Start the server
+docker compose up -d
+
+# 4. Verify
+curl http://localhost:1661/health
+```
+
+The setup script:
+- builds the `mindoodb-server` Docker image
+- creates the data directory (`../mindoodb-data/server`) and password file (`../mindoodb-data/.server_unlock`, mode 600)
+- initialises the server identity and optionally creates a system admin keypair interactively
+- writes a `docker-compose.override.yml` if you chose a non-default data path or bind address (e.g. a VPN interface IP)
+
+After setup, manage the server with:
+
+```bash
+docker compose up -d        # start
+docker compose down          # stop
+docker compose logs -f       # follow logs
+docker compose up -d --build # rebuild image and restart
+```
+
+### What's next?
+
+Once the server is healthy, you can create a tenant and start syncing data:
+
+```typescript
+import { BaseMindooTenantFactory, InMemoryContentAddressedStoreFactory } from "mindoodb";
+
+const factory = new BaseMindooTenantFactory(new InMemoryContentAddressedStoreFactory());
+const result = await factory.createTenant({
+  tenantId: "acme",
+  adminName: "cn=admin/o=acme",
+  adminPassword: "admin-pass",
+  userName: "cn=alice/o=acme",
+  userPassword: "alice-pass",
+});
+
+await result.tenant.publishToServer("http://localhost:1661", {
+  adminUsername: result.adminUser.username,
+  registerUsers: [factory.toPublicUserId(result.appUser)],
+});
+```
+
+See the [Single Server Setup](#walkthrough-single-server-setup) walkthrough for the full flow including data sync.
 
 ## System admin API (`/system/*`)
 
 Server administration uses **`/system/...`** routes (the old **`/admin/...`** paths are gone). Authenticate with a JWT from **`POST /system/auth/challenge`** and **`POST /system/auth/authenticate`**, then send **`Authorization: Bearer <token>`** on later requests. Full flow and capabilities are in [Server Security](docs/server-security.md). In Node you can use **`MindooDBServerAdmin`** (with your `CryptoAdapter`) instead of raw `curl`.
 
 The **`curl`** examples below use **`$SYSTEM_ADMIN_JWT`** as a placeholder for that token.
-
-## Quick Start
-
-Prefer **`MINDOODB_SERVER_PASSWORD_FILE`** (path to a file containing the password) over **`MINDOODB_SERVER_PASSWORD`** so the plaintext secret is not stored in the process environment block (visible via `docker inspect`, `/proc/<pid>/environ`, etc.). For **`server:add-to-network`**, use **`--password-file`** instead of **`MINDOODB_SYSTEM_ADMIN_PASSWORD`** when you can.
-
-```bash
-# 1. Build MindooDB (from the root directory)
-nvm use 20
-npm install
-npm run build
-
-# 2. Store the server password in a file (one-time)
-echo -n 'your-secret' > ./.server-password && chmod 600 ./.server-password
-
-# 3. Initialize server identity (one-time setup, from repo root)
-MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:init -- --name server1
-
-# 4. Start the server
-MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:start
-```
-
-`npm run server:dev` runs the TypeScript entry with `ts-node-dev` (same flags as in the table below).
 
 ## CLI Reference
 
@@ -96,7 +131,6 @@ data/
 ├── server-identity.json                       # Global server identity (PrivateUserId)
 ├── config.json                                # Capabilities-based system admin config
 ├── trusted-servers.json                       # Public keys of trusted remote servers
-├── tenant-api-keys.json                       # Delegated tenant creation API keys
 ├── system-admin-cn-sysadmin-o-myorg.identity.json  # System admin identity (password-encrypted)
 ├── acme/
 │   ├── config.json                            # Tenant configuration
@@ -136,14 +170,6 @@ See [Server Security](docs/server-security.md) for full details.
 | `GET` | `/system/trusted-servers` | JWT | List trusted servers |
 | `POST` | `/system/trusted-servers` | JWT | Add a trusted server |
 | `DELETE` | `/system/trusted-servers/:serverName` | JWT | Remove a trusted server |
-
-#### Tenant Creation Key Management
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `GET` | `/system/tenant-api-keys` | JWT | List tenant creation keys (masked) |
-| `POST` | `/system/tenant-api-keys` | JWT | Create a tenant creation key |
-| `DELETE` | `/system/tenant-api-keys/:name` | JWT | Revoke a tenant creation key |
 
 ### Authentication Endpoints
 
@@ -195,25 +221,28 @@ See [Server Security](docs/server-security.md) for full details.
 
 1. **System admin** — `config.json` capabilities + Ed25519 challenge/response + short-lived JWT for `/system/*`. Optional **`MINDOODB_ADMIN_ALLOWED_IPS`** restricts which client IPs may use the `/system/*` HTTP surface.
 
-2. **Tenant creation key** — delegated keys stored in `tenant-api-keys.json` (managed via `/system/tenant-api-keys`). Intended for limited tenant registration; see server implementation for current enforcement.
+2. **User JWT** — per-tenant sync via Ed25519 challenge-response. Users are authenticated against the tenant directory (admin-signed).
 
-3. **User JWT** — per-tenant sync via Ed25519 challenge-response. Users are authenticated against the tenant directory (admin-signed).
+Tenant creation is authorized through the system admin capability model. To delegate selected tenant IDs or prefixes to specific admins, scope `POST:/system/tenants/<pattern>` rules in `config.json`.
 
 ## Walkthrough: Single Server Setup
 
 ### 1. Initialize the server
 
+Run the interactive setup script from the repository root:
+
 ```bash
-mkdir -p ./data && echo -n 'secret' > ./data/.server-password && chmod 600 ./data/.server-password
-MINDOODB_SERVER_PASSWORD_FILE=./data/.server-password npm run server:init -- --name server1 --data-dir ./data
+bash setup.sh
 ```
 
-This creates `server-identity.json`, `trusted-servers.json`, and `tenant-api-keys.json` in the data directory, and prints the server's public keys.
+The script prompts for a server name, password, data directory, and bind address. It builds the Docker image, creates the data directory and password file, and initialises the server identity. You can also create a system admin keypair interactively during this step.
+
+This creates `server-identity.json`, `trusted-servers.json`, and `config.json` in the data directory, and prints the server's public keys.
 
 ### 2. Start the server
 
 ```bash
-MINDOODB_SERVER_PASSWORD_FILE=./data/.server-password npm run server:dev -- -d ./data -p 1661
+docker compose up -d
 ```
 
 ### 3. Client creates a tenant and publishes to server
@@ -260,17 +289,17 @@ await db.syncStoreChanges();
 
 ### 1. Initialize both servers
 
-```bash
-# Server 1
-mkdir -p ./data1 && echo -n 'secret1' > ./data1/.server-password && chmod 600 ./data1/.server-password
-MINDOODB_SERVER_PASSWORD_FILE=./data1/.server-password npm run server:init -- --name server1 --data-dir ./data1
+Run `bash setup.sh` on each machine (or in separate data directories for local testing). Example for two servers side by side on the same host:
 
-# Server 2
-mkdir -p ./data2 && echo -n 'secret2' > ./data2/.server-password && chmod 600 ./data2/.server-password
-MINDOODB_SERVER_PASSWORD_FILE=./data2/.server-password npm run server:init -- --name server2 --data-dir ./data2
+```bash
+# Server 1 — run setup.sh, choose data dir ../mindoodb-data-s1, bind 127.0.0.1
+bash setup.sh
+
+# Server 2 — run setup.sh again, choose data dir ../mindoodb-data-s2, bind 127.0.0.1
+bash setup.sh
 ```
 
-Both commands print the server's public keys.
+Both runs print the server's public keys.
 
 ### 2. Exchange public keys via the system admin API
 
@@ -325,49 +354,21 @@ And vice versa on server 2.
 
 ### 5. Start servers with auto-sync
 
+Add `--auto-sync` via the `command` key in each server's `docker-compose.override.yml`:
+
+```yaml
+services:
+  mindoodb:
+    command: ["--auto-sync"]
+```
+
+Then start both servers:
+
 ```bash
-MINDOODB_SERVER_PASSWORD_FILE=./data1/.server-password npm run server:dev -- -d ./data1 -s
+docker compose up -d
 ```
 
 The servers will periodically sync all configured tenant databases, relaying encrypted entries without decrypting them.
-
-## Walkthrough: Delegated Tenant Creation
-
-### 1. Admin creates a tenant creation key
-
-```bash
-curl -X POST http://localhost:1661/system/tenant-api-keys \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
-  -d '{"name": "acme-corp", "tenantIdPrefix": "acme-"}'
-```
-
-Response:
-```json
-{
-  "success": true,
-  "name": "acme-corp",
-  "apiKey": "mdb_tk_a1b2c3d4...",
-  "tenantIdPrefix": "acme-"
-}
-```
-
-### 2. Share the key with the customer
-
-The customer uses this key when publishing their tenant:
-
-```typescript
-await tenant.publishToServer("http://localhost:1661", {
-  adminApiKey: "mdb_tk_a1b2c3d4...",
-  adminUsername: adminUser.username,
-  registerUsers: [factory.toPublicUserId(appUser)],
-});
-```
-
-### 3. Prefix enforcement
-
-- `tenantId: "acme-prod"` — allowed (matches prefix `acme-`)
-- `tenantId: "other-org"` — rejected with 403
 
 ## Network Management
 
@@ -400,19 +401,19 @@ The `add-to-network` CLI automates mutual trust exchange when adding a new serve
 **Secrets:** Prefer **`--password-file`** for the system admin password (and **`MINDOODB_SERVER_PASSWORD_FILE`** for the server identity) so secrets are not placed in the process environment. Use **`MINDOODB_SYSTEM_ADMIN_PASSWORD`** only when you must script without files. A leading space before the command or `HISTCONTROL=ignorespace` reduces shell-history leakage for typed passwords.
 
 ```bash
-# 1. Initialize the new server
-mkdir -p ./data4 && echo -n 'secret4' > ./data4/.server-password && chmod 600 ./data4/.server-password
-MINDOODB_SERVER_PASSWORD_FILE=./data4/.server-password npm run server:init -- --name server4 --data-dir ./data4
+# 1. Initialize the new server (interactive setup)
+bash setup.sh
+# Choose: name=server4, data dir=../mindoodb-data-s4, bind address and port as needed
 
 # 2. Start it
-MINDOODB_SERVER_PASSWORD_FILE=./data4/.server-password npm run server:dev -- -d ./data4 -p 3003 &
+docker compose up -d
 
 # 3. Add it to the existing network (same system admin identity on every server)
-echo -n 'admin-pass' > ./.admin-password && chmod 600 ./.admin-password
+printf '%s' 'admin-pass' > ./.admin-password && chmod 600 ./.admin-password
 npm run server:add-to-network -- \
   --new-server http://localhost:3003 \
   --servers http://localhost:1661,http://localhost:3001,http://localhost:3002 \
-  --identity ./data1/system-admin-cn-sysadmin-o-myorg.identity.json \
+  --identity ../mindoodb-data/server/system-admin-cn-sysadmin-o-myorg.identity.json \
   --password-file ./.admin-password
 ```
 
@@ -463,17 +464,17 @@ Note: the server name in the URL must be percent-encoded (e.g., `CN%3Dserver2` f
 ### Complete workflow: new server joins and starts syncing
 
 ```bash
-# Step 1: Init and start the new server (password from file, not env)
-echo -n 'secret' > ./data3/.server-password && chmod 600 ./data3/.server-password
-MINDOODB_SERVER_PASSWORD_FILE=./data3/.server-password npm run server:init -- --name server3 --data-dir ./data3
-MINDOODB_SERVER_PASSWORD_FILE=./data3/.server-password npm run server:dev -- -d ./data3 -p 3002 &
+# Step 1: Init and start the new server
+bash setup.sh
+# Choose: name=server3, data dir=../mindoodb-data-s3
+docker compose up -d
 
 # Step 2: Add to network (establishes trust with all existing servers)
-echo -n 'admin-pass' > ./.admin-password && chmod 600 ./.admin-password
+printf '%s' 'admin-pass' > ./.admin-password && chmod 600 ./.admin-password
 npm run server:add-to-network -- \
   --new-server http://localhost:3002 \
   --servers http://localhost:1661,http://localhost:3001 \
-  --identity ./data1/system-admin-cn-sysadmin-o-myorg.identity.json \
+  --identity ../mindoodb-data/server/system-admin-cn-sysadmin-o-myorg.identity.json \
   --password-file ./.admin-password
 
 # Step 3: Register the tenant on the new server (if not already published)
@@ -490,7 +491,7 @@ curl -X POST http://localhost:1661/system/tenants/acme/sync-servers \
   -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
   -d '{"name":"CN=server3","url":"http://localhost:3002","syncIntervalMs":60000,"databases":["directory","main"]}'
 
-# Step 5: Restart servers with --auto-sync to activate periodic sync
+# Step 5: Add --auto-sync via docker-compose.override.yml and restart
 ```
 
 Sync config changes take effect on the next server restart or when auto-sync timers are restarted.
@@ -535,19 +536,6 @@ Generated by `npm run server:init`. Contains a `PrivateUserId` with encrypted pr
     "name": "CN=server2",
     "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
     "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n..."
-  }
-]
-```
-
-### `tenant-api-keys.json` (global)
-
-```json
-[
-  {
-    "apiKey": "mdb_tk_a1b2c3...",
-    "name": "acme-corp",
-    "tenantIdPrefix": "acme-",
-    "createdAt": 1708617600000
   }
 ]
 ```
@@ -694,56 +682,79 @@ Available DNS plugins include Cloudflare, Route53, Google Cloud DNS, DigitalOcea
 
 The server ships with a multi-stage `Dockerfile` under `src/node/server/` that produces a minimal Alpine-based image. The build context must be the **repository root** so the library and server compile together.
 
-### Build the image
+**Recommended:** use `bash setup.sh` (see [Quick Start](#quick-start)) to build, initialise, and configure everything interactively. The rest of this section covers manual Docker commands for advanced use cases.
+
+### docker-compose.yml
+
+The repository includes a `docker-compose.yml` that uses the default data paths (`../mindoodb-data`). After running `setup.sh`, start and stop with:
 
 ```bash
-# From the repository root
-docker build -f src/node/server/Dockerfile -t mindoodb-server .
+docker compose up -d        # start
+docker compose down          # stop
+docker compose logs -f       # follow logs
+docker compose up -d --build # rebuild image after code changes
 ```
 
-### Initialize server identity
+If you chose a non-default data directory or bind address during setup, `setup.sh` writes a `docker-compose.override.yml` that is merged automatically.
 
-The identity is stored inside the data directory, so point the container at a local `./data` folder. The init script requires overriding the default entrypoint. Prefer a **mounted password file** so the secret is not passed as `-e MINDOODB_SERVER_PASSWORD=...`:
+### Manual Docker commands (without setup.sh)
+
+If you prefer not to use the setup script, here are the individual steps:
 
 ```bash
-echo -n 'your-secret' > ./server-password && chmod 600 ./server-password
-docker run --rm \
-  -v "$(pwd)/data:/data" \
-  -v "$(pwd)/server-password:/run/secrets/server_password:ro" \
-  -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_password \
+# Build the image
+docker build -f src/node/server/Dockerfile -t mindoodb-server .
+
+# Create data directory and password file
+mkdir -p ../mindoodb-data/server
+printf '%s' 'your-secret' > ../mindoodb-data/.server_unlock
+chmod 600 ../mindoodb-data/.server_unlock
+
+# Initialize server identity (interactive — prompts for system admin creation)
+docker run --rm -it \
+  -v "$(pwd)/../mindoodb-data/server:/data" \
+  -v "$(pwd)/../mindoodb-data/.server_unlock:/run/secrets/server_unlock:ro" \
+  -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_unlock \
   --entrypoint node \
   mindoodb-server dist/node/server/serverinit.js --data-dir /data --name server1
-```
 
-### Run the server
+# Start the server
+docker compose up -d
 
-```bash
-docker run -d --name mindoodb \
-  -v "$(pwd)/data:/data" \
-  -v "$(pwd)/server-password:/run/secrets/server_password:ro" \
-  -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_password \
-  -p 1661:1661 \
-  mindoodb-server
-```
-
-Optional: restrict `/system/*` to specific networks, e.g. `-e MINDOODB_ADMIN_ALLOWED_IPS=127.0.0.1,10.0.0.0/8`.
-
-Additional CLI flags can be appended after the image name:
-
-```bash
-docker run -d --name mindoodb \
-  -v "$(pwd)/data:/data" \
-  -v "$(pwd)/server-password:/run/secrets/server_password:ro" \
-  -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_password \
-  -p 8443:8443 \
-  mindoodb-server --port 8443 --auto-sync
-```
-
-### Verify
-
-```bash
+# Verify
 curl http://localhost:1661/health
 ```
+
+### Bind to a specific IP
+
+To restrict the server to a specific network interface (e.g. a VPN), edit the `ports` section in `docker-compose.override.yml`:
+
+```yaml
+services:
+  mindoodb:
+    ports:
+      - "10.8.0.1:1661:1661"
+```
+
+Or pass the bind address during `bash setup.sh` when prompted.
+
+### Additional flags
+
+Environment variables and CLI flags can be added to `docker-compose.override.yml`:
+
+```yaml
+services:
+  mindoodb:
+    environment:
+      MINDOODB_ADMIN_ALLOWED_IPS: "127.0.0.1,10.0.0.0/8"
+    command: ["--port", "8443", "--auto-sync"]
+    ports:
+      - "0.0.0.0:8443:8443"
+```
+
+### Password handling
+
+Prefer **`MINDOODB_SERVER_PASSWORD_FILE`** over **`MINDOODB_SERVER_PASSWORD`** so the plaintext secret is not stored in the process environment block (visible via `docker inspect`, `/proc/<pid>/environ`). The setup script and `docker-compose.yml` use file-based passwords by default. See [Server Security](docs/server-security.md) for details on Docker secrets.
 
 ## Development
 

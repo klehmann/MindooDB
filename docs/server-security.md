@@ -200,14 +200,6 @@ sequenceDiagram
 | POST | `/system/trusted-servers` | JWT | Add a trusted server |
 | DELETE | `/system/trusted-servers/:serverName` | JWT | Remove a trusted server |
 
-### Tenant Creation Key Management
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/system/tenant-api-keys` | JWT | List creation keys |
-| POST | `/system/tenant-api-keys` | JWT | Create a creation key |
-| DELETE | `/system/tenant-api-keys/:name` | JWT | Remove a creation key |
-
 ### Per-Tenant Sync Server Management
 
 | Method | Path | Auth | Description |
@@ -226,7 +218,7 @@ sequenceDiagram
 
 `PUT /system/config` accepts a full `ServerConfig` JSON body. Before overwriting, the server creates a timestamped backup (e.g., `config.2026-03-27T16-30-45.123Z.json`) in the same directory. Self-lockout protection rejects any config change that would remove the calling admin's `PUT /system/config` access.
 
-Capability checks use the new rules immediately after a successful update. In-flight JWTs remain valid (same HMAC secret), but removed principals will fail the capability check on their next request.
+Capability checks use the new rules immediately after a successful update. In-flight JWTs remain valid (same HMAC secret), but removed principals will fail the capability check on their next request. Tenant creation is authorized the same way: scope `POST:/system/tenants/<pattern>` rules to delegate specific tenant IDs or prefixes.
 
 ## Key Rotation
 
@@ -264,4 +256,3 @@ The old `MINDOODB_ADMIN_API_KEY` environment variable and `/admin/*` routes have
 | `DELETE /admin/tenants/:tenantId` | `DELETE /system/tenants/:tenantId` |
 | `GET /admin/trusted-servers` | `GET /system/trusted-servers` |
 | `/:tenantId/admin/trigger-sync` | `POST /system/tenants/:tenantId/trigger-sync` |
-| `PublishToServerOptions.adminApiKey` | `PublishToServerOptions.systemAdminUser` + `.systemAdminPassword` |

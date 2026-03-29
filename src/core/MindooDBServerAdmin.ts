@@ -24,21 +24,6 @@ interface TrustedServer {
   encryptionPublicKey: string;
 }
 
-interface TenantCreationKeyInfo {
-  name: string;
-  tenantIdPrefix?: string;
-  createdAt: number;
-  apiKeyPreview: string;
-}
-
-interface TenantCreationKeyFull {
-  success: boolean;
-  name: string;
-  apiKey: string;
-  tenantIdPrefix?: string;
-  createdAt: number;
-}
-
 interface SyncServerConfig {
   name: string;
   url: string;
@@ -158,34 +143,6 @@ export class MindooDBServerAdmin {
     return await this.authenticatedRequest(
       "DELETE",
       `/system/trusted-servers/${encodeURIComponent(serverName)}`,
-    );
-  }
-
-  // =========================================================================
-  // Tenant creation key management
-  // =========================================================================
-
-  async listTenantCreationKeys(): Promise<TenantCreationKeyInfo[]> {
-    const res = await this.authenticatedRequest("GET", "/system/tenant-api-keys");
-    return (res as { keys: TenantCreationKeyInfo[] }).keys;
-  }
-
-  async createTenantCreationKey(
-    name: string,
-    tenantIdPrefix?: string,
-  ): Promise<TenantCreationKeyFull> {
-    return await this.authenticatedRequest("POST", "/system/tenant-api-keys", {
-      name,
-      tenantIdPrefix,
-    });
-  }
-
-  async removeTenantCreationKey(
-    name: string,
-  ): Promise<{ success: boolean; message?: string }> {
-    return await this.authenticatedRequest(
-      "DELETE",
-      `/system/tenant-api-keys/${encodeURIComponent(name)}`,
     );
   }
 

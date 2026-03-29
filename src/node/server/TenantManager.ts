@@ -19,7 +19,6 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from "fs";
 import { join } from "path";
-import { randomBytes, timingSafeEqual } from "crypto";
 
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
@@ -45,7 +44,6 @@ import type {
   RegisterTenantRequest,
   UserConfig,
   TrustedServer,
-  TenantCreationKey,
   NamedRemoteServerConfig,
 } from "./types";
 
@@ -235,7 +233,7 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
  * - Registering new tenants
  * - Managing tenant stores and authentication services
  * - Creating a real MindooDB tenant for directory reading (when keys available)
- * - Runtime management of trusted servers and tenant creation keys
+ * - Runtime management of trusted servers
  */
 export class TenantManager {
   private dataDir: string;
@@ -245,7 +243,6 @@ export class TenantManager {
 
   private serverIdentity: PrivateUserId | null = null;
   private trustedServers: TrustedServer[] = [];
-  private tenantCreationKeys: TenantCreationKey[] = [];
 
   constructor(dataDir: string, serverPassword?: string) {
     this.dataDir = dataDir;
@@ -271,13 +268,6 @@ export class TenantManager {
     if (existsSync(trustedPath)) {
       this.trustedServers = JSON.parse(readFileSync(trustedPath, "utf-8"));
       console.log(`[TenantManager] Loaded ${this.trustedServers.length} trusted server(s)`);
-    }
-
-    // Load tenant creation keys
-    const keysPath = join(dataDir, "tenant-api-keys.json");
-    if (existsSync(keysPath)) {
-      this.tenantCreationKeys = JSON.parse(readFileSync(keysPath, "utf-8"));
-      console.log(`[TenantManager] Loaded ${this.tenantCreationKeys.length} tenant creation key(s)`);
     }
   }
 
@@ -332,67 +322,6 @@ export class TenantManager {
   private persistTrustedServers(): void {
     const filePath = join(this.dataDir, "trusted-servers.json");
     writeFileSync(filePath, JSON.stringify(this.trustedServers, null, 2), "utf-8");
-  }
-
-  // =======================================================================
-  // Tenant creation key management
-  // =======================================================================
-
-  listTenantCreationKeys(): TenantCreationKey[] {
-    return this.tenantCreationKeys.map((k) => ({ ...k }));
-  }
-
-  addTenantCreationKey(name: string, tenantIdPrefix?: string): TenantCreationKey {
-    const existing = this.tenantCreationKeys.find(
-      (k) => k.name.toLowerCase() === name.toLowerCase(),
-    );
-    if (existing) {
-      throw new Error(`Tenant creation key "${name}" already exists`);
-    }
-
-    const key: TenantCreationKey = {
-      apiKey: "mdb_tk_" + randomBytes(32).toString("hex"),
-      name,
-      tenantIdPrefix,
-      createdAt: Date.now(),
-    };
-
-    this.tenantCreationKeys.push(key);
-    this.persistTenantCreationKeys();
-    console.log(`[TenantManager] Created tenant creation key: ${name}${tenantIdPrefix ? ` (prefix: ${tenantIdPrefix})` : ""}`);
-    return key;
-  }
-
-  removeTenantCreationKey(name: string): boolean {
-    const idx = this.tenantCreationKeys.findIndex(
-      (k) => k.name.toLowerCase() === name.toLowerCase(),
-    );
-    if (idx === -1) return false;
-    this.tenantCreationKeys.splice(idx, 1);
-    this.persistTenantCreationKeys();
-    console.log(`[TenantManager] Removed tenant creation key: ${name}`);
-    return true;
-  }
-
-  /**
-   * Validate a tenant creation API key against a tenantId.
-   * Returns true if the key exists and the tenantId satisfies the prefix constraint.
-   */
-  validateTenantCreationKey(apiKey: string, tenantId: string): boolean {
-    const key = this.tenantCreationKeys.find((k) => {
-      if (k.apiKey.length !== apiKey.length) return false;
-      return timingSafeEqual(Buffer.from(k.apiKey), Buffer.from(apiKey));
-    });
-    if (!key) return false;
-    if (key.tenantIdPrefix) {
-      return tenantId.toLowerCase().startsWith(key.tenantIdPrefix.toLowerCase());
-    }
-    return true;
-  }
-
-  private persistTenantCreationKeys(): void {
-    const filePath = join(this.dataDir, "tenant-api-keys.json");
-    writeFileSync(filePath, JSON.stringify(this.tenantCreationKeys, null, 2), "utf-8");
   }
 
   // =======================================================================
