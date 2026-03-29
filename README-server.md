@@ -23,7 +23,7 @@ The fastest way to get a server running is the interactive setup script. It prom
 git clone https://github.com/klehmann/MindooDB.git && cd MindooDB
 
 # 2. Run the interactive setup
-bash setup.sh
+bash serversetup.sh
 
 # 3. Start the server
 docker compose up -d
@@ -36,7 +36,7 @@ The setup script:
 - builds the `mindoodb-server` Docker image
 - creates the data directory (`../mindoodb-data/server`) and password file (`../mindoodb-data/.server_unlock`, mode 600)
 - initialises the server identity and optionally creates a system admin keypair interactively
-- writes a `docker-compose.override.yml` if you chose a non-default data path or bind address (e.g. a VPN interface IP)
+- writes a `docker-compose.override.yml` with your current host uid/gid, chosen bind address, and SELinux relabeling options when needed
 
 After setup, manage the server with:
 
@@ -232,7 +232,7 @@ Tenant creation is authorized through the system admin capability model. To dele
 Run the interactive setup script from the repository root:
 
 ```bash
-bash setup.sh
+bash serversetup.sh
 ```
 
 The script prompts for a server name, password, data directory, and bind address. It builds the Docker image, creates the data directory and password file, and initialises the server identity. You can also create a system admin keypair interactively during this step.
@@ -289,14 +289,14 @@ await db.syncStoreChanges();
 
 ### 1. Initialize both servers
 
-Run `bash setup.sh` on each machine (or in separate data directories for local testing). Example for two servers side by side on the same host:
+Run `bash serversetup.sh` on each machine (or in separate data directories for local testing). Example for two servers side by side on the same host:
 
 ```bash
-# Server 1 — run setup.sh, choose data dir ../mindoodb-data-s1, bind 127.0.0.1
-bash setup.sh
+# Server 1 — run serversetup.sh, choose data dir ../mindoodb-data-s1, bind 127.0.0.1
+bash serversetup.sh
 
-# Server 2 — run setup.sh again, choose data dir ../mindoodb-data-s2, bind 127.0.0.1
-bash setup.sh
+# Server 2 — run serversetup.sh again, choose data dir ../mindoodb-data-s2, bind 127.0.0.1
+bash serversetup.sh
 ```
 
 Both runs print the server's public keys.
@@ -402,7 +402,7 @@ The `add-to-network` CLI automates mutual trust exchange when adding a new serve
 
 ```bash
 # 1. Initialize the new server (interactive setup)
-bash setup.sh
+bash serversetup.sh
 # Choose: name=server4, data dir=../mindoodb-data-s4, bind address and port as needed
 
 # 2. Start it
@@ -465,7 +465,7 @@ Note: the server name in the URL must be percent-encoded (e.g., `CN%3Dserver2` f
 
 ```bash
 # Step 1: Init and start the new server
-bash setup.sh
+bash serversetup.sh
 # Choose: name=server3, data dir=../mindoodb-data-s3
 docker compose up -d
 
@@ -682,11 +682,11 @@ Available DNS plugins include Cloudflare, Route53, Google Cloud DNS, DigitalOcea
 
 The server ships with a multi-stage `Dockerfile` under `src/node/server/` that produces a minimal Alpine-based image. The build context must be the **repository root** so the library and server compile together.
 
-**Recommended:** use `bash setup.sh` (see [Quick Start](#quick-start)) to build, initialise, and configure everything interactively. The rest of this section covers manual Docker commands for advanced use cases.
+**Recommended:** use `bash serversetup.sh` (see [Quick Start](#quick-start)) to build, initialise, and configure everything interactively. The rest of this section covers manual Docker commands for advanced use cases.
 
 ### docker-compose.yml
 
-The repository includes a `docker-compose.yml` that uses the default data paths (`../mindoodb-data`). After running `setup.sh`, start and stop with:
+The repository includes a `docker-compose.yml` that uses the default data paths (`../mindoodb-data`). After running `serversetup.sh`, start and stop with:
 
 ```bash
 docker compose up -d        # start
@@ -695,9 +695,9 @@ docker compose logs -f       # follow logs
 docker compose up -d --build # rebuild image after code changes
 ```
 
-If you chose a non-default data directory or bind address during setup, `setup.sh` writes a `docker-compose.override.yml` that is merged automatically.
+`serversetup.sh` writes a `docker-compose.override.yml` that is merged automatically. This override pins the container to your current host uid/gid so the non-root container can read the password file and write to the mounted data directory. On SELinux hosts it also adds relabeled bind mounts.
 
-### Manual Docker commands (without setup.sh)
+### Manual Docker commands (without serversetup.sh)
 
 If you prefer not to use the setup script, here are the individual steps:
 
@@ -711,7 +711,9 @@ printf '%s' 'your-secret' > ../mindoodb-data/.server_unlock
 chmod 600 ../mindoodb-data/.server_unlock
 
 # Initialize server identity (interactive — prompts for system admin creation)
+# Run as your current host uid/gid so the container can read/write the bind mounts.
 docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
   -v "$(pwd)/../mindoodb-data/server:/data" \
   -v "$(pwd)/../mindoodb-data/.server_unlock:/run/secrets/server_unlock:ro" \
   -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_unlock \
@@ -725,6 +727,8 @@ docker compose up -d
 curl http://localhost:1661/health
 ```
 
+On SELinux hosts, append `:Z` to the `/data` bind mount and `,Z` to the read-only password-file mount.
+
 ### Bind to a specific IP
 
 To restrict the server to a specific network interface (e.g. a VPN), edit the `ports` section in `docker-compose.override.yml`:
@@ -736,7 +740,7 @@ services:
       - "10.8.0.1:1661:1661"
 ```
 
-Or pass the bind address during `bash setup.sh` when prompted.
+Or pass the bind address during `bash serversetup.sh` when prompted.
 
 ### Additional flags
 
