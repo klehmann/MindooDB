@@ -36,7 +36,7 @@ The setup script:
 - builds the `mindoodb-server` Docker image
 - creates the data directory (`../mindoodb-data/server`) and password file (`../mindoodb-data/.server_unlock`, mode 600)
 - initialises the server identity and optionally creates a system admin keypair interactively
-- writes a `.env` file with your current host uid/gid, chosen bind address, absolute data path, and SELinux relabeling suffixes when needed
+- writes a `docker-compose.override.yml` with your current host uid/gid, bind mounts, and one or more published port bindings based on your chosen bind address
 
 After setup, manage the server with:
 
@@ -695,7 +695,12 @@ docker compose logs -f       # follow logs
 docker compose up -d --build # rebuild image after code changes
 ```
 
-`serversetup.sh` writes a `.env` file that docker compose reads automatically. It pins the container to your current host uid/gid so the non-root container can read the password file and write to the mounted data directory. On SELinux hosts it also adds the required mount suffixes. The script also removes a stale `docker-compose.override.yml` from older setup runs so port bindings do not get duplicated.
+`serversetup.sh` writes a `docker-compose.override.yml` that docker compose merges automatically. It pins the container to your current host uid/gid so the non-root container can read the password file and write to the mounted data directory. On SELinux hosts it also adds the required mount suffixes.
+
+The generated override also contains the published port bindings. This supports all three common setups:
+- bind all interfaces (`0.0.0.0`)
+- bind a single specific IP (for example a VPN address)
+- bind both `127.0.0.1` and one specific extra IP
 
 ### Manual Docker commands (without serversetup.sh)
 
@@ -731,13 +736,9 @@ On SELinux hosts, append `:Z` to the `/data` bind mount and `,Z` to the read-onl
 
 ### Bind to a specific IP
 
-To restrict the server to a specific network interface (e.g. a VPN), edit `MINDOODB_BIND_ADDR` in `.env`:
+To restrict the server to a specific network interface (e.g. a VPN), rerun `bash serversetup.sh` and provide the bind address when prompted.
 
-```dotenv
-MINDOODB_BIND_ADDR=10.8.0.1
-```
-
-Or pass the bind address during `bash serversetup.sh` when prompted.
+If you also want local checks from the same host, answer `y` when asked whether to also bind `127.0.0.1`. The generated `docker-compose.override.yml` will then contain both mappings.
 
 ### Additional flags
 
