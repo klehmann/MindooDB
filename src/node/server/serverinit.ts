@@ -20,8 +20,8 @@
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
-import { execFileSync } from "child_process";
 import { createInterface } from "readline";
+import { Writable } from "stream";
 
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../../core/BaseMindooTenantFactory";
@@ -135,32 +135,47 @@ async function promptLine(rl: ReturnType<typeof createInterface>, question: stri
 }
 
 async function promptHiddenLine(question: string): Promise<string> {
-  const rl = createReadline();
-  const restoreEcho = () => {
-    if (process.stdin.isTTY) {
-      try {
-        execFileSync("stty", ["echo"], { stdio: ["inherit", "inherit", "inherit"] });
-      } catch {
-        // Best effort only; avoid masking the original prompt result.
-      }
-    }
-  };
-
   if (!process.stdin.isTTY) {
+    const rl = createReadline();
     const answer = await promptLine(rl, question);
     rl.close();
     return answer;
   }
 
-  try {
-    execFileSync("stty", ["-echo"], { stdio: ["inherit", "inherit", "inherit"] });
-    const answer = await promptLine(rl, question);
-    process.stderr.write("\n");
-    return answer;
-  } finally {
-    restoreEcho();
-    rl.close();
-  }
+  let muted = false;
+  const output = new Writable({
+    write(chunk, encoding, callback) {
+      if (!muted) {
+        process.stderr.write(chunk, encoding as BufferEncoding);
+      }
+      callback();
+    },
+  });
+  const rl = createInterface({
+    input: process.stdin,
+    output,
+    terminal: true,
+  });
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      muted = false;
+      rl.close();
+    };
+
+    rl.on("SIGINT", () => {
+      cleanup();
+      process.kill(process.pid, "SIGINT");
+    });
+
+    process.stderr.write(question);
+    muted = true;
+    rl.question("", (answer) => {
+      process.stderr.write("\n");
+      cleanup();
+      resolve(answer);
+    });
+  });
 }
 
 async function main(): Promise<void> {
