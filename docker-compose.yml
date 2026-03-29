@@ -5,9 +5,9 @@
 #   password file:   ../mindoodb-data/.server_unlock
 #
 # Run `bash serversetup.sh` first to build the image, create the data directory,
-# and initialise the server identity. serversetup.sh also writes a
-# docker-compose.override.yml with the current host uid/gid, selected bind
-# address, and SELinux relabeling options when needed.
+# and initialise the server identity. serversetup.sh also writes a `.env`
+# file with the current host uid/gid, selected bind address, absolute data
+# paths, and SELinux relabeling suffixes when needed.
 #
 # Usage:
 #   docker compose up -d        # start
@@ -21,11 +21,12 @@ services:
     build:
       context: .
       dockerfile: src/node/server/Dockerfile
+    user: "${MINDOODB_RUNTIME_UID:-0}:${MINDOODB_RUNTIME_GID:-0}"
     restart: unless-stopped
     volumes:
-      - ../mindoodb-data/server:/data
-      - ../mindoodb-data/.server_unlock:/run/secrets/server_unlock:ro
+      - ${MINDOODB_DATA_DIR:-../mindoodb-data}/server:/data${MINDOODB_DATA_MOUNT_SUFFIX:-}
+      - ${MINDOODB_DATA_DIR:-../mindoodb-data}/.server_unlock:/run/secrets/server_unlock:ro${MINDOODB_PASSWORD_MOUNT_SUFFIX:-}
     environment:
       MINDOODB_SERVER_PASSWORD_FILE: /run/secrets/server_unlock
     ports:
-      - "0.0.0.0:1661:1661"
+      - "${MINDOODB_BIND_ADDR:-0.0.0.0}:1661:1661"
