@@ -7,6 +7,7 @@
  */
 
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
+import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import type { PrivateUserId } from "./userid";
 import type { EncryptedPrivateKey } from "./types";
 
@@ -51,15 +52,6 @@ interface RegisterTenantBody {
     signingPublicKey: string;
     encryptionPublicKey: string;
   }>;
-}
-
-function base64ToUint8Array(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
 }
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
@@ -323,50 +315,11 @@ export class MindooDBServerAdmin {
     password: string,
     saltString: string,
   ): Promise<ArrayBuffer> {
-    const subtle = this.cryptoAdapter.getSubtle();
-
-    const salt = base64ToUint8Array(encrypted.salt);
-    const iv = base64ToUint8Array(encrypted.iv);
-    const ciphertext = base64ToUint8Array(encrypted.ciphertext);
-    const tag = base64ToUint8Array(encrypted.tag);
-    const iterations = encrypted.iterations || 310000;
-
-    const saltStringBytes = new TextEncoder().encode(saltString);
-    const combinedSalt = new Uint8Array(salt.length + saltStringBytes.length);
-    combinedSalt.set(salt);
-    combinedSalt.set(saltStringBytes, salt.length);
-
-    const passwordKey = await subtle.importKey(
-      "raw",
-      new TextEncoder().encode(password),
-      { name: "PBKDF2" },
-      false,
-      ["deriveKey"],
+    return decryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      encrypted,
+      password,
+      saltString,
     );
-
-    const derivedKey = await subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: combinedSalt,
-        iterations,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["decrypt"],
-    );
-
-    const ciphertextWithTag = new Uint8Array(ciphertext.length + tag.length);
-    ciphertextWithTag.set(ciphertext);
-    ciphertextWithTag.set(tag, ciphertext.length);
-
-    const decrypted = await subtle.decrypt(
-      { name: "AES-GCM", iv: new Uint8Array(iv), tagLength: 128 },
-      derivedKey,
-      new Uint8Array(ciphertextWithTag),
-    );
-
-    return decrypted;
   }
 }

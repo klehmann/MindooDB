@@ -266,6 +266,20 @@ export interface MindooTenantFactory {
   toPublicUserId(privateUserId: PrivateUserId): PublicUserId;
 
   /**
+   * Re-encrypts an identity's private keys with a new password.
+   *
+   * @param identity The private identity to update
+   * @param oldPassword The current password
+   * @param newPassword The new password to protect both private keys
+   * @return A new PrivateUserId with unchanged public keys and re-encrypted private keys
+   */
+  changeIdentityPassword(
+    identity: PrivateUserId,
+    oldPassword: string,
+    newPassword: string,
+  ): Promise<PrivateUserId>;
+
+  /**
    * Creates a new signing key pair for the tenant.
    * Returns both the public and encrypted private key, as the public key is needed
    * for signature verification by other users.

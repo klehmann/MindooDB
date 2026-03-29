@@ -21,6 +21,7 @@ import { KeyBag } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
+import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
@@ -929,124 +930,26 @@ export class BaseMindooTenant implements MindooTenant {
     this.logger.debug(`decryptPrivateKey: Password length: ${password.length}`);
     this.logger.debug(`decryptPrivateKey: EncryptedKey iterations: ${encryptedKey.iterations}`);
     
-    const subtle = this.cryptoAdapter.getSubtle();
-
-    // Decode base64 strings
-    this.logger.debug(`decryptPrivateKey: Decoding base64 strings`);
-    let ciphertext: Uint8Array;
-    let iv: Uint8Array;
-    let tag: Uint8Array;
-    let saltBytes: Uint8Array;
+    this.logger.debug(`decryptPrivateKey: Delegating PBKDF2 + AES-GCM work to shared helper`);
     try {
-      ciphertext = this.base64ToUint8Array(encryptedKey.ciphertext);
-      iv = this.base64ToUint8Array(encryptedKey.iv);
-      tag = this.base64ToUint8Array(encryptedKey.tag);
-      saltBytes = this.base64ToUint8Array(encryptedKey.salt);
-      this.logger.debug(`decryptPrivateKey: Decoded - ciphertext: ${ciphertext.length} bytes, iv: ${iv.length} bytes, tag: ${tag.length} bytes, salt: ${saltBytes.length} bytes`);
-    } catch (error) {
-      this.logger.error(`decryptPrivateKey: Error decoding base64:`, error);
-      throw error;
-    }
-
-    // Derive key from password using PBKDF2
-    // Combine the stored salt bytes with the salt string for additional security
-    // This ensures different key types (signing, encryption, etc.) use different derived keys
-    // even if they share the same password
-    this.logger.debug(`decryptPrivateKey: Combining salt with saltString`);
-    const saltStringBytes = new TextEncoder().encode(saltString);
-    const combinedSalt = new Uint8Array(saltBytes.length + saltStringBytes.length);
-    combinedSalt.set(saltBytes);
-    combinedSalt.set(saltStringBytes, saltBytes.length);
-    this.logger.debug(`decryptPrivateKey: Combined salt length: ${combinedSalt.length} bytes`);
-
-    this.logger.debug(`decryptPrivateKey: Importing password key for PBKDF2`);
-    let passwordKey: CryptoKey;
-    try {
-      passwordKey = await subtle.importKey(
-        "raw",
-        new TextEncoder().encode(password),
-        "PBKDF2",
-        false,
-        ["deriveBits", "deriveKey"]
-      );
-      this.logger.debug(`decryptPrivateKey: Successfully imported password key`);
-    } catch (error) {
-      this.logger.error(`decryptPrivateKey: Error importing password key:`, error);
-      throw error;
-    }
-
-    this.logger.debug(`decryptPrivateKey: Deriving key with PBKDF2 (iterations: ${encryptedKey.iterations})`);
-    let derivedKey: CryptoKey;
-    try {
-      derivedKey = await subtle.deriveKey(
-        {
-          name: "PBKDF2",
-          salt: combinedSalt,
-          iterations: encryptedKey.iterations,
-          hash: "SHA-256",
-        },
-        passwordKey,
-        {
-          name: "AES-GCM",
-          length: 256,
-        },
-        false,
-        ["decrypt"]
-      );
-      this.logger.debug(`decryptPrivateKey: Successfully derived key`);
-    } catch (error) {
-      this.logger.error(`decryptPrivateKey: Error deriving key:`, error);
-      throw error;
-    }
-
-    // Combine ciphertext and tag (GCM authentication tag is separate)
-    // AES-GCM expects the tag to be appended to the ciphertext
-    this.logger.debug(`decryptPrivateKey: Combining ciphertext and tag`);
-    const encryptedData = new Uint8Array(ciphertext.length + tag.length);
-    encryptedData.set(ciphertext);
-    encryptedData.set(tag, ciphertext.length);
-    this.logger.debug(`decryptPrivateKey: Combined encrypted data length: ${encryptedData.length} bytes`);
-
-    // Decrypt the private key
-    this.logger.debug(`decryptPrivateKey: Decrypting with AES-GCM`);
-    this.logger.debug(`decryptPrivateKey: IV length: ${iv.length} bytes (expected: 12 for AES-GCM)`);
-    this.logger.debug(`decryptPrivateKey: Tag length: ${tag.length} bytes (expected: 16 for 128-bit tag)`);
-    this.logger.debug(`decryptPrivateKey: Ciphertext length: ${ciphertext.length} bytes`);
-    let decrypted: ArrayBuffer;
-    try {
-      // Create a new ArrayBuffer to ensure we have the correct buffer without any offset issues
-      const encryptedBuffer = new Uint8Array(encryptedData).buffer;
-      this.logger.debug(`decryptPrivateKey: Encrypted buffer size: ${encryptedBuffer.byteLength} bytes`);
-      
-      decrypted = await subtle.decrypt(
-        {
-          name: "AES-GCM",
-          iv: new Uint8Array(iv), // Create a new Uint8Array to ensure proper buffer
-          tagLength: 128,
-        },
-        derivedKey,
-        encryptedBuffer
+      const decrypted = await decryptPrivateKeyWithPassword(
+        this.cryptoAdapter,
+        encryptedKey,
+        password,
+        saltString,
       );
       this.logger.debug(`decryptPrivateKey: Successfully decrypted, result length: ${decrypted.byteLength} bytes`);
+      return decrypted;
     } catch (error) {
       this.logger.error(`decryptPrivateKey: Error during decryption:`, error);
       this.logger.error(`decryptPrivateKey: Error details:`, {
         errorName: error instanceof Error ? error.name : typeof error,
         errorMessage: error instanceof Error ? error.message : String(error),
-        ivLength: iv.length,
-        tagLength: tag.length,
-        ciphertextLength: ciphertext.length,
-        encryptedDataLength: encryptedData.length,
         iterations: encryptedKey.iterations,
-        saltString: saltString,
-        encryptedDataByteOffset: encryptedData.byteOffset,
-        encryptedDataByteLength: encryptedData.byteLength,
-        encryptedDataBufferLength: encryptedData.buffer.byteLength,
+        saltString,
       });
       throw error;
     }
-
-    return decrypted;
   }
 
   /**

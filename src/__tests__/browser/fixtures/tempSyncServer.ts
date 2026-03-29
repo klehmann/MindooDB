@@ -6,8 +6,13 @@ import { Server } from "http";
 import { build } from "esbuild";
 import { writeFileSync } from "fs";
 
+import { InMemoryContentAddressedStoreFactory } from "../../../appendonlystores/InMemoryContentAddressedStoreFactory";
+import { BaseMindooTenantFactory } from "../../../core/BaseMindooTenantFactory";
+import { MindooDBServerAdmin } from "../../../core/MindooDBServerAdmin";
+import type { PrivateUserId } from "../../../core/userid";
 import { NodeCryptoAdapter } from "../../../node/crypto/NodeCryptoAdapter";
 import { MindooDBServer } from "../../../node/server/MindooDBServer";
+import type { ServerConfig } from "../../../node/server/types";
 
 export interface BrowserSyncServerContext {
   baseUrl: string;
@@ -69,6 +74,10 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
 
   const cryptoAdapter = new NodeCryptoAdapter();
   const subtle = cryptoAdapter.getSubtle();
+  const factory = new BaseMindooTenantFactory(
+    new InMemoryContentAddressedStoreFactory(),
+    cryptoAdapter,
+  );
 
   const adminSigningKeyPair = await subtle.generateKey(
     { name: "Ed25519" },
@@ -127,7 +136,19 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
     "PRIVATE KEY"
   );
 
-  const mindooServer = new MindooDBServer(dataDir);
+  const systemAdmin = await factory.createUserId("cn=browser-admin/o=test", "browser-admin-pass");
+  const config: ServerConfig = {
+    capabilities: {
+      "ALL:/system/*": [
+        {
+          username: systemAdmin.username,
+          publicsignkey: systemAdmin.userSigningKeyPair.publicKey as string,
+        },
+      ],
+    },
+  };
+
+  const mindooServer = new MindooDBServer(dataDir, undefined, undefined, config);
   const app = express();
 
   app.get("/__browser-test__/index.html", (_req, res) => {
@@ -152,32 +173,18 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
   }
 
   const baseUrl = `http://127.0.0.1:${address.port}`;
-
-  const registerResponse = await fetch(`${baseUrl}/api/admin/register-tenant`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      tenantId,
-      adminSigningPublicKey: adminSigningPublicKeyPem,
-      adminEncryptionPublicKey: adminEncryptionPublicKeyPem,
-      users: [
-        {
-          username,
-          signingPublicKey: userSigningPublicKeyPem,
-          encryptionPublicKey: userEncryptionPublicKeyPem,
-        },
-      ],
-    }),
-  });
-
-  if (!registerResponse.ok) {
-    const errorBody = await registerResponse.text();
-    throw new Error(
-      `Failed to register tenant on temporary sync server: ${registerResponse.status} ${errorBody}`
-    );
-  }
+  await registerTenant(
+    baseUrl,
+    systemAdmin,
+    "browser-admin-pass",
+    cryptoAdapter,
+    tenantId,
+    adminSigningPublicKeyPem,
+    adminEncryptionPublicKeyPem,
+    username,
+    userSigningPublicKeyPem,
+    userEncryptionPublicKeyPem,
+  );
 
   return {
     context: {
@@ -213,4 +220,36 @@ function arrayBufferToPEM(buffer: ArrayBuffer, type: string): string {
   const base64 = Buffer.from(buffer).toString("base64");
   const lines = base64.match(/.{1,64}/g) || [];
   return `-----BEGIN ${type}-----\n${lines.join("\n")}\n-----END ${type}-----`;
+}
+
+async function registerTenant(
+  baseUrl: string,
+  systemAdminUser: PrivateUserId,
+  systemAdminPassword: string,
+  cryptoAdapter: NodeCryptoAdapter,
+  tenantId: string,
+  adminSigningPublicKey: string,
+  adminEncryptionPublicKey: string,
+  username: string,
+  signingPublicKey: string,
+  encryptionPublicKey: string,
+): Promise<void> {
+  const adminClient = new MindooDBServerAdmin({
+    serverUrl: `${baseUrl}/api`,
+    systemAdminUser,
+    systemAdminPassword,
+    cryptoAdapter,
+  });
+
+  await adminClient.registerTenant(tenantId, {
+    adminSigningPublicKey,
+    adminEncryptionPublicKey,
+    users: [
+      {
+        username,
+        signingPublicKey,
+        encryptionPublicKey,
+      },
+    ],
+  });
 }

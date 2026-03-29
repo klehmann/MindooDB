@@ -17,6 +17,7 @@ import {
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
+import { decryptPrivateKey as decryptPrivateKeyWithPassword, encryptPrivateKey as encryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbkdf2Iterations";
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
@@ -265,6 +266,52 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     };
   }
 
+  async changeIdentityPassword(
+    identity: PrivateUserId,
+    oldPassword: string,
+    newPassword: string,
+  ): Promise<PrivateUserId> {
+    this.logger.debug(`Changing identity password for: ${identity.username}`);
+
+    const decryptedSigningKey = await decryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      identity.userSigningKeyPair.privateKey,
+      oldPassword,
+      "signing",
+    );
+    const decryptedEncryptionKey = await decryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      identity.userEncryptionKeyPair.privateKey,
+      oldPassword,
+      "encryption",
+    );
+
+    const encryptedSigningKey = await encryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      new Uint8Array(decryptedSigningKey),
+      newPassword,
+      "signing",
+    );
+    const encryptedEncryptionKey = await encryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      new Uint8Array(decryptedEncryptionKey),
+      newPassword,
+      "encryption",
+    );
+
+    return {
+      username: identity.username,
+      userSigningKeyPair: {
+        publicKey: identity.userSigningKeyPair.publicKey,
+        privateKey: encryptedSigningKey,
+      },
+      userEncryptionKeyPair: {
+        publicKey: identity.userEncryptionKeyPair.publicKey,
+        privateKey: encryptedEncryptionKey,
+      },
+    };
+  }
+
   /**
    * Creates a new signing key pair for the tenant.
    * Returns both the public and encrypted private key, as the public key is needed
@@ -494,88 +541,16 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log(`[encryptPrivateKey] Starting encryption with salt: "${saltString}", key size: ${privateKeyBytes.length} bytes`);
     const startTime = Date.now();
     
-    const subtle = this.cryptoAdapter.getSubtle();
-    // Bind getRandomValues to maintain 'this' context
-    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
-
-    // Generate random salt and IV
-    console.log('[encryptPrivateKey] Generating random salt and IV...');
-    const saltArray = new Uint8Array(16); // 16 bytes salt
-    randomValues(saltArray);
-    const salt = new Uint8Array(saltArray);
-
-    const ivArray = new Uint8Array(12); // 12 bytes for AES-GCM
-    randomValues(ivArray);
-    const iv = new Uint8Array(ivArray);
-    console.log('[encryptPrivateKey] ✓ Salt and IV generated');
-
-    // Combine salt with saltString for key derivation (same as decryption)
-    const saltStringBytes = new TextEncoder().encode(saltString);
-    const combinedSalt = new Uint8Array(salt.length + saltStringBytes.length);
-    combinedSalt.set(salt);
-    combinedSalt.set(saltStringBytes, salt.length);
-
-    // Derive encryption key from password using PBKDF2
-    console.log('[encryptPrivateKey] Importing password key...');
-    const importKeyStart = Date.now();
-    const passwordKey = await subtle.importKey(
-      "raw",
-      new TextEncoder().encode(password),
-      "PBKDF2",
-      false,
-      ["deriveBits", "deriveKey"]
-    );
-    console.log('[encryptPrivateKey] ✓ Password key imported in', Date.now() - importKeyStart, 'ms');
-
     const iterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
-    console.log(`[encryptPrivateKey] Deriving key with PBKDF2 (${iterations} iterations)...`);
-    const deriveKeyStart = Date.now();
-    const derivedKey = await subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: combinedSalt,
-        iterations: iterations,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      false,
-      ["encrypt"]
-    );
-    console.log('[encryptPrivateKey] ✓ Key derived in', Date.now() - deriveKeyStart, 'ms');
-
-    // Encrypt the private key
-    console.log('[encryptPrivateKey] Encrypting private key data...');
+    console.log('[encryptPrivateKey] Delegating salt generation, PBKDF2, and AES-GCM encryption to shared helper...');
     const encryptStart = Date.now();
-    const encrypted = await subtle.encrypt(
-      {
-        name: "AES-GCM",
-        iv: iv,
-        tagLength: 128,
-      },
-      derivedKey,
-      privateKeyBytes.buffer as ArrayBuffer
+    const encryptedKey = await encryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      privateKeyBytes,
+      password,
+      saltString,
     );
     console.log('[encryptPrivateKey] ✓ Private key encrypted in', Date.now() - encryptStart, 'ms');
-
-    // Extract ciphertext and tag from encrypted data
-    // AES-GCM appends the tag at the end
-    const encryptedArray = new Uint8Array(encrypted);
-    const tagLength = 16; // 128 bits = 16 bytes
-    const ciphertext = encryptedArray.slice(0, encryptedArray.length - tagLength);
-    const tag = encryptedArray.slice(encryptedArray.length - tagLength);
-
-    // Create encrypted key structure
-    const encryptedKey: EncryptedPrivateKey = {
-      ciphertext: this.uint8ArrayToBase64(ciphertext),
-      iv: this.uint8ArrayToBase64(iv),
-      tag: this.uint8ArrayToBase64(tag),
-      salt: this.uint8ArrayToBase64(salt),
-      iterations: iterations,
-    };
 
     const totalTime = Date.now() - startTime;
     console.log(`[encryptPrivateKey] ✓ Encryption completed in ${totalTime}ms total`);

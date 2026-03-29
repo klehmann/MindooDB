@@ -4,6 +4,9 @@
  */
 
 import { ExpoGoCryptoAdapter } from "../reactnative/crypto/ExpoGoCryptoAdapter";
+import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
+import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
+import { decryptPrivateKey } from "../core/crypto/privateKeyEncryption";
 
 // Mock expo-standard-web-crypto
 jest.mock("expo-standard-web-crypto");
@@ -364,6 +367,53 @@ describe("ExpoGoCryptoAdapter", () => {
 
       expect(new Uint8Array(key1)).toEqual(new Uint8Array(key2));
     });
+  });
+
+  describe("identity password rotation", () => {
+    it("re-encrypts identities with the Expo Go adapter", async () => {
+      const factory = new BaseMindooTenantFactory(
+        new InMemoryContentAddressedStoreFactory(),
+        adapter,
+      );
+
+      const identity = await factory.createUserId("CN=expo-user/O=test", "old-password");
+      const updatedIdentity = await factory.changeIdentityPassword(
+        identity,
+        "old-password",
+        "new-password",
+      );
+
+      expect(updatedIdentity.username).toBe(identity.username);
+      expect(updatedIdentity.userSigningKeyPair.publicKey).toBe(identity.userSigningKeyPair.publicKey);
+      expect(updatedIdentity.userEncryptionKeyPair.publicKey).toBe(identity.userEncryptionKeyPair.publicKey);
+
+      await expect(
+        decryptPrivateKey(
+          adapter,
+          updatedIdentity.userSigningKeyPair.privateKey,
+          "old-password",
+          "signing",
+        ),
+      ).rejects.toThrow();
+
+      await expect(
+        decryptPrivateKey(
+          adapter,
+          updatedIdentity.userSigningKeyPair.privateKey,
+          "new-password",
+          "signing",
+        ),
+      ).resolves.toBeInstanceOf(ArrayBuffer);
+
+      await expect(
+        decryptPrivateKey(
+          adapter,
+          updatedIdentity.userEncryptionKeyPair.privateKey,
+          "new-password",
+          "encryption",
+        ),
+      ).resolves.toBeInstanceOf(ArrayBuffer);
+    }, 60000);
   });
 
   describe("HMAC-SHA256", () => {

@@ -72,6 +72,49 @@ test.describe("MindooDB browser runtime", () => {
     expect(result.count).toBe(1);
   });
 
+  test("changes identity password in the real browser bundle", async ({ page }) => {
+    await page.goto(server.context.testPageUrl);
+
+    const result = await page.evaluate(async ({ browserBundleUrl }) => {
+      const bundle = await import(browserBundleUrl);
+      const browserModule = bundle.browserModule;
+      const {
+        BaseMindooTenantFactory,
+        InMemoryContentAddressedStoreFactory,
+        createCryptoAdapter,
+      } = browserModule;
+
+      const cryptoAdapter = createCryptoAdapter();
+      const storeFactory = new InMemoryContentAddressedStoreFactory();
+      const factory = new BaseMindooTenantFactory(storeFactory, cryptoAdapter);
+
+      const original = await factory.createUserId("CN=browser-password-user/O=mindoo", "old-password");
+      const updated = await factory.changeIdentityPassword(original, "old-password", "new-password");
+
+      return {
+        usernamePreserved: updated.username === original.username,
+        signingPublicKeyPreserved:
+          updated.userSigningKeyPair.publicKey === original.userSigningKeyPair.publicKey,
+        encryptionPublicKeyPreserved:
+          updated.userEncryptionKeyPair.publicKey === original.userEncryptionKeyPair.publicKey,
+        signingCiphertextChanged:
+          updated.userSigningKeyPair.privateKey.ciphertext !== original.userSigningKeyPair.privateKey.ciphertext,
+        encryptionCiphertextChanged:
+          updated.userEncryptionKeyPair.privateKey.ciphertext !== original.userEncryptionKeyPair.privateKey.ciphertext,
+        signingIterations: updated.userSigningKeyPair.privateKey.iterations,
+        encryptionIterations: updated.userEncryptionKeyPair.privateKey.iterations,
+      };
+    }, { browserBundleUrl: server.context.browserBundleUrl });
+
+    expect(result.usernamePreserved).toBe(true);
+    expect(result.signingPublicKeyPreserved).toBe(true);
+    expect(result.encryptionPublicKeyPreserved).toBe(true);
+    expect(result.signingCiphertextChanged).toBe(true);
+    expect(result.encryptionCiphertextChanged).toBe(true);
+    expect(result.signingIterations).toBeGreaterThan(0);
+    expect(result.encryptionIterations).toBeGreaterThan(0);
+  });
+
   test("syncs entries from browser through real HTTP sync endpoint", async ({ page }) => {
     await page.goto(server.context.testPageUrl);
 

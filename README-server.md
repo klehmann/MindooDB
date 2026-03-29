@@ -47,6 +47,16 @@ docker compose logs -f       # follow logs
 docker compose up -d --build # rebuild image and restart
 ```
 
+For identity utilities on a Docker-deployed server, use the wrapper script from the repository root:
+
+```bash
+./mindoodb-cli.sh identity:info server.identity.json
+./mindoodb-cli.sh identity:change-password server.identity.json
+./mindoodb-cli.sh identity:export-public system-admin-cn-sysadmin-o-myorg.identity.json --output ./system-admin.public.json
+```
+
+Files inside the mounted server data directory can be referenced by filename alone. Running `./mindoodb-cli.sh` without arguments prints a command overview, and each `identity:*` command prints its own help when called without the required parameters.
+
 ### What's next?
 
 Once the server is healthy, you can create a tenant and start syncing data:
@@ -111,6 +121,42 @@ The **`curl`** examples below use **`$SYSTEM_ADMIN_JWT`** as a placeholder for t
 | `--help` | Show help message | — |
 
 Password resolution: `MINDOODB_SYSTEM_ADMIN_PASSWORD`, then `--password-file`, then a hidden prompt on an interactive TTY. The **same** identity must be authorized in each server’s `config.json` for every URL you pass.
+
+### `npm run identity:info` — Show public information from an identity file
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--identity` | Path to an `*.identity.json` file | **required** |
+| `--help` | Show help message | — |
+
+Prints the username, a stable SHA-256 username hash (`Public user ID (hex)`), both public keys, the fixed salt string names (`signing`, `encryption`), and whether encrypted private keys are present.
+
+### `npm run identity:change-password` — Re-encrypt an identity with a new password
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--identity` | Path to an `*.identity.json` file | **required** |
+| `--help` | Show help message | — |
+
+Prompts for the current password, the new password, and confirmation using hidden input. The file is updated atomically in place.
+
+### `npm run identity:export-public` — Export only the public portion of an identity
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--identity` | Path to an `*.identity.json` file | **required** |
+| `--output` | Write JSON to a file instead of stdout | stdout |
+| `--help` | Show help message | — |
+
+This emits the corresponding `PublicUserId` JSON object:
+
+```json
+{
+  "username": "cn=sysadmin/o=myorg",
+  "userSigningPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+  "userEncryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+}
+```
 
 ## Environment Variables
 
