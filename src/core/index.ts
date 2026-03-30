@@ -4,7 +4,7 @@
 export * from "./types";
 
 // User ID types
-export { PublicUserId, PrivateUserId } from "./userid";
+export type { PublicUserId, PrivateUserId } from "./userid";
 
 // Base classes
 export { BaseMindooDB } from "./BaseMindooDB";
@@ -17,7 +17,7 @@ export {
 } from "./MindooDBServerAdmin";
 
 // Crypto
-export { CryptoAdapter } from "./crypto/CryptoAdapter";
+export type { CryptoAdapter } from "./crypto/CryptoAdapter";
 export { RSAEncryption } from "./crypto/RSAEncryption";
 export { MindooDocSigner } from "./crypto/MindooDocSigner";
 
@@ -59,32 +59,32 @@ export {
 
 // Content-addressed stores
 export {
-  ContentAddressedStore,
-  ContentAddressedStoreFactory,
-  CreateStoreResult,
-  OpenStoreOptions,
-  StoreCompactionStatus,
-  StoreScanCursor,
-  StoreScanFilters,
-  StoreScanResult,
-  StoreIdBloomSummary,
-  MaterializationPlanOptions,
-  MaterializationPlanDiagnostics,
-  DocumentMaterializationPlan,
-  DocumentMaterializationBatchPlan,
+  type ContentAddressedStore,
+  type ContentAddressedStoreFactory,
+  type CreateStoreResult,
+  type OpenStoreOptions,
+  type StoreCompactionStatus,
+  type StoreScanCursor,
+  type StoreScanFilters,
+  type StoreScanResult,
+  type StoreIdBloomSummary,
+  type MaterializationPlanOptions,
+  type MaterializationPlanDiagnostics,
+  type DocumentMaterializationPlan,
+  type DocumentMaterializationBatchPlan,
 } from "./appendonlystores/types";
 export { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory } from "./appendonlystores/InMemoryContentAddressedStore";
 
 // Network
 export { AuthenticationService } from "./appendonlystores/network/AuthenticationService";
-export { NetworkTransport, NetworkTransportConfig } from "./appendonlystores/network/NetworkTransport";
+export type { NetworkTransport, NetworkTransportConfig } from "./appendonlystores/network/NetworkTransport";
 export {
-  NetworkEncryptedEntry,
-  UserPublicKeys,
-  NetworkAuthTokenPayload,
-  AuthChallenge,
-  AuthResult,
-  NetworkSyncCapabilities,
+  type NetworkEncryptedEntry,
+  type UserPublicKeys,
+  type NetworkAuthTokenPayload,
+  type AuthChallenge,
+  type AuthResult,
+  type NetworkSyncCapabilities,
   NetworkErrorType,
   NetworkError,
 } from "./appendonlystores/network/types";
