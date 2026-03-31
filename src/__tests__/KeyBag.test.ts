@@ -1,7 +1,7 @@
 import { KeyBag } from "../core/keys/KeyBag";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, EncryptedPrivateKey } from "../core/types";
+import { PrivateUserId, EncryptedPrivateKey, DEFAULT_TENANT_KEY_ID } from "../core/types";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 describe("KeyBag", () => {
@@ -134,7 +134,7 @@ describe("KeyBag", () => {
   describe("createTenantKey and createDocKey", () => {
     it("should create and store a tenant key without password wrapper", async () => {
       await keyBag.createTenantKey("tenant-a");
-      const key = await keyBag.get("tenant", "tenant-a");
+      const key = await keyBag.get("doc", "tenant-a", DEFAULT_TENANT_KEY_ID);
       expect(key).toBeDefined();
       expect(key!.length).toBe(32); // AES-256 raw key bytes
     });
@@ -433,14 +433,14 @@ describe("KeyBag", () => {
 
   describe("clone", () => {
     it("should clone key entries in memory", async () => {
-      await keyBag.set("tenant", "tenant-1", new Uint8Array([1, 2, 3]));
+      await keyBag.set("doc", "tenant-1", DEFAULT_TENANT_KEY_ID, new Uint8Array([1, 2, 3]));
       await keyBag.set("doc", docTenantId, "doc-1", new Uint8Array([4, 5, 6]), 1000);
 
       const cloned = keyBag.clone();
 
-      expect(await cloned.get("tenant", "tenant-1")).toEqual(new Uint8Array([1, 2, 3]));
+      expect(await cloned.get("doc", "tenant-1", DEFAULT_TENANT_KEY_ID)).toEqual(new Uint8Array([1, 2, 3]));
       expect(await cloned.get("doc", docTenantId, "doc-1")).toEqual(new Uint8Array([4, 5, 6]));
-      expect(await cloned.listKeys()).toEqual(expect.arrayContaining(["tenant:tenant-1", `doc:${docTenantId}:doc-1`]));
+      expect(await cloned.listKeys()).toEqual(expect.arrayContaining([`doc:tenant-1:${DEFAULT_TENANT_KEY_ID}`, `doc:${docTenantId}:doc-1`]));
     });
 
     it("should keep clone independent from original mutations", async () => {
@@ -572,6 +572,95 @@ describe("KeyBag", () => {
       );
 
       await expect(wrongPasswordKeyBag.load(saved)).rejects.toThrow();
+    });
+
+    it("should normalize legacy tenant scoped keys during load", async () => {
+      (keyBag as unknown as {
+        keys: Map<string, Array<{ key: Uint8Array; createdAt?: number }>>;
+      }).keys = new Map([
+        [
+          "tenant:legacy-tenant",
+          [{ key: new Uint8Array([1, 2, 3, 4]), createdAt: 1234 }],
+        ],
+      ]);
+
+      const saved = await keyBag.save();
+
+      const loadedKeyBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter()
+      );
+
+      await loadedKeyBag.load(saved);
+
+      expect(await loadedKeyBag.listKeys()).toEqual([`doc:legacy-tenant:${DEFAULT_TENANT_KEY_ID}`]);
+      expect(await loadedKeyBag.get("doc", "legacy-tenant", DEFAULT_TENANT_KEY_ID)).toEqual(
+        new Uint8Array([1, 2, 3, 4])
+      );
+    });
+  });
+
+  describe("key details and version operations", () => {
+    it("should list key details with version metadata", async () => {
+      await keyBag.set("doc", "tenant-1", DEFAULT_TENANT_KEY_ID, new Uint8Array(32), 2000);
+      await keyBag.set("doc", docTenantId, "alpha", new Uint8Array(16), 1000);
+      await keyBag.set("doc", docTenantId, "alpha", new Uint8Array(24), 3000);
+
+      const details = await keyBag.listKeyDetails();
+
+      expect(details).toEqual(expect.arrayContaining([
+        {
+          scopedKeyId: `doc:tenant-1:${DEFAULT_TENANT_KEY_ID}`,
+          createdAt: 2000,
+          keyLengthBits: 256,
+          versionIndex: 0,
+        },
+        {
+          scopedKeyId: `doc:${docTenantId}:alpha`,
+          createdAt: 3000,
+          keyLengthBits: 192,
+          versionIndex: 0,
+        },
+        {
+          scopedKeyId: `doc:${docTenantId}:alpha`,
+          createdAt: 1000,
+          keyLengthBits: 128,
+          versionIndex: 1,
+        },
+      ]));
+    });
+
+    it("should export a specific key version", async () => {
+      const keyPassword = "keypassword123";
+      const olderKey = new Uint8Array([1, 2, 3, 4]);
+      const newerKey = new Uint8Array([5, 6, 7, 8]);
+      await keyBag.set("doc", docTenantId, "versioned", olderKey, 1000);
+      await keyBag.set("doc", docTenantId, "versioned", newerKey, 2000);
+
+      const exportedOlder = await keyBag.encryptAndExportKeyVersion("doc", docTenantId, "versioned", 1, keyPassword);
+      const importedBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter()
+      );
+
+      await importedBag.decryptAndImportKey("doc", docTenantId, "versioned", exportedOlder!, keyPassword);
+
+      expect(await importedBag.get("doc", docTenantId, "versioned")).toEqual(olderKey);
+      expect(exportedOlder?.createdAt).toBe(1000);
+    });
+
+    it("should delete only the selected key version", async () => {
+      const olderKey = new Uint8Array([1]);
+      const newerKey = new Uint8Array([2]);
+      await keyBag.set("doc", docTenantId, "versioned", olderKey, 1000);
+      await keyBag.set("doc", docTenantId, "versioned", newerKey, 2000);
+
+      await keyBag.deleteKeyVersion("doc", docTenantId, "versioned", 0);
+
+      const remainingKeys = await keyBag.getAllKeys("doc", docTenantId, "versioned");
+      expect(remainingKeys).toEqual([olderKey]);
     });
   });
 

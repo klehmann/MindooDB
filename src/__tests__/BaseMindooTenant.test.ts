@@ -27,7 +27,7 @@ describe("BaseMindooTenant", () => {
   describe("createTenant", () => {
     it("should create a new tenant with factory, user ID and keyBag", async () => {
       const tenantId = "test-tenant-123";
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       await keyBag.createTenantKey(tenantId);
 
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
@@ -39,7 +39,7 @@ describe("BaseMindooTenant", () => {
 
     it("should initialize tenant successfully", async () => {
       const tenantId = "test-tenant-456";
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       await keyBag.createTenantKey(tenantId);
 
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
@@ -53,7 +53,7 @@ describe("BaseMindooTenant", () => {
     const tenantId = "test-tenant-operations";
 
     beforeEach(async () => {
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       await keyBag.createTenantKey(tenantId);
       tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
     });
@@ -84,7 +84,7 @@ describe("BaseMindooTenant", () => {
       const tenantId = "test-tenant-encryption";
       
       // Create required keys directly in KeyBag
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       await keyBag.createTenantKey(tenantId);
 
       tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
@@ -178,7 +178,7 @@ describe("BaseMindooTenant", () => {
       const tenantId = "test-tenant-signing";
 
       // Create required keys directly in KeyBag
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       await keyBag.createTenantKey(tenantId);
 
       tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
@@ -248,9 +248,15 @@ describe("BaseMindooTenant", () => {
 
     beforeEach(async () => {
       const tenantId = "test-tenant-db";
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       await keyBag.createTenantKey(tenantId);
       tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
+      const directory = await tenant.openDirectory();
+      await directory.registerUser(
+        factory.toPublicUserId(currentUser),
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword
+      );
     });
 
     it("should open a database", async () => {

@@ -22,7 +22,7 @@ export { RSAEncryption } from "./crypto/RSAEncryption";
 export { MindooDocSigner } from "./crypto/MindooDocSigner";
 
 // Keys
-export { KeyBag } from "./keys/KeyBag";
+export { KeyBag, type KeyDetail } from "./keys/KeyBag";
 
 // URI
 export {

@@ -36,7 +36,7 @@ import type {
   MindooTenantDirectory,
   EncryptedPrivateKey,
 } from "../core/types";
-import { PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import type {
   ContentAddressedStore,
   ContentAddressedStoreFactory,
@@ -134,7 +134,12 @@ async function createTenantSetup(
       cryptoAdapter,
     );
     await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, (await existingSetup.keyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!);
-    await keyBag.set("tenant", tenantId, (await existingSetup.keyBag.get("tenant", tenantId))!);
+    await keyBag.set(
+      "doc",
+      tenantId,
+      DEFAULT_TENANT_KEY_ID,
+      (await existingSetup.keyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID))!,
+    );
 
     const tenant = await factory.openTenant(
       tenantId,
@@ -548,6 +553,7 @@ describe("protocol compatibility", () => {
     async getTenantSettings(): Promise<MindooDoc | null> { return null; }
     async changeTenantSettings(..._a: any[]): Promise<void> {}
     async getDBSettings(_dbId: string): Promise<MindooDoc | null> { return null; }
+    async listKnownDBIds(): Promise<string[]> { return ["directory", "main"]; }
     async changeDBSettings(..._a: any[]): Promise<void> {}
     async getGroups(): Promise<string[]> { return []; }
     async getGroupMembers(_g: string): Promise<string[]> { return []; }
@@ -780,12 +786,12 @@ async function prepareDenseSyncPair(dbName: string) {
 
   const targetFactory = new InMemoryContentAddressedStoreFactory();
   const targetSetup = await createTenantSetup(targetFactory, sourceSetup);
-  const targetDb = await targetSetup.tenant.openDB(dbName);
 
   // Sync directory so the target can verify signatures from the source user
   const sourceDir = await sourceSetup.tenant.openDB("directory");
   const targetDir = await targetSetup.tenant.openDB("directory");
   await targetDir.pullChangesFrom(sourceDir);
+  const targetDb = await targetSetup.tenant.openDB(dbName);
 
   return { sourceSetup, sourceDb, targetSetup, targetDb };
 }

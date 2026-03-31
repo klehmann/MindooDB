@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooTenantDirectory, PUBLIC_INFOS_KEY_ID, MindooDoc } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooTenantDirectory, DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID, MindooDoc } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -41,9 +41,9 @@ describe("$publicinfos Key System", () => {
       new NodeCryptoAdapter()
     );
     await seedKeyBag.createTenantKey(tenantId);
-    await seedKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
-    tenantEncryptionKey = (await seedKeyBag.get("tenant", tenantId))!;
-    publicInfosKey = (await seedKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!;
+    await seedKeyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
+    tenantEncryptionKey = (await seedKeyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID))!;
+    publicInfosKey = (await seedKeyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!;
     
   }, 30000);
 
@@ -56,8 +56,8 @@ describe("$publicinfos Key System", () => {
         "fullclientpass",
         new NodeCryptoAdapter()
       );
-      await fullClientKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
-      await fullClientKeyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await fullClientKeyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await fullClientKeyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const fullClientTenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, fullClientUser, "fullclientpass", fullClientKeyBag);
       
       // Register admin user
@@ -77,7 +77,7 @@ describe("$publicinfos Key System", () => {
         new NodeCryptoAdapter()
       );
       // Server only gets $publicinfos key, NOT the default tenant key
-      await serverKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await serverKeyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
       
       // Register server user via full client (admin operation)
       const publicServerUser = factory.toPublicUserId(serverUser);
@@ -88,7 +88,7 @@ describe("$publicinfos Key System", () => {
       );
       
       // Create tenant instance for server
-      await serverKeyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await serverKeyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const serverTenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, serverUser, "serverpass", serverKeyBag);
       
       // Sync directory data from full client to server
@@ -122,8 +122,8 @@ describe("$publicinfos Key System", () => {
     it("grantaccess documents should have username_hash and username_encrypted", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
-      await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
-      await keyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await keyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "clientpass", keyBag);
       
       // Register a user
@@ -178,8 +178,8 @@ describe("$publicinfos Key System", () => {
     it("username_hash should be deterministic (revoke and re-register produces same hash)", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
-      await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
-      await keyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await keyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "clientpass", keyBag);
       
       const directory = await tenant.openDirectory();
@@ -248,8 +248,8 @@ describe("$publicinfos Key System", () => {
     it("should reject registration of same username (case-insensitive) with different keys", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
-      await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
-      await keyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await keyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "clientpass", keyBag);
       
       const directory = await tenant.openDirectory();
@@ -274,8 +274,8 @@ describe("$publicinfos Key System", () => {
     it("should skip re-registration of same user with same keys", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
-      await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
-      await keyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await keyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "clientpass", keyBag);
       
       const directory = await tenant.openDirectory();
@@ -322,8 +322,8 @@ describe("$publicinfos Key System", () => {
     it("group documents should have members_hashes and members_encrypted", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
-      await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
-      await keyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await keyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "clientpass", keyBag);
       
       const directory = await tenant.openDirectory();
@@ -388,8 +388,8 @@ describe("$publicinfos Key System", () => {
     it("getGroupMembers should return member hashes for lookups", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
-      await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
-      await keyBag.set("tenant", tenantId, tenantEncryptionKey);
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+      await keyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
       const tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "clientpass", keyBag);
       
       const directory = await tenant.openDirectory();

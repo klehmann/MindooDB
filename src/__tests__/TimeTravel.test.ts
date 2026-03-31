@@ -29,9 +29,8 @@ describe("TimeTravel", () => {
     
     adminUserPassword = "adminpass123";
     adminUser = await factory.createUserId("CN=admin/O=testtenant", adminUserPassword);
-    await userKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
-    
     const tenantId = "test-tenant";
+    await userKeyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
     await userKeyBag.createTenantKey(tenantId);
     tenant = await factory.openTenant(
       tenantId,

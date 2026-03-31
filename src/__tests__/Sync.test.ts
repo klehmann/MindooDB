@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ContentAddressedStoreFactory, ContentAddressedStore, PUBLIC_INFOS_KEY_ID, SyncProgress } from "../core/types";
+import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ContentAddressedStoreFactory, ContentAddressedStore, DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID, SyncProgress } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -69,7 +69,7 @@ describe("sync test", () => {
     // Create tenant encryption key (store it so user2 can use the same one)
     // Create tenant for user1 using factory1
     await user1KeyBag.createTenantKey(tenantId);
-    tenantEncryptionKey = (await user1KeyBag.get("tenant", tenantId))!;
+    tenantEncryptionKey = (await user1KeyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID))!;
     tenant1 = await factory1.openTenant(
       tenantId,
       adminUser.userSigningKeyPair.publicKey,
@@ -121,27 +121,25 @@ describe("sync test", () => {
     
     // Add $publicinfos key to user2 KeyBag
     await user2KeyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
-    await user2KeyBag.set("tenant", tenantId, tenantEncryptionKey);
+    await user2KeyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
     
     tenant2 = await factory2.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, user2, user2Password, user2KeyBag);
     
-    // Step 4: User2 opens "directory" and "contacts" databases (which are empty by default)
-    const directory2 = await tenant2.openDB("directory");    
-    const contactsDB2 = await tenant2.openDB("contacts");
+    // Step 4: User2 opens the directory database, which is allowed before access is known
+    const directory2 = await tenant2.openDB("directory");
 
-    // Verify both databases are empty for user2
+    // Verify the directory is empty for user2 before syncing
     const allDirectoryDocs2 = await directory2.getAllDocumentIds();
-    const allContacts2 = await contactsDB2.getAllDocumentIds();
     expect(allDirectoryDocs2.length).toBe(0);
-    expect(allContacts2.length).toBe(0);
-    
-    // Step 5: User2 uses pullChangesFrom to populate both underlying AppendOnlyStore's
+
+    // Step 5: User2 uses pullChangesFrom to populate the directory store first
     // Get the stores from user1's databases
     const directoryStore1 = (await tenant1.openDB("directory")).getStore();
     const contactsStore1 = (await tenant1.openDB("contacts")).getStore();
     
-    // Pull changes from user1's stores to user2's stores
+    // Pull the directory first so tenant access is granted before opening regular DBs
     await directory2.pullChangesFrom(directoryStore1);
+    const contactsDB2 = await tenant2.openDB("contacts");
     await contactsDB2.pullChangesFrom(contactsStore1);
     
     // Step 6: Verify user2 can now see the data
@@ -253,7 +251,7 @@ describe("sync test", () => {
     await u3KeyBag.set("doc", tid, PUBLIC_INFOS_KEY_ID, pubInfosKey);
     
     await u1KeyBag.createTenantKey(tid);
-    const tenantKey = (await u1KeyBag.get("tenant", tid))!;
+    const tenantKey = (await u1KeyBag.get("doc", tid, DEFAULT_TENANT_KEY_ID))!;
     const t1 = await f1.openTenant(
       tid,
       adminUser.userSigningKeyPair.publicKey,
@@ -295,14 +293,15 @@ describe("sync test", () => {
     expect(allSecrets1[0]).toBe(secretDocId);
     
     // User2 sets up tenant (does NOT have the named key in their KeyBag)
-    await u2KeyBag.set("tenant", tid, tenantKey);
+    await u2KeyBag.set("doc", tid, DEFAULT_TENANT_KEY_ID, tenantKey);
     const t2 = await f2.openTenant(tid, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, u2, u2Pass, u2KeyBag);
     const dir2 = await t2.openDB("directory");
-    const secretDB2 = await t2.openDB("secrets");
     
     // User2 syncs directory from User1
     const dirStore1 = (await t1.openDB("directory")).getStore();
     await dir2.pullChangesFrom(dirStore1);
+    
+    const secretDB2 = await t2.openDB("secrets");
     
     // User2 syncs secrets database from User1
     // This should NOT throw - the encrypted entries are stored, but the document is skipped
@@ -318,13 +317,14 @@ describe("sync test", () => {
     expect(store2Ids.length).toBeGreaterThan(0);
     
     // User3 sets up tenant (HAS the named key in their KeyBag)
-    await u3KeyBag.set("tenant", tid, tenantKey);
+    await u3KeyBag.set("doc", tid, DEFAULT_TENANT_KEY_ID, tenantKey);
     const t3 = await f3.openTenant(tid, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, u3, u3Pass, u3KeyBag);
     const dir3 = await t3.openDB("directory");
-    const secretDB3 = await t3.openDB("secrets");
     
     // User3 syncs directory from User2
     await dir3.pullChangesFrom(dir2.getStore());
+    
+    const secretDB3 = await t3.openDB("secrets");
     
     // User3 syncs secrets database from User2's store
     await secretDB3.pullChangesFrom(secretDB2.getStore());
@@ -384,7 +384,7 @@ describe("sync test", () => {
     await directory1.registerUser(publicUser2, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
 
     await user2KeyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
-    await user2KeyBag.set("tenant", tenantId, tenantEncryptionKey);
+    await user2KeyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantEncryptionKey);
     tenant2 = await factory2.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, user2, user2Password, user2KeyBag);
 
     const directory2 = await tenant2.openDB("directory");

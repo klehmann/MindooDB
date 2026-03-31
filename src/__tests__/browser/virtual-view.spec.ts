@@ -35,11 +35,15 @@ test.describe("MindooDB browser virtual view", () => {
 
       const user = await factory.createUserId("CN=virtual-view-user/O=mindoo", "user-password");
       const adminUser = await factory.createUserId("CN=admin/O=mindoo", "admin-password");
-      const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "user-password");
+      const keyBag = new KeyBag(
+        user.userEncryptionKeyPair.privateKey,
+        "user-password",
+        cryptoAdapter
+      );
 
       const tenantId = "virtual-view-tenant";
       await keyBag.createTenantKey(tenantId);
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       const tenant = await factory.openTenant(
         tenantId,
         adminUser.userSigningKeyPair.publicKey,
@@ -47,6 +51,12 @@ test.describe("MindooDB browser virtual view", () => {
         user,
         "user-password",
         keyBag
+      );
+      const directory = await tenant.openDirectory();
+      await directory.registerUser(
+        factory.toPublicUserId(user),
+        adminUser.userSigningKeyPair.privateKey,
+        "admin-password"
       );
       const db = await tenant.openDB("employees");
 

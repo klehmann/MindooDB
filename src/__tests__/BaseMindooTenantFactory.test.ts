@@ -180,7 +180,7 @@ describe("BaseMindooTenantFactory", () => {
       expect(createUserIdSpy).not.toHaveBeenCalled();
       expect(result.adminUser).toBe(adminUser);
       expect(result.appUser).toBe(appUser);
-      expect(await result.keyBag.get("tenant", tenantId)).toBeDefined();
+      expect(await result.keyBag.get("doc", tenantId, "default")).toBeDefined();
       expect(await result.keyBag.get("doc", tenantId, "$publicinfos")).toBeDefined();
       await expect(result.tenant.openDirectory()).resolves.toBeDefined();
 

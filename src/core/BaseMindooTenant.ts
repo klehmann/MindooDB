@@ -12,6 +12,7 @@ import {
   JoinRequest,
   JoinResponse,
   ApproveJoinRequestOptions,
+  DEFAULT_TENANT_KEY_ID,
   PublishToServerOptions,
   PUBLIC_INFOS_KEY_ID,
 } from "./types";
@@ -204,9 +205,9 @@ export class BaseMindooTenant implements MindooTenant {
           this.logger.debug(`Using cached tenant key, length: ${symmetricKey.length} bytes`);
         } else {
           this.logger.debug(`Resolving tenant encryption key from KeyBag`);
-          const tenantKey = await this.keyBag.get("tenant", this.tenantId);
+          const tenantKey = await this.keyBag.get("doc", this.tenantId, DEFAULT_TENANT_KEY_ID);
           if (!tenantKey) {
-            throw new SymmetricKeyNotFoundError(`tenant:${this.tenantId}`);
+            throw new SymmetricKeyNotFoundError(`doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}`);
           }
           symmetricKey = tenantKey;
           this.decryptedTenantKeyCache = symmetricKey;
@@ -328,9 +329,9 @@ export class BaseMindooTenant implements MindooTenant {
       if (this.decryptedTenantKeyCache) {
         symmetricKey = this.decryptedTenantKeyCache;
       } else {
-        const tenantKey = await this.keyBag.get("tenant", this.tenantId);
+        const tenantKey = await this.keyBag.get("doc", this.tenantId, DEFAULT_TENANT_KEY_ID);
         if (!tenantKey) {
-          throw new SymmetricKeyNotFoundError(`tenant:${this.tenantId}`);
+          throw new SymmetricKeyNotFoundError(`doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}`);
         }
         symmetricKey = tenantKey;
         this.decryptedTenantKeyCache = symmetricKey;
@@ -514,12 +515,42 @@ export class BaseMindooTenant implements MindooTenant {
     return this.directoryCache;
   }
 
+  private async assertCurrentUserCanOpenDB(id: string): Promise<void> {
+    if (id === "directory") {
+      return;
+    }
+
+    const currentUser = await this.getCurrentUserId();
+    if (currentUser.userSigningPublicKey === this.getAdministrationPublicKey()) {
+      return;
+    }
+
+    const directory = await this.openDirectory();
+    const registeredUser = await directory.getUserPublicKeys(currentUser.username);
+    const hasMatchingGrant =
+      registeredUser?.signingPublicKey === currentUser.userSigningPublicKey &&
+      registeredUser?.encryptionPublicKey === currentUser.userEncryptionPublicKey;
+
+    if (hasMatchingGrant) {
+      return;
+    }
+
+    this.logger.warn(
+      `Denied database open for ungranted user ${currentUser.username} on database ${id}`,
+    );
+    throw new Error(
+      `User "${currentUser.username}" does not have tenant access yet; the tenant admin must grant access first.`,
+    );
+  }
+
   async openDB(id: string, options?: OpenDBOptions): Promise<MindooDB> {
     // Enforce admin-only mode for directory database - this is a security invariant
     // The directory database must only accept entries signed by the admin key
     const effectiveOptions: OpenDBOptions = id === "directory"
       ? { ...options, adminOnlyDb: true }
       : options ?? {};
+
+    await this.assertCurrentUserCanOpenDB(id);
     
     // Return cached database if it exists
     const cached = this.databaseCache.get(id);
@@ -603,8 +634,9 @@ export class BaseMindooTenant implements MindooTenant {
 
     // 2. Export the tenant key encrypted with the share password
     const encryptedTenantKey = await this.keyBag.encryptAndExportKey(
-      "tenant",
+      "doc",
       this.tenantId,
+      DEFAULT_TENANT_KEY_ID,
       options.sharePassword
     );
     if (!encryptedTenantKey) {
@@ -1049,9 +1081,9 @@ export class BaseMindooTenant implements MindooTenant {
       if (this.decryptedTenantKeyCache) {
         return this.decryptedTenantKeyCache;
       }
-      const tenantKey = await this.keyBag.get("tenant", this.tenantId);
+      const tenantKey = await this.keyBag.get("doc", this.tenantId, DEFAULT_TENANT_KEY_ID);
       if (!tenantKey) {
-        throw new SymmetricKeyNotFoundError(`tenant:${this.tenantId}`);
+        throw new SymmetricKeyNotFoundError(`doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}`);
       }
       const symmetricKey = tenantKey;
       this.decryptedTenantKeyCache = symmetricKey;

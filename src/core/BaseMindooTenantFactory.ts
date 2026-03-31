@@ -6,6 +6,7 @@ import {
   SigningKeyPair,
   EncryptionKeyPair,
   PUBLIC_INFOS_KEY_ID,
+  DEFAULT_TENANT_KEY_ID,
   CreateTenantOptions,
   CreateTenantResult,
   JoinRequest,
@@ -420,7 +421,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       this.cryptoAdapter,
       this.logger.createChild("KeyBag")
     );
-    await keyBag.createTenantKey(options.tenantId);
+    await keyBag.createDocKey(options.tenantId, DEFAULT_TENANT_KEY_ID);
     await keyBag.createDocKey(options.tenantId, PUBLIC_INFOS_KEY_ID);
 
     // 3. Open tenant
@@ -501,8 +502,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
 
     // 2. Import the encrypted tenant key
     await keyBag.decryptAndImportKey(
-      "tenant",
+      "doc",
       response.tenantId,
+      DEFAULT_TENANT_KEY_ID,
       response.encryptedTenantKey,
       options.sharePassword
     );
@@ -566,7 +568,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   }
 
   private async assertRequiredKeysInKeyBag(tenantId: string, keyBag: KeyBag): Promise<void> {
-    // Note: The tenant key (type "tenant", id tenantId) is NOT checked here.
+    // Note: The default tenant key (type "doc", id DEFAULT_TENANT_KEY_ID) is NOT checked here.
     // It is only needed when decrypting regular database payloads (decryptionKeyId "default").
     // Server-side tenants that only need directory access can operate without it.
     // If it is missing and code tries to decrypt regular data, a clear

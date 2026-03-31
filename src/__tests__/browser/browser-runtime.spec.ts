@@ -33,11 +33,15 @@ test.describe("MindooDB browser runtime", () => {
 
       const user = await factory.createUserId("CN=browser-local-user/O=mindoo", "user-password");
       const adminUser = await factory.createUserId("CN=admin/O=mindoo", "admin-password");
-      const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "user-password");
+      const keyBag = new KeyBag(
+        user.userEncryptionKeyPair.privateKey,
+        "user-password",
+        cryptoAdapter
+      );
 
       const tenantId = "browser-local-tenant";
       await keyBag.createTenantKey(tenantId);
-      await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+      await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
       const tenant = await factory.openTenant(
         tenantId,
         adminUser.userSigningKeyPair.publicKey,
@@ -45,6 +49,13 @@ test.describe("MindooDB browser runtime", () => {
         user,
         "user-password",
         keyBag
+      );
+
+      const directory = await tenant.openDirectory();
+      await directory.registerUser(
+        factory.toPublicUserId(user),
+        adminUser.userSigningKeyPair.privateKey,
+        "admin-password"
       );
 
       const db = await tenant.openDB("browser-local-db");

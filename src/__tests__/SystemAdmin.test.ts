@@ -18,6 +18,8 @@ import type { PrivateUserId } from "../core/userid";
 import type { ServerConfig } from "../node/server/types";
 import { MindooDBServer } from "../node/server/MindooDBServer";
 
+jest.setTimeout(30000);
+
 async function httpRequest(
   url: string,
   method: string = "GET",
@@ -143,6 +145,9 @@ async function createTestSetup(
 }
 
 async function teardownTestSetup(setup: TestSetup): Promise<void> {
+  if (!setup?.httpServer) {
+    return;
+  }
   await new Promise<void>((resolve) => {
     setup.httpServer.close(() => resolve());
   });

@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, ProcessChangesCursor, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { DEFAULT_TENANT_KEY_ID, PrivateUserId, MindooTenant, MindooDB, MindooDoc, ProcessChangesCursor, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -30,15 +30,27 @@ describe("iterateChangesSince", () => {
     currentUserKeyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, currentUserPassword, cryptoAdapter);
     
     tenantId = "test-tenant-iterate-changes";
-    await adminKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await adminKeyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
     await adminKeyBag.createTenantKey(tenantId);
-    await currentUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
-    await currentUserKeyBag.set("tenant", tenantId, (await adminKeyBag.get("tenant", tenantId))!);
+    await currentUserKeyBag.set(
+      "doc",
+      tenantId,
+      PUBLIC_INFOS_KEY_ID,
+      (await adminKeyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!,
+    );
+    await currentUserKeyBag.set(
+      "doc",
+      tenantId,
+      DEFAULT_TENANT_KEY_ID,
+      (await adminKeyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID))!,
+    );
     tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, currentUserKeyBag);
     
     const directory = await tenant.openDirectory();
     const publicAdminUser = factory.toPublicUserId(adminUser);
     await directory.registerUser(publicAdminUser, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
+    const publicCurrentUser = factory.toPublicUserId(currentUser);
+    await directory.registerUser(publicCurrentUser, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
   }, 30000);
 
   describe("large document set", () => {

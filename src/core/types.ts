@@ -15,6 +15,13 @@ import { MindooDocSigner } from "./crypto/MindooDocSigner";
 export const PUBLIC_INFOS_KEY_ID = "$publicinfos";
 
 /**
+ * Well-known key ID for the tenant-wide default document encryption key.
+ *
+ * KeyBag location: type "doc", id DEFAULT_TENANT_KEY_ID.
+ */
+export const DEFAULT_TENANT_KEY_ID = "default";
+
+/**
  * An EncryptedPrivateKey is a private key that is encrypted with a password.
  * Used for both asymmetric keys (RSA, Ed25519, ECDH) and symmetric keys (AES-256).
  */

@@ -1,6 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { PrivateUserId, MindooTenant, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { DEFAULT_TENANT_KEY_ID, PrivateUserId, MindooTenant, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { createHash } from "crypto";
@@ -39,12 +39,22 @@ describe("Group Management", () => {
     );
     
     tenantId = "test-tenant-groups";
-    await adminKeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await adminKeyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
     await adminKeyBag.createTenantKey(tenantId);
     const currentUser = await factory.createUserId("CN=currentuser/O=testtenant", "currentpass123");
     const currentUserKeyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "currentpass123", cryptoAdapter);
-    await currentUserKeyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await adminKeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
-    await currentUserKeyBag.set("tenant", tenantId, (await adminKeyBag.get("tenant", tenantId))!);
+    await currentUserKeyBag.set(
+      "doc",
+      tenantId,
+      PUBLIC_INFOS_KEY_ID,
+      (await adminKeyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!,
+    );
+    await currentUserKeyBag.set(
+      "doc",
+      tenantId,
+      DEFAULT_TENANT_KEY_ID,
+      (await adminKeyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID))!,
+    );
     tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, "currentpass123", currentUserKeyBag);
     
     // Register the admin user in the directory so their key is trusted

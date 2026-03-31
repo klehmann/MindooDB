@@ -59,7 +59,7 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
 
         const tenantId = "virtual-view-idb-tenant";
         await keyBag.createTenantKey(tenantId);
-        await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+        await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
         const tenant = await factory.openTenant(
           tenantId,
           adminUser.userSigningKeyPair.publicKey,
@@ -67,6 +67,12 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
           user,
           "user-password",
           keyBag
+        );
+        const directory = await tenant.openDirectory();
+        await directory.registerUser(
+          factory.toPublicUserId(user),
+          adminUser.userSigningKeyPair.privateKey,
+          "admin-password"
         );
         const db = await tenant.openDB("employees");
 
@@ -223,7 +229,7 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
         );
 
         await keyBag.createTenantKey(tenantId);
-        await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+        await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
         const tenant = await factory.openTenant(
           tenantId,
           adminUser.userSigningKeyPair.publicKey,
@@ -231,6 +237,12 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
           user,
           "user-password",
           keyBag
+        );
+        const directory = await tenant.openDirectory();
+        await directory.registerUser(
+          factory.toPublicUserId(user),
+          adminUser.userSigningKeyPair.privateKey,
+          "admin-password"
         );
         const db = await tenant.openDB("persist-employees");
 

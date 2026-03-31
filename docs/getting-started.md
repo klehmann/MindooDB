@@ -50,11 +50,11 @@ const { tenant, adminUser, appUser, keyBag } = await factory.createTenant({
 });
 ```
 
-Behind the scenes, `createTenant` performs five operations: it creates the admin identity (Ed25519 signing key + RSA-OAEP encryption key), creates the regular user identity, generates the tenant encryption key and the `$publicinfos` key in a new KeyBag, opens the tenant, and registers the regular user in the admin-signed directory database.
+Behind the scenes, `createTenant` performs five operations: it creates the admin identity (Ed25519 signing key + RSA-OAEP encryption key), creates the regular user identity, generates the default data encryption key and the `$publicinfos` key in a new KeyBag, opens the tenant, and registers the regular user in the admin-signed directory database.
 
 The admin identity is kept separate from the regular user identity by design. Admin credentials are used exclusively for privileged operations like registering users and changing tenant settings; the regular user identity is what you use for day-to-day document operations. This separation limits the blast radius if a user's device is compromised.
 
-> **For platform engineers:** The admin signing key (Ed25519) is the root of trust. Every user registration in the directory is signed with this key. Clients and servers verify these signatures before trusting any user's public key. The `$publicinfos` key (AES-256) encrypts only the directory's access-control entries so that the server can validate users without seeing plaintext usernames.
+> **For platform engineers:** The admin signing key (Ed25519) is the root of trust. Every user registration in the directory is signed with this key. Clients and servers verify these signatures before trusting any user's public key. The default AES-256 data-encryption key lives at `doc:<tenantId>:default`, and the `$publicinfos` key lives at `doc:<tenantId>:$publicinfos`. The `$publicinfos` key encrypts only the directory's access-control entries so that the server can validate users without seeing plaintext usernames.
 
 ---
 
@@ -78,7 +78,7 @@ await tenant.publishToServer("https://sync.example.com", {
 });
 ```
 
-This authenticates as the system admin (challenge/response with Ed25519 signature), then registers the tenant on the server. The server receives the admin's public signing key, public encryption key, and the `$publicinfos` key — it uses the `$publicinfos` key to read the directory database and validate incoming sync requests against the admin-signed user registry.
+This authenticates as the system admin (challenge/response with Ed25519 signature), then registers the tenant on the server. The server receives the admin's public signing key, public encryption key, and the `$publicinfos` key from `doc:<tenantId>:$publicinfos` — it uses that key to read the directory database and validate incoming sync requests against the admin-signed user registry.
 
 If you want to pre-register users on the server at the same time (so they can sync immediately after joining), pass them as an option:
 
@@ -189,7 +189,7 @@ const { tenant: bobTenant, keyBag: bobKeyBag } = await factory.joinTenant(
 );
 ```
 
-`joinTenant` parses the response, decrypts the symmetric keys using the share password, creates a new KeyBag with the imported keys, and opens the tenant. Bob now has a fully operational tenant that can read and write encrypted data.
+`joinTenant` parses the response, decrypts the symmetric keys using the share password, creates a new KeyBag with the imported keys, and opens the tenant. The imported KeyBag now contains `doc:<tenantId>:default` for regular tenant data and `doc:<tenantId>:$publicinfos` for the directory. Bob now has a fully operational tenant that can read and write encrypted data.
 
 ---
 
@@ -236,7 +236,7 @@ Documents use Automerge CRDTs under the hood, so concurrent edits from multiple 
 
 ## Step 6: Persisting and Restoring a Session
 
-The examples above create everything in memory. In a real application, you need to persist the user identity and KeyBag so the tenant can be reopened after a restart without repeating the setup or join flow.
+The examples above create everything in memory. In a real application, you need to persist the user identity and KeyBag so the tenant can be reopened after a restart without repeating the setup or join flow. Persist the whole KeyBag as-is; it already includes both `doc:<tenantId>:default` and `doc:<tenantId>:$publicinfos` when the user has full tenant access.
 
 Three pieces of data need to be saved:
 
