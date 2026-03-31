@@ -400,11 +400,18 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    */
   async createTenant(options: CreateTenantOptions): Promise<CreateTenantResult> {
     this.logger.info(`Creating tenant: ${options.tenantId}`);
-    console.log(`[createTenant] Creating tenant "${options.tenantId}" with admin "${options.adminName}" and user "${options.userName}"`);
+    const hasExistingUsers = "adminUser" in options;
+    const adminLabel = hasExistingUsers ? options.adminUser.username : options.adminName;
+    const userLabel = hasExistingUsers ? options.appUser.username : options.userName;
+    console.log(`[createTenant] Creating tenant "${options.tenantId}" with admin "${adminLabel}" and user "${userLabel}"`);
 
-    // 1. Create admin and app user identities
-    const adminUser = await this.createUserId(options.adminName, options.adminPassword);
-    const appUser = await this.createUserId(options.userName, options.userPassword);
+    // 1. Create or reuse admin and app user identities
+    const adminUser = hasExistingUsers
+      ? options.adminUser
+      : await this.createUserId(options.adminName, options.adminPassword);
+    const appUser = hasExistingUsers
+      ? options.appUser
+      : await this.createUserId(options.userName, options.userPassword);
 
     // 2. Create KeyBag with required keys
     const keyBag = new KeyBag(
@@ -414,7 +421,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       this.logger.createChild("KeyBag")
     );
     await keyBag.createTenantKey(options.tenantId);
-    await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
+    await keyBag.createDocKey(options.tenantId, PUBLIC_INFOS_KEY_ID);
 
     // 3. Open tenant
     const tenant = await this.openTenant(
@@ -503,6 +510,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     // 3. Import the encrypted $publicinfos key
     await keyBag.decryptAndImportKey(
       "doc",
+      response.tenantId,
       PUBLIC_INFOS_KEY_ID,
       response.encryptedPublicInfosKey,
       options.sharePassword
@@ -564,11 +572,11 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     // If it is missing and code tries to decrypt regular data, a clear
     // SymmetricKeyNotFoundError will be thrown at the point of use.
 
-    const publicInfosKey = await keyBag.get("doc", PUBLIC_INFOS_KEY_ID);
+    const publicInfosKey = await keyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID);
     if (!publicInfosKey) {
       throw new Error(
-        `Missing required directory access key in KeyBag: ("doc", "${PUBLIC_INFOS_KEY_ID}"). ` +
-          `Create/import it first with keyBag.createDocKey("${PUBLIC_INFOS_KEY_ID}") or keyBag.decryptAndImportKey("doc", "${PUBLIC_INFOS_KEY_ID}", encryptedPublicInfosKey, password).`
+        `Missing required directory access key in KeyBag: ("doc", "${tenantId}", "${PUBLIC_INFOS_KEY_ID}"). ` +
+          `Create/import it first with keyBag.createDocKey("${tenantId}", "${PUBLIC_INFOS_KEY_ID}") or keyBag.decryptAndImportKey("doc", "${tenantId}", "${PUBLIC_INFOS_KEY_ID}", encryptedPublicInfosKey, password).`
       );
     }
   }

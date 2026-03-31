@@ -215,7 +215,7 @@ export class BaseMindooTenant implements MindooTenant {
       } else {
         this.logger.debug(`Getting named key from KeyBag: ${decryptionKeyId}`);
         // Get the decrypted key from KeyBag
-        const decryptedKey = await this.keyBag.get("doc", decryptionKeyId);
+        const decryptedKey = await this.keyBag.get("doc", this.tenantId, decryptionKeyId);
         if (!decryptedKey) {
           throw new SymmetricKeyNotFoundError(decryptionKeyId);
         }
@@ -337,7 +337,7 @@ export class BaseMindooTenant implements MindooTenant {
       }
     } else {
       // Get the decrypted key from KeyBag
-      const decryptedKey = await this.keyBag.get("doc", decryptionKeyId);
+      const decryptedKey = await this.keyBag.get("doc", this.tenantId, decryptionKeyId);
       if (!decryptedKey) {
         throw new SymmetricKeyNotFoundError(decryptionKeyId);
       }
@@ -614,6 +614,7 @@ export class BaseMindooTenant implements MindooTenant {
     // 3. Export the $publicinfos key encrypted with the share password
     const encryptedPublicInfosKey = await this.keyBag.encryptAndExportKey(
       "doc",
+      this.tenantId,
       PUBLIC_INFOS_KEY_ID,
       options.sharePassword
     );
@@ -660,7 +661,7 @@ export class BaseMindooTenant implements MindooTenant {
     const baseUrl = serverUrl.replace(/\/$/, "");
 
     // Export the $publicinfos key so the server can read the directory DB
-    const publicInfosKeyBytes = await this.keyBag.get("doc", PUBLIC_INFOS_KEY_ID);
+    const publicInfosKeyBytes = await this.keyBag.get("doc", this.tenantId, PUBLIC_INFOS_KEY_ID);
     if (!publicInfosKeyBytes) {
       throw new Error(`Cannot publish to server: $publicinfos key not found in KeyBag`);
     }
@@ -1057,7 +1058,7 @@ export class BaseMindooTenant implements MindooTenant {
       return symmetricKey;
     } else {
       // Get the decrypted key from KeyBag
-      const decryptedKey = await this.keyBag.get("doc", decryptionKeyId);
+      const decryptedKey = await this.keyBag.get("doc", this.tenantId, decryptionKeyId);
       if (!decryptedKey) {
         throw new SymmetricKeyNotFoundError(decryptionKeyId);
       }

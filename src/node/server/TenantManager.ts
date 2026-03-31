@@ -644,7 +644,7 @@ export class TenantManager {
       this.cryptoAdapter,
     );
     const publicInfosKeyBytes = Buffer.from(config.publicInfosKey!, "base64");
-    await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, new Uint8Array(publicInfosKeyBytes));
+    await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, new Uint8Array(publicInfosKeyBytes));
 
     // Collect trusted server signing keys for additionalTrustedKeys
     const openOptions: OpenTenantOptions = {};

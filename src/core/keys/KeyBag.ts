@@ -48,8 +48,10 @@ export class KeyBag {
    * @param keyId The ID of the key to read
    * @return The exported key, or null if not found
    */
-  async get(type: KeyType, id: string): Promise<Uint8Array | null> {
-    const scopedKeyId = buildScopedKeyId(type, id);
+  async get(type: "tenant", id: string): Promise<Uint8Array | null>;
+  async get(type: "doc", tenantId: string, id: string): Promise<Uint8Array | null>;
+  async get(type: KeyType, arg1: string, arg2?: string): Promise<Uint8Array | null> {
+    const scopedKeyId = this.buildScopedKeyId(type, arg1, arg2);
     const keyEntries = this.keys.get(scopedKeyId);
     if (!keyEntries || keyEntries.length === 0) {
       return null;
@@ -72,8 +74,10 @@ export class KeyBag {
    * @param keyId The ID of the keys to read
    * @return Array of keys sorted by createdAt (newest first), or empty array if not found
    */
-  async getAllKeys(type: KeyType, id: string): Promise<Uint8Array[]> {
-    const scopedKeyId = buildScopedKeyId(type, id);
+  async getAllKeys(type: "tenant", id: string): Promise<Uint8Array[]>;
+  async getAllKeys(type: "doc", tenantId: string, id: string): Promise<Uint8Array[]>;
+  async getAllKeys(type: KeyType, arg1: string, arg2?: string): Promise<Uint8Array[]> {
+    const scopedKeyId = this.buildScopedKeyId(type, arg1, arg2);
     const keyEntries = this.keys.get(scopedKeyId);
     if (!keyEntries || keyEntries.length === 0) {
       return [];
@@ -97,8 +101,14 @@ export class KeyBag {
    * @param key The key bytes
    * @param createdAt Optional creation timestamp (milliseconds since Unix epoch)
    */
-  async set(type: KeyType, id: string, key: Uint8Array, createdAt?: number): Promise<void> {
-    const scopedKeyId = buildScopedKeyId(type, id);
+  async set(type: "tenant", id: string, key: Uint8Array, createdAt?: number): Promise<void>;
+  async set(type: "doc", tenantId: string, id: string, key: Uint8Array, createdAt?: number): Promise<void>;
+  async set(type: KeyType, arg1: string, arg2: string | Uint8Array, arg3?: Uint8Array | number, arg4?: number): Promise<void> {
+    const scopedKeyId = type === "doc"
+      ? buildScopedKeyId(type, arg1, arg2 as string)
+      : buildScopedKeyId(type, arg1);
+    const key = type === "doc" ? arg3 as Uint8Array : arg2 as Uint8Array;
+    const createdAt = type === "doc" ? arg4 : arg3 as number | undefined;
     const keyEntries = this.keys.get(scopedKeyId) || [];
     keyEntries.push({ key, createdAt });
     this.keys.set(scopedKeyId, keyEntries);
@@ -116,8 +126,8 @@ export class KeyBag {
    * Creates a new document symmetric key (AES-256) and stores it directly in this KeyBag.
    * This avoids temporary password-wrapped key blobs when the key is only needed locally.
    */
-  async createDocKey(keyId: string, createdAt?: number): Promise<void> {
-    await this.createAndStoreSymmetricKey("doc", keyId, createdAt);
+  async createDocKey(tenantId: string, keyId: string, createdAt?: number): Promise<void> {
+    await this.createAndStoreSymmetricKey("doc", tenantId, keyId, createdAt);
   }
 
   /**
@@ -130,9 +140,23 @@ export class KeyBag {
    * @param password The password to decrypt the key
    * @return A promise that resolves when the key is decrypted and stored
    */
-  async decryptAndImportKey(type: KeyType, id: string, key: EncryptedPrivateKey, password: string): Promise<void> {
-    const salt = buildKeyDerivationSalt(type, id);
-    const scopedKeyId = buildScopedKeyId(type, id);
+  async decryptAndImportKey(type: "tenant", id: string, key: EncryptedPrivateKey, password: string): Promise<void>;
+  async decryptAndImportKey(type: "doc", tenantId: string, id: string, key: EncryptedPrivateKey, password: string): Promise<void>;
+  async decryptAndImportKey(
+    type: KeyType,
+    arg1: string,
+    arg2: string | EncryptedPrivateKey,
+    arg3: EncryptedPrivateKey | string,
+    arg4?: string,
+  ): Promise<void> {
+    const salt = type === "doc"
+      ? buildKeyDerivationSalt(type, arg1, arg2 as string)
+      : buildKeyDerivationSalt(type, arg1);
+    const scopedKeyId = type === "doc"
+      ? buildScopedKeyId(type, arg1, arg2 as string)
+      : buildScopedKeyId(type, arg1);
+    const key = type === "doc" ? arg3 as EncryptedPrivateKey : arg2 as EncryptedPrivateKey;
+    const password = type === "doc" ? arg4 as string : arg3 as string;
     const decryptedKeyBytes = await this.decryptPrivateKey(key, password, salt);
     const keyEntries = this.keys.get(scopedKeyId) || [];
     keyEntries.push({ 
@@ -151,9 +175,19 @@ export class KeyBag {
    * @param password The password to encrypt the key with
    * @return A promise that resolves to the encrypted private key, or null if the key is not found
    */
-  async encryptAndExportKey(type: KeyType, id: string, password: string): Promise<EncryptedPrivateKey | null> {
-    const scopedKeyId = buildScopedKeyId(type, id);
-    const key = await this.get(type, id);
+  async encryptAndExportKey(type: "tenant", id: string, password: string): Promise<EncryptedPrivateKey | null>;
+  async encryptAndExportKey(type: "doc", tenantId: string, id: string, password: string): Promise<EncryptedPrivateKey | null>;
+  async encryptAndExportKey(
+    type: KeyType,
+    arg1: string,
+    arg2: string,
+    arg3?: string,
+  ): Promise<EncryptedPrivateKey | null> {
+    const scopedKeyId = type === "doc"
+      ? buildScopedKeyId(type, arg1, arg2)
+      : buildScopedKeyId(type, arg1);
+    const key = type === "doc" ? await this.get(type, arg1, arg2) : await this.get(type, arg1);
+    const password = type === "doc" ? arg3 as string : arg2;
     if (!key) {
       return null;
     }
@@ -177,7 +211,7 @@ export class KeyBag {
     const encryptedKey = await this.encryptPrivateKey(
       key,
       password,
-      buildKeyDerivationSalt(type, id)
+      type === "doc" ? buildKeyDerivationSalt(type, arg1, arg2) : buildKeyDerivationSalt(type, arg1)
     );
     
     // Include the createdAt timestamp if available
@@ -195,8 +229,10 @@ export class KeyBag {
    * @param id The key identifier (tenantId or doc keyId)
    * @return A promise that resolves when the keys are deleted
    */
-  async deleteKey(type: KeyType, id: string): Promise<void> {
-    this.keys.delete(buildScopedKeyId(type, id));
+  async deleteKey(type: "tenant", id: string): Promise<void>;
+  async deleteKey(type: "doc", tenantId: string, id: string): Promise<void>;
+  async deleteKey(type: KeyType, arg1: string, arg2?: string): Promise<void> {
+    this.keys.delete(this.buildScopedKeyId(type, arg1, arg2));
   }
 
   /**
@@ -508,9 +544,21 @@ export class KeyBag {
    * Generates a new AES-256 key and stores raw key bytes in KeyBag.
    */
   private async createAndStoreSymmetricKey(
-    type: KeyType,
+    type: "tenant",
     id: string,
     createdAt?: number
+  ): Promise<void>;
+  private async createAndStoreSymmetricKey(
+    type: "doc",
+    tenantId: string,
+    id: string,
+    createdAt?: number
+  ): Promise<void>;
+  private async createAndStoreSymmetricKey(
+    type: KeyType,
+    arg1: string,
+    arg2?: string | number,
+    arg3?: number
   ): Promise<void> {
     const subtle = this.cryptoAdapter.getSubtle();
     const key = await subtle.generateKey(
@@ -522,7 +570,22 @@ export class KeyBag {
       ["encrypt", "decrypt"]
     );
     const keyMaterial = await subtle.exportKey("raw", key);
-    await this.set(type, id, new Uint8Array(keyMaterial), createdAt);
+    if (type === "doc") {
+      await this.set(type, arg1, arg2 as string, new Uint8Array(keyMaterial), arg3);
+    } else {
+      await this.set(type, arg1, new Uint8Array(keyMaterial), arg2 as number | undefined);
+    }
+  }
+
+  private buildScopedKeyId(type: KeyType, arg1: string, arg2?: string): string {
+    if (type === "doc") {
+      if (!arg2) {
+        throw new Error("Document keys require a tenantId and keyId.");
+      }
+      return buildScopedKeyId(type, arg1, arg2);
+    }
+
+    return buildScopedKeyId(type, arg1);
   }
 
   /**

@@ -940,6 +940,10 @@ class MockTenantDirectory implements MindooTenantDirectory {
     return user.revoked;
   }
 
+  async listKnownDBIds(): Promise<string[]> {
+    return ["directory", "main"];
+  }
+
   // GDPR methods - not used in tests
   async requestDocHistoryPurge(
     _dbId: string,

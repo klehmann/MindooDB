@@ -95,21 +95,33 @@ export interface OpenTenantOptions {
 
 // ==================== Join Flow Types ====================
 
-/**
- * Options for creating a new tenant with a single convenience call.
- */
-export interface CreateTenantOptions {
-  /** Tenant identifier (e.g. "acme") */
-  tenantId: string;
-  /** Distinguished name for the admin user (e.g. "cn=admin/o=acme") */
-  adminName: string;
+interface CreateTenantPasswords {
   /** Password for the admin user's private keys */
   adminPassword: string;
-  /** Distinguished name for the regular app user (e.g. "cn=alice/o=acme") */
-  userName: string;
   /** Password for the regular user's private keys */
   userPassword: string;
 }
+
+/**
+ * Options for creating a new tenant with a single convenience call.
+ */
+export type CreateTenantOptions =
+  | ({
+    /** Tenant identifier (e.g. "acme") */
+    tenantId: string;
+    /** Distinguished name for the admin user (e.g. "cn=admin/o=acme") */
+    adminName: string;
+    /** Distinguished name for the regular app user (e.g. "cn=alice/o=acme") */
+    userName: string;
+  } & CreateTenantPasswords)
+  | ({
+    /** Tenant identifier (e.g. "acme") */
+    tenantId: string;
+    /** Existing admin private identity */
+    adminUser: PrivateUserId;
+    /** Existing regular app user private identity */
+    appUser: PrivateUserId;
+  } & CreateTenantPasswords);
 
 /**
  * Result of creating a new tenant via createTenant().
@@ -121,7 +133,7 @@ export interface CreateTenantResult {
   adminUser: PrivateUserId;
   /** The regular app user's private identity */
   appUser: PrivateUserId;
-  /** The KeyBag containing tenant and $publicinfos keys */
+  /** The KeyBag containing the tenant key and tenant-scoped doc keys */
   keyBag: KeyBag;
 }
 
@@ -233,7 +245,7 @@ export interface MindooTenantFactory {
    * @param currentUserPassword The password to decrypt the current user's private keys
    * @param keyBag The KeyBag instance for storing and loading tenant/doc keys.
    *               Must contain:
-   *               - $publicinfos key under type "doc" and id PUBLIC_INFOS_KEY_ID
+   *               - $publicinfos key under type "doc", tenant id tenantId, and id PUBLIC_INFOS_KEY_ID
    *               Optionally (required for decrypting regular database payloads):
    *               - tenant key under type "tenant" and id tenantId
    * @return The tenant

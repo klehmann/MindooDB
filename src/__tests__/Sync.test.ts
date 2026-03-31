@@ -61,13 +61,13 @@ describe("sync test", () => {
     adminUserPassword = "adminpass123";
     adminUser = await factory1.createUserId("CN=admin/O=testtenant", adminUserPassword);
     
+    tenantId = "test-tenant-sync";
     // Create $publicinfos symmetric key (required for all servers/clients)
-    await user1KeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
-    publicInfosKey = (await user1KeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!;
+    await user1KeyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
+    publicInfosKey = (await user1KeyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!;
     
     // Create tenant encryption key (store it so user2 can use the same one)
     // Create tenant for user1 using factory1
-    tenantId = "test-tenant-sync";
     await user1KeyBag.createTenantKey(tenantId);
     tenantEncryptionKey = (await user1KeyBag.get("tenant", tenantId))!;
     tenant1 = await factory1.openTenant(
@@ -120,7 +120,7 @@ describe("sync test", () => {
     // User2 uses factory2 which has its own separate store factory
     
     // Add $publicinfos key to user2 KeyBag
-    await user2KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
+    await user2KeyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
     await user2KeyBag.set("tenant", tenantId, tenantEncryptionKey);
     
     tenant2 = await factory2.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, user2, user2Password, user2KeyBag);
@@ -242,16 +242,16 @@ describe("sync test", () => {
     const adminPass = "adminpass";
     const adminUser = await f1.createUserId("CN=admin/O=test", adminPass);
     
-    // Create $publicinfos symmetric key (required for all users)
-    await u1KeyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
-    const pubInfosKey = (await u1KeyBag.get("doc", PUBLIC_INFOS_KEY_ID))!;
-    
-    // Add $publicinfos key to all KeyBags
-    await u2KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, pubInfosKey);
-    await u3KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, pubInfosKey);
-    
     // Create tenant for user1
     const tid = "named-key-sync-test";
+    // Create $publicinfos symmetric key (required for all users)
+    await u1KeyBag.createDocKey(tid, PUBLIC_INFOS_KEY_ID);
+    const pubInfosKey = (await u1KeyBag.get("doc", tid, PUBLIC_INFOS_KEY_ID))!;
+    
+    // Add $publicinfos key to all KeyBags
+    await u2KeyBag.set("doc", tid, PUBLIC_INFOS_KEY_ID, pubInfosKey);
+    await u3KeyBag.set("doc", tid, PUBLIC_INFOS_KEY_ID, pubInfosKey);
+    
     await u1KeyBag.createTenantKey(tid);
     const tenantKey = (await u1KeyBag.get("tenant", tid))!;
     const t1 = await f1.openTenant(
@@ -271,11 +271,11 @@ describe("sync test", () => {
     
     // User1 creates a named symmetric key (shared only with User3, NOT User2)
     const namedKeyId = "secret-project-key";
-    await u1KeyBag.createDocKey(namedKeyId);
-    const namedKey = (await u1KeyBag.get("doc", namedKeyId))!;
+    await u1KeyBag.createDocKey(tid, namedKeyId);
+    const namedKey = (await u1KeyBag.get("doc", tid, namedKeyId))!;
 
     // Import the key into User3's KeyBag (User3 has the key, User2 does NOT)
-    await u3KeyBag.set("doc", namedKeyId, namedKey);
+    await u3KeyBag.set("doc", tid, namedKeyId, namedKey);
     
     // User1 creates an encrypted document with the named key
     const secretDB1 = await t1.openDB("secrets");
@@ -383,7 +383,7 @@ describe("sync test", () => {
     await directory1.registerUser(publicUser1, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
     await directory1.registerUser(publicUser2, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
 
-    await user2KeyBag.set("doc", PUBLIC_INFOS_KEY_ID, publicInfosKey);
+    await user2KeyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
     await user2KeyBag.set("tenant", tenantId, tenantEncryptionKey);
     tenant2 = await factory2.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, user2, user2Password, user2KeyBag);
 

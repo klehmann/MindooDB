@@ -24,8 +24,8 @@ describe("Attachments", () => {
     currentUser = await factory.createUserId("CN=testuser/O=testtenant", currentUserPassword);
     keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, currentUserPassword, factory.getCryptoAdapter());
 
-    await keyBag.createDocKey(PUBLIC_INFOS_KEY_ID);
     const tenantId = "test-tenant-attachments";
+    await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
     await keyBag.createTenantKey(tenantId);
     tenant = await factory.openTenant(tenantId, adminUser.userSigningKeyPair.publicKey, adminUser.userEncryptionKeyPair.publicKey, currentUser, currentUserPassword, keyBag);
 

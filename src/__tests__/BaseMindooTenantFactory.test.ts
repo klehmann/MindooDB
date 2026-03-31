@@ -116,7 +116,7 @@ describe("BaseMindooTenantFactory", () => {
         new NodeCryptoAdapter()
       );
       await keyBag.createTenantKey(tenantId);
-      await keyBag.createDocKey("$publicinfos");
+      await keyBag.createDocKey(tenantId, "$publicinfos");
 
       await expect(
         factory.openTenant(
@@ -140,7 +140,7 @@ describe("BaseMindooTenantFactory", () => {
         new NodeCryptoAdapter()
       );
       await keyBag.createTenantKey(tenantId);
-      await keyBag.createDocKey("$publicinfos");
+      await keyBag.createDocKey(tenantId, "$publicinfos");
 
       await expect(
         (async () => {
@@ -155,6 +155,36 @@ describe("BaseMindooTenantFactory", () => {
           await tenant.openDB("should-not-open");
         })()
       ).rejects.toThrow("currentUser must not be the administration identity");
+    });
+  });
+
+  describe("createTenant", () => {
+    it("reuses existing identities when provided", async () => {
+      const tenantId = "existing-identities";
+      const adminPassword = "adminpass123";
+      const userPassword = "userpass123";
+      const adminUser = await factory.createUserId("CN=admin/O=existing", adminPassword);
+      const appUser = await factory.createUserId("CN=user/O=existing", userPassword);
+      const createUserIdSpy = jest.spyOn(factory, "createUserId");
+
+      createUserIdSpy.mockClear();
+
+      const result = await factory.createTenant({
+        tenantId,
+        adminUser,
+        adminPassword,
+        appUser,
+        userPassword,
+      });
+
+      expect(createUserIdSpy).not.toHaveBeenCalled();
+      expect(result.adminUser).toBe(adminUser);
+      expect(result.appUser).toBe(appUser);
+      expect(await result.keyBag.get("tenant", tenantId)).toBeDefined();
+      expect(await result.keyBag.get("doc", tenantId, "$publicinfos")).toBeDefined();
+      await expect(result.tenant.openDirectory()).resolves.toBeDefined();
+
+      createUserIdSpy.mockRestore();
     });
   });
 
@@ -210,8 +240,9 @@ describe("BaseMindooTenantFactory", () => {
       const user = await factory.createUserId("CN=testuser/O=testtenant", "testpassword123");
       const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "testpassword123", new NodeCryptoAdapter());
 
-      await keyBag.createDocKey("test-doc-key");
-      const key = await keyBag.get("doc", "test-doc-key");
+      const tenantId = "testtenant";
+      await keyBag.createDocKey(tenantId, "test-doc-key");
+      const key = await keyBag.get("doc", tenantId, "test-doc-key");
 
       expect(key).toBeDefined();
       expect(key!.length).toBe(32);
@@ -221,10 +252,11 @@ describe("BaseMindooTenantFactory", () => {
       const user = await factory.createUserId("CN=testuser/O=testtenant", "testpassword123");
       const keyBag = new KeyBag(user.userEncryptionKeyPair.privateKey, "testpassword123", new NodeCryptoAdapter());
 
-      await keyBag.createDocKey("test-doc-key");
-      const key1 = await keyBag.get("doc", "test-doc-key");
-      await keyBag.createDocKey("test-doc-key");
-      const allKeys = await keyBag.getAllKeys("doc", "test-doc-key");
+      const tenantId = "testtenant";
+      await keyBag.createDocKey(tenantId, "test-doc-key");
+      const key1 = await keyBag.get("doc", tenantId, "test-doc-key");
+      await keyBag.createDocKey(tenantId, "test-doc-key");
+      const allKeys = await keyBag.getAllKeys("doc", tenantId, "test-doc-key");
 
       expect(key1).toBeDefined();
       expect(allKeys.length).toBe(2);

@@ -133,7 +133,7 @@ async function createTenantSetup(
       USER_PASS,
       cryptoAdapter,
     );
-    await keyBag.set("doc", PUBLIC_INFOS_KEY_ID, (await existingSetup.keyBag.get("doc", PUBLIC_INFOS_KEY_ID))!);
+    await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, (await existingSetup.keyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!);
     await keyBag.set("tenant", tenantId, (await existingSetup.keyBag.get("tenant", tenantId))!);
 
     const tenant = await factory.openTenant(
