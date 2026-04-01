@@ -84,7 +84,7 @@ export interface TenantConfig {
   /** Per-database store configuration overrides */
   databaseStores?: Record<string, DatabaseStoreConfig>;
 
-  /** Registered users (clients and other servers) — bootstrap/test fallback */
+  /** Registered users (clients and other servers) — bootstrap/test fallback, ignored when publicInfosKey is present */
   users?: UserConfig[];
 
   /** Remote servers to sync with (for server-to-server sync) */
@@ -107,7 +107,7 @@ export interface RegisterTenantRequest {
   publicInfosKey?: string;
   /** Default store type (default: "file") */
   defaultStoreType?: StoreType;
-  /** Initial users to register (for testing/bootstrapping only) */
+  /** Initial users to register (for testing/bootstrapping only, ignored when publicInfosKey is present) */
   users?: UserConfig[];
 }
 

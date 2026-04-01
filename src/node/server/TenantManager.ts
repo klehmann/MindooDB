@@ -344,7 +344,9 @@ export class TenantManager {
       adminEncryptionPublicKey: request.adminEncryptionPublicKey,
       publicInfosKey: request.publicInfosKey,
       defaultStoreType: request.defaultStoreType || "file",
-      users: request.users || [],
+      // When $publicinfos is present, directory grant documents are the source of
+      // truth for tenant users. Keep config.json free of bootstrap app users.
+      users: request.publicInfosKey ? [] : (request.users || []),
     };
 
     const configPath = join(tenantDir, "config.json");

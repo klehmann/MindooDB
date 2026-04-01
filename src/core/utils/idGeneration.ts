@@ -8,8 +8,50 @@
  * - Blockchain-like integrity for document entries
  */
 
-import { encode as base62Encode, decode as base62Decode } from '@digitalmaas/uuid-base62';
 import { v7 as uuidv7 } from 'uuid';
+
+const BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const UUID_NO_DASH_LENGTH = 32;
+const BASE62_UUID_LENGTH = 22;
+
+function trimLeft(target: string, length: number): string {
+  let trim = 0;
+  while (target[trim] === "0" && target.length - trim > length) {
+    trim++;
+  }
+  return target.slice(trim);
+}
+
+function ensureLength(target: string, length: number): string {
+  if (target.length < length) {
+    return target.padStart(length, "0");
+  }
+  if (target.length > length) {
+    return trimLeft(target, length);
+  }
+  return target;
+}
+
+function hexToBase62(uuid: string): string {
+  const normalized = uuid.replace(/-/g, "");
+  if (!/^[0-9a-fA-F]{32}$/.test(normalized)) {
+    throw new TypeError(`Invalid UUID for base62 encoding: ${uuid}`);
+  }
+
+  let value = BigInt(`0x${normalized}`);
+  if (value === 0n) {
+    return "0".repeat(BASE62_UUID_LENGTH);
+  }
+
+  let encoded = "";
+  while (value > 0n) {
+    const digit = Number(value % 62n);
+    encoded = BASE62_ALPHABET[digit] + encoded;
+    value /= 62n;
+  }
+
+  return ensureLength(encoded, BASE62_UUID_LENGTH);
+}
 
 /**
  * Generate a document entry ID with blockchain-like chaining.
@@ -75,8 +117,7 @@ export function generateAttachmentChunkId(
   chunkUuid7?: string
 ): string {
   const chunkId = chunkUuid7 || uuidv7();
-  // base62Encode expects UUID with dashes
-  const base62Chunk = base62Encode(chunkId);
+  const base62Chunk = hexToBase62(chunkId);
   return `${docId}_a_${fileUuid7}_${base62Chunk}`;
 }
 

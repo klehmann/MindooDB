@@ -13,6 +13,7 @@ import { Server } from "http";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
+import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
 import { MindooDBServerAdmin } from "../core/MindooDBServerAdmin";
 import type { PrivateUserId } from "../core/userid";
 import type { ServerConfig } from "../node/server/types";
@@ -69,6 +70,7 @@ interface TestSetup {
   server: MindooDBServer;
   httpServer: Server;
   baseUrl: string;
+  dataDir: string;
   config: ServerConfig;
   adminUser: PrivateUserId;
   adminSigningKeyPair: CryptoKeyPair;
@@ -137,6 +139,7 @@ async function createTestSetup(
     server,
     httpServer,
     baseUrl,
+    dataDir,
     config,
     adminUser,
     adminSigningKeyPair,
@@ -223,6 +226,62 @@ async function getSystemAdminToken(
   });
 
   return (authRes.body as { token: string }).token;
+}
+
+async function decryptUserSigningKey(
+  cryptoAdapter: NodeCryptoAdapter,
+  user: PrivateUserId,
+  password: string,
+): Promise<CryptoKey> {
+  const subtle = cryptoAdapter.getSubtle();
+  const encrypted = user.userSigningKeyPair.privateKey as {
+    salt: string;
+    iv: string;
+    ciphertext: string;
+    tag: string;
+    iterations?: number;
+  };
+  const salt = Buffer.from(encrypted.salt, "base64");
+  const iv = Buffer.from(encrypted.iv, "base64");
+  const ciphertext = Buffer.from(encrypted.ciphertext, "base64");
+  const tag = Buffer.from(encrypted.tag, "base64");
+  const iterations = encrypted.iterations || 310000;
+
+  const saltStringBytes = new TextEncoder().encode("signing");
+  const combinedSalt = new Uint8Array(salt.length + saltStringBytes.length);
+  combinedSalt.set(salt);
+  combinedSalt.set(saltStringBytes, salt.length);
+
+  const passwordKey = await subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"],
+  );
+  const derivedKey = await subtle.deriveKey(
+    { name: "PBKDF2", salt: combinedSalt, iterations, hash: "SHA-256" },
+    passwordKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"],
+  );
+  const ciphertextWithTag = new Uint8Array(ciphertext.length + tag.length);
+  ciphertextWithTag.set(ciphertext);
+  ciphertextWithTag.set(tag, ciphertext.length);
+  const decrypted = await subtle.decrypt(
+    { name: "AES-GCM", iv, tagLength: 128 },
+    derivedKey,
+    ciphertextWithTag,
+  );
+
+  return subtle.importKey(
+    "pkcs8",
+    decrypted,
+    { name: "Ed25519" },
+    false,
+    ["sign"],
+  );
 }
 
 // ===========================================================================
@@ -664,6 +723,81 @@ describe("System Admin Security", () => {
       );
       expect((body as { tenants: string[] }).tenants).toContain("publish-sysadmin-test");
     }, 60000);
+
+    test("should authenticate the first user from synced directory grants without config users", async () => {
+      const fs = await import("fs");
+      const path = await import("path");
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, cryptoAdapter);
+
+      const result = await localFactory.createTenant({
+        tenantId: "publish-directory-grant-test",
+        adminName: "cn=admin/o=publish-test",
+        adminPassword: "admin-pass",
+        userName: "cn=user1/o=publish-test",
+        userPassword: "user-pass",
+      });
+
+      await result.tenant.publishToServer(setup.baseUrl, {
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        adminUsername: result.adminUser.username,
+      });
+
+      const configPath = path.join(setup.dataDir, "publish-directory-grant-test", "config.json");
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as { users?: unknown[] };
+      expect(config.users ?? []).toHaveLength(0);
+
+      const directoryDb = await result.tenant.openDB("directory", { adminOnlyDb: true });
+      await directoryDb.syncStoreChanges();
+      const remote = await result.tenant.connectToServer(
+        setup.baseUrl,
+        "directory",
+      ) as ClientNetworkContentAddressedStore;
+      const adminSigningKey = await decryptUserSigningKey(
+        cryptoAdapter,
+        result.adminUser,
+        "admin-pass",
+      );
+
+      remote.setSyncAuthOverride({
+        username: result.adminUser.username,
+        signingKey: adminSigningKey,
+      });
+      try {
+        await directoryDb.pushChangesTo(remote);
+      } finally {
+        remote.clearSyncAuthOverride();
+      }
+
+      const challengeRes = await httpRequest(
+        `${setup.baseUrl}/publish-directory-grant-test/auth/challenge`,
+        "POST",
+        { username: result.appUser.username },
+      );
+      expect(challengeRes.status).toBe(200);
+      const challenge = (challengeRes.body as { challenge: string }).challenge;
+      const appSigningKey = await decryptUserSigningKey(
+        cryptoAdapter,
+        result.appUser,
+        "user-pass",
+      );
+      const signature = await signChallenge(cryptoAdapter, appSigningKey, challenge);
+      const authRes = await httpRequest(
+        `${setup.baseUrl}/publish-directory-grant-test/auth/authenticate`,
+        "POST",
+        {
+          challenge,
+          signature: uint8ArrayToBase64(signature),
+        },
+      );
+
+      expect(authRes.status).toBe(200);
+      expect(authRes.body).toMatchObject({
+        success: true,
+        token: expect.any(String),
+      });
+    }, 60000);
   });
 
   // =========================================================================
@@ -720,6 +854,37 @@ describe("System Admin Security", () => {
 
       const tenantsAfter = await admin.listTenants();
       expect(tenantsAfter).not.toContain("wrapper-test");
+    });
+
+    test("should ignore bootstrap app users in config when publicInfosKey is present", async () => {
+      const fs = await import("fs");
+      const path = await import("path");
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+
+      const adminSigningKey = await factory.createSigningKeyPair("pw");
+      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
+      const userSigningKey = await factory.createSigningKeyPair("pw");
+      const userEncryptionKey = await factory.createEncryptionKeyPair("pw");
+
+      await admin.registerTenant("wrapper-publicinfos-test", {
+        adminSigningPublicKey: adminSigningKey.publicKey,
+        adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+        publicInfosKey: "AQ==",
+        users: [{
+          username: "cn=appuser/o=test",
+          signingPublicKey: userSigningKey.publicKey,
+          encryptionPublicKey: userEncryptionKey.publicKey,
+        }],
+      });
+
+      const configPath = path.join(setup.dataDir, "wrapper-publicinfos-test", "config.json");
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as { users?: unknown[] };
+      expect(config.users ?? []).toHaveLength(0);
     });
 
     test("should manage trusted servers", async () => {
@@ -842,6 +1007,7 @@ describe("System Admin Security", () => {
         server,
         httpServer,
         baseUrl,
+        dataDir,
         config,
         adminUser,
         adminSigningKeyPair: undefined as any,
