@@ -14,8 +14,8 @@ import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
  * 
  * Key design decisions tested here:
  * - grantaccess/revokeaccess documents are encrypted with $publicinfos key
- * - username is stored as username_hash (SHA-256) and username_encrypted (RSA)
- * - Only admin can decrypt username_encrypted via their RSA private key
+ * - username is stored as username_hash (SHA-256) and user_details_encrypted
+ * - Tenant users can decrypt user_details_encrypted with the default tenant key
  */
 describe("$publicinfos Key System", () => {
   let factory: BaseMindooTenantFactory;
@@ -119,7 +119,7 @@ describe("$publicinfos Key System", () => {
   });
 
   describe("Document structure", () => {
-    it("grantaccess documents should have username_hash and username_encrypted", async () => {
+    it("grantaccess documents should have username_hash and user_details_encrypted", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
       await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
@@ -162,10 +162,10 @@ describe("$publicinfos Key System", () => {
       expect((data.username_hash as string).length).toBe(64);
       expect(/^[a-f0-9]+$/.test(data.username_hash as string)).toBe(true);
       
-      // Verify username_encrypted exists and is base64 encoded
-      expect(data.username_encrypted).toBeDefined();
-      expect(typeof data.username_encrypted).toBe("string");
-      expect((data.username_encrypted as string).length).toBeGreaterThan(0);
+      // Verify user_details_encrypted exists and is base64 encoded
+      expect(data.user_details_encrypted).toBeDefined();
+      expect(typeof data.user_details_encrypted).toBe("string");
+      expect((data.user_details_encrypted as string).length).toBeGreaterThan(0);
       
       // Verify the old username field does NOT exist
       expect(data.username).toBeUndefined();
@@ -385,7 +385,7 @@ describe("$publicinfos Key System", () => {
       expect(data.members).toBeUndefined();
     }, 60000);
     
-    it("getGroupMembers should return member hashes for lookups", async () => {
+    it("getGroupMembers should return decrypted member names", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
       await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
@@ -412,14 +412,10 @@ describe("$publicinfos Key System", () => {
         adminUserPassword
       );
       
-      // getGroupMembers now returns hashes, not actual usernames
       const returnedMembers = await directory.getGroupMembers(groupName);
       
       expect(returnedMembers.length).toBe(1);
-      // The returned value should be a hash (64 hex chars), not the username
-      expect(returnedMembers[0].length).toBe(64);
-      expect(/^[a-f0-9]+$/.test(returnedMembers[0])).toBe(true);
-      expect(returnedMembers[0]).not.toBe("CN=tester1/O=testtenant");
+      expect(returnedMembers[0]).toBe("CN=tester1/O=testtenant");
     }, 60000);
   });
 });

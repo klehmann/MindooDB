@@ -545,6 +545,19 @@ describe("protocol compatibility", () => {
       if (!u || u.revoked) return null;
       return { signingPublicKey: u.signingKey, encryptionPublicKey: u.encryptionKey };
     }
+    async getUserBySigningPublicKey(publicKey: string) {
+      for (const [username, user] of this.users.entries()) {
+        if (user.signingKey === publicKey) {
+          return {
+            username,
+            signingPublicKey: user.signingKey,
+            encryptionPublicKey: user.encryptionKey,
+            details: { username },
+          };
+        }
+      }
+      return null;
+    }
     async isUserRevoked(username: string): Promise<boolean> {
       return this.users.get(username)?.revoked ?? true;
     }

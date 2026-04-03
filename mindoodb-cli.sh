@@ -156,8 +156,8 @@ esac
 
 DATA_DIR_HOST="$(extract_data_dir_host_path)"
 SELINUX_SUFFIX="$(detect_selinux_suffix)"
-EXTRA_VOLUMES=()
-PASSTHROUGH_ARGS=()
+declare -a EXTRA_VOLUMES=()
+declare -a PASSTHROUGH_ARGS=()
 IDENTITY_INPUT=""
 OUTPUT_INPUT=""
 
@@ -188,7 +188,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-TRANSLATED_ARGS=("${PASSTHROUGH_ARGS[@]}")
+declare -a TRANSLATED_ARGS=()
+if [[ ${#PASSTHROUGH_ARGS[@]} -gt 0 ]]; then
+  TRANSLATED_ARGS+=("${PASSTHROUGH_ARGS[@]}")
+fi
 if [[ -n "$IDENTITY_INPUT" ]]; then
   translate_input_path "$IDENTITY_INPUT"
   TRANSLATED_ARGS+=("--identity" "$IDENTITY_CONTAINER_PATH")
@@ -199,13 +202,25 @@ if [[ -n "$OUTPUT_INPUT" ]]; then
   TRANSLATED_ARGS+=("--output" "$OUTPUT_CONTAINER_PATH")
 fi
 
-TTY_ARGS=()
+declare -a TTY_ARGS=()
 if [[ ! -t 0 ]]; then
   TTY_ARGS+=("-T")
 fi
 
-docker compose run --rm --no-deps "${TTY_ARGS[@]}" "${EXTRA_VOLUMES[@]}" \
-  --entrypoint node \
-  "$SERVICE_NAME" \
-  "$CLI_SCRIPT" \
-  "${TRANSLATED_ARGS[@]}"
+declare -a DOCKER_CMD=(docker compose run --rm --no-deps)
+if [[ ${#TTY_ARGS[@]} -gt 0 ]]; then
+  DOCKER_CMD+=("${TTY_ARGS[@]}")
+fi
+if [[ ${#EXTRA_VOLUMES[@]} -gt 0 ]]; then
+  DOCKER_CMD+=("${EXTRA_VOLUMES[@]}")
+fi
+DOCKER_CMD+=(
+  --entrypoint node
+  "$SERVICE_NAME"
+  "$CLI_SCRIPT"
+)
+if [[ ${#TRANSLATED_ARGS[@]} -gt 0 ]]; then
+  DOCKER_CMD+=("${TRANSLATED_ARGS[@]}")
+fi
+
+"${DOCKER_CMD[@]}"

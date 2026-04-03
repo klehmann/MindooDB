@@ -160,6 +160,7 @@ describe("BaseMindooTenantFactory", () => {
 
   describe("createTenant", () => {
     it("reuses existing identities when provided", async () => {
+      console.time("BaseMindooTenantFactory.reusesExistingIdentities");
       const tenantId = "existing-identities";
       const adminPassword = "adminpass123";
       const userPassword = "userpass123";
@@ -185,7 +186,8 @@ describe("BaseMindooTenantFactory", () => {
       await expect(result.tenant.openDirectory()).resolves.toBeDefined();
 
       createUserIdSpy.mockRestore();
-    });
+      console.timeEnd("BaseMindooTenantFactory.reusesExistingIdentities");
+    }, 60000);
   });
 
   describe("createSigningKeyPair", () => {

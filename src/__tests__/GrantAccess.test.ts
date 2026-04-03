@@ -76,7 +76,8 @@ describe("granting tenant access", () => {
     await directory.registerUser(
       publicRegularUser,
       adminUser.userSigningKeyPair.privateKey,
-      adminUserPassword
+      adminUserPassword,
+      { email: "regularuser@example.com" },
     );
     
     // Get the directory database
@@ -113,11 +114,11 @@ describe("granting tenant access", () => {
     const docData = accessGrantDoc!.doc.getData();
     expect(docData.form).toBe("useroperation");
     expect(docData.type).toBe("grantaccess");
-    // Username is now stored as hash (username_hash) and encrypted (username_encrypted)
+    // Username is now stored as hash plus a tenant-readable encrypted details envelope.
     expect(docData.username_hash).toBeDefined();
     expect(typeof docData.username_hash).toBe("string");
-    expect(docData.username_encrypted).toBeDefined();
-    expect(typeof docData.username_encrypted).toBe("string");
+    expect(docData.user_details_encrypted).toBeDefined();
+    expect(typeof docData.user_details_encrypted).toBe("string");
     expect(docData.userSigningPublicKey).toBe(regularUser.userSigningKeyPair.publicKey);
     expect(docData.userEncryptionPublicKey).toBe(regularUser.userEncryptionKeyPair.publicKey);
     
@@ -135,6 +136,66 @@ describe("granting tenant access", () => {
     console.log(`Found access grant document: ${accessGrantDoc!.doc.getId()}`);
     console.log(`Document created at: ${new Date(accessGrantDoc!.doc.getCreatedAt()).toISOString()}`);
     console.log(`Document last modified at: ${new Date(accessGrantDoc!.doc.getLastModified()).toISOString()}`);
+  });
+
+  it("should resolve tenant-readable user details by signing public key", async () => {
+    const directory = await tenant.openDirectory();
+    const publicRegularUser = factory.toPublicUserId(regularUser);
+
+    await directory.registerUser(
+      publicRegularUser,
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+      { email: "regularuser@example.com" },
+    );
+
+    const userLookup = await directory.getUserBySigningPublicKey(regularUser.userSigningKeyPair.publicKey);
+
+    expect(userLookup).toEqual({
+      username: regularUser.username,
+      signingPublicKey: regularUser.userSigningKeyPair.publicKey,
+      encryptionPublicKey: regularUser.userEncryptionKeyPair.publicKey,
+      details: {
+        username: regularUser.username,
+        email: "regularuser@example.com",
+      },
+    });
+  });
+
+  it("should gracefully handle legacy grant documents without tenant-readable user details", async () => {
+    const directory = await tenant.openDirectory();
+    const directoryDB = await tenant.openDB("directory");
+    const legacyDoc = await directoryDB.createDocumentWithSigningKey(
+      adminUser.userSigningKeyPair,
+      adminUserPassword,
+      PUBLIC_INFOS_KEY_ID,
+    );
+    const legacyUsernameHash = await (directory as unknown as { hashUsername: (username: string) => Promise<string> })
+      .hashUsername(regularUser.username);
+
+    await directoryDB.changeDocWithSigningKey(
+      legacyDoc,
+      async (doc: MindooDoc) => {
+        const data = doc.getData();
+        data.form = "useroperation";
+        data.type = "grantaccess";
+        data.username_hash = legacyUsernameHash;
+        data.username_encrypted = "legacy-admin-only-payload";
+        data.userSigningPublicKey = regularUser.userSigningKeyPair.publicKey;
+        data.userEncryptionPublicKey = regularUser.userEncryptionKeyPair.publicKey;
+      },
+      adminUser.userSigningKeyPair,
+      adminUserPassword,
+    );
+
+    const userLookup = await directory.getUserBySigningPublicKey(regularUser.userSigningKeyPair.publicKey);
+
+    expect(userLookup).toEqual({
+      username: legacyUsernameHash,
+      signingPublicKey: regularUser.userSigningKeyPair.publicKey,
+      encryptionPublicKey: regularUser.userEncryptionKeyPair.publicKey,
+      details: null,
+    });
   });
 });
 

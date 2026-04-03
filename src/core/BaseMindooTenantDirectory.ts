@@ -1,6 +1,18 @@
-import { EncryptedPrivateKey, MindooDB, MindooDoc, MindooTenant, MindooTenantDirectory, ProcessChangesCursor, PublicUserId, SigningKeyPair, PUBLIC_INFOS_KEY_ID } from "./types";
+import {
+  DEFAULT_TENANT_KEY_ID,
+  type DirectoryUserDetails,
+  type DirectoryUserLookup,
+  EncryptedPrivateKey,
+  MindooDB,
+  MindooDoc,
+  MindooTenant,
+  MindooTenantDirectory,
+  ProcessChangesCursor,
+  PublicUserId,
+  SigningKeyPair,
+  PUBLIC_INFOS_KEY_ID,
+} from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
-import { RSAEncryption } from "./crypto/RSAEncryption";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
@@ -14,15 +26,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private trustedKeysCache: Map<string, boolean> = new Map();
   // Mapping from grant document ID to public key (needed for revocation lookups)
   private grantDocIdToPublicKey: Map<string, string> = new Map();
+  // Best-effort reverse lookup cache for public signing key -> user details.
+  // Entries remain available even after revocation so historical UIs can still show identity labels.
+  private userLookupCache: Map<string, DirectoryUserLookup> = new Map();
 
   // Cache for settings documents
   private tenantSettingsCache: MindooDoc | null = null;
   private dbSettingsCache: Map<string, MindooDoc> = new Map();
 
   // Cache for groups: key -> merged group data (key: lowercase groupName)
-  // We store merged data separately to avoid mutating MindooDoc objects
-  // members_hashes are used for lookups, members_encrypted only admin can decrypt
-  private groupsCache: Map<string, { docId: string; members_hashes: string[] }> = new Map();
+  // We store merged data separately to avoid mutating MindooDoc objects.
+  private groupsCache: Map<string, { docId: string; members_hashes: string[]; members_encrypted: string[] }> = new Map();
 
   // Unified cache cursor for all document types
   private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
@@ -54,7 +68,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   async registerUser(
     userId: PublicUserId,
     administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
+    administrationPrivateKeyPassword: string,
+    userDetails?: DirectoryUserDetails,
   ): Promise<void> {
     this.logger.info(`Registering user: ${userId.username}`);
 
@@ -91,10 +106,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
-    // Compute username hash and encrypted username before creating the document
+    // Compute username hash and encrypted user details before creating the document
     // (since the callback to changeDocWithSigningKey cannot be async for automerge reasons)
     const usernameHash = await this.hashUsername(userId.username);
-    const usernameEncrypted = await this.encryptForAdmin(userId.username);
+    const userDetailsEncrypted = await this.encryptUserDetailsForTenant(
+      this.buildUserDetailsPayload(userId.username, userDetails),
+    );
 
     // Add user to directory database
     this.logger.debug(`Creating document for user registration`);
@@ -115,7 +132,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.form = "useroperation";
         data.type = "grantaccess";
         data.username_hash = usernameHash;
-        data.username_encrypted = usernameEncrypted;
+        data.user_details_encrypted = userDetailsEncrypted;
         data.userSigningPublicKey = userId.userSigningPublicKey;
         data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
@@ -206,9 +223,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
-    // Compute username hash and encrypted username before creating documents
+    // Compute username hash and encrypted user details before creating documents
     const usernameHash = await this.hashUsername(username);
-    const usernameEncrypted = await this.encryptForAdmin(username);
+    const userDetailsEncrypted = await this.encryptUserDetailsForTenant(
+      this.buildUserDetailsPayload(username),
+    );
 
     // Create revocation documents for each grant access document found
     for (const grantAccessDoc of grantAccessDocs) {
@@ -228,7 +247,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.form = "useroperation";
         data.type = "revokeaccess";
         data.username_hash = usernameHash;
-        data.username_encrypted = usernameEncrypted;
+        data.user_details_encrypted = userDetailsEncrypted;
         data.revokeDocId = revokeDocId;
         data.requestDataWipe = requestDataWipe;
       }, adminSigningKeyPair, administrationPrivateKeyPassword);
@@ -299,6 +318,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     if (startCursor === null) {
       this.trustedKeysCache.clear();
       this.grantDocIdToPublicKey.clear();
+      this.userLookupCache.clear();
       this.tenantSettingsCache = null;
       this.dbSettingsCache.clear();
       this.groupsCache.clear();
@@ -325,6 +345,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
               }
               // Store mapping for future revocation lookups (persisted across iterations)
               this.grantDocIdToPublicKey.set(doc.getId(), userPublicKey);
+              const userLookup = await this.buildUserLookup(data);
+              if (userLookup) {
+                this.userLookupCache.set(userPublicKey, userLookup);
+              }
       }
       
       // Check if this is a revoke access document
@@ -375,8 +399,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     // Merge group documents with the same name
     for (const [normalizedGroupName, docs] of groupDocsByName.entries()) {
-      // Collect all member hashes from all documents with this group name
+      // Collect all member hashes and encrypted values from all documents with this group name
       const allMembersHashes = new Set<string>();
+      const allMembersEncrypted = new Set<string>();
       let latestDoc: MindooDoc | null = null;
       let isDeleted = false;
       
@@ -388,11 +413,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         if (doc.isDeleted() || data._deleted === true) {
           isDeleted = true;
         }
-        // Use members_hashes for the cache (privacy-preserving lookups)
+        // Use members_hashes for membership lookups.
         if (data.members_hashes && Array.isArray(data.members_hashes)) {
           for (const memberHash of data.members_hashes) {
             if (typeof memberHash === "string") {
               allMembersHashes.add(memberHash);
+            }
+          }
+        }
+        if (data.members_encrypted && Array.isArray(data.members_encrypted)) {
+          for (const encryptedMember of data.members_encrypted) {
+            if (typeof encryptedMember === "string") {
+              allMembersEncrypted.add(encryptedMember);
             }
           }
         }
@@ -409,6 +441,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         this.groupsCache.set(normalizedGroupName, {
           docId: latestDoc.getId(),
           members_hashes: Array.from(allMembersHashes),
+          members_encrypted: Array.from(allMembersEncrypted),
         });
       }
     }
@@ -530,6 +563,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   async getUserPublicKeys(username: string): Promise<{
     signingPublicKey: string;
     encryptionPublicKey: string;
+    details?: DirectoryUserDetails | null;
   } | null> {
     this.logger.debug(`Getting public keys for username: ${username}`);
     
@@ -555,10 +589,19 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }
     
     this.logger.debug(`Found public keys for username: ${username}`);
+    const cachedLookup = this.userLookupCache.get(signingPublicKey);
     return {
       signingPublicKey,
       encryptionPublicKey,
+      details: cachedLookup?.details ?? null,
     };
+  }
+
+  async getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    return this.userLookupCache.get(publicKey) ?? null;
   }
 
   /**
@@ -812,9 +855,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       return [];
     }
     
-    // Return member hashes (actual usernames are encrypted and only admin can decrypt)
-    // This allows checking membership via hash comparison
-    return [...groupData.members_hashes];
+    const members = new Set<string>();
+    for (const encryptedMember of groupData.members_encrypted) {
+      const decryptedMember = await this.decryptGroupMemberForTenant(encryptedMember);
+      if (decryptedMember) {
+        members.add(decryptedMember);
+      }
+    }
+    return Array.from(members);
   }
 
   async addUsersToGroup(
@@ -835,7 +883,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     
     // Compute hashes and encrypted values for all new usernames
     const newMembersHashes = await Promise.all(username.map(u => this.hashUsername(u)));
-    const newMembersEncrypted = await Promise.all(username.map(u => this.encryptForAdmin(u)));
+    const newMembersEncrypted = await Promise.all(username.map(u => this.encryptGroupMemberForTenant(u)));
     
     // Get the actual document from the database (using cached docId if available)
     const cachedGroup = this.groupsCache.get(normalizedGroupName);
@@ -1041,19 +1089,92 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       .join('');
   }
 
-  /**
-   * Encrypt plaintext with admin's RSA public encryption key.
-   * Only the admin with the corresponding private key can decrypt.
-   * 
-   * @param plaintext The text to encrypt
-   * @return The base64-encoded encrypted data
-   */
-  private async encryptForAdmin(plaintext: string): Promise<string> {
-    const adminEncKey = this.tenant.getAdministrationEncryptionPublicKey();
-    const rsaEnc = new RSAEncryption(this.tenant.getCryptoAdapter());
+  private buildUserDetailsPayload(
+    username: string,
+    userDetails?: DirectoryUserDetails,
+  ): DirectoryUserDetails {
+    const details: DirectoryUserDetails = { username };
+    if (!userDetails) {
+      return details;
+    }
+
+    for (const [key, value] of Object.entries(userDetails)) {
+      if (key === "username" || typeof value !== "string" || !value.trim()) {
+        continue;
+      }
+      details[key] = value;
+    }
+
+    return details;
+  }
+
+  private async encryptUserDetailsForTenant(userDetails: DirectoryUserDetails): Promise<string> {
     const encoder = new TextEncoder();
-    const encrypted = await rsaEnc.encrypt(encoder.encode(plaintext), adminEncKey);
+    const payload = encoder.encode(JSON.stringify(userDetails));
+    const encrypted = await this.tenant.encryptPayload(payload, DEFAULT_TENANT_KEY_ID);
     return this.uint8ArrayToBase64(encrypted);
+  }
+
+  private async decryptUserDetailsForTenant(encryptedBase64: string): Promise<DirectoryUserDetails | null> {
+    try {
+      const encrypted = this.base64ToUint8Array(encryptedBase64);
+      const decrypted = await this.tenant.decryptPayload(encrypted, DEFAULT_TENANT_KEY_ID);
+      const decoded = new TextDecoder().decode(decrypted);
+      const parsed = JSON.parse(decoded) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return null;
+      }
+
+      const details: DirectoryUserDetails = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        if (typeof value === "string" && value.trim()) {
+          details[key] = value;
+        }
+      }
+
+      return Object.keys(details).length ? details : null;
+    } catch (error) {
+      this.logger.debug("Could not decrypt tenant-readable user details, treating entry as legacy or inaccessible", error);
+      return null;
+    }
+  }
+
+  private async buildUserLookup(data: Record<string, unknown>): Promise<DirectoryUserLookup | null> {
+    const signingPublicKey = typeof data.userSigningPublicKey === "string" ? data.userSigningPublicKey : null;
+    const encryptionPublicKey = typeof data.userEncryptionPublicKey === "string" ? data.userEncryptionPublicKey : null;
+    if (!signingPublicKey || !encryptionPublicKey) {
+      return null;
+    }
+
+    const encryptedDetails = typeof data.user_details_encrypted === "string" ? data.user_details_encrypted : null;
+    const details = encryptedDetails ? await this.decryptUserDetailsForTenant(encryptedDetails) : null;
+    const username = details?.username
+      ?? (typeof data.username_hash === "string" ? data.username_hash : "");
+
+    return {
+      username,
+      signingPublicKey,
+      encryptionPublicKey,
+      details,
+    };
+  }
+
+  private async encryptGroupMemberForTenant(plaintext: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const encrypted = await this.tenant.encryptPayload(encoder.encode(plaintext), DEFAULT_TENANT_KEY_ID);
+    return this.uint8ArrayToBase64(encrypted);
+  }
+
+  private async decryptGroupMemberForTenant(encryptedBase64: string): Promise<string | null> {
+    try {
+      const encrypted = this.base64ToUint8Array(encryptedBase64);
+      const decrypted = await this.tenant.decryptPayload(encrypted, DEFAULT_TENANT_KEY_ID);
+      const member = new TextDecoder().decode(decrypted).trim();
+      return member || null;
+    } catch (error) {
+      this.logger.debug("Could not decrypt group member entry, skipping unreadable member", error);
+      return null;
+    }
   }
 
   /**
@@ -1065,5 +1186,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       binary += String.fromCharCode(bytes[i]);
     }
     return btoa(binary);
+  }
+
+  private base64ToUint8Array(base64: string): Uint8Array {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
   }
 }

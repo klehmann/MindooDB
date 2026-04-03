@@ -932,6 +932,20 @@ class MockTenantDirectory implements MindooTenantDirectory {
     };
   }
 
+  async getUserBySigningPublicKey(publicKey: string) {
+    for (const [username, user] of this.users.entries()) {
+      if (user.signingKey === publicKey) {
+        return {
+          username,
+          signingPublicKey: user.signingKey,
+          encryptionPublicKey: user.encryptionKey,
+          details: { username },
+        };
+      }
+    }
+    return null;
+  }
+
   async isUserRevoked(username: string): Promise<boolean> {
     const user = this.users.get(username);
     if (!user) {

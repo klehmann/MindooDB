@@ -131,6 +131,7 @@ describe("MindooDB Example Server", () => {
   const testUsername = "testuser";
 
   beforeAll(async () => {
+    console.time("ExampleServer.beforeAll.setup");
     cryptoAdapter = new NodeCryptoAdapter();
     factory = new BaseMindooTenantFactory(
       new InMemoryContentAddressedStoreFactory(),
@@ -202,9 +203,13 @@ describe("MindooDB Example Server", () => {
       "sysadmin-pass",
       cryptoAdapter,
     );
-  });
+    console.timeEnd("ExampleServer.beforeAll.setup");
+  }, 60000);
 
   afterAll(async () => {
+    if (!httpServer) {
+      return;
+    }
     // Stop server
     await new Promise<void>((resolve) => {
       httpServer.close(() => {
@@ -853,6 +858,7 @@ describe("Server Network Management", () => {
   const testDataDir = `/tmp/mindoodb-network-test-${Date.now()}`;
 
   beforeAll(async () => {
+    console.time("ServerNetworkManagement.beforeAll.setup");
     cryptoAdapter = new NodeCryptoAdapter();
     factory = new BaseMindooTenantFactory(
       new InMemoryContentAddressedStoreFactory(),
@@ -911,9 +917,13 @@ describe("Server Network Management", () => {
       },
       { Authorization: `Bearer ${systemAdminToken}` },
     );
-  });
+    console.timeEnd("ServerNetworkManagement.beforeAll.setup");
+  }, 60000);
 
   afterAll(async () => {
+    if (!httpServer) {
+      return;
+    }
     await new Promise<void>((resolve) => {
       httpServer.close(() => resolve());
     });

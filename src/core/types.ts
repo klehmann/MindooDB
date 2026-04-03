@@ -947,6 +947,17 @@ export interface MindooDocPayload {
   [key: string]: unknown;
 }
 
+export interface DirectoryUserDetails {
+  [key: string]: string;
+}
+
+export interface DirectoryUserLookup {
+  username: string;
+  signingPublicKey: string;
+  encryptionPublicKey: string;
+  details: DirectoryUserDetails | null;
+}
+
 export interface MindooTenantDirectory {
 
   /**
@@ -959,7 +970,8 @@ export interface MindooTenantDirectory {
    * @return A promise that resolves when the user is registered
    */
   registerUser(userId: PublicUserId, administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
+    administrationPrivateKeyPassword: string,
+    userDetails?: DirectoryUserDetails,
   ): Promise<void>;
 
   /**
@@ -996,7 +1008,17 @@ export interface MindooTenantDirectory {
   getUserPublicKeys(username: string): Promise<{
     signingPublicKey: string;
     encryptionPublicKey: string;
+    details?: DirectoryUserDetails | null;
   } | null>;
+
+  /**
+   * Look up a user by their public signing key.
+   * This is useful for reverse-resolving historical change authors to friendly labels.
+   *
+   * @param publicKey The public signing key to look up (Ed25519, PEM format)
+   * @return The matching user record, or null if no registration is known
+   */
+  getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null>;
 
   /**
    * Check if a user has been revoked.
@@ -1125,6 +1147,11 @@ export interface MindooTenantDirectory {
    * 
    * @param groupName The name of the group to look up (case-insensitive, converted to lowercase)
    * @return The members of the group
+   */
+  /**
+   * Get the decrypted member names for a group.
+   * Entries that cannot be decrypted are skipped so callers can still work with
+   * the readable subset of the group.
    */
   getGroupMembers(groupName: string): Promise<string[]>;
 
