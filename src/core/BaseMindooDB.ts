@@ -18,11 +18,16 @@ import {
   DocumentHistoryResult,
   AttachmentReference,
   AttachmentConfig,
+  DocumentCacheConfig,
+  SnapshotConfig,
   SigningKeyPair,
   EncryptedPrivateKey,
   PerformanceCallback,
   SyncOptions,
   SyncResult,
+  DocumentHistoryPageEntry,
+  DocumentHistoryPageOptions,
+  DocumentHistoryPageResult,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import type {
@@ -49,8 +54,10 @@ import type { CacheManager } from "./cache/CacheManager";
  * Default chunk size for attachments: 256KB
  */
 const DEFAULT_CHUNK_SIZE_BYTES = 256 * 1024;
-const SNAPSHOT_MIN_CHANGES = 100;
-const SNAPSHOT_COOLDOWN_MS = 10 * 60 * 1000;
+const DEFAULT_SNAPSHOT_MIN_CHANGES = 100;
+const DEFAULT_SNAPSHOT_COOLDOWN_MS = 10 * 60 * 1000;
+const DEFAULT_MAX_CACHED_DOCS = 128;
+const DEFAULT_ITERATE_PREFETCH_WINDOW_DOCS = 0;
 
 /**
  * Internal representation of a document with its Automerge state
@@ -102,6 +109,11 @@ export class BaseMindooDB implements MindooDB {
   
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
+  private readonly maxCachedDocs: number;
+  private readonly iteratePrefetchWindowDocs: number;
+  private readonly cacheRestoreLimit: number;
+  private readonly snapshotMinChanges: number;
+  private readonly snapshotCooldownMs: number;
   
   // Track which entry IDs we've already processed
   private processedEntryIds: string[] = [];
@@ -128,6 +140,8 @@ export class BaseMindooDB implements MindooDB {
     store: ContentAddressedStore, 
     attachmentStore?: ContentAddressedStore,
     attachmentConfig?: AttachmentConfig,
+    documentCacheConfig?: DocumentCacheConfig,
+    snapshotConfig?: SnapshotConfig,
     adminOnlyDb: boolean = false,
     logger?: Logger,
     performanceCallback?: PerformanceCallback
@@ -137,6 +151,29 @@ export class BaseMindooDB implements MindooDB {
     this.attachmentStore = attachmentStore;
     this.chunkSizeBytes = attachmentConfig?.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
     this._isAdminOnlyDb = adminOnlyDb;
+    this.maxCachedDocs = Math.max(
+      1,
+      Math.floor(documentCacheConfig?.maxEntries ?? DEFAULT_MAX_CACHED_DOCS)
+    );
+    this.iteratePrefetchWindowDocs = Math.max(
+      0,
+      Math.floor(
+        documentCacheConfig?.iteratePrefetchWindowDocs ??
+          DEFAULT_ITERATE_PREFETCH_WINDOW_DOCS
+      )
+    );
+    this.cacheRestoreLimit = Math.max(
+      1,
+      Math.floor(documentCacheConfig?.restoreLimit ?? this.maxCachedDocs)
+    );
+    this.snapshotMinChanges = Math.max(
+      1,
+      Math.floor(snapshotConfig?.minChanges ?? DEFAULT_SNAPSHOT_MIN_CHANGES)
+    );
+    this.snapshotCooldownMs = Math.max(
+      0,
+      Math.floor(snapshotConfig?.cooldownMs ?? DEFAULT_SNAPSHOT_COOLDOWN_MS)
+    );
     // Create logger if not provided (for backward compatibility)
     this.logger =
       logger ||
@@ -181,12 +218,49 @@ export class BaseMindooDB implements MindooDB {
   clearDirty(): void {
     this.dirtyDocIds.clear();
     this.cacheMetaDirty = false;
+    this.evictCachedDocsIfNeeded();
   }
 
   private markDocDirty(docId: string): void {
     this.dirtyDocIds.add(docId);
     this.cacheMetaDirty = true;
     this.cacheManager?.markDirty();
+  }
+
+  private getCachedDocument(docId: string): InternalDoc | null {
+    const cached = this.docCache.get(docId) ?? null;
+    if (!cached) {
+      return null;
+    }
+    this.touchCachedDocument(docId, cached);
+    return cached;
+  }
+
+  private touchCachedDocument(docId: string, internalDoc: InternalDoc): void {
+    this.docCache.delete(docId);
+    this.docCache.set(docId, internalDoc);
+  }
+
+  private storeCachedDocument(internalDoc: InternalDoc): void {
+    this.touchCachedDocument(internalDoc.id, internalDoc);
+    this.evictCachedDocsIfNeeded(new Set([internalDoc.id]));
+  }
+
+  private evictCachedDocsIfNeeded(protectedDocIds?: Set<string>): void {
+    if (this.docCache.size <= this.maxCachedDocs) {
+      return;
+    }
+
+    for (const [docId] of this.docCache) {
+      if (this.docCache.size <= this.maxCachedDocs) {
+        break;
+      }
+      if (protectedDocIds?.has(docId)) {
+        continue;
+      }
+      this.docCache.delete(docId);
+      this.dirtyDocIds.delete(docId);
+    }
   }
 
   /**
@@ -306,6 +380,9 @@ export class BaseMindooDB implements MindooDB {
       let restoredDocs = 0;
 
       for (const id of docIds) {
+        if (restoredDocs >= this.cacheRestoreLimit) {
+          break;
+        }
         if (!id.startsWith(docPrefix)) continue;
         const docId = id.slice(docPrefix.length);
 
@@ -314,7 +391,7 @@ export class BaseMindooDB implements MindooDB {
 
         try {
           const internal = this.deserializeDoc(docBytes);
-          this.docCache.set(docId, internal);
+          this.storeCachedDocument(internal);
           restoredDocs++;
         } catch (e) {
           this.logger.warn(`Failed to restore cached doc ${docId}, will reload from store: ${e}`);
@@ -435,6 +512,7 @@ export class BaseMindooDB implements MindooDB {
    * @param isDeleted Whether the document is deleted
    */
   private updateIndex(docId: string, lastModified: number, isDeleted: boolean): void {
+    const startedAt = Date.now();
     const assignedSeq = this.nextChangeSeq;
     const newEntry = { docId, changeSeq: assignedSeq, lastModified, isDeleted };
     const existingIndex = this.indexLookup.get(docId);
@@ -486,6 +564,12 @@ export class BaseMindooDB implements MindooDB {
     for (let i = insertIndex; i < this.index.length; i++) {
       this.indexLookup.set(this.index[i].docId, i);
     }
+
+    this.performanceCallback?.onIndexUpdate?.({
+      docId,
+      operation: existingIndex === undefined ? "insert" : "update",
+      time: Date.now() - startedAt,
+    });
   }
 
   /**
@@ -562,6 +646,7 @@ export class BaseMindooDB implements MindooDB {
    * On first call (when processedEntryIds is empty), it will process all entries.
    */
   async syncStoreChanges(): Promise<void> {
+    const syncStartedAt = Date.now();
     this.logger.debug(`Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
     this.logger.debug(`Already processed ${this.processedEntryIds.length} entry IDs`);
     
@@ -571,6 +656,14 @@ export class BaseMindooDB implements MindooDB {
     
     if (newEntryMetadata.length === 0) {
       this.logger.debug(`No new entries to process`);
+      this.performanceCallback?.onSyncOperation?.({
+        operation: "findNewEntries",
+        time: Date.now() - syncStartedAt,
+        details: {
+          newEntryCount: 0,
+          processedEntryCount: this.processedEntryIds.length,
+        },
+      });
       return;
     }
     
@@ -590,11 +683,12 @@ export class BaseMindooDB implements MindooDB {
     
     // Helper function to process a single document
     const processDocument = async (docId: string, entryMetadataList: StoreEntryMetadata[]): Promise<void> => {
+      const processStartedAt = Date.now();
       try {
         this.logger.debug(`===== Processing document ${docId} with ${entryMetadataList.length} new entry(s) in syncStoreChanges =====`);
         
         // Check if document is cached
-        const cachedDoc = this.docCache.get(docId);
+        const cachedDoc = this.getCachedDocument(docId);
         
         let updatedDoc: InternalDoc | null = null;
         
@@ -667,6 +761,16 @@ export class BaseMindooDB implements MindooDB {
         this.logger.error(`===== ERROR processing document ${docId} in syncStoreChanges =====`, error);
         // Re-throw the error so we can see what's happening in the test
         throw error;
+      } finally {
+        this.performanceCallback?.onSyncOperation?.({
+          operation: "processDocument",
+          time: Date.now() - processStartedAt,
+          details: {
+            docId,
+            entryCount: entryMetadataList.length,
+            cacheHit: this.docCache.has(docId),
+          },
+        });
       }
     };
     
@@ -691,6 +795,15 @@ export class BaseMindooDB implements MindooDB {
     this.cacheManager?.markDirty();
     
     this.logger.debug(`Synced ${newEntryMetadata.length} new entries, index now has ${this.index.length} documents`);
+    this.performanceCallback?.onSyncOperation?.({
+      operation: "findNewEntries",
+      time: Date.now() - syncStartedAt,
+      details: {
+        newEntryCount: newEntryMetadata.length,
+        documentCount: entriesByDoc.size,
+        indexSize: this.index.length,
+      },
+    });
   }
 
   private supportsCursorScan(store: ContentAddressedStore): boolean {
@@ -724,8 +837,19 @@ export class BaseMindooDB implements MindooDB {
   }
 
   private async getNewEntryMetadataForSync(): Promise<StoreEntryMetadata[]> {
+    const startedAt = Date.now();
     if (!this.supportsCursorScan(this.store)) {
-      return this.store.findNewEntries(this.processedEntryIds);
+      const result = await this.store.findNewEntries(this.processedEntryIds);
+      this.performanceCallback?.onSyncOperation?.({
+        operation: "findNewEntries",
+        time: Date.now() - startedAt,
+        details: {
+          mode: "knownIds",
+          resultCount: result.length,
+          processedEntryCount: this.processedEntryIds.length,
+        },
+      });
+      return result;
     }
 
     const allNew: StoreEntryMetadata[] = [];
@@ -741,6 +865,15 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.processedEntryCursor = cursor;
+    this.performanceCallback?.onSyncOperation?.({
+      operation: "findNewEntries",
+      time: Date.now() - startedAt,
+      details: {
+        mode: "cursorScan",
+        resultCount: allNew.length,
+        cursor,
+      },
+    });
     return allNew;
   }
 
@@ -1198,7 +1331,7 @@ export class BaseMindooDB implements MindooDB {
     };
     
     // Update cache and index
-    this.docCache.set(docId, internalDoc);
+    this.storeCachedDocument(internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, false);
     this.markDocDirty(docId);
     
@@ -1223,6 +1356,7 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async getDocumentAtTimestamp(docId: string, timestamp: number): Promise<MindooDoc | null> {
+    const startedAt = Date.now();
     this.logger.debug(`Getting document ${docId} at timestamp ${timestamp}`);
     
     // Get all entry metadata for this document
@@ -1234,6 +1368,13 @@ export class BaseMindooDB implements MindooDB {
       .sort((a, b) => a.createdAt - b.createdAt);
     
     if (relevantEntries.length === 0) {
+      this.performanceCallback?.onHistoryOperation?.({
+        operation: "getDocumentAtTimestamp",
+        docId,
+        time: Date.now() - startedAt,
+        scannedEntries: 0,
+        bounded: false,
+      });
       return null; // Document didn't exist at that time
     }
     
@@ -1299,6 +1440,15 @@ export class BaseMindooDB implements MindooDB {
       isDeleted,
     };
     
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "getDocumentAtTimestamp",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: relevantEntries.length,
+      returnedEntries: 1,
+      bounded: false,
+    });
+
     return this.wrapDocument(internalDoc);
   }
 
@@ -1430,6 +1580,57 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  async getDocumentHistoryPage(
+    docId: string,
+    options?: DocumentHistoryPageOptions
+  ): Promise<DocumentHistoryPageResult> {
+    const startedAt = Date.now();
+    const limit = Math.max(1, Math.floor(options?.limit ?? 100));
+    const offset = Math.max(0, Math.floor(options?.cursor?.offset ?? 0));
+
+    // This API stays metadata-only so large history views can page cheaply
+    // without reconstructing every historical Automerge document state.
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    const relevantEntries = allEntryMetadata
+      .filter(
+        (em) =>
+          em.entryType === "doc_create" ||
+          em.entryType === "doc_change" ||
+          em.entryType === "doc_delete"
+      )
+      .sort((a, b) => a.createdAt - b.createdAt);
+
+    // Cursor paging is offset-based because the result is a bounded timeline view
+    // over the doc's sorted change metadata, not a resumable store scan cursor.
+    const slice = relevantEntries.slice(offset, offset + limit);
+    const entries: DocumentHistoryPageEntry[] = slice.map((entry) => ({
+      entryId: entry.id,
+      entryType: entry.entryType,
+      changeCreatedAt: entry.createdAt,
+      changeCreatedByPublicKey: entry.createdByPublicKey,
+      dependencyIds: [...entry.dependencyIds],
+      isDeleted: entry.entryType === "doc_delete",
+    }));
+    const nextOffset = offset + entries.length;
+    const hasMore = nextOffset < relevantEntries.length;
+    const result: DocumentHistoryPageResult = {
+      entries,
+      nextCursor: hasMore ? { offset: nextOffset } : null,
+      hasMore,
+    };
+
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "getDocumentHistoryPage",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: relevantEntries.length,
+      returnedEntries: entries.length,
+      bounded: true,
+    });
+
+    return result;
+  }
+
   async getAllDocumentIds(): Promise<string[]> {
     // Return all non-deleted document IDs from index
     const docIds: string[] = [];
@@ -1540,6 +1741,8 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`Document ${docId} not found or already deleted`);
     }
     
+    const now = Date.now();
+
     // Create deletion change by clearing all fields from the document
     // This ensures Automerge produces actual change bytes
     // The deletion is also tracked via the "doc_delete" type entry in the append-only store
@@ -1550,6 +1753,7 @@ export class BaseMindooDB implements MindooDB {
       }
       // Mark as deleted for clarity
       (doc as Record<string, unknown>)._deleted = true;
+      (doc as Record<string, unknown>)._lastModified = now;
     });
     
     // Get the change bytes from the document
@@ -1597,7 +1801,7 @@ export class BaseMindooDB implements MindooDB {
       contentHash,
       docId,
       dependencyIds,
-      createdAt: Date.now(),
+      createdAt: now,
       createdByPublicKey,
       decryptionKeyId: internalDoc.decryptionKeyId,
       signature,
@@ -1619,8 +1823,8 @@ export class BaseMindooDB implements MindooDB {
 
     // Update cache and index
     internalDoc.isDeleted = true;
-    internalDoc.lastModified = Date.now();
-    this.docCache.set(docId, internalDoc);
+    internalDoc.lastModified = now;
+    this.storeCachedDocument(internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, true);
     this.markDocDirty(docId);
     
@@ -1665,7 +1869,7 @@ export class BaseMindooDB implements MindooDB {
     }
     
     // Get internal document from cache or load it
-    let internalDoc = this.docCache.get(docId);
+    let internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
       this.logger.debug(`Document ${docId} not in cache, loading from store`);
       const loadedDoc = await this.loadDocumentInternal(docId);
@@ -2020,7 +2224,7 @@ export class BaseMindooDB implements MindooDB {
       contentHash,
       docId,
       dependencyIds,
-      createdAt: Date.now(),
+      createdAt: now,
       createdByPublicKey,
       decryptionKeyId: internalDoc.decryptionKeyId,
       signature,
@@ -2042,8 +2246,8 @@ export class BaseMindooDB implements MindooDB {
 
     // Update cache and index
     internalDoc.doc = newDoc;
-    internalDoc.lastModified = Date.now();
-    this.docCache.set(docId, internalDoc);
+    internalDoc.lastModified = now;
+    this.storeCachedDocument(internalDoc);
     this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted);
     this.markDocDirty(docId);
     
@@ -2083,10 +2287,13 @@ export class BaseMindooDB implements MindooDB {
       const latestSnapshot = snapshots[0] || null;
       const latestSnapshotAt = latestSnapshot?.createdAt ?? 0;
       const changesSinceSnapshot = replayEntries.filter((em) => em.createdAt > latestSnapshotAt).length;
-      if (changesSinceSnapshot < SNAPSHOT_MIN_CHANGES) {
+      if (changesSinceSnapshot < this.snapshotMinChanges) {
         return;
       }
-      if (latestSnapshot && Date.now() - latestSnapshot.createdAt < SNAPSHOT_COOLDOWN_MS) {
+      if (
+        latestSnapshot &&
+        Date.now() - latestSnapshot.createdAt < this.snapshotCooldownMs
+      ) {
         return;
       }
 
@@ -2135,9 +2342,58 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  private async prefetchIterationWindow(
+    indexSnapshot: Array<{
+      docId: string;
+      changeSeq: number;
+      lastModified: number;
+      isDeleted: boolean;
+    }>,
+    startIndex: number
+  ): Promise<number> {
+    if (this.iteratePrefetchWindowDocs <= 0) {
+      return 0;
+    }
+
+    const docIds: string[] = [];
+    const seen = new Set<string>();
+    // Only look ahead a bounded number of uncached docs so iteration does not
+    // materialize the entire remaining changefeed tail up front.
+    for (
+      let i = startIndex;
+      i < indexSnapshot.length && docIds.length < this.iteratePrefetchWindowDocs;
+      i++
+    ) {
+      const docId = indexSnapshot[i].docId;
+      if (seen.has(docId) || this.docCache.has(docId)) {
+        continue;
+      }
+      seen.add(docId);
+      docIds.push(docId);
+    }
+
+    if (docIds.length === 0) {
+      return 0;
+    }
+
+    // Prefetch is opportunistic: iteration can still fall back to on-demand
+    // loads, so individual prefetch failures are logged and ignored here.
+    await Promise.all(
+      docIds.map((docId) =>
+        this.loadDocumentInternal(docId).catch((err) => {
+          this.logger.warn(`Failed to prefetch document ${docId}:`, err);
+          return null;
+        })
+      )
+    );
+
+    return docIds.length;
+  }
+
   async *iterateChangesSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
+    const startedAt = Date.now();
     // Default to initial cursor if null is provided.
     // Prefer deterministic sequence-based cursoring; keep legacy fallback compatibility.
     const actualCursor: ProcessChangesCursor = cursor ?? { changeSeq: 0, lastModified: 0, docId: "" };
@@ -2183,74 +2439,74 @@ export class BaseMindooDB implements MindooDB {
       }
     }
 
-    // Pre-check which documents are in cache to optimize iteration
-    const uncachedDocIds: string[] = [];
-    for (let i = startIndex; i < indexSnapshot.length; i++) {
-      const entry = indexSnapshot[i];
-      if (!this.docCache.has(entry.docId)) {
-        uncachedDocIds.push(entry.docId);
-      }
-    }
+    let prefetchedDocuments = await this.prefetchIterationWindow(
+      indexSnapshot,
+      startIndex
+    );
+    let yieldedDocuments = 0;
+    let loadedDocuments = 0;
     
-    // Prefetch uncached documents in batches (if any)
-    if (uncachedDocIds.length > 0) {
-      this.logger.debug(`Prefetching ${uncachedDocIds.length} uncached documents for iteration`);
-      const prefetchBatchSize = 10;
-      for (let i = 0; i < uncachedDocIds.length; i += prefetchBatchSize) {
-        const batch = uncachedDocIds.slice(i, i + prefetchBatchSize);
-        await Promise.all(
-          batch.map(docId => this.loadDocumentInternal(docId).catch(err => {
-            this.logger.warn(`Failed to prefetch document ${docId}:`, err);
-            return null;
-          }))
-        );
-      }
-    }
-    
-    // Iterate through the stable snapshot and yield documents one at a time.
-    // Documents should now be in cache from prefetching
-    for (let i = startIndex; i < indexSnapshot.length; i++) {
-      const entry = indexSnapshot[i];
-      
-      try {
-        this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
+    try {
+      // Iterate through the stable snapshot and yield documents one at a time.
+      for (let i = startIndex; i < indexSnapshot.length; i++) {
+        const entry = indexSnapshot[i];
         
-        // Check cache first (should be there after prefetching)
-        let internalDoc: InternalDoc | null = this.docCache.get(entry.docId) || null;
-        
-        if (!internalDoc) {
-          // Fallback to loading if not in cache (shouldn't happen after prefetching)
-          this.logger.debug(`Document ${entry.docId} not in cache, loading from store`);
-          internalDoc = await this.loadDocumentInternal(entry.docId);
+        try {
+          this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
+          
+          let internalDoc: InternalDoc | null = this.getCachedDocument(entry.docId);
+          
+          if (!internalDoc) {
+            this.logger.debug(`Document ${entry.docId} not in cache, loading from store`);
+            internalDoc = await this.loadDocumentInternal(entry.docId);
+            if (internalDoc) {
+              loadedDocuments++;
+            }
+          }
+
+          if (!internalDoc) {
+            this.logger.warn(`Document ${entry.docId} not found, skipping`);
+            continue;
+          }
+          
+          // Wrap the document (works for both deleted and non-deleted documents)
+          const doc = this.wrapDocument(internalDoc);
+          this.logger.debug(`Successfully loaded document ${entry.docId} (isDeleted: ${doc.isDeleted()})`);
+          
+          // Create cursor for current document
+          const currentCursor: ProcessChangesCursor = {
+            changeSeq: entry.changeSeq,
+            lastModified: entry.lastModified,
+            docId: entry.docId,
+          };
+          
+          // Yield immediately - this allows the caller to break early after each document
+          // Deleted documents are included so external indexes can handle deletions
+          yieldedDocuments++;
+          yield { doc, cursor: currentCursor };
+          prefetchedDocuments += await this.prefetchIterationWindow(
+            indexSnapshot,
+            i + 1
+          );
+        } catch (error) {
+          this.logger.error(`Error processing document ${entry.docId}:`, error);
+          // Stop processing on error
+          throw error;
         }
-        
-        if (!internalDoc) {
-          this.logger.warn(`Document ${entry.docId} not found, skipping`);
-          continue;
-        }
-        
-        // Wrap the document (works for both deleted and non-deleted documents)
-        const doc = this.wrapDocument(internalDoc);
-        this.logger.debug(`Successfully loaded document ${entry.docId} (isDeleted: ${doc.isDeleted()})`);
-        
-        // Create cursor for current document
-        const currentCursor: ProcessChangesCursor = {
-          changeSeq: entry.changeSeq,
-          lastModified: entry.lastModified,
-          docId: entry.docId,
-        };
-        
-        // Yield immediately - this allows the caller to break early after each document
-        // Deleted documents are included so external indexes can handle deletions
-        yield { doc, cursor: currentCursor };
-      } catch (error) {
-        this.logger.error(`Error processing document ${entry.docId}:`, error);
-        // Stop processing on error
-        throw error;
       }
+    } finally {
+      this.logger.debug(`Iteration completed`);
+      this.performanceCallback?.onSyncOperation?.({
+        operation: "iterateChangesSince",
+        time: Date.now() - startedAt,
+        details: {
+          yieldedDocuments,
+          prefetchedDocuments,
+          loadedDocuments,
+          startIndex,
+        },
+      });
     }
-    
-    this.logger.debug(`Iteration completed`);
   }
 
   /**
@@ -2425,7 +2681,7 @@ export class BaseMindooDB implements MindooDB {
     };
     
     // Update cache
-    this.docCache.set(docId, updatedInternalDoc);
+    this.storeCachedDocument(updatedInternalDoc);
     this.markDocDirty(docId);
     
     return updatedInternalDoc;
@@ -2435,22 +2691,61 @@ export class BaseMindooDB implements MindooDB {
    * Internal method to load a document from the content-addressed store
    */
   private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
+    const startedAt = Date.now();
+    const cacheCheckStartedAt = Date.now();
     // Check cache first
     if (this.docCache.has(docId)) {
       this.logger.debug(`Document ${docId} found in cache, returning cached version`);
-      return this.docCache.get(docId)!;
+      const cached = this.getCachedDocument(docId)!;
+      this.performanceCallback?.onDocumentLoad?.({
+        docId,
+        cacheHit: true,
+        metadataEntriesScanned: 0,
+        replayEntriesLoaded: 0,
+        snapshotUsed: false,
+        cacheCheckTime: Date.now() - cacheCheckStartedAt,
+        storeQueryTime: 0,
+        entryLoadTime: 0,
+        signatureVerificationTime: 0,
+        decryptionTime: 0,
+        automergeTime: 0,
+        totalTime: Date.now() - startedAt,
+      });
+      return cached;
     }
     
     this.logger.debug(`===== Starting to load document ${docId} from store =====`);
+    const cacheCheckTime = Date.now() - cacheCheckStartedAt;
+    let storeQueryTime = 0;
+    let entryLoadTime = 0;
+    let signatureVerificationTime = 0;
+    let decryptionTime = 0;
+    let automergeTime = 0;
     
     // Get all entry metadata for this document
     // TODO: Implement loading from last snapshot if available
     this.logger.debug(`Getting all entry hashes for document ${docId}`);
+    const storeQueryStartedAt = Date.now();
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    storeQueryTime += Date.now() - storeQueryStartedAt;
     this.logger.debug(`Found ${allEntryMetadata.length} total entry hashes for document ${docId}`);
     
     if (allEntryMetadata.length === 0) {
       this.logger.debug(`No entry hashes found for document ${docId}, returning null`);
+      this.performanceCallback?.onDocumentLoad?.({
+        docId,
+        cacheHit: false,
+        metadataEntriesScanned: 0,
+        replayEntriesLoaded: 0,
+        snapshotUsed: false,
+        cacheCheckTime,
+        storeQueryTime,
+        entryLoadTime,
+        signatureVerificationTime,
+        decryptionTime,
+        automergeTime,
+        totalTime: Date.now() - startedAt,
+      });
       return null;
     }
     
@@ -2459,7 +2754,20 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Entry types for ${docId}: ${entryTypes}`);
     
     const metadataById = new Map(allEntryMetadata.map((meta) => [meta.id, meta]));
+    const planStartedAt = Date.now();
     const materializationPlan = await this.store.planDocumentMaterialization(docId, { includeDiagnostics: true });
+    const planTime = Date.now() - planStartedAt;
+    this.performanceCallback?.onSyncOperation?.({
+      operation: "planDocumentMaterialization",
+      time: planTime,
+      details: {
+        docId,
+        metadataEntriesScanned: allEntryMetadata.length,
+        replayEntriesLoaded: materializationPlan.entryIdsToApply.length,
+        snapshotEntryId: materializationPlan.snapshotEntryId,
+        diagnostics: materializationPlan.diagnostics,
+      },
+    });
     let startFromSnapshot = materializationPlan.snapshotEntryId !== null;
     const snapshotMeta = materializationPlan.snapshotEntryId
       ? (metadataById.get(materializationPlan.snapshotEntryId) || null)
@@ -2484,7 +2792,9 @@ export class BaseMindooDB implements MindooDB {
     let doc: AutomergeTypes.Doc<MindooDocPayload> | undefined = undefined;
     if (startFromSnapshot && snapshotMeta) {
       this.logger.debug(`Loading snapshot for document ${docId}`);
+      const snapshotLoadStartedAt = Date.now();
       const snapshotEntries = await this.store.getEntries([snapshotMeta.id]);
+      entryLoadTime += Date.now() - snapshotLoadStartedAt;
       this.logger.debug(`Retrieved ${snapshotEntries.length} snapshot entry(s) from store`);
       if (snapshotEntries.length > 0) {
         const snapshotData = snapshotEntries[0];
@@ -2496,11 +2806,13 @@ export class BaseMindooDB implements MindooDB {
         } else {
           // Verify signature against the encrypted snapshot (no decryption needed)
           // We sign the encrypted payload, so anyone can verify signatures without decryption keys
+          const signatureStartedAt = Date.now();
           isValid = await this.tenant.verifySignature(
             snapshotData.encryptedData,
             snapshotData.signature,
             snapshotData.createdByPublicKey
           );
+          signatureVerificationTime += Date.now() - signatureStartedAt;
         }
         if (!isValid) {
           this.logger.warn(`Invalid signature for snapshot ${snapshotData.id}, falling back to loading from scratch`);
@@ -2509,17 +2821,21 @@ export class BaseMindooDB implements MindooDB {
         } else {
           this.logger.debug(`Snapshot signature valid, decrypting snapshot`);
           // Decrypt snapshot (only after signature verification passes)
+          const decryptStartedAt = Date.now();
           const decryptedSnapshot = await this.tenant.decryptPayload(
             snapshotData.encryptedData,
             snapshotData.decryptionKeyId
           );
+          decryptionTime += Date.now() - decryptStartedAt;
           this.logger.debug(`Decrypted snapshot (${snapshotData.encryptedData.length} -> ${decryptedSnapshot.length} bytes)`);
           
           // Load snapshot using Automerge.load()
           // This deserializes a full document snapshot from binary data
           // According to Automerge docs: load() is equivalent to init() followed by loadIncremental()
           this.logger.debug(`Loading snapshot into Automerge document`);
+          const automergeStartedAt = Date.now();
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
+          automergeTime += Date.now() - automergeStartedAt;
           this.logger.debug(`Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
           
           // Register the snapshot's automerge hash -> entry ID mapping
@@ -2540,7 +2856,9 @@ export class BaseMindooDB implements MindooDB {
     
     // Load and apply all entries
     this.logger.debug(`Fetching ${entriesToLoad.length} entries from store for document ${docId}`);
+    const entryLoadStartedAt = Date.now();
     const entries = await this.store.getEntries(entriesToLoad.map(em => em.id));
+    entryLoadTime += Date.now() - entryLoadStartedAt;
     this.logger.debug(`Retrieved ${entries.length} entries from store for document ${docId}`);
     this.logger.debug(`Loading document ${docId}: found ${entries.length} entries to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);
     
@@ -2587,6 +2905,7 @@ export class BaseMindooDB implements MindooDB {
       }
 
       // Verify all signatures in parallel using cached keys
+      const signatureStartedAt = Date.now();
       const signatureVerificationResults = await Promise.all(
         validEntries.map(async (entryData) => {
           const cryptoKey = keyMap.get(entryData.createdByPublicKey);
@@ -2603,6 +2922,7 @@ export class BaseMindooDB implements MindooDB {
           return { entryData, isValid };
         })
       );
+      signatureVerificationTime += Date.now() - signatureStartedAt;
       
       // Filter out entries with invalid signatures
       const verifiedEntries = signatureVerificationResults
@@ -2620,6 +2940,7 @@ export class BaseMindooDB implements MindooDB {
         // Parallel decryption - decrypt all entries concurrently
         // Automerge handles dependency buffering internally, so we can decrypt all in parallel
         this.logger.debug(`Decrypting ${verifiedEntries.length} entries in parallel`);
+        const decryptionStartedAt = Date.now();
         const decryptionResults = await Promise.all(
           verifiedEntries.map(async (entryData) => {
             const decryptedPayload = await this.tenant.decryptPayload(
@@ -2629,6 +2950,7 @@ export class BaseMindooDB implements MindooDB {
             return { entryData, decryptedPayload };
           })
         );
+        decryptionTime += Date.now() - decryptionStartedAt;
         
         // Collect change bytes and register automerge hash mappings
         const changeBytes: Uint8Array[] = [];
@@ -2646,8 +2968,10 @@ export class BaseMindooDB implements MindooDB {
         if (changeBytes.length > 0) {
           this.logger.debug(`Applying ${changeBytes.length} changes to document ${docId} using batch applyChanges`);
           try {
+            const automergeStartedAt = Date.now();
             const result = Automerge.applyChanges<MindooDocPayload>(doc!, changeBytes);
             doc = result[0] as AutomergeTypes.Doc<MindooDocPayload>;
+            automergeTime += Date.now() - automergeStartedAt;
             this.logger.debug(`Successfully applied ${changeBytes.length} changes to document ${docId}`);
             this.logger.debug(`Document state after applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
           } catch (error) {
@@ -2693,9 +3017,23 @@ export class BaseMindooDB implements MindooDB {
     };
     
     // Update cache
-    this.docCache.set(docId, internalDoc);
+    this.storeCachedDocument(internalDoc);
     this.markDocDirty(docId);
     this.logger.debug(`===== Successfully loaded document ${docId} and cached it =====`);
+    this.performanceCallback?.onDocumentLoad?.({
+      docId,
+      cacheHit: false,
+      metadataEntriesScanned: allEntryMetadata.length,
+      replayEntriesLoaded: entriesToLoad.length,
+      snapshotUsed: startFromSnapshot && snapshotMeta !== null,
+      cacheCheckTime,
+      storeQueryTime,
+      entryLoadTime,
+      signatureVerificationTime,
+      decryptionTime,
+      automergeTime,
+      totalTime: Date.now() - startedAt,
+    });
     
     return internalDoc;
   }
@@ -2839,7 +3177,7 @@ export class BaseMindooDB implements MindooDB {
    * Get an attachment reference by ID from a document's _attachments array.
    */
   private getAttachmentRefInternal(docId: string, attachmentId: string): AttachmentReference {
-    const internalDoc = this.docCache.get(docId);
+    const internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
       throw new Error(`Document ${docId} not found in cache`);
     }

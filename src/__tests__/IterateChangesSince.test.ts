@@ -1,6 +1,15 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import { DEFAULT_TENANT_KEY_ID, PrivateUserId, MindooTenant, MindooDB, MindooDoc, ProcessChangesCursor, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import {
+  DEFAULT_TENANT_KEY_ID,
+  PrivateUserId,
+  MindooTenant,
+  MindooDB,
+  MindooDoc,
+  ProcessChangesCursor,
+  PUBLIC_INFOS_KEY_ID,
+  PerformanceCallback,
+} from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -100,15 +109,17 @@ describe("iterateChangesSince", () => {
       // Verify all documents were processed
       expect(processedDocs.length).toBe(numDocs);
       
-      // Verify documents are in correct order (by lastModified, then docId)
+      // Verify documents are in correct deterministic order (by changeSeq, then docId)
       for (let i = 1; i < processedDocs.length; i++) {
         const prev = processedDocs[i - 1];
         const curr = processedDocs[i];
+        const prevChangeSeq = prev.cursor.changeSeq ?? 0;
+        const currChangeSeq = curr.cursor.changeSeq ?? 0;
         
-        if (prev.lastModified === curr.lastModified) {
+        if (prevChangeSeq === currChangeSeq) {
           expect(prev.docId.localeCompare(curr.docId)).toBeLessThanOrEqual(0);
         } else {
-          expect(prev.lastModified).toBeLessThanOrEqual(curr.lastModified);
+          expect(prevChangeSeq).toBeLessThan(currChangeSeq);
         }
       }
       
@@ -117,6 +128,7 @@ describe("iterateChangesSince", () => {
         const result = processedDocs[i];
         expect(result.cursor.docId).toBe(result.docId);
         expect(result.cursor.lastModified).toBe(result.lastModified);
+        expect((result.cursor.changeSeq ?? 0)).toBeGreaterThan(0);
       }
     }, 60000);
   });
@@ -166,6 +178,101 @@ describe("iterateChangesSince", () => {
       // Should have processed the remaining documents
       expect(processedCount + resumedCount).toBe(numDocs);
     }, 60000);
+
+    it("does not materialize the entire tail when iteration stops early", async () => {
+      const loadMetrics: Array<{ docId: string; cacheHit: boolean }> = [];
+      const syncMetrics: Array<{
+        operation: string;
+        details?: Record<string, unknown>;
+      }> = [];
+      const performanceCallback: PerformanceCallback = {
+        onDocumentLoad: (metrics) => {
+          loadMetrics.push({ docId: metrics.docId, cacheHit: metrics.cacheHit });
+        },
+        onSyncOperation: (metrics) => {
+          syncMetrics.push(metrics);
+        },
+      };
+      const db = await tenant.openDB("test-db-no-tail-prefetch", {
+        documentCacheConfig: {
+          maxEntries: 8,
+          iteratePrefetchWindowDocs: 0,
+        },
+        performanceCallback,
+      });
+
+      const numDocs = 120;
+      for (let i = 0; i < numDocs; i++) {
+        const doc = await db.createDocument();
+        await db.changeDoc(doc, (d) => {
+          d.getData().index = i;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+
+      await db.syncStoreChanges();
+      loadMetrics.length = 0;
+      syncMetrics.length = 0;
+
+      let processedCount = 0;
+      for await (const _result of db.iterateChangesSince(null)) {
+        processedCount++;
+        if (processedCount === 5) {
+          break;
+        }
+      }
+
+      expect(processedCount).toBe(5);
+      expect(loadMetrics.filter((metric) => !metric.cacheHit).length).toBeLessThanOrEqual(5);
+
+      const iterationMetric = syncMetrics.find(
+        (metric) => metric.operation === "iterateChangesSince"
+      );
+      expect(iterationMetric).toBeDefined();
+      expect(iterationMetric?.details?.prefetchedDocuments).toBe(0);
+      expect(
+        Number(iterationMetric?.details?.loadedDocuments ?? Number.NaN)
+      ).toBeLessThanOrEqual(5);
+    }, 60000);
+  });
+
+  describe("bounded cache", () => {
+    it("evicts cold documents when the cache budget is exceeded", async () => {
+      const loadMetrics: Array<{ docId: string; cacheHit: boolean }> = [];
+      const db = await tenant.openDB("test-db-bounded-cache", {
+        documentCacheConfig: {
+          maxEntries: 2,
+          iteratePrefetchWindowDocs: 0,
+        },
+        performanceCallback: {
+          onDocumentLoad: (metrics) => {
+            loadMetrics.push({ docId: metrics.docId, cacheHit: metrics.cacheHit });
+          },
+        },
+      });
+
+      const docIds: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const doc = await db.createDocument();
+        docIds.push(doc.getId());
+        await db.changeDoc(doc, (d) => {
+          d.getData().index = i;
+        });
+      }
+
+      await db.syncStoreChanges();
+      loadMetrics.length = 0;
+
+      await db.getDocument(docIds[0]);
+      await db.getDocument(docIds[1]);
+      await db.getDocument(docIds[2]);
+      await db.getDocument(docIds[0]);
+
+      const doc0Misses = loadMetrics.filter(
+        (metric) => metric.docId === docIds[0] && !metric.cacheHit
+      );
+      expect(doc0Misses).toHaveLength(2);
+    });
   });
 
   describe("deleted documents", () => {

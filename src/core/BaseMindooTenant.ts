@@ -563,7 +563,14 @@ export class BaseMindooTenant implements MindooTenant {
     }
 
     // Extract store options and DB-specific options
-    const { adminOnlyDb, attachmentConfig, ...storeOptions } = effectiveOptions;
+    const {
+      adminOnlyDb,
+      attachmentConfig,
+      documentCacheConfig,
+      snapshotConfig,
+      performanceCallback,
+      ...storeOptions
+    } = effectiveOptions;
     
     // Create the database stores using the factory
     const { docStore, attachmentStore } = this.storeFactory.createStore(id, storeOptions);
@@ -574,8 +581,11 @@ export class BaseMindooTenant implements MindooTenant {
       docStore, 
       attachmentStore, 
       attachmentConfig,
+      documentCacheConfig,
+      snapshotConfig,
       adminOnlyDb ?? false,
-      dbLogger
+      dbLogger,
+      performanceCallback
     );
     if (this.cacheManager) {
       db.setCacheManager(this.cacheManager);

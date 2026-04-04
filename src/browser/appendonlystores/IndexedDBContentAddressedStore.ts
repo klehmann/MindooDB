@@ -639,10 +639,22 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
+    const keys: string[] = [];
 
-    const keys = await reqToPromise(entriesOS.getAllKeys());
-    this.logger.debug(`Returning ${keys.length} entry IDs`);
-    return keys as string[];
+    return new Promise<string[]>((resolve, reject) => {
+      const cursorReq = entriesOS.openKeyCursor();
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (!cursor) {
+          this.logger.debug(`Returning ${keys.length} entry IDs`);
+          resolve(keys);
+          return;
+        }
+        keys.push(String(cursor.primaryKey));
+        cursor.continue();
+      };
+      cursorReq.onerror = () => reject(cursorReq.error);
+    });
   }
 
   async scanEntriesSince(
@@ -746,7 +758,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     docId: string,
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationPlan> {
-    const entries = await this.findNewEntriesForDoc([], docId);
+    const entries = await this.readEntriesForDoc(docId);
     return computeDocumentMaterializationPlan(docId, entries, options);
   }
 
@@ -754,10 +766,19 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     docIds: string[],
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationBatchPlan> {
-    const db = await this.ensureOpen();
-    const tx = db.transaction(ENTRIES_STORE, "readonly");
-    const entriesOS = tx.objectStore(ENTRIES_STORE);
-    const all = (await reqToPromise(entriesOS.getAll())) as StoreEntryMetadata[];
+    const all: StoreEntryMetadata[] = [];
+    // Batch doc-scoped index reads so browser planning stays proportional to
+    // the requested documents instead of loading the entire entries store.
+    const concurrency = 16;
+    for (let offset = 0; offset < docIds.length; offset += concurrency) {
+      const batch = docIds.slice(offset, offset + concurrency);
+      const batchResults = await Promise.all(
+        batch.map((docId) => this.readEntriesForDoc(docId))
+      );
+      for (const entries of batchResults) {
+        all.push(...entries);
+      }
+    }
     return computeBatchMaterializationPlan(all, docIds, options);
   }
 
@@ -962,5 +983,29 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       return false;
     }
     return true;
+  }
+
+  private async readEntriesForDoc(docId: string): Promise<StoreEntryMetadata[]> {
+    const db = await this.ensureOpen();
+    const tx = db.transaction(ENTRIES_STORE, "readonly");
+    const entriesOS = tx.objectStore(ENTRIES_STORE);
+    const index = entriesOS.index(IDX_DOC_ID);
+    const entries: StoreEntryMetadata[] = [];
+
+    // Stream one document's metadata through the docId index so callers can
+    // plan or hydrate per-doc state without a whole-store metadata read.
+    return new Promise<StoreEntryMetadata[]>((resolve, reject) => {
+      const cursorReq = index.openCursor(IDBKeyRange.only(docId));
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (!cursor) {
+          resolve(entries);
+          return;
+        }
+        entries.push(cursor.value as StoreEntryMetadata);
+        cursor.continue();
+      };
+      cursorReq.onerror = () => reject(cursorReq.error);
+    });
   }
 }

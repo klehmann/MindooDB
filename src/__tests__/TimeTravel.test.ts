@@ -189,8 +189,11 @@ describe("TimeTravel", () => {
       // Verify independence - they are different objects
       expect(versions[0]).not.toBe(versions[1]);
       // Verify they have different data values
-      const firstValue = versions[versions.length - 2].getData().value;
-      const secondValue = versions[versions.length - 1].getData().value;
+      const values = versions
+        .map((version) => version.getData().value)
+        .filter((value): value is number => typeof value === "number");
+      const firstValue = values[values.length - 2];
+      const secondValue = values[values.length - 1];
       expect(firstValue).toBe(1);
       expect(secondValue).toBe(2);
       expect(firstValue).not.toBe(secondValue);
@@ -244,13 +247,40 @@ describe("TimeTravel", () => {
         history.push(histDoc);
       }
       
-      // Should have at least create + one change + delete entry
+      // History should include create, active state before deletion, and deleted state.
       expect(history.length).toBeGreaterThanOrEqual(3);
       // Last entry should be the deleted state
       expect(history[history.length - 1].isDeleted()).toBe(true);
       // Second to last should be the active state before deletion
       expect(history[history.length - 2].getData().status).toBe("active");
       expect(history[history.length - 2].isDeleted()).toBe(false);
+    });
+
+    it("should page history metadata without materializing every version", async () => {
+      const doc = await db.createDocument();
+      const docId = doc.getId();
+
+      for (let i = 1; i <= 5; i++) {
+        await db.changeDoc(doc, (d) => {
+          d.getData().version = i;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      const page1 = await db.getDocumentHistoryPage(docId, { limit: 3 });
+      expect(page1.entries).toHaveLength(3);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.entries[0].entryType).toBe("doc_create");
+      expect(page1.entries[1].entryType).toBe("doc_change");
+
+      const page2 = await db.getDocumentHistoryPage(docId, {
+        cursor: page1.nextCursor,
+        limit: 3,
+      });
+      expect(page2.entries.length).toBeGreaterThanOrEqual(3);
+      expect(page2.entries[0].changeCreatedAt).toBeGreaterThanOrEqual(
+        page1.entries[2].changeCreatedAt
+      );
     });
   });
 

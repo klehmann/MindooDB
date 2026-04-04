@@ -1002,4 +1002,85 @@ test.describe("IndexedDBContentAddressedStore", () => {
     expect(result.entriesCount).toBe(2);
     expect(result.ids).toEqual(["id1", "id2"]);
   });
+
+  test("should avoid whole-store getAll reads for batch materialization planning", async ({
+    page,
+  }) => {
+    await page.goto(server.context.testPageUrl);
+
+    const result = await page.evaluate(
+      async ({ browserBundleUrl }) => {
+        function createTestEntry(
+          docId: string,
+          id: string,
+          contentHash: string,
+          dependencyIds: string[] = [],
+          entryType = "doc_change",
+          createdAt = Date.now()
+        ) {
+          const encryptedData = new Uint8Array([10, 20, 30, 40, 50]);
+          return {
+            entryType,
+            id,
+            contentHash,
+            docId,
+            dependencyIds,
+            createdAt,
+            createdByPublicKey: "test-public-key",
+            decryptionKeyId: "default",
+            signature: new Uint8Array([1, 2, 3, 4]),
+            originalSize: 4,
+            encryptedSize: encryptedData.length,
+            encryptedData,
+          };
+        }
+
+        const bundle = await import(browserBundleUrl);
+        const { IndexedDBContentAddressedStore } = bundle.browserModule;
+        const prefix = "test-plan-batch-" + Date.now();
+        const store = new IndexedDBContentAddressedStore("plan-batch-db", undefined, {
+          basePath: prefix,
+        });
+        const originalGetAll = IDBObjectStore.prototype.getAll;
+        let getAllCalls = 0;
+        // Count whole-store metadata reads on the entries store so this test
+        // fails if batch planning regresses back to entriesOS.getAll().
+        IDBObjectStore.prototype.getAll = function (...args) {
+          if (this.name === "entries") {
+            getAllCalls++;
+          }
+          return originalGetAll.apply(this, args);
+        };
+
+        try {
+          const now = Date.now();
+          await store.putEntries([
+            createTestEntry("doc-a", "doc-a-create", "hash-a-1", [], "doc_create", now),
+            createTestEntry("doc-a", "doc-a-change", "hash-a-2", ["doc-a-create"], "doc_change", now + 1),
+            createTestEntry("doc-b", "doc-b-create", "hash-b-1", [], "doc_create", now + 2),
+            createTestEntry("doc-b", "doc-b-change", "hash-b-2", ["doc-b-create"], "doc_change", now + 3),
+            createTestEntry("doc-c", "doc-c-create", "hash-c-1", [], "doc_create", now + 4),
+            createTestEntry("doc-c", "doc-c-change", "hash-c-2", ["doc-c-create"], "doc_change", now + 5),
+          ]);
+
+          const plan = await store.planDocumentMaterializationBatch(
+            ["doc-a", "doc-b"],
+            { includeDiagnostics: true }
+          );
+
+          return {
+            getAllCalls,
+            plannedDocs: plan.plans.map((entry: { docId: string }) => entry.docId).sort(),
+          };
+        } finally {
+          IDBObjectStore.prototype.getAll = originalGetAll;
+          await store.clearAllLocalData();
+        }
+      },
+      { browserBundleUrl: server.context.browserBundleUrl }
+    );
+
+    expect(result.getAllCalls).toBe(0);
+    expect(result.plannedDocs).toEqual(["doc-a", "doc-b"]);
+  });
 });

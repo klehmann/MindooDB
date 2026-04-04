@@ -761,6 +761,51 @@ export interface AttachmentConfig {
 }
 
 /**
+ * Configuration for the in-memory document cache.
+ */
+export interface DocumentCacheConfig {
+  /**
+   * Maximum number of fully materialized documents kept in memory at once.
+   * Dirty documents remain pinned until cache state has been flushed.
+   * Default: 128
+   */
+  maxEntries?: number;
+
+  /**
+   * Number of upcoming documents to prefetch during changefeed iteration.
+   * Set to 0 to disable eager iteration prefetch.
+   * Default: 0
+   */
+  iteratePrefetchWindowDocs?: number;
+
+  /**
+   * Maximum number of documents restored from the local cache store during
+   * startup.  Prevents large cache checkpoints from rehydrating every
+   * document into memory immediately.
+   * Default: same as `maxEntries`
+   */
+  restoreLimit?: number;
+}
+
+/**
+ * Configuration for automatic snapshot creation.
+ */
+export interface SnapshotConfig {
+  /**
+   * Minimum number of replay entries since the latest snapshot before a new
+   * snapshot is considered.
+   * Default: 100
+   */
+  minChanges?: number;
+
+  /**
+   * Minimum time between snapshot writes for the same document.
+   * Default: 10 minutes
+   */
+  cooldownMs?: number;
+}
+
+/**
  * A MindooDoc is a document that is stored in the MindooDB.
  * It's a wrapper around the Automerge document.
  */
@@ -1288,6 +1333,21 @@ export interface OpenDBOptions extends OpenStoreOptions {
    * If not provided, defaults are used.
    */
   attachmentConfig?: AttachmentConfig;
+
+  /**
+   * Configuration for the in-memory materialized document cache.
+   */
+  documentCacheConfig?: DocumentCacheConfig;
+
+  /**
+   * Configuration for automatic snapshot creation.
+   */
+  snapshotConfig?: SnapshotConfig;
+
+  /**
+   * Optional performance callback for profiling hot paths.
+   */
+  performanceCallback?: PerformanceCallback;
 }
 
 /**
@@ -1301,6 +1361,9 @@ export interface PerformanceCallback {
   onDocumentLoad?: (metrics: {
     docId: string;
     cacheHit: boolean;
+    metadataEntriesScanned: number;
+    replayEntriesLoaded: number;
+    snapshotUsed: boolean;
     cacheCheckTime: number;
     storeQueryTime: number;
     entryLoadTime: number;
@@ -1323,10 +1386,65 @@ export interface PerformanceCallback {
    * Called during sync operations.
    */
   onSyncOperation?: (metrics: {
-    operation: 'findNewEntries' | 'processDocument' | 'updateIndex';
+    operation:
+      | 'findNewEntries'
+      | 'processDocument'
+      | 'updateIndex'
+      | 'iterateChangesSince'
+      | 'planDocumentMaterialization'
+      | 'planDocumentMaterializationBatch'
+      | 'bloomRebuild';
     time: number;
     details?: Record<string, any>;
   }) => void;
+
+  /**
+   * Called for bounded history/time-travel workflows.
+   */
+  onHistoryOperation?: (metrics: {
+    operation: 'getDocumentAtTimestamp' | 'getDocumentHistoryPage';
+    docId: string;
+    time: number;
+    scannedEntries: number;
+    returnedEntries?: number;
+    bounded?: boolean;
+  }) => void;
+}
+
+/**
+ * Cursor for paged history metadata access.
+ */
+export interface DocumentHistoryPageCursor {
+  offset: number;
+}
+
+/**
+ * One history entry in a bounded history page.
+ */
+export interface DocumentHistoryPageEntry {
+  entryId: string;
+  entryType: StoreEntryType;
+  changeCreatedAt: number;
+  changeCreatedByPublicKey: string;
+  dependencyIds: string[];
+  isDeleted: boolean;
+}
+
+/**
+ * Options for bounded history metadata access.
+ */
+export interface DocumentHistoryPageOptions {
+  cursor?: DocumentHistoryPageCursor | null;
+  limit?: number;
+}
+
+/**
+ * Page result for bounded history metadata access.
+ */
+export interface DocumentHistoryPageResult {
+  entries: DocumentHistoryPageEntry[];
+  nextCursor: DocumentHistoryPageCursor | null;
+  hasMore: boolean;
 }
 
 /**
@@ -1493,6 +1611,18 @@ export interface MindooDB {
    * @return An async generator that yields DocumentHistoryResult objects containing the document state and change metadata, in chronological order from oldest to newest
    */
   iterateDocumentHistory(docId: string): AsyncGenerator<DocumentHistoryResult, void, unknown>;
+
+  /**
+   * Return bounded history metadata for a document without materializing every
+   * historical document state.
+   *
+   * This is intended for scalable history UIs where the caller wants a paged
+   * timeline first, and only materializes specific snapshots on demand.
+   */
+  getDocumentHistoryPage(
+    docId: string,
+    options?: DocumentHistoryPageOptions
+  ): Promise<DocumentHistoryPageResult>;
 
   /**
    * Get all document IDs in this database.
