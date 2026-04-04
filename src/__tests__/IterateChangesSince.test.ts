@@ -1,4 +1,5 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
+import { BaseMindooDB } from "../core/BaseMindooDB";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import {
   DEFAULT_TENANT_KEY_ID,
@@ -234,6 +235,145 @@ describe("iterateChangesSince", () => {
         Number(iterationMetric?.details?.loadedDocuments ?? Number.NaN)
       ).toBeLessThanOrEqual(5);
     }, 60000);
+  });
+
+  describe("metadata-only iteration", () => {
+    it("yields latest-state metadata without materializing documents", async () => {
+      const loadMetrics: Array<{ docId: string; cacheHit: boolean }> = [];
+      const syncMetrics: Array<{
+        operation: string;
+        details?: Record<string, unknown>;
+      }> = [];
+      const db = await tenant.openDB("test-db-metadata-only", {
+        performanceCallback: {
+          onDocumentLoad: (metrics) => {
+            loadMetrics.push({ docId: metrics.docId, cacheHit: metrics.cacheHit });
+          },
+          onSyncOperation: (metrics) => {
+            syncMetrics.push(metrics);
+          },
+        },
+      });
+
+      const docIds: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const doc = await db.createDocument();
+        docIds.push(doc.getId());
+        await db.changeDoc(doc, (d) => {
+          d.getData().index = i;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      await db.deleteDocument(docIds[2]);
+      await db.syncStoreChanges();
+      loadMetrics.length = 0;
+      syncMetrics.length = 0;
+
+      const seen: Array<{ docId: string; isDeleted: boolean; cursor: ProcessChangesCursor }> = [];
+      for await (const result of db.iterateChangeMetadataSince(null)) {
+        seen.push(result);
+      }
+
+      expect(seen).toHaveLength(6);
+      expect(loadMetrics).toHaveLength(0);
+      expect(seen.some((entry) => entry.docId === docIds[2] && entry.isDeleted)).toBe(true);
+      expect(seen.every((entry) => entry.cursor.docId === entry.docId)).toBe(true);
+
+      const iterationMetric = syncMetrics.find(
+        (metric) => metric.operation === "iterateChangeMetadataSince"
+      );
+      expect(iterationMetric).toBeDefined();
+      expect(iterationMetric?.details?.yieldedDocuments).toBe(6);
+    });
+
+    it("resumes metadata iteration from the last yielded cursor", async () => {
+      const db = await tenant.openDB("test-db-metadata-resume");
+      const expectedIds: string[] = [];
+
+      for (let i = 0; i < 8; i++) {
+        const doc = await db.createDocument();
+        expectedIds.push(doc.getId());
+        await db.changeDoc(doc, (d) => {
+          d.getData().index = i;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      await db.syncStoreChanges();
+
+      const firstPass: string[] = [];
+      let resumeCursor: ProcessChangesCursor | null = null;
+      for await (const result of db.iterateChangeMetadataSince(null)) {
+        firstPass.push(result.docId);
+        resumeCursor = result.cursor;
+        if (firstPass.length === 3) {
+          break;
+        }
+      }
+
+      const secondPass: string[] = [];
+      for await (const result of db.iterateChangeMetadataSince(resumeCursor)) {
+        secondPass.push(result.docId);
+      }
+
+      expect(firstPass).toHaveLength(3);
+      expect([...firstPass, ...secondPass]).toEqual(expectedIds);
+    });
+  });
+
+  describe("snapshot policy", () => {
+    it("writes a snapshot early enough for cold reopen loads to use it", async () => {
+      const dbName = "test-db-snapshot-policy";
+      const db = await tenant.openDB(dbName, {
+        snapshotConfig: {
+          minChanges: 2,
+          cooldownMs: 0,
+        },
+      });
+
+      const doc = await db.createDocument();
+      const docId = doc.getId();
+      await db.changeDoc(doc, (d) => {
+        d.getData().title = "snapshot-me";
+      });
+
+      const docEntries = await db.getStore().findNewEntriesForDoc([], docId);
+      expect(docEntries.some((entry) => entry.entryType === "doc_snapshot")).toBe(true);
+
+      const loadMetrics: Array<{
+        snapshotUsed: boolean;
+        replayEntriesLoaded: number;
+        metadataEntriesScanned: number;
+      }> = [];
+      const reopenedDb = new BaseMindooDB(
+        tenant as any,
+        db.getStore(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        undefined,
+        {
+          onDocumentLoad: (metrics) => {
+            if (metrics.docId === docId) {
+              loadMetrics.push({
+                snapshotUsed: metrics.snapshotUsed,
+                replayEntriesLoaded: metrics.replayEntriesLoaded,
+                metadataEntriesScanned: metrics.metadataEntriesScanned,
+              });
+            }
+          },
+        }
+      );
+      await reopenedDb.initialize();
+
+      const reopenedDoc = await reopenedDb.getDocument(docId);
+      expect(reopenedDoc.getData().title).toBe("snapshot-me");
+      expect(loadMetrics).toHaveLength(1);
+      expect(loadMetrics[0].snapshotUsed).toBe(true);
+      expect(loadMetrics[0].replayEntriesLoaded).toBe(0);
+      expect(loadMetrics[0].metadataEntriesScanned).toBeGreaterThanOrEqual(3);
+    });
   });
 
   describe("bounded cache", () => {

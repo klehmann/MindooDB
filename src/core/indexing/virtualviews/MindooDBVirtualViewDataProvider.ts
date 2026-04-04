@@ -24,7 +24,8 @@ export interface MindooDBVirtualViewDataProviderOptions {
 
 /**
  * Data provider that reads documents from a MindooDB and provides them
- * to a VirtualView. Uses iterateChangesSince for incremental updates.
+ * to a VirtualView. It uses metadata-first incremental updates so delete-only
+ * changes can be handled without materializing document bodies.
  */
 export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider {
   private readonly origin: string;
@@ -61,27 +62,39 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     const change = new VirtualViewDataChange(this.origin);
     const columns = this.view.getColumns();
 
-    // Process documents using iterateChangesSince for incremental updates
-    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor)) {
-      const docId = doc.getId();
-      const isDeleted = doc.isDeleted();
-      
-      // Check if document passes filter
-      const passesFilter = !isDeleted && (!this.filterFunction || this.filterFunction(doc));
-      
+    // Drive incremental updates from metadata first so deleted documents can be
+    // removed from the view without paying the cost to materialize them.
+    for await (const { docId, isDeleted, cursor } of this.db.iterateChangeMetadataSince(this.cursor)) {
+      if (isDeleted) {
+        if (this.knownDocIds.has(docId)) {
+          change.removeEntry(docId);
+          this.knownDocIds.delete(docId);
+        }
+        this.cursor = cursor;
+        continue;
+      }
+
+      const doc = await this.db.getDocument(docId);
+      if (!doc || doc.isDeleted()) {
+        if (this.knownDocIds.has(docId)) {
+          change.removeEntry(docId);
+          this.knownDocIds.delete(docId);
+        }
+        this.cursor = cursor;
+        continue;
+      }
+
+      const passesFilter = !this.filterFunction || this.filterFunction(doc);
+
       if (passesFilter) {
-        // Document should be in the view
-        // Compute column values
         const columnValues = this.computeColumnValues(doc, columns);
         change.addEntry(docId, columnValues);
         this.knownDocIds.add(docId);
       } else if (this.knownDocIds.has(docId)) {
-        // Document was in the view but no longer matches (deleted or filter changed)
         change.removeEntry(docId);
         this.knownDocIds.delete(docId);
       }
-      
-      // Update cursor to track progress
+
       this.cursor = cursor;
     }
 

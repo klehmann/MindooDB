@@ -23,6 +23,7 @@ import {
   SigningKeyPair,
   EncryptedPrivateKey,
   PerformanceCallback,
+  ProcessChangeSummaryResult,
   SyncOptions,
   SyncResult,
   DocumentHistoryPageEntry,
@@ -37,6 +38,7 @@ import type {
   StoreIdBloomSummary,
 } from "./appendonlystores/types";
 import { bloomMightContainId } from "./appendonlystores/bloom";
+import { computeDocumentMaterializationPlan } from "./appendonlystores/MaterializationPlanner";
 import { 
   generateDocEntryId, 
   computeContentHash, 
@@ -740,8 +742,22 @@ export class BaseMindooDB implements MindooDB {
                 `Skipping metadata-first index for doc ${docId} — decryption key "${representativeEntry.decryptionKeyId}" not available`,
               );
             } else {
-              const lastModified = Math.max(...docLifecycleEntries.map((e) => e.createdAt));
-              const isDeleted = docLifecycleEntries.some((e) => e.entryType === "doc_delete");
+              const mutationEntries = docLifecycleEntries.filter(
+                (e) =>
+                  e.entryType === "doc_create" ||
+                  e.entryType === "doc_change" ||
+                  e.entryType === "doc_delete",
+              );
+              // Snapshots compact replay history but should not change the user-visible
+              // modification time when the original create/change/delete entries still exist.
+              const entriesForLastModified =
+                mutationEntries.length > 0 ? mutationEntries : docLifecycleEntries;
+              const lastModified = Math.max(
+                ...entriesForLastModified.map((e) => e.createdAt),
+              );
+              const isDeleted = mutationEntries.some(
+                (e) => e.entryType === "doc_delete",
+              );
               this.updateIndex(docId, lastModified, isDeleted);
               this.logger.debug(
                 `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted})`,
@@ -2390,6 +2406,95 @@ export class BaseMindooDB implements MindooDB {
     return docIds.length;
   }
 
+  private getStartIndexForCursor(
+    indexSnapshot: Array<{
+      docId: string;
+      changeSeq: number;
+      lastModified: number;
+      isDeleted: boolean;
+    }>,
+    actualCursor: ProcessChangesCursor
+  ): number {
+    let startIndex = 0;
+    if (indexSnapshot.length === 0) {
+      return startIndex;
+    }
+
+    const cursorSeq =
+      typeof actualCursor.changeSeq === "number" ? actualCursor.changeSeq : 0;
+
+    let left = 0;
+    let right = indexSnapshot.length - 1;
+
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      const entry = indexSnapshot[mid];
+      const cursorComparable = {
+        docId: actualCursor.docId,
+        changeSeq: cursorSeq,
+      };
+      const cmp = this.compareIndexEntries(cursorComparable, entry);
+
+      if (cmp < 0) {
+        right = mid - 1;
+        startIndex = mid;
+      } else {
+        left = mid + 1;
+        startIndex = mid + 1;
+      }
+    }
+
+    if (startIndex < indexSnapshot.length) {
+      const entry = indexSnapshot[startIndex];
+      if (entry.changeSeq === cursorSeq && entry.docId === actualCursor.docId) {
+        startIndex++;
+      }
+    }
+
+    return startIndex;
+  }
+
+  async *iterateChangeMetadataSince(
+    cursor: ProcessChangesCursor | null
+  ): AsyncGenerator<ProcessChangeSummaryResult, void, unknown> {
+    const startedAt = Date.now();
+    const actualCursor: ProcessChangesCursor = cursor ?? {
+      changeSeq: 0,
+      lastModified: 0,
+      docId: "",
+    };
+    const indexSnapshot = [...this.index];
+    const startIndex = this.getStartIndexForCursor(indexSnapshot, actualCursor);
+    let yieldedDocuments = 0;
+
+    try {
+      for (let i = startIndex; i < indexSnapshot.length; i++) {
+        const entry = indexSnapshot[i];
+        const currentCursor: ProcessChangesCursor = {
+          changeSeq: entry.changeSeq,
+          lastModified: entry.lastModified,
+          docId: entry.docId,
+        };
+        yieldedDocuments++;
+        yield {
+          docId: entry.docId,
+          lastModified: entry.lastModified,
+          isDeleted: entry.isDeleted,
+          cursor: currentCursor,
+        };
+      }
+    } finally {
+      this.performanceCallback?.onSyncOperation?.({
+        operation: "iterateChangeMetadataSince",
+        time: Date.now() - startedAt,
+        details: {
+          yieldedDocuments,
+          startIndex,
+        },
+      });
+    }
+  }
+
   async *iterateChangesSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
@@ -2405,39 +2510,7 @@ export class BaseMindooDB implements MindooDB {
 
     // Find starting position using binary search
     // We want to find the first entry that is greater than the cursor.
-    let startIndex = 0;
-    if (indexSnapshot.length > 0) {
-      const cursorSeq =
-        typeof actualCursor.changeSeq === "number"
-          ? actualCursor.changeSeq
-          : 0;
-
-      let left = 0;
-      let right = indexSnapshot.length - 1;
-
-      while (left <= right) {
-        const mid = Math.floor((left + right) / 2);
-        const entry = indexSnapshot[mid];
-        const cursorComparable = { docId: actualCursor.docId, changeSeq: cursorSeq };
-        const cmp = this.compareIndexEntries(cursorComparable, entry);
-
-        if (cmp < 0) {
-          right = mid - 1;
-          startIndex = mid;
-        } else {
-          left = mid + 1;
-          startIndex = mid + 1;
-        }
-      }
-      
-      // If we found an exact match, start from the next entry.
-      if (startIndex < indexSnapshot.length) {
-        const entry = indexSnapshot[startIndex];
-        if (entry.changeSeq === cursorSeq && entry.docId === actualCursor.docId) {
-          startIndex++;
-        }
-      }
-    }
+    const startIndex = this.getStartIndexForCursor(indexSnapshot, actualCursor);
 
     let prefetchedDocuments = await this.prefetchIterationWindow(
       indexSnapshot,
@@ -2755,7 +2828,9 @@ export class BaseMindooDB implements MindooDB {
     
     const metadataById = new Map(allEntryMetadata.map((meta) => [meta.id, meta]));
     const planStartedAt = Date.now();
-    const materializationPlan = await this.store.planDocumentMaterialization(docId, { includeDiagnostics: true });
+    const materializationPlan = computeDocumentMaterializationPlan(docId, allEntryMetadata, {
+      includeDiagnostics: true,
+    });
     const planTime = Date.now() - planStartedAt;
     this.performanceCallback?.onSyncOperation?.({
       operation: "planDocumentMaterialization",

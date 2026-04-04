@@ -1297,6 +1297,32 @@ export interface ProcessChangesResult {
 }
 
 /**
+ * Result yielded by the metadata-only latest-state iterator.
+ * Contains the latest known index metadata without materializing the document.
+ */
+export interface ProcessChangeSummaryResult {
+  /**
+   * The document ID that changed.
+   */
+  docId: string;
+
+  /**
+   * Latest user-visible modification timestamp for the document.
+   */
+  lastModified: number;
+
+  /**
+   * Whether the latest known state is deleted.
+   */
+  isDeleted: boolean;
+
+  /**
+   * The cursor position of this document in the deterministic changefeed.
+   */
+  cursor: ProcessChangesCursor;
+}
+
+/**
  * Result yielded by the iterateDocumentHistory generator.
  */
 export interface DocumentHistoryResult {
@@ -1391,6 +1417,7 @@ export interface PerformanceCallback {
       | 'processDocument'
       | 'updateIndex'
       | 'iterateChangesSince'
+      | 'iterateChangeMetadataSince'
       | 'planDocumentMaterialization'
       | 'planDocumentMaterializationBatch'
       | 'bloomRebuild';
@@ -1731,6 +1758,20 @@ export interface MindooDB {
    * @return An async generator that yields ProcessChangesResult objects containing the document and its cursor. Each document is yielded immediately after loading, enabling early termination.
    */
   iterateChangesSince(cursor: ProcessChangesCursor | null): AsyncGenerator<ProcessChangesResult, void, unknown>;
+
+  /**
+   * Iterate over latest-state change metadata since a given cursor without
+   * loading, verifying, or decrypting the full document body.
+   *
+   * This is intended for external indexes, sync checkpoints, and overview UIs
+   * that only need document IDs, deletion flags, and cursors.
+   *
+   * @param cursor The cursor to start processing changes from. Use `null` to start from the beginning.
+   * @return An async generator that yields metadata-only change summaries.
+   */
+  iterateChangeMetadataSince(
+    cursor: ProcessChangesCursor | null
+  ): AsyncGenerator<ProcessChangeSummaryResult, void, unknown>;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.

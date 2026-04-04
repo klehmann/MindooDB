@@ -187,6 +187,131 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
     expect(result.updatedState.docsByCategory.Sales).toEqual(["Zoe"]);
   });
 
+  test("deletion-only updates do not materialize deleted documents", async ({
+    page,
+  }) => {
+    await page.goto(server.context.testPageUrl);
+
+    const result = await page.evaluate(
+      async ({ browserBundleUrl }) => {
+        const bundle = await import(browserBundleUrl);
+        const browserModule = bundle.browserModule;
+        const {
+          BaseMindooTenantFactory,
+          IndexedDBContentAddressedStoreFactory,
+          KeyBag,
+          PUBLIC_INFOS_KEY_ID,
+          createCryptoAdapter,
+          VirtualViewFactory,
+          ColumnSorting,
+        } = browserModule;
+
+        const prefix =
+          "vv-delete-test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+        const cryptoAdapter = createCryptoAdapter();
+        const storeFactory = new IndexedDBContentAddressedStoreFactory(prefix);
+        const factory = new BaseMindooTenantFactory(storeFactory, cryptoAdapter);
+
+        const user = await factory.createUserId(
+          "CN=virtual-view-user/O=mindoo",
+          "user-password"
+        );
+        const adminUser = await factory.createUserId(
+          "CN=admin/O=mindoo",
+          "admin-password"
+        );
+        const keyBag = new KeyBag(
+          user.userEncryptionKeyPair.privateKey,
+          "user-password",
+          cryptoAdapter
+        );
+
+        const tenantId = "virtual-view-delete-tenant";
+        await keyBag.createTenantKey(tenantId);
+        await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
+        const tenant = await factory.openTenant(
+          tenantId,
+          adminUser.userSigningKeyPair.publicKey,
+          adminUser.userEncryptionKeyPair.publicKey,
+          user,
+          "user-password",
+          keyBag
+        );
+        const directory = await tenant.openDirectory();
+        await directory.registerUser(
+          factory.toPublicUserId(user),
+          adminUser.userSigningKeyPair.privateKey,
+          "admin-password"
+        );
+
+        const loadMetrics: Array<{ docId: string; cacheHit: boolean }> = [];
+        const db = await tenant.openDB("employees", {
+          performanceCallback: {
+            onDocumentLoad: (metrics: { docId: string; cacheHit: boolean }) => {
+              loadMetrics.push(metrics);
+            },
+          },
+        });
+
+        const createEmployee = async (
+          name: string,
+          department: string
+        ): Promise<string> => {
+          const doc = await db.createDocument();
+          await db.changeDoc(
+            doc,
+            async (d: { getData: () => Record<string, unknown> }) => {
+              const data = d.getData();
+              data.name = name;
+              data.department = department;
+            }
+          );
+          return doc.getId();
+        };
+
+        const keepId = await createEmployee("Alice", "Sales");
+        const deleteId = await createEmployee("Bob", "Sales");
+
+        const view = await VirtualViewFactory.createView()
+          .addCategoryColumn("department", {
+            sorting: ColumnSorting.ASCENDING,
+          })
+          .addSortedColumn("name", ColumnSorting.ASCENDING)
+          .withDB("employees", db)
+          .buildAndUpdate();
+
+        loadMetrics.length = 0;
+        await db.deleteDocument(deleteId);
+        loadMetrics.length = 0;
+        await view.update();
+
+        const remainingDocs = view
+          .getRoot()
+          .getChildCategories()
+          .flatMap((category: { getChildDocuments: () => Array<{ docId: string }> }) =>
+            category.getChildDocuments().map((doc: { docId: string }) => doc.docId)
+          );
+
+        const store = db.getStore();
+        if (store.clearAllLocalData) {
+          await store.clearAllLocalData();
+        }
+
+        return {
+          remainingDocs,
+          keepId,
+          deleteId,
+          loadMetrics,
+        };
+      },
+      { browserBundleUrl: server.context.browserBundleUrl }
+    );
+
+    expect(result.remainingDocs).toEqual([result.keepId]);
+    expect(result.remainingDocs).not.toContain(result.deleteId);
+    expect(result.loadMetrics).toEqual([]);
+  });
+
   test("IndexedDB store data survives page reload", async ({ page }) => {
     await page.goto(server.context.testPageUrl);
 
