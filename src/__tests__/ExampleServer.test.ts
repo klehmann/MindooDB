@@ -12,7 +12,7 @@ import { Server } from "http";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
-import type { SigningKeyPair, EncryptionKeyPair } from "../core/types";
+import type { EncryptionKeyPair, MindooDBServerInfo, SigningKeyPair } from "../core/types";
 import type { PrivateUserId } from "../core/userid";
 import type { ServerConfig } from "../node/server/types";
 
@@ -937,7 +937,7 @@ describe("Server Network Management", () => {
     test("should return server info with name and public keys", async () => {
       const { status, body } = await httpRequest(`${baseUrl}/.well-known/mindoodb-server-info`);
       expect(status).toBe(200);
-      const info = body as { name: string; signingPublicKey: string; encryptionPublicKey: string };
+      const info = body as MindooDBServerInfo;
       expect(info.name).toBe("CN=test-network-server");
       expect(info.signingPublicKey).toContain("-----BEGIN PUBLIC KEY-----");
       expect(info.encryptionPublicKey).toContain("-----BEGIN PUBLIC KEY-----");

@@ -22,6 +22,18 @@ export const PUBLIC_INFOS_KEY_ID = "$publicinfos";
 export const DEFAULT_TENANT_KEY_ID = "default";
 
 /**
+ * JSON payload returned by `GET /.well-known/mindoodb-server-info`.
+ */
+export interface MindooDBServerInfo {
+  /** Canonical server name, typically a Notes/Domino-style DN. */
+  name: string;
+  /** Ed25519 public key in PEM format used for signing/auth verification. */
+  signingPublicKey: string;
+  /** RSA-OAEP public key in PEM format used for encryption. */
+  encryptionPublicKey: string;
+}
+
+/**
  * An EncryptedPrivateKey is a private key that is encrypted with a password.
  * Used for both asymmetric keys (RSA, Ed25519, ECDH) and symmetric keys (AES-256).
  */

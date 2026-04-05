@@ -1,3 +1,5 @@
+import type { MindooDBServerInfo } from "../../core/types";
+
 /**
  * Types for the MindooDB Example Server
  */
@@ -24,14 +26,7 @@ export interface UserConfig {
  * A remote server trusted for server-to-server sync.
  * Stored globally in <dataDir>/trusted-servers.json.
  */
-export interface TrustedServer {
-  /** Server name (e.g., "CN=server2") */
-  name: string;
-  /** Ed25519 public key in PEM format */
-  signingPublicKey: string;
-  /** RSA-OAEP public key in PEM format */
-  encryptionPublicKey: string;
-}
+export interface TrustedServer extends MindooDBServerInfo {}
 
 /**
  * Configuration for a remote server to sync with (per-tenant).

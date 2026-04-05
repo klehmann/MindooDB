@@ -10,6 +10,7 @@
 
 import { readFileSync } from "fs";
 import { MindooDBServerAdmin } from "../../core/MindooDBServerAdmin";
+import type { MindooDBServerInfo } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 
@@ -21,12 +22,6 @@ interface CliOptions {
   identityPath: string;
   passwordFile: string;
   help: boolean;
-}
-
-interface ServerInfo {
-  name: string;
-  signingPublicKey: string;
-  encryptionPublicKey: string;
 }
 
 /** Exported for tests. */
@@ -176,7 +171,7 @@ function readPasswordHidden(prompt: string): Promise<string> {
   });
 }
 
-async function fetchServerInfo(serverUrl: string): Promise<ServerInfo> {
+async function fetchServerInfo(serverUrl: string): Promise<MindooDBServerInfo> {
   const url = `${serverUrl}/.well-known/mindoodb-server-info`;
   console.log(`  Fetching server info from ${url}`);
   const response = await fetch(url);
@@ -188,7 +183,7 @@ async function fetchServerInfo(serverUrl: string): Promise<ServerInfo> {
     );
   }
 
-  const info = body as ServerInfo;
+  const info = body as MindooDBServerInfo;
   if (!info.name || !info.signingPublicKey || !info.encryptionPublicKey) {
     throw new Error(`Invalid server info response from ${serverUrl}`);
   }
@@ -211,7 +206,7 @@ function createAdmin(
 
 async function addTrustedServer(
   targetUrl: string,
-  serverInfo: ServerInfo,
+  serverInfo: MindooDBServerInfo,
   identity: PrivateUserId,
   password: string,
 ): Promise<void> {
