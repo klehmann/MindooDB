@@ -12,6 +12,7 @@
  */
 
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
+import { isWildcardSystemAdminPrincipal } from "./config";
 
 interface ParsedRule {
   method: string;
@@ -67,8 +68,14 @@ export class CapabilityMatcher {
 
       for (const principal of rule.principals) {
         if (
-          principal.username.toLowerCase() === normalizedUsername &&
-          principal.publicsignkey === publicsignkey
+          this.principalMatches(
+            rule,
+            method,
+            httpPath,
+            principal,
+            normalizedUsername,
+            publicsignkey,
+          )
         ) {
           return true;
         }
@@ -88,8 +95,14 @@ export class CapabilityMatcher {
     for (const rule of this.rules) {
       for (const principal of rule.principals) {
         if (
-          principal.username.toLowerCase() === normalizedUsername &&
-          principal.publicsignkey === publicsignkey
+          this.principalMatches(
+            rule,
+            rule.method,
+            rule.pathPattern,
+            principal,
+            normalizedUsername,
+            publicsignkey,
+          )
         ) {
           return true;
         }
@@ -101,6 +114,40 @@ export class CapabilityMatcher {
 
   private methodMatches(ruleMethod: string, requestMethod: string): boolean {
     return ruleMethod === "ALL" || ruleMethod === requestMethod;
+  }
+
+  private principalMatches(
+    rule: ParsedRule,
+    requestMethod: string,
+    requestPath: string,
+    principal: SystemAdminPrincipal,
+    normalizedUsername: string,
+    publicsignkey: string,
+  ): boolean {
+    if (
+      principal.username.toLowerCase() === normalizedUsername &&
+      principal.publicsignkey === publicsignkey
+    ) {
+      return true;
+    }
+
+    if (
+      isWildcardSystemAdminPrincipal(principal) &&
+      this.isTenantCreationRule(rule.method, rule.pathPattern) &&
+      this.isTenantCreationRequest(requestMethod, requestPath)
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private isTenantCreationRule(method: string, pathPattern: string): boolean {
+    return method === "POST" && pathPattern.startsWith("/system/tenants/");
+  }
+
+  private isTenantCreationRequest(method: string, path: string): boolean {
+    return method === "POST" && path.startsWith("/system/tenants/");
   }
 
   /**

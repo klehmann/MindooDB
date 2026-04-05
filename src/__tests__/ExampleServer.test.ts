@@ -679,7 +679,7 @@ describe("MindooDB Example Server", () => {
 
       test("should reject tenantId with special characters", async () => {
         const { status, body } = await httpRequest(
-          `${baseUrl}/tenant_with_underscore/auth/challenge`,
+          `${baseUrl}/tenant.with.dot/auth/challenge`,
           "POST",
           { username: "anyone" }
         );

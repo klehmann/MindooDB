@@ -84,10 +84,31 @@ export function validateStringLength(value: unknown, maxLength: number, fieldNam
 export const RESERVED_TENANT_NAMES = new Set(["admin", "system", "health", "statics"]);
 
 /**
- * Validates a tenant ID: must pass identifier rules and must not be a reserved name.
+ * Validates tenant ID syntax without checking reserved route names.
+ */
+export function validateTenantIdFormat(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ValidationError("tenantId is required and must be a non-empty string");
+  }
+
+  if (value.length > 64) {
+    throw new ValidationError("tenantId must be at most 64 characters");
+  }
+
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(value)) {
+    throw new ValidationError(
+      "tenantId must start with a letter or digit and contain only lowercase letters, digits, hyphens, and underscores",
+    );
+  }
+
+  return value;
+}
+
+/**
+ * Validates a tenant ID: must pass tenant ID syntax rules and must not be reserved.
  */
 export function validateTenantId(value: unknown): string {
-  const id = validateIdentifier(value, "tenantId");
+  const id = validateTenantIdFormat(value);
   if (RESERVED_TENANT_NAMES.has(id)) {
     throw new ValidationError(
       `tenantId "${id}" is reserved and cannot be used`,

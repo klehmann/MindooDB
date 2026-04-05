@@ -36,7 +36,14 @@ import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
 import { TenantManager } from "./TenantManager";
 import { CapabilityMatcher } from "./CapabilityMatcher";
 import { SystemAdminAuthService } from "./SystemAdminAuth";
-import { validateServerConfig, backupConfig, writeConfig } from "./config";
+import {
+  validateServerConfig,
+  backupConfig,
+  writeConfig,
+  isConfigBackupFilename,
+  listConfigBackups,
+  loadConfigBackup,
+} from "./config";
 import {
   isSystemIpAllowListDisabled,
   readSystemIpAllowListFromEnv,
@@ -53,6 +60,7 @@ import type {
 import {
   validateIdentifier,
   validateTenantId,
+  validateTenantIdFormat,
   validateUsername,
   validateArraySize,
   validateStringLength,
@@ -354,7 +362,7 @@ export class MindooDBServer {
     }
 
     try {
-      validateIdentifier(rawTenantId, "tenantId");
+      validateTenantIdFormat(rawTenantId);
     } catch {
       res.status(400).json({ error: "Invalid tenant ID format" });
       return;
@@ -462,7 +470,7 @@ export class MindooDBServer {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
         try {
-          validateIdentifier(tenantId, "tenantId");
+          validateTenantId(tenantId);
         } catch {
           res.status(400).json({ error: "Invalid tenantId format" });
           return;
@@ -490,7 +498,7 @@ export class MindooDBServer {
         const tenantId = req.params.tenantId.toLowerCase();
 
         try {
-          validateIdentifier(tenantId, "tenantId");
+          validateTenantId(tenantId);
         } catch {
           res.status(400).json({ error: "Invalid tenantId format" });
           return;
@@ -576,7 +584,7 @@ export class MindooDBServer {
     router.get("/tenants/:tenantId/sync-servers", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
-        try { validateIdentifier(tenantId, "tenantId"); } catch {
+        try { validateTenantId(tenantId); } catch {
           res.status(400).json({ error: "Invalid tenantId format" });
           return;
         }
@@ -595,7 +603,7 @@ export class MindooDBServer {
     router.post("/tenants/:tenantId/sync-servers", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
-        try { validateIdentifier(tenantId, "tenantId"); } catch {
+        try { validateTenantId(tenantId); } catch {
           res.status(400).json({ error: "Invalid tenantId format" });
           return;
         }
@@ -637,7 +645,7 @@ export class MindooDBServer {
     router.delete("/tenants/:tenantId/sync-servers/:serverName", authMiddleware, (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
-        try { validateIdentifier(tenantId, "tenantId"); } catch {
+        try { validateTenantId(tenantId); } catch {
           res.status(400).json({ error: "Invalid tenantId format" });
           return;
         }
@@ -669,6 +677,39 @@ export class MindooDBServer {
     router.post("/tenants/:tenantId/trigger-sync", authMiddleware, this.handleTriggerSync.bind(this));
 
     // Runtime config management
+    router.get("/config/backups", authMiddleware, (req: Request, res: Response) => {
+      try {
+        res.json({ backups: listConfigBackups(this.configPath) });
+      } catch (error) {
+        console.error("[MindooDBServer] Error listing config backups:", error);
+        res.status(500).json({ error: "Failed to list config backups" });
+      }
+    });
+
+    router.get("/config/backups/:backupFile", authMiddleware, (req: Request, res: Response) => {
+      try {
+        const backupFile = decodeURIComponent(req.params.backupFile);
+        if (!isConfigBackupFilename(backupFile)) {
+          res.status(400).json({ error: "Invalid config backup filename" });
+          return;
+        }
+
+        const config = loadConfigBackup(this.configPath, backupFile);
+        res.json({ file: backupFile, config });
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Config backup not found:")) {
+          res.status(404).json({ error: "Config backup not found" });
+          return;
+        }
+        if (error instanceof Error && error.message.startsWith("Invalid config backup filename:")) {
+          res.status(400).json({ error: "Invalid config backup filename" });
+          return;
+        }
+        console.error("[MindooDBServer] Error reading config backup:", error);
+        res.status(500).json({ error: "Failed to read config backup" });
+      }
+    });
+
     router.get("/config", authMiddleware, (req: Request, res: Response) => {
       res.json(this.serverConfig);
     });

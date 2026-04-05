@@ -14,6 +14,10 @@ export { BaseMindooTenantFactory } from "./BaseMindooTenantFactory";
 export {
   MindooDBServerAdmin,
   type MindooDBServerAdminOptions,
+  type ServerConfig,
+  type SystemAdminPrincipal,
+  type ConfigBackupInfo,
+  type ConfigBackupResponse,
 } from "./MindooDBServerAdmin";
 
 // Crypto

@@ -1,7 +1,7 @@
 /**
  * Optional IP allowlist for /system/* routes (MINDOODB_ADMIN_ALLOWED_IPS).
  *
- * Comma-separated IPv4/IPv6 addresses or IPv4 CIDRs. Use `*` to allow all.
+ * Comma-separated IPv4/IPv6 addresses or IPv4/IPv6 CIDRs. Use `*` to allow all.
  * IPv4-mapped IPv6 (::ffff:x.x.x.x) is normalized to the IPv4 form for matching.
  */
 
@@ -69,6 +69,115 @@ function ipv4MatchesCidr(ip: string, cidr: string): boolean {
   return (ipNum & mask) === (baseNum & mask);
 }
 
+function parseIpv4Parts(ip: string): number[] | null {
+  if (!isIPv4(ip)) {
+    return null;
+  }
+  const parts = ip.split(".").map((p) => parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
+    return null;
+  }
+  return parts;
+}
+
+function parseIpv6SegmentList(part: string): number[] | null {
+  if (part === "") {
+    return [];
+  }
+
+  const segments: number[] = [];
+  for (const token of part.split(":")) {
+    if (token.length === 0) {
+      return null;
+    }
+
+    if (token.includes(".")) {
+      const ipv4Parts = parseIpv4Parts(token);
+      if (!ipv4Parts) {
+        return null;
+      }
+      segments.push((ipv4Parts[0] << 8) | ipv4Parts[1]);
+      segments.push((ipv4Parts[2] << 8) | ipv4Parts[3]);
+      continue;
+    }
+
+    if (!/^[0-9a-fA-F]{1,4}$/.test(token)) {
+      return null;
+    }
+
+    segments.push(parseInt(token, 16));
+  }
+
+  return segments;
+}
+
+function ipv6ToBigInt(ip: string): bigint | null {
+  if (!isIPv6(ip)) {
+    return null;
+  }
+
+  const doubleColonCount = ip.split("::").length - 1;
+  if (doubleColonCount > 1) {
+    return null;
+  }
+
+  let parts: number[];
+
+  if (ip.includes("::")) {
+    const [leftRaw, rightRaw] = ip.split("::");
+    const left = parseIpv6SegmentList(leftRaw);
+    const right = parseIpv6SegmentList(rightRaw);
+    if (!left || !right) {
+      return null;
+    }
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) {
+      return null;
+    }
+    parts = [...left, ...new Array<number>(missing).fill(0), ...right];
+  } else {
+    const parsed = parseIpv6SegmentList(ip);
+    if (!parsed || parsed.length !== 8) {
+      return null;
+    }
+    parts = parsed;
+  }
+
+  if (parts.length !== 8 || parts.some((n) => n < 0 || n > 0xffff)) {
+    return null;
+  }
+
+  let result = 0n;
+  for (const part of parts) {
+    result = (result << 16n) | BigInt(part);
+  }
+  return result;
+}
+
+function ipv6MatchesCidr(ip: string, cidr: string): boolean {
+  const slash = cidr.indexOf("/");
+  if (slash === -1) {
+    return false;
+  }
+  const base = cidr.slice(0, slash);
+  const bits = parseInt(cidr.slice(slash + 1), 10);
+  if (!isIPv6(base) || Number.isNaN(bits) || bits < 0 || bits > 128) {
+    return false;
+  }
+
+  const ipNum = ipv6ToBigInt(ip);
+  const baseNum = ipv6ToBigInt(base);
+  if (ipNum === null || baseNum === null) {
+    return false;
+  }
+  if (bits === 0) {
+    return true;
+  }
+
+  const shift = 128n - BigInt(bits);
+  return (ipNum >> shift) === (baseNum >> shift);
+}
+
 /**
  * Returns true if clientIp is allowed by the allowlist string (non-empty, not `*`).
  */
@@ -84,9 +193,15 @@ export function isClientIpAllowedForSystemList(
       if (isIPv4(clientIp) && ipv4MatchesCidr(clientIp, entry)) {
         return true;
       }
+      if (isIPv6(clientIp) && ipv6MatchesCidr(clientIp, entry)) {
+        return true;
+      }
       continue;
     }
     if (clientIp === entry) {
+      return true;
+    }
+    if (isIPv6(clientIp) && isIPv6(entry) && ipv6ToBigInt(clientIp) === ipv6ToBigInt(entry)) {
       return true;
     }
   }

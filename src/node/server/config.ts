@@ -5,10 +5,49 @@
  * authorization for system admin endpoints.
  */
 
-import { existsSync, readFileSync, copyFileSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  readFileSync,
+  copyFileSync,
+  writeFileSync,
+  readdirSync,
+} from "fs";
 import { join, dirname, basename } from "path";
 
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
+
+export interface ConfigBackupInfo {
+  file: string;
+  createdAt: string;
+}
+
+const CONFIG_BACKUP_FILENAME_RE =
+  /^config\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d{3})?Z)\.json$/;
+
+export function isTenantCreationCapabilityRule(ruleKey: string): boolean {
+  const colonIdx = ruleKey.indexOf(":");
+  if (colonIdx === -1) {
+    return false;
+  }
+
+  const method = ruleKey.substring(0, colonIdx).toUpperCase();
+  const pathPattern = ruleKey.substring(colonIdx + 1);
+
+  return method === "POST" && pathPattern.startsWith("/system/tenants/");
+}
+
+export function isWildcardSystemAdminPrincipal(
+  principal: SystemAdminPrincipal,
+): boolean {
+  return principal.username === "*" && principal.publicsignkey === "*";
+}
+
+export function hasTenantCreationWildcardPrincipal(config: ServerConfig): boolean {
+  return Object.entries(config.capabilities).some(([ruleKey, principals]) =>
+    isTenantCreationCapabilityRule(ruleKey) &&
+    principals.some((principal) => isWildcardSystemAdminPrincipal(principal)),
+  );
+}
 
 /**
  * Resolve the config file path from CLI argument or data directory fallback.
@@ -152,6 +191,21 @@ function validatePrincipal(
     );
   }
 
+  const hasWildcardField = obj.username === "*" || obj.publicsignkey === "*";
+  if (hasWildcardField) {
+    if (obj.username !== "*" || obj.publicsignkey !== "*") {
+      throw new Error(
+        `config.json at ${filePath}: principal #${index} in rule "${ruleKey}" must use "*" for both "username" and "publicsignkey"`,
+      );
+    }
+
+    if (!isTenantCreationCapabilityRule(ruleKey)) {
+      throw new Error(
+        `config.json at ${filePath}: wildcard principal "*" is only allowed for POST:/system/tenants/... rules`,
+      );
+    }
+  }
+
   return {
     username: obj.username,
     publicsignkey: obj.publicsignkey,
@@ -182,6 +236,58 @@ export function backupConfig(configPath: string): string {
 export function writeConfig(configPath: string, config: ServerConfig): void {
   writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
   console.log(`[Config] Config written to ${configPath}`);
+}
+
+export function isConfigBackupFilename(fileName: string): boolean {
+  return CONFIG_BACKUP_FILENAME_RE.test(fileName);
+}
+
+function parseBackupTimestamp(fileName: string): string | null {
+  const match = CONFIG_BACKUP_FILENAME_RE.exec(fileName);
+  if (!match) {
+    return null;
+  }
+
+  return match[1].replace(
+    /^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2}(?:\.\d{3})?Z)$/,
+    "$1:$2:$3",
+  );
+}
+
+export function listConfigBackups(configPath: string): ConfigBackupInfo[] {
+  const dir = dirname(configPath);
+
+  return readdirSync(dir)
+    .filter((file) => isConfigBackupFilename(file))
+    .map((file) => {
+      const createdAt = parseBackupTimestamp(file);
+      if (!createdAt) {
+        throw new Error(`Invalid config backup filename: ${file}`);
+      }
+      return { file, createdAt };
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export function loadConfigBackup(configPath: string, backupFile: string): ServerConfig {
+  if (!isConfigBackupFilename(backupFile)) {
+    throw new Error(`Invalid config backup filename: ${backupFile}`);
+  }
+
+  const backupPath = join(dirname(configPath), backupFile);
+  if (!existsSync(backupPath)) {
+    throw new Error(`Config backup not found: ${backupFile}`);
+  }
+
+  const raw = readFileSync(backupPath, "utf-8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`Failed to parse config backup ${backupFile}: ${err}`);
+  }
+
+  return validateServerConfig(parsed, backupPath);
 }
 
 /**

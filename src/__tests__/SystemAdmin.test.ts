@@ -556,6 +556,158 @@ describe("System Admin Security", () => {
     });
   });
 
+  describe("Wildcard Tenant Creation Authorization", () => {
+    let setup: TestSetup;
+    const port = 4010;
+
+    beforeAll(async () => {
+      const config: ServerConfig = {
+        capabilities: {
+          "POST:/system/tenants/*": [
+            {
+              username: "*",
+              publicsignkey: "*",
+            },
+          ],
+        },
+      };
+
+      setup = await createTestSetup(port, cryptoAdapter, factory, config);
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+    });
+
+    test("wildcard principal can authenticate and create a tenant", async () => {
+      const wildcardUser = await factory.createUserId("cn=demo-any/o=test", "demo-pass");
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        wildcardUser,
+        "demo-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/open-demo`,
+        "POST",
+        {
+          adminSigningPublicKey: wildcardUser.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: wildcardUser.userEncryptionKeyPair.publicKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(201);
+    });
+
+    test("wildcard principal cannot call GET /system/tenants", async () => {
+      const wildcardUser = await factory.createUserId("cn=demo-reader/o=test", "reader-pass");
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        wildcardUser,
+        "reader-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/tenants`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(403);
+    });
+
+    test("wildcard principal cannot call PUT /system/config", async () => {
+      const wildcardUser = await factory.createUserId("cn=demo-config/o=test", "config-pass");
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        wildcardUser,
+        "config-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/config`,
+        "PUT",
+        setup.config,
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(403);
+    });
+  });
+
+  describe("Wildcard Tenant Prefix Authorization", () => {
+    let setup: TestSetup;
+    const port = 4011;
+
+    beforeAll(async () => {
+      const config: ServerConfig = {
+        capabilities: {
+          "POST:/system/tenants/demo_*": [
+            {
+              username: "*",
+              publicsignkey: "*",
+            },
+          ],
+        },
+      };
+
+      setup = await createTestSetup(port, cryptoAdapter, factory, config);
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+    });
+
+    test("wildcard principal can create demo_foo when only demo_* is allowed", async () => {
+      const wildcardUser = await factory.createUserId("cn=demo-prefix/o=test", "demo-prefix-pass");
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        wildcardUser,
+        "demo-prefix-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/demo_foo`,
+        "POST",
+        {
+          adminSigningPublicKey: wildcardUser.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: wildcardUser.userEncryptionKeyPair.publicKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(201);
+    });
+
+    test("wildcard principal cannot create prod_foo when only demo_* is allowed", async () => {
+      const wildcardUser = await factory.createUserId("cn=prod-prefix/o=test", "prod-prefix-pass");
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        wildcardUser,
+        "prod-prefix-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/prod_foo`,
+        "POST",
+        {
+          adminSigningPublicKey: wildcardUser.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: wildcardUser.userEncryptionKeyPair.publicKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(403);
+    });
+  });
+
   // =========================================================================
   // Tenant CRUD routes
   // =========================================================================
@@ -954,6 +1106,239 @@ describe("System Admin Security", () => {
       const result = await admin.triggerTenantSync("sync-test");
       expect(result.success).toBe(true);
     });
+
+    test("should update tenant config through the wrapper", async () => {
+      const fs = await import("fs");
+      const path = await import("path");
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+
+      const adminSigningKey = await factory.createSigningKeyPair("pw");
+      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
+      await admin.registerTenant("wrapper-update-test", {
+        adminSigningPublicKey: adminSigningKey.publicKey,
+        adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+      });
+
+      const result = await admin.updateTenant("wrapper-update-test", {
+        defaultStoreType: "inmemory",
+      });
+      expect(result.success).toBe(true);
+      expect(result.message).toContain("updated");
+
+      const configPath = path.join(setup.dataDir, "wrapper-update-test", "config.json");
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
+        defaultStoreType?: string;
+      };
+      expect(config.defaultStoreType).toBe("inmemory");
+    });
+
+  });
+
+  describe("MindooDBServerAdmin config helpers", () => {
+    let setup: TestSetup;
+    const port = 4007;
+
+    beforeAll(async () => {
+      setup = await createTestSetup(port, cryptoAdapter, factory);
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+    });
+
+    test("should grant access, dedupe duplicate grants, and query matching rules", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+      const delegatedAdmin = await factory.createUserId("cn=delegated-admin/o=test", "delegate-pass");
+      const principal = {
+        username: delegatedAdmin.username,
+        publicsignkey: delegatedAdmin.userSigningKeyPair.publicKey as string,
+      };
+
+      const grantResult = await admin.grantSystemAdminAccess(principal, [
+        "POST:/system/tenants/*",
+        "GET:/system/tenants",
+      ]);
+      expect(grantResult.success).toBe(true);
+      expect(grantResult.addedToRules.sort()).toEqual([
+        "GET:/system/tenants",
+        "POST:/system/tenants/*",
+      ]);
+      expect(grantResult.alreadyPresentRules).toEqual([]);
+
+      const duplicateGrant = await admin.grantSystemAdminAccess(principal, [
+        "POST:/system/tenants/*",
+      ]);
+      expect(duplicateGrant.success).toBe(true);
+      expect(duplicateGrant.addedToRules).toEqual([]);
+      expect(duplicateGrant.alreadyPresentRules).toEqual(["POST:/system/tenants/*"]);
+
+      const currentConfig = await admin.getConfig();
+      expect(currentConfig.capabilities["POST:/system/tenants/*"]).toHaveLength(1);
+
+      const access = await admin.findSystemAdminAccess(principal);
+      expect(access.principal).toEqual(principal);
+      expect(access.rules).toEqual([
+        "GET:/system/tenants",
+        "POST:/system/tenants/*",
+      ]);
+    });
+
+    test("should revoke delegated access from selected rules and then all rules", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+      const existingPrincipal = (await admin.getConfig()).capabilities["POST:/system/tenants/*"][0];
+
+      const revokeOneRule = await admin.revokeSystemAdminAccess(existingPrincipal, {
+        rules: ["GET:/system/tenants"],
+      });
+      expect(revokeOneRule.success).toBe(true);
+      expect(revokeOneRule.removedFromRules).toEqual(["GET:/system/tenants"]);
+
+      const afterPartialRevoke = await admin.findSystemAdminAccess(existingPrincipal);
+      expect(afterPartialRevoke.rules).toEqual(["POST:/system/tenants/*"]);
+
+      const revokeEverywhere = await admin.revokeSystemAdminAccess(existingPrincipal);
+      expect(revokeEverywhere.success).toBe(true);
+      expect(revokeEverywhere.removedFromRules).toEqual(["POST:/system/tenants/*"]);
+
+      const afterFullRevoke = await admin.findSystemAdminAccess(existingPrincipal);
+      expect(afterFullRevoke.rules).toEqual([]);
+      const config = await admin.getConfig();
+      expect(config.capabilities["POST:/system/tenants/*"]).toBeUndefined();
+    });
+
+    test("should reject empty grant rule lists", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+      const principal = {
+        username: "cn=no-rules/o=test",
+        publicsignkey: "-----BEGIN PUBLIC KEY-----\nTEST\n-----END PUBLIC KEY-----",
+      };
+
+      await expect(admin.grantSystemAdminAccess(principal, [])).rejects.toThrow(
+        "grantSystemAdminAccess requires at least one rule",
+      );
+    });
+
+    test("should report no rules for a principal that is not present", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+      const missingPrincipal = {
+        username: "cn=missing/o=test",
+        publicsignkey: "-----BEGIN PUBLIC KEY-----\nMISSING\n-----END PUBLIC KEY-----",
+      };
+
+      const result = await admin.findSystemAdminAccess(missingPrincipal);
+      expect(result.principal).toEqual(missingPrincipal);
+      expect(result.rules).toEqual([]);
+    });
+
+    test("should treat revoking a missing principal as a no-op", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+      const missingPrincipal = {
+        username: "cn=missing/o=test",
+        publicsignkey: "-----BEGIN PUBLIC KEY-----\nMISSING\n-----END PUBLIC KEY-----",
+      };
+
+      const result = await admin.revokeSystemAdminAccess(missingPrincipal);
+      expect(result.success).toBe(true);
+      expect(result.removedFromRules).toEqual([]);
+    });
+
+    test("should surface authentication failures for invalid admin credentials", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "wrong-password",
+        cryptoAdapter,
+      });
+
+      await expect(admin.listTenants()).rejects.toThrow();
+    });
+
+  });
+
+  describe("MindooDBServerAdmin auth behavior", () => {
+    let setup: TestSetup;
+    const port = 4009;
+
+    beforeAll(async () => {
+      setup = await createTestSetup(port, cryptoAdapter, factory);
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+    });
+
+    test("should allow a granted principal to authenticate and lose access after revoke", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+      const delegatedAdmin = await factory.createUserId("cn=auth-check/o=test", "delegated-pass");
+      const principal = {
+        username: delegatedAdmin.username,
+        publicsignkey: delegatedAdmin.userSigningKeyPair.publicKey as string,
+      };
+
+      await admin.grantSystemAdminAccess(principal, ["POST:/system/tenants/*"]);
+
+      const delegatedToken = await getSystemAdminToken(
+        setup.baseUrl,
+        delegatedAdmin,
+        "delegated-pass",
+        cryptoAdapter,
+        factory,
+      );
+      const createTenantResponse = await httpRequest(
+        `${setup.baseUrl}/system/tenants/delegated-auth-test`,
+        "POST",
+        {
+          adminSigningPublicKey: delegatedAdmin.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: delegatedAdmin.userEncryptionKeyPair.publicKey,
+        },
+        { Authorization: `Bearer ${delegatedToken}` },
+      );
+      expect(createTenantResponse.status).toBe(201);
+
+      await admin.revokeSystemAdminAccess(principal);
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/auth/challenge`,
+        "POST",
+        principal,
+      );
+      expect(status).toBe(404);
+    });
   });
 
   // =========================================================================
@@ -1183,6 +1568,43 @@ describe("System Admin Security", () => {
       expect(status2).toBe(400);
     });
 
+    test("PUT /system/config rejects wildcard principals on non-tenant routes", async () => {
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        setup.adminUser,
+        "admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status, body } = await httpRequest(
+        `${setup.baseUrl}/system/config`,
+        "PUT",
+        {
+          capabilities: {
+            "GET:/system/tenants": [
+              {
+                username: "*",
+                publicsignkey: "*",
+              },
+            ],
+            "ALL:/system/*": [
+              {
+                username: setup.adminUser.username,
+                publicsignkey: setup.adminUser.userSigningKeyPair.publicKey,
+              },
+            ],
+          },
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+
+      expect(status).toBe(400);
+      expect((body as { error: string }).error).toContain(
+        'wildcard principal "*" is only allowed for POST:/system/tenants/... rules',
+      );
+    });
+
     test("GET /system/config reflects updated config", async () => {
       const token = await getSystemAdminToken(
         setup.baseUrl,
@@ -1202,6 +1624,147 @@ describe("System Admin Security", () => {
       const config = body as ServerConfig;
       // Should reflect the update from the earlier test (2 principals)
       expect(config.capabilities["ALL:/system/*"].length).toBe(2);
+    });
+
+    test("GET /system/config/backups lists created backups", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+
+      const backups = await admin.listConfigBackups();
+      expect(backups.length).toBeGreaterThan(0);
+      expect(backups[0].file).toMatch(/^config\.\d{4}-\d{2}-\d{2}T.*\.json$/);
+      expect(backups[0].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    });
+
+    test("GET /system/config/backups/:backupFile returns a validated previous snapshot", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+
+      const [backup] = await admin.listConfigBackups();
+      expect(backup).toBeDefined();
+
+      const previousConfig = await admin.getConfigBackup(backup.file);
+      expect(previousConfig.file).toBe(backup.file);
+      expect(previousConfig.config.capabilities["ALL:/system/*"]).toHaveLength(1);
+      expect(previousConfig.config.capabilities["ALL:/system/*"][0].username).toBe(
+        setup.adminUser.username,
+      );
+    });
+
+  });
+
+  describe("Runtime Config Backup edge cases", () => {
+    let setup: TestSetup;
+    let dataDir: string;
+    const port = 4008;
+
+    beforeAll(async () => {
+      const fs = await import("fs");
+      const path = await import("path");
+      dataDir = `/tmp/mindoodb-config-backup-edge-test-${Date.now()}`;
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(path.join(dataDir, "trusted-servers.json"), "[]", "utf-8");
+
+      const serverIdentity = await factory.createUserId("CN=config-edge-test-server", "test-password");
+      fs.writeFileSync(
+        path.join(dataDir, "server.identity.json"),
+        JSON.stringify(serverIdentity, null, 2),
+        "utf-8",
+      );
+
+      const adminUser = await factory.createUserId("cn=sysadmin/o=test", "admin-pass");
+      const config: ServerConfig = {
+        capabilities: {
+          "ALL:/system/*": [
+            {
+              username: adminUser.username,
+              publicsignkey: adminUser.userSigningKeyPair.publicKey as string,
+            },
+          ],
+        },
+      };
+
+      const configPath = path.join(dataDir, "config.json");
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+      fs.writeFileSync(
+        path.join(dataDir, "config.2026-01-01T00-00-00.000Z.json"),
+        JSON.stringify(config, null, 2),
+        "utf-8",
+      );
+
+      const server = new MindooDBServer(dataDir, "test-password", undefined, config, configPath);
+      const baseUrl = `http://localhost:${port}`;
+      const httpServer = await new Promise<Server>((resolve) => {
+        const s = server.getApp().listen(port, () => resolve(s));
+      });
+
+      setup = {
+        server,
+        httpServer,
+        baseUrl,
+        dataDir,
+        config,
+        adminUser,
+        adminSigningKeyPair: undefined as any,
+        adminSigningPublicKeyPem: "",
+      };
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+      const fs = await import("fs");
+      const files = fs.readdirSync(dataDir);
+      for (const f of files) {
+        fs.unlinkSync(`${dataDir}/${f}`);
+      }
+      fs.rmdirSync(dataDir);
+    });
+
+    test("GET /system/config/backups/:backupFile rejects invalid filenames", async () => {
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        setup.adminUser,
+        "admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status, body } = await httpRequest(
+        `${setup.baseUrl}/system/config/backups/not-a-backup.json`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${token}` },
+      );
+
+      expect(status).toBe(400);
+      expect((body as { error: string }).error).toContain("Invalid config backup filename");
+    });
+
+    test("readConfigBackup reads a known backup via the explicit wrapper method", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+
+      const previousConfig = await admin.readConfigBackup(
+        "config.2026-01-01T00-00-00.000Z.json",
+      );
+
+      expect(previousConfig.file).toBe("config.2026-01-01T00-00-00.000Z.json");
+      expect(previousConfig.config.capabilities["ALL:/system/*"]).toHaveLength(1);
+      expect(previousConfig.config.capabilities["ALL:/system/*"][0].username).toBe(
+        setup.adminUser.username,
+      );
     });
   });
 });

@@ -11,6 +11,9 @@ import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/pri
 import type { PrivateUserId } from "./userid";
 import type { EncryptedPrivateKey } from "./types";
 
+/**
+ * Connection and authentication options for {@link MindooDBServerAdmin}.
+ */
 export interface MindooDBServerAdminOptions {
   serverUrl: string;
   systemAdminUser: PrivateUserId;
@@ -32,13 +35,38 @@ interface SyncServerConfig {
   databases: string[];
 }
 
+/**
+ * One system-admin identity as stored in server `config.json`.
+ *
+ * A principal is uniquely identified by the combination of `username` and
+ * `publicsignkey`.
+ */
 export interface SystemAdminPrincipal {
   username: string;
   publicsignkey: string;
 }
 
+/**
+ * Runtime server config returned by `GET /system/config`.
+ */
 export interface ServerConfig {
   capabilities: Record<string, SystemAdminPrincipal[]>;
+}
+
+/**
+ * Metadata for one historical `config.json` backup.
+ */
+export interface ConfigBackupInfo {
+  file: string;
+  createdAt: string;
+}
+
+/**
+ * Response body for reading one historical config backup.
+ */
+export interface ConfigBackupResponse {
+  file: string;
+  config: ServerConfig;
 }
 
 interface RegisterTenantBody {
@@ -62,6 +90,43 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function normalizePrincipalKey(principal: SystemAdminPrincipal): string {
+  return `${principal.username.toLowerCase()}\0${principal.publicsignkey}`;
+}
+
+function dedupePrincipals(principals: SystemAdminPrincipal[]): SystemAdminPrincipal[] {
+  const seen = new Set<string>();
+  const result: SystemAdminPrincipal[] = [];
+  for (const principal of principals) {
+    const key = normalizePrincipalKey(principal);
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(principal);
+    }
+  }
+  return result;
+}
+
+function cloneServerConfig(config: ServerConfig): ServerConfig {
+  return {
+    capabilities: Object.fromEntries(
+      Object.entries(config.capabilities).map(([rule, principals]) => [
+        rule,
+        principals.map((principal) => ({ ...principal })),
+      ]),
+    ),
+  };
+}
+
+/**
+ * High-level client for authenticated access to MindooDB server `/system/*`
+ * endpoints.
+ *
+ * This wrapper performs the Ed25519 challenge/response flow automatically,
+ * caches the short-lived JWT, and exposes ergonomic methods for common server
+ * administration tasks such as tenant registration, runtime config updates,
+ * and delegated system-admin management.
+ */
 export class MindooDBServerAdmin {
   private baseUrl: string;
   private adminUser: PrivateUserId;
@@ -71,6 +136,9 @@ export class MindooDBServerAdmin {
   private cachedToken: string | null = null;
   private tokenExpiresAt: number = 0;
 
+  /**
+   * Create a new system-admin API client for one MindooDB server.
+   */
   constructor(options: MindooDBServerAdminOptions) {
     this.baseUrl = options.serverUrl.replace(/\/$/, "");
     this.adminUser = options.systemAdminUser;
@@ -82,11 +150,20 @@ export class MindooDBServerAdmin {
   // Tenant management
   // =========================================================================
 
+  /**
+   * List all tenant IDs currently registered on the server.
+   */
   async listTenants(): Promise<string[]> {
     const res = await this.authenticatedRequest("GET", "/system/tenants");
     return (res as { tenants: string[] }).tenants;
   }
 
+  /**
+   * Create a new tenant on the server.
+   *
+   * The caller must already be authorized for `POST /system/tenants/:tenantId`
+   * by the server's runtime config.
+   */
   async registerTenant(
     tenantId: string,
     body: RegisterTenantBody,
@@ -98,6 +175,9 @@ export class MindooDBServerAdmin {
     );
   }
 
+  /**
+   * Update server-side metadata for an existing tenant.
+   */
   async updateTenant(
     tenantId: string,
     updates: Record<string, unknown>,
@@ -109,6 +189,9 @@ export class MindooDBServerAdmin {
     );
   }
 
+  /**
+   * Remove a tenant from the server.
+   */
   async removeTenant(
     tenantId: string,
   ): Promise<{ success: boolean; message?: string }> {
@@ -122,15 +205,24 @@ export class MindooDBServerAdmin {
   // Trusted server management
   // =========================================================================
 
+  /**
+   * List globally trusted peer servers used for server-to-server sync.
+   */
   async listTrustedServers(): Promise<TrustedServer[]> {
     const res = await this.authenticatedRequest("GET", "/system/trusted-servers");
     return (res as { servers: TrustedServer[] }).servers;
   }
 
+  /**
+   * Add one globally trusted peer server.
+   */
   async addTrustedServer(server: TrustedServer): Promise<{ success: boolean; message?: string }> {
     return await this.authenticatedRequest("POST", "/system/trusted-servers", server);
   }
 
+  /**
+   * Remove one globally trusted peer server by name.
+   */
   async removeTrustedServer(serverName: string): Promise<{ success: boolean; message?: string }> {
     return await this.authenticatedRequest(
       "DELETE",
@@ -142,6 +234,9 @@ export class MindooDBServerAdmin {
   // Per-tenant sync server management
   // =========================================================================
 
+  /**
+   * List sync server targets configured for one tenant.
+   */
   async listTenantSyncServers(tenantId: string): Promise<SyncServerConfig[]> {
     const res = await this.authenticatedRequest(
       "GET",
@@ -150,6 +245,9 @@ export class MindooDBServerAdmin {
     return (res as { servers: SyncServerConfig[] }).servers;
   }
 
+  /**
+   * Add one sync target for a tenant.
+   */
   async addTenantSyncServer(
     tenantId: string,
     config: SyncServerConfig,
@@ -161,6 +259,9 @@ export class MindooDBServerAdmin {
     );
   }
 
+  /**
+   * Remove one tenant-specific sync target.
+   */
   async removeTenantSyncServer(
     tenantId: string,
     serverName: string,
@@ -175,6 +276,9 @@ export class MindooDBServerAdmin {
   // Trigger sync
   // =========================================================================
 
+  /**
+   * Trigger an on-demand sync for one tenant.
+   */
   async triggerTenantSync(
     tenantId: string,
   ): Promise<{ success: boolean; message?: string }> {
@@ -188,14 +292,179 @@ export class MindooDBServerAdmin {
   // Runtime config management
   // =========================================================================
 
+  /**
+   * Fetch the currently active runtime server config.
+   */
   async getConfig(): Promise<ServerConfig> {
     return await this.authenticatedRequest("GET", "/system/config");
   }
 
+  /**
+   * Replace the full runtime server config.
+   *
+   * The server remains the source of truth for validation, backup creation, and
+   * self-lockout protection.
+   */
   async updateConfig(
     config: ServerConfig,
-  ): Promise<{ success: boolean; message?: string }> {
+  ): Promise<{ success: boolean; message?: string; backupFile?: string }> {
     return await this.authenticatedRequest("PUT", "/system/config", config);
+  }
+
+  /**
+   * List historical config backups created by prior runtime config updates.
+   */
+  async listConfigBackups(): Promise<ConfigBackupInfo[]> {
+    const res = await this.authenticatedRequest("GET", "/system/config/backups");
+    return (res as { backups: ConfigBackupInfo[] }).backups;
+  }
+
+  /**
+   * Read one historical config backup from the server.
+   */
+  async readConfigBackup(backupFile: string): Promise<ConfigBackupResponse> {
+    return await this.authenticatedRequest(
+      "GET",
+      `/system/config/backups/${encodeURIComponent(backupFile)}`,
+    );
+  }
+
+  /**
+   * Read one historical config backup from the server.
+   *
+   * Alias for {@link readConfigBackup} kept for compatibility with earlier
+   * wrapper code.
+   */
+  async getConfigBackup(backupFile: string): Promise<ConfigBackupResponse> {
+    return await this.readConfigBackup(backupFile);
+  }
+
+  /**
+   * Return all capability rules that currently include the given principal.
+   *
+   * This is a client-side convenience method derived from `getConfig()`. It
+   * does not require a dedicated server endpoint.
+   */
+  async findSystemAdminAccess(
+    principal: SystemAdminPrincipal,
+  ): Promise<{ principal: SystemAdminPrincipal; rules: string[] }> {
+    const config = await this.getConfig();
+    const principalKey = normalizePrincipalKey(principal);
+    const rules = Object.entries(config.capabilities)
+      .filter(([, principals]) =>
+        principals.some((existing) => normalizePrincipalKey(existing) === principalKey),
+      )
+      .map(([rule]) => rule)
+      .sort();
+
+    return {
+      principal: { ...principal },
+      rules,
+    };
+  }
+
+  /**
+   * Grant a principal access to one or more capability rules.
+   *
+   * Missing rules are created automatically. Existing principal entries are
+   * deduplicated by `username.toLowerCase()` + `publicsignkey`.
+   */
+  async grantSystemAdminAccess(
+    principal: SystemAdminPrincipal,
+    rules: string[],
+  ): Promise<{
+    success: boolean;
+    config: ServerConfig;
+    addedToRules: string[];
+    alreadyPresentRules: string[];
+    backupFile?: string;
+  }> {
+    if (rules.length === 0) {
+      throw new Error("grantSystemAdminAccess requires at least one rule");
+    }
+
+    const config = await this.getConfig();
+    const nextConfig = cloneServerConfig(config);
+    const principalKey = normalizePrincipalKey(principal);
+    const addedToRules: string[] = [];
+    const alreadyPresentRules: string[] = [];
+
+    for (const rule of rules) {
+      const existing = nextConfig.capabilities[rule] ?? [];
+      const alreadyPresent = existing.some(
+        (candidate) => normalizePrincipalKey(candidate) === principalKey,
+      );
+
+      if (alreadyPresent) {
+        alreadyPresentRules.push(rule);
+        continue;
+      }
+
+      nextConfig.capabilities[rule] = dedupePrincipals([
+        ...existing,
+        { ...principal },
+      ]);
+      addedToRules.push(rule);
+    }
+
+    const result = await this.updateConfig(nextConfig);
+    return {
+      success: result.success,
+      config: nextConfig,
+      addedToRules,
+      alreadyPresentRules,
+      backupFile: result.backupFile,
+    };
+  }
+
+  /**
+   * Revoke a principal from selected capability rules, or from all rules when
+   * no `rules` filter is provided.
+   */
+  async revokeSystemAdminAccess(
+    principal: SystemAdminPrincipal,
+    options?: { rules?: string[] },
+  ): Promise<{
+    success: boolean;
+    config: ServerConfig;
+    removedFromRules: string[];
+    backupFile?: string;
+  }> {
+    const config = await this.getConfig();
+    const nextConfig = cloneServerConfig(config);
+    const principalKey = normalizePrincipalKey(principal);
+    const targetRules = options?.rules ?? Object.keys(nextConfig.capabilities);
+    const removedFromRules: string[] = [];
+
+    for (const rule of targetRules) {
+      const existing = nextConfig.capabilities[rule];
+      if (!existing) {
+        continue;
+      }
+
+      const filtered = existing.filter(
+        (candidate) => normalizePrincipalKey(candidate) !== principalKey,
+      );
+
+      if (filtered.length === existing.length) {
+        continue;
+      }
+
+      removedFromRules.push(rule);
+      if (filtered.length === 0) {
+        delete nextConfig.capabilities[rule];
+      } else {
+        nextConfig.capabilities[rule] = filtered;
+      }
+    }
+
+    const result = await this.updateConfig(nextConfig);
+    return {
+      success: result.success,
+      config: nextConfig,
+      removedFromRules,
+      backupFile: result.backupFile,
+    };
   }
 
   // =========================================================================

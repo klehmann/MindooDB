@@ -11,7 +11,10 @@
 import { v7 as uuidv7 } from "uuid";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
-import { extractAllPrincipals } from "./config";
+import {
+  extractAllPrincipals,
+  hasTenantCreationWildcardPrincipal,
+} from "./config";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +46,7 @@ export class SystemAdminAuthService {
   private challengeExpirationMs: number;
   private tokenExpirationMs: number;
   private principals: SystemAdminPrincipal[];
+  private allowTenantCreationWildcardPrincipal: boolean;
   private cryptoAdapter: CryptoAdapter;
 
   constructor(
@@ -56,6 +60,8 @@ export class SystemAdminAuthService {
   ) {
     this.cryptoAdapter = cryptoAdapter;
     this.principals = extractAllPrincipals(config);
+    this.allowTenantCreationWildcardPrincipal =
+      hasTenantCreationWildcardPrincipal(config);
     this.jwtSecret =
       options?.jwtSecret ?? cryptoAdapter.getRandomValues(new Uint8Array(32));
     this.challengeExpirationMs = options?.challengeExpirationMs ?? 5 * 60 * 1000;
@@ -69,6 +75,8 @@ export class SystemAdminAuthService {
    */
   reloadPrincipals(config: ServerConfig): void {
     this.principals = extractAllPrincipals(config);
+    this.allowTenantCreationWildcardPrincipal =
+      hasTenantCreationWildcardPrincipal(config);
   }
 
   /**
@@ -87,7 +95,7 @@ export class SystemAdminAuthService {
         p.username.toLowerCase() === normalizedUsername &&
         p.publicsignkey === publicsignkey,
     );
-    if (!found) {
+    if (!found && !this.allowTenantCreationWildcardPrincipal) {
       throw new Error("Unknown system admin principal");
     }
 

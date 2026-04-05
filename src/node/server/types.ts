@@ -139,6 +139,10 @@ export interface TenantContext {
 /**
  * A principal entry in a capability rule.
  * Identifies a system admin by both username and public signing key.
+ *
+ * The special wildcard principal `{ username: "*", publicsignkey: "*" }`
+ * is reserved for demo tenant-creation rules and is rejected for all other
+ * system endpoints.
  */
 export interface SystemAdminPrincipal {
   username: string;
@@ -172,7 +176,8 @@ export const ENV_VARS = {
   /**
    * Optional comma-separated allowlist for /system/* (system admin HTTP surface).
    * If unset or `*`, any client IP may call /system/* (JWT + capabilities still required).
-   * Example: `127.0.0.1,::1,10.0.0.0/8`
+   * Supports exact IPv4/IPv6 addresses plus IPv4/IPv6 CIDRs.
+   * Example: `127.0.0.1,::1,10.0.0.0/8,2001:db8::/32`
    */
   ADMIN_ALLOWED_IPS: "MINDOODB_ADMIN_ALLOWED_IPS",
 } as const;
