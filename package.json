@@ -53,6 +53,7 @@
     "test:browser": "npm run build && playwright test",
     "test:browser:watch": "npm run build && playwright test --ui",
     "test:all": "npm test && npm run test:browser",
+    "prepublishOnly": "npm run build && npm run test",
     "identity:info": "node dist/node/cli/identity-info.js",
     "identity:change-password": "node dist/node/cli/change-identity-password.js",
     "identity:export-public": "node dist/node/cli/identity-export-public.js",
