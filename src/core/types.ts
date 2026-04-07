@@ -1550,6 +1550,7 @@ export interface SyncOptions {
  */
 export interface SyncResult {
   transferredEntries: number;
+  scannedEntries: number;
   cancelled: boolean;
 }
 

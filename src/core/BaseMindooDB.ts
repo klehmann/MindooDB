@@ -1006,7 +1006,7 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions
-  ): Promise<{ transferred: number; cancelled: boolean }> {
+  ): Promise<{ transferred: number; scanned: number; cancelled: boolean }> {
     if (options?.mode === "dense") {
       return this.syncEntriesFromStoreDense(sourceStore, targetStore, options);
     }
@@ -1032,7 +1032,7 @@ export class BaseMindooDB implements MindooDB {
       let currentPage = 0;
       while (true) {
         if (options?.signal?.aborted) {
-          return { transferred, cancelled: true };
+          return { transferred, scanned, cancelled: true };
         }
 
         const page = await sourceStore.scanEntriesSince!(cursor, pageSize);
@@ -1064,7 +1064,7 @@ export class BaseMindooDB implements MindooDB {
           break;
         }
       }
-      return { transferred, cancelled: false };
+      return { transferred, scanned, cancelled: false };
     }
 
     onProgress?.({
@@ -1077,11 +1077,11 @@ export class BaseMindooDB implements MindooDB {
     const targetIds = await targetStore.getAllIds();
     const sourceNewMetadata = await sourceStore.findNewEntries(targetIds);
     if (sourceNewMetadata.length === 0) {
-      return { transferred: 0, cancelled: false };
+      return { transferred: 0, scanned: 0, cancelled: false };
     }
 
     if (options?.signal?.aborted) {
-      return { transferred: 0, cancelled: true };
+      return { transferred: 0, scanned: 0, cancelled: true };
     }
 
     onProgress?.({
@@ -1103,7 +1103,11 @@ export class BaseMindooDB implements MindooDB {
       totalSourceEntries: sourceNewMetadata.length,
     });
 
-    return { transferred: sourceEntries.length, cancelled: false };
+    return {
+      transferred: sourceEntries.length,
+      scanned: sourceNewMetadata.length,
+      cancelled: false,
+    };
   }
 
   /**
@@ -1126,7 +1130,7 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions,
-  ): Promise<{ transferred: number; cancelled: boolean }> {
+  ): Promise<{ transferred: number; scanned: number; cancelled: boolean }> {
     const onProgress = options?.onProgress;
 
     onProgress?.({
@@ -1137,7 +1141,7 @@ export class BaseMindooDB implements MindooDB {
     });
 
     if (options?.signal?.aborted) {
-      return { transferred: 0, cancelled: true };
+      return { transferred: 0, scanned: 0, cancelled: true };
     }
 
     // ── Phase 1: discover documents ──────────────────────────────────
@@ -1148,11 +1152,11 @@ export class BaseMindooDB implements MindooDB {
     this.logger.info(`Dense sync: found ${docIds.length} documents on source`);
 
     if (docIds.length === 0) {
-      return { transferred: 0, cancelled: false };
+      return { transferred: 0, scanned: 0, cancelled: false };
     }
 
     if (options?.signal?.aborted) {
-      return { transferred: 0, cancelled: true };
+      return { transferred: 0, scanned: 0, cancelled: true };
     }
 
     // ── Phase 2: batch plan on source ────────────────────────────────
@@ -1189,7 +1193,7 @@ export class BaseMindooDB implements MindooDB {
     );
 
     if (options?.signal?.aborted) {
-      return { transferred: 0, cancelled: true };
+      return { transferred: 0, scanned: neededIds.size, cancelled: true };
     }
 
     // ── Phase 4: filter out entries the target already has ───────────
@@ -1203,11 +1207,11 @@ export class BaseMindooDB implements MindooDB {
     );
 
     if (missingIds.length === 0) {
-      return { transferred: 0, cancelled: false };
+      return { transferred: 0, scanned: allNeededArray.length, cancelled: false };
     }
 
     if (options?.signal?.aborted) {
-      return { transferred: 0, cancelled: true };
+      return { transferred: 0, scanned: allNeededArray.length, cancelled: true };
     }
 
     // ── Phase 5: transfer missing entries in pages ───────────────────
@@ -1216,7 +1220,7 @@ export class BaseMindooDB implements MindooDB {
 
     for (let offset = 0; offset < missingIds.length; offset += pageSize) {
       if (options?.signal?.aborted) {
-        return { transferred, cancelled: true };
+        return { transferred, scanned: allNeededArray.length, cancelled: true };
       }
 
       const batch = missingIds.slice(offset, offset + pageSize);
@@ -1234,7 +1238,7 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.logger.info(`Dense sync complete: transferred ${transferred} entries`);
-    return { transferred, cancelled: false };
+    return { transferred, scanned: allNeededArray.length, cancelled: false };
   }
 
   getStore(): ContentAddressedStore {
@@ -3905,12 +3909,16 @@ export class BaseMindooDB implements MindooDB {
 
       if (syncResult.cancelled) {
         this.logger.info(`Pull cancelled after transferring ${syncResult.transferred} entries`);
-        return { transferredEntries: syncResult.transferred, cancelled: true };
+        return {
+          transferredEntries: syncResult.transferred,
+          scannedEntries: syncResult.scanned,
+          cancelled: true,
+        };
       }
 
       if (syncResult.transferred === 0) {
         this.logger.debug(`No new entries to pull`);
-        return { transferredEntries: 0, cancelled: false };
+        return { transferredEntries: 0, scannedEntries: syncResult.scanned, cancelled: false };
       }
       
       options?.onProgress?.({
@@ -3933,7 +3941,11 @@ export class BaseMindooDB implements MindooDB {
         scannedEntries: syncResult.transferred,
       });
 
-      return { transferredEntries: syncResult.transferred, cancelled: false };
+      return {
+        transferredEntries: syncResult.transferred,
+        scannedEntries: syncResult.scanned,
+        cancelled: false,
+      };
     } finally {
       restoreAuthOverride();
     }
@@ -3966,7 +3978,11 @@ export class BaseMindooDB implements MindooDB {
 
       if (syncResult.cancelled) {
         this.logger.info(`Push cancelled after transferring ${syncResult.transferred} entries`);
-        return { transferredEntries: syncResult.transferred, cancelled: true };
+        return {
+          transferredEntries: syncResult.transferred,
+          scannedEntries: syncResult.scanned,
+          cancelled: true,
+        };
       }
 
       if (syncResult.transferred === 0) {
@@ -3982,7 +3998,11 @@ export class BaseMindooDB implements MindooDB {
         scannedEntries: syncResult.transferred,
       });
 
-      return { transferredEntries: syncResult.transferred, cancelled: false };
+      return {
+        transferredEntries: syncResult.transferred,
+        scannedEntries: syncResult.scanned,
+        cancelled: false,
+      };
     } finally {
       restoreAuthOverride();
     }
