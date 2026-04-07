@@ -57,6 +57,7 @@ export class BaseMindooTenant implements MindooTenant {
   private storeFactory: ContentAddressedStoreFactory;
   private databaseCache: Map<string, MindooDB> = new Map();
   private directoryCache: MindooTenantDirectory | null = null;
+  private remoteStoreCache: Map<string, Promise<ContentAddressedStore>> = new Map();
 
   // Cache for decrypted keys (to avoid repeated decryption)
   private decryptedTenantKeyCache?: Uint8Array;
@@ -884,44 +885,62 @@ export class BaseMindooTenant implements MindooTenant {
     console.log(`[connectToServer] Connecting to server: ${serverUrl}, db: ${dbId}`);
     this.logger.info(`Connecting to server: ${serverUrl}, db: ${dbId}`);
 
-    // Lazy-import network modules to avoid circular dependencies and keep core lightweight
-    const { HttpTransport } = await import("../appendonlystores/network/HttpTransport.js");
-    const { ClientNetworkContentAddressedStore } = await import(
-      "../appendonlystores/network/ClientNetworkContentAddressedStore.js"
-    );
+    const normalizedServerUrl = serverUrl.replace(/\/$/, "");
+    const cacheKey = `${normalizedServerUrl}::${dbId}`;
+    const cachedStore = this.remoteStoreCache.get(cacheKey);
+    if (cachedStore) {
+      this.logger.debug(`Reusing cached remote store for ${normalizedServerUrl}, db: ${dbId}`);
+      return cachedStore;
+    }
 
-    // Create the HTTP transport
-    const baseUrl = `${serverUrl.replace(/\/$/, "")}/${this.tenantId}`;
-    const transport = new HttpTransport(
-      {
-        baseUrl,
-        tenantId: this.tenantId,
+    const remoteStorePromise = (async () => {
+      // Lazy-import network modules to avoid circular dependencies and keep core lightweight
+      const { HttpTransport } = await import("../appendonlystores/network/HttpTransport.js");
+      const { ClientNetworkContentAddressedStore } = await import(
+        "../appendonlystores/network/ClientNetworkContentAddressedStore.js"
+      );
+
+      // Create the HTTP transport
+      const baseUrl = `${normalizedServerUrl}/${this.tenantId}`;
+      const transport = new HttpTransport(
+        {
+          baseUrl,
+          tenantId: this.tenantId,
+          dbId,
+        },
+        this.logger.createChild("HttpTransport")
+      );
+
+      // Get the current user's decrypted signing key
+      const signingKey = await this.getDecryptedSigningKey();
+
+      // Get the current user's decrypted RSA encryption private key (for decrypting entries)
+      const decryptedEncryptionKey = await this.getDecryptedEncryptionKey();
+
+      // Create the client network store
+      const store = new ClientNetworkContentAddressedStore(
         dbId,
-      },
-      this.logger.createChild("HttpTransport")
-    );
+        transport,
+        this.cryptoAdapter,
+        this.currentUser.username,
+        signingKey,
+        decryptedEncryptionKey,
+        this.logger.createChild(`ClientNetworkStore:${dbId}`)
+      );
 
-    // Get the current user's decrypted signing key
-    const signingKey = await this.getDecryptedSigningKey();
+      console.log(`[connectToServer] ✓ Connected to server for db "${dbId}"`);
+      this.logger.info(`Connected to server for db "${dbId}"`);
 
-    // Get the current user's decrypted RSA encryption private key (for decrypting entries)
-    const decryptedEncryptionKey = await this.getDecryptedEncryptionKey();
+      return store;
+    })();
 
-    // Create the client network store
-    const store = new ClientNetworkContentAddressedStore(
-      dbId,
-      transport,
-      this.cryptoAdapter,
-      this.currentUser.username,
-      signingKey,
-      decryptedEncryptionKey,
-      this.logger.createChild(`ClientNetworkStore:${dbId}`)
-    );
-
-    console.log(`[connectToServer] ✓ Connected to server for db "${dbId}"`);
-    this.logger.info(`Connected to server for db "${dbId}"`);
-
-    return store;
+    this.remoteStoreCache.set(cacheKey, remoteStorePromise);
+    try {
+      return await remoteStorePromise;
+    } catch (error) {
+      this.remoteStoreCache.delete(cacheKey);
+      throw error;
+    }
   }
 
   /**

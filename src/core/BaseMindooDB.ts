@@ -114,6 +114,7 @@ export class BaseMindooDB implements MindooDB {
   private readonly maxCachedDocs: number;
   private readonly iteratePrefetchWindowDocs: number;
   private readonly cacheRestoreLimit: number;
+  private readonly reconcileRestoredIndexOnInit: boolean;
   private readonly snapshotMinChanges: number;
   private readonly snapshotCooldownMs: number;
   
@@ -168,6 +169,7 @@ export class BaseMindooDB implements MindooDB {
       1,
       Math.floor(documentCacheConfig?.restoreLimit ?? this.maxCachedDocs)
     );
+    this.reconcileRestoredIndexOnInit = documentCacheConfig?.reconcileRestoredIndexOnInit ?? false;
     this.snapshotMinChanges = Math.max(
       1,
       Math.floor(snapshotConfig?.minChanges ?? DEFAULT_SNAPSHOT_MIN_CHANGES)
@@ -355,7 +357,6 @@ export class BaseMindooDB implements MindooDB {
       if (checkpoint.processedEntryIds) {
         this.processedEntryIds = checkpoint.processedEntryIds;
       }
-
       // Rebuild indexLookup from index
       this.indexLookup.clear();
       for (let i = 0; i < this.index.length; i++) {
@@ -399,6 +400,7 @@ export class BaseMindooDB implements MindooDB {
           this.logger.warn(`Failed to restore cached doc ${docId}, will reload from store: ${e}`);
         }
       }
+      this.logger.info(`Restored ${restoredDocs} cached documents for ${this.store.getId()}`);
 
       this.logger.info(`Restored ${restoredDocs} documents from cache for ${prefix}`);
       return true;
@@ -635,11 +637,56 @@ export class BaseMindooDB implements MindooDB {
       if (restored) {
         this.logger.info("Restored from cache, processing delta only");
         await this.syncStoreChanges();
+        if (this.reconcileRestoredIndexOnInit) {
+          await this.reconcileRestoredIndexWithStore();
+        }
         return;
       }
     }
 
     await this.syncStoreChanges();
+  }
+
+  private async reconcileRestoredIndexWithStore(): Promise<void> {
+    const lifecycleMetadata = await this.scanAllMetadata(this.store);
+    const lifecycleDocIds = Array.from(new Set(
+      lifecycleMetadata
+        .filter((entry) =>
+          entry.entryType === "doc_create"
+          || entry.entryType === "doc_change"
+          || entry.entryType === "doc_delete"
+          || entry.entryType === "doc_snapshot",
+        )
+        .map((entry) => entry.docId),
+    )).sort((left, right) => left.localeCompare(right));
+    const missingDocIds = lifecycleDocIds.filter((docId) => !this.indexLookup.has(docId));
+
+    if (missingDocIds.length === 0) {
+      return;
+    }
+
+    this.logger.warn(
+      `Detected stale cache checkpoint for ${this.store.getId()} - ` +
+      `index is missing ${missingDocIds.length} document(s): ${missingDocIds.join(", ")}. ` +
+      `Rebuilding metadata from local store.`,
+    );
+
+    this.index = [];
+    this.indexLookup.clear();
+    this.docCache.clear();
+    this.automergeHashToEntryId.clear();
+    this.processedEntryIds = [];
+    this.processedEntryCursor = null;
+    this.nextChangeSeq = 1;
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+
+    await this.syncStoreChanges();
+
+    this.logger.info(
+      `Metadata rebuild complete for ${this.store.getId()} - ` +
+      `index now has ${this.index.length} document(s).`,
+    );
   }
 
   /**
@@ -653,10 +700,11 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Already processed ${this.processedEntryIds.length} entry IDs`);
     
     // Find new entries that we haven't processed yet
-    const newEntryMetadata = await this.getNewEntryMetadataForSync();
+    const { entries: newEntryMetadata, nextCursor } = await this.getNewEntryMetadataForSync();
     this.logger.debug(`Found ${newEntryMetadata.length} new entries`);
     
     if (newEntryMetadata.length === 0) {
+      this.processedEntryCursor = nextCursor;
       this.logger.debug(`No new entries to process`);
       this.performanceCallback?.onSyncOperation?.({
         operation: "findNewEntries",
@@ -807,6 +855,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Append new entry IDs to our processed list
     this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
+    this.processedEntryCursor = nextCursor;
     this.cacheMetaDirty = true;
     this.cacheManager?.markDirty();
     
@@ -852,7 +901,10 @@ export class BaseMindooDB implements MindooDB {
     return all;
   }
 
-  private async getNewEntryMetadataForSync(): Promise<StoreEntryMetadata[]> {
+  private async getNewEntryMetadataForSync(): Promise<{
+    entries: StoreEntryMetadata[];
+    nextCursor: StoreScanCursor | null;
+  }> {
     const startedAt = Date.now();
     if (!this.supportsCursorScan(this.store)) {
       const result = await this.store.findNewEntries(this.processedEntryIds);
@@ -865,7 +917,10 @@ export class BaseMindooDB implements MindooDB {
           processedEntryCount: this.processedEntryIds.length,
         },
       });
-      return result;
+      return {
+        entries: result,
+        nextCursor: this.processedEntryCursor,
+      };
     }
 
     const allNew: StoreEntryMetadata[] = [];
@@ -880,7 +935,6 @@ export class BaseMindooDB implements MindooDB {
       }
     }
 
-    this.processedEntryCursor = cursor;
     this.performanceCallback?.onSyncOperation?.({
       operation: "findNewEntries",
       time: Date.now() - startedAt,
@@ -890,7 +944,10 @@ export class BaseMindooDB implements MindooDB {
         cursor,
       },
     });
-    return allNew;
+    return {
+      entries: allNew,
+      nextCursor: cursor,
+    };
   }
 
   /**

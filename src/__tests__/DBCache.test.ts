@@ -1,6 +1,8 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
+import { BaseMindooDB } from "../core/BaseMindooDB";
 import { InMemoryContentAddressedStore } from "../core/appendonlystores/InMemoryContentAddressedStore";
 import { InMemoryLocalCacheStore } from "../core/cache/LocalCacheStore";
+import { EncryptedLocalCacheStore } from "../core/cache/EncryptedLocalCacheStore";
 import { MindooTenant, MindooDoc, ContentAddressedStoreFactory, CreateStoreResult, OpenStoreOptions } from "../core/types";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { CacheManager } from "../core/cache/CacheManager";
@@ -70,6 +72,34 @@ describe("BaseMindooDB cache integration", () => {
       t.cacheManager = new CacheManager(store, { flushIntervalMs: 60000 });
     }
     t.databaseCache.clear();
+  }
+
+  function simulateRestartWithoutFlush(): void {
+    const t = tenant as any;
+    if (t.cacheManager) {
+      const oldManager = t.cacheManager as any;
+      if (oldManager.timer) {
+        clearTimeout(oldManager.timer);
+        oldManager.timer = null;
+      }
+      oldManager.disposed = true;
+      const store = oldManager.getStore();
+      t.cacheManager = new CacheManager(store, { flushIntervalMs: 60000 });
+    }
+    t.databaseCache.clear();
+  }
+
+  async function loadContactsCheckpoint() {
+    const metaKey = (await cacheStore.list("db-meta")).find((key) => key.endsWith("/contacts"));
+    expect(metaKey).toBeTruthy();
+    const encryptedCacheStore = new EncryptedLocalCacheStore(cacheStore, "userpass", crypto);
+    const rawMeta = await encryptedCacheStore.get("db-meta", metaKey!);
+    expect(rawMeta).toBeTruthy();
+    const checkpoint = JSON.parse(new TextDecoder().decode(rawMeta!)) as {
+      processedEntryCursor?: { createdAt: number; id: string } | null;
+      index: Array<{ docId: string }>;
+    };
+    return { metaKey: metaKey!, encryptedCacheStore, checkpoint };
   }
 
   it("should write cache entries when a document is created and flushed", async () => {
@@ -209,5 +239,144 @@ describe("BaseMindooDB cache integration", () => {
     const db2 = await tenant.openDB("mutable");
     const rd = await db2.getDocument(docId);
     expect(rd.getData().version).toBe(2);
+  }, 30000);
+
+  it("should expose a stale cache checkpoint when reconcileRestoredIndexOnInit is disabled", async () => {
+    const db1 = await tenant.openDB("contacts");
+
+    const doc1 = await db1.createDocument();
+    const doc1Id = doc1.getId();
+    await db1.changeDoc(doc1, (d: MindooDoc) => {
+      d.getData().name = "Charlie";
+    });
+
+    const cacheManager = (tenant as any).cacheManager as CacheManager;
+    await cacheManager.flush();
+
+    const doc2 = await db1.createDocument();
+    const doc2Id = doc2.getId();
+    await db1.changeDoc(doc2, (d: MindooDoc) => {
+      d.getData().name = "Diana";
+    });
+
+    const store = db1.getStore();
+    let cursor: { createdAt: number; id: string } | null = null;
+    while (true) {
+      const page = await store.scanEntriesSince!(cursor, 1000);
+      cursor = page.nextCursor;
+      if (!page.hasMore) {
+        break;
+      }
+    }
+
+    const { metaKey, encryptedCacheStore, checkpoint } = await loadContactsCheckpoint();
+    checkpoint.processedEntryCursor = cursor;
+    expect(checkpoint.index.map((entry) => entry.docId)).toEqual([doc1Id]);
+    await encryptedCacheStore.put("db-meta", metaKey, new TextEncoder().encode(JSON.stringify(checkpoint)));
+
+    simulateRestartWithoutFlush();
+
+    const db2 = await tenant.openDB("contacts", {
+      documentCacheConfig: {
+        reconcileRestoredIndexOnInit: false,
+      },
+    });
+    expect(await db2.getAllDocumentIds()).toEqual([doc1Id]);
+  }, 30000);
+
+  it("should rebuild metadata when reconcileRestoredIndexOnInit is enabled", async () => {
+    const db1 = await tenant.openDB("contacts");
+
+    const doc1 = await db1.createDocument();
+    const doc1Id = doc1.getId();
+    await db1.changeDoc(doc1, (d: MindooDoc) => {
+      d.getData().name = "Charlie";
+    });
+
+    const cacheManager = (tenant as any).cacheManager as CacheManager;
+    await cacheManager.flush();
+
+    const doc2 = await db1.createDocument();
+    const doc2Id = doc2.getId();
+    await db1.changeDoc(doc2, (d: MindooDoc) => {
+      d.getData().name = "Diana";
+    });
+
+    const store = db1.getStore();
+    let cursor: { createdAt: number; id: string } | null = null;
+    while (true) {
+      const page = await store.scanEntriesSince!(cursor, 1000);
+      cursor = page.nextCursor;
+      if (!page.hasMore) {
+        break;
+      }
+    }
+
+    const { metaKey, encryptedCacheStore, checkpoint } = await loadContactsCheckpoint();
+    checkpoint.processedEntryCursor = cursor;
+    expect(checkpoint.index.map((entry) => entry.docId)).toEqual([doc1Id]);
+    await encryptedCacheStore.put("db-meta", metaKey, new TextEncoder().encode(JSON.stringify(checkpoint)));
+
+    simulateRestartWithoutFlush();
+
+    const db2 = await tenant.openDB("contacts", {
+      documentCacheConfig: {
+        reconcileRestoredIndexOnInit: true,
+      },
+    });
+    expect(await db2.getAllDocumentIds()).toEqual([doc1Id, doc2Id].sort((left, right) => left.localeCompare(right)));
+
+    const restored1 = await db2.getDocument(doc1Id);
+    expect(restored1.getData().name).toBe("Charlie");
+
+    const restored2 = await db2.getDocument(doc2Id);
+    expect(restored2.getData().name).toBe("Diana");
+  }, 30000);
+
+  it("should not commit processedEntryCursor when sync processing fails", async () => {
+    const db1 = await tenant.openDB("contacts");
+
+    const doc1 = await db1.createDocument();
+    await db1.changeDoc(doc1, (d: MindooDoc) => {
+      d.getData().name = "Charlie";
+    });
+
+    const cacheManager = (tenant as any).cacheManager as CacheManager;
+    await cacheManager.flush();
+
+    const doc2 = await db1.createDocument();
+    const doc2Id = doc2.getId();
+    await db1.changeDoc(doc2, (d: MindooDoc) => {
+      d.getData().name = "Diana";
+    });
+
+    simulateRestartWithoutFlush();
+
+    const db2 = new BaseMindooDB(
+      tenant as any,
+      db1.getStore(),
+      db1.getAttachmentStore(),
+      undefined,
+      {
+        reconcileRestoredIndexOnInit: false,
+      },
+    );
+    const restartedCacheManager = (tenant as any).cacheManager as CacheManager;
+    db2.setCacheManager(restartedCacheManager);
+    const restored = await (db2 as any).restoreFromCache(restartedCacheManager.getStore());
+    expect(restored).toBe(true);
+
+    const beforeCursor = (db2 as any).processedEntryCursor;
+    const originalHasDecryptionKey = (tenant as any).hasDecryptionKey.bind(tenant);
+    (tenant as any).hasDecryptionKey = jest.fn(async () => {
+      throw new Error(`boom:${doc2Id}`);
+    });
+
+    try {
+      await expect((db2 as any).syncStoreChanges()).rejects.toThrow(`boom:${doc2Id}`);
+      expect((db2 as any).processedEntryCursor).toEqual(beforeCursor);
+    } finally {
+      (tenant as any).hasDecryptionKey = originalHasDecryptionKey;
+    }
   }, 30000);
 });

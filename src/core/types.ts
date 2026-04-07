@@ -797,6 +797,15 @@ export interface DocumentCacheConfig {
    * Default: same as `maxEntries`
    */
   restoreLimit?: number;
+
+  /**
+   * When enabled, verifies after cache restore that the restored document
+   * index still matches the underlying local store and rebuilds metadata if a
+   * stale checkpoint is detected. Intended for troubleshooting sync/cache
+   * inconsistencies because it adds an extra metadata scan during startup.
+   * Default: false
+   */
+  reconcileRestoredIndexOnInit?: boolean;
 }
 
 /**
