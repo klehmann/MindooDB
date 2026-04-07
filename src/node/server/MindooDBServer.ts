@@ -412,7 +412,7 @@ export class MindooDBServer {
     }
 
     if (!this.tenantManager.tenantExists(rawTenantId)) {
-      res.status(404).json({ error: "Tenant not found" });
+      res.status(404).json({ error: this.formatTenantNotFoundOnServerError(rawTenantId) });
       return;
     }
 
@@ -941,6 +941,11 @@ export class MindooDBServer {
 
   private validateDbId(dbId: unknown): string {
     return validateIdentifier(dbId, "dbId");
+  }
+
+  private formatTenantNotFoundOnServerError(tenantId: string): string {
+    const serverName = this.tenantManager.getServerPublicInfo()?.name ?? "unknown";
+    return `Tenant ${tenantId} not found on server ${serverName}`;
   }
 
   // ==================== Tenant Auth Handlers ====================

@@ -968,6 +968,19 @@ describe("System Admin Security", () => {
       expect(response.body).toMatchObject({ error: "Tenant not found on server" });
     });
 
+    test("tenant auth challenge includes tenant and server name when the tenant is unknown", async () => {
+      const tenantId = "missing-tenant";
+      const response = await httpRequest(
+        `${setup.baseUrl}/${tenantId}/auth/challenge`,
+        "POST",
+        { username: "cn=user/o=test" },
+      );
+      expect(response.status).toBe(404);
+      expect(response.body).toMatchObject({
+        error: "Tenant missing-tenant not found on server CN=test-sysadmin-server",
+      });
+    });
+
     test("GET /system/tenants lists tenants", async () => {
       const token = await getSystemAdminToken(
         setup.baseUrl,
