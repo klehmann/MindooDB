@@ -38,6 +38,18 @@ The setup script:
 - initialises the server identity and optionally creates a system admin keypair interactively
 - writes a `docker-compose.override.yml` with your current host uid/gid, bind mounts, and one or more published port bindings based on your chosen bind address
 
+For an existing deployment, use one of these update paths instead of reinitialising blindly:
+
+```bash
+# Safe interactive update for an existing server
+bash serversetup.sh --update
+
+# Or rebuild the image and restart without touching setup files
+docker compose up -d --build
+```
+
+`bash serversetup.sh --update` preserves the existing `server.identity.json`, `server.keybag`, `config.json`, tenant data, `trusted-servers.json`, and `.server_unlock`, while still rebuilding the Docker image and regenerating `docker-compose.override.yml`.
+
 After setup, manage the server with:
 
 ```bash
@@ -46,6 +58,14 @@ docker compose down          # stop
 docker compose logs -f       # follow logs
 docker compose up -d --build # rebuild image and restart
 ```
+
+When rerunning `bash serversetup.sh` without `--update`, the script now detects an existing `server.identity.json` and offers three choices:
+
+- safe update (preserve identity, keybag, config, tenant data, and password file)
+- overwrite identity (destructive re-init)
+- abort
+
+Only choose overwrite if you intentionally want to replace the server identity and reinitialise the deployment.
 
 For identity utilities on a Docker-deployed server, use the wrapper script from the repository root:
 
@@ -902,7 +922,7 @@ Available DNS plugins include Cloudflare, Route53, Google Cloud DNS, DigitalOcea
 
 The server ships with a multi-stage `Dockerfile` under `src/node/server/` that produces a minimal Alpine-based image. The build context must be the **repository root** so the library and server compile together.
 
-**Recommended:** use `bash serversetup.sh` (see [Quick Start](#quick-start)) to build, initialise, and configure everything interactively. The rest of this section covers manual Docker commands for advanced use cases.
+**Recommended:** use `bash serversetup.sh` for first-time setup, and `bash serversetup.sh --update` for safe interactive updates to an existing deployment. The rest of this section covers manual Docker commands for advanced use cases.
 
 ### docker-compose.yml
 
@@ -912,6 +932,8 @@ The generated override also contains the published port bindings. This supports 
 - bind all interfaces (`0.0.0.0`)
 - bind a single specific IP (for example a VPN address)
 - bind both `127.0.0.1` and one specific extra IP
+
+If you only changed application code and do not need to adjust ports or bind addresses, `docker compose up -d --build` is usually enough.
 
 ### Manual Docker commands (without serversetup.sh)
 
@@ -947,9 +969,11 @@ On SELinux hosts, append `:Z` to the `/data` bind mount and `,Z` to the read-onl
 
 ### Bind to a specific IP
 
-To restrict the server to a specific network interface (e.g. a VPN), rerun `bash serversetup.sh` and provide the bind address when prompted.
+To restrict the server to a specific network interface (e.g. a VPN), rerun `bash serversetup.sh --update` and provide the bind address when prompted. Update mode preserves the existing server identity, keybag, config, tenant data, and password file while regenerating `docker-compose.override.yml`.
 
 If you also want local checks from the same host, answer `y` when asked whether to also bind `127.0.0.1`. The generated `docker-compose.override.yml` will then contain both mappings.
+
+Avoid the overwrite path unless you intentionally want to replace `server.identity.json`. Replacing the server identity breaks the relationship to server-owned encrypted state such as `server.keybag`, so it should be treated as a destructive reinitialization step, not a normal upgrade.
 
 ### Additional flags
 
