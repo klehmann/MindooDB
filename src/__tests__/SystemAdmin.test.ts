@@ -1125,11 +1125,17 @@ describe("System Admin Security", () => {
         setup.baseUrl,
         "directory",
       ) as ClientNetworkContentAddressedStore;
+      const remoteAgain = await result.tenant.connectToServer(
+        setup.baseUrl,
+        "directory",
+      ) as ClientNetworkContentAddressedStore;
       const adminSigningKey = await decryptUserSigningKey(
         cryptoAdapter,
         result.adminUser,
         "admin-pass",
       );
+
+      expect(remoteAgain).toBe(remote);
 
       remote.setSyncAuthOverride({
         username: result.adminUser.username,
