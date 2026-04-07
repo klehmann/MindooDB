@@ -213,7 +213,7 @@ export class MindooDBServer {
   private setupMiddleware(): void {
     this.app.use(helmet());
 
-    const corsOrigin = process.env.MINDOODB_CORS_ORIGIN;
+    const corsOrigin = this.readCorsOriginsFromEnv();
     this.app.use(cors({
       origin: corsOrigin || false,
       methods: ["GET", "POST", "PUT", "DELETE"],
@@ -234,6 +234,21 @@ export class MindooDBServer {
       console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
       next();
     });
+  }
+
+  private readCorsOriginsFromEnv(): string | string[] | undefined {
+    const raw = process.env.MINDOODB_CORS_ORIGIN?.trim();
+    if (!raw) {
+      return undefined;
+    }
+    const origins = raw
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    if (origins.length <= 1) {
+      return origins[0];
+    }
+    return origins;
   }
 
   private setupRoutes(): void {
@@ -264,7 +279,7 @@ export class MindooDBServer {
         validateTenantId(tenantId);
         const fingerprints = await this.tenantManager.listTenantPublicInfosFingerprints(tenantId);
         if (fingerprints.length === 0) {
-          res.status(404).json({ error: `Tenant ${tenantId} has no $publicinfos fingerprints` });
+          res.status(404).json({ error: "Tenant not found on server" });
           return;
         }
         const response: TenantPublicInfosFingerprintsResponse = {
@@ -278,7 +293,7 @@ export class MindooDBServer {
           return;
         }
         if (error instanceof Error && error.message.includes("not found")) {
-          res.status(404).json({ error: error.message });
+          res.status(404).json({ error: "Tenant not found on server" });
           return;
         }
         console.error("[MindooDBServer] Error reading tenant publicInfos fingerprints:", error);

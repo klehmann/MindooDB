@@ -593,6 +593,40 @@ describe("System Admin Security", () => {
     });
   });
 
+  describe("CORS configuration", () => {
+    let setup: TestSetup;
+    const port = 4011;
+    const previousCorsOrigin = process.env.MINDOODB_CORS_ORIGIN;
+
+    beforeAll(async () => {
+      process.env.MINDOODB_CORS_ORIGIN = "http://localhost:4174,https://mindoodb-haven.pages.dev,https://haven.mindoo.de";
+      setup = await createTestSetup(port, cryptoAdapter, factory);
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+      if (previousCorsOrigin === undefined) {
+        delete process.env.MINDOODB_CORS_ORIGIN;
+      } else {
+        process.env.MINDOODB_CORS_ORIGIN = previousCorsOrigin;
+      }
+    });
+
+    test("allows requests from configured CORS origins and rejects others", async () => {
+      const allowedResponse = await fetch(`${setup.baseUrl}/health`, {
+        headers: { Origin: "https://mindoodb-haven.pages.dev" },
+      });
+      expect(allowedResponse.status).toBe(200);
+      expect(allowedResponse.headers.get("access-control-allow-origin")).toBe("https://mindoodb-haven.pages.dev");
+
+      const disallowedResponse = await fetch(`${setup.baseUrl}/health`, {
+        headers: { Origin: "https://evil.example.com" },
+      });
+      expect(disallowedResponse.status).toBe(200);
+      expect(disallowedResponse.headers.get("access-control-allow-origin")).toBeNull();
+    });
+  });
+
   describe("Wildcard Tenant Creation Authorization", () => {
     let setup: TestSetup;
     const port = 4010;
@@ -922,6 +956,16 @@ describe("System Admin Security", () => {
       );
       expect(deleteResponse.status).toBe(200);
       expect(await loadServerStoredPublicInfosKeys(setup, tenantId)).toHaveLength(0);
+    });
+
+    test("public well-known fingerprints return a stable not-found message for unknown tenants", async () => {
+      const tenantId = "missing-tenant";
+      const response = await httpRequest(
+        `${setup.baseUrl}/.well-known/mindoodb-tenants/${tenantId}/publicinfos-fingerprints`,
+        "GET",
+      );
+      expect(response.status).toBe(404);
+      expect(response.body).toMatchObject({ error: "Tenant not found on server" });
     });
 
     test("GET /system/tenants lists tenants", async () => {
