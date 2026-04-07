@@ -300,38 +300,7 @@ print_summary() {
 
 run_setup_mode() {
   FORCE_FLAG=""
-  if [[ -f "$IDENTITY_FILE" ]]; then
-    if [[ "$MODE_SOURCE" == "flag" ]]; then
-      error "Update mode was requested, but $IDENTITY_FILE already exists. Use the default interactive mode if you want to overwrite it."
-      exit 1
-    fi
-    echo ""
-    printf "  Server identity already exists at %s.\n" "$IDENTITY_FILE"
-    printf "  Choose action: [u]pdate safely / [o]verwrite identity / [a]bort: "
-    local action
-    read -r action
-    case "$(to_lower "$action")" in
-      u)
-        MODE="update"
-        SERVER_NAME="unchanged"
-        ;;
-      o)
-        FORCE_FLAG="--force"
-        ;;
-      ""|a)
-        info "Aborted. Existing identity kept."
-        exit 0
-        ;;
-      *)
-        error "Please answer u, o, or a."
-        exit 1
-        ;;
-    esac
-    if [[ "$MODE" == "update" ]]; then
-      run_update_mode
-      return
-    fi
-  fi
+  prompt_default "Server name" "$DEFAULT_SERVER_NAME" SERVER_NAME
 
   prompt_password "Server unlock password" SERVER_PASSWORD
 
@@ -412,13 +381,39 @@ fi
 
 banner "Configuration"
 
-if [[ "$MODE" == "update" ]]; then
-  SERVER_NAME="unchanged"
-else
-  prompt_default "Server name" "$DEFAULT_SERVER_NAME" SERVER_NAME
-fi
 prompt_default "Data directory" "$DEFAULT_DATA_DIR" DATA_DIR
 set_data_paths
+
+if [[ "$MODE" == "update" ]]; then
+  SERVER_NAME="unchanged"
+elif [[ -f "$IDENTITY_FILE" ]]; then
+  echo ""
+  printf "  Server identity already exists at %s.\n" "$IDENTITY_FILE"
+  printf "  Choose action: [u]pdate safely / [o]verwrite identity / [a]bort: "
+  read -r action
+  case "$(to_lower "$action")" in
+    u)
+      MODE="update"
+      SERVER_NAME="unchanged"
+      ;;
+    o)
+      FORCE_FLAG="--force"
+      ;;
+    ""|a)
+      info "Aborted. Existing identity kept."
+      exit 0
+      ;;
+    *)
+      error "Please answer u, o, or a."
+      exit 1
+      ;;
+  esac
+fi
+
+if [[ "$MODE" != "update" ]]; then
+  prompt_default "Server name" "$DEFAULT_SERVER_NAME" SERVER_NAME
+fi
+
 prompt_default "Bind address (0.0.0.0 = all interfaces)" "$DEFAULT_BIND_ADDR" BIND_ADDR
 if [[ "$BIND_ADDR" != "0.0.0.0" && "$BIND_ADDR" != "127.0.0.1" ]]; then
   prompt_yes_no "Also bind localhost (127.0.0.1) for local health checks?" "n" ALSO_BIND_LOCALHOST

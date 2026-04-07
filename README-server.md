@@ -16,7 +16,7 @@ A Node.js/Express server implementing the MindooDB sync API with:
 
 ## Quick Start
 
-The fastest way to get a server running is the interactive setup script. It prompts for a server name, password, data directory, and bind address, then builds the Docker image and initialises the server identity (including optional system admin creation):
+The fastest way to get a server running is the interactive setup script. It prompts for the data directory first, detects whether this is a fresh setup or an existing deployment, and then asks only for the values needed for the chosen path (for example server name and password for fresh setup, or just bind settings for safe update). It then builds the Docker image and initialises the server identity when needed (including optional system admin creation):
 
 ```bash
 # 1. Clone and enter the repo
