@@ -7,9 +7,10 @@
  */
 
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
+import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import type { PrivateUserId } from "./userid";
-import type { EncryptedPrivateKey } from "./types";
+import type { EncryptedPrivateKey, MindooDBServerInfo } from "./types";
 
 /**
  * Connection and authentication options for {@link MindooDBServerAdmin}.
@@ -74,6 +75,7 @@ interface RegisterTenantBody {
   adminEncryptionPublicKey: string;
   adminUsername?: string;
   publicInfosKey?: string;
+  encryptedPublicInfosKey?: string;
   defaultStoreType?: "inmemory" | "file";
   users?: Array<{
     username: string;
@@ -88,6 +90,15 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
+}
+
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 function normalizePrincipalKey(principal: SystemAdminPrincipal): string {
@@ -168,10 +179,27 @@ export class MindooDBServerAdmin {
     tenantId: string,
     body: RegisterTenantBody,
   ): Promise<{ success: boolean; tenantId: string; message?: string }> {
+    const requestBody: RegisterTenantBody = { ...body };
+    if (!requestBody.encryptedPublicInfosKey) {
+      if (!requestBody.publicInfosKey) {
+        throw new Error("registerTenant requires publicInfosKey or encryptedPublicInfosKey");
+      }
+      try {
+        const serverInfo = await this.fetchServerInfo();
+        requestBody.encryptedPublicInfosKey = await this.encryptPublicInfosKey(
+          requestBody.publicInfosKey,
+          serverInfo.encryptionPublicKey,
+        );
+        delete requestBody.publicInfosKey;
+      } catch (error) {
+        // Fallback for servers that do not expose an encryption key yet.
+        console.warn("[MindooDBServerAdmin] Falling back to raw publicInfosKey transport:", error);
+      }
+    }
     return await this.authenticatedRequest(
       "POST",
       `/system/tenants/${encodeURIComponent(tenantId)}`,
-      body,
+      requestBody,
     );
   }
 
@@ -574,6 +602,47 @@ export class MindooDBServerAdmin {
     this.tokenExpiresAt = Date.now() + 55 * 60 * 1000;
 
     return result.token;
+  }
+
+  private async fetchServerInfo(): Promise<MindooDBServerInfo> {
+    const response = await fetch(`${this.baseUrl}/.well-known/mindoodb-server-info`, {
+      headers: { Accept: "application/json" },
+    });
+    let body: unknown = null;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+    if (!response.ok) {
+      const errorMessage = typeof (body as { error?: unknown } | null)?.error === "string"
+        ? (body as { error: string }).error
+        : `Could not read ${this.baseUrl}/.well-known/mindoodb-server-info (HTTP ${response.status}).`;
+      throw new Error(errorMessage);
+    }
+    if (
+      !body
+      || typeof body !== "object"
+      || Array.isArray(body)
+      || typeof (body as MindooDBServerInfo).name !== "string"
+      || typeof (body as MindooDBServerInfo).signingPublicKey !== "string"
+      || typeof (body as MindooDBServerInfo).encryptionPublicKey !== "string"
+    ) {
+      throw new Error("The server returned an invalid .well-known payload.");
+    }
+    return body as MindooDBServerInfo;
+  }
+
+  private async encryptPublicInfosKey(
+    publicInfosKeyBase64: string,
+    encryptionPublicKey: string,
+  ): Promise<string> {
+    const rsaEncryption = new RSAEncryption(this.cryptoAdapter);
+    const encrypted = await rsaEncryption.encrypt(
+      base64ToUint8Array(publicInfosKeyBase64),
+      encryptionPublicKey,
+    );
+    return uint8ArrayToBase64(encrypted);
   }
 
   /**

@@ -71,15 +71,12 @@ export interface TenantConfig {
   /** RSA-OAEP public key in PEM format for encrypting admin-only data */
   adminEncryptionPublicKey: string;
 
-  /** Base64-encoded $publicinfos AES-256 symmetric key for reading the directory DB */
-  publicInfosKey?: string;
-
   /** Default store type for new databases (default: "file") */
   defaultStoreType?: StoreType;
   /** Per-database store configuration overrides */
   databaseStores?: Record<string, DatabaseStoreConfig>;
 
-  /** Registered users (clients and other servers) — bootstrap/test fallback, ignored when publicInfosKey is present */
+  /** Registered users (clients and other servers) kept for bootstrap metadata only */
   users?: UserConfig[];
 
   /** Remote servers to sync with (for server-to-server sync) */
@@ -98,8 +95,10 @@ export interface RegisterTenantRequest {
   adminSigningPublicKey: string;
   /** RSA-OAEP public key in PEM format */
   adminEncryptionPublicKey: string;
-  /** Base64-encoded $publicinfos AES-256 symmetric key for reading the directory DB */
+  /** Legacy fallback: base64-encoded raw $publicinfos AES-256 key */
   publicInfosKey?: string;
+  /** Preferred transport: base64-encoded RSA-encrypted $publicinfos AES-256 key */
+  encryptedPublicInfosKey?: string;
   /** Default store type (default: "file") */
   defaultStoreType?: StoreType;
   /** Initial users to register (for testing/bootstrapping only, ignored when publicInfosKey is present) */
@@ -112,7 +111,13 @@ export interface RegisterTenantRequest {
 export interface RegisterTenantResponse {
   success: boolean;
   tenantId: string;
+  created?: boolean;
   message?: string;
+}
+
+export interface TenantPublicInfosFingerprintsResponse {
+  tenantId: string;
+  fingerprints: string[];
 }
 
 /**

@@ -24,6 +24,8 @@ import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import { BaseMindooTenantFactory } from "../../core/BaseMindooTenantFactory";
+import { RSAEncryption } from "../../core/crypto/RSAEncryption";
+import { decryptPrivateKey } from "../../core/crypto/privateKeyEncryption";
 import { KeyBag } from "../../core/keys/KeyBag";
 import type {
   MindooTenant,
@@ -33,6 +35,7 @@ import type {
   CreateStoreResult,
   OpenStoreOptions,
   OpenTenantOptions,
+  EncryptedPrivateKey,
 } from "../../core/types";
 import { PUBLIC_INFOS_KEY_ID } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
@@ -58,6 +61,11 @@ interface LoadedTenant {
   directory: MindooTenantDirectory;
   mindooTenant?: MindooTenant;
   serverStores: Map<string, ServerNetworkContentAddressedStore>;
+}
+
+interface RegisterTenantResult {
+  context: TenantContext;
+  created: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,16 +332,154 @@ export class TenantManager {
     writeFileSync(filePath, JSON.stringify(this.trustedServers, null, 2), "utf-8");
   }
 
+  private getServerKeyBagPath(): string {
+    return join(this.dataDir, "server.keybag");
+  }
+
+  private async loadServerKeyBag(): Promise<KeyBag> {
+    if (!this.serverIdentity || !this.serverPassword) {
+      throw new Error("Server identity and server password are required to manage tenant $publicinfos keys");
+    }
+    const keyBag = new KeyBag(
+      this.serverIdentity.userEncryptionKeyPair.privateKey,
+      this.serverPassword,
+      this.cryptoAdapter,
+    );
+    const keyBagPath = this.getServerKeyBagPath();
+    if (existsSync(keyBagPath)) {
+      const data = readFileSync(keyBagPath);
+      await keyBag.load(new Uint8Array(data));
+    }
+    return keyBag;
+  }
+
+  private async saveServerKeyBag(keyBag: KeyBag): Promise<void> {
+    writeFileSync(this.getServerKeyBagPath(), Buffer.from(await keyBag.save()));
+  }
+
+  private bytesToBase64(bytes: Uint8Array): string {
+    return Buffer.from(bytes).toString("base64");
+  }
+
+  private mergeUniqueKeys(keys: Uint8Array[]): Uint8Array[] {
+    const seen = new Set<string>();
+    const unique: Uint8Array[] = [];
+    for (const key of keys) {
+      const signature = this.bytesToBase64(key);
+      if (seen.has(signature)) {
+        continue;
+      }
+      seen.add(signature);
+      unique.push(key);
+    }
+    return unique;
+  }
+
+  private async computePublicInfosFingerprint(key: Uint8Array): Promise<string> {
+    const digest = await this.cryptoAdapter.getSubtle().digest("SHA-256", key as BufferSource);
+    return Array.from(new Uint8Array(digest).slice(0, 8))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join(":");
+  }
+
+  private async decryptEncryptedPublicInfosKey(base64Payload: string): Promise<Uint8Array> {
+    if (!this.serverIdentity) {
+      throw new Error("Server identity not initialized; cannot decrypt encrypted $publicinfos payload");
+    }
+    if (!this.serverPassword) {
+      throw new Error("Server password not configured; cannot decrypt encrypted $publicinfos payload");
+    }
+    const privateKeyBuffer = await decryptPrivateKey(
+      this.cryptoAdapter,
+      this.serverIdentity.userEncryptionKeyPair.privateKey as EncryptedPrivateKey,
+      this.serverPassword,
+      "encryption",
+    );
+    const privateKey = await this.cryptoAdapter.getSubtle().importKey(
+      "pkcs8",
+      privateKeyBuffer,
+      {
+        name: "RSA-OAEP",
+        hash: "SHA-256",
+      },
+      false,
+      ["decrypt"],
+    );
+    const decrypted = await new RSAEncryption(this.cryptoAdapter).decrypt(
+      new Uint8Array(Buffer.from(base64Payload, "base64")),
+      privateKey,
+    );
+    return new Uint8Array(decrypted);
+  }
+
+  private async resolveIncomingPublicInfosKey(request: RegisterTenantRequest): Promise<Uint8Array> {
+    if (request.encryptedPublicInfosKey) {
+      return this.decryptEncryptedPublicInfosKey(request.encryptedPublicInfosKey);
+    }
+    if (request.publicInfosKey) {
+      return new Uint8Array(Buffer.from(request.publicInfosKey, "base64"));
+    }
+    throw new Error("Tenant registration requires encryptedPublicInfosKey or publicInfosKey");
+  }
+
+  private async getStoredPublicInfosKeys(tenantId: string): Promise<Uint8Array[]> {
+    const keys: Uint8Array[] = [];
+    if (this.serverIdentity && this.serverPassword && existsSync(this.getServerKeyBagPath())) {
+      const keyBag = await this.loadServerKeyBag();
+      keys.push(...await keyBag.getAllKeys("doc", tenantId, PUBLIC_INFOS_KEY_ID));
+    }
+    return this.mergeUniqueKeys(keys);
+  }
+
+  private async persistTenantPublicInfosKey(tenantId: string, key: Uint8Array): Promise<void> {
+    const keyBag = await this.loadServerKeyBag();
+    const existingKeys = await keyBag.getAllKeys("doc", tenantId, PUBLIC_INFOS_KEY_ID);
+    const incomingSignature = this.bytesToBase64(key);
+    const alreadyStored = existingKeys.some((entry) => this.bytesToBase64(entry) === incomingSignature);
+    if (!alreadyStored) {
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, key, Date.now());
+      await this.saveServerKeyBag(keyBag);
+    }
+  }
+
+  async listTenantPublicInfosFingerprints(tenantId: string): Promise<string[]> {
+    const normalizedId = tenantId.toLowerCase();
+    const configPath = join(this.dataDir, normalizedId, "config.json");
+    if (!existsSync(configPath)) {
+      throw new Error(`Tenant ${normalizedId} not found`);
+    }
+    const fingerprints = await Promise.all(
+      (await this.getStoredPublicInfosKeys(normalizedId)).map((key) => this.computePublicInfosFingerprint(key)),
+    );
+    return [...new Set(fingerprints)].sort();
+  }
+
   // =======================================================================
   // Tenant management
   // =======================================================================
 
-  registerTenant(request: RegisterTenantRequest): TenantContext {
+  async registerTenant(request: RegisterTenantRequest): Promise<RegisterTenantResult> {
     const tenantId = request.tenantId.toLowerCase();
     const tenantDir = join(this.dataDir, tenantId);
+    const configPath = join(tenantDir, "config.json");
+    if (!this.serverIdentity || !this.serverPassword) {
+      throw new Error("Tenant registration requires an unlocked server identity to store $publicinfos keys");
+    }
+    const publicInfosKey = await this.resolveIncomingPublicInfosKey(request);
 
-    if (existsSync(tenantDir)) {
-      throw new Error(`Tenant ${tenantId} already exists`);
+    if (existsSync(configPath)) {
+      const existingConfig: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+      const incomingSignature = this.bytesToBase64(publicInfosKey);
+      const existingKeys = await this.getStoredPublicInfosKeys(tenantId);
+      const hasMatch = existingKeys.some((key) => this.bytesToBase64(key) === incomingSignature);
+      if (hasMatch) {
+        console.log(`[TenantManager] Tenant ${tenantId} already registered with matching $publicinfos key`);
+        return {
+          context: { tenantId, config: existingConfig },
+          created: false,
+        };
+      }
+      throw new Error(`Tenant ${tenantId} already exists with different $publicinfos key`);
     }
 
     mkdirSync(tenantDir, { recursive: true });
@@ -342,19 +488,25 @@ export class TenantManager {
       adminUsername: request.adminUsername,
       adminSigningPublicKey: request.adminSigningPublicKey,
       adminEncryptionPublicKey: request.adminEncryptionPublicKey,
-      publicInfosKey: request.publicInfosKey,
       defaultStoreType: request.defaultStoreType || "file",
-      // When $publicinfos is present, directory grant documents are the source of
-      // truth for tenant users. Keep config.json free of bootstrap app users.
-      users: request.publicInfosKey ? [] : (request.users || []),
+      users: [],
     };
+    try {
+      writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+      await this.persistTenantPublicInfosKey(tenantId, publicInfosKey);
+    } catch (error) {
+      rmSync(tenantDir, { recursive: true, force: true });
+      throw error;
+    }
 
-    const configPath = join(tenantDir, "config.json");
-    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+    console.log(
+      `[TenantManager] Registered tenant: ${tenantId} ($publicinfos stored in server keybag)`,
+    );
 
-    console.log(`[TenantManager] Registered tenant: ${tenantId} (publicInfosKey: ${config.publicInfosKey ? "yes" : "no"})`);
-
-    return { tenantId, config };
+    return {
+      context: { tenantId, config },
+      created: true,
+    };
   }
 
   async getTenant(tenantId: string): Promise<LoadedTenant> {
@@ -425,7 +577,7 @@ export class TenantManager {
     console.log(`[TenantManager] Updated tenant config: ${normalizedId}`);
   }
 
-  removeTenant(tenantId: string): void {
+  async removeTenant(tenantId: string): Promise<void> {
     const normalizedId = tenantId.toLowerCase();
     const tenantDir = join(this.dataDir, normalizedId);
 
@@ -434,6 +586,11 @@ export class TenantManager {
     }
 
     this.loadedTenants.delete(normalizedId);
+    if (this.serverIdentity && this.serverPassword && existsSync(this.getServerKeyBagPath())) {
+      const keyBag = await this.loadServerKeyBag();
+      await keyBag.deleteKey("doc", normalizedId, PUBLIC_INFOS_KEY_ID);
+      await this.saveServerKeyBag(keyBag);
+    }
     rmSync(tenantDir, { recursive: true, force: true });
 
     console.log(`[TenantManager] Removed tenant: ${normalizedId}`);
@@ -575,9 +732,10 @@ export class TenantManager {
       "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">;
     let mindooTenant: MindooTenant | undefined;
 
-    if (config.publicInfosKey && this.serverIdentity && this.serverPassword) {
+    const publicInfosKeys = await this.getStoredPublicInfosKeys(tenantId);
+    if (publicInfosKeys.length > 0 && this.serverIdentity && this.serverPassword) {
       try {
-        const result = await this.createDirectoryTenant(tenantId, config, storeFactory);
+        const result = await this.createDirectoryTenant(tenantId, config, storeFactory, publicInfosKeys);
         mindooTenant = result.tenant;
         innerDirectory = await mindooTenant.openDirectory();
         console.log(`[TenantManager] Loaded tenant ${tenantId} with real directory`);
@@ -586,10 +744,10 @@ export class TenantManager {
         innerDirectory = new SimpleMindooDirectory(config);
       }
     } else {
-      if (config.publicInfosKey && !this.serverIdentity) {
-        console.log(`[TenantManager] Tenant ${tenantId} has publicInfosKey but no server identity; using config-based directory`);
+      if (publicInfosKeys.length > 0 && !this.serverIdentity) {
+        console.log(`[TenantManager] Tenant ${tenantId} has $publicinfos keys but no server identity; using config-based directory`);
       } else {
-        console.log(`[TenantManager] No publicInfosKey for ${tenantId}, using config-based directory`);
+        console.log(`[TenantManager] No $publicinfos keys for ${tenantId}, using config-based directory`);
       }
       innerDirectory = new SimpleMindooDirectory(config);
     }
@@ -633,6 +791,7 @@ export class TenantManager {
     tenantId: string,
     config: TenantConfig,
     storeFactory: StoreFactory,
+    publicInfosKeys: Uint8Array[],
   ): Promise<{ tenant: MindooTenant }> {
     const storeFactoryAdapter = new StoreFactoryAdapter(storeFactory);
     const factory = new BaseMindooTenantFactory(storeFactoryAdapter, this.cryptoAdapter);
@@ -645,8 +804,9 @@ export class TenantManager {
       this.serverPassword!,
       this.cryptoAdapter,
     );
-    const publicInfosKeyBytes = Buffer.from(config.publicInfosKey!, "base64");
-    await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, new Uint8Array(publicInfosKeyBytes));
+    for (const publicInfosKey of this.mergeUniqueKeys(publicInfosKeys)) {
+      await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+    }
 
     // Collect trusted server signing keys for additionalTrustedKeys
     const openOptions: OpenTenantOptions = {};

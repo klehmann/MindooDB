@@ -1,15 +1,16 @@
 import express from "express";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { Server } from "http";
 import { build } from "esbuild";
-import { writeFileSync } from "fs";
 
 import { InMemoryContentAddressedStoreFactory } from "../../../appendonlystores/InMemoryContentAddressedStoreFactory";
+import { ClientNetworkContentAddressedStore } from "../../../appendonlystores/network/ClientNetworkContentAddressedStore";
+import { HttpTransport } from "../../../appendonlystores/network/HttpTransport";
 import { BaseMindooTenantFactory } from "../../../core/BaseMindooTenantFactory";
-import { MindooDBServerAdmin } from "../../../core/MindooDBServerAdmin";
 import type { PrivateUserId } from "../../../core/userid";
+import { decryptPrivateKey } from "../../../core/crypto/privateKeyEncryption";
 import { NodeCryptoAdapter } from "../../../node/crypto/NodeCryptoAdapter";
 import { MindooDBServer } from "../../../node/server/MindooDBServer";
 import type { ServerConfig } from "../../../node/server/types";
@@ -78,64 +79,12 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
     new InMemoryContentAddressedStoreFactory(),
     cryptoAdapter,
   );
-
-  const adminSigningKeyPair = await subtle.generateKey(
-    { name: "Ed25519" },
-    true,
-    ["sign", "verify"]
-  ) as CryptoKeyPair;
-  const adminEncryptionKeyPair = await subtle.generateKey(
-    {
-      name: "RSA-OAEP",
-      modulusLength: 3072,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: "SHA-256",
-    },
-    true,
-    ["encrypt", "decrypt"]
-  ) as CryptoKeyPair;
-
-  const userSigningKeyPair = await subtle.generateKey(
-    { name: "Ed25519" },
-    true,
-    ["sign", "verify"]
-  ) as CryptoKeyPair;
-  const userEncryptionKeyPair = await subtle.generateKey(
-    {
-      name: "RSA-OAEP",
-      modulusLength: 3072,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: "SHA-256",
-    },
-    true,
-    ["encrypt", "decrypt"]
-  ) as CryptoKeyPair;
-
-  const adminSigningPublicKeyPem = arrayBufferToPEM(
-    await subtle.exportKey("spki", adminSigningKeyPair.publicKey),
-    "PUBLIC KEY"
+  const serverIdentity = await factory.createUserId("CN=browser-test-server", "browser-server-pass");
+  writeFileSync(
+    path.join(dataDir, "server.identity.json"),
+    JSON.stringify(serverIdentity, null, 2),
+    "utf-8",
   );
-  const adminEncryptionPublicKeyPem = arrayBufferToPEM(
-    await subtle.exportKey("spki", adminEncryptionKeyPair.publicKey),
-    "PUBLIC KEY"
-  );
-  const userSigningPublicKeyPem = arrayBufferToPEM(
-    await subtle.exportKey("spki", userSigningKeyPair.publicKey),
-    "PUBLIC KEY"
-  );
-  const userSigningPrivateKeyPem = arrayBufferToPEM(
-    await subtle.exportKey("pkcs8", userSigningKeyPair.privateKey),
-    "PRIVATE KEY"
-  );
-  const userEncryptionPublicKeyPem = arrayBufferToPEM(
-    await subtle.exportKey("spki", userEncryptionKeyPair.publicKey),
-    "PUBLIC KEY"
-  );
-  const userEncryptionPrivateKeyPem = arrayBufferToPEM(
-    await subtle.exportKey("pkcs8", userEncryptionKeyPair.privateKey),
-    "PRIVATE KEY"
-  );
-
   const systemAdmin = await factory.createUserId("cn=browser-admin/o=test", "browser-admin-pass");
   const config: ServerConfig = {
     capabilities: {
@@ -148,7 +97,7 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
     },
   };
 
-  const mindooServer = new MindooDBServer(dataDir, undefined, undefined, config);
+  const mindooServer = new MindooDBServer(dataDir, "browser-server-pass", undefined, config);
   const app = express();
 
   app.get("/__browser-test__/index.html", (_req, res) => {
@@ -173,18 +122,61 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
   }
 
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  await registerTenant(
-    baseUrl,
-    systemAdmin,
-    "browser-admin-pass",
-    cryptoAdapter,
+  const result = await factory.createTenant({
     tenantId,
-    adminSigningPublicKeyPem,
-    adminEncryptionPublicKeyPem,
-    username,
-    userSigningPublicKeyPem,
-    userEncryptionPublicKeyPem,
+    adminName: `cn=admin/o=${tenantId}`,
+    adminPassword: "browser-tenant-admin-pass",
+    userName: username,
+    userPassword: "browser-user-pass",
+  });
+  await result.tenant.publishToServer(`${baseUrl}/api`, {
+    systemAdminUser: systemAdmin,
+    systemAdminPassword: "browser-admin-pass",
+    adminUsername: result.adminUser.username,
+  });
+  const userSigningPublicKeyPem = result.appUser.userSigningKeyPair.publicKey;
+  const userEncryptionPublicKeyPem = result.appUser.userEncryptionKeyPair.publicKey;
+  const userSigningPrivateKeyPem = arrayBufferToPEM(
+    await decryptPrivateKey(
+      cryptoAdapter,
+      result.appUser.userSigningKeyPair.privateKey,
+      "browser-user-pass",
+      "signing",
+    ),
+    "PRIVATE KEY",
   );
+  const userEncryptionPrivateKeyPem = arrayBufferToPEM(
+    await decryptPrivateKey(
+      cryptoAdapter,
+      result.appUser.userEncryptionKeyPair.privateKey,
+      "browser-user-pass",
+      "encryption",
+    ),
+    "PRIVATE KEY",
+  );
+  const directoryDb = await result.tenant.openDB("directory", { adminOnlyDb: true });
+  await directoryDb.syncStoreChanges();
+  const remote = new ClientNetworkContentAddressedStore(
+    "directory",
+    new HttpTransport({
+      baseUrl: `${baseUrl}/api/${tenantId}`,
+      tenantId,
+      dbId: "directory",
+    }),
+    cryptoAdapter,
+    result.appUser.username,
+    await decryptUserSigningKey(cryptoAdapter, result.appUser, "browser-user-pass"),
+    userEncryptionPrivateKeyPem,
+  );
+  remote.setSyncAuthOverride({
+    username: result.adminUser.username,
+    signingKey: await decryptUserSigningKey(cryptoAdapter, result.adminUser, "browser-tenant-admin-pass"),
+  });
+  try {
+    await directoryDb.pushChangesTo(remote);
+  } finally {
+    remote.clearSyncAuthOverride();
+  }
 
   return {
     context: {
@@ -194,7 +186,7 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
       browserBundleUrl: `${baseUrl}/__browser-test__/mindoodb-browser-bundle.js`,
       tenantId,
       dbId,
-      username,
+      username: result.appUser.username,
       userSigningPublicKeyPem,
       userSigningPrivateKeyPem,
       userEncryptionPublicKeyPem,
@@ -222,34 +214,23 @@ function arrayBufferToPEM(buffer: ArrayBuffer, type: string): string {
   return `-----BEGIN ${type}-----\n${lines.join("\n")}\n-----END ${type}-----`;
 }
 
-async function registerTenant(
-  baseUrl: string,
-  systemAdminUser: PrivateUserId,
-  systemAdminPassword: string,
+async function decryptUserSigningKey(
   cryptoAdapter: NodeCryptoAdapter,
-  tenantId: string,
-  adminSigningPublicKey: string,
-  adminEncryptionPublicKey: string,
-  username: string,
-  signingPublicKey: string,
-  encryptionPublicKey: string,
-): Promise<void> {
-  const adminClient = new MindooDBServerAdmin({
-    serverUrl: `${baseUrl}/api`,
-    systemAdminUser,
-    systemAdminPassword,
+  user: PrivateUserId,
+  password: string,
+): Promise<CryptoKey> {
+  const subtle = cryptoAdapter.getSubtle();
+  const decrypted = await decryptPrivateKey(
     cryptoAdapter,
-  });
-
-  await adminClient.registerTenant(tenantId, {
-    adminSigningPublicKey,
-    adminEncryptionPublicKey,
-    users: [
-      {
-        username,
-        signingPublicKey,
-        encryptionPublicKey,
-      },
-    ],
-  });
+    user.userSigningKeyPair.privateKey,
+    password,
+    "signing",
+  );
+  return subtle.importKey(
+    "pkcs8",
+    decrypted,
+    { name: "Ed25519" },
+    false,
+    ["sign"],
+  );
 }

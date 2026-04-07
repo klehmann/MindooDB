@@ -22,6 +22,7 @@ import { KeyBag } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
+import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
@@ -707,14 +708,49 @@ export class BaseMindooTenant implements MindooTenant {
     if (!publicInfosKeyBytes) {
       throw new Error(`Cannot publish to server: $publicinfos key not found in KeyBag`);
     }
-    const publicInfosKeyBase64 = this.uint8ArrayToBase64(publicInfosKeyBytes);
-
     // Build the registration request body
     const requestBody: Record<string, unknown> = {
       adminSigningPublicKey: this.administrationPublicKey,
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
-      publicInfosKey: publicInfosKeyBase64,
     };
+    try {
+      const serverInfoResponse = await fetch(`${baseUrl}/.well-known/mindoodb-server-info`, {
+        headers: {
+          Accept: "application/json",
+        },
+      });
+      let serverInfoBody: unknown = null;
+      try {
+        serverInfoBody = await serverInfoResponse.json();
+      } catch {
+        serverInfoBody = null;
+      }
+      if (!serverInfoResponse.ok) {
+        throw new Error(
+          typeof (serverInfoBody as { error?: unknown } | null)?.error === "string"
+            ? (serverInfoBody as { error: string }).error
+            : `Could not read ${baseUrl}/.well-known/mindoodb-server-info (HTTP ${serverInfoResponse.status}).`,
+        );
+      }
+      if (
+        !serverInfoBody
+        || typeof serverInfoBody !== "object"
+        || Array.isArray(serverInfoBody)
+        || typeof (serverInfoBody as { encryptionPublicKey?: unknown }).encryptionPublicKey !== "string"
+      ) {
+        throw new Error("The server returned an invalid .well-known payload.");
+      }
+      const rsaEncryption = new RSAEncryption(this.cryptoAdapter);
+      requestBody.encryptedPublicInfosKey = this.uint8ArrayToBase64(
+        await rsaEncryption.encrypt(
+          publicInfosKeyBytes,
+          (serverInfoBody as { encryptionPublicKey: string }).encryptionPublicKey,
+        ),
+      );
+    } catch (error) {
+      console.warn("[publishToServer] Falling back to raw publicInfosKey transport:", error);
+      requestBody.publicInfosKey = this.uint8ArrayToBase64(publicInfosKeyBytes);
+    }
     if (options?.adminUsername) {
       requestBody.adminUsername = options.adminUsername;
     }

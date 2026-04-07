@@ -15,6 +15,7 @@ import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
 import { MindooDBServerAdmin } from "../core/MindooDBServerAdmin";
+import { KeyBag } from "../core/keys/KeyBag";
 import type { PrivateUserId } from "../core/userid";
 import type { ServerConfig } from "../node/server/types";
 import { MindooDBServer } from "../node/server/MindooDBServer";
@@ -60,6 +61,41 @@ function arrayBufferToPEM(buffer: ArrayBuffer, type: string): string {
   const base64 = Buffer.from(buffer).toString("base64");
   const lines = base64.match(/.{1,64}/g) || [];
   return `-----BEGIN ${type}-----\n${lines.join("\n")}\n-----END ${type}-----`;
+}
+
+function createPublicInfosKeyBase64(seed: number): string {
+  return Buffer.alloc(32, seed).toString("base64");
+}
+
+function formatFingerprint(bytes: Uint8Array): string {
+  return Array.from(bytes.slice(0, 8))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join(":");
+}
+
+async function computeSymmetricKeyFingerprint(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+  return formatFingerprint(new Uint8Array(digest));
+}
+
+async function loadServerStoredPublicInfosKeys(setup: TestSetup, tenantId: string): Promise<Uint8Array[]> {
+  const serverIdentity = setup.server.getTenantManager().getServerIdentity();
+  if (!serverIdentity) {
+    return [];
+  }
+  const fs = await import("fs");
+  const path = await import("path");
+  const keyBagPath = path.join(setup.dataDir, "server.keybag");
+  if (!fs.existsSync(keyBagPath)) {
+    return [];
+  }
+  const keyBag = new KeyBag(
+    serverIdentity.userEncryptionKeyPair.privateKey,
+    "test-password",
+    new NodeCryptoAdapter(),
+  );
+  await keyBag.load(new Uint8Array(fs.readFileSync(keyBagPath)));
+  return keyBag.getAllKeys("doc", tenantId, "$publicinfos");
 }
 
 // ===========================================================================
@@ -508,6 +544,7 @@ describe("System Admin Security", () => {
         {
           adminSigningPublicKey: adminSigningKey.publicKey,
           adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(5),
         },
         { Authorization: `Bearer ${token}` },
       );
@@ -595,6 +632,7 @@ describe("System Admin Security", () => {
         {
           adminSigningPublicKey: wildcardUser.userSigningKeyPair.publicKey,
           adminEncryptionPublicKey: wildcardUser.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(6),
         },
         { Authorization: `Bearer ${token}` },
       );
@@ -679,6 +717,7 @@ describe("System Admin Security", () => {
         {
           adminSigningPublicKey: wildcardUser.userSigningKeyPair.publicKey,
           adminEncryptionPublicKey: wildcardUser.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(7),
         },
         { Authorization: `Bearer ${token}` },
       );
@@ -742,11 +781,147 @@ describe("System Admin Security", () => {
         {
           adminSigningPublicKey: adminSigningKey.publicKey,
           adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(1),
         },
         { Authorization: `Bearer ${token}` },
       );
       expect(status).toBe(201);
       expect(body).toMatchObject({ success: true, tenantId: "crud-test" });
+    });
+
+    test("tenant registration stores $publicinfos in the server keybag, not config.json", async () => {
+      const fs = await import("fs");
+      const path = await import("path");
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        setup.adminUser,
+        "admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+      const tenantId = "keybag-test";
+      const publicInfosKey = createPublicInfosKeyBase64(9);
+      const adminSigningKey = await factory.createSigningKeyPair("pw");
+      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/${tenantId}`,
+        "POST",
+        {
+          adminSigningPublicKey: adminSigningKey.publicKey,
+          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          publicInfosKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(201);
+
+      const configPath = path.join(setup.dataDir, tenantId, "config.json");
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as { publicInfosKey?: string };
+      expect(config.publicInfosKey).toBeUndefined();
+
+      const storedKeys = await loadServerStoredPublicInfosKeys(setup, tenantId);
+      expect(storedKeys.map((key) => Buffer.from(key).toString("base64"))).toContain(publicInfosKey);
+    });
+
+    test("POST /system/tenants/:tenantId is idempotent for the same $publicinfos key and rejects mismatches", async () => {
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        setup.adminUser,
+        "admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+      const tenantId = "crud-idempotent-test";
+      const publicInfosKey = createPublicInfosKeyBase64(10);
+      const conflictingPublicInfosKey = createPublicInfosKeyBase64(11);
+      const adminSigningKey = await factory.createSigningKeyPair("pw");
+      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
+
+      const initialResponse = await httpRequest(
+        `${setup.baseUrl}/system/tenants/${tenantId}`,
+        "POST",
+        {
+          adminSigningPublicKey: adminSigningKey.publicKey,
+          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          publicInfosKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(initialResponse.status).toBe(201);
+
+      const repeatResponse = await httpRequest(
+        `${setup.baseUrl}/system/tenants/${tenantId}`,
+        "POST",
+        {
+          adminSigningPublicKey: adminSigningKey.publicKey,
+          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          publicInfosKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(repeatResponse.status).toBe(200);
+      expect(repeatResponse.body).toMatchObject({ success: true, tenantId, created: false });
+
+      const conflictResponse = await httpRequest(
+        `${setup.baseUrl}/system/tenants/${tenantId}`,
+        "POST",
+        {
+          adminSigningPublicKey: adminSigningKey.publicKey,
+          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          publicInfosKey: conflictingPublicInfosKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(conflictResponse.status).toBe(409);
+    });
+
+    test("public well-known fingerprints reflect stored keys and tenant deletion removes them", async () => {
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        setup.adminUser,
+        "admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+      const tenantId = "crud-fingerprint-test";
+      const publicInfosKey = createPublicInfosKeyBase64(12);
+      const expectedFingerprint = await computeSymmetricKeyFingerprint(
+        new Uint8Array(Buffer.from(publicInfosKey, "base64")),
+      );
+      const adminSigningKey = await factory.createSigningKeyPair("pw");
+      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
+
+      const createResponse = await httpRequest(
+        `${setup.baseUrl}/system/tenants/${tenantId}`,
+        "POST",
+        {
+          adminSigningPublicKey: adminSigningKey.publicKey,
+          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          publicInfosKey,
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(createResponse.status).toBe(201);
+
+      const fingerprintResponse = await httpRequest(
+        `${setup.baseUrl}/.well-known/mindoodb-tenants/${tenantId}/publicinfos-fingerprints`,
+        "GET",
+      );
+      expect(fingerprintResponse.status).toBe(200);
+      expect(fingerprintResponse.body).toMatchObject({
+        tenantId,
+        fingerprints: [expectedFingerprint],
+      });
+
+      const deleteResponse = await httpRequest(
+        `${setup.baseUrl}/system/tenants/${tenantId}`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(deleteResponse.status).toBe(200);
+      expect(await loadServerStoredPublicInfosKeys(setup, tenantId)).toHaveLength(0);
     });
 
     test("GET /system/tenants lists tenants", async () => {
@@ -994,6 +1169,7 @@ describe("System Admin Security", () => {
       const result = await admin.registerTenant("wrapper-test", {
         adminSigningPublicKey: adminSigningKey.publicKey,
         adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+        publicInfosKey: createPublicInfosKeyBase64(2),
       });
       expect(result.success).toBe(true);
       expect(result.tenantId).toBe("wrapper-test");
@@ -1075,6 +1251,7 @@ describe("System Admin Security", () => {
       await admin.registerTenant("sync-test", {
         adminSigningPublicKey: adminSigningKey.publicKey,
         adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+        publicInfosKey: createPublicInfosKeyBase64(3),
       });
 
       const addResult = await admin.addTenantSyncServer("sync-test", {
@@ -1122,6 +1299,7 @@ describe("System Admin Security", () => {
       await admin.registerTenant("wrapper-update-test", {
         adminSigningPublicKey: adminSigningKey.publicKey,
         adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+        publicInfosKey: createPublicInfosKeyBase64(4),
       });
 
       const result = await admin.updateTenant("wrapper-update-test", {
@@ -1325,6 +1503,7 @@ describe("System Admin Security", () => {
         {
           adminSigningPublicKey: delegatedAdmin.userSigningKeyPair.publicKey,
           adminEncryptionPublicKey: delegatedAdmin.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(8),
         },
         { Authorization: `Bearer ${delegatedToken}` },
       );

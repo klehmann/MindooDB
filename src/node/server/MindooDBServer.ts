@@ -54,6 +54,7 @@ import type {
   RegisterTenantRequest,
   RegisterTenantResponse,
   ListTenantsResponse,
+  TenantPublicInfosFingerprintsResponse,
   TrustedServer,
   NamedRemoteServerConfig,
 } from "./types";
@@ -257,6 +258,33 @@ export class MindooDBServer {
       }
       res.json(info);
     });
+    this.app.get("/.well-known/mindoodb-tenants/:tenantId/publicinfos-fingerprints", async (req, res) => {
+      const tenantId = req.params.tenantId.toLowerCase();
+      try {
+        validateTenantId(tenantId);
+        const fingerprints = await this.tenantManager.listTenantPublicInfosFingerprints(tenantId);
+        if (fingerprints.length === 0) {
+          res.status(404).json({ error: `Tenant ${tenantId} has no $publicinfos fingerprints` });
+          return;
+        }
+        const response: TenantPublicInfosFingerprintsResponse = {
+          tenantId,
+          fingerprints,
+        };
+        res.json(response);
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          res.status(400).json({ error: error.message });
+          return;
+        }
+        if (error instanceof Error && error.message.includes("not found")) {
+          res.status(404).json({ error: error.message });
+          return;
+        }
+        console.error("[MindooDBServer] Error reading tenant publicInfos fingerprints:", error);
+        res.status(500).json({ error: "Failed to read tenant publicInfos fingerprints" });
+      }
+    });
 
     // Static file serving
     if (this.staticDir) {
@@ -407,7 +435,7 @@ export class MindooDBServer {
       }
     });
 
-    router.post("/tenants/:tenantId", authMiddleware, (req: Request, res: Response) => {
+    router.post("/tenants/:tenantId", authMiddleware, async (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
 
@@ -441,24 +469,36 @@ export class MindooDBServer {
 
         validateStringLength(request.adminSigningPublicKey, MAX_PEM_KEY_LENGTH, "adminSigningPublicKey");
         validateStringLength(request.adminEncryptionPublicKey, MAX_PEM_KEY_LENGTH, "adminEncryptionPublicKey");
-
-        if (this.tenantManager.tenantExists(tenantId)) {
-          res.status(409).json({ error: `Tenant ${tenantId} already exists` });
+        if (!request.encryptedPublicInfosKey && !request.publicInfosKey) {
+          res.status(400).json({ error: "encryptedPublicInfosKey or publicInfosKey is required" });
           return;
         }
+        if (request.publicInfosKey !== undefined) {
+          validateStringLength(request.publicInfosKey, MAX_PEM_KEY_LENGTH, "publicInfosKey");
+        }
+        if (request.encryptedPublicInfosKey !== undefined) {
+          validateStringLength(request.encryptedPublicInfosKey, MAX_PEM_KEY_LENGTH, "encryptedPublicInfosKey");
+        }
 
-        const context = this.tenantManager.registerTenant(request);
+        const result = await this.tenantManager.registerTenant(request);
 
         const response: RegisterTenantResponse = {
           success: true,
-          tenantId: context.tenantId,
-          message: `Tenant ${context.tenantId} registered successfully`,
+          tenantId: result.context.tenantId,
+          created: result.created,
+          message: result.created
+            ? `Tenant ${result.context.tenantId} registered successfully`
+            : `Tenant ${result.context.tenantId} already exists with matching $publicinfos key`,
         };
 
-        res.status(201).json(response);
+        res.status(result.created ? 201 : 200).json(response);
       } catch (error) {
         if (error instanceof ValidationError) {
           res.status(400).json({ error: error.message });
+          return;
+        }
+        if (error instanceof Error && error.message.includes("different $publicinfos key")) {
+          res.status(409).json({ error: error.message });
           return;
         }
         console.error("[MindooDBServer] Error registering tenant:", error);
@@ -493,7 +533,7 @@ export class MindooDBServer {
       }
     });
 
-    router.delete("/tenants/:tenantId", authMiddleware, (req: Request, res: Response) => {
+    router.delete("/tenants/:tenantId", authMiddleware, async (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
 
@@ -509,7 +549,7 @@ export class MindooDBServer {
           return;
         }
 
-        this.tenantManager.removeTenant(tenantId);
+        await this.tenantManager.removeTenant(tenantId);
         res.json({ success: true, message: `Tenant ${tenantId} removed` });
       } catch (error) {
         console.error("[MindooDBServer] Error removing tenant:", error);

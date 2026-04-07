@@ -185,7 +185,13 @@ describe("MindooDB Example Server", () => {
       },
     };
 
-    server = new MindooDBServer(testDataDir, undefined, undefined, config);
+    const serverIdentity = await factory.createUserId("CN=example-test-server", "test-password");
+    fs.writeFileSync(
+      path.join(testDataDir, "server.identity.json"),
+      JSON.stringify(serverIdentity, null, 2),
+      "utf-8",
+    );
+    server = new MindooDBServer(testDataDir, "test-password", undefined, config);
     baseUrl = `http://localhost:${testPort}`;
 
     // Start server
