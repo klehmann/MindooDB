@@ -1722,6 +1722,16 @@ export class BaseMindooDB implements MindooDB {
     return docIds;
   }
 
+  async getDeletedDocumentIds(): Promise<string[]> {
+    const docIds: string[] = [];
+    for (const entry of this.index) {
+      if (entry.isDeleted) {
+        docIds.push(entry.docId);
+      }
+    }
+    return docIds;
+  }
+
   async getAllDocumentIdsAtTimestamp(timestamp: number): Promise<string[]> {
     // findEntries() uses an exclusive upper bound (createdAt < creationDateUntil).
     // Query up to timestamp + 1 so entries created exactly at `timestamp` are included

@@ -111,6 +111,9 @@ describe("TimeTravel", () => {
       
       await db.deleteDocument(docId);
       const deleteTime = Date.now();
+
+      expect(await db.getAllDocumentIds()).not.toContain(docId);
+      expect(await db.getDeletedDocumentIds()).toContain(docId);
       
       // Document should exist before deletion
       const beforeDelete = await db.getDocumentAtTimestamp(docId, modifyTime);

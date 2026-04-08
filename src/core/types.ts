@@ -1688,11 +1688,21 @@ export interface MindooDB {
   ): Promise<DocumentHistoryPageResult>;
 
   /**
-   * Get all document IDs in this database.
+   * Get all non-deleted document IDs in this database.
    *
    * @return A list of document IDs
    */
   getAllDocumentIds(): Promise<string[]>;
+
+  /**
+   * Get all deleted document IDs in this database.
+   *
+   * Deleted documents remain available through history/time-travel APIs until
+   * their history is purged.
+   *
+   * @return A list of deleted document IDs
+   */
+  getDeletedDocumentIds(): Promise<string[]>;
 
   /**
    * Get all document IDs that existed at a specific timestamp.
