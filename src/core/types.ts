@@ -31,6 +31,10 @@ export interface MindooDBServerInfo {
   signingPublicKey: string;
   /** RSA-OAEP public key in PEM format used for encryption. */
   encryptionPublicKey: string;
+  /** Configured JSON request body limit string accepted by the server, e.g. "5mb". */
+  maxJsonRequestBodyLimit?: string;
+  /** Parsed JSON request body limit in bytes when the configured limit is machine-readable. */
+  maxJsonRequestBodyBytes?: number;
 }
 
 /**
@@ -580,6 +584,9 @@ export type {
   StoreScanFilters,
   StoreScanResult,
   StoreIdBloomSummary,
+  AttachmentReadPlanOptions,
+  AttachmentReadPlanChunk,
+  AttachmentReadPlan,
   MaterializationPlanOptions,
   MaterializationPlanDiagnostics,
   DocumentMaterializationPlan,

@@ -10,6 +10,8 @@ import type {
   StoreCompactionStatus,
 } from "../../core/types";
 import type {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
@@ -141,6 +143,29 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       this.logger.debug(`Decrypted ${entries.length} entries`);
 
       return entries;
+    });
+  }
+
+  async getEntryMetadata(id: string): Promise<StoreEntryMetadata | null> {
+    return this.withTransparentReauth("getEntryMetadata", async () => {
+      this.logger.debug(`Getting metadata for entry ${id} from remote`);
+      const token = await this.ensureAuthenticated();
+      return this.transport.getEntryMetadata(token, id);
+    });
+  }
+
+  async planAttachmentReadByWalkingMetadata(
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions,
+  ): Promise<AttachmentReadPlan> {
+    return this.withTransparentReauth("planAttachmentReadByWalkingMetadata", async () => {
+      const capabilities = await this.getCapabilities();
+      if (!capabilities.supportsAttachmentReadPlanning || !this.transport.planAttachmentReadByWalkingMetadata) {
+        throw new Error("Remote server does not support required attachment read planning protocol");
+      }
+      const token = await this.ensureAuthenticated();
+      return this.transport.planAttachmentReadByWalkingMetadata(token, lastChunkId, attachmentSize, options);
     });
   }
 
@@ -341,6 +366,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         supportsCompactionStatus: false,
         supportsMaterializationPlanning: false,
         supportsBatchMaterializationPlanning: false,
+        supportsAttachmentReadPlanning: false,
       };
       return this.capabilitiesCache;
     });

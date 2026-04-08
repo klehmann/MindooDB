@@ -128,12 +128,43 @@ export interface AuthResult {
  * Used by clients to choose fast paths while preserving compatibility.
  */
 export interface NetworkSyncCapabilities {
+  /**
+   * Version of the advertised sync protocol shape.
+   * Useful for coarse compatibility checks and rollout diagnostics.
+   */
   protocolVersion: string;
+  /**
+   * Remote store supports cursor-based metadata scans via `scanEntriesSince()`.
+   * Clients can avoid full known-id exchanges when reconciling large stores.
+   */
   supportsCursorScan: boolean;
+  /**
+   * Remote store supports Bloom-filter summaries via `getIdBloomSummary()`.
+   * Clients can use probabilistic prefiltering before exact reconciliation.
+   */
   supportsIdBloomSummary: boolean;
+  /**
+   * Remote store exposes compaction/index observability via `getCompactionStatus()`.
+   * This is informational and used for monitoring/debugging rather than correctness.
+   */
   supportsCompactionStatus: boolean;
+  /**
+   * Remote store can compute a materialization plan for one document.
+   * Clients can ask the server which snapshot and change entries are needed
+   * instead of scanning and planning locally.
+   */
   supportsMaterializationPlanning: boolean;
+  /**
+   * Remote store can compute materialization plans for multiple documents in one call.
+   * Clients can reduce round trips when opening or refreshing many documents.
+   */
   supportsBatchMaterializationPlanning: boolean;
+  /**
+   * Remote store can compute attachment read plans from chunk metadata.
+   * Clients can delegate attachment range planning to the server instead of
+   * walking attachment chunk metadata over the network.
+   */
+  supportsAttachmentReadPlanning: boolean;
 }
 
 /**
@@ -150,6 +181,8 @@ export enum NetworkErrorType {
   CHALLENGE_EXPIRED = "CHALLENGE_EXPIRED",
   /** Network communication error */
   NETWORK_ERROR = "NETWORK_ERROR",
+  /** Request payload exceeded the remote server limit */
+  PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE",
   /** Server-side error */
   SERVER_ERROR = "SERVER_ERROR",
   /** User not found in directory */

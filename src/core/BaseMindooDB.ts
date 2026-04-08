@@ -42,6 +42,7 @@ import {
   computeDocumentMaterializationPlan,
   topologicalByDependencies,
 } from "./appendonlystores/MaterializationPlanner";
+import { planAttachmentReadByWalkingMetadata } from "./appendonlystores/AttachmentReadPlanner";
 import { 
   generateDocEntryId, 
   computeContentHash, 
@@ -1442,9 +1443,19 @@ export class BaseMindooDB implements MindooDB {
     // Get all entry metadata for this document
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
     
-    // Filter entries up to the timestamp
+    // Filter to document replay metadata plus snapshots up to the timestamp.
+    // Attachment chunks are not part of the Automerge replay DAG and must not
+    // participate in historical materialization.
     const relevantEntries = allEntryMetadata
-      .filter(em => em.createdAt <= timestamp)
+      .filter((em) =>
+        em.createdAt <= timestamp
+        && (
+          em.entryType === "doc_create"
+          || em.entryType === "doc_change"
+          || em.entryType === "doc_delete"
+          || em.entryType === "doc_snapshot"
+        )
+      )
       .sort((a, b) => a.createdAt - b.createdAt);
     
     if (relevantEntries.length === 0) {
@@ -1457,59 +1468,116 @@ export class BaseMindooDB implements MindooDB {
       });
       return null; // Document didn't exist at that time
     }
-    
-    // Load entries
-    const entries = await this.store.getEntries(relevantEntries.map(em => em.id));
-    
-    // Apply changes in order
-    let doc = Automerge.init<MindooDocPayload>();
-    for (const entryData of entries) {
-      // Admin-only mode: only accept entries signed by the admin key
+
+    const metadataById = new Map(relevantEntries.map((meta) => [meta.id, meta]));
+    const materializationPlan = computeDocumentMaterializationPlan(docId, relevantEntries);
+    let startFromSnapshot = materializationPlan.snapshotEntryId !== null;
+    const snapshotMeta = materializationPlan.snapshotEntryId
+      ? (metadataById.get(materializationPlan.snapshotEntryId) || null)
+      : null;
+    if (startFromSnapshot && !snapshotMeta) {
+      this.logger.warn(
+        `Planner referenced snapshot ${materializationPlan.snapshotEntryId} not found in metadata for ${docId}; falling back to replay without snapshot`,
+      );
+      startFromSnapshot = false;
+    }
+
+    let doc: AutomergeTypes.Doc<MindooDocPayload> | undefined = undefined;
+    if (startFromSnapshot && snapshotMeta) {
+      const snapshotEntries = await this.store.getEntries([snapshotMeta.id]);
+      if (snapshotEntries.length > 0) {
+        const snapshotData = snapshotEntries[0];
+
+        let isValid = false;
+        if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+          this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
+        } else {
+          isValid = await this.tenant.verifySignature(
+            snapshotData.encryptedData,
+            snapshotData.signature,
+            snapshotData.createdByPublicKey,
+          );
+        }
+
+        if (!isValid) {
+          this.logger.warn(`Invalid signature for snapshot ${snapshotData.id}, falling back to replay without snapshot`);
+          startFromSnapshot = false;
+        } else {
+          const decryptedSnapshot = await this.tenant.decryptPayload(
+            snapshotData.encryptedData,
+            snapshotData.decryptionKeyId,
+          );
+          doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
+
+          const parsed = parseDocEntryId(snapshotData.id);
+          if (parsed) {
+            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          }
+        }
+      }
+    }
+
+    if (!doc) {
+      doc = Automerge.init<MindooDocPayload>();
+    }
+
+    const entriesToApply = materializationPlan.entryIdsToApply
+      .map((id) => metadataById.get(id))
+      .filter((entry): entry is StoreEntryMetadata => entry !== undefined);
+    const loadedEntries = entriesToApply.length > 0
+      ? await this.store.getEntries(entriesToApply.map((entry) => entry.id))
+      : [];
+    const entryById = new Map(loadedEntries.map((entry) => [entry.id, entry]));
+
+    for (const entryMeta of entriesToApply) {
+      const entryData = entryById.get(entryMeta.id);
+      if (!entryData) {
+        this.logger.warn(`Entry ${entryMeta.id} not found in store, skipping`);
+        continue;
+      }
+
       if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
-      
-      // Verify signature against the encrypted payload (no decryption needed)
-      // We sign the encrypted payload, so anyone can verify signatures without decryption keys
+
       const isValid = await this.tenant.verifySignature(
         entryData.encryptedData,
         entryData.signature,
-        entryData.createdByPublicKey
+        entryData.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
         continue;
       }
-      
-      // Decrypt payload (only after signature verification passes)
+
       const decryptedPayload = await this.tenant.decryptPayload(
         entryData.encryptedData,
-        entryData.decryptionKeyId
+        entryData.decryptionKeyId,
       );
-
-      // Apply change using loadIncremental - this is the recommended way for binary change data
       doc = Automerge.loadIncremental(doc, decryptedPayload);
-      
-      // Register the automerge hash -> entry ID mapping for future dependency resolution
+
       const parsed = parseDocEntryId(entryData.id);
       if (parsed) {
         this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
       }
     }
 
-    // Check if document was deleted at this timestamp
-    // Look for a "doc_delete" type entry in the relevant entries
-    const deleteEntry = relevantEntries.find(em => em.entryType === "doc_delete" && em.createdAt <= timestamp);
-    const isDeleted = deleteEntry !== undefined;
-    
-    // Find the first entry to get createdAt and decryptionKeyId
-    const firstEntry = relevantEntries.length > 0 ? relevantEntries[0] : null;
-    const createdAt = firstEntry ? firstEntry.createdAt : timestamp;
-    const decryptionKeyId = firstEntry ? firstEntry.decryptionKeyId : "default";
-    
-    // Use delete entry timestamp as lastModified if deleted, otherwise use the requested timestamp
-    const lastModified = isDeleted && deleteEntry ? deleteEntry.createdAt : timestamp;
+    const replayEntries = relevantEntries.filter(
+      (entry) =>
+        entry.entryType === "doc_create"
+        || entry.entryType === "doc_change"
+        || entry.entryType === "doc_delete",
+    );
+    const firstReplayEntry = replayEntries.length > 0 ? replayEntries[0] : null;
+    const lastReplayEntry = replayEntries.length > 0 ? replayEntries[replayEntries.length - 1] : null;
+    const createdAt = firstReplayEntry?.createdAt ?? snapshotMeta?.createdAt ?? timestamp;
+    const decryptionKeyId =
+      firstReplayEntry?.decryptionKeyId
+      ?? snapshotMeta?.decryptionKeyId
+      ?? "default";
+    const isDeleted = lastReplayEntry?.entryType === "doc_delete";
+    const lastModified = lastReplayEntry?.createdAt ?? snapshotMeta?.createdAt ?? timestamp;
     
     const internalDoc: InternalDoc = {
       id: docId,
@@ -3344,6 +3412,59 @@ export class BaseMindooDB implements MindooDB {
     return ref;
   }
 
+  private async planAttachmentRead(
+    store: ContentAddressedStore,
+    ref: AttachmentReference,
+    startByte: number,
+    endByteExclusive: number,
+  ) {
+    if (store.planAttachmentReadByWalkingMetadata) {
+      try {
+        // if the store has a planAttachmentReadByWalkingMetadata method, use it for less overhead through the network
+        return await store.planAttachmentReadByWalkingMetadata(ref.lastChunkId, ref.size, {
+          startByte,
+          endByteExclusive,
+        });
+      } catch (error) {
+        this.logger.debug(
+          "Store-level attachment read planner failed, falling back to local metadata walk",
+          { attachmentId: ref.attachmentId, error }
+        );
+      }
+    }
+    // fall back to local metadata walk
+    return planAttachmentReadByWalkingMetadata(store, ref.lastChunkId, ref.size, {
+      startByte,
+      endByteExclusive,
+    });
+  }
+
+  private async decryptAttachmentChunk(chunk: StoreEntry): Promise<Uint8Array> {
+    if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
+      throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
+    }
+
+    const isValid = await this.tenant.verifySignature(
+      chunk.encryptedData,
+      chunk.signature,
+      chunk.createdByPublicKey
+    );
+    if (!isValid) {
+      throw new Error(`Invalid signature for chunk ${chunk.id}`);
+    }
+
+    const plaintext = await this.tenant.decryptAttachmentPayload(
+      chunk.encryptedData,
+      chunk.decryptionKeyId
+    );
+    if (plaintext.length !== chunk.originalSize) {
+      throw new Error(
+        `Attachment chunk ${chunk.id} decrypted to ${plaintext.length} bytes, expected ${chunk.originalSize}`,
+      );
+    }
+    return plaintext;
+  }
+
   /**
    * Internal method to fetch and concatenate all chunks for an attachment.
    */
@@ -3368,26 +3489,7 @@ export class BaseMindooDB implements MindooDB {
     let totalSize = 0;
     
     for (const chunk of chunks) {
-      // Admin-only mode: only accept chunks signed by the admin key
-      if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
-        throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
-      }
-      
-      // Verify signature
-      const isValid = await this.tenant.verifySignature(
-        chunk.encryptedData,
-        chunk.signature,
-        chunk.createdByPublicKey
-      );
-      if (!isValid) {
-        throw new Error(`Invalid signature for chunk ${chunk.id}`);
-      }
-      
-      // Decrypt
-      const plaintext = await this.tenant.decryptAttachmentPayload(
-        chunk.encryptedData,
-        chunk.decryptionKeyId
-      );
+      const plaintext = await this.decryptAttachmentChunk(chunk);
       plaintextChunks.push(plaintext);
       totalSize += plaintext.length;
     }
@@ -3420,53 +3522,18 @@ export class BaseMindooDB implements MindooDB {
     }
     
     const ref = this.getAttachmentRefInternal(docId, attachmentId);
-    
-    if (endByte > ref.size) {
-      throw new Error(`End byte ${endByte} exceeds attachment size ${ref.size}`);
-    }
-    
     const store = this.getEffectiveAttachmentStore();
-    const chunkSize = this.chunkSizeBytes;
-    
-    // Calculate which chunks we need
-    const startChunkIndex = Math.floor(startByte / chunkSize);
-    const endChunkIndex = Math.floor((endByte - 1) / chunkSize);
-    
-    // Resolve dependency chain to get all chunk IDs
-    const allChunkIds = await store.resolveDependencies(ref.lastChunkId, { includeStart: true });
-    
-    // Get only the chunks we need
-    const neededChunkIds = allChunkIds.slice(startChunkIndex, endChunkIndex + 1);
+    const readPlan = await this.planAttachmentRead(store, ref, startByte, endByte);
+    const neededChunkIds = readPlan.chunkPlans.map((chunkPlan) => chunkPlan.id);
     const chunks = await store.getEntries(neededChunkIds);
-    
+
     // Decrypt needed chunks
     const plaintextChunks: Uint8Array[] = [];
     for (const chunk of chunks) {
-      // Admin-only mode: only accept chunks signed by the admin key
-      if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
-        throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
-      }
-      
-      // Verify signature
-      const isValid = await this.tenant.verifySignature(
-        chunk.encryptedData,
-        chunk.signature,
-        chunk.createdByPublicKey
-      );
-      if (!isValid) {
-        throw new Error(`Invalid signature for chunk ${chunk.id}`);
-      }
-      
-      // Decrypt
-      const plaintext = await this.tenant.decryptAttachmentPayload(
-        chunk.encryptedData,
-        chunk.decryptionKeyId
-      );
+      const plaintext = await this.decryptAttachmentChunk(chunk);
       plaintextChunks.push(plaintext);
     }
     
-    // Calculate offsets within the fetched chunks
-    const offsetInFirstChunk = startByte - (startChunkIndex * chunkSize);
     const totalNeededBytes = endByte - startByte;
     
     // Extract the requested range
@@ -3476,7 +3543,7 @@ export class BaseMindooDB implements MindooDB {
     
     for (let i = 0; i < plaintextChunks.length && bytesRemaining > 0; i++) {
       const chunk = plaintextChunks[i];
-      const chunkStart = i === 0 ? offsetInFirstChunk : 0;
+      const chunkStart = i === 0 ? readPlan.offsetInFirstChunk : 0;
       const bytesToCopy = Math.min(chunk.length - chunkStart, bytesRemaining);
       result.set(chunk.slice(chunkStart, chunkStart + bytesToCopy), resultOffset);
       resultOffset += bytesToCopy;
@@ -3498,44 +3565,27 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Streaming attachment ${attachmentId} from offset ${startOffset}`);
     
     const ref = this.getAttachmentRefInternal(docId, attachmentId);
+    if (startOffset < 0 || startOffset > ref.size) {
+      throw new Error(`Invalid stream offset ${startOffset} for attachment size ${ref.size}`);
+    }
+    if (ref.size === 0 || startOffset === ref.size) {
+      return;
+    }
     const store = this.getEffectiveAttachmentStore();
-    const chunkSize = this.chunkSizeBytes;
-    
-    // Calculate starting chunk
-    const startChunkIndex = Math.floor(startOffset / chunkSize);
-    const offsetInStartChunk = startOffset % chunkSize;
-    
-    // Resolve dependency chain to get all chunk IDs
-    const allChunkIds = await store.resolveDependencies(ref.lastChunkId, { includeStart: true });
-    
+    const readPlan = await this.planAttachmentRead(store, ref, startOffset, ref.size);
+
     // Stream chunks starting from startChunkIndex
-    for (let i = startChunkIndex; i < allChunkIds.length; i++) {
-      const [chunk] = await store.getEntries([allChunkIds[i]]);
-      
-      // Admin-only mode: only accept chunks signed by the admin key
-      if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
-        throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
+    for (let i = 0; i < readPlan.chunkPlans.length; i++) {
+      const chunkPlan = readPlan.chunkPlans[i];
+      const [chunk] = await store.getEntries([chunkPlan.id]);
+      if (!chunk) {
+        throw new Error(`Attachment chunk ${chunkPlan.id} not found in store`);
       }
-      
-      // Verify signature
-      const isValid = await this.tenant.verifySignature(
-        chunk.encryptedData,
-        chunk.signature,
-        chunk.createdByPublicKey
-      );
-      if (!isValid) {
-        throw new Error(`Invalid signature for chunk ${chunk.id}`);
-      }
-      
-      // Decrypt
-      const plaintext = await this.tenant.decryptAttachmentPayload(
-        chunk.encryptedData,
-        chunk.decryptionKeyId
-      );
-      
+      const plaintext = await this.decryptAttachmentChunk(chunk);
+
       // For first chunk, skip bytes before startOffset
-      if (i === startChunkIndex && offsetInStartChunk > 0) {
-        yield plaintext.slice(offsetInStartChunk);
+      if (i === 0 && readPlan.offsetInFirstChunk > 0) {
+        yield plaintext.slice(readPlan.offsetInFirstChunk);
       } else {
         yield plaintext;
       }

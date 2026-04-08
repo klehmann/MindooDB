@@ -33,7 +33,11 @@ describe("Attachments", () => {
     const publicUser = factory.toPublicUserId(currentUser);
     await directory.registerUser(publicUser, adminUser.userSigningKeyPair.privateKey, adminUserPassword);
 
-    db = await tenant.openDB("test-db");
+    db = await tenant.openDB("test-db", {
+      attachmentConfig: {
+        chunkSizeBytes: 128,
+      },
+    });
   }, 30000);
 
   afterEach(async () => {
@@ -227,6 +231,50 @@ describe("Attachments", () => {
       await expect(reloadedDoc.getAttachmentRange(attachmentId!, 5, 3))
         .rejects.toThrow("Invalid byte range");
     }, 30000);
+
+    it("uses metadata traversal instead of full dependency resolution for partial reads", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000);
+      for (let i = 0; i < testData.length; i++) {
+        testData[i] = i % 256;
+      }
+      let attachmentId: string | undefined;
+
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      const attachmentStore = db.getAttachmentStore() ?? db.getStore();
+      const resolveSpy = jest.spyOn(attachmentStore, "resolveDependencies");
+      const metadataSpy = jest.spyOn(attachmentStore, "getEntryMetadata");
+
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const rangeData = await reloadedDoc.getAttachmentRange(attachmentId!, 820, 960);
+
+      expect(rangeData).toEqual(testData.slice(820, 960));
+      expect(resolveSpy).not.toHaveBeenCalled();
+      expect(metadataSpy).toHaveBeenCalled();
+    }, 30000);
+
+    it("keeps range reads correct when chunkSizeBytes changes between write and read", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000);
+      for (let i = 0; i < testData.length; i++) {
+        testData[i] = i % 256;
+      }
+      let attachmentId: string | undefined;
+
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      (db as any).chunkSizeBytes = 512;
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const rangeData = await reloadedDoc.getAttachmentRange(attachmentId!, 100, 820);
+      expect(rangeData).toEqual(testData.slice(100, 820));
+    }, 30000);
   });
 
   describe("removeAttachment", () => {
@@ -400,6 +448,73 @@ describe("Attachments", () => {
       }
       
       expect(chunkCount).toBe(1);
+    }, 30000);
+
+    it("uses metadata traversal instead of full dependency resolution for offset streams", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000);
+      for (let i = 0; i < testData.length; i++) {
+        testData[i] = i % 256;
+      }
+      let attachmentId: string | undefined;
+
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      const attachmentStore = db.getAttachmentStore() ?? db.getStore();
+      const resolveSpy = jest.spyOn(attachmentStore, "resolveDependencies");
+      const metadataSpy = jest.spyOn(attachmentStore, "getEntryMetadata");
+
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of reloadedDoc.streamAttachment(attachmentId!, 820)) {
+        chunks.push(chunk);
+      }
+
+      const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      expect(result).toEqual(testData.slice(820));
+      expect(resolveSpy).not.toHaveBeenCalled();
+      expect(metadataSpy).toHaveBeenCalled();
+    }, 30000);
+
+    it("keeps offset streams correct when chunkSizeBytes changes between write and read", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000);
+      for (let i = 0; i < testData.length; i++) {
+        testData[i] = i % 256;
+      }
+      let attachmentId: string | undefined;
+
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      (db as any).chunkSizeBytes = 512;
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of reloadedDoc.streamAttachment(attachmentId!, 500)) {
+        chunks.push(chunk);
+      }
+
+      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      expect(result).toEqual(testData.slice(500));
     }, 30000);
   });
 

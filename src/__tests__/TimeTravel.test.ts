@@ -1,6 +1,7 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { MindooDB, MindooDoc, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import type { StoreEntryMetadata } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
@@ -125,6 +126,61 @@ describe("TimeTravel", () => {
       const atDelete = await db.getDocumentAtTimestamp(docId, deleteTime);
       expect(atDelete).not.toBeNull();
       expect(atDelete!.isDeleted()).toBe(true);
+    });
+
+    it("should ignore attachment entries when reconstructing a historical document", async () => {
+      const doc = await db.createDocument();
+      const docId = doc.getId();
+
+      await db.changeDoc(doc, (d) => {
+        d.getData().version = 1;
+      });
+      const versionOneTime = Date.now();
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      await db.changeDoc(doc, async (d) => {
+        await d.addAttachment(
+          new Uint8Array([1, 2, 3, 4]),
+          "history.bin",
+          "application/octet-stream",
+        );
+      });
+
+      const historicalDoc = await db.getDocumentAtTimestamp(docId, versionOneTime);
+      expect(historicalDoc).not.toBeNull();
+      expect(historicalDoc!.getData().version).toBe(1);
+    });
+
+    it("should reconstruct history correctly when snapshots exist", async () => {
+      const snapshotDb = await tenant.openDB("time-travel-snapshots", {
+        snapshotConfig: {
+          minChanges: 1,
+          cooldownMs: 0,
+        },
+      });
+
+      const doc = await snapshotDb.createDocument();
+      const docId = doc.getId();
+      const timestamps: number[] = [];
+
+      for (let i = 1; i <= 3; i++) {
+        await snapshotDb.changeDoc(doc, (d: MindooDoc) => {
+          d.getData().version = i;
+        });
+        timestamps.push(Date.now());
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const snapshots = (await snapshotDb.getStore().findEntries("doc_snapshot", null, null))
+        .filter((entry: StoreEntryMetadata) => entry.docId === docId);
+      expect(snapshots.length).toBeGreaterThan(0);
+
+      for (let i = 0; i < timestamps.length; i++) {
+        const historicalDoc = await snapshotDb.getDocumentAtTimestamp(docId, timestamps[i]);
+        expect(historicalDoc).not.toBeNull();
+        expect(historicalDoc!.getData().version).toBe(i + 1);
+      }
     });
   });
 

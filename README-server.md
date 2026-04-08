@@ -791,10 +791,12 @@ The **`curl`** examples in this document use **`$SYSTEM_ADMIN_JWT`** as a placeh
 | `POST` | `/:tenantId/sync/findNewEntries` | Find entries we don't have |
 | `POST` | `/:tenantId/sync/findNewEntriesForDoc` | Find entries for specific document |
 | `POST` | `/:tenantId/sync/getEntries` | Get specific entries |
+| `POST` | `/:tenantId/sync/getEntryMetadata` | Get metadata for a single entry |
 | `POST` | `/:tenantId/sync/putEntries` | Push entries to server |
 | `POST` | `/:tenantId/sync/hasEntries` | Check which entry IDs exist |
 | `GET` | `/:tenantId/sync/getAllIds` | Get all entry IDs |
 | `POST` | `/:tenantId/sync/resolveDependencies` | Resolve dependency chain |
+| `POST` | `/:tenantId/sync/planAttachmentReadByWalkingMetadata` | Build an attachment read plan on the server |
 | `POST` | `/:tenantId/sync/findEntries` | Find entries by type/date |
 | `POST` | `/:tenantId/sync/scanEntriesSince` | Cursor-based entry scanning |
 | `POST` | `/:tenantId/sync/getIdBloomSummary` | Get Bloom filter summary |

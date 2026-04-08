@@ -29,6 +29,11 @@ import type {
   StoreCompactionStatus,
 } from "../../core/types";
 import type {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
+  DocumentMaterializationBatchPlan,
+  DocumentMaterializationPlan,
+  MaterializationPlanOptions,
 } from "../../core/appendonlystores/types";
 import type { NetworkSyncCapabilities } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
@@ -79,6 +84,7 @@ declare global {
     interface Request {
       tenantId?: string;
       systemAdmin?: { username: string; publicsignkey: string };
+      jsonBodyBytes?: number;
     }
   }
 }
@@ -98,26 +104,36 @@ interface SerializedEntryMetadata {
   encryptedSize: number;
 }
 
-interface MaterializationPlanOptions {
-  includeDiagnostics?: boolean;
-}
-
-interface DocumentMaterializationPlan {
-  docId: string;
-  snapshotEntryId: string | null;
-  entryIdsToApply: string[];
-}
-
-interface DocumentMaterializationBatchPlan {
-  plans: DocumentMaterializationPlan[];
-}
-
 interface SerializedEntry extends SerializedEntryMetadata {
   encryptedData: string;
 }
 
 interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string;
+}
+
+function parseBodySizeLimitToBytes(limit: string): number | null {
+  const normalized = limit.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (/^\d+$/.test(normalized)) {
+    return Number(normalized);
+  }
+  const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)$/);
+  if (!match) {
+    return null;
+  }
+  const value = Number(match[1]);
+  const unit = match[2];
+  const multiplier = unit === "b"
+    ? 1
+    : unit === "kb"
+      ? 1024
+      : unit === "mb"
+        ? 1024 * 1024
+        : 1024 * 1024 * 1024;
+  return Math.round(value * multiplier);
 }
 
 export class MindooDBServer {
@@ -128,6 +144,8 @@ export class MindooDBServer {
   private readonly staticDir: string | undefined;
   private serverConfig: ServerConfig;
   private configPath: string;
+  private readonly jsonBodyLimit: string;
+  private readonly jsonBodyLimitBytes: number | null;
 
   constructor(
     dataDir: string,
@@ -140,6 +158,8 @@ export class MindooDBServer {
     this.tenantManager = new TenantManager(dataDir, serverPassword);
     this.staticDir = staticDir;
     this.configPath = configPath ?? path.join(dataDir, "config.json");
+    this.jsonBodyLimit = process.env.MINDOODB_JSON_BODY_LIMIT?.trim() || "5mb";
+    this.jsonBodyLimitBytes = parseBodySizeLimitToBytes(this.jsonBodyLimit);
 
     this.serverConfig = config ?? { capabilities: {} };
     this.capabilityMatcher = new CapabilityMatcher(this.serverConfig);
@@ -229,10 +249,19 @@ export class MindooDBServer {
       message: { error: "Too many requests, please try again later" },
     }));
 
-    this.app.use(express.json({ limit: "5mb" }));
+    this.app.use(express.json({
+      limit: this.jsonBodyLimit,
+      verify: (req, _res, buf) => {
+        (req as Request).jsonBodyBytes = buf.length;
+      },
+    }));
 
     this.app.use((req: Request, res: Response, next: NextFunction) => {
-      console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+      const contentType = req.headers["content-type"] ?? "-";
+      const contentLength = req.headers["content-length"] ?? "-";
+      console.log(
+        `[${new Date().toISOString()}] ${req.method} ${req.path} content-type=${contentType} content-length=${contentLength}`,
+      );
       next();
     });
   }
@@ -272,7 +301,11 @@ export class MindooDBServer {
         res.status(503).json({ error: "Server identity not initialized" });
         return;
       }
-      res.json(info);
+      res.json({
+        ...info,
+        maxJsonRequestBodyLimit: this.jsonBodyLimit,
+        maxJsonRequestBodyBytes: this.jsonBodyLimitBytes ?? undefined,
+      });
     });
     this.app.get("/.well-known/mindoodb-tenants/:tenantId/publicinfos-fingerprints", async (req, res) => {
       const tenantId = req.params.tenantId.toLowerCase();
@@ -928,12 +961,14 @@ export class MindooDBServer {
     router.post("/sync/getCompactionStatus", syncRateLimit, this.handleGetCompactionStatus.bind(this));
     router.get("/sync/capabilities", syncRateLimit, this.handleGetCapabilities.bind(this));
     router.post("/sync/getEntries", syncRateLimit, this.handleGetEntries.bind(this));
+    router.post("/sync/getEntryMetadata", syncRateLimit, this.handleGetEntryMetadata.bind(this));
     router.post("/sync/putEntries", syncRateLimit, this.handlePutEntries.bind(this));
     router.post("/sync/hasEntries", syncRateLimit, this.handleHasEntries.bind(this));
     router.get("/sync/getAllIds", syncRateLimit, this.handleGetAllIds.bind(this));
     router.post("/sync/resolveDependencies", syncRateLimit, this.handleResolveDependencies.bind(this));
     router.post("/sync/planDocumentMaterialization", syncRateLimit, this.handlePlanDocumentMaterialization.bind(this));
     router.post("/sync/planDocumentMaterializationBatch", syncRateLimit, this.handlePlanDocumentMaterializationBatch.bind(this));
+    router.post("/sync/planAttachmentReadByWalkingMetadata", syncRateLimit, this.handlePlanAttachmentReadByWalkingMetadata.bind(this));
 
     return router;
   }
@@ -1150,23 +1185,89 @@ export class MindooDBServer {
     }
   }
 
-  private async handlePutEntries(req: Request, res: Response): Promise<void> {
+  private async handleGetEntryMetadata(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
+      const { dbId, id } = req.body as { dbId?: string; id?: string };
+
+      const validDbId = this.validateDbId(dbId);
+      if (!id) {
+        res.status(400).json({ error: "id is required" });
+        return;
+      }
+
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const entry = await serverStore.handleGetEntryMetadata(token, id);
+
+      res.json({
+        entry: entry ? this.serializeEntryMetadata(entry) : null,
+      });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
+  private async handlePutEntries(req: Request, res: Response): Promise<void> {
+    let stage = "extract-token";
+    try {
+      const token = this.extractToken(req);
+      stage = "read-body";
       const { dbId, entries } = req.body;
 
       const validDbId = this.validateDbId(dbId);
       validateArraySize(entries, MAX_PUT_ENTRIES, "entries");
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
-      const deserializedEntries = (entries || []).map((e: SerializedEntry) =>
-        this.deserializeEntry(e),
+      const serializedEntries = Array.isArray(entries) ? entries as SerializedEntry[] : [];
+      const serializedEntryTypeCounts = serializedEntries.reduce<Record<string, number>>((acc, entry) => {
+        const key = entry?.entryType ?? "unknown";
+        acc[key] = (acc[key] ?? 0) + 1;
+        return acc;
+      }, {});
+      console.log(
+        `[MindooDBServer] putEntries request tenant=${req.tenantId ?? "-"} db=${validDbId} entries=${serializedEntries.length} parsed-bytes=${req.jsonBodyBytes ?? "-"} content-length=${req.headers["content-length"] ?? "-"} types=${JSON.stringify(serializedEntryTypeCounts)}`,
       );
 
+      stage = "load-server-store";
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      stage = "deserialize-entries";
+      const deserializedEntries = serializedEntries.map((entry, index) => {
+        try {
+          return this.deserializeEntry(entry);
+        } catch (error) {
+          console.error("[MindooDBServer] putEntries failed while deserializing entry", {
+            index,
+            id: entry?.id ?? "-",
+            type: entry?.entryType ?? "-",
+            docId: entry?.docId ?? "-",
+            encryptedSize: entry?.encryptedSize ?? "-",
+            originalSize: entry?.originalSize ?? "-",
+            signatureLength: entry?.signature?.length ?? "-",
+            encryptedDataLength: entry?.encryptedData?.length ?? "-",
+            error,
+          });
+          throw error;
+        }
+      });
+      const totalEncryptedBytes = deserializedEntries.reduce((sum, entry) => sum + entry.encryptedData.byteLength, 0);
+      const totalOriginalBytes = deserializedEntries.reduce((sum, entry) => sum + entry.originalSize, 0);
+      console.log(
+        `[MindooDBServer] putEntries deserialized tenant=${req.tenantId ?? "-"} db=${validDbId} entries=${deserializedEntries.length} totalEncryptedBytes=${totalEncryptedBytes} totalOriginalBytes=${totalOriginalBytes}`,
+      );
+
+      stage = "store-entries";
       await serverStore.handlePutEntries(token, deserializedEntries);
+      stage = "respond-success";
 
       res.json({ success: true });
     } catch (error) {
+      console.error("[MindooDBServer] putEntries failed", {
+        stage,
+        tenantId: req.tenantId ?? "-",
+        dbId: req.body?.dbId ?? "-",
+        parsedBytes: req.jsonBodyBytes ?? "-",
+        contentLength: req.headers["content-length"] ?? "-",
+        entryCount: Array.isArray(req.body?.entries) ? req.body.entries.length : "-",
+        error,
+      });
       this.handleRequestError(error, res);
     }
   }
@@ -1262,6 +1363,41 @@ export class MindooDBServer {
     }
   }
 
+  private async handlePlanAttachmentReadByWalkingMetadata(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId, lastChunkId, attachmentSize, options } = req.body as {
+        dbId?: string;
+        lastChunkId?: string;
+        attachmentSize?: number;
+        options?: AttachmentReadPlanOptions;
+      };
+      const validDbId = this.validateDbId(dbId);
+      if (!lastChunkId) {
+        res.status(400).json({ error: "lastChunkId is required" });
+        return;
+      }
+      if (typeof attachmentSize !== "number" || !Number.isFinite(attachmentSize)) {
+        res.status(400).json({ error: "attachmentSize is required" });
+        return;
+      }
+      if (!options || typeof options.startByte !== "number") {
+        res.status(400).json({ error: "options.startByte is required" });
+        return;
+      }
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const plan = await (serverStore as any).handlePlanAttachmentReadByWalkingMetadata(
+        token,
+        lastChunkId,
+        attachmentSize,
+        options,
+      );
+      res.json({ plan: plan as AttachmentReadPlan });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
   // ==================== Management Handlers ====================
 
   private async handleTriggerSync(req: Request, res: Response): Promise<void> {
@@ -1313,7 +1449,44 @@ export class MindooDBServer {
   }
 
   private errorHandler(err: Error, req: Request, res: Response, next: NextFunction): void {
-    console.error("[MindooDBServer] Unhandled error:", err);
+    const parserError = err as Error & {
+      status?: number;
+      statusCode?: number;
+      type?: string;
+      limit?: number;
+      length?: number;
+      body?: unknown;
+    };
+    const status = parserError.statusCode ?? parserError.status;
+    if (status === 413 || parserError.type === "entity.too.large") {
+      console.error("[MindooDBServer] Request body too large", {
+        method: req.method,
+        path: req.path,
+        contentLength: req.headers["content-length"] ?? "-",
+        parsedBytes: req.jsonBodyBytes ?? "-",
+        limit: parserError.limit ?? this.jsonBodyLimit,
+      });
+      res.status(413).json({ error: "Request body too large" });
+      return;
+    }
+    if (status === 400 && parserError.type === "entity.parse.failed") {
+      console.error("[MindooDBServer] Invalid JSON body", {
+        method: req.method,
+        path: req.path,
+        contentLength: req.headers["content-length"] ?? "-",
+        parsedBytes: req.jsonBodyBytes ?? "-",
+        error: err,
+      });
+      res.status(400).json({ error: "Invalid JSON body" });
+      return;
+    }
+    console.error("[MindooDBServer] Unhandled error", {
+      method: req.method,
+      path: req.path,
+      contentLength: req.headers["content-length"] ?? "-",
+      parsedBytes: req.jsonBodyBytes ?? "-",
+      error: err,
+    });
     res.status(500).json({ error: "Internal server error" });
   }
 

@@ -9,6 +9,8 @@ import type {
   StoreCompactionStatus,
 } from "../../types";
 import type {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
@@ -172,6 +174,19 @@ export interface NetworkTransport {
   ): Promise<DocumentMaterializationBatchPlan>;
 
   /**
+   * Compute an attachment read plan on the remote store.
+   *
+   * This allows the remote side to walk its local attachment metadata and
+   * return a backend-agnostic chunk plan to the client with a single request.
+   */
+  planAttachmentReadByWalkingMetadata?(
+    token: string,
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions
+  ): Promise<AttachmentReadPlan>;
+
+  /**
    * Get entries from the remote store.
    * 
    * The returned entries have their payloads RSA-encrypted with the
@@ -188,6 +203,21 @@ export interface NetworkTransport {
     token: string,
     ids: string[]
   ): Promise<NetworkEncryptedEntry[]>;
+
+  /**
+   * Get metadata for a single entry from the remote store.
+   *
+   * Useful for metadata-first dependency planning where the payload is not
+   * needed yet.
+   *
+   * @param token JWT access token from authenticate()
+   * @param id The entry ID to retrieve metadata for
+   * @returns The entry metadata, or null if the entry does not exist
+   */
+  getEntryMetadata(
+    token: string,
+    id: string
+  ): Promise<StoreEntryMetadata | null>;
 
   /**
    * Push entries to the remote store.

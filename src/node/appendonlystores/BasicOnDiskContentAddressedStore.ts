@@ -43,6 +43,8 @@ import { mkdir, readdir, readFile, rm, access, rename, unlink, open, stat } from
 import { constants as fsConstants } from "fs";
 import * as path from "path";
 import {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   ContentAddressedStore,
   ContentAddressedStoreFactory,
   CreateStoreResult,
@@ -58,6 +60,7 @@ import {
   StoreScanResult,
   StoreIdBloomSummary,
 } from "../../core/appendonlystores/types";
+import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
 import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
@@ -1206,6 +1209,20 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
       result.push({ ...metadata, encryptedData });
     }
     return result;
+  }
+
+  async getEntryMetadata(id: string): Promise<StoreEntryMetadata | null> {
+    await this.ensureInitialized();
+    return this.readMetadataById(id);
+  }
+
+  async planAttachmentReadByWalkingMetadata(
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions,
+  ): Promise<AttachmentReadPlan> {
+    await this.ensureInitialized();
+    return planAttachmentReadByWalkingMetadata(this, lastChunkId, attachmentSize, options);
   }
 
   /**

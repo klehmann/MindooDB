@@ -17,6 +17,8 @@
  */
 
 import type {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   ContentAddressedStore,
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
@@ -29,6 +31,7 @@ import type {
   StoreIdBloomSummary,
   OpenStoreOptions,
 } from "../../core/appendonlystores/types";
+import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
 import type {
   StoreEntry,
@@ -574,6 +577,22 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       `Retrieved ${result.length} entries out of ${ids.length} requested`
     );
     return result;
+  }
+
+  async getEntryMetadata(id: string): Promise<StoreEntryMetadata | null> {
+    const db = await this.ensureOpen();
+    const tx = db.transaction(ENTRIES_STORE, "readonly");
+    const entriesOS = tx.objectStore(ENTRIES_STORE);
+    const metadata = (await reqToPromise(entriesOS.get(id))) as StoreEntryMetadata | undefined;
+    return metadata ?? null;
+  }
+
+  async planAttachmentReadByWalkingMetadata(
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions,
+  ): Promise<AttachmentReadPlan> {
+    return planAttachmentReadByWalkingMetadata(this, lastChunkId, attachmentSize, options);
   }
 
   async hasEntries(ids: string[]): Promise<string[]> {

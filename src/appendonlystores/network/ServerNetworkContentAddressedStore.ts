@@ -11,6 +11,8 @@ import type {
   StoreCompactionStatus,
 } from "../../core/types";
 import type {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
@@ -291,6 +293,8 @@ export class ServerNetworkContentAddressedStore {
         typeof this.localStore.planDocumentMaterialization === "function",
       supportsBatchMaterializationPlanning:
         typeof this.localStore.planDocumentMaterializationBatch === "function",
+      supportsAttachmentReadPlanning:
+        typeof this.localStore.planAttachmentReadByWalkingMetadata === "function",
     };
   }
 
@@ -364,6 +368,18 @@ export class ServerNetworkContentAddressedStore {
     
     this.logger.debug(`Encrypted ${encryptedEntries.length} entries for user: ${username}`);
     return encryptedEntries;
+  }
+
+  async handleGetEntryMetadata(
+    token: string,
+    id: string
+  ): Promise<StoreEntryMetadata | null> {
+    this.logger.debug(`Handling getEntryMetadata request for ${id}`);
+
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+
+    return this.localStore.getEntryMetadata(id);
   }
 
   /**
@@ -484,6 +500,20 @@ export class ServerNetworkContentAddressedStore {
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     return this.localStore.planDocumentMaterializationBatch(docIds, options);
+  }
+
+  async handlePlanAttachmentReadByWalkingMetadata(
+    token: string,
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions,
+  ): Promise<AttachmentReadPlan> {
+    const tokenPayload = await this.validateToken(token);
+    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+    if (!this.localStore.planAttachmentReadByWalkingMetadata) {
+      throw new Error("Remote store does not support attachment read planning");
+    }
+    return this.localStore.planAttachmentReadByWalkingMetadata(lastChunkId, attachmentSize, options);
   }
 
   /**

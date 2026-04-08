@@ -1,4 +1,5 @@
 import type {
+  MindooDBServerInfo,
   StoreEntry,
   StoreEntryMetadata,
   StoreEntryType,
@@ -9,6 +10,8 @@ import type {
   StoreCompactionStatus,
 } from "../../core/types";
 import type {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
@@ -41,6 +44,7 @@ export class HttpTransport implements NetworkTransport {
   private config: NetworkTransportConfig;
   private baseUrl: string;
   private logger: Logger;
+  private remoteJsonBodyLimitBytesPromise: Promise<number | null> | null = null;
 
   constructor(config: NetworkTransportConfig, logger?: Logger) {
     this.config = {
@@ -151,6 +155,7 @@ export class HttpTransport implements NetworkTransport {
         supportsCompactionStatus: false,
         supportsMaterializationPlanning: false,
         supportsBatchMaterializationPlanning: false,
+        supportsAttachmentReadPlanning: false,
       };
     }
   }
@@ -403,6 +408,33 @@ export class HttpTransport implements NetworkTransport {
     return data.batchPlan as DocumentMaterializationBatchPlan;
   }
 
+  async planAttachmentReadByWalkingMetadata(
+    token: string,
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions
+  ): Promise<AttachmentReadPlan> {
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/planAttachmentReadByWalkingMetadata`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          lastChunkId,
+          attachmentSize,
+          options,
+        }),
+      }
+    );
+    const data = await response.json();
+    return data.plan as AttachmentReadPlan;
+  }
+
   /**
    * Get entries from the remote store.
    */
@@ -440,17 +472,14 @@ export class HttpTransport implements NetworkTransport {
     return entries;
   }
 
-  /**
-   * Push entries to the remote store.
-   */
-  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
-    this.logger.debug(`Pushing ${entries.length} entries`);
-    
-    // Serialize the entries for transmission
-    const serializedEntries = entries.map(e => this.serializeEntry(e));
-    
-    await this.fetchWithRetry(
-      `${this.baseUrl}/sync/putEntries`,
+  async getEntryMetadata(
+    token: string,
+    id: string
+  ): Promise<StoreEntryMetadata | null> {
+    this.logger.debug(`Getting metadata for entry ${id}`);
+
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/sync/getEntryMetadata`,
       {
         method: "POST",
         headers: {
@@ -460,11 +489,31 @@ export class HttpTransport implements NetworkTransport {
         body: JSON.stringify({
           tenantId: this.config.tenantId,
           dbId: this.config.dbId,
-          entries: serializedEntries,
+          id,
         }),
       }
     );
-    
+
+    const data = await response.json();
+    return data.entry ? this.deserializeEntryMetadata(data.entry as SerializedEntryMetadata) : null;
+  }
+
+  /**
+   * Push entries to the remote store.
+   */
+  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
+    this.logger.debug(`Pushing ${entries.length} entries`);
+    if (entries.length === 0) {
+      return;
+    }
+
+    const serializedEntries = entries.map((entry) => this.serializeEntry(entry));
+    const maxBodyBytes = await this.getRemoteJsonBodyLimitBytes();
+    if (maxBodyBytes) {
+      this.logger.debug(`Remote JSON body limit advertised as ${maxBodyBytes} bytes`);
+    }
+    await this.pushSerializedEntries(token, serializedEntries, maxBodyBytes);
+
     this.logger.debug(`Successfully pushed ${entries.length} entries`);
   }
 
@@ -604,6 +653,11 @@ export class HttpTransport implements NetworkTransport {
                 NetworkErrorType.USER_NOT_FOUND,
                 errorData.error || "Not found"
               );
+            case 413:
+              throw new NetworkError(
+                NetworkErrorType.PAYLOAD_TOO_LARGE,
+                errorData.error || "Request body too large"
+              );
             default:
               throw new NetworkError(
                 NetworkErrorType.SERVER_ERROR,
@@ -621,7 +675,8 @@ export class HttpTransport implements NetworkTransport {
           if (
             error.type === NetworkErrorType.INVALID_TOKEN ||
             error.type === NetworkErrorType.USER_REVOKED ||
-            error.type === NetworkErrorType.INVALID_SIGNATURE
+            error.type === NetworkErrorType.INVALID_SIGNATURE ||
+            error.type === NetworkErrorType.PAYLOAD_TOO_LARGE
           ) {
             throw error;
           }
@@ -650,6 +705,192 @@ export class HttpTransport implements NetworkTransport {
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private async getRemoteJsonBodyLimitBytes(): Promise<number | null> {
+    if (!this.remoteJsonBodyLimitBytesPromise) {
+      this.remoteJsonBodyLimitBytesPromise = this.fetchRemoteJsonBodyLimitBytes();
+    }
+    return this.remoteJsonBodyLimitBytesPromise;
+  }
+
+  private async fetchRemoteJsonBodyLimitBytes(): Promise<number | null> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      this.config.timeout || 30000,
+    );
+    try {
+      const serverInfoUrl = new URL("/.well-known/mindoodb-server-info", this.baseUrl);
+      const response = await fetch(serverInfoUrl.toString(), {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const data = await response.json() as MindooDBServerInfo;
+      if (
+        typeof data.maxJsonRequestBodyBytes === "number"
+        && Number.isFinite(data.maxJsonRequestBodyBytes)
+        && data.maxJsonRequestBodyBytes > 0
+      ) {
+        return Math.floor(data.maxJsonRequestBodyBytes);
+      }
+      if (typeof data.maxJsonRequestBodyLimit === "string") {
+        return this.parseByteSizeLimit(data.maxJsonRequestBodyLimit);
+      }
+      return null;
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        this.logger.debug("Could not read remote JSON body limit; falling back to adaptive batching.", error);
+      }
+      return null;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private parseByteSizeLimit(limit: string): number | null {
+    const normalized = limit.trim().toLowerCase();
+    if (/^\d+$/.test(normalized)) {
+      return Number(normalized);
+    }
+    const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)$/);
+    if (!match) {
+      return null;
+    }
+    const value = Number(match[1]);
+    const unit = match[2];
+    const multiplier = unit === "b"
+      ? 1
+      : unit === "kb"
+        ? 1024
+        : unit === "mb"
+          ? 1024 * 1024
+          : 1024 * 1024 * 1024;
+    return Math.round(value * multiplier);
+  }
+
+  private async pushSerializedEntries(
+    token: string,
+    serializedEntries: SerializedEntry[],
+    maxBodyBytes: number | null,
+  ): Promise<void> {
+    if (serializedEntries.length === 0) {
+      return;
+    }
+
+    if (maxBodyBytes !== null) {
+      const batches = this.partitionSerializedEntriesForMaxBodySize(serializedEntries, maxBodyBytes);
+      if (batches.length > 1) {
+        this.logger.debug(`Split putEntries payload into ${batches.length} batch(es) for body limit ${maxBodyBytes}`);
+      }
+      for (const batch of batches) {
+        await this.sendSerializedEntriesBatch(token, batch, maxBodyBytes);
+      }
+      return;
+    }
+
+    await this.sendSerializedEntriesBatch(token, serializedEntries, null);
+  }
+
+  private async sendSerializedEntriesBatch(
+    token: string,
+    serializedEntries: SerializedEntry[],
+    maxBodyBytes: number | null,
+  ): Promise<void> {
+    try {
+      await this.postSerializedEntries(token, serializedEntries);
+    } catch (error) {
+      if (
+        error instanceof NetworkError
+        && error.type === NetworkErrorType.PAYLOAD_TOO_LARGE
+        && serializedEntries.length > 1
+      ) {
+        const midpoint = Math.ceil(serializedEntries.length / 2);
+        const left = serializedEntries.slice(0, midpoint);
+        const right = serializedEntries.slice(midpoint);
+        this.logger.warn(
+          `putEntries batch with ${serializedEntries.length} entries exceeded remote limit; retrying as ${left.length} + ${right.length} batches.`,
+        );
+        await this.pushSerializedEntries(token, left, maxBodyBytes);
+        await this.pushSerializedEntries(token, right, maxBodyBytes);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private partitionSerializedEntriesForMaxBodySize(
+    serializedEntries: SerializedEntry[],
+    maxBodyBytes: number,
+  ): SerializedEntry[][] {
+    const batches: SerializedEntry[][] = [];
+    const emptyBodyBytes = this.measureBodyBytes(JSON.stringify({
+      tenantId: this.config.tenantId,
+      dbId: this.config.dbId,
+      entries: [],
+    }));
+
+    let currentBatch: SerializedEntry[] = [];
+    let currentBodyBytes = emptyBodyBytes;
+
+    for (const entry of serializedEntries) {
+      const entryBodyBytes = this.measureBodyBytes(JSON.stringify(entry));
+      const separatorBytes = currentBatch.length > 0 ? 1 : 0;
+      const nextBodyBytes = currentBodyBytes + separatorBytes + entryBodyBytes;
+
+      if (emptyBodyBytes + entryBodyBytes > maxBodyBytes) {
+        throw new NetworkError(
+          NetworkErrorType.PAYLOAD_TOO_LARGE,
+          `Single entry ${entry.id} exceeds remote request body limit of ${maxBodyBytes} bytes`,
+        );
+      }
+
+      if (nextBodyBytes > maxBodyBytes) {
+        batches.push(currentBatch);
+        currentBatch = [entry];
+        currentBodyBytes = emptyBodyBytes + entryBodyBytes;
+      } else {
+        currentBatch.push(entry);
+        currentBodyBytes = nextBodyBytes;
+      }
+    }
+
+    if (currentBatch.length > 0) {
+      batches.push(currentBatch);
+    }
+
+    return batches;
+  }
+
+  private async postSerializedEntries(
+    token: string,
+    serializedEntries: SerializedEntry[],
+  ): Promise<void> {
+    await this.fetchWithRetry(
+      `${this.baseUrl}/sync/putEntries`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          entries: serializedEntries,
+        }),
+      }
+    );
+  }
+
+  private measureBodyBytes(value: string): number {
+    return new TextEncoder().encode(value).length;
   }
 
   private uint8ArrayToBase64(bytes: Uint8Array): string {

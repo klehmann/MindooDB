@@ -38,6 +38,8 @@ import type {
 } from "../core/types";
 import { DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import type {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   ContentAddressedStore,
   ContentAddressedStoreFactory,
   CreateStoreResult,
@@ -601,6 +603,9 @@ describe("protocol compatibility", () => {
     async getEntries(_t: string, _ids: string[]): Promise<NetworkEncryptedEntry[]> {
       return [];
     }
+    async getEntryMetadata(_t: string, _id: string): Promise<StoreEntryMetadata | null> {
+      return null;
+    }
     async putEntries(_t: string, _entries: StoreEntry[]): Promise<void> {}
     async hasEntries(_t: string, _ids: string[]): Promise<string[]> {
       return [];
@@ -627,6 +632,7 @@ describe("protocol compatibility", () => {
         supportsCompactionStatus: false,
         supportsMaterializationPlanning: false,
         supportsBatchMaterializationPlanning: false,
+        supportsAttachmentReadPlanning: false,
       };
     }
     async getCompactionStatus(_t: string): Promise<StoreCompactionStatus> {
@@ -635,6 +641,14 @@ describe("protocol compatibility", () => {
         totalCompactions: 0,
         lastCompactionAt: null,
       } as StoreCompactionStatus;
+    }
+    async planAttachmentReadByWalkingMetadata(
+      _t: string,
+      _lastChunkId: string,
+      _attachmentSize: number,
+      _options: AttachmentReadPlanOptions,
+    ): Promise<AttachmentReadPlan> {
+      throw new Error("not supported");
     }
     // Deliberately no planDocumentMaterialization or planDocumentMaterializationBatch
   }
@@ -658,6 +672,9 @@ describe("protocol compatibility", () => {
     await expect(client.planDocumentMaterializationBatch(["doc1"])).rejects.toThrow(
       /does not support required batch materialization planning protocol/,
     );
+    await expect(
+      client.planAttachmentReadByWalkingMetadata("chunk-1", 1000, { startByte: 100, endByteExclusive: 200 }),
+    ).rejects.toThrow(/does not support required attachment read planning protocol/);
   });
 
   test("capabilities correctly report v3 protocol with materialization support", async () => {
@@ -692,6 +709,70 @@ describe("protocol compatibility", () => {
     expect(caps.protocolVersion).toBe("sync-v4");
     expect(caps.supportsMaterializationPlanning).toBe(true);
     expect(caps.supportsBatchMaterializationPlanning).toBe(true);
+    expect(caps.supportsAttachmentReadPlanning).toBe(true);
+  });
+
+  test("client attachment planner delegates to transport when remote support exists", async () => {
+    class AttachmentPlanningTransport extends OldServerTransport {
+      override async getCapabilities(_t: string): Promise<NetworkSyncCapabilities> {
+        return {
+          protocolVersion: "sync-v4",
+          supportsCursorScan: true,
+          supportsIdBloomSummary: true,
+          supportsCompactionStatus: false,
+          supportsMaterializationPlanning: false,
+          supportsBatchMaterializationPlanning: false,
+          supportsAttachmentReadPlanning: true,
+        };
+      }
+
+      override async planAttachmentReadByWalkingMetadata(
+        _token: string,
+        _lastChunkId: string,
+        _attachmentSize: number,
+        _options: AttachmentReadPlanOptions,
+      ): Promise<AttachmentReadPlan> {
+        return {
+          attachmentSize: 1000,
+          startByte: 100,
+          endByteExclusive: 200,
+          chunkPlans: [{
+            id: "chunk-1",
+            startByte: 0,
+            endByteExclusive: 256,
+            originalSize: 256,
+          }],
+          offsetInFirstChunk: 100,
+        };
+      }
+    }
+
+    const subtle = cryptoAdapter.getSubtle();
+    const keyPair = await subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
+
+    const client = new ClientNetworkContentAddressedStore(
+      "test-db",
+      new AttachmentPlanningTransport(),
+      cryptoAdapter,
+      "testuser",
+      keyPair.privateKey,
+      "mock-enc-key",
+    );
+
+    await expect(
+      client.planAttachmentReadByWalkingMetadata("chunk-1", 1000, { startByte: 100, endByteExclusive: 200 }),
+    ).resolves.toEqual({
+      attachmentSize: 1000,
+      startByte: 100,
+      endByteExclusive: 200,
+      chunkPlans: [{
+        id: "chunk-1",
+        startByte: 0,
+        endByteExclusive: 256,
+        originalSize: 256,
+      }],
+      offsetInFirstChunk: 100,
+    });
   });
 });
 

@@ -183,6 +183,69 @@ export interface DocumentMaterializationBatchPlan {
 }
 
 /**
+ * Byte-range request for attachment reads.
+ */
+export interface AttachmentReadPlanOptions {
+  /**
+   * Inclusive start byte within the plaintext attachment.
+   */
+  startByte: number;
+  /**
+   * Exclusive end byte within the plaintext attachment.
+   * Defaults to the attachment size.
+   */
+  endByteExclusive?: number;
+}
+
+/**
+ * One planned attachment chunk covering a plaintext byte window.
+ */
+export interface AttachmentReadPlanChunk {
+  /**
+   * Store entry ID of the chunk.
+   */
+  id: string;
+  /**
+   * Inclusive plaintext start byte of this chunk within the full attachment.
+   */
+  startByte: number;
+  /**
+   * Exclusive plaintext end byte of this chunk within the full attachment.
+   */
+  endByteExclusive: number;
+  /**
+   * Plaintext size of this chunk as stored in metadata.
+   */
+  originalSize: number;
+}
+
+/**
+ * Store-level plan for reading a plaintext attachment byte range.
+ */
+export interface AttachmentReadPlan {
+  /**
+   * Declared plaintext attachment size.
+   */
+  attachmentSize: number;
+  /**
+   * Inclusive requested start byte.
+   */
+  startByte: number;
+  /**
+   * Exclusive requested end byte.
+   */
+  endByteExclusive: number;
+  /**
+   * Ordered chunk plans needed to satisfy the read.
+   */
+  chunkPlans: AttachmentReadPlanChunk[];
+  /**
+   * Number of bytes to skip from the first planned chunk.
+   */
+  offsetInFirstChunk: number;
+}
+
+/**
  * Result of creating stores for a database.
  * Contains the document store and an optional separate attachment store.
  */
@@ -267,6 +330,40 @@ export interface ContentAddressedStore {
    * @return A list of entries (may be shorter than input if some don't exist)
    */
   getEntries(ids: string[]): Promise<StoreEntry[]>;
+
+  /**
+   * Get metadata for a single entry without loading its encrypted payload.
+   *
+   * This is useful for dependency planning and attachment range access where
+   * callers only need dependency links, sizes, or timestamps before deciding
+   * which payload entries to fetch.
+   *
+   * @param id The entry ID to look up
+   * @return The entry metadata, or null if the entry does not exist
+   */
+  getEntryMetadata(id: string): Promise<StoreEntryMetadata | null>;
+
+  /**
+   * Optionally plan a plaintext attachment read range.
+   *
+   * Implementations may optimize metadata traversal (for example via batching,
+   * dependency pre-resolution, or caching) while callers still receive a
+   * backend-agnostic chunk plan.
+   *
+   * Custom stores do not need to implement this from scratch: core helper
+   * planners can compose existing methods like `getEntryMetadata()` and
+   * `resolveDependencies()`.
+   *
+   * @param lastChunkId The newest attachment chunk entry ID
+   * @param attachmentSize Declared plaintext attachment size
+   * @param options Requested plaintext byte window
+   * @return A read plan for the requested attachment bytes
+   */
+  planAttachmentReadByWalkingMetadata?(
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions
+  ): Promise<AttachmentReadPlan>;
 
   /**
    * Check which IDs from the provided list exist in this store.

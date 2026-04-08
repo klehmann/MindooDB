@@ -1,4 +1,6 @@
 import {
+  AttachmentReadPlan,
+  AttachmentReadPlanOptions,
   ContentAddressedStore,
   ContentAddressedStoreFactory,
   CreateStoreResult,
@@ -13,6 +15,7 @@ import {
   StoreScanResult,
   StoreIdBloomSummary,
 } from "./types";
+import { planAttachmentReadByWalkingMetadata } from "./AttachmentReadPlanner";
 import { createIdBloomSummary } from "./bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "./MaterializationPlanner";
 import type {
@@ -147,6 +150,18 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
 
     this.logger.debug(`Retrieved ${result.length} entries out of ${ids.length} requested`);
     return result;
+  }
+
+  async getEntryMetadata(id: string): Promise<StoreEntryMetadata | null> {
+    return this.entries.get(id) ?? null;
+  }
+
+  async planAttachmentReadByWalkingMetadata(
+    lastChunkId: string,
+    attachmentSize: number,
+    options: AttachmentReadPlanOptions,
+  ): Promise<AttachmentReadPlan> {
+    return planAttachmentReadByWalkingMetadata(this, lastChunkId, attachmentSize, options);
   }
 
   /**
