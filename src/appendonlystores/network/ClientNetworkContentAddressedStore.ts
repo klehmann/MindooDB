@@ -51,6 +51,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   // Cached access token
   private accessToken: string | null = null;
   private tokenExpiry: number = 0;
+  private authenticationPromise: Promise<string> | null = null;
   private logger: Logger;
   private capabilitiesCache: NetworkSyncCapabilities | null = null;
   private syncAuthOverride: {
@@ -109,13 +110,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     if (entries.length === 0) {
       return;
     }
-    
-    this.logger.debug(`Pushing ${entries.length} entries to remote`);
-    
-    const token = await this.ensureAuthenticated();
-    await this.transport.putEntries(token, entries);
-    
-    this.logger.debug(`Successfully pushed ${entries.length} entries`);
+
+    await this.withTransparentReauth("putEntries", async () => {
+      this.logger.debug(`Pushing ${entries.length} entries to remote`);
+      const token = await this.ensureAuthenticated();
+      await this.transport.putEntries(token, entries);
+      this.logger.debug(`Successfully pushed ${entries.length} entries`);
+    });
   }
 
   /**
@@ -125,22 +126,22 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @returns The entries with decrypted payloads
    */
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
-    this.logger.debug(`Getting ${ids.length} entries from remote`);
-    
     if (ids.length === 0) {
       return [];
     }
-    
-    const token = await this.ensureAuthenticated();
-    
-    const encryptedEntries = await this.transport.getEntries(token, ids);
-    this.logger.debug(`Received ${encryptedEntries.length} encrypted entries from remote`);
-    
-    // Decrypt the RSA layer for each entry
-    const entries = await this.decryptNetworkEntries(encryptedEntries);
-    this.logger.debug(`Decrypted ${entries.length} entries`);
-    
-    return entries;
+
+    return this.withTransparentReauth("getEntries", async () => {
+      this.logger.debug(`Getting ${ids.length} entries from remote`);
+      const token = await this.ensureAuthenticated();
+      const encryptedEntries = await this.transport.getEntries(token, ids);
+      this.logger.debug(`Received ${encryptedEntries.length} encrypted entries from remote`);
+
+      // Decrypt the RSA layer for each entry
+      const entries = await this.decryptNetworkEntries(encryptedEntries);
+      this.logger.debug(`Decrypted ${entries.length} entries`);
+
+      return entries;
+    });
   }
 
   /**
@@ -150,17 +151,17 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @returns List of IDs that exist in the remote store
    */
   async hasEntries(ids: string[]): Promise<string[]> {
-    this.logger.debug(`Checking ${ids.length} IDs in remote`);
-    
     if (ids.length === 0) {
       return [];
     }
-    
-    const token = await this.ensureAuthenticated();
-    const existingIds = await this.transport.hasEntries(token, ids);
-    this.logger.debug(`Found ${existingIds.length} existing entries`);
-    
-    return existingIds;
+
+    return this.withTransparentReauth("hasEntries", async () => {
+      this.logger.debug(`Checking ${ids.length} IDs in remote`);
+      const token = await this.ensureAuthenticated();
+      const existingIds = await this.transport.hasEntries(token, ids);
+      this.logger.debug(`Found ${existingIds.length} existing entries`);
+      return existingIds;
+    });
   }
 
   /**
@@ -170,27 +171,29 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @returns List of new entry metadata from the remote store
    */
   async findNewEntries(knownIds: string[]): Promise<StoreEntryMetadata[]> {
-    this.logger.debug(`Finding new entries from remote`);
-    
-    const token = await this.ensureAuthenticated();
-    //TODO improve this by using a bloom filter
-    const newEntries = await this.transport.findNewEntries(token, knownIds);
-    
-    this.logger.debug(`Found ${newEntries.length} new entries from remote`);
-    return newEntries;
+    return this.withTransparentReauth("findNewEntries", async () => {
+      this.logger.debug(`Finding new entries from remote`);
+      const token = await this.ensureAuthenticated();
+      //TODO improve this by using a bloom filter
+      const newEntries = await this.transport.findNewEntries(token, knownIds);
+
+      this.logger.debug(`Found ${newEntries.length} new entries from remote`);
+      return newEntries;
+    });
   }
 
   /**
    * Find new entries for a specific document from the remote store.
    */
   async findNewEntriesForDoc(knownIds: string[], docId: string): Promise<StoreEntryMetadata[]> {
-    this.logger.debug(`Finding new entries for doc ${docId} from remote`);
-    
-    const token = await this.ensureAuthenticated();
-    const newEntries = await this.transport.findNewEntriesForDoc(token, knownIds, docId);
-    
-    this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
-    return newEntries;
+    return this.withTransparentReauth("findNewEntriesForDoc", async () => {
+      this.logger.debug(`Finding new entries for doc ${docId} from remote`);
+      const token = await this.ensureAuthenticated();
+      const newEntries = await this.transport.findNewEntriesForDoc(token, knownIds, docId);
+
+      this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
+      return newEntries;
+    });
   }
 
   /**
@@ -201,18 +204,27 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     creationDateFrom: number | null,
     creationDateUntil: number | null
   ): Promise<StoreEntryMetadata[]> {
-    this.logger.debug(`Finding entries of type ${type} from remote`);
-    
-    const token = await this.ensureAuthenticated();
-    const entries = await this.transport.findEntries(
-      token,
-      type,
-      creationDateFrom,
-      creationDateUntil
-    );
-    
-    this.logger.debug(`Found ${entries.length} entries of type ${type}`);
-    return entries;
+    return this.withTransparentReauth("findEntries", async () => {
+      this.logger.debug(`Finding entries of type ${type} from remote`);
+      const token = await this.ensureAuthenticated();
+      const entries = await this.transport.findEntries(
+        token,
+        type,
+        creationDateFrom,
+        creationDateUntil
+      );
+
+      this.logger.debug(`Found ${entries.length} entries of type ${type}`);
+      return entries;
+    });
+  }
+
+  private supportsReceiptOrderCursorProtocol(
+    capabilities: NetworkSyncCapabilities,
+  ): boolean {
+    const match = /^sync-v(\d+)$/.exec(capabilities.protocolVersion);
+    const version = match ? Number(match[1]) : 0;
+    return version >= 4;
   }
 
   /**
@@ -220,13 +232,14 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * Used for synchronization to identify which entries the remote has.
    */
   async getAllIds(): Promise<string[]> {
-    this.logger.debug(`Getting all entry IDs from remote`);
-    
-    const token = await this.ensureAuthenticated();
-    const allIds = await this.transport.getAllIds(token);
-    
-    this.logger.debug(`Remote has ${allIds.length} entry IDs`);
-    return allIds;
+    return this.withTransparentReauth("getAllIds", async () => {
+      this.logger.debug(`Getting all entry IDs from remote`);
+      const token = await this.ensureAuthenticated();
+      const allIds = await this.transport.getAllIds(token);
+
+      this.logger.debug(`Remote has ${allIds.length} entry IDs`);
+      return allIds;
+    });
   }
 
   /**
@@ -238,126 +251,151 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     limit: number = Number.MAX_SAFE_INTEGER,
     filters?: StoreScanFilters
   ): Promise<StoreScanResult> {
-    const token = await this.ensureAuthenticated();
-    const capabilities = await this.getCapabilities();
-    if (capabilities.supportsCursorScan && this.transport.scanEntriesSince) {
-      return this.transport.scanEntriesSince(token, cursor, limit, filters);
-    }
+    return this.withTransparentReauth("scanEntriesSince", async () => {
+      const capabilities = await this.getCapabilities();
+      if (
+        capabilities.supportsCursorScan &&
+        this.transport.scanEntriesSince &&
+        this.supportsReceiptOrderCursorProtocol(capabilities)
+      ) {
+        const token = await this.ensureAuthenticated();
+        return this.transport.scanEntriesSince(token, cursor, limit, filters);
+      }
 
-    // Compatibility fallback: fetch metadata via legacy endpoint and paginate client-side.
-    const all = await this.findNewEntries([]);
-    const filtered = all
-      .filter((meta) => {
-        if (filters?.docId && meta.docId !== filters.docId) {
-          return false;
-        }
-        if (filters?.entryTypes && filters.entryTypes.length > 0 && !filters.entryTypes.includes(meta.entryType)) {
-          return false;
-        }
-        if (filters?.creationDateFrom !== undefined && filters.creationDateFrom !== null && meta.createdAt < filters.creationDateFrom) {
-          return false;
-        }
-        if (filters?.creationDateUntil !== undefined && filters.creationDateUntil !== null && meta.createdAt >= filters.creationDateUntil) {
-          return false;
-        }
-        return true;
-      })
-      .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt));
+      // Compatibility fallback: fetch metadata via legacy endpoint and paginate client-side.
+      const all = await this.findNewEntries([]);
+      const filtered = all
+        .filter((meta) => {
+          if (filters?.docId && meta.docId !== filters.docId) {
+            return false;
+          }
+          if (filters?.entryTypes && filters.entryTypes.length > 0 && !filters.entryTypes.includes(meta.entryType)) {
+            return false;
+          }
+          if (filters?.creationDateFrom !== undefined && filters.creationDateFrom !== null && meta.createdAt < filters.creationDateFrom) {
+            return false;
+          }
+          if (filters?.creationDateUntil !== undefined && filters.creationDateUntil !== null && meta.createdAt >= filters.creationDateUntil) {
+            return false;
+          }
+          return true;
+        })
+        .sort((a, b) => {
+          const leftReceiptOrder = a.receiptOrder ?? 0;
+          const rightReceiptOrder = b.receiptOrder ?? 0;
+          return leftReceiptOrder === rightReceiptOrder
+            ? a.id.localeCompare(b.id)
+            : leftReceiptOrder - rightReceiptOrder;
+        });
 
-    const startIndex =
-      cursor === null
-        ? 0
-        : filtered.findIndex((meta) => meta.createdAt > cursor.createdAt || (meta.createdAt === cursor.createdAt && meta.id > cursor.id));
+      const startIndex =
+        cursor === null
+          ? 0
+          : filtered.findIndex((meta) =>
+              (meta.receiptOrder ?? 0) > cursor.receiptOrder ||
+              ((meta.receiptOrder ?? 0) === cursor.receiptOrder && meta.id > cursor.id)
+            );
 
-    if (startIndex === -1) {
-      return { entries: [], nextCursor: cursor, hasMore: false };
-    }
+      if (startIndex === -1) {
+        return { entries: [], nextCursor: cursor, hasMore: false };
+      }
 
-    const page = filtered.slice(startIndex, startIndex + limit);
-    const last = page.length > 0 ? page[page.length - 1] : null;
-    return {
-      entries: page,
-      nextCursor: last ? { createdAt: last.createdAt, id: last.id } : cursor,
-      hasMore: startIndex + page.length < filtered.length,
-    };
+      const page = filtered.slice(startIndex, startIndex + limit);
+      const last = page.length > 0 ? page[page.length - 1] : null;
+      return {
+        entries: page,
+        nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
+        hasMore: startIndex + page.length < filtered.length,
+      };
+    });
   }
 
   async getIdBloomSummary(): Promise<StoreIdBloomSummary> {
-    const token = await this.ensureAuthenticated();
-    const capabilities = await this.getCapabilities();
-    if (capabilities.supportsIdBloomSummary && this.transport.getIdBloomSummary) {
-      return this.transport.getIdBloomSummary(token);
-    }
+    return this.withTransparentReauth("getIdBloomSummary", async () => {
+      const capabilities = await this.getCapabilities();
+      if (capabilities.supportsIdBloomSummary && this.transport.getIdBloomSummary) {
+        const token = await this.ensureAuthenticated();
+        return this.transport.getIdBloomSummary(token);
+      }
 
-    // Compatibility fallback for older transports.
-    const ids = await this.getAllIds();
-    return createIdBloomSummary(ids);
+      // Compatibility fallback for older transports.
+      const ids = await this.getAllIds();
+      return createIdBloomSummary(ids);
+    });
   }
 
   async getCapabilities(): Promise<NetworkSyncCapabilities> {
     if (this.capabilitiesCache) {
       return this.capabilitiesCache;
     }
-    const token = await this.ensureAuthenticated();
-    if (this.transport.getCapabilities) {
-      this.capabilitiesCache = await this.transport.getCapabilities(token);
+    return this.withTransparentReauth("getCapabilities", async () => {
+      const token = await this.ensureAuthenticated();
+      if (this.transport.getCapabilities) {
+        this.capabilitiesCache = await this.transport.getCapabilities(token);
+        return this.capabilitiesCache;
+      }
+      this.capabilitiesCache = {
+        protocolVersion: "sync-v1",
+        supportsCursorScan: false,
+        supportsIdBloomSummary: false,
+        supportsCompactionStatus: false,
+        supportsMaterializationPlanning: false,
+        supportsBatchMaterializationPlanning: false,
+      };
       return this.capabilitiesCache;
-    }
-    this.capabilitiesCache = {
-      protocolVersion: "sync-v1",
-      supportsCursorScan: false,
-      supportsIdBloomSummary: false,
-      supportsCompactionStatus: false,
-      supportsMaterializationPlanning: false,
-      supportsBatchMaterializationPlanning: false,
-    };
-    return this.capabilitiesCache;
+    });
   }
 
   async getCompactionStatus(): Promise<StoreCompactionStatus> {
-    const token = await this.ensureAuthenticated();
-    const capabilities = await this.getCapabilities();
-    if (capabilities.supportsCompactionStatus && this.transport.getCompactionStatus) {
-      return this.transport.getCompactionStatus(token);
-    }
-    // Compatibility fallback for older transports.
-    return {
-      enabled: false,
-      compactionMinFiles: 0,
-      compactionMaxBytes: 0,
-      totalCompactions: 0,
-      totalCompactedFiles: 0,
-      totalCompactedBytes: 0,
-      totalCompactionDurationMs: 0,
-      lastCompactionAt: null,
-      lastCompactedFiles: 0,
-      lastCompactedBytes: 0,
-      lastCompactionDurationMs: 0,
-    };
+    return this.withTransparentReauth("getCompactionStatus", async () => {
+      const capabilities = await this.getCapabilities();
+      if (capabilities.supportsCompactionStatus && this.transport.getCompactionStatus) {
+        const token = await this.ensureAuthenticated();
+        return this.transport.getCompactionStatus(token);
+      }
+      // Compatibility fallback for older transports.
+      return {
+        enabled: false,
+        compactionMinFiles: 0,
+        compactionMaxBytes: 0,
+        totalCompactions: 0,
+        totalCompactedFiles: 0,
+        totalCompactedBytes: 0,
+        totalCompactionDurationMs: 0,
+        lastCompactionAt: null,
+        lastCompactedFiles: 0,
+        lastCompactedBytes: 0,
+        lastCompactionDurationMs: 0,
+      };
+    });
   }
 
   async planDocumentMaterialization(
     docId: string,
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationPlan> {
-    const token = await this.ensureAuthenticated();
-    const capabilities = await this.getCapabilities();
-    if (!capabilities.supportsMaterializationPlanning || !this.transport.planDocumentMaterialization) {
-      throw new Error("Remote server does not support required materialization planning protocol");
-    }
-    return this.transport.planDocumentMaterialization(token, docId, options);
+    return this.withTransparentReauth("planDocumentMaterialization", async () => {
+      const capabilities = await this.getCapabilities();
+      if (!capabilities.supportsMaterializationPlanning || !this.transport.planDocumentMaterialization) {
+        throw new Error("Remote server does not support required materialization planning protocol");
+      }
+      const token = await this.ensureAuthenticated();
+      return this.transport.planDocumentMaterialization(token, docId, options);
+    });
   }
 
   async planDocumentMaterializationBatch(
     docIds: string[],
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationBatchPlan> {
-    const token = await this.ensureAuthenticated();
-    const capabilities = await this.getCapabilities();
-    if (!capabilities.supportsBatchMaterializationPlanning || !this.transport.planDocumentMaterializationBatch) {
-      throw new Error("Remote server does not support required batch materialization planning protocol");
-    }
-    return this.transport.planDocumentMaterializationBatch(token, docIds, options);
+    return this.withTransparentReauth("planDocumentMaterializationBatch", async () => {
+      const capabilities = await this.getCapabilities();
+      if (!capabilities.supportsBatchMaterializationPlanning || !this.transport.planDocumentMaterializationBatch) {
+        throw new Error("Remote server does not support required batch materialization planning protocol");
+      }
+      const token = await this.ensureAuthenticated();
+      return this.transport.planDocumentMaterializationBatch(token, docIds, options);
+    });
   }
 
   /**
@@ -369,13 +407,15 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     startId: string,
     options?: Record<string, unknown>
   ): Promise<string[]> {
-    this.logger.debug(`Resolving dependencies for ${startId}`);
-    
-    const token = await this.ensureAuthenticated();
-    const resolvedIds = await this.transport.resolveDependencies(token, startId, options);
-    
-    this.logger.debug(`Resolved ${resolvedIds.length} dependencies`);
-    return resolvedIds;
+    return this.withTransparentReauth("resolveDependencies", async () => {
+      this.logger.debug(`Resolving dependencies for ${startId}`);
+
+      const token = await this.ensureAuthenticated();
+      const resolvedIds = await this.transport.resolveDependencies(token, startId, options);
+
+      this.logger.debug(`Resolved ${resolvedIds.length} dependencies`);
+      return resolvedIds;
+    });
   }
 
   /**
@@ -397,35 +437,51 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    */
   private async ensureAuthenticated(): Promise<string> {
     const now = Date.now();
-    
+
     // Check if we have a valid token
     if (this.accessToken && this.tokenExpiry > now + 60000) { // 1 minute buffer
       return this.accessToken;
     }
-    
+
+    if (this.authenticationPromise) {
+      return this.authenticationPromise;
+    }
+
+    this.authenticationPromise = this.performAuthentication();
+    try {
+      return await this.authenticationPromise;
+    } finally {
+      if (this.authenticationPromise) {
+        this.authenticationPromise = null;
+      }
+    }
+  }
+
+  private async performAuthentication(): Promise<string> {
+    const now = Date.now();
     const authUsername = this.getActiveAuthUsername();
     this.logger.debug(`Authenticating user: ${authUsername}`);
-    
+
     // Request a challenge
     const challenge = await this.transport.requestChallenge(authUsername);
     this.logger.debug(`Received challenge: ${challenge}`);
-    
+
     // Sign the challenge
     const signature = await this.signChallengeWithKey(challenge, this.getActiveSigningKey());
     this.logger.debug(`Signed challenge`);
-    
+
     // Authenticate
     const result = await this.transport.authenticate(challenge, signature);
-    
+
     if (!result.success || !result.token) {
       throw new NetworkError(
         NetworkErrorType.INVALID_SIGNATURE,
         result.error || "Authentication failed"
       );
     }
-    
+
     this.accessToken = result.token;
-    
+
     // Parse token expiry from JWT (simple extraction)
     try {
       const parts = result.token.split(".");
@@ -437,7 +493,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       // Default to 1 hour if we can't parse
       this.tokenExpiry = now + 3600000;
     }
-    
+
     this.logger.debug(`Authentication successful`);
     return this.accessToken;
   }
@@ -510,6 +566,32 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.accessToken = null;
     this.tokenExpiry = 0;
     this.capabilitiesCache = null;
+  }
+
+  private async refreshAuthentication(): Promise<string> {
+    this.clearAuthCache();
+    return this.ensureAuthenticated();
+  }
+
+  private isInvalidTokenError(error: unknown): error is NetworkError {
+    return error instanceof NetworkError && error.type === NetworkErrorType.INVALID_TOKEN;
+  }
+
+  private async withTransparentReauth<T>(
+    operationName: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!this.isInvalidTokenError(error)) {
+        throw error;
+      }
+
+      this.logger.warn(`Received invalid token during ${operationName}, refreshing authentication and retrying once`);
+      await this.refreshAuthentication();
+      return operation();
+    }
   }
 
   /**

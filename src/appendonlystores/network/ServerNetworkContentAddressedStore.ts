@@ -228,13 +228,22 @@ export class ServerNetworkContentAddressedStore {
         }
         return true;
       })
-      .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt));
+      .sort((a, b) => {
+        const leftReceiptOrder = a.receiptOrder ?? 0;
+        const rightReceiptOrder = b.receiptOrder ?? 0;
+        return leftReceiptOrder === rightReceiptOrder
+          ? a.id.localeCompare(b.id)
+          : leftReceiptOrder - rightReceiptOrder;
+      });
 
     const max = limit ?? Number.MAX_SAFE_INTEGER;
     const startIndex =
       cursor === null
         ? 0
-        : sorted.findIndex((meta) => meta.createdAt > cursor.createdAt || (meta.createdAt === cursor.createdAt && meta.id > cursor.id));
+        : sorted.findIndex((meta) =>
+            (meta.receiptOrder ?? 0) > cursor.receiptOrder ||
+            ((meta.receiptOrder ?? 0) === cursor.receiptOrder && meta.id > cursor.id)
+          );
 
     if (startIndex === -1) {
       return { entries: [], nextCursor: cursor, hasMore: false };
@@ -244,7 +253,7 @@ export class ServerNetworkContentAddressedStore {
     const last = page.length > 0 ? page[page.length - 1] : null;
     return {
       entries: page,
-      nextCursor: last ? { createdAt: last.createdAt, id: last.id } : cursor,
+      nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
       hasMore: startIndex + page.length < sorted.length,
     };
   }
@@ -274,7 +283,7 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
 
     return {
-      protocolVersion: "sync-v3",
+      protocolVersion: "sync-v4",
       supportsCursorScan: typeof this.localStore.scanEntriesSince === "function",
       supportsIdBloomSummary: typeof this.localStore.getIdBloomSummary === "function",
       supportsCompactionStatus: typeof this.localStore.getCompactionStatus === "function",

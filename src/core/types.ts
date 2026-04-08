@@ -662,6 +662,20 @@ export interface StoreEntryMetadata {
   createdAt: number;
 
   /**
+   * Monotonic store-local insertion order assigned when the entry becomes
+   * visible in a specific replica.
+   *
+   * This is distinct from `createdAt`:
+   * - `createdAt` captures author/origin time and is stable across replicas
+   * - `receiptOrder` captures local receipt/persistence order and may differ
+   *   between replicas
+   *
+   * Stores may omit this on pre-migration metadata, but `scanEntriesSince()`
+   * must only return cursors built from entries that have a concrete value.
+   */
+  receiptOrder?: number;
+
+  /**
    * The public signing key of the user who created this entry (Ed25519, PEM format).
    * Used for signature verification and audit trails.
    */

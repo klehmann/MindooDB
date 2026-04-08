@@ -5,7 +5,13 @@ import { AuthenticationService } from "../core/appendonlystores/network/Authenti
 import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
 import { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { NetworkTransport } from "../core/appendonlystores/network/NetworkTransport";
-import type { NetworkEncryptedEntry, AuthResult, NetworkSyncCapabilities } from "../core/appendonlystores/network/types";
+import {
+  NetworkError,
+  NetworkErrorType,
+  type NetworkEncryptedEntry,
+  type AuthResult,
+  type NetworkSyncCapabilities,
+} from "../core/appendonlystores/network/types";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -361,6 +367,7 @@ describe("Network Sync", () => {
     let serverStore: ContentAddressedStore;
     let serverHandler: ServerNetworkContentAddressedStore;
     let clientStore: ClientNetworkContentAddressedStore;
+    let mockTransport: MockNetworkTransport;
     let mockDirectory: MockTenantDirectory;
     let userSigningKeyPair: CryptoKeyPair;
     let userEncryptionKeyPair: CryptoKeyPair;
@@ -426,7 +433,7 @@ describe("Network Sync", () => {
       );
       
       // Create mock transport
-      const mockTransport = new MockNetworkTransport(serverHandler);
+      mockTransport = new MockNetworkTransport(serverHandler);
       
       // Create client store (no local store - pure remote proxy)
       clientStore = new ClientNetworkContentAddressedStore(
@@ -541,12 +548,23 @@ describe("Network Sync", () => {
 
     test("should negotiate capabilities from remote", async () => {
       const caps = await clientStore.getCapabilities();
-      expect(caps.protocolVersion).toBe("sync-v3");
+      expect(caps.protocolVersion).toBe("sync-v4");
       expect(caps.supportsCursorScan).toBe(true);
       expect(caps.supportsIdBloomSummary).toBe(true);
       expect(caps.supportsCompactionStatus).toBe(false);
       expect(caps.supportsMaterializationPlanning).toBe(true);
       expect(caps.supportsBatchMaterializationPlanning).toBe(true);
+    });
+
+    test("should scan entries via cursor in remote receipt order", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash-newer", 3000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash-older", 1000)]);
+
+      const scanned = await clientStore.scanEntriesSince!(null, 10);
+      expect(scanned.entries.map((entry) => entry.id)).toEqual(["hash-newer", "hash-older"]);
+      expect(scanned.entries[0].createdAt).toBeGreaterThan(scanned.entries[1].createdAt);
+      expect(scanned.entries[0].receiptOrder).toBe(1);
+      expect(scanned.entries[1].receiptOrder).toBe(2);
     });
 
     test("should return fallback compaction status when remote does not expose it", async () => {
@@ -635,6 +653,80 @@ describe("Network Sync", () => {
       // Query again - should re-authenticate
       const entries = await clientStore.findNewEntries(["hash1"]);
       expect(entries.length).toBe(1);
+    });
+
+    test("should transparently re-authenticate once after invalid token", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+
+      await clientStore.findNewEntries([]);
+
+      const requestChallengeSpy = jest.spyOn(mockTransport, "requestChallenge");
+      const authenticateSpy = jest.spyOn(mockTransport, "authenticate");
+      const originalFindNewEntries = mockTransport.findNewEntries.bind(mockTransport);
+      let failOnce = true;
+      jest.spyOn(mockTransport, "findNewEntries").mockImplementation(async (token, haveIds) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new NetworkError(NetworkErrorType.INVALID_TOKEN, "Invalid or expired token");
+        }
+        return originalFindNewEntries(token, haveIds);
+      });
+
+      const entries = await clientStore.findNewEntries([]);
+
+      expect(entries.length).toBe(1);
+      expect(requestChallengeSpy).toHaveBeenCalledTimes(1);
+      expect(authenticateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("should fail after a single retry when invalid token persists", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+
+      await clientStore.findNewEntries([]);
+
+      const requestChallengeSpy = jest.spyOn(mockTransport, "requestChallenge");
+      const authenticateSpy = jest.spyOn(mockTransport, "authenticate");
+      const findNewEntriesSpy = jest.spyOn(mockTransport, "findNewEntries").mockRejectedValue(
+        new NetworkError(NetworkErrorType.INVALID_TOKEN, "Invalid or expired token")
+      );
+
+      await expect(clientStore.findNewEntries([])).rejects.toMatchObject({
+        name: "NetworkError",
+        type: NetworkErrorType.INVALID_TOKEN,
+        message: "Invalid or expired token",
+      });
+      expect(findNewEntriesSpy).toHaveBeenCalledTimes(2);
+      expect(requestChallengeSpy).toHaveBeenCalledTimes(1);
+      expect(authenticateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("should share a single re-authentication across parallel invalid-token retries", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+
+      await clientStore.findNewEntries([]);
+
+      const requestChallengeSpy = jest.spyOn(mockTransport, "requestChallenge");
+      const authenticateSpy = jest.spyOn(mockTransport, "authenticate");
+      const originalFindNewEntries = mockTransport.findNewEntries.bind(mockTransport);
+      let invalidTokenResponses = 0;
+      jest.spyOn(mockTransport, "findNewEntries").mockImplementation(async (token, haveIds) => {
+        if (invalidTokenResponses < 2) {
+          invalidTokenResponses += 1;
+          await sleep(10);
+          throw new NetworkError(NetworkErrorType.INVALID_TOKEN, "Invalid or expired token");
+        }
+        return originalFindNewEntries(token, haveIds);
+      });
+
+      const [first, second] = await Promise.all([
+        clientStore.findNewEntries([]),
+        clientStore.findNewEntries([]),
+      ]);
+
+      expect(first.length).toBe(1);
+      expect(second.length).toBe(1);
+      expect(requestChallengeSpy).toHaveBeenCalledTimes(1);
+      expect(authenticateSpy).toHaveBeenCalledTimes(1);
     });
   });
 

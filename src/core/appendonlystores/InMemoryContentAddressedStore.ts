@@ -46,6 +46,9 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   
   /** Cached sorted entries for efficient cursor-based scanning (invalidated on mutation) */
   private sortedEntriesCache: StoreEntryMetadata[] | null = null;
+
+  /** Monotonic local insertion order assigned when entries are persisted. */
+  private nextReceiptOrder = 1;
   
   /** Reference count per contentHash for O(1) orphan detection during purge */
   private contentRefCount: Map<string, number> = new Map();
@@ -82,7 +85,11 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       }
 
       // Separate metadata from encrypted data
-      const { encryptedData, ...metadata } = entry;
+      const { encryptedData, receiptOrder: _ignoredReceiptOrder, ...rest } = entry;
+      const metadata: StoreEntryMetadata = {
+        ...rest,
+        receiptOrder: this.nextReceiptOrder++,
+      };
       
       // Store metadata by id
       this.entries.set(entry.id, metadata);
@@ -256,16 +263,16 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   }
 
   /**
-   * Return all entries sorted by (createdAt ASC, id ASC).
+   * Return all entries sorted by (receiptOrder ASC, id ASC).
    * Result is cached and invalidated on mutation for amortized O(1) access.
    */
   private getSortedEntries(): StoreEntryMetadata[] {
     if (!this.sortedEntriesCache) {
       this.sortedEntriesCache = Array.from(this.entries.values())
         .sort((a, b) =>
-          a.createdAt === b.createdAt
+          (a.receiptOrder ?? 0) === (b.receiptOrder ?? 0)
             ? a.id.localeCompare(b.id)
-            : a.createdAt - b.createdAt
+            : (a.receiptOrder ?? 0) - (b.receiptOrder ?? 0)
         );
     }
     return this.sortedEntriesCache;
@@ -273,7 +280,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
 
   /**
    * Binary search for the index of the first entry strictly after `cursor`
-   * in the sorted (createdAt, id) order.
+   * in the sorted (receiptOrder, id) order.
    * Returns sorted.length when no entry comes after the cursor.
    */
   private binarySearchAfterCursor(
@@ -286,8 +293,8 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       const mid = (lo + hi) >>> 1;
       const m = sorted[mid];
       if (
-        m.createdAt < cursor.createdAt ||
-        (m.createdAt === cursor.createdAt && m.id <= cursor.id)
+        (m.receiptOrder ?? 0) < cursor.receiptOrder ||
+        ((m.receiptOrder ?? 0) === cursor.receiptOrder && m.id <= cursor.id)
       ) {
         lo = mid + 1;
       } else {
@@ -331,7 +338,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
 
   /**
    * Cursor-based metadata scan for high-volume synchronization.
-   * Ordering: createdAt ASC, id ASC.
+   * Ordering: receiptOrder ASC, id ASC.
    *
    * Uses a cached sorted index with binary search for O(log n) cursor
    * lookup instead of re-sorting all entries on every call.
@@ -369,7 +376,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     return {
       entries: page,
       nextCursor: last
-        ? { createdAt: last.createdAt, id: last.id }
+        ? { receiptOrder: last.receiptOrder ?? 0, id: last.id }
         : cursor,
       hasMore,
     };

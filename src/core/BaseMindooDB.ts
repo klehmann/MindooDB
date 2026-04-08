@@ -38,7 +38,10 @@ import type {
   StoreIdBloomSummary,
 } from "./appendonlystores/types";
 import { bloomMightContainId } from "./appendonlystores/bloom";
-import { computeDocumentMaterializationPlan } from "./appendonlystores/MaterializationPlanner";
+import {
+  computeDocumentMaterializationPlan,
+  topologicalByDependencies,
+} from "./appendonlystores/MaterializationPlanner";
 import { 
   generateDocEntryId, 
   computeContentHash, 
@@ -309,7 +312,7 @@ export class BaseMindooDB implements MindooDB {
 
   private exportMetadataCheckpoint(): Uint8Array {
     const checkpoint: Record<string, unknown> = {
-      version: 1,
+      version: 2,
       processedEntryCursor: this.processedEntryCursor,
       index: this.index,
       nextChangeSeq: this.nextChangeSeq,
@@ -345,7 +348,7 @@ export class BaseMindooDB implements MindooDB {
       }
 
       const checkpoint = JSON.parse(new TextDecoder().decode(metaBytes));
-      if (checkpoint.version !== 1) {
+      if (checkpoint.version !== 2) {
         this.logger.warn(`Unknown cache version ${checkpoint.version}, ignoring cache`);
         return false;
       }
@@ -2673,11 +2676,14 @@ export class BaseMindooDB implements MindooDB {
       return null; // No changes
     }
     
-    // Sort entries by timestamp
-    entriesToApply.sort((a, b) => a.createdAt - b.createdAt);
+    const entriesById = new Map(entriesToApply.map((entry) => [entry.id, entry]));
+    const orderedEntryIds = topologicalByDependencies(
+      new Set(entriesToApply.map((entry) => entry.id)),
+      entriesById,
+    );
     
     // Load entries from store
-    const entries = await this.store.getEntries(entriesToApply.map(em => em.id));
+    const entries = await this.store.getEntries(orderedEntryIds);
     
     // Filter entries for admin-only mode first
     const validEntries = entries.filter(entryData => {
@@ -2797,9 +2803,12 @@ export class BaseMindooDB implements MindooDB {
     
     // Update metadata
     const payload = updatedDoc as unknown as MindooDocPayload;
-    const lastEntry = entries[entries.length - 1];
+    const lastEntryCreatedAt = entries.reduce(
+      (maxCreatedAt, entry) => Math.max(maxCreatedAt, entry.createdAt),
+      cachedDoc.lastModified,
+    );
     const lastModified = (payload._lastModified as number) || 
-                         (lastEntry ? lastEntry.createdAt : cachedDoc.lastModified);
+                         lastEntryCreatedAt;
     
     // Check if document was deleted
     const hasDeleteEntry = newEntryMetadata.some(em => em.entryType === "doc_delete");
@@ -2813,7 +2822,6 @@ export class BaseMindooDB implements MindooDB {
       decryptionKeyId: cachedDoc.decryptionKeyId,
       isDeleted,
     };
-    
     // Update cache
     this.storeCachedDocument(updatedInternalDoc);
     this.markDocDirty(docId);

@@ -43,7 +43,7 @@ describeStress("BasicOnDiskContentAddressedStore stress matrix", () => {
         indexingEnabled: true,
       });
 
-      let cursor: { createdAt: number; id: string } | null = null;
+      let cursor: { receiptOrder: number; id: string } | null = null;
       let scanned = 0;
       do {
         const page = await restarted.scanEntriesSince!(cursor, 256);

@@ -150,7 +150,7 @@ function coveredBySnapshot(
  * @returns Entry IDs in dependency-first order suitable for sequential
  *          application to an Automerge document.
  */
-function topologicalByDependencies(
+export function topologicalByDependencies(
   ids: Set<string>,
   replayById: Map<string, StoreEntryMetadata>,
 ): string[] {

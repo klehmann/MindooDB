@@ -267,11 +267,14 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   private contentRefCount = new Map<string, number>();
 
   /**
-   * All metadata sorted by `(createdAt ASC, id ASC)`.
+   * All metadata sorted by `(receiptOrder ASC, id ASC)`.
    * Supports O(log N) lower-bound binary search for cursor-based scans
    * in {@link scanEntriesSince}.
    */
   private orderedMetadata: StoreEntryMetadata[] = [];
+
+  /** Next monotonic local receipt order assigned on insert. */
+  private nextReceiptOrder = 1;
 
   /** Current phase and progress of the index build (building / ready). */
   private indexStatus: StoreIndexBuildStatus;
@@ -360,10 +363,24 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     await mkdir(this.contentDir, { recursive: true });
     await mkdir(this.metadataSegmentsDir, { recursive: true });
 
+    const migratedReceiptOrder = await this.ensurePersistedReceiptOrder();
+
     if (!this.indexingEnabled) {
       this.indexStatus = {
         phase: "ready",
         indexingEnabled: false,
+        progress01: 1,
+      };
+      return;
+    }
+
+    if (migratedReceiptOrder) {
+      await this.rebuildInMemoryIndexes();
+      await this.persistMetadataIndex();
+      await this.clearMetadataSegments(Array.from(this.appliedMetadataSegmentFiles));
+      this.indexStatus = {
+        phase: "ready",
+        indexingEnabled: true,
         progress01: 1,
       };
       return;
@@ -382,6 +399,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
       await this.persistMetadataIndex();
       await this.clearMetadataSegments(Array.from(this.appliedMetadataSegmentFiles));
     }
+    this.recomputeNextReceiptOrder();
     this.indexStatus = {
       phase: "ready",
       indexingEnabled: true,
@@ -406,6 +424,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     this.contentRefCount.clear();
     this.orderedMetadata = [];
     this.appliedMetadataSegmentFiles.clear();
+    this.nextReceiptOrder = 1;
   }
 
   /**
@@ -413,7 +432,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    *
    * Clears all in-memory structures, reads every `entries/*.json` file,
    * populates the primary, secondary, and ref-count indexes, and finally
-   * sorts `orderedMetadata` by `(createdAt, id)`.
+   * sorts `orderedMetadata` by `(receiptOrder, id)`.
    *
    * This is the slowest startup path (O(N) filesystem reads) and is only
    * used when the persisted snapshot + segments cannot be validated.
@@ -442,7 +461,8 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
       );
       this.orderedMetadata.push(metadata);
     }
-    this.orderedMetadata.sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt));
+    this.orderedMetadata.sort((a, b) => this.compareMetadata(a, b));
+    this.recomputeNextReceiptOrder();
   }
 
   /**
@@ -482,6 +502,8 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
         );
         this.orderedMetadata.push(metadata);
       }
+      this.orderedMetadata.sort((a, b) => this.compareMetadata(a, b));
+      this.recomputeNextReceiptOrder();
       return true;
     } catch (err) {
       this.logger.warn(`Failed to load metadata index, rebuilding from entry files: ${String(err)}`);
@@ -723,19 +745,21 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   // ---------------------------------------------------------------------------
 
   /**
-   * Compare two metadata entries by the canonical sort key `(createdAt, id)`.
+   * Compare two metadata entries by the canonical sort key `(receiptOrder, id)`.
    * Used to maintain and query the `orderedMetadata` sorted array.
    */
   private compareMetadata(a: StoreEntryMetadata, b: StoreEntryMetadata): number {
-    if (a.createdAt !== b.createdAt) {
-      return a.createdAt - b.createdAt;
+    const leftReceiptOrder = a.receiptOrder ?? 0;
+    const rightReceiptOrder = b.receiptOrder ?? 0;
+    if (leftReceiptOrder !== rightReceiptOrder) {
+      return leftReceiptOrder - rightReceiptOrder;
     }
     return a.id.localeCompare(b.id);
   }
 
   /**
    * Binary search for the first index in `orderedMetadata` that is strictly
-   * greater than the given cursor position `(createdAt, id)`.
+   * greater than the given cursor position `(receiptOrder, id)`.
    *
    * Returns 0 when cursor is `null` (start from the beginning).
    * Runs in O(log N) time.
@@ -750,8 +774,8 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
       const mid = Math.floor((left + right) / 2);
       const candidate = this.orderedMetadata[mid];
       const greater =
-        candidate.createdAt > cursor.createdAt ||
-        (candidate.createdAt === cursor.createdAt && candidate.id > cursor.id);
+        (candidate.receiptOrder ?? 0) > cursor.receiptOrder ||
+        ((candidate.receiptOrder ?? 0) === cursor.receiptOrder && candidate.id > cursor.id);
       if (greater) {
         right = mid;
       } else {
@@ -860,6 +884,82 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
       (this.contentRefCount.get(metadata.contentHash) || 0) + 1
     );
     this.insertOrderedMetadata(metadata);
+    this.nextReceiptOrder = Math.max(this.nextReceiptOrder, (metadata.receiptOrder ?? 0) + 1);
+  }
+
+  private recomputeNextReceiptOrder(): void {
+    const maxReceiptOrder = this.orderedMetadata.reduce(
+      (max, metadata) => Math.max(max, metadata.receiptOrder ?? 0),
+      0,
+    );
+    this.nextReceiptOrder = maxReceiptOrder + 1;
+  }
+
+  private compareLegacyCreatedAtId(a: StoreEntryMetadata, b: StoreEntryMetadata): number {
+    if (a.createdAt !== b.createdAt) {
+      return a.createdAt - b.createdAt;
+    }
+    return a.id.localeCompare(b.id);
+  }
+
+  /**
+   * Ensure every persisted metadata file has a `receiptOrder`.
+   *
+   * Older on-disk stores predate receipt-order discovery and therefore only
+   * persist `createdAt`. On startup we detect that legacy shape, assign a
+   * deterministic synthetic `receiptOrder` by sorting existing entries using
+   * the old `(createdAt, id)` rule, and rewrite the metadata files in that
+   * order. This preserves a stable forward cursor contract after migration,
+   * even though the exact historic arrival order is unknowable for preexisting
+   * rows.
+   *
+   * @returns `true` when a backfill rewrite was performed, `false` when the
+   *          store already had receipt-order metadata (or was empty).
+   */
+  private async ensurePersistedReceiptOrder(): Promise<boolean> {
+    const files = await this.listEntryFiles();
+    if (files.length === 0) {
+      this.nextReceiptOrder = 1;
+      return false;
+    }
+
+    const metadataList: Array<{ fileName: string; metadata: StoreEntryMetadata }> = [];
+    let missingReceiptOrder = false;
+    let maxReceiptOrder = 0;
+
+    for (const fileName of files) {
+      const metadata = await this.readMetadataByFileName(fileName);
+      if (!metadata) {
+        continue;
+      }
+      metadataList.push({ fileName, metadata });
+      if (typeof metadata.receiptOrder !== "number") {
+        missingReceiptOrder = true;
+      } else {
+        maxReceiptOrder = Math.max(maxReceiptOrder, metadata.receiptOrder);
+      }
+    }
+
+    if (!missingReceiptOrder) {
+      this.nextReceiptOrder = maxReceiptOrder + 1;
+      return false;
+    }
+
+    metadataList.sort((left, right) =>
+      this.compareLegacyCreatedAtId(left.metadata, right.metadata),
+    );
+    let nextReceiptOrder = 1;
+    for (const { fileName, metadata } of metadataList) {
+      const migrated: StoreEntryMetadata = {
+        ...metadata,
+        receiptOrder: nextReceiptOrder++,
+      };
+      const filePath = path.join(this.entriesDir, fileName);
+      await this.writeFileAtomic(filePath, JSON.stringify(serializeMetadata(migrated)));
+    }
+
+    this.nextReceiptOrder = nextReceiptOrder;
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -1056,7 +1156,11 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
         await this.writeFileAtomic(contentPath, entry.encryptedData);
       }
 
-      const { encryptedData, ...metadata } = entry;
+      const { encryptedData, receiptOrder: _ignoredReceiptOrder, ...rest } = entry;
+      const metadata: StoreEntryMetadata = {
+        ...rest,
+        receiptOrder: this.nextReceiptOrder++,
+      };
       const serialized = JSON.stringify(serializeMetadata(metadata));
       await this.writeFileAtomic(metadataPath, serialized);
       hasMutation = true;
@@ -1205,7 +1309,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   /**
    * Return all entry ids in the store.
    *
-   * When indexing is enabled, returns ids in `(createdAt, id)` order.
+   * When indexing is enabled, returns ids in `(receiptOrder, id)` order.
    * Without indexing, order depends on the filesystem directory listing.
    */
   async getAllIds(): Promise<string[]> {
@@ -1222,7 +1326,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    *
    * Designed for high-volume synchronization: the caller repeatedly advances
    * a cursor to stream through all entries in deterministic
-   * `(createdAt ASC, id ASC)` order, optionally applying filters.
+   * `(receiptOrder ASC, id ASC)` order, optionally applying filters.
    *
    * **Indexed path** (default):
    * - O(log N) binary search for the cursor position.
@@ -1253,7 +1357,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
         const last = page.length > 0 ? page[page.length - 1] : null;
         return {
           entries: page,
-          nextCursor: last ? { createdAt: last.createdAt, id: last.id } : cursor,
+          nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
           hasMore: startIndex + page.length < this.orderedMetadata.length,
         };
       }
@@ -1280,7 +1384,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
       const last = page.length > 0 ? page[page.length - 1] : null;
       return {
         entries: page,
-        nextCursor: last ? { createdAt: last.createdAt, id: last.id } : cursor,
+        nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
         hasMore,
       };
     }
@@ -1302,12 +1406,12 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
         }
         return true;
       })
-      .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt));
+      .sort((a, b) => this.compareMetadata(a, b));
 
     const startIndex =
       cursor === null
         ? 0
-        : all.findIndex((meta) => meta.createdAt > cursor.createdAt || (meta.createdAt === cursor.createdAt && meta.id > cursor.id));
+        : all.findIndex((meta) => (meta.receiptOrder ?? 0) > cursor.receiptOrder || ((meta.receiptOrder ?? 0) === cursor.receiptOrder && meta.id > cursor.id));
 
     if (startIndex === -1) {
       return { entries: [], nextCursor: cursor, hasMore: false };
@@ -1317,7 +1421,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     const last = page.length > 0 ? page[page.length - 1] : null;
     return {
       entries: page,
-      nextCursor: last ? { createdAt: last.createdAt, id: last.id } : cursor,
+      nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
       hasMore: startIndex + page.length < all.length,
     };
   }

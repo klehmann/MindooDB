@@ -5,12 +5,13 @@
  * is delegated to IDB itself (no in-memory maps), keeping memory usage low
  * even for stores with hundreds of thousands of entries.
  *
- * Schema (IDB version 1):
+ * Schema (IDB version 2):
  *   - `entries`     : metadata per entry id, indexed by docId, contentHash,
- *                     (entryType, createdAt), and (createdAt, id)
+ *                     (entryType, createdAt), (createdAt, id), and (receiptOrder, id)
  *   - `content`     : encrypted payload per contentHash with reference counting
  *   - `bloom_cache` : single cached bloom filter summary, incrementally updated
  *                     on inserts and fully rebuilt on purge or size threshold
+ *   - `store_meta`  : small key/value records such as the next receipt-order counter
  *
  * @module IndexedDBContentAddressedStore
  */
@@ -40,19 +41,22 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 // IDB Constants
 // ---------------------------------------------------------------------------
 
-const IDB_VERSION = 1;
+const IDB_VERSION = 2;
 const ENTRIES_STORE = "entries";
 const CONTENT_STORE = "content";
 const BLOOM_CACHE_STORE = "bloom_cache";
+const META_STORE = "store_meta";
 
 // Index names
 const IDX_DOC_ID = "by_docId";
 const IDX_ENTRY_TYPE_CREATED_AT = "by_entryType_createdAt";
 const IDX_CREATED_AT_ID = "by_createdAt_id";
+const IDX_RECEIPT_ORDER_ID = "by_receiptOrder_id";
 const IDX_CONTENT_HASH = "by_contentHash";
 
 // Bloom cache key
 const BLOOM_CACHE_KEY = "current";
+const RECEIPT_ORDER_COUNTER_KEY = "receiptOrderCounter";
 
 // ---------------------------------------------------------------------------
 // Browser-compatible bloom filter helpers (no Buffer dependency)
@@ -306,10 +310,12 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
+        const transaction = (event.target as IDBOpenDBRequest).transaction!;
 
         // entries store
+        let entriesStore: IDBObjectStore;
         if (!db.objectStoreNames.contains(ENTRIES_STORE)) {
-          const entriesStore = db.createObjectStore(ENTRIES_STORE, {
+          entriesStore = db.createObjectStore(ENTRIES_STORE, {
             keyPath: "id",
           });
           entriesStore.createIndex(IDX_DOC_ID, "docId", { unique: false });
@@ -321,9 +327,19 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
           entriesStore.createIndex(IDX_CREATED_AT_ID, ["createdAt", "id"], {
             unique: true,
           });
+          entriesStore.createIndex(IDX_RECEIPT_ORDER_ID, ["receiptOrder", "id"], {
+            unique: true,
+          });
           entriesStore.createIndex(IDX_CONTENT_HASH, "contentHash", {
             unique: false,
           });
+        } else {
+          entriesStore = transaction.objectStore(ENTRIES_STORE);
+          if (!entriesStore.indexNames.contains(IDX_RECEIPT_ORDER_ID)) {
+            entriesStore.createIndex(IDX_RECEIPT_ORDER_ID, ["receiptOrder", "id"], {
+              unique: true,
+            });
+          }
         }
 
         // content store
@@ -334,6 +350,35 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
         // bloom cache store
         if (!db.objectStoreNames.contains(BLOOM_CACHE_STORE)) {
           db.createObjectStore(BLOOM_CACHE_STORE, { keyPath: "key" });
+        }
+
+        // store meta
+        let metaStore: IDBObjectStore;
+        if (!db.objectStoreNames.contains(META_STORE)) {
+          metaStore = db.createObjectStore(META_STORE, { keyPath: "key" });
+        } else {
+          metaStore = transaction.objectStore(META_STORE);
+        }
+
+        if ((event.oldVersion ?? 0) < 2) {
+          let nextReceiptOrder = 1;
+          const cursorReq = entriesStore.index(IDX_CREATED_AT_ID).openCursor();
+          cursorReq.onsuccess = () => {
+            const cursor = cursorReq.result;
+            if (!cursor) {
+              metaStore.put({
+                key: RECEIPT_ORDER_COUNTER_KEY,
+                value: nextReceiptOrder - 1,
+              });
+              return;
+            }
+            const metadata = cursor.value as StoreEntryMetadata;
+            cursor.update({
+              ...metadata,
+              receiptOrder: nextReceiptOrder++,
+            });
+            cursor.continue();
+          };
         }
       };
 
@@ -382,14 +427,20 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
     const db = await this.ensureOpen();
     const tx = db.transaction(
-      [ENTRIES_STORE, CONTENT_STORE, BLOOM_CACHE_STORE],
+      [ENTRIES_STORE, CONTENT_STORE, BLOOM_CACHE_STORE, META_STORE],
       "readwrite"
     );
     const entriesOS = tx.objectStore(ENTRIES_STORE);
     const contentOS = tx.objectStore(CONTENT_STORE);
     const bloomOS = tx.objectStore(BLOOM_CACHE_STORE);
+    const metaOS = tx.objectStore(META_STORE);
 
     const insertedIds: string[] = [];
+    const counterRecord = await reqToPromise(
+      metaOS.get(RECEIPT_ORDER_COUNTER_KEY)
+    ) as { key: string; value: number } | undefined;
+    let nextReceiptOrder =
+      typeof counterRecord?.value === "number" ? counterRecord.value + 1 : 1;
 
     for (const entry of entries) {
       // Check if entry already exists (skip duplicate)
@@ -400,7 +451,11 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       }
 
       // Separate metadata from encrypted data
-      const { encryptedData, ...metadata } = entry;
+      const { encryptedData, receiptOrder: _ignoredReceiptOrder, ...rest } = entry;
+      const metadata: StoreEntryMetadata = {
+        ...rest,
+        receiptOrder: nextReceiptOrder++,
+      };
 
       // Store metadata
       await reqToPromise(entriesOS.put(metadata));
@@ -430,6 +485,15 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
       insertedIds.push(entry.id);
       this.logger.debug(`Stored entry ${entry.id} for doc ${entry.docId}`);
+    }
+
+    if (insertedIds.length > 0) {
+      await reqToPromise(
+        metaOS.put({
+          key: RECEIPT_ORDER_COUNTER_KEY,
+          value: nextReceiptOrder - 1,
+        })
+      );
     }
 
     // Incrementally update bloom cache with newly inserted IDs
@@ -665,12 +729,12 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
-    const index = entriesOS.index(IDX_CREATED_AT_ID);
+    const index = entriesOS.index(IDX_RECEIPT_ORDER_ID);
 
     // Build lower bound from cursor
     let range: IDBKeyRange | null = null;
     if (cursor) {
-      range = IDBKeyRange.lowerBound([cursor.createdAt, cursor.id], true);
+      range = IDBKeyRange.lowerBound([cursor.receiptOrder, cursor.id], true);
     }
 
     const page: StoreEntryMetadata[] = [];
@@ -686,7 +750,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
           resolve({
             entries: page,
             nextCursor: last
-              ? { createdAt: last.createdAt, id: last.id }
+              ? { receiptOrder: last.receiptOrder ?? 0, id: last.id }
               : cursor,
             hasMore,
           });
@@ -704,7 +768,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
           const last = page[page.length - 1];
           resolve({
             entries: page,
-            nextCursor: { createdAt: last.createdAt, id: last.id },
+            nextCursor: { receiptOrder: last.receiptOrder ?? 0, id: last.id },
             hasMore: true,
           });
           return;

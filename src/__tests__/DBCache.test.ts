@@ -3,7 +3,18 @@ import { BaseMindooDB } from "../core/BaseMindooDB";
 import { InMemoryContentAddressedStore } from "../core/appendonlystores/InMemoryContentAddressedStore";
 import { InMemoryLocalCacheStore } from "../core/cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "../core/cache/EncryptedLocalCacheStore";
-import { MindooTenant, MindooDoc, ContentAddressedStoreFactory, CreateStoreResult, OpenStoreOptions } from "../core/types";
+import { KeyBag } from "../core/keys/KeyBag";
+import {
+  MindooTenant,
+  MindooDoc,
+  ContentAddressedStoreFactory,
+  CreateStoreResult,
+  OpenStoreOptions,
+  PrivateUserId,
+  AttachmentReference,
+  DEFAULT_TENANT_KEY_ID,
+  PUBLIC_INFOS_KEY_ID,
+} from "../core/types";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { CacheManager } from "../core/cache/CacheManager";
 
@@ -32,10 +43,17 @@ class PersistentInMemoryStoreFactory implements ContentAddressedStoreFactory {
  */
 describe("BaseMindooDB cache integration", () => {
   const crypto = new NodeCryptoAdapter();
+  const tenantId = "test-cache-tenant";
+  const adminPassword = "adminpass";
+  const userPassword = "userpass";
 
   let cacheStore: InMemoryLocalCacheStore;
   let factory: BaseMindooTenantFactory;
   let tenant: MindooTenant;
+  let adminUser: PrivateUserId;
+  let appUser: PrivateUserId;
+  let keyBag: KeyBag;
+  let remoteTenant: MindooTenant | undefined;
 
   beforeEach(async () => {
     cacheStore = new InMemoryLocalCacheStore();
@@ -47,17 +65,21 @@ describe("BaseMindooDB cache integration", () => {
     );
 
     const result = await factory.createTenant({
-      tenantId: "test-cache-tenant",
+      tenantId,
       adminName: "CN=admin/O=test",
-      adminPassword: "adminpass",
+      adminPassword,
       userName: "CN=user/O=test",
-      userPassword: "userpass",
+      userPassword,
     });
     tenant = result.tenant;
+    adminUser = result.adminUser;
+    appUser = result.appUser;
+    keyBag = result.keyBag;
   }, 30000);
 
   afterEach(async () => {
     await (tenant as any).disposeCacheManager?.();
+    await (remoteTenant as any)?.disposeCacheManager?.();
   });
 
   /**
@@ -92,14 +114,73 @@ describe("BaseMindooDB cache integration", () => {
   async function loadContactsCheckpoint() {
     const metaKey = (await cacheStore.list("db-meta")).find((key) => key.endsWith("/contacts"));
     expect(metaKey).toBeTruthy();
-    const encryptedCacheStore = new EncryptedLocalCacheStore(cacheStore, "userpass", crypto);
+    const encryptedCacheStore = new EncryptedLocalCacheStore(cacheStore, userPassword, crypto);
     const rawMeta = await encryptedCacheStore.get("db-meta", metaKey!);
     expect(rawMeta).toBeTruthy();
     const checkpoint = JSON.parse(new TextDecoder().decode(rawMeta!)) as {
-      processedEntryCursor?: { createdAt: number; id: string } | null;
+      processedEntryCursor?: { receiptOrder: number; id: string } | null;
       index: Array<{ docId: string }>;
     };
     return { metaKey: metaKey!, encryptedCacheStore, checkpoint };
+  }
+
+  async function createRemoteTenant(): Promise<MindooTenant> {
+    const remoteFactory = new BaseMindooTenantFactory(
+      new PersistentInMemoryStoreFactory(),
+      crypto,
+    );
+    const remoteKeyBag = new KeyBag(
+      appUser.userEncryptionKeyPair.privateKey,
+      userPassword,
+      crypto,
+    );
+
+    const publicInfosKey = await keyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID);
+    const tenantKey = await keyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID);
+    expect(publicInfosKey).toBeTruthy();
+    expect(tenantKey).toBeTruthy();
+
+    await remoteKeyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey!);
+    await remoteKeyBag.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantKey!);
+
+    remoteTenant = await remoteFactory.openTenant(
+      tenantId,
+      adminUser.userSigningKeyPair.publicKey,
+      adminUser.userEncryptionKeyPair.publicKey,
+      appUser,
+      userPassword,
+      remoteKeyBag,
+    );
+
+    const localDirectory = await tenant.openDB("directory");
+    const remoteDirectory = await remoteTenant.openDB("directory");
+    await remoteDirectory.pullChangesFrom(localDirectory.getStore());
+
+    return remoteTenant;
+  }
+
+  function summarizeAttachments(doc: MindooDoc): Array<{
+    attachmentId: string;
+    fileName: string;
+    mimeType: string;
+    size: number;
+    lastChunkId: string;
+  }> {
+    const attachments = ((doc.getData()._attachments as AttachmentReference[] | undefined) ?? [])
+      .map((attachment) => ({
+        attachmentId: attachment.attachmentId,
+        fileName: attachment.fileName,
+        mimeType: attachment.mimeType,
+        size: attachment.size,
+        lastChunkId: attachment.lastChunkId,
+      }))
+      .sort((left, right) => left.attachmentId.localeCompare(right.attachmentId));
+
+    expect(doc.getAttachments().map((attachment) => attachment.attachmentId).sort()).toEqual(
+      attachments.map((attachment) => attachment.attachmentId),
+    );
+
+    return attachments;
   }
 
   it("should write cache entries when a document is created and flushed", async () => {
@@ -241,6 +322,123 @@ describe("BaseMindooDB cache integration", () => {
     expect(rd.getData().version).toBe(2);
   }, 30000);
 
+  it("should merge concurrent attachment additions across sync and restore merged attachments from cache", async () => {
+    const otherTenant = await createRemoteTenant();
+
+    const localDb = await tenant.openDB("contacts");
+    const remoteDb = await otherTenant.openDB("contacts");
+
+    const initialDoc = await localDb.createDocument();
+    const docId = initialDoc.getId();
+    await localDb.changeDoc(initialDoc, (d: MindooDoc) => {
+      d.getData().title = "Shared attachment doc";
+    });
+
+    await remoteDb.pullChangesFrom(localDb.getStore());
+
+    const localAttachmentData = new Uint8Array([1, 2, 3, 4]);
+    const remoteAttachmentData = new Uint8Array([9, 8, 7, 6, 5]);
+    let localAttachmentId = "";
+    let remoteAttachmentId = "";
+
+    await localDb.changeDoc(initialDoc, async (d: MindooDoc) => {
+      const attachment = await d.addAttachment(localAttachmentData, "local.bin", "application/octet-stream");
+      localAttachmentId = attachment.attachmentId;
+    });
+
+    const remoteInitialDoc = await remoteDb.getDocument(docId);
+    await remoteDb.changeDoc(remoteInitialDoc, async (d: MindooDoc) => {
+      const attachment = await d.addAttachment(remoteAttachmentData, "remote.bin", "application/octet-stream");
+      remoteAttachmentId = attachment.attachmentId;
+    });
+
+    const divergentLocalDoc = await localDb.getDocument(docId);
+    const divergentRemoteDoc = await remoteDb.getDocument(docId);
+    expect(summarizeAttachments(divergentLocalDoc).map((attachment) => attachment.fileName)).toEqual(["local.bin"]);
+    expect(summarizeAttachments(divergentRemoteDoc).map((attachment) => attachment.fileName)).toEqual(["remote.bin"]);
+
+    await localDb.pushChangesTo(remoteDb.getStore());
+    await remoteDb.syncStoreChanges();
+    await localDb.pullChangesFrom(remoteDb.getStore());
+
+    const mergedLocalDoc = await localDb.getDocument(docId);
+    const mergedRemoteDoc = await remoteDb.getDocument(docId);
+    const localSummary = summarizeAttachments(mergedLocalDoc);
+    const remoteSummary = summarizeAttachments(mergedRemoteDoc);
+
+    expect(localSummary).toEqual(remoteSummary);
+    expect(localSummary.map((attachment) => attachment.fileName).sort()).toEqual(["local.bin", "remote.bin"]);
+
+    expect(await mergedLocalDoc.getAttachment(localAttachmentId)).toEqual(localAttachmentData);
+    expect(await mergedLocalDoc.getAttachment(remoteAttachmentId)).toEqual(remoteAttachmentData);
+    expect(await mergedRemoteDoc.getAttachment(localAttachmentId)).toEqual(localAttachmentData);
+    expect(await mergedRemoteDoc.getAttachment(remoteAttachmentId)).toEqual(remoteAttachmentData);
+
+    const cacheManager = (tenant as any).cacheManager as CacheManager;
+    await cacheManager.flush();
+    await simulateRestart();
+
+    const getSpy = jest.spyOn(cacheStore, "get");
+    const reopenedDb = await tenant.openDB("contacts");
+    const restoredDoc = await reopenedDb.getDocument(docId);
+    const restoredSummary = summarizeAttachments(restoredDoc);
+
+    expect(getSpy).toHaveBeenCalled();
+    expect(restoredSummary).toEqual(localSummary);
+    expect(await restoredDoc.getAttachment(localAttachmentId)).toEqual(localAttachmentData);
+    expect(await restoredDoc.getAttachment(remoteAttachmentId)).toEqual(remoteAttachmentData);
+
+    getSpy.mockRestore();
+  }, 30000);
+
+  it("should discover pulled backfilled attachment changes older than the processed cursor", async () => {
+    const otherTenant = await createRemoteTenant();
+
+    const localDb = await tenant.openDB("contacts");
+    const remoteDb = await otherTenant.openDB("contacts");
+
+    const initialDoc = await localDb.createDocument();
+    const docId = initialDoc.getId();
+    await localDb.changeDoc(initialDoc, (d: MindooDoc) => {
+      d.getData().title = "Backfilled attachment doc";
+    });
+
+    await remoteDb.pullChangesFrom(localDb.getStore());
+    await remoteDb.syncStoreChanges();
+
+    const remoteAttachmentData = new Uint8Array([9, 8, 7, 6, 5]);
+    const localAttachmentData = new Uint8Array([1, 2, 3, 4]);
+    let remoteAttachmentId = "";
+    let localAttachmentId = "";
+
+    const remoteInitialDoc = await remoteDb.getDocument(docId);
+    await remoteDb.changeDoc(remoteInitialDoc, async (d: MindooDoc) => {
+      const attachment = await d.addAttachment(remoteAttachmentData, "remote-first.bin", "application/octet-stream");
+      remoteAttachmentId = attachment.attachmentId;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const localInitialDoc = await localDb.getDocument(docId);
+    await localDb.changeDoc(localInitialDoc, async (d: MindooDoc) => {
+      const attachment = await d.addAttachment(localAttachmentData, "local-second.bin", "application/octet-stream");
+      localAttachmentId = attachment.attachmentId;
+    });
+
+    await localDb.pullChangesFrom(remoteDb.getStore());
+    await localDb.syncStoreChanges();
+
+    const mergedLocalDoc = await localDb.getDocument(docId);
+    const mergedSummary = summarizeAttachments(mergedLocalDoc);
+
+    expect(mergedSummary.map((attachment) => attachment.fileName).sort()).toEqual([
+      "local-second.bin",
+      "remote-first.bin",
+    ]);
+    expect(await mergedLocalDoc.getAttachment(localAttachmentId)).toEqual(localAttachmentData);
+    expect(await mergedLocalDoc.getAttachment(remoteAttachmentId)).toEqual(remoteAttachmentData);
+  }, 30000);
+
   it("should expose a stale cache checkpoint when reconcileRestoredIndexOnInit is disabled", async () => {
     const db1 = await tenant.openDB("contacts");
 
@@ -260,7 +458,7 @@ describe("BaseMindooDB cache integration", () => {
     });
 
     const store = db1.getStore();
-    let cursor: { createdAt: number; id: string } | null = null;
+    let cursor: { receiptOrder: number; id: string } | null = null;
     while (true) {
       const page = await store.scanEntriesSince!(cursor, 1000);
       cursor = page.nextCursor;
@@ -303,7 +501,7 @@ describe("BaseMindooDB cache integration", () => {
     });
 
     const store = db1.getStore();
-    let cursor: { createdAt: number; id: string } | null = null;
+    let cursor: { receiptOrder: number; id: string } | null = null;
     while (true) {
       const page = await store.scanEntriesSince!(cursor, 1000);
       cursor = page.nextCursor;

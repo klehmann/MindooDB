@@ -680,6 +680,7 @@ export class HttpTransport implements NetworkTransport {
       docId: metadata.docId,
       dependencyIds: metadata.dependencyIds,
       createdAt: metadata.createdAt,
+      receiptOrder: metadata.receiptOrder,
       createdByPublicKey: metadata.createdByPublicKey,
       decryptionKeyId: metadata.decryptionKeyId,
       snapshotHeadHashes: metadata.snapshotHeadHashes,
@@ -701,6 +702,7 @@ export class HttpTransport implements NetworkTransport {
       docId: serialized.docId,
       dependencyIds: serialized.dependencyIds,
       createdAt: serialized.createdAt,
+      receiptOrder: serialized.receiptOrder,
       createdByPublicKey: serialized.createdByPublicKey,
       decryptionKeyId: serialized.decryptionKeyId,
       snapshotHeadHashes: serialized.snapshotHeadHashes,
@@ -730,6 +732,7 @@ interface SerializedEntryMetadata {
   docId: string;
   dependencyIds: string[];
   createdAt: number;
+  receiptOrder?: number;
   createdByPublicKey: string;
   decryptionKeyId: string;
   snapshotHeadHashes?: string[];

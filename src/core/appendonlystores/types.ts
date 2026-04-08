@@ -79,10 +79,10 @@ export interface AwaitIndexReadyOptions {
 
 /**
  * Cursor used by cursor-based store scans.
- * Entries are ordered by (createdAt, id) ascending.
+ * Entries are ordered by (receiptOrder, id) ascending.
  */
 export interface StoreScanCursor {
-  createdAt: number;
+  receiptOrder: number;
   id: string;
 }
 
@@ -324,7 +324,7 @@ export interface ContentAddressedStore {
    * Cursor-based metadata scan.
    * Preferred for large stores to avoid known-id set exchange.
    *
-   * Ordering is deterministic: (createdAt ASC, id ASC).
+   * Ordering is deterministic: (receiptOrder ASC, id ASC).
    * Returned entries are strictly after `cursor`.
    */
   scanEntriesSince?(

@@ -423,6 +423,53 @@ test.describe("IndexedDBContentAddressedStore", () => {
     expect(result.page2HasMore).toBe(false);
   });
 
+  test("should scan entries by insertion order even when createdAt is older", async ({ page }) => {
+    await page.goto(server.context.testPageUrl);
+
+    const result = await page.evaluate(
+      async ({ browserBundleUrl }) => {
+        function createTestEntry(docId: string, id: string, contentHash: string, createdAt: number) {
+          const encryptedData = new Uint8Array([10, 20, 30, 40, 50]);
+          return {
+            entryType: "doc_change", id, contentHash, docId, dependencyIds: [] as string[],
+            createdAt, createdByPublicKey: "test-public-key",
+            decryptionKeyId: "default", signature: new Uint8Array([1, 2, 3, 4]),
+            originalSize: 4, encryptedSize: encryptedData.length, encryptedData,
+          };
+        }
+
+        const bundle = await import(browserBundleUrl);
+        const { IndexedDBContentAddressedStore } = bundle.browserModule;
+        const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+        const store = new IndexedDBContentAddressedStore("scan-receipt-order-test", undefined, { basePath: prefix });
+
+        try {
+          const now = Date.now();
+          await store.putEntries([
+            createTestEntry("doc1", "id-newer", "c-newer", now + 1000),
+          ]);
+          await store.putEntries([
+            createTestEntry("doc1", "id-older", "c-older", now - 1000),
+          ]);
+
+          const scanned = await store.scanEntriesSince(null, 10);
+          return {
+            ids: scanned.entries.map((e: any) => e.id),
+            createdAts: scanned.entries.map((e: any) => e.createdAt),
+            receiptOrders: scanned.entries.map((e: any) => e.receiptOrder),
+          };
+        } finally {
+          await store.clearAllLocalData();
+        }
+      },
+      { browserBundleUrl: server.context.browserBundleUrl }
+    );
+
+    expect(result.ids).toEqual(["id-newer", "id-older"]);
+    expect(result.createdAts[0]).toBeGreaterThan(result.createdAts[1]);
+    expect(result.receiptOrders).toEqual([1, 2]);
+  });
+
   test("should support doc filter in cursor scan", async ({ page }) => {
     await page.goto(server.context.testPageUrl);
 

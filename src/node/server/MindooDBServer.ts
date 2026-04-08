@@ -90,6 +90,7 @@ interface SerializedEntryMetadata {
   docId: string;
   dependencyIds: string[];
   createdAt: number;
+  receiptOrder?: number;
   createdByPublicKey: string;
   decryptionKeyId: string;
   signature: string;
@@ -1326,6 +1327,7 @@ export class MindooDBServer {
       docId: metadata.docId,
       dependencyIds: metadata.dependencyIds,
       createdAt: metadata.createdAt,
+      receiptOrder: metadata.receiptOrder,
       createdByPublicKey: metadata.createdByPublicKey,
       decryptionKeyId: metadata.decryptionKeyId,
       signature: this.uint8ArrayToBase64(metadata.signature),
@@ -1342,6 +1344,7 @@ export class MindooDBServer {
       docId: serialized.docId,
       dependencyIds: serialized.dependencyIds,
       createdAt: serialized.createdAt,
+      receiptOrder: serialized.receiptOrder,
       createdByPublicKey: serialized.createdByPublicKey,
       decryptionKeyId: serialized.decryptionKeyId,
       signature: this.base64ToUint8Array(serialized.signature),

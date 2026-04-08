@@ -689,7 +689,7 @@ describe("protocol compatibility", () => {
     expect(authResult.success).toBe(true);
     const caps = await serverHandler.handleGetCapabilities(authResult.token!);
 
-    expect(caps.protocolVersion).toBe("sync-v3");
+    expect(caps.protocolVersion).toBe("sync-v4");
     expect(caps.supportsMaterializationPlanning).toBe(true);
     expect(caps.supportsBatchMaterializationPlanning).toBe(true);
   });
