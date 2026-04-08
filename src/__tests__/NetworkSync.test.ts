@@ -69,6 +69,10 @@ class MockNetworkTransport implements NetworkTransport {
     return this.server.handleGetEntries(token, ids);
   }
 
+  async getEntryMetadata(token: string, id: string): Promise<StoreEntryMetadata | null> {
+    return this.server.handleGetEntryMetadata(token, id);
+  }
+
   async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
     return this.server.handlePutEntries(token, entries);
   }
