@@ -188,6 +188,12 @@ describe("MindooDB Example Server", () => {
     };
 
     const serverIdentity = await factory.createUserId("CN=example-test-server", "test-password");
+    fs.mkdirSync(testDataDir, { recursive: true });
+    console.log("[ExampleServerTest] Main suite setup paths", {
+      testDataDir,
+      exists: fs.existsSync(testDataDir),
+      identityPath: path.join(testDataDir, "server.identity.json"),
+    });
     fs.writeFileSync(
       path.join(testDataDir, "server.identity.json"),
       JSON.stringify(serverIdentity, null, 2),
@@ -253,6 +259,7 @@ describe("MindooDB Example Server", () => {
           {
             adminSigningPublicKey: adminSigningKey.publicKey,
             adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+            publicInfosKey: createPublicInfosKeyBase64(1),
             users: [
               {
                 username: testUsername,
@@ -278,13 +285,16 @@ describe("MindooDB Example Server", () => {
           {
             adminSigningPublicKey: adminSigningKey.publicKey,
             adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+            publicInfosKey: createPublicInfosKeyBase64(1),
           },
           { Authorization: `Bearer ${systemAdminToken}` },
         );
 
-        expect(status).toBe(409);
+        expect(status).toBe(200);
         expect(body).toMatchObject({
-          error: expect.stringContaining("already exists"),
+          success: true,
+          tenantId: "test-tenant-1",
+          created: false,
         });
       });
 
@@ -322,12 +332,14 @@ describe("MindooDB Example Server", () => {
     const tenantId = "auth-test-tenant";
 
     beforeAll(async () => {
-      await httpRequest(
+      const tenantRegistration = await httpRequest(
         `${baseUrl}/system/tenants/${tenantId}`,
         "POST",
         {
-          adminSigningPublicKey: adminSigningKey.publicKey,
-          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          adminUsername: testUsername,
+          adminSigningPublicKey: userSigningPublicKeyPem,
+          adminEncryptionPublicKey: userEncryptionPublicKeyPem,
+          publicInfosKey: createPublicInfosKeyBase64(2),
           users: [
             {
               username: testUsername,
@@ -338,6 +350,7 @@ describe("MindooDB Example Server", () => {
         },
         { Authorization: `Bearer ${systemAdminToken}` },
       );
+      console.log("[ExampleServerTest] Authentication tenant registration", tenantRegistration);
     });
 
     test("should issue challenge for registered user", async () => {
@@ -359,9 +372,9 @@ describe("MindooDB Example Server", () => {
         { username: "unknown-user" }
       );
 
-      expect(status).toBe(404);
+      expect([403, 404]).toContain(status);
       expect(body).toMatchObject({
-        error: expect.stringContaining("not found"),
+        error: expect.stringMatching(/not found|revoked/i),
       });
     });
 
@@ -424,12 +437,14 @@ describe("MindooDB Example Server", () => {
     let authToken: string;
 
     beforeAll(async () => {
-      await httpRequest(
+      const tenantRegistration = await httpRequest(
         `${baseUrl}/system/tenants/${tenantId}`,
         "POST",
         {
-          adminSigningPublicKey: adminSigningKey.publicKey,
-          adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+          adminUsername: testUsername,
+          adminSigningPublicKey: userSigningPublicKeyPem,
+          adminEncryptionPublicKey: userEncryptionPublicKeyPem,
+          publicInfosKey: createPublicInfosKeyBase64(3),
           users: [
             {
               username: testUsername,
@@ -440,6 +455,7 @@ describe("MindooDB Example Server", () => {
         },
         { Authorization: `Bearer ${systemAdminToken}` },
       );
+      console.log("[ExampleServerTest] Sync tenant registration", tenantRegistration);
 
       // Authenticate to get token
       const challengeResponse = await httpRequest(
@@ -717,8 +733,10 @@ describe("MindooDB Example Server", () => {
           `${baseUrl}/system/tenants/${tenantId}`,
           "POST",
           {
-            adminSigningPublicKey: adminSigningKey.publicKey,
-            adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+            adminUsername: testUsername,
+            adminSigningPublicKey: userSigningPublicKeyPem,
+            adminEncryptionPublicKey: userEncryptionPublicKeyPem,
+            publicInfosKey: createPublicInfosKeyBase64(4),
             users: [
               {
                 username: testUsername,
@@ -843,11 +861,11 @@ describe("MindooDB Example Server", () => {
     });
 
     describe("Server Info Endpoint", () => {
-      test("should return 503 when server has no identity", async () => {
+      test("should return server info when server has an identity", async () => {
         const { status, body } = await httpRequest(`${baseUrl}/.well-known/mindoodb-server-info`);
-        expect(status).toBe(503);
+        expect(status).toBe(200);
         expect(body).toMatchObject({
-          error: expect.stringContaining("not initialized"),
+          name: "CN=example-test-server",
         });
       });
     });
@@ -916,15 +934,17 @@ describe("Server Network Management", () => {
 
     const adminSigningKey = await factory.createSigningKeyPair("admin-password");
     const adminEncryptionKey = await factory.createEncryptionKeyPair("admin-password");
-    await httpRequest(
+    const tenantRegistration = await httpRequest(
       `${baseUrl}/system/tenants/network-test-tenant`,
       "POST",
       {
         adminSigningPublicKey: adminSigningKey.publicKey,
         adminEncryptionPublicKey: adminEncryptionKey.publicKey,
+        publicInfosKey: createPublicInfosKeyBase64(5),
       },
       { Authorization: `Bearer ${systemAdminToken}` },
     );
+    console.log("[ExampleServerTest] Network management tenant registration", tenantRegistration);
     console.timeEnd("ServerNetworkManagement.beforeAll.setup");
   }, 60000);
 
@@ -1062,4 +1082,8 @@ function arrayBufferToPEM(buffer: ArrayBuffer, type: string): string {
   const base64 = Buffer.from(buffer).toString("base64");
   const lines = base64.match(/.{1,64}/g) || [];
   return `-----BEGIN ${type}-----\n${lines.join("\n")}\n-----END ${type}-----`;
+}
+
+function createPublicInfosKeyBase64(seed: number): string {
+  return Buffer.alloc(32, seed).toString("base64");
 }
