@@ -9,9 +9,10 @@ COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 
 COPY tsconfig.json ./
-COPY scripts/ ./scripts/
 COPY src/ ./src/
-RUN npm run build
+# The server image only needs the compiled Node output; avoid depending on
+# repository helper scripts that may not be present in minimal deployment checkouts.
+RUN npx tsc
 
 # Production node_modules only: reinstall from lockfile (library deps), then add
 # the HTTP stack. Avoids `npm prune` leaving an inconsistent tree with npm 10.
