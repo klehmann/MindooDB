@@ -197,6 +197,9 @@ describe("Document DAG analysis", () => {
     expect(userEntry?.primaryGraphLaneId).toBeTruthy();
     expect(userTwoEntry?.primaryGraphLaneId).toBeTruthy();
     expect(userEntry?.primaryGraphLaneId).not.toBe(userTwoEntry?.primaryGraphLaneId);
+    expect(userEntry?.automergeActorId).toBeTruthy();
+    expect(userTwoEntry?.automergeActorId).toBeTruthy();
+    expect(userEntry?.automergeActorId).not.toBe(userTwoEntry?.automergeActorId);
 
     const userBranchDoc = await userDb.materializeDocumentBranchAtEntry(docId, userBranch!.headEntryId);
     const userTwoBranchDoc = await userDb.materializeDocumentBranchAtEntry(docId, userTwoBranch!.headEntryId);

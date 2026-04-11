@@ -1799,6 +1799,11 @@ export class BaseMindooDB implements MindooDB {
     const relevantEntries = allEntryMetadata
       .filter((entry) => entry.createdAt <= resolvedTimestamp && isDagEntry(entry));
     const result = computeDocumentDagAnalysis(docId, relevantEntries, resolvedTimestamp);
+    const actorIdByEntryId = await this.decodeAutomergeActorIds(relevantEntries);
+    result.entries = result.entries.map((entry) => ({
+      ...entry,
+      automergeActorId: actorIdByEntryId.get(entry.entryId) ?? null,
+    }));
     this.performanceCallback?.onHistoryOperation?.({
       operation: "analyzeDocumentDagAtTimestamp",
       docId,
@@ -1807,6 +1812,52 @@ export class BaseMindooDB implements MindooDB {
       returnedEntries: result.entries.length,
       bounded: true,
     });
+    return result;
+  }
+
+  /**
+   * Decodes Automerge actor ids for replay entries so analysis consumers can color
+   * or group nodes by the logical Automerge actor instead of transport metadata.
+   */
+  private async decodeAutomergeActorIds(
+    relevantEntries: StoreEntryMetadata[],
+  ): Promise<Map<string, string | null>> {
+    const result = new Map<string, string | null>();
+    const replayEntries = relevantEntries.filter((entry) => entry.entryType !== "doc_snapshot");
+    if (replayEntries.length === 0) {
+      return result;
+    }
+    const loadedEntries = await this.store.getEntries(replayEntries.map((entry) => entry.id));
+    const entryById = new Map(loadedEntries.map((entry) => [entry.id, entry]));
+    for (const metadata of replayEntries) {
+      const entry = entryById.get(metadata.id);
+      if (!entry) {
+        result.set(metadata.id, null);
+        continue;
+      }
+      if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
+        result.set(metadata.id, null);
+        continue;
+      }
+      const isValid = await this.tenant.verifySignature(
+        entry.encryptedData,
+        entry.signature,
+        entry.createdByPublicKey,
+      );
+      if (!isValid) {
+        result.set(metadata.id, null);
+        continue;
+      }
+      const decryptedPayload = await this.tenant.decryptPayload(
+        entry.encryptedData,
+        entry.decryptionKeyId,
+      );
+      const decodedAutomergeChange = Automerge.decodeChange(decryptedPayload) as Record<string, unknown>;
+      result.set(
+        metadata.id,
+        typeof decodedAutomergeChange.actor === "string" ? decodedAutomergeChange.actor : null,
+      );
+    }
     return result;
   }
 

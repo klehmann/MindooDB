@@ -401,6 +401,7 @@ export function computeDocumentDagAnalysis(
       entryType: entry.entryType,
       createdAt: entry.createdAt,
       createdByPublicKey: entry.createdByPublicKey,
+      automergeActorId: null,
       dependencyIds: [...entry.dependencyIds],
       childEntryIds: historicalLanePlan.childEntryIdsByEntryId.get(entry.id) ?? [],
       snapshotHeadEntryIds: [...(entry.snapshotHeadEntryIds ?? [])],

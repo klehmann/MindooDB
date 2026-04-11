@@ -1562,6 +1562,7 @@ export interface DocumentDagEntrySummary {
   entryType: StoreEntryType;
   createdAt: number;
   createdByPublicKey: string;
+  automergeActorId: string | null;
   dependencyIds: string[];
   childEntryIds: string[];
   snapshotHeadEntryIds: string[];
