@@ -1471,7 +1471,13 @@ export interface PerformanceCallback {
    * Called for bounded history/time-travel workflows.
    */
   onHistoryOperation?: (metrics: {
-    operation: 'getDocumentAtTimestamp' | 'getDocumentHistoryPage';
+    operation:
+      | 'getDocumentAtTimestamp'
+      | 'getDocumentHistoryPage'
+      | 'analyzeDocumentDagAtTimestamp'
+      | 'materializeDocumentBranchAtEntry'
+      | 'materializeDocumentBranchAtTimestamp'
+      | 'describeDocumentDagEntry';
     docId: string;
     time: number;
     scannedEntries: number;
@@ -1514,6 +1520,114 @@ export interface DocumentHistoryPageResult {
   entries: DocumentHistoryPageEntry[];
   nextCursor: DocumentHistoryPageCursor | null;
   hasMore: boolean;
+}
+
+/**
+ * Timestamp input for DAG analysis APIs.
+ */
+export type DocumentDagAnalysisTimestamp = number | "now";
+
+/**
+ * Lightweight summary of one decoded Automerge operation.
+ */
+export interface DocumentDagChangeOperationSummary {
+  action: string;
+  key?: string | null;
+  obj?: string | null;
+  insert?: boolean;
+  valuePreview?: string | null;
+}
+
+/**
+ * Decoded change details for a single DAG entry.
+ */
+export interface DocumentDagDecodedChangeSummary {
+  actorId: string | null;
+  hash: string | null;
+  seq: number | null;
+  message: string | null;
+  dependencyHashes: string[];
+  opCount: number;
+  actionCounts: Record<string, number>;
+  touchedKeys: string[];
+  touchedPaths: string[];
+  operations: DocumentDagChangeOperationSummary[];
+}
+
+/**
+ * One node in the document DAG explorer.
+ */
+export interface DocumentDagEntrySummary {
+  entryId: string;
+  entryType: StoreEntryType;
+  createdAt: number;
+  createdByPublicKey: string;
+  dependencyIds: string[];
+  childEntryIds: string[];
+  snapshotHeadEntryIds: string[];
+  snapshotHeadHashes: string[];
+  automergeHash: string | null;
+  isActiveHead: boolean;
+  isDeleted: boolean;
+  branchHeadEntryIds: string[];
+  graphLaneIds: string[];
+  primaryGraphLaneId: string | null;
+  isMergePoint: boolean;
+  isForkPoint: boolean;
+}
+
+/**
+ * Summary of the ancestor closure for one active head.
+ */
+export interface DocumentDagBranchSummary {
+  headEntryId: string;
+  headCreatedAt: number;
+  headCreatedByPublicKey: string;
+  ancestorEntryIds: string[];
+  compatibleSnapshotEntryId: string | null;
+  compatibleSnapshotCreatedAt: number | null;
+}
+
+/**
+ * Metadata-only DAG analysis result for one document at a point in time.
+ */
+export interface DocumentDagAnalysisResult {
+  docId: string;
+  timestamp: number;
+  activeHeadEntryIds: string[];
+  graphLaneIds: string[];
+  entries: DocumentDagEntrySummary[];
+  branches: DocumentDagBranchSummary[];
+}
+
+/**
+ * Lazy, per-entry details for hover/tooling in DAG explorers.
+ */
+export interface DocumentDagEntryDetails {
+  docId: string;
+  entryId: string;
+  entryType: StoreEntryType;
+  createdAt: number;
+  createdByPublicKey: string;
+  dependencyIds: string[];
+  snapshotHeadEntryIds: string[];
+  snapshotHeadHashes: string[];
+  automergeHash: string | null;
+  decodedChange: DocumentDagDecodedChangeSummary | null;
+}
+
+/**
+ * Result of reconstructing one branch-local document state for a selected DAG head.
+ */
+export interface DocumentDagBranchMaterializationResult {
+  docId: string;
+  headEntryId: string;
+  headCreatedAt: number;
+  headCreatedByPublicKey: string;
+  snapshotEntryId: string | null;
+  entryIdsApplied: string[];
+  branchEntryIds: string[];
+  doc: MindooDoc;
 }
 
 /**
@@ -1693,6 +1807,47 @@ export interface MindooDB {
     docId: string,
     options?: DocumentHistoryPageOptions
   ): Promise<DocumentHistoryPageResult>;
+
+  /**
+   * Analyze the document DAG visible at a point in time without materializing
+   * every branch-local Automerge state.
+   *
+   * The result contains the active replay heads, per-entry metadata, and
+   * derived branch summaries keyed by active head.
+   */
+  analyzeDocumentDagAtTimestamp(
+    docId: string,
+    timestamp: DocumentDagAnalysisTimestamp
+  ): Promise<DocumentDagAnalysisResult>;
+
+  /**
+   * Reconstruct the branch-local document state for the selected head entry.
+   *
+   * This follows the selected head's ancestor closure only, ignoring unrelated
+   * concurrent branches unless the selected head explicitly depends on them.
+   */
+  materializeDocumentBranchAtEntry(
+    docId: string,
+    headEntryId: string
+  ): Promise<DocumentDagBranchMaterializationResult | null>;
+
+  /**
+   * Reconstruct the branch-local document state for a selected head within a
+   * time-bounded DAG slice.
+   */
+  materializeDocumentBranchAtTimestamp(
+    docId: string,
+    timestamp: DocumentDagAnalysisTimestamp,
+    headEntryId: string
+  ): Promise<DocumentDagBranchMaterializationResult | null>;
+
+  /**
+   * Decode and summarize one DAG entry for hover/tooling use cases.
+   */
+  describeDocumentDagEntry(
+    docId: string,
+    entryId: string
+  ): Promise<DocumentDagEntryDetails | null>;
 
   /**
    * Get all non-deleted document IDs in this database.

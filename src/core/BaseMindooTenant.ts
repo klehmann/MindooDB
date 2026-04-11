@@ -89,7 +89,7 @@ export class BaseMindooTenant implements MindooTenant {
     currentUserPassword: string,
     keyBag: KeyBag,
     storeFactory: ContentAddressedStoreFactory,
-    cryptoAdapter?: CryptoAdapter,
+    cryptoAdapter: CryptoAdapter,
     logger?: Logger,
     additionalTrustedKeys?: ReadonlyMap<string, boolean>,
     localCacheStore?: LocalCacheStore,
@@ -103,13 +103,10 @@ export class BaseMindooTenant implements MindooTenant {
     this.keyBag = keyBag;
     this.storeFactory = storeFactory;
     this.additionalTrustedKeys = additionalTrustedKeys;
-    // Import createCryptoAdapter dynamically to avoid issues in browser environments
     if (!cryptoAdapter) {
-      const { createCryptoAdapter } = require("./crypto/CryptoAdapter");
-      this.cryptoAdapter = createCryptoAdapter();
-    } else {
-      this.cryptoAdapter = cryptoAdapter;
+      throw new Error("BaseMindooTenant requires a CryptoAdapter instance.");
     }
+    this.cryptoAdapter = cryptoAdapter;
     // Create logger if not provided (for backward compatibility)
     this.logger =
       logger ||

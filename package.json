@@ -3,7 +3,7 @@
   "version": "0.0.7",
   "description": "End-to-End Encrypted, Offline-first Sync Database",
   "main": "./dist/node/index.js",
-  "browser": "./dist/browser/index.js",
+  "browser": "./dist/browser/index.mjs",
   "react-native": "./dist/reactnative/index.js",
   "types": "./dist/core/index.d.ts",
   "repository": {
@@ -22,13 +22,19 @@
   ],
   "exports": {
     ".": {
+      "types": "./dist/core/index.d.ts",
       "react-native": "./dist/reactnative/index.js",
-      "browser": "./dist/browser/index.js",
+      "browser": "./dist/browser/index.mjs",
       "node": "./dist/node/index.js",
       "default": "./dist/node/index.js"
     },
     "./core": "./dist/core/index.js",
-    "./browser": "./dist/browser/index.js",
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "import": "./dist/browser/index.mjs",
+      "require": "./dist/browser/index.js",
+      "default": "./dist/browser/index.mjs"
+    },
     "./node": "./dist/node/index.js",
     "./reactnative": "./dist/reactnative/index.js"
   },
@@ -44,7 +50,7 @@
     "mindoodb": "./scripts/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/generate-browser-esm-wrapper.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:stress": "MINDOODB_STRESS_TESTS=1 jest --runInBand BasicOnDiskContentAddressedStore.stress",

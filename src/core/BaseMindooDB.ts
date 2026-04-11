@@ -7,6 +7,11 @@ import type * as AutomergeTypes from "@automerge/automerge/slim";
 import { v7 as uuidv7 } from "uuid";
 import {
   MindooDB,
+  DocumentDagAnalysisTimestamp,
+  DocumentDagAnalysisResult,
+  DocumentDagBranchMaterializationResult,
+  DocumentDagDecodedChangeSummary,
+  DocumentDagEntryDetails,
   MindooDoc,
   MindooDocPayload,
   StoreEntry,
@@ -42,6 +47,11 @@ import {
   computeDocumentMaterializationPlan,
   topologicalByDependencies,
 } from "./appendonlystores/MaterializationPlanner";
+import {
+  computeBranchMaterializationPlan,
+  computeDocumentDagAnalysis,
+  isDagEntry,
+} from "./DocumentDagAnalysis";
 import { planAttachmentReadByWalkingMetadata } from "./appendonlystores/AttachmentReadPlanner";
 import { 
   generateDocEntryId, 
@@ -1779,6 +1789,261 @@ export class BaseMindooDB implements MindooDB {
     return result;
   }
 
+  async analyzeDocumentDagAtTimestamp(
+    docId: string,
+    timestamp: DocumentDagAnalysisTimestamp,
+  ): Promise<DocumentDagAnalysisResult> {
+    const startedAt = Date.now();
+    const resolvedTimestamp = this.resolveDagTimestamp(timestamp);
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    const relevantEntries = allEntryMetadata
+      .filter((entry) => entry.createdAt <= resolvedTimestamp && isDagEntry(entry));
+    const result = computeDocumentDagAnalysis(docId, relevantEntries, resolvedTimestamp);
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "analyzeDocumentDagAtTimestamp",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: relevantEntries.length,
+      returnedEntries: result.entries.length,
+      bounded: true,
+    });
+    return result;
+  }
+
+  async materializeDocumentBranchAtEntry(
+    docId: string,
+    headEntryId: string,
+  ): Promise<DocumentDagBranchMaterializationResult | null> {
+    const startedAt = Date.now();
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    const plan = computeBranchMaterializationPlan(docId, allEntryMetadata, headEntryId);
+    if (!plan) {
+      this.performanceCallback?.onHistoryOperation?.({
+        operation: "materializeDocumentBranchAtEntry",
+        docId,
+        time: Date.now() - startedAt,
+        scannedEntries: allEntryMetadata.length,
+        returnedEntries: 0,
+        bounded: true,
+      });
+      return null;
+    }
+    const metadataById = new Map(allEntryMetadata.map((entry) => [entry.id, entry]));
+    const branchEntries = plan.branchEntryIds
+      .map((entryId) => metadataById.get(entryId))
+      .filter((entry): entry is StoreEntryMetadata => entry !== undefined);
+    const internalDoc = await this.materializeDocumentFromPlan(
+      docId,
+      allEntryMetadata,
+      branchEntries,
+      plan.snapshotEntryId,
+      plan.entryIdsToApply,
+      plan.headCreatedAt,
+    );
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "materializeDocumentBranchAtEntry",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: allEntryMetadata.length,
+      returnedEntries: internalDoc ? 1 : 0,
+      bounded: true,
+    });
+    if (!internalDoc) {
+      return null;
+    }
+    return {
+      docId,
+      headEntryId: plan.headEntryId,
+      headCreatedAt: plan.headCreatedAt,
+      headCreatedByPublicKey: plan.headCreatedByPublicKey,
+      snapshotEntryId: plan.snapshotEntryId,
+      entryIdsApplied: [...plan.entryIdsToApply],
+      branchEntryIds: [...plan.branchEntryIds],
+      doc: this.wrapDocument(internalDoc),
+    };
+  }
+
+  async materializeDocumentBranchAtTimestamp(
+    docId: string,
+    timestamp: DocumentDagAnalysisTimestamp,
+    headEntryId: string,
+  ): Promise<DocumentDagBranchMaterializationResult | null> {
+    const startedAt = Date.now();
+    const resolvedTimestamp = this.resolveDagTimestamp(timestamp);
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    const relevantEntries = allEntryMetadata
+      .filter((entry) => entry.createdAt <= resolvedTimestamp && isDagEntry(entry));
+    const plan = computeBranchMaterializationPlan(docId, relevantEntries, headEntryId);
+    if (!plan) {
+      this.performanceCallback?.onHistoryOperation?.({
+        operation: "materializeDocumentBranchAtTimestamp",
+        docId,
+        time: Date.now() - startedAt,
+        scannedEntries: relevantEntries.length,
+        returnedEntries: 0,
+        bounded: true,
+      });
+      return null;
+    }
+    const metadataById = new Map(relevantEntries.map((entry) => [entry.id, entry]));
+    const branchEntries = plan.branchEntryIds
+      .map((entryId) => metadataById.get(entryId))
+      .filter((entry): entry is StoreEntryMetadata => entry !== undefined);
+    const internalDoc = await this.materializeDocumentFromPlan(
+      docId,
+      relevantEntries,
+      branchEntries,
+      plan.snapshotEntryId,
+      plan.entryIdsToApply,
+      resolvedTimestamp,
+    );
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "materializeDocumentBranchAtTimestamp",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: relevantEntries.length,
+      returnedEntries: internalDoc ? 1 : 0,
+      bounded: true,
+    });
+    if (!internalDoc) {
+      return null;
+    }
+    return {
+      docId,
+      headEntryId: plan.headEntryId,
+      headCreatedAt: plan.headCreatedAt,
+      headCreatedByPublicKey: plan.headCreatedByPublicKey,
+      snapshotEntryId: plan.snapshotEntryId,
+      entryIdsApplied: [...plan.entryIdsToApply],
+      branchEntryIds: [...plan.branchEntryIds],
+      doc: this.wrapDocument(internalDoc),
+    };
+  }
+
+  async describeDocumentDagEntry(
+    docId: string,
+    entryId: string,
+  ): Promise<DocumentDagEntryDetails | null> {
+    const startedAt = Date.now();
+    const metadata = await this.store.getEntryMetadata(entryId);
+    if (!metadata || metadata.docId !== docId || !isDagEntry(metadata)) {
+      this.performanceCallback?.onHistoryOperation?.({
+        operation: "describeDocumentDagEntry",
+        docId,
+        time: Date.now() - startedAt,
+        scannedEntries: metadata ? 1 : 0,
+        returnedEntries: 0,
+        bounded: true,
+      });
+      return null;
+    }
+    let decodedChange: DocumentDagDecodedChangeSummary | null = null;
+    if (metadata.entryType !== "doc_snapshot") {
+      const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+      const entries = await this.store.getEntries([entryId]);
+      const entry = entries[0];
+      if (entry) {
+        let isValid = false;
+        if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
+          this.logger.warn(`Admin-only DB: skipping DAG details for ${entry.id} not signed by admin key`);
+        } else {
+          isValid = await this.tenant.verifySignature(
+            entry.encryptedData,
+            entry.signature,
+            entry.createdByPublicKey,
+          );
+        }
+        if (isValid) {
+          const decryptedPayload = await this.tenant.decryptPayload(
+            entry.encryptedData,
+            entry.decryptionKeyId,
+          );
+          const decodedAutomergeChange = Automerge.decodeChange(decryptedPayload) as Record<string, unknown>;
+          decodedChange = this.summarizeDecodedChange(decodedAutomergeChange);
+          decodedChange.touchedPaths = await this.deriveReadableTouchedPaths(
+            docId,
+            metadata,
+            allEntryMetadata,
+            decodedChange.touchedKeys,
+          );
+        }
+      }
+    }
+    const parsed = parseDocEntryId(metadata.id);
+    const result: DocumentDagEntryDetails = {
+      docId,
+      entryId: metadata.id,
+      entryType: metadata.entryType,
+      createdAt: metadata.createdAt,
+      createdByPublicKey: metadata.createdByPublicKey,
+      dependencyIds: [...metadata.dependencyIds],
+      snapshotHeadEntryIds: [...(metadata.snapshotHeadEntryIds ?? [])],
+      snapshotHeadHashes: [...(metadata.snapshotHeadHashes ?? [])],
+      automergeHash: parsed?.automergeHash ?? null,
+      decodedChange,
+    };
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "describeDocumentDagEntry",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: 1,
+      returnedEntries: 1,
+      bounded: true,
+    });
+    return result;
+  }
+
+  /**
+   * Derives human-readable changed field paths for one DAG entry.
+   *
+   * This compares the branch-local document state at the selected entry with each
+   * reachable parent state, then normalizes array indices so the UI can show stable
+   * paths such as `_attachments[].fileName` instead of raw Automerge op keys only.
+   */
+  private async deriveReadableTouchedPaths(
+    docId: string,
+    entryMetadata: StoreEntryMetadata,
+    allEntryMetadata: StoreEntryMetadata[],
+    touchedKeys: string[],
+  ): Promise<string[]> {
+    if (entryMetadata.entryType === "doc_snapshot") {
+      return [];
+    }
+
+    const currentDoc = await this.materializeBranchInternalDoc(docId, allEntryMetadata, entryMetadata.id);
+    const currentData = this.getReadableDiffValueForDoc(currentDoc);
+    const parentEntryIds = entryMetadata.dependencyIds.filter((dependencyId) =>
+      allEntryMetadata.some((entry) => entry.id === dependencyId),
+    );
+    const diffPaths = new Set<string>();
+
+    if (parentEntryIds.length === 0) {
+      this.collectReadableDiffPaths(undefined, currentData, "", diffPaths);
+    } else {
+      for (const parentEntryId of parentEntryIds) {
+        const parentDoc = await this.materializeBranchInternalDoc(docId, allEntryMetadata, parentEntryId);
+        const parentData = this.getReadableDiffValueForDoc(parentDoc);
+        this.collectReadableDiffPaths(parentData, currentData, "", diffPaths);
+      }
+    }
+
+    const normalizedPaths = Array.from(diffPaths)
+      .map((path) => path.replace(/\[\d+\]/g, "[]"))
+      .filter((path, index, allPaths) => path.length > 0 && allPaths.indexOf(path) === index)
+      .sort();
+    if (normalizedPaths.length === 0) {
+      return [];
+    }
+
+    const touchedKeySet = new Set(touchedKeys);
+    if (touchedKeySet.size === 0) {
+      return normalizedPaths;
+    }
+
+    const filteredPaths = normalizedPaths.filter((path) => touchedKeySet.has(this.extractLeafPathSegment(path)));
+    return filteredPaths.length > 0 ? filteredPaths : normalizedPaths;
+  }
+
   async getAllDocumentIds(): Promise<string[]> {
     // Return all non-deleted document IDs from index
     const docIds: string[] = [];
@@ -2594,6 +2859,320 @@ export class BaseMindooDB implements MindooDB {
     }
 
     return startIndex;
+  }
+
+  private resolveDagTimestamp(timestamp: DocumentDagAnalysisTimestamp): number {
+    return timestamp === "now" ? Date.now() : timestamp;
+  }
+
+  private previewChangeValue(value: unknown): string | null {
+    if (value === undefined) {
+      return null;
+    }
+    if (typeof value === "string") {
+      return value.length > 80 ? `${value.slice(0, 77)}...` : value;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    if (value === null) {
+      return "null";
+    }
+    try {
+      const serialized = JSON.stringify(value);
+      if (!serialized) {
+        return null;
+      }
+      return serialized.length > 80 ? `${serialized.slice(0, 77)}...` : serialized;
+    } catch {
+      return String(value);
+    }
+  }
+
+  /**
+   * Materializes a single branch-local document state for a specific DAG head.
+   *
+   * This is the internal building block used by DAG inspection helpers when they
+   * need the document exactly as that branch would have looked at `headEntryId`.
+   */
+  private async materializeBranchInternalDoc(
+    docId: string,
+    allEntryMetadata: StoreEntryMetadata[],
+    headEntryId: string,
+  ): Promise<InternalDoc | null> {
+    const plan = computeBranchMaterializationPlan(docId, allEntryMetadata, headEntryId);
+    if (!plan) {
+      return null;
+    }
+    const metadataById = new Map(allEntryMetadata.map((entry) => [entry.id, entry]));
+    const branchEntries = plan.branchEntryIds
+      .map((entryId) => metadataById.get(entryId))
+      .filter((entry): entry is StoreEntryMetadata => entry !== undefined);
+    return this.materializeDocumentFromPlan(
+      docId,
+      allEntryMetadata,
+      branchEntries,
+      plan.snapshotEntryId,
+      plan.entryIdsToApply,
+      plan.headCreatedAt,
+    );
+  }
+
+  /**
+   * Converts an internal doc into a plain JS value that is safe to diff for UI summaries.
+   *
+   * Deleted or missing docs are normalized to `undefined` so the diff code can treat
+   * creation/deletion as ordinary before/after transitions.
+   */
+  private getReadableDiffValueForDoc(internalDoc: InternalDoc | null): unknown {
+    if (!internalDoc || internalDoc.isDeleted) {
+      return undefined;
+    }
+    return this.wrapDocument(internalDoc).getData();
+  }
+
+  /**
+   * Walks two plain JS values and records the changed field paths.
+   *
+   * Arrays are tracked by index first and later normalized to `[]` for display,
+   * which keeps attachment-style changes readable in the DAG explorer.
+   */
+  private collectReadableDiffPaths(
+    beforeValue: unknown,
+    afterValue: unknown,
+    basePath: string,
+    results: Set<string>,
+  ): void {
+    if (Object.is(beforeValue, afterValue)) {
+      return;
+    }
+
+    if (Array.isArray(beforeValue) || Array.isArray(afterValue)) {
+      const beforeArray = Array.isArray(beforeValue) ? beforeValue : [];
+      const afterArray = Array.isArray(afterValue) ? afterValue : [];
+      const maxLength = Math.max(beforeArray.length, afterArray.length);
+      if (maxLength === 0 && basePath) {
+        results.add(basePath);
+        return;
+      }
+      for (let index = 0; index < maxLength; index++) {
+        this.collectReadableDiffPaths(
+          beforeArray[index],
+          afterArray[index],
+          `${basePath}[${index}]`,
+          results,
+        );
+      }
+      return;
+    }
+
+    if (this.isPlainDiffObject(beforeValue) || this.isPlainDiffObject(afterValue)) {
+      const beforeObject = this.isPlainDiffObject(beforeValue) ? beforeValue : {};
+      const afterObject = this.isPlainDiffObject(afterValue) ? afterValue : {};
+      const childKeys = new Set([...Object.keys(beforeObject), ...Object.keys(afterObject)]);
+      if (childKeys.size === 0 && basePath) {
+        results.add(basePath);
+        return;
+      }
+      for (const key of childKeys) {
+        const nextPath = basePath ? `${basePath}.${key}` : key;
+        this.collectReadableDiffPaths(beforeObject[key], afterObject[key], nextPath, results);
+      }
+      return;
+    }
+
+    if (basePath) {
+      results.add(basePath);
+    }
+  }
+
+  /**
+   * Returns true for diffable object literals and false for arrays/binary payloads.
+   */
+  private isPlainDiffObject(value: unknown): value is Record<string, unknown> {
+    return value !== null
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && !(value instanceof Uint8Array);
+  }
+
+  /**
+   * Extracts the terminal field name from a normalized path for loose key/path matching.
+   */
+  private extractLeafPathSegment(path: string): string {
+    const normalizedPath = path.replace(/\[\]/g, "");
+    const segments = normalizedPath.split(".");
+    return segments[segments.length - 1] ?? normalizedPath;
+  }
+
+  /**
+   * Produces a compact, UI-oriented summary of a decoded Automerge change.
+   *
+   * The raw Automerge ops are reduced to counts, touched keys, and a short list of
+   * previewable operations so Haven can show useful change context without dumping
+   * the full decoded structure.
+   */
+  private summarizeDecodedChange(decodedChange: Record<string, unknown>): DocumentDagDecodedChangeSummary {
+    const operations = Array.isArray(decodedChange.ops) ? decodedChange.ops : [];
+    const actionCounts: Record<string, number> = {};
+    const touchedKeys = new Set<string>();
+    const summarizedOperations = operations.slice(0, 12).map((operation) => {
+      const op = operation as Record<string, unknown>;
+      const action = typeof op.action === "string" ? op.action : "unknown";
+      actionCounts[action] = (actionCounts[action] ?? 0) + 1;
+      const key = typeof op.key === "string"
+        ? op.key
+        : typeof op.elemId === "string"
+          ? op.elemId
+          : null;
+      if (typeof op.key === "string") {
+        touchedKeys.add(op.key);
+      }
+      return {
+        action,
+        key,
+        obj: typeof op.obj === "string" ? op.obj : null,
+        insert: typeof op.insert === "boolean" ? op.insert : undefined,
+        valuePreview: this.previewChangeValue(op.value),
+      };
+    });
+    for (const operation of operations.slice(12)) {
+      const op = operation as Record<string, unknown>;
+      const action = typeof op.action === "string" ? op.action : "unknown";
+      actionCounts[action] = (actionCounts[action] ?? 0) + 1;
+      if (typeof op.key === "string") {
+        touchedKeys.add(op.key);
+      }
+    }
+    return {
+      actorId: typeof decodedChange.actor === "string" ? decodedChange.actor : null,
+      hash: typeof decodedChange.hash === "string" ? decodedChange.hash : null,
+      seq: typeof decodedChange.seq === "number" ? decodedChange.seq : null,
+      message: typeof decodedChange.message === "string" ? decodedChange.message : null,
+      dependencyHashes: Array.isArray(decodedChange.deps)
+        ? decodedChange.deps.filter((dep): dep is string => typeof dep === "string")
+        : [],
+      opCount: operations.length,
+      actionCounts,
+      touchedKeys: Array.from(touchedKeys).sort(),
+      touchedPaths: [],
+      operations: summarizedOperations,
+    };
+  }
+
+  /**
+   * Rebuilds a document from a materialization plan produced by the DAG/history planners.
+   *
+   * The plan may start from a compatible snapshot and then replay incremental changes,
+   * or fall back to a full replay if no usable snapshot is available.
+   */
+  private async materializeDocumentFromPlan(
+    docId: string,
+    allEntryMetadata: StoreEntryMetadata[],
+    replayEntriesForState: StoreEntryMetadata[],
+    snapshotEntryId: string | null,
+    entryIdsToApply: string[],
+    fallbackTimestamp: number,
+  ): Promise<InternalDoc | null> {
+    if (replayEntriesForState.length === 0 && !snapshotEntryId) {
+      return null;
+    }
+    const metadataById = new Map(allEntryMetadata.map((entry) => [entry.id, entry]));
+    let startFromSnapshot = snapshotEntryId !== null;
+    const snapshotMeta = snapshotEntryId ? (metadataById.get(snapshotEntryId) || null) : null;
+    if (startFromSnapshot && !snapshotMeta) {
+      this.logger.warn(
+        `Materialization referenced snapshot ${snapshotEntryId} not found in metadata for ${docId}; falling back to replay without snapshot`,
+      );
+      startFromSnapshot = false;
+    }
+
+    let doc: AutomergeTypes.Doc<MindooDocPayload> | undefined = undefined;
+    if (startFromSnapshot && snapshotMeta) {
+      const snapshotEntries = await this.store.getEntries([snapshotMeta.id]);
+      if (snapshotEntries.length > 0) {
+        const snapshotData = snapshotEntries[0];
+        let isValid = false;
+        if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+          this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
+        } else {
+          isValid = await this.tenant.verifySignature(
+            snapshotData.encryptedData,
+            snapshotData.signature,
+            snapshotData.createdByPublicKey,
+          );
+        }
+        if (!isValid) {
+          this.logger.warn(`Invalid signature for snapshot ${snapshotData.id}, falling back to replay without snapshot`);
+          startFromSnapshot = false;
+        } else {
+          const decryptedSnapshot = await this.tenant.decryptPayload(
+            snapshotData.encryptedData,
+            snapshotData.decryptionKeyId,
+          );
+          doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
+          const parsed = parseDocEntryId(snapshotData.id);
+          if (parsed) {
+            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          }
+        }
+      }
+    }
+
+    if (!doc) {
+      doc = Automerge.init<MindooDocPayload>();
+    }
+
+    const entriesToApply = entryIdsToApply
+      .map((id) => metadataById.get(id))
+      .filter((entry): entry is StoreEntryMetadata => entry !== undefined);
+    const loadedEntries = entriesToApply.length > 0
+      ? await this.store.getEntries(entriesToApply.map((entry) => entry.id))
+      : [];
+    const entryById = new Map(loadedEntries.map((entry) => [entry.id, entry]));
+    for (const entryMeta of entriesToApply) {
+      const entryData = entryById.get(entryMeta.id);
+      if (!entryData) {
+        this.logger.warn(`Entry ${entryMeta.id} not found in store, skipping`);
+        continue;
+      }
+      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+        this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
+        continue;
+      }
+      const isValid = await this.tenant.verifySignature(
+        entryData.encryptedData,
+        entryData.signature,
+        entryData.createdByPublicKey,
+      );
+      if (!isValid) {
+        this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
+        continue;
+      }
+      const decryptedPayload = await this.tenant.decryptPayload(
+        entryData.encryptedData,
+        entryData.decryptionKeyId,
+      );
+      doc = Automerge.loadIncremental(doc, decryptedPayload);
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
+    }
+
+    const orderedReplayEntries = [...replayEntriesForState].sort((left, right) =>
+      left.createdAt !== right.createdAt ? left.createdAt - right.createdAt : left.id.localeCompare(right.id),
+    );
+    const firstReplayEntry = orderedReplayEntries[0] ?? null;
+    const lastReplayEntry = orderedReplayEntries[orderedReplayEntries.length - 1] ?? null;
+    return {
+      id: docId,
+      doc,
+      createdAt: firstReplayEntry?.createdAt ?? snapshotMeta?.createdAt ?? fallbackTimestamp,
+      lastModified: lastReplayEntry?.createdAt ?? snapshotMeta?.createdAt ?? fallbackTimestamp,
+      decryptionKeyId: firstReplayEntry?.decryptionKeyId ?? snapshotMeta?.decryptionKeyId ?? "default",
+      isDeleted: lastReplayEntry?.entryType === "doc_delete",
+    };
   }
 
   async *iterateChangeMetadataSince(
