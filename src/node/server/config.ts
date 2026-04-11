@@ -14,7 +14,12 @@ import {
 } from "fs";
 import { join, dirname, basename } from "path";
 
-import type { ServerConfig, SystemAdminPrincipal } from "./types";
+import type {
+  RateLimitConfig,
+  ServerConfig,
+  ServerRateLimitsConfig,
+  SystemAdminPrincipal,
+} from "./types";
 
 export interface ConfigBackupInfo {
   file: string;
@@ -124,7 +129,8 @@ export function validateServerConfig(raw: unknown, filePath: string): ServerConf
     );
   }
 
-  const config: ServerConfig = { capabilities };
+  const rateLimits = validateRateLimits(obj.rateLimits, filePath);
+  const config: ServerConfig = rateLimits ? { capabilities, rateLimits } : { capabilities };
 
   const principalCount = Object.values(capabilities).reduce(
     (sum, arr) => sum + arr.length,
@@ -135,6 +141,73 @@ export function validateServerConfig(raw: unknown, filePath: string): ServerConf
   );
 
   return config;
+}
+
+function validateRateLimits(
+  raw: unknown,
+  filePath: string,
+): ServerRateLimitsConfig | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config.json at ${filePath}: "rateLimits" must be an object`);
+  }
+
+  const obj = raw as Record<string, unknown>;
+  const sync = validateRateLimitConfig(obj.sync, "sync", filePath);
+
+  const rateLimits: ServerRateLimitsConfig = {};
+  if (sync) {
+    rateLimits.sync = sync;
+  }
+  return Object.keys(rateLimits).length > 0 ? rateLimits : {};
+}
+
+function validateRateLimitConfig(
+  raw: unknown,
+  name: string,
+  filePath: string,
+): RateLimitConfig | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config.json at ${filePath}: "rateLimits.${name}" must be an object`);
+  }
+
+  const obj = raw as Record<string, unknown>;
+  const config: RateLimitConfig = {};
+
+  if (obj.windowMs !== undefined) {
+    config.windowMs = validatePositiveInteger(
+      obj.windowMs,
+      `rateLimits.${name}.windowMs`,
+      filePath,
+    );
+  }
+  if (obj.max !== undefined) {
+    config.max = validatePositiveInteger(
+      obj.max,
+      `rateLimits.${name}.max`,
+      filePath,
+    );
+  }
+
+  return Object.keys(config).length > 0 ? config : {};
+}
+
+function validatePositiveInteger(
+  raw: unknown,
+  fieldName: string,
+  filePath: string,
+): number {
+  if (!Number.isInteger(raw) || (raw as number) <= 0) {
+    throw new Error(
+      `config.json at ${filePath}: "${fieldName}" must be a positive integer`,
+    );
+  }
+  return raw as number;
 }
 
 /**

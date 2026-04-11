@@ -154,6 +154,15 @@ export interface SystemAdminPrincipal {
   publicsignkey: string;
 }
 
+export interface RateLimitConfig {
+  windowMs?: number;
+  max?: number;
+}
+
+export interface ServerRateLimitsConfig {
+  sync?: RateLimitConfig;
+}
+
 /**
  * Server-level configuration loaded from config.json.
  *
@@ -164,6 +173,7 @@ export interface SystemAdminPrincipal {
  */
 export interface ServerConfig {
   capabilities: Record<string, SystemAdminPrincipal[]>;
+  rateLimits?: ServerRateLimitsConfig;
 }
 
 /**

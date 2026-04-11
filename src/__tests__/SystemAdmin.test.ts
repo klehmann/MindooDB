@@ -153,6 +153,7 @@ async function createTestSetup(
   const adminUser = await factory.createUserId("cn=sysadmin/o=test", "admin-pass");
 
   const config: ServerConfig = {
+    ...configOverride,
     capabilities: {
       "ALL:/system/*": [
         {
@@ -1693,6 +1694,12 @@ describe("System Admin Security", () => {
       const secondAdmin = await factory.createUserId("cn=secondadmin/o=test", "pw2");
 
       const newConfig: ServerConfig = {
+        rateLimits: {
+          sync: {
+            windowMs: 120_000,
+            max: 2_000,
+          },
+        },
         capabilities: {
           "ALL:/system/*": [
             {
@@ -1734,6 +1741,10 @@ describe("System Admin Security", () => {
         fs.readFileSync(`${dataDir}/config.json`, "utf-8"),
       );
       expect(diskConfig.capabilities["ALL:/system/*"].length).toBe(2);
+      expect(diskConfig.rateLimits?.sync).toEqual({
+        windowMs: 120_000,
+        max: 2_000,
+      });
 
       // Verify new rules take effect immediately: second admin can now authenticate
       const secondToken = await getSystemAdminToken(
@@ -1808,6 +1819,28 @@ describe("System Admin Security", () => {
         { Authorization: `Bearer ${token}` },
       );
       expect(status2).toBe(400);
+
+      const { status: status3 } = await httpRequest(
+        `${setup.baseUrl}/system/config`,
+        "PUT",
+        {
+          capabilities: {
+            "ALL:/system/*": [
+              {
+                username: setup.adminUser.username,
+                publicsignkey: setup.adminUser.userSigningKeyPair.publicKey,
+              },
+            ],
+          },
+          rateLimits: {
+            sync: {
+              max: 0,
+            },
+          },
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status3).toBe(400);
     });
 
     test("PUT /system/config rejects wildcard principals on non-tenant routes", async () => {
@@ -1866,6 +1899,10 @@ describe("System Admin Security", () => {
       const config = body as ServerConfig;
       // Should reflect the update from the earlier test (2 principals)
       expect(config.capabilities["ALL:/system/*"].length).toBe(2);
+      expect(config.rateLimits?.sync).toEqual({
+        windowMs: 120_000,
+        max: 2_000,
+      });
     });
 
     test("GET /system/config/backups lists created backups", async () => {

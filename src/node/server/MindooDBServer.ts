@@ -112,6 +112,9 @@ interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string;
 }
 
+const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
+const DEFAULT_SYNC_RATE_LIMIT_MAX = 1_000;
+
 function parseBodySizeLimitToBytes(limit: string): number | null {
   const normalized = limit.trim().toLowerCase();
   if (!normalized) {
@@ -931,6 +934,7 @@ export class MindooDBServer {
 
   private createTenantRouter(): Router {
     const router = Router({ mergeParams: true });
+    const syncRateLimitConfig = this.getSyncRateLimitConfig();
 
     // Auth endpoints get stricter rate limiting
     const authRateLimit = rateLimit({
@@ -943,8 +947,8 @@ export class MindooDBServer {
 
     // Sync endpoints get a higher limit
     const syncRateLimit = rateLimit({
-      windowMs: 60_000,
-      max: 200,
+      windowMs: syncRateLimitConfig.windowMs,
+      max: syncRateLimitConfig.max,
       standardHeaders: true,
       legacyHeaders: false,
       message: { error: "Too many sync requests, please try again later" },
@@ -971,6 +975,13 @@ export class MindooDBServer {
     router.post("/sync/planAttachmentReadByWalkingMetadata", syncRateLimit, this.handlePlanAttachmentReadByWalkingMetadata.bind(this));
 
     return router;
+  }
+
+  private getSyncRateLimitConfig(): { windowMs: number; max: number } {
+    return {
+      windowMs: this.serverConfig.rateLimits?.sync?.windowMs ?? DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS,
+      max: this.serverConfig.rateLimits?.sync?.max ?? DEFAULT_SYNC_RATE_LIMIT_MAX,
+    };
   }
 
   // ==================== Validation Helpers ====================
