@@ -883,6 +883,13 @@ export interface MindooDoc {
   getLastModified(): number;
   
   /**
+   * Get the decryption key ID used for this document.
+   *
+   * @return The key ID ("default" or a named key ID)
+   */
+  getDecryptionKeyId(): string;
+  
+  /**
    * Check if the document has been deleted.
    * Deletion is tracked via "delete" type entries in the append-only store.
    *

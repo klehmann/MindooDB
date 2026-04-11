@@ -2400,6 +2400,7 @@ export class BaseMindooDB implements MindooDB {
       getId: () => docId,
       getCreatedAt: () => internalDoc.createdAt,
       getLastModified: () => internalDoc.lastModified,
+      getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => false,
       getData: () => {
         // Return a proxy that collects property assignments and deletions
@@ -3970,6 +3971,7 @@ export class BaseMindooDB implements MindooDB {
       getId: () => docId,
       getCreatedAt: () => internalDoc.createdAt,
       getLastModified: () => internalDoc.lastModified,
+      getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => internalDoc.isDeleted,
       getData: () => {
         // Convert Automerge document to plain JS object, converting Text objects to strings
