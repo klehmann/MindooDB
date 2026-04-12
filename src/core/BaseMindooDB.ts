@@ -1067,10 +1067,28 @@ export class BaseMindooDB implements MindooDB {
         scanned += page.entries.length;
 
         if (page.entries.length > 0) {
+          onProgress?.({
+            phase: 'transferring',
+            message: `Scanned ${scanned} entries, checking for changes (page ${currentPage})...`,
+            transferredEntries: transferred,
+            scannedEntries: scanned,
+            totalSourceEntries: totalSourceEstimate,
+            currentPage,
+          });
+
           const ids = page.entries.map((m) => m.id);
           const missingIds = await this.filterMissingIds(targetStore, ids, targetBloom);
 
           if (missingIds.length > 0) {
+            onProgress?.({
+              phase: 'transferring',
+              message: `Transferring ${missingIds.length} entries (page ${currentPage}, scanned ${scanned})...`,
+              transferredEntries: transferred,
+              scannedEntries: scanned,
+              totalSourceEntries: totalSourceEstimate,
+              currentPage,
+            });
+
             const missingEntries = await sourceStore.getEntries(missingIds);
             await targetStore.putEntries(missingEntries);
             transferred += missingEntries.length;
