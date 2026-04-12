@@ -14,6 +14,7 @@ import {
   AttachmentReference,
   DEFAULT_TENANT_KEY_ID,
   PUBLIC_INFOS_KEY_ID,
+  StoreKind,
 } from "../core/types";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { CacheManager } from "../core/cache/CacheManager";
@@ -24,14 +25,25 @@ import { CacheManager } from "../core/cache/CacheManager";
  */
 class PersistentInMemoryStoreFactory implements ContentAddressedStoreFactory {
   private stores = new Map<string, InMemoryContentAddressedStore>();
+  private attachmentStores = new Map<string, InMemoryContentAddressedStore>();
 
   createStore(dbId: string, options?: OpenStoreOptions): CreateStoreResult {
-    let store = this.stores.get(dbId);
-    if (!store) {
-      store = new InMemoryContentAddressedStore(dbId, undefined, options);
-      this.stores.set(dbId, store);
+    let docStore = this.stores.get(dbId);
+    if (!docStore) {
+      docStore = new InMemoryContentAddressedStore(dbId, StoreKind.docs, undefined, options);
+      this.stores.set(dbId, docStore);
     }
-    return { docStore: store };
+    let attachmentStore = this.attachmentStores.get(dbId);
+    if (!attachmentStore) {
+      attachmentStore = new InMemoryContentAddressedStore(
+        dbId,
+        StoreKind.attachments,
+        undefined,
+        options,
+      );
+      this.attachmentStores.set(dbId, attachmentStore);
+    }
+    return { docStore, attachmentStore };
   }
 }
 
@@ -358,8 +370,10 @@ describe("BaseMindooDB cache integration", () => {
     expect(summarizeAttachments(divergentRemoteDoc).map((attachment) => attachment.fileName)).toEqual(["remote.bin"]);
 
     await localDb.pushChangesTo(remoteDb.getStore());
+    await localDb.pushChangesTo(remoteDb.getAttachmentStore(), { storeKind: StoreKind.attachments });
     await remoteDb.syncStoreChanges();
     await localDb.pullChangesFrom(remoteDb.getStore());
+    await localDb.pullChangesFrom(remoteDb.getAttachmentStore(), { storeKind: StoreKind.attachments });
 
     const mergedLocalDoc = await localDb.getDocument(docId);
     const mergedRemoteDoc = await remoteDb.getDocument(docId);
@@ -426,6 +440,7 @@ describe("BaseMindooDB cache integration", () => {
     });
 
     await localDb.pullChangesFrom(remoteDb.getStore());
+    await localDb.pullChangesFrom(remoteDb.getAttachmentStore(), { storeKind: StoreKind.attachments });
     await localDb.syncStoreChanges();
 
     const mergedLocalDoc = await localDb.getDocument(docId);

@@ -28,6 +28,9 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "../../core/types";
+import {
+  StoreKind,
+} from "../../core/appendonlystores/types";
 import type {
   AttachmentReadPlan,
   AttachmentReadPlanOptions,
@@ -957,22 +960,25 @@ export class MindooDBServer {
     router.post("/auth/challenge", authRateLimit, this.handleChallenge.bind(this));
     router.post("/auth/authenticate", authRateLimit, this.handleAuthenticate.bind(this));
 
-    router.post("/sync/findNewEntries", syncRateLimit, this.handleFindNewEntries.bind(this));
-    router.post("/sync/findNewEntriesForDoc", syncRateLimit, this.handleFindNewEntriesForDoc.bind(this));
-    router.post("/sync/findEntries", syncRateLimit, this.handleFindEntries.bind(this));
-    router.post("/sync/scanEntriesSince", syncRateLimit, this.handleScanEntriesSince.bind(this));
-    router.post("/sync/getIdBloomSummary", syncRateLimit, this.handleGetIdBloomSummary.bind(this));
-    router.post("/sync/getCompactionStatus", syncRateLimit, this.handleGetCompactionStatus.bind(this));
-    router.get("/sync/capabilities", syncRateLimit, this.handleGetCapabilities.bind(this));
-    router.post("/sync/getEntries", syncRateLimit, this.handleGetEntries.bind(this));
-    router.post("/sync/getEntryMetadata", syncRateLimit, this.handleGetEntryMetadata.bind(this));
-    router.post("/sync/putEntries", syncRateLimit, this.handlePutEntries.bind(this));
-    router.post("/sync/hasEntries", syncRateLimit, this.handleHasEntries.bind(this));
-    router.get("/sync/getAllIds", syncRateLimit, this.handleGetAllIds.bind(this));
-    router.post("/sync/resolveDependencies", syncRateLimit, this.handleResolveDependencies.bind(this));
-    router.post("/sync/planDocumentMaterialization", syncRateLimit, this.handlePlanDocumentMaterialization.bind(this));
-    router.post("/sync/planDocumentMaterializationBatch", syncRateLimit, this.handlePlanDocumentMaterializationBatch.bind(this));
-    router.post("/sync/planAttachmentReadByWalkingMetadata", syncRateLimit, this.handlePlanAttachmentReadByWalkingMetadata.bind(this));
+    for (const storeKind of ["docs", "attachments"] as const) {
+      const syncBase = `/sync/${storeKind}`;
+      router.post(`${syncBase}/findNewEntries`, syncRateLimit, this.handleFindNewEntries.bind(this));
+      router.post(`${syncBase}/findNewEntriesForDoc`, syncRateLimit, this.handleFindNewEntriesForDoc.bind(this));
+      router.post(`${syncBase}/findEntries`, syncRateLimit, this.handleFindEntries.bind(this));
+      router.post(`${syncBase}/scanEntriesSince`, syncRateLimit, this.handleScanEntriesSince.bind(this));
+      router.post(`${syncBase}/getIdBloomSummary`, syncRateLimit, this.handleGetIdBloomSummary.bind(this));
+      router.post(`${syncBase}/getCompactionStatus`, syncRateLimit, this.handleGetCompactionStatus.bind(this));
+      router.get(`${syncBase}/capabilities`, syncRateLimit, this.handleGetCapabilities.bind(this));
+      router.post(`${syncBase}/getEntries`, syncRateLimit, this.handleGetEntries.bind(this));
+      router.post(`${syncBase}/getEntryMetadata`, syncRateLimit, this.handleGetEntryMetadata.bind(this));
+      router.post(`${syncBase}/putEntries`, syncRateLimit, this.handlePutEntries.bind(this));
+      router.post(`${syncBase}/hasEntries`, syncRateLimit, this.handleHasEntries.bind(this));
+      router.get(`${syncBase}/getAllIds`, syncRateLimit, this.handleGetAllIds.bind(this));
+      router.post(`${syncBase}/resolveDependencies`, syncRateLimit, this.handleResolveDependencies.bind(this));
+      router.post(`${syncBase}/planDocumentMaterialization`, syncRateLimit, this.handlePlanDocumentMaterialization.bind(this));
+      router.post(`${syncBase}/planDocumentMaterializationBatch`, syncRateLimit, this.handlePlanDocumentMaterializationBatch.bind(this));
+      router.post(`${syncBase}/planAttachmentReadByWalkingMetadata`, syncRateLimit, this.handlePlanAttachmentReadByWalkingMetadata.bind(this));
+    }
 
     return router;
   }
@@ -1044,7 +1050,11 @@ export class MindooDBServer {
       const validDbId = this.validateDbId(dbId);
       validateArraySize(haveIds, MAX_HAVE_IDS, "haveIds");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(
+        req.tenantId!,
+        validDbId,
+        this.getStoreKindFromRequest(req),
+      );
       const entries = await serverStore.handleFindNewEntries(token, haveIds || []);
 
       res.json({
@@ -1067,7 +1077,7 @@ export class MindooDBServer {
       }
       validateArraySize(haveIds, MAX_HAVE_IDS, "haveIds");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const entries = await serverStore.handleFindNewEntriesForDoc(token, haveIds || [], docId);
 
       res.json({
@@ -1085,7 +1095,7 @@ export class MindooDBServer {
 
       const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const entries = await serverStore.handleFindEntries(
         token,
         type,
@@ -1113,7 +1123,7 @@ export class MindooDBServer {
 
       const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const result = await serverStore.handleScanEntriesSince(
         token,
         cursor ?? null,
@@ -1138,7 +1148,7 @@ export class MindooDBServer {
 
       const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const summary = await serverStore.handleGetIdBloomSummary(token);
       res.json({ summary: summary as StoreIdBloomSummary });
     } catch (error) {
@@ -1151,7 +1161,7 @@ export class MindooDBServer {
       const token = this.extractToken(req);
       const rawDbId = (req.query.dbId as string) || "directory";
       const validDbId = this.validateDbId(rawDbId);
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const capabilities = await serverStore.handleGetCapabilities(token);
       res.json({ capabilities: capabilities as NetworkSyncCapabilities });
     } catch (error) {
@@ -1166,7 +1176,7 @@ export class MindooDBServer {
 
       const validDbId = this.validateDbId(dbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const status = await serverStore.handleGetCompactionStatus(token);
       res.json({ status: status as StoreCompactionStatus });
     } catch (error) {
@@ -1182,7 +1192,7 @@ export class MindooDBServer {
       const validDbId = this.validateDbId(dbId);
       validateArraySize(ids, MAX_ENTRY_IDS, "ids");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const entries = await serverStore.handleGetEntries(token, ids || []);
 
       res.json({
@@ -1207,7 +1217,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const entry = await serverStore.handleGetEntryMetadata(token, id);
 
       res.json({
@@ -1238,7 +1248,7 @@ export class MindooDBServer {
       );
 
       stage = "load-server-store";
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       stage = "deserialize-entries";
       const deserializedEntries = serializedEntries.map((entry, index) => {
         try {
@@ -1291,7 +1301,7 @@ export class MindooDBServer {
       const validDbId = this.validateDbId(dbId);
       validateArraySize(ids, MAX_ENTRY_IDS, "ids");
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const existingIds = await serverStore.handleHasEntries(token, ids || []);
 
       res.json({ ids: existingIds });
@@ -1306,7 +1316,7 @@ export class MindooDBServer {
       const rawDbId = (req.query.dbId as string) || "directory";
       const validDbId = this.validateDbId(rawDbId);
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const ids = await serverStore.handleGetAllIds(token);
 
       res.json({ ids });
@@ -1326,7 +1336,7 @@ export class MindooDBServer {
         return;
       }
 
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const ids = await serverStore.handleResolveDependencies(token, startId, options);
 
       res.json({ ids });
@@ -1348,7 +1358,7 @@ export class MindooDBServer {
         res.status(400).json({ error: "docId is required" });
         return;
       }
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const plan = await (serverStore as any).handlePlanDocumentMaterialization(token, docId, options);
       res.json({ plan: plan as DocumentMaterializationPlan });
     } catch (error) {
@@ -1366,7 +1376,7 @@ export class MindooDBServer {
       };
       const validDbId = this.validateDbId(dbId);
       validateArraySize(docIds, MAX_HAVE_IDS, "docIds");
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const batchPlan = await (serverStore as any).handlePlanDocumentMaterializationBatch(token, docIds || [], options);
       res.json({ batchPlan: batchPlan as DocumentMaterializationBatchPlan });
     } catch (error) {
@@ -1396,7 +1406,7 @@ export class MindooDBServer {
         res.status(400).json({ error: "options.startByte is required" });
         return;
       }
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId);
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const plan = await (serverStore as any).handlePlanAttachmentReadByWalkingMetadata(
         token,
         lastChunkId,
@@ -1416,6 +1426,17 @@ export class MindooDBServer {
   }
 
   // ==================== Helper Methods ====================
+
+  private getStoreKindFromRequest(req: Request): StoreKind {
+    const trimmedPath = req.path.replace(/\/$/, "");
+    if (trimmedPath.startsWith("/sync/docs/") || trimmedPath === "/sync/docs/capabilities" || trimmedPath === "/sync/docs/getAllIds") {
+      return StoreKind.docs;
+    }
+    if (trimmedPath.startsWith("/sync/attachments/") || trimmedPath === "/sync/attachments/capabilities" || trimmedPath === "/sync/attachments/getAllIds") {
+      return StoreKind.attachments;
+    }
+    throw new Error(`Unsupported sync store kind for path: ${req.path}`);
+  }
 
   private extractToken(req: Request): string {
     const auth = req.headers.authorization;

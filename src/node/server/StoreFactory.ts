@@ -4,7 +4,7 @@
 
 import { InMemoryContentAddressedStore } from "../../core/appendonlystores/InMemoryContentAddressedStore";
 import { BasicOnDiskContentAddressedStore } from "../appendonlystores/BasicOnDiskContentAddressedStore";
-import type { ContentAddressedStore } from "../../core/types";
+import { StoreKind, type ContentAddressedStore } from "../../core/types";
 import type { StoreType, TenantConfig } from "./types";
 
 /**
@@ -18,7 +18,7 @@ export class StoreFactory {
   private tenantId: string;
   private dataDir: string;
   
-  /** Cache of created stores: Map<"tenantId:dbId", store> */
+  /** Cache of created stores: Map<"tenantId:dbId:storeKind", store> */
   private stores: Map<string, ContentAddressedStore> = new Map();
 
   constructor(tenantId: string, config: TenantConfig, dataDir?: string) {
@@ -33,8 +33,8 @@ export class StoreFactory {
    * @param dbId The database identifier
    * @returns The content-addressed store for the database
    */
-  getStore(dbId: string): ContentAddressedStore {
-    const cacheKey = `${this.tenantId}:${dbId}`;
+  getStore(dbId: string, storeKind: StoreKind): ContentAddressedStore {
+    const cacheKey = `${this.tenantId}:${dbId}:${storeKind}`;
     
     // Check cache first
     const existing = this.stores.get(cacheKey);
@@ -46,11 +46,11 @@ export class StoreFactory {
     const storeType = this.getStoreTypeForDb(dbId);
     
     // Create the store
-    const store = this.createStore(dbId, storeType);
+    const store = this.createStore(dbId, storeType, storeKind);
     
     // Cache and return
     this.stores.set(cacheKey, store);
-    console.log(`[StoreFactory] Created ${storeType} store for ${this.tenantId}/${dbId}`);
+    console.log(`[StoreFactory] Created ${storeType} ${storeKind} store for ${this.tenantId}/${dbId}`);
     
     return store;
   }
@@ -72,14 +72,14 @@ export class StoreFactory {
   /**
    * Create a new store instance of the specified type.
    */
-  private createStore(dbId: string, storeType: StoreType): ContentAddressedStore {
+  private createStore(dbId: string, storeType: StoreType, storeKind: StoreKind): ContentAddressedStore {
     switch (storeType) {
       case "inmemory":
-        return new InMemoryContentAddressedStore(dbId);
+        return new InMemoryContentAddressedStore(dbId, storeKind);
       
       case "file": {
         const basePath = `${this.dataDir}/${this.tenantId}/stores`;
-        return new BasicOnDiskContentAddressedStore(dbId, undefined, { basePath });
+        return new BasicOnDiskContentAddressedStore(dbId, storeKind, undefined, { basePath });
       }
       
       default:

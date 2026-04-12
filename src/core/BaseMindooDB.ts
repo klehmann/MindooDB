@@ -36,6 +36,9 @@ import {
   DocumentHistoryPageResult,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
+import {
+  StoreKind,
+} from "./appendonlystores/types";
 import type {
   ContentAddressedStore,
   StoreScanCursor,
@@ -109,7 +112,7 @@ interface InternalDoc {
 export class BaseMindooDB implements MindooDB {
   private tenant: BaseMindooTenant;
   private store: ContentAddressedStore;
-  private attachmentStore: ContentAddressedStore | undefined;
+  private attachmentStore: ContentAddressedStore;
   private chunkSizeBytes: number;
   
   // Admin-only mode: only entries signed by the admin key are loaded
@@ -155,7 +158,7 @@ export class BaseMindooDB implements MindooDB {
   constructor(
     tenant: BaseMindooTenant, 
     store: ContentAddressedStore, 
-    attachmentStore?: ContentAddressedStore,
+    attachmentStore: ContentAddressedStore,
     attachmentConfig?: AttachmentConfig,
     documentCacheConfig?: DocumentCacheConfig,
     snapshotConfig?: SnapshotConfig,
@@ -163,6 +166,16 @@ export class BaseMindooDB implements MindooDB {
     logger?: Logger,
     performanceCallback?: PerformanceCallback
   ) {
+    if (store.getStoreKind() !== StoreKind.docs) {
+      throw new Error(
+        `[BaseMindooDB] Expected primary store kind ${StoreKind.docs} but received ${store.getStoreKind()}`
+      );
+    }
+    if (attachmentStore.getStoreKind() !== StoreKind.attachments) {
+      throw new Error(
+        `[BaseMindooDB] Expected attachment store kind ${StoreKind.attachments} but received ${attachmentStore.getStoreKind()}`
+      );
+    }
     this.tenant = tenant;
     this.store = store;
     this.attachmentStore = attachmentStore;
@@ -1259,7 +1272,7 @@ export class BaseMindooDB implements MindooDB {
     return this.store;
   }
 
-  getAttachmentStore(): ContentAddressedStore | undefined {
+  getAttachmentStore(): ContentAddressedStore {
     return this.attachmentStore;
   }
 
@@ -4227,10 +4240,10 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Get the effective attachment store (attachment store if configured, otherwise doc store).
+   * Get the attachment store for this database.
    */
   private getEffectiveAttachmentStore(): ContentAddressedStore {
-    return this.attachmentStore || this.store;
+    return this.attachmentStore;
   }
 
   /**
@@ -4490,9 +4503,18 @@ export class BaseMindooDB implements MindooDB {
    * Resolve a sync target to a ContentAddressedStore.
    * Accepts either a raw store or a MindooDB instance (calls getStore()).
    */
-  private resolveStore(remote: ContentAddressedStore | MindooDB): ContentAddressedStore {
+  private getStoreForKind(storeKind: StoreKind = StoreKind.docs): ContentAddressedStore {
+    return storeKind === StoreKind.attachments ? this.attachmentStore : this.store;
+  }
+
+  private resolveStore(
+    remote: ContentAddressedStore | MindooDB,
+    storeKind: StoreKind = StoreKind.docs,
+  ): ContentAddressedStore {
     if ('getStore' in remote && typeof (remote as MindooDB).getStore === 'function') {
-      return (remote as MindooDB).getStore();
+      return storeKind === StoreKind.attachments
+        ? (remote as MindooDB).getAttachmentStore()
+        : (remote as MindooDB).getStore();
     }
     return remote as ContentAddressedStore;
   }
@@ -4590,21 +4612,26 @@ export class BaseMindooDB implements MindooDB {
    * 3. Stores them in our local store
    * 4. Syncs the local store to process the new entries
    *
+   * The optional `storeKind` sync option selects which store is synced.
+   * By default, this method syncs the docs store only.
+   *
    * @param remote The remote store or MindooDB instance to pull entries from
-   * @param options Optional sync options for progress tracking, paging, and cancellation
+   * @param options Optional sync options for progress tracking, paging, cancellation, and store selection
    * @return A promise that resolves with the sync result
    */
   async pullChangesFrom(remote: ContentAddressedStore | MindooDB, options?: SyncOptions): Promise<SyncResult> {
-    const remoteStore = this.resolveStore(remote);
+    const storeKind = options?.storeKind ?? StoreKind.docs;
+    const localStore = this.getStoreForKind(storeKind);
+    const remoteStore = this.resolveStore(remote, storeKind);
 
-    if (this.store.getId() !== remoteStore.getId()) {
-      throw new Error(`[BaseMindooDB] Cannot pull entries from the incompatible store ${this.store.getId()}`);
+    if (localStore.getId() !== remoteStore.getId() || localStore.getStoreKind() !== remoteStore.getStoreKind()) {
+      throw new Error(`[BaseMindooDB] Cannot pull entries from the incompatible store ${localStore.getId()}/${localStore.getStoreKind()}`);
     }
 
-    this.logger.info(`Pulling entries from remote store ${remoteStore.getId()}`);
+    this.logger.info(`Pulling entries from remote store ${remoteStore.getId()}/${remoteStore.getStoreKind()}`);
     const restoreAuthOverride = await this.applyNetworkAuthOverrideForSync(remoteStore, options);
     try {
-      const syncResult = await this.syncEntriesFromStore(remoteStore, this.store, options);
+      const syncResult = await this.syncEntriesFromStore(remoteStore, localStore, options);
       this.logger.debug(`Transferred ${syncResult.transferred} entries from remote store`);
 
       if (syncResult.cancelled) {
@@ -4630,13 +4657,15 @@ export class BaseMindooDB implements MindooDB {
 
       // Sync the local store to process the new entries
       // This will update the index, cache, and processedEntryIds
-      await this.syncStoreChanges();
+      if (storeKind === StoreKind.docs) {
+        await this.syncStoreChanges();
+      }
       
       this.logger.info(`Pull complete, synced ${syncResult.transferred} entries`);
 
       options?.onProgress?.({
         phase: 'complete',
-        message: `Pull complete: ${syncResult.transferred} entries synced`,
+        message: `Pull complete: ${syncResult.transferred} ${storeKind} entries synced`,
         transferredEntries: syncResult.transferred,
         scannedEntries: syncResult.transferred,
       });
@@ -4659,21 +4688,26 @@ export class BaseMindooDB implements MindooDB {
    * 2. Retrieves those entries from our local store
    * 3. Stores them in the remote store
    *
+   * The optional `storeKind` sync option selects which store is synced.
+   * By default, this method syncs the docs store only.
+   *
    * @param remote The remote store or MindooDB instance to push entries to
-   * @param options Optional sync options for progress tracking, paging, and cancellation
+   * @param options Optional sync options for progress tracking, paging, cancellation, and store selection
    * @return A promise that resolves with the sync result
    */
   async pushChangesTo(remote: ContentAddressedStore | MindooDB, options?: SyncOptions): Promise<SyncResult> {
-    const remoteStore = this.resolveStore(remote);
+    const storeKind = options?.storeKind ?? StoreKind.docs;
+    const localStore = this.getStoreForKind(storeKind);
+    const remoteStore = this.resolveStore(remote, storeKind);
 
-    if (this.store.getId() !== remoteStore.getId()) {
-      throw new Error(`[BaseMindooDB] Cannot push entries to the incompatible store ${this.store.getId()}`);
+    if (localStore.getId() !== remoteStore.getId() || localStore.getStoreKind() !== remoteStore.getStoreKind()) {
+      throw new Error(`[BaseMindooDB] Cannot push entries to the incompatible store ${localStore.getId()}/${localStore.getStoreKind()}`);
     }
 
-    this.logger.info(`Pushing entries to remote store ${remoteStore.getId()}`);
+    this.logger.info(`Pushing entries to remote store ${remoteStore.getId()}/${remoteStore.getStoreKind()}`);
     const restoreAuthOverride = await this.applyNetworkAuthOverrideForSync(remoteStore, options);
     try {
-      const syncResult = await this.syncEntriesFromStore(this.store, remoteStore, options);
+      const syncResult = await this.syncEntriesFromStore(localStore, remoteStore, options);
       this.logger.debug(`Transferred ${syncResult.transferred} entries to remote store`);
 
       if (syncResult.cancelled) {

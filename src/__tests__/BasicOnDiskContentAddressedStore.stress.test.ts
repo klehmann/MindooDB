@@ -4,7 +4,7 @@ import { constants as fsConstants } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { BasicOnDiskContentAddressedStore } from "../node/appendonlystores/BasicOnDiskContentAddressedStore";
-import type { StoreEntry } from "../core/types";
+import { StoreKind, type StoreEntry } from "../core/types";
 
 const describeStress = process.env.MINDOODB_STRESS_TESTS === "1" ? describe : describe.skip;
 const isSoak = process.env.MINDOODB_SOAK_TESTS === "1";
@@ -24,7 +24,7 @@ describeStress("BasicOnDiskContentAddressedStore stress matrix", () => {
     "high-volume append + restart + cursor scan remains consistent",
     async () => {
       const totalEntries = isSoak ? 8000 : 1500;
-      const store = new BasicOnDiskContentAddressedStore("stress-db", undefined, {
+      const store = new BasicOnDiskContentAddressedStore("stress-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled: true,
         metadataSegmentCompactionMinFiles: 48,
@@ -38,7 +38,7 @@ describeStress("BasicOnDiskContentAddressedStore stress matrix", () => {
       }
       const statusBeforeRestart = await store.getCompactionStatus!();
 
-      const restarted = new BasicOnDiskContentAddressedStore("stress-db", undefined, {
+      const restarted = new BasicOnDiskContentAddressedStore("stress-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled: true,
       });
@@ -71,7 +71,7 @@ describeStress("BasicOnDiskContentAddressedStore stress matrix", () => {
       for (let w = 0; w < writers; w++) {
         writerTasks.push(
           (async () => {
-            const writer = new BasicOnDiskContentAddressedStore("stress-db", undefined, {
+            const writer = new BasicOnDiskContentAddressedStore("stress-db", StoreKind.docs, undefined, {
               basePath,
               indexingEnabled: true,
               metadataSegmentCompactionMinFiles: 32,
@@ -88,7 +88,7 @@ describeStress("BasicOnDiskContentAddressedStore stress matrix", () => {
 
       await Promise.all(writerTasks);
 
-      const verifier = new BasicOnDiskContentAddressedStore("stress-db", undefined, {
+      const verifier = new BasicOnDiskContentAddressedStore("stress-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled: true,
       });
@@ -109,7 +109,7 @@ describeStress("BasicOnDiskContentAddressedStore stress matrix", () => {
       const segmentsDir = join(dbRoot, "metadata-segments");
       const expectedIds = new Set<string>();
 
-      const store = new BasicOnDiskContentAddressedStore("stress-db", undefined, {
+      const store = new BasicOnDiskContentAddressedStore("stress-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled: true,
         metadataSegmentCompactionMinFiles: 16,
@@ -143,7 +143,7 @@ describeStress("BasicOnDiskContentAddressedStore stress matrix", () => {
           }
         }
 
-        const restarted = new BasicOnDiskContentAddressedStore("stress-db", undefined, {
+        const restarted = new BasicOnDiskContentAddressedStore("stress-db", StoreKind.docs, undefined, {
           basePath,
           indexingEnabled: true,
         });

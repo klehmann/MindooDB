@@ -20,6 +20,7 @@
  */
 
 import { MindooDBServer } from "./MindooDBServer";
+import { StoreKind } from "../../core/types";
 import { ServerSync, startPeriodicSync } from "./ServerSync";
 import { loadServerConfig, resolveConfigPath } from "./config";
 import { resolveServerPassword } from "./resolveServerPassword";
@@ -230,7 +231,7 @@ async function main(): Promise<void> {
               tenantId,
               serverIdentity,
               serverPassword,
-              async (dbId) => tenantManager.getStore(tenantId, dbId),
+              async (dbId) => tenantManager.getStore(tenantId, dbId, StoreKind.docs),
             );
 
             const stopSync = startPeriodicSync(serverSync, config.remoteServers);

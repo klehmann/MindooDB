@@ -12,6 +12,7 @@ import {
   type AuthResult,
   type NetworkSyncCapabilities,
 } from "../core/appendonlystores/network/types";
+import { StoreKind } from "../core/types";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -442,6 +443,7 @@ describe("Network Sync", () => {
       // Create client store (no local store - pure remote proxy)
       clientStore = new ClientNetworkContentAddressedStore(
         "test-db",
+        StoreKind.docs,
         mockTransport,
         cryptoAdapter,
         "testuser",
@@ -811,6 +813,7 @@ describe("Network Sync", () => {
       // Create remote store (ClientNetworkContentAddressedStore as pure remote proxy)
       remoteStore = new ClientNetworkContentAddressedStore(
         "test-db",
+        StoreKind.docs,
         mockTransport,
         cryptoAdapter,
         "testuser",

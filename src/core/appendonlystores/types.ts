@@ -245,9 +245,14 @@ export interface AttachmentReadPlan {
   offsetInFirstChunk: number;
 }
 
+export enum StoreKind {
+  docs = "docs",
+  attachments = "attachments",
+}
+
 /**
  * Result of creating stores for a database.
- * Contains the document store and an optional separate attachment store.
+ * Contains the document store and the attachment store.
  */
 export interface CreateStoreResult {
   /**
@@ -257,14 +262,9 @@ export interface CreateStoreResult {
   docStore: ContentAddressedStore;
   
   /**
-   * Optional separate store for attachment chunks (attachment_chunk).
-   * If not provided, attachments are stored in the docStore.
-   * Having a separate store enables:
-   * - Different storage backends (e.g., local docs, cloud attachments)
-   * - Different caching/eviction policies
-   * - Cost optimization (cheaper storage for large attachments)
+   * Separate store for attachment chunks (attachment_chunk).
    */
-  attachmentStore?: ContentAddressedStore;
+  attachmentStore: ContentAddressedStore;
 }
 
 /**
@@ -275,11 +275,11 @@ export interface CreateStoreResult {
 export interface ContentAddressedStoreFactory {
   /**
    * Create stores for the given database ID.
-   * Returns a document store and optionally a separate attachment store.
+   * Returns a document store and a separate attachment store.
    * 
    * @param dbId The ID of the database (e.g., "directory" for the tenant directory database)
    * @param options Optional configuration for store creation (e.g., preferLocal, custom settings)
-   * @return An object containing the document store and optional attachment store
+   * @return An object containing the document store and attachment store
    */
   createStore(dbId: string, options?: OpenStoreOptions): CreateStoreResult;
 }
@@ -311,6 +311,12 @@ export interface ContentAddressedStore {
    * @return The ID of the store
    */
   getId(): string;
+
+  /**
+   * Get the store kind so callers can distinguish docs and attachments stores
+   * even when they belong to the same logical database.
+   */
+  getStoreKind(): StoreKind;
 
   /**
    * Store one or more entries. 

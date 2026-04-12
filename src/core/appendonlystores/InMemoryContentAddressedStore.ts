@@ -9,6 +9,7 @@ import {
   MaterializationPlanOptions,
   OpenStoreOptions,
   StoreIndexBuildStatus,
+  StoreKind,
   AwaitIndexReadyOptions,
   StoreScanCursor,
   StoreScanFilters,
@@ -37,6 +38,7 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
  */
 export class InMemoryContentAddressedStore implements ContentAddressedStore {
   private dbId: string;
+  private readonly storeKind: StoreKind;
   
   /** Metadata indexed by entry id */
   private entries: Map<string, StoreEntryMetadata> = new Map();
@@ -59,16 +61,26 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   private logger: Logger;
   private readonly indexingEnabled: boolean;
 
-  constructor(dbId: string, logger?: Logger, options?: OpenStoreOptions) {
+  constructor(
+    dbId: string,
+    storeKind: StoreKind = StoreKind.docs,
+    logger?: Logger,
+    options?: OpenStoreOptions,
+  ) {
     this.dbId = dbId;
+    this.storeKind = storeKind;
     this.logger =
       logger ||
-      new MindooLogger(getDefaultLogLevel(), `InMemoryStore:${dbId}`, true);
+      new MindooLogger(getDefaultLogLevel(), `InMemoryStore:${dbId}:${storeKind}`, true);
     this.indexingEnabled = options?.indexingEnabled !== false;
   }
 
   getId(): string {
     return this.dbId;
+  }
+
+  getStoreKind(): StoreKind {
+    return this.storeKind;
   }
 
   /**
@@ -607,16 +619,21 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
  */
 export class InMemoryContentAddressedStoreFactory implements ContentAddressedStoreFactory {
   createStore(dbId: string, options?: OpenStoreOptions): CreateStoreResult {
-    // For in-memory stores, we use a single store for both documents and attachments
-    // Note: options are ignored for in-memory stores but accepted for interface compatibility
-    const store = new InMemoryContentAddressedStore(dbId, undefined, options);
+    const docStore = new InMemoryContentAddressedStore(dbId, StoreKind.docs, undefined, options);
+    const attachmentStore = new InMemoryContentAddressedStore(
+      dbId,
+      StoreKind.attachments,
+      undefined,
+      options,
+    );
     if (options?.clearLocalDataOnStartup) {
       // Initialize in a deterministic clean state for parity with persistent stores.
-      void store.clearAllLocalData();
+      void docStore.clearAllLocalData();
+      void attachmentStore.clearAllLocalData();
     }
     return {
-      docStore: store,
-      // attachmentStore not provided - will use docStore for attachments
+      docStore,
+      attachmentStore,
     };
   }
 }

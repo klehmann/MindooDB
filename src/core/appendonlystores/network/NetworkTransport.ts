@@ -14,6 +14,7 @@ import type {
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
+  StoreKind,
 } from "../types";
 import type { NetworkEncryptedEntry, AuthResult, NetworkSyncCapabilities } from "./types";
 
@@ -317,4 +318,9 @@ export interface NetworkTransportConfig {
    * Database ID for scoping requests (optional)
    */
   dbId?: string;
+
+  /**
+   * Store kind for selecting the docs or attachments sync endpoint.
+   */
+  storeKind?: StoreKind;
 }

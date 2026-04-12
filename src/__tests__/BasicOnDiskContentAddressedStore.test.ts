@@ -3,7 +3,7 @@ import { rm, readFile, readdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BasicOnDiskContentAddressedStore } from "../node/appendonlystores/BasicOnDiskContentAddressedStore";
-import { StoreEntry } from "../core/types";
+import { StoreEntry, StoreKind } from "../core/types";
 
 describe.each([true, false])(
   "BasicOnDiskContentAddressedStore (indexingEnabled=%s)",
@@ -19,14 +19,14 @@ describe.each([true, false])(
     });
 
     test("persists entries across restart", async () => {
-      const store1 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store1 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
         metadataSegmentCompactionMinFiles: 8,
       });
       await store1.putEntries([createTestEntry("doc1", "id1", "content1")]);
 
-      const store2 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store2 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -39,7 +39,7 @@ describe.each([true, false])(
     });
 
     test("clearLocalDataOnStartup starts with empty store", async () => {
-      const store1 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store1 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -48,13 +48,13 @@ describe.each([true, false])(
         createTestEntry("doc1", "id2", "content2"),
       ]);
 
-      const beforeReset = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const beforeReset = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
       expect((await beforeReset.getAllIds()).length).toBe(2);
 
-      const resetStore = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const resetStore = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
         clearLocalDataOnStartup: true,
@@ -66,7 +66,7 @@ describe.each([true, false])(
     });
 
     test("explicit clearAllLocalData wipes existing data", async () => {
-      const store = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -90,7 +90,7 @@ describe.each([true, false])(
       e2.createdAt = now + 1;
       e3.createdAt = now + 2;
 
-      const store = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -112,7 +112,7 @@ describe.each([true, false])(
       e1.createdAt = now;
       e2.createdAt = now + 1;
 
-      const store1 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store1 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -122,7 +122,7 @@ describe.each([true, false])(
       expect(page1.entries.map((e) => e.id)).toEqual(["id1"]);
       expect(page1.hasMore).toBe(true);
 
-      const store2 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store2 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -144,7 +144,7 @@ describe.each([true, false])(
       e2.createdAt = now + 1;
       e3.createdAt = now + 2;
 
-      const store = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -169,14 +169,14 @@ describe.each([true, false])(
       e2.createdAt = now + 1;
       e3.createdAt = now + 2;
 
-      const store1 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store1 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
       await store1.putEntries([e1, e2, e3]);
 
       // Simulate crash-stale index segment: drop one row from the latest segment.
-      const segmentsDir = join(basePath, "test-db", "metadata-segments");
+      const segmentsDir = join(basePath, "test-db", StoreKind.docs, "metadata-segments");
       const segmentFiles = (await readdir(segmentsDir))
         .filter((fileName) => fileName.endsWith(".json"))
         .sort();
@@ -187,7 +187,7 @@ describe.each([true, false])(
       const stale = persisted.slice(0, 2);
       await writeFile(latestSegmentPath, JSON.stringify(stale), "utf-8");
 
-      const store2 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store2 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -202,7 +202,7 @@ describe.each([true, false])(
       }
 
       const now = Date.now();
-      const store1 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store1 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -214,7 +214,7 @@ describe.each([true, false])(
         await store1.putEntries([entry]);
       }
 
-      const segmentsDir = join(basePath, "test-db", "metadata-segments");
+      const segmentsDir = join(basePath, "test-db", StoreKind.docs, "metadata-segments");
       const segmentFiles = (await readdir(segmentsDir)).filter((fileName) =>
         fileName.endsWith(".json")
       );
@@ -224,7 +224,7 @@ describe.each([true, false])(
       expect(compaction?.lastCompactedFiles).toBeGreaterThan(0);
       expect(compaction?.lastCompactionAt).not.toBeNull();
 
-      const store2 = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store2 = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
       });
@@ -240,7 +240,7 @@ describe.each([true, false])(
       }
 
       const now = Date.now();
-      const store = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
         metadataSegmentCompactionMinFiles: 0,
@@ -253,7 +253,7 @@ describe.each([true, false])(
         await store.putEntries([entry]);
       }
 
-      const segmentsDir = join(basePath, "test-db", "metadata-segments");
+      const segmentsDir = join(basePath, "test-db", StoreKind.docs, "metadata-segments");
       const segmentFiles = (await readdir(segmentsDir)).filter((fileName) =>
         fileName.endsWith(".json")
       );
@@ -269,7 +269,7 @@ describe.each([true, false])(
       }
 
       const now = Date.now();
-      const store = new BasicOnDiskContentAddressedStore("test-db", undefined, {
+      const store = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
         basePath,
         indexingEnabled,
         metadataSegmentCompactionMinFiles: 10_000,
@@ -283,7 +283,7 @@ describe.each([true, false])(
         await store.putEntries([entry]);
       }
 
-      const segmentsDir = join(basePath, "test-db", "metadata-segments");
+      const segmentsDir = join(basePath, "test-db", StoreKind.docs, "metadata-segments");
       const segmentFiles = (await readdir(segmentsDir)).filter((fileName) =>
         fileName.endsWith(".json")
       );

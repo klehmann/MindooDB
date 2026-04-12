@@ -7,7 +7,7 @@
 
 import { HttpTransport } from "../../appendonlystores/network/HttpTransport";
 import { ClientNetworkContentAddressedStore } from "../../appendonlystores/network/ClientNetworkContentAddressedStore";
-import type { ContentAddressedStore, EncryptedPrivateKey } from "../../core/types";
+import { StoreKind, type ContentAddressedStore, type EncryptedPrivateKey } from "../../core/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { PrivateUserId } from "../../core/userid";
 import type { RemoteServerConfig } from "./types";
@@ -105,6 +105,7 @@ export class ServerSync {
 
     const remoteStore = new ClientNetworkContentAddressedStore(
       dbId,
+      StoreKind.docs,
       transport,
       this.cryptoAdapter,
       this.serverIdentity.username,

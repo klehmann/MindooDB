@@ -54,6 +54,7 @@ import {
   OpenStoreOptions,
   StoreIndexBuildStatus,
   StoreCompactionStatus,
+  StoreKind,
   AwaitIndexReadyOptions,
   StoreScanCursor,
   StoreScanFilters,
@@ -197,6 +198,9 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   /** Unique database identifier; used as the top-level directory name. */
   private readonly dbId: string;
 
+  /** Distinguishes document and attachment stores for the same database. */
+  private readonly storeKind: StoreKind;
+
   /** Logger scoped to this store instance. */
   private readonly logger: Logger;
 
@@ -298,12 +302,18 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    * @param logger   Optional logger; a default console logger is created if omitted.
    * @param options  Store configuration (base path, indexing, compaction thresholds, etc.).
    */
-  constructor(dbId: string, logger?: Logger, options?: OpenStoreOptions) {
+  constructor(
+    dbId: string,
+    storeKind: StoreKind = StoreKind.docs,
+    logger?: Logger,
+    options?: OpenStoreOptions,
+  ) {
     this.dbId = dbId;
+    this.storeKind = storeKind;
     this.logger =
       logger ||
-      new MindooLogger(getDefaultLogLevel(), `BasicOnDiskStore:${dbId}`, true);
-    this.storeRoot = path.join(options?.basePath?.toString() || ".mindoodb-store", dbId);
+      new MindooLogger(getDefaultLogLevel(), `BasicOnDiskStore:${dbId}:${storeKind}`, true);
+    this.storeRoot = path.join(options?.basePath?.toString() || ".mindoodb-store", dbId, storeKind);
     this.entriesDir = path.join(this.storeRoot, "entries");
     this.contentDir = path.join(this.storeRoot, "content");
     this.metadataIndexPath = path.join(this.storeRoot, "metadata-index.json");
@@ -1121,6 +1131,10 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     return this.dbId;
   }
 
+  getStoreKind(): StoreKind {
+    return this.storeKind;
+  }
+
   getCacheIdentity(): string {
     return `disk:${this.storeRoot}`;
   }
@@ -1684,7 +1698,13 @@ export class BasicOnDiskContentAddressedStoreFactory implements ContentAddressed
    */
   createStore(dbId: string, options?: OpenStoreOptions): CreateStoreResult {
     return {
-      docStore: new BasicOnDiskContentAddressedStore(dbId, undefined, options),
+      docStore: new BasicOnDiskContentAddressedStore(dbId, StoreKind.docs, undefined, options),
+      attachmentStore: new BasicOnDiskContentAddressedStore(
+        dbId,
+        StoreKind.attachments,
+        undefined,
+        options,
+      ),
     };
   }
 }

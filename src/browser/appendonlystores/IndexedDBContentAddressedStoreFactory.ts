@@ -9,6 +9,9 @@
  * @module IndexedDBContentAddressedStoreFactory
  */
 
+import {
+  StoreKind,
+} from "../../core/appendonlystores/types";
 import type {
   ContentAddressedStoreFactory,
   CreateStoreResult,
@@ -39,19 +42,27 @@ export class IndexedDBContentAddressedStoreFactory
       ...options,
       basePath: (options?.basePath as string) || this.defaultBasePath,
     };
-
-    const store = new IndexedDBContentAddressedStore(
+    const docStore = new IndexedDBContentAddressedStore(
       dbId,
+      StoreKind.docs,
+      this.logger,
+      mergedOptions
+    );
+    const attachmentStore = new IndexedDBContentAddressedStore(
+      dbId,
+      StoreKind.attachments,
       this.logger,
       mergedOptions
     );
 
     if (mergedOptions.clearLocalDataOnStartup) {
-      void store.clearAllLocalData();
+      void docStore.clearAllLocalData();
+      void attachmentStore.clearAllLocalData();
     }
 
     return {
-      docStore: store,
+      docStore,
+      attachmentStore,
     };
   }
 }

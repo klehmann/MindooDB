@@ -173,6 +173,7 @@ test.describe("MindooDB browser runtime", () => {
 
       const remoteStore = new ClientNetworkContentAddressedStore(
         ctx.dbId,
+        "docs",
         transport,
         cryptoAdapter,
         ctx.username,

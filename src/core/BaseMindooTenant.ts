@@ -5,6 +5,7 @@ import {
   ContentAddressedStore,
   ContentAddressedStoreFactory,
   OpenStoreOptions,
+  StoreKind,
   OpenDBOptions,
   MindooTenantFactory,
   MindooTenantDirectory,
@@ -878,12 +879,16 @@ export class BaseMindooTenant implements MindooTenant {
   /**
    * Create a remote store connected to a MindooDB server, ready for sync.
    */
-  async connectToServer(serverUrl: string, dbId: string): Promise<ContentAddressedStore> {
-    console.log(`[connectToServer] Connecting to server: ${serverUrl}, db: ${dbId}`);
-    this.logger.info(`Connecting to server: ${serverUrl}, db: ${dbId}`);
+  async connectToServer(
+    serverUrl: string,
+    dbId: string,
+    storeKind: StoreKind = StoreKind.docs,
+  ): Promise<ContentAddressedStore> {
+    console.log(`[connectToServer] Connecting to server: ${serverUrl}, db: ${dbId}, storeKind: ${storeKind}`);
+    this.logger.info(`Connecting to server: ${serverUrl}, db: ${dbId}, storeKind: ${storeKind}`);
 
     const normalizedServerUrl = serverUrl.replace(/\/$/, "");
-    const cacheKey = `${normalizedServerUrl}::${dbId}`;
+    const cacheKey = `${normalizedServerUrl}::${dbId}::${storeKind}`;
     const cachedStore = this.remoteStoreCache.get(cacheKey);
     if (cachedStore) {
       this.logger.debug(`Reusing cached remote store for ${normalizedServerUrl}, db: ${dbId}`);
@@ -904,6 +909,7 @@ export class BaseMindooTenant implements MindooTenant {
           baseUrl,
           tenantId: this.tenantId,
           dbId,
+          storeKind,
         },
         this.logger.createChild("HttpTransport")
       );
@@ -917,12 +923,13 @@ export class BaseMindooTenant implements MindooTenant {
       // Create the client network store
       const store = new ClientNetworkContentAddressedStore(
         dbId,
+        storeKind,
         transport,
         this.cryptoAdapter,
         this.currentUser.username,
         signingKey,
         decryptedEncryptionKey,
-        this.logger.createChild(`ClientNetworkStore:${dbId}`)
+        this.logger.createChild(`ClientNetworkStore:${dbId}:${storeKind}`)
       );
 
       console.log(`[connectToServer] ✓ Connected to server for db "${dbId}"`);

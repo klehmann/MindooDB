@@ -36,7 +36,7 @@ import type {
   MindooTenantDirectory,
   EncryptedPrivateKey,
 } from "../core/types";
-import { DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID, StoreKind } from "../core/types";
 import type {
   AttachmentReadPlan,
   AttachmentReadPlanOptions,
@@ -94,14 +94,20 @@ function createStoreEntry(
  */
 class SharedStoreFactory implements ContentAddressedStoreFactory {
   private stores = new Map<string, InMemoryContentAddressedStore>();
+  private attachmentStores = new Map<string, InMemoryContentAddressedStore>();
 
   createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
-    let store = this.stores.get(dbId);
-    if (!store) {
-      store = new InMemoryContentAddressedStore(dbId);
-      this.stores.set(dbId, store);
+    let docStore = this.stores.get(dbId);
+    if (!docStore) {
+      docStore = new InMemoryContentAddressedStore(dbId, StoreKind.docs);
+      this.stores.set(dbId, docStore);
     }
-    return { docStore: store };
+    let attachmentStore = this.attachmentStores.get(dbId);
+    if (!attachmentStore) {
+      attachmentStore = new InMemoryContentAddressedStore(dbId, StoreKind.attachments);
+      this.attachmentStores.set(dbId, attachmentStore);
+    }
+    return { docStore, attachmentStore };
   }
 
   getStore(dbId: string): InMemoryContentAddressedStore | undefined {
@@ -659,6 +665,7 @@ describe("protocol compatibility", () => {
 
     const client = new ClientNetworkContentAddressedStore(
       "test-db",
+      StoreKind.docs,
       new OldServerTransport(),
       cryptoAdapter,
       "testuser",
@@ -752,6 +759,7 @@ describe("protocol compatibility", () => {
 
     const client = new ClientNetworkContentAddressedStore(
       "test-db",
+      StoreKind.docs,
       new AttachmentPlanningTransport(),
       cryptoAdapter,
       "testuser",

@@ -36,6 +36,7 @@ import type {
   OpenStoreOptions,
   OpenTenantOptions,
   EncryptedPrivateKey,
+  StoreKind,
 } from "../../core/types";
 import { PUBLIC_INFOS_KEY_ID } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
@@ -75,7 +76,10 @@ interface RegisterTenantResult {
 class StoreFactoryAdapter implements ContentAddressedStoreFactory {
   constructor(private storeFactory: StoreFactory) {}
   createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
-    return { docStore: this.storeFactory.getStore(dbId) };
+    return {
+      docStore: this.storeFactory.getStore(dbId, "docs" as StoreKind),
+      attachmentStore: this.storeFactory.getStore(dbId, "attachments" as StoreKind),
+    };
   }
 }
 
@@ -662,15 +666,20 @@ export class TenantManager {
   // Server stores
   // =======================================================================
 
-  async getServerStore(tenantId: string, dbId: string): Promise<ServerNetworkContentAddressedStore> {
+  async getServerStore(
+    tenantId: string,
+    dbId: string,
+    storeKind: StoreKind,
+  ): Promise<ServerNetworkContentAddressedStore> {
     const tenant = await this.getTenant(tenantId);
 
-    const cached = tenant.serverStores.get(dbId);
+    const cacheKey = `${dbId}:${storeKind}`;
+    const cached = tenant.serverStores.get(cacheKey);
     if (cached) {
       return cached;
     }
 
-    const localStore = tenant.storeFactory.getStore(dbId);
+    const localStore = tenant.storeFactory.getStore(dbId, storeKind);
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
       tenant.directory as unknown as MindooTenantDirectory,
@@ -678,15 +687,15 @@ export class TenantManager {
       this.cryptoAdapter,
     );
 
-    tenant.serverStores.set(dbId, serverStore);
-    console.log(`[TenantManager] Created server store for ${tenantId}/${dbId}`);
+    tenant.serverStores.set(cacheKey, serverStore);
+    console.log(`[TenantManager] Created server store for ${tenantId}/${dbId}/${storeKind}`);
 
     return serverStore;
   }
 
-  async getStore(tenantId: string, dbId: string): Promise<ContentAddressedStore> {
+  async getStore(tenantId: string, dbId: string, storeKind: StoreKind): Promise<ContentAddressedStore> {
     const tenant = await this.getTenant(tenantId);
-    return tenant.storeFactory.getStore(dbId);
+    return tenant.storeFactory.getStore(dbId, storeKind);
   }
 
   async getAuthService(tenantId: string): Promise<AuthenticationService> {

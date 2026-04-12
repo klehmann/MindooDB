@@ -16,6 +16,7 @@ import type {
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
 } from "../../core/appendonlystores/types";
+import { StoreKind } from "../../core/appendonlystores/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
@@ -67,6 +68,14 @@ export class HttpTransport implements NetworkTransport {
 
   getIdentity(): string {
     return this.baseUrl;
+  }
+
+  private getStoreKind(): StoreKind {
+    return this.config.storeKind ?? StoreKind.docs;
+  }
+
+  private getSyncBasePath(): string {
+    return `${this.baseUrl}/sync/${this.getStoreKind()}`;
   }
 
   /**
@@ -132,7 +141,7 @@ export class HttpTransport implements NetworkTransport {
   async getCapabilities(token: string): Promise<NetworkSyncCapabilities> {
     try {
       const response = await this.fetchWithRetry(
-        `${this.baseUrl}/sync/capabilities${this.config.dbId ? `?dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
+        `${this.getSyncBasePath()}/capabilities${this.config.dbId ? `?dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
         {
           method: "GET",
           headers: {
@@ -170,7 +179,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Finding new entries, have ${haveIds.length} IDs`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/findNewEntries`,
+      `${this.getSyncBasePath()}/findNewEntries`,
       {
         method: "POST",
         headers: {
@@ -207,7 +216,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Finding new entries for doc ${docId}, have ${haveIds.length} IDs`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/findNewEntriesForDoc`,
+      `${this.getSyncBasePath()}/findNewEntriesForDoc`,
       {
         method: "POST",
         headers: {
@@ -246,7 +255,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Finding entries of type ${type} in date range`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/findEntries`,
+      `${this.getSyncBasePath()}/findEntries`,
       {
         method: "POST",
         headers: {
@@ -286,7 +295,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Scanning entries since cursor`);
 
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/scanEntriesSince`,
+      `${this.getSyncBasePath()}/scanEntriesSince`,
       {
         method: "POST",
         headers: {
@@ -320,7 +329,7 @@ export class HttpTransport implements NetworkTransport {
    */
   async getIdBloomSummary(token: string): Promise<StoreIdBloomSummary> {
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/getIdBloomSummary`,
+      `${this.getSyncBasePath()}/getIdBloomSummary`,
       {
         method: "POST",
         headers: {
@@ -340,7 +349,7 @@ export class HttpTransport implements NetworkTransport {
 
   async getCompactionStatus(token: string): Promise<StoreCompactionStatus> {
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/getCompactionStatus`,
+      `${this.getSyncBasePath()}/getCompactionStatus`,
       {
         method: "POST",
         headers: {
@@ -364,7 +373,7 @@ export class HttpTransport implements NetworkTransport {
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationPlan> {
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/planDocumentMaterialization`,
+      `${this.getSyncBasePath()}/planDocumentMaterialization`,
       {
         method: "POST",
         headers: {
@@ -389,7 +398,7 @@ export class HttpTransport implements NetworkTransport {
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationBatchPlan> {
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/planDocumentMaterializationBatch`,
+      `${this.getSyncBasePath()}/planDocumentMaterializationBatch`,
       {
         method: "POST",
         headers: {
@@ -415,7 +424,7 @@ export class HttpTransport implements NetworkTransport {
     options: AttachmentReadPlanOptions
   ): Promise<AttachmentReadPlan> {
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/planAttachmentReadByWalkingMetadata`,
+      `${this.getSyncBasePath()}/planAttachmentReadByWalkingMetadata`,
       {
         method: "POST",
         headers: {
@@ -445,7 +454,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Getting ${ids.length} entries`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/getEntries`,
+      `${this.getSyncBasePath()}/getEntries`,
       {
         method: "POST",
         headers: {
@@ -479,7 +488,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Getting metadata for entry ${id}`);
 
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/getEntryMetadata`,
+      `${this.getSyncBasePath()}/getEntryMetadata`,
       {
         method: "POST",
         headers: {
@@ -528,7 +537,7 @@ export class HttpTransport implements NetworkTransport {
     }
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/hasEntries`,
+      `${this.getSyncBasePath()}/hasEntries`,
       {
         method: "POST",
         headers: {
@@ -557,7 +566,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Getting all entry IDs`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/getAllIds?tenantId=${encodeURIComponent(this.config.tenantId)}${this.config.dbId ? `&dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
+      `${this.getSyncBasePath()}/getAllIds?tenantId=${encodeURIComponent(this.config.tenantId)}${this.config.dbId ? `&dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
       {
         method: "GET",
         headers: {
@@ -584,7 +593,7 @@ export class HttpTransport implements NetworkTransport {
     this.logger.debug(`Resolving dependencies for ${startId}`);
     
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/sync/resolveDependencies`,
+      `${this.getSyncBasePath()}/resolveDependencies`,
       {
         method: "POST",
         headers: {
@@ -873,7 +882,7 @@ export class HttpTransport implements NetworkTransport {
     serializedEntries: SerializedEntry[],
   ): Promise<void> {
     await this.fetchWithRetry(
-      `${this.baseUrl}/sync/putEntries`,
+      `${this.getSyncBasePath()}/putEntries`,
       {
         method: "POST",
         headers: {

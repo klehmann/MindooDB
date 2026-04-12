@@ -1,6 +1,7 @@
 import type { KeyBag } from "./keys/KeyBag";
 import type { KeyType } from "./keys/KeyContext";
 import type { PublicUserId, PrivateUserId } from "./userid";
+import { StoreKind } from "./appendonlystores/types";
 import type { ContentAddressedStore, OpenStoreOptions } from "./appendonlystores/types";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
@@ -568,9 +569,10 @@ export interface MindooTenant {
    *
    * @param serverUrl The base URL of the MindooDB server (e.g. "http://localhost:3000")
    * @param dbId The database ID to connect to (e.g. "todos")
+   * @param storeKind The store kind to connect to (e.g. StoreKind.docs or StoreKind.attachments)
    * @return A ContentAddressedStore connected to the remote server
    */
-  connectToServer(serverUrl: string, dbId: string): Promise<ContentAddressedStore>;
+  connectToServer(serverUrl: string, dbId: string, storeKind?: StoreKind): Promise<ContentAddressedStore>;
 }
 
 // Re-export ContentAddressedStore and ContentAddressedStoreFactory from appendonlystores
@@ -592,6 +594,8 @@ export type {
   DocumentMaterializationPlan,
   DocumentMaterializationBatchPlan,
 } from "./appendonlystores/types";
+
+export { StoreKind } from "./appendonlystores/types";
 
 /**
  * The type of entry stored in the ContentAddressedStore.
@@ -1669,6 +1673,7 @@ export interface SyncOptions {
   onProgress?: (progress: SyncProgress) => void;
   pageSize?: number;
   signal?: AbortSignal;
+  storeKind?: StoreKind;
   /**
    * Optional network auth override for this sync call.
    *
@@ -1723,11 +1728,10 @@ export interface MindooDB {
 
   /**
    * Get the content-addressed store that is used to store attachment chunks for this database.
-   * Returns undefined if no attachment store was configured.
    *
-   * @return The content-addressed store for attachments, or undefined if not configured
+   * @return The content-addressed store for attachments
    */
-  getAttachmentStore(): ContentAddressedStore | undefined;
+  getAttachmentStore(): ContentAddressedStore;
 
   /**
    * Create a new document (unencrypted, uses tenant default encryption)

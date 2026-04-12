@@ -16,6 +16,9 @@
  * @module IndexedDBContentAddressedStore
  */
 
+import {
+  StoreKind,
+} from "../../core/appendonlystores/types";
 import type {
   AttachmentReadPlan,
   AttachmentReadPlanOptions,
@@ -60,6 +63,14 @@ const IDX_CONTENT_HASH = "by_contentHash";
 // Bloom cache key
 const BLOOM_CACHE_KEY = "current";
 const RECEIPT_ORDER_COUNTER_KEY = "receiptOrderCounter";
+
+function qualifyIndexedDbNamespace(namespace: string, storeKind: StoreKind): string {
+  const separatorIndex = namespace.indexOf("-");
+  if (separatorIndex === -1) {
+    return `${namespace}_${storeKind}`;
+  }
+  return `${namespace.slice(0, separatorIndex)}_${storeKind}${namespace.slice(separatorIndex)}`;
+}
 
 // ---------------------------------------------------------------------------
 // Browser-compatible bloom filter helpers (no Buffer dependency)
@@ -275,24 +286,31 @@ function txToPromise(tx: IDBTransaction): Promise<void> {
  */
 export class IndexedDBContentAddressedStore implements ContentAddressedStore {
   private readonly storeId: string;
+  private readonly storeKind: StoreKind;
   private readonly idbName: string;
   private readonly logger: Logger;
 
   private db: IDBDatabase | null = null;
   private openPromise: Promise<IDBDatabase> | null = null;
 
-  constructor(storeId: string, logger?: Logger, options?: OpenStoreOptions) {
+  constructor(
+    storeId: string,
+    storeKind: StoreKind = StoreKind.docs,
+    logger?: Logger,
+    options?: OpenStoreOptions,
+  ) {
     this.storeId = storeId;
+    this.storeKind = storeKind;
     this.logger =
       logger ??
       new MindooLogger(
         getDefaultLogLevel(),
-        `IndexedDBStore:${storeId}`,
+        `IndexedDBStore:${storeId}:${storeKind}`,
         true
       );
 
     const prefix = (options?.basePath as string) || "default";
-    this.idbName = `mindoodb_${prefix}_${storeId}`;
+    this.idbName = `mindoodb_${qualifyIndexedDbNamespace(prefix, storeKind)}_${storeId}`;
   }
 
   // -------------------------------------------------------------------------
@@ -419,6 +437,10 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
   getId(): string {
     return this.storeId;
+  }
+
+  getStoreKind(): StoreKind {
+    return this.storeKind;
   }
 
   getCacheIdentity(): string {

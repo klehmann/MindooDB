@@ -347,7 +347,7 @@ describe("iterateChangesSince", () => {
       const reopenedDb = new BaseMindooDB(
         tenant as any,
         db.getStore(),
-        undefined,
+        db.getAttachmentStore(),
         undefined,
         undefined,
         undefined,

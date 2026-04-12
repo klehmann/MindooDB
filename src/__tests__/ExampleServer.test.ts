@@ -479,7 +479,7 @@ describe("MindooDB Example Server", () => {
 
     test("should get all IDs from empty store", async () => {
       const { status, body } = await httpRequest(
-        `${baseUrl}/${tenantId}/sync/getAllIds?dbId=test-db`,
+        `${baseUrl}/${tenantId}/sync/docs/getAllIds?dbId=test-db`,
         "GET",
         undefined,
         { Authorization: `Bearer ${authToken}` }
@@ -491,7 +491,7 @@ describe("MindooDB Example Server", () => {
 
     test("should find no new entries in empty store", async () => {
       const { status, body } = await httpRequest(
-        `${baseUrl}/${tenantId}/sync/findNewEntries`,
+        `${baseUrl}/${tenantId}/sync/docs/findNewEntries`,
         "POST",
         { dbId: "test-db", haveIds: [] },
         { Authorization: `Bearer ${authToken}` }
@@ -503,7 +503,7 @@ describe("MindooDB Example Server", () => {
 
     test("should reject sync without auth token", async () => {
       const { status } = await httpRequest(
-        `${baseUrl}/${tenantId}/sync/getAllIds?dbId=test-db`,
+        `${baseUrl}/${tenantId}/sync/docs/getAllIds?dbId=test-db`,
         "GET"
       );
 
@@ -512,7 +512,7 @@ describe("MindooDB Example Server", () => {
 
     test("should reject sync with invalid token", async () => {
       const { status } = await httpRequest(
-        `${baseUrl}/${tenantId}/sync/getAllIds?dbId=test-db`,
+        `${baseUrl}/${tenantId}/sync/docs/getAllIds?dbId=test-db`,
         "GET",
         undefined,
         { Authorization: "Bearer invalid-token" }
@@ -763,7 +763,7 @@ describe("MindooDB Example Server", () => {
         const token = (authResponse.body as { token: string }).token;
 
         const { status, body } = await httpRequest(
-          `${baseUrl}/${tenantId}/sync/findNewEntries`,
+          `${baseUrl}/${tenantId}/sync/docs/findNewEntries`,
           "POST",
           { dbId: "../../../etc", haveIds: [] },
           { Authorization: `Bearer ${token}` }
@@ -848,7 +848,7 @@ describe("MindooDB Example Server", () => {
         });
 
         const { status, body } = await httpRequest(
-          `${baseUrl}/${tenantId}/sync/putEntries`,
+          `${baseUrl}/${tenantId}/sync/docs/putEntries`,
           "POST",
           { dbId: "test-db", entries: oversizedEntries },
           { Authorization: `Bearer ${token}` }

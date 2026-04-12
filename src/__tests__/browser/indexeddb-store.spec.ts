@@ -40,7 +40,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("basic-ops", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("basic-ops", "docs", undefined, { basePath: prefix });
 
         try {
           const entry = createTestEntry("doc1", "id1", "content1");
@@ -75,7 +75,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("empty-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("empty-test", "docs", undefined, { basePath: prefix });
 
         try {
           const retrieved = await store.getEntries(["non-existent"]);
@@ -108,7 +108,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("has-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("has-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -154,7 +154,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("allids-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("allids-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -202,7 +202,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("dedup-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("dedup-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -256,7 +256,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("noop-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("noop-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([createTestEntry("doc1", "id1", "content1")]);
@@ -296,7 +296,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("docquery-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("docquery-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -345,7 +345,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("newentries-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("newentries-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -391,7 +391,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("scan-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("scan-test", "docs", undefined, { basePath: prefix });
 
         try {
           const now = Date.now();
@@ -441,7 +441,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("scan-receipt-order-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("scan-receipt-order-test", "docs", undefined, { basePath: prefix });
 
         try {
           const now = Date.now();
@@ -488,7 +488,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("scanfilter-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("scanfilter-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -527,7 +527,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("findentries-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("findentries-test", "docs", undefined, { basePath: prefix });
 
         try {
           const now = Date.now();
@@ -586,7 +586,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("bloom-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("bloom-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -630,7 +630,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("bloom-cache-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("bloom-cache-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([createTestEntry("doc1", "id1", "c1")]);
@@ -683,7 +683,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("purge-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("purge-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -730,7 +730,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("purge-orphan-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("purge-orphan-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -784,7 +784,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("deps-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("deps-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -824,7 +824,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const store = new IndexedDBContentAddressedStore("deps-stop-test", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("deps-stop-test", "docs", undefined, { basePath: prefix });
 
         try {
           await store.putEntries([
@@ -869,8 +869,8 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-        const storeA = new IndexedDBContentAddressedStore("db-A", undefined, { basePath: prefix });
-        const storeB = new IndexedDBContentAddressedStore("db-B", undefined, { basePath: prefix });
+        const storeA = new IndexedDBContentAddressedStore("db-A", "docs", undefined, { basePath: prefix });
+        const storeB = new IndexedDBContentAddressedStore("db-B", "docs", undefined, { basePath: prefix });
 
         try {
           await storeA.putEntries([createTestEntry("doc1", "id1", "c1")]);
@@ -924,10 +924,10 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-persist-" + Date.now();
 
-        const store1 = new IndexedDBContentAddressedStore("persist-db", undefined, { basePath: prefix });
+        const store1 = new IndexedDBContentAddressedStore("persist-db", "docs", undefined, { basePath: prefix });
         await store1.putEntries([createTestEntry("doc1", "id1", "c1")]);
 
-        const store2 = new IndexedDBContentAddressedStore("persist-db", undefined, { basePath: prefix });
+        const store2 = new IndexedDBContentAddressedStore("persist-db", "docs", undefined, { basePath: prefix });
         const ids = await store2.getAllIds();
         const entries = await store2.getEntries(["id1"]);
 
@@ -966,13 +966,13 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-clear-" + Date.now();
 
-        const store = new IndexedDBContentAddressedStore("clear-db", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("clear-db", "docs", undefined, { basePath: prefix });
         await store.putEntries([createTestEntry("doc1", "id1", "c1")]);
         const beforeIds = await store.getAllIds();
 
         await store.clearAllLocalData();
 
-        const store2 = new IndexedDBContentAddressedStore("clear-db", undefined, { basePath: prefix });
+        const store2 = new IndexedDBContentAddressedStore("clear-db", "docs", undefined, { basePath: prefix });
         const afterIds = await store2.getAllIds();
         await store2.clearAllLocalData();
 
@@ -1011,7 +1011,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
 
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
-        const store = new IndexedDBContentAddressedStore("nav-db", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("nav-db", "docs", undefined, { basePath: prefix });
         await store.putEntries([
           createTestEntry("doc1", "id1", "c1"),
           createTestEntry("doc2", "id2", "c2"),
@@ -1027,7 +1027,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
       async ({ browserBundleUrl, prefix }) => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
-        const store = new IndexedDBContentAddressedStore("nav-db", undefined, { basePath: prefix });
+        const store = new IndexedDBContentAddressedStore("nav-db", "docs", undefined, { basePath: prefix });
 
         try {
           const ids = await store.getAllIds();
@@ -1085,7 +1085,7 @@ test.describe("IndexedDBContentAddressedStore", () => {
         const bundle = await import(browserBundleUrl);
         const { IndexedDBContentAddressedStore } = bundle.browserModule;
         const prefix = "test-plan-batch-" + Date.now();
-        const store = new IndexedDBContentAddressedStore("plan-batch-db", undefined, {
+        const store = new IndexedDBContentAddressedStore("plan-batch-db", "docs", undefined, {
           basePath: prefix,
         });
         const originalGetAll = IDBObjectStore.prototype.getAll;

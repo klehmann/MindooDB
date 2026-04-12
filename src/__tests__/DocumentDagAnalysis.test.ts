@@ -3,20 +3,26 @@ import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemo
 import { InMemoryContentAddressedStore } from "../core/appendonlystores/InMemoryContentAddressedStore";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
-import { DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID } from "../core/types";
+import { DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID, StoreKind } from "../core/types";
 import type { MindooDB, OpenDBOptions } from "../core/types";
 
 describe("Document DAG analysis", () => {
   class SharedInMemoryContentAddressedStoreFactory extends InMemoryContentAddressedStoreFactory {
     private stores = new Map<string, InMemoryContentAddressedStore>();
+    private attachmentStores = new Map<string, InMemoryContentAddressedStore>();
 
     override createStore(dbId: string) {
-      let store = this.stores.get(dbId);
-      if (!store) {
-        store = new InMemoryContentAddressedStore(dbId);
-        this.stores.set(dbId, store);
+      let docStore = this.stores.get(dbId);
+      if (!docStore) {
+        docStore = new InMemoryContentAddressedStore(dbId, StoreKind.docs);
+        this.stores.set(dbId, docStore);
       }
-      return { docStore: store };
+      let attachmentStore = this.attachmentStores.get(dbId);
+      if (!attachmentStore) {
+        attachmentStore = new InMemoryContentAddressedStore(dbId, StoreKind.attachments);
+        this.attachmentStores.set(dbId, attachmentStore);
+      }
+      return { docStore, attachmentStore };
     }
   }
 

@@ -15,6 +15,7 @@ import type {
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
+  StoreKind,
 } from "../../core/appendonlystores/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
@@ -43,6 +44,7 @@ import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
  */
 export class ClientNetworkContentAddressedStore implements ContentAddressedStore {
   private dbId: string;
+  private readonly storeKind: StoreKind;
   private transport: NetworkTransport;
   private rsaEncryption: RSAEncryption;
   private privateEncryptionKey: CryptoKey | string;
@@ -75,6 +77,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    */
   constructor(
     dbId: string,
+    storeKind: StoreKind,
     transport: NetworkTransport,
     cryptoAdapter: CryptoAdapter,
     username: string,
@@ -83,6 +86,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     logger?: Logger
   ) {
     this.dbId = dbId;
+    this.storeKind = storeKind;
     this.transport = transport;
     this.cryptoAdapter = cryptoAdapter;
     this.username = username;
@@ -90,7 +94,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.privateEncryptionKey = privateEncryptionKey;
     this.logger =
       logger ||
-      new MindooLogger(getDefaultLogLevel(), `ClientNetworkStore:${dbId}`, true);
+      new MindooLogger(getDefaultLogLevel(), `ClientNetworkStore:${dbId}:${storeKind}`, true);
     const rsaLogger = this.logger.createChild("RSAEncryption");
     this.rsaEncryption = new RSAEncryption(cryptoAdapter, rsaLogger);
   }
@@ -99,9 +103,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     return this.dbId;
   }
 
+  getStoreKind(): StoreKind {
+    return this.storeKind;
+  }
+
   getCacheIdentity(): string {
     const transportId = this.transport.getIdentity?.() ?? "unknown";
-    return `net:${transportId}/${this.dbId}`;
+    return `net:${transportId}/${this.dbId}/${this.storeKind}`;
   }
 
   /**

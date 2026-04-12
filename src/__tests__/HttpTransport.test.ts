@@ -70,7 +70,7 @@ describe("HttpTransport.putEntries", () => {
           headers: { "Content-Type": "application/json" },
         });
       }
-      if (url === "https://sync.example.com/tenant-a/sync/putEntries") {
+      if (url === "https://sync.example.com/tenant-a/sync/docs/putEntries") {
         return new Response(JSON.stringify({ success: true }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -95,7 +95,7 @@ describe("HttpTransport.putEntries", () => {
 
     const putEntriesCalls = fetchMock.mock.calls.filter(([input]) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      return url === "https://sync.example.com/tenant-a/sync/putEntries";
+      return url === "https://sync.example.com/tenant-a/sync/docs/putEntries";
     });
     expect(putEntriesCalls).toHaveLength(3);
     for (const [, init] of putEntriesCalls) {
@@ -117,7 +117,7 @@ describe("HttpTransport.putEntries", () => {
           headers: { "Content-Type": "application/json" },
         });
       }
-      if (url === "https://sync.example.com/tenant-a/sync/putEntries") {
+      if (url === "https://sync.example.com/tenant-a/sync/docs/putEntries") {
         const body = JSON.parse(String(init?.body)) as { entries: Array<{ id: string }> };
         if (body.entries.length > 1) {
           return new Response(JSON.stringify({ error: "Request body too large" }), {
@@ -148,7 +148,7 @@ describe("HttpTransport.putEntries", () => {
 
     const putEntriesCalls = fetchMock.mock.calls.filter(([input]) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      return url === "https://sync.example.com/tenant-a/sync/putEntries";
+      return url === "https://sync.example.com/tenant-a/sync/docs/putEntries";
     });
     expect(putEntriesCalls).toHaveLength(3);
     const batchSizes = putEntriesCalls.map(([, init]) => {

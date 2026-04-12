@@ -9,6 +9,7 @@ import { InMemoryContentAddressedStoreFactory } from "../../../appendonlystores/
 import { ClientNetworkContentAddressedStore } from "../../../appendonlystores/network/ClientNetworkContentAddressedStore";
 import { HttpTransport } from "../../../appendonlystores/network/HttpTransport";
 import { BaseMindooTenantFactory } from "../../../core/BaseMindooTenantFactory";
+import { StoreKind } from "../../../core/appendonlystores/types";
 import type { PrivateUserId } from "../../../core/userid";
 import { decryptPrivateKey } from "../../../core/crypto/privateKeyEncryption";
 import { NodeCryptoAdapter } from "../../../node/crypto/NodeCryptoAdapter";
@@ -158,6 +159,7 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
   await directoryDb.syncStoreChanges();
   const remote = new ClientNetworkContentAddressedStore(
     "directory",
+    StoreKind.docs,
     new HttpTransport({
       baseUrl: `${baseUrl}/api/${tenantId}`,
       tenantId,
