@@ -995,6 +995,12 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  private static setSyncAbortSignalOnStore(store: ContentAddressedStore, signal?: AbortSignal): void {
+    if ('setSyncAbortSignal' in store && typeof (store as any).setSyncAbortSignal === 'function') {
+      (store as any).setSyncAbortSignal(signal);
+    }
+  }
+
   /**
    * From a list of candidate IDs, return only those the target store is
    * missing.  Uses bloom-filter pre-screening when available, then falls
@@ -1034,14 +1040,36 @@ export class BaseMindooDB implements MindooDB {
     targetStore: ContentAddressedStore,
     options?: SyncOptions
   ): Promise<{ transferred: number; scanned: number; cancelled: boolean }> {
-    if (options?.mode === "dense") {
-      return this.syncEntriesFromStoreDense(sourceStore, targetStore, options);
+    const signal = options?.signal;
+    BaseMindooDB.setSyncAbortSignalOnStore(sourceStore, signal);
+    BaseMindooDB.setSyncAbortSignalOnStore(targetStore, signal);
+    try {
+      if (options?.mode === "dense") {
+        return await this.syncEntriesFromStoreDense(sourceStore, targetStore, options);
+      }
+      return await this.syncEntriesFromStoreImpl(sourceStore, targetStore, options);
+    } catch (error) {
+      if (signal?.aborted) {
+        this.logger.info("Sync cancelled by abort signal");
+        return { transferred: 0, scanned: 0, cancelled: true };
+      }
+      throw error;
+    } finally {
+      BaseMindooDB.setSyncAbortSignalOnStore(sourceStore, undefined);
+      BaseMindooDB.setSyncAbortSignalOnStore(targetStore, undefined);
     }
+  }
 
+  private async syncEntriesFromStoreImpl(
+    sourceStore: ContentAddressedStore,
+    targetStore: ContentAddressedStore,
+    options?: SyncOptions
+  ): Promise<{ transferred: number; scanned: number; cancelled: boolean }> {
     let transferred = 0;
     let scanned = 0;
     const onProgress = options?.onProgress;
     const pageSize = options?.pageSize ?? 1000;
+    const signal = options?.signal;
 
     const targetBloom = await this.getTargetBloomSummary(targetStore);
     const totalSourceEstimate = targetBloom?.totalIds;
@@ -1058,13 +1086,17 @@ export class BaseMindooDB implements MindooDB {
       let cursor: StoreScanCursor | null = null;
       let currentPage = 0;
       while (true) {
-        if (options?.signal?.aborted) {
+        if (signal?.aborted) {
           return { transferred, scanned, cancelled: true };
         }
 
         const page = await sourceStore.scanEntriesSince!(cursor, pageSize);
         currentPage++;
         scanned += page.entries.length;
+
+        if (signal?.aborted) {
+          return { transferred, scanned, cancelled: true };
+        }
 
         if (page.entries.length > 0) {
           onProgress?.({
@@ -1079,6 +1111,10 @@ export class BaseMindooDB implements MindooDB {
           const ids = page.entries.map((m) => m.id);
           const missingIds = await this.filterMissingIds(targetStore, ids, targetBloom);
 
+          if (signal?.aborted) {
+            return { transferred, scanned, cancelled: true };
+          }
+
           if (missingIds.length > 0) {
             onProgress?.({
               phase: 'transferring',
@@ -1090,6 +1126,9 @@ export class BaseMindooDB implements MindooDB {
             });
 
             const missingEntries = await sourceStore.getEntries(missingIds);
+            if (signal?.aborted) {
+              return { transferred, scanned, cancelled: true };
+            }
             await targetStore.putEntries(missingEntries);
             transferred += missingEntries.length;
           }

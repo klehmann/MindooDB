@@ -63,6 +63,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     signingKey: CryptoKey;
     privateEncryptionKey?: CryptoKey | string;
   } | null = null;
+  private _syncAbortSignal?: AbortSignal;
 
   /**
    * Create a new ClientNetworkContentAddressedStore.
@@ -110,6 +111,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   getCacheIdentity(): string {
     const transportId = this.transport.getIdentity?.() ?? "unknown";
     return `net:${transportId}/${this.dbId}/${this.storeKind}`;
+  }
+
+  setSyncAbortSignal(signal?: AbortSignal): void {
+    this._syncAbortSignal = signal;
+    if ('setSyncAbortSignal' in this.transport) {
+      (this.transport as { setSyncAbortSignal(signal?: AbortSignal): void }).setSyncAbortSignal(signal);
+    }
   }
 
   /**

@@ -46,6 +46,7 @@ export class HttpTransport implements NetworkTransport {
   private baseUrl: string;
   private logger: Logger;
   private remoteJsonBodyLimitBytesPromise: Promise<number | null> | null = null;
+  private _syncAbortSignal?: AbortSignal;
 
   constructor(config: NetworkTransportConfig, logger?: Logger) {
     this.config = {
@@ -68,6 +69,10 @@ export class HttpTransport implements NetworkTransport {
 
   getIdentity(): string {
     return this.baseUrl;
+  }
+
+  setSyncAbortSignal(signal?: AbortSignal): void {
+    this._syncAbortSignal = signal;
   }
 
   private getStoreKind(): StoreKind {
@@ -626,15 +631,26 @@ export class HttpTransport implements NetworkTransport {
     let lastError: Error | null = null;
     const attempts = this.config.retryAttempts || 3;
     const baseDelay = this.config.retryDelayMs || 1000;
+    const externalSignal = this._syncAbortSignal;
     
     for (let attempt = 0; attempt < attempts; attempt++) {
+      if (externalSignal?.aborted) {
+        throw new NetworkError(NetworkErrorType.SERVER_ERROR, "Sync cancelled");
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(
+        () => controller.abort(),
+        this.config.timeout || 30000
+      );
+
+      let onExternalAbort: (() => void) | undefined;
+      if (externalSignal && !externalSignal.aborted) {
+        onExternalAbort = () => controller.abort();
+        externalSignal.addEventListener('abort', onExternalAbort);
+      }
+
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(
-          () => controller.abort(),
-          this.config.timeout || 30000
-        );
-        
         const response = await fetch(url, {
           ...options,
           signal: controller.signal,
@@ -677,6 +693,11 @@ export class HttpTransport implements NetworkTransport {
         
         return response;
       } catch (error) {
+        if (externalSignal?.aborted) {
+          clearTimeout(timeoutId);
+          throw new NetworkError(NetworkErrorType.SERVER_ERROR, "Sync cancelled");
+        }
+
         lastError = error as Error;
         
         // Don't retry for certain error types
@@ -702,6 +723,11 @@ export class HttpTransport implements NetworkTransport {
         if (attempt < attempts - 1) {
           const delay = baseDelay * Math.pow(2, attempt);
           await this.sleep(delay);
+        }
+      } finally {
+        clearTimeout(timeoutId);
+        if (onExternalAbort) {
+          externalSignal!.removeEventListener('abort', onExternalAbort);
         }
       }
     }
