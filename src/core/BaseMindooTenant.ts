@@ -677,6 +677,9 @@ export class BaseMindooTenant implements MindooTenant {
     if (options.serverUrl) {
       joinResponse.serverUrl = options.serverUrl;
     }
+    if (options.adminUsername) {
+      joinResponse.adminUsername = options.adminUsername;
+    }
 
     console.log(`[approveJoinRequest] ✓ Join request approved for user "${request.username}"`);
     this.logger.info(`Join request approved for user: ${request.username}`);

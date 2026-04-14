@@ -55,7 +55,9 @@ function validateAttachmentChunkMetadata(
   id: string,
 ): StoreEntryMetadata {
   if (!metadata) {
-    throw new Error(`Attachment chunk ${id} not found in store`);
+    throw new Error(
+      `Attachment chunk ${id} not found in store. The document metadata exists, but the attachment payload may not be synced locally yet.`,
+    );
   }
   if (metadata.entryType !== "attachment_chunk") {
     throw new Error(`Entry ${id} is not an attachment chunk`);

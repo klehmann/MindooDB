@@ -190,6 +190,8 @@ export interface ApproveJoinRequestOptions {
   sharePassword: string;
   /** Optional server URL to include in the response so the joining user knows where to sync */
   serverUrl?: string;
+  /** Optional admin username to include in the response so the joining user can display it */
+  adminUsername?: string;
   /** If "uri", approveJoinRequest returns a mdb://join-response/... URI string instead of an object */
   format?: "object" | "uri";
 }
@@ -212,6 +214,8 @@ export interface JoinResponse {
   adminEncryptionPublicKey: string;
   /** Optional server URL for sync */
   serverUrl?: string;
+  /** Optional admin username for display purposes */
+  adminUsername?: string;
   /** Tenant symmetric key, encrypted with the sharePassword */
   encryptedTenantKey: EncryptedPrivateKey;
   /** $publicinfos symmetric key, encrypted with the sharePassword */

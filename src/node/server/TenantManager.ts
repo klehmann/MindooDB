@@ -18,7 +18,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from "fs";
-import { join } from "path";
+import { join, resolve, sep } from "path";
 
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
@@ -386,6 +386,19 @@ export class TenantManager {
       .join(":");
   }
 
+  private resolveTenantDir(tenantId: string): string {
+    const baseDir = resolve(this.dataDir);
+    const tenantDir = resolve(baseDir, tenantId);
+    if (tenantDir !== baseDir && !tenantDir.startsWith(`${baseDir}${sep}`)) {
+      throw new Error(`Resolved tenant path escapes data directory for tenantId "${tenantId}"`);
+    }
+    return tenantDir;
+  }
+
+  private resolveTenantConfigPath(tenantId: string): string {
+    return join(this.resolveTenantDir(tenantId), "config.json");
+  }
+
   private async decryptEncryptedPublicInfosKey(base64Payload: string): Promise<Uint8Array> {
     if (!this.serverIdentity) {
       throw new Error("Server identity not initialized; cannot decrypt encrypted $publicinfos payload");
@@ -448,7 +461,7 @@ export class TenantManager {
 
   async listTenantPublicInfosFingerprints(tenantId: string): Promise<string[]> {
     const normalizedId = tenantId.toLowerCase();
-    const configPath = join(this.dataDir, normalizedId, "config.json");
+    const configPath = this.resolveTenantConfigPath(normalizedId);
     if (!existsSync(configPath)) {
       throw new Error(`Tenant ${normalizedId} not found`);
     }
@@ -464,8 +477,8 @@ export class TenantManager {
 
   async registerTenant(request: RegisterTenantRequest): Promise<RegisterTenantResult> {
     const tenantId = request.tenantId.toLowerCase();
-    const tenantDir = join(this.dataDir, tenantId);
-    const configPath = join(tenantDir, "config.json");
+    const tenantDir = this.resolveTenantDir(tenantId);
+    const configPath = this.resolveTenantConfigPath(tenantId);
     if (!this.serverIdentity || !this.serverPassword) {
       throw new Error("Tenant registration requires an unlocked server identity to store $publicinfos keys");
     }
@@ -529,8 +542,7 @@ export class TenantManager {
 
   tenantExists(tenantId: string): boolean {
     const normalizedId = tenantId.toLowerCase();
-    const tenantDir = join(this.dataDir, normalizedId);
-    const configPath = join(tenantDir, "config.json");
+    const configPath = this.resolveTenantConfigPath(normalizedId);
     return existsSync(configPath);
   }
 
@@ -563,7 +575,7 @@ export class TenantManager {
     updates: Partial<Pick<TenantConfig, "defaultStoreType" | "remoteServers">>,
   ): void {
     const normalizedId = tenantId.toLowerCase();
-    const configPath = join(this.dataDir, normalizedId, "config.json");
+    const configPath = this.resolveTenantConfigPath(normalizedId);
     if (!existsSync(configPath)) {
       throw new Error(`Tenant ${normalizedId} not found`);
     }
@@ -583,7 +595,7 @@ export class TenantManager {
 
   async removeTenant(tenantId: string): Promise<void> {
     const normalizedId = tenantId.toLowerCase();
-    const tenantDir = join(this.dataDir, normalizedId);
+    const tenantDir = this.resolveTenantDir(normalizedId);
 
     if (!existsSync(tenantDir)) {
       throw new Error(`Tenant ${normalizedId} does not exist`);
@@ -606,7 +618,7 @@ export class TenantManager {
 
   getTenantSyncServers(tenantId: string): NamedRemoteServerConfig[] {
     const normalizedId = tenantId.toLowerCase();
-    const configPath = join(this.dataDir, normalizedId, "config.json");
+    const configPath = this.resolveTenantConfigPath(normalizedId);
     if (!existsSync(configPath)) {
       throw new Error(`Tenant ${normalizedId} not found`);
     }
@@ -616,7 +628,7 @@ export class TenantManager {
 
   addTenantSyncServer(tenantId: string, server: NamedRemoteServerConfig): void {
     const normalizedId = tenantId.toLowerCase();
-    const configPath = join(this.dataDir, normalizedId, "config.json");
+    const configPath = this.resolveTenantConfigPath(normalizedId);
     if (!existsSync(configPath)) {
       throw new Error(`Tenant ${normalizedId} not found`);
     }
@@ -641,7 +653,7 @@ export class TenantManager {
 
   removeTenantSyncServer(tenantId: string, serverName: string): boolean {
     const normalizedId = tenantId.toLowerCase();
-    const configPath = join(this.dataDir, normalizedId, "config.json");
+    const configPath = this.resolveTenantConfigPath(normalizedId);
     if (!existsSync(configPath)) {
       throw new Error(`Tenant ${normalizedId} not found`);
     }
@@ -723,8 +735,7 @@ export class TenantManager {
   // -----------------------------------------------------------------------
 
   private async loadTenant(tenantId: string): Promise<LoadedTenant> {
-    const tenantDir = join(this.dataDir, tenantId);
-    const configPath = join(tenantDir, "config.json");
+    const configPath = this.resolveTenantConfigPath(tenantId);
 
     if (!existsSync(configPath)) {
       throw new Error(`Tenant ${tenantId} not found: ${configPath}`);

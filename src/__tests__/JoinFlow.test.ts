@@ -311,4 +311,85 @@ describe("Join Flow (convenience API)", () => {
       ).rejects.toThrow(/expected a JoinResponse/);
     }, 30000);
   });
+
+  describe("adminUsername in join response", () => {
+    it("should include adminUsername when provided", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+
+      const result = await localFactory.createTenant({
+        tenantId: "test-admin-username",
+        adminName: "cn=admin/o=test",
+        adminPassword,
+        userName: "cn=alice/o=test",
+        userPassword: user1Password,
+      });
+
+      const user = await localFactory.createUserId("cn=bob/o=test", user2Password);
+      const joinRequest = localFactory.createJoinRequest(user);
+
+      const response = await result.tenant.approveJoinRequest(joinRequest, {
+        adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+        sharePassword,
+        adminUsername: "cn=admin/o=test",
+      });
+
+      expect(response.adminUsername).toBe("cn=admin/o=test");
+    }, 30000);
+
+    it("should omit adminUsername when not provided", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+
+      const result = await localFactory.createTenant({
+        tenantId: "test-no-admin-username",
+        adminName: "cn=admin/o=test",
+        adminPassword,
+        userName: "cn=alice/o=test",
+        userPassword: user1Password,
+      });
+
+      const user = await localFactory.createUserId("cn=bob/o=test", user2Password);
+      const joinRequest = localFactory.createJoinRequest(user);
+
+      const response = await result.tenant.approveJoinRequest(joinRequest, {
+        adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+        sharePassword,
+      });
+
+      expect(response.adminUsername).toBeUndefined();
+    }, 30000);
+
+    it("should round-trip adminUsername through URI encoding", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+
+      const result = await localFactory.createTenant({
+        tenantId: "test-admin-uri-rt",
+        adminName: "cn=admin/o=test",
+        adminPassword,
+        userName: "cn=alice/o=test",
+        userPassword: user1Password,
+      });
+
+      const user = await localFactory.createUserId("cn=bob/o=test", user2Password);
+      const joinRequestURI = localFactory.createJoinRequest(user, { format: "uri" });
+
+      const joinResponseURI = await result.tenant.approveJoinRequest(joinRequestURI, {
+        adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+        sharePassword,
+        adminUsername: "cn=admin/o=test",
+        format: "uri",
+      });
+
+      expect(typeof joinResponseURI).toBe("string");
+      expect(joinResponseURI).toMatch(/^mdb:\/\/join-response\//);
+
+      const decoded = decodeMindooURI<JoinResponse>(joinResponseURI);
+      expect(decoded.payload.adminUsername).toBe("cn=admin/o=test");
+    }, 30000);
+  });
 });

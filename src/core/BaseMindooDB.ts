@@ -4100,10 +4100,10 @@ export class BaseMindooDB implements MindooDB {
   /**
    * Get an attachment reference by ID from a document's _attachments array.
    */
-  private getAttachmentRefInternal(docId: string, attachmentId: string): AttachmentReference {
-    const internalDoc = this.getCachedDocument(docId);
+  private async getAttachmentRefInternal(docId: string, attachmentId: string): Promise<AttachmentReference> {
+    const internalDoc = this.getCachedDocument(docId) ?? await this.loadDocumentInternal(docId);
     if (!internalDoc) {
-      throw new Error(`Document ${docId} not found in cache`);
+      throw new Error(`Document ${docId} not found while reading attachment ${attachmentId}`);
     }
     const payload = internalDoc.doc as unknown as MindooDocPayload;
     const attachments = (payload._attachments as AttachmentReference[]) || [];
@@ -4176,7 +4176,7 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<Uint8Array> {
     this.logger.debug(`Getting attachment ${attachmentId} from document ${docId}`);
     
-    const ref = this.getAttachmentRefInternal(docId, attachmentId);
+    const ref = await this.getAttachmentRefInternal(docId, attachmentId);
     const store = this.getEffectiveAttachmentStore();
     
     // Resolve dependency chain to get all chunk IDs in order (oldest first)
@@ -4223,7 +4223,7 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`Invalid byte range: [${startByte}, ${endByte})`);
     }
     
-    const ref = this.getAttachmentRefInternal(docId, attachmentId);
+    const ref = await this.getAttachmentRefInternal(docId, attachmentId);
     const store = this.getEffectiveAttachmentStore();
     const readPlan = await this.planAttachmentRead(store, ref, startByte, endByte);
     const neededChunkIds = readPlan.chunkPlans.map((chunkPlan) => chunkPlan.id);
@@ -4266,7 +4266,7 @@ export class BaseMindooDB implements MindooDB {
   ): AsyncGenerator<Uint8Array, void, unknown> {
     this.logger.debug(`Streaming attachment ${attachmentId} from offset ${startOffset}`);
     
-    const ref = this.getAttachmentRefInternal(docId, attachmentId);
+    const ref = await this.getAttachmentRefInternal(docId, attachmentId);
     if (startOffset < 0 || startOffset > ref.size) {
       throw new Error(`Invalid stream offset ${startOffset} for attachment size ${ref.size}`);
     }
@@ -4281,7 +4281,9 @@ export class BaseMindooDB implements MindooDB {
       const chunkPlan = readPlan.chunkPlans[i];
       const [chunk] = await store.getEntries([chunkPlan.id]);
       if (!chunk) {
-        throw new Error(`Attachment chunk ${chunkPlan.id} not found in store`);
+        throw new Error(
+          `Attachment chunk ${chunkPlan.id} not found in store. The document metadata exists, but the attachment payload may not be synced locally yet.`,
+        );
       }
       const plaintext = await this.decryptAttachmentChunk(chunk);
 

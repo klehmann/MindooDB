@@ -824,6 +824,12 @@ describe("System Admin Security", () => {
       expect(body).toMatchObject({ success: true, tenantId: "crud-test" });
     });
 
+    test("TenantManager rejects tenant paths that escape the data directory", async () => {
+      expect(() => {
+        setup.server.getTenantManager().updateTenantConfig("../escape", {});
+      }).toThrow('Resolved tenant path escapes data directory for tenantId "../escape"');
+    });
+
     test("tenant registration stores $publicinfos in the server keybag, not config.json", async () => {
       const fs = await import("fs");
       const path = await import("path");

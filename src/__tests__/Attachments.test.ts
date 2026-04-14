@@ -180,6 +180,24 @@ describe("Attachments", () => {
       expect(retrievedData).toEqual(testData);
     }, 30000);
 
+    it("reloads the document when attachment reads outlive the document cache", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      let attachmentId: string | undefined;
+
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      const reloadedDoc = await db.getDocument(doc.getId());
+      (db as any).docCache.clear();
+
+      const retrievedData = await reloadedDoc.getAttachment(attachmentId!);
+
+      expect(retrievedData).toEqual(testData);
+    }, 30000);
+
     it("should throw error for non-existent attachment", async () => {
       const doc = await db.createDocument();
       
@@ -255,6 +273,28 @@ describe("Attachments", () => {
       expect(rangeData).toEqual(testData.slice(820, 960));
       expect(resolveSpy).not.toHaveBeenCalled();
       expect(metadataSpy).toHaveBeenCalled();
+    }, 30000);
+
+    it("explains when attachment payload chunks are not synced locally yet", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000);
+      for (let i = 0; i < testData.length; i++) {
+        testData[i] = i % 256;
+      }
+      let attachmentId: string | undefined;
+
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const attachmentRef = reloadedDoc.getAttachments()[0]!;
+      const attachmentStore = db.getAttachmentStore() as any;
+      attachmentStore.entries.delete(attachmentRef.lastChunkId);
+
+      await expect(reloadedDoc.getAttachmentRange(attachmentId!, 820, 960))
+        .rejects.toThrow("attachment payload may not be synced locally yet");
     }, 30000);
 
     it("keeps range reads correct when chunkSizeBytes changes between write and read", async () => {
