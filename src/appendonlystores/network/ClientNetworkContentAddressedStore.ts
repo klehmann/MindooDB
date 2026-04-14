@@ -120,6 +120,14 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     }
   }
 
+  private throwIfSyncAborted(): void {
+    if (this._syncAbortSignal?.aborted) {
+      const error = new Error("Sync cancelled");
+      error.name = "AbortError";
+      throw error;
+    }
+  }
+
   /**
    * Store entries to the remote store.
    * The entries are pushed to the server immediately.
@@ -150,11 +158,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
 
     return this.withTransparentReauth("getEntries", async () => {
       this.logger.debug(`Getting ${ids.length} entries from remote`);
+      this.throwIfSyncAborted();
       const token = await this.ensureAuthenticated();
       const encryptedEntries = await this.transport.getEntries(token, ids);
       this.logger.debug(`Received ${encryptedEntries.length} encrypted entries from remote`);
 
       // Decrypt the RSA layer for each entry
+      this.throwIfSyncAborted();
       const entries = await this.decryptNetworkEntries(encryptedEntries);
       this.logger.debug(`Decrypted ${entries.length} entries`);
 
@@ -570,6 +580,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     const results: StoreEntry[] = [];
     
     for (const enc of encryptedEntries) {
+      this.throwIfSyncAborted();
       // Decrypt the RSA layer to get the original symmetric-encrypted payload
       const encryptedData = await this.rsaEncryption.decrypt(
         enc.rsaEncryptedPayload,

@@ -1035,6 +1035,116 @@ export class BaseMindooDB implements MindooDB {
     return missingIds;
   }
 
+  /**
+   * Determine how many entry IDs to fetch per `getEntries` call during sync.
+   *
+   * This is intentionally separate from the metadata scan `pageSize` so that
+   * scanning can page through large ID lists quickly while the heavier
+   * payload downloads use a smaller batch to keep progress responsive and
+   * cancellation timely.
+   *
+   * Priority: explicit option > attachment default (100) > pageSize fallback.
+   */
+  private resolveTransferBatchSize(options?: SyncOptions): number {
+    if (options?.transferBatchSize && options.transferBatchSize > 0) {
+      return options.transferBatchSize;
+    }
+    if (options?.storeKind === StoreKind.attachments) {
+      return 100;
+    }
+    return options?.pageSize ?? 1000;
+  }
+
+  /**
+   * Transfer a set of entry IDs from source to target in fixed-size batches,
+   * emitting progress and checking for cancellation between each batch.
+   *
+   * Callers (cursor-scan path and legacy path) collect the IDs that need
+   * transferring, then delegate to this method instead of issuing one
+   * monolithic `getEntries`.  This gives three benefits:
+   *
+   * 1. The UI receives frequent progress updates with batch metadata so long
+   *    transfers no longer look frozen.
+   * 2. Cancellation can interrupt work between batches rather than waiting
+   *    for one large HTTP response to complete.
+   * 3. Each server-side `getEntries` + RSA encryption unit is smaller,
+   *    reducing the risk of socket timeouts on large payloads.
+   *
+   * Returns partial progress on cancellation so callers can report how much
+   * was actually transferred before the abort.
+   */
+  private async transferEntriesInBatches(
+    sourceStore: ContentAddressedStore,
+    targetStore: ContentAddressedStore,
+    entryIds: string[],
+    options: SyncOptions | undefined,
+    state: {
+      transferred: number;
+      scanned: number;
+      totalSourceEntries?: number;
+      currentPage?: number;
+    },
+  ): Promise<{ transferred: number; cancelled: boolean }> {
+    if (entryIds.length === 0) {
+      return { transferred: state.transferred, cancelled: false };
+    }
+
+    const onProgress = options?.onProgress;
+    const signal = options?.signal;
+    const transferBatchSize = this.resolveTransferBatchSize(options);
+    const totalTransferBatches = Math.max(1, Math.ceil(entryIds.length / transferBatchSize));
+    let transferred = state.transferred;
+
+    for (let offset = 0; offset < entryIds.length; offset += transferBatchSize) {
+      if (signal?.aborted) {
+        return { transferred, cancelled: true };
+      }
+
+      const currentTransferBatch = Math.floor(offset / transferBatchSize) + 1;
+      const batchIds = entryIds.slice(offset, offset + transferBatchSize);
+      const pageSummary = state.currentPage ? `page ${state.currentPage}, ` : "";
+      onProgress?.({
+        phase: "transferring",
+        message: `Transferring batch ${currentTransferBatch}/${totalTransferBatches} (${batchIds.length} entries, ${pageSummary}scanned ${state.scanned})...`,
+        transferredEntries: transferred,
+        scannedEntries: state.scanned,
+        totalSourceEntries: state.totalSourceEntries,
+        currentPage: state.currentPage,
+        currentTransferBatch,
+        totalTransferBatches,
+        transferBatchSize,
+      });
+
+      try {
+        const batchEntries = await sourceStore.getEntries(batchIds);
+        if (signal?.aborted) {
+          return { transferred, cancelled: true };
+        }
+        await targetStore.putEntries(batchEntries);
+        transferred += batchEntries.length;
+      } catch (error) {
+        if (signal?.aborted) {
+          return { transferred, cancelled: true };
+        }
+        throw error;
+      }
+
+      onProgress?.({
+        phase: "transferring",
+        message: `Transferred ${transferred} entries after batch ${currentTransferBatch}/${totalTransferBatches}`,
+        transferredEntries: transferred,
+        scannedEntries: state.scanned,
+        totalSourceEntries: state.totalSourceEntries,
+        currentPage: state.currentPage,
+        currentTransferBatch,
+        totalTransferBatches,
+        transferBatchSize,
+      });
+    }
+
+    return { transferred, cancelled: false };
+  }
+
   private async syncEntriesFromStore(
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
@@ -1116,21 +1226,22 @@ export class BaseMindooDB implements MindooDB {
           }
 
           if (missingIds.length > 0) {
-            onProgress?.({
-              phase: 'transferring',
-              message: `Transferring ${missingIds.length} entries (page ${currentPage}, scanned ${scanned})...`,
-              transferredEntries: transferred,
-              scannedEntries: scanned,
-              totalSourceEntries: totalSourceEstimate,
-              currentPage,
-            });
-
-            const missingEntries = await sourceStore.getEntries(missingIds);
-            if (signal?.aborted) {
+            const transferResult = await this.transferEntriesInBatches(
+              sourceStore,
+              targetStore,
+              missingIds,
+              options,
+              {
+                transferred,
+                scanned,
+                totalSourceEntries: totalSourceEstimate,
+                currentPage,
+              },
+            );
+            transferred = transferResult.transferred;
+            if (transferResult.cancelled) {
               return { transferred, scanned, cancelled: true };
             }
-            await targetStore.putEntries(missingEntries);
-            transferred += missingEntries.length;
           }
         }
 
@@ -1171,24 +1282,37 @@ export class BaseMindooDB implements MindooDB {
     onProgress?.({
       phase: 'transferring',
       message: `Transferring ${sourceNewMetadata.length} entries...`,
-      transferredEntries: 0,
+      transferredEntries: transferred,
       scannedEntries: sourceNewMetadata.length,
       totalSourceEntries: sourceNewMetadata.length,
     });
 
-    const sourceEntries = await sourceStore.getEntries(sourceNewMetadata.map((m) => m.id));
-    await targetStore.putEntries(sourceEntries);
+    const transferResult = await this.transferEntriesInBatches(
+      sourceStore,
+      targetStore,
+      sourceNewMetadata.map((m) => m.id),
+      options,
+      {
+        transferred,
+        scanned: sourceNewMetadata.length,
+        totalSourceEntries: sourceNewMetadata.length,
+      },
+    );
+    transferred = transferResult.transferred;
+    if (transferResult.cancelled) {
+      return { transferred, scanned: sourceNewMetadata.length, cancelled: true };
+    }
 
     onProgress?.({
       phase: 'transferring',
-      message: `Transferred ${sourceEntries.length} entries`,
-      transferredEntries: sourceEntries.length,
+      message: `Transferred ${transferred} entries`,
+      transferredEntries: transferred,
       scannedEntries: sourceNewMetadata.length,
       totalSourceEntries: sourceNewMetadata.length,
     });
 
     return {
-      transferred: sourceEntries.length,
+      transferred,
       scanned: sourceNewMetadata.length,
       cancelled: false,
     };
@@ -4711,13 +4835,29 @@ export class BaseMindooDB implements MindooDB {
         phase: 'processing',
         message: `Processing ${syncResult.transferred} new entries...`,
         transferredEntries: syncResult.transferred,
-        scannedEntries: syncResult.transferred,
+        scannedEntries: syncResult.scanned,
       });
 
       // Sync the local store to process the new entries
       // This will update the index, cache, and processedEntryIds
+      if (options?.signal?.aborted) {
+        this.logger.info(`Pull cancelled before local processing after transferring ${syncResult.transferred} entries`);
+        return {
+          transferredEntries: syncResult.transferred,
+          scannedEntries: syncResult.scanned,
+          cancelled: true,
+        };
+      }
       if (storeKind === StoreKind.docs) {
         await this.syncStoreChanges();
+      }
+      if (options?.signal?.aborted) {
+        this.logger.info(`Pull cancelled after local processing for ${storeKind} entries`);
+        return {
+          transferredEntries: syncResult.transferred,
+          scannedEntries: syncResult.scanned,
+          cancelled: true,
+        };
       }
       
       this.logger.info(`Pull complete, synced ${syncResult.transferred} entries`);
@@ -4726,7 +4866,7 @@ export class BaseMindooDB implements MindooDB {
         phase: 'complete',
         message: `Pull complete: ${syncResult.transferred} ${storeKind} entries synced`,
         transferredEntries: syncResult.transferred,
-        scannedEntries: syncResult.transferred,
+        scannedEntries: syncResult.scanned,
       });
 
       return {
@@ -4788,7 +4928,7 @@ export class BaseMindooDB implements MindooDB {
         phase: 'complete',
         message: `Push complete: ${syncResult.transferred} entries transferred`,
         transferredEntries: syncResult.transferred,
-        scannedEntries: syncResult.transferred,
+        scannedEntries: syncResult.scanned,
       });
 
       return {

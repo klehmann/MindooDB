@@ -117,6 +117,7 @@ interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
 
 const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_SYNC_RATE_LIMIT_MAX = 1_000;
+const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
 
 function parseBodySizeLimitToBytes(limit: string): number | null {
   const normalized = limit.trim().toLowerCase();
@@ -221,7 +222,7 @@ export class MindooDBServer {
       console.log(`[MindooDBServer] Listening on port ${port}`);
     });
 
-    server.setTimeout(30_000);
+    server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
   }
 
   listenTls(port: number, certPath: string, keyPath: string): void {
@@ -234,7 +235,7 @@ export class MindooDBServer {
       console.log(`[MindooDBServer] Listening on HTTPS port ${port}`);
     });
 
-    server.setTimeout(30_000);
+    server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
   }
 
   private setupMiddleware(): void {

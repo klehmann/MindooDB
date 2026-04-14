@@ -1650,12 +1650,24 @@ export interface DocumentDagBranchMaterializationResult {
  * Progress information emitted during pull/push sync operations.
  */
 export interface SyncProgress {
+  /** Current lifecycle stage of the sync operation. */
   phase: 'preparing' | 'planning' | 'transferring' | 'processing' | 'complete';
+  /** Human-readable status description suitable for display in a UI. */
   message: string;
+  /** Cumulative number of entries successfully written to the target store so far. */
   transferredEntries: number;
+  /** Cumulative number of source entries whose metadata has been examined. */
   scannedEntries: number;
+  /** Estimated total entry count on the source, when known (e.g. from a bloom summary). */
   totalSourceEntries?: number;
+  /** 1-based index of the current metadata scan page (set during cursor-based scanning). */
   currentPage?: number;
+  /** 1-based index of the current transfer batch within the active scan page or legacy transfer. */
+  currentTransferBatch?: number;
+  /** Total number of transfer batches planned for the current set of missing IDs. */
+  totalTransferBatches?: number;
+  /** Number of entry IDs fetched per `getEntries` call in this transfer run. */
+  transferBatchSize?: number;
 }
 
 /**
@@ -1676,6 +1688,7 @@ export type SyncMode = "full" | "dense";
 export interface SyncOptions {
   onProgress?: (progress: SyncProgress) => void;
   pageSize?: number;
+  transferBatchSize?: number;
   signal?: AbortSignal;
   storeKind?: StoreKind;
   /**

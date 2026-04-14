@@ -42,6 +42,7 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
  * - GET /sync/getAllIds - Get all entry IDs from the server
  */
 export class HttpTransport implements NetworkTransport {
+  private static readonly DEFAULT_TIMEOUT_MS = 120_000;
   private config: NetworkTransportConfig;
   private baseUrl: string;
   private logger: Logger;
@@ -50,7 +51,7 @@ export class HttpTransport implements NetworkTransport {
 
   constructor(config: NetworkTransportConfig, logger?: Logger) {
     this.config = {
-      timeout: 30000,
+      timeout: HttpTransport.DEFAULT_TIMEOUT_MS,
       retryAttempts: 3,
       retryDelayMs: 1000,
       ...config,
@@ -641,7 +642,7 @@ export class HttpTransport implements NetworkTransport {
       const controller = new AbortController();
       const timeoutId = setTimeout(
         () => controller.abort(),
-        this.config.timeout || 30000
+        this.config.timeout || HttpTransport.DEFAULT_TIMEOUT_MS
       );
 
       let onExternalAbort: (() => void) | undefined;
@@ -753,7 +754,7 @@ export class HttpTransport implements NetworkTransport {
     const controller = new AbortController();
     const timeoutId = setTimeout(
       () => controller.abort(),
-      this.config.timeout || 30000,
+      this.config.timeout || HttpTransport.DEFAULT_TIMEOUT_MS,
     );
     try {
       const serverInfoUrl = new URL("/.well-known/mindoodb-server-info", this.baseUrl);

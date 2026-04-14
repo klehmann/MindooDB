@@ -446,6 +446,64 @@ describe("sync test", () => {
     expect(lastEvent.transferredEntries).toBeGreaterThan(0);
   });
 
+  it("pullChangesFrom should expose transfer batch progress for chunked syncs", async () => {
+    await setupTenant2AndPull();
+
+    const contactsDB1 = await tenant1.openDB("contacts");
+    for (let i = 0; i < 4; i++) {
+      const doc = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(doc, async (d) => {
+        d.getData().name = `Chunked Contact ${i}`;
+      });
+    }
+
+    const contactsDB2 = await tenant2.openDB("contacts");
+    const contactsStore1 = contactsDB1.getStore();
+    const progressEvents: SyncProgress[] = [];
+
+    const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+      pageSize: 1000,
+      transferBatchSize: 2,
+      onProgress: (progress) => progressEvents.push({ ...progress }),
+    });
+
+    expect(result.cancelled).toBe(false);
+    const transferEvents = progressEvents.filter((event) => event.currentTransferBatch !== undefined);
+    expect(transferEvents.length).toBeGreaterThan(1);
+    expect(transferEvents.some((event) => event.totalTransferBatches && event.totalTransferBatches > 1)).toBe(true);
+    expect(transferEvents.every((event) => event.transferBatchSize === 2)).toBe(true);
+  });
+
+  it("pullChangesFrom should keep partial counts when cancelled between transfer batches", async () => {
+    await setupTenant2AndPull();
+
+    const contactsDB1 = await tenant1.openDB("contacts");
+    for (let i = 0; i < 5; i++) {
+      const doc = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(doc, async (d) => {
+        d.getData().name = `Cancel Contact ${i}`;
+      });
+    }
+
+    const contactsDB2 = await tenant2.openDB("contacts");
+    const contactsStore1 = contactsDB1.getStore();
+    const controller = new AbortController();
+
+    const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+      pageSize: 1000,
+      transferBatchSize: 2,
+      signal: controller.signal,
+      onProgress: (progress) => {
+        if (progress.currentTransferBatch === 1 && progress.transferredEntries > 0) {
+          controller.abort();
+        }
+      },
+    });
+
+    expect(result.cancelled).toBe(true);
+    expect(result.transferredEntries).toBeGreaterThan(0);
+  });
+
   it("pullChangesFrom should support cancellation via AbortSignal", async () => {
     await setupTenant2AndPull();
 
