@@ -15,6 +15,8 @@ import {
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 
+const DIRECTORY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private tenant: BaseMindooTenant;
   private directoryDB: MindooDB | null = null;
@@ -40,6 +42,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
 
   // Unified cache cursor for all document types
   private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
+  private lastDirectorySyncTimestamp = 0;
   private logger: Logger;
 
   constructor(tenant: BaseMindooTenant, logger?: Logger) {
@@ -284,16 +287,27 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       }
     }
     
-    // Check cache first - if we have a cached result, return it after ensuring we're up to date
-    // Sync changes to make sure everything is processed
-    const directoryDB = await this.getDirectoryDB();
-    await directoryDB.syncStoreChanges();
-    
-    // Update unified cache with any new changes since last cursor
-    await this.updateUnifiedCache();
-    
-    // Now check the cache
-    const cachedResult = this.trustedKeysCache.get(publicKey);
+    // Refresh directory state at most once per interval.
+    const now = Date.now();
+    let didSync = false;
+    if (now - this.lastDirectorySyncTimestamp >= DIRECTORY_SYNC_INTERVAL_MS) {
+      const directoryDB = await this.getDirectoryDB();
+      await directoryDB.syncStoreChanges();
+      await this.updateUnifiedCache();
+      this.lastDirectorySyncTimestamp = now;
+      didSync = true;
+    }
+
+    let cachedResult = this.trustedKeysCache.get(publicKey);
+    if (cachedResult === undefined && !didSync) {
+      // Cache miss and not synced yet - sync once and re-check immediately.
+      const directoryDB = await this.getDirectoryDB();
+      await directoryDB.syncStoreChanges();
+      await this.updateUnifiedCache();
+      this.lastDirectorySyncTimestamp = Date.now();
+      cachedResult = this.trustedKeysCache.get(publicKey);
+    }
+
     if (cachedResult !== undefined) {
       this.logger.debug(`Public key validation result (from cache): ${cachedResult}`);
       return cachedResult;
