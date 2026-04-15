@@ -160,6 +160,7 @@ export interface RateLimitConfig {
 }
 
 export interface ServerRateLimitsConfig {
+  auth?: RateLimitConfig;
   sync?: RateLimitConfig;
 }
 

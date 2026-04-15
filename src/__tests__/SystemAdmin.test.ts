@@ -478,6 +478,73 @@ describe("System Admin Security", () => {
     });
   });
 
+  describe("Auth Rate Limiting", () => {
+    let setup: TestSetup;
+    const port = 4007;
+
+    beforeAll(async () => {
+      setup = await createTestSetup(port, cryptoAdapter, factory, {
+        rateLimits: {
+          auth: {
+            windowMs: 60_000,
+            max: 1,
+          },
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+    });
+
+    test("uses configured auth rate limits for repeated system challenges", async () => {
+      const requestBody = {
+        username: setup.adminUser.username,
+        publicsignkey: setup.adminUser.userSigningKeyPair.publicKey,
+      };
+
+      const first = await httpRequest(
+        `${setup.baseUrl}/system/auth/challenge`,
+        "POST",
+        requestBody,
+      );
+      const second = await httpRequest(
+        `${setup.baseUrl}/system/auth/challenge`,
+        "POST",
+        requestBody,
+      );
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(429);
+      expect(second.body).toMatchObject({
+        error: "Too many authentication attempts, please try again later",
+      });
+    });
+
+    test("challenge limiting is isolated by username to avoid cross-user collisions", async () => {
+      const firstUnknownUser = await httpRequest(
+        `${setup.baseUrl}/system/auth/challenge`,
+        "POST",
+        {
+          username: "someone-else",
+          publicsignkey: setup.adminUser.userSigningKeyPair.publicKey,
+        },
+      );
+      const differentUsername = await httpRequest(
+        `${setup.baseUrl}/system/auth/challenge`,
+        "POST",
+        {
+          username: "another-user",
+          publicsignkey: setup.adminUser.userSigningKeyPair.publicKey,
+        },
+      );
+
+      expect(firstUnknownUser.status).toBe(404);
+      expect(differentUsername.status).toBe(404);
+      expect(differentUsername.status).not.toBe(429);
+    });
+  });
+
   // =========================================================================
   // Capability-based authorization on /system/* routes
   // =========================================================================

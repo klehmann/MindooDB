@@ -155,9 +155,13 @@ function validateRateLimits(
   }
 
   const obj = raw as Record<string, unknown>;
+  const auth = validateRateLimitConfig(obj.auth, "auth", filePath);
   const sync = validateRateLimitConfig(obj.sync, "sync", filePath);
 
   const rateLimits: ServerRateLimitsConfig = {};
+  if (auth) {
+    rateLimits.auth = auth;
+  }
   if (sync) {
     rateLimits.sync = sync;
   }

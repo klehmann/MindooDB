@@ -82,6 +82,12 @@ import {
   MAX_CHALLENGE_LENGTH,
 } from "./validation";
 
+/**
+ * Augment Express Request with fields populated by our middleware:
+ * - tenantId: set by tenantMiddleware after validating the :tenantId URL param
+ * - systemAdmin: set by systemAdminMiddleware after JWT verification
+ * - jsonBodyBytes: raw byte count captured during JSON body parsing (for diagnostics)
+ */
 declare global {
   namespace Express {
     interface Request {
@@ -92,6 +98,12 @@ declare global {
   }
 }
 
+/**
+ * Wire-format types for the sync HTTP API.
+ *
+ * Binary fields (signature, encryptedData, rsaEncryptedPayload) are base64-
+ * encoded strings in transit and converted to Uint8Array on deserialization.
+ */
 interface SerializedEntryMetadata {
   entryType: StoreEntryType;
   id: string;
@@ -115,10 +127,21 @@ interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string;
 }
 
+/**
+ * Rate-limit defaults. Auth and sync have separate tiers because a single
+ * challenge/authenticate handshake is two requests; with multiple tenants,
+ * store kinds, and token renewals the auth budget exhausts quickly if set
+ * too low. These can be overridden in config.json under `rateLimits.auth`
+ * and `rateLimits.sync`.
+ */
+const DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS = 60_000;
+const DEFAULT_AUTH_RATE_LIMIT_MAX = 120;
 const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_SYNC_RATE_LIMIT_MAX = 1_000;
+
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
 
+/** Parse a human-readable size string ("5mb", "1024", "100kb") into bytes. */
 function parseBodySizeLimitToBytes(limit: string): number | null {
   const normalized = limit.trim().toLowerCase();
   if (!normalized) {
@@ -154,6 +177,15 @@ export class MindooDBServer {
   private readonly jsonBodyLimit: string;
   private readonly jsonBodyLimitBytes: number | null;
 
+  /**
+   * @param dataDir      Root directory for on-disk tenant data and server identity
+   * @param serverPassword  Password used to decrypt the server identity private keys
+   *                        and per-tenant key bags at startup
+   * @param staticDir    Optional directory served at /statics/ (e.g. the Haven web UI)
+   * @param config       Pre-loaded ServerConfig; when omitted, an empty config
+   *                     is used (all /system/* endpoints locked down)
+   * @param configPath   Explicit path to config.json; defaults to `<dataDir>/config.json`
+   */
   constructor(
     dataDir: string,
     serverPassword?: string,
@@ -171,6 +203,8 @@ export class MindooDBServer {
     this.serverConfig = config ?? { capabilities: {} };
     this.capabilityMatcher = new CapabilityMatcher(this.serverConfig);
 
+    // SystemAdminAuthService generates a random HMAC-SHA256 secret for JWTs
+    // on each server start — existing tokens become invalid after restart.
     const cryptoAdapter = this.tenantManager.getCryptoAdapter();
     this.systemAdminAuth = new SystemAdminAuthService(
       cryptoAdapter,
@@ -211,6 +245,11 @@ export class MindooDBServer {
     return this.configPath;
   }
 
+  /**
+   * Hot-swap the server config without restarting. In-flight JWTs remain
+   * valid (same HMAC secret), but removed principals will fail the
+   * CapabilityMatcher check on their next request.
+   */
   reloadConfig(newConfig: ServerConfig): void {
     this.serverConfig = newConfig;
     this.capabilityMatcher.reload(newConfig);
@@ -225,6 +264,12 @@ export class MindooDBServer {
     server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
   }
 
+  /**
+   * Start the server with TLS using HTTP/2 (with automatic HTTP/1.1 ALPN
+   * fallback for clients that don't support h2). Express is mounted as the
+   * raw handler because http2.createSecureServer doesn't natively integrate
+   * with Express; the `as unknown` casts bridge the type gap.
+   */
   listenTls(port: number, certPath: string, keyPath: string): void {
     const tlsOptions = {
       allowHTTP1: true,
@@ -241,6 +286,15 @@ export class MindooDBServer {
     server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
   }
 
+  /**
+   * Global middleware stack applied to every request, in order:
+   * 1. helmet — security headers (CSP, X-Frame-Options, etc.)
+   * 2. cors — controlled cross-origin access for web clients (e.g. Haven)
+   * 3. global rate limit — coarse IP-based throttle as a safety net;
+   *    individual route tiers (auth, sync, system) provide finer control
+   * 4. JSON body parser — captures raw byte size for diagnostics
+   * 5. request logger
+   */
   private setupMiddleware(): void {
     this.app.use(helmet());
 
@@ -276,6 +330,7 @@ export class MindooDBServer {
     });
   }
 
+  /** Parse MINDOODB_CORS_ORIGIN env var; supports comma-separated multiple origins. */
   private readCorsOriginsFromEnv(): string | string[] | undefined {
     const raw = process.env.MINDOODB_CORS_ORIGIN?.trim();
     if (!raw) {
@@ -291,8 +346,16 @@ export class MindooDBServer {
     return origins;
   }
 
+  /**
+   * Route hierarchy:
+   *  /                         — redirect to static UI (if present)
+   *  /health                   — unauthenticated health probe
+   *  /.well-known/*            — public discovery endpoints (server info, tenant fingerprints)
+   *  /statics/*                — optional static file serving (Haven web UI)
+   *  /system/*                 — admin API: IP-allowlisted, JWT-authenticated, capability-checked
+   *  /:tenantId/*              — per-tenant sync & auth API
+   */
   private setupRoutes(): void {
-    // Root redirect
     this.app.get("/", (req: Request, res: Response) => {
       if (this.staticDir && existsSync(path.join(this.staticDir, "index.html"))) {
         res.redirect(302, "/statics/index.html");
@@ -305,6 +368,8 @@ export class MindooDBServer {
       res.json({ status: "ok", timestamp: Date.now() });
     });
 
+    // .well-known endpoints are unauthenticated so clients can discover
+    // server identity and tenant availability before attempting to authenticate.
     this.app.get("/.well-known/mindoodb-server-info", (req, res) => {
       const info = this.tenantManager.getServerPublicInfo();
       if (!info) {
@@ -358,7 +423,10 @@ export class MindooDBServer {
       console.log(`[MindooDBServer] Serving static files from ${resolvedStaticDir} at /statics/`);
     }
 
-    // System admin routes (replaces former /admin/*)
+    // /system/* admin routes are protected by three layers (applied in order):
+    //  1. IP allowlist — optional whitelist via MINDOODB_ADMIN_ALLOWED_IPS env var
+    //  2. Rate limit  — aggressive per-IP throttle (30 req/min)
+    //  3. JWT auth    — applied per-route (auth endpoints exempt; they *produce* JWTs)
     const systemIpRaw = readSystemIpAllowListFromEnv();
     if (!isSystemIpAllowListDisabled(systemIpRaw)) {
       console.log(
@@ -383,9 +451,11 @@ export class MindooDBServer {
       systemRouter,
     );
 
-    // Tenant-scoped routes
+    // Tenant-scoped routes: tenantMiddleware validates the :tenantId param
+    // and rejects unknown tenants before any handler runs.
     this.app.use("/:tenantId", this.tenantMiddleware.bind(this), this.createTenantRouter());
 
+    // Express error handler — must be registered last and have the 4-arg signature
     this.app.use(this.errorHandler.bind(this));
   }
 
@@ -466,20 +536,19 @@ export class MindooDBServer {
 
   // ==================== System Routes ====================
 
+  /**
+   * Wire up all /system/* routes. Auth endpoints sit outside the JWT
+   * middleware because they implement the challenge-response handshake
+   * that *produces* the JWT. Every other route requires a valid JWT and
+   * passes through the CapabilityMatcher for fine-grained authorization.
+   */
   private setupSystemRoutes(router: Router): void {
-    // Auth endpoints — no JWT required (these *produce* JWTs)
-    const authRateLimit = rateLimit({
-      windowMs: 60_000,
-      max: 20,
-      standardHeaders: true,
-      legacyHeaders: false,
-      message: { error: "Too many authentication attempts, please try again later" },
-    });
+    const challengeRateLimit = this.createAuthRateLimit("system", "challenge");
+    const authenticateRateLimit = this.createAuthRateLimit("system", "authenticate");
 
-    router.post("/auth/challenge", authRateLimit, this.handleSystemChallenge.bind(this));
-    router.post("/auth/authenticate", authRateLimit, this.handleSystemAuthenticate.bind(this));
+    router.post("/auth/challenge", challengeRateLimit, this.handleSystemChallenge.bind(this));
+    router.post("/auth/authenticate", authenticateRateLimit, this.handleSystemAuthenticate.bind(this));
 
-    // All other /system/* routes require JWT + capability check
     const authMiddleware = this.systemAdminMiddleware.bind(this);
 
     // Tenant CRUD
@@ -494,6 +563,8 @@ export class MindooDBServer {
       }
     });
 
+    // Tenant registration is idempotent: re-POSTing with the same tenantId
+    // and matching $publicinfos key returns 200 instead of 409.
     router.post("/tenants/:tenantId", authMiddleware, async (req: Request, res: Response) => {
       try {
         const tenantId = req.params.tenantId.toLowerCase();
@@ -892,7 +963,8 @@ export class MindooDBServer {
         return;
       }
 
-      // Self-lockout protection: verify the calling admin retains PUT /system/config access
+      // Self-lockout protection: simulate the proposed config against the calling
+      // admin's identity — reject if they would lose their own config access.
       const callingAdmin = req.systemAdmin!;
       const proposedMatcher = new CapabilityMatcher(newConfig);
       if (
@@ -939,20 +1011,22 @@ export class MindooDBServer {
 
   // ==================== Tenant Routes ====================
 
+  /**
+   * Build the per-tenant router. Rate limiters are scoped: auth endpoints
+   * use a per-user composite key (see createAuthRateLimit) while sync
+   * endpoints use a plain IP-based bucket with a higher ceiling.
+   *
+   * Both "docs" and "attachments" store kinds expose the same set of sync
+   * operations, mounted at /sync/docs/* and /sync/attachments/*.
+   */
   private createTenantRouter(): Router {
     const router = Router({ mergeParams: true });
+    const authRateLimitConfig = this.getAuthRateLimitConfig();
     const syncRateLimitConfig = this.getSyncRateLimitConfig();
 
-    // Auth endpoints get stricter rate limiting
-    const authRateLimit = rateLimit({
-      windowMs: 60_000,
-      max: 20,
-      standardHeaders: true,
-      legacyHeaders: false,
-      message: { error: "Too many authentication attempts, please try again later" },
-    });
+    const challengeRateLimit = this.createAuthRateLimit("tenant", "challenge");
+    const authenticateRateLimit = this.createAuthRateLimit("tenant", "authenticate");
 
-    // Sync endpoints get a higher limit
     const syncRateLimit = rateLimit({
       windowMs: syncRateLimitConfig.windowMs,
       max: syncRateLimitConfig.max,
@@ -961,8 +1035,12 @@ export class MindooDBServer {
       message: { error: "Too many sync requests, please try again later" },
     });
 
-    router.post("/auth/challenge", authRateLimit, this.handleChallenge.bind(this));
-    router.post("/auth/authenticate", authRateLimit, this.handleAuthenticate.bind(this));
+    console.log(
+      `[MindooDBServer] Tenant auth rate limit configured windowMs=${authRateLimitConfig.windowMs} max=${authRateLimitConfig.max}`,
+    );
+
+    router.post("/auth/challenge", challengeRateLimit, this.handleChallenge.bind(this));
+    router.post("/auth/authenticate", authenticateRateLimit, this.handleAuthenticate.bind(this));
 
     for (const storeKind of ["docs", "attachments"] as const) {
       const syncBase = `/sync/${storeKind}`;
@@ -987,11 +1065,105 @@ export class MindooDBServer {
     return router;
   }
 
+  /** Resolved auth rate-limit config; falls back to defaults when not set in config.json. */
+  private getAuthRateLimitConfig(): { windowMs: number; max: number } {
+    return {
+      windowMs: this.serverConfig.rateLimits?.auth?.windowMs ?? DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS,
+      max: this.serverConfig.rateLimits?.auth?.max ?? DEFAULT_AUTH_RATE_LIMIT_MAX,
+    };
+  }
+
+  /** Resolved sync rate-limit config; falls back to defaults when not set in config.json. */
   private getSyncRateLimitConfig(): { windowMs: number; max: number } {
     return {
       windowMs: this.serverConfig.rateLimits?.sync?.windowMs ?? DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS,
       max: this.serverConfig.rateLimits?.sync?.max ?? DEFAULT_SYNC_RATE_LIMIT_MAX,
     };
+  }
+
+  /**
+   * Create a rate-limiter for authentication endpoints. Challenge and
+   * authenticate get separate limiters so that one phase can't starve the
+   * other. The custom keyGenerator buckets by (scope, tenant, phase, IP,
+   * username) — this prevents users behind a shared IP (NAT / reverse
+   * proxy) from exhausting each other's budgets.
+   */
+  private createAuthRateLimit(
+    scope: "system" | "tenant",
+    phase: "challenge" | "authenticate",
+  ) {
+    const authRateLimitConfig = this.getAuthRateLimitConfig();
+    return rateLimit({
+      windowMs: authRateLimitConfig.windowMs,
+      max: authRateLimitConfig.max,
+      standardHeaders: true,
+      legacyHeaders: false,
+      keyGenerator: (req: Request) => this.getAuthRateLimitKey(req, scope, phase),
+      handler: (req, res, _next, options) => {
+        this.logAuthRateLimitHit(req, scope, phase);
+        res.status(options.statusCode).json(options.message);
+      },
+      message: { error: "Too many authentication attempts, please try again later" },
+    });
+  }
+
+  /**
+   * Composite rate-limit key. Challenge requests include the username so
+   * that brute-forcing one account doesn't block legitimate users on the
+   * same IP. Authenticate requests omit username because the challenge
+   * token is already scoped to a single principal.
+   */
+  private getAuthRateLimitKey(
+    req: Request,
+    scope: "system" | "tenant",
+    phase: "challenge" | "authenticate",
+  ): string {
+    const tenantId = scope === "tenant"
+      ? req.tenantId ?? req.params.tenantId?.toLowerCase() ?? "-"
+      : "system";
+    const clientIp = this.getClientIpForRateLimit(req);
+
+    if (phase === "challenge") {
+      const username = typeof req.body?.username === "string"
+        ? req.body.username.trim().toLowerCase()
+        : "-";
+      return `${scope}:${tenantId}:${phase}:${clientIp}:${username}`;
+    }
+
+    return `${scope}:${tenantId}:${phase}:${clientIp}`;
+  }
+
+  /**
+   * Emit a structured warning when an auth rate limit is triggered.
+   * The forwarded-for header is logged to help diagnose situations where
+   * a reverse proxy collapses many clients onto a single visible IP.
+   */
+  private logAuthRateLimitHit(
+    req: Request,
+    scope: "system" | "tenant",
+    phase: "challenge" | "authenticate",
+  ): void {
+    const forwardedForHeader = req.headers["x-forwarded-for"];
+    const forwardedFor = Array.isArray(forwardedForHeader)
+      ? forwardedForHeader.join(", ")
+      : forwardedForHeader;
+    const username = typeof req.body?.username === "string" ? req.body.username : "-";
+
+    console.warn(
+      `[MindooDBServer] Auth rate limit exceeded scope=${scope} phase=${phase} tenant=${req.tenantId ?? req.params.tenantId?.toLowerCase() ?? "-"} ip=${this.getClientIpForRateLimit(req)} forwarded-for=${forwardedFor ?? "-"} username=${username} path=${req.path}`,
+    );
+  }
+
+  /**
+   * Best-effort client IP. Express populates `req.ip` from the trust-proxy
+   * setting; fall back to the raw socket address when it's unavailable.
+   */
+  private getClientIpForRateLimit(req: Request): string {
+    return (
+      (typeof req.ip === "string" && req.ip.length > 0
+        ? req.ip
+        : req.socket?.remoteAddress) ?? "unknown"
+    );
   }
 
   // ==================== Validation Helpers ====================
@@ -1006,6 +1178,10 @@ export class MindooDBServer {
   }
 
   // ==================== Tenant Auth Handlers ====================
+  // Two-step challenge-response flow:
+  //  1. POST /auth/challenge  → client sends username, server returns a random nonce
+  //  2. POST /auth/authenticate → client signs the nonce with its Ed25519 private key,
+  //     server verifies the signature and returns a JWT for subsequent sync calls
 
   private async handleChallenge(req: Request, res: Response): Promise<void> {
     try {
@@ -1232,6 +1408,11 @@ export class MindooDBServer {
     }
   }
 
+  /**
+   * Ingest encrypted entries from a client. The `stage` variable tracks
+   * progress through the pipeline so that error logs pinpoint the failing
+   * step (token extraction → body parsing → deserialization → storage).
+   */
   private async handlePutEntries(req: Request, res: Response): Promise<void> {
     let stage = "extract-token";
     try {
@@ -1431,6 +1612,11 @@ export class MindooDBServer {
 
   // ==================== Helper Methods ====================
 
+  /**
+   * Derive the StoreKind from the request path. Both "docs" and
+   * "attachments" share the same handler implementations; the store kind
+   * selects which on-disk append-only store to operate against.
+   */
   private getStoreKindFromRequest(req: Request): StoreKind {
     const trimmedPath = req.path.replace(/\/$/, "");
     if (trimmedPath.startsWith("/sync/docs/") || trimmedPath === "/sync/docs/capabilities" || trimmedPath === "/sync/docs/getAllIds") {
@@ -1450,6 +1636,7 @@ export class MindooDBServer {
     return auth.substring(7);
   }
 
+  /** Map domain errors to HTTP status codes; unknown errors become 500. */
   private handleRequestError(error: unknown, res: Response): void {
     if (error instanceof ValidationError) {
       res.status(400).json({ error: error.message });
@@ -1484,6 +1671,11 @@ export class MindooDBServer {
     }
   }
 
+  /**
+   * Express error handler (4-arg signature). Handles body-parser errors
+   * (413 entity too large, 400 parse failed) with structured JSON responses;
+   * everything else is logged and returned as a generic 500.
+   */
   private errorHandler(err: Error, req: Request, res: Response, next: NextFunction): void {
     const parserError = err as Error & {
       status?: number;
@@ -1527,6 +1719,9 @@ export class MindooDBServer {
   }
 
   // ==================== Serialization ====================
+  // Entries are stored with binary fields (Uint8Array) internally but
+  // transmitted as base64 strings over JSON. These methods handle the
+  // conversion in both directions.
 
   private serializeEntryMetadata(metadata: StoreEntryMetadata): SerializedEntryMetadata {
     return {
