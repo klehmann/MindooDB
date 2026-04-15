@@ -472,24 +472,6 @@ export class BaseMindooTenant implements MindooTenant {
     return isValid;
   }
 
-  async validatePublicSigningKey(publicKey: string): Promise<boolean> {
-    this.logger.info(`Validating public signing key`);
-
-    // Load the directory database to check if this key belongs to a trusted user
-    const directoryDB = await this.openDB("directory");
-    
-    // TODO: Query the directory database to check if this public key belongs to a registered,
-    // non-revoked user. For now, return true as a placeholder.
-    // The directory database should contain user records with their public signing keys.
-    
-    // This is a placeholder - in a full implementation, we would:
-    // 1. Query the directory database for users with this public key
-    // 2. Check if the user is registered and not revoked
-    // 3. Return true only if the key belongs to a trusted user
-    
-    return true; // TODO: Implement actual validation against directory database
-  }
-
   async getCurrentUserId(): Promise<PublicUserId> {
     // Convert PrivateUserId to PublicUserId
     return {

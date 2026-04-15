@@ -450,15 +450,6 @@ export interface MindooTenant {
   decryptPayload(encryptedPayload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array>;
 
   /**
-   * Validates a public signing key by checking if it belongs to a trusted user in the tenant.
-   * This is used for signature verification when loading changes from the append-only store.
-   * 
-   * @param publicKey The public signing key to validate (Ed25519, PEM format)
-   * @return True if the public key belongs to a trusted (registered and not revoked) user, false otherwise
-   */
-  validatePublicSigningKey(publicKey: string): Promise<boolean>;
-
-  /**
    * Get the current user ID for the tenant.
    * This provides user context for operations that need to know which user is performing them.
    * Used for signing document changes.
