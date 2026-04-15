@@ -13,7 +13,7 @@
  */
 
 import express, { Request, Response, NextFunction, Router } from "express";
-import https from "https";
+import http2 from "http2";
 import path from "path";
 import { readFileSync, existsSync } from "fs";
 import helmet from "helmet";
@@ -227,12 +227,15 @@ export class MindooDBServer {
 
   listenTls(port: number, certPath: string, keyPath: string): void {
     const tlsOptions = {
+      allowHTTP1: true,
       cert: readFileSync(certPath),
       key: readFileSync(keyPath),
     };
-    const server = https.createServer(tlsOptions, this.app);
+    const server = http2.createSecureServer(tlsOptions, (req, res) => {
+      this.app(req as unknown as express.Request, res as unknown as express.Response);
+    });
     server.listen(port, () => {
-      console.log(`[MindooDBServer] Listening on HTTPS port ${port}`);
+      console.log(`[MindooDBServer] Listening on HTTPS port ${port} with HTTP/2 enabled (HTTP/1 fallback active)`);
     });
 
     server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
@@ -267,7 +270,7 @@ export class MindooDBServer {
       const contentType = req.headers["content-type"] ?? "-";
       const contentLength = req.headers["content-length"] ?? "-";
       console.log(
-        `[${new Date().toISOString()}] ${req.method} ${req.path} content-type=${contentType} content-length=${contentLength}`,
+        `[${new Date().toISOString()}] HTTP/${req.httpVersion} ${req.method} ${req.path} content-type=${contentType} content-length=${contentLength}`,
       );
       next();
     });

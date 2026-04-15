@@ -73,6 +73,7 @@ import type { CacheManager } from "./cache/CacheManager";
  * Default chunk size for attachments: 256KB
  */
 const DEFAULT_CHUNK_SIZE_BYTES = 256 * 1024;
+const DEFAULT_ATTACHMENT_STREAM_BATCH_SIZE = 4;
 const DEFAULT_SNAPSHOT_MIN_CHANGES = 100;
 const DEFAULT_SNAPSHOT_COOLDOWN_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_CACHED_DOCS = 128;
@@ -4400,22 +4401,28 @@ export class BaseMindooDB implements MindooDB {
     const store = this.getEffectiveAttachmentStore();
     const readPlan = await this.planAttachmentRead(store, ref, startOffset, ref.size);
 
-    // Stream chunks starting from startChunkIndex
-    for (let i = 0; i < readPlan.chunkPlans.length; i++) {
-      const chunkPlan = readPlan.chunkPlans[i];
-      const [chunk] = await store.getEntries([chunkPlan.id]);
-      if (!chunk) {
-        throw new Error(
-          `Attachment chunk ${chunkPlan.id} not found in store. The document metadata exists, but the attachment payload may not be synced locally yet.`,
-        );
-      }
-      const plaintext = await this.decryptAttachmentChunk(chunk);
+    for (let i = 0; i < readPlan.chunkPlans.length; i += DEFAULT_ATTACHMENT_STREAM_BATCH_SIZE) {
+      const chunkPlansBatch = readPlan.chunkPlans.slice(i, i + DEFAULT_ATTACHMENT_STREAM_BATCH_SIZE);
+      const batchIds = chunkPlansBatch.map((chunkPlan) => chunkPlan.id);
+      const chunks = await store.getEntries(batchIds);
+      const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
 
-      // For first chunk, skip bytes before startOffset
-      if (i === 0 && readPlan.offsetInFirstChunk > 0) {
-        yield plaintext.slice(readPlan.offsetInFirstChunk);
-      } else {
-        yield plaintext;
+      for (let batchIndex = 0; batchIndex < chunkPlansBatch.length; batchIndex++) {
+        const chunkPlan = chunkPlansBatch[batchIndex];
+        const chunk = chunkById.get(chunkPlan.id);
+        if (!chunk) {
+          throw new Error(
+            `Attachment chunk ${chunkPlan.id} not found in store. The document metadata exists, but the attachment payload may not be synced locally yet.`,
+          );
+        }
+        const plaintext = await this.decryptAttachmentChunk(chunk);
+
+        // For first chunk, skip bytes before startOffset
+        if (i === 0 && batchIndex === 0 && readPlan.offsetInFirstChunk > 0) {
+          yield plaintext.slice(readPlan.offsetInFirstChunk);
+        } else {
+          yield plaintext;
+        }
       }
     }
     

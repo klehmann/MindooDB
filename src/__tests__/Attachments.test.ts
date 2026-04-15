@@ -490,6 +490,43 @@ describe("Attachments", () => {
       expect(chunkCount).toBe(1);
     }, 30000);
 
+    it("batches attachment chunk fetches while preserving stream order", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000);
+      for (let i = 0; i < testData.length; i++) {
+        testData[i] = i % 256;
+      }
+      let attachmentId: string | undefined;
+
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "batched.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      const attachmentStore = db.getAttachmentStore() ?? db.getStore();
+      const getEntriesSpy = jest.spyOn(attachmentStore, "getEntries");
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const chunks: Uint8Array[] = [];
+
+      for await (const chunk of reloadedDoc.streamAttachment(attachmentId!)) {
+        chunks.push(chunk);
+      }
+
+      expect(getEntriesSpy).toHaveBeenCalledTimes(2);
+      expect(getEntriesSpy.mock.calls[0]?.[0]).toHaveLength(4);
+      expect(getEntriesSpy.mock.calls[1]?.[0]).toHaveLength(4);
+
+      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      expect(result).toEqual(testData);
+    }, 30000);
+
     it("uses metadata traversal instead of full dependency resolution for offset streams", async () => {
       const doc = await db.createDocument();
       const testData = new Uint8Array(1000);

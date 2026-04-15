@@ -160,7 +160,7 @@ Examples:
   # Start server with static files (e.g. bootstrap UI for distributed web apps)
   npm run server:dev -- -w ./webapp-bootstrap
 
-  # Start server with TLS (HTTPS)
+  # Start server with TLS (HTTPS + HTTP/2 with HTTP/1 fallback)
   npm run server:dev -- --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem -p 443
 `);
 }
@@ -181,7 +181,7 @@ async function main(): Promise<void> {
   console.log(`Port: ${options.port}`);
   console.log(`Auto-sync: ${options.autoSync ? "enabled" : "disabled"}`);
   console.log(`Static dir: ${options.staticDir || "not set"}`);
-  console.log(`TLS: ${options.tlsCert ? "enabled" : "disabled"}`);
+  console.log(`TLS / HTTP2: ${options.tlsCert ? "enabled" : "disabled"}`);
 
   if ((options.tlsCert && !options.tlsKey) || (!options.tlsCert && options.tlsKey)) {
     console.error("Error: --tls-cert and --tls-key must both be provided");
