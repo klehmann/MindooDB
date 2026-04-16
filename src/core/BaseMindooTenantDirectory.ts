@@ -258,6 +258,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       this.logger.debug(`Created revocation document for grant access doc: ${revokeDocId}`);
     }
     
+    // Update the cache so that subsequent validatePublicSigningKey calls
+    // see the revocation without waiting for the next sync interval
+    await this.updateUnifiedCache();
+    
     this.logger.info(`Revoked user: ${username} (created ${grantAccessDocs.length} revocation document(s))`);
   }
 
