@@ -13,11 +13,17 @@ export { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 export { BrowserCryptoAdapter, createCryptoAdapter } from "./crypto/BrowserCryptoAdapter";
 
 // Browser-specific IndexedDB content-addressed store
-export { IndexedDBContentAddressedStore } from "./appendonlystores/IndexedDBContentAddressedStore";
+export {
+  IndexedDBContentAddressedStore,
+  readContentAddressedStoreBytes,
+} from "./appendonlystores/IndexedDBContentAddressedStore";
 export { IndexedDBContentAddressedStoreFactory } from "./appendonlystores/IndexedDBContentAddressedStoreFactory";
 
 // Browser-specific cache store
-export { IndexedDBLocalCacheStore } from "./cache/IndexedDBLocalCacheStore";
+export {
+  IndexedDBLocalCacheStore,
+  readLocalCacheStoreBytes,
+} from "./cache/IndexedDBLocalCacheStore";
 
 // Network helpers used by browser sync clients
 export { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";

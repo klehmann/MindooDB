@@ -63,6 +63,25 @@ const IDX_CONTENT_HASH = "by_contentHash";
 // Bloom cache key
 const BLOOM_CACHE_KEY = "current";
 const RECEIPT_ORDER_COUNTER_KEY = "receiptOrderCounter";
+const TOTAL_CONTENT_BYTES_KEY = "total_content_bytes";
+const TOTAL_METADATA_BYTES_KEY = "total_metadata_bytes";
+
+interface MetaValueRecord {
+  key: string;
+  value: number;
+}
+
+interface ContentRecord {
+  contentHash: string;
+  data: ArrayBufferLike | Uint8Array;
+  refCount: number;
+}
+
+interface StoreByteTotals {
+  contentBytes: number;
+  metadataBytes: number;
+  totalBytes: number;
+}
 
 function qualifyIndexedDbNamespace(namespace: string, storeKind: StoreKind): string {
   const separatorIndex = namespace.indexOf("-");
@@ -265,6 +284,80 @@ function txToPromise(tx: IDBTransaction): Promise<void> {
   });
 }
 
+/**
+ * Returns the serialized metadata size used for approximate payload-byte
+ * accounting. This excludes IndexedDB structural overhead such as keys,
+ * indexes, and B-tree pages.
+ */
+function getMetadataPayloadBytes(metadata: StoreEntryMetadata): number {
+  return JSON.stringify(metadata).length;
+}
+
+async function readNumericMetaValue(
+  store: IDBObjectStore,
+  key: string
+): Promise<number | null> {
+  const record = (await reqToPromise(
+    store.get(key)
+  )) as MetaValueRecord | undefined;
+  return typeof record?.value === "number" ? record.value : null;
+}
+
+async function writeNumericMetaValue(
+  store: IDBObjectStore,
+  key: string,
+  value: number
+): Promise<void> {
+  await reqToPromise(store.put({ key, value } satisfies MetaValueRecord));
+}
+
+async function computeStoredBytes(
+  entriesStore: IDBObjectStore,
+  contentStore: IDBObjectStore
+): Promise<StoreByteTotals> {
+  let contentBytes = 0;
+  let metadataBytes = 0;
+
+  await new Promise<void>((resolve, reject) => {
+    const request = contentStore.openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve();
+        return;
+      }
+
+      const record = cursor.value as ContentRecord;
+      contentBytes += record.data.byteLength;
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const request = entriesStore.openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve();
+        return;
+      }
+
+      metadataBytes += getMetadataPayloadBytes(
+        cursor.value as StoreEntryMetadata
+      );
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+  });
+
+  return {
+    contentBytes,
+    metadataBytes,
+    totalBytes: contentBytes + metadataBytes,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Main class
 // ---------------------------------------------------------------------------
@@ -413,7 +506,14 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
           this.db = null;
           this.openPromise = null;
         };
-        resolve(this.db);
+        void this.backfillStoredBytesIfNeeded(this.db)
+          .then(() => resolve(this.db!))
+          .catch((error) => {
+            this.db?.close();
+            this.db = null;
+            this.openPromise = null;
+            reject(error);
+          });
       };
 
       request.onerror = () => {
@@ -447,6 +547,31 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     return `idb:${this.idbName}`;
   }
 
+  /**
+   * Returns approximate payload bytes currently stored in this browser-backed
+   * content-addressed store.
+   *
+   * `contentBytes` counts the encrypted payload blobs currently retained in the
+   * deduplicated content store. `metadataBytes` counts the serialized metadata
+   * entries. When multiple entries share the same `contentHash`, only the
+   * first retained payload contributes to `contentBytes`; later references only
+   * increase `refCount`.
+   */
+  async getStoredBytes(): Promise<StoreByteTotals> {
+    const db = await this.ensureOpen();
+    const tx = db.transaction(META_STORE, "readonly");
+    const metaOS = tx.objectStore(META_STORE);
+    const contentBytes =
+      (await readNumericMetaValue(metaOS, TOTAL_CONTENT_BYTES_KEY)) ?? 0;
+    const metadataBytes =
+      (await readNumericMetaValue(metaOS, TOTAL_METADATA_BYTES_KEY)) ?? 0;
+    return {
+      contentBytes,
+      metadataBytes,
+      totalBytes: contentBytes + metadataBytes,
+    };
+  }
+
   async putEntries(entries: StoreEntry[]): Promise<void> {
     if (entries.length === 0) return;
 
@@ -461,11 +586,15 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     const metaOS = tx.objectStore(META_STORE);
 
     const insertedIds: string[] = [];
-    const counterRecord = await reqToPromise(
+    const counterRecord = (await reqToPromise(
       metaOS.get(RECEIPT_ORDER_COUNTER_KEY)
-    ) as { key: string; value: number } | undefined;
+    )) as MetaValueRecord | undefined;
     let nextReceiptOrder =
       typeof counterRecord?.value === "number" ? counterRecord.value + 1 : 1;
+    let totalContentBytes =
+      (await readNumericMetaValue(metaOS, TOTAL_CONTENT_BYTES_KEY)) ?? 0;
+    let totalMetadataBytes =
+      (await readNumericMetaValue(metaOS, TOTAL_METADATA_BYTES_KEY)) ?? 0;
 
     for (const entry of entries) {
       // Check if entry already exists (skip duplicate)
@@ -481,14 +610,15 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
         ...rest,
         receiptOrder: nextReceiptOrder++,
       };
+      totalMetadataBytes += getMetadataPayloadBytes(metadata);
 
       // Store metadata
       await reqToPromise(entriesOS.put(metadata));
 
       // Deduplicate content
-      const existingContent = await reqToPromise(
+      const existingContent = (await reqToPromise(
         contentOS.get(entry.contentHash)
-      );
+      )) as ContentRecord | undefined;
       if (existingContent) {
         existingContent.refCount += 1;
         await reqToPromise(contentOS.put(existingContent));
@@ -501,8 +631,9 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
             contentHash: entry.contentHash,
             data: encryptedData,
             refCount: 1,
-          })
+          } satisfies ContentRecord)
         );
+        totalContentBytes += encryptedData.byteLength;
         this.logger.debug(
           `Stored content for hash ${entry.contentHash.substring(0, 8)}...`
         );
@@ -513,11 +644,20 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     }
 
     if (insertedIds.length > 0) {
-      await reqToPromise(
-        metaOS.put({
-          key: RECEIPT_ORDER_COUNTER_KEY,
-          value: nextReceiptOrder - 1,
-        })
+      await writeNumericMetaValue(
+        metaOS,
+        RECEIPT_ORDER_COUNTER_KEY,
+        nextReceiptOrder - 1
+      );
+      await writeNumericMetaValue(
+        metaOS,
+        TOTAL_CONTENT_BYTES_KEY,
+        totalContentBytes
+      );
+      await writeNumericMetaValue(
+        metaOS,
+        TOTAL_METADATA_BYTES_KEY,
+        totalMetadataBytes
       );
     }
 
@@ -950,13 +1090,18 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
     const db = await this.ensureOpen();
     const tx = db.transaction(
-      [ENTRIES_STORE, CONTENT_STORE, BLOOM_CACHE_STORE],
+      [ENTRIES_STORE, CONTENT_STORE, BLOOM_CACHE_STORE, META_STORE],
       "readwrite"
     );
     const entriesOS = tx.objectStore(ENTRIES_STORE);
     const contentOS = tx.objectStore(CONTENT_STORE);
     const bloomOS = tx.objectStore(BLOOM_CACHE_STORE);
+    const metaOS = tx.objectStore(META_STORE);
     const docIndex = entriesOS.index(IDX_DOC_ID);
+    let totalContentBytes =
+      (await readNumericMetaValue(metaOS, TOTAL_CONTENT_BYTES_KEY)) ?? 0;
+    let totalMetadataBytes =
+      (await readNumericMetaValue(metaOS, TOTAL_METADATA_BYTES_KEY)) ?? 0;
 
     // Collect all entries for this docId
     const entriesToPurge: StoreEntryMetadata[] = [];
@@ -984,14 +1129,16 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     // Delete entries and decrement content ref counts
     for (const entry of entriesToPurge) {
       await reqToPromise(entriesOS.delete(entry.id));
+      totalMetadataBytes -= getMetadataPayloadBytes(entry);
 
-      const contentRecord = await reqToPromise(
+      const contentRecord = (await reqToPromise(
         contentOS.get(entry.contentHash)
-      );
+      )) as ContentRecord | undefined;
       if (contentRecord) {
         const newCount = contentRecord.refCount - 1;
         if (newCount <= 0) {
           await reqToPromise(contentOS.delete(entry.contentHash));
+          totalContentBytes -= contentRecord.data.byteLength;
           this.logger.debug(
             `Cleaned up orphaned content ${entry.contentHash.substring(0, 8)}...`
           );
@@ -1005,6 +1152,16 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     // Invalidate bloom cache
     await reqToPromise(
       bloomOS.put({ key: BLOOM_CACHE_KEY, summary: null, dirty: true })
+    );
+    await writeNumericMetaValue(
+      metaOS,
+      TOTAL_CONTENT_BYTES_KEY,
+      Math.max(0, totalContentBytes)
+    );
+    await writeNumericMetaValue(
+      metaOS,
+      TOTAL_METADATA_BYTES_KEY,
+      Math.max(0, totalMetadataBytes)
     );
 
     await txToPromise(tx);
@@ -1113,4 +1270,144 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       cursorReq.onerror = () => reject(cursorReq.error);
     });
   }
+
+  /**
+   * Backfills the byte counters the first time an existing database is opened
+   * after payload accounting is introduced. The backfill persists both totals
+   * within one transaction so later writes start from a consistent baseline.
+   */
+  private async backfillStoredBytesIfNeeded(db: IDBDatabase): Promise<void> {
+    const readTx = db.transaction(META_STORE, "readonly");
+    const readMetaOS = readTx.objectStore(META_STORE);
+    const contentBytes = await readNumericMetaValue(
+      readMetaOS,
+      TOTAL_CONTENT_BYTES_KEY
+    );
+    const metadataBytes = await readNumericMetaValue(
+      readMetaOS,
+      TOTAL_METADATA_BYTES_KEY
+    );
+
+    if (contentBytes !== null && metadataBytes !== null) {
+      return;
+    }
+
+    const writeTx = db.transaction(
+      [ENTRIES_STORE, CONTENT_STORE, META_STORE],
+      "readwrite"
+    );
+    const totals = await computeStoredBytes(
+      writeTx.objectStore(ENTRIES_STORE),
+      writeTx.objectStore(CONTENT_STORE)
+    );
+    const writeMetaOS = writeTx.objectStore(META_STORE);
+    await writeNumericMetaValue(
+      writeMetaOS,
+      TOTAL_CONTENT_BYTES_KEY,
+      totals.contentBytes
+    );
+    await writeNumericMetaValue(
+      writeMetaOS,
+      TOTAL_METADATA_BYTES_KEY,
+      totals.metadataBytes
+    );
+    await txToPromise(writeTx);
+  }
+}
+
+/**
+ * Reads content-addressed payload counters from an existing IndexedDB database
+ * without opening the higher-level store abstraction or triggering a backfill.
+ *
+ * The returned byte counts reflect encrypted content payload bytes plus
+ * serialized metadata payload bytes already persisted by the store. For older
+ * browser databases that predate the byte counters, the helper falls back to a
+ * read-only scan of the legacy stores instead of writing the missing totals.
+ * When the database does not exist, the function returns `null`.
+ */
+export async function readContentAddressedStoreBytes(
+  idbName: string
+): Promise<Omit<StoreByteTotals, "totalBytes"> | null> {
+  return new Promise((resolve, reject) => {
+    let createdDuringProbe = false;
+    const request = indexedDB.open(idbName);
+
+    request.onupgradeneeded = (event) => {
+      if (event.oldVersion === 0) {
+        createdDuringProbe = true;
+        request.transaction?.abort();
+      }
+    };
+
+    request.onsuccess = async () => {
+      const db = request.result;
+      try {
+        let contentBytes: number | null = null;
+        let metadataBytes: number | null = null;
+
+        if (db.objectStoreNames.contains(META_STORE)) {
+          const tx = db.transaction(META_STORE, "readonly");
+          const metaOS = tx.objectStore(META_STORE);
+          contentBytes = await readNumericMetaValue(
+            metaOS,
+            TOTAL_CONTENT_BYTES_KEY
+          );
+          metadataBytes = await readNumericMetaValue(
+            metaOS,
+            TOTAL_METADATA_BYTES_KEY
+          );
+        }
+
+        if (contentBytes === null || metadataBytes === null) {
+          if (
+            !db.objectStoreNames.contains(ENTRIES_STORE) ||
+            !db.objectStoreNames.contains(CONTENT_STORE)
+          ) {
+            db.close();
+            resolve(null);
+            return;
+          }
+
+          const scanTx = db.transaction(
+            [ENTRIES_STORE, CONTENT_STORE],
+            "readonly"
+          );
+          const totals = await computeStoredBytes(
+            scanTx.objectStore(ENTRIES_STORE),
+            scanTx.objectStore(CONTENT_STORE)
+          );
+          await txToPromise(scanTx);
+          contentBytes = totals.contentBytes;
+          metadataBytes = totals.metadataBytes;
+        }
+
+        db.close();
+        resolve({ contentBytes, metadataBytes });
+      } catch (error) {
+        db.close();
+        reject(error);
+      }
+    };
+
+    request.onerror = async () => {
+      if (createdDuringProbe || request.error?.name === "AbortError") {
+        try {
+          await new Promise<void>((cleanupResolve) => {
+            const cleanupRequest = indexedDB.deleteDatabase(idbName);
+            cleanupRequest.onsuccess = () => cleanupResolve();
+            cleanupRequest.onerror = () => cleanupResolve();
+            cleanupRequest.onblocked = () => cleanupResolve();
+          });
+        } finally {
+          resolve(null);
+        }
+        return;
+      }
+
+      reject(
+        request.error ??
+          new Error(`Could not open IndexedDB database "${idbName}".`)
+      );
+    };
+  });
 }
