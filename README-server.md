@@ -36,7 +36,7 @@ The setup script:
 - builds the `mindoodb-server` Docker image
 - creates the data directory (`../mindoodb-data/server`) and password file (`../mindoodb-data/.server_unlock`, mode 600)
 - initialises the server identity and optionally creates a system admin keypair interactively
-- writes a `docker-compose.override.yml` with your current host uid/gid, bind mounts, and one or more published port bindings based on your chosen bind address
+- writes a `docker-compose.override.yml` with your current host uid/gid, bind mounts, and one or more published port bindings based on your chosen bind address and host port
 
 For an existing deployment, use one of these update paths instead of reinitialising blindly:
 
@@ -49,6 +49,10 @@ docker compose up -d --build
 ```
 
 `bash serversetup.sh --update` preserves the existing `server.identity.json`, `server.keybag`, `config.json`, tenant data, `trusted-servers.json`, and `.server_unlock`, while still rebuilding the Docker image and regenerating `docker-compose.override.yml`. Before the override is rewritten, the script now saves the previous file as `docker-compose.override.<timestamp>.yml`.
+
+The setup and update flows now prompt for a separate `Host port`. This lets you keep MindooDB listening on its internal container port `1661` while publishing a different host port such as `80`.
+
+For example, if you want to run behind the Cloudflare DNS proxy, rerun `bash serversetup.sh --update` and choose `Host port: 80`. The generated compose override will publish `80:1661`, which Cloudflare can reach, while the application inside the container continues to use port `1661`.
 
 After setup, manage the server with:
 
@@ -974,6 +978,27 @@ On SELinux hosts, append `:Z` to the `/data` bind mount and `,Z` to the read-onl
 To restrict the server to a specific network interface (e.g. a VPN), rerun `bash serversetup.sh --update` and provide the bind address when prompted. Update mode preserves the existing server identity, keybag, config, tenant data, and password file while regenerating `docker-compose.override.yml`.
 
 If you also want local checks from the same host, answer `y` when asked whether to also bind `127.0.0.1`. The generated `docker-compose.override.yml` will then contain both mappings.
+
+### Publish on a different host port
+
+`serversetup.sh` now distinguishes between:
+
+- the container port, which stays at `1661`
+- the published host port, which you choose via the `Host port` prompt
+
+This is useful when an upstream proxy only supports standard web ports. Examples:
+
+- default local/demo setup: `1661:1661`
+- Cloudflare proxy or direct HTTP on port 80: `80:1661`
+- alternate public port: `8080:1661`
+
+To change only the published host port for an existing deployment, rerun:
+
+```bash
+bash serversetup.sh --update
+```
+
+Then enter the existing data directory, keep your preferred bind address, and choose the new `Host port`.
 
 Avoid the overwrite path unless you intentionally want to replace `server.identity.json`. Replacing the server identity breaks the relationship to server-owned encrypted state such as `server.keybag`, so it should be treated as a destructive reinitialization step, not a normal upgrade.
 

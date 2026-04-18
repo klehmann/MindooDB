@@ -20,7 +20,8 @@ DOCKERFILE="src/node/server/Dockerfile"
 DEFAULT_SERVER_NAME="server1"
 DEFAULT_DATA_DIR="../mindoodb-data"
 DEFAULT_BIND_ADDR="0.0.0.0"
-DEFAULT_PORT="1661"
+DEFAULT_CONTAINER_PORT="1661"
+DEFAULT_HOST_PORT="1661"
 DEFAULT_CORS_ORIGIN="http://localhost:4174,https://haven.mindoodb.com"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
@@ -39,6 +40,7 @@ SELINUX_NOTES=""
 HEALTHCHECK_URL=""
 FORCE_FLAG=""
 ALSO_BIND_LOCALHOST=false
+HOST_PORT="$DEFAULT_HOST_PORT"
 
 show_help() {
   cat <<'EOF'
@@ -102,6 +104,20 @@ prompt_default() {
   printf "  %s [%s]: " "$prompt" "$default"
   read -r value
   eval "$var_name=\"\${value:-$default}\""
+}
+
+prompt_port() {
+  local prompt="$1" default="$2" var_name="$3" value
+  while true; do
+    printf "  %s [%s]: " "$prompt" "$default"
+    read -r value
+    value="${value:-$default}"
+    if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 )); then
+      eval "$var_name=\"\$value\""
+      return
+    fi
+    error "Please enter a port between 1 and 65535."
+  done
 }
 
 prompt_yes_no() {
@@ -196,14 +212,14 @@ prepare_mounts() {
 }
 
 prepare_ports() {
-  PORT_LINES=("      - \"${BIND_ADDR}:${DEFAULT_PORT}:${DEFAULT_PORT}\"")
-  HEALTHCHECK_URL="http://${BIND_ADDR}:${DEFAULT_PORT}/health"
+  PORT_LINES=("      - \"${BIND_ADDR}:${HOST_PORT}:${DEFAULT_CONTAINER_PORT}\"")
+  HEALTHCHECK_URL="http://${BIND_ADDR}:${HOST_PORT}/health"
   if [[ "$BIND_ADDR" == "0.0.0.0" ]]; then
-    HEALTHCHECK_URL="http://localhost:${DEFAULT_PORT}/health"
+    HEALTHCHECK_URL="http://localhost:${HOST_PORT}/health"
   fi
   if $ALSO_BIND_LOCALHOST; then
-    PORT_LINES=("      - \"127.0.0.1:${DEFAULT_PORT}:${DEFAULT_PORT}\"" "${PORT_LINES[@]}")
-    HEALTHCHECK_URL="http://localhost:${DEFAULT_PORT}/health"
+    PORT_LINES=("      - \"127.0.0.1:${HOST_PORT}:${DEFAULT_CONTAINER_PORT}\"" "${PORT_LINES[@]}")
+    HEALTHCHECK_URL="http://localhost:${HOST_PORT}/health"
   fi
 }
 
@@ -289,10 +305,11 @@ print_summary() {
     info "Password file:     $PASSWORD_FILE (preserved)"
   fi
   if $ALSO_BIND_LOCALHOST; then
-    info "Bind addresses:    127.0.0.1:$DEFAULT_PORT, $BIND_ADDR:$DEFAULT_PORT"
+    info "Bind addresses:    127.0.0.1:$HOST_PORT, $BIND_ADDR:$HOST_PORT"
   else
-    info "Bind address:      $BIND_ADDR:$DEFAULT_PORT"
+    info "Bind address:      $BIND_ADDR:$HOST_PORT"
   fi
+  info "Container port:    $DEFAULT_CONTAINER_PORT"
   info "Docker image:      $DOCKER_IMAGE"
   info "Runtime user:      ${HOST_UID}:${HOST_GID}"
   info "Override file:     docker-compose.override.yml"
@@ -315,18 +332,17 @@ print_summary() {
 
 run_setup_mode() {
   FORCE_FLAG=""
-  prompt_default "Server name" "$DEFAULT_SERVER_NAME" SERVER_NAME
-
   prompt_password "Server unlock password" SERVER_PASSWORD
 
   echo ""
   info "Server name:    $SERVER_NAME"
   info "Data directory: $DATA_DIR"
   if $ALSO_BIND_LOCALHOST; then
-    info "Bind addresses: 127.0.0.1:$DEFAULT_PORT, $BIND_ADDR:$DEFAULT_PORT"
+    info "Bind addresses: 127.0.0.1:$HOST_PORT, $BIND_ADDR:$HOST_PORT"
   else
-    info "Bind address:   $BIND_ADDR:$DEFAULT_PORT"
+    info "Bind address:   $BIND_ADDR:$HOST_PORT"
   fi
+  info "Container port: $DEFAULT_CONTAINER_PORT"
   echo ""
 
   write_password_file
@@ -361,10 +377,11 @@ run_update_mode() {
   info "Existing identity, keybag, config, tenant data, and password file will be preserved."
   info "Data directory: $DATA_DIR"
   if $ALSO_BIND_LOCALHOST; then
-    info "Bind addresses: 127.0.0.1:$DEFAULT_PORT, $BIND_ADDR:$DEFAULT_PORT"
+    info "Bind addresses: 127.0.0.1:$HOST_PORT, $BIND_ADDR:$HOST_PORT"
   else
-    info "Bind address:   $BIND_ADDR:$DEFAULT_PORT"
+    info "Bind address:   $BIND_ADDR:$HOST_PORT"
   fi
+  info "Container port: $DEFAULT_CONTAINER_PORT"
   echo ""
 
   mkdir -p "$SERVER_DATA"
@@ -430,6 +447,7 @@ if [[ "$MODE" != "update" ]]; then
 fi
 
 prompt_default "Bind address (0.0.0.0 = all interfaces)" "$DEFAULT_BIND_ADDR" BIND_ADDR
+prompt_port "Host port" "$DEFAULT_HOST_PORT" HOST_PORT
 if [[ "$BIND_ADDR" != "0.0.0.0" && "$BIND_ADDR" != "127.0.0.1" ]]; then
   prompt_yes_no "Also bind localhost (127.0.0.1) for local health checks?" "n" ALSO_BIND_LOCALHOST
 fi
