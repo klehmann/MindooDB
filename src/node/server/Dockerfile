@@ -5,8 +5,7 @@
 FROM node:20-alpine AS builder
 WORKDIR /build
 
-# COPY package.json package-lock.json ./
-COPY package.json ./
+COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 
 COPY tsconfig.json ./
