@@ -3463,6 +3463,40 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  getLatestChangeCursor(): ProcessChangesCursor | null {
+    const latestEntry = this.index[this.index.length - 1];
+    if (!latestEntry) {
+      return null;
+    }
+    return {
+      changeSeq: latestEntry.changeSeq,
+      lastModified: latestEntry.lastModified,
+      docId: latestEntry.docId,
+    };
+  }
+
+  seedStoreScanCursor(cursor: StoreScanCursor | null): void {
+    if (!cursor || this.index.length > 0 || this.processedEntryIds.length > 0) {
+      return;
+    }
+    if (
+      this.processedEntryCursor
+      && (
+        this.processedEntryCursor.receiptOrder > cursor.receiptOrder
+        || (
+          this.processedEntryCursor.receiptOrder === cursor.receiptOrder
+          && this.processedEntryCursor.id >= cursor.id
+        )
+      )
+    ) {
+      return;
+    }
+
+    this.processedEntryCursor = cursor;
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
   async *iterateChangesSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {

@@ -68,10 +68,16 @@ export class AuthenticationService {
 
   /**
    * Generate a challenge for a user to sign.
-   * 
+   *
+   * Note: the server cannot distinguish between a user whose access was explicitly
+   * revoked and a user whose grant-access document simply has not been synced to
+   * this server yet. In both cases the directory exposes no active grant document
+   * and we return USER_REVOKED with a message that mentions both possibilities so
+   * admins can diagnose the issue.
+   *
    * @param username The username requesting authentication
    * @returns The challenge string (UUID v7)
-   * @throws NetworkError if user not found or revoked
+   * @throws NetworkError if user not found or has no active access grant
    */
   async generateChallenge(username: string): Promise<string> {
     this.logger.debug(`Generating challenge for user: ${username}`);
@@ -82,9 +88,19 @@ export class AuthenticationService {
       // Check if user was revoked or never existed
       const isRevoked = await this.directory.isUserRevoked(username);
       if (isRevoked) {
-        throw new NetworkError(NetworkErrorType.USER_REVOKED, `User ${username} has been revoked`);
+        throw new NetworkError(
+          NetworkErrorType.USER_REVOKED,
+          `User "${username}" has no active access grant for this tenant on this server. `
+            + `The access may have been revoked, or the tenant's directory database may not have `
+            + `been synced to this server yet. Ask the tenant administrator to sync the directory.`,
+        );
       }
-      throw new NetworkError(NetworkErrorType.USER_NOT_FOUND, `User ${username} not found`);
+      throw new NetworkError(
+        NetworkErrorType.USER_NOT_FOUND,
+        `User "${username}" is not found in this server's tenant directory. `
+          + `The user may not have been registered yet, or the tenant's directory database may `
+          + `not have been synced to this server yet. Ask the tenant administrator to sync the directory.`,
+      );
     }
     
     // Generate UUID v7 challenge
@@ -156,10 +172,13 @@ export class AuthenticationService {
     // Get user's public signing key
     const userKeys = await this.directory.getUserPublicKeys(username);
     if (!userKeys) {
-      this.logger.debug(`User not found or revoked: ${username}`);
+      this.logger.debug(`User not found or has no active access grant on this server: ${username}`);
       return {
         success: false,
-        error: "User not found or revoked",
+        error:
+          `User "${username}" is not found, or has no active access grant on this server. `
+            + `The tenant's directory database may not have been synced to this server yet, `
+            + `or the access was revoked.`,
       };
     }
     

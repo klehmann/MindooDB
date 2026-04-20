@@ -167,6 +167,7 @@ export class HttpTransport implements NetworkTransport {
         protocolVersion: "sync-v1",
         supportsCursorScan: false,
         supportsIdBloomSummary: false,
+        supportsLatestScanCursor: false,
         supportsCompactionStatus: false,
         supportsMaterializationPlanning: false,
         supportsBatchMaterializationPlanning: false,
@@ -589,6 +590,26 @@ export class HttpTransport implements NetworkTransport {
   }
 
   /**
+   * Get the latest store scan cursor from the remote store.
+   */
+  async getLatestScanCursor(token: string): Promise<StoreScanCursor | null> {
+    this.logger.debug("Getting latest store scan cursor");
+
+    const response = await this.fetchWithRetry(
+      `${this.getSyncBasePath()}/getLatestScanCursor?tenantId=${encodeURIComponent(this.config.tenantId)}${this.config.dbId ? `&dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
+      {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+        },
+      }
+    );
+
+    const data = await response.json();
+    return (data.cursor as StoreScanCursor | null | undefined) ?? null;
+  }
+
+  /**
    * Resolve the dependency chain starting from an entry ID.
    */
   async resolveDependencies(
@@ -684,6 +705,14 @@ export class HttpTransport implements NetworkTransport {
                 NetworkErrorType.PAYLOAD_TOO_LARGE,
                 errorData.error || "Request body too large"
               );
+            case 429: {
+              const retryAfterMs = this.parseRetryAfterMs(response.headers.get("Retry-After"));
+              throw new NetworkError(
+                NetworkErrorType.RATE_LIMITED,
+                errorData.error || "Too many requests",
+                retryAfterMs,
+              );
+            }
             default:
               throw new NetworkError(
                 NetworkErrorType.SERVER_ERROR,
@@ -707,7 +736,8 @@ export class HttpTransport implements NetworkTransport {
             error.type === NetworkErrorType.INVALID_TOKEN ||
             error.type === NetworkErrorType.USER_REVOKED ||
             error.type === NetworkErrorType.INVALID_SIGNATURE ||
-            error.type === NetworkErrorType.PAYLOAD_TOO_LARGE
+            error.type === NetworkErrorType.PAYLOAD_TOO_LARGE ||
+            error.type === NetworkErrorType.RATE_LIMITED
           ) {
             throw error;
           }
@@ -741,6 +771,21 @@ export class HttpTransport implements NetworkTransport {
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private parseRetryAfterMs(retryAfterHeader: string | null): number | undefined {
+    if (!retryAfterHeader) {
+      return undefined;
+    }
+    const seconds = Number(retryAfterHeader);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds * 1000;
+    }
+    const dateMs = Date.parse(retryAfterHeader);
+    if (Number.isNaN(dateMs)) {
+      return undefined;
+    }
+    return Math.max(0, dateMs - Date.now());
   }
 
   private async getRemoteJsonBodyLimitBytes(): Promise<number | null> {

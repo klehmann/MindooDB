@@ -1048,6 +1048,7 @@ export class MindooDBServer {
       router.post(`${syncBase}/findNewEntriesForDoc`, syncRateLimit, this.handleFindNewEntriesForDoc.bind(this));
       router.post(`${syncBase}/findEntries`, syncRateLimit, this.handleFindEntries.bind(this));
       router.post(`${syncBase}/scanEntriesSince`, syncRateLimit, this.handleScanEntriesSince.bind(this));
+      router.get(`${syncBase}/getLatestScanCursor`, syncRateLimit, this.handleGetLatestScanCursor.bind(this));
       router.post(`${syncBase}/getIdBloomSummary`, syncRateLimit, this.handleGetIdBloomSummary.bind(this));
       router.post(`${syncBase}/getCompactionStatus`, syncRateLimit, this.handleGetCompactionStatus.bind(this));
       router.get(`${syncBase}/capabilities`, syncRateLimit, this.handleGetCapabilities.bind(this));
@@ -1321,6 +1322,23 @@ export class MindooDBServer {
     }
   }
 
+  private async handleGetLatestScanCursor(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const validDbId = this.validateDbId(req.query.dbId);
+
+      const serverStore = await this.tenantManager.getServerStore(
+        req.tenantId!,
+        validDbId,
+        this.getStoreKindFromRequest(req),
+      );
+      const cursor = await serverStore.handleGetLatestScanCursor(token);
+      res.json({ cursor });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
   private async handleGetIdBloomSummary(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
@@ -1339,8 +1357,7 @@ export class MindooDBServer {
   private async handleGetCapabilities(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
-      const rawDbId = (req.query.dbId as string) || "directory";
-      const validDbId = this.validateDbId(rawDbId);
+      const validDbId = this.validateDbId(req.query.dbId);
       const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const capabilities = await serverStore.handleGetCapabilities(token);
       res.json({ capabilities: capabilities as NetworkSyncCapabilities });
@@ -1498,8 +1515,7 @@ export class MindooDBServer {
   private async handleGetAllIds(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
-      const rawDbId = (req.query.dbId as string) || "directory";
-      const validDbId = this.validateDbId(rawDbId);
+      const validDbId = this.validateDbId(req.query.dbId);
 
       const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const ids = await serverStore.handleGetAllIds(token);

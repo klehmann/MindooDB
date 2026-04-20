@@ -520,6 +520,24 @@ describe("MindooDB Example Server", () => {
 
       expect(status).toBe(401);
     });
+
+    test("should reject sync GET endpoints when dbId is missing from the url", async () => {
+      const endpoints = [
+        `${baseUrl}/${tenantId}/sync/docs/getAllIds`,
+        `${baseUrl}/${tenantId}/sync/docs/capabilities`,
+        `${baseUrl}/${tenantId}/sync/docs/getLatestScanCursor`,
+      ];
+
+      for (const url of endpoints) {
+        const { status } = await httpRequest(
+          url,
+          "GET",
+          undefined,
+          { Authorization: `Bearer ${authToken}` }
+        );
+        expect(status).toBe(400);
+      }
+    });
   });
 
   describe("publishToServer convenience method", () => {

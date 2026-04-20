@@ -1352,6 +1352,33 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     return files.map(fromEntryFileName);
   }
 
+  async getLatestScanCursor(): Promise<StoreScanCursor | null> {
+    await this.ensureInitialized();
+
+    if (this.indexingEnabled) {
+      const last = this.orderedMetadata[this.orderedMetadata.length - 1];
+      if (!last || last.receiptOrder === undefined) {
+        return null;
+      }
+      return {
+        receiptOrder: last.receiptOrder,
+        id: last.id,
+      };
+    }
+
+    const all = (await this.listAllMetadata())
+      .filter((meta) => meta.receiptOrder !== undefined)
+      .sort((a, b) => this.compareMetadata(a, b));
+    const last = all[all.length - 1];
+    if (!last || last.receiptOrder === undefined) {
+      return null;
+    }
+    return {
+      receiptOrder: last.receiptOrder,
+      id: last.id,
+    };
+  }
+
   /**
    * Cursor-based paginated scan over entry metadata.
    *

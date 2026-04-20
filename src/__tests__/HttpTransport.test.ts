@@ -189,3 +189,101 @@ describe("HttpTransport.putEntries", () => {
     } satisfies Partial<NetworkError>);
   });
 });
+
+describe("HttpTransport rate limiting", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  test("does not retry 429 responses", async () => {
+    const fetchMock = jest.fn(async () =>
+      new Response(JSON.stringify({ error: "Too many sync requests, please try again later" }), {
+        status: 429,
+        headers: { "Content-Type": "application/json" },
+      }));
+    global.fetch = fetchMock as typeof fetch;
+
+    const transport = new HttpTransport({
+      baseUrl: "https://sync.example.com/tenant-a",
+      tenantId: "tenant-a",
+      dbId: "main",
+      retryAttempts: 3,
+      retryDelayMs: 1,
+    });
+
+    await expect(transport.findNewEntries("token", [])).rejects.toMatchObject({
+      name: "NetworkError",
+      type: NetworkErrorType.RATE_LIMITED,
+      message: "Too many sync requests, please try again later",
+    } satisfies Partial<NetworkError>);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("captures Retry-After metadata for 429 responses", async () => {
+    const fetchMock = jest.fn(async () =>
+      new Response(JSON.stringify({ error: "Too many sync requests, please try again later" }), {
+        status: 429,
+        headers: {
+          "Content-Type": "application/json",
+          "Retry-After": "7",
+        },
+      }));
+    global.fetch = fetchMock as typeof fetch;
+
+    const transport = new HttpTransport({
+      baseUrl: "https://sync.example.com/tenant-a",
+      tenantId: "tenant-a",
+      dbId: "main",
+      retryAttempts: 1,
+    });
+
+    await expect(transport.findNewEntries("token", [])).rejects.toMatchObject({
+      name: "NetworkError",
+      type: NetworkErrorType.RATE_LIMITED,
+      retryAfterMs: 7000,
+    } satisfies Partial<NetworkError>);
+  });
+});
+
+describe("HttpTransport getLatestScanCursor", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  test("requests the latest scan cursor from the remote store", async () => {
+    const fetchMock = jest.fn(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === "https://sync.example.com/tenant-a/sync/docs/getLatestScanCursor?tenantId=tenant-a&dbId=main") {
+        return new Response(JSON.stringify({
+          cursor: {
+            receiptOrder: 12,
+            id: "entry-12",
+          },
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    const transport = new HttpTransport({
+      baseUrl: "https://sync.example.com/tenant-a",
+      tenantId: "tenant-a",
+      dbId: "main",
+      retryAttempts: 1,
+    });
+
+    await expect(transport.getLatestScanCursor("token")).resolves.toEqual({
+      receiptOrder: 12,
+      id: "entry-12",
+    });
+  });
+});

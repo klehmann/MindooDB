@@ -389,12 +389,24 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         protocolVersion: "sync-v1",
         supportsCursorScan: false,
         supportsIdBloomSummary: false,
+        supportsLatestScanCursor: false,
         supportsCompactionStatus: false,
         supportsMaterializationPlanning: false,
         supportsBatchMaterializationPlanning: false,
         supportsAttachmentReadPlanning: false,
       };
       return this.capabilitiesCache;
+    });
+  }
+
+  async getLatestScanCursor(): Promise<StoreScanCursor | null> {
+    return this.withTransparentReauth("getLatestScanCursor", async () => {
+      const capabilities = await this.getCapabilities();
+      if (capabilities.supportsLatestScanCursor && this.transport.getLatestScanCursor) {
+        const token = await this.ensureAuthenticated();
+        return this.transport.getLatestScanCursor(token);
+      }
+      return null;
     });
   }
 

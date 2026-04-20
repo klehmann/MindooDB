@@ -318,6 +318,28 @@ describe("iterateChangesSince", () => {
       expect(firstPass).toHaveLength(3);
       expect([...firstPass, ...secondPass]).toEqual(expectedIds);
     });
+
+    it("returns the latest change cursor without iterating metadata", async () => {
+      const db = await tenant.openDB("test-db-latest-cursor");
+      let latestDocId = "";
+
+      for (let i = 0; i < 4; i++) {
+        const doc = await db.createDocument();
+        latestDocId = doc.getId();
+        await db.changeDoc(doc, (d) => {
+          d.getData().index = i;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      await db.syncStoreChanges();
+
+      const cursor = db.getLatestChangeCursor?.();
+
+      expect(cursor).toBeTruthy();
+      expect(cursor?.docId).toBe(latestDocId);
+      expect(typeof cursor?.changeSeq).toBe("number");
+      expect(cursor?.lastModified).toBeGreaterThan(0);
+    });
   });
 
   describe("snapshot policy", () => {

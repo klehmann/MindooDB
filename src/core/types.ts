@@ -2,7 +2,7 @@ import type { KeyBag } from "./keys/KeyBag";
 import type { KeyType } from "./keys/KeyContext";
 import type { PublicUserId, PrivateUserId } from "./userid";
 import { StoreKind } from "./appendonlystores/types";
-import type { ContentAddressedStore, OpenStoreOptions } from "./appendonlystores/types";
+import type { ContentAddressedStore, OpenStoreOptions, StoreScanCursor } from "./appendonlystores/types";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 
@@ -2000,6 +2000,19 @@ export interface MindooDB {
   iterateChangeMetadataSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangeSummaryResult, void, unknown>;
+
+  /**
+   * Return the latest available changefeed cursor without iterating the full
+   * change index. Returns `null` when the database has no indexed changes yet.
+   */
+  getLatestChangeCursor?(): ProcessChangesCursor | null;
+
+  /**
+   * Seed the raw store scan cursor when initial content came from another
+   * source (for example, a server-rendered view snapshot) and future syncs
+   * should start from the current remote head instead of replaying history.
+   */
+  seedStoreScanCursor?(cursor: StoreScanCursor | null): void;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.

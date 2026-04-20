@@ -289,6 +289,18 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     return ids;
   }
 
+  async getLatestScanCursor(): Promise<StoreScanCursor | null> {
+    const sorted = this.getSortedEntries();
+    const last = sorted[sorted.length - 1];
+    if (!last || last.receiptOrder === undefined) {
+      return null;
+    }
+    return {
+      receiptOrder: last.receiptOrder,
+      id: last.id,
+    };
+  }
+
   /**
    * Return all entries sorted by (receiptOrder ASC, id ASC).
    * Result is cached and invalidated on mutation for amortized O(1) access.
