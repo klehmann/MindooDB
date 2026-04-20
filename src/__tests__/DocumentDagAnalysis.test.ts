@@ -164,6 +164,21 @@ describe("Document DAG analysis", () => {
     return { userDb, userTwoDb };
   }
 
+  async function scanDocMetadata(db: MindooDB, docId: string): Promise<any[]> {
+    const store = db.getStore() as any;
+    let cursor: any = null;
+    const entries: any[] = [];
+    while (true) {
+      const page: any = await store.scanEntriesSince(cursor, 1000, { docId });
+      entries.push(...page.entries);
+      cursor = page.nextCursor;
+      if (!page.hasMore) {
+        break;
+      }
+    }
+    return entries;
+  }
+
   it("analyzes concurrent heads and reconstructs signer-local branches", async () => {
     const dbId = "dag-concurrent";
     const { userDb, userTwoDb } = await createSharedDbPair(dbId);
@@ -339,5 +354,66 @@ describe("Document DAG analysis", () => {
     );
     expect(deletedBranch).not.toBeNull();
     expect(deletedBranch!.doc.isDeleted()).toBe(true);
+  });
+
+  it("recovers missing dependency entry ids from store metadata before writing", async () => {
+    const dbId = "dag-recover-missing-deps";
+    const { userDb } = await createSharedDbPair(dbId);
+
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().step = 1;
+    });
+
+    const beforeEntries = await scanDocMetadata(userDb, docId);
+    const firstChange = beforeEntries
+      .filter((entry) => entry.entryType === "doc_change")
+      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))[0];
+    expect(firstChange).toBeTruthy();
+
+    const hashMap = (userDb as any).automergeHashToEntryId as Map<string, Map<string, string>>;
+    hashMap.delete(docId);
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().step = 2;
+    });
+
+    const afterEntries = await scanDocMetadata(userDb, docId);
+    const changeEntries = afterEntries
+      .filter((entry) => entry.entryType === "doc_change")
+      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    expect(changeEntries).toHaveLength(2);
+    expect(changeEntries[1]!.dependencyIds).toEqual([firstChange.id]);
+  });
+
+  it("fails writes instead of persisting broken dependency metadata when recovery cannot find parents", async () => {
+    const dbId = "dag-missing-deps-hard-fail";
+    const { userDb } = await createSharedDbPair(dbId);
+
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().step = 1;
+    });
+
+    const entries = await scanDocMetadata(userDb, docId);
+    const firstChange = entries.find((entry) => entry.entryType === "doc_change");
+    expect(firstChange).toBeTruthy();
+
+    const hashMap = (userDb as any).automergeHashToEntryId as Map<string, Map<string, string>>;
+    hashMap.delete(docId);
+
+    const store = userDb.getStore() as any;
+    store.entries.delete(firstChange.id);
+    store.sortedEntriesCache = null;
+
+    await expect(userDb.changeDoc(doc, (draft) => {
+      draft.getData().step = 2;
+    })).rejects.toThrow(`Could not resolve automerge dependency hashes`);
+
+    const finalEntries = await scanDocMetadata(userDb, docId);
+    const finalChangeEntries = finalEntries.filter((entry) => entry.entryType === "doc_change");
+    expect(finalChangeEntries).toHaveLength(0);
   });
 });

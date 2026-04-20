@@ -645,6 +645,56 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Rebuild the in-memory automerge-hash lookup for one document from stored metadata.
+   *
+   * This is a defensive recovery path for cases where the cached lookup missed
+   * previously stored entries even though the content-addressed store already has
+   * enough metadata to recover them.
+   */
+  private async hydrateAutomergeHashMappingsFromStore(docId: string): Promise<void> {
+    const allMetadata = await this.scanAllMetadata(this.store, { docId });
+    for (const metadata of allMetadata) {
+      const parsed = parseDocEntryId(metadata.id);
+      if (!parsed) {
+        continue;
+      }
+      this.registerAutomergeHashMapping(docId, parsed.automergeHash, metadata.id);
+    }
+  }
+
+  /**
+   * Resolve Automerge dependency hashes to entry IDs without silently dropping parents.
+   *
+   * The fast path uses the in-memory hash lookup. If that lookup is incomplete, we
+   * rebuild it from local store metadata once before failing the write.
+   */
+  private async ensureAutomergeDepsResolved(docId: string, automergeHashes: string[]): Promise<string[]> {
+    if (automergeHashes.length === 0) {
+      return [];
+    }
+
+    const resolvedEntryIds = this.resolveAutomergeDepsToEntryIds(docId, automergeHashes);
+    if (resolvedEntryIds.length === automergeHashes.length) {
+      return resolvedEntryIds;
+    }
+
+    this.logger.warn(
+      `Falling back to metadata scan for unresolved automerge dependency hashes in doc ${docId}`,
+    );
+    await this.hydrateAutomergeHashMappingsFromStore(docId);
+
+    const recoveredEntryIds = this.resolveAutomergeDepsToEntryIds(docId, automergeHashes);
+    if (recoveredEntryIds.length === automergeHashes.length) {
+      return recoveredEntryIds;
+    }
+
+    const missingHashes = automergeHashes.filter((hash) => this.getEntryIdForAutomergeHash(docId, hash) === null);
+    throw new Error(
+      `Could not resolve automerge dependency hashes ${missingHashes.join(", ")} to entry IDs for doc ${docId}`,
+    );
+  }
+
+  /**
    * Get the SubtleCrypto instance from the tenant's crypto adapter.
    */
   private getSubtle(): SubtleCrypto {
@@ -1561,7 +1611,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Generated entry ID: ${entryId}`);
     
     // Resolve Automerge dependency hashes to entry IDs (empty for first change)
-    const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
+    const dependencyIds = await this.ensureAutomergeDepsResolved(docId, automergeDepHashes);
     
     // Sign the encrypted payload - either with custom key or current user's key
     let signature: Uint8Array;
@@ -2446,7 +2496,7 @@ export class BaseMindooDB implements MindooDB {
     const entryId = await generateDocEntryId(docId, automergeHash, automergeDepHashes, this.getSubtle());
 
     // Resolve Automerge dependency hashes to entry IDs
-    const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
+    const dependencyIds = await this.ensureAutomergeDepsResolved(docId, automergeDepHashes);
 
     // Sign the encrypted payload - either with custom key or current user's key
     let signature: Uint8Array;
@@ -2872,7 +2922,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Generated entry ID for change: ${entryId}`);
 
     // Resolve Automerge dependency hashes to entry IDs
-    const dependencyIds = this.resolveAutomergeDepsToEntryIds(docId, automergeDepHashes);
+    const dependencyIds = await this.ensureAutomergeDepsResolved(docId, automergeDepHashes);
 
     // Sign the encrypted payload - use custom key if provided, otherwise current user's key
     let signature: Uint8Array;
@@ -2968,7 +3018,7 @@ export class BaseMindooDB implements MindooDB {
       }
 
       const headHashes = Automerge.getHeads(internalDoc.doc);
-      const headEntryIds = this.resolveAutomergeDepsToEntryIds(docId, headHashes);
+      const headEntryIds = await this.ensureAutomergeDepsResolved(docId, headHashes);
       const snapshotBytes = Automerge.save(internalDoc.doc);
       const encryptedPayload = await this.tenant.encryptPayload(snapshotBytes, internalDoc.decryptionKeyId);
       const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
