@@ -437,12 +437,6 @@ export interface ContentAddressedStore {
   ): Promise<StoreScanResult>;
 
   /**
-   * Return the latest available scan cursor without iterating the full
-   * metadata set. Useful for incremental-sync bootstrap.
-   */
-  getLatestScanCursor?(): Promise<StoreScanCursor | null>;
-
-  /**
    * Optional probabilistic summary over entry IDs for sync optimization.
    * Callers must still perform exact reconciliation for correctness.
    */

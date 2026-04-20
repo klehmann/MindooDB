@@ -261,22 +261,6 @@ export class ServerNetworkContentAddressedStore {
   }
 
   /**
-   * Handle a latest-scan-cursor request from a client.
-   */
-  async handleGetLatestScanCursor(token: string): Promise<StoreScanCursor | null> {
-    this.logger.debug("Handling getLatestScanCursor request");
-
-    const tokenPayload = await this.validateToken(token);
-    this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
-
-    if (this.localStore.getLatestScanCursor) {
-      return this.localStore.getLatestScanCursor();
-    }
-
-    return null;
-  }
-
-  /**
    * Handle a getIdBloomSummary request from a client.
    */
   async handleGetIdBloomSummary(token: string): Promise<StoreIdBloomSummary> {
@@ -304,7 +288,6 @@ export class ServerNetworkContentAddressedStore {
       protocolVersion: "sync-v4",
       supportsCursorScan: typeof this.localStore.scanEntriesSince === "function",
       supportsIdBloomSummary: typeof this.localStore.getIdBloomSummary === "function",
-      supportsLatestScanCursor: typeof this.localStore.getLatestScanCursor === "function",
       supportsCompactionStatus: typeof this.localStore.getCompactionStatus === "function",
       supportsMaterializationPlanning:
         typeof this.localStore.planDocumentMaterialization === "function",

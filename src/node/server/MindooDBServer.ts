@@ -1048,7 +1048,6 @@ export class MindooDBServer {
       router.post(`${syncBase}/findNewEntriesForDoc`, syncRateLimit, this.handleFindNewEntriesForDoc.bind(this));
       router.post(`${syncBase}/findEntries`, syncRateLimit, this.handleFindEntries.bind(this));
       router.post(`${syncBase}/scanEntriesSince`, syncRateLimit, this.handleScanEntriesSince.bind(this));
-      router.get(`${syncBase}/getLatestScanCursor`, syncRateLimit, this.handleGetLatestScanCursor.bind(this));
       router.post(`${syncBase}/getIdBloomSummary`, syncRateLimit, this.handleGetIdBloomSummary.bind(this));
       router.post(`${syncBase}/getCompactionStatus`, syncRateLimit, this.handleGetCompactionStatus.bind(this));
       router.get(`${syncBase}/capabilities`, syncRateLimit, this.handleGetCapabilities.bind(this));
@@ -1317,23 +1316,6 @@ export class MindooDBServer {
         nextCursor: result.nextCursor,
         hasMore: result.hasMore,
       });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleGetLatestScanCursor(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const validDbId = this.validateDbId(req.query.dbId);
-
-      const serverStore = await this.tenantManager.getServerStore(
-        req.tenantId!,
-        validDbId,
-        this.getStoreKindFromRequest(req),
-      );
-      const cursor = await serverStore.handleGetLatestScanCursor(token);
-      res.json({ cursor });
     } catch (error) {
       this.handleRequestError(error, res);
     }

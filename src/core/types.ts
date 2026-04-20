@@ -2008,13 +2008,6 @@ export interface MindooDB {
   getLatestChangeCursor?(): ProcessChangesCursor | null;
 
   /**
-   * Seed the raw store scan cursor when initial content came from another
-   * source (for example, a server-rendered view snapshot) and future syncs
-   * should start from the current remote head instead of replaying history.
-   */
-  seedStoreScanCursor?(cursor: StoreScanCursor | null): void;
-
-  /**
    * Sync changes from the append-only store by finding new changes and processing them.
    * This method can be called multiple times to incrementally sync new changes.
    * On first call (when processedChangeHashes is empty), it will process all changes.

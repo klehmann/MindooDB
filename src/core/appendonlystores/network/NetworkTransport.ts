@@ -147,14 +147,6 @@ export interface NetworkTransport {
   ): Promise<StoreScanResult>;
 
   /**
-   * Return the latest available store scan cursor without scanning metadata.
-   *
-   * Optional transport capability. Implementations that do not support this
-   * can omit it; callers should fall back to other bootstrap paths.
-   */
-  getLatestScanCursor?(token: string): Promise<StoreScanCursor | null>;
-
-  /**
    * Optional probabilistic ID summary for sync optimization.
    */
   getIdBloomSummary?(token: string): Promise<StoreIdBloomSummary>;

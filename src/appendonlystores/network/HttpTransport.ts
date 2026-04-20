@@ -167,7 +167,6 @@ export class HttpTransport implements NetworkTransport {
         protocolVersion: "sync-v1",
         supportsCursorScan: false,
         supportsIdBloomSummary: false,
-        supportsLatestScanCursor: false,
         supportsCompactionStatus: false,
         supportsMaterializationPlanning: false,
         supportsBatchMaterializationPlanning: false,
@@ -587,26 +586,6 @@ export class HttpTransport implements NetworkTransport {
     
     this.logger.debug(`Retrieved ${ids.length} entry IDs`);
     return ids;
-  }
-
-  /**
-   * Get the latest store scan cursor from the remote store.
-   */
-  async getLatestScanCursor(token: string): Promise<StoreScanCursor | null> {
-    this.logger.debug("Getting latest store scan cursor");
-
-    const response = await this.fetchWithRetry(
-      `${this.getSyncBasePath()}/getLatestScanCursor?tenantId=${encodeURIComponent(this.config.tenantId)}${this.config.dbId ? `&dbId=${encodeURIComponent(this.config.dbId)}` : ""}`,
-      {
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-        },
-      }
-    );
-
-    const data = await response.json();
-    return (data.cursor as StoreScanCursor | null | undefined) ?? null;
   }
 
   /**

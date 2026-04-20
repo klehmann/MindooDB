@@ -525,7 +525,6 @@ describe("MindooDB Example Server", () => {
       const endpoints = [
         `${baseUrl}/${tenantId}/sync/docs/getAllIds`,
         `${baseUrl}/${tenantId}/sync/docs/capabilities`,
-        `${baseUrl}/${tenantId}/sync/docs/getLatestScanCursor`,
       ];
 
       for (const url of endpoints) {

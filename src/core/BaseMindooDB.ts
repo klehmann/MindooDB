@@ -3475,28 +3475,6 @@ export class BaseMindooDB implements MindooDB {
     };
   }
 
-  seedStoreScanCursor(cursor: StoreScanCursor | null): void {
-    if (!cursor || this.index.length > 0 || this.processedEntryIds.length > 0) {
-      return;
-    }
-    if (
-      this.processedEntryCursor
-      && (
-        this.processedEntryCursor.receiptOrder > cursor.receiptOrder
-        || (
-          this.processedEntryCursor.receiptOrder === cursor.receiptOrder
-          && this.processedEntryCursor.id >= cursor.id
-        )
-      )
-    ) {
-      return;
-    }
-
-    this.processedEntryCursor = cursor;
-    this.cacheMetaDirty = true;
-    this.cacheManager?.markDirty();
-  }
-
   async *iterateChangesSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {

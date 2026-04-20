@@ -99,10 +99,6 @@ class MockNetworkTransport implements NetworkTransport {
     return this.server.handleScanEntriesSince(token, cursor, limit, filters);
   }
 
-  async getLatestScanCursor(token: string): Promise<StoreScanCursor | null> {
-    return this.server.handleGetLatestScanCursor(token);
-  }
-
   async getIdBloomSummary(token: string): Promise<StoreIdBloomSummary> {
     return this.server.handleGetIdBloomSummary(token);
   }
@@ -561,20 +557,9 @@ describe("Network Sync", () => {
       expect(caps.protocolVersion).toBe("sync-v4");
       expect(caps.supportsCursorScan).toBe(true);
       expect(caps.supportsIdBloomSummary).toBe(true);
-      expect(caps.supportsLatestScanCursor).toBe(true);
       expect(caps.supportsCompactionStatus).toBe(false);
       expect(caps.supportsMaterializationPlanning).toBe(true);
       expect(caps.supportsBatchMaterializationPlanning).toBe(true);
-    });
-
-    test("should fetch the latest scan cursor from remote", async () => {
-      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
-      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000)]);
-
-      await expect(clientStore.getLatestScanCursor?.()).resolves.toEqual({
-        receiptOrder: 2,
-        id: "hash2",
-      });
     });
 
     test("should scan entries via cursor in remote receipt order", async () => {

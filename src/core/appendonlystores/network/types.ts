@@ -144,11 +144,6 @@ export interface NetworkSyncCapabilities {
    */
   supportsIdBloomSummary: boolean;
   /**
-   * Remote store can return the latest store scan cursor in O(1) time.
-   * Clients can seed a local sync cursor without replaying remote metadata.
-   */
-  supportsLatestScanCursor: boolean;
-  /**
    * Remote store exposes compaction/index observability via `getCompactionStatus()`.
    * This is informational and used for monitoring/debugging rather than correctness.
    */
