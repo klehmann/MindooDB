@@ -35,10 +35,17 @@ import type { ContentAddressedStore } from "../core/appendonlystores/types";
  * without actual network calls. Used for testing the client-server interaction.
  */
 class MockNetworkTransport implements NetworkTransport {
+  private static nextIdentity = 1;
   private server: ServerNetworkContentAddressedStore;
+  private identity: string;
 
-  constructor(server: ServerNetworkContentAddressedStore) {
+  constructor(server: ServerNetworkContentAddressedStore, identity = `mock-transport-${MockNetworkTransport.nextIdentity++}`) {
     this.server = server;
+    this.identity = identity;
+  }
+
+  getIdentity(): string {
+    return this.identity;
   }
 
   async requestChallenge(username: string): Promise<string> {
@@ -733,6 +740,59 @@ describe("Network Sync", () => {
       expect(second.length).toBe(1);
       expect(requestChallengeSpy).toHaveBeenCalledTimes(1);
       expect(authenticateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("should reuse one authentication across store instances for the same tenant identity", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+
+      const sharedTransportIdentity = "shared-auth-scope";
+      const transportA = new MockNetworkTransport(serverHandler, sharedTransportIdentity);
+      const transportB = new MockNetworkTransport(serverHandler, sharedTransportIdentity);
+      const firstStore = new ClientNetworkContentAddressedStore(
+        "test-db",
+        StoreKind.docs,
+        transportA,
+        cryptoAdapter,
+        "testuser",
+        userSigningKeyPair.privateKey,
+        userEncryptionPrivateKeyPem
+      );
+      const secondStore = new ClientNetworkContentAddressedStore(
+        "test-db",
+        StoreKind.docs,
+        transportB,
+        cryptoAdapter,
+        "testuser",
+        userSigningKeyPair.privateKey,
+        userEncryptionPrivateKeyPem
+      );
+
+      const challengeSpyA = jest.spyOn(transportA, "requestChallenge");
+      const challengeSpyB = jest.spyOn(transportB, "requestChallenge");
+      const authenticateSpyA = jest.spyOn(transportA, "authenticate");
+      const authenticateSpyB = jest.spyOn(transportB, "authenticate");
+
+      const [first, second] = await Promise.all([
+        firstStore.findNewEntries([]),
+        secondStore.findNewEntries([]),
+      ]);
+
+      expect(first.length).toBe(1);
+      expect(second.length).toBe(1);
+      expect(challengeSpyA.mock.calls.length + challengeSpyB.mock.calls.length).toBe(1);
+      expect(authenticateSpyA.mock.calls.length + authenticateSpyB.mock.calls.length).toBe(1);
+    });
+
+    test("should coalesce concurrent capability fetches", async () => {
+      const getCapabilitiesSpy = jest.spyOn(mockTransport, "getCapabilities");
+
+      const [first, second] = await Promise.all([
+        clientStore.getCapabilities(),
+        clientStore.getCapabilities(),
+      ]);
+
+      expect(first).toEqual(second);
+      expect(getCapabilitiesSpy).toHaveBeenCalledTimes(1);
     });
   });
 
