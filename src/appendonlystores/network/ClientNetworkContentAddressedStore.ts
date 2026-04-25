@@ -28,6 +28,16 @@ import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 
+type SharedAuthenticationState = {
+  accessToken: string | null;
+  tokenExpiry: number;
+  authenticationPromise: Promise<string> | null;
+};
+
+type MindooDBGlobalAuthState = typeof globalThis & {
+  __mindoodbSharedAuthenticationState?: Map<string, SharedAuthenticationState>;
+};
+
 /**
  * Client-side network ContentAddressedStore that forwards all operations to a remote server.
  * 
@@ -58,6 +68,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   private authenticationPromise: Promise<string> | null = null;
   private logger: Logger;
   private capabilitiesCache: NetworkSyncCapabilities | null = null;
+  private capabilitiesPromise: Promise<NetworkSyncCapabilities> | null = null;
   private syncAuthOverride: {
     username: string;
     signingKey: CryptoKey;
@@ -379,7 +390,10 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     if (this.capabilitiesCache) {
       return this.capabilitiesCache;
     }
-    return this.withTransparentReauth("getCapabilities", async () => {
+    if (this.capabilitiesPromise) {
+      return this.capabilitiesPromise;
+    }
+    this.capabilitiesPromise = this.withTransparentReauth("getCapabilities", async () => {
       const token = await this.ensureAuthenticated();
       if (this.transport.getCapabilities) {
         this.capabilitiesCache = await this.transport.getCapabilities(token);
@@ -396,6 +410,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       };
       return this.capabilitiesCache;
     });
+    try {
+      return await this.capabilitiesPromise;
+    } finally {
+      if (this.capabilitiesPromise) {
+        this.capabilitiesPromise = null;
+      }
+    }
   }
 
   async getCompactionStatus(): Promise<StoreCompactionStatus> {
@@ -489,27 +510,58 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    */
   private async ensureAuthenticated(): Promise<string> {
     const now = Date.now();
+    const sharedState = this.getSharedAuthenticationState();
+    const sharedKey = this.getSharedAuthenticationKey();
 
     // Check if we have a valid token
     if (this.accessToken && this.tokenExpiry > now + 60000) { // 1 minute buffer
+      this.logger.info(`[auth-share] Reusing local cached token for ${sharedKey}`);
+      return this.accessToken;
+    }
+
+    if (sharedState.accessToken && sharedState.tokenExpiry > now + 60000) {
+      this.accessToken = sharedState.accessToken;
+      this.tokenExpiry = sharedState.tokenExpiry;
+      this.logger.info(`[auth-share] Adopting shared cached token for ${sharedKey}`);
       return this.accessToken;
     }
 
     if (this.authenticationPromise) {
+      this.logger.info(`[auth-share] Awaiting local in-flight authentication for ${sharedKey}`);
       return this.authenticationPromise;
     }
 
-    this.authenticationPromise = this.performAuthentication();
+    if (sharedState.authenticationPromise) {
+      this.logger.info(`[auth-share] Awaiting shared in-flight authentication for ${sharedKey}`);
+      this.authenticationPromise = sharedState.authenticationPromise;
+      try {
+        const token = await sharedState.authenticationPromise;
+        this.accessToken = sharedState.accessToken ?? token;
+        this.tokenExpiry = sharedState.tokenExpiry;
+        return token;
+      } finally {
+        if (this.authenticationPromise === sharedState.authenticationPromise) {
+          this.authenticationPromise = null;
+        }
+      }
+    }
+
+    this.logger.info(`[auth-share] Starting shared authentication for ${sharedKey}`);
+    this.authenticationPromise = this.performAuthentication(sharedState);
+    sharedState.authenticationPromise = this.authenticationPromise;
     try {
       return await this.authenticationPromise;
     } finally {
+      if (sharedState.authenticationPromise === this.authenticationPromise) {
+        sharedState.authenticationPromise = null;
+      }
       if (this.authenticationPromise) {
         this.authenticationPromise = null;
       }
     }
   }
 
-  private async performAuthentication(): Promise<string> {
+  private async performAuthentication(sharedState: SharedAuthenticationState): Promise<string> {
     const now = Date.now();
     const authUsername = this.getActiveAuthUsername();
     this.logger.debug(`Authenticating user: ${authUsername}`);
@@ -533,6 +585,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     }
 
     this.accessToken = result.token;
+    sharedState.accessToken = result.token;
 
     // Parse token expiry from JWT (simple extraction)
     try {
@@ -545,6 +598,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       // Default to 1 hour if we can't parse
       this.tokenExpiry = now + 3600000;
     }
+    sharedState.tokenExpiry = this.tokenExpiry;
 
     this.logger.debug(`Authentication successful`);
     return this.accessToken;
@@ -611,14 +665,65 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     return results;
   }
 
+  private buildSharedAuthenticationKey(username: string): string {
+    const transportIdentity = this.transport.getIdentity?.() ?? "unknown";
+    return `${transportIdentity}::${username}`;
+  }
+
+  private getSharedAuthenticationKey(): string {
+    return this.buildSharedAuthenticationKey(this.getActiveAuthUsername());
+  }
+
+  private static getSharedAuthenticationRegistry(): Map<string, SharedAuthenticationState> {
+    const globalAuthState = globalThis as MindooDBGlobalAuthState;
+    if (!globalAuthState.__mindoodbSharedAuthenticationState) {
+      globalAuthState.__mindoodbSharedAuthenticationState = new Map<string, SharedAuthenticationState>();
+    }
+    return globalAuthState.__mindoodbSharedAuthenticationState;
+  }
+
+  private getSharedAuthenticationState(): SharedAuthenticationState {
+    const key = this.getSharedAuthenticationKey();
+    const registry = ClientNetworkContentAddressedStore.getSharedAuthenticationRegistry();
+    const existing = registry.get(key);
+    if (existing) {
+      return existing;
+    }
+    const created: SharedAuthenticationState = {
+      accessToken: null,
+      tokenExpiry: 0,
+      authenticationPromise: null,
+    };
+    registry.set(key, created);
+    return created;
+  }
+
+  private clearSharedAuthenticationState(username: string): void {
+    const existing = ClientNetworkContentAddressedStore.getSharedAuthenticationRegistry().get(
+      this.buildSharedAuthenticationKey(username),
+    );
+    if (!existing) {
+      return;
+    }
+    existing.accessToken = null;
+    existing.tokenExpiry = 0;
+    existing.authenticationPromise = null;
+  }
+
   /**
    * Clear the cached access token.
    * Call this if you need to force re-authentication.
    */
   clearAuthCache(): void {
+    const sharedState = this.getSharedAuthenticationState();
+    const sharedKey = this.getSharedAuthenticationKey();
+    this.logger.info(`[auth-share] Clearing auth cache for ${sharedKey}`);
     this.accessToken = null;
     this.tokenExpiry = 0;
     this.capabilitiesCache = null;
+    this.capabilitiesPromise = null;
+    sharedState.accessToken = null;
+    sharedState.tokenExpiry = 0;
   }
 
   private async refreshAuthentication(): Promise<string> {
@@ -658,15 +763,19 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       privateEncryptionKey?: CryptoKey | string;
     } | null
   ): void {
+    const previousUsername = this.getActiveAuthUsername();
     this.syncAuthOverride = override;
     // Changing auth identity requires token refresh.
     this.clearAuthCache();
+    this.clearSharedAuthenticationState(previousUsername);
   }
 
   clearSyncAuthOverride(): void {
     if (this.syncAuthOverride) {
+      const previousUsername = this.syncAuthOverride.username;
       this.syncAuthOverride = null;
       this.clearAuthCache();
+      this.clearSharedAuthenticationState(previousUsername);
     }
   }
 
