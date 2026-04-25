@@ -9,7 +9,7 @@ Even if someone has full access to your infrastructure — database dumps, backu
 
 Your data is encrypted on the client before it ever touches a server. No plaintext. No server-side keys. No trust required.
 
-> ⚠️ **Alpha software**: This project is in early development and not yet recommended for production use. APIs may change without notice.
+> ⚠️ **Beta software**: This project is in early development and not yet recommended for production use. APIs may change without notice.
 
 Use AI to explore this repository:
 
