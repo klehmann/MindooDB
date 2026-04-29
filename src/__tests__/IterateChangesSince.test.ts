@@ -286,6 +286,33 @@ describe("iterateChangesSince", () => {
       expect(iterationMetric?.details?.yieldedDocuments).toBe(6);
     });
 
+    it("reports undeletes as live metadata and materialized changes", async () => {
+      const db = await tenant.openDB("test-db-metadata-undelete");
+      const doc = await db.createDocument();
+      await db.changeDoc(doc, (d) => {
+        d.getData().title = "restorable";
+      });
+
+      await db.deleteDocument(doc.getId());
+      await db.undeleteDocument(doc.getId());
+      await db.syncStoreChanges();
+
+      const seen: Array<{ docId: string; isDeleted: boolean; cursor: ProcessChangesCursor }> = [];
+      for await (const result of db.iterateChangeMetadataSince(null)) {
+        seen.push(result);
+      }
+      expect(seen).toContainEqual(expect.objectContaining({
+        docId: doc.getId(),
+        isDeleted: false,
+      }));
+
+      const materialized: Array<{ docId: string; isDeleted: boolean }> = [];
+      for await (const { doc: changedDoc } of db.iterateChangesSince(null)) {
+        materialized.push({ docId: changedDoc.getId(), isDeleted: changedDoc.isDeleted() });
+      }
+      expect(materialized).toContainEqual({ docId: doc.getId(), isDeleted: false });
+    });
+
     it("resumes metadata iteration from the last yielded cursor", async () => {
       const db = await tenant.openDB("test-db-metadata-resume");
       const expectedIds: string[] = [];

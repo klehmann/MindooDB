@@ -313,7 +313,9 @@ Need commercial support, have questions, or want to request a feature? We're her
 
 ## License
 
-Apache 2.0
+MindooDB is released under the [Apache License 2.0](./LICENSE). See the [`LICENSE`](./LICENSE) file for the full text.
+
+Copyright (c) 2026 Mindoo GmbH.
 
 ## Author
 

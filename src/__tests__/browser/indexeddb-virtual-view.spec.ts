@@ -291,6 +291,17 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
           .flatMap((category: { getChildDocuments: () => Array<{ docId: string }> }) =>
             category.getChildDocuments().map((doc: { docId: string }) => doc.docId)
           );
+        const deleteOnlyLoadMetrics = [...loadMetrics];
+
+        await db.undeleteDocument(deleteId);
+        await view.update();
+
+        const restoredDocs = view
+          .getRoot()
+          .getChildCategories()
+          .flatMap((category: { getChildDocuments: () => Array<{ docId: string }> }) =>
+            category.getChildDocuments().map((doc: { docId: string }) => doc.docId)
+          );
 
         const store = db.getStore();
         if (store.clearAllLocalData) {
@@ -299,9 +310,10 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
 
         return {
           remainingDocs,
+          restoredDocs,
           keepId,
           deleteId,
-          loadMetrics,
+          deleteOnlyLoadMetrics,
         };
       },
       { browserBundleUrl: server.context.browserBundleUrl }
@@ -309,7 +321,8 @@ test.describe("MindooDB browser virtual view with IndexedDB store", () => {
 
     expect(result.remainingDocs).toEqual([result.keepId]);
     expect(result.remainingDocs).not.toContain(result.deleteId);
-    expect(result.loadMetrics).toEqual([]);
+    expect(result.restoredDocs.sort()).toEqual([result.keepId, result.deleteId].sort());
+    expect(result.deleteOnlyLoadMetrics).toEqual([]);
   });
 
   test("IndexedDB store data survives page reload", async ({ page }) => {

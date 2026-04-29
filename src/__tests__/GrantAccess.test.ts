@@ -173,7 +173,7 @@ describe("granting tenant access", () => {
     const legacyUsernameHash = await (directory as unknown as { hashUsername: (username: string) => Promise<string> })
       .hashUsername(regularUser.username);
 
-    await directoryDB.changeDocWithSigningKey(
+    await directoryDB.changeDoc(
       legacyDoc,
       async (doc: MindooDoc) => {
         const data = doc.getData();
@@ -184,8 +184,10 @@ describe("granting tenant access", () => {
         data.userSigningPublicKey = regularUser.userSigningKeyPair.publicKey;
         data.userEncryptionPublicKey = regularUser.userEncryptionKeyPair.publicKey;
       },
-      adminUser.userSigningKeyPair,
-      adminUserPassword,
+      {
+        signingKeyPair: adminUser.userSigningKeyPair,
+        signingKeyPassword: adminUserPassword,
+      },
     );
 
     const userLookup = await directory.getUserBySigningPublicKey(regularUser.userSigningKeyPair.publicKey);

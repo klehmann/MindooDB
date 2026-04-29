@@ -17,7 +17,7 @@ import type {
  * - `entryIdsToApply` contains exactly the replay entries needed to reconstruct
  *   latest state that are not already covered by the selected snapshot.
  */
-const DOC_REPLAY_TYPES = new Set(["doc_create", "doc_change", "doc_delete"]);
+const DOC_REPLAY_TYPES = new Set(["doc_create", "doc_change", "doc_delete", "doc_undelete"]);
 
 /**
  * Returns true for entry types that can influence Automerge latest state replay.
@@ -232,7 +232,7 @@ export function topologicalByDependencies(
  * - If no snapshots exist, all replay entries are returned (full rebuild).
  *
  * Attachment entries (`attachment_chunk`) are never included — the planner
- * operates exclusively on `doc_create`, `doc_change`, and `doc_delete`
+ * operates exclusively on `doc_create`, `doc_change`, `doc_delete`, and `doc_undelete`
  * entries (the types tracked by `DOC_REPLAY_TYPES`).
  *
  * @param docId            The document to plan for.

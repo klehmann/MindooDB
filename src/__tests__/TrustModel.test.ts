@@ -310,7 +310,7 @@ describe("Trust Model Security", () => {
       );
     }, 30000);
 
-    it("should allow admin key to create, change, and delete documents in directory", async () => {
+    it("should allow admin key to create, change, delete, and undelete documents in directory", async () => {
       // Get the directory DB (admin-only mode)
       const directoryDB = await tenant.openDB("directory") as BaseMindooDB;
       
@@ -322,25 +322,37 @@ describe("Trust Model Security", () => {
       expect(doc.getId()).toBeDefined();
       
       // Change the document using the admin signing key - should succeed
-      await directoryDB.changeDocWithSigningKey(doc, (d) => {
+      await directoryDB.changeDoc(doc, (d) => {
         d.getData().testField = "admin created this";
-      }, adminUser.userSigningKeyPair, adminUserPassword);
+      }, {
+        signingKeyPair: adminUser.userSigningKeyPair,
+        signingKeyPassword: adminUserPassword,
+      });
       
       // Verify the change was applied
       const reloadedDoc = await directoryDB.getDocument(doc.getId());
       expect(reloadedDoc.getData().testField).toBe("admin created this");
       
       // Delete the document using the admin signing key - should succeed
-      await directoryDB.deleteDocumentWithSigningKey(
-        doc.getId(),
-        adminUser.userSigningKeyPair,
-        adminUserPassword
-      );
+      await directoryDB.deleteDocument(doc.getId(), {
+        signingKeyPair: adminUser.userSigningKeyPair,
+        signingKeyPassword: adminUserPassword,
+      });
       
       // Verify the document is deleted
       await expect(directoryDB.getDocument(doc.getId())).rejects.toThrow(
         `Document ${doc.getId()} has been deleted`
       );
+
+      // Undelete the document using the admin signing key - should succeed
+      await directoryDB.undeleteDocument(doc.getId(), {
+        signingKeyPair: adminUser.userSigningKeyPair,
+        signingKeyPassword: adminUserPassword,
+      });
+
+      const undeletedDoc = await directoryDB.getDocument(doc.getId());
+      expect(undeletedDoc.isDeleted()).toBe(false);
+      expect(undeletedDoc.getData().testField).toBe("admin created this");
     }, 30000);
   });
 

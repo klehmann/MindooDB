@@ -403,6 +403,24 @@ describe("TimeTravel", () => {
       const idsAfterDelete = await db.getAllDocumentIdsAtTimestamp(deleteTime + 1000);
       expect(idsAfterDelete).not.toContain(doc1Id);
     });
+
+    test("should include documents again after undelete timestamp", async () => {
+      const doc1 = await db.createDocument();
+      const doc1Id = doc1.getId();
+      const createTime = Date.now();
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+      await db.deleteDocument(doc1Id);
+      const deleteTime = Date.now();
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+      await db.undeleteDocument(doc1Id);
+      const undeleteTime = Date.now();
+
+      expect(await db.getAllDocumentIdsAtTimestamp(createTime)).toContain(doc1Id);
+      expect(await db.getAllDocumentIdsAtTimestamp(deleteTime)).not.toContain(doc1Id);
+      expect(await db.getAllDocumentIdsAtTimestamp(undeleteTime)).toContain(doc1Id);
+    });
     
     test("should return empty array for timestamp before any documents", async () => {
       const doc1 = await db.createDocument();

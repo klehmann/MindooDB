@@ -7,8 +7,9 @@ import type {
 import { parseDocEntryId } from "./utils/idGeneration";
 import { topologicalByDependencies } from "./appendonlystores/MaterializationPlanner";
 
-const REPLAY_ENTRY_TYPES = new Set(["doc_create", "doc_change", "doc_delete"]);
-const DAG_ENTRY_TYPES = new Set(["doc_create", "doc_change", "doc_delete", "doc_snapshot"]);
+const REPLAY_ENTRY_TYPES = new Set(["doc_create", "doc_change", "doc_delete", "doc_undelete"]);
+const DAG_ENTRY_TYPES = new Set(["doc_create", "doc_change", "doc_delete", "doc_undelete", "doc_snapshot"]);
+const LIFECYCLE_TERMINAL_ENTRY_TYPES = new Set(["doc_delete", "doc_undelete"]);
 
 /**
  * Returns true when the entry participates in replaying a document state.
@@ -92,6 +93,61 @@ function collectReplayAncestors(
     }
   }
   return visited;
+}
+
+/**
+ * Determines whether the latest lifecycle terminal reachable from the active
+ * replay heads leaves the document deleted.
+ *
+ * When multiple terminal entries survive on concurrent branches, the entry with
+ * the latest `createdAt` wins; `id` breaks timestamp ties deterministically.
+ */
+export function isDeletedFromHeads(
+  headEntryIds: string[],
+  replayById: Map<string, StoreEntryMetadata>,
+): boolean {
+  const reachableTerminalIds = new Set<string>();
+  for (const headEntryId of headEntryIds) {
+    // Only lifecycle terminal entries reachable from active heads can affect
+    // the document's current alive/deleted state.
+    const ancestors = collectReplayAncestors(replayById, headEntryId);
+    for (const entryId of ancestors) {
+      const entry = replayById.get(entryId);
+      if (entry && LIFECYCLE_TERMINAL_ENTRY_TYPES.has(entry.entryType)) {
+        reachableTerminalIds.add(entryId);
+      }
+    }
+  }
+
+  if (reachableTerminalIds.size === 0) {
+    return false;
+  }
+
+  const terminalIds = Array.from(reachableTerminalIds);
+  const survivingTerminalIds = terminalIds.filter((candidateId) => {
+    // If a later terminal entry depends on this candidate, the candidate has
+    // been causally superseded and should not compete in the final latest-wins
+    // comparison. Concurrent terminals survive this pruning step.
+    for (const otherId of terminalIds) {
+      if (otherId === candidateId) {
+        continue;
+      }
+      if (collectReplayAncestors(replayById, otherId).has(candidateId)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  // Remaining terminals are concurrent branch outcomes. Pick the deterministic
+  // latest one so every replica derives the same lifecycle state from metadata.
+  const latestTerminal = survivingTerminalIds
+    .map((entryId) => replayById.get(entryId))
+    .filter((entry): entry is StoreEntryMetadata => entry !== undefined)
+    .sort(compareByCreatedAtThenId)
+    .at(-1);
+
+  return latestTerminal?.entryType === "doc_delete";
 }
 
 /**
@@ -359,6 +415,7 @@ function buildBranchSummary(
     ancestorEntryIds: orderedAncestors,
     compatibleSnapshotEntryId: compatibleSnapshot?.id ?? null,
     compatibleSnapshotCreatedAt: compatibleSnapshot?.createdAt ?? null,
+    isDeleted: isDeletedFromHeads([headEntryId], replayById),
   };
 }
 
@@ -396,6 +453,12 @@ export function computeDocumentDagAnalysis(
       }
       return ancestorSetsByHead.get(headEntryId)?.has(entry.id) ?? false;
     });
+    const lifecycleHeadEntryIds = entry.entryType === "doc_snapshot"
+      ? getSnapshotRoots(entry)
+      : [entry.id];
+    const liveStateAfter = isDeletedFromHeads(lifecycleHeadEntryIds, replayById)
+      ? "deleted"
+      : "alive";
     return {
       entryId: entry.id,
       entryType: entry.entryType,
@@ -408,7 +471,9 @@ export function computeDocumentDagAnalysis(
       snapshotHeadHashes: [...(entry.snapshotHeadHashes ?? [])],
       automergeHash: parsed?.automergeHash ?? null,
       isActiveHead: activeHeadEntryIds.includes(entry.id),
-      isDeleted: entry.entryType === "doc_delete",
+      isDeleted: liveStateAfter === "deleted",
+      isUndelete: entry.entryType === "doc_undelete",
+      liveStateAfter,
       branchHeadEntryIds,
       graphLaneIds: entry.entryType === "doc_snapshot"
         ? getSnapshotRoots(entry)

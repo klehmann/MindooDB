@@ -109,8 +109,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
-    // Compute username hash and encrypted user details before creating the document
-    // (since the callback to changeDocWithSigningKey cannot be async for automerge reasons)
+    // Compute username hash and encrypted user details before creating the document.
     const usernameHash = await this.hashUsername(userId.username);
     const userDetailsEncrypted = await this.encryptUserDetailsForTenant(
       this.buildUserDetailsPayload(userId.username, userDetails),
@@ -129,8 +128,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     this.logger.debug(`Document created: ${newDoc.getId()}`);
     
     try {
-      // Set the document data fields - changeDocWithSigningKey handles signing at entry level
-      await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
+      // Set the document data fields with the admin key at entry level
+      await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "grantaccess";
@@ -138,9 +137,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.user_details_encrypted = userDetailsEncrypted;
         data.userSigningPublicKey = userId.userSigningPublicKey;
         data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
-      }, adminSigningKeyPair, administrationPrivateKeyPassword);
+      }, {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
     } catch (error) {
-      this.logger.error(`ERROR in changeDocWithSigningKey:`, error);
+      this.logger.error(`ERROR in changeDoc:`, error);
       throw error;
     }
     
@@ -244,8 +246,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         PUBLIC_INFOS_KEY_ID
       );
       
-      // Set the document data fields - changeDocWithSigningKey handles signing at entry level
-      await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
+      // Set the document data fields with the admin key at entry level
+      await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
         const data = doc.getData();
         data.form = "useroperation";
         data.type = "revokeaccess";
@@ -253,7 +255,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.user_details_encrypted = userDetailsEncrypted;
         data.revokeDocId = revokeDocId;
         data.requestDataWipe = requestDataWipe;
-      }, adminSigningKeyPair, administrationPrivateKeyPassword);
+      }, {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
 
       this.logger.debug(`Created revocation document for grant access doc: ${revokeDocId}`);
     }
@@ -427,8 +432,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         const data = doc.getData();
         // Track the latest document (by iteration order, which is by lastModified)
         latestDoc = doc;
-        // Check if document is deleted (via isDeleted() or _deleted flag in data)
-        if (doc.isDeleted() || data._deleted === true) {
+        // Check if document is deleted via lifecycle metadata.
+        if (doc.isDeleted()) {
           isDeleted = true;
         }
         // Use members_hashes for membership lookups.
@@ -665,8 +670,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       administrationPrivateKeyPassword
     );
     
-    // Set the document data fields - changeDocWithSigningKey handles signing at entry level
-    await directoryDB.changeDocWithSigningKey(newDoc, async (doc: MindooDoc) => {
+    // Set the document data fields with the admin key at entry level
+    await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
       const data = doc.getData();
       data.form = "useroperation";
       data.type = "requestdochistorypurge";
@@ -676,7 +681,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.reason = reason;
       }
       data.requestedAt = Date.now();
-    }, adminSigningKeyPair, administrationPrivateKeyPassword);
+    }, {
+      signingKeyPair: adminSigningKeyPair,
+      signingKeyPassword: administrationPrivateKeyPassword,
+    });
     
     this.logger.info(`Created purge request for ${docId} in ${dbId}`);
   }
@@ -783,7 +791,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }
     
     // Apply changes and ensure form field is correct
-    await directoryDB.changeDocWithSigningKey(
+    await directoryDB.changeDoc(
       settingsDoc,
       async (d: MindooDoc) => {
         // Call user's change function
@@ -792,8 +800,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         // Ensure form field is always correct (overwrite if user changed it)
         d.getData().form = "tenantsettings";
       },
-      adminSigningKeyPair,
-      administrationPrivateKeyPassword
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
     );
     
     // Invalidate cache
@@ -827,7 +837,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }
     
     // Apply changes and ensure form and dbid fields are correct
-    await directoryDB.changeDocWithSigningKey(
+    await directoryDB.changeDoc(
       settingsDoc,
       async (d: MindooDoc) => {
         // Call user's change function
@@ -838,8 +848,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.form = "dbsettings";
         data.dbid = dbId;
       },
-      adminSigningKeyPair,
-      administrationPrivateKeyPassword
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
     );
     
     // Invalidate cache for this dbId
@@ -920,7 +932,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     }
     
     // Apply changes and ensure form, type, and groupName fields are correct
-    await directoryDB.changeDocWithSigningKey(
+    await directoryDB.changeDoc(
       groupDoc,
       async (d: MindooDoc) => {
         const data = d.getData();
@@ -955,8 +967,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.type = "group";
         data.groupName = normalizedGroupName;
       },
-      adminSigningKeyPair,
-      administrationPrivateKeyPassword
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
     );
     
     // Invalidate cache for this group
@@ -998,7 +1012,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const hashesToRemove = new Set(await Promise.all(username.map(u => this.hashUsername(u))));
     
     // Remove users from members arrays
-    await directoryDB.changeDocWithSigningKey(
+    await directoryDB.changeDoc(
       groupDoc,
       async (d: MindooDoc) => {
         const data = d.getData();
@@ -1027,8 +1041,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.type = "group";
         data.groupName = normalizedGroupName;
       },
-      adminSigningKeyPair,
-      administrationPrivateKeyPassword
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
     );
     
     // Invalidate cache for this group
@@ -1063,11 +1079,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     };
     
     // Delete the document using the proper API
-    await directoryDB.deleteDocumentWithSigningKey(
-      cachedGroup.docId,
-      adminSigningKeyPair,
-      administrationPrivateKeyPassword
-    );
+    await directoryDB.deleteDocument(cachedGroup.docId, {
+      signingKeyPair: adminSigningKeyPair,
+      signingKeyPassword: administrationPrivateKeyPassword,
+    });
     
     // Remove from cache
     this.groupsCache.delete(normalizedGroupName);

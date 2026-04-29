@@ -347,6 +347,8 @@ describe("Document DAG analysis", () => {
     await userDb.deleteDocument(docId);
     const afterDeleteAnalysis = await userDb.analyzeDocumentDagAtTimestamp(docId, "now");
     expect(afterDeleteAnalysis.activeHeadEntryIds).toHaveLength(1);
+    expect(afterDeleteAnalysis.entries.at(-1)?.liveStateAfter).toBe("deleted");
+    expect(afterDeleteAnalysis.branches[0]?.isDeleted).toBe(true);
 
     const deletedBranch = await userDb.materializeDocumentBranchAtEntry(
       docId,
@@ -354,6 +356,14 @@ describe("Document DAG analysis", () => {
     );
     expect(deletedBranch).not.toBeNull();
     expect(deletedBranch!.doc.isDeleted()).toBe(true);
+
+    await userDb.undeleteDocument(docId);
+    const afterUndeleteAnalysis = await userDb.analyzeDocumentDagAtTimestamp(docId, "now");
+    const undeleteEntry = afterUndeleteAnalysis.entries.at(-1);
+    expect(undeleteEntry?.entryType).toBe("doc_undelete");
+    expect(undeleteEntry?.isUndelete).toBe(true);
+    expect(undeleteEntry?.liveStateAfter).toBe("alive");
+    expect(afterUndeleteAnalysis.branches[0]?.isDeleted).toBe(false);
   });
 
   it("recovers missing dependency entry ids from store metadata before writing", async () => {

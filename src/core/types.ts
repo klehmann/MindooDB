@@ -603,6 +603,7 @@ export type StoreEntryType =
   | "doc_change"      // Document modification (subsequent Automerge changes)
   | "doc_snapshot"    // Automerge snapshot for performance optimization
   | "doc_delete"      // Document deletion (tombstone entry)
+  | "doc_undelete"    // Document undeletion (lifecycle entry)
   | "attachment_chunk"; // File attachment chunk
 
 /**
@@ -722,9 +723,8 @@ export interface StoreEntryMetadata {
 export interface StoreEntry extends StoreEntryMetadata {
   /**
    * The encrypted binary payload data.
-   * - For doc_create/doc_change: Encrypted Automerge change bytes
+   * - For doc_create/doc_change/doc_delete/doc_undelete: Encrypted Automerge change bytes
    * - For doc_snapshot: Encrypted Automerge snapshot bytes
-   * - For doc_delete: Encrypted Automerge change bytes (may be empty change)
    * - For attachment_chunk: Encrypted file chunk data
    * 
    * The IV and authentication tag are embedded within this data.
@@ -847,6 +847,104 @@ export interface SnapshotConfig {
 }
 
 /**
+ * Regex used to validate caller-provided MindooDoc IDs.
+ *
+ * The first character must be an ASCII letter; subsequent characters may be
+ * ASCII letters, ASCII digits, or `_`. This keeps caller-provided IDs safe to
+ * use unmodified in content-addressed store entry IDs and on disk.
+ */
+export const CUSTOM_DOC_ID_REGEX = /^[A-Za-z][A-Za-z0-9_]*$/;
+
+/**
+ * Options accepted by `MindooDB.createDocument()`.
+ */
+export interface CreateOptions {
+  /**
+   * Caller-provided document ID. When provided it must match
+   * `^[A-Za-z][A-Za-z0-9_]*$` (see `CUSTOM_DOC_ID_REGEX`). When omitted, a fresh
+   * UUID7 is generated.
+   *
+   * If a document with this ID already exists locally, `createDocument()`
+   * returns the existing document (idempotent create). For independent replicas
+   * to converge on the same custom ID, MindooDB seeds custom-ID documents with
+   * a hard-coded initial Automerge change so they share Automerge ancestry.
+   */
+  id?: string;
+
+  /**
+   * Symmetric encryption key ID to use for this document. Defaults to `"default"`
+   * (the tenant key). Replaces `createEncryptedDocument(decryptionKeyId)`.
+   */
+  decryptionKeyId?: string;
+
+  /**
+   * Optional signing key pair to sign the initial document entry with. When
+   * provided, `signingKeyPassword` must be provided as well. Replaces
+   * `createDocumentWithSigningKey(signingKeyPair, signingKeyPassword, ...)`.
+   */
+  signingKeyPair?: SigningKeyPair;
+
+  /**
+   * Password used to decrypt the private key of `signingKeyPair`. Required when
+   * `signingKeyPair` is provided.
+   */
+  signingKeyPassword?: string;
+}
+
+/**
+ * Options accepted by `MindooDB.deleteDocument()`.
+ */
+export interface DeleteOptions {
+  /**
+   * Optional signing key pair to sign the delete lifecycle entry with. When
+   * provided, `signingKeyPassword` must be provided as well. Replaces
+   * `deleteDocumentWithSigningKey(signingKeyPair, signingKeyPassword)`.
+   */
+  signingKeyPair?: SigningKeyPair;
+
+  /**
+   * Password used to decrypt the private key of `signingKeyPair`. Required when
+   * `signingKeyPair` is provided.
+   */
+  signingKeyPassword?: string;
+}
+
+/**
+ * Options accepted by `MindooDB.undeleteDocument()`.
+ */
+export interface UndeleteOptions {
+  /**
+   * Optional signing key pair to sign the undelete lifecycle entry with. When
+   * provided, `signingKeyPassword` must be provided as well.
+   */
+  signingKeyPair?: SigningKeyPair;
+
+  /**
+   * Password used to decrypt the private key of `signingKeyPair`. Required when
+   * `signingKeyPair` is provided.
+   */
+  signingKeyPassword?: string;
+}
+
+/**
+ * Options accepted by `MindooDB.changeDoc()`.
+ */
+export interface ChangeOptions {
+  /**
+   * Optional signing key pair to sign the document change entry with. When
+   * provided, `signingKeyPassword` must be provided as well. Replaces
+   * `changeDocWithSigningKey(doc, changeFunc, signingKeyPair, signingKeyPassword)`.
+   */
+  signingKeyPair?: SigningKeyPair;
+
+  /**
+   * Password used to decrypt the private key of `signingKeyPair`. Required when
+   * `signingKeyPair` is provided.
+   */
+  signingKeyPassword?: string;
+}
+
+/**
  * A MindooDoc is a document that is stored in the MindooDB.
  * It's a wrapper around the Automerge document.
  */
@@ -902,6 +1000,15 @@ export interface MindooDoc {
    * @return The payload of the document
    */
   getData(): MindooDocPayload;
+
+  /**
+   * Get the current Automerge heads for this document.
+   *
+   * These heads are a causal token that callers can pass back with granular
+   * text edits so MindooDB can apply stale editor operations at their original
+   * base version and then merge them with newer document changes.
+   */
+  getHeads(): string[];
 
   // ========== Attachment Write Methods ==========
   // These methods only work within the changeDoc() callback.
@@ -1038,6 +1145,24 @@ export interface MindooDoc {
 
 export interface MindooDocPayload {
   [key: string]: unknown;
+}
+
+export interface MindooTextEdit {
+  index: number;
+  deleteCount: number;
+  insert?: string;
+}
+
+export interface MindooTextPatch {
+  path: Array<string | number>;
+  baseHeads?: string[];
+  edits: MindooTextEdit[];
+}
+
+export interface MindooTextPatchResult {
+  doc: MindooDoc;
+  heads: string[];
+  data: MindooDocPayload;
 }
 
 export interface DirectoryUserDetails {
@@ -1375,6 +1500,12 @@ export interface ProcessChangeSummaryResult {
  */
 export interface DocumentHistoryResult {
   /**
+   * Persisted DAG entry id for the change that produced this materialized state.
+   * Stable across restarts while the backing store entry exists.
+   */
+  changeEntryId: string;
+
+  /**
    * The document state after applying this change.
    * Each document is an independent clone, safe to store in arrays.
    */
@@ -1576,6 +1707,8 @@ export interface DocumentDagEntrySummary {
   automergeHash: string | null;
   isActiveHead: boolean;
   isDeleted: boolean;
+  isUndelete: boolean;
+  liveStateAfter: "alive" | "deleted";
   branchHeadEntryIds: string[];
   graphLaneIds: string[];
   primaryGraphLaneId: string | null;
@@ -1593,6 +1726,7 @@ export interface DocumentDagBranchSummary {
   ancestorEntryIds: string[];
   compatibleSnapshotEntryId: string | null;
   compatibleSnapshotCreatedAt: number | null;
+  isDeleted: boolean;
 }
 
 /**
@@ -1742,15 +1876,32 @@ export interface MindooDB {
   getAttachmentStore(): ContentAddressedStore;
 
   /**
-   * Create a new document (unencrypted, uses tenant default encryption)
+   * Create a new document.
    *
-   * @return The new document
+   * Without options the document gets a fresh UUID7 id and is encrypted with the
+   * tenant's default symmetric key. The behavior of `createEncryptedDocument()` and
+   * `createDocumentWithSigningKey()` is fully expressible through `CreateOptions`.
+   *
+   * Caller-provided `id` enables two important use cases:
+   * - app developers can directly load known documents without first creating a view
+   * - app migrations from systems like Notes/Domino or MongoDB can preserve their
+   *   original document IDs
+   *
+   * For documents created with the same caller-provided `id` on independent replicas,
+   * MindooDB uses a hard-coded initial Automerge change so the replicas share Automerge
+   * ancestry and merge correctly when synced. If a document with the given `id` already
+   * exists locally, the existing document is returned (idempotent create).
+   *
+   * @param options Optional creation options.
+   * @return The new (or, if `options.id` already exists locally, existing) document.
    */
-  createDocument(): Promise<MindooDoc>;
+  createDocument(options?: CreateOptions): Promise<MindooDoc>;
 
   /**
    * Create a new document with optional encryption using a named symmetric key.
-   * 
+   *
+   * @deprecated Use `createDocument({ decryptionKeyId })` instead.
+   *
    * @param decryptionKeyId Optional key ID for encryption. If not provided, uses "default" (tenant key).
    *                        If provided, document will be encrypted with the named symmetric key.
    *                        All changes to this document will use the same key ID.
@@ -1762,7 +1913,9 @@ export interface MindooDB {
    * Create a new document using a specific signing key.
    * This is like createDocument but allows signing with a different key than the current user's.
    * Used for directory operations that must be signed with the administration key.
-   * 
+   *
+   * @deprecated Use `createDocument({ signingKeyPair, signingKeyPassword, decryptionKeyId })` instead.
+   *
    * @param signingKeyPair The signing key pair to use for signing the initial entry
    * @param signingKeyPassword The password to decrypt the signing private key
    * @param decryptionKeyId Optional key ID for encryption. If not provided, uses "default" (tenant key).
@@ -1901,17 +2054,23 @@ export interface MindooDB {
   getAllDocumentIdsAtTimestamp(timestamp: number): Promise<string[]>;
 
   /**
-   * Delete a document by its ID
+   * Delete a document by its ID.
+   *
+   * When `options.signingKeyPair` is provided, the delete lifecycle entry is
+   * signed with that key instead of the current user's key.
    *
    * @param docId The ID of the document
+   * @param options Optional signing options for the delete entry
    * @return A promise that resolves when the document is deleted
    */
-  deleteDocument(docId: string): Promise<void>;
+  deleteDocument(docId: string, options?: DeleteOptions): Promise<void>;
 
   /**
    * Delete a document using a specific signing key.
    * This is like deleteDocument but allows signing with a different key than the current user's.
    * Used for directory operations that must be signed with the administration key.
+   *
+   * @deprecated Use `deleteDocument(docId, { signingKeyPair, signingKeyPassword })` instead.
    * 
    * @param docId The ID of the document
    * @param signingKeyPair The signing key pair to use for signing the deletion
@@ -1923,6 +2082,19 @@ export interface MindooDB {
     signingKeyPair: SigningKeyPair,
     signingKeyPassword: string
   ): Promise<void>;
+
+  /**
+   * Undelete a document by its ID.
+   *
+   * Deleted documents remain in the append-only store. Undeleting writes a new
+   * lifecycle entry that marks the latest document state as alive again without
+   * clearing or replacing the existing document body.
+   *
+   * @param docId The ID of the document
+   * @param options Optional signing options for the undelete entry
+   * @return A promise that resolves when the document is undeleted
+   */
+  undeleteDocument(docId: string, options?: UndeleteOptions): Promise<void>;
 
   /**
    * Change a document. This internally produces a binary Automerge change
@@ -1940,17 +2112,31 @@ export interface MindooDB {
    * 
    * @param doc The document to change
    * @param changeFunc The function to change the document (can be async to perform operations like signing)
+   * @param options Optional signing options for the change entry
    * @return A promise that resolves when the document is changed
    */
   changeDoc(
     doc: MindooDoc,
-    changeFunc: (doc: MindooDoc) => void | Promise<void>
+    changeFunc: (doc: MindooDoc) => void | Promise<void>,
+    options?: ChangeOptions
   ): Promise<void>;
+
+  /**
+   * Apply granular text edits at a document path.
+   *
+   * If `baseHeads` is provided, edits are applied at that historical Automerge
+   * version using `changeAt`, then merged into the current document. This lets
+   * apps flush buffered text operations based on a stale local copy without
+   * overwriting concurrent edits that arrived meanwhile.
+   */
+  applyTextPatch(doc: MindooDoc, patch: MindooTextPatch): Promise<MindooTextPatchResult>;
 
   /**
    * Change a document using a specific signing key.
    * This is like changeDoc but allows signing with a different key than the current user's.
    * Used for directory operations that must be signed with the administration key.
+   *
+   * @deprecated Use `changeDoc(doc, changeFunc, { signingKeyPair, signingKeyPassword })` instead.
    * 
    * @param doc The document to change
    * @param changeFunc The function to change the document (can be async)
