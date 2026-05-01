@@ -2,6 +2,7 @@
 
 // Types
 export * from "./types";
+export * from "./databaseIdValidation";
 
 // User ID types
 export type { PublicUserId, PrivateUserId } from "./userid";

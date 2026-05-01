@@ -1,5 +1,6 @@
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { BaseMindooTenant } from "../core/BaseMindooTenant";
+import { BaseMindooDB } from "../core/BaseMindooDB";
 import { InMemoryContentAddressedStoreFactory } from "../core/appendonlystores/InMemoryContentAddressedStore";
 import { PrivateUserId, MindooTenant, PUBLIC_INFOS_KEY_ID } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
@@ -265,6 +266,37 @@ describe("BaseMindooTenant", () => {
 
       expect(db).toBeDefined();
       expect(db.getTenant()).toBe(tenant);
+    });
+
+    it("should open a database id containing dots", async () => {
+      const db = await tenant.openDB("test.database");
+
+      expect(db).toBeDefined();
+      expect(db.getTenant()).toBe(tenant);
+    });
+
+    it("should open a database id containing uppercase letters", async () => {
+      const db = await tenant.openDB("TestDatabase");
+
+      expect(db).toBeDefined();
+      expect(db.getTenant()).toBe(tenant);
+    });
+
+    it.each(["test_database", "test database", "-test", ".test", ""])(
+      "should reject invalid database id %j",
+      async (dbId) => {
+        await expect(tenant.openDB(dbId)).rejects.toThrow(
+          /contain only letters, digits, dots, and hyphens|required/i,
+        );
+      },
+    );
+
+    it("should reject invalid database ids during direct BaseMindooDB creation", () => {
+      const { docStore, attachmentStore } = storeFactory.createStore("test_database");
+
+      expect(() => new BaseMindooDB(tenant as BaseMindooTenant, docStore, attachmentStore)).toThrow(
+        /contain only letters, digits, dots, and hyphens/i,
+      );
     });
 
     it("should open multiple databases", async () => {

@@ -31,6 +31,7 @@ import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
 import { CacheManager } from "./cache/CacheManager";
+import { validateDatabaseId } from "./databaseIdValidation";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -526,19 +527,21 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   async openDB(id: string, options?: OpenDBOptions): Promise<MindooDB> {
+    const validDbId = validateDatabaseId(id, "dbId");
+
     // Enforce admin-only mode for directory database - this is a security invariant
     // The directory database must only accept entries signed by the admin key
-    const effectiveOptions: OpenDBOptions = id === "directory"
+    const effectiveOptions: OpenDBOptions = validDbId === "directory"
       ? { ...options, adminOnlyDb: true }
       : options ?? {};
 
-    await this.assertCurrentUserCanOpenDB(id);
+    await this.assertCurrentUserCanOpenDB(validDbId);
     
     // Return cached database if it exists
-    const cached = this.databaseCache.get(id);
+    const cached = this.databaseCache.get(validDbId);
     if (cached) {
       // For directory DB, verify admin-only flag matches (defensive check)
-      if (id === "directory" && !cached.isAdminOnlyDb()) {
+      if (validDbId === "directory" && !cached.isAdminOnlyDb()) {
         throw new Error("Directory database was cached without adminOnlyDb - this should never happen");
       }
       return cached;
@@ -555,7 +558,7 @@ export class BaseMindooTenant implements MindooTenant {
     } = effectiveOptions;
     
     // Create the database stores using the factory
-    const { docStore, attachmentStore } = this.storeFactory.createStore(id, storeOptions);
+    const { docStore, attachmentStore } = this.storeFactory.createStore(validDbId, storeOptions);
     
     const dbLogger = this.logger.createChild("BaseMindooDB");
     const db = new BaseMindooDB(
@@ -575,7 +578,7 @@ export class BaseMindooTenant implements MindooTenant {
     await db.initialize();
     
     // Cache the database for future use
-    this.databaseCache.set(id, db);
+    this.databaseCache.set(validDbId, db);
     return db;
   }
 
@@ -869,14 +872,16 @@ export class BaseMindooTenant implements MindooTenant {
     dbId: string,
     storeKind: StoreKind = StoreKind.docs,
   ): Promise<ContentAddressedStore> {
-    console.log(`[connectToServer] Connecting to server: ${serverUrl}, db: ${dbId}, storeKind: ${storeKind}`);
-    this.logger.info(`Connecting to server: ${serverUrl}, db: ${dbId}, storeKind: ${storeKind}`);
+    const validDbId = validateDatabaseId(dbId, "dbId");
+
+    console.log(`[connectToServer] Connecting to server: ${serverUrl}, db: ${validDbId}, storeKind: ${storeKind}`);
+    this.logger.info(`Connecting to server: ${serverUrl}, db: ${validDbId}, storeKind: ${storeKind}`);
 
     const normalizedServerUrl = serverUrl.replace(/\/$/, "");
-    const cacheKey = `${normalizedServerUrl}::${dbId}::${storeKind}`;
+    const cacheKey = `${normalizedServerUrl}::${validDbId}::${storeKind}`;
     const cachedStore = this.remoteStoreCache.get(cacheKey);
     if (cachedStore) {
-      this.logger.debug(`Reusing cached remote store for ${normalizedServerUrl}, db: ${dbId}`);
+      this.logger.debug(`Reusing cached remote store for ${normalizedServerUrl}, db: ${validDbId}`);
       return cachedStore;
     }
 
@@ -893,7 +898,7 @@ export class BaseMindooTenant implements MindooTenant {
         {
           baseUrl,
           tenantId: this.tenantId,
-          dbId,
+          dbId: validDbId,
           storeKind,
         },
         this.logger.createChild("HttpTransport")
@@ -907,18 +912,18 @@ export class BaseMindooTenant implements MindooTenant {
 
       // Create the client network store
       const store = new ClientNetworkContentAddressedStore(
-        dbId,
+        validDbId,
         storeKind,
         transport,
         this.cryptoAdapter,
         this.currentUser.username,
         signingKey,
         decryptedEncryptionKey,
-        this.logger.createChild(`ClientNetworkStore:${dbId}:${storeKind}`)
+        this.logger.createChild(`ClientNetworkStore:${validDbId}:${storeKind}`)
       );
 
-      console.log(`[connectToServer] ✓ Connected to server for db "${dbId}"`);
-      this.logger.info(`Connected to server for db "${dbId}"`);
+      console.log(`[connectToServer] ✓ Connected to server for db "${validDbId}"`);
+      this.logger.info(`Connected to server for db "${validDbId}"`);
 
       return store;
     })();

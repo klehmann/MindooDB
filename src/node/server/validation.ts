@@ -5,27 +5,19 @@
  * by enforcing strict rules on all user-supplied identifiers and arrays.
  */
 
+import { getDatabaseIdValidationError } from "../../core/databaseIdValidation";
+
 /**
- * Validates an identifier (tenantId, dbId, serverName, etc.).
- * Must be 1-64 chars, lowercase alphanumeric + hyphens, start with alphanumeric.
+ * Validates an identifier (dbId, serverName, etc.).
+ * Must be 1-64 chars, ASCII letters/digits/dots/hyphens, start with alphanumeric.
  * Rejects path separators, "..", leading dots, and special characters.
  */
 export function validateIdentifier(value: unknown, fieldName: string): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new ValidationError(`${fieldName} is required and must be a non-empty string`);
+  const error = getDatabaseIdValidationError(value, fieldName);
+  if (error) {
+    throw new ValidationError(error);
   }
-
-  if (value.length > 64) {
-    throw new ValidationError(`${fieldName} must be at most 64 characters`);
-  }
-
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(value)) {
-    throw new ValidationError(
-      `${fieldName} must start with a letter or digit and contain only lowercase letters, digits, and hyphens`,
-    );
-  }
-
-  return value;
+  return value as string;
 }
 
 /**

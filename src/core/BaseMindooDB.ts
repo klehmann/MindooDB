@@ -17,6 +17,13 @@ import {
   DocumentDagBranchMaterializationResult,
   DocumentDagDecodedChangeSummary,
   DocumentDagEntryDetails,
+  DocumentConflictAnalysisEvent,
+  DocumentConflictAnalysisOptions,
+  DocumentConflictPath,
+  DocumentConflictReport,
+  DocumentConflictReportOptions,
+  DocumentConflictSummary,
+  DocumentConflictValueSummary,
   MindooDoc,
   MindooDocPayload,
   StoreEntry,
@@ -64,6 +71,10 @@ import {
   isDeletedFromHeads,
   isDagEntry,
 } from "./DocumentDagAnalysis";
+import {
+  computeDocumentConflictAnalysisPlan,
+  formatDocumentConflictPath,
+} from "./DocumentConflictAnalysis";
 import { planAttachmentReadByWalkingMetadata } from "./appendonlystores/AttachmentReadPlanner";
 import { 
   generateDocEntryId, 
@@ -74,6 +85,7 @@ import {
 } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import { validateDatabaseId } from "./databaseIdValidation";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import type { ICacheable } from "./cache/CacheManager";
 import type { CacheManager } from "./cache/CacheManager";
@@ -98,6 +110,19 @@ interface InternalDoc {
   lastModified: number;
   decryptionKeyId: string;
   isDeleted: boolean;
+}
+
+interface VerifiedReplayChange {
+  entry: StoreEntryMetadata;
+  changeBytes: Uint8Array;
+  automergeHash: string | null;
+  dependencyHashes: string[];
+}
+
+interface ConflictDetectionResult {
+  conflicts: DocumentConflictSummary[];
+  resolutions: Array<Extract<DocumentConflictAnalysisEvent, { type: "conflictResolved" }>>;
+  entriesApplied: number;
 }
 
 /**
@@ -222,6 +247,13 @@ export class BaseMindooDB implements MindooDB {
     logger?: Logger,
     performanceCallback?: PerformanceCallback
   ) {
+    validateDatabaseId(store.getId(), "dbId");
+    validateDatabaseId(attachmentStore.getId(), "dbId");
+    if (store.getId() !== attachmentStore.getId()) {
+      throw new Error(
+        `[BaseMindooDB] Expected document and attachment stores to share dbId but received ${store.getId()} and ${attachmentStore.getId()}`
+      );
+    }
     if (store.getStoreKind() !== StoreKind.docs) {
       throw new Error(
         `[BaseMindooDB] Expected primary store kind ${StoreKind.docs} but received ${store.getStoreKind()}`
@@ -2451,6 +2483,818 @@ export class BaseMindooDB implements MindooDB {
       bounded: true,
     });
     return result;
+  }
+
+  /**
+   * Streams conflict-analysis events for one or more documents.
+   *
+   * This is the UI/server friendly entry point for conflict analysis. It first
+   * does a metadata-only preflight for each document, then only decrypts and
+   * replays document changes when the DAG contains concurrency candidates. The
+   * yielded DTOs intentionally expose MindooDB concepts only; callers never get
+   * direct access to Automerge documents, patches, operation IDs, or objects.
+   *
+   * @param docIds Document IDs to analyze. Documents are processed sequentially
+   *   so browser callers can render progress and stop early without a large
+   *   burst of synchronous work.
+   * @param options Controls quick/full mode, value detail level, cancellation,
+   *   per-document conflict limits, and cooperative event-loop yielding.
+   * @returns An async generator yielding progress, conflict, resolution, done,
+   *   and error events.
+   */
+  async *analyzeDocumentConflicts(
+    docIds: string[],
+    options: DocumentConflictAnalysisOptions = {},
+  ): AsyncGenerator<DocumentConflictAnalysisEvent, void, unknown> {
+    const totalDocs = docIds.length;
+    let scannedDocs = 0;
+    const mode = options.mode ?? "quick";
+    let lastYieldAt = Date.now();
+
+    for (const docId of docIds) {
+      this.throwIfConflictAnalysisAborted(options.signal);
+      const docStartedAt = Date.now();
+      yield { type: "docStart", docId };
+
+      try {
+        const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+        yield {
+          type: "progress",
+          scannedDocs,
+          totalDocs,
+          docId,
+          scannedEntries: allEntryMetadata.length,
+          message: `Scanned conflict metadata for document ${docId}`,
+        };
+
+        const plan = computeDocumentConflictAnalysisPlan(docId, allEntryMetadata);
+        let conflictsFound = 0;
+        let hadConflicts = false;
+
+        if (plan.hasConcurrencyCandidates) {
+          const maxConflictsPerDoc = options.maxConflictsPerDoc ?? (mode === "quick" ? 1 : undefined);
+          const detection = await this.detectDocumentConflictsFromPlan(
+            docId,
+            plan,
+            {
+              ...options,
+              mode,
+              maxConflictsPerDoc,
+            },
+          );
+
+          for (const conflict of detection.conflicts) {
+            this.throwIfConflictAnalysisAborted(options.signal);
+            hadConflicts = true;
+            conflictsFound += conflict.paths.length;
+            yield {
+              type: "conflictDetected",
+              conflict,
+              quick: mode === "quick",
+            };
+            lastYieldAt = await this.maybeYieldForConflictAnalysis(options.yieldEveryMs, lastYieldAt);
+          }
+
+          if (mode === "full") {
+            for (const resolution of detection.resolutions) {
+              this.throwIfConflictAnalysisAborted(options.signal);
+              yield resolution;
+              lastYieldAt = await this.maybeYieldForConflictAnalysis(options.yieldEveryMs, lastYieldAt);
+            }
+          }
+        }
+
+        scannedDocs++;
+        yield {
+          type: "docDone",
+          docId,
+          hadConflicts,
+          conflictsFound,
+          entriesScanned: allEntryMetadata.length,
+        };
+        this.performanceCallback?.onHistoryOperation?.({
+          operation: "analyzeDocumentConflicts",
+          docId,
+          time: Date.now() - docStartedAt,
+          scannedEntries: allEntryMetadata.length,
+          returnedEntries: conflictsFound,
+          bounded: true,
+        });
+      } catch (error) {
+        if (options.signal?.aborted) {
+          throw error;
+        }
+        yield { type: "error", docId, error };
+        scannedDocs++;
+      }
+
+      yield {
+        type: "progress",
+        scannedDocs,
+        totalDocs,
+        docId,
+        message: `Completed conflict analysis for document ${docId}`,
+      };
+      lastYieldAt = await this.maybeYieldForConflictAnalysis(options.yieldEveryMs, lastYieldAt);
+    }
+  }
+
+  /**
+   * Builds a complete conflict report for a single document.
+   *
+   * This is a convenience wrapper around `analyzeDocumentConflicts()`. It forces
+   * full analysis mode, consumes the event stream internally, and returns a
+   * stable report object suitable for server-side jobs or UI detail panels.
+   *
+   * @param docId Document ID to analyze.
+   * @param options Report options. The wrapper ignores quick-mode limits because
+   *   reports are intended to describe the full known conflict history.
+   * @returns Aggregated conflict and resolution information for the document.
+   */
+  async getDocumentConflictReport(
+    docId: string,
+    options: DocumentConflictReportOptions = {},
+  ): Promise<DocumentConflictReport> {
+    const startedAt = Date.now();
+    const report: DocumentConflictReport = {
+      docId,
+      hadConflicts: false,
+      conflictsFound: 0,
+      conflicts: [],
+      resolutions: [],
+      entriesScanned: 0,
+      errors: [],
+    };
+
+    for await (const event of this.analyzeDocumentConflicts([docId], {
+      ...options,
+      mode: "full",
+    })) {
+      if (event.type === "conflictDetected") {
+        report.hadConflicts = true;
+        report.conflicts.push(event.conflict);
+        report.conflictsFound += event.conflict.paths.length;
+      } else if (event.type === "conflictResolved") {
+        report.resolutions.push(event);
+      } else if (event.type === "docDone") {
+        report.entriesScanned = event.entriesScanned;
+      } else if (event.type === "error") {
+        report.errors.push(event);
+      }
+    }
+
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "getDocumentConflictReport",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: report.entriesScanned,
+      returnedEntries: report.conflictsFound,
+      bounded: true,
+    });
+    return report;
+  }
+
+  /**
+   * Replays verified document changes and detects conflict/resolution events.
+   *
+   * The input `plan` is metadata-only and has already determined that analyzing
+   * this document is worth the cost. This method performs the private Automerge
+   * work: decrypting changes, replaying them in dependency order, inspecting
+   * changed paths, and optionally resolving conflicting value summaries. All
+   * Automerge-specific objects are converted to MindooDB DTOs before returning.
+   *
+   * Conflict detection has three phases:
+   * 1. Before applying a change, inspect existing multi-head states. This catches
+   *    conflicts that exist between active heads and conflicts that are about to
+   *    be resolved by a merge/resolution change.
+   * 2. After applying a change, inspect Automerge patches for changed paths and
+   *    confirm conflicts with `getConflicts()` on those changed paths only.
+   * 3. After replay completes, inspect remaining active heads so unresolved
+   *    conflicts are still reported for documents that never wrote a merge change.
+   *
+   * @param docId Document being analyzed.
+   * @param plan Metadata-only replay/concurrency plan for the document.
+   * @param options Analysis options propagated from the public API.
+   * @returns Conflict findings, resolution events, and the number of entries
+   *   successfully replayed.
+   */
+  private async detectDocumentConflictsFromPlan(
+    docId: string,
+    plan: ReturnType<typeof computeDocumentConflictAnalysisPlan>,
+    options: DocumentConflictAnalysisOptions,
+  ): Promise<ConflictDetectionResult> {
+    const verifiedChanges = await this.loadVerifiedReplayChanges(plan.replayEntries);
+    const hashToEntryId = this.buildAutomergeHashToEntryId(plan.replayEntries, verifiedChanges);
+    const activeConflictPaths = new Map<string, DocumentConflictPath>();
+    const conflicts: DocumentConflictSummary[] = [];
+    const resolutions: Array<Extract<DocumentConflictAnalysisEvent, { type: "conflictResolved" }>> = [];
+    const maxConflictsPerDoc = options.maxConflictsPerDoc;
+    let entriesApplied = 0;
+    let doc = Automerge.init<MindooDocPayload>();
+
+    for (const entryId of plan.orderedReplayEntryIds) {
+      this.throwIfConflictAnalysisAborted(options.signal);
+      const change = verifiedChanges.get(entryId);
+      if (!change) {
+        continue;
+      }
+
+      const beforeHeads = Automerge.getHeads(doc);
+      // A multi-head state can already contain conflicts before the next change
+      // is applied. This is especially important for resolution changes: the
+      // conflict exists in the dependency heads and disappears after the write.
+      if (beforeHeads.length > 1) {
+        const alreadyReported = new Set([
+          ...conflicts.flatMap((conflict) => conflict.paths.map((path) => path.pathString)),
+          ...activeConflictPaths.keys(),
+        ]);
+        const preApplyConflictPaths = this.collectDocumentConflictPaths(
+          doc,
+          options.detail === "values",
+        ).filter((path) => !alreadyReported.has(path.pathString));
+        const conflictPathCount = conflicts.reduce((count, conflict) => count + conflict.paths.length, 0);
+        const remainingBudget = maxConflictsPerDoc === undefined
+          ? preApplyConflictPaths.length
+          : Math.max(0, maxConflictsPerDoc - conflictPathCount);
+        const boundedPreApplyConflictPaths = preApplyConflictPaths.slice(0, remainingBudget);
+        if (boundedPreApplyConflictPaths.length > 0) {
+          for (const path of boundedPreApplyConflictPaths) {
+            activeConflictPaths.set(path.pathString, path);
+          }
+          conflicts.push({
+            docId,
+            location: {
+              kind: change.entry.dependencyIds.length > 1 ? "merge-deps" : "active-heads",
+              entryId: change.entry.id,
+              createdAt: change.entry.createdAt,
+              createdByPublicKey: change.entry.createdByPublicKey,
+              headEntryIds: beforeHeads
+                .map((head) => hashToEntryId.get(head))
+                .filter((headEntryId): headEntryId is string => typeof headEntryId === "string"),
+              automergeHeads: [...beforeHeads],
+            },
+            paths: boundedPreApplyConflictPaths,
+          });
+        }
+      }
+      const afterDoc = Automerge.loadIncremental(doc, change.changeBytes);
+      const afterHeads = Automerge.getHeads(afterDoc);
+      const patches = this.diffAutomergeHeads(afterDoc, beforeHeads, afterHeads);
+      const detectedPaths = new Map<string, DocumentConflictPath>();
+
+      // Patches tell us which paths changed, keeping analysis proportional to
+      // the change size. We then confirm conflict state with getConflicts() for
+      // those paths only, rather than walking arbitrary JSON after every change.
+      for (const patch of patches) {
+        const path = this.getConflictPatchPath(patch);
+        if (!path) {
+          continue;
+        }
+        if (this.isInternalConflictPath(path)) {
+          continue;
+        }
+        const pathString = formatDocumentConflictPath(path);
+        const action = this.getConflictPatchAction(patch);
+        const isConflictPut = action === "put" && (
+          this.isConflictPatch(patch) || this.hasDocumentConflictAtPath(afterDoc, path)
+        );
+
+        if (isConflictPut) {
+          const conflictPath = this.buildDocumentConflictPath(
+            afterDoc,
+            path,
+            options.detail === "values",
+          );
+          detectedPaths.set(pathString, conflictPath);
+          activeConflictPaths.set(pathString, conflictPath);
+          continue;
+        }
+
+        if ((action === "put" || action === "del") && activeConflictPaths.has(pathString)) {
+          resolutions.push({
+            type: "conflictResolved",
+            docId,
+            entryId: change.entry.id,
+            createdAt: change.entry.createdAt,
+            createdByPublicKey: change.entry.createdByPublicKey,
+            path: activeConflictPaths.get(pathString)!,
+            automergeHash: change.automergeHash,
+          });
+          activeConflictPaths.delete(pathString);
+        }
+      }
+
+      if (detectedPaths.size > 0) {
+        conflicts.push({
+          docId,
+          location: {
+            kind: "entry-after",
+            entryId: change.entry.id,
+            createdAt: change.entry.createdAt,
+            createdByPublicKey: change.entry.createdByPublicKey,
+            headEntryIds: afterHeads
+              .map((head) => hashToEntryId.get(head))
+              .filter((headEntryId): headEntryId is string => typeof headEntryId === "string"),
+            automergeHeads: [...afterHeads],
+          },
+          paths: Array.from(detectedPaths.values()).sort((left, right) =>
+            left.pathString.localeCompare(right.pathString),
+          ),
+        });
+      }
+
+      doc = afterDoc;
+      entriesApplied++;
+
+      const conflictPathCount = conflicts.reduce((count, conflict) => count + conflict.paths.length, 0);
+      if (maxConflictsPerDoc !== undefined && conflictPathCount >= maxConflictsPerDoc) {
+        break;
+      }
+    }
+
+    // If the document still has multiple active heads after replay, there may
+    // be unresolved conflicts with no later patch to surface them. Do one final
+    // tree scan in that bounded case so active conflicts are visible.
+    if (
+      plan.activeHeadEntryIds.length > 1
+      && (maxConflictsPerDoc === undefined
+        || conflicts.reduce((count, conflict) => count + conflict.paths.length, 0) < maxConflictsPerDoc)
+    ) {
+      const alreadyReported = new Set(
+        conflicts.flatMap((conflict) => conflict.paths.map((path) => path.pathString)),
+      );
+      const activeConflictPaths = this.collectDocumentConflictPaths(
+        doc,
+        options.detail === "values",
+      ).filter((path) => !alreadyReported.has(path.pathString));
+      const remainingBudget = maxConflictsPerDoc === undefined
+        ? activeConflictPaths.length
+        : Math.max(
+          0,
+          maxConflictsPerDoc - conflicts.reduce((count, conflict) => count + conflict.paths.length, 0),
+        );
+      const boundedActiveConflictPaths = activeConflictPaths.slice(0, remainingBudget);
+      if (boundedActiveConflictPaths.length > 0) {
+        conflicts.push({
+          docId,
+          location: {
+            kind: "active-heads",
+            headEntryIds: [...plan.activeHeadEntryIds],
+            automergeHeads: Automerge.getHeads(doc),
+          },
+          paths: boundedActiveConflictPaths,
+        });
+      }
+    }
+
+    return { conflicts, resolutions, entriesApplied };
+  }
+
+  /**
+   * Loads, verifies, decrypts, and decodes replay changes for conflict analysis.
+   *
+   * This mirrors the security checks used by normal materialization paths:
+   * admin-only databases ignore non-admin entries, signatures are verified
+   * before decryption, and malformed/missing entries are skipped with warnings.
+   *
+   * @param replayEntries Metadata entries selected by the conflict planner.
+   * @returns Map keyed by store entry ID containing decrypted change bytes and
+   *   decoded Automerge hash/dependency metadata for private replay.
+   */
+  private async loadVerifiedReplayChanges(
+    replayEntries: StoreEntryMetadata[],
+  ): Promise<Map<string, VerifiedReplayChange>> {
+    const loadedEntries = replayEntries.length > 0
+      ? await this.store.getEntries(replayEntries.map((entry) => entry.id))
+      : [];
+    const entryById = new Map(loadedEntries.map((entry) => [entry.id, entry]));
+    const result = new Map<string, VerifiedReplayChange>();
+
+    for (const metadata of replayEntries) {
+      const entry = entryById.get(metadata.id);
+      if (!entry) {
+        this.logger.warn(`Conflict analysis: entry ${metadata.id} not found in store, skipping`);
+        continue;
+      }
+      if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
+        this.logger.warn(`Admin-only DB: skipping conflict analysis entry ${entry.id} not signed by admin key`);
+        continue;
+      }
+      const isValid = await this.tenant.verifySignature(
+        entry.encryptedData,
+        entry.signature,
+        entry.createdByPublicKey,
+      );
+      if (!isValid) {
+        this.logger.warn(`Invalid signature for conflict analysis entry ${entry.id}, skipping`);
+        continue;
+      }
+      const changeBytes = await this.tenant.decryptPayload(
+        entry.encryptedData,
+        entry.decryptionKeyId,
+      );
+      const decodedChange = Automerge.decodeChange(changeBytes) as Record<string, unknown>;
+      result.set(metadata.id, {
+        entry: metadata,
+        changeBytes,
+        automergeHash: typeof decodedChange.hash === "string" ? decodedChange.hash : null,
+        dependencyHashes: Array.isArray(decodedChange.deps)
+          ? decodedChange.deps.filter((dep): dep is string => typeof dep === "string")
+          : [],
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Builds a private lookup from Automerge change hashes to MindooDB entry IDs.
+   *
+   * Public conflict DTOs use MindooDB entry IDs, while Automerge heads are
+   * hashes. This lookup lets us translate internal head sets back to stable
+   * store-entry references for UI and report consumers.
+   *
+   * @param replayEntries Store metadata for replay entries.
+   * @param verifiedChanges Decrypted/decoded changes keyed by entry ID.
+   * @returns Map from Automerge hash to MindooDB store entry ID.
+   */
+  private buildAutomergeHashToEntryId(
+    replayEntries: StoreEntryMetadata[],
+    verifiedChanges: Map<string, VerifiedReplayChange>,
+  ): Map<string, string> {
+    const result = new Map<string, string>();
+    for (const entry of replayEntries) {
+      const parsed = parseDocEntryId(entry.id);
+      if (parsed) {
+        result.set(parsed.automergeHash, entry.id);
+      }
+      const verified = verifiedChanges.get(entry.id);
+      if (verified?.automergeHash) {
+        result.set(verified.automergeHash, entry.id);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Calls Automerge's diff API through a defensive private adapter.
+   *
+   * The public API must not depend on Automerge patch types. This wrapper keeps
+   * the cast and optional-method handling localized so a future Automerge API
+   * change affects only this internal method.
+   *
+   * @param doc Materialized internal Automerge document containing both head sets.
+   * @param beforeHeads Heads before applying the current change.
+   * @param afterHeads Heads after applying the current change.
+   * @returns Raw patch-like records for internal inspection only.
+   */
+  private diffAutomergeHeads(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    beforeHeads: string[],
+    afterHeads: string[],
+  ): Array<Record<string, unknown>> {
+    const automergeApi = Automerge as unknown as {
+      diff?: (
+        doc: AutomergeTypes.Doc<MindooDocPayload>,
+        before: string[],
+        after: string[],
+      ) => Array<Record<string, unknown>>;
+    };
+    if (typeof automergeApi.diff !== "function") {
+      return [];
+    }
+    return automergeApi.diff(doc, beforeHeads, afterHeads);
+  }
+
+  /**
+   * Reads a patch action without leaking Automerge patch types into the codebase.
+   *
+   * @param patch Raw patch-like record returned by the private diff adapter.
+   * @returns Patch action string, or null when unavailable.
+   */
+  private getConflictPatchAction(patch: Record<string, unknown>): string | null {
+    return typeof patch.action === "string" ? patch.action : null;
+  }
+
+  /**
+   * Normalizes a raw patch path into a JSON-safe MindooDB path array.
+   *
+   * @param patch Raw patch-like record returned by the private diff adapter.
+   * @returns A path made of string/number segments, or null for unsupported
+   *   patch shapes.
+   */
+  private getConflictPatchPath(patch: Record<string, unknown>): Array<string | number> | null {
+    const path = patch.path;
+    if (!Array.isArray(path) || path.length === 0) {
+      return null;
+    }
+    const normalized = path.filter(
+      (segment): segment is string | number =>
+        typeof segment === "string" || typeof segment === "number",
+    );
+    return normalized.length === path.length ? normalized : null;
+  }
+
+  /**
+   * Checks Automerge's optional conflict marker on a raw patch.
+   *
+   * Some conflict states are not surfaced solely by this flag, so callers also
+   * verify changed paths with `hasDocumentConflictAtPath()`.
+   *
+   * @param patch Raw patch-like record returned by the private diff adapter.
+   * @returns True when the patch explicitly says it wrote a conflicted value.
+   */
+  private isConflictPatch(patch: Record<string, unknown>): boolean {
+    return patch.conflict === true;
+  }
+
+  /**
+   * Filters MindooDB bookkeeping fields out of app-facing conflict results.
+   *
+   * `_lastModified` can conflict naturally because independent replicas update
+   * it during every change. Reporting it would be noisy and not useful to app
+   * developers analyzing their own JSON payload.
+   *
+   * @param path Candidate conflict path.
+   * @returns True when the path belongs to MindooDB internals.
+   */
+  private isInternalConflictPath(path: Array<string | number>): boolean {
+    return path[0] === "_lastModified";
+  }
+
+  /**
+   * Confirms whether a specific document path currently has multiple values.
+   *
+   * This is the narrow, path-level use of Automerge conflict inspection. It is
+   * called only for paths surfaced by patches or by the bounded active-head scan.
+   *
+   * @param doc Internal document or nested object containing the candidate path.
+   * @param path Path relative to `doc`.
+   * @returns True when Automerge reports more than one conflicting value.
+   */
+  private hasDocumentConflictAtPath(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    path: Array<string | number>,
+  ): boolean {
+    if (path.length === 0) {
+      return false;
+    }
+    const prop = path[path.length - 1];
+    const parent = this.readValueAtDocumentPath(doc, path.slice(0, -1));
+    if (parent === undefined || parent === null) {
+      return false;
+    }
+    const conflicts = Automerge.getConflicts(parent as never, prop as never);
+    return !!conflicts && Object.keys(conflicts).length > 1;
+  }
+
+  /**
+   * Converts a conflict path into the public DTO representation.
+   *
+   * @param doc Internal document used to optionally resolve value summaries.
+   * @param path JSON-style path segments for the conflicted field.
+   * @param includeValues Whether to include winner/loser value summaries.
+   * @returns Public path DTO with optional conflict values.
+   */
+  private buildDocumentConflictPath(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    path: Array<string | number>,
+    includeValues: boolean,
+  ): DocumentConflictPath {
+    const pathString = formatDocumentConflictPath(path);
+    const result: DocumentConflictPath = { path: [...path], pathString };
+    if (includeValues) {
+      result.values = this.getDocumentConflictValueSummaries(doc, path);
+    }
+    return result;
+  }
+
+  /**
+   * Scans a materialized document for current conflicts.
+   *
+   * This is intentionally used only for bounded multi-head states: before a
+   * resolving change is applied and after replay if unresolved active heads
+   * remain. Regular per-change analysis stays patch-driven for performance.
+   *
+   * @param doc Internal materialized document to inspect.
+   * @param includeValues Whether to include value summaries in returned paths.
+   * @returns Sorted conflict path DTOs.
+   */
+  private collectDocumentConflictPaths(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    includeValues: boolean,
+  ): DocumentConflictPath[] {
+    const results = new Map<string, DocumentConflictPath>();
+    const seen = new WeakSet<object>();
+    this.collectDocumentConflictPathsFromParent(doc, doc, [], includeValues, results, seen);
+    return Array.from(results.values()).sort((left, right) =>
+      left.pathString.localeCompare(right.pathString),
+    );
+  }
+
+  /**
+   * Recursive worker for `collectDocumentConflictPaths()`.
+   *
+   * @param root Root internal document used when value summaries need absolute
+   *   paths.
+   * @param parent Current object/array being inspected.
+   * @param basePath Path from `root` to `parent`.
+   * @param includeValues Whether to include value summaries.
+   * @param results Mutable result map keyed by path string.
+   * @param seen Object identity set used to avoid cycles/proxy revisits.
+   */
+  private collectDocumentConflictPathsFromParent(
+    root: AutomergeTypes.Doc<MindooDocPayload>,
+    parent: unknown,
+    basePath: Array<string | number>,
+    includeValues: boolean,
+    results: Map<string, DocumentConflictPath>,
+    seen: WeakSet<object>,
+  ): void {
+    if (parent === null || parent === undefined || typeof parent !== "object") {
+      return;
+    }
+    if (seen.has(parent)) {
+      return;
+    }
+    seen.add(parent);
+
+    const keys: Array<string | number> = Array.isArray(parent)
+      ? parent.map((_value, index) => index)
+      : Object.keys(parent);
+
+    for (const key of keys) {
+      const path = [...basePath, key];
+      if (this.isInternalConflictPath(path)) {
+        continue;
+      }
+      if (this.hasDocumentConflictAtPath(parent as AutomergeTypes.Doc<MindooDocPayload>, [key])) {
+        const conflictPath = this.buildDocumentConflictPath(
+          root,
+          path,
+          includeValues,
+        );
+        results.set(conflictPath.pathString, conflictPath);
+      }
+      this.collectDocumentConflictPathsFromParent(
+        root,
+        (parent as Record<string | number, unknown>)[key],
+        path,
+        includeValues,
+        results,
+        seen,
+      );
+    }
+  }
+
+  /**
+   * Reads winner/loser summaries for one conflicted path.
+   *
+   * Values are converted into JSON-safe summaries so callers can inspect them
+   * without seeing Automerge-specific wrappers or mutable document objects.
+   *
+   * @param doc Internal document containing the conflict.
+   * @param path Absolute path to the conflicted field.
+   * @returns Stable list of conflict value summaries.
+   */
+  private getDocumentConflictValueSummaries(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    path: Array<string | number>,
+  ): DocumentConflictValueSummary[] {
+    if (path.length === 0) {
+      return [];
+    }
+    const prop = path[path.length - 1];
+    const parent = this.readValueAtDocumentPath(doc, path.slice(0, -1));
+    if (parent === undefined || parent === null) {
+      return [];
+    }
+    const conflicts = Automerge.getConflicts(parent as never, prop as never);
+    if (!conflicts) {
+      return [];
+    }
+    const winner = this.readValueAtDocumentPath(doc, path);
+    const winnerFingerprint = this.fingerprintConflictValue(winner);
+    return Object.entries(conflicts)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([conflictId, value]) => ({
+        conflictId,
+        preview: this.previewChangeValue(value),
+        value: this.toJsonSafeConflictValue(value),
+        isWinner: this.fingerprintConflictValue(value) === winnerFingerprint,
+      }));
+  }
+
+  /**
+   * Reads a nested value using the public path representation.
+   *
+   * @param root Root object/document to read from.
+   * @param path String/number path segments.
+   * @returns The value at the path, or undefined when any segment is missing.
+   */
+  private readValueAtDocumentPath(root: unknown, path: Array<string | number>): unknown {
+    let current = root;
+    for (const segment of path) {
+      if (current === null || current === undefined) {
+        return undefined;
+      }
+      current = (current as Record<string | number, unknown>)[segment];
+    }
+    return current;
+  }
+
+  /**
+   * Produces a stable comparison key for conflict winner detection.
+   *
+   * @param value Value to fingerprint.
+   * @returns String key derived from the JSON-safe representation.
+   */
+  private fingerprintConflictValue(value: unknown): string {
+    try {
+      return JSON.stringify(this.toJsonSafeConflictValue(value));
+    } catch {
+      return String(value);
+    }
+  }
+
+  /**
+   * Converts arbitrary conflict values to bounded, JSON-safe data.
+   *
+   * This avoids exposing live Automerge objects and prevents very deep or cyclic
+   * structures from overwhelming reports.
+   *
+   * @param value Value to convert.
+   * @param depth Current recursion depth.
+   * @param seen Objects already visited during this conversion.
+   * @returns JSON-safe scalar, array/object subset, or compact placeholder.
+   */
+  private toJsonSafeConflictValue(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
+    if (
+      value === null
+      || typeof value === "string"
+      || typeof value === "number"
+      || typeof value === "boolean"
+    ) {
+      return value;
+    }
+    if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+      return undefined;
+    }
+    if (value instanceof Uint8Array) {
+      return { type: "Uint8Array", byteLength: value.byteLength };
+    }
+    if (typeof value !== "object") {
+      return String(value);
+    }
+    if (seen.has(value)) {
+      return "[Circular]";
+    }
+    if (depth >= 4) {
+      return this.previewChangeValue(value);
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      return value.slice(0, 50).map((item) => this.toJsonSafeConflictValue(item, depth + 1, seen));
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value).slice(0, 50)) {
+      result[key] = this.toJsonSafeConflictValue(child, depth + 1, seen);
+    }
+    return result;
+  }
+
+  /**
+   * Throws when the caller cancels conflict analysis.
+   *
+   * @param signal Optional `AbortSignal` supplied through analysis options.
+   */
+  private throwIfConflictAnalysisAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new Error("Conflict analysis aborted");
+    }
+  }
+
+  /**
+   * Cooperatively yields to the event loop during long browser/server scans.
+   *
+   * @param yieldEveryMs Minimum elapsed time before yielding. Undefined disables
+   *   cooperative yielding; `0` yields at every call site.
+   * @param lastYieldAt Timestamp of the previous yield.
+   * @returns Updated timestamp to carry into the next call.
+   */
+  private async maybeYieldForConflictAnalysis(
+    yieldEveryMs: number | undefined,
+    lastYieldAt: number,
+  ): Promise<number> {
+    if (yieldEveryMs === undefined || yieldEveryMs < 0) {
+      return lastYieldAt;
+    }
+    const now = Date.now();
+    if (now - lastYieldAt < yieldEveryMs) {
+      return lastYieldAt;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    return Date.now();
   }
 
   /**

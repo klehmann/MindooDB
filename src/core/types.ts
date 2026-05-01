@@ -1614,7 +1614,9 @@ export interface PerformanceCallback {
       | 'analyzeDocumentDagAtTimestamp'
       | 'materializeDocumentBranchAtEntry'
       | 'materializeDocumentBranchAtTimestamp'
-      | 'describeDocumentDagEntry';
+      | 'describeDocumentDagEntry'
+      | 'analyzeDocumentConflicts'
+      | 'getDocumentConflictReport';
     docId: string;
     time: number;
     scannedEntries: number;
@@ -1755,6 +1757,139 @@ export interface DocumentDagEntryDetails {
   snapshotHeadHashes: string[];
   automergeHash: string | null;
   decodedChange: DocumentDagDecodedChangeSummary | null;
+}
+
+/**
+ * Conflict analysis mode controls how much history the analyzer traverses.
+ */
+export type DocumentConflictAnalysisMode = "quick" | "full";
+
+/**
+ * Conflict detail level controls whether conflicting values are summarized.
+ */
+export type DocumentConflictDetailLevel = "paths-only" | "values";
+
+/**
+ * JSON-safe path segment returned by conflict analysis.
+ */
+export type DocumentConflictPathSegment = string | number;
+
+/**
+ * JSON-safe value summary for one conflicting value.
+ *
+ * `value` is included only when it can be represented safely without exposing
+ * CRDT-specific objects. `preview` is always intended for compact UI display.
+ */
+export interface DocumentConflictValueSummary {
+  conflictId: string;
+  preview: string | null;
+  value?: unknown;
+  isWinner: boolean;
+}
+
+/**
+ * One conflicted document path detected during analysis.
+ */
+export interface DocumentConflictPath {
+  path: DocumentConflictPathSegment[];
+  pathString: string;
+  values?: DocumentConflictValueSummary[];
+}
+
+/**
+ * Describes where in the document DAG a conflict observation was made.
+ */
+export interface DocumentConflictLocation {
+  kind: "entry-after" | "active-heads" | "merge-deps";
+  entryId?: string;
+  createdAt?: number;
+  createdByPublicKey?: string;
+  headEntryIds: string[];
+  automergeHeads: string[];
+}
+
+/**
+ * Conflict observation or resolution event for one document.
+ */
+export interface DocumentConflictSummary {
+  docId: string;
+  location: DocumentConflictLocation;
+  paths: DocumentConflictPath[];
+}
+
+/**
+ * Options accepted by conflict analysis APIs.
+ */
+export interface DocumentConflictAnalysisOptions {
+  mode?: DocumentConflictAnalysisMode;
+  detail?: DocumentConflictDetailLevel;
+  pageSize?: number;
+  yieldEveryMs?: number;
+  maxConflictsPerDoc?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Options accepted by the convenience report API.
+ */
+export interface DocumentConflictReportOptions extends Omit<DocumentConflictAnalysisOptions, "mode" | "maxConflictsPerDoc"> {
+}
+
+/**
+ * Streaming event emitted by `analyzeDocumentConflicts()`.
+ */
+export type DocumentConflictAnalysisEvent =
+  | {
+      type: "progress";
+      scannedDocs: number;
+      totalDocs: number;
+      docId?: string;
+      scannedEntries?: number;
+      message: string;
+    }
+  | {
+      type: "docStart";
+      docId: string;
+    }
+  | {
+      type: "conflictDetected";
+      conflict: DocumentConflictSummary;
+      quick: boolean;
+    }
+  | {
+      type: "conflictResolved";
+      docId: string;
+      entryId: string;
+      createdAt: number;
+      createdByPublicKey: string;
+      path: DocumentConflictPath;
+      automergeHash: string | null;
+    }
+  | {
+      type: "docDone";
+      docId: string;
+      hadConflicts: boolean;
+      conflictsFound: number;
+      entriesScanned: number;
+    }
+  | {
+      type: "error";
+      docId?: string;
+      entryId?: string;
+      error: unknown;
+    };
+
+/**
+ * Full conflict report for one document.
+ */
+export interface DocumentConflictReport {
+  docId: string;
+  hadConflicts: boolean;
+  conflictsFound: number;
+  conflicts: DocumentConflictSummary[];
+  resolutions: Array<Extract<DocumentConflictAnalysisEvent, { type: "conflictResolved" }>>;
+  entriesScanned: number;
+  errors: Array<Extract<DocumentConflictAnalysisEvent, { type: "error" }>>;
 }
 
 /**
@@ -2021,6 +2156,27 @@ export interface MindooDB {
     docId: string,
     entryId: string
   ): Promise<DocumentDagEntryDetails | null>;
+
+  /**
+   * Stream conflict analysis events for one or more documents.
+   *
+   * The API intentionally returns MindooDB DTOs only. It does not expose
+   * Automerge documents, patches, or operation objects so the storage backend
+   * can evolve without changing callers.
+   */
+  analyzeDocumentConflicts(
+    docIds: string[],
+    options?: DocumentConflictAnalysisOptions
+  ): AsyncGenerator<DocumentConflictAnalysisEvent, void, unknown>;
+
+  /**
+   * Build a full conflict report for one document by consuming the streaming
+   * analyzer internally.
+   */
+  getDocumentConflictReport(
+    docId: string,
+    options?: DocumentConflictReportOptions
+  ): Promise<DocumentConflictReport>;
 
   /**
    * Get all non-deleted document IDs in this database.
