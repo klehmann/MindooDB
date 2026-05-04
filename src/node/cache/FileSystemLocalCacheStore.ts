@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, rename, unlink, open, rm } from "fs/promises";
 import * as path from "path";
-import type { LocalCacheStore } from "../../core/cache/LocalCacheStore";
+import { defaultGetMany, type LocalCacheStore } from "../../core/cache/LocalCacheStore";
 
 function tempPathFor(finalPath: string): string {
   return `${finalPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -44,6 +44,10 @@ export class FileSystemLocalCacheStore implements LocalCacheStore {
       if (e.code === "ENOENT") return null;
       throw e;
     }
+  }
+
+  async getMany(type: string, ids: string[]): Promise<Array<Uint8Array | null>> {
+    return defaultGetMany(this, type, ids);
   }
 
   async put(type: string, id: string, value: Uint8Array): Promise<void> {

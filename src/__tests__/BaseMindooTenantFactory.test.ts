@@ -188,6 +188,90 @@ describe("BaseMindooTenantFactory", () => {
       createUserIdSpy.mockRestore();
       console.timeEnd("BaseMindooTenantFactory.reusesExistingIdentities");
     }, 60000);
+
+    it("mutates an existingKeyBag in place across two consecutive createTenant calls", async () => {
+      const adminPassword = "adminpass-existingbag";
+      const userPassword = "userpass-existingbag";
+
+      const adminUser = await factory.createUserId("CN=admin/O=existingbag", adminPassword);
+      const appUser = await factory.createUserId("CN=user/O=existingbag", userPassword);
+
+      // Caller derives a wrapping key once and constructs a single live KeyBag
+      const wrappingKey = await KeyBag.deriveWrappingKey(
+        appUser.userEncryptionKeyPair.privateKey,
+        userPassword,
+        factory.getCryptoAdapter(),
+      );
+      const liveBag = new KeyBag({
+        wrappingKey,
+        cryptoAdapter: factory.getCryptoAdapter(),
+      });
+
+      const tenantA = "tenant-a-existingbag";
+      const tenantB = "tenant-b-existingbag";
+
+      const resultA = await factory.createTenant({
+        tenantId: tenantA,
+        adminUser,
+        adminPassword,
+        appUser,
+        userPassword,
+        existingKeyBag: liveBag,
+      });
+      const resultB = await factory.createTenant({
+        tenantId: tenantB,
+        adminUser,
+        adminPassword,
+        appUser,
+        userPassword,
+        existingKeyBag: liveBag,
+      });
+
+      // The same bag instance is returned for both calls (no merge needed)
+      expect(resultA.keyBag).toBe(liveBag);
+      expect(resultB.keyBag).toBe(liveBag);
+
+      // The bag now holds keys for both tenants
+      expect(await liveBag.get("doc", tenantA, "default")).toBeDefined();
+      expect(await liveBag.get("doc", tenantA, "$publicinfos")).toBeDefined();
+      expect(await liveBag.get("doc", tenantB, "default")).toBeDefined();
+      expect(await liveBag.get("doc", tenantB, "$publicinfos")).toBeDefined();
+
+      // The live bag persists round-trip via the wrapping key (no password)
+      const persisted = await liveBag.save();
+      const restored = new KeyBag({
+        wrappingKey,
+        cryptoAdapter: factory.getCryptoAdapter(),
+      });
+      await restored.load(persisted);
+      expect(await restored.get("doc", tenantA, "default")).toEqual(
+        await liveBag.get("doc", tenantA, "default"),
+      );
+      expect(await restored.get("doc", tenantB, "default")).toEqual(
+        await liveBag.get("doc", tenantB, "default"),
+      );
+    }, 60000);
+
+    it("falls back to a fresh KeyBag when existingKeyBag is omitted", async () => {
+      const adminPassword = "adminpass-fresh";
+      const userPassword = "userpass-fresh";
+      const tenantId = "tenant-fresh-bag";
+
+      const adminUser = await factory.createUserId("CN=admin/O=freshbag", adminPassword);
+      const appUser = await factory.createUserId("CN=user/O=freshbag", userPassword);
+
+      const result = await factory.createTenant({
+        tenantId,
+        adminUser,
+        adminPassword,
+        appUser,
+        userPassword,
+      });
+
+      expect(result.keyBag).toBeInstanceOf(KeyBag);
+      expect(await result.keyBag.get("doc", tenantId, "default")).toBeDefined();
+      expect(await result.keyBag.get("doc", tenantId, "$publicinfos")).toBeDefined();
+    }, 60000);
   });
 
   describe("createSigningKeyPair", () => {

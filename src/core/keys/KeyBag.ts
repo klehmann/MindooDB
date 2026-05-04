@@ -20,32 +20,186 @@ export interface KeyDetail {
 }
 
 /**
+ * Options accepted by {@link KeyBag.constructor} when constructing a KeyBag from
+ * an already-derived AES-GCM wrapping {@link CryptoKey}.
+ *
+ * Prefer this form over the legacy password-taking constructor: the wrapping
+ * key can be derived once during user login (via {@link KeyBag.deriveWrappingKey})
+ * and held as a non-extractable {@link CryptoKey} for the lifetime of the
+ * session, so {@link KeyBag.save} and {@link KeyBag.load} no longer need to
+ * re-run PBKDF2 or hold the plaintext password in memory.
+ */
+export interface KeyBagWrappingKeyOptions {
+  /**
+   * The AES-GCM {@link CryptoKey} used to encrypt/decrypt the persisted KeyBag
+   * blob. Must have `usages` including `["encrypt", "decrypt"]`. Typically
+   * imported with `extractable: false` to avoid the raw bytes leaking into
+   * the JS heap.
+   */
+  wrappingKey: CryptoKey;
+  /** Crypto adapter to use for encryption and decryption. */
+  cryptoAdapter: CryptoAdapter;
+  /** Optional logger instance. */
+  logger?: Logger;
+}
+
+/**
  * The KeyBag is used to store encryption keys that the current user has access to
  * in order to decrypt document changes stored in the AppendOnlyStore.
  * Supports key rotation by storing multiple versions per keyId (newest first).
+ *
+ * Two construction modes are supported:
+ *  - Legacy: pass `(userEncryptionKey, password, cryptoAdapter, ...)`. Each
+ *    {@link save} / {@link load} call re-derives the AES-GCM wrapping key from
+ *    `password` via PBKDF2. Required `password` is held by the instance for
+ *    its lifetime.
+ *  - Preferred: pass `({ wrappingKey, cryptoAdapter, ... })`. The caller has
+ *    already derived the wrapping key (e.g. via {@link deriveWrappingKey})
+ *    and the bag never sees the password. PBKDF2 runs zero times in this
+ *    mode, and the bag is safe to persist/restore from storage repeatedly
+ *    without password-handling overhead.
  */
 export class KeyBag {
-  private userEncryptionKey: EncryptedPrivateKey;
-  private userEncryptionKeyPassword: string;
+  private userEncryptionKey: EncryptedPrivateKey | null;
+  private userEncryptionKeyPassword: string | null;
+  private wrappingKey: CryptoKey | null;
   private keys: Map<string, KeyEntry[]> = new Map();
   private cryptoAdapter: CryptoAdapter;
   private logger: Logger;
 
   /**
-   * Creates a new KeyBag instance.
-   * 
-   * @param userEncryptionKey The encrypted user encryption key
-   * @param userEncryptionKeyPassword The password to decrypt the user encryption key
-   * @param cryptoAdapter The crypto adapter to use for encryption and decryption
-   * @param logger Optional logger instance
+   * Creates a KeyBag from a user encryption key + password (legacy form).
+   *
+   * @deprecated Prefer the wrapping-key constructor overload. The password
+   *   form holds the plaintext password for the lifetime of the bag and
+   *   re-runs PBKDF2 on every {@link save}/{@link load} call.
+   *
+   * @param userEncryptionKey The encrypted user encryption key (provides
+   *   the salt used for KeyBag wrapping-key derivation).
+   * @param userEncryptionKeyPassword The password to derive the KeyBag
+   *   wrapping key.
+   * @param cryptoAdapter The crypto adapter to use for encryption and
+   *   decryption.
+   * @param logger Optional logger instance.
    */
-  constructor(userEncryptionKey: EncryptedPrivateKey, userEncryptionKeyPassword: string, cryptoAdapter: CryptoAdapter, logger?: Logger) {
-    this.userEncryptionKey = userEncryptionKey;
+  constructor(userEncryptionKey: EncryptedPrivateKey, userEncryptionKeyPassword: string, cryptoAdapter: CryptoAdapter, logger?: Logger);
+  /**
+   * Creates a KeyBag from a pre-derived AES-GCM wrapping {@link CryptoKey}.
+   *
+   * Recommended for production use: derive `wrappingKey` once at login via
+   * {@link KeyBag.deriveWrappingKey} and reuse it across {@link save}/{@link load}.
+   * No plaintext password is retained by the bag in this mode.
+   */
+  constructor(options: KeyBagWrappingKeyOptions);
+  constructor(
+    userEncryptionKeyOrOptions: EncryptedPrivateKey | KeyBagWrappingKeyOptions,
+    userEncryptionKeyPassword?: string,
+    cryptoAdapter?: CryptoAdapter,
+    logger?: Logger,
+  ) {
+    if (KeyBag.isWrappingKeyOptions(userEncryptionKeyOrOptions)) {
+      this.userEncryptionKey = null;
+      this.userEncryptionKeyPassword = null;
+      this.wrappingKey = userEncryptionKeyOrOptions.wrappingKey;
+      this.cryptoAdapter = userEncryptionKeyOrOptions.cryptoAdapter;
+      this.logger =
+        userEncryptionKeyOrOptions.logger
+        || new MindooLogger(getDefaultLogLevel(), "KeyBag", true);
+      return;
+    }
+
+    if (userEncryptionKeyPassword === undefined || cryptoAdapter === undefined) {
+      throw new Error("KeyBag legacy constructor requires (userEncryptionKey, password, cryptoAdapter, logger?).");
+    }
+    this.userEncryptionKey = userEncryptionKeyOrOptions;
     this.userEncryptionKeyPassword = userEncryptionKeyPassword;
+    this.wrappingKey = null;
     this.cryptoAdapter = cryptoAdapter;
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), "KeyBag", true);
+  }
+
+  /**
+   * Derives the AES-GCM wrapping {@link CryptoKey} that {@link KeyBag.save}
+   * and {@link KeyBag.load} use to encrypt/decrypt the persisted bag blob.
+   *
+   * This runs PBKDF2 once with the same parameters the legacy constructor
+   * uses internally (combined salt = `userEncryptionKey.salt` +
+   * `"key-bag-encryption"`, iterations from
+   * {@link resolvePbkdf2Iterations}), so a key derived here is fully
+   * interchangeable with the password-derived key for both new and existing
+   * persisted bags.
+   *
+   * Callers that want to eliminate plaintext-password retention should
+   * derive the wrapping key once at login and pass it to the
+   * {@link KeyBagWrappingKeyOptions} constructor overload.
+   *
+   * @param userEncryptionKey The user's encrypted encryption key (provides
+   *   the salt). Only `userEncryptionKey.salt` is read; the encrypted
+   *   bytes are not touched.
+   * @param password The user's password.
+   * @param cryptoAdapter Crypto adapter to use for the derivation.
+   * @param options.extractable Whether the returned key should be
+   *   extractable. Defaults to `false` so the raw bytes never appear in
+   *   the JS heap.
+   */
+  static async deriveWrappingKey(
+    userEncryptionKey: EncryptedPrivateKey,
+    password: string,
+    cryptoAdapter: CryptoAdapter,
+    options?: { extractable?: boolean },
+  ): Promise<CryptoKey> {
+    const subtle = cryptoAdapter.getSubtle();
+
+    const userKeySaltBytes = KeyBag.staticBase64ToUint8Array(userEncryptionKey.salt);
+    const saltStringBytes = new TextEncoder().encode("key-bag-encryption");
+    const combinedSalt = new Uint8Array(userKeySaltBytes.length + saltStringBytes.length);
+    combinedSalt.set(userKeySaltBytes);
+    combinedSalt.set(saltStringBytes, userKeySaltBytes.length);
+
+    const passwordInput = new TextEncoder().encode(`${password}:key-bag-encryption`);
+
+    const passwordKey = await subtle.importKey(
+      "raw",
+      passwordInput,
+      "PBKDF2",
+      false,
+      ["deriveKey"],
+    );
+
+    const iterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    return subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt: combinedSalt,
+        iterations,
+        hash: "SHA-256",
+      },
+      passwordKey,
+      {
+        name: "AES-GCM",
+        length: 256,
+      },
+      options?.extractable ?? false,
+      ["encrypt", "decrypt"],
+    );
+  }
+
+  private static isWrappingKeyOptions(value: EncryptedPrivateKey | KeyBagWrappingKeyOptions): value is KeyBagWrappingKeyOptions {
+    return typeof value === "object"
+      && value !== null
+      && "wrappingKey" in value
+      && "cryptoAdapter" in value;
+  }
+
+  private static staticBase64ToUint8Array(base64: string): Uint8Array {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
   }
 
   /**
@@ -320,15 +474,34 @@ export class KeyBag {
   /**
    * Creates an in-memory clone of this KeyBag.
    * The clone contains deep-copied key material and independent key maps.
+   *
+   * The clone follows the same construction mode as this instance:
+   *  - bags built with the wrapping-key constructor are cloned with the
+   *    same {@link CryptoKey} reference (the underlying key handle is safe
+   *    to share across instances - it is treated as immutable),
+   *  - bags built with the legacy password constructor are cloned with the
+   *    same encrypted user key + plaintext password.
    */
   clone(): KeyBag {
-    const clonedUserEncryptionKey: EncryptedPrivateKey = { ...this.userEncryptionKey };
-    const cloned = new KeyBag(
-      clonedUserEncryptionKey,
-      this.userEncryptionKeyPassword,
-      this.cryptoAdapter,
-      this.logger
-    );
+    let cloned: KeyBag;
+    if (this.wrappingKey !== null) {
+      cloned = new KeyBag({
+        wrappingKey: this.wrappingKey,
+        cryptoAdapter: this.cryptoAdapter,
+        logger: this.logger,
+      });
+    } else {
+      if (this.userEncryptionKey === null || this.userEncryptionKeyPassword === null) {
+        throw new Error("KeyBag.clone(): legacy bag missing userEncryptionKey/password.");
+      }
+      const clonedUserEncryptionKey: EncryptedPrivateKey = { ...this.userEncryptionKey };
+      cloned = new KeyBag(
+        clonedUserEncryptionKey,
+        this.userEncryptionKeyPassword,
+        this.cryptoAdapter,
+        this.logger
+      );
+    }
 
     cloned.keys = new Map(
       Array.from(this.keys.entries()).map(([scopedKeyId, entries]) => [
@@ -344,16 +517,15 @@ export class KeyBag {
   }
 
   /**
-   * Save the key bag to a binary data blob, encrypted with the user encryption key.
-   * 
+   * Save the key bag to a binary data blob, encrypted with the wrapping key
+   * (either the {@link CryptoKey} provided to the constructor or one derived
+   * on demand from the legacy password).
+   *
    * @return A promise that resolves to the encrypted binary data (Uint8Array)
    */
   async save(): Promise<Uint8Array> {
     this.logger.debug(`Saving key bag with ${this.keys.size} keys`);
-    
-    // Serialize the map to JSON and convert to Uint8Array
-    // Convert Uint8Array values to base64 strings for JSON serialization
-    // Support multiple keys per keyId with createdAt timestamps
+
     const mapArray: Array<[string, Array<{key: string, createdAt?: number}>]> = Array.from(this.keys.entries()).map(([keyId, keyEntries]) => [
       keyId,
       keyEntries.map(entry => ({
@@ -363,172 +535,84 @@ export class KeyBag {
     ]);
     const jsonString = JSON.stringify(mapArray);
     const plaintext = new TextEncoder().encode(jsonString);
-    
-    const subtle = this.cryptoAdapter.getSubtle();
-    // Bind getRandomValues to maintain 'this' context
-    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
-    
-    // Derive an AES-GCM key using PBKDF2 with the user encryption key's salt
-    // Use the salt from the user encryption key as part of the key derivation
-    const userKeySaltBytes = this.base64ToUint8Array(this.userEncryptionKey.salt);
-    
-    // Combine with a fixed string to differentiate from other key derivations
-    const saltStringBytes = new TextEncoder().encode("key-bag-encryption");
-    const combinedSalt = new Uint8Array(userKeySaltBytes.length + saltStringBytes.length);
-    combinedSalt.set(userKeySaltBytes);
-    combinedSalt.set(saltStringBytes, userKeySaltBytes.length);
-    
-    // Use the user's password as input for PBKDF2
-    const passwordInput = new TextEncoder().encode(`${this.userEncryptionKeyPassword}:key-bag-encryption`);
-    
-    const passwordKey = await subtle.importKey(
-      "raw",
-      passwordInput,
-      "PBKDF2",
-      false,
-      ["deriveKey"]
-    );
-    
-    const keyBagIterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
-    if (keyBagIterations !== DEFAULT_PBKDF2_ITERATIONS) {
-      this.logger.warn(`Using overridden PBKDF2 iterations for KeyBag.save(): ${keyBagIterations}`);
-    }
 
-    // Derive AES-GCM key using PBKDF2
-    const derivedKey = await subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: combinedSalt,
-        iterations: keyBagIterations,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      false,
-      ["encrypt"]
-    );
-    
-    // Generate IV for AES-GCM
+    const subtle = this.cryptoAdapter.getSubtle();
+    const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
+
+    const wrappingKey = await this.resolveWrappingKey("encrypt");
+
     const ivArray = new Uint8Array(12); // 12 bytes for AES-GCM
     randomValues(ivArray);
     const iv = new Uint8Array(ivArray);
-    
-    // Encrypt the plaintext
+
     const encrypted = await subtle.encrypt(
       {
         name: "AES-GCM",
         iv: iv,
         tagLength: 128,
       },
-      derivedKey,
+      wrappingKey,
       plaintext.buffer as ArrayBuffer
     );
-    
-    // Extract ciphertext and tag
+
+    // AES-GCM appends the 16-byte authentication tag at the end of the ciphertext
     const encryptedArray = new Uint8Array(encrypted);
-    const tagLength = 16; // 128 bits = 16 bytes
+    const tagLength = 16;
     const ciphertext = encryptedArray.slice(0, encryptedArray.length - tagLength);
     const tag = encryptedArray.slice(encryptedArray.length - tagLength);
-    
-    // Combine IV + tag + ciphertext
-    // Format: IV (12 bytes) + tag (16 bytes) + ciphertext (variable)
+
+    // Combined wire format: IV (12B) + tag (16B) + ciphertext (variable)
     const result = new Uint8Array(12 + 16 + ciphertext.length);
     result.set(iv, 0);
     result.set(tag, 12);
     result.set(ciphertext, 12 + 16);
-    
+
     this.logger.debug(`Saved key bag (${plaintext.length} -> ${result.length} bytes)`);
     return result;
   }
 
   /**
-   * Load the key bag from a binary data blob, decrypted with the user encryption key.
+   * Load the key bag from a binary data blob, decrypted with the wrapping key
+   * (either the {@link CryptoKey} provided to the constructor or one derived
+   * on demand from the legacy password).
    * 
    * @param encryptedData The encrypted binary data to load (Uint8Array)
    * @return A promise that resolves when the keys are loaded
    */
   async load(encryptedData: Uint8Array): Promise<void> {
     this.logger.debug(`Loading key bag`);
-    
+
     if (encryptedData.length < 28) {
       throw new Error("Encrypted data too short (missing IV and tag)");
     }
-    
-    // Extract IV, tag, and ciphertext
+
     const iv = encryptedData.slice(0, 12);
     const tag = encryptedData.slice(12, 28);
     const ciphertext = encryptedData.slice(28);
-    
-    const subtle = this.cryptoAdapter.getSubtle();
-    
-    // Derive the same AES-GCM key (same process as encryption)
-    const userKeySaltBytes = this.base64ToUint8Array(this.userEncryptionKey.salt);
-    
-    // Combine with the same fixed string as encryption
-    const saltStringBytes = new TextEncoder().encode("key-bag-encryption");
-    const combinedSalt = new Uint8Array(userKeySaltBytes.length + saltStringBytes.length);
-    combinedSalt.set(userKeySaltBytes);
-    combinedSalt.set(saltStringBytes, userKeySaltBytes.length);
-    
-    // Use the user's password as input for PBKDF2 (same as encryption)
-    const passwordInput = new TextEncoder().encode(`${this.userEncryptionKeyPassword}:key-bag-encryption`);
-    
-    const passwordKey = await subtle.importKey(
-      "raw",
-      passwordInput,
-      "PBKDF2",
-      false,
-      ["deriveKey"]
-    );
-    
-    const keyBagIterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
-    if (keyBagIterations !== DEFAULT_PBKDF2_ITERATIONS) {
-      this.logger.warn(`Using overridden PBKDF2 iterations for KeyBag.load(): ${keyBagIterations}`);
-    }
 
-    // Derive AES-GCM key using PBKDF2 (same parameters as encryption)
-    const derivedKey = await subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: combinedSalt,
-        iterations: keyBagIterations,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      {
-        name: "AES-GCM",
-        length: 256,
-      },
-      false,
-      ["decrypt"]
-    );
-    
-    // Combine ciphertext and tag
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    const wrappingKey = await this.resolveWrappingKey("decrypt");
+
+    // Re-attach the auth tag for SubtleCrypto's combined input format
     const encryptedDataWithTag = new Uint8Array(ciphertext.length + tag.length);
     encryptedDataWithTag.set(ciphertext);
     encryptedDataWithTag.set(tag, ciphertext.length);
-    
-    // Decrypt
+
     const decrypted = await subtle.decrypt(
       {
         name: "AES-GCM",
         iv: iv,
         tagLength: 128,
       },
-      derivedKey,
+      wrappingKey,
       encryptedDataWithTag.buffer as ArrayBuffer
     );
-    
-    // Deserialize JSON to map
+
     const decryptedArray = new Uint8Array(decrypted);
     const jsonString = new TextDecoder().decode(decryptedArray);
     const mapArray: Array<[string, Array<{key: string, createdAt?: number}>]> = JSON.parse(jsonString);
-    
-    // Convert base64 strings back to Uint8Array arrays
-    // Support multiple keys per keyId with createdAt timestamps
+
     const loadedKeys = new Map<string, KeyEntry[]>();
     for (const [scopedKeyId, keyEntries] of mapArray) {
       const normalizedScopedKeyId = this.normalizeLoadedScopedKeyId(scopedKeyId);
@@ -540,8 +624,69 @@ export class KeyBag {
       loadedKeys.set(normalizedScopedKeyId, existingEntries.concat(normalizedEntries));
     }
     this.keys = loadedKeys;
-    
+
     this.logger.debug(`Loaded key bag (${encryptedData.length} -> ${this.keys.size} keys)`);
+  }
+
+  /**
+   * Returns the AES-GCM wrapping key used for {@link save}/{@link load}.
+   *
+   * - If this bag was constructed with a pre-derived `wrappingKey`, returns
+   *   that key directly. The caller-supplied key already supports both
+   *   `encrypt` and `decrypt`, so no per-usage derivation is needed.
+   * - Otherwise (legacy password constructor), derives a wrapping key from
+   *   the stored password + user encryption salt via PBKDF2 with the
+   *   requested usage. The derived key is intentionally not cached on the
+   *   instance: the password constructor is the slow path and exists for
+   *   backward compatibility only.
+   */
+  private async resolveWrappingKey(usage: "encrypt" | "decrypt"): Promise<CryptoKey> {
+    if (this.wrappingKey) {
+      return this.wrappingKey;
+    }
+
+    if (this.userEncryptionKey === null || this.userEncryptionKeyPassword === null) {
+      throw new Error("KeyBag is missing both a wrapping key and a password; cannot resolve wrapping key.");
+    }
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    const userKeySaltBytes = this.base64ToUint8Array(this.userEncryptionKey.salt);
+    const saltStringBytes = new TextEncoder().encode("key-bag-encryption");
+    const combinedSalt = new Uint8Array(userKeySaltBytes.length + saltStringBytes.length);
+    combinedSalt.set(userKeySaltBytes);
+    combinedSalt.set(saltStringBytes, userKeySaltBytes.length);
+
+    const passwordInput = new TextEncoder().encode(`${this.userEncryptionKeyPassword}:key-bag-encryption`);
+
+    const passwordKey = await subtle.importKey(
+      "raw",
+      passwordInput,
+      "PBKDF2",
+      false,
+      ["deriveKey"]
+    );
+
+    const keyBagIterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    if (keyBagIterations !== DEFAULT_PBKDF2_ITERATIONS) {
+      this.logger.warn(`Using overridden PBKDF2 iterations for KeyBag.${usage === "encrypt" ? "save" : "load"}(): ${keyBagIterations}`);
+    }
+
+    return subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt: combinedSalt,
+        iterations: keyBagIterations,
+        hash: "SHA-256",
+      },
+      passwordKey,
+      {
+        name: "AES-GCM",
+        length: 256,
+      },
+      false,
+      [usage],
+    );
   }
 
   /**

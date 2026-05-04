@@ -1452,6 +1452,69 @@ describe("System Admin Security", () => {
       expect(config.defaultStoreType).toBe("inmemory");
     });
 
+    test("constructor throws when neither password nor signing key is provided", () => {
+      expect(() => new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        cryptoAdapter,
+      })).toThrow(/systemAdminPassword.*systemAdminSigningKey/);
+    });
+
+  });
+
+  describe("MindooDBServerAdmin pre-imported signing key", () => {
+    let setup: TestSetup;
+    const port = 4013;
+
+    beforeAll(async () => {
+      setup = await createTestSetup(port, cryptoAdapter, factory);
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+    });
+
+    test("should authenticate using a pre-imported systemAdminSigningKey (no password)", async () => {
+      const subtle = cryptoAdapter.getSubtle();
+
+      // Import the signing key once with extractable: false - the
+      // typical login-time path.
+      const decryptPkEncryptionModule = await import("../core/crypto/privateKeyEncryption");
+      const signingKeyBuffer = await decryptPkEncryptionModule.decryptPrivateKey(
+        cryptoAdapter,
+        setup.adminUser.userSigningKeyPair.privateKey,
+        "admin-pass",
+        "signing",
+      );
+      const signingKey = await subtle.importKey(
+        "pkcs8",
+        signingKeyBuffer,
+        { name: "Ed25519" },
+        false,
+        ["sign"],
+      );
+
+      // Spy on the helper that decrypts the private key from the password.
+      const decryptSpy = jest.spyOn(decryptPkEncryptionModule, "decryptPrivateKey");
+
+      try {
+        // Construct WITHOUT a password: the signing key alone must be enough.
+        const admin = new MindooDBServerAdmin({
+          serverUrl: setup.baseUrl,
+          systemAdminUser: setup.adminUser,
+          systemAdminSigningKey: signingKey,
+          cryptoAdapter,
+        });
+
+        const tenants = await admin.listTenants();
+        expect(Array.isArray(tenants)).toBe(true);
+
+        // The password decrypt path should never run.
+        expect(decryptSpy).not.toHaveBeenCalled();
+      } finally {
+        decryptSpy.mockRestore();
+      }
+    });
   });
 
   describe("MindooDBServerAdmin config helpers", () => {

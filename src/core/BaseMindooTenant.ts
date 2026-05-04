@@ -95,6 +95,20 @@ export class BaseMindooTenant implements MindooTenant {
     logger?: Logger,
     additionalTrustedKeys?: ReadonlyMap<string, boolean>,
     localCacheStore?: LocalCacheStore,
+    /**
+     * Optional pre-derived crypto material for the current user. When the
+     * caller has already decrypted the user's signing/encryption private
+     * keys (e.g. once at login) and/or derived the cache encryption key,
+     * passing them here skips the per-instance PBKDF2 + decrypt path. The
+     * `currentUserPassword` argument may then be empty and is never used
+     * downstream (as long as the requested key is already present in the
+     * cache).
+     */
+    preDecryptedMaterial?: {
+      signingKey?: CryptoKey;
+      encryptionKey?: CryptoKey;
+      cacheEncryptionKey?: CryptoKey;
+    },
   ) {
     this.factory = factory;
     this.tenantId = tenantId;
@@ -114,14 +128,33 @@ export class BaseMindooTenant implements MindooTenant {
       logger ||
       new MindooLogger(getDefaultLogLevel(), `Tenant:${tenantId}`, true);
 
-    // Set up cache if a local cache store is provided
+    // Pre-warm the per-user CryptoKey caches so getDecryptedSigningKey()
+    // and getDecryptedEncryptionKey() never run PBKDF2 + decryptPrivateKey
+    // when the caller has already derived these keys at login.
+    if (preDecryptedMaterial?.signingKey) {
+      this.decryptedUserSigningKeyCache = preDecryptedMaterial.signingKey;
+    }
+    if (preDecryptedMaterial?.encryptionKey) {
+      this.decryptedUserEncryptionKeyCache = preDecryptedMaterial.encryptionKey;
+    }
+
+    // Set up cache if a local cache store is provided. When a pre-derived
+    // cache encryption key is available, prefer that to skip the password
+    // path and avoid retaining the plaintext password inside the encrypted
+    // cache wrapper.
     if (localCacheStore) {
-      const encryptedStore = new EncryptedLocalCacheStore(
-        localCacheStore,
-        currentUserPassword,
-        this.cryptoAdapter,
-        this.logger.createChild("EncryptedCache"),
-      );
+      const encryptedStore = preDecryptedMaterial?.cacheEncryptionKey
+        ? new EncryptedLocalCacheStore(localCacheStore, {
+            cacheKey: preDecryptedMaterial.cacheEncryptionKey,
+            cryptoAdapter: this.cryptoAdapter,
+            logger: this.logger.createChild("EncryptedCache"),
+          })
+        : new EncryptedLocalCacheStore(
+            localCacheStore,
+            currentUserPassword,
+            this.cryptoAdapter,
+            this.logger.createChild("EncryptedCache"),
+          );
       this.cacheManager = new CacheManager(
         encryptedStore,
         undefined,
@@ -160,6 +193,17 @@ export class BaseMindooTenant implements MindooTenant {
 
   getCryptoAdapter(): CryptoAdapter {
     return this.cryptoAdapter;
+  }
+
+  private normalizeTimeTravelDate(value: OpenDBOptions["timeTravelDate"]): number | null {
+    if (value == null || value === "") {
+      return null;
+    }
+    const timestamp = value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
+    if (!Number.isFinite(timestamp)) {
+      throw new Error(`Invalid timeTravelDate: ${String(value)}`);
+    }
+    return timestamp;
   }
 
   getFactory(): MindooTenantFactory {
@@ -534,11 +578,15 @@ export class BaseMindooTenant implements MindooTenant {
     const effectiveOptions: OpenDBOptions = validDbId === "directory"
       ? { ...options, adminOnlyDb: true }
       : options ?? {};
+    const normalizedTimeTravelDate = this.normalizeTimeTravelDate(effectiveOptions.timeTravelDate);
+    const databaseCacheKey = normalizedTimeTravelDate == null
+      ? validDbId
+      : `${validDbId}::tt:${normalizedTimeTravelDate}`;
 
     await this.assertCurrentUserCanOpenDB(validDbId);
     
     // Return cached database if it exists
-    const cached = this.databaseCache.get(validDbId);
+    const cached = this.databaseCache.get(databaseCacheKey);
     if (cached) {
       // For directory DB, verify admin-only flag matches (defensive check)
       if (validDbId === "directory" && !cached.isAdminOnlyDb()) {
@@ -550,6 +598,7 @@ export class BaseMindooTenant implements MindooTenant {
     // Extract store options and DB-specific options
     const {
       adminOnlyDb,
+      timeTravelDate: _timeTravelDate,
       attachmentConfig,
       documentCacheConfig,
       snapshotConfig,
@@ -557,8 +606,17 @@ export class BaseMindooTenant implements MindooTenant {
       ...storeOptions
     } = effectiveOptions;
     
-    // Create the database stores using the factory
-    const { docStore, attachmentStore } = this.storeFactory.createStore(validDbId, storeOptions);
+    // Snapshot opens can share an already-open live store instance. This keeps
+    // in-memory factories usable while the snapshot DB maintains isolated state.
+    const liveDbForSnapshot = normalizedTimeTravelDate == null
+      ? null
+      : this.databaseCache.get(validDbId);
+    const { docStore, attachmentStore } = liveDbForSnapshot
+      ? {
+          docStore: liveDbForSnapshot.getStore(),
+          attachmentStore: liveDbForSnapshot.getAttachmentStore(),
+        }
+      : this.storeFactory.createStore(validDbId, storeOptions);
     
     const dbLogger = this.logger.createChild("BaseMindooDB");
     const db = new BaseMindooDB(
@@ -570,15 +628,16 @@ export class BaseMindooTenant implements MindooTenant {
       snapshotConfig,
       adminOnlyDb ?? false,
       dbLogger,
-      performanceCallback
+      performanceCallback,
+      normalizedTimeTravelDate,
     );
-    if (this.cacheManager) {
+    if (this.cacheManager && normalizedTimeTravelDate == null) {
       db.setCacheManager(this.cacheManager);
     }
     await db.initialize();
     
     // Cache the database for future use
-    this.databaseCache.set(validDbId, db);
+    this.databaseCache.set(databaseCacheKey, db);
     return db;
   }
 

@@ -299,4 +299,272 @@ describe("Document conflict analysis", () => {
       }
     }).rejects.toThrow("Conflict analysis aborted");
   });
+
+  it("filters out already-seen conflicts when a checkpoint is provided", async () => {
+    const { userDb, userTwoDb } = await createSharedDbPair("conflict-since-filter");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    const userTwoView = await userTwoDb.getDocument(docId);
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "from-user";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().title = "from-user-two";
+    });
+
+    const checkpoint = await userDb.getConflictScanCheckpoint();
+    const events = await collectConflictEvents(userDb, docId, {
+      mode: "full",
+      since: checkpoint,
+    });
+
+    expect(events.some((event) => event.type === "conflictDetected")).toBe(false);
+    expect(events.some((event) => event.type === "scanCheckpoint")).toBe(true);
+  });
+
+  it("uses receipt order for since filtering instead of only wall-clock time", async () => {
+    const { userDb, userTwoDb } = await createSharedDbPair("conflict-since-receipt-order");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    const userTwoView = await userTwoDb.getDocument(docId);
+    const checkpoint = {
+      ...(await userDb.getConflictScanCheckpoint()),
+      takenAt: Date.now() + 60_000,
+    };
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "from-user";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().title = "from-user-two";
+    });
+
+    const events = await collectConflictEvents(userDb, docId, {
+      mode: "full",
+      since: checkpoint,
+    });
+
+    expect(events.some((event) => event.type === "conflictDetected")).toBe(true);
+  });
+
+  it("reports resolutions that happen after the checkpoint", async () => {
+    const { userDb, userTwoDb } = await createSharedDbPair("conflict-since-resolution");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    const userTwoView = await userTwoDb.getDocument(docId);
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "from-user";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().title = "from-user-two";
+    });
+
+    const checkpoint = await userDb.getConflictScanCheckpoint();
+    const mergeDb = await openUserDb("conflict-since-resolution");
+    const mergedDoc = await mergeDb.getDocument(docId);
+    await mergeDb.changeDoc(mergedDoc, (draft) => {
+      draft.getData().title = "resolved";
+    });
+
+    const events = await collectConflictEvents(mergeDb, docId, {
+      mode: "full",
+      since: checkpoint,
+    });
+
+    expect(events.some((event) => event.type === "conflictResolved")).toBe(true);
+  });
+
+  it("can include unresolved conflicts that predate the checkpoint", async () => {
+    const { userDb, userTwoDb } = await createSharedDbPair("conflict-since-unresolved");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    const userTwoView = await userTwoDb.getDocument(docId);
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "from-user";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().title = "from-user-two";
+    });
+
+    const checkpoint = await userDb.getConflictScanCheckpoint();
+    const events = await collectConflictEvents(userDb, docId, {
+      mode: "full",
+      since: checkpoint,
+      includeUnresolvedFromBefore: true,
+    });
+
+    expect(events.some((event) => event.type === "conflictDetected")).toBe(true);
+  });
+
+  it("resolves the prior value at the merge base for a conflicted path", async () => {
+    const { userDb, userTwoDb } = await createSharedDbPair("conflict-base-value");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "base";
+    });
+
+    const userTwoView = await userTwoDb.getDocument(docId);
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "from-user";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().title = "from-user-two";
+    });
+
+    const report = await userDb.getDocumentConflictReport(docId, { detail: "values" });
+    const conflict = report.conflicts.find((candidate) =>
+      candidate.paths.some((path) => path.pathString === "title"),
+    );
+    expect(conflict).toBeDefined();
+    if (!conflict) {
+      return;
+    }
+    const titlePath = conflict.paths.find((path) => path.pathString === "title");
+    expect(titlePath).toBeDefined();
+    if (!titlePath) {
+      return;
+    }
+    const baseValues = await userDb.getDocumentConflictBaseValues(docId, [
+      { location: conflict.location, path: titlePath.path, pathString: titlePath.pathString },
+    ]);
+    expect(baseValues).toHaveLength(1);
+    expect(baseValues[0]?.status).toBe("available");
+    expect(baseValues[0]?.preview).toBe("base");
+    expect(baseValues[0]?.baseEntryId).toBeTruthy();
+  });
+
+  it("returns no-prior-value when the conflicted field did not exist before the conflict", async () => {
+    const { userDb, userTwoDb } = await createSharedDbPair("conflict-base-no-prior");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    const userTwoView = await userTwoDb.getDocument(docId);
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "from-user";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().title = "from-user-two";
+    });
+
+    const report = await userDb.getDocumentConflictReport(docId, { detail: "values" });
+    const conflict = report.conflicts.find((candidate) =>
+      candidate.paths.some((path) => path.pathString === "title"),
+    );
+    expect(conflict).toBeDefined();
+    if (!conflict) {
+      return;
+    }
+    const titlePath = conflict.paths.find((path) => path.pathString === "title");
+    expect(titlePath).toBeDefined();
+    if (!titlePath) {
+      return;
+    }
+    const [baseValue] = await userDb.getDocumentConflictBaseValues(docId, [
+      { location: conflict.location, path: titlePath.path, pathString: titlePath.pathString },
+    ]);
+    expect(baseValue?.status).toBe("no-prior-value");
+    expect(baseValue?.preview).toBeNull();
+    expect(baseValue?.baseEntryId).toBeTruthy();
+  });
+
+  it("coalesces multiple queries that share a merge base into a single materialization", async () => {
+    const { userDb, userTwoDb } = await createSharedDbPair("conflict-base-coalesce");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "base-title";
+      draft.getData().status = "base-status";
+    });
+
+    const userTwoView = await userTwoDb.getDocument(docId);
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "user-title";
+      draft.getData().status = "user-status";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().title = "two-title";
+      draft.getData().status = "two-status";
+    });
+
+    const report = await userDb.getDocumentConflictReport(docId, { detail: "values" });
+    const queries = report.conflicts.flatMap((conflict) =>
+      conflict.paths
+        .filter((path) => path.pathString === "title" || path.pathString === "status")
+        .map((path) => ({
+          location: conflict.location,
+          path: path.path,
+          pathString: path.pathString,
+        })),
+    );
+    expect(queries.length).toBeGreaterThanOrEqual(2);
+
+    const baseValues = await userDb.getDocumentConflictBaseValues(docId, queries);
+    expect(baseValues).toHaveLength(queries.length);
+    const baseEntryIds = new Set(baseValues.map((value) => value.baseEntryId));
+    expect(baseEntryIds.size).toBe(1);
+    const titleValue = baseValues.find((value) => value.pathString === "title");
+    const statusValue = baseValues.find((value) => value.pathString === "status");
+    expect(titleValue?.preview).toBe("base-title");
+    expect(statusValue?.preview).toBe("base-status");
+  });
+
+  it("returns missing-entry when the conflict location's entry is not in the local store", async () => {
+    const { userDb } = await createSharedDbPair("conflict-base-missing-entry");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "base";
+    });
+
+    const [baseValue] = await userDb.getDocumentConflictBaseValues(docId, [
+      {
+        location: {
+          kind: "entry-after",
+          entryId: "non-existent-entry-id",
+          headEntryIds: [],
+          automergeHeads: [],
+        },
+        path: ["title"],
+        pathString: "title",
+      },
+    ]);
+    expect(baseValue?.status).toBe("missing-entry");
+    expect(baseValue?.preview).toBeNull();
+    expect(baseValue?.baseEntryId).toBeNull();
+  });
+
+  it("returns an empty array when no queries are supplied", async () => {
+    const { userDb } = await createSharedDbPair("conflict-base-empty");
+    const doc = await userDb.createDocument();
+    expect(await userDb.getDocumentConflictBaseValues(doc.getId(), [])).toEqual([]);
+  });
+
+  it("emits a final conflict scan checkpoint", async () => {
+    const { userDb } = await createSharedDbPair("conflict-since-checkpoint-event");
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    const inputCheckpoint = await userDb.getConflictScanCheckpoint();
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().title = "after-checkpoint";
+    });
+
+    const events = await collectConflictEvents(userDb, docId, {
+      since: inputCheckpoint,
+    });
+    const checkpointEvents = events.filter((event) => event.type === "scanCheckpoint");
+
+    expect(checkpointEvents).toHaveLength(1);
+    const [checkpointEvent] = checkpointEvents;
+    expect(checkpointEvent?.type).toBe("scanCheckpoint");
+    if (checkpointEvent?.type !== "scanCheckpoint") {
+      return;
+    }
+    expect(checkpointEvent.checkpoint.changeSeqAsOf).toBeGreaterThanOrEqual(inputCheckpoint.changeSeqAsOf);
+    expect(checkpointEvent.checkpoint.takenAt).toBeGreaterThanOrEqual(inputCheckpoint.takenAt);
+  });
 });

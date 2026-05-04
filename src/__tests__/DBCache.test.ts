@@ -238,13 +238,17 @@ describe("BaseMindooDB cache integration", () => {
     await simulateRestart();
 
     const getSpy = jest.spyOn(cacheStore, "get");
+    const getManySpy = jest.spyOn(cacheStore, "getMany");
 
     const db2 = await tenant.openDB("contacts");
 
-    expect(getSpy).toHaveBeenCalled();
+    // The metadata checkpoint is loaded via the single-key `get`,
+    // while doc records are loaded in batched `getMany` calls (Phase 3
+    // of the L1/L2 cache plan).
     const getTypes = getSpy.mock.calls.map(([type]) => type);
     expect(getTypes).toContain("db-meta");
-    expect(getTypes).toContain("doc");
+    const getManyTypes = getManySpy.mock.calls.map(([type]) => type);
+    expect(getManyTypes).toContain("doc");
 
     const restoredDoc1 = await db2.getDocument(doc1Id);
     expect(restoredDoc1.getData().name).toBe("Alice");
@@ -255,6 +259,7 @@ describe("BaseMindooDB cache integration", () => {
     expect(restoredDoc2.getData().email).toBe("bob@example.com");
 
     getSpy.mockRestore();
+    getManySpy.mockRestore();
   }, 30000);
 
   it("should process delta entries after cache restore", async () => {

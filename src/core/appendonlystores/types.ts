@@ -498,6 +498,17 @@ export interface ContentAddressedStore {
   purgeDocHistory(docId: string): Promise<void>;
 
   /**
+   * Delete chunks for one attachment that never committed to document history.
+   * Implementations must update content refcounts and byte accounting.
+   */
+  deleteEntriesForAttachment?(docId: string, attachmentId: string): Promise<number>;
+
+  /**
+   * Delete specific entry ids, used for small local recovery ledger records.
+   */
+  deleteEntriesById?(entryIds: string[]): Promise<number>;
+
+  /**
    * Optional lifecycle hook for stores that persist local data.
    * Implementations should delete all local store data and reset in-memory state.
    */

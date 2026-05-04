@@ -99,6 +99,24 @@ export class MMKVLocalCacheStore implements LocalCacheStore {
     return MMKVLocalCacheStore.fromBase64(str);
   }
 
+  async getMany(type: string, ids: string[]): Promise<Array<Uint8Array | null>> {
+    if (ids.length === 0) return [];
+
+    if (this.mmkv) {
+      return ids.map((id) => {
+        const buf = this.mmkv!.getBuffer(this.toKey(type, id));
+        return buf === undefined ? null : new Uint8Array(buf);
+      });
+    }
+
+    return Promise.all(
+      ids.map(async (id) => {
+        const str = await this.asyncStorage!.getItem(this.toKey(type, id));
+        return str === null ? null : MMKVLocalCacheStore.fromBase64(str);
+      }),
+    );
+  }
+
   async put(type: string, id: string, value: Uint8Array): Promise<void> {
     const key = this.toKey(type, id);
 

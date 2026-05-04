@@ -137,6 +137,13 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       tenantLogger,
       options?.additionalTrustedKeys,
       this.localCacheStore,
+      options?.preDecryptedUserKeys
+        ? {
+            signingKey: options.preDecryptedUserKeys.signingKey,
+            encryptionKey: options.preDecryptedUserKeys.encryptionKey,
+            cacheEncryptionKey: options.preDecryptedUserKeys.cacheEncryptionKey,
+          }
+        : undefined,
     );
 
     // Initialize the tenant
@@ -414,8 +421,11 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       ? options.appUser
       : await this.createUserId(options.userName, options.userPassword);
 
-    // 2. Create KeyBag with required keys
-    const keyBag = new KeyBag(
+    // 2. Create or reuse a KeyBag and add the new tenant's required keys.
+    //    When `existingKeyBag` is supplied, the bag is mutated in place
+    //    (no merge step needed) and returned as-is in the result, so the
+    //    caller can persist it once after createTenant returns.
+    const keyBag = options.existingKeyBag ?? new KeyBag(
       appUser.userEncryptionKeyPair.privateKey,
       options.userPassword,
       this.cryptoAdapter,
@@ -492,8 +502,10 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log(`[joinTenant] Joining tenant "${response.tenantId}"`);
     this.logger.info(`Joining tenant: ${response.tenantId}`);
 
-    // 1. Create a new KeyBag for this user
-    const keyBag = new KeyBag(
+    // 1. Create or reuse a KeyBag for this user. When `existingKeyBag` is
+    //    supplied, the joined tenant's keys are added to the existing bag
+    //    in place; the same bag instance is returned to the caller.
+    const keyBag = options.existingKeyBag ?? new KeyBag(
       options.user.userEncryptionKeyPair.privateKey,
       options.password,
       this.cryptoAdapter,

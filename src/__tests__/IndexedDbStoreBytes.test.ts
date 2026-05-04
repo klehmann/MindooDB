@@ -387,4 +387,47 @@ describe("IndexedDB browser store byte counters", () => {
 
     expect(await readLocalCacheStoreBytes(dbName)).toBe(5);
   });
+
+  it("getMany batches reads in a single transaction and preserves ordering", async () => {
+    const dbName = "cache-getmany-batch";
+    const store = new IndexedDBLocalCacheStore(dbName);
+
+    await store.put("doc", "a", new Uint8Array([1]));
+    await store.put("doc", "b", new Uint8Array([2, 3]));
+    await store.put("doc", "c", new Uint8Array([4, 5, 6]));
+
+    const results = await store.getMany("doc", [
+      "c",
+      "missing-1",
+      "a",
+      "missing-2",
+      "b",
+    ]);
+
+    expect(results).toEqual([
+      new Uint8Array([4, 5, 6]),
+      null,
+      new Uint8Array([1]),
+      null,
+      new Uint8Array([2, 3]),
+    ]);
+
+    expect(await store.getMany("doc", [])).toEqual([]);
+
+    closeStoreConnection(store);
+  });
+
+  it("getMany respects type isolation", async () => {
+    const dbName = "cache-getmany-types";
+    const store = new IndexedDBLocalCacheStore(dbName);
+
+    await store.put("doc", "shared-id", new Uint8Array([1]));
+    await store.put("vv", "shared-id", new Uint8Array([2]));
+
+    expect(await store.getMany("doc", ["shared-id"])).toEqual([new Uint8Array([1])]);
+    expect(await store.getMany("vv", ["shared-id"])).toEqual([new Uint8Array([2])]);
+    expect(await store.getMany("other", ["shared-id"])).toEqual([null]);
+
+    closeStoreConnection(store);
+  });
 });

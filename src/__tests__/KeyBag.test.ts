@@ -714,5 +714,119 @@ describe("KeyBag", () => {
       expect(retrieved!.length).toBeGreaterThan(0);
     });
   });
+
+  describe("wrapping-key constructor", () => {
+    it("derives a wrapping key with the documented PBKDF2 parameters", async () => {
+      const wrappingKey = await KeyBag.deriveWrappingKey(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter(),
+      );
+
+      expect(wrappingKey).toBeDefined();
+      expect(wrappingKey.algorithm.name).toBe("AES-GCM");
+      expect((wrappingKey.algorithm as unknown as { length: number }).length).toBe(256);
+      expect(wrappingKey.usages).toEqual(expect.arrayContaining(["encrypt", "decrypt"]));
+      expect(wrappingKey.extractable).toBe(false);
+    });
+
+    it("save+load is interchangeable between password and wrapping-key constructors", async () => {
+      // Set up keys via the legacy (password) bag
+      const key1 = new Uint8Array([1, 2, 3, 4]);
+      const key2 = new Uint8Array([5, 6, 7, 8]);
+      await keyBag.set("doc", docTenantId, "alpha", key1, 1000);
+      await keyBag.set("doc", docTenantId, "beta", key2, 2000);
+
+      const passwordSaved = await keyBag.save();
+
+      // Load it into a wrapping-key bag using a key derived from the same password
+      const wrappingKey = await KeyBag.deriveWrappingKey(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter(),
+      );
+      const wrappingBag = new KeyBag({
+        wrappingKey,
+        cryptoAdapter: factory.getCryptoAdapter(),
+      });
+      await wrappingBag.load(passwordSaved);
+      expect(await wrappingBag.get("doc", docTenantId, "alpha")).toEqual(key1);
+      expect(await wrappingBag.get("doc", docTenantId, "beta")).toEqual(key2);
+
+      // Save from the wrapping-key bag, load back into the legacy password bag
+      const wrappingSaved = await wrappingBag.save();
+      const passwordBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter(),
+      );
+      await passwordBag.load(wrappingSaved);
+      expect(await passwordBag.get("doc", docTenantId, "alpha")).toEqual(key1);
+      expect(await passwordBag.get("doc", docTenantId, "beta")).toEqual(key2);
+    });
+
+    it("clones a wrapping-key bag without re-derivation", async () => {
+      const wrappingKey = await KeyBag.deriveWrappingKey(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter(),
+      );
+      const bag = new KeyBag({
+        wrappingKey,
+        cryptoAdapter: factory.getCryptoAdapter(),
+      });
+      await bag.set("doc", docTenantId, "alpha", new Uint8Array([42]), 100);
+
+      const cloned = bag.clone();
+      // Mutate original; clone should be unaffected
+      await bag.deleteKey("doc", docTenantId, "alpha");
+
+      expect(await bag.get("doc", docTenantId, "alpha")).toBeNull();
+      expect(await cloned.get("doc", docTenantId, "alpha")).toEqual(new Uint8Array([42]));
+
+      // The clone can save+load using the same wrapping key (no password retained)
+      const saved = await cloned.save();
+      const reopened = new KeyBag({
+        wrappingKey,
+        cryptoAdapter: factory.getCryptoAdapter(),
+      });
+      await reopened.load(saved);
+      expect(await reopened.get("doc", docTenantId, "alpha")).toEqual(new Uint8Array([42]));
+    });
+
+    it("wrapping-key constructor without a password makes resolveWrappingKey skip PBKDF2", async () => {
+      const wrappingKey = await KeyBag.deriveWrappingKey(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter(),
+      );
+      const bag = new KeyBag({
+        wrappingKey,
+        cryptoAdapter: factory.getCryptoAdapter(),
+      });
+
+      const subtle = factory.getCryptoAdapter().getSubtle();
+      const importKeySpy = jest.spyOn(subtle, "importKey");
+      const deriveKeySpy = jest.spyOn(subtle, "deriveKey");
+
+      try {
+        await bag.set("doc", docTenantId, "alpha", new Uint8Array([1]));
+        await bag.save();
+        // Neither importKey("raw", ...) for PBKDF2 nor deriveKey for the
+        // wrapping key should run when a wrapping CryptoKey was supplied.
+        const importPbkdf2Calls = importKeySpy.mock.calls.filter(
+          (call) => call[2] === "PBKDF2",
+        );
+        const deriveAesGcmCalls = deriveKeySpy.mock.calls.filter(
+          (call) => (call[2] as { name?: string })?.name === "AES-GCM",
+        );
+        expect(importPbkdf2Calls).toHaveLength(0);
+        expect(deriveAesGcmCalls).toHaveLength(0);
+      } finally {
+        importKeySpy.mockRestore();
+        deriveKeySpy.mockRestore();
+      }
+    });
+  });
 });
 
