@@ -52,6 +52,8 @@ import {
   DocumentHistoryPageOptions,
   DocumentHistoryPageResult,
   MindooTextEdit,
+  MindooJsonPatch,
+  MindooJsonPatchResult,
   MindooTextPatch,
   MindooTextPatchResult,
   WarmerScheduler,
@@ -4465,6 +4467,75 @@ export class BaseMindooDB implements MindooDB {
     };
   }
 
+  async applyJsonPatch(doc: MindooDoc, patch: MindooJsonPatch): Promise<MindooJsonPatchResult> {
+    this.assertWritable("applyJsonPatch");
+    const docId = doc.getId();
+    this.logger.debug(`===== applyJsonPatch called for document ${docId} =====`);
+
+    if (this._isAdminOnlyDb) {
+      const adminPublicKey = this.getAdminPublicKey();
+      const currentUser = await this.tenant.getCurrentUserId();
+      if (currentUser.userSigningPublicKey !== adminPublicKey) {
+        throw new Error("Admin-only database: only the admin key can modify data");
+      }
+    }
+
+    let internalDoc = this.getCachedDocument(docId);
+    if (!internalDoc) {
+      const loadedDoc = await this.loadDocumentInternal(docId);
+      if (!loadedDoc) {
+        throw new Error(`Document ${docId} not found`);
+      }
+      internalDoc = loadedDoc;
+    }
+
+    if (internalDoc.isDeleted) {
+      throw new Error(`Document ${docId} has been deleted`);
+    }
+
+    this.validateJsonPatch(patch);
+    const now = Date.now();
+    const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
+    const applyPatch = (automergeDoc: MindooDocPayload) => {
+      this.applyJsonPatchOperations(automergeDoc, patch);
+      automergeDoc._lastModified = now;
+    };
+
+    let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    try {
+      if (patch.baseHeads && patch.baseHeads.length > 0) {
+        const result = Automerge.changeAt(
+          internalDoc.doc,
+          patch.baseHeads as AutomergeTypes.Heads,
+          applyPatch,
+        );
+        newDoc = result.newDoc as AutomergeTypes.Doc<MindooDocPayload>;
+      } else {
+        newDoc = Automerge.change(internalDoc.doc, applyPatch);
+      }
+      this.logger.debug(`Successfully applied JSON patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+    } catch (error) {
+      this.logger.error(`Error applying JSON patch for document ${docId}:`, error);
+      throw error;
+    }
+
+    await this.persistDocumentChange({
+      internalDoc,
+      newDoc,
+      now,
+      headsBeforeChange,
+      useCustomKey: false,
+      successMessage: "JSON patched",
+    });
+
+    const wrapped = this.wrapDocument(internalDoc);
+    return {
+      doc: wrapped,
+      heads: wrapped.getHeads(),
+      data: wrapped.getData(),
+    };
+  }
+
   private async changeDocInternal(
     doc: MindooDoc,
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
@@ -4868,6 +4939,116 @@ export class BaseMindooDB implements MindooDB {
         throw new Error("Text edit insert value must be a string when provided");
       }
     }
+  }
+
+  private validateJsonPatch(patch: MindooJsonPatch): void {
+    const operationCount = (patch.set?.length ?? 0)
+      + (patch.unset?.length ?? 0)
+      + (patch.listDelete?.length ?? 0)
+      + (patch.listInsert?.length ?? 0);
+    if (operationCount === 0) {
+      throw new Error("JSON patch must include at least one operation");
+    }
+    for (const operation of patch.set ?? []) {
+      this.validateJsonPath(operation.path, "JSON set");
+    }
+    for (const operation of patch.unset ?? []) {
+      this.validateJsonPath(operation.path, "JSON unset");
+    }
+    for (const operation of patch.listDelete ?? []) {
+      this.validateJsonPath(operation.path, "JSON listDelete");
+      if (!Number.isInteger(operation.index) || operation.index < 0) {
+        throw new Error("JSON listDelete index must be a non-negative integer");
+      }
+      if (!Number.isInteger(operation.deleteCount) || operation.deleteCount < 0) {
+        throw new Error("JSON listDelete deleteCount must be a non-negative integer");
+      }
+    }
+    for (const operation of patch.listInsert ?? []) {
+      this.validateJsonPath(operation.path, "JSON listInsert");
+      if (!Number.isInteger(operation.index) || operation.index < 0) {
+        throw new Error("JSON listInsert index must be a non-negative integer");
+      }
+      if (!Array.isArray(operation.values)) {
+        throw new Error("JSON listInsert values must be an array");
+      }
+    }
+  }
+
+  private validateJsonPath(path: Array<string | number>, label: string): void {
+    if (!Array.isArray(path) || path.length === 0) {
+      throw new Error(`${label} path must contain at least one segment`);
+    }
+    for (const segment of path) {
+      if (typeof segment !== "string" && typeof segment !== "number") {
+        throw new Error(`${label} path segments must be strings or numbers`);
+      }
+    }
+  }
+
+  private applyJsonPatchOperations(automergeDoc: MindooDocPayload, patch: MindooJsonPatch): void {
+    for (const operation of patch.set ?? []) {
+      this.setJsonValueAtPath(automergeDoc, operation.path, structuredClone(operation.value));
+    }
+    for (const operation of patch.unset ?? []) {
+      this.unsetJsonValueAtPath(automergeDoc, operation.path);
+    }
+    for (const operation of patch.listDelete ?? []) {
+      const list = this.readJsonListAtPath(automergeDoc, operation.path);
+      list.splice(operation.index, operation.deleteCount);
+    }
+    for (const operation of patch.listInsert ?? []) {
+      const list = this.readJsonListAtPath(automergeDoc, operation.path);
+      list.splice(operation.index, 0, ...structuredClone(operation.values));
+    }
+  }
+
+  private setJsonValueAtPath(target: MindooDocPayload, path: Array<string | number>, value: unknown): void {
+    const parent = this.ensureJsonParentAtPath(target, path);
+    parent[path[path.length - 1]] = value;
+  }
+
+  private unsetJsonValueAtPath(target: MindooDocPayload, path: Array<string | number>): void {
+    const parent = this.readJsonParentAtPath(target, path);
+    delete parent[path[path.length - 1]];
+  }
+
+  private readJsonListAtPath(target: MindooDocPayload, path: Array<string | number>): unknown[] {
+    let value: any = target;
+    for (const segment of path) {
+      value = value?.[segment];
+    }
+    if (!Array.isArray(value)) {
+      throw new Error(`Cannot apply JSON list operation to non-array value at '${path.map(String).join(".")}'`);
+    }
+    return value;
+  }
+
+  private ensureJsonParentAtPath(target: MindooDocPayload, path: Array<string | number>): Record<string | number, unknown> {
+    let parent: any = target;
+    for (let index = 0; index < path.length - 1; index += 1) {
+      const segment = path[index];
+      const nextSegment = path[index + 1];
+      if (parent[segment] === undefined || parent[segment] === null) {
+        parent[segment] = typeof nextSegment === "number" ? [] : {};
+      }
+      parent = parent[segment];
+      if (parent === null || typeof parent !== "object") {
+        throw new Error(`Cannot apply JSON patch through non-object path segment '${String(segment)}'`);
+      }
+    }
+    return parent;
+  }
+
+  private readJsonParentAtPath(target: MindooDocPayload, path: Array<string | number>): Record<string | number, unknown> {
+    let parent: any = target;
+    for (let index = 0; index < path.length - 1; index += 1) {
+      parent = parent?.[path[index]];
+      if (parent === null || typeof parent !== "object") {
+        throw new Error(`Cannot resolve JSON patch path '${path.map(String).join(".")}'`);
+      }
+    }
+    return parent;
   }
 
   private ensureTextPath(automergeDoc: MindooDocPayload, path: Array<string | number>): void {

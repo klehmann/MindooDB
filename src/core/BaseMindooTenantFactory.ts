@@ -441,7 +441,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       adminUser.userEncryptionKeyPair.publicKey,
       appUser,
       options.userPassword,
-      keyBag
+      keyBag,
+      options.preDecryptedAppUserKeys ? { preDecryptedUserKeys: options.preDecryptedAppUserKeys } : undefined,
     );
 
     // 4. Register the app user in the directory
@@ -537,7 +538,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       response.adminEncryptionPublicKey,
       options.user,
       options.password,
-      keyBag
+      keyBag,
+      options.preDecryptedUserKeys ? { preDecryptedUserKeys: options.preDecryptedUserKeys } : undefined,
     );
 
     console.log(`[joinTenant] ✓ Joined tenant "${response.tenantId}" successfully`);

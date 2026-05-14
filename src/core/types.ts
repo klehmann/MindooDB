@@ -162,7 +162,15 @@ export interface PreDecryptedUserKeys {
 interface CreateTenantPasswords {
   /** Password for the admin user's private keys */
   adminPassword: string;
-  /** Password for the regular user's private keys */
+  /**
+   * Password for the regular (app) user's private keys.
+   *
+   * When {@link existingKeyBag} **and** {@link preDecryptedAppUserKeys}
+   * are both supplied the password is no longer needed by `createTenant`
+   * (the bag has already been wrapped, and `openTenant` consumes the
+   * pre-imported `CryptoKey`s directly). Callers in that live-bag mode
+   * may pass an empty string.
+   */
   userPassword: string;
   /**
    * Optional pre-existing {@link KeyBag} to extend with the new tenant's
@@ -175,6 +183,14 @@ interface CreateTenantPasswords {
    * password-based KeyBag wrapping derivation (existing behavior).
    */
   existingKeyBag?: KeyBag;
+  /**
+   * Optional pre-decrypted CryptoKeys for the *app user* identity that
+   * are forwarded to the underlying {@link MindooTenantFactory.openTenant}
+   * call. When supplied alongside {@link existingKeyBag} the
+   * password-based decryption + import of the app user's signing /
+   * encryption private keys is skipped entirely.
+   */
+  preDecryptedAppUserKeys?: PreDecryptedUserKeys;
 }
 
 /**
@@ -284,7 +300,17 @@ export interface JoinResponse {
 export interface JoinTenantOptions {
   /** The user's locally-generated private identity (keys never leave this device) */
   user: PrivateUserId;
-  /** The password for the user's private keys */
+  /**
+   * The password for the user's private keys.
+   *
+   * Required when neither {@link existingKeyBag} nor
+   * {@link preDecryptedUserKeys} is supplied. When `existingKeyBag` is
+   * provided the password is *not* used to construct a new KeyBag; when
+   * `preDecryptedUserKeys.signingKey` and `preDecryptedUserKeys.encryptionKey`
+   * are both supplied the password is *not* used to decrypt the user's
+   * private keys before opening the tenant. In those live-bag cases
+   * callers may pass an empty string.
+   */
   password: string;
   /** The shared password used to decrypt the keys in the join response */
   sharePassword: string;
@@ -299,6 +325,16 @@ export interface JoinTenantOptions {
    * password-based KeyBag wrapping derivation (existing behavior).
    */
   existingKeyBag?: KeyBag;
+  /**
+   * Optional pre-decrypted user keys forwarded to the underlying
+   * {@link MindooTenantFactory.openTenant} call. When the joining user's
+   * signing/encryption {@link CryptoKey}s are already available
+   * (e.g. because they were unlocked once at app startup via a live
+   * Haven session) supplying them here avoids the password-based
+   * decryption + import that `openTenant` would otherwise perform on
+   * the encrypted private keys carried on the user identity.
+   */
+  preDecryptedUserKeys?: PreDecryptedUserKeys;
 }
 
 /**
@@ -1403,23 +1439,86 @@ export interface MindooDoc {
   ): AsyncGenerator<Uint8Array, void, unknown>;
 }
 
+/** Plain JSON-compatible document payload materialized from a MindooDoc. */
 export interface MindooDocPayload {
   [key: string]: unknown;
 }
 
+/**
+ * Single text splice applied to the string at a text patch path.
+ *
+ * `index` is a character offset in the current text value, `deleteCount`
+ * removes characters from that offset, and `insert` adds replacement text.
+ */
 export interface MindooTextEdit {
   index: number;
   deleteCount: number;
   insert?: string;
 }
 
+/**
+ * Ordered text edits for one string field in a MindooDoc.
+ *
+ * `path` addresses the target string inside the document payload. When
+ * supplied, `baseHeads` identifies the Automerge heads the caller based the
+ * edit on, allowing the backend to apply order-sensitive text changes in the
+ * intended causal context.
+ */
 export interface MindooTextPatch {
   path: Array<string | number>;
   baseHeads?: string[];
   edits: MindooTextEdit[];
 }
 
+/** Result returned after applying a text patch and materializing the document. */
 export interface MindooTextPatchResult {
+  doc: MindooDoc;
+  heads: string[];
+  data: MindooDocPayload;
+}
+
+/** Sets a value at `path`, creating or replacing that payload field. */
+export interface MindooJsonSetPatch {
+  path: Array<string | number>;
+  value: unknown;
+}
+
+/** Removes the value at `path` from the payload object or list. */
+export interface MindooJsonUnsetPatch {
+  path: Array<string | number>;
+}
+
+/** Inserts one or more values into the list located at `path`. */
+export interface MindooJsonListInsertPatch {
+  path: Array<string | number>;
+  index: number;
+  values: unknown[];
+}
+
+/** Deletes one or more values from the list located at `path`. */
+export interface MindooJsonListDeletePatch {
+  path: Array<string | number>;
+  index: number;
+  deleteCount: number;
+}
+
+/**
+ * Granular JSON mutation batch for a MindooDoc payload.
+ *
+ * Operations are applied in patch order by operation group. `baseHeads` has the
+ * same role as in text patches: it records the document heads the caller saw
+ * before constructing operations whose order matters, such as list inserts.
+ */
+export interface MindooJsonPatch {
+  baseHeads?: string[];
+  set?: MindooJsonSetPatch[];
+  unset?: MindooJsonUnsetPatch[];
+  listInsert?: MindooJsonListInsertPatch[];
+  listDelete?: MindooJsonListDeletePatch[];
+}
+
+/** Result returned after applying a JSON patch and materializing the document. */
+export interface MindooJsonPatchResult {
   doc: MindooDoc;
   heads: string[];
   data: MindooDocPayload;
@@ -2651,6 +2750,16 @@ export interface MindooDB {
    * overwriting concurrent edits that arrived meanwhile.
    */
   applyTextPatch(doc: MindooDoc, patch: MindooTextPatch): Promise<MindooTextPatchResult>;
+
+  /**
+   * Apply granular JSON edits at document paths.
+   *
+   * If `baseHeads` is provided, edits are applied at that historical Automerge
+   * version using `changeAt`, then merged into the current document. This lets
+   * apps flush buffered object/list operations based on a stale local copy
+   * without replacing concurrent changes that arrived meanwhile.
+   */
+  applyJsonPatch(doc: MindooDoc, patch: MindooJsonPatch): Promise<MindooJsonPatchResult>;
 
   /**
    * Change a document using a specific signing key.

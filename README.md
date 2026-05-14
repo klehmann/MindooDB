@@ -65,7 +65,7 @@ Traditional databases trust the server. If your hosting provider is compromised,
 ### Installation
 
 ```bash
-npm install mindoodb
+pnpm add mindoodb
 ```
 
 > 📱 **React Native / Expo?** See the [React Native setup guide](./docs/reactnative.md) for mobile-specific instructions with native performance.
@@ -76,7 +76,7 @@ npm install mindoodb
 |---------|---------------|------------------|
 | Node.js | Use `mindoodb` directly in a Node script | [Getting Started](./docs/getting-started.md#nodejs) |
 | Web | Import from `mindoodb/browser` | [Getting Started](./docs/getting-started.md#web-browser) |
-| React Native / Expo | Run `npx mindoodb setup-react-native` in your app root | [React Native Guide](./docs/reactnative.md) |
+| React Native / Expo | Run `pnpm dlx mindoodb setup-react-native` in your app root | [React Native Guide](./docs/reactnative.md) |
 
 ### React Native Recommendation
 
@@ -268,25 +268,25 @@ Run tests from the command line:
 
 ```bash
 # Node.js unit/integration tests (Jest)
-npm test
+pnpm test
 
 # Install Chromium once for browser tests
-npm run test:browser:install
+pnpm test:browser:install
 
 # Real browser runtime tests (Playwright + headless Chromium)
-npm run test:browser
+pnpm test:browser
 
 # Run Node + browser lanes
-npm run test:all
+pnpm test:all
 ```
 
 ### Test coverage by environment
 
 | Environment | Command | What is covered today |
 |-------------|---------|------------------------|
-| Node.js | `npm test` | Full Jest suite for core APIs (documents, sync logic, indexing, virtual views, settings, trust model, attachments, etc.) |
-| Browser | `npm run test:browser` | Real Chromium runtime via Playwright, including browser entrypoint usage, document lifecycle, real HTTP sync endpoint flows, and browser Virtual View update behavior |
-| React Native / Expo | `npm test -- ReactNativeCrypto.test.ts` | Crypto adapter behavior in Jest (uses `src/__mocks__/expo-standard-web-crypto.ts`), not a device/simulator E2E run |
+| Node.js | `pnpm test` | Full Jest suite for core APIs (documents, sync logic, indexing, virtual views, settings, trust model, attachments, etc.) |
+| Browser | `pnpm test:browser` | Real Chromium runtime via Playwright, including browser entrypoint usage, document lifecycle, real HTTP sync endpoint flows, and browser Virtual View update behavior |
+| React Native / Expo | `pnpm test -- ReactNativeCrypto.test.ts` | Crypto adapter behavior in Jest (uses `src/__mocks__/expo-standard-web-crypto.ts`), not a device/simulator E2E run |
 
 ### Browser sync test behavior
 
