@@ -179,6 +179,51 @@ interface InternalDoc {
   isDeleted: boolean;
 }
 
+/**
+ * Local visibility state for an index entry.
+ *
+ * - `"visible"`: the current tenant KeyBag can resolve the document's
+ *   encryption key, so the doc participates in the public read paths
+ *   (`getAllDocumentIds`, `iterateChangesSince`, virtual views, ...).
+ * - `"inaccessible"`: the doc exists in the underlying store but the
+ *   current KeyBag cannot decrypt it. The entry stays in the index as
+ *   an internal tombstone so metadata-only consumers can emit a
+ *   `isDeleted: true` change and removal from caches/views happens
+ *   exactly once. The doc body is never materialized while in this
+ *   state.
+ *
+ * Visibility is local cache/index state, *not* persisted into the
+ * append-only store. The store entries are unchanged; only this
+ * database instance's view of them flips.
+ */
+type DocumentAccessState = "visible" | "inaccessible";
+
+/**
+ * One row in the in-memory changefeed index.
+ *
+ * The index is the source of truth for what this `BaseMindooDB`
+ * exposes to readers, ordered by `(changeSeq, docId)`. `decryptionKeyId`
+ * and `accessState` are required to keep the visibility reconciliation
+ * layer (see {@link BaseMindooDB.reconcileKeyVisibility}) self-contained:
+ * they let cache/view consumers drop entries by key id without touching
+ * document bodies, and let the read paths refuse to surface entries
+ * whose key has been revoked.
+ */
+interface DocumentIndexEntry {
+  /** Document id this entry represents. */
+  docId: string;
+  /** Monotonic local sequence assigned at the latest visibility transition. */
+  changeSeq: number;
+  /** Latest user-visible modification timestamp from the underlying store. */
+  lastModified: number;
+  /** Whether the latest known state is a tombstone (deleted *or* inaccessible). */
+  isDeleted: boolean;
+  /** Encryption key id used to decrypt this document's payload. */
+  decryptionKeyId: string;
+  /** See {@link DocumentAccessState}. */
+  accessState: DocumentAccessState;
+}
+
 interface VerifiedReplayChange {
   entry: StoreEntryMetadata;
   changeBytes: Uint8Array;
@@ -269,7 +314,7 @@ export class BaseMindooDB implements MindooDB {
   
   // Internal changefeed index: sorted by (changeSeq, docId) for deterministic iteration.
   // lastModified remains available for UX metadata but is not the primary cursor key.
-  private index: Array<{ docId: string; changeSeq: number; lastModified: number; isDeleted: boolean }> = [];
+  private index: DocumentIndexEntry[] = [];
   
   // Lookup map for O(1) access to index entries by docId
   private indexLookup: Map<string, number> = new Map(); // Map<docId, arrayIndex>
@@ -310,6 +355,21 @@ export class BaseMindooDB implements MindooDB {
   private cachePrefix: string | null = null;
   private dirtyDocIds: Set<string> = new Set();
   private cacheMetaDirty: boolean = false;
+
+  /**
+   * Tenant KeyBag fingerprint observed at the time the in-memory index
+   * was last reconciled with the underlying store.
+   *
+   * Persisted alongside the cache checkpoint so warm starts can compare
+   * the current fingerprint against the stored one and skip a full
+   * metadata scan (and the associated REST round-trips against remote
+   * stores) when the bag composition has not changed since the last
+   * flush.
+   *
+   * Set to `null` when no reconciliation has been performed yet, or
+   * when the tenant does not expose a fingerprint method.
+   */
+  private lastReconciledKeyBagFingerprint: string | null = null;
 
   // ---------------------------------------------------------------------------
   // Background L2 warmer state (single-flight + cancellation).
@@ -701,6 +761,14 @@ export class BaseMindooDB implements MindooDB {
       checkpoint.processedEntryIds = this.processedEntryIds;
     }
 
+    // Persist the KeyBag fingerprint observed at the last reconciliation
+    // so the next restore can decide whether to skip the visibility
+    // metadata scan. `null` is acceptable - older checkpoints simply
+    // force one reconcile on the next startup.
+    if (this.lastReconciledKeyBagFingerprint !== null) {
+      checkpoint.keyBagFingerprint = this.lastReconciledKeyBagFingerprint;
+    }
+
     return new TextEncoder().encode(JSON.stringify(checkpoint));
   }
 
@@ -731,11 +799,19 @@ export class BaseMindooDB implements MindooDB {
       if (checkpoint.processedEntryIds) {
         this.processedEntryIds = checkpoint.processedEntryIds;
       }
+      this.lastReconciledKeyBagFingerprint =
+        typeof checkpoint.keyBagFingerprint === "string" ? checkpoint.keyBagFingerprint : null;
       // Rebuild indexLookup from index
       this.indexLookup.clear();
       for (let i = 0; i < this.index.length; i++) {
         if (typeof this.index[i].changeSeq !== "number") {
           this.index[i].changeSeq = i + 1;
+        }
+        if (!this.index[i].decryptionKeyId) {
+          this.index[i].decryptionKeyId = "default";
+        }
+        if (!this.index[i].accessState) {
+          this.index[i].accessState = "visible";
         }
         this.indexLookup.set(this.index[i].docId, i);
       }
@@ -797,6 +873,20 @@ export class BaseMindooDB implements MindooDB {
             const deserialized = this.deserializeDoc(docBytes);
             if (deserialized === null) {
               skippedLegacyDocs++;
+              continue;
+            }
+            // Defence-in-depth: an L2 record holds the decrypted Automerge
+            // state. If the current KeyBag can no longer resolve the doc's
+            // key (e.g. the user lost access between sessions) we evict
+            // both the L2 record and any L1 entry instead of restoring
+            // plaintext into memory. The post-restore call to
+            // `reconcileKeyVisibility` will then flip the index entry to
+            // `"inaccessible"` so future reads behave correctly.
+            const canRead = await this.tenant.hasDecryptionKey(deserialized.internal.decryptionKeyId);
+            if (!canRead) {
+              const docId = batch[i].slice(docPrefix.length);
+              await store.delete("doc", batch[i]);
+              this.docCache.delete(docId);
               continue;
             }
             await this.storeCachedDocument(deserialized.internal);
@@ -941,26 +1031,54 @@ export class BaseMindooDB implements MindooDB {
 
   /**
    * Update the index entry for a document.
-   * When a document changes, it gets a new monotonic sequence and is moved to
-   * maintain order by (changeSeq, docId).
-   * 
-   * Optimized to only update lookup map for entries that actually moved.
-   * 
+   *
+   * When a document changes, it gets a new monotonic sequence and is
+   * moved within the sorted index to maintain `(changeSeq, docId)` order.
+   * The lookup map is only patched for the range of entries that actually
+   * shifted.
+   *
+   * Idempotent: if every tracked field (`lastModified`, `isDeleted`,
+   * `decryptionKeyId`, `accessState`) matches the existing entry the
+   * call is a no-op and no new `changeSeq` is consumed. This is what
+   * keeps repeated visibility reconciliations from inflating the
+   * changefeed.
+   *
    * @param docId The document ID
    * @param lastModified The new last modified timestamp
-   * @param isDeleted Whether the document is deleted
+   * @param isDeleted Whether the document is a deletion/inaccessibility tombstone
+   * @param decryptionKeyId Encryption key id derived from the doc's store metadata
+   * @param accessState `"visible"` for readable docs, `"inaccessible"` for
+   *   tombstones produced by the key visibility layer
    */
-  private updateIndex(docId: string, lastModified: number, isDeleted: boolean): void {
+  private updateIndex(
+    docId: string,
+    lastModified: number,
+    isDeleted: boolean,
+    decryptionKeyId: string = "default",
+    accessState: DocumentAccessState = "visible",
+  ): void {
     const startedAt = Date.now();
     const assignedSeq = this.nextChangeSeq;
-    const newEntry = { docId, changeSeq: assignedSeq, lastModified, isDeleted };
+    const newEntry: DocumentIndexEntry = {
+      docId,
+      changeSeq: assignedSeq,
+      lastModified,
+      isDeleted,
+      decryptionKeyId,
+      accessState,
+    };
     const existingIndex = this.indexLookup.get(docId);
     
     // Check if the entry already exists and hasn't changed position
     if (existingIndex !== undefined) {
       const existingEntry = this.index[existingIndex];
       // If only metadata flags stayed identical and caller replays same state, skip.
-      if (existingEntry.lastModified === lastModified && existingEntry.isDeleted === isDeleted) {
+      if (
+        existingEntry.lastModified === lastModified
+        && existingEntry.isDeleted === isDeleted
+        && existingEntry.decryptionKeyId === decryptionKeyId
+        && existingEntry.accessState === accessState
+      ) {
         return; // No change needed
       }
       
@@ -1168,6 +1286,26 @@ export class BaseMindooDB implements MindooDB {
       if (restored) {
         this.logger.info("Restored from cache, processing delta only");
         await this.syncStoreChanges();
+
+        // Visibility reconciliation runs a full metadata scan over the
+        // store, which on a remote store is one or more REST round-trips.
+        // Skip it on warm starts when we can prove the KeyBag composition
+        // has not changed since the last flush by comparing fingerprints.
+        // Fall back to the unconditional reconcile when the tenant does
+        // not expose a fingerprint so we never silently miss a key
+        // transition.
+        const currentFingerprint = await this.computeCurrentKeyBagFingerprint();
+        const fingerprintMatches =
+          currentFingerprint !== null && currentFingerprint === this.lastReconciledKeyBagFingerprint;
+        if (!fingerprintMatches) {
+          await this.reconcileKeyVisibility();
+        }
+        this.markKeyBagFingerprintReconciled(currentFingerprint);
+
+        // If `reconcileRestoredIndexOnInit` triggers a full rebuild,
+        // that rebuild reruns `syncStoreChanges` from scratch, which
+        // applies per-doc visibility checks itself. We do not need to
+        // call `reconcileKeyVisibility` again afterwards.
         if (this.reconcileRestoredIndexOnInit) {
           await this.reconcileRestoredIndexWithStore();
         }
@@ -1176,6 +1314,218 @@ export class BaseMindooDB implements MindooDB {
     }
 
     await this.syncStoreChanges();
+    // First-time materialization: `syncStoreChanges` already filters out
+    // docs whose keys are unavailable, so the only thing left to do is
+    // record the current fingerprint for the next warm start.
+    this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
+  }
+
+  /**
+   * Compute the current tenant KeyBag fingerprint, or `null` when the
+   * tenant does not expose one (older `MindooTenant` implementations).
+   */
+  private async computeCurrentKeyBagFingerprint(): Promise<string | null> {
+    if (typeof this.tenant.getDocKeyFingerprint !== "function") {
+      return null;
+    }
+    return this.tenant.getDocKeyFingerprint();
+  }
+
+  /**
+   * Record that the in-memory index now reflects the given KeyBag
+   * fingerprint. Marks the cache metadata dirty whenever the recorded
+   * value changes so the new fingerprint reaches the persisted
+   * checkpoint at the next flush.
+   */
+  private markKeyBagFingerprintReconciled(fingerprint: string | null): void {
+    if (this.lastReconciledKeyBagFingerprint === fingerprint) {
+      return;
+    }
+    this.lastReconciledKeyBagFingerprint = fingerprint;
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
+  /**
+   * Derive the per-doc visibility summary needed to reconcile the index
+   * against the current KeyBag state.
+   *
+   * - `decryptionKeyId` is taken from the chronologically first lifecycle
+   *   entry, mirroring how {@link syncStoreChanges} materializes a doc.
+   *   Replay entries inside a doc cannot retroactively re-key it.
+   * - `lastModified` is the latest `createdAt` among the entries that
+   *   would be replayed for this doc (or, if none exist, the lifecycle
+   *   entries themselves). This matches the user-visible timestamp the
+   *   existing read path produces.
+   * - `isDeleted` is the lifecycle state derived from the same metadata
+   *   {@link syncStoreChanges} would have observed.
+   *
+   * Returns `null` when there are no lifecycle entries for the doc,
+   * meaning there is nothing to reconcile.
+   */
+  private deriveDocumentVisibilityMetadata(metadata: StoreEntryMetadata[]): {
+    decryptionKeyId: string;
+    lastModified: number;
+    isDeleted: boolean;
+  } | null {
+    const lifecycleEntries = metadata.filter(
+      (entry) =>
+        entry.entryType === "doc_create"
+        || entry.entryType === "doc_change"
+        || entry.entryType === "doc_delete"
+        || entry.entryType === "doc_undelete"
+        || entry.entryType === "doc_snapshot",
+    );
+    if (lifecycleEntries.length === 0) {
+      return null;
+    }
+    lifecycleEntries.sort((left, right) =>
+      left.createdAt !== right.createdAt ? left.createdAt - right.createdAt : left.id.localeCompare(right.id)
+    );
+
+    const replayEntries = metadata.filter((entry) => this.isDocumentReplayEntry(entry));
+    const entriesForLastModified = replayEntries.length > 0 ? replayEntries : lifecycleEntries;
+    return {
+      decryptionKeyId: lifecycleEntries[0].decryptionKeyId,
+      lastModified: Math.max(...entriesForLastModified.map((entry) => entry.createdAt)),
+      isDeleted: this.computeIsDeletedFromMetadata(metadata),
+    };
+  }
+
+  /**
+   * Evict every locally cached form of a document.
+   *
+   * Used by the visibility layer whenever a document transitions to
+   * `"inaccessible"` (the user lost the decryption key) or when a stale
+   * L2 record for an inaccessible doc is discovered. The point is to
+   * make sure no decrypted plaintext or in-memory Automerge state for
+   * the doc survives beyond the key revocation.
+   *
+   *  - L1 (`docCache`) is cleared and the dirty marker dropped so we do
+   *    not later persist a stale entry.
+   *  - The automerge-hash lookup is cleared so any future re-add starts
+   *    with a clean re-materialization.
+   *  - The L2 record is deleted via the {@link LocalCacheStore} (if a
+   *    cache manager is attached). Failures are logged but never thrown:
+   *    a leftover encrypted record is preferable to crashing the read
+   *    path that triggered the purge.
+   */
+  private async purgeMaterializedDocument(docId: string): Promise<void> {
+    this.docCache.delete(docId);
+    this.dirtyDocIds.delete(docId);
+    this.automergeHashToEntryId.delete(docId);
+
+    const store = this.cacheManager?.getStore();
+    if (store) {
+      try {
+        await store.delete("doc", `${this.getCachePrefix()}/${docId}`);
+      } catch (error) {
+        // Best-effort: failure to evict the L2 record only means a stale
+        // cached doc may linger on disk; the index entry below still
+        // marks the doc inaccessible so read paths refuse to surface it.
+        this.logger.warn(`Failed to evict L2 cache record for inaccessible doc ${docId}: ${error}`);
+      }
+    }
+  }
+
+  /**
+   * Reconcile the in-memory index with the current tenant KeyBag.
+   *
+   * This is the core entry point for "the user's keys changed; refresh
+   * what this database thinks is visible". It is safe to call repeatedly,
+   * including from concurrent live updates: the underlying `updateIndex`
+   * call only consumes a new `changeSeq` when state actually transitions.
+   *
+   * Behaviour for each doc that exists in the underlying store:
+   *
+   *  - **Key now available, no entry / inaccessible entry** -> mark
+   *    `"visible"` and emit a new index revision so view providers can
+   *    re-add the doc. The doc body will be materialized lazily on the
+   *    next read.
+   *  - **Key now available, already visible** -> no-op.
+   *  - **Key now missing, currently visible** -> purge any materialized
+   *    state and mark `"inaccessible"` with `isDeleted: true` so
+   *    metadata-only feeds emit a single tombstone and views remove
+   *    the entry.
+   *  - **Key now missing, already inaccessible (or not yet in index)** ->
+   *    no index change, but we still call {@link purgeMaterializedDocument}
+   *    defensively to scrub any leftover plaintext cache that might exist.
+   *
+   * Time-travel views are immutable; the function returns early for them.
+   * After running, if any transition occurred we mark the cache metadata
+   * dirty so the new visibility state survives a process restart.
+   */
+  public async reconcileKeyVisibility(): Promise<void> {
+    if (this.isTimeTravelMode()) {
+      return;
+    }
+
+    const lifecycleMetadata = await this.scanAllMetadata(this.store);
+    const metadataByDoc = new Map<string, StoreEntryMetadata[]>();
+    for (const entry of lifecycleMetadata) {
+      if (
+        entry.entryType !== "doc_create"
+        && entry.entryType !== "doc_change"
+        && entry.entryType !== "doc_delete"
+        && entry.entryType !== "doc_undelete"
+        && entry.entryType !== "doc_snapshot"
+      ) {
+        continue;
+      }
+      const entries = metadataByDoc.get(entry.docId) ?? [];
+      entries.push(entry);
+      metadataByDoc.set(entry.docId, entries);
+    }
+
+    let changed = false;
+    // Deterministic ordering by docId keeps the resulting changefeed
+    // stable between runs, which simplifies test expectations.
+    const docIds = Array.from(metadataByDoc.keys()).sort((left, right) => left.localeCompare(right));
+    for (const docId of docIds) {
+      const visibility = this.deriveDocumentVisibilityMetadata(metadataByDoc.get(docId)!);
+      if (!visibility) {
+        continue;
+      }
+
+      const existingIndex = this.indexLookup.get(docId);
+      const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
+      const canRead = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
+
+      if (canRead) {
+        // Reveal-on-add only triggers when the previous state was
+        // missing or inaccessible; visible->visible transitions stay
+        // idempotent via the existing `updateIndex` short-circuit.
+        if (!existing || existing.accessState === "inaccessible") {
+          this.updateIndex(docId, visibility.lastModified, visibility.isDeleted, visibility.decryptionKeyId, "visible");
+          changed = true;
+        }
+        continue;
+      }
+
+      if (existing?.accessState === "visible") {
+        // Key was revoked while we still had plaintext state in cache:
+        // wipe it and flip the index entry to an inaccessible tombstone
+        // with `isDeleted: true` so view feeds emit a clean removal.
+        await this.purgeMaterializedDocument(docId);
+        this.updateIndex(docId, visibility.lastModified, true, visibility.decryptionKeyId, "inaccessible");
+        changed = true;
+      } else {
+        // Already inaccessible (or never seen). Scrub defensively in
+        // case a previous session left an L2 record behind.
+        await this.purgeMaterializedDocument(docId);
+      }
+    }
+
+    if (changed) {
+      this.cacheMetaDirty = true;
+      this.cacheManager?.markDirty();
+    }
+
+    // Whatever path triggered the reconcile (init, KeyBag listener,
+    // explicit caller), record the fingerprint observed during this
+    // pass so a subsequent warm start with identical bag composition
+    // can skip the scan.
+    this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
   }
 
   private async reconcileRestoredIndexWithStore(): Promise<void> {
@@ -1288,7 +1638,7 @@ export class BaseMindooDB implements MindooDB {
             if (updatedDoc) {
               this.logger.debug(`Successfully updated cached document ${docId} incrementally`);
               // Only update index if document actually changed
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted);
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible");
               this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted})`);
             } else {
               this.logger.debug(`Document ${docId} unchanged after applying new entries, skipping index update`);
@@ -1299,7 +1649,7 @@ export class BaseMindooDB implements MindooDB {
             this.docCache.delete(docId);
             updatedDoc = await this.loadDocumentInternal(docId);
             if (updatedDoc) {
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted);
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible");
             }
           }
         } else {
@@ -1339,7 +1689,7 @@ export class BaseMindooDB implements MindooDB {
                 ...entriesForLastModified.map((e) => e.createdAt),
               );
               const isDeleted = this.computeIsDeletedFromMetadata(allDocMetadata);
-              this.updateIndex(docId, lastModified, isDeleted);
+              this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible");
               this.logger.debug(
                 `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted})`,
               );
@@ -1347,12 +1697,54 @@ export class BaseMindooDB implements MindooDB {
           }
         }
       } catch (error) {
-        // Handle missing symmetric key gracefully - skip documents we can't decrypt
+        // Missing symmetric key during live sync: the doc exists in the
+        // store but we cannot decrypt it. Treat this as a visibility
+        // transition rather than a hard failure:
+        //  - If the doc had previously been visible, purge any plaintext
+        //    we still hold and flip the index entry to `"inaccessible"`
+        //    with a deletion tombstone so view feeds remove it cleanly.
+        //  - If the doc was never visible (first time we see it without
+        //    a key), we simply skip; `reconcileKeyVisibility` will mark
+        //    it appropriately the next time it runs.
+        // Either way we advance the processed-entries marker so a
+        // subsequent sync doesn't endlessly retry the same untranslatable
+        // doc.
         if (error instanceof SymmetricKeyNotFoundError) {
           this.logger.debug(`Skipping document ${docId} - missing key: ${error.keyId}`);
-          // Mark entry IDs as processed so we don't retry them
+          // Avoid a per-doc scanAllMetadata round-trip here: everything
+          // we need is already in this batch's entryMetadataList plus the
+          // existing index entry (if any). We do NOT need a second pass
+          // over the underlying store - the key is missing, so we just
+          // record an inaccessibility tombstone.
+          const existingIndex = this.indexLookup.get(docId);
+          const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
+          if (existing?.accessState === "visible") {
+            const lifecycleEntriesInBatch = entryMetadataList.filter((entry) =>
+              entry.entryType === "doc_create"
+              || entry.entryType === "doc_change"
+              || entry.entryType === "doc_delete"
+              || entry.entryType === "doc_undelete"
+              || entry.entryType === "doc_snapshot",
+            );
+            // Prefer a lifecycle entry from the failing batch for the
+            // key id (they all share the same `decryptionKeyId` for a
+            // doc), then fall back to any entry, then to the existing
+            // index entry. One of these must be present whenever we
+            // reach this branch.
+            const representative =
+              lifecycleEntriesInBatch[0] ?? entryMetadataList[0];
+            const decryptionKeyId = representative?.decryptionKeyId ?? existing.decryptionKeyId;
+            const batchLastModified = entryMetadataList.length > 0
+              ? Math.max(...entryMetadataList.map((entry) => entry.createdAt))
+              : 0;
+            const lastModified = Math.max(existing.lastModified, batchLastModified);
+            await this.purgeMaterializedDocument(docId);
+            this.updateIndex(docId, lastModified, true, decryptionKeyId, "inaccessible");
+            this.cacheMetaDirty = true;
+            this.cacheManager?.markDirty();
+          }
           this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
-          return; // Skip this document
+          return;
         }
         
         this.logger.error(`===== ERROR processing document ${docId} in syncStoreChanges =====`, error);
@@ -2264,7 +2656,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Update cache and index
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, false);
+    this.updateIndex(docId, internalDoc.lastModified, false, internalDoc.decryptionKeyId, "visible");
     this.markDocDirty(docId);
     
     this.logger.info(`Document ${docId} created successfully`);
@@ -4120,7 +4512,7 @@ export class BaseMindooDB implements MindooDB {
     // Return all non-deleted document IDs from index
     const docIds: string[] = [];
     for (const entry of this.index) {
-      if (!entry.isDeleted) {
+      if (entry.accessState === "visible" && !entry.isDeleted) {
         docIds.push(entry.docId);
       }
     }
@@ -4130,7 +4522,7 @@ export class BaseMindooDB implements MindooDB {
   async getDeletedDocumentIds(): Promise<string[]> {
     const docIds: string[] = [];
     for (const entry of this.index) {
-      if (entry.isDeleted) {
+      if (entry.accessState === "visible" && entry.isDeleted) {
         docIds.push(entry.docId);
       }
     }
@@ -4183,6 +4575,10 @@ export class BaseMindooDB implements MindooDB {
       // A document cannot exist before its create entry, even if malformed or
       // partial metadata somehow contains later lifecycle entries.
       if (!ordered.some((entry) => entry.entryType === "doc_create" && entry.createdAt <= timestamp)) {
+        continue;
+      }
+      const createEntry = ordered.find((entry) => entry.entryType === "doc_create");
+      if (createEntry && !(await this.tenant.hasDecryptionKey(createEntry.decryptionKeyId))) {
         continue;
       }
       // Delete and undelete are terminal lifecycle markers. The latest one at
@@ -4322,7 +4718,7 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.isDeleted = entryType === "doc_delete";
     internalDoc.lastModified = now;
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted);
+    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible");
     this.markDocDirty(docId);
   }
 
@@ -5150,7 +5546,7 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.doc = newDoc;
     internalDoc.lastModified = now;
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted);
+    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible");
     this.markDocDirty(docId);
 
     this.logger.info(`Document ${docId} ${successMessage} successfully`);
@@ -5248,6 +5644,7 @@ export class BaseMindooDB implements MindooDB {
       changeSeq: number;
       lastModified: number;
       isDeleted: boolean;
+      accessState?: DocumentAccessState;
     }>,
     startIndex: number
   ): Promise<number> {
@@ -5264,7 +5661,11 @@ export class BaseMindooDB implements MindooDB {
       i < indexSnapshot.length && docIds.length < this.iteratePrefetchWindowDocs;
       i++
     ) {
-      const docId = indexSnapshot[i].docId;
+      const entry = indexSnapshot[i];
+      if (entry.accessState === "inaccessible") {
+        continue;
+      }
+      const docId = entry.docId;
       if (seen.has(docId) || this.docCache.has(docId)) {
         continue;
       }
@@ -5733,6 +6134,9 @@ export class BaseMindooDB implements MindooDB {
       // Iterate through the stable snapshot and yield documents one at a time.
       for (let i = startIndex; i < indexSnapshot.length; i++) {
         const entry = indexSnapshot[i];
+        if (entry.accessState !== "visible") {
+          continue;
+        }
         
         try {
           this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
@@ -6035,6 +6439,14 @@ export class BaseMindooDB implements MindooDB {
     }
 
     const { internal, persistedChangeSeq } = deserialized;
+    // L2 records persist the decrypted Automerge state. If the current
+    // KeyBag cannot resolve the doc's key, scrub the cached copy and
+    // refuse to surface it instead of returning plaintext for which the
+    // caller no longer has authorization.
+    if (!(await this.tenant.hasDecryptionKey(internal.decryptionKeyId))) {
+      await this.purgeMaterializedDocument(docId);
+      return null;
+    }
 
     const indexEntryIdx = this.indexLookup.get(docId);
     if (indexEntryIdx === undefined) {
@@ -6343,10 +6755,25 @@ export class BaseMindooDB implements MindooDB {
   private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
     const startedAt = Date.now();
     const cacheCheckStartedAt = Date.now();
-    // Check cache first
+    // Short-circuit on the visibility layer: a doc marked
+    // `"inaccessible"` is logically absent for this database, regardless
+    // of whether L1/L2 still hold a cached copy. This keeps the public
+    // contract of `loadDocumentInternal` aligned with `getDocument` /
+    // `getAllDocumentIds`.
+    const indexEntryIdx = this.indexLookup.get(docId);
+    if (indexEntryIdx !== undefined && this.index[indexEntryIdx].accessState === "inaccessible") {
+      return null;
+    }
     if (this.docCache.has(docId)) {
       this.logger.debug(`Document ${docId} found in cache, returning cached version`);
       const cached = this.getCachedDocument(docId)!;
+      // Belt-and-braces: even if the index says visible, recheck the
+      // KeyBag before returning plaintext. Catches races where a key
+      // was just removed but the index has not been reconciled yet.
+      if (!(await this.tenant.hasDecryptionKey(cached.decryptionKeyId))) {
+        await this.purgeMaterializedDocument(docId);
+        return null;
+      }
       this.performanceCallback?.onDocumentLoad?.({
         docId,
         cacheHit: true,

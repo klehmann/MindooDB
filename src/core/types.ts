@@ -620,6 +620,35 @@ export interface MindooTenant {
   openDB(id: string, options?: OpenDBOptions): Promise<MindooDB>;
 
   /**
+   * Replay any pending local KeyBag mutations and refresh open live
+   * databases so document visibility matches the current key set.
+   *
+   * Implementations must be idempotent and safe to call concurrently.
+   * The optional shape allows alternative tenant implementations (e.g.
+   * server-side, test doubles) to omit visibility reconciliation when it
+   * is not applicable.
+   */
+  reconcileKeyBagChanges?(): Promise<void>;
+
+  /**
+   * Return whether the current KeyBag can resolve the given document
+   * encryption key id. Implementations must not throw when the key is
+   * missing; they should return `false` instead so callers can use the
+   * result as a guard before attempting decryption.
+   */
+  hasDecryptionKey?(decryptionKeyId: string): Promise<boolean>;
+
+  /**
+   * Return a stable, opaque fingerprint of the doc keys this tenant
+   * currently has access to. The fingerprint must change whenever the
+   * set of available doc keys changes for the tenant, and must be safe
+   * to persist (no raw key material). Used by databases to skip
+   * visibility reconciliation on warm starts when the KeyBag composition
+   * has not changed since the last cache flush.
+   */
+  getDocKeyFingerprint?(): Promise<string>;
+
+  /**
    * Creates a MindooDocSigner instance for signing and verifying document items.
    * The signer uses the tenant's cryptographic infrastructure for key management.
    * 
@@ -2843,6 +2872,20 @@ export interface MindooDB {
    * @return A promise that resolves when the sync is complete.
    */
   syncStoreChanges(): Promise<void>;
+
+  /**
+   * Reconcile local document visibility with the current tenant KeyBag.
+   *
+   * Reveals documents whose decryption keys are now available, hides
+   * documents whose keys have been removed, and purges any plaintext
+   * caches for inaccessible documents. The method only touches in-memory
+   * and L2 caches owned by this database instance - it does not write
+   * synthetic store entries and is safe to call repeatedly.
+   *
+   * Optional so alternative database implementations (e.g. read-only
+   * views, time-travel snapshots) can omit it.
+   */
+  reconcileKeyVisibility?(): Promise<void>;
 
   /**
    * Start the L2 background warmer.

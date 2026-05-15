@@ -12,6 +12,65 @@ interface KeyEntry {
   createdAt?: number; // milliseconds since Unix epoch
 }
 
+/**
+ * Opaque cursor into the {@link KeyBag} local changes feed.
+ *
+ * `changeSeq` is a monotonic in-memory sequence number assigned to each
+ * doc-key mutation by {@link KeyBag.recordKeyChange}. The sequence is
+ * local to a single `KeyBag` instance and resets when the bag is
+ * recreated; cursors must therefore not be persisted across process
+ * restarts.
+ */
+export interface KeyBagChangeCursor {
+  changeSeq: number;
+}
+
+/**
+ * High-level intent of a doc-key mutation event emitted by the {@link KeyBag}
+ * local changes feed. The action describes what the caller did to the bag,
+ * not whether a key remains afterwards (see {@link KeyBagChangeEvent.hasKey}).
+ */
+export type KeyBagChangeAction = "add" | "remove";
+
+/**
+ * One event in the local {@link KeyBag} changes feed.
+ *
+ * Events are emitted by {@link KeyBag.set}, {@link KeyBag.createDocKey},
+ * {@link KeyBag.createTenantKey}, {@link KeyBag.decryptAndImportKey},
+ * {@link KeyBag.deleteKey}, and {@link KeyBag.deleteKeyVersion} whenever the
+ * set of available doc-key versions for a scoped key id actually changes.
+ *
+ * Events intentionally never carry raw key bytes: they are designed to be
+ * safe to pass through telemetry, listeners, and tests without expanding the
+ * exposure surface of secret material.
+ */
+export interface KeyBagChangeEvent {
+  /** Monotonic local sequence number assigned at emit time. */
+  changeSeq: number;
+  /** Scoped key type (currently always `"doc"`). */
+  type: KeyType;
+  /** Tenant the affected key belongs to. */
+  tenantId: string;
+  /** Key identifier within the tenant (e.g. `"default"`, `"$publicinfos"`, or a named key id). */
+  keyId: string;
+  /** Whether the caller added a key version or removed one. */
+  action: KeyBagChangeAction;
+  /** Number of remaining stored versions for this scoped key id after the mutation. */
+  versionsRemaining: number;
+  /** Convenience flag equal to `versionsRemaining > 0`. */
+  hasKey: boolean;
+}
+
+/**
+ * Listener callback registered through {@link KeyBag.onChanges}.
+ *
+ * Listener invocations happen synchronously from the mutating call site
+ * after the underlying key store has been updated. Listeners must be
+ * short-lived; long-running work should be deferred (`void`-prefixed
+ * promises or microtask scheduling are recommended).
+ */
+export type KeyBagChangeListener = (event: KeyBagChangeEvent) => void;
+
 export interface KeyDetail {
   scopedKeyId: string;
   createdAt?: number;
@@ -64,6 +123,19 @@ export class KeyBag {
   private userEncryptionKeyPassword: string | null;
   private wrappingKey: CryptoKey | null;
   private keys: Map<string, KeyEntry[]> = new Map();
+  /**
+   * In-memory append-only log of doc-key mutations applied to this bag.
+   *
+   * Used by {@link iterateChangesSince} and {@link getLatestChangeCursor}
+   * so consumers (notably {@link BaseMindooTenant}) can reconcile state
+   * from a cursor even if they missed live listener notifications.
+   *
+   * Bound by the number of doc-key mutations per session, which in
+   * practice is small (one entry per add/remove/version change).
+   */
+  private keyChanges: KeyBagChangeEvent[] = [];
+  private nextKeyChangeSeq = 1;
+  private changeListeners: Set<KeyBagChangeListener> = new Set();
   private cryptoAdapter: CryptoAdapter;
   private logger: Logger;
 
@@ -203,6 +275,95 @@ export class KeyBag {
   }
 
   /**
+   * Subscribe to live doc-key mutation events.
+   *
+   * Listeners receive a shallow copy of the same {@link KeyBagChangeEvent}
+   * record that gets appended to the internal feed, so reads via
+   * {@link iterateChangesSince} stay consistent with what listeners see.
+   * Listener exceptions are caught and logged so they cannot break the
+   * mutating call site.
+   *
+   * Live notifications are a convenience: callers that need to be robust
+   * against missed events should also persist a cursor and replay through
+   * {@link iterateChangesSince}.
+   *
+   * @returns A disposer that removes the listener.
+   */
+  onChanges(listener: KeyBagChangeListener): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Snapshot the current head of the local changes feed.
+   *
+   * Returns `null` when no doc-key mutations have ever been observed by
+   * this bag instance. Useful as a starting cursor when a consumer wants
+   * to react only to *future* changes.
+   */
+  getLatestChangeCursor(): KeyBagChangeCursor | null {
+    const latest = this.keyChanges[this.keyChanges.length - 1];
+    return latest ? { changeSeq: latest.changeSeq } : null;
+  }
+
+  /**
+   * Iterate doc-key mutation events strictly after the given cursor.
+   *
+   * Pass `null` to consume all events since the bag was created. Yielded
+   * events are independent copies, so consumers may mutate them freely
+   * without affecting other listeners. Events are emitted in the order
+   * the underlying mutations occurred, which is also the order of their
+   * `changeSeq` values.
+   */
+  async *iterateChangesSince(cursor: KeyBagChangeCursor | null): AsyncGenerator<KeyBagChangeEvent, void, unknown> {
+    const startSeq = cursor?.changeSeq ?? 0;
+    for (const event of this.keyChanges) {
+      if (event.changeSeq > startSeq) {
+        yield { ...event };
+      }
+    }
+  }
+
+  /**
+   * Append a doc-key mutation event to the local feed and notify
+   * subscribed listeners.
+   *
+   * Called from every mutation site after the underlying `keys` map has
+   * been updated. Never includes raw key bytes in the recorded event so
+   * the feed is safe to expose to telemetry or external consumers.
+   */
+  private recordKeyChange(
+    type: KeyType,
+    tenantId: string,
+    keyId: string,
+    action: KeyBagChangeAction,
+    versionsRemaining: number,
+  ): void {
+    const event: KeyBagChangeEvent = {
+      changeSeq: this.nextKeyChangeSeq++,
+      type,
+      tenantId,
+      keyId,
+      action,
+      versionsRemaining,
+      hasKey: versionsRemaining > 0,
+    };
+    this.keyChanges.push(event);
+    for (const listener of this.changeListeners) {
+      try {
+        listener({ ...event });
+      } catch (error) {
+        // Listener failure must not break the mutation; just log and continue.
+        // Pass the error as a separate argument so the logger captures the
+        // full (sanitized) stack trace rather than just the toString() form.
+        this.logger.warn(`KeyBag change listener failed`, error);
+      }
+    }
+  }
+
+  /**
    * Reads a key from the key bag.
    * Returns the newest key (based on createdAt) or the first key if no timestamps are available.
    *
@@ -266,6 +427,7 @@ export class KeyBag {
     const keyEntries = this.keys.get(scopedKeyId) || [];
     keyEntries.push({ key, createdAt });
     this.keys.set(scopedKeyId, keyEntries);
+    this.recordKeyChange(type, tenantId, id, "add", keyEntries.length);
   }
 
   /**
@@ -311,6 +473,7 @@ export class KeyBag {
       createdAt: key.createdAt 
     });
     this.keys.set(scopedKeyId, keyEntries);
+    this.recordKeyChange(type, tenantId, id, "add", keyEntries.length);
   }
 
   /**
@@ -412,7 +575,13 @@ export class KeyBag {
    */
   async deleteKey(type: KeyType, tenantId: string, id: string): Promise<void>;
   async deleteKey(type: KeyType, tenantId: string, id: string): Promise<void> {
-    this.keys.delete(buildScopedKeyId(type, tenantId, id));
+    const scopedKeyId = buildScopedKeyId(type, tenantId, id);
+    const existing = this.keys.get(scopedKeyId);
+    if (!existing || existing.length === 0) {
+      return;
+    }
+    this.keys.delete(scopedKeyId);
+    this.recordKeyChange(type, tenantId, id, "remove", 0);
   }
 
   /**
@@ -437,10 +606,12 @@ export class KeyBag {
     const remainingEntries = keyEntries.filter((entry) => entry !== target);
     if (remainingEntries.length === 0) {
       this.keys.delete(scopedKeyId);
+      this.recordKeyChange(type, tenantId, id, "remove", 0);
       return;
     }
 
     this.keys.set(scopedKeyId, remainingEntries);
+    this.recordKeyChange(type, tenantId, id, "remove", remainingEntries.length);
   }
 
   /**
@@ -450,6 +621,40 @@ export class KeyBag {
    */
   async listKeys(): Promise<string[]> {
     return Array.from(this.keys.keys());
+  }
+
+  /**
+   * Build a stable fingerprint of the doc-type keys available for a given
+   * tenant.
+   *
+   * The fingerprint changes whenever the *set* of scoped key ids the bag
+   * holds for `doc:tenantId:*` gains or loses an entry, but does not
+   * depend on key version counts or key material. It is used by
+   * {@link BaseMindooDB} to short-circuit visibility reconciliation on
+   * warm starts when the bag composition has not changed since the last
+   * cache flush, avoiding an otherwise unconditional full metadata scan
+   * against the underlying store (potentially several REST round-trips
+   * against a remote store).
+   *
+   * Implementation notes:
+   * - Scoped key ids are not secret (only key bytes are), so we use the
+   *   sorted ids directly rather than hashing them. This keeps the
+   *   fingerprint debuggable and avoids dragging crypto into a hot
+   *   startup path.
+   * - The leading `v1:` tag is a format version so future iterations can
+   *   extend the fingerprint without colliding with old persisted
+   *   values.
+   */
+  async getDocKeyFingerprint(tenantId: string): Promise<string> {
+    const prefix = `doc:${tenantId}:`;
+    const scopedIds: string[] = [];
+    for (const scopedKeyId of this.keys.keys()) {
+      if (scopedKeyId.startsWith(prefix)) {
+        scopedIds.push(scopedKeyId);
+      }
+    }
+    scopedIds.sort();
+    return `v1:${scopedIds.join("|")}`;
   }
 
   /**

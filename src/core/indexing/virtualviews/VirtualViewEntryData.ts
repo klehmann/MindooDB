@@ -28,6 +28,18 @@ export class VirtualViewEntryData {
   
   /** Column values for this entry */
   private columnValues: Map<string, unknown> = new Map();
+
+  /**
+   * Encryption key id of the source document at the time this entry was
+   * inserted.
+   *
+   * Only meaningful for document entries (categories and root leave it
+   * `undefined`). Stored so `VirtualView.purgeEntriesByDecryptionKeyId`
+   * can locate and remove every entry tied to a revoked key without
+   * having to re-read the underlying database. This value is never part
+   * of the public column data exposed to view consumers.
+   */
+  private decryptionKeyId?: string;
   
   /** Sorted child entries by sort key */
   private childEntriesBySortKey: Map<string, VirtualViewEntryData> = new Map();
@@ -73,7 +85,8 @@ export class VirtualViewEntryData {
     origin: string,
     docId: string,
     sortKey: ViewEntrySortKey,
-    childrenComparator: ViewEntrySortKeyComparator
+    childrenComparator: ViewEntrySortKeyComparator,
+    decryptionKeyId?: string,
   ) {
     this.parentView = parentView;
     this._parent = parent;
@@ -81,6 +94,7 @@ export class VirtualViewEntryData {
     this.docId = docId;
     this.sortKey = sortKey;
     this.childrenComparator = childrenComparator;
+    this.decryptionKeyId = decryptionKeyId;
   }
 
   // Getters
@@ -94,6 +108,23 @@ export class VirtualViewEntryData {
 
   getSortKey(): ViewEntrySortKey {
     return this.sortKey;
+  }
+
+  /**
+   * Encryption key id of the source document, or `undefined` for
+   * non-document entries (categories, root, or document entries created
+   * before this field was introduced).
+   */
+  getDecryptionKeyId(): string | undefined {
+    return this.decryptionKeyId;
+  }
+
+  /**
+   * Update the cached encryption key id. Intended for restore paths and
+   * tests; ordinary insert/update flows set the value via the constructor.
+   */
+  setDecryptionKeyId(decryptionKeyId: string | undefined): void {
+    this.decryptionKeyId = decryptionKeyId;
   }
 
   getChildrenComparator(): ViewEntrySortKeyComparator {
