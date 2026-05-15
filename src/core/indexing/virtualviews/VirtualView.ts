@@ -11,10 +11,68 @@ import {
   ORIGIN_VIRTUALVIEW,
   scopedDocIdKey,
   createScopedDocId,
+  parseScopedDocIdKey,
 } from "./types";
 import type { LocalCacheStore } from "../../cache/LocalCacheStore";
 import type { ICacheable } from "../../cache/CacheManager";
 import type { CacheManager } from "../../cache/CacheManager";
+
+/**
+ * Compact serialized sort key stored in the virtual-view tree cache.
+ */
+interface SerializedVirtualViewSortKey {
+  /** Whether this sort key represents a category entry instead of a document entry. */
+  c: boolean;
+  /** Sort values used by the entry comparator. */
+  v: unknown[];
+  /** Source data-provider origin for the entry represented by this key. */
+  o: string;
+  /** Document or category id for the entry represented by this key. */
+  d: string;
+}
+
+/**
+ * Cached count values for a virtual-view entry.
+ */
+type SerializedVirtualViewCounts = [
+  childCount: number,
+  childCategoryCount: number,
+  childDocumentCount: number,
+  descendantCount: number,
+  descendantDocumentCount: number,
+  descendantCategoryCount: number,
+];
+
+/**
+ * Compact serialized virtual-view tree node stored in the local cache.
+ *
+ * Short property names keep the persisted cache smaller; the comments document
+ * the expanded meaning of each field for editor hover help.
+ */
+interface SerializedVirtualViewNode {
+  /** Source data-provider origin for this entry. */
+  o: string;
+  /** Document or generated category id for this entry. */
+  d: string;
+  /** Sort key needed to restore this entry without recalculating sort values. */
+  sk: SerializedVirtualViewSortKey;
+  /** Materialized column values for this entry, keyed by column name. */
+  cv: Record<string, unknown>;
+  /** Tree indentation level for this entry. */
+  il: number;
+  /** Position of this entry among its siblings. */
+  si: number;
+  /** Category-order direction flag used by this entry's child comparator. */
+  cod: boolean;
+  /** Cached child and descendant counts, stored in restore argument order. */
+  cnt: SerializedVirtualViewCounts;
+  /** Recursively serialized child entries. */
+  ch: SerializedVirtualViewNode[];
+  /** Cached total values for total columns, omitted when the entry has no totals. */
+  tv?: Record<string, number>;
+  /** Internal decryption key metadata for document entries, omitted for categories/root. */
+  dk?: string;
+}
 
 /**
  * VirtualView creates a hierarchical, sorted view of documents from one or more MindooDB instances.
@@ -313,7 +371,7 @@ export class VirtualView {
       }
 
       // Add entry to the view
-      const addedEntries = this.addEntry(origin, docId, columnValues, root, this.categoryColumns);
+      const addedEntries = this.addEntry(origin, docId, columnValues, root, this.categoryColumns, entryData.decryptionKeyId);
       if (addedEntries.length > 0) {
         indexChanged = true;
         const scopedKey = scopedDocIdKey(createScopedDocId(origin, docId));
@@ -339,6 +397,36 @@ export class VirtualView {
   }
 
   /**
+   * Remove every document entry sourced from `origin` whose stored
+   * `decryptionKeyId` matches the given key id.
+   *
+   * Used by the key visibility reconciliation layer when a key is
+   * revoked so view consumers stop seeing entries they can no longer
+   * decrypt. Implemented in terms of `applyChanges` so that removal
+   * triggers the normal cleanup paths (empty parent categories collapse,
+   * change notifications fire, etc.).
+   *
+   * The function is a no-op when no matching document entries exist, so
+   * callers may invoke it speculatively without performance concerns.
+   */
+  purgeEntriesByDecryptionKeyId(origin: string, decryptionKeyId: string): void {
+    const change = new VirtualViewDataChange(origin);
+    for (const [scopedKey, entries] of this.entriesByDocId.entries()) {
+      const parsed = parseScopedDocIdKey(scopedKey);
+      if (parsed.origin !== origin) {
+        continue;
+      }
+      if (entries.some((entry) => entry.isDocument() && entry.getDecryptionKeyId() === decryptionKeyId)) {
+        change.removeEntry(parsed.docId);
+      }
+    }
+
+    if (change.hasChanges()) {
+      this.applyChanges(change);
+    }
+  }
+
+  /**
    * Override this method to filter entries
    */
   protected isAccepted(
@@ -357,7 +445,8 @@ export class VirtualView {
     docId: string,
     columnValues: Record<string, unknown>,
     targetParent: VirtualViewEntryData,
-    remainingCategoryColumns: VirtualViewColumn[]
+    remainingCategoryColumns: VirtualViewColumn[],
+    decryptionKeyId?: string,
   ): VirtualViewEntryData[] {
     const createdEntries: VirtualViewEntryData[] = [];
 
@@ -383,7 +472,8 @@ export class VirtualView {
         origin,
         docId,
         sortKey,
-        childComparator
+        childComparator,
+        decryptionKeyId,
       );
       newDocEntry.setColumnValues(columnValues);
 
@@ -496,7 +586,7 @@ export class VirtualView {
         }
 
         // Continue with remaining categories under the last subcategory
-        const addedEntries = this.addEntry(origin, docId, columnValues, currentParent, remainingColumns);
+        const addedEntries = this.addEntry(origin, docId, columnValues, currentParent, remainingColumns, decryptionKeyId);
         createdEntries.push(...addedEntries);
       } else {
         // Simple category value
@@ -549,7 +639,7 @@ export class VirtualView {
         }
 
         // Continue with remaining categories
-        const addedEntries = this.addEntry(origin, docId, columnValues, existingCategory, remainingColumns);
+        const addedEntries = this.addEntry(origin, docId, columnValues, existingCategory, remainingColumns, decryptionKeyId);
         createdEntries.push(...addedEntries);
       }
     }
@@ -762,14 +852,14 @@ export class VirtualView {
     return new TextEncoder().encode(JSON.stringify(snapshot));
   }
 
-  private serializeNode(entry: VirtualViewEntryData): unknown {
+  private serializeNode(entry: VirtualViewEntryData): SerializedVirtualViewNode {
     const sk = entry.getSortKey();
     const comp = entry.getChildrenComparator();
 
     const children = entry.getChildEntries();
     const serializedChildren = children.map(c => this.serializeNode(c));
 
-    const node: Record<string, unknown> = {
+    const node: SerializedVirtualViewNode = {
       o: entry.origin,
       d: entry.docId,
       sk: { c: sk.isCategory, v: [...sk.values], o: sk.origin, d: sk.docId },
@@ -791,6 +881,9 @@ export class VirtualView {
     const tv = entry.getTotalValues();
     if (tv && Object.keys(tv).length > 0) {
       node.tv = tv;
+    }
+    if (entry.isDocument() && entry.getDecryptionKeyId()) {
+      node.dk = entry.getDecryptionKeyId();
     }
 
     return node;
@@ -872,6 +965,7 @@ export class VirtualView {
       data.d,
       sk,
       comparator,
+      data.dk,
     );
     entry.setColumnValues(data.cv ?? {});
     entry.setIndentLevels(data.il ?? 0);

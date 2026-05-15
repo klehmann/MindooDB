@@ -29,15 +29,20 @@ describe("MindooDBServer", () => {
     );
 
     server = new MindooDBServer(testDataDir, "test-password");
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       httpServer = server.getApp().listen(0, () => {
         const address = httpServer.address();
         if (!address || typeof address === "string") {
-          throw new Error("Failed to determine test server port");
+          reject(new Error("Failed to determine test server port"));
+          return;
         }
         baseUrl = `http://127.0.0.1:${address.port}`;
         resolve();
       });
+      // Without this handler an EADDRINUSE or other bind failure leaves
+      // the listen promise pending until the hook times out, masking the
+      // real cause.
+      httpServer.on("error", reject);
     });
   }, 30000);
 

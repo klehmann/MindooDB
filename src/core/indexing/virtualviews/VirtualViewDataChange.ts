@@ -28,13 +28,20 @@ export class VirtualViewDataChange {
   }
 
   /**
-   * Add a document to the view with computed column values
-   * 
+   * Add (or update) an entry to be applied by the next `applyChanges`.
+   *
+   * `decryptionKeyId` is opaque metadata propagated into the view's
+   * internal entry so that `VirtualView.purgeEntriesByDecryptionKeyId`
+   * can later drop every entry tied to a revoked key. Pass `undefined`
+   * for non-document sources or when the encryption key id is not
+   * known.
+   *
    * @param docId Document ID
    * @param values Computed column values
+   * @param decryptionKeyId Encryption key id of the source document
    */
-  addEntry(docId: string, values: Record<string, unknown>): void {
-    this._additions.set(docId, { docId, values });
+  addEntry(docId: string, values: Record<string, unknown>, decryptionKeyId?: string): void {
+    this._additions.set(docId, { docId, values, decryptionKeyId });
   }
 
   /**

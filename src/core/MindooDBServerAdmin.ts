@@ -14,11 +14,35 @@ import type { EncryptedPrivateKey, MindooDBServerInfo } from "./types";
 
 /**
  * Connection and authentication options for {@link MindooDBServerAdmin}.
+ *
+ * Two authentication modes are supported:
+ *  - Legacy (password): supply `systemAdminPassword`. The admin's encrypted
+ *    Ed25519 signing key is decrypted on every (re-)authentication round.
+ *    The plaintext password is held by the client for its lifetime.
+ *  - Pre-imported key (preferred): supply `systemAdminSigningKey` instead
+ *    of (or in addition to) `systemAdminPassword`. The CryptoKey is used
+ *    directly to sign the challenge response, no PBKDF2 runs and no
+ *    password is retained. Typically derived once at login via
+ *    `subtle.importKey("pkcs8", ..., { name: "Ed25519" }, false, ["sign"])`.
  */
 export interface MindooDBServerAdminOptions {
   serverUrl: string;
   systemAdminUser: PrivateUserId;
-  systemAdminPassword: string;
+  /**
+   * Password used to decrypt the admin's signing private key.
+   *
+   * Required when `systemAdminSigningKey` is not supplied. Ignored when
+   * `systemAdminSigningKey` is supplied.
+   */
+  systemAdminPassword?: string;
+  /**
+   * Pre-imported Ed25519 signing {@link CryptoKey} for the admin user.
+   *
+   * When supplied, the password is unused and may be omitted. The key is
+   * typically imported with `extractable: false` so the raw bytes never
+   * appear in the JS heap.
+   */
+  systemAdminSigningKey?: CryptoKey;
   /** Platform crypto (e.g. `NodeCryptoAdapter`, browser `createCryptoAdapter()`, RN adapter). */
   cryptoAdapter: CryptoAdapter;
 }
@@ -141,7 +165,8 @@ function cloneServerConfig(config: ServerConfig): ServerConfig {
 export class MindooDBServerAdmin {
   private baseUrl: string;
   private adminUser: PrivateUserId;
-  private adminPassword: string;
+  private adminPassword: string | null;
+  private adminSigningKey: CryptoKey | null;
   private cryptoAdapter: CryptoAdapter;
 
   private cachedToken: string | null = null;
@@ -153,8 +178,15 @@ export class MindooDBServerAdmin {
   constructor(options: MindooDBServerAdminOptions) {
     this.baseUrl = options.serverUrl.replace(/\/$/, "");
     this.adminUser = options.systemAdminUser;
-    this.adminPassword = options.systemAdminPassword;
+    this.adminPassword = options.systemAdminPassword ?? null;
+    this.adminSigningKey = options.systemAdminSigningKey ?? null;
     this.cryptoAdapter = options.cryptoAdapter;
+
+    if (this.adminPassword === null && this.adminSigningKey === null) {
+      throw new Error(
+        "MindooDBServerAdmin requires either `systemAdminPassword` or `systemAdminSigningKey`.",
+      );
+    }
   }
 
   // =========================================================================
@@ -534,18 +566,31 @@ export class MindooDBServerAdmin {
 
     const subtle = this.cryptoAdapter.getSubtle();
 
-    const signingKeyBuffer = await this.decryptPrivateKey(
-      this.adminUser.userSigningKeyPair.privateKey as EncryptedPrivateKey,
-      this.adminPassword,
-      "signing",
-    );
-    const signingKey = await subtle.importKey(
-      "pkcs8",
-      signingKeyBuffer,
-      { name: "Ed25519" },
-      false,
-      ["sign"],
-    );
+    // Prefer a caller-supplied signing CryptoKey (no PBKDF2, no plaintext
+    // password retained); fall back to decrypting the encrypted private
+    // key with the legacy password each round.
+    let signingKey: CryptoKey;
+    if (this.adminSigningKey) {
+      signingKey = this.adminSigningKey;
+    } else {
+      if (this.adminPassword === null) {
+        throw new Error(
+          "MindooDBServerAdmin: no signing key and no password available to authenticate.",
+        );
+      }
+      const signingKeyBuffer = await this.decryptPrivateKey(
+        this.adminUser.userSigningKeyPair.privateKey as EncryptedPrivateKey,
+        this.adminPassword,
+        "signing",
+      );
+      signingKey = await subtle.importKey(
+        "pkcs8",
+        signingKeyBuffer,
+        { name: "Ed25519" },
+        false,
+        ["sign"],
+      );
+    }
 
     const challengeRes = await fetch(`${this.baseUrl}/system/auth/challenge`, {
       method: "POST",

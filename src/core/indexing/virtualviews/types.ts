@@ -135,6 +135,14 @@ export interface EntryData {
   docId: string;
   /** Computed column values */
   values: Record<string, unknown>;
+  /**
+   * Encryption key id of the source document at the time this entry was
+   * produced. Carried purely so the view can later evict every entry
+   * tied to a key the user no longer holds (see
+   * `VirtualView.purgeEntriesByDecryptionKeyId`). Never surfaced as a
+   * column value to consumers.
+   */
+  decryptionKeyId?: string;
 }
 
 /**

@@ -16,23 +16,35 @@ type AutomergeAPI = typeof AutomergeWasm;
 let Automerge: AutomergeAPI;
 let isNative = false;
 
-try {
-  // Try to load native Automerge (React Native only)
-  // @ts-ignore - Module may not exist on Node.js/Browser
-  const nativeModule = require('react-native-automerge-generated');
+function isReactNativeRuntime() {
+  return typeof navigator !== "undefined" && navigator.product === "ReactNative";
+}
 
-  if (nativeModule?.Automerge) {
-    // Use the WASM-compatible API from react-native-automerge-generated
-    Automerge = nativeModule.Automerge as AutomergeAPI;
-    isNative = true;
-    console.log('[MindooDB] ✓ Using native Rust Automerge (react-native-automerge-generated)');
-  } else {
-    // Module loaded but Automerge API not available
+if (isReactNativeRuntime()) {
+  try {
+    // Keep the optional native module hidden from browser dependency scanners.
+    const nativeModuleName = "react-native-automerge-generated";
+    const nativeRequire = typeof require === "function" ? require : undefined;
+    const nativeModule = nativeRequire?.(nativeModuleName);
+
+    if (nativeModule?.Automerge) {
+      // Use the WASM-compatible API from react-native-automerge-generated
+      Automerge = nativeModule.Automerge as AutomergeAPI;
+      isNative = true;
+      console.log('[MindooDB] ✓ Using native Rust Automerge (react-native-automerge-generated)');
+    } else {
+      // Module loaded but Automerge API not available
+      Automerge = AutomergeWasm;
+      console.log('[MindooDB] ⚠ Native module loaded but Automerge API unavailable, using WASM');
+    }
+  } catch (error) {
+    // Native module not available (React Native development without native binding)
     Automerge = AutomergeWasm;
-    console.log('[MindooDB] ⚠ Native module loaded but Automerge API unavailable, using WASM');
+    isNative = false;
+    console.log('[MindooDB] ℹ Using WASM Automerge (Browser/Node.js mode)');
   }
-} catch (error) {
-  // Native module not available (Browser/Node.js)
+} else {
+  // Browser/Node.js
   Automerge = AutomergeWasm;
   isNative = false;
   console.log('[MindooDB] ℹ Using WASM Automerge (Browser/Node.js mode)');

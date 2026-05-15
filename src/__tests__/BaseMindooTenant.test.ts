@@ -76,6 +76,7 @@ describe("BaseMindooTenant", () => {
       expect(publicUserId.userSigningPublicKey).toBe(currentUser.userSigningKeyPair.publicKey);
       expect(publicUserId.userEncryptionPublicKey).toBe(currentUser.userEncryptionKeyPair.publicKey);
     });
+
   });
 
   describe("encryption and decryption", () => {
@@ -266,6 +267,26 @@ describe("BaseMindooTenant", () => {
 
       expect(db).toBeDefined();
       expect(db.getTenant()).toBe(tenant);
+    });
+
+    it("opens time travel databases as isolated read-only snapshots", async () => {
+      const liveDb = await tenant.openDB("timetravel-test");
+      const first = await liveDb.createDocument({ id: "firstDoc" });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const cutoff = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await liveDb.createDocument({ id: "secondDoc" });
+
+      const liveAgain = await tenant.openDB("timetravel-test");
+      const snapshotDb = await tenant.openDB("timetravel-test", { timeTravelDate: cutoff });
+
+      expect(liveAgain).toBe(liveDb);
+      expect(snapshotDb).not.toBe(liveDb);
+      expect(snapshotDb.isTimeTravelMode()).toBe(true);
+      expect(snapshotDb.isReadOnly()).toBe(true);
+      await expect(snapshotDb.getDocument(first.getId())).resolves.toBeDefined();
+      await expect(snapshotDb.getDocument("secondDoc")).rejects.toThrow();
+      await expect(snapshotDb.createDocument({ id: "blockedDoc" })).rejects.toThrow(/read-only mode/);
     });
 
     it("should open a database id containing dots", async () => {

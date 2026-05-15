@@ -19,7 +19,7 @@ import {
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
-import { KeyBag } from "./keys/KeyBag";
+import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
@@ -60,6 +60,24 @@ export class BaseMindooTenant implements MindooTenant {
   private databaseCache: Map<string, MindooDB> = new Map();
   private directoryCache: MindooTenantDirectory | null = null;
   private remoteStoreCache: Map<string, Promise<ContentAddressedStore>> = new Map();
+  /**
+   * Cursor into the local KeyBag changes feed. Tracks the last event
+   * consumed by {@link reconcileKeyBagChanges} so we can replay only the
+   * deltas and stay idempotent across both live notifications and
+   * explicit reconcile calls.
+   */
+  private keyBagChangeCursor: KeyBagChangeCursor | null = null;
+  /**
+   * Disposer returned by {@link KeyBag.onChanges} for live notifications.
+   * `null` once the tenant has been torn down via {@link disposeCacheManager}.
+   */
+  private unsubscribeKeyBagChanges: (() => void) | null = null;
+  /**
+   * Single-flight latch for {@link reconcileKeyBagChanges}. Concurrent calls
+   * coalesce onto the same in-flight reconcile so live listener firings and
+   * explicit calls cannot race against each other or duplicate work.
+   */
+  private keyBagReconcilePromise: Promise<void> | null = null;
 
   // Cache for decrypted keys (to avoid repeated decryption)
   private decryptedTenantKeyCache?: Uint8Array;
@@ -95,6 +113,20 @@ export class BaseMindooTenant implements MindooTenant {
     logger?: Logger,
     additionalTrustedKeys?: ReadonlyMap<string, boolean>,
     localCacheStore?: LocalCacheStore,
+    /**
+     * Optional pre-derived crypto material for the current user. When the
+     * caller has already decrypted the user's signing/encryption private
+     * keys (e.g. once at login) and/or derived the cache encryption key,
+     * passing them here skips the per-instance PBKDF2 + decrypt path. The
+     * `currentUserPassword` argument may then be empty and is never used
+     * downstream (as long as the requested key is already present in the
+     * cache).
+     */
+    preDecryptedMaterial?: {
+      signingKey?: CryptoKey;
+      encryptionKey?: CryptoKey;
+      cacheEncryptionKey?: CryptoKey;
+    },
   ) {
     this.factory = factory;
     this.tenantId = tenantId;
@@ -113,15 +145,51 @@ export class BaseMindooTenant implements MindooTenant {
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), `Tenant:${tenantId}`, true);
+    // Hook the local KeyBag changes feed:
+    //  - Snapshot the cursor so any pre-existing key state is treated as
+    //    "already seen" and only future mutations trigger reconciliation.
+    //  - Subscribe to live events scoped to this tenant; missed events
+    //    are still recovered when callers invoke
+    //    {@link reconcileKeyBagChanges} explicitly (it replays from the
+    //    cursor regardless of whether the listener fired).
+    this.keyBagChangeCursor = this.keyBag.getLatestChangeCursor();
+    this.unsubscribeKeyBagChanges = this.keyBag.onChanges((event) => {
+      if (event.type !== "doc" || event.tenantId !== this.tenantId) {
+        return;
+      }
+      // Fire-and-forget: errors are surfaced via the reconcile path itself.
+      // We intentionally do not await here to keep the mutation call site
+      // synchronous from the listener's perspective.
+      void this.reconcileKeyBagChanges();
+    });
 
-    // Set up cache if a local cache store is provided
+    // Pre-warm the per-user CryptoKey caches so getDecryptedSigningKey()
+    // and getDecryptedEncryptionKey() never run PBKDF2 + decryptPrivateKey
+    // when the caller has already derived these keys at login.
+    if (preDecryptedMaterial?.signingKey) {
+      this.decryptedUserSigningKeyCache = preDecryptedMaterial.signingKey;
+    }
+    if (preDecryptedMaterial?.encryptionKey) {
+      this.decryptedUserEncryptionKeyCache = preDecryptedMaterial.encryptionKey;
+    }
+
+    // Set up cache if a local cache store is provided. When a pre-derived
+    // cache encryption key is available, prefer that to skip the password
+    // path and avoid retaining the plaintext password inside the encrypted
+    // cache wrapper.
     if (localCacheStore) {
-      const encryptedStore = new EncryptedLocalCacheStore(
-        localCacheStore,
-        currentUserPassword,
-        this.cryptoAdapter,
-        this.logger.createChild("EncryptedCache"),
-      );
+      const encryptedStore = preDecryptedMaterial?.cacheEncryptionKey
+        ? new EncryptedLocalCacheStore(localCacheStore, {
+            cacheKey: preDecryptedMaterial.cacheEncryptionKey,
+            cryptoAdapter: this.cryptoAdapter,
+            logger: this.logger.createChild("EncryptedCache"),
+          })
+        : new EncryptedLocalCacheStore(
+            localCacheStore,
+            currentUserPassword,
+            this.cryptoAdapter,
+            this.logger.createChild("EncryptedCache"),
+          );
       this.cacheManager = new CacheManager(
         encryptedStore,
         undefined,
@@ -152,6 +220,12 @@ export class BaseMindooTenant implements MindooTenant {
    * Should be called when the tenant is being closed.
    */
   async disposeCacheManager(): Promise<void> {
+    // Unsubscribe from KeyBag changes alongside cache teardown. Callers
+    // already use `disposeCacheManager` as the "tenant is closing" signal,
+    // so this keeps lifecycle hooks in one place. Safe to call multiple
+    // times - the disposer is nulled out after the first call.
+    this.unsubscribeKeyBagChanges?.();
+    this.unsubscribeKeyBagChanges = null;
     if (this.cacheManager) {
       await this.cacheManager.dispose();
       this.cacheManager = null;
@@ -160,6 +234,17 @@ export class BaseMindooTenant implements MindooTenant {
 
   getCryptoAdapter(): CryptoAdapter {
     return this.cryptoAdapter;
+  }
+
+  private normalizeTimeTravelDate(value: OpenDBOptions["timeTravelDate"]): number | null {
+    if (value == null || value === "") {
+      return null;
+    }
+    const timestamp = value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
+    if (!Number.isFinite(timestamp)) {
+      throw new Error(`Invalid timeTravelDate: ${String(value)}`);
+    }
+    return timestamp;
   }
 
   getFactory(): MindooTenantFactory {
@@ -534,15 +619,26 @@ export class BaseMindooTenant implements MindooTenant {
     const effectiveOptions: OpenDBOptions = validDbId === "directory"
       ? { ...options, adminOnlyDb: true }
       : options ?? {};
+    const normalizedTimeTravelDate = this.normalizeTimeTravelDate(effectiveOptions.timeTravelDate);
+    const databaseCacheKey = normalizedTimeTravelDate == null
+      ? validDbId
+      : `${validDbId}::tt:${normalizedTimeTravelDate}`;
 
     await this.assertCurrentUserCanOpenDB(validDbId);
     
     // Return cached database if it exists
-    const cached = this.databaseCache.get(validDbId);
+    const cached = this.databaseCache.get(databaseCacheKey);
     if (cached) {
       // For directory DB, verify admin-only flag matches (defensive check)
       if (validDbId === "directory" && !cached.isAdminOnlyDb()) {
         throw new Error("Directory database was cached without adminOnlyDb - this should never happen");
+      }
+      // Live databases must reflect the current KeyBag state before they
+      // are handed back to callers. Time-travel snapshots are immutable
+      // historical views and intentionally do not participate in
+      // visibility reconciliation, so we skip the call for them.
+      if (normalizedTimeTravelDate == null) {
+        await this.reconcileKeyBagChanges();
       }
       return cached;
     }
@@ -550,6 +646,7 @@ export class BaseMindooTenant implements MindooTenant {
     // Extract store options and DB-specific options
     const {
       adminOnlyDb,
+      timeTravelDate: _timeTravelDate,
       attachmentConfig,
       documentCacheConfig,
       snapshotConfig,
@@ -557,8 +654,17 @@ export class BaseMindooTenant implements MindooTenant {
       ...storeOptions
     } = effectiveOptions;
     
-    // Create the database stores using the factory
-    const { docStore, attachmentStore } = this.storeFactory.createStore(validDbId, storeOptions);
+    // Snapshot opens can share an already-open live store instance. This keeps
+    // in-memory factories usable while the snapshot DB maintains isolated state.
+    const liveDbForSnapshot = normalizedTimeTravelDate == null
+      ? null
+      : this.databaseCache.get(validDbId);
+    const { docStore, attachmentStore } = liveDbForSnapshot
+      ? {
+          docStore: liveDbForSnapshot.getStore(),
+          attachmentStore: liveDbForSnapshot.getAttachmentStore(),
+        }
+      : this.storeFactory.createStore(validDbId, storeOptions);
     
     const dbLogger = this.logger.createChild("BaseMindooDB");
     const db = new BaseMindooDB(
@@ -570,16 +676,88 @@ export class BaseMindooTenant implements MindooTenant {
       snapshotConfig,
       adminOnlyDb ?? false,
       dbLogger,
-      performanceCallback
+      performanceCallback,
+      normalizedTimeTravelDate,
     );
-    if (this.cacheManager) {
+    if (this.cacheManager && normalizedTimeTravelDate == null) {
       db.setCacheManager(this.cacheManager);
     }
     await db.initialize();
     
     // Cache the database for future use
-    this.databaseCache.set(validDbId, db);
+    this.databaseCache.set(databaseCacheKey, db);
     return db;
+  }
+
+  /**
+   * Replay any pending KeyBag mutations for this tenant and refresh open
+   * live databases so document visibility matches the current key set.
+   *
+   * Designed as the single barrier callers can `await` to be certain that
+   * subsequent reads observe the latest add/remove of doc keys. Behaviour:
+   *
+   *  - Idempotent and concurrency-safe. Concurrent callers share the same
+   *    in-flight reconcile via {@link keyBagReconcilePromise}, and a second
+   *    call after the cursor catches up is a fast no-op.
+   *  - Cursor-based. Replays from the persisted cursor in
+   *    {@link keyBagChangeCursor}, so missed live notifications are
+   *    automatically recovered.
+   *  - Tenant-scoped. Events for other tenants in a shared KeyBag are
+   *    consumed (the cursor still advances) but ignored.
+   *  - Invalidates the cached tenant default key when its add/remove was
+   *    observed, so the next encrypt/decrypt call re-reads the bag.
+   *  - Skips time-travel databases. Those views are immutable historical
+   *    cuts and never participate in visibility reconciliation.
+   */
+  async reconcileKeyBagChanges(): Promise<void> {
+    if (this.keyBagReconcilePromise) {
+      return this.keyBagReconcilePromise;
+    }
+
+    this.keyBagReconcilePromise = (async () => {
+      let sawTenantDocKeyChange = false;
+      let latestCursor = this.keyBagChangeCursor;
+
+      // Consume every pending event so the cursor advances even for
+      // unrelated tenants sharing the same bag. We only need to react to
+      // doc keys for our own tenant though.
+      for await (const event of this.keyBag.iterateChangesSince(this.keyBagChangeCursor)) {
+        latestCursor = { changeSeq: event.changeSeq };
+        if (event.type !== "doc" || event.tenantId !== this.tenantId) {
+          continue;
+        }
+
+        sawTenantDocKeyChange = true;
+        if (event.keyId === DEFAULT_TENANT_KEY_ID) {
+          // The cached plaintext default key may now refer to a rotated
+          // or removed version; drop it so the next access re-resolves.
+          this.decryptedTenantKeyCache = undefined;
+        }
+      }
+
+      this.keyBagChangeCursor = latestCursor;
+      if (!sawTenantDocKeyChange) {
+        return;
+      }
+
+      // Notify every open live database; time-travel views are read-only
+      // historical snapshots and intentionally skip reconciliation.
+      for (const db of this.databaseCache.values()) {
+        if (db.isTimeTravelMode()) {
+          continue;
+        }
+        const reconcile = (db as unknown as { reconcileKeyVisibility?: () => Promise<void> }).reconcileKeyVisibility;
+        if (typeof reconcile === "function") {
+          await reconcile.call(db);
+        }
+      }
+    })();
+
+    try {
+      await this.keyBagReconcilePromise;
+    } finally {
+      this.keyBagReconcilePromise = null;
+    }
   }
 
   createDocSignerFor(signKey: SigningKeyPair): MindooDocSigner {
@@ -1125,6 +1303,17 @@ export class BaseMindooTenant implements MindooTenant {
       }
       throw error;
     }
+  }
+
+  /**
+   * Stable fingerprint of the doc-type keys this tenant currently has
+   * access to, delegating to {@link KeyBag.getDocKeyFingerprint} scoped
+   * to this tenant. Persisted by {@link BaseMindooDB} alongside its cache
+   * checkpoint so warm starts can skip a full metadata scan when the
+   * KeyBag composition has not changed.
+   */
+  async getDocKeyFingerprint(): Promise<string> {
+    return this.keyBag.getDocKeyFingerprint(this.tenantId);
   }
 
   /**

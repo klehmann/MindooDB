@@ -344,11 +344,7 @@ export class TenantManager {
     if (!this.serverIdentity || !this.serverPassword) {
       throw new Error("Server identity and server password are required to manage tenant $publicinfos keys");
     }
-    const keyBag = new KeyBag(
-      this.serverIdentity.userEncryptionKeyPair.privateKey,
-      this.serverPassword,
-      this.cryptoAdapter,
-    );
+    const keyBag = await this.createServerKeyBag(this.serverIdentity, this.serverPassword);
     const keyBagPath = this.getServerKeyBagPath();
     if (existsSync(keyBagPath)) {
       const data = readFileSync(keyBagPath);
@@ -357,8 +353,22 @@ export class TenantManager {
     return keyBag;
   }
 
+  private async createServerKeyBag(serverUser: PrivateUserId, serverPassword: string): Promise<KeyBag> {
+    const wrappingKey = await KeyBag.deriveWrappingKey(
+      serverUser.userEncryptionKeyPair.privateKey,
+      serverPassword,
+      this.cryptoAdapter,
+    );
+
+    return new KeyBag({
+      wrappingKey,
+      cryptoAdapter: this.cryptoAdapter,
+    });
+  }
+
   private async saveServerKeyBag(keyBag: KeyBag): Promise<void> {
-    writeFileSync(this.getServerKeyBagPath(), Buffer.from(await keyBag.save()));
+    const data = await keyBag.save();
+    writeFileSync(this.getServerKeyBagPath(), new DataView(data.buffer, data.byteOffset, data.byteLength));
   }
 
   private bytesToBase64(bytes: Uint8Array): string {
@@ -819,11 +829,7 @@ export class TenantManager {
     const serverUser = this.serverIdentity!;
 
     // Create a KeyBag using the server user's encryption key
-    const keyBag = new KeyBag(
-      serverUser.userEncryptionKeyPair.privateKey,
-      this.serverPassword!,
-      this.cryptoAdapter,
-    );
+    const keyBag = await this.createServerKeyBag(serverUser, this.serverPassword!);
     for (const publicInfosKey of this.mergeUniqueKeys(publicInfosKeys)) {
       await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
     }

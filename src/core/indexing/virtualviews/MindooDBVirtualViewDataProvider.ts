@@ -88,7 +88,11 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
 
       if (passesFilter) {
         const columnValues = this.computeColumnValues(doc, columns);
-        change.addEntry(docId, columnValues);
+        // Propagate the source document's encryption key id into the
+        // view entry. This metadata is later used by
+        // `VirtualView.purgeEntriesByDecryptionKeyId` to drop entries in
+        // bulk when a key is revoked, without re-reading the database.
+        change.addEntry(docId, columnValues, doc.getDecryptionKeyId());
         this.knownDocIds.add(docId);
       } else if (this.knownDocIds.has(docId)) {
         change.removeEntry(docId);

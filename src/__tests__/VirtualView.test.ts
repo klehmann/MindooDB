@@ -171,6 +171,33 @@ describe("VirtualView", () => {
       // Should have two subcategories Q1 and Q2
       expect(year2024.getChildCount()).toBe(2);
     });
+
+    it("should fan out array category values and preserve backslash hierarchy", () => {
+      const view = new VirtualView([
+        VirtualViewColumn.category("category", { sorting: ColumnSorting.ASCENDING }),
+        VirtualViewColumn.sorted("name", ColumnSorting.ASCENDING),
+      ]);
+
+      const change = new VirtualViewDataChange("test");
+      change.addEntry("doc1", { category: ["a\\b", "c"], name: "Fanout document" });
+
+      view.applyChanges(change);
+
+      const root = view.getRoot();
+      const topLevelCategories = root.getChildCategories();
+      expect(topLevelCategories.map((category) => category.getCategoryValue())).toEqual(["a", "c"]);
+
+      const categoryA = topLevelCategories.find((category) => category.getCategoryValue() === "a");
+      const categoryC = topLevelCategories.find((category) => category.getCategoryValue() === "c");
+      expect(categoryA).toBeDefined();
+      expect(categoryC).toBeDefined();
+
+      expect(categoryA?.getChildDocumentCount()).toBe(0);
+      expect(categoryA?.getDescendantDocumentCount()).toBe(1);
+      expect(categoryA?.getChildCategories().map((category) => category.getCategoryValue())).toEqual(["b"]);
+      expect(categoryA?.getChildCategories()[0]?.getChildDocumentCount()).toBe(1);
+      expect(categoryC?.getChildDocumentCount()).toBe(1);
+    });
   });
 
   describe("VirtualView totals", () => {

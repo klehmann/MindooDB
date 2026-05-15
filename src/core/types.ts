@@ -115,6 +115,46 @@ export interface OpenTenantOptions {
    * Map value: true if trusted, false if explicitly revoked
    */
   additionalTrustedKeys?: ReadonlyMap<string, boolean>;
+  /**
+   * Optional pre-decrypted signing/encryption CryptoKeys for the current
+   * user. When supplied, the tenant uses these directly instead of
+   * decrypting the encrypted private keys with the user password on first
+   * use. Typically derived once at login (see e.g.
+   * {@link KeyBag.deriveWrappingKey}) and held as `extractable: false`
+   * CryptoKeys for the lifetime of the session.
+   *
+   * When provided, the `currentUserPassword` argument to
+   * {@link MindooTenantFactory.openTenant} may be empty - it will not be
+   * used as long as the requested cached key is already present.
+   */
+  preDecryptedUserKeys?: PreDecryptedUserKeys;
+}
+
+/**
+ * Pre-decrypted user CryptoKeys that callers can pass to
+ * {@link MindooTenantFactory.openTenant} via {@link OpenTenantOptions}.
+ *
+ * Each key is independent. Whichever key is set is used directly; the
+ * other is still decrypted on demand from the user password on first
+ * use.
+ */
+export interface PreDecryptedUserKeys {
+  /**
+   * Pre-imported Ed25519 signing {@link CryptoKey} (`["sign"]` usage).
+   * Skips the password-based decryption + import for the user's signing key.
+   */
+  signingKey?: CryptoKey;
+  /**
+   * Pre-imported RSA-OAEP encryption {@link CryptoKey} (`["decrypt"]` usage).
+   * Skips the password-based decryption + import for the user's encryption key.
+   */
+  encryptionKey?: CryptoKey;
+  /**
+   * Pre-derived AES-GCM cache encryption {@link CryptoKey} (`["encrypt", "decrypt"]`
+   * usage). Skips the password-based PBKDF2 derivation that the
+   * `EncryptedLocalCacheStore` performs internally.
+   */
+  cacheEncryptionKey?: CryptoKey;
 }
 
 // ==================== Join Flow Types ====================
@@ -122,8 +162,35 @@ export interface OpenTenantOptions {
 interface CreateTenantPasswords {
   /** Password for the admin user's private keys */
   adminPassword: string;
-  /** Password for the regular user's private keys */
+  /**
+   * Password for the regular (app) user's private keys.
+   *
+   * When {@link existingKeyBag} **and** {@link preDecryptedAppUserKeys}
+   * are both supplied the password is no longer needed by `createTenant`
+   * (the bag has already been wrapped, and `openTenant` consumes the
+   * pre-imported `CryptoKey`s directly). Callers in that live-bag mode
+   * may pass an empty string.
+   */
   userPassword: string;
+  /**
+   * Optional pre-existing {@link KeyBag} to extend with the new tenant's
+   * keys. When supplied, `createTenant` will mutate this bag in place
+   * (adding the new tenant's `default` and `$publicinfos` doc keys) and
+   * return the same instance in {@link CreateTenantResult.keyBag}. The
+   * caller is then responsible for persisting the bag once.
+   *
+   * When omitted, `createTenant` constructs a fresh bag using the legacy
+   * password-based KeyBag wrapping derivation (existing behavior).
+   */
+  existingKeyBag?: KeyBag;
+  /**
+   * Optional pre-decrypted CryptoKeys for the *app user* identity that
+   * are forwarded to the underlying {@link MindooTenantFactory.openTenant}
+   * call. When supplied alongside {@link existingKeyBag} the
+   * password-based decryption + import of the app user's signing /
+   * encryption private keys is skipped entirely.
+   */
+  preDecryptedAppUserKeys?: PreDecryptedUserKeys;
 }
 
 /**
@@ -149,6 +216,11 @@ export type CreateTenantOptions =
 
 /**
  * Result of creating a new tenant via createTenant().
+ *
+ * When the caller provided {@link CreateTenantOptions.existingKeyBag}, the
+ * returned `keyBag` is the same instance (mutated in place with the new
+ * tenant's keys). Callers should not double-save in that case - persist
+ * the bag once after `createTenant` returns.
  */
 export interface CreateTenantResult {
   /** The opened tenant, ready to use */
@@ -228,14 +300,50 @@ export interface JoinResponse {
 export interface JoinTenantOptions {
   /** The user's locally-generated private identity (keys never leave this device) */
   user: PrivateUserId;
-  /** The password for the user's private keys */
+  /**
+   * The password for the user's private keys.
+   *
+   * Required when neither {@link existingKeyBag} nor
+   * {@link preDecryptedUserKeys} is supplied. When `existingKeyBag` is
+   * provided the password is *not* used to construct a new KeyBag; when
+   * `preDecryptedUserKeys.signingKey` and `preDecryptedUserKeys.encryptionKey`
+   * are both supplied the password is *not* used to decrypt the user's
+   * private keys before opening the tenant. In those live-bag cases
+   * callers may pass an empty string.
+   */
   password: string;
   /** The shared password used to decrypt the keys in the join response */
   sharePassword: string;
+  /**
+   * Optional pre-existing {@link KeyBag} to extend with the joined tenant's
+   * keys. When supplied, `joinTenant` will mutate this bag in place (adding
+   * the joined tenant's `default` and `$publicinfos` doc keys) and return
+   * the same instance in {@link JoinTenantResult.keyBag}. The caller is
+   * then responsible for persisting the bag once.
+   *
+   * When omitted, `joinTenant` constructs a fresh bag using the legacy
+   * password-based KeyBag wrapping derivation (existing behavior).
+   */
+  existingKeyBag?: KeyBag;
+  /**
+   * Optional pre-decrypted user keys forwarded to the underlying
+   * {@link MindooTenantFactory.openTenant} call. When the joining user's
+   * signing/encryption {@link CryptoKey}s are already available
+   * (e.g. because they were unlocked once at app startup via a live
+   * Haven session) supplying them here avoids the password-based
+   * decryption + import that `openTenant` would otherwise perform on
+   * the encrypted private keys carried on the user identity.
+   */
+  preDecryptedUserKeys?: PreDecryptedUserKeys;
 }
 
 /**
  * Result of joining a tenant via joinTenant().
+ *
+ * When the caller provided {@link JoinTenantOptions.existingKeyBag}, the
+ * returned `keyBag` is the same instance (mutated in place with the joined
+ * tenant's keys). Callers should not double-save in that case - persist the
+ * bag once after `joinTenant` returns.
  */
 export interface JoinTenantResult {
   /** The opened tenant, ready to use */
@@ -512,6 +620,35 @@ export interface MindooTenant {
   openDB(id: string, options?: OpenDBOptions): Promise<MindooDB>;
 
   /**
+   * Replay any pending local KeyBag mutations and refresh open live
+   * databases so document visibility matches the current key set.
+   *
+   * Implementations must be idempotent and safe to call concurrently.
+   * The optional shape allows alternative tenant implementations (e.g.
+   * server-side, test doubles) to omit visibility reconciliation when it
+   * is not applicable.
+   */
+  reconcileKeyBagChanges?(): Promise<void>;
+
+  /**
+   * Return whether the current KeyBag can resolve the given document
+   * encryption key id. Implementations must not throw when the key is
+   * missing; they should return `false` instead so callers can use the
+   * result as a guard before attempting decryption.
+   */
+  hasDecryptionKey?(decryptionKeyId: string): Promise<boolean>;
+
+  /**
+   * Return a stable, opaque fingerprint of the doc keys this tenant
+   * currently has access to. The fingerprint must change whenever the
+   * set of available doc keys changes for the tenant, and must be safe
+   * to persist (no raw key material). Used by databases to skip
+   * visibility reconciliation on warm starts when the KeyBag composition
+   * has not changed since the last cache flush.
+   */
+  getDocKeyFingerprint?(): Promise<string>;
+
+  /**
    * Creates a MindooDocSigner instance for signing and verifying document items.
    * The signer uses the tenant's cryptographic infrastructure for key management.
    * 
@@ -604,6 +741,7 @@ export type StoreEntryType =
   | "doc_snapshot"    // Automerge snapshot for performance optimization
   | "doc_delete"      // Document deletion (tombstone entry)
   | "doc_undelete"    // Document undeletion (lifecycle entry)
+  | "pending_attachment_upload" // Local recovery ledger for incomplete attachment uploads
   | "attachment_chunk"; // File attachment chunk
 
 /**
@@ -681,6 +819,24 @@ export interface StoreEntryMetadata {
    * must only return cursors built from entries that have a concrete value.
    */
   receiptOrder?: number;
+
+  /**
+   * Attachment id associated with attachment chunks or pending upload ledgers.
+   * For historical safety, cleanup only acts on pending upload ledgers that
+   * prove an attachment never reached a committed document revision.
+   */
+  attachmentId?: string;
+
+  /**
+   * Attachment ids committed by this document entry. Used by local recovery to
+   * distinguish never-committed uploads from attachments required by history.
+   */
+  attachmentIds?: string[];
+
+  /**
+   * Start timestamp for `pending_attachment_upload` recovery ledgers.
+   */
+  uploadStartedAt?: number;
 
   /**
    * The public signing key of the user who created this entry (Ed25519, PEM format).
@@ -780,6 +936,14 @@ export interface AttachmentReference {
   createdBy: string;
 }
 
+export interface IncompleteAttachmentUploadReclaimResult {
+  scannedLedgers: number;
+  reclaimedUploads: number;
+  reclaimedChunks: number;
+  keptCommittedUploads: number;
+  keptRecentUploads: number;
+}
+
 /**
  * Configuration for attachment handling in MindooDB.
  */
@@ -819,6 +983,28 @@ export interface DocumentCacheConfig {
   restoreLimit?: number;
 
   /**
+   * Number of cached documents fetched per batch during the eager
+   * startup restore (`restoreFromCache`). Each batch issues a single
+   * `LocalCacheStore.getMany` call, so this knob trades transaction
+   * overhead for transient memory pressure:
+   *
+   * - smaller values (e.g. 32-64) reduce peak memory at the cost of
+   *   more cache-store transactions; sensible on memory-constrained
+   *   targets (mobile, RN) or with very large average doc bodies (e.g.
+   *   attachments-as-documents),
+   * - larger values (e.g. 512-1024) amortise per-transaction overhead
+   *   but hold more encrypted+decrypted byte buffers in memory at the
+   *   same time.
+   *
+   * Has no effect when `restoreToL2` is `true` (no eager fill happens).
+   * Has no effect on lazy L2 reads (`tryLoadFromL2`) or on the
+   * background warmer, both of which load one document at a time.
+   *
+   * Default: 256 (~25 MB transient peak per batch at 50 KB/doc).
+   */
+  restoreBatchSize?: number;
+
+  /**
    * When enabled, verifies after cache restore that the restored document
    * index still matches the underlying local store and rebuilds metadata if a
    * stale checkpoint is detected. Intended for troubleshooting sync/cache
@@ -826,6 +1012,145 @@ export interface DocumentCacheConfig {
    * Default: false
    */
   reconcileRestoredIndexOnInit?: boolean;
+
+  /**
+   * When `true`, the persisted document cache is treated as the L2 tier
+   * of an L1/L2 cache split: startup does **not** eagerly materialize
+   * any cached documents into the in-memory L1 cache. Instead, the L2
+   * payloads stay on disk and individual `getDocument()` calls pull
+   * them in lazily via the L2 read path (which compares the persisted
+   * `changeSeq + automergeHeads` against the live index, applies
+   * deltas if stale, and then promotes to L1).
+   *
+   * This unlocks the "L2 much larger than L1" use case (e.g. 30k docs
+   * persisted, 128 in RAM) without burning startup time and memory on
+   * documents the user may never read.
+   *
+   * When `false` (the default), startup behavior is unchanged: cached
+   * documents are eagerly loaded into L1 up to `restoreLimit`. Even in
+   * eager mode the restore now uses the new batched `getMany` API to
+   * amortize per-key transaction overhead.
+   */
+  restoreToL2?: boolean;
+
+  /**
+   * Tuning for the optional background L2 warmer.
+   *
+   * The warmer is started explicitly via `startBackgroundWarmer()` and
+   * walks the in-memory document index, ensuring every doc has an
+   * up-to-date L2 cache record (using the same `tryLoadFromL2` path
+   * foreground reads use). It yields to the host runtime between
+   * batches so it does not starve other work.
+   */
+  warmer?: DocumentCacheWarmerConfig;
+}
+
+/**
+ * Cooperative scheduler used by the L2 background warmer to yield
+ * between batches so it does not monopolize the event loop.
+ *
+ * The default implementation uses `setTimeout(0)` which works in both
+ * Node and browsers. Embedders can plug in custom schedulers (e.g. one
+ * that yields via `requestIdleCallback` in the browser, or that
+ * coalesces yields with their own task queue).
+ */
+export interface WarmerScheduler {
+  /**
+   * Yield control back to the host runtime. The warmer will resume
+   * processing once the returned promise resolves.
+   */
+  yield(): Promise<void>;
+}
+
+/**
+ * Tuning options for the background L2 warmer.
+ */
+export interface DocumentCacheWarmerConfig {
+  /**
+   * Number of documents to process between scheduler yields. Smaller
+   * values yield more often (better responsiveness on the foreground
+   * thread, slightly higher per-doc overhead). Larger values run faster
+   * but block the event loop in larger bursts.
+   * Default: 50
+   */
+  batchSize?: number;
+
+  /**
+   * Custom scheduler implementation. Defaults to a `setTimeout(0)`-based
+   * scheduler that works in any JavaScript runtime.
+   */
+  scheduler?: WarmerScheduler;
+}
+
+/**
+ * Lifecycle phases for a background L2 warmer pass.
+ *
+ * - `warming`  - the warmer is actively processing documents; `processed`
+ *                will continue to grow until it reaches `total`.
+ * - `done`     - the warmer reached the end of its document snapshot; the
+ *                pass terminated successfully.
+ * - `cancelled`- the warmer observed an abort signal mid-pass and exited
+ *                early. `processed` reflects how far it got; the
+ *                remaining `total - processed` documents were not warmed.
+ */
+export type BackgroundWarmerPhase = "warming" | "done" | "cancelled";
+
+/**
+ * Snapshot of a background L2 warmer pass, suitable for driving a
+ * progress UI.
+ *
+ * `total` is captured once at the start of the pass (a snapshot of
+ * `index.length`); concurrent doc creations during the pass do not
+ * grow `total` so the bar can advance monotonically toward 100%.
+ *
+ * `processed` includes both docs that were warmed (an L2 record was
+ * read or refreshed) and docs that were skipped because they were
+ * already hot in L1 - in both cases the warmer is "done" with that doc.
+ */
+export interface BackgroundWarmerProgress {
+  /** Number of docs the warmer has finished visiting in this pass. */
+  processed: number;
+  /** Total docs the warmer intends to visit in this pass. */
+  total: number;
+  /** Lifecycle phase. See {@link BackgroundWarmerPhase}. */
+  phase: BackgroundWarmerPhase;
+}
+
+/**
+ * Options accepted by {@link MindooDB.startBackgroundWarmer}.
+ */
+export interface StartBackgroundWarmerOptions {
+  /**
+   * Optional `AbortSignal` that the caller can use to cancel this
+   * warmer pass without affecting any other in-flight passes.
+   * Aborting via the signal has the same effect as calling
+   * {@link MindooDB.stopBackgroundWarmer}.
+   *
+   * Note: warmer single-flight semantics mean that if a warmer is
+   * already running when `startBackgroundWarmer` is called, the
+   * existing in-flight promise is returned and the new `signal` is
+   * NOT honored (since the existing pass owns its own internal
+   * cancellation lifecycle). Callers that need precise cancellation
+   * control should call {@link MindooDB.stopBackgroundWarmer} first.
+   */
+  signal?: AbortSignal;
+
+  /**
+   * Optional progress callback invoked by the warmer once per
+   * scheduler-yield batch (i.e. roughly every
+   * `DocumentCacheWarmerConfig.batchSize` documents) and once more
+   * with `phase: "done"` or `phase: "cancelled"` when the pass
+   * settles.
+   *
+   * Designed for driving a progress bar / "Warming…" UI affordance.
+   * Per-doc invocation is intentionally avoided so the callback
+   * doesn't add measurable overhead even on warmers that walk
+   * 30,000+ documents.
+   *
+   * Errors thrown from this callback are caught and logged so a buggy
+   * progress consumer cannot break the warmer.
+   */
+  onProgress?: (progress: BackgroundWarmerProgress) => void;
 }
 
 /**
@@ -1143,23 +1468,86 @@ export interface MindooDoc {
   ): AsyncGenerator<Uint8Array, void, unknown>;
 }
 
+/** Plain JSON-compatible document payload materialized from a MindooDoc. */
 export interface MindooDocPayload {
   [key: string]: unknown;
 }
 
+/**
+ * Single text splice applied to the string at a text patch path.
+ *
+ * `index` is a character offset in the current text value, `deleteCount`
+ * removes characters from that offset, and `insert` adds replacement text.
+ */
 export interface MindooTextEdit {
   index: number;
   deleteCount: number;
   insert?: string;
 }
 
+/**
+ * Ordered text edits for one string field in a MindooDoc.
+ *
+ * `path` addresses the target string inside the document payload. When
+ * supplied, `baseHeads` identifies the Automerge heads the caller based the
+ * edit on, allowing the backend to apply order-sensitive text changes in the
+ * intended causal context.
+ */
 export interface MindooTextPatch {
   path: Array<string | number>;
   baseHeads?: string[];
   edits: MindooTextEdit[];
 }
 
+/** Result returned after applying a text patch and materializing the document. */
 export interface MindooTextPatchResult {
+  doc: MindooDoc;
+  heads: string[];
+  data: MindooDocPayload;
+}
+
+/** Sets a value at `path`, creating or replacing that payload field. */
+export interface MindooJsonSetPatch {
+  path: Array<string | number>;
+  value: unknown;
+}
+
+/** Removes the value at `path` from the payload object or list. */
+export interface MindooJsonUnsetPatch {
+  path: Array<string | number>;
+}
+
+/** Inserts one or more values into the list located at `path`. */
+export interface MindooJsonListInsertPatch {
+  path: Array<string | number>;
+  index: number;
+  values: unknown[];
+}
+
+/** Deletes one or more values from the list located at `path`. */
+export interface MindooJsonListDeletePatch {
+  path: Array<string | number>;
+  index: number;
+  deleteCount: number;
+}
+
+/**
+ * Granular JSON mutation batch for a MindooDoc payload.
+ *
+ * Operations are applied in patch order by operation group. `baseHeads` has the
+ * same role as in text patches: it records the document heads the caller saw
+ * before constructing operations whose order matters, such as list inserts.
+ */
+export interface MindooJsonPatch {
+  baseHeads?: string[];
+  set?: MindooJsonSetPatch[];
+  unset?: MindooJsonUnsetPatch[];
+  listInsert?: MindooJsonListInsertPatch[];
+  listDelete?: MindooJsonListDeletePatch[];
+}
+
+/** Result returned after applying a JSON patch and materializing the document. */
+export interface MindooJsonPatchResult {
   doc: MindooDoc;
   heads: string[];
   data: MindooDocPayload;
@@ -1532,6 +1920,14 @@ export interface OpenDBOptions extends OpenStoreOptions {
    * This is used for the directory database to prevent recursion and ensure security.
    */
   adminOnlyDb?: boolean;
+
+  /**
+   * Optional read-only historical cutoff for opening the database.
+   *
+   * When set, entries with createdAt >= timeTravelDate are ignored. The
+   * normalized value maps to store-level creationDateUntil semantics.
+   */
+  timeTravelDate?: number | Date | string;
   
   /**
    * Configuration for attachment handling (chunk size, etc.)
@@ -1616,7 +2012,8 @@ export interface PerformanceCallback {
       | 'materializeDocumentBranchAtTimestamp'
       | 'describeDocumentDagEntry'
       | 'analyzeDocumentConflicts'
-      | 'getDocumentConflictReport';
+      | 'getDocumentConflictReport'
+      | 'getDocumentConflictBaseValues';
     docId: string;
     time: number;
     scannedEntries: number;
@@ -1803,6 +2200,7 @@ export interface DocumentConflictLocation {
   kind: "entry-after" | "active-heads" | "merge-deps";
   entryId?: string;
   createdAt?: number;
+  receiptOrder?: number;
   createdByPublicKey?: string;
   headEntryIds: string[];
   automergeHeads: string[];
@@ -1818,6 +2216,19 @@ export interface DocumentConflictSummary {
 }
 
 /**
+ * Durable cursor for incremental conflict scans.
+ *
+ * `changeSeqAsOf` is used for cheap document-level pre-filtering through the
+ * document index. `storeReceiptOrderAsOf` is used for per-event filtering so
+ * late-arriving sync entries are surfaced even if their author timestamp is old.
+ */
+export interface ConflictScanCheckpoint {
+  changeSeqAsOf: number;
+  storeReceiptOrderAsOf?: number;
+  takenAt: number;
+}
+
+/**
  * Options accepted by conflict analysis APIs.
  */
 export interface DocumentConflictAnalysisOptions {
@@ -1826,6 +2237,8 @@ export interface DocumentConflictAnalysisOptions {
   pageSize?: number;
   yieldEveryMs?: number;
   maxConflictsPerDoc?: number;
+  since?: ConflictScanCheckpoint;
+  includeUnresolvedFromBefore?: boolean;
   signal?: AbortSignal;
 }
 
@@ -1861,6 +2274,7 @@ export type DocumentConflictAnalysisEvent =
       docId: string;
       entryId: string;
       createdAt: number;
+      receiptOrder?: number;
       createdByPublicKey: string;
       path: DocumentConflictPath;
       automergeHash: string | null;
@@ -1877,6 +2291,10 @@ export type DocumentConflictAnalysisEvent =
       docId?: string;
       entryId?: string;
       error: unknown;
+    }
+  | {
+      type: "scanCheckpoint";
+      checkpoint: ConflictScanCheckpoint;
     };
 
 /**
@@ -1890,6 +2308,40 @@ export interface DocumentConflictReport {
   resolutions: Array<Extract<DocumentConflictAnalysisEvent, { type: "conflictResolved" }>>;
   entriesScanned: number;
   errors: Array<Extract<DocumentConflictAnalysisEvent, { type: "error" }>>;
+  scanCheckpoint: ConflictScanCheckpoint | null;
+}
+
+/**
+ * Request to look up the value at a conflicted path as it stood at the merge
+ * base of the contributing branches (the "old" value before the conflict).
+ */
+export interface DocumentConflictBaseValueQuery {
+  /** Conflict location as returned by `getDocumentConflictReport`. */
+  location: DocumentConflictLocation;
+  /** Structured path segments (matches `DocumentConflictPath.path`). */
+  path: DocumentConflictPathSegment[];
+  /** Stable string key (matches `DocumentConflictPath.pathString`). */
+  pathString: string;
+}
+
+/**
+ * Result for one base-value lookup.
+ *
+ * - `available`: a previous value existed at the merge base; `preview` and
+ *   `value` are populated.
+ * - `no-prior-value`: a merge base was found but the path did not exist there
+ *   (e.g. both branches independently created the field).
+ * - `no-base`: no shared ancestor could be determined for the contributing
+ *   heads (e.g. the conflict has only one head, or the parent set is empty).
+ * - `missing-entry`: the conflict's `entryId` is not (or no longer) in the
+ *   local store; the base value cannot be resolved.
+ */
+export interface DocumentConflictBaseValue {
+  pathString: string;
+  baseEntryId: string | null;
+  status: "available" | "no-prior-value" | "no-base" | "missing-entry";
+  preview: string | null;
+  value?: unknown;
 }
 
 /**
@@ -1997,6 +2449,21 @@ export interface MindooDB {
   isAdminOnlyDb(): boolean;
 
   /**
+   * True when this database was opened with a timeTravelDate cutoff.
+   */
+  isTimeTravelMode(): boolean;
+
+  /**
+   * True when mutating APIs are disabled for this database instance.
+   */
+  isReadOnly(): boolean;
+
+  /**
+   * Normalized time travel cutoff in epoch milliseconds, or null for live mode.
+   */
+  getTimeTravelDate(): number | null;
+
+  /**
    * Get the content-addressed store that is used to store document changes for this database.
    *
    * @return The content-addressed store for documents
@@ -2009,6 +2476,10 @@ export interface MindooDB {
    * @return The content-addressed store for attachments
    */
   getAttachmentStore(): ContentAddressedStore;
+
+  reclaimIncompleteAttachmentUploads?(
+    options?: { minAgeMs?: number }
+  ): Promise<IncompleteAttachmentUploadReclaimResult>;
 
   /**
    * Create a new document.
@@ -2179,6 +2650,28 @@ export interface MindooDB {
   ): Promise<DocumentConflictReport>;
 
   /**
+   * Resolve the value each conflicted path had at its merge base (the most
+   * recent common ancestor of the branches that contributed to the conflict).
+   *
+   * Each query independently maps to a base value so the caller can request
+   * lookups lazily — for example, only for the paths it currently displays.
+   * Queries that share a merge base are coalesced internally so the
+   * underlying document state is materialized at most once per base entry.
+   */
+  getDocumentConflictBaseValues(
+    docId: string,
+    queries: DocumentConflictBaseValueQuery[]
+  ): Promise<DocumentConflictBaseValue[]>;
+
+  /**
+   * Return an incremental conflict-scan checkpoint for the current local view.
+   *
+   * Callers can persist this value after presenting scan results and pass it
+   * back as `DocumentConflictAnalysisOptions.since` on the next run.
+   */
+  getConflictScanCheckpoint(): Promise<ConflictScanCheckpoint>;
+
+  /**
    * Get all non-deleted document IDs in this database.
    *
    * @return A list of document IDs
@@ -2288,6 +2781,16 @@ export interface MindooDB {
   applyTextPatch(doc: MindooDoc, patch: MindooTextPatch): Promise<MindooTextPatchResult>;
 
   /**
+   * Apply granular JSON edits at document paths.
+   *
+   * If `baseHeads` is provided, edits are applied at that historical Automerge
+   * version using `changeAt`, then merged into the current document. This lets
+   * apps flush buffered object/list operations based on a stale local copy
+   * without replacing concurrent changes that arrived meanwhile.
+   */
+  applyJsonPatch(doc: MindooDoc, patch: MindooJsonPatch): Promise<MindooJsonPatchResult>;
+
+  /**
    * Change a document using a specific signing key.
    * This is like changeDoc but allows signing with a different key than the current user's.
    * Used for directory operations that must be signed with the administration key.
@@ -2353,15 +2856,98 @@ export interface MindooDB {
    * Sync changes from the append-only store by finding new changes and processing them.
    * This method can be called multiple times to incrementally sync new changes.
    * On first call (when processedChangeHashes is empty), it will process all changes.
-   * 
+   *
    * The method uses a stored list of processed change hashes to determine which changes
    * are new. It calls AppendOnlyStore.findNewChanges() to find unprocessed changes,
    * then processes them to update the cached database documents and index.
    * After processing, the new change hashes are appended to the stored list.
    *
-   * @return A promise that resolves when the sync is complete
+   * Sync deliberately does NOT trigger the L2 background warmer. Callers
+   * that want to warm the L2 cache after a sync (e.g. the Haven sync
+   * page once a sync settles) should call {@link startBackgroundWarmer}
+   * explicitly. This keeps casual `syncStoreChanges()` calls cheap and
+   * leaves warmer scheduling to the caller, which knows whether the
+   * cost of a full L2 walk is worth paying for the current workload.
+   *
+   * @return A promise that resolves when the sync is complete.
    */
   syncStoreChanges(): Promise<void>;
+
+  /**
+   * Reconcile local document visibility with the current tenant KeyBag.
+   *
+   * Reveals documents whose decryption keys are now available, hides
+   * documents whose keys have been removed, and purges any plaintext
+   * caches for inaccessible documents. The method only touches in-memory
+   * and L2 caches owned by this database instance - it does not write
+   * synthetic store entries and is safe to call repeatedly.
+   *
+   * Optional so alternative database implementations (e.g. read-only
+   * views, time-travel snapshots) can omit it.
+   */
+  reconcileKeyVisibility?(): Promise<void>;
+
+  /**
+   * Start the L2 background warmer.
+   *
+   * Walks the in-memory document index and ensures every document has
+   * an up-to-date L2 cache record (using the same internal load-from-L2
+   * code path foreground reads use). Runs in batches with cooperative
+   * yields so foreground operations are not starved.
+   *
+   * Intended to be called explicitly by long-lived sessions that just
+   * finished a sync (e.g. the Haven sync page after pulling/pushing
+   * completes) so subsequent reads - especially virtual view rebuilds
+   * - hit the fast L2 path. Casual database opens should NOT call this;
+   * pay the warmer cost only when the workload is about to benefit
+   * from a fully warm L2.
+   *
+   * Single-flight: a second call while the warmer is already running
+   * returns the same in-flight promise rather than starting a second
+   * pass. The returned promise resolves when the warmer has finished
+   * (either by visiting every document or by being cancelled via
+   * {@link stopBackgroundWarmer} or via the optional `signal`).
+   *
+   * @param options See {@link StartBackgroundWarmerOptions}: optional
+   *   `signal` for per-call cancellation and `onProgress` for driving
+   *   a progress UI.
+   */
+  startBackgroundWarmer?(options?: StartBackgroundWarmerOptions): Promise<void>;
+
+  /**
+   * Cancel the running background warmer (if any). Returns a promise
+   * that resolves once the in-flight warmer pass has observed the
+   * cancellation and returned (so callers can `await` clean shutdown).
+   * Safe to call when no warmer is running - resolves immediately in
+   * that case.
+   *
+   * Useful before initiating destructive operations (key rotation, data
+   * wipe, etc.) so the warmer cannot race against the mutation, and at
+   * the end of tests to ensure no background work outlives the test.
+   */
+  stopBackgroundWarmer?(): Promise<void>;
+
+  /**
+   * Returns `true` while the L2 background warmer is actively
+   * processing documents. Useful for "Warming…" UI indicators and
+   * tests that need to coordinate with warmer progress.
+   */
+  isWarmerRunning?(): boolean;
+
+  /**
+   * Snapshot of the current (or most recent) background warmer pass's
+   * progress, or `null` if no warmer has ever run on this database
+   * instance. Designed for UIs that mount AFTER the warmer has already
+   * started (e.g. the user navigates back to the Sync page mid-warm)
+   * and need to "catch up" on state without missing onProgress events.
+   *
+   * After a warmer settles, the returned snapshot persists with its
+   * final `phase` (`"done"` or `"cancelled"`) so the UI can decide
+   * whether to keep showing a "Optimized" message or fade away. The
+   * snapshot is replaced on the next {@link startBackgroundWarmer}
+   * call.
+   */
+  getBackgroundWarmerProgress?(): BackgroundWarmerProgress | null;
 
   /**
    * Pull changes from a remote content-addressed store or another MindooDB instance.

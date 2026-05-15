@@ -281,7 +281,9 @@ export class ServerSync {
 
   private base64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
     const buf = Buffer.from(base64, "base64");
-    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    const bytes = new Uint8Array(buf.byteLength);
+    bytes.set(buf);
+    return bytes;
   }
 }
 

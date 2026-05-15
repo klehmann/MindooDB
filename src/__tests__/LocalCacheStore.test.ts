@@ -69,6 +69,31 @@ describe("InMemoryLocalCacheStore", () => {
     expect(await store.get("vv", "b")).toBeNull();
     expect(await store.list("doc")).toEqual([]);
   });
+
+  it("getMany returns values in input order with nulls for misses", async () => {
+    await store.put("doc", "a", new Uint8Array([1]));
+    await store.put("doc", "c", new Uint8Array([3]));
+
+    const results = await store.getMany("doc", ["a", "missing", "c", "alsoMissing"]);
+    expect(results).toEqual([
+      new Uint8Array([1]),
+      null,
+      new Uint8Array([3]),
+      null,
+    ]);
+  });
+
+  it("getMany returns empty array for empty input", async () => {
+    expect(await store.getMany("doc", [])).toEqual([]);
+  });
+
+  it("getMany respects type isolation", async () => {
+    await store.put("doc", "id1", new Uint8Array([1]));
+    await store.put("vv", "id1", new Uint8Array([2]));
+
+    expect(await store.getMany("doc", ["id1"])).toEqual([new Uint8Array([1])]);
+    expect(await store.getMany("vv", ["id1"])).toEqual([new Uint8Array([2])]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -134,6 +159,22 @@ describe("FileSystemLocalCacheStore", () => {
     await store.clear();
     expect(await store.get("doc", "a")).toBeNull();
     expect(await store.list("doc")).toEqual([]);
+  });
+
+  it("getMany returns values in input order with nulls for misses", async () => {
+    await store.put("doc", "a", new Uint8Array([10]));
+    await store.put("doc", "tenant/store/c", new Uint8Array([30]));
+
+    const results = await store.getMany("doc", [
+      "a",
+      "missing",
+      "tenant/store/c",
+    ]);
+    expect(results).toEqual([
+      new Uint8Array([10]),
+      null,
+      new Uint8Array([30]),
+    ]);
   });
 });
 
@@ -217,6 +258,40 @@ describe("EncryptedLocalCacheStore", () => {
     await store.put("doc", "large", largeData);
     const result = await store.get("doc", "large");
     expect(result).toEqual(largeData);
+  });
+
+  it("getMany decrypts each entry and preserves order/nulls", async () => {
+    const inner = new InMemoryLocalCacheStore();
+    const store = new EncryptedLocalCacheStore(inner, password, crypto);
+
+    const dataA = new Uint8Array([1, 2, 3]);
+    const dataC = new TextEncoder().encode("hello world");
+    await store.put("doc", "a", dataA);
+    await store.put("doc", "c", dataC);
+
+    const results = await store.getMany("doc", ["a", "missing", "c"]);
+    expect(results).toEqual([dataA, null, dataC]);
+  });
+
+  it("getMany returns null for entries that fail to decrypt", async () => {
+    const inner = new InMemoryLocalCacheStore();
+    const writer = new EncryptedLocalCacheStore(inner, "passwordA", crypto);
+    const reader = new EncryptedLocalCacheStore(inner, "passwordB", crypto);
+
+    await writer.put("doc", "id1", new Uint8Array([1]));
+    await writer.put("doc", "id2", new Uint8Array([2]));
+
+    const results = await reader.getMany("doc", ["id1", "id2"]);
+    expect(results).toEqual([null, null]);
+  });
+
+  it("getMany returns empty array for empty input without touching inner store", async () => {
+    const inner = new InMemoryLocalCacheStore();
+    const innerSpy = jest.spyOn(inner, "getMany");
+    const store = new EncryptedLocalCacheStore(inner, password, crypto);
+
+    expect(await store.getMany("doc", [])).toEqual([]);
+    expect(innerSpy).not.toHaveBeenCalled();
   });
 });
 

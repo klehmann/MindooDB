@@ -1,9 +1,11 @@
 import type { LocalCacheStore } from "../../core/cache/LocalCacheStore";
+import { isIndexedDBConnectionLostError } from "../appendonlystores/IndexedDBContentAddressedStore";
 
 const STORE_NAME = "kv";
 const SIZE_META_STORE = "size_meta";
 const TOTAL_BYTES_KEY = "totalBytes";
 const IDB_VERSION = 2;
+const RECONNECT_RETRY_DELAYS_MS = [50, 250, 1000];
 
 interface SizeMetaRecord {
   key: string;
@@ -28,6 +30,10 @@ function transactionToPromise(tx: IDBTransaction): Promise<void> {
     tx.onabort = () =>
       reject(tx.error ?? new Error("IndexedDB transaction aborted."));
   });
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 async function readStoredBytesValue(store: IDBObjectStore): Promise<number | null> {
@@ -100,16 +106,15 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
       request.onsuccess = () => {
         this.db = request.result;
         this.db.onversionchange = () => {
-          this.db?.close();
-          this.db = null;
-          this.openPromise = null;
+          this.resetConnection();
+        };
+        this.db.onclose = () => {
+          this.resetConnection();
         };
         void this.backfillStoredBytesIfNeeded(this.db)
           .then(() => resolve(this.db!))
           .catch((error) => {
-            this.db?.close();
-            this.db = null;
-            this.openPromise = null;
+            this.resetConnection();
             reject(error);
           });
       };
@@ -120,6 +125,37 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
     });
 
     return this.openPromise;
+  }
+
+  private resetConnection(): void {
+    const db = this.db;
+    this.db = null;
+    this.openPromise = null;
+    try {
+      db?.close();
+    } catch {
+      // Ignore close errors from already-invalid WebKit IDB handles.
+    }
+  }
+
+  private async runWithReconnect<T>(
+    operation: () => Promise<T>
+  ): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= RECONNECT_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        if (!isIndexedDBConnectionLostError(error) || attempt >= RECONNECT_RETRY_DELAYS_MS.length) {
+          throw error;
+        }
+        this.resetConnection();
+        await wait(RECONNECT_RETRY_DELAYS_MS[attempt]);
+        await this.getDb();
+      }
+    }
+    throw lastError;
   }
 
   private toKey(type: string, id: string): string {
@@ -133,15 +169,18 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
    * excludes IndexedDB structural overhead.
    */
   async getStoredBytes(): Promise<number> {
-    const db = await this.getDb();
-    const tx = db.transaction(SIZE_META_STORE, "readonly");
-    const sizeMetaStore = tx.objectStore(SIZE_META_STORE);
-    return (await readStoredBytesValue(sizeMetaStore)) ?? 0;
+    return this.runWithReconnect(async () => {
+      const db = await this.getDb();
+      const tx = db.transaction(SIZE_META_STORE, "readonly");
+      const sizeMetaStore = tx.objectStore(SIZE_META_STORE);
+      return (await readStoredBytesValue(sizeMetaStore)) ?? 0;
+    });
   }
 
   async get(type: string, id: string): Promise<Uint8Array | null> {
+    return this.runWithReconnect(async () => {
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
+    return new Promise<Uint8Array | null>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, "readonly");
       const store = tx.objectStore(STORE_NAME);
       const request = store.get(this.toKey(type, id));
@@ -155,9 +194,53 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
       };
       request.onerror = () => reject(request.error);
     });
+    });
+  }
+
+  /**
+   * Batch read that issues all `get` requests inside a single readonly
+   * transaction. Compared to N independent `get` calls, this avoids the
+   * per-call IndexedDB transaction setup/teardown cost and lets the engine
+   * pipeline the underlying disk reads.
+   *
+   * Results are returned in the same order as `ids`. Missing entries become
+   * `null` at their index.
+   */
+  async getMany(type: string, ids: string[]): Promise<Array<Uint8Array | null>> {
+    if (ids.length === 0) return [];
+    return this.runWithReconnect(async () => {
+      const db = await this.getDb();
+      return new Promise<Array<Uint8Array | null>>((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, "readonly");
+        const store = tx.objectStore(STORE_NAME);
+        const results: Array<Uint8Array | null> = new Array(ids.length).fill(null);
+        let firstError: unknown = null;
+
+        for (let i = 0; i < ids.length; i++) {
+          const index = i;
+          const request = store.get(this.toKey(type, ids[i]));
+          request.onsuccess = () => {
+            const value = request.result;
+            results[index] = value === undefined ? null : new Uint8Array(value);
+          };
+          request.onerror = () => {
+            if (firstError === null) firstError = request.error;
+          };
+        }
+
+        tx.oncomplete = () => {
+          if (firstError !== null) reject(firstError);
+          else resolve(results);
+        };
+        tx.onerror = () => reject(tx.error ?? firstError);
+        tx.onabort = () =>
+          reject(tx.error ?? firstError ?? new Error("IndexedDB transaction aborted."));
+      });
+    });
   }
 
   async put(type: string, id: string, value: Uint8Array): Promise<void> {
+    return this.runWithReconnect(async () => {
     const db = await this.getDb();
     const tx = db.transaction([STORE_NAME, SIZE_META_STORE], "readwrite");
     const store = tx.objectStore(STORE_NAME);
@@ -173,9 +256,11 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
     store.put(nextValue, key);
     await writeStoredBytesValue(sizeMetaStore, Math.max(0, nextTotalBytes));
     await transactionToPromise(tx);
+    });
   }
 
   async delete(type: string, id: string): Promise<void> {
+    return this.runWithReconnect(async () => {
     const db = await this.getDb();
     const tx = db.transaction([STORE_NAME, SIZE_META_STORE], "readwrite");
     const store = tx.objectStore(STORE_NAME);
@@ -191,9 +276,11 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
       Math.max(0, totalBytes - getPayloadBytes(existingValue ?? new ArrayBuffer(0)))
     );
     await transactionToPromise(tx);
+    });
   }
 
   async list(type: string): Promise<string[]> {
+    return this.runWithReconnect(async () => {
     const db = await this.getDb();
     const prefix = `${type}\0`;
 
@@ -208,9 +295,11 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
       };
       request.onerror = () => reject(request.error);
     });
+    });
   }
 
   async clear(): Promise<void> {
+    return this.runWithReconnect(async () => {
     const db = await this.getDb();
     const tx = db.transaction([STORE_NAME, SIZE_META_STORE], "readwrite");
     const store = tx.objectStore(STORE_NAME);
@@ -218,6 +307,7 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
     store.clear();
     await writeStoredBytesValue(sizeMetaStore, 0);
     await transactionToPromise(tx);
+    });
   }
 
   /**

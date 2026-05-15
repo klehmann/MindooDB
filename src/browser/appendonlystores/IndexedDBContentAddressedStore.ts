@@ -65,6 +65,7 @@ const BLOOM_CACHE_KEY = "current";
 const RECEIPT_ORDER_COUNTER_KEY = "receiptOrderCounter";
 const TOTAL_CONTENT_BYTES_KEY = "total_content_bytes";
 const TOTAL_METADATA_BYTES_KEY = "total_metadata_bytes";
+const RECONNECT_RETRY_DELAYS_MS = [50, 250, 1000];
 
 interface MetaValueRecord {
   key: string;
@@ -89,6 +90,24 @@ function qualifyIndexedDbNamespace(namespace: string, storeKind: StoreKind): str
     return `${namespace}_${storeKind}`;
   }
   return `${namespace.slice(0, separatorIndex)}_${storeKind}${namespace.slice(separatorIndex)}`;
+}
+
+export function isIndexedDBConnectionLostError(error: unknown): boolean {
+  const name = error instanceof DOMException || error instanceof Error ? error.name : "";
+  const message = error instanceof DOMException || error instanceof Error
+    ? error.message
+    : String(error ?? "");
+  const normalized = message.toLowerCase();
+  return name === "InvalidStateError"
+    || name === "UnknownError"
+    || normalized.includes("connection to indexed database server lost")
+    || normalized.includes("connection to the database lost")
+    || normalized.includes("database connection is closing")
+    || normalized.includes("indexeddb transaction aborted");
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -502,16 +521,18 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
           this.logger.warn(
             "IndexedDB version change detected, closing connection"
           );
-          this.db?.close();
-          this.db = null;
-          this.openPromise = null;
+          this.resetConnection();
+        };
+        this.db.onclose = () => {
+          this.logger.warn(
+            `IndexedDB connection closed for ${this.idbName}; future operations will reopen it`
+          );
+          this.resetConnection();
         };
         void this.backfillStoredBytesIfNeeded(this.db)
           .then(() => resolve(this.db!))
           .catch((error) => {
-            this.db?.close();
-            this.db = null;
-            this.openPromise = null;
+            this.resetConnection();
             reject(error);
           });
       };
@@ -547,6 +568,42 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     return `idb:${this.idbName}`;
   }
 
+  private resetConnection(): void {
+    const db = this.db;
+    this.db = null;
+    this.openPromise = null;
+    try {
+      db?.close();
+    } catch {
+      // Ignore close errors from already-invalid WebKit IDB handles.
+    }
+  }
+
+  private async runWithReconnect<T>(
+    opName: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= RECONNECT_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        if (!isIndexedDBConnectionLostError(error) || attempt >= RECONNECT_RETRY_DELAYS_MS.length) {
+          throw error;
+        }
+        this.logger.warn(
+          `[idb-recovery] ${opName} failed for ${this.idbName}; reopening IndexedDB connection (attempt ${attempt + 1})`,
+          error
+        );
+        this.resetConnection();
+        await wait(RECONNECT_RETRY_DELAYS_MS[attempt]);
+        await this.ensureOpen();
+      }
+    }
+    throw lastError;
+  }
+
   /**
    * Returns approximate payload bytes currently stored in this browser-backed
    * content-addressed store.
@@ -558,23 +615,26 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
    * increase `refCount`.
    */
   async getStoredBytes(): Promise<StoreByteTotals> {
-    const db = await this.ensureOpen();
-    const tx = db.transaction(META_STORE, "readonly");
-    const metaOS = tx.objectStore(META_STORE);
-    const contentBytes =
-      (await readNumericMetaValue(metaOS, TOTAL_CONTENT_BYTES_KEY)) ?? 0;
-    const metadataBytes =
-      (await readNumericMetaValue(metaOS, TOTAL_METADATA_BYTES_KEY)) ?? 0;
-    return {
-      contentBytes,
-      metadataBytes,
-      totalBytes: contentBytes + metadataBytes,
-    };
+    return this.runWithReconnect("getStoredBytes", async () => {
+      const db = await this.ensureOpen();
+      const tx = db.transaction(META_STORE, "readonly");
+      const metaOS = tx.objectStore(META_STORE);
+      const contentBytes =
+        (await readNumericMetaValue(metaOS, TOTAL_CONTENT_BYTES_KEY)) ?? 0;
+      const metadataBytes =
+        (await readNumericMetaValue(metaOS, TOTAL_METADATA_BYTES_KEY)) ?? 0;
+      return {
+        contentBytes,
+        metadataBytes,
+        totalBytes: contentBytes + metadataBytes,
+      };
+    });
   }
 
   async putEntries(entries: StoreEntry[]): Promise<void> {
     if (entries.length === 0) return;
 
+    return this.runWithReconnect("putEntries", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction(
       [ENTRIES_STORE, CONTENT_STORE, BLOOM_CACHE_STORE, META_STORE],
@@ -700,11 +760,13 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     }
 
     await txToPromise(tx);
+    });
   }
 
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
     if (ids.length === 0) return [];
 
+    return this.runWithReconnect("getEntries", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction([ENTRIES_STORE, CONTENT_STORE], "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
@@ -739,14 +801,17 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       `Retrieved ${result.length} entries out of ${ids.length} requested`
     );
     return result;
+    });
   }
 
   async getEntryMetadata(id: string): Promise<StoreEntryMetadata | null> {
-    const db = await this.ensureOpen();
-    const tx = db.transaction(ENTRIES_STORE, "readonly");
-    const entriesOS = tx.objectStore(ENTRIES_STORE);
-    const metadata = (await reqToPromise(entriesOS.get(id))) as StoreEntryMetadata | undefined;
-    return metadata ?? null;
+    return this.runWithReconnect("getEntryMetadata", async () => {
+      const db = await this.ensureOpen();
+      const tx = db.transaction(ENTRIES_STORE, "readonly");
+      const entriesOS = tx.objectStore(ENTRIES_STORE);
+      const metadata = (await reqToPromise(entriesOS.get(id))) as StoreEntryMetadata | undefined;
+      return metadata ?? null;
+    });
   }
 
   async planAttachmentReadByWalkingMetadata(
@@ -760,6 +825,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
   async hasEntries(ids: string[]): Promise<string[]> {
     if (ids.length === 0) return [];
 
+    return this.runWithReconnect("hasEntries", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
@@ -776,9 +842,11 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       `Found ${existing.length} existing entries out of ${ids.length} checked`
     );
     return existing;
+    });
   }
 
   async findNewEntries(knownIds: string[]): Promise<StoreEntryMetadata[]> {
+    return this.runWithReconnect("findNewEntries", async () => {
     const knownSet = new Set(knownIds);
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
@@ -805,12 +873,14 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       };
       cursorReq.onerror = () => reject(cursorReq.error);
     });
+    });
   }
 
   async findNewEntriesForDoc(
     knownIds: string[],
     docId: string
   ): Promise<StoreEntryMetadata[]> {
+    return this.runWithReconnect("findNewEntriesForDoc", async () => {
     const knownSet = new Set(knownIds);
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
@@ -838,6 +908,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       };
       cursorReq.onerror = () => reject(cursorReq.error);
     });
+    });
   }
 
   async findEntries(
@@ -845,6 +916,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     creationDateFrom: number | null,
     creationDateUntil: number | null
   ): Promise<StoreEntryMetadata[]> {
+    return this.runWithReconnect("findEntries", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
@@ -878,9 +950,11 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       };
       cursorReq.onerror = () => reject(cursorReq.error);
     });
+    });
   }
 
   async getAllIds(): Promise<string[]> {
+    return this.runWithReconnect("getAllIds", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
@@ -900,6 +974,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       };
       cursorReq.onerror = () => reject(cursorReq.error);
     });
+    });
   }
 
   async scanEntriesSince(
@@ -907,6 +982,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     limit: number = Number.MAX_SAFE_INTEGER,
     filters?: StoreScanFilters
   ): Promise<StoreScanResult> {
+    return this.runWithReconnect("scanEntriesSince", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
@@ -964,9 +1040,11 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
       cursorReq.onerror = () => reject(cursorReq.error);
     });
+    });
   }
 
   async getIdBloomSummary(): Promise<StoreIdBloomSummary> {
+    return this.runWithReconnect("getIdBloomSummary", async () => {
     const db = await this.ensureOpen();
 
     // Try to read from cache first
@@ -997,34 +1075,39 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     await txToPromise(writeTx);
 
     return summary;
+    });
   }
 
   async planDocumentMaterialization(
     docId: string,
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationPlan> {
-    const entries = await this.readEntriesForDoc(docId);
-    return computeDocumentMaterializationPlan(docId, entries, options);
+    return this.runWithReconnect("planDocumentMaterialization", async () => {
+      const entries = await this.readEntriesForDoc(docId);
+      return computeDocumentMaterializationPlan(docId, entries, options);
+    });
   }
 
   async planDocumentMaterializationBatch(
     docIds: string[],
     options?: MaterializationPlanOptions
   ): Promise<DocumentMaterializationBatchPlan> {
-    const all: StoreEntryMetadata[] = [];
-    // Batch doc-scoped index reads so browser planning stays proportional to
-    // the requested documents instead of loading the entire entries store.
-    const concurrency = 16;
-    for (let offset = 0; offset < docIds.length; offset += concurrency) {
-      const batch = docIds.slice(offset, offset + concurrency);
-      const batchResults = await Promise.all(
-        batch.map((docId) => this.readEntriesForDoc(docId))
-      );
-      for (const entries of batchResults) {
-        all.push(...entries);
+    return this.runWithReconnect("planDocumentMaterializationBatch", async () => {
+      const all: StoreEntryMetadata[] = [];
+      // Batch doc-scoped index reads so browser planning stays proportional to
+      // the requested documents instead of loading the entire entries store.
+      const concurrency = 16;
+      for (let offset = 0; offset < docIds.length; offset += concurrency) {
+        const batch = docIds.slice(offset, offset + concurrency);
+        const batchResults = await Promise.all(
+          batch.map((docId) => this.readEntriesForDoc(docId))
+        );
+        for (const entries of batchResults) {
+          all.push(...entries);
+        }
       }
-    }
-    return computeBatchMaterializationPlan(all, docIds, options);
+      return computeBatchMaterializationPlan(all, docIds, options);
+    });
   }
 
   async resolveDependencies(
@@ -1035,6 +1118,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     const maxDepth = options?.maxDepth as number | undefined;
     const includeStart = options?.includeStart !== false;
 
+    return this.runWithReconnect("resolveDependencies", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);
@@ -1083,11 +1167,13 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     result.reverse();
     this.logger.debug(`Resolved ${result.length} dependencies for ${startId}`);
     return result;
+    });
   }
 
   async purgeDocHistory(docId: string): Promise<void> {
     this.logger.info(`Purging entry history for document: ${docId}`);
 
+    return this.runWithReconnect("purgeDocHistory", async () => {
     const db = await this.ensureOpen();
     const tx = db.transaction(
       [ENTRIES_STORE, CONTENT_STORE, BLOOM_CACHE_STORE, META_STORE],
@@ -1168,6 +1254,28 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     this.logger.info(
       `Purged ${entriesToPurge.length} entries for document ${docId}`
     );
+    });
+  }
+
+  async deleteEntriesForAttachment(docId: string, attachmentId: string): Promise<number> {
+    const prefix = `${docId}_a_${attachmentId}_`;
+    return this.deleteEntriesWhere(
+      `deleteEntriesForAttachment:${attachmentId}`,
+      (entry) => entry.docId === docId
+        && entry.entryType === "attachment_chunk"
+        && (entry.attachmentId === attachmentId || entry.id.startsWith(prefix))
+    );
+  }
+
+  async deleteEntriesById(entryIds: string[]): Promise<number> {
+    if (entryIds.length === 0) {
+      return 0;
+    }
+    const ids = new Set(entryIds);
+    return this.deleteEntriesWhere(
+      "deleteEntriesById",
+      (entry) => ids.has(entry.id)
+    );
   }
 
   async clearAllLocalData(): Promise<void> {
@@ -1245,6 +1353,82 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
       return false;
     }
     return true;
+  }
+
+  private async deleteEntriesWhere(
+    opName: string,
+    predicate: (entry: StoreEntryMetadata) => boolean
+  ): Promise<number> {
+    return this.runWithReconnect(opName, async () => {
+      const db = await this.ensureOpen();
+      const tx = db.transaction(
+        [ENTRIES_STORE, CONTENT_STORE, BLOOM_CACHE_STORE, META_STORE],
+        "readwrite"
+      );
+      const entriesOS = tx.objectStore(ENTRIES_STORE);
+      const contentOS = tx.objectStore(CONTENT_STORE);
+      const bloomOS = tx.objectStore(BLOOM_CACHE_STORE);
+      const metaOS = tx.objectStore(META_STORE);
+      let totalContentBytes =
+        (await readNumericMetaValue(metaOS, TOTAL_CONTENT_BYTES_KEY)) ?? 0;
+      let totalMetadataBytes =
+        (await readNumericMetaValue(metaOS, TOTAL_METADATA_BYTES_KEY)) ?? 0;
+      let removedCount = 0;
+
+      await new Promise<void>((resolve, reject) => {
+        const cursorReq = entriesOS.openCursor();
+        cursorReq.onsuccess = async () => {
+          const cursor = cursorReq.result;
+          if (!cursor) {
+            resolve();
+            return;
+          }
+          try {
+            const entry = cursor.value as StoreEntryMetadata;
+            if (predicate(entry)) {
+              await reqToPromise(cursor.delete());
+              totalMetadataBytes -= getMetadataPayloadBytes(entry);
+              const contentRecord = (await reqToPromise(
+                contentOS.get(entry.contentHash)
+              )) as ContentRecord | undefined;
+              if (contentRecord) {
+                const nextRefCount = contentRecord.refCount - 1;
+                if (nextRefCount <= 0) {
+                  await reqToPromise(contentOS.delete(entry.contentHash));
+                  totalContentBytes -= contentRecord.data.byteLength;
+                } else {
+                  contentRecord.refCount = nextRefCount;
+                  await reqToPromise(contentOS.put(contentRecord));
+                }
+              }
+              removedCount++;
+            }
+            cursor.continue();
+          } catch (error) {
+            reject(error);
+          }
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+      });
+
+      if (removedCount > 0) {
+        await reqToPromise(
+          bloomOS.put({ key: BLOOM_CACHE_KEY, summary: null, dirty: true })
+        );
+        await writeNumericMetaValue(
+          metaOS,
+          TOTAL_CONTENT_BYTES_KEY,
+          Math.max(0, totalContentBytes)
+        );
+        await writeNumericMetaValue(
+          metaOS,
+          TOTAL_METADATA_BYTES_KEY,
+          Math.max(0, totalMetadataBytes)
+        );
+      }
+      await txToPromise(tx);
+      return removedCount;
+    });
   }
 
   private async readEntriesForDoc(docId: string): Promise<StoreEntryMetadata[]> {
