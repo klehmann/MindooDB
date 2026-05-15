@@ -205,7 +205,13 @@ async function getSystemAdminToken(
   // Decrypt signing key
   const encrypted = adminUser.userSigningKeyPair.privateKey as any;
   const salt = Buffer.from(encrypted.salt, "base64");
-  const iv = Buffer.from(encrypted.iv, "base64");
+  // Use a freshly allocated Uint8Array so the IV is typed as
+  // `Uint8Array<ArrayBuffer>` (a valid `BufferSource`) rather than a
+  // Node `Buffer` whose `.buffer` is `ArrayBufferLike` (which TS rejects
+  // when WebCrypto expects a strict `ArrayBuffer`-backed view).
+  const ivBytes = Buffer.from(encrypted.iv, "base64");
+  const iv = new Uint8Array(ivBytes.length);
+  iv.set(ivBytes);
   const ciphertext = Buffer.from(encrypted.ciphertext, "base64");
   const tag = Buffer.from(encrypted.tag, "base64");
   const iterations = encrypted.iterations || 310000;
@@ -279,7 +285,13 @@ async function decryptUserSigningKey(
     iterations?: number;
   };
   const salt = Buffer.from(encrypted.salt, "base64");
-  const iv = Buffer.from(encrypted.iv, "base64");
+  // Use a freshly allocated Uint8Array so the IV is typed as
+  // `Uint8Array<ArrayBuffer>` (a valid `BufferSource`) rather than a
+  // Node `Buffer` whose `.buffer` is `ArrayBufferLike` (which TS rejects
+  // when WebCrypto expects a strict `ArrayBuffer`-backed view).
+  const ivBytes = Buffer.from(encrypted.iv, "base64");
+  const iv = new Uint8Array(ivBytes.length);
+  iv.set(ivBytes);
   const ciphertext = Buffer.from(encrypted.ciphertext, "base64");
   const tag = Buffer.from(encrypted.tag, "base64");
   const iterations = encrypted.iterations || 310000;

@@ -58,7 +58,13 @@ async function getSystemAdminToken(
 
   const encrypted = adminUser.userSigningKeyPair.privateKey as any;
   const salt = Buffer.from(encrypted.salt, "base64");
-  const iv = Buffer.from(encrypted.iv, "base64");
+  // Use a freshly allocated Uint8Array so the IV is typed as
+  // `Uint8Array<ArrayBuffer>` (a valid `BufferSource`) rather than a
+  // Node `Buffer` whose `.buffer` is `ArrayBufferLike` (which TS rejects
+  // when WebCrypto expects a strict `ArrayBuffer`-backed view).
+  const ivBytes = Buffer.from(encrypted.iv, "base64");
+  const iv = new Uint8Array(ivBytes.length);
+  iv.set(ivBytes);
   const ciphertext = Buffer.from(encrypted.ciphertext, "base64");
   const tag = Buffer.from(encrypted.tag, "base64");
   const iterations = encrypted.iterations || 310000;
@@ -120,7 +126,11 @@ describe("MindooDB Example Server", () => {
   let baseUrl: string;
   let systemAdmin: PrivateUserId;
   let systemAdminToken: string;
-  const testPort = 3099;
+  // Port 0 asks the OS for a free ephemeral port. Hardcoded ports collide
+  // with other Jest workers, parallel local dev servers, or sockets stuck
+  // in TIME_WAIT from a previous run, which then surfaces as a hung
+  // beforeAll (the listen callback never fires) and a wall of unrelated
+  // test failures.
   const testDataDir = `/tmp/mindoodb-test-${Date.now()}`;
 
   // Test keys
@@ -200,14 +210,22 @@ describe("MindooDB Example Server", () => {
       "utf-8",
     );
     server = new MindooDBServer(testDataDir, "test-password", undefined, config);
-    baseUrl = `http://localhost:${testPort}`;
 
-    // Start server
-    await new Promise<void>((resolve) => {
-      httpServer = server.getApp().listen(testPort, () => {
-        console.log(`Test server started on port ${testPort}`);
+    // Start server on an OS-assigned port; reject the promise on bind
+    // errors so we surface EADDRINUSE-style failures immediately instead
+    // of timing out the hook.
+    await new Promise<void>((resolve, reject) => {
+      httpServer = server.getApp().listen(0, () => {
+        const address = httpServer.address();
+        if (!address || typeof address === "string") {
+          reject(new Error("Failed to determine test server port"));
+          return;
+        }
+        baseUrl = `http://127.0.0.1:${address.port}`;
+        console.log(`Test server started on port ${address.port}`);
         resolve();
       });
+      httpServer.on("error", reject);
     });
 
     // Get a system admin JWT for tests that need it
@@ -579,8 +597,8 @@ describe("MindooDB Example Server", () => {
       // Isolate this scenario in its own server instance/data dir so it can
       // control bootstrap state without affecting other tests.
       const isolatedDataDir = `/tmp/mindoodb-bootstrap-${Date.now()}`;
-      const isolatedPort = 3107;
-      const isolatedBaseUrl = `http://localhost:${isolatedPort}`;
+      // See note on port allocation in the top-level describe block.
+      let isolatedBaseUrl = "";
       const isolatedServerPassword = "server-bootstrap-pass";
       const isolatedServerUsername = "CN=server-bootstrap";
 
@@ -620,8 +638,17 @@ describe("MindooDB Example Server", () => {
         undefined,
         isolatedConfig,
       );
-      const isolatedHttpServer = await new Promise<Server>((resolve) => {
-        const s = isolatedServer.getApp().listen(isolatedPort, () => resolve(s));
+      const isolatedHttpServer = await new Promise<Server>((resolve, reject) => {
+        const s = isolatedServer.getApp().listen(0, () => {
+          const address = s.address();
+          if (!address || typeof address === "string") {
+            reject(new Error("Failed to determine isolated test server port"));
+            return;
+          }
+          isolatedBaseUrl = `http://127.0.0.1:${address.port}`;
+          resolve(s);
+        });
+        s.on("error", reject);
       });
 
       try {
@@ -897,7 +924,7 @@ describe("Server Network Management", () => {
   let factory: BaseMindooTenantFactory;
   let systemAdmin: PrivateUserId;
   let systemAdminToken: string;
-  const testPort = 3097;
+  // See note on port allocation in the first describe block above.
   const testDataDir = `/tmp/mindoodb-network-test-${Date.now()}`;
 
   beforeAll(async () => {
@@ -936,10 +963,18 @@ describe("Server Network Management", () => {
     };
 
     server = new MindooDBServer(testDataDir, "test-password", undefined, config);
-    baseUrl = `http://localhost:${testPort}`;
 
-    await new Promise<void>((resolve) => {
-      httpServer = server.getApp().listen(testPort, () => resolve());
+    await new Promise<void>((resolve, reject) => {
+      httpServer = server.getApp().listen(0, () => {
+        const address = httpServer.address();
+        if (!address || typeof address === "string") {
+          reject(new Error("Failed to determine test server port"));
+          return;
+        }
+        baseUrl = `http://127.0.0.1:${address.port}`;
+        resolve();
+      });
+      httpServer.on("error", reject);
     });
 
     systemAdminToken = await getSystemAdminToken(
