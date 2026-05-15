@@ -5,9 +5,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
-# Note: package-lock.json should be committed for npm projects
+# Note: Using pnpm; package-lock.json and yarn.lock should never appear in this repo.
+package-lock.json
 yarn.lock
-pnpm-lock.yaml
 
 # TypeScript
 *.tsbuildinfo
