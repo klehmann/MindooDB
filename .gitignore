@@ -8,14 +8,18 @@ lerna-debug.log*
 # Note: Using pnpm; package-lock.json and yarn.lock should never appear in this repo.
 package-lock.json
 yarn.lock
+kl_npminstall.sh
+README-dev.md
 
 # TypeScript
 *.tsbuildinfo
 *.js.map
+.cursor/
 dist/
 build/
 lib/
 out/
+docs-local/
 *.js
 !*.config.js
 
