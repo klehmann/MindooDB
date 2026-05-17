@@ -264,8 +264,30 @@ export interface ApproveJoinRequestOptions {
   serverUrl?: string;
   /** Optional admin username to include in the response so the joining user can display it */
   adminUsername?: string;
+  /**
+   * Optional document key ids to share with the joining user.
+   *
+   * `$publicinfos` is always included because it is required for directory
+   * access. When this option is omitted, the response includes the historical
+   * default set: `$publicinfos` and `default`.
+   */
+  sharedDocKeyIds?: string[];
   /** If "uri", approveJoinRequest returns a mdb://join-response/... URI string instead of an object */
   format?: "object" | "uri";
+}
+
+export interface JoinResponseEncryptedDocKeyVersion {
+  /** Original KeyBag creation timestamp for this key version, used for rotation ordering. */
+  createdAt?: number;
+  /** Symmetric document key version encrypted with the shared password. */
+  encryptedKey: EncryptedPrivateKey;
+}
+
+export interface JoinResponseEncryptedDocKey {
+  /** Logical document key id within the tenant, e.g. "$publicinfos", "default", or a named key. */
+  keyId: string;
+  /** Encrypted key versions, sorted newest first by createdAt when timestamps are available. */
+  versions: JoinResponseEncryptedDocKeyVersion[];
 }
 
 /**
@@ -276,8 +298,8 @@ export interface ApproveJoinRequestOptions {
  * The encrypted keys can only be unlocked with the sharePassword communicated separately.
  */
 export interface JoinResponse {
-  /** Protocol version (always 1 for now) */
-  v: 1;
+  /** Protocol version. v2 carries versioned document-key bundles. */
+  v: 2;
   /** Tenant identifier */
   tenantId: string;
   /** Admin's public signing key (Ed25519, PEM) — needed to open the tenant */
@@ -288,10 +310,8 @@ export interface JoinResponse {
   serverUrl?: string;
   /** Optional admin username for display purposes */
   adminUsername?: string;
-  /** Tenant symmetric key, encrypted with the sharePassword */
-  encryptedTenantKey: EncryptedPrivateKey;
-  /** $publicinfos symmetric key, encrypted with the sharePassword */
-  encryptedPublicInfosKey: EncryptedPrivateKey;
+  /** Selected tenant document keys, encrypted with the sharePassword. */
+  encryptedDocKeys: JoinResponseEncryptedDocKey[];
 }
 
 /**
@@ -317,7 +337,7 @@ export interface JoinTenantOptions {
   /**
    * Optional pre-existing {@link KeyBag} to extend with the joined tenant's
    * keys. When supplied, `joinTenant` will mutate this bag in place (adding
-   * the joined tenant's `default` and `$publicinfos` doc keys) and return
+   * the joined tenant's shared document keys) and return
    * the same instance in {@link JoinTenantResult.keyBag}. The caller is
    * then responsible for persisting the bag once.
    *
@@ -672,7 +692,7 @@ export interface MindooTenant {
    * This orchestrates:
    * 1. Parsing the join request (object or mdb:// URI string)
    * 2. Registering the user in the tenant directory
-   * 3. Exporting the tenant key and $publicinfos key, encrypted with the sharePassword
+   * 3. Exporting selected document keys, encrypted with the sharePassword
    * 4. Packaging everything into a JoinResponse
    *
    * @param joinRequest A JoinRequest object or a mdb://join-request/... URI string

@@ -23,6 +23,7 @@ import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbk
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
+import { validateTenantId } from "./tenantIdValidation";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 
 /**
@@ -407,11 +408,12 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
    * Create a new tenant with a single call.
    */
   async createTenant(options: CreateTenantOptions): Promise<CreateTenantResult> {
-    this.logger.info(`Creating tenant: ${options.tenantId}`);
+    const tenantId = validateTenantId(options.tenantId);
+    this.logger.info(`Creating tenant: ${tenantId}`);
     const hasExistingUsers = "adminUser" in options;
     const adminLabel = hasExistingUsers ? options.adminUser.username : options.adminName;
     const userLabel = hasExistingUsers ? options.appUser.username : options.userName;
-    console.log(`[createTenant] Creating tenant "${options.tenantId}" with admin "${adminLabel}" and user "${userLabel}"`);
+    console.log(`[createTenant] Creating tenant "${tenantId}" with admin "${adminLabel}" and user "${userLabel}"`);
 
     // 1. Create or reuse admin and app user identities
     const adminUser = hasExistingUsers
@@ -431,12 +433,12 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       this.cryptoAdapter,
       this.logger.createChild("KeyBag")
     );
-    await keyBag.createDocKey(options.tenantId, DEFAULT_TENANT_KEY_ID);
-    await keyBag.createDocKey(options.tenantId, PUBLIC_INFOS_KEY_ID);
+    await keyBag.createDocKey(tenantId, DEFAULT_TENANT_KEY_ID);
+    await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
 
     // 3. Open tenant
     const tenant = await this.openTenant(
-      options.tenantId,
+      tenantId,
       adminUser.userSigningKeyPair.publicKey,
       adminUser.userEncryptionKeyPair.publicKey,
       appUser,
@@ -453,8 +455,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       options.adminPassword
     );
 
-    console.log(`[createTenant] ✓ Tenant "${options.tenantId}" created successfully`);
-    this.logger.info(`Tenant "${options.tenantId}" created successfully`);
+    console.log(`[createTenant] ✓ Tenant "${tenantId}" created successfully`);
+    this.logger.info(`Tenant "${tenantId}" created successfully`);
 
     return { tenant, adminUser, appUser, keyBag };
   }
@@ -513,25 +515,37 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       this.logger.createChild("KeyBag")
     );
 
-    // 2. Import the encrypted tenant key
-    await keyBag.decryptAndImportKey(
-      "doc",
-      response.tenantId,
-      DEFAULT_TENANT_KEY_ID,
-      response.encryptedTenantKey,
-      options.sharePassword
-    );
+    if (response.v !== 2 || !Array.isArray(response.encryptedDocKeys)) {
+      throw new Error("Invalid join response: expected a v2 encryptedDocKeys payload");
+    }
 
-    // 3. Import the encrypted $publicinfos key
-    await keyBag.decryptAndImportKey(
-      "doc",
-      response.tenantId,
-      PUBLIC_INFOS_KEY_ID,
-      response.encryptedPublicInfosKey,
-      options.sharePassword
-    );
+    if (!response.encryptedDocKeys.some((entry) => entry.keyId === PUBLIC_INFOS_KEY_ID)) {
+      throw new Error(`Invalid join response: missing required "${PUBLIC_INFOS_KEY_ID}" document key`);
+    }
 
-    // 4. Open the tenant
+    // 2. Import all encrypted document key versions from the join response.
+    // Preserve the version timestamps so key rotation ordering remains stable
+    // in the recipient's KeyBag.
+    for (const entry of response.encryptedDocKeys) {
+      if (!entry.keyId || !Array.isArray(entry.versions) || entry.versions.length === 0) {
+        throw new Error("Invalid join response: encryptedDocKeys entries must include a keyId and versions");
+      }
+
+      for (const version of entry.versions) {
+        await keyBag.decryptAndImportKey(
+          "doc",
+          response.tenantId,
+          entry.keyId,
+          {
+            ...version.encryptedKey,
+            createdAt: version.createdAt ?? version.encryptedKey.createdAt,
+          },
+          options.sharePassword
+        );
+      }
+    }
+
+    // 3. Open the tenant
     const tenant = await this.openTenant(
       response.tenantId,
       response.adminSigningPublicKey,

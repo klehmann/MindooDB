@@ -13,6 +13,10 @@ import type {
   JoinResponse,
   CreateTenantResult,
 } from "../core/types";
+import {
+  DEFAULT_TENANT_KEY_ID,
+  PUBLIC_INFOS_KEY_ID,
+} from "../core/types";
 import type { PrivateUserId } from "../core/userid";
 
 describe("Join Flow (convenience API)", () => {
@@ -27,6 +31,10 @@ describe("Join Flow (convenience API)", () => {
   const user2Name = "cn=bob/o=acme";
   const user2Password = "bob-pass-456";
   const sharePassword = "shared-secret-789";
+
+  function getDocKeyBundle(response: JoinResponse, keyId: string) {
+    return response.encryptedDocKeys.find((entry) => entry.keyId === keyId);
+  }
 
   beforeAll(() => {
     storeFactory = new InMemoryContentAddressedStoreFactory();
@@ -60,6 +68,20 @@ describe("Join Flow (convenience API)", () => {
       const keys = await directory.getUserPublicKeys(user1Name);
       expect(keys).not.toBeNull();
       expect(keys!.signingPublicKey).toBe(result.appUser.userSigningKeyPair.publicKey);
+    }, 30000);
+
+    it("should reject tenant ids that do not match server tenant id rules", async () => {
+      await expect(
+        factory.createTenant({
+          tenantId: "Acme.Corp",
+          adminName,
+          adminPassword,
+          userName: user1Name,
+          userPassword: user1Password,
+        }),
+      ).rejects.toThrow(
+        /tenantId must start with a letter or digit and contain only lowercase letters, digits, hyphens, and underscores/,
+      );
     }, 30000);
   });
 
@@ -137,7 +159,7 @@ describe("Join Flow (convenience API)", () => {
     }, 120000);
 
     it("should produce a valid JoinResponse", () => {
-      expect(joinResponse.v).toBe(1);
+      expect(joinResponse.v).toBe(2);
       expect(joinResponse.tenantId).toBe("test-join-obj");
       expect(joinResponse.adminSigningPublicKey).toBe(
         adminResult.adminUser.userSigningKeyPair.publicKey
@@ -145,8 +167,8 @@ describe("Join Flow (convenience API)", () => {
       expect(joinResponse.adminEncryptionPublicKey).toBe(
         adminResult.adminUser.userEncryptionKeyPair.publicKey
       );
-      expect(joinResponse.encryptedTenantKey).toBeDefined();
-      expect(joinResponse.encryptedPublicInfosKey).toBeDefined();
+      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)?.versions).toHaveLength(1);
+      expect(getDocKeyBundle(joinResponse, PUBLIC_INFOS_KEY_ID)?.versions).toHaveLength(1);
     });
 
     it("should register user2 in the directory", async () => {
@@ -155,6 +177,57 @@ describe("Join Flow (convenience API)", () => {
       expect(keys).not.toBeNull();
       expect(keys!.signingPublicKey).toBe(user2.userSigningKeyPair.publicKey);
     });
+  });
+
+  describe("join response shared document keys", () => {
+    it("should export all versions for selected key ids and omit unselected default", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+      const localTenantId = "test-join-selected-keys";
+      const namedKeyId = "finance";
+      const olderCreatedAt = 1000;
+      const newerCreatedAt = 2000;
+
+      const adminResult = await localFactory.createTenant({
+        tenantId: localTenantId,
+        adminName: `cn=admin/o=${localTenantId}`,
+        adminPassword,
+        userName: `cn=alice/o=${localTenantId}`,
+        userPassword: user1Password,
+      });
+      await adminResult.keyBag.createDocKey(localTenantId, namedKeyId, olderCreatedAt);
+      await adminResult.keyBag.createDocKey(localTenantId, namedKeyId, newerCreatedAt);
+
+      const user2 = await localFactory.createUserId(`cn=bob/o=${localTenantId}`, user2Password);
+      const joinRequest = localFactory.createJoinRequest(user2);
+      const joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
+        adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+        sharePassword,
+        sharedDocKeyIds: [namedKeyId],
+      });
+
+      expect(getDocKeyBundle(joinResponse, PUBLIC_INFOS_KEY_ID)?.versions).toHaveLength(1);
+      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)).toBeUndefined();
+      expect(getDocKeyBundle(joinResponse, namedKeyId)?.versions.map((version) => version.createdAt)).toEqual([
+        newerCreatedAt,
+        olderCreatedAt,
+      ]);
+
+      const joinResult = await localFactory.joinTenant(joinResponse, {
+        user: user2,
+        password: user2Password,
+        sharePassword,
+      });
+      const importedDetails = await joinResult.keyBag.listKeyDetails();
+      const importedNamedVersions = importedDetails
+        .filter((detail) => detail.scopedKeyId === `doc:${localTenantId}:${namedKeyId}`)
+        .map((detail) => detail.createdAt);
+
+      expect(importedDetails.some((detail) => detail.scopedKeyId === `doc:${localTenantId}:${PUBLIC_INFOS_KEY_ID}`)).toBe(true);
+      expect(importedDetails.some((detail) => detail.scopedKeyId === `doc:${localTenantId}:${DEFAULT_TENANT_KEY_ID}`)).toBe(false);
+      expect(importedNamedVersions).toEqual([newerCreatedAt, olderCreatedAt]);
+    }, 120000);
   });
 
   describe("full join flow (URI format)", () => {

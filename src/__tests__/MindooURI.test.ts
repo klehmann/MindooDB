@@ -19,12 +19,30 @@ describe("MindooURI", () => {
 
     it("should encode a join-response payload", () => {
       const payload = {
-        v: 1,
+        v: 2,
         tenantId: "acme",
         adminSigningPublicKey: "pk1",
         adminEncryptionPublicKey: "pk2",
-        encryptedTenantKey: { ciphertext: "ct", iv: "iv", tag: "tag", salt: "s", iterations: 100000 },
-        encryptedPublicInfosKey: { ciphertext: "ct2", iv: "iv2", tag: "tag2", salt: "s2", iterations: 100000 },
+        encryptedDocKeys: [
+          {
+            keyId: "$publicinfos",
+            versions: [
+              {
+                createdAt: 2,
+                encryptedKey: { ciphertext: "ct2", iv: "iv2", tag: "tag2", salt: "s2", iterations: 100000 },
+              },
+            ],
+          },
+          {
+            keyId: "default",
+            versions: [
+              {
+                createdAt: 1,
+                encryptedKey: { ciphertext: "ct", iv: "iv", tag: "tag", salt: "s", iterations: 100000 },
+              },
+            ],
+          },
+        ],
       };
 
       const uri = encodeMindooURI("join-response", payload);
@@ -75,20 +93,29 @@ describe("MindooURI", () => {
 
     it("should roundtrip a join-response", () => {
       const payload = {
-        v: 1,
+        v: 2,
         tenantId: "acme",
         adminSigningPublicKey: "pk1",
         adminEncryptionPublicKey: "pk2",
         serverUrl: "https://sync.acme.com",
-        encryptedTenantKey: { ciphertext: "ct", iv: "iv", tag: "tag", salt: "s", iterations: 100000 },
-        encryptedPublicInfosKey: { ciphertext: "ct2", iv: "iv2", tag: "tag2", salt: "s2", iterations: 100000 },
+        encryptedDocKeys: [
+          {
+            keyId: "$publicinfos",
+            versions: [
+              {
+                createdAt: 2,
+                encryptedKey: { ciphertext: "ct2", iv: "iv2", tag: "tag2", salt: "s2", iterations: 100000 },
+              },
+            ],
+          },
+        ],
       };
 
       const uri = encodeMindooURI("join-response", payload);
       const decoded = decodeMindooURI(uri);
 
       expect(decoded.type).toBe("join-response");
-      expect(decoded.version).toBe(1);
+      expect(decoded.version).toBe(2);
       expect(decoded.payload).toEqual(payload);
     });
 
@@ -150,8 +177,16 @@ describe("MindooURI", () => {
 
     it("should return true for valid join-response URI", () => {
       const uri = encodeMindooURI("join-response", {
-        v: 1, tenantId: "acme", adminSigningPublicKey: "pk1", adminEncryptionPublicKey: "pk2",
-        encryptedTenantKey: {}, encryptedPublicInfosKey: {},
+        v: 2,
+        tenantId: "acme",
+        adminSigningPublicKey: "pk1",
+        adminEncryptionPublicKey: "pk2",
+        encryptedDocKeys: [
+          {
+            keyId: "$publicinfos",
+            versions: [{ encryptedKey: {} }],
+          },
+        ],
       });
       expect(isMindooURI(uri)).toBe(true);
     });
