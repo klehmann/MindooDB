@@ -6,6 +6,10 @@
  */
 
 import { getDatabaseIdValidationError } from "../../core/databaseIdValidation";
+import {
+  getTenantIdValidationError,
+  RESERVED_TENANT_NAMES,
+} from "../../core/tenantIdValidation";
 
 /**
  * Validates an identifier (dbId, serverName, etc.).
@@ -71,29 +75,17 @@ export function validateStringLength(value: unknown, maxLength: number, fieldNam
 }
 
 /**
- * Tenant IDs that are reserved because they collide with server route prefixes.
- */
-export const RESERVED_TENANT_NAMES = new Set(["admin", "system", "health", "statics"]);
-
-/**
  * Validates tenant ID syntax without checking reserved route names.
  */
 export function validateTenantIdFormat(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new ValidationError("tenantId is required and must be a non-empty string");
+  const error = getTenantIdValidationError(value, "tenantId", {
+    allowReserved: true,
+  });
+  if (error) {
+    throw new ValidationError(error);
   }
 
-  if (value.length > 64) {
-    throw new ValidationError("tenantId must be at most 64 characters");
-  }
-
-  if (!/^[a-z0-9][a-z0-9_-]*$/.test(value)) {
-    throw new ValidationError(
-      "tenantId must start with a letter or digit and contain only lowercase letters, digits, hyphens, and underscores",
-    );
-  }
-
-  return value;
+  return value as string;
 }
 
 /**

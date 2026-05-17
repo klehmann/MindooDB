@@ -12,6 +12,8 @@ import {
   SigningKeyPair,
   JoinRequest,
   JoinResponse,
+  JoinResponseEncryptedDocKey,
+  JoinResponseEncryptedDocKeyVersion,
   ApproveJoinRequestOptions,
   DEFAULT_TENANT_KEY_ID,
   PublishToServerOptions,
@@ -766,6 +768,68 @@ export class BaseMindooTenant implements MindooTenant {
     return new MindooDocSigner(this, signKey, signerLogger);
   }
 
+  private async exportJoinResponseDocKeyVersions(
+    keyId: string,
+    sharePassword: string
+  ): Promise<JoinResponseEncryptedDocKey> {
+    const scopedKeyId = `doc:${this.tenantId}:${keyId}`;
+    const details = (await this.keyBag.listKeyDetails())
+      .filter((detail) => detail.scopedKeyId === scopedKeyId)
+      .sort((a, b) => a.versionIndex - b.versionIndex);
+
+    if (details.length === 0) {
+      throw new Error(`Failed to export document key "${keyId}" for tenant "${this.tenantId}"`);
+    }
+
+    const versions: JoinResponseEncryptedDocKeyVersion[] = [];
+    for (const detail of details) {
+      const encryptedKey = await this.keyBag.encryptAndExportKeyVersion(
+        "doc",
+        this.tenantId,
+        keyId,
+        detail.versionIndex,
+        sharePassword
+      );
+      if (!encryptedKey) {
+        throw new Error(
+          `Failed to export document key "${keyId}" version ${detail.versionIndex} for tenant "${this.tenantId}"`
+        );
+      }
+
+      const { createdAt: encryptedKeyCreatedAt, ...encryptedKeyPayload } = encryptedKey;
+      versions.push({
+        createdAt: detail.createdAt ?? encryptedKeyCreatedAt,
+        encryptedKey: encryptedKeyPayload,
+      });
+    }
+
+    return { keyId, versions };
+  }
+
+  private resolveJoinResponseDocKeyIds(options: ApproveJoinRequestOptions): string[] {
+    const requestedKeyIds = options.sharedDocKeyIds ?? [PUBLIC_INFOS_KEY_ID, DEFAULT_TENANT_KEY_ID];
+    const keyIds = new Set<string>();
+    keyIds.add(PUBLIC_INFOS_KEY_ID);
+
+    for (const keyId of requestedKeyIds) {
+      const normalizedKeyId = keyId.trim();
+      if (normalizedKeyId) {
+        keyIds.add(normalizedKeyId);
+      }
+    }
+
+    return [
+      PUBLIC_INFOS_KEY_ID,
+      ...Array.from(keyIds)
+        .filter((keyId) => keyId !== PUBLIC_INFOS_KEY_ID)
+        .sort((a, b) => {
+          if (a === DEFAULT_TENANT_KEY_ID) return -1;
+          if (b === DEFAULT_TENANT_KEY_ID) return 1;
+          return a.localeCompare(b);
+        }),
+    ];
+  }
+
   // ==================== Convenience Methods ====================
 
   /**
@@ -805,36 +869,22 @@ export class BaseMindooTenant implements MindooTenant {
       options.adminPassword
     );
 
-    // 2. Export the tenant key encrypted with the share password
-    const encryptedTenantKey = await this.keyBag.encryptAndExportKey(
-      "doc",
-      this.tenantId,
-      DEFAULT_TENANT_KEY_ID,
-      options.sharePassword
+    // 2. Export selected document keys encrypted with the share password.
+    // `$publicinfos` is mandatory because the joining user needs it for
+    // directory access; all selected key ids include every rotated version.
+    const encryptedDocKeys = await Promise.all(
+      this.resolveJoinResponseDocKeyIds(options).map((keyId) =>
+        this.exportJoinResponseDocKeyVersions(keyId, options.sharePassword)
+      )
     );
-    if (!encryptedTenantKey) {
-      throw new Error(`Failed to export tenant key for tenant "${this.tenantId}"`);
-    }
 
-    // 3. Export the $publicinfos key encrypted with the share password
-    const encryptedPublicInfosKey = await this.keyBag.encryptAndExportKey(
-      "doc",
-      this.tenantId,
-      PUBLIC_INFOS_KEY_ID,
-      options.sharePassword
-    );
-    if (!encryptedPublicInfosKey) {
-      throw new Error(`Failed to export $publicinfos key`);
-    }
-
-    // 4. Build the join response
+    // 3. Build the join response
     const joinResponse: JoinResponse = {
-      v: 1,
+      v: 2,
       tenantId: this.tenantId,
       adminSigningPublicKey: this.administrationPublicKey,
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
-      encryptedTenantKey,
-      encryptedPublicInfosKey,
+      encryptedDocKeys,
     };
 
     if (options.serverUrl) {
