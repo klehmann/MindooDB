@@ -84,6 +84,54 @@ describe("applyJsonPatch", () => {
     expect(result.heads.length).toBeGreaterThan(0);
   }, 30000);
 
+  it("creates the target array when listInsert points at a missing field", async () => {
+    // Reproduces the TeamGrid scenario where a legacy worksheet document
+    // pre-dates the `chartOrder` schema field. The in-memory clone has
+    // been migrated to include `chartOrder: []`, but the persisted
+    // Automerge document never had it. A `listInsert` against that field
+    // must create the array on the fly rather than throwing
+    // "Cannot apply JSON list operation to non-array value".
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (draft) => {
+      draft.getData().teamgrid = {
+        workbook: {
+          worksheetsById: {
+            sheet_1: {
+              rowOrder: ["row_1"],
+            },
+          },
+        },
+      };
+    });
+    const baseHeads = doc.getHeads();
+
+    const result = await db.applyJsonPatch(doc, {
+      baseHeads,
+      listInsert: [{
+        path: ["teamgrid", "workbook", "worksheetsById", "sheet_1", "chartOrder"],
+        index: 0,
+        values: ["chart_1"],
+      }],
+    });
+
+    expect(
+      ((result.data.teamgrid as any).workbook.worksheetsById.sheet_1.chartOrder as string[]),
+    ).toEqual(["chart_1"]);
+  }, 30000);
+
+  it("rejects listInsert when the target path resolves to a non-array value", async () => {
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (draft) => {
+      draft.getData().subject = "Has a string here";
+    });
+    const baseHeads = doc.getHeads();
+
+    await expect(db.applyJsonPatch(doc, {
+      baseHeads,
+      listInsert: [{ path: ["subject"], index: 0, values: ["nope"] }],
+    })).rejects.toThrow(/non-array value/);
+  }, 30000);
+
   it("merges two stale-head list inserts into the same order array", async () => {
     const doc = await db.createDocument();
     await db.changeDoc(doc, (draft) => {
