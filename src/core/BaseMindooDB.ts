@@ -5394,7 +5394,7 @@ export class BaseMindooDB implements MindooDB {
       list.splice(operation.index, operation.deleteCount);
     }
     for (const operation of patch.listInsert ?? []) {
-      const list = this.readJsonListAtPath(automergeDoc, operation.path);
+      const list = this.ensureJsonListAtPath(automergeDoc, operation.path);
       list.splice(operation.index, 0, ...structuredClone(operation.values));
     }
   }
@@ -5418,6 +5418,41 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`Cannot apply JSON list operation to non-array value at '${path.map(String).join(".")}'`);
     }
     return value;
+  }
+
+  /**
+   * Like {@link readJsonListAtPath} but creates the array (and any missing
+   * intermediate parents) when the path does not yet resolve to a list.
+   *
+   * Used by `listInsert` so an insert into a previously-unset field — e.g.
+   * the first chart on a TeamGrid worksheet whose underlying Automerge
+   * document predates the chart schema — initializes the list rather than
+   * failing. Mirrors how `setJsonValueAtPath` already auto-creates missing
+   * intermediate parents via `ensureJsonParentAtPath`.
+   *
+   * Existing non-array values still throw: silently overwriting a string
+   * or object with `[]` would mask real schema bugs.
+   */
+  private ensureJsonListAtPath(target: MindooDocPayload, path: Array<string | number>): unknown[] {
+    const parent = this.ensureJsonParentAtPath(target, path);
+    const leaf = path[path.length - 1];
+    const existing = parent[leaf];
+    if (existing === undefined || existing === null) {
+      // Assign through the proxy first so Automerge installs a tracked
+      // list, then re-read it so the splice below mutates the
+      // Automerge-managed array rather than the local literal (the local
+      // literal would be detached and the change would be lost).
+      parent[leaf] = [];
+      const tracked = parent[leaf];
+      if (!Array.isArray(tracked)) {
+        throw new Error(`Failed to initialize JSON list at '${path.map(String).join(".")}'`);
+      }
+      return tracked;
+    }
+    if (!Array.isArray(existing)) {
+      throw new Error(`Cannot apply JSON list operation to non-array value at '${path.map(String).join(".")}'`);
+    }
+    return existing;
   }
 
   private ensureJsonParentAtPath(target: MindooDocPayload, path: Array<string | number>): Record<string | number, unknown> {
