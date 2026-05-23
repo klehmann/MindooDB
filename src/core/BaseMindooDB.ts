@@ -54,6 +54,10 @@ import {
   MindooTextEdit,
   MindooJsonPatch,
   MindooJsonPatchResult,
+  MindooRichTextPatch,
+  MindooRichTextPatchResult,
+  MindooRichTextSnapshot,
+  MindooRichTextSpan,
   MindooTextPatch,
   MindooTextPatchResult,
   WarmerScheduler,
@@ -322,6 +326,7 @@ export class BaseMindooDB implements MindooDB {
   
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
+  private wrappedInternalDocs: WeakMap<MindooDoc, InternalDoc> = new WeakMap();
   private readonly maxCachedDocs: number;
   private readonly iteratePrefetchWindowDocs: number;
   private readonly cacheRestoreLimit: number;
@@ -4863,6 +4868,109 @@ export class BaseMindooDB implements MindooDB {
     };
   }
 
+  async applyRichTextPatch(doc: MindooDoc, patch: MindooRichTextPatch): Promise<MindooRichTextPatchResult> {
+    this.assertWritable("applyRichTextPatch");
+    const docId = doc.getId();
+    this.logger.debug(`===== applyRichTextPatch called for document ${docId} =====`);
+
+    if (this._isAdminOnlyDb) {
+      const adminPublicKey = this.getAdminPublicKey();
+      const currentUser = await this.tenant.getCurrentUserId();
+      if (currentUser.userSigningPublicKey !== adminPublicKey) {
+        throw new Error("Admin-only database: only the admin key can modify data");
+      }
+    }
+
+    let internalDoc = this.getCachedDocument(docId);
+    if (!internalDoc) {
+      const loadedDoc = await this.loadDocumentInternal(docId);
+      if (!loadedDoc) {
+        throw new Error(`Document ${docId} not found`);
+      }
+      internalDoc = loadedDoc;
+    }
+
+    if (internalDoc.isDeleted) {
+      throw new Error(`Document ${docId} has been deleted`);
+    }
+
+    this.validateRichTextPatch(patch);
+    const now = Date.now();
+    const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
+    const applySpans = (automergeDoc: MindooDocPayload) => {
+      this.ensureRichTextPath(automergeDoc, patch.path);
+      (Automerge as any).updateSpans(
+        automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+        patch.path as AutomergeTypes.Prop[],
+        this.reviveRichTextSpans(patch.spans),
+        patch.updateSpansConfig,
+      );
+      automergeDoc._lastModified = now;
+    };
+
+    let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    try {
+      if (patch.baseHeads && patch.baseHeads.length > 0) {
+        const result = Automerge.changeAt(
+          internalDoc.doc,
+          patch.baseHeads as AutomergeTypes.Heads,
+          applySpans,
+        );
+        newDoc = result.newDoc as AutomergeTypes.Doc<MindooDocPayload>;
+      } else {
+        newDoc = Automerge.change(internalDoc.doc, applySpans);
+      }
+      this.logger.debug(`Successfully applied rich-text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+    } catch (error) {
+      this.logger.error(`Error applying rich-text patch for document ${docId}:`, error);
+      throw error;
+    }
+
+    await this.persistDocumentChange({
+      internalDoc,
+      newDoc,
+      now,
+      headsBeforeChange,
+      useCustomKey: false,
+      successMessage: "rich text patched",
+    });
+
+    const wrapped = this.wrapDocument(internalDoc);
+    return {
+      doc: wrapped,
+      heads: wrapped.getHeads(),
+      data: wrapped.getData(),
+    };
+  }
+
+  async getRichTextSnapshot(doc: MindooDoc, path: Array<string | number>): Promise<MindooRichTextSnapshot> {
+    const docId = doc.getId();
+    this.validateJsonPath(path, "Rich-text snapshot");
+    let internalDoc = this.wrappedInternalDocs.get(doc) ?? null;
+    if (!internalDoc) {
+      internalDoc = this.getCachedDocument(docId);
+    }
+    if (!internalDoc) {
+      const loadedDoc = await this.loadDocumentInternal(docId);
+      if (!loadedDoc) {
+        throw new Error(`Document ${docId} not found`);
+      }
+      internalDoc = loadedDoc;
+    }
+    if (internalDoc.isDeleted) {
+      throw new Error(`Document ${docId} has been deleted`);
+    }
+    const spans = (Automerge as any).spans(
+      internalDoc.doc as AutomergeTypes.Doc<MindooDocPayload>,
+      path as AutomergeTypes.Prop[],
+    ) as unknown[];
+    return {
+      path: [...path],
+      heads: Automerge.getHeads(internalDoc.doc),
+      spans: this.dehydrateRichTextSpans(spans),
+    };
+  }
+
   async applyJsonPatch(doc: MindooDoc, patch: MindooJsonPatch): Promise<MindooJsonPatchResult> {
     this.assertWritable("applyJsonPatch");
     const docId = doc.getId();
@@ -5371,6 +5479,31 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  private validateRichTextPatch(patch: MindooRichTextPatch): void {
+    this.validateJsonPath(patch.path, "Rich-text patch");
+    if (!Array.isArray(patch.spans)) {
+      throw new Error("Rich-text patch spans must be an array");
+    }
+    for (const span of patch.spans) {
+      if (!span || typeof span !== "object") {
+        throw new Error("Rich-text span must be an object");
+      }
+      if (span.type === "text") {
+        if (typeof span.value !== "string") {
+          throw new Error("Rich-text text span value must be a string");
+        }
+        continue;
+      }
+      if (span.type === "block") {
+        if (!span.value || typeof span.value !== "object" || Array.isArray(span.value)) {
+          throw new Error("Rich-text block span value must be an object");
+        }
+        continue;
+      }
+      throw new Error("Rich-text span type must be 'text' or 'block'");
+    }
+  }
+
   private validateJsonPath(path: Array<string | number>, label: string): void {
     if (!Array.isArray(path) || path.length === 0) {
       throw new Error(`${label} path must contain at least one segment`);
@@ -5380,6 +5513,82 @@ export class BaseMindooDB implements MindooDB {
         throw new Error(`${label} path segments must be strings or numbers`);
       }
     }
+  }
+
+  private reviveRichTextSpans(spans: MindooRichTextSpan[]): unknown[] {
+    return spans.map((span) => {
+      if (span.type === "text") {
+        return {
+          type: "text",
+          value: span.value,
+          marks: span.marks ? this.reviveRichTextValue(span.marks) : undefined,
+        };
+      }
+      return {
+        type: "block",
+        value: this.reviveRichTextValue(span.value),
+      };
+    });
+  }
+
+  private reviveRichTextValue(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.reviveRichTextValue(entry));
+    }
+    if (!value || typeof value !== "object") {
+      return value;
+    }
+    const record = value as Record<string, unknown>;
+    if (record.type === "immutableString" && typeof record.value === "string") {
+      return new (Automerge as any).ImmutableString(record.value);
+    }
+    return Object.fromEntries(
+      Object.entries(record).map(([key, entry]) => [
+        key,
+        this.reviveRichTextValue(entry),
+      ]),
+    );
+  }
+
+  private dehydrateRichTextSpans(spans: unknown[]): MindooRichTextSpan[] {
+    return spans.map((span) => {
+      const record = span as { type?: unknown; value?: unknown; marks?: unknown };
+      if (record.type === "text") {
+        return {
+          type: "text",
+          value: typeof record.value === "string" ? record.value : "",
+          marks: record.marks
+            ? this.dehydrateRichTextValue(record.marks) as Record<string, any>
+            : undefined,
+        };
+      }
+      return {
+        type: "block",
+        value: this.dehydrateRichTextValue(record.value) as Record<string, any>,
+      };
+    });
+  }
+
+  private dehydrateRichTextValue(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.dehydrateRichTextValue(entry));
+    }
+    if (!value || typeof value !== "object") {
+      return value;
+    }
+    if ((Automerge as any).isImmutableString?.(value)) {
+      return {
+        type: "immutableString",
+        value: String(value),
+      };
+    }
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(record).map(([key, entry]) => [
+        key,
+        this.dehydrateRichTextValue(entry),
+      ]),
+    );
   }
 
   private applyJsonPatchOperations(automergeDoc: MindooDocPayload, patch: MindooJsonPatch): void {
@@ -5504,6 +5713,31 @@ export class BaseMindooDB implements MindooDB {
     }
     if (typeof currentValue !== "string") {
       throw new Error(`Cannot apply text patch to non-string value at '${path.map(String).join(".")}'`);
+    }
+  }
+
+  private ensureRichTextPath(automergeDoc: MindooDocPayload, path: Array<string | number>): void {
+    let target: any = automergeDoc;
+    for (let i = 0; i < path.length - 1; i++) {
+      const segment = path[i];
+      const nextSegment = path[i + 1];
+      if (target[segment] === undefined || target[segment] === null) {
+        target[segment] = typeof nextSegment === "number" ? [] : {};
+      }
+      target = target[segment];
+      if (target === null || typeof target !== "object") {
+        throw new Error(`Cannot apply rich-text patch through non-object path segment '${String(segment)}'`);
+      }
+    }
+
+    const leaf = path[path.length - 1];
+    const currentValue = target[leaf];
+    if (currentValue === undefined || currentValue === null) {
+      target[leaf] = "";
+      return;
+    }
+    if (typeof currentValue !== "string") {
+      throw new Error(`Cannot apply rich-text patch to non-string value at '${path.map(String).join(".")}'`);
     }
   }
 
@@ -7248,7 +7482,7 @@ export class BaseMindooDB implements MindooDB {
       }) as MindooDocPayload;
     };
 
-    return {
+    const wrapped: MindooDoc = {
       getDatabase: () => db,
       getId: () => docId,
       getCreatedAt: () => internalDoc.createdAt,
@@ -7317,6 +7551,8 @@ export class BaseMindooDB implements MindooDB {
         );
       },
     };
+    this.wrappedInternalDocs.set(wrapped, internalDoc);
+    return wrapped;
   }
 
   /**
