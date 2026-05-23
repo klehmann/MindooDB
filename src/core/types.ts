@@ -1526,6 +1526,131 @@ export interface MindooTextPatchResult {
   data: MindooDocPayload;
 }
 
+/**
+ * Plain JSON scalar values that can appear inside rich-text marks and block
+ * payloads.
+ */
+export type MindooRichTextScalar =
+  | string
+  | number
+  | boolean
+  | null;
+
+/**
+ * Tagged representation of an Automerge `ImmutableString` inside a rich-text
+ * mark or block payload.
+ *
+ * Automerge distinguishes mutable text from immutable string values; the
+ * mindoodb bridge serializes the latter as `{ type: "immutableString", value }`
+ * so cross-process callers (apps, RPC, persistence) can round-trip them
+ * without depending on Automerge runtime classes. `applyRichTextPatch`
+ * rehydrates this shape back into an `Automerge.ImmutableString` before
+ * applying the patch, and `getRichTextSnapshot` dehydrates `ImmutableString`
+ * values it observes back into this tagged form.
+ */
+export interface MindooRichTextImmutableString {
+  type: "immutableString";
+  value: string;
+}
+
+/**
+ * Any value that can appear as the leaf of a rich-text mark map or block
+ * payload after materialization.
+ *
+ * Composes scalars, tagged immutable strings, arrays, and nested objects so
+ * mark/block payloads can carry arbitrary structured metadata (e.g. font
+ * settings, list-item attributes, table-cell properties) while still being
+ * fully JSON-serializable on the wire.
+ */
+export type MindooRichTextMaterializeValue =
+  | MindooRichTextScalar
+  | MindooRichTextImmutableString
+  | MindooRichTextMaterializeValue[]
+  | { [key: string]: MindooRichTextMaterializeValue };
+
+/**
+ * Run of plain text inside a rich-text field.
+ *
+ * `value` is the literal characters of the run. `marks` carries the inline
+ * formatting that applies to the whole run (e.g. `{ bold: true, font: "Arial" }`).
+ * Each entry in `marks` is forwarded to Automerge's rich-text marks and is
+ * therefore expected to be JSON-friendly via {@link MindooRichTextMaterializeValue}.
+ */
+export interface MindooRichTextTextSpan {
+  type: "text";
+  value: string;
+  marks?: Record<string, MindooRichTextMaterializeValue>;
+}
+
+/**
+ * Structural marker inside a rich-text field (paragraph, heading, list item,
+ * table cell, ...).
+ *
+ * `value` carries the block's attributes — typically a tag plus any extra
+ * metadata the editor needs to faithfully reconstruct the structure. Block
+ * spans never carry textual content themselves; the visible characters live
+ * in adjacent {@link MindooRichTextTextSpan} entries.
+ */
+export interface MindooRichTextBlockSpan {
+  type: "block";
+  value: Record<string, MindooRichTextMaterializeValue>;
+}
+
+/**
+ * One element of an ordered span list that describes a rich-text field.
+ *
+ * A rich-text field is rendered by walking the spans in order: each
+ * {@link MindooRichTextTextSpan} contributes characters with their marks, and
+ * each {@link MindooRichTextBlockSpan} marks a structural boundary (start of a
+ * paragraph, heading, list item, table cell, ...).
+ */
+export type MindooRichTextSpan =
+  | MindooRichTextTextSpan
+  | MindooRichTextBlockSpan;
+
+/**
+ * Replacement span snapshot for a rich-text field at a document path.
+ *
+ * `path` addresses the target rich-text field inside the document payload.
+ * `spans` is the new ordered span list — `applyRichTextPatch` forwards it to
+ * Automerge's `updateSpans`, which performs a structural diff against the
+ * current spans and produces a minimal Automerge change. When supplied,
+ * `baseHeads` identifies the document heads the caller saw before composing
+ * the snapshot, allowing the patch to be authored at that causal point and
+ * merged with any concurrent changes that arrived since (analogous to
+ * {@link MindooTextPatch}/{@link MindooJsonPatch}). `updateSpansConfig` is
+ * passed straight through to Automerge for editors that need to tune the
+ * rich-text merge behavior.
+ */
+export interface MindooRichTextPatch {
+  path: Array<string | number>;
+  baseHeads?: string[];
+  spans: MindooRichTextSpan[];
+  updateSpansConfig?: Record<string, unknown>;
+}
+
+/** Result returned after applying a rich-text patch and materializing the document. */
+export interface MindooRichTextPatchResult {
+  doc: MindooDoc;
+  heads: string[];
+  data: MindooDocPayload;
+}
+
+/**
+ * Read-only snapshot of a rich-text field returned by `getRichTextSnapshot`.
+ *
+ * `path` echoes the requested field path. `heads` are the Automerge heads of
+ * the document at read time and are the natural value to feed back into
+ * `MindooRichTextPatch.baseHeads` when authoring the next edit. `spans`
+ * mirrors the live Automerge spans, with any embedded `ImmutableString`
+ * values dehydrated to {@link MindooRichTextImmutableString}.
+ */
+export interface MindooRichTextSnapshot {
+  path: Array<string | number>;
+  heads: string[];
+  spans: MindooRichTextSpan[];
+}
+
 /** Sets a value at `path`, creating or replacing that payload field. */
 export interface MindooJsonSetPatch {
   path: Array<string | number>;
@@ -2809,6 +2934,36 @@ export interface MindooDB {
    * without replacing concurrent changes that arrived meanwhile.
    */
   applyJsonPatch(doc: MindooDoc, patch: MindooJsonPatch): Promise<MindooJsonPatchResult>;
+
+  /**
+   * Apply a rich-text span snapshot at a document path.
+   *
+   * The patch describes the desired final state of the rich-text field as an
+   * ordered list of {@link MindooRichTextSpan}s (text runs with marks plus
+   * block markers). The implementation forwards the snapshot to Automerge's
+   * `updateSpans`, which structurally diffs it against the current spans and
+   * produces a minimal change — so two replicas writing different snapshots
+   * concurrently still merge into a consistent document instead of clobbering
+   * each other. If `baseHeads` is provided, the rich-text update is authored
+   * at that historical Automerge version using `changeAt`, then merged into
+   * the current document; this lets editors flush a snapshot taken from a
+   * stale local copy without overwriting concurrent edits that arrived
+   * meanwhile. The target path is autovivified to an empty string when it
+   * does not yet exist; applying a rich-text patch on top of a non-string
+   * value at the same path is rejected.
+   */
+  applyRichTextPatch(doc: MindooDoc, patch: MindooRichTextPatch): Promise<MindooRichTextPatchResult>;
+
+  /**
+   * Read the current Automerge rich-text spans from a document path.
+   *
+   * Returns the live ordered span list together with the document heads at
+   * read time. Embedded `Automerge.ImmutableString` values are dehydrated to
+   * {@link MindooRichTextImmutableString} so the snapshot is fully
+   * JSON-serializable. The returned `heads` are the natural value to feed
+   * back into `MindooRichTextPatch.baseHeads` when authoring the next edit.
+   */
+  getRichTextSnapshot(doc: MindooDoc, path: Array<string | number>): Promise<MindooRichTextSnapshot>;
 
   /**
    * Change a document using a specific signing key.
