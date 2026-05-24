@@ -1608,15 +1608,136 @@ export type MindooRichTextSpan =
   | MindooRichTextTextSpan
   | MindooRichTextBlockSpan;
 
+export interface MindooRichTextMarkRange {
+  index: number;
+  length: number;
+  marks: Record<string, MindooRichTextMaterializeValue>;
+}
+
+export interface MindooRichTextSpliceStep {
+  type: "splice";
+  index: number;
+  deleteCount: number;
+  insert?: string;
+  marks?: MindooRichTextMarkRange[];
+}
+
+export type MindooRichTextStep = MindooRichTextSpliceStep;
+
+/**
+ * Ordered rich-text positional operations authored against a base document.
+ *
+ * Unlike `MindooRichTextPatch`, this does not ask Automerge to diff a complete
+ * span snapshot. The operations are already positional and are forwarded to
+ * Automerge's rich-text primitives (`splice` and `mark`) at `baseHeads`.
+ */
+export interface MindooRichTextStepPatch {
+  path: Array<string | number>;
+  baseHeads?: string[];
+  steps: MindooRichTextStep[];
+}
+
+export interface MindooStructuredRichTextBlock {
+  id: string;
+  type: string;
+  attrs?: Record<string, MindooRichTextMaterializeValue>;
+  parentId?: string | null;
+  children?: string[];
+  isEmbed?: boolean;
+  text?: string;
+  marks?: Record<string, MindooRichTextMaterializeValue>;
+  runs?: Array<{
+    text: string;
+    marks?: Record<string, MindooRichTextMaterializeValue>;
+  }>;
+}
+
+export interface MindooStructuredRichTextBody {
+  version: 1 | 2;
+  blocks: MindooStructuredRichTextBlock[];
+  blockOrder?: string[];
+  blocksById?: Record<string, MindooStructuredRichTextBlock>;
+}
+
+export type MindooStructuredRichTextOperation =
+  | {
+      type: "setDocument";
+      body: MindooStructuredRichTextBody;
+    }
+  | {
+      type: "insertText";
+      blockId: string;
+      offset: number;
+      text: string;
+      marks?: Record<string, MindooRichTextMaterializeValue>;
+    }
+  | {
+      type: "deleteText";
+      blockId: string;
+      offset: number;
+      length: number;
+    }
+  | {
+      type: "splitBlock";
+      blockId: string;
+      offset: number;
+      newBlock: MindooStructuredRichTextBlock;
+    }
+  | {
+      type: "joinBlocks";
+      leftBlockId: string;
+      rightBlockId: string;
+    }
+  | {
+      type: "insertBlock";
+      index: number;
+      block: MindooStructuredRichTextBlock;
+    }
+  | {
+      type: "deleteBlock";
+      blockId: string;
+    }
+  | {
+      type: "setBlockAttrs";
+      blockId: string;
+      attrs: Record<string, MindooRichTextMaterializeValue>;
+    }
+  | {
+      type: "replaceBlock";
+      blockId: string;
+      block: MindooStructuredRichTextBlock;
+      index?: number;
+    }
+  | {
+      type: "replaceSubtree";
+      rootBlockId: string;
+      blocks: MindooStructuredRichTextBlock[];
+      index?: number;
+    };
+
+/**
+ * Semantic structured rich-text operations against a block-based body document.
+ *
+ * Unlike rich-text span snapshots, these operations keep structural edits
+ * addressable by stable block IDs and text edits scoped to block-local offsets.
+ * If `baseHeads` is supplied, the operation batch is authored at the rendered
+ * Automerge heads and then merged into the current document.
+ */
+export interface MindooStructuredRichTextPatch {
+  path: Array<string | number>;
+  baseHeads?: string[];
+  operations: MindooStructuredRichTextOperation[];
+}
+
 /**
  * Replacement span snapshot for a rich-text field at a document path.
  *
  * `path` addresses the target rich-text field inside the document payload.
- * `spans` is the new ordered span list — `applyRichTextPatch` forwards it to
- * Automerge's `updateSpans`, which performs a structural diff against the
- * current spans and produces a minimal Automerge change. When supplied,
+ * `spans` is the new ordered span list. `spansSequence` is an ordered list of
+ * per-transaction snapshots, forwarded to Automerge's `updateSpans` one at a
+ * time so each structural diff stays small. When supplied,
  * `baseHeads` identifies the document heads the caller saw before composing
- * the snapshot, allowing the patch to be authored at that causal point and
+ * the snapshots, allowing the patch to be authored at that causal point and
  * merged with any concurrent changes that arrived since (analogous to
  * {@link MindooTextPatch}/{@link MindooJsonPatch}). `updateSpansConfig` is
  * passed straight through to Automerge for editors that need to tune the
@@ -1625,7 +1746,8 @@ export type MindooRichTextSpan =
 export interface MindooRichTextPatch {
   path: Array<string | number>;
   baseHeads?: string[];
-  spans: MindooRichTextSpan[];
+  spans?: MindooRichTextSpan[];
+  spansSequence?: MindooRichTextSpan[][];
   updateSpansConfig?: Record<string, unknown>;
 }
 
@@ -1635,6 +1757,8 @@ export interface MindooRichTextPatchResult {
   heads: string[];
   data: MindooDocPayload;
 }
+
+export type MindooStructuredRichTextPatchResult = MindooRichTextPatchResult;
 
 /**
  * Read-only snapshot of a rich-text field returned by `getRichTextSnapshot`.
@@ -1649,6 +1773,45 @@ export interface MindooRichTextSnapshot {
   path: Array<string | number>;
   heads: string[];
   spans: MindooRichTextSpan[];
+}
+
+/**
+ * Binary snapshot of the full internal Automerge document.
+ *
+ * `binary` is the decrypted `Automerge.save()` payload for the document at
+ * read time. `heads` are the Automerge heads at the same point. A local
+ * replica should record these heads and pass them back as
+ * {@link MindooAutomergeChangesPatch.baseHeads} when flushing so Haven can
+ * correlate the change batch with the snapshot the client started from.
+ */
+export interface MindooAutomergeSnapshot {
+  binary: Uint8Array;
+  heads: string[];
+}
+
+/**
+ * Raw Automerge change batch produced by an external replica.
+ *
+ * Each entry in `changes` is a change byte sequence from
+ * `Automerge.getChangesSince` (or equivalent) on the client's local replica.
+ * Haven merges the batch into its **current** document with
+ * `Automerge.applyChanges`, so concurrent edits on the server are combined
+ * by Automerge's CRDT logic rather than rejected.
+ *
+ * `baseHeads` is optional metadata: the document heads the client had when it
+ * authored `changes`. It is not a precondition for merging — the server applies
+ * changes even when its heads have moved on since that point.
+ */
+export interface MindooAutomergeChangesPatch {
+  baseHeads?: string[];
+  changes: Uint8Array[];
+}
+
+/** Result returned after applying an Automerge change batch. */
+export interface MindooAutomergePatchResult {
+  doc: MindooDoc;
+  heads: string[];
+  data: MindooDocPayload;
 }
 
 /** Sets a value at `path`, creating or replacing that payload field. */
@@ -1676,6 +1839,30 @@ export interface MindooJsonListDeletePatch {
   deleteCount: number;
 }
 
+/** Splices text at `path` using Automerge text semantics. */
+export interface MindooJsonTextSplicePatch {
+  path: Array<string | number>;
+  index: number;
+  deleteCount: number;
+  insert?: string;
+}
+
+/** Applies one or more Automerge marks to a text range at `path`. */
+export interface MindooJsonTextMarkPatch {
+  path: Array<string | number>;
+  index: number;
+  length: number;
+  marks: Record<string, MindooRichTextMaterializeValue>;
+}
+
+/** Removes Automerge marks from a text range at `path`. */
+export interface MindooJsonTextUnmarkPatch {
+  path: Array<string | number>;
+  index: number;
+  length: number;
+  names: string[];
+}
+
 /**
  * Granular JSON mutation batch for a MindooDoc payload.
  *
@@ -1689,6 +1876,9 @@ export interface MindooJsonPatch {
   unset?: MindooJsonUnsetPatch[];
   listInsert?: MindooJsonListInsertPatch[];
   listDelete?: MindooJsonListDeletePatch[];
+  textSplice?: MindooJsonTextSplicePatch[];
+  textMark?: MindooJsonTextMarkPatch[];
+  textUnmark?: MindooJsonTextUnmarkPatch[];
 }
 
 /** Result returned after applying a JSON patch and materializing the document. */
@@ -2955,6 +3145,23 @@ export interface MindooDB {
   applyRichTextPatch(doc: MindooDoc, patch: MindooRichTextPatch): Promise<MindooRichTextPatchResult>;
 
   /**
+   * Apply ordered positional rich-text operations at a document path.
+   *
+   * If `baseHeads` is provided, the operations are authored at that historical
+   * Automerge version using `changeAt`, then merged into the current document.
+   */
+  applyRichTextStepsPatch(doc: MindooDoc, patch: MindooRichTextStepPatch): Promise<MindooRichTextPatchResult>;
+
+  /**
+   * Apply semantic structured rich-text operations to a block-based body document.
+   *
+   * Structured rich-text operations address stable block IDs and block-local text offsets
+   * instead of a single materialized rich-text string, which lets concurrent
+   * structural and text edits merge at the Automerge object level.
+   */
+  applyStructuredRichTextPatch(doc: MindooDoc, patch: MindooStructuredRichTextPatch): Promise<MindooStructuredRichTextPatchResult>;
+
+  /**
    * Read the current Automerge rich-text spans from a document path.
    *
    * Returns the live ordered span list together with the document heads at
@@ -2964,6 +3171,30 @@ export interface MindooDB {
    * back into `MindooRichTextPatch.baseHeads` when authoring the next edit.
    */
   getRichTextSnapshot(doc: MindooDoc, path: Array<string | number>): Promise<MindooRichTextSnapshot>;
+
+  /**
+   * Export the full internal Automerge document as a binary snapshot.
+   *
+   * Returns the decrypted `Automerge.save()` payload together with the current
+   * document heads so external editors can host a local replica and later flush
+   * raw Automerge change bytes back via {@link applyAutomergeChanges}.
+   */
+  exportAutomergeSnapshot(doc: MindooDoc): Promise<MindooAutomergeSnapshot>;
+
+  /**
+   * Merge raw Automerge change bytes into the current document and persist them.
+   *
+   * Each change in `patch.changes` is merged into the server's current document
+   * with `Automerge.applyChanges`, so edits authored against an older snapshot
+   * still combine with concurrent server-side changes. Optional `baseHeads`
+   * records the client's starting heads for logging only; it does not gate the
+   * merge. The resulting delta is encrypted and stored as one or more
+   * `doc_change` entries.
+   */
+  applyAutomergeChanges(
+    doc: MindooDoc,
+    patch: MindooAutomergeChangesPatch,
+  ): Promise<MindooAutomergePatchResult>;
 
   /**
    * Change a document using a specific signing key.
