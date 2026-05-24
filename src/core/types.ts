@@ -1804,6 +1804,20 @@ export interface MindooAutomergeSnapshot {
  */
 export interface MindooAutomergeChangesPatch {
   baseHeads?: string[];
+  /**
+   * Heads of the client's local replica after authoring `changes`. When
+   * provided, the apply response includes `changesSince` so the client can
+   * reconcile its replica without downloading a full snapshot.
+   */
+  replicaHeads?: string[];
+  changes: Uint8Array[];
+}
+
+/** Incremental catch-up bytes for a client replica after an apply merge. */
+export interface MindooAutomergeChangesSince {
+  /** Echo of `replicaHeads` from the request. */
+  sinceHeads: string[];
+  /** Changes on the merged canonical doc that the replica is missing. */
   changes: Uint8Array[];
 }
 
@@ -1812,6 +1826,11 @@ export interface MindooAutomergePatchResult {
   doc: MindooDoc;
   heads: string[];
   data: MindooDocPayload;
+  /**
+   * Present when the request included `replicaHeads`. Apply locally with
+   * `Automerge.applyChanges` instead of reloading a full snapshot.
+   */
+  changesSince?: MindooAutomergeChangesSince;
 }
 
 /** Sets a value at `path`, creating or replacing that payload field. */
@@ -3188,8 +3207,11 @@ export interface MindooDB {
    * with `Automerge.applyChanges`, so edits authored against an older snapshot
    * still combine with concurrent server-side changes. Optional `baseHeads`
    * records the client's starting heads for logging only; it does not gate the
-   * merge. The resulting delta is encrypted and stored as one or more
-   * `doc_change` entries.
+   * merge. When `replicaHeads` is supplied, the response includes
+   * `changesSince` — the incremental bytes needed to bring the client's local
+   * replica up to the merged canonical heads without a full snapshot download.
+   * The resulting delta is encrypted and stored as one or more `doc_change`
+   * entries.
    */
   applyAutomergeChanges(
     doc: MindooDoc,

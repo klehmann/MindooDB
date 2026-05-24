@@ -60,7 +60,9 @@ describe("Automerge binary export and apply", () => {
     expect(snapshot.binary.byteLength).toBeGreaterThan(0);
     expect(snapshot.heads.length).toBeGreaterThan(0);
 
-    let replica = Automerge.load<{ body: string; subject?: string }>(snapshot.binary, { actor: "replica-a" });
+    let replica = Automerge.load<{ body: string; subject?: string }>(snapshot.binary, {
+      actor: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
     const baseHeads = [...snapshot.heads];
 
     replica = Automerge.change(replica, (draft) => {
@@ -73,14 +75,59 @@ describe("Automerge binary export and apply", () => {
 
     const changes = Automerge.getChangesSince(replica, baseHeads as Automerge.Heads);
     expect(changes.length).toBeGreaterThan(0);
+    const replicaHeads = Automerge.getHeads(replica);
 
     const result = await db.applyAutomergeChanges(doc, {
       baseHeads,
+      replicaHeads,
       changes,
     });
 
     expect(result.data.body).toBe("Hello world");
     expect(result.data.subject).toBe("Concurrent metadata");
+    expect(result.changesSince).toBeDefined();
+    expect(result.changesSince?.sinceHeads).toEqual(replicaHeads);
+    expect(result.changesSince?.changes.length).toBeGreaterThan(0);
+
+    const [reconciledReplica] = Automerge.applyChanges(
+      replica,
+      result.changesSince!.changes,
+    );
+    expect(Automerge.getHeads(reconciledReplica).sort()).toEqual(result.heads.sort());
+    expect(reconciledReplica.body).toBe("Hello world");
+    expect(reconciledReplica.subject).toBe("Concurrent metadata");
+  }, 30000);
+
+  it("returns empty changesSince when the replica is already up to date", async () => {
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (draft) => {
+      draft.getData().body = "Hello";
+    });
+
+    const snapshot = await db.exportAutomergeSnapshot(doc);
+    let replica = Automerge.load<{ body: string }>(snapshot.binary, {
+      actor: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    const baseHeads = [...snapshot.heads];
+
+    replica = Automerge.change(replica, (draft) => {
+      Automerge.updateSpans(draft, ["body"], [{ type: "text", value: "Hello world" }]);
+    });
+
+    const changes = Automerge.getChangesSince(replica, baseHeads as Automerge.Heads);
+    const replicaHeads = Automerge.getHeads(replica);
+
+    const result = await db.applyAutomergeChanges(doc, {
+      baseHeads,
+      replicaHeads,
+      changes,
+    });
+
+    expect(result.changesSince).toEqual({
+      sinceHeads: replicaHeads,
+      changes: [],
+    });
+    expect(result.heads.sort()).toEqual(replicaHeads.sort());
   }, 30000);
 });
 

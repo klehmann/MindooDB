@@ -5302,10 +5302,31 @@ export class BaseMindooDB implements MindooDB {
     }
 
     const wrapped = this.wrapDocument(internalDoc);
+    const mergedHeads = wrapped.getHeads();
+    let changesSince: MindooAutomergePatchResult["changesSince"];
+    if (patch.replicaHeads?.length) {
+      try {
+        const missingChanges = Automerge.getChangesSince(
+          newDoc,
+          patch.replicaHeads as AutomergeTypes.Heads,
+        );
+        changesSince = {
+          sinceHeads: [...patch.replicaHeads],
+          changes: missingChanges.map((change) => new Uint8Array(change)),
+        };
+      } catch (error) {
+        this.logger.debug(
+          `Could not compute Automerge changesSince for document ${docId}:`,
+          error,
+        );
+      }
+    }
+
     return {
       doc: wrapped,
-      heads: wrapped.getHeads(),
+      heads: mergedHeads,
       data: wrapped.getData(),
+      changesSince,
     };
   }
 
