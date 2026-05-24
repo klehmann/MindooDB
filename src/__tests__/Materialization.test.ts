@@ -920,6 +920,29 @@ describe("dense sync mode", () => {
     expect(loaded.getData().field19).toBe("value19");
   }, 60000);
 
+  test("dense-synced snapshot heads remain writable without losing the next change", async () => {
+    const { sourceDb, targetDb, targetSetup } = await prepareDenseSyncPair("dense-post-snapshot-edit-test");
+
+    const doc = await sourceDb.createDocument();
+    const docId = doc.getId();
+    for (let i = 0; i < 8; i++) {
+      await sourceDb.changeDoc(doc, (d: MindooDoc) => {
+        d.getData()[`sourceField${i}`] = `source-value-${i}`;
+      });
+    }
+
+    await targetDb.pullChangesFrom(sourceDb, { mode: "dense" });
+    const targetDoc = await targetDb.getDocument(docId);
+    await targetDb.changeDoc(targetDoc, (d: MindooDoc) => {
+      d.getData().targetEdit = "survives";
+    });
+
+    const reopenedTargetDb = await targetSetup.tenant.openDB("dense-post-snapshot-edit-test");
+    const reloaded = await reopenedTargetDb.getDocument(docId);
+    expect(reloaded.getData().sourceField7).toBe("source-value-7");
+    expect(reloaded.getData().targetEdit).toBe("survives");
+  }, 60000);
+
   test("dense-synced documents appear in getAllDocumentIds", async () => {
     const { sourceDb, targetDb } = await prepareDenseSyncPair("dense-ids-test");
 

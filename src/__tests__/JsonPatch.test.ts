@@ -153,4 +153,40 @@ describe("applyJsonPatch", () => {
     expect(result.data.rowOrder).toContain("row_2");
     expect(result.data.rowOrder).toContain("row_3");
   }, 30000);
+
+  it("merges stale-head text splices inside nested JSON values", async () => {
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (draft) => {
+      draft.getData().bodyDoc = {
+        version: 2,
+        blocks: [{ id: "p1", type: "paragraph", text: "Hello" }],
+      };
+    });
+    const baseHeads = doc.getHeads();
+
+    await db.applyJsonPatch(doc, {
+      baseHeads,
+      textSplice: [{
+        path: ["bodyDoc", "blocks", 0, "text"],
+        index: 5,
+        deleteCount: 0,
+        insert: " A",
+      }],
+    });
+
+    const result = await db.applyJsonPatch(doc, {
+      baseHeads,
+      textSplice: [{
+        path: ["bodyDoc", "blocks", 0, "text"],
+        index: 0,
+        deleteCount: 0,
+        insert: "B ",
+      }],
+    });
+
+    const block = ((result.data.bodyDoc as any).blocks as Array<{ text: string }>)[0];
+    expect(block.text).toContain("B ");
+    expect(block.text).toContain("Hello");
+    expect(block.text).toContain(" A");
+  }, 30000);
 });
