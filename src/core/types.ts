@@ -1637,98 +1637,6 @@ export interface MindooRichTextStepPatch {
   steps: MindooRichTextStep[];
 }
 
-export interface MindooStructuredRichTextBlock {
-  id: string;
-  type: string;
-  attrs?: Record<string, MindooRichTextMaterializeValue>;
-  parentId?: string | null;
-  children?: string[];
-  isEmbed?: boolean;
-  text?: string;
-  marks?: Record<string, MindooRichTextMaterializeValue>;
-  runs?: Array<{
-    text: string;
-    marks?: Record<string, MindooRichTextMaterializeValue>;
-  }>;
-}
-
-export interface MindooStructuredRichTextBody {
-  version: 1 | 2;
-  blocks: MindooStructuredRichTextBlock[];
-  blockOrder?: string[];
-  blocksById?: Record<string, MindooStructuredRichTextBlock>;
-}
-
-export type MindooStructuredRichTextOperation =
-  | {
-      type: "setDocument";
-      body: MindooStructuredRichTextBody;
-    }
-  | {
-      type: "insertText";
-      blockId: string;
-      offset: number;
-      text: string;
-      marks?: Record<string, MindooRichTextMaterializeValue>;
-    }
-  | {
-      type: "deleteText";
-      blockId: string;
-      offset: number;
-      length: number;
-    }
-  | {
-      type: "splitBlock";
-      blockId: string;
-      offset: number;
-      newBlock: MindooStructuredRichTextBlock;
-    }
-  | {
-      type: "joinBlocks";
-      leftBlockId: string;
-      rightBlockId: string;
-    }
-  | {
-      type: "insertBlock";
-      index: number;
-      block: MindooStructuredRichTextBlock;
-    }
-  | {
-      type: "deleteBlock";
-      blockId: string;
-    }
-  | {
-      type: "setBlockAttrs";
-      blockId: string;
-      attrs: Record<string, MindooRichTextMaterializeValue>;
-    }
-  | {
-      type: "replaceBlock";
-      blockId: string;
-      block: MindooStructuredRichTextBlock;
-      index?: number;
-    }
-  | {
-      type: "replaceSubtree";
-      rootBlockId: string;
-      blocks: MindooStructuredRichTextBlock[];
-      index?: number;
-    };
-
-/**
- * Semantic structured rich-text operations against a block-based body document.
- *
- * Unlike rich-text span snapshots, these operations keep structural edits
- * addressable by stable block IDs and text edits scoped to block-local offsets.
- * If `baseHeads` is supplied, the operation batch is authored at the rendered
- * Automerge heads and then merged into the current document.
- */
-export interface MindooStructuredRichTextPatch {
-  path: Array<string | number>;
-  baseHeads?: string[];
-  operations: MindooStructuredRichTextOperation[];
-}
-
 /**
  * Replacement span snapshot for a rich-text field at a document path.
  *
@@ -1757,8 +1665,6 @@ export interface MindooRichTextPatchResult {
   heads: string[];
   data: MindooDocPayload;
 }
-
-export type MindooStructuredRichTextPatchResult = MindooRichTextPatchResult;
 
 /**
  * Read-only snapshot of a rich-text field returned by `getRichTextSnapshot`.
@@ -3170,15 +3076,6 @@ export interface MindooDB {
    * Automerge version using `changeAt`, then merged into the current document.
    */
   applyRichTextStepsPatch(doc: MindooDoc, patch: MindooRichTextStepPatch): Promise<MindooRichTextPatchResult>;
-
-  /**
-   * Apply semantic structured rich-text operations to a block-based body document.
-   *
-   * Structured rich-text operations address stable block IDs and block-local text offsets
-   * instead of a single materialized rich-text string, which lets concurrent
-   * structural and text edits merge at the Automerge object level.
-   */
-  applyStructuredRichTextPatch(doc: MindooDoc, patch: MindooStructuredRichTextPatch): Promise<MindooStructuredRichTextPatchResult>;
 
   /**
    * Read the current Automerge rich-text spans from a document path.
