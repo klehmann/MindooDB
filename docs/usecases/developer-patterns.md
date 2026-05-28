@@ -10,7 +10,7 @@ Testing MindooDB applications requires special attention to offline scenarios, s
 
 ### Testing Offline Scenarios
 
-MindooDB's offline-first design means that all operations work locally before synchronizing with remote stores. Testing this behavior ensures your application gracefully handles connectivity changes.
+MindooDB's local-first design means that all operations work locally before synchronizing with remote stores. Testing this behavior ensures your application gracefully handles connectivity changes.
 
 **Pattern**: Test offline creation and retrieval
 

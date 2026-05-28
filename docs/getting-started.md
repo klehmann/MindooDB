@@ -1,6 +1,6 @@
 # Getting Started with MindooDB
 
-MindooDB is an end-to-end encrypted, offline-first sync database that runs on Node.js, web browsers, and React Native. You create tenants and users entirely on the client — private keys never leave the device, and the server only ever sees encrypted blobs. This guide walks you through the complete setup: creating a tenant, publishing it to a server, inviting a second user, and collaborating on shared encrypted data.
+MindooDB is an end-to-end encrypted, local-first sync database that runs on Node.js, web browsers, and React Native. You create tenants and users entirely on the client — private keys never leave the device, and the server only ever sees encrypted blobs. This guide walks you through the complete setup: creating a tenant, publishing it to a server, inviting a second user, and collaborating on shared encrypted data.
 
 If you have used traditional databases before, MindooDB will feel familiar in terms of reading and writing documents. The difference is that everything is cryptographically signed, encrypted, and designed for multi-device sync without trusting the server.
 

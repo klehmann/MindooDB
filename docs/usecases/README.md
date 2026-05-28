@@ -4,14 +4,14 @@ This directory contains comprehensive documentation on how to leverage MindooDB'
 
 ## Overview
 
-MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** designed for secure, distributed document storage and synchronization. This collection of use case documents explores creative ways to model data, organize databases, and leverage MindooDB's features to build powerful applications.
+MindooDB is an **End-to-End Encrypted, Local-first Sync Database** designed for secure, distributed document storage and synchronization. This collection of use case documents explores creative ways to model data, organize databases, and leverage MindooDB's features to build powerful applications.
 
 ## Key Capabilities
 
 MindooDB's architecture enables several unique patterns:
 
 - **End-to-End Encryption**: All data is encrypted before leaving the client, ensuring server-side security
-- **Offline-First**: Create and modify documents without network connectivity
+- **Local-First**: Create and modify documents without network connectivity
 - **Append-Only Store**: Complete audit trail with cryptographic integrity
 - **Multi-Tenant Collaboration**: Share data across organizations with fine-grained access control
 - **Incremental Sync**: Efficient data transfer using `iterateChangesSince()`

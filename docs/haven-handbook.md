@@ -1,6 +1,6 @@
 # The Haven Handbook
 
-A complete, friendly guide to MindooDB Haven — the browser-based workspace for encrypted, offline-first collaboration on MindooDB.
+A complete, friendly guide to MindooDB Haven — the browser-based workspace for encrypted, local-first collaboration on MindooDB.
 
 This handbook walks through everything Haven does, in the order you are likely to encounter it. It is written for three overlapping audiences: everyday users who spend their time in the Workspace, team admins who set up tenants and register apps, and platform admins who run a MindooDB server. You do not have to read it front to back. If you already know the basics, the section headers will let you jump straight to what you need. If you are brand new, start at the beginning and follow the first-ten-minutes walkthrough.
 
@@ -60,7 +60,7 @@ When you install Haven on a phone and launch it from the home screen, it opens i
 
 The first time you open Haven, it greets you with a Welcome page that turns the whole setup — identity, admin, tenant, or joining an existing team — into a short guided flow. You can do all of this by hand later through Preferences → User ids and Preferences → Tenants, but the Welcome page is by far the easiest path, so use it whenever you can.
 
-The Welcome page opens with a short pitch (end-to-end encrypted, offline-first, zero-trust servers) and three big buttons: Create a tenant, Join a team, and Open tenants. Below those, two cards explain what each path actually does. If Haven already has an unlocked identity, a small banner tells you so — the wizard will happily reuse it and skip the identity step if you want.
+The Welcome page opens with a short pitch (end-to-end encrypted, local-first, zero-trust servers) and three big buttons: Create a tenant, Join a team, and Open tenants. Below those, two cards explain what each path actually does. If Haven already has an unlocked identity, a small banner tells you so — the wizard will happily reuse it and skip the identity step if you want.
 
 ### Path one: starting your own tenant
 

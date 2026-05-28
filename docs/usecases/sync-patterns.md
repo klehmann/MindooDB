@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB supports multiple synchronization patterns: peer-to-peer (P2P), client-server, and server-server. This document explores these patterns, how to implement them, and when to use each approach. It also covers sync without decryption, incremental sync, and offline-first workflows.
+MindooDB supports multiple synchronization patterns: peer-to-peer (P2P), client-server, and server-server. This document explores these patterns, how to implement them, and when to use each approach. It also covers sync without decryption, incremental sync, and local-first workflows.
 
 ## Key Concepts
 
@@ -223,9 +223,9 @@ if (newForServer.length > 0) {
 - Web applications requiring persistence
 - Enterprise deployments with centralized IT management
 
-### Offline-First Client-Server
+### Local-First Client-Server
 
-The offline-first pattern ensures applications remain fully functional without network connectivity, syncing changes when connectivity returns.
+The local-first pattern ensures applications remain fully functional without network connectivity, syncing changes when connectivity returns.
 
 **Pattern**: Clients work offline, sync when connected
 
@@ -583,7 +583,7 @@ await dbA.pullChangesFrom(dbB.getStore());
 // No conflicts!
 ```
 
-## Offline-First Workflows
+## Local-First Workflows
 
 ### Local-First Data Creation
 
@@ -749,6 +749,6 @@ MindooDB supports flexible synchronization patterns:
 3. **Server-Server Sync** for multi-site replication
 4. **Sync Without Decryption** for secure backups
 5. **Incremental Sync** for efficient data transfer
-6. **Offline-First** for resilient applications
+6. **Local-First** for resilient applications
 
 By choosing the right sync pattern for your use case, you can build robust, scalable applications that work reliably across different network conditions and deployment scenarios.

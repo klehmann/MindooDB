@@ -12,7 +12,7 @@ The goal is not to make app developers handle every merge manually. The goal is 
 
 ### Understanding Offline Collaboration
 
-In a traditional server-first database, write conflicts are often rejected immediately. In MindooDB, writes are accepted locally and reconciled later. This is what enables offline-first collaboration, but it also means important events may only become visible when histories are inspected after sync.
+In a traditional server-first database, write conflicts are often rejected immediately. In MindooDB, writes are accepted locally and reconciled later. This is what enables local-first collaboration, but it also means important events may only become visible when histories are inspected after sync.
 
 DAG analysis answers questions such as:
 
@@ -342,4 +342,4 @@ Conflict analysis becomes important when:
 - support teams need to explain surprising document state
 - admins need operational confidence across many offline clients
 
-In other words: the feature is an observability layer for systems that trust offline-first convergence but still need to explain it.
+In other words: the feature is an observability layer for systems that trust local-first convergence but still need to explain it.

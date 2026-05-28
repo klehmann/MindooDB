@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB's unique architecture—end-to-end encryption, offline-first operation, append-only stores, and fine-grained access control—makes it particularly well-suited for specific types of applications and organizations. This document identifies target audiences and use cases that leverage MindooDB's strengths most effectively.
+MindooDB's unique architecture—end-to-end encryption, local-first operation, append-only stores, and fine-grained access control—makes it particularly well-suited for specific types of applications and organizations. This document identifies target audiences and use cases that leverage MindooDB's strengths most effectively.
 
 ## Core Value Propositions
 
@@ -10,7 +10,7 @@ Before diving into specific audiences, it's important to understand what makes M
 
 **End-to-End Encryption** means that all data is encrypted on the client device before it ever travels across the network or reaches any server. This fundamental design ensures that even if servers are compromised, attackers cannot read your data—they only see encrypted bytes. This is fundamentally different from "encryption at rest" offered by traditional databases, where the server holds the decryption keys.
 
-**Offline-First Operation** ensures that applications continue working without network connectivity. Users can create, edit, and delete documents while offline, and all changes automatically synchronize when connectivity returns. The Automerge CRDT technology handles conflict resolution automatically, so concurrent offline edits merge cleanly without manual intervention.
+**Local-First Operation** ensures that applications continue working without network connectivity. Users can create, edit, and delete documents while offline, and all changes automatically synchronize when connectivity returns. The Automerge CRDT technology handles conflict resolution automatically, so concurrent offline edits merge cleanly without manual intervention.
 
 **Append-Only Audit Trails** provide a complete, tamper-proof history of all changes to every document. Because data is never overwritten—only appended—you can reconstruct any historical state and prove that records haven't been altered. This is invaluable for regulatory compliance and legal proceedings.
 
@@ -155,7 +155,7 @@ These applications derive significant value from MindooDB's unique features:
 1. **Regulated Industries**: Healthcare, finance, legal—where compliance and audit trails are critical
 2. **Multi-Organization Collaboration**: Applications requiring secure data sharing across company boundaries
 3. **Privacy-Critical Applications**: Where data privacy is paramount and server compromise is a concern
-4. **Offline-First Applications**: Field operations, remote locations, unreliable connectivity
+4. **Local-First Applications**: Field operations, remote locations, unreliable connectivity
 5. **Audit-Heavy Applications**: Where complete change history is required for compliance or legal purposes
 
 ### Medium-Value Applications
@@ -164,7 +164,7 @@ These applications benefit but may have alternatives:
 
 1. **Standard CRUD Applications**: Can use MindooDB but may be overkill
 2. **Single-Organization Applications**: May not need multi-tenant features
-3. **Always-Online Applications**: May not need offline-first capabilities
+3. **Always-Online Applications**: May not need local-first capabilities
 4. **Simple Access Control**: May not need document-level encryption
 
 ## Decision Framework: When to Choose MindooDB
@@ -173,7 +173,7 @@ These applications benefit but may have alternatives:
 
 ✅ **You need end-to-end encryption** and cannot trust your hosting provider  
 ✅ **You require complete audit trails** with cryptographic integrity  
-✅ **You need offline-first operation** for field or remote operations  
+✅ **You need local-first operation** for field or remote operations  
 ✅ **You collaborate across organizations** and need fine-grained access control  
 ✅ **You need simple backups** and disaster recovery without key exposure  
 ✅ **You require regulatory compliance** (HIPAA, SOX, GDPR, etc.)  
@@ -183,7 +183,7 @@ These applications benefit but may have alternatives:
 ### Consider Alternatives When:
 
 ❌ **You only need simple CRUD operations** without collaboration  
-❌ **You always have reliable network connectivity** and don't need offline-first  
+❌ **You always have reliable network connectivity** and don't need local-first  
 ❌ **You don't need end-to-end encryption** and can trust your hosting provider  
 ❌ **You have simple access control needs** that don't require document-level encryption  
 ❌ **You need complex relational queries** that don't fit document model  
@@ -195,7 +195,7 @@ These applications benefit but may have alternatives:
 
 Traditional relational databases like PostgreSQL and MySQL remain excellent choices for many applications. They offer **complex relational queries** with SQL, **higher write throughput** for transaction-heavy workloads, a **mature ecosystem** of tools and expertise, and **lower complexity** for simple CRUD applications.
 
-However, MindooDB provides capabilities that traditional databases cannot easily match. **End-to-end encryption** ensures that even database administrators cannot read sensitive data. **Built-in offline-first synchronization** eliminates the need for complex offline-online reconciliation logic. **Complete audit trails** with cryptographic integrity provide tamper-evident record-keeping. **Multi-tenant collaboration** enables secure data sharing across organizational boundaries.
+However, MindooDB provides capabilities that traditional databases cannot easily match. **End-to-end encryption** ensures that even database administrators cannot read sensitive data. **Built-in local-first synchronization** eliminates the need for complex offline-online reconciliation logic. **Complete audit trails** with cryptographic integrity provide tamper-evident record-keeping. **Multi-tenant collaboration** enables secure data sharing across organizational boundaries.
 
 Choose traditional databases when you need complex joins, high write throughput, or have simple security requirements. Choose MindooDB when privacy, offline operation, or multi-party collaboration are primary concerns.
 
@@ -203,7 +203,7 @@ Choose traditional databases when you need complex joins, high write throughput,
 
 Cloud databases like Firebase and Supabase provide **managed infrastructure** that eliminates operational burden, **real-time subscriptions** for reactive applications, **built-in authentication** services, and **simpler setup** for common use cases.
 
-MindooDB offers fundamentally different security properties. With **end-to-end encryption**, the server cannot read your data—even if the cloud provider is compromised or compelled by law enforcement, your data remains private. **No vendor lock-in** results from client-side tenant creation—you can switch hosting providers without migrating data. **Offline-first by design** means applications work seamlessly without connectivity, not as an afterthought. **Multi-organization collaboration** with cryptographic access control enables partnerships that cloud databases cannot securely support.
+MindooDB offers fundamentally different security properties. With **end-to-end encryption**, the server cannot read your data—even if the cloud provider is compromised or compelled by law enforcement, your data remains private. **No vendor lock-in** results from client-side tenant creation—you can switch hosting providers without migrating data. **Local-first by design** means applications work seamlessly without connectivity, not as an afterthought. **Multi-organization collaboration** with cryptographic access control enables partnerships that cloud databases cannot securely support.
 
 Choose cloud databases when you trust your provider completely and want minimal operational overhead. Choose MindooDB when you need true data sovereignty, offline operation, or cross-organizational collaboration.
 

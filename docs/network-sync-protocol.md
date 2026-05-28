@@ -51,7 +51,7 @@ This section is for engineering leaders and architects evaluating platform optio
 
 ### What you get
 
-- **Offline-first by design.** Clients work independently and sync when connectivity is available. There is no requirement for always-on server access.
+- **Local-first by design.** Clients work independently and sync when connectivity is available. There is no requirement for always-on server access.
 - **End-to-end encryption.** Data is encrypted before it enters the store and again during transport. The server never sees plaintext.
 - **Progressive optimization.** Start with baseline sync for fast time-to-market. Enable cursor scanning and Bloom filters later when data volume justifies it — no protocol changes required.
 - **Immediate user revocation.** Access can be cut off without waiting for token expiry or cache invalidation.

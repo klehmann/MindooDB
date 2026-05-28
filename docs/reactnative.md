@@ -5,7 +5,7 @@ This guide covers setting up MindooDB in a React Native / Expo project with **na
 ## Why MindooDB for React Native?
 
 🔐 **End-to-end encrypted** - Your data is encrypted on the device before it ever touches a server
-📴 **Offline-first** - Full functionality without network; sync when connected
+📴 **Local-first** - Full functionality without network; sync when connected
 🚀 **Native performance** - Uses Rust instead of WebAssembly for CRDT operations
 🤝 **Real-time collaboration** - Automatic conflict resolution for concurrent edits
 ✍️ **Signed changes** - Every change is cryptographically signed and tamper-proof

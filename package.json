@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "End-to-End Encrypted, Offline-first Sync Database",
+  "description": "End-to-End Encrypted, Local-first Sync Database",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.mjs",
   "react-native": "./dist/reactnative/index.js",
@@ -17,7 +17,7 @@
   "keywords": [
     "database",
     "e2e-encryption",
-    "offline-first",
+    "local-first",
     "sync",
     "crdt",
     "automerge",

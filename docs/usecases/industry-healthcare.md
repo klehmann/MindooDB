@@ -159,7 +159,7 @@ class MedicalDeviceData {
 - **Time-Sharded**: Monthly databases for device data
 - **Device-Based**: Separate databases per device
 - **Time-Series**: Efficient storage of readings
-- **Offline-First**: Devices work independently
+- **Local-First**: Devices work independently
 
 **Benefits:**
 - Efficient storage of time-series data

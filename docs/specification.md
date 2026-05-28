@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** for secure, distributed document storage. Clients create tenants locally and synchronize through content-addressed stores containing cryptographically signed and encrypted document histories.
+MindooDB is an **End-to-End Encrypted, Local-first Sync Database** for secure, distributed document storage. Clients create tenants locally and synchronize through content-addressed stores containing cryptographically signed and encrypted document histories.
 
 **Design Principles:**
 - No central authority required—tenants created entirely client-side
@@ -701,7 +701,7 @@ Multiple keys per user (signing, encryption, named symmetric keys) require:
 | **Collaborative Editing** | Automerge CRDTs + signed changes |
 | **Secure File Sharing** | Named keys for need-to-know access |
 | **Audit-Compliant Systems** | Append-only, signed, timestamped history |
-| **Offline-First Apps** | Full functionality without network |
+| **Local-First Apps** | Full functionality without network |
 
 ---
 

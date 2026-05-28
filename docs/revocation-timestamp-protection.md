@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This document describes a critical security problem in MindooDB: **how to prevent revoked users from creating backdated changes by manipulating their system clock**. The problem arises from the end-to-end encrypted, offline-first architecture where clients control change timestamps. We analyze multiple cryptographic approaches to solve this problem while maintaining the system's core principles: end-to-end encryption, offline operation, and hybrid deployment models.
+This document describes a critical security problem in MindooDB: **how to prevent revoked users from creating backdated changes by manipulating their system clock**. The problem arises from the end-to-end encrypted, local-first architecture where clients control change timestamps. We analyze multiple cryptographic approaches to solve this problem while maintaining the system's core principles: end-to-end encryption, offline operation, and hybrid deployment models.
 
 **Recommended Solution**: Hybrid approach using directory sequence numbers combined with local monotonic counters (Solution D), providing defense-in-depth protection while maintaining offline capabilities.
 
@@ -56,7 +56,7 @@ Any solution must respect MindooDB's fundamental principles:
    - All operations cryptographically verified
    - Trust established through cryptographic proofs
 
-2. **Offline-First Operation**
+2. **Local-First Operation**
    - System must work when offline
    - Changes can be created without network connectivity
    - Synchronization happens when connectivity is available
