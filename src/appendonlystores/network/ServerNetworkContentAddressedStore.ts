@@ -28,6 +28,45 @@ import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
+import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
+import type { AccessDecision } from "../../core/accesscontrol/types";
+
+/**
+ * Server-side Tier 1 access evaluator (docs/accesscontrol.md §7). Given a
+ * pushed entry and the database it targets, returns whether the entry is
+ * allowed by the identity-tier policy at the entry's trusted time. Supplied by
+ * the host server, which has access to the directory-state node and can resolve
+ * the author's identity set; kept as a callback so this transport layer stays
+ * decoupled from the directory implementation and remains easy to unit-test.
+ */
+export type ServerTier1Evaluator = (
+  entry: StoreEntry,
+  dbid: string
+) => Promise<AccessDecision>;
+
+/**
+ * Resolves a wipe-targeted signing key to the id of the admin-signed grant
+ * document carrying its remote-wipe directive (docs/accesscontrol.md §6.5), or
+ * null if the key is not wipe-targeted. Supplied by the host server from the
+ * directory; kept as a callback so this transport layer stays decoupled.
+ */
+export type WipeGrantDocIdResolver = (signingKey: string) => Promise<string | null>;
+
+/** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
+export interface ServerAccessControlOptions {
+  /** The trusted-time provider used to stamp receipts on accepted entries (§5, §13). */
+  timestampProvider?: TimestampProvider;
+  /** The database id witnessed entries are bound to (the store's db context). */
+  witnessDbid?: string;
+  /** Tier 1 evaluator; when present, denied pushes are rejected with ACCESS_DENIED. */
+  tier1Evaluator?: ServerTier1Evaluator;
+  /**
+   * Remote-wipe resolver (§6.5). When present, a wipe-scoped token is served
+   * only the admin-signed grant document carrying its directive (on the
+   * directory store) and nothing else (on data stores); pushes are denied.
+   */
+  wipeGrantDocIdResolver?: WipeGrantDocIdResolver;
+}
 
 /**
  * Server-side network handler for ContentAddressedStore operations.
@@ -48,6 +87,16 @@ export class ServerNetworkContentAddressedStore {
   private rsaEncryption: RSAEncryption;
   private cryptoAdapter: CryptoAdapter;
   private logger: Logger;
+  /** Trusted-time provider for stamping receipts; undefined disables access-control v1. */
+  private timestampProvider?: TimestampProvider;
+  /** Database id bound into witness receipts for this store. */
+  private witnessDbid?: string;
+  /** Optional Tier 1 evaluator; undefined keeps the legacy membership-only check. */
+  private tier1Evaluator?: ServerTier1Evaluator;
+  /** Optional remote-wipe resolver; undefined disables wipe-scoped serving. */
+  private wipeGrantDocIdResolver?: WipeGrantDocIdResolver;
+  /** The directory database id, where grant documents live (§6.5). */
+  private static readonly DIRECTORY_DB_ID = "directory";
 
   /**
    * Create a new ServerNetworkContentAddressedStore.
@@ -63,7 +112,8 @@ export class ServerNetworkContentAddressedStore {
     directory: MindooTenantDirectory,
     authService: AuthenticationService,
     cryptoAdapter: CryptoAdapter,
-    logger?: Logger
+    logger?: Logger,
+    accessControl?: ServerAccessControlOptions
   ) {
     this.localStore = localStore;
     this.directory = directory;
@@ -74,6 +124,36 @@ export class ServerNetworkContentAddressedStore {
       new MindooLogger(getDefaultLogLevel(), `ServerNetworkStore:${localStore.getId()}`, true);
     const rsaLogger = this.logger.createChild("RSAEncryption");
     this.rsaEncryption = new RSAEncryption(cryptoAdapter, rsaLogger);
+    this.timestampProvider = accessControl?.timestampProvider;
+    this.witnessDbid = accessControl?.witnessDbid;
+    this.tier1Evaluator = accessControl?.tier1Evaluator;
+    this.wipeGrantDocIdResolver = accessControl?.wipeGrantDocIdResolver;
+  }
+
+  /**
+   * Compute the id allow-list for a (possibly wipe-scoped) token
+   * (docs/accesscontrol.md §6.5). Returns:
+   *  - `null` for a normal token: serving is unrestricted; OR
+   *  - a `Set<string>` for a wipe-scoped token: only these entry ids may be
+   *    served. On the directory store this is exactly the admin-signed grant
+   *    document carrying the directive; on any data store it is empty.
+   */
+  private async wipeAllowedIds(
+    payload: NetworkAuthTokenPayload,
+  ): Promise<Set<string> | null> {
+    if (!payload.wipe || !payload.deviceSigningKey || !this.wipeGrantDocIdResolver) {
+      return null;
+    }
+    // A wipe-targeted device gets no data-database content at all.
+    if (this.localStore.getId() !== ServerNetworkContentAddressedStore.DIRECTORY_DB_ID) {
+      return new Set<string>();
+    }
+    const grantDocId = await this.wipeGrantDocIdResolver(payload.deviceSigningKey);
+    if (!grantDocId) {
+      return new Set<string>();
+    }
+    const metas = await this.localStore.findNewEntriesForDoc([], grantDocId);
+    return new Set(metas.map((m) => m.id));
   }
 
   /**
@@ -131,7 +211,8 @@ export class ServerNetworkContentAddressedStore {
     const newEntries = await this.localStore.findNewEntries(knownIds);
     this.logger.debug(`Found ${newEntries.length} new entries`);
     
-    return newEntries;
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    return allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
   }
 
   /**
@@ -158,7 +239,8 @@ export class ServerNetworkContentAddressedStore {
     const newEntries = await this.localStore.findNewEntriesForDoc(knownIds, docId);
     this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
     
-    return newEntries;
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    return allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
   }
 
   /**
@@ -190,7 +272,8 @@ export class ServerNetworkContentAddressedStore {
     );
     this.logger.debug(`Found ${entries.length} entries`);
     
-    return entries;
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    return allowed ? entries.filter((e) => allowed.has(e.id)) : entries;
   }
 
   /**
@@ -208,6 +291,19 @@ export class ServerNetworkContentAddressedStore {
     // Validate token
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+
+    // Wipe-scoped token (§6.5): return only the allowed entries (the grant
+    // directive on the directory store, nothing on data stores) in a single
+    // terminal page, regardless of cursor.
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    if (allowed) {
+      if (allowed.size === 0) {
+        return { entries: [], nextCursor: cursor, hasMore: false };
+      }
+      const all = await this.localStore.findNewEntries([]);
+      const entries = all.filter((e) => allowed.has(e.id));
+      return { entries, nextCursor: cursor, hasMore: false };
+    }
 
     if (this.localStore.scanEntriesSince) {
       return this.localStore.scanEntriesSince(cursor, limit, filters);
@@ -295,6 +391,12 @@ export class ServerNetworkContentAddressedStore {
         typeof this.localStore.planDocumentMaterializationBatch === "function",
       supportsAttachmentReadPlanning:
         typeof this.localStore.planAttachmentReadByWalkingMetadata === "function",
+      // Access-control v1 negotiation (docs/accesscontrol.md §4). `serverTime`
+      // lets the client run its clock-skew guard before syncing; the flag
+      // advertises that this server stamps witness receipts and enforces Tier 1.
+      serverTime: Date.now(),
+      supportsAccessControlV1: this.timestampProvider !== undefined,
+      supportsRemoteWipeV1: this.wipeGrantDocIdResolver !== undefined,
     };
   }
 
@@ -358,8 +460,12 @@ export class ServerNetworkContentAddressedStore {
     
     this.logger.debug(`Retrieved encryption key for user: ${username}`);
     
+    // Restrict a wipe-scoped token to only the grant directive (§6.5).
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    const requestedIds = allowed ? ids.filter((id) => allowed.has(id)) : ids;
+
     // Get the entries from local store
-    const entries = await this.localStore.getEntries(ids);
+    const entries = await this.localStore.getEntries(requestedIds);
     this.logger.debug(`Retrieved ${entries.length} entries from local store`);
     
     // Encrypt each entry with the user's RSA public key
@@ -381,6 +487,10 @@ export class ServerNetworkContentAddressedStore {
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
 
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    if (allowed && !allowed.has(id)) {
+      return null;
+    }
     return this.localStore.getEntryMetadata(id);
   }
 
@@ -390,16 +500,31 @@ export class ServerNetworkContentAddressedStore {
    * @param token The JWT access token
    * @param entries The entries to store
    */
-  async handlePutEntries(token: string, entries: StoreEntry[]): Promise<void> {
+  async handlePutEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
     this.logger.debug(`Handling putEntries request for ${entries.length} entries`);
     
     // Validate token
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
-    
+
+    // A wipe-targeted device may not push anything (§6.5): it exists only to
+    // receive the wipe directive and then delete its local copy.
+    if (tokenPayload.wipe && this.wipeGrantDocIdResolver) {
+      throw new NetworkError(
+        NetworkErrorType.ACCESS_DENIED,
+        "Device is targeted for remote wipe and may not push entries",
+      );
+    }
+
+    // A single acceptance time for this batch so receipts are consistent and a
+    // batch cannot interleave with the witness's own monotonic clock (§5.3).
+    const receivedAt = Date.now();
+    const stampedMetadata: StoreEntryMetadata[] = [];
+
     // Process each entry
+    const toStore: StoreEntry[] = [];
     for (const entry of entries) {
-      // Verify the entry was created by a trusted user
+      // Verify the entry was created by a trusted user (baseline Tier 1).
       const isValidKey = await this.directory.validatePublicSigningKey(entry.createdByPublicKey);
       if (!isValidKey) {
         throw new NetworkError(
@@ -407,11 +532,58 @@ export class ServerNetworkContentAddressedStore {
           `Entry ${entry.id} was not signed by a trusted user`
         );
       }
+
+      // Rule-based Tier 1 enforcement (docs/accesscontrol.md §7). The server can
+      // only decide the identity tier; content-tier (Tier 2) gates are deferred
+      // to clients and treated as allowed here.
+      if (this.tier1Evaluator) {
+        const decision = await this.tier1Evaluator(entry, this.witnessDbid ?? this.localStore.getId());
+        if (!decision.allowed) {
+          throw new NetworkError(
+            NetworkErrorType.ACCESS_DENIED,
+            `Entry ${entry.id} denied by Tier 1 policy: ${decision.reason}`
+          );
+        }
+      }
+
+      // Stamp a witness receipt onto the accepted entry (§5.3). Self-authored
+      // entries (the witness pushing its own data) are not self-witnessed.
+      //
+      // Legacy entries (no `entryVersion`) are NOT witnessed: they predate the
+      // witness era and the version-aware trusted-time rule treats them as
+      // stable at their `createdAt` (see core/storeEntryTime.ts). Stamping a
+      // `receivedAt = now` on them when an old local DB first syncs to a fresh
+      // server would collapse every old doc onto "today" and re-introduce the
+      // "access since: today" bug. Only witness-era writers (`entryVersion`
+      // present) are eligible for a receipt.
+      if (
+        this.timestampProvider
+        && entry.entryVersion !== undefined
+        && entry.createdByPublicKey !== this.timestampProvider.issuerPublicKey
+      ) {
+        const stamp = await this.timestampProvider.stamp(
+          entry,
+          { dbid: this.witnessDbid ?? this.localStore.getId(), receivedAt }
+        );
+        const witnessed: StoreEntry = { ...entry, ...stamp };
+        toStore.push(witnessed);
+        stampedMetadata.push(this.toMetadata(witnessed));
+      } else {
+        toStore.push(entry);
+        stampedMetadata.push(this.toMetadata(entry));
+      }
     }
     
-    // Store all entries
-    await this.localStore.putEntries(entries);
-    this.logger.debug(`Successfully stored ${entries.length} entries`);
+    // Store all entries (witnessed where applicable)
+    await this.localStore.putEntries(toStore);
+    this.logger.debug(`Successfully stored ${toStore.length} entries`);
+    return stampedMetadata;
+  }
+
+  /** Project a store entry to its metadata (including any witness fields). */
+  private toMetadata(entry: StoreEntry): StoreEntryMetadata {
+    const { encryptedData: _encryptedData, ...metadata } = entry;
+    return metadata as StoreEntryMetadata;
   }
 
   /**
@@ -433,7 +605,8 @@ export class ServerNetworkContentAddressedStore {
     const existingIds = await this.localStore.hasEntries(ids);
     this.logger.debug(`Found ${existingIds.length} existing entries out of ${ids.length} checked`);
     
-    return existingIds;
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    return allowed ? existingIds.filter((id) => allowed.has(id)) : existingIds;
   }
 
   /**
@@ -454,7 +627,8 @@ export class ServerNetworkContentAddressedStore {
     const allIds = await this.localStore.getAllIds();
     this.logger.debug(`Returning ${allIds.length} entry IDs`);
     
-    return allIds;
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    return allowed ? allIds.filter((id) => allowed.has(id)) : allIds;
   }
 
   /**
@@ -477,6 +651,12 @@ export class ServerNetworkContentAddressedStore {
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
+    // A wipe-scoped token may not traverse the DAG beyond its grant directive.
+    const allowed = await this.wipeAllowedIds(tokenPayload);
+    if (allowed) {
+      return allowed.has(startId) ? [startId] : [];
+    }
+
     // Resolve dependencies in local store
     const resolvedIds = await this.localStore.resolveDependencies(startId, options);
     this.logger.debug(`Resolved ${resolvedIds.length} dependencies`);

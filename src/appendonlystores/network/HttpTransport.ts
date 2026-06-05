@@ -516,10 +516,10 @@ export class HttpTransport implements NetworkTransport {
   /**
    * Push entries to the remote store.
    */
-  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
+  async putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
     this.logger.debug(`Pushing ${entries.length} entries`);
     if (entries.length === 0) {
-      return;
+      return [];
     }
 
     const serializedEntries = entries.map((entry) => this.serializeEntry(entry));
@@ -527,9 +527,10 @@ export class HttpTransport implements NetworkTransport {
     if (maxBodyBytes) {
       this.logger.debug(`Remote JSON body limit advertised as ${maxBodyBytes} bytes`);
     }
-    await this.pushSerializedEntries(token, serializedEntries, maxBodyBytes);
+    const receipts = await this.pushSerializedEntries(token, serializedEntries, maxBodyBytes);
 
-    this.logger.debug(`Successfully pushed ${entries.length} entries`);
+    this.logger.debug(`Successfully pushed ${entries.length} entries (${receipts.length} receipts)`);
+    return receipts;
   }
 
   /**
@@ -839,9 +840,9 @@ export class HttpTransport implements NetworkTransport {
     token: string,
     serializedEntries: SerializedEntry[],
     maxBodyBytes: number | null,
-  ): Promise<void> {
+  ): Promise<StoreEntryMetadata[]> {
     if (serializedEntries.length === 0) {
-      return;
+      return [];
     }
 
     if (maxBodyBytes !== null) {
@@ -849,22 +850,23 @@ export class HttpTransport implements NetworkTransport {
       if (batches.length > 1) {
         this.logger.debug(`Split putEntries payload into ${batches.length} batch(es) for body limit ${maxBodyBytes}`);
       }
+      const receipts: StoreEntryMetadata[] = [];
       for (const batch of batches) {
-        await this.sendSerializedEntriesBatch(token, batch, maxBodyBytes);
+        receipts.push(...await this.sendSerializedEntriesBatch(token, batch, maxBodyBytes));
       }
-      return;
+      return receipts;
     }
 
-    await this.sendSerializedEntriesBatch(token, serializedEntries, null);
+    return this.sendSerializedEntriesBatch(token, serializedEntries, null);
   }
 
   private async sendSerializedEntriesBatch(
     token: string,
     serializedEntries: SerializedEntry[],
     maxBodyBytes: number | null,
-  ): Promise<void> {
+  ): Promise<StoreEntryMetadata[]> {
     try {
-      await this.postSerializedEntries(token, serializedEntries);
+      return await this.postSerializedEntries(token, serializedEntries);
     } catch (error) {
       if (
         error instanceof NetworkError
@@ -877,9 +879,9 @@ export class HttpTransport implements NetworkTransport {
         this.logger.warn(
           `putEntries batch with ${serializedEntries.length} entries exceeded remote limit; retrying as ${left.length} + ${right.length} batches.`,
         );
-        await this.pushSerializedEntries(token, left, maxBodyBytes);
-        await this.pushSerializedEntries(token, right, maxBodyBytes);
-        return;
+        const leftReceipts = await this.pushSerializedEntries(token, left, maxBodyBytes);
+        const rightReceipts = await this.pushSerializedEntries(token, right, maxBodyBytes);
+        return [...leftReceipts, ...rightReceipts];
       }
       throw error;
     }
@@ -931,8 +933,8 @@ export class HttpTransport implements NetworkTransport {
   private async postSerializedEntries(
     token: string,
     serializedEntries: SerializedEntry[],
-  ): Promise<void> {
-    await this.fetchWithRetry(
+  ): Promise<StoreEntryMetadata[]> {
+    const response = await this.fetchWithRetry(
       `${this.getSyncBasePath()}/putEntries`,
       {
         method: "POST",
@@ -947,6 +949,19 @@ export class HttpTransport implements NetworkTransport {
         }),
       }
     );
+
+    // The server returns witness receipts (stamped metadata) for accepted
+    // entries (docs/accesscontrol.md §5.3). Older servers omit the field.
+    let receipts: StoreEntryMetadata[] = [];
+    try {
+      const data = await response.json();
+      const serialized = (data?.receipts as SerializedEntryMetadata[] | undefined) ?? [];
+      receipts = serialized.map((e) => this.deserializeEntryMetadata(e));
+    } catch {
+      // Non-JSON / empty body from a legacy server: no receipts to apply.
+      receipts = [];
+    }
+    return receipts;
   }
 
   private measureBodyBytes(value: string): number {
@@ -989,6 +1004,12 @@ export class HttpTransport implements NetworkTransport {
       signature: this.uint8ArrayToBase64(metadata.signature),
       originalSize: metadata.originalSize,
       encryptedSize: metadata.encryptedSize,
+      receivedAt: metadata.receivedAt,
+      receivedByPublicKey: metadata.receivedByPublicKey,
+      receivedDateSignature: metadata.receivedDateSignature
+        ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
+        : undefined,
+      entryVersion: metadata.entryVersion,
     };
   }
 
@@ -1011,6 +1032,12 @@ export class HttpTransport implements NetworkTransport {
       signature: this.base64ToUint8Array(serialized.signature),
       originalSize: serialized.originalSize,
       encryptedSize: serialized.encryptedSize,
+      receivedAt: serialized.receivedAt,
+      receivedByPublicKey: serialized.receivedByPublicKey,
+      receivedDateSignature: serialized.receivedDateSignature
+        ? this.base64ToUint8Array(serialized.receivedDateSignature)
+        : undefined,
+      entryVersion: serialized.entryVersion,
     };
   }
 
@@ -1041,6 +1068,12 @@ interface SerializedEntryMetadata {
   signature: string; // base64
   originalSize: number;
   encryptedSize: number;
+  // Access-control witness receipt (docs/accesscontrol.md §5).
+  receivedAt?: number;
+  receivedByPublicKey?: string;
+  receivedDateSignature?: string; // base64
+  // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
+  entryVersion?: number;
 }
 
 interface SerializedEntry extends SerializedEntryMetadata {

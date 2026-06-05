@@ -78,8 +78,10 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
  * (a `Uint8Array` at runtime) is stored as a base64-encoded string so it
  * can be written directly to JSON files and metadata segments.
  */
-interface SerializedStoreEntryMetadata extends Omit<StoreEntryMetadata, "signature"> {
+interface SerializedStoreEntryMetadata
+  extends Omit<StoreEntryMetadata, "signature" | "receivedDateSignature"> {
   signature: string; // base64
+  receivedDateSignature?: string; // base64 (access-control witness receipt)
 }
 
 /**
@@ -127,6 +129,9 @@ function serializeMetadata(metadata: StoreEntryMetadata): SerializedStoreEntryMe
   return {
     ...metadata,
     signature: Buffer.from(metadata.signature).toString("base64"),
+    receivedDateSignature: metadata.receivedDateSignature
+      ? Buffer.from(metadata.receivedDateSignature).toString("base64")
+      : undefined,
   };
 }
 
@@ -138,6 +143,9 @@ function deserializeMetadata(serialized: SerializedStoreEntryMetadata): StoreEnt
   return {
     ...serialized,
     signature: new Uint8Array(Buffer.from(serialized.signature, "base64")),
+    receivedDateSignature: serialized.receivedDateSignature
+      ? new Uint8Array(Buffer.from(serialized.receivedDateSignature, "base64"))
+      : undefined,
   };
 }
 
@@ -1192,6 +1200,57 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     }
 
     if (hasMutation && this.indexingEnabled) {
+      await this.appendMetadataSegment(segmentRecords);
+    }
+  }
+
+  /**
+   * Apply witness receipts to already-stored entries (docs/accesscontrol.md §5.3).
+   *
+   * Rewrites the affected metadata files with the witness fields and a fresh
+   * `receiptOrder` so the revision feed's `scanEntriesSince` cursor re-discovers
+   * the now-witnessed entries. Receipts whose entry is absent locally, or that
+   * match the already-stored witness, are skipped (idempotent).
+   */
+  async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
+    await this.ensureInitialized();
+    const segmentRecords: SerializedMetadataSegmentRecord[] = [];
+
+    for (const receipt of receipts) {
+      if (receipt.receivedAt === undefined) {
+        continue;
+      }
+      const existing = await this.readMetadataById(receipt.id);
+      if (!existing) {
+        continue;
+      }
+      if (
+        existing.receivedAt === receipt.receivedAt &&
+        existing.receivedByPublicKey === receipt.receivedByPublicKey
+      ) {
+        continue;
+      }
+
+      const updated: StoreEntryMetadata = {
+        ...existing,
+        receivedAt: receipt.receivedAt,
+        receivedByPublicKey: receipt.receivedByPublicKey,
+        receivedDateSignature: receipt.receivedDateSignature,
+        receiptScheme: receipt.receiptScheme,
+        receiptOrder: this.nextReceiptOrder++,
+      };
+      await this.writeFileAtomic(
+        this.metadataPathForId(receipt.id),
+        JSON.stringify(serializeMetadata(updated)),
+      );
+
+      if (this.indexingEnabled) {
+        this.applyMetadataUpsert(updated);
+        segmentRecords.push({ op: "upsert", metadata: serializeMetadata(updated) });
+      }
+    }
+
+    if (segmentRecords.length > 0 && this.indexingEnabled) {
       await this.appendMetadataSegment(segmentRecords);
     }
   }

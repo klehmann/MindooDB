@@ -143,16 +143,20 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * Store entries to the remote store.
    * The entries are pushed to the server immediately.
    */
-  async putEntries(entries: StoreEntry[]): Promise<void> {
+  async putEntries(entries: StoreEntry[]): Promise<void | StoreEntryMetadata[]> {
     if (entries.length === 0) {
-      return;
+      return [];
     }
 
-    await this.withTransparentReauth("putEntries", async () => {
+    return this.withTransparentReauth("putEntries", async () => {
       this.logger.debug(`Pushing ${entries.length} entries to remote`);
       const token = await this.ensureAuthenticated();
-      await this.transport.putEntries(token, entries);
-      this.logger.debug(`Successfully pushed ${entries.length} entries`);
+      // The server stamps witness receipts onto accepted entries and returns
+      // them so the pushing client can persist the attestation locally
+      // (docs/accesscontrol.md §5.3). Surface them to the sync orchestrator.
+      const receipts = await this.transport.putEntries(token, entries);
+      this.logger.debug(`Successfully pushed ${entries.length} entries (${receipts.length} receipts)`);
+      return receipts;
     });
   }
 

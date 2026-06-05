@@ -24,6 +24,7 @@ import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
+import { extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
@@ -585,6 +586,121 @@ export class BaseMindooTenant implements MindooTenant {
     return this.directoryCache;
   }
 
+  /**
+   * Check whether an admin has requested a remote wipe of THIS device and, if
+   * so, delete the entire local tenant (docs/accesscontrol.md §6.5).
+   *
+   * The directive lives in the current user's admin-signed `grantaccess`
+   * document as `wipeRequestedForSigningKeys`. Because the directory database is
+   * admin-only, any grant document that materializes there is already verified
+   * as admin-signed — so finding this device's signing key in that list is a
+   * genuine, admin-issued directive (the server, which may be hostile, cannot
+   * forge it). Sync the directory before calling this so the latest directive is
+   * visible.
+   *
+   * @returns true if a wipe was applied (the tenant is now gone locally), false
+   *   if this device is not targeted.
+   */
+  async checkAndApplyRemoteWipe(): Promise<boolean> {
+    const directory = await this.openDirectory();
+    const myKey = this.currentUser.userSigningKeyPair.publicKey;
+
+    const finder = directory as unknown as {
+      findGrantAccessDocuments?: (username: string) => Promise<Array<{ getData(): Record<string, unknown> }>>;
+    };
+    if (typeof finder.findGrantAccessDocuments !== "function") {
+      return false;
+    }
+
+    const grants = await finder.findGrantAccessDocuments(this.currentUser.username);
+    const targeted = grants.some((grant) =>
+      extractWipeRequestedSigningKeys(grant.getData()).includes(myKey),
+    );
+    if (!targeted) {
+      return false;
+    }
+
+    this.logger.warn(
+      `Remote-wipe directive found for this device; deleting local tenant "${this.tenantId}".`,
+    );
+    await this.wipeLocalTenant();
+    return true;
+  }
+
+  /**
+   * Delete all local data for this tenant from the device (docs/accesscontrol.md
+   * §6.5): every local database (the directory database plus all known data
+   * databases), this tenant's keys in the (multi-tenant) KeyBag, and all
+   * in-memory caches. Other tenants on the same device are untouched.
+   *
+   * Idempotent and best-effort: once the local tenant is gone there is nothing
+   * left to delete. Pass extra database ids for databases that exist locally but
+   * have not been opened in this session.
+   *
+   * @param additionalDbIds Optional extra local database ids to wipe.
+   */
+  async wipeLocalTenant(additionalDbIds?: string[]): Promise<void> {
+    // Every local database belonging to this tenant: the directory plus any
+    // opened/known data databases. Wipe is a whole-tenant operation.
+    const dbIds = new Set<string>([
+      "directory",
+      ...this.databaseCache.keys(),
+      ...(additionalDbIds ?? []),
+    ]);
+
+    for (const dbId of dbIds) {
+      await this.clearLocalStoresForDb(dbId);
+    }
+
+    // Drop in-memory caches and decrypted key material so nothing lingers.
+    this.databaseCache.clear();
+    this.directoryCache = null;
+    this.remoteStoreCache.clear();
+    this.decryptedTenantKeyCache = undefined;
+    this.decryptedUserSigningKeyCache = undefined;
+    this.decryptedUserEncryptionKeyCache = undefined;
+    this.disposeCacheManager();
+
+    // Remove this tenant's keys from the multi-tenant KeyBag, leaving other
+    // tenants intact.
+    try {
+      await this.keyBag.deleteTenantKeys(this.tenantId);
+    } catch (error) {
+      this.logger.warn(`wipeLocalTenant: failed to delete KeyBag keys: ${error}`);
+    }
+  }
+
+  /** Clear the document and attachment stores for one local database. */
+  private async clearLocalStoresForDb(dbId: string): Promise<void> {
+    let docStore: ContentAddressedStore | undefined;
+    let attachmentStore: ContentAddressedStore | undefined;
+
+    const opened = this.databaseCache.get(dbId);
+    if (opened) {
+      docStore = opened.getStore();
+      attachmentStore = opened.getAttachmentStore();
+    } else {
+      try {
+        const created = this.storeFactory.createStore(dbId);
+        docStore = created.docStore;
+        attachmentStore = created.attachmentStore;
+      } catch (error) {
+        this.logger.warn(`wipeLocalTenant: could not open stores for db "${dbId}": ${error}`);
+        return;
+      }
+    }
+
+    for (const store of [docStore, attachmentStore]) {
+      if (store && typeof store.clearAllLocalData === "function") {
+        try {
+          await store.clearAllLocalData();
+        } catch (error) {
+          this.logger.warn(`wipeLocalTenant: clearAllLocalData failed for db "${dbId}": ${error}`);
+        }
+      }
+    }
+  }
+
   private async assertCurrentUserCanOpenDB(id: string): Promise<void> {
     if (id === "directory") {
       return;
@@ -863,10 +979,18 @@ export class BaseMindooTenant implements MindooTenant {
       userSigningPublicKey: request.signingPublicKey,
       userEncryptionPublicKey: request.encryptionPublicKey,
     };
+    // Device label for this key pair (§6.5): an explicit admin-provided label
+    // overrides the one suggested by the joining user in the request.
+    const deviceLabel =
+      typeof options.label === "string" && options.label.trim().length > 0
+        ? options.label.trim()
+        : request.label;
     await directory.registerUser(
       publicUserId,
       options.adminSigningKey,
-      options.adminPassword
+      options.adminPassword,
+      undefined,
+      deviceLabel,
     );
 
     // 2. Export selected document keys encrypted with the share password.

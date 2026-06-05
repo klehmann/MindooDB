@@ -5,6 +5,40 @@ export * from "./types";
 export * from "./databaseIdValidation";
 export * from "./tenantIdValidation";
 
+// Access-control directory schema + time-travel state (docs/accesscontrol.md
+// §6/§8). Surfaced so consumers (e.g. the Haven directory-history UI) can read
+// the time-travel DirectoryStateNode returned by
+// MindooTenantDirectory.getDirectoryStateAt / getDirectoryStateHead.
+export {
+  ACCESS_CONTROL_FORM,
+  ACL_DEFAULT_POLICY_DOC_ID,
+  DEFAULT_POLICY_DEFAULTS,
+  RULE_TYPES,
+  RULE_TYPE_TO_DENY_FIELD,
+  effectivePolicy,
+  aclDbPolicyDocId,
+  aclRuleDocId,
+  aclTrustedWitnessDocId,
+  encodeAclIdComponent,
+  decodeAclIdComponent,
+  type RuleType,
+  type Operator,
+  type WithFieldWhen,
+  type WithFieldClause,
+  type DefaultAccessPolicyDoc,
+  type AclRuleDoc,
+  type TrustedWitnessDoc,
+  type AccessTier,
+  type AccessDecision,
+} from "./accesscontrol/types";
+export {
+  createGenesisNode,
+  nodeCovering,
+  type DirectoryStateNode,
+  type UserGrantSnapshot,
+  type GroupSnapshot,
+} from "./accesscontrol/DirectoryStateNode";
+
 // User ID types
 export type { PublicUserId, PrivateUserId } from "./userid";
 

@@ -2,6 +2,7 @@
 // React Native: native Rust (react-native-automerge-generated)
 // Browser/Node.js: WASM (@automerge/automerge/slim)
 import { Automerge } from "./automerge-adapter";
+import { entryTrustedTime, isProvisional, isVersioned, metadataWitnessState } from "./storeEntryTime";
 // Import types from WASM package (types are compatible across implementations)
 import type * as AutomergeTypes from "@automerge/automerge/slim";
 import { v7 as uuidv7 } from "uuid";
@@ -33,10 +34,13 @@ import {
   StoreEntry,
   StoreEntryMetadata,
   StoreEntryType,
+  CURRENT_STORE_ENTRY_VERSION,
   MindooTenant,
   ProcessChangesCursor,
   ProcessChangesResult,
   DocumentHistoryResult,
+  RevisionCursor,
+  ChangeRevisionResult,
   AttachmentReference,
   AttachmentConfig,
   DocumentCacheConfig,
@@ -102,6 +106,11 @@ import {
   generateFileUuid7,
 } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
+import {
+  QuarantineRecord,
+} from "./accesscontrol/materializationGuard";
+import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
+import type { RuleType, AccessDecision } from "./accesscontrol/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 import { validateDatabaseId } from "./databaseIdValidation";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
@@ -185,6 +194,36 @@ interface InternalDoc {
   lastModified: number;
   decryptionKeyId: string;
   isDeleted: boolean;
+  /**
+   * Whether any of this document's store entries is versioned but not yet
+   * witnessed ({@link isProvisional}). Surfaced via
+   * {@link MindooDoc.isAwaitingWitness}. Optional on the in-memory shape:
+   * construction sites that have the document's metadata compute it; the rest
+   * default to `false` (legacy / unknown docs are never awaiting witness).
+   */
+  awaitingWitness?: boolean;
+  /**
+   * Whether this document is witness-era (has a versioned store entry) AND fully
+   * witnessed (no entry still provisional). Surfaced via
+   * {@link MindooDoc.isWitnessed}. Mutually exclusive with
+   * {@link awaitingWitness}; legacy docs (no versioned entries) are neither.
+   * Optional on the in-memory shape: defaults to `false` for legacy/unknown docs.
+   */
+  witnessed?: boolean;
+}
+
+/**
+ * Cached per-document merged state for the revision-grain changefeed LRU
+ * (see {@link BaseMindooDB.revisionFeedDocCache}). `doc` is the merge of exactly
+ * the replay entries in `coveredIds`; `createdAt`/`decryptionKeyId` come from the
+ * document's `doc_create` entry.
+ */
+interface RevisionFeedDocState {
+  doc: AutomergeTypes.Doc<MindooDocPayload>;
+  /** Replay entry ids whose merge `doc` represents. */
+  coveredIds: Set<string>;
+  createdAt: number;
+  decryptionKeyId: string;
 }
 
 /**
@@ -230,6 +269,21 @@ interface DocumentIndexEntry {
   decryptionKeyId: string;
   /** See {@link DocumentAccessState}. */
   accessState: DocumentAccessState;
+  /**
+   * Whether the document has a versioned-but-un-witnessed entry
+   * ({@link isProvisional}). Part of the change identity so a witness receipt
+   * (which flips this from `true`→`false` without touching Automerge content)
+   * bumps {@link changeSeq} and re-emits the doc on the metadata feed, letting
+   * VirtualViews filtered on witness status re-evaluate it.
+   */
+  awaitingWitness: boolean;
+  /**
+   * Whether the document is witness-era and fully witnessed (see
+   * {@link InternalDoc.witnessed}). Part of the change identity alongside
+   * {@link awaitingWitness} so a witness receipt re-emits the doc on the
+   * metadata feed.
+   */
+  witnessed: boolean;
 }
 
 interface VerifiedReplayChange {
@@ -314,6 +368,17 @@ export class BaseMindooDB implements MindooDB {
   private tenant: BaseMindooTenant;
   private store: ContentAddressedStore;
   private attachmentStore: ContentAddressedStore;
+  /**
+   * Per-tenant quarantine/audit log of entries rejected during materialization
+   * (docs/accesscontrol.md §10). In-memory; surfaced via {@link getQuarantineLog}
+   * for Haven's audit view.
+   */
+  private quarantineLog: QuarantineRecord[] = [];
+  /**
+   * Short-TTL cache of "is access control active for this tenant?" so the
+   * materialization fast-path does not re-query the directory on every load.
+   */
+  private aclActiveCache: { value: boolean; at: number } | null = null;
   private chunkSizeBytes: number;
   
   // Admin-only mode: only entries signed by the admin key are loaded
@@ -348,6 +413,26 @@ export class BaseMindooDB implements MindooDB {
   // Track which entry IDs we've already processed
   private processedEntryIds: string[] = [];
   private processedEntryCursor: StoreScanCursor | null = null;
+
+  /**
+   * In-memory LRU of per-document merged state used by the revision-grain
+   * changefeed ({@link iterateRevisionsInternal}). Each entry holds a document's
+   * fully-merged Automerge doc together with the exact set of replay entry ids
+   * that merge covers, so an incremental feed advance can seed the next fold
+   * from the cached state (applying only the newly-arrived suffix) instead of
+   * re-decrypting and re-folding the document's whole history. Bounded by
+   * {@link revisionFeedCacheLimit}; least-recently-used docs are evicted and
+   * reconstructed from the best snapshot on the next touch.
+   */
+  private revisionFeedDocCache = new Map<string, RevisionFeedDocState>();
+  private readonly revisionFeedCacheLimit = 256;
+  /**
+   * Window size for batching encrypted-payload loads while folding a document's
+   * revision suffix ({@link foldDocRevisions}): one {@link ContentAddressedStore.getEntries}
+   * round trip per window instead of one per revision, while bounding peak
+   * memory and response size on a snapshot-less cold-start re-fold.
+   */
+  private readonly revisionFoldLoadWindow = 256;
   
   // Index: automergeHash -> entryId for each document
   // Used for resolving Automerge dependency hashes to entry IDs
@@ -735,6 +820,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified: internal.lastModified,
       decryptionKeyId: internal.decryptionKeyId,
       isDeleted: internal.isDeleted,
+      awaitingWitness: internal.awaitingWitness ?? false,
+      witnessed: internal.witnessed ?? false,
       changeSeq,
       automergeHeads,
     });
@@ -821,6 +908,14 @@ export class BaseMindooDB implements MindooDB {
         }
         if (!this.index[i].accessState) {
           this.index[i].accessState = "visible";
+        }
+        if (typeof this.index[i].awaitingWitness !== "boolean") {
+          // Caches written before the witness-aware flag: treat as not awaiting.
+          this.index[i].awaitingWitness = false;
+        }
+        if (typeof this.index[i].witnessed !== "boolean") {
+          // Caches written before the witness-aware flag: treat as not witnessed.
+          this.index[i].witnessed = false;
         }
         this.indexLookup.set(this.index[i].docId, i);
       }
@@ -954,6 +1049,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified: header.lastModified,
       decryptionKeyId: header.decryptionKeyId,
       isDeleted: header.isDeleted,
+      awaitingWitness: typeof header.awaitingWitness === "boolean" ? header.awaitingWitness : false,
+      witnessed: typeof header.witnessed === "boolean" ? header.witnessed : false,
     };
 
     return {
@@ -1065,6 +1162,8 @@ export class BaseMindooDB implements MindooDB {
     isDeleted: boolean,
     decryptionKeyId: string = "default",
     accessState: DocumentAccessState = "visible",
+    awaitingWitness: boolean = false,
+    witnessed: boolean = false,
   ): void {
     const startedAt = Date.now();
     const assignedSeq = this.nextChangeSeq;
@@ -1075,6 +1174,8 @@ export class BaseMindooDB implements MindooDB {
       isDeleted,
       decryptionKeyId,
       accessState,
+      awaitingWitness,
+      witnessed,
     };
     const existingIndex = this.indexLookup.get(docId);
     
@@ -1082,11 +1183,16 @@ export class BaseMindooDB implements MindooDB {
     if (existingIndex !== undefined) {
       const existingEntry = this.index[existingIndex];
       // If only metadata flags stayed identical and caller replays same state, skip.
+      // `awaitingWitness` is part of this identity so a witness receipt (which
+      // changes only `receivedAt`, not Automerge content) still bumps changeSeq
+      // and re-emits the doc on the metadata feed.
       if (
         existingEntry.lastModified === lastModified
         && existingEntry.isDeleted === isDeleted
         && existingEntry.decryptionKeyId === decryptionKeyId
         && existingEntry.accessState === accessState
+        && existingEntry.awaitingWitness === awaitingWitness
+        && existingEntry.witnessed === witnessed
       ) {
         return; // No change needed
       }
@@ -1526,7 +1632,8 @@ export class BaseMindooDB implements MindooDB {
         // missing or inaccessible; visible->visible transitions stay
         // idempotent via the existing `updateIndex` short-circuit.
         if (!existing || existing.accessState === "inaccessible") {
-          this.updateIndex(docId, visibility.lastModified, visibility.isDeleted, visibility.decryptionKeyId, "visible");
+          const { awaitingWitness, witnessed } = metadataWitnessState(metadataByDoc.get(docId)!);
+          this.updateIndex(docId, visibility.lastModified, visibility.isDeleted, visibility.decryptionKeyId, "visible", awaitingWitness, witnessed);
           changed = true;
         }
         continue;
@@ -1668,8 +1775,8 @@ export class BaseMindooDB implements MindooDB {
             if (updatedDoc) {
               this.logger.debug(`Successfully updated cached document ${docId} incrementally`);
               // Only update index if document actually changed
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible");
-              this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted})`);
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false);
+              this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted}, awaitingWitness: ${updatedDoc.awaitingWitness ?? false})`);
             } else {
               this.logger.debug(`Document ${docId} unchanged after applying new entries, skipping index update`);
             }
@@ -1679,7 +1786,7 @@ export class BaseMindooDB implements MindooDB {
             this.docCache.delete(docId);
             updatedDoc = await this.loadDocumentInternal(docId);
             if (updatedDoc) {
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible");
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false);
             }
           }
         } else {
@@ -1719,9 +1826,10 @@ export class BaseMindooDB implements MindooDB {
                 ...entriesForLastModified.map((e) => e.createdAt),
               );
               const isDeleted = this.computeIsDeletedFromMetadata(allDocMetadata);
-              this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible");
+              const { awaitingWitness, witnessed } = metadataWitnessState(allDocMetadata);
+              this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible", awaitingWitness, witnessed);
               this.logger.debug(
-                `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted})`,
+                `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted}, awaitingWitness: ${awaitingWitness})`,
               );
             }
           }
@@ -2062,7 +2170,14 @@ export class BaseMindooDB implements MindooDB {
         if (signal?.aborted) {
           return { transferred, cancelled: true };
         }
-        await targetStore.putEntries(batchEntries);
+        const putResult = await targetStore.putEntries(batchEntries);
+        // On push, the remote (witnessing) target returns receipts for accepted
+        // entries; persist them back onto the local source so the revision feed
+        // re-anchors them from the provisional head to their committed
+        // `receivedAt` (docs/accesscontrol.md §5.3). Pull targets return void.
+        if (Array.isArray(putResult) && putResult.length > 0 && sourceStore.applyWitnessReceipts) {
+          await sourceStore.applyWitnessReceipts(putResult);
+        }
         transferred += batchEntries.length;
       } catch (error) {
         if (signal?.aborted) {
@@ -2379,7 +2494,12 @@ export class BaseMindooDB implements MindooDB {
 
       const batch = missingIds.slice(offset, offset + pageSize);
       const entries = await sourceStore.getEntries(batch);
-      await targetStore.putEntries(entries);
+      const putResult = await targetStore.putEntries(entries);
+      // Persist any witness receipts back onto the local source (see push path
+      // in transferEntriesInBatches; docs/accesscontrol.md §5.3).
+      if (Array.isArray(putResult) && putResult.length > 0 && sourceStore.applyWitnessReceipts) {
+        await sourceStore.applyWitnessReceipts(putResult);
+      }
       transferred += entries.length;
 
       onProgress?.({
@@ -2515,11 +2635,30 @@ export class BaseMindooDB implements MindooDB {
     const keyId = options.decryptionKeyId ?? "default";
     const useCustomDocId = options.id !== undefined;
 
+    // Sanitize caller-provided initial values: internal/reserved fields (those
+    // starting with "_", e.g. "_attachments") are managed by MindooDB and must
+    // not be seeded by callers.
+    const initialValueEntries = options.initialValues
+      ? Object.entries(options.initialValues).filter(([k]) => !k.startsWith("_"))
+      : [];
+    const hasInitialValues = initialValueEntries.length > 0;
+
     if (useCustomDocId) {
       if (!CUSTOM_DOC_ID_REGEX.test(options.id!)) {
         throw new Error(
           `createDocument: invalid document id "${options.id}". ` +
           `Custom document IDs must match ${CUSTOM_DOC_ID_REGEX.source}.`
+        );
+      }
+      // Custom-ID documents are seeded with a hard-coded initial change so that
+      // independent replicas converge on the same Automerge hash. Baking
+      // caller values into that change would diverge the hash per content, so
+      // initialValues is unsupported on the custom-ID path in v1. Create the
+      // document first, then apply values via changeDoc().
+      if (hasInitialValues) {
+        throw new Error(
+          "createDocument: initialValues is not supported together with a custom id; " +
+          "create the document, then apply values with changeDoc()."
         );
       }
     }
@@ -2587,6 +2726,12 @@ export class BaseMindooDB implements MindooDB {
           // Store metadata in the document payload
           // We need to modify the document to ensure a change is created
           doc._attachments = [];
+          // Seed caller-provided initial values within the same doc_create
+          // change so a doc_create Tier 2 rule can evaluate them in the
+          // "after" state (docs/accesscontrol.md §6.3, §9).
+          for (const [key, value] of initialValueEntries) {
+            (doc as Record<string, unknown>)[key] = value;
+          }
         });
         this.logger.debug(`Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
       } catch (error) {
@@ -2660,6 +2805,7 @@ export class BaseMindooDB implements MindooDB {
       signature,
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     
     // Create full entry object
@@ -2674,6 +2820,13 @@ export class BaseMindooDB implements MindooDB {
     // Register automerge hash -> entry ID mapping
     this.registerAutomergeHashMapping(docId, automergeHash, entryId);
     
+    // A freshly created entry is versioned and un-witnessed, so the document is
+    // awaiting witness until it is pushed and stamped with a `receivedAt`.
+    const awaitingWitness = isProvisional(entryMetadata);
+    // Witnessed only once a versioned entry carries a `receivedAt`; a brand-new
+    // local create is versioned-but-provisional, so it is not yet witnessed.
+    const witnessed = isVersioned(entryMetadata) && !awaitingWitness;
+
     // Create internal document representation
     const internalDoc: InternalDoc = {
       id: docId,
@@ -2682,11 +2835,13 @@ export class BaseMindooDB implements MindooDB {
       lastModified: now,
       decryptionKeyId: keyId,
       isDeleted: false,
+      awaitingWitness,
+      witnessed,
     };
     
     // Update cache and index
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, false, internalDoc.decryptionKeyId, "visible");
+    this.updateIndex(docId, internalDoc.lastModified, false, internalDoc.decryptionKeyId, "visible", awaitingWitness, witnessed);
     this.markDocDirty(docId);
     
     this.logger.info(`Document ${docId} created successfully`);
@@ -2997,6 +3152,556 @@ export class BaseMindooDB implements MindooDB {
         };
       }
       
+    }
+  }
+
+  async *iterateChangeRevisionsSince(
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    yield* this.iterateRevisionsInternal(null, cursor);
+  }
+
+  async *iterateDocRevisionsSince(
+    docId: string,
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    yield* this.iterateRevisionsInternal(docId, cursor);
+  }
+
+  /**
+   * Shared implementation of the revision-grain changefeed
+   * ({@link iterateChangeRevisionsSince} / {@link iterateDocRevisionsSince}).
+   *
+   * Two distinct orderings drive the feed (docs/accesscontrol.md §8):
+   *
+   * - **Discovery (receiptOrder).** New entries are discovered via the store's
+   *   gap-free `scanEntriesSince(cursor)` scan in `(receiptOrder, id)` order, so
+   *   an incremental advance reads only entries appended since the cursor and
+   *   never re-scans cold documents. The resumable {@link RevisionCursor} is this
+   *   scan position, parked just before the earliest un-witnessed entry so the
+   *   provisional head overlay is re-evaluated on every resume.
+   * - **Materialization (trusted time).** Each affected document's changes are
+   *   folded in trusted-time order, so every yielded revision carries the
+   *   document's *trusted-time-bounded merge* — the merge of all of the doc's
+   *   changes with `trustedTime <= this revision's trustedTime`. This is correct
+   *   at the head and at every intermediate node, and concurrent same-base
+   *   changes merge from the larger-trusted-time instant onward.
+   *
+   * Trusted-time rule: witnessed entries use their witness `receivedAt`;
+   * un-witnessed local entries use the current wall clock, so they always sit at
+   * the provisional head and never appear in past-time reads until witnessed.
+   *
+   * An in-memory per-doc LRU ({@link revisionFeedDocCache}) lets the common
+   * in-order advance seed from cached state and decrypt only the new suffix; a
+   * cache miss reconstructs the seed from the best snapshot whose coverage is
+   * within the fold prefix via {@link computeDocumentMaterializationPlan}.
+   */
+  private async *iterateRevisionsInternal(
+    docIdFilter: string | null,
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    // ── Phase 1: discover new entries in receiptOrder ─────────────────────
+    const { newEntries, resumeCursor } = await this.discoverRevisionEntries(
+      docIdFilter,
+      cursor,
+    );
+    if (newEntries.length === 0) {
+      return;
+    }
+
+    // Trusted time for un-witnessed entries is the current wall clock, computed
+    // once per run so all un-witnessed entries share a stable head instant.
+    const now = Date.now();
+
+    // Affected documents (those with at least one newly-discovered entry), and
+    // the set of new entry ids per doc (the trusted-time positions from which the
+    // doc's merged state may have changed and must be re-folded / re-emitted).
+    const newIdsByDoc = new Map<string, Set<string>>();
+    for (const em of newEntries) {
+      let set = newIdsByDoc.get(em.docId);
+      if (!set) {
+        set = new Set<string>();
+        newIdsByDoc.set(em.docId, set);
+      }
+      set.add(em.id);
+    }
+
+    // ── Phase 2: per affected doc, fold in trusted-time order, emit suffix ──
+    for (const docId of Array.from(newIdsByDoc.keys()).sort()) {
+      yield* this.foldDocRevisions(docId, newIdsByDoc.get(docId)!, now, resumeCursor);
+    }
+  }
+
+  /**
+   * Discovery phase of {@link iterateRevisionsInternal}: walk the store in
+   * `(receiptOrder, id)` order from `cursor`, collecting the newly-appended
+   * replay entries and computing the resume cursor.
+   *
+   * The resume cursor is the witnessed stable-prefix watermark: it advances over
+   * leading witnessed entries but stops just before the first un-witnessed entry,
+   * so un-witnessed entries (whose trusted time is provisional `now`) are
+   * re-discovered and re-evaluated as a head overlay on the next resume.
+   */
+  private async discoverRevisionEntries(
+    docIdFilter: string | null,
+    cursor: RevisionCursor | null,
+  ): Promise<{ newEntries: StoreEntryMetadata[]; resumeCursor: RevisionCursor | null }> {
+    const replayTypes: StoreEntryType[] = [
+      "doc_create",
+      "doc_change",
+      "doc_delete",
+      "doc_undelete",
+    ];
+    const newEntries: StoreEntryMetadata[] = [];
+    // Never regress below the input cursor; only advance while still in the
+    // leading witnessed prefix.
+    let stableCursor: RevisionCursor | null = cursor;
+    let sawProvisional = false;
+
+    const consider = (em: StoreEntryMetadata): void => {
+      if (!this.isDocumentReplayEntry(em)) {
+        return;
+      }
+      // Admin-only mode: only accept entries signed by the admin key (mirrors
+      // materialization / iterateDocumentHistory). Non-admin entries are
+      // permanently ignored and do not gate the stable cursor.
+      if (this._isAdminOnlyDb && em.createdByPublicKey !== this.getAdminPublicKey()) {
+        return;
+      }
+      newEntries.push(em);
+      // The resume cursor may only advance through the leading prefix of
+      // STABLE entries (whose trusted time never moves): witnessed entries and
+      // legacy un-witnessed entries (stable at createdAt). It must park before
+      // the first PROVISIONAL entry (versioned + un-witnessed, trusted time =
+      // now), because that entry's position will change once it is witnessed
+      // and re-delivered with a fresh receiptOrder. See {@link isProvisional}.
+      const provisional = isProvisional(em);
+      if (!sawProvisional) {
+        if (!provisional && em.receiptOrder !== undefined) {
+          stableCursor = { receiptOrder: em.receiptOrder, id: em.id };
+        } else if (provisional) {
+          sawProvisional = true;
+        }
+      }
+    };
+
+    if (this.supportsCursorScan(this.store)) {
+      const baseFilters: StoreScanFilters = { entryTypes: replayTypes };
+      if (docIdFilter) {
+        baseFilters.docId = docIdFilter;
+      }
+      const scanFilters = this.mergeTimeTravelScanFilters(baseFilters);
+      let scanCursor: StoreScanCursor | null = cursor
+        ? { receiptOrder: cursor.receiptOrder, id: cursor.id }
+        : null;
+      while (true) {
+        const page = await this.store.scanEntriesSince!(scanCursor, 1000, scanFilters);
+        for (const em of page.entries) {
+          consider(em);
+        }
+        scanCursor = page.nextCursor;
+        if (!page.hasMore) {
+          break;
+        }
+      }
+    } else {
+      // Fallback for stores without cursor scan: scan all metadata, order by
+      // (receiptOrder, id), and take entries strictly after the cursor.
+      const filters: StoreScanFilters | undefined = docIdFilter
+        ? { docId: docIdFilter }
+        : undefined;
+      const all = (await this.scanAllMetadata(this.store, filters))
+        .filter((em) => this.isDocumentReplayEntry(em))
+        .sort((a, b) => this.compareReceiptOrder(a, b));
+      for (const em of all) {
+        if (cursor && !this.isAfterReceiptCursor(em, cursor)) {
+          continue;
+        }
+        consider(em);
+      }
+    }
+
+    return { newEntries, resumeCursor: stableCursor };
+  }
+
+  /** Compare two entries by `(receiptOrder, id)` ascending. */
+  private compareReceiptOrder(a: StoreEntryMetadata, b: StoreEntryMetadata): number {
+    const ra = a.receiptOrder ?? 0;
+    const rb = b.receiptOrder ?? 0;
+    return ra !== rb ? ra - rb : a.id.localeCompare(b.id);
+  }
+
+  /** True when `em` is strictly after `cursor` in `(receiptOrder, id)` order. */
+  private isAfterReceiptCursor(em: StoreEntryMetadata, cursor: RevisionCursor): boolean {
+    const ro = em.receiptOrder ?? 0;
+    if (ro !== cursor.receiptOrder) {
+      return ro > cursor.receiptOrder;
+    }
+    return em.id.localeCompare(cursor.id) > 0;
+  }
+
+  /**
+   * Materialization phase for a single affected document: fold its changes in
+   * trusted-time order and yield one revision per change from the earliest
+   * newly-discovered (or superseded) position onward, each carrying the
+   * trusted-time-bounded merged document state.
+   */
+  private async *foldDocRevisions(
+    docId: string,
+    newIds: Set<string>,
+    now: number,
+    resumeCursor: RevisionCursor | null,
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    // All metadata for this doc (metadata only, cheap). Includes snapshots, used
+    // for cache-miss seed reconstruction.
+    const docAllMeta = await this.scanAllMetadata(this.store, { docId });
+    let replayMeta = docAllMeta.filter((em) => this.isDocumentReplayEntry(em));
+    if (this._isAdminOnlyDb) {
+      const adminKey = this.getAdminPublicKey();
+      replayMeta = replayMeta.filter((em) => em.createdByPublicKey === adminKey);
+    }
+    if (replayMeta.length === 0) {
+      return;
+    }
+
+    // Order the doc's changes by trusted time (version-aware rule, see
+    // {@link entryTrustedTime}): witnessed -> receivedAt; versioned un-witnessed
+    // floats to the provisional head (now); legacy un-witnessed stays at its
+    // stable createdAt.
+    const ttSorted = replayMeta
+      .map((meta) => ({
+        meta,
+        tt: entryTrustedTime(meta, now),
+        witnessed: meta.receivedAt !== undefined,
+      }))
+      .sort((a, b) => (a.tt !== b.tt ? a.tt - b.tt : a.meta.id.localeCompare(b.meta.id)));
+
+    // First trusted-time position touched by a newly-discovered entry. From here
+    // the doc's merged state (and every later revision) may have changed, so we
+    // re-fold and re-emit the suffix; earlier revisions are unchanged.
+    const firstChangedIdx = ttSorted.findIndex((r) => newIds.has(r.meta.id));
+    if (firstChangedIdx < 0) {
+      return;
+    }
+
+    // Origin time and key id come from the document's create entry, independent
+    // of fold order (under the trusted-time rule un-witnessed entries can sort
+    // before the create, so we must not rely on seeing the create first).
+    const createMeta = replayMeta.find((m) => m.entryType === "doc_create");
+
+    // Seed the running doc to the merge of the unchanged prefix.
+    const prefix = ttSorted.slice(0, firstChangedIdx).map((r) => r.meta);
+    const seed = await this.seedRevisionFold(docId, prefix, docAllMeta);
+    let doc: AutomergeTypes.Doc<MindooDocPayload> =
+      seed.doc ?? Automerge.init<MindooDocPayload>();
+    const createdAt = createMeta?.createdAt ?? seed.createdAt ?? 0;
+    const decryptionKeyId = createMeta?.decryptionKeyId ?? seed.decryptionKeyId ?? "default";
+
+    // Cumulative metadata up to and including each revision (deletion state).
+    const seenMeta: StoreEntryMetadata[] = [...prefix];
+
+    // Load + verify + decrypt the suffix in trusted-time-order windows: one
+    // getEntries round trip per window instead of one per revision (a real win
+    // for network/on-disk stores), and verify/decrypt the whole window in
+    // parallel (independent per-entry crypto). Folding (applyChanges) below
+    // still runs strictly sequentially in trusted-time order. The window also
+    // bounds peak memory and response size (the suffix is the whole history on a
+    // snapshot-less cold-start re-fold).
+    let preparedById = new Map<string, { entry: StoreEntry; payload: Uint8Array }>();
+    let windowEnd = firstChangedIdx;
+    for (let i = firstChangedIdx; i < ttSorted.length; i++) {
+      const rev = ttSorted[i];
+      const meta = rev.meta;
+
+      if (i >= windowEnd) {
+        const windowMetas = ttSorted.slice(i, i + this.revisionFoldLoadWindow);
+        windowEnd = i + windowMetas.length;
+        const batch = await this.store.getEntries(windowMetas.map((r) => r.meta.id));
+        const prepared = await Promise.all(
+          batch.map(async (entry) => {
+            const isValid = await this.tenant.verifySignature(
+              entry.encryptedData,
+              entry.signature,
+              entry.createdByPublicKey,
+            );
+            if (!isValid) {
+              this.logger.warn(`Invalid signature for revision entry ${entry.id}, skipping`);
+              return null;
+            }
+            const payload = await this.tenant.decryptPayload(
+              entry.encryptedData,
+              entry.decryptionKeyId,
+            );
+            return { entry, payload };
+          }),
+        );
+        preparedById = new Map();
+        for (const p of prepared) {
+          if (p) {
+            preparedById.set(p.entry.id, p);
+          }
+        }
+      }
+
+      const ready = preparedById.get(meta.id);
+      if (!ready) {
+        // Absent from the loaded window means missing in the store or it failed
+        // signature verification (already logged during the parallel prepare).
+        this.logger.warn(`Revision entry ${meta.id} unavailable (missing or invalid), skipping`);
+        continue;
+      }
+      const entryData = ready.entry;
+      const decryptedPayload = ready.payload;
+
+      // applyChanges buffers changes with unmet causal deps until they arrive,
+      // so a change folded before its doc_create (possible under the trusted-time
+      // rule for same-instant un-witnessed entries) still converges.
+      const [appliedDoc] = Automerge.applyChanges(doc, [decryptedPayload]);
+      doc = appliedDoc;
+
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
+
+      seenMeta.push(meta);
+
+      const internalDoc: InternalDoc = {
+        id: docId,
+        doc: Automerge.clone(doc),
+        createdAt,
+        lastModified: meta.createdAt,
+        decryptionKeyId,
+        // Deletion as of this revision = latest reachable lifecycle entry among
+        // this document's replay entries seen up to and including this one.
+        isDeleted: this.computeIsDeletedFromMetadata([...seenMeta]),
+      };
+
+      yield {
+        docId,
+        entryId: meta.id,
+        doc: this.wrapDocument(internalDoc),
+        entryType: meta.entryType,
+        trustedTime: rev.tt,
+        witnessed: rev.witnessed,
+        createdByPublicKey: meta.createdByPublicKey,
+        cursor: resumeCursor,
+      };
+    }
+
+    // Cache the doc's full merged state for the next incremental advance.
+    this.putRevisionFeedCache(docId, {
+      doc,
+      coveredIds: new Set(ttSorted.map((r) => r.meta.id)),
+      createdAt,
+      decryptionKeyId,
+    });
+  }
+
+  /**
+   * Reconstruct the merged state of a document covering exactly the replay
+   * entries in `prefix` (the unchanged head of a trusted-time fold).
+   *
+   * Fast path: if the LRU holds a merged doc whose coverage is a subset of the
+   * prefix, clone it and apply only the missing entries. Otherwise reconstruct
+   * from the best snapshot whose coverage is fully within the prefix (so the
+   * snapshot can never pull in changes beyond the fold point) plus the uncovered
+   * prefix tail, via {@link computeDocumentMaterializationPlan}.
+   */
+  private async seedRevisionFold(
+    docId: string,
+    prefix: StoreEntryMetadata[],
+    docAllMeta: StoreEntryMetadata[],
+  ): Promise<{
+    doc: AutomergeTypes.Doc<MindooDocPayload> | null;
+    createdAt: number | null;
+    decryptionKeyId: string | null;
+  }> {
+    if (prefix.length === 0) {
+      return { doc: null, createdAt: null, decryptionKeyId: null };
+    }
+
+    const createEntry = prefix.find((m) => m.entryType === "doc_create");
+    const createdAt = createEntry ? createEntry.createdAt : null;
+    const decryptionKeyId = createEntry ? createEntry.decryptionKeyId : null;
+    const prefixIds = new Set(prefix.map((m) => m.id));
+
+    // LRU fast path: cached coverage is a subset of the prefix -> reuse + apply
+    // only the missing entries (no snapshot/genesis reconstruction).
+    const cached = this.getRevisionFeedCache(docId);
+    if (cached && this.isIdSubset(cached.coveredIds, prefixIds)) {
+      const missing = prefix.filter((m) => !cached.coveredIds.has(m.id));
+      const doc = await this.applyChangeEntries(docId, Automerge.clone(cached.doc), missing);
+      return {
+        doc,
+        createdAt: createdAt ?? cached.createdAt,
+        decryptionKeyId: decryptionKeyId ?? cached.decryptionKeyId,
+      };
+    }
+
+    // Cache miss: reconstruct from the best in-prefix snapshot + uncovered tail.
+    const prefixSnapshots = docAllMeta.filter(
+      (m) => m.entryType === "doc_snapshot" && this.snapshotRootsWithin(m, prefixIds),
+    );
+    const planInput = [...prefix, ...prefixSnapshots];
+    const plan = computeDocumentMaterializationPlan(docId, planInput);
+    const metadataById = new Map(planInput.map((m) => [m.id, m]));
+
+    let doc: AutomergeTypes.Doc<MindooDocPayload> | null = null;
+    if (plan.snapshotEntryId) {
+      const snapMeta = metadataById.get(plan.snapshotEntryId);
+      if (snapMeta) {
+        doc = await this.loadSnapshotForFold(docId, snapMeta);
+      }
+    }
+    if (!doc) {
+      doc = Automerge.init<MindooDocPayload>();
+    }
+
+    const tail = plan.entryIdsToApply
+      .map((id) => metadataById.get(id))
+      .filter((m): m is StoreEntryMetadata => m !== undefined);
+    doc = await this.applyChangeEntries(docId, doc, tail);
+
+    return { doc, createdAt, decryptionKeyId };
+  }
+
+  /** True when every id in `sub` is contained in `sup`. */
+  private isIdSubset(sub: Set<string>, sup: Set<string>): boolean {
+    if (sub.size > sup.size) {
+      return false;
+    }
+    for (const id of sub) {
+      if (!sup.has(id)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * True when all of a snapshot's coverage roots are within `idSet`, i.e. the
+   * snapshot represents a state reachable from entries inside the set (safe to
+   * use as a seed without pulling in later changes).
+   */
+  private snapshotRootsWithin(
+    snapshotMeta: StoreEntryMetadata,
+    idSet: Set<string>,
+  ): boolean {
+    const roots =
+      snapshotMeta.snapshotHeadEntryIds && snapshotMeta.snapshotHeadEntryIds.length > 0
+        ? snapshotMeta.snapshotHeadEntryIds
+        : snapshotMeta.dependencyIds;
+    if (!roots || roots.length === 0) {
+      return false;
+    }
+    return roots.every((r) => idSet.has(r));
+  }
+
+  /** Load, verify, and decrypt a snapshot into an Automerge doc, or `null`. */
+  private async loadSnapshotForFold(
+    docId: string,
+    snapshotMeta: StoreEntryMetadata,
+  ): Promise<AutomergeTypes.Doc<MindooDocPayload> | null> {
+    const entries = await this.store.getEntries([snapshotMeta.id]);
+    if (entries.length === 0) {
+      return null;
+    }
+    const snapshotData = entries[0];
+    if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+      this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
+      return null;
+    }
+    const isValid = await this.tenant.verifySignature(
+      snapshotData.encryptedData,
+      snapshotData.signature,
+      snapshotData.createdByPublicKey,
+    );
+    if (!isValid) {
+      this.logger.warn(`Invalid signature for snapshot ${snapshotData.id}, falling back to replay`);
+      return null;
+    }
+    const decryptedSnapshot = await this.tenant.decryptPayload(
+      snapshotData.encryptedData,
+      snapshotData.decryptionKeyId,
+    );
+    const doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
+    const parsed = parseDocEntryId(snapshotData.id);
+    if (parsed) {
+      this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+    }
+    this.registerSnapshotHeadHashMappings(snapshotData);
+    return doc;
+  }
+
+  /**
+   * Load, verify, decrypt, and apply a set of replay change entries onto `doc`.
+   * `Automerge.applyChanges` buffers changes whose causal dependencies are not
+   * yet present, so the entries need not be supplied in dependency order.
+   */
+  private async applyChangeEntries(
+    docId: string,
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    metas: StoreEntryMetadata[],
+  ): Promise<AutomergeTypes.Doc<MindooDocPayload>> {
+    if (metas.length === 0) {
+      return doc;
+    }
+    const loaded = await this.store.getEntries(metas.map((m) => m.id));
+    const byId = new Map(loaded.map((e) => [e.id, e]));
+    const changes: Uint8Array[] = [];
+    for (const meta of metas) {
+      const entryData = byId.get(meta.id);
+      if (!entryData) {
+        this.logger.warn(`Revision entry ${meta.id} not found in store, skipping`);
+        continue;
+      }
+      const isValid = await this.tenant.verifySignature(
+        entryData.encryptedData,
+        entryData.signature,
+        entryData.createdByPublicKey,
+      );
+      if (!isValid) {
+        this.logger.warn(`Invalid signature for revision entry ${entryData.id}, skipping`);
+        continue;
+      }
+      const decrypted = await this.tenant.decryptPayload(
+        entryData.encryptedData,
+        entryData.decryptionKeyId,
+      );
+      changes.push(decrypted);
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
+    }
+    if (changes.length === 0) {
+      return doc;
+    }
+    const [applied] = Automerge.applyChanges(doc, changes);
+    return applied;
+  }
+
+  /** Touch the revision-feed LRU, moving `docId` to most-recently-used. */
+  private getRevisionFeedCache(docId: string): RevisionFeedDocState | undefined {
+    const state = this.revisionFeedDocCache.get(docId);
+    if (state) {
+      this.revisionFeedDocCache.delete(docId);
+      this.revisionFeedDocCache.set(docId, state);
+    }
+    return state;
+  }
+
+  /** Insert/update the revision-feed LRU, evicting the least-recently-used. */
+  private putRevisionFeedCache(docId: string, state: RevisionFeedDocState): void {
+    this.revisionFeedDocCache.delete(docId);
+    this.revisionFeedDocCache.set(docId, state);
+    while (this.revisionFeedDocCache.size > this.revisionFeedCacheLimit) {
+      const oldest = this.revisionFeedDocCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.revisionFeedDocCache.delete(oldest);
     }
   }
 
@@ -4736,6 +5441,7 @@ export class BaseMindooDB implements MindooDB {
       signature,
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     const fullEntry: StoreEntry = {
       ...entryMetadata,
@@ -4750,8 +5456,14 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.doc = newDoc;
     internalDoc.isDeleted = entryType === "doc_delete";
     internalDoc.lastModified = now;
+    // The delete/undelete entry just written is versioned and un-witnessed, so
+    // the document is awaiting witness until pushed + stamped with a receipt.
+    internalDoc.awaitingWitness = isProvisional(entryMetadata) || (internalDoc.awaitingWitness ?? false);
+    // The doc is now witness-era (we just wrote a versioned entry), so it is
+    // witnessed iff it is no longer awaiting a receipt.
+    internalDoc.witnessed = isVersioned(entryMetadata) && !internalDoc.awaitingWitness;
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible");
+    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
     this.markDocDirty(docId);
   }
 
@@ -5429,6 +6141,8 @@ export class BaseMindooDB implements MindooDB {
       getLastModified: () => internalDoc.lastModified,
       getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => false,
+      isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
+      isWitnessed: () => internalDoc.witnessed ?? false,
       getHeads: () => Automerge.getHeads(internalDoc.doc),
       getData: () => {
         // Return a proxy that collects property assignments and deletions
@@ -6381,8 +7095,17 @@ export class BaseMindooDB implements MindooDB {
 
     internalDoc.doc = newDoc;
     internalDoc.lastModified = now;
+    // The change entries just written are versioned and un-witnessed, so the
+    // document is awaiting witness (until pushed + stamped with a receipt).
+    internalDoc.awaitingWitness = entries.some(isProvisional) || (internalDoc.awaitingWitness ?? false);
+    // `versioned` is sticky: any versioned entry (new or already reflected by a
+    // prior awaiting/witnessed flag) keeps the doc in the witness-aware era.
+    const versioned = entries.some(isVersioned)
+      || internalDoc.awaitingWitness
+      || (internalDoc.witnessed ?? false);
+    internalDoc.witnessed = versioned && !internalDoc.awaitingWitness;
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible");
+    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
     this.markDocDirty(docId);
 
     this.logger.info(`Document ${docId} ${successMessage} successfully`);
@@ -6446,6 +7169,7 @@ export class BaseMindooDB implements MindooDB {
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
       attachmentIds: attachmentIds && attachmentIds.length > 0 ? attachmentIds : undefined,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     return {
       ...entryMetadata,
@@ -6939,6 +7663,7 @@ export class BaseMindooDB implements MindooDB {
     );
     const firstReplayEntry = orderedReplayEntries[0] ?? null;
     const lastReplayEntry = orderedReplayEntries[orderedReplayEntries.length - 1] ?? null;
+    const witnessState = metadataWitnessState(replayEntriesForState);
     return {
       id: docId,
       doc,
@@ -6946,6 +7671,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified: lastReplayEntry?.createdAt ?? snapshotMeta?.createdAt ?? fallbackTimestamp,
       decryptionKeyId: firstReplayEntry?.decryptionKeyId ?? snapshotMeta?.decryptionKeyId ?? "default",
       isDeleted: this.computeIsDeletedFromMetadata(replayEntriesForState),
+      awaitingWitness: witnessState.awaitingWitness,
+      witnessed: witnessState.witnessed,
     };
   }
 
@@ -7239,14 +7966,27 @@ export class BaseMindooDB implements MindooDB {
     // Check if document actually changed
     const headsAfter = Automerge.getHeads(updatedDoc);
     const headsChanged = JSON.stringify(headsBefore) !== JSON.stringify(headsAfter);
-    
-    if (!headsChanged) {
-      this.logger.debug(`Document ${docId} heads unchanged after applying new entries`);
+
+    // A witness receipt changes only an entry's `receivedAt` (metadata), not the
+    // Automerge content, so a freshly-witnessed entry re-delivered by the cursor
+    // scan leaves the heads UNCHANGED. We must still recompute the per-doc
+    // "awaiting witness" flag and refresh the index/cache so the doc is
+    // re-delivered on the metadata feed and re-evaluated by VirtualViews;
+    // otherwise the flag would never clear. So we compute it up front (reusing
+    // the metadata scan we need anyway) and only bail when NOTHING observable
+    // changed — neither the content nor the witness status.
+    const allDocMetadata = await this.scanAllMetadata(this.store, { docId });
+    const { awaitingWitness, witnessed } = metadataWitnessState(allDocMetadata);
+    const awaitingWitnessChanged = awaitingWitness !== (cachedDoc.awaitingWitness ?? false);
+    const witnessedChanged = witnessed !== (cachedDoc.witnessed ?? false);
+
+    if (!headsChanged && !awaitingWitnessChanged && !witnessedChanged) {
+      this.logger.debug(`Document ${docId} heads and witness status unchanged after applying new entries`);
       return null; // Document didn't actually change
     }
-    
-    this.logger.debug(`Document ${docId} changed: heads before=${JSON.stringify(headsBefore)}, after=${JSON.stringify(headsAfter)}`);
-    
+
+    this.logger.debug(`Document ${docId} changed: heads before=${JSON.stringify(headsBefore)}, after=${JSON.stringify(headsAfter)}, awaitingWitness=${awaitingWitness}`);
+
     // Update metadata
     const payload = updatedDoc as unknown as MindooDocPayload;
     const lastEntryCreatedAt = entries.reduce(
@@ -7255,8 +7995,7 @@ export class BaseMindooDB implements MindooDB {
     );
     const lastModified = (payload._lastModified as number) || 
                          lastEntryCreatedAt;
-    
-    const allDocMetadata = await this.scanAllMetadata(this.store, { docId });
+
     const isDeleted = this.computeIsDeletedFromMetadata(allDocMetadata);
     
     const updatedInternalDoc: InternalDoc = {
@@ -7266,6 +8005,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified,
       decryptionKeyId: cachedDoc.decryptionKeyId,
       isDeleted,
+      awaitingWitness,
+      witnessed,
     };
     // Update cache
     await this.storeCachedDocument(updatedInternalDoc);
@@ -7648,6 +8389,289 @@ export class BaseMindooDB implements MindooDB {
   /**
    * Internal method to load a document from the content-addressed store
    */
+  /**
+   * The per-tenant quarantine/audit log: entries rejected during
+   * materialization by the access-control layer (docs/accesscontrol.md §10).
+   * Exposed for audit views (e.g. Haven). Entries remain in the append-only
+   * store but are excluded from materialized state and queries.
+   */
+  getQuarantineLog(): readonly QuarantineRecord[] {
+    return this.quarantineLog;
+  }
+
+  /**
+   * Whether access control is active for this tenant and should gate
+   * materialization. Admin-only databases (incl. the directory itself) are
+   * always exempt — admin is the root of trust, and exempting the directory DB
+   * also avoids re-entrancy. Cached briefly to keep the load fast-path cheap.
+   * Fails closed-to-disabled on any directory error so document loads never
+   * break due to a transient directory issue (Tier 2 only gates honest clients).
+   */
+  private async isAclEnforced(): Promise<boolean> {
+    if (this._isAdminOnlyDb) return false;
+    const now = Date.now();
+    if (this.aclActiveCache && now - this.aclActiveCache.at < 3000) {
+      return this.aclActiveCache.value;
+    }
+    let value = false;
+    try {
+      const directory = (await this.tenant.openDirectory()) as unknown as {
+        isAccessControlActive?: () => Promise<boolean>;
+      };
+      if (typeof directory.isAccessControlActive === "function") {
+        value = await directory.isAccessControlActive();
+      }
+    } catch (error) {
+      this.logger.debug(`[ACL] active-check failed, treating as inactive: ${error}`);
+      value = false;
+    }
+    this.aclActiveCache = { value, at: now };
+    return value;
+  }
+
+  /** Append a record to the quarantine/audit log (and log it). */
+  private recordQuarantine(rec: QuarantineRecord): void {
+    this.quarantineLog.push(rec);
+    console.log(
+      `[MindooDB][ACL] Quarantined entry ${rec.entryId} (doc ${rec.docId}): ${rec.reason} — ${rec.detail}`,
+    );
+  }
+
+  /**
+   * Materialize a document through the access-control (Tier 2) path
+   * (docs/accesscontrol.md §10). Entries are evaluated deterministically in
+   * trusted-time order; an entry is quarantined if it violates a rule, fails
+   * op-type re-derivation, or causally depends on a quarantined entry
+   * (cascade). The accepted set is therefore a causally-closed prefix identical
+   * across replicas, which is what makes "quarantine on receipt" safe under
+   * eventual consistency.
+   *
+   * Snapshots are intentionally bypassed here and the document is rebuilt from
+   * individually-verified lifecycle entries (the spec's fallback), so a snapshot
+   * can never smuggle content past Tier 2.
+   *
+   * @returns the materialized {@link InternalDoc} (or `null` if nothing is
+   *   accepted / the document is absent), or `undefined` when access control is
+   *   not enforced (caller uses the optimized fast path).
+   */
+  private async maybeMaterializeWithAccessControl(
+    docId: string,
+    allEntryMetadata: StoreEntryMetadata[],
+  ): Promise<InternalDoc | null | undefined> {
+    if (!(await this.isAclEnforced())) return undefined;
+
+    const dbid = this.store.getId();
+    const directory = (await this.tenant.openDirectory()) as unknown as {
+      evaluateClientAccess: (input: {
+        op: RuleType;
+        dbid: string;
+        signingKey: string;
+        trustedTime: number;
+        isAuthor: boolean;
+        beforeDoc: Record<string, unknown> | null;
+        afterDoc: Record<string, unknown> | null;
+      }) => Promise<AccessDecision>;
+      getTrustedWitnessKeysAt?: (T: number) => Promise<Set<string>>;
+    };
+
+    // One verifier per materialization enforces per-witness `receivedAt`
+    // monotonicity across the entries we accept, in trusted-time order (§5.4).
+    // A verify-only provider (no signer) routes receipts to the right scheme.
+    const subtle = this.getSubtle();
+    const receiptVerifier = new Ed25519WitnessProvider({ subtle }).createVerifier();
+    const nowMs = Date.now();
+
+    // Lifecycle entries only, folded in deterministic causal order. Un-witnessed
+    // entries (versioned or legacy) order by their author time `createdAt`, NOT
+    // the provisional `now`: this fold computes per-step before/after states for
+    // Tier 2 evaluation, so it must preserve authoring order rather than
+    // collapsing every still-provisional entry onto a single `now` (which would
+    // tie-break by entry id and scramble causal sequence). The version-aware
+    // head/`now` selection only matters for the changefeed stamp and the
+    // judgment-site node selection below, not for this fold order.
+    const dataEntries = allEntryMetadata
+      .filter((m) => this.isDocumentReplayEntry(m))
+      .sort((a, b) =>
+        (a.receivedAt ?? a.createdAt) === (b.receivedAt ?? b.createdAt)
+          ? a.id.localeCompare(b.id)
+          : (a.receivedAt ?? a.createdAt) - (b.receivedAt ?? b.createdAt),
+      );
+    if (dataEntries.length === 0) return null;
+
+    const creatorKey =
+      dataEntries.find((m) => m.entryType === "doc_create")?.createdByPublicKey ?? null;
+
+    const fetched = await this.store.getEntries(dataEntries.map((m) => m.id));
+    const entryById = new Map(fetched.map((e) => [e.id, e]));
+
+    let currentDoc: AutomergeTypes.Doc<MindooDocPayload> | null = null;
+    let createdAt: number | null = null;
+    let decryptionKeyId = "default";
+    const acceptedMeta: StoreEntryMetadata[] = [];
+    const quarantined = new Set<string>();
+
+    const quarantine = (meta: StoreEntryMetadata, reason: QuarantineRecord["reason"], detail: string): void => {
+      quarantined.add(meta.id);
+      this.recordQuarantine({
+        entryId: meta.id,
+        docId,
+        dbid,
+        entryType: meta.entryType,
+        reason,
+        detail,
+        // Audit record: the entry's own (stable) time — receipt time if
+        // witnessed, else author time. Not the provisional head `now`.
+        trustedTime: meta.receivedAt ?? meta.createdAt,
+        recordedAt: Date.now(),
+      });
+    };
+
+    for (const meta of dataEntries) {
+      const entry = entryById.get(meta.id);
+      if (!entry) continue;
+
+      // Admin-only DBs are exempt (handled by isAclEnforced); here we honor the
+      // tenant admin key as always-trusted via the directory identity set.
+
+      // Cascade: any quarantined dependency taints this entry (§10).
+      if (meta.dependencyIds.some((dep) => quarantined.has(dep))) {
+        quarantine(meta, "cascade_dependent", "causally depends on a quarantined entry");
+        continue;
+      }
+
+      // Verify the author signature over the encrypted payload.
+      const cryptoKey = await this.getOrImportPublicKey(entry.createdByPublicKey);
+      if (!cryptoKey || !(await this.verifySignatureWithKey(cryptoKey, entry.encryptedData, entry.signature))) {
+        quarantine(meta, "invalid_signature", "signature verification failed");
+        continue;
+      }
+
+      // Validate the witness receipt, if any (§5.4): a present receipt must come
+      // from a currently-trusted witness, carry a valid signature, and respect
+      // per-witness monotonicity and the future-time bound. Entries with no
+      // receipt are local/not-yet-witnessed and pass this check.
+      if (directory.getTrustedWitnessKeysAt && (meta.receivedAt !== undefined || meta.receivedByPublicKey)) {
+        try {
+          const trustedWitnessKeys = await directory.getTrustedWitnessKeysAt(meta.receivedAt ?? meta.createdAt);
+          const receiptResult = await receiptVerifier.validate(
+            meta,
+            { dbid, trustedWitnessKeys, nowMs },
+          );
+          if (!receiptResult.ok) {
+            quarantine(meta, "invalid_witness_receipt", receiptResult.reason ?? "invalid witness receipt");
+            continue;
+          }
+        } catch (error) {
+          this.logger.warn(`[ACL] receipt validation failed for ${meta.id}, accepting: ${error}`);
+        }
+      }
+
+      const isGenesis = currentDoc === null;
+      if (isGenesis && meta.entryType !== "doc_create") {
+        // Not a valid document start (mirrors the fast path); skip.
+        continue;
+      }
+      // Op-type defense in depth (§10): a doc_create must be a genesis change.
+      if (meta.entryType === "doc_create" && !isGenesis) {
+        quarantine(meta, "op_type_mismatch", "signed doc_create but not a genesis change");
+        continue;
+      }
+
+      // Decrypt and compute the candidate (after) state.
+      const decrypted = await this.tenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId);
+      const baseDoc = currentDoc ?? Automerge.init<MindooDocPayload>();
+      let afterDoc: AutomergeTypes.Doc<MindooDocPayload>;
+      try {
+        afterDoc = Automerge.loadIncremental(Automerge.clone(baseDoc), decrypted);
+      } catch (error) {
+        quarantine(meta, "op_type_mismatch", `failed to decode change: ${error}`);
+        continue;
+      }
+
+      const beforeJS = currentDoc
+        ? (this.convertAutomergeToJS(currentDoc) as unknown as Record<string, unknown>)
+        : null;
+      const afterJS = this.convertAutomergeToJS(afterDoc) as unknown as Record<string, unknown>;
+
+      const isAuthor = creatorKey !== null && entry.createdByPublicKey === creatorKey;
+      // Trusted-time rule (docs/accesscontrol.md §8, version-aware): a witnessed
+      // entry is judged against the directory as it provably was at its
+      // `receivedAt`. A versioned un-witnessed entry (provisional) has no
+      // provable position, so it is judged against the current directory HEAD —
+      // `MAX_SAFE_INTEGER` selects the head node deterministically regardless of
+      // where the directory's own provisional (un-witnessed) entries currently
+      // float, which a wall-clock `now` would not (those entries can sit at a
+      // later `now`). A legacy un-witnessed entry predates witnessing and is
+      // stable at its `createdAt`, so it is judged against the historical
+      // directory state in effect then. See {@link isProvisional}.
+      const trustedTime = isProvisional(meta)
+        ? Number.MAX_SAFE_INTEGER
+        : (meta.receivedAt ?? meta.createdAt);
+
+      let decision: AccessDecision;
+      try {
+        decision = await directory.evaluateClientAccess({
+          op: meta.entryType as RuleType,
+          dbid,
+          signingKey: entry.createdByPublicKey,
+          trustedTime,
+          isAuthor,
+          beforeDoc: beforeJS,
+          afterDoc: afterJS,
+        });
+      } catch (error) {
+        // Fail-open for availability: Tier 2 only gates honest clients, so a
+        // transient directory error should not break the document load.
+        this.logger.warn(`[ACL] evaluation failed for ${meta.id}, materializing: ${error}`);
+        decision = { allowed: true, reason: "directory unavailable; deferred", tier: "tier1" };
+      }
+
+      if (!decision.allowed) {
+        quarantine(
+          meta,
+          decision.tier === "tier2" ? "tier2_denied" : "tier1_recheck_denied",
+          decision.reason,
+        );
+        continue;
+      }
+
+      // Accept the entry.
+      currentDoc = afterDoc;
+      if (isGenesis) {
+        createdAt = meta.createdAt;
+        decryptionKeyId = meta.decryptionKeyId;
+      }
+      acceptedMeta.push(meta);
+      const parsed = parseDocEntryId(entry.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entry.id);
+      }
+    }
+
+    if (currentDoc === null) {
+      // The create was quarantined or absent: the document is logically absent.
+      return null;
+    }
+
+    const payload = currentDoc as unknown as MindooDocPayload;
+    const isDeleted = this.computeIsDeletedFromMetadata(acceptedMeta);
+    const lastAccepted = acceptedMeta[acceptedMeta.length - 1];
+    const lastModified =
+      (payload._lastModified as number) || (lastAccepted ? lastAccepted.createdAt : Date.now());
+    const witnessState = metadataWitnessState(acceptedMeta);
+
+    return {
+      id: docId,
+      doc: currentDoc,
+      createdAt: createdAt ?? lastModified,
+      lastModified,
+      decryptionKeyId,
+      isDeleted,
+      awaitingWitness: witnessState.awaitingWitness,
+      witnessed: witnessState.witnessed,
+    };
+  }
+
   private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
     const startedAt = Date.now();
     const cacheCheckStartedAt = Date.now();
@@ -7748,7 +8772,35 @@ export class BaseMindooDB implements MindooDB {
     // Log all entry types
     const entryTypes = allEntryMetadata.map(em => `${em.entryType}@${em.createdAt}`).join(', ');
     this.logger.debug(`Entry types for ${docId}: ${entryTypes}`);
-    
+
+    // Access-control materialization (docs/accesscontrol.md §10): when the
+    // tenant has access control active, materialize through the Tier 2
+    // quarantine path (deterministic per-entry evaluation + cascade) instead of
+    // the optimized batch path. Returns `undefined` when ACL is not enforced,
+    // in which case we fall through to the normal fast path below.
+    const aclResult = await this.maybeMaterializeWithAccessControl(docId, allEntryMetadata);
+    if (aclResult !== undefined) {
+      if (aclResult) {
+        await this.storeCachedDocument(aclResult);
+        this.markDocDirty(docId);
+      }
+      this.performanceCallback?.onDocumentLoad?.({
+        docId,
+        cacheHit: false,
+        metadataEntriesScanned: allEntryMetadata.length,
+        replayEntriesLoaded: allEntryMetadata.length,
+        snapshotUsed: false,
+        cacheCheckTime,
+        storeQueryTime,
+        entryLoadTime,
+        signatureVerificationTime,
+        decryptionTime,
+        automergeTime,
+        totalTime: Date.now() - startedAt,
+      });
+      return aclResult;
+    }
+
     const metadataById = new Map(allEntryMetadata.map((meta) => [meta.id, meta]));
     const planStartedAt = Date.now();
     const materializationPlan = computeDocumentMaterializationPlan(docId, allEntryMetadata, {
@@ -8004,6 +9056,7 @@ export class BaseMindooDB implements MindooDB {
     
     this.logger.debug(`Document ${docId} metadata: createdAt=${createdAt}, lastModified=${lastModified}, decryptionKeyId=${decryptionKeyId}`);
     
+    const witnessState = metadataWitnessState(allEntryMetadata);
     const internalDoc: InternalDoc = {
       id: docId,
       doc: doc!, // doc is guaranteed to be defined at this point
@@ -8011,6 +9064,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified,
       decryptionKeyId,
       isDeleted,
+      awaitingWitness: witnessState.awaitingWitness,
+      witnessed: witnessState.witnessed,
     };
     
     // Update cache
@@ -8117,6 +9172,8 @@ export class BaseMindooDB implements MindooDB {
       getLastModified: () => internalDoc.lastModified,
       getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => internalDoc.isDeleted,
+      isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
+      isWitnessed: () => internalDoc.witnessed ?? false,
       getHeads: () => Automerge.getHeads(internalDoc.doc),
       getData: () => {
         // Convert Automerge document to plain JS object, converting Text objects to strings

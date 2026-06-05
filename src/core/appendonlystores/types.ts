@@ -323,10 +323,32 @@ export interface ContentAddressedStore {
    * - Metadata is stored by entry id (always unique)
    * - Encrypted bytes are deduplicated by contentHash (same bytes stored once)
    *
+   * A remote (network) store may return witness receipts (stamped metadata with
+   * `receivedAt`/`receivedByPublicKey`/`receivedDateSignature`) for the accepted
+   * entries so the pushing client can persist the attestation on its local copy
+   * via {@link applyWitnessReceipts} (docs/accesscontrol.md §5.3). Local stores
+   * return `void`; callers that do not need receipts can ignore the result.
+   *
    * @param entries The entries to store
-   * @return A promise that resolves when all entries are stored
+   * @return A promise that resolves when all entries are stored, optionally
+   *   carrying witness receipts for the accepted entries.
    */
-  putEntries(entries: StoreEntry[]): Promise<void>;
+  putEntries(entries: StoreEntry[]): Promise<void | StoreEntryMetadata[]>;
+
+  /**
+   * Apply witness receipts to entries already present in this (local) store.
+   *
+   * Each receipt is the server-stamped metadata for an entry this store
+   * authored and pushed; applying it copies the witness fields (`receivedAt`,
+   * `receivedByPublicKey`, `receivedDateSignature`, `receiptScheme`) onto the
+   * stored entry and assigns it a fresh `receiptOrder` so the revision feed's
+   * `scanEntriesSince` cursor re-discovers it and re-anchors it from the
+   * provisional head to its committed `receivedAt` position (docs/accesscontrol.md
+   * §5.3, §8). Receipts for entries not present locally are ignored.
+   *
+   * Optional: stores without a receipt-order backbone may omit this.
+   */
+  applyWitnessReceipts?(receipts: StoreEntryMetadata[]): Promise<void>;
 
   /**
    * Get entries by their IDs.

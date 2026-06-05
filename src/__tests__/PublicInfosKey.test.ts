@@ -213,7 +213,7 @@ describe("$publicinfos Key System", () => {
       // Revoke user
       await directory.revokeUser(
         publicUser.username,
-        false,
+        {},
         adminUser.userSigningKeyPair.privateKey,
         adminUserPassword
       );

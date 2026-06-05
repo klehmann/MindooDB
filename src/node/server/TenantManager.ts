@@ -23,6 +23,11 @@ import { join, resolve, sep } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { ServerTier1Evaluator } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
+import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
+import { Ed25519WitnessProvider } from "../../core/accesscontrol/timestamp/Ed25519WitnessProvider";
+import type { BaseMindooTenantDirectory } from "../../core/BaseMindooTenantDirectory";
 import { BaseMindooTenantFactory } from "../../core/BaseMindooTenantFactory";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { decryptPrivateKey } from "../../core/crypto/privateKeyEncryption";
@@ -255,6 +260,8 @@ export class TenantManager {
 
   private serverIdentity: PrivateUserId | null = null;
   private trustedServers: TrustedServer[] = [];
+  /** Lazily-built, cached witness signer (server's Ed25519 signing identity). */
+  private witnessSigner: WitnessSigner | undefined;
 
   constructor(dataDir: string, serverPassword?: string) {
     this.dataDir = dataDir;
@@ -298,6 +305,50 @@ export class TenantManager {
       signingPublicKey: this.serverIdentity.userSigningKeyPair.publicKey as string,
       encryptionPublicKey: this.serverIdentity.userEncryptionKeyPair.publicKey as string,
     };
+  }
+
+  /**
+   * Build (and cache) the server's witness identity used to stamp receipts on
+   * accepted entries (docs/accesscontrol.md §5.3). Returns undefined when the
+   * server identity or its unlock password is unavailable, in which case the
+   * server runs in pre-access-control mode (no stamping, no Tier 1 advertised).
+   */
+  async getWitnessSigner(): Promise<WitnessSigner | undefined> {
+    if (this.witnessSigner) return this.witnessSigner;
+    if (!this.serverIdentity || !this.serverPassword) return undefined;
+
+    const subtle = this.cryptoAdapter.getSubtle();
+    const signingKeyBuffer = await decryptPrivateKey(
+      this.cryptoAdapter,
+      this.serverIdentity.userSigningKeyPair.privateKey as EncryptedPrivateKey,
+      this.serverPassword,
+      "signing",
+    );
+    const signingPrivateKey = await subtle.importKey(
+      "pkcs8",
+      signingKeyBuffer,
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+    this.witnessSigner = {
+      publicKeyPem: this.serverIdentity.userSigningKeyPair.publicKey as string,
+      signingPrivateKey,
+      subtle,
+    };
+    return this.witnessSigner;
+  }
+
+  /**
+   * Build the trusted-time provider that stamps receipts on accepted entries
+   * (docs/accesscontrol.md §5.3, §13). v1 wraps the server's Ed25519 witness
+   * identity; returns undefined when no witness signer is available, leaving the
+   * server in pre-access-control mode.
+   */
+  async getTimestampProvider(): Promise<TimestampProvider | undefined> {
+    const signer = await this.getWitnessSigner();
+    if (!signer) return undefined;
+    return new Ed25519WitnessProvider({ signer, subtle: signer.subtle });
   }
 
   // =======================================================================
@@ -702,17 +753,94 @@ export class TenantManager {
     }
 
     const localStore = tenant.storeFactory.getStore(dbId, storeKind);
+
+    // Access-control v1 wiring (docs/accesscontrol.md §5–§7). The witness signer
+    // lets the server stamp receipts on accepted entries; the Tier 1 evaluator
+    // enforces identity-tier rules at push time. Both are only active when the
+    // server identity is unlocked and the directory supports evaluation, so
+    // pre-access-control deployments keep their existing behavior.
+    const timestampProvider = await this.getTimestampProvider();
+    const directory = tenant.directory as unknown as MindooTenantDirectory;
+    const tier1Evaluator = this.buildTier1Evaluator(directory, localStore);
+    const wipeGrantDocIdResolver = this.buildWipeGrantDocIdResolver(directory);
+
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
-      tenant.directory as unknown as MindooTenantDirectory,
+      directory,
       tenant.authService,
       this.cryptoAdapter,
+      undefined,
+      { timestampProvider, witnessDbid: dbId, tier1Evaluator, wipeGrantDocIdResolver },
     );
 
     tenant.serverStores.set(cacheKey, serverStore);
     console.log(`[TenantManager] Created server store for ${tenantId}/${dbId}/${storeKind}`);
 
     return serverStore;
+  }
+
+  /**
+   * Build a Tier 1 evaluator closure for a server store, or undefined when the
+   * directory cannot evaluate access (e.g. config-based directory without the
+   * access-control state chain). The closure resolves `$author` for non-create
+   * ops by reading the document's `doc_create` entry creator key from the local
+   * store (metadata only, no decryption) and comparing it to the change author.
+   */
+  private buildTier1Evaluator(
+    directory: MindooTenantDirectory,
+    localStore: ContentAddressedStore,
+  ): ServerTier1Evaluator | undefined {
+    const evaluable = directory as unknown as {
+      evaluateAccessForSigningKey?: BaseMindooTenantDirectory["evaluateAccessForSigningKey"];
+    };
+    if (typeof evaluable.evaluateAccessForSigningKey !== "function") {
+      return undefined;
+    }
+
+    return async (entry, dbid) => {
+      // The witness evaluates Tier 1 at its acceptance time (now), the same time
+      // it will stamp into the receipt (docs/accesscontrol.md §5.3, §7).
+      const trustedTime = Date.now();
+
+      // Resolve `$author`: for doc_create the author is the creator; otherwise
+      // compare the change signer to the document's original doc_create author.
+      let isAuthor = entry.entryType === "doc_create";
+      if (!isAuthor) {
+        try {
+          const docEntries = await localStore.findNewEntriesForDoc([], entry.docId);
+          const createEntry = docEntries.find((m) => m.entryType === "doc_create");
+          if (createEntry) {
+            isAuthor = createEntry.createdByPublicKey === entry.createdByPublicKey;
+          }
+        } catch {
+          // If we cannot resolve the creator, leave isAuthor false; a rule that
+          // requires $author will deny, which is the safe (fail-closed) choice.
+        }
+      }
+
+      return evaluable.evaluateAccessForSigningKey!({
+        op: entry.entryType as Parameters<BaseMindooTenantDirectory["evaluateAccessForSigningKey"]>[0]["op"],
+        dbid,
+        signingKey: entry.createdByPublicKey,
+        trustedTime,
+        isAuthor,
+      });
+    };
+  }
+
+  /**
+   * Build a remote-wipe resolver closure for a server store, or undefined when
+   * the directory does not support wipe directives (docs/accesscontrol.md §6.5).
+   * Maps a wipe-targeted signing key to the admin-signed grant document id so
+   * the server can serve only that document to the targeted device.
+   */
+  private buildWipeGrantDocIdResolver(
+    directory: MindooTenantDirectory,
+  ): ((signingKey: string) => Promise<string | null>) | undefined {
+    if (typeof directory.getWipeGrantDocId !== "function") {
+      return undefined;
+    }
+    return (signingKey: string) => directory.getWipeGrantDocId!(signingKey);
   }
 
   async getStore(tenantId: string, dbId: string, storeKind: StoreKind): Promise<ContentAddressedStore> {

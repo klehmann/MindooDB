@@ -13,6 +13,7 @@ import {
 } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
+import { createWitnessingTenant } from "./_helpers/witnessingTenant";
 
 describe("iterateChangesSince", () => {
   let factory: BaseMindooTenantFactory;
@@ -796,6 +797,91 @@ describe("iterateChangesSince", () => {
         // The processed order should match sorted order (or be sorted by timestamp then docId)
         const processedId = processedDocIds[i];
         expect(sortedDocIds).toContain(processedId);
+      }
+    }, 60000);
+  });
+
+  describe("iterateChangeRevisionsSince (revision-grain feed)", () => {
+    it("yields one result per change for an in-place-edited document", async () => {
+      const db = await tenant.openDB("test-db");
+
+      const doc = await db.createDocument();
+      const docId = doc.getId();
+      await db.changeDoc(doc, (d) => { d.getData().v = 1; });
+      const afterV1 = await db.getDocument(docId);
+      await db.changeDoc(afterV1, (d) => { d.getData().v = 2; });
+      const afterV2 = await db.getDocument(docId);
+      await db.changeDoc(afterV2, (d) => { d.getData().v = 3; });
+      await db.syncStoreChanges();
+
+      const revisions = [];
+      for await (const rev of db.iterateDocRevisionsSince(docId, null)) {
+        revisions.push(rev);
+      }
+
+      // doc_create + three changes = four revisions (doc-grain would yield one).
+      expect(revisions.length).toBeGreaterThanOrEqual(4);
+      expect(revisions.every((r) => r.docId === docId)).toBe(true);
+      // Each revision corresponds to a distinct store entry.
+      expect(new Set(revisions.map((r) => r.entryId)).size).toBe(revisions.length);
+
+      // The fully-folded final revision carries the complete merge (v === 3).
+      const finalValue = (revisions[revisions.length - 1].doc.getData() as Record<string, unknown>).v;
+      expect(finalValue).toBe(3);
+
+      // Doc-grain feed yields the document exactly once.
+      let docGrain = 0;
+      for await (const { doc: d } of db.iterateChangesSince(null)) {
+        if (d.getId() === docId) docGrain++;
+      }
+      expect(docGrain).toBe(1);
+    }, 60000);
+
+    it("folds witnessed revisions per doc in trusted-time order and resumes from a cursor", async () => {
+      // Use a witnessing tenant so entries carry distinct, increasing receivedAt
+      // (the access-control trusted time); un-witnessed entries float to "now".
+      const ctx = await createWitnessingTenant("test-tenant-revfeed");
+      try {
+        const db = await ctx.tenant.openDB("test-db");
+
+        const a = await db.createDocument();
+        await db.changeDoc(a, (d) => { d.getData().k = "a1"; });
+        const b = await db.createDocument();
+        await db.changeDoc(b, (d) => { d.getData().k = "b1"; });
+        await db.syncStoreChanges();
+
+        const all = [];
+        for await (const rev of db.iterateChangeRevisionsSince(null)) {
+          all.push(rev);
+        }
+        expect(all.length).toBeGreaterThanOrEqual(4);
+        expect(all.every((r) => r.witnessed)).toBe(true);
+
+        // Within each document, revisions are emitted in non-decreasing trusted time.
+        const byDoc = new Map<string, number[]>();
+        for (const rev of all) {
+          const list = byDoc.get(rev.docId) ?? [];
+          list.push(rev.trustedTime);
+          byDoc.set(rev.docId, list);
+        }
+        for (const times of byDoc.values()) {
+          for (let i = 1; i < times.length; i++) {
+            expect(times[i]).toBeGreaterThanOrEqual(times[i - 1]);
+          }
+        }
+
+        // Resuming from a witnessed cursor yields no entries already covered by it.
+        const resumeCursor = all[all.length - 1].cursor;
+        expect(resumeCursor).not.toBeNull();
+        const resumed = [];
+        for await (const rev of db.iterateChangeRevisionsSince(resumeCursor)) {
+          resumed.push(rev.entryId);
+        }
+        // Everything is witnessed and folded; resuming from the head watermark
+        // re-discovers nothing.
+        expect(resumed).toEqual([]);
+      } finally {
+        await (ctx.tenant as unknown as { disposeCacheManager?: () => Promise<void> }).disposeCacheManager?.();
       }
     }, 60000);
   });

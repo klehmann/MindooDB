@@ -85,6 +85,23 @@ export class AuthenticationService {
     // Check if user exists and is not revoked
     const userKeys = await this.directory.getUserPublicKeys(username);
     if (!userKeys) {
+      // A revoked device may still need to authenticate far enough to learn it
+      // must wipe (docs/accesscontrol.md §6.5). Allow the challenge if any of the
+      // user's keys is the target of a remote-wipe directive.
+      const universe = await this.getSigningKeyUniverse(username);
+      if (universe.wipeRequested.length > 0) {
+        const challenge = uuidv7();
+        const now = Date.now();
+        this.challenges.set(challenge, {
+          challenge,
+          username,
+          createdAt: now,
+          expiresAt: now + this.challengeExpirationMs,
+          used: false,
+        });
+        this.cleanupExpiredChallenges();
+        return challenge;
+      }
       // Check if user was revoked or never existed
       const isRevoked = await this.directory.isUserRevoked(username);
       if (isRevoked) {
@@ -169,9 +186,19 @@ export class AuthenticationService {
     
     const username = authChallenge.username;
     
-    // Get user's public signing key
-    const userKeys = await this.directory.getUserPublicKeys(username);
-    if (!userKeys) {
+    // Build the set of candidate signing keys this device could be using: the
+    // user's active (granted) keys plus any keys targeted for remote wipe
+    // (§6.5). The wipe set lets a revoked-by-key-removal device authenticate
+    // just far enough to receive the directive.
+    const universe = await this.getSigningKeyUniverse(username);
+    const candidateKeys = new Set<string>([...universe.active, ...universe.wipeRequested]);
+    // Legacy fallback: directories without the wipe API expose only the primary
+    // key via getUserPublicKeys.
+    if (candidateKeys.size === 0) {
+      const userKeys = await this.directory.getUserPublicKeys(username);
+      if (userKeys) candidateKeys.add(userKeys.signingPublicKey);
+    }
+    if (candidateKeys.size === 0) {
       this.logger.debug(`User not found or has no active access grant on this server: ${username}`);
       return {
         success: false,
@@ -181,30 +208,53 @@ export class AuthenticationService {
             + `or the access was revoked.`,
       };
     }
-    
-    // Verify signature
-    const isValid = await this.verifySignature(
-      challenge,
-      signature,
-      userKeys.signingPublicKey
-    );
-    
-    if (!isValid) {
+
+    // Find which candidate key produced the signature; that is the device's key.
+    let matchedKey: string | null = null;
+    for (const key of candidateKeys) {
+      if (await this.verifySignature(challenge, signature, key)) {
+        matchedKey = key;
+        break;
+      }
+    }
+
+    if (!matchedKey) {
       this.logger.debug(`Invalid signature for user: ${username}`);
       return {
         success: false,
         error: "Invalid signature",
       };
     }
+
+    const wipe = universe.wipeRequested.includes(matchedKey);
+    // Generate JWT token, recording the authenticated device key and whether it
+    // is wipe-targeted so sync handlers can serve only the grant directive.
+    const token = await this.generateToken(username, { deviceSigningKey: matchedKey, wipe });
     
-    // Generate JWT token
-    const token = await this.generateToken(username);
-    
-    this.logger.info(`Authentication successful for user: ${username}`);
+    this.logger.info(
+      `Authentication successful for user: ${username}${wipe ? " (remote-wipe directive pending)" : ""}`,
+    );
     return {
       success: true,
       token,
     };
+  }
+
+  /**
+   * Resolve the user's signing-key universe (active + wipe-targeted) via the
+   * optional directory API, returning empty sets when unsupported.
+   */
+  private async getSigningKeyUniverse(
+    username: string,
+  ): Promise<{ active: string[]; wipeRequested: string[] }> {
+    if (typeof this.directory.getUserSigningKeyUniverse === "function") {
+      try {
+        return await this.directory.getUserSigningKeyUniverse(username);
+      } catch (error) {
+        this.logger.debug(`getUserSigningKeyUniverse failed for ${username}: ${error}`);
+      }
+    }
+    return { active: [], wipeRequested: [] };
   }
 
   /**
@@ -231,11 +281,16 @@ export class AuthenticationService {
         return null;
       }
       
-      // Check if user is still valid (not revoked)
-      const isRevoked = await this.directory.isUserRevoked(payload.sub);
-      if (isRevoked) {
-        this.logger.debug(`User revoked: ${payload.sub}`);
-        return null;
+      // Check if user is still valid (not revoked). A wipe-scoped token is the
+      // deliberate exception (§6.5): a revoked device must still be able to fetch
+      // the admin-signed grant doc carrying its wipe directive, so we honor the
+      // token but downstream sync handlers restrict it to that single document.
+      if (!payload.wipe) {
+        const isRevoked = await this.directory.isUserRevoked(payload.sub);
+        if (isRevoked) {
+          this.logger.debug(`User revoked: ${payload.sub}`);
+          return null;
+        }
       }
       
       this.logger.debug(`Token valid for user: ${payload.sub}`);
@@ -293,7 +348,10 @@ export class AuthenticationService {
    * Generate a JWT token.
    * Uses HMAC-SHA256 for signing.
    */
-  private async generateToken(username: string): Promise<string> {
+  private async generateToken(
+    username: string,
+    options?: { deviceSigningKey?: string; wipe?: boolean },
+  ): Promise<string> {
     const subtle = this.cryptoAdapter.getSubtle();
     
     const now = Math.floor(Date.now() / 1000);
@@ -303,6 +361,8 @@ export class AuthenticationService {
       exp: now + Math.floor(this.tokenExpirationMs / 1000),
       tenantId: this.tenantId,
     };
+    if (options?.deviceSigningKey) payload.deviceSigningKey = options.deviceSigningKey;
+    if (options?.wipe) payload.wipe = true;
     
     // Create JWT header and payload
     const header = { alg: "HS256", typ: "JWT" };

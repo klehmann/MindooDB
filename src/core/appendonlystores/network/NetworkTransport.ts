@@ -227,13 +227,19 @@ export interface NetworkTransport {
    * The server will verify that the entry was created by a trusted user
    * (by checking the createdByPublicKey against the tenant directory).
    * 
+   * Returns the witness receipts the server stamped onto the accepted entries
+   * (stamped metadata carrying `receivedAt`/`receivedByPublicKey`/
+   * `receivedDateSignature`), so the client can persist the attestation locally
+   * (docs/accesscontrol.md §5.3). May be empty when the server does not witness.
+   *
    * @param token JWT access token from authenticate()
    * @param entries The entries to push to the remote store
+   * @returns Witness receipts (stamped metadata) for the accepted entries
    * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
    * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
    * @throws NetworkError with type INVALID_SIGNATURE if entry signature verification fails
    */
-  putEntries(token: string, entries: StoreEntry[]): Promise<void>;
+  putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]>;
 
   /**
    * Check which of the provided IDs exist in the remote store.

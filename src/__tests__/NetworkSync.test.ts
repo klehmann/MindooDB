@@ -81,7 +81,7 @@ class MockNetworkTransport implements NetworkTransport {
     return this.server.handleGetEntryMetadata(token, id);
   }
 
-  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
+  async putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
     return this.server.handlePutEntries(token, entries);
   }
 
@@ -1064,7 +1064,7 @@ class MockTenantDirectory implements MindooTenantDirectory {
   // Interface method - not used in tests  
   async revokeUser(
     _username: string,
-    _requestDataWipe: boolean,
+    _options: { signingKeys?: string[]; encryptionKeys?: string[]; requestDataWipe?: boolean },
     _administrationPrivateKey: EncryptedPrivateKey,
     _administrationPrivateKeyPassword: string
   ): Promise<void> {

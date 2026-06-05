@@ -464,9 +464,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   /**
    * Create a join request from a user's private identity.
    */
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" }): JoinRequest;
-  createJoinRequest(user: PrivateUserId, options: { format: "uri" }): string;
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri" }): JoinRequest | string {
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object"; label?: string }): JoinRequest;
+  createJoinRequest(user: PrivateUserId, options: { format: "uri"; label?: string }): string;
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri"; label?: string }): JoinRequest | string {
     const publicUser = this.toPublicUserId(user);
 
     const joinRequest: JoinRequest = {
@@ -475,6 +475,13 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       signingPublicKey: publicUser.userSigningPublicKey,
       encryptionPublicKey: publicUser.userEncryptionPublicKey,
     };
+
+    // Optional device label the joining user suggests for this key pair (§6.5).
+    // The approving admin may override it via ApproveJoinRequestOptions.label.
+    const trimmedLabel = typeof options?.label === "string" ? options.label.trim() : "";
+    if (trimmedLabel.length > 0) {
+      joinRequest.label = trimmedLabel;
+    }
 
     if (options?.format === "uri") {
       return encodeMindooURI("join-request", joinRequest as unknown as Record<string, unknown>);

@@ -2,6 +2,8 @@ import {
   DEFAULT_TENANT_KEY_ID,
   type DirectoryUserDetails,
   type DirectoryUserLookup,
+  type GrantKeyPair,
+  type GrantKeyPairInfo,
   EncryptedPrivateKey,
   MindooDB,
   MindooDoc,
@@ -14,8 +16,43 @@ import {
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import {
+  extractSigningPublicKeys,
+  extractEncryptionPublicKeys,
+  extractWipeRequestedSigningKeys,
+  extractKeyPairs,
+  applyKeyPairFields,
+  mergeKeyPairs,
+} from "./accesscontrol/grantKeys";
+import { aclTrustedWitnessDocId } from "./accesscontrol/types";
+import {
+  DirectoryStateNode,
+} from "./accesscontrol/DirectoryStateNode";
+import { DirectoryTimeTravelIndex, ProjectRevisionFn } from "./accesscontrol/DirectoryTimeTravelIndex";
+import { projectDirectoryRevision } from "./accesscontrol/directoryProjection";
+import {
+  ACCESS_CONTROL_FORM,
+  ACL_DEFAULT_POLICY_DOC_ID,
+  AclRuleDoc,
+  DefaultAccessPolicyDoc,
+  PSEUDO_TOKEN_ADMIN,
+  PSEUDO_TOKEN_AUTHOR,
+  PSEUDO_TOKEN_EVERYONE,
+  RuleType,
+  WithFieldClause,
+  aclRuleDocId,
+  aclDbPolicyDocId,
+  validateAclRule,
+} from "./accesscontrol/types";
+import { IdentitySet, evaluateAccess } from "./accesscontrol/evaluate";
+import { AccessDecision } from "./accesscontrol/types";
 
 const DIRECTORY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+
+/** De-duplicated union of two string lists, preserving first-seen order. */
+function unionStrings(existing: string[], added: string[]): string[] {
+  return Array.from(new Set([...existing, ...added]));
+}
 
 export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private tenant: BaseMindooTenant;
@@ -26,11 +63,19 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   // Note: No recursion guard needed because directory DB is admin-only,
   // so loading entries doesn't trigger validatePublicSigningKey recursively
   private trustedKeysCache: Map<string, boolean> = new Map();
-  // Mapping from grant document ID to public key (needed for revocation lookups)
-  private grantDocIdToPublicKey: Map<string, string> = new Map();
+  // Mapping from grant document ID to the signing public keys it currently
+  // grants. Revocation is expressed by removing keys from a grant document
+  // (docs/accesscontrol.md §6.5), so the set of trusted keys is recomputed as
+  // the union of all grant documents' current key arrays after each cache pass.
+  private grantDocIdToSigningKeys: Map<string, string[]> = new Map();
   // Best-effort reverse lookup cache for public signing key -> user details.
   // Entries remain available even after revocation so historical UIs can still show identity labels.
   private userLookupCache: Map<string, DirectoryUserLookup> = new Map();
+  // Remote-wipe directive index (docs/accesscontrol.md §6.5): signing public key
+  // targeted for wipe -> id of the admin-signed grant document carrying the
+  // directive. Self-contained key values survive key removal, so this stays
+  // populated even after the user is revoked by key-array removal.
+  private wipeKeyToGrantDocId: Map<string, string> = new Map();
 
   // Cache for settings documents
   private tenantSettingsCache: MindooDoc | null = null;
@@ -39,6 +84,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   // Cache for groups: key -> merged group data (key: lowercase groupName)
   // We store merged data separately to avoid mutating MindooDoc objects.
   private groupsCache: Map<string, { docId: string; members_hashes: string[]; members_encrypted: string[] }> = new Map();
+
+  // Time-travel access-control state (docs/accesscontrol.md §8). Built from the
+  // revision-grain changefeed (`iterateChangeRevisionsSince`) so every directory
+  // revision becomes its own chain node, stamped by trusted time. Persisted to
+  // disk as a compact delta log via the tenant CacheManager. Decoupled from the
+  // legacy doc-grain caches above, which remain the source of truth for the
+  // existing "now" public methods.
+  private timeTravel: DirectoryTimeTravelIndex | null = null;
+  // Last in-memory changefeed cursor the time-travel chain was built against,
+  // used to skip the (potentially expensive) feed rebuild when the directory
+  // has not changed since the previous build.
+  private lastTimeTravelChangeSeq: number | null = null;
 
   // Unified cache cursor for all document types
   private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
@@ -73,19 +130,25 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
     userDetails?: DirectoryUserDetails,
+    label?: string,
   ): Promise<void> {
     this.logger.info(`Registering user: ${userId.username}`);
 
-    // Check if user with same username (case-insensitive) already exists
+    // Check if user with same username (case-insensitive) already has ACTIVE
+    // access. A grant whose keys were removed (revocation, §6.5) is ignored
+    // here so the user can be re-registered after being revoked.
     const existingDocs = await this.findGrantAccessDocuments(userId.username);
-    if (existingDocs.length > 0) {
-      // Check if the keys match the existing registration
-      const existingDoc = existingDocs[existingDocs.length - 1]; // Use most recent
+    const activeDocs = existingDocs.filter(
+      (doc) => extractSigningPublicKeys(doc.getData()).length > 0,
+    );
+    if (activeDocs.length > 0) {
+      // Check if the keys match the existing active registration
+      const existingDoc = activeDocs[activeDocs.length - 1]; // Use most recent
       const existingData = existingDoc.getData();
       
       const keysMatch = 
-        existingData.userSigningPublicKey === userId.userSigningPublicKey &&
-        existingData.userEncryptionPublicKey === userId.userEncryptionPublicKey;
+        extractSigningPublicKeys(existingData).includes(userId.userSigningPublicKey) &&
+        extractEncryptionPublicKeys(existingData).includes(userId.userEncryptionPublicKey);
       
       if (keysMatch) {
         // Same user with same keys - skip re-registration
@@ -109,8 +172,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
 
-    // Compute username hash and encrypted user details before creating the document.
-    const usernameHash = await this.hashUsername(userId.username);
+    // Compute username hash (salted v2 for new documents) and encrypted user
+    // details before creating the document.
+    const usernameHash = await this.hashUsernameForWrite(userId.username);
     const userDetailsEncrypted = await this.encryptUserDetailsForTenant(
       this.buildUserDetailsPayload(userId.username, userDetails),
     );
@@ -134,9 +198,19 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.form = "useroperation";
         data.type = "grantaccess";
         data.username_hash = usernameHash;
+        data.username_hash_v = BaseMindooTenantDirectory.USERNAME_HASH_VERSION;
         data.user_details_encrypted = userDetailsEncrypted;
-        data.userSigningPublicKey = userId.userSigningPublicKey;
-        data.userEncryptionPublicKey = userId.userEncryptionPublicKey;
+        // New grants write the canonical `userKeyPairs` form (§6.5), pairing
+        // the device's signing+encryption keys with an optional label, while
+        // applyKeyPairFields mirrors the legacy array/scalar fields so older
+        // clients keep working. The admin can later add more devices or relabel.
+        const trimmedLabel = typeof label === "string" ? label.trim() : "";
+        const initialPair: GrantKeyPair = {
+          signingPublicKey: userId.userSigningPublicKey,
+          encryptionPublicKey: userId.userEncryptionPublicKey,
+        };
+        if (trimmedLabel.length > 0) initialPair.label = trimmedLabel;
+        applyKeyPairFields(data, [initialPair]);
       }, {
         signingKeyPair: adminSigningKeyPair,
         signingKeyPassword: administrationPrivateKeyPassword,
@@ -159,115 +233,133 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // Update unified cache to ensure we have latest data
     await this.updateUnifiedCache();
     
-    // Compute the hash to search for
-    const targetHash = await this.hashUsername(username);
+    // Compute the candidate hashes to search for. We match against BOTH the
+    // legacy (v1, unsalted) and salted (v2) forms so that documents written
+    // under either scheme are found (docs/accesscontrol.md §6.5).
+    const targetHashes = new Set(await this.usernameHashCandidates(username));
+    const matchesTarget = (value: unknown): boolean =>
+      typeof value === "string" && targetHashes.has(value);
     
     const matchingDocs: MindooDoc[] = [];
-    const revokedDocIds = new Set<string>();
-    
-    // Use the generator-based iteration API for cleaner code
-    // No signature verification needed - DB already enforces admin-only
+
+    // Use the generator-based iteration API for cleaner code.
+    // No signature verification needed - DB already enforces admin-only.
+    // Revocation no longer uses a separate document: it removes keys from the
+    // grant document in place (docs/accesscontrol.md §6.5). A fully-revoked user
+    // therefore still has a grant document here, but with empty key arrays.
+    // Callers that need "active access" should inspect the key arrays (see
+    // {@link isUserRevoked} / {@link getUserPublicKeys}).
     for await (const { doc } of directoryDB.iterateChangesSince(null)) {
       const data = doc.getData();
-      
-      // Check if this is a grant access document we're looking for (by username_hash)
-      if (data.form === "useroperation" && 
-          data.type === "grantaccess" && 
-          data.username_hash === targetHash) {
-        this.logger.debug(`Found grant access document for username hash: ${targetHash}`);
-              matchingDocs.push(doc);
-      }
-      
-      // Check if this is a revoke access document for the same username (by username_hash)
-      if (data.form === "useroperation" && 
-          data.type === "revokeaccess" && 
-          data.username_hash === targetHash &&
-          data.revokeDocId &&
-          typeof data.revokeDocId === "string") {
-        this.logger.debug(`Found revoke access document for username hash: ${targetHash}, revoking doc ID: ${data.revokeDocId}`);
-              revokedDocIds.add(data.revokeDocId);
+
+      if (data.form === "useroperation" &&
+          data.type === "grantaccess" &&
+          matchesTarget(data.username_hash)) {
+        this.logger.debug(`Found grant access document for username: ${username}`);
+        matchingDocs.push(doc);
       }
     }
-    
-    // Filter out revoked documents
-    const activeDocs = matchingDocs.filter(doc => !revokedDocIds.has(doc.getId()));
-    
-    if (activeDocs.length === 0) {
-      this.logger.debug(`No active grant access documents found for username: ${username} (found ${matchingDocs.length} total, ${revokedDocIds.size} revoked)`);
-    } else {
-      this.logger.debug(`Found ${activeDocs.length} active grant access document(s) for username: ${username} (${matchingDocs.length} total, ${revokedDocIds.size} revoked)`);
-    }
-    
-    return activeDocs;
+
+    this.logger.debug(`Found ${matchingDocs.length} grant access document(s) for username: ${username}`);
+    return matchingDocs;
   }
 
+  /**
+   * Revoke a user's access by removing their keys from the grant document
+   * (docs/accesscontrol.md §6.5). This replaces the legacy `revokeaccess`
+   * document model entirely: revocation is now an in-place edit of the grant
+   * document's `userSigningPublicKeys` / `userEncryptionPublicKeys` arrays.
+   *
+   * By default (no `options.signingKeys`) the user is fully revoked: every
+   * signing AND encryption key is removed, so the grant document remains but
+   * carries no keys. To revoke a single device/key, pass the specific
+   * `signingKeys` (and optionally matching `encryptionKeys`) to remove.
+   *
+   * When `options.requestDataWipe` is true, the removed signing keys are also
+   * flagged for a remote device wipe (§6.5) before removal, so the targeted
+   * devices delete their local tenant on next sync. The wipe directive is
+   * stored self-contained on the grant document and survives key removal.
+   *
+   * BREAKING CHANGE: the previous signature took a positional `requestDataWipe`
+   * boolean; it now takes an options object so specific keys can be targeted.
+   *
+   * @param username The user to revoke (format: "CN=<username>/O=<tenantId>").
+   * @param options.signingKeys Specific signing keys to remove; omit/empty to
+   *   remove all of the user's keys (full revocation).
+   * @param options.encryptionKeys Specific encryption keys to remove. Ignored
+   *   for a full revocation (all encryption keys are removed in that case).
+   * @param options.requestDataWipe Also request a remote wipe of the removed
+   *   signing keys' devices.
+   */
   async revokeUser(
     username: string,
-    requestDataWipe: boolean,
+    options: {
+      signingKeys?: string[];
+      encryptionKeys?: string[];
+      requestDataWipe?: boolean;
+    },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void> {
     this.logger.info(`Revoking user: ${username}`);
 
-    // Find all grant access documents for this user
     const grantAccessDocs = await this.findGrantAccessDocuments(username);
-    
-    // If no grant access documents found, exit early
     if (grantAccessDocs.length === 0) {
       this.logger.debug(`No grant access documents found for ${username}, exiting revocation`);
       return;
     }
 
-    // Cast to BaseMindooTenant to access protected methods
-    const baseTenant = this.tenant as BaseMindooTenant;
-    const directoryDB = await this.getDirectoryDB();
+    const fullRevoke = !options.signingKeys || options.signingKeys.length === 0;
 
-    // Create SigningKeyPair for the administration key
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    // Determine which signing/encryption keys to strip from the grant. A full
+    // revocation removes every key currently present across the user's grant
+    // documents; a targeted revocation removes only the supplied keys.
+    let signingToRemove: string[];
+    let encryptionToRemove: string[];
+    if (fullRevoke) {
+      const allSigning = new Set<string>();
+      const allEncryption = new Set<string>();
+      for (const grant of grantAccessDocs) {
+        const data = grant.getData();
+        for (const key of extractSigningPublicKeys(data)) allSigning.add(key);
+        for (const key of extractEncryptionPublicKeys(data)) allEncryption.add(key);
+      }
+      signingToRemove = Array.from(allSigning);
+      encryptionToRemove = Array.from(allEncryption);
+    } else {
+      signingToRemove = options.signingKeys ?? [];
+      encryptionToRemove = options.encryptionKeys ?? [];
+    }
 
-    // Compute username hash and encrypted user details before creating documents
-    const usernameHash = await this.hashUsername(username);
-    const userDetailsEncrypted = await this.encryptUserDetailsForTenant(
-      this.buildUserDetailsPayload(username),
+    // Flag the removed devices for remote wipe BEFORE removing the keys, so the
+    // self-contained wipe directive is recorded on the grant document (§6.5).
+    if (options.requestDataWipe && signingToRemove.length > 0) {
+      await this.requestDeviceWipe(
+        username,
+        signingToRemove,
+        administrationPrivateKey,
+        administrationPrivateKeyPassword,
+      );
+    }
+
+    await this.removeUserKeys(
+      username,
+      signingToRemove,
+      encryptionToRemove,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
     );
 
-    // Create revocation documents for each grant access document found
-    for (const grantAccessDoc of grantAccessDocs) {
-      const revokeDocId = grantAccessDoc.getId();
-
-      // Create document with admin signing key so the initial entry is trusted
-      // Use PUBLIC_INFOS_KEY_ID so servers can validate users without full tenant access
-      const newDoc = await directoryDB.createDocumentWithSigningKey(
-        adminSigningKeyPair,
-        administrationPrivateKeyPassword,
-        PUBLIC_INFOS_KEY_ID
-      );
-      
-      // Set the document data fields with the admin key at entry level
-      await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
-        const data = doc.getData();
-        data.form = "useroperation";
-        data.type = "revokeaccess";
-        data.username_hash = usernameHash;
-        data.user_details_encrypted = userDetailsEncrypted;
-        data.revokeDocId = revokeDocId;
-        data.requestDataWipe = requestDataWipe;
-      }, {
-        signingKeyPair: adminSigningKeyPair,
-        signingKeyPassword: administrationPrivateKeyPassword,
-      });
-
-      this.logger.debug(`Created revocation document for grant access doc: ${revokeDocId}`);
-    }
-    
-    // Update the cache so that subsequent validatePublicSigningKey calls
-    // see the revocation without waiting for the next sync interval
+    // removeUserKeys already refreshes the unified cache; refresh once more to
+    // be explicit so subsequent validatePublicSigningKey calls observe the
+    // revocation without waiting for the next sync interval.
     await this.updateUnifiedCache();
-    
-    this.logger.info(`Revoked user: ${username} (created ${grantAccessDocs.length} revocation document(s))`);
+
+    this.logger.info(
+      fullRevoke
+        ? `Revoked user: ${username} (removed all keys from ${grantAccessDocs.length} grant document(s))`
+        : `Revoked ${signingToRemove.length} signing key(s) for user: ${username}`,
+    );
   }
 
   async validatePublicSigningKey(publicKey: string): Promise<boolean> {
@@ -340,8 +432,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // If processing from the beginning, clear all caches first
     if (startCursor === null) {
       this.trustedKeysCache.clear();
-      this.grantDocIdToPublicKey.clear();
+      this.grantDocIdToSigningKeys.clear();
       this.userLookupCache.clear();
+      this.wipeKeyToGrantDocId.clear();
       this.tenantSettingsCache = null;
       this.dbSettingsCache.clear();
       this.groupsCache.clear();
@@ -356,41 +449,43 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       
       // Process user operation documents (grant/revoke access)
       if (data.form === "useroperation") {
-      // Check if this is a grant access document
-        if (data.type === "grantaccess" && 
-          data.userSigningPublicKey &&
-          typeof data.userSigningPublicKey === "string") {
-              const userPublicKey = data.userSigningPublicKey;
-              this.logger.debug(`Cache: adding trusted key from grant access document`);
-              // Mark as active (true) unless already revoked
-              if (!this.trustedKeysCache.has(userPublicKey) || this.trustedKeysCache.get(userPublicKey) === true) {
-                this.trustedKeysCache.set(userPublicKey, true);
-              }
-              // Store mapping for future revocation lookups (persisted across iterations)
-              this.grantDocIdToPublicKey.set(doc.getId(), userPublicKey);
-              const userLookup = await this.buildUserLookup(data);
-              if (userLookup) {
-                this.userLookupCache.set(userPublicKey, userLookup);
-              }
-      }
-      
-      // Check if this is a revoke access document
-        if (data.type === "revokeaccess" &&
-          data.revokeDocId &&
-          typeof data.revokeDocId === "string") {
-              const revokedDocId = data.revokeDocId;
-              // Find the public key for this grant doc ID and mark as revoked
-              // Use the persistent mapping that survives across iterations
-              const revokedPublicKey = this.grantDocIdToPublicKey.get(revokedDocId);
-              if (revokedPublicKey) {
-                this.logger.debug(`Cache: revoking key for doc ${revokedDocId}`);
-                this.trustedKeysCache.set(revokedPublicKey, false);
-              } else {
-                this.logger.warn(`Cache: revocation for unknown grant doc ${revokedDocId}`);
+      // Check if this is a grant access document. A grant may carry MULTIPLE
+      // signing keys (key rollover / multiple devices, §6.5); honor all of
+      // them, with a legacy scalar fallback handled by extractSigningPublicKeys.
+        const grantedSigningKeys =
+          data.type === "grantaccess" ? extractSigningPublicKeys(data) : [];
+        // Index any remote-wipe directive on this grant (§6.5) regardless of how
+        // many signing keys remain: the wipe values are self-contained and must
+        // survive full key-array revocation so a revoked device can still be told
+        // to wipe. Maps each wipe-targeted signing key to this grant doc's id.
+        if (data.type === "grantaccess") {
+          for (const wipeKey of extractWipeRequestedSigningKeys(data)) {
+            this.wipeKeyToGrantDocId.set(wipeKey, doc.getId());
+          }
+        }
+        if (data.type === "grantaccess") {
+              // Record this grant document's CURRENT signing keys. Because grant
+              // documents are Automerge-merged in place, removing keys (the only
+              // revocation mechanism, §6.5) is reflected by a smaller array here.
+              // The authoritative trustedKeysCache is rebuilt from the union of
+              // all grant documents once the change loop completes, so a key
+              // dropped from this document is no longer trusted unless another
+              // grant still lists it.
+              this.grantDocIdToSigningKeys.set(doc.getId(), grantedSigningKeys);
+
+              if (grantedSigningKeys.length > 0) {
+                const userLookup = await this.buildUserLookup(data);
+                if (userLookup) {
+                  // Keep identity labels available even after the keys are later
+                  // revoked, so historical UIs can still resolve old authors.
+                  for (const userPublicKey of grantedSigningKeys) {
+                    this.userLookupCache.set(userPublicKey, userLookup);
+                  }
+                }
               }
             }
       }
-      
+
       // Process group documents
       if (data.form === "group" && 
           data.type === "group" &&
@@ -419,7 +514,20 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       // Update cursor after each document
       this.unifiedCacheLastCursor = cursor;
     }
-    
+
+    // Rebuild the trusted signing-key set as the union of every grant
+    // document's current keys (docs/accesscontrol.md §6.5). Revocation removes
+    // keys from a grant, so a key absent from this union is no longer trusted;
+    // validatePublicSigningKey treats "not present" as untrusted. This is
+    // recomputed on every pass (full or incremental) because the per-grant map
+    // is the source of truth and persists across incremental updates.
+    this.trustedKeysCache.clear();
+    for (const signingKeys of this.grantDocIdToSigningKeys.values()) {
+      for (const key of signingKeys) {
+        this.trustedKeysCache.set(key, true);
+      }
+    }
+
     // Merge group documents with the same name
     for (const [normalizedGroupName, docs] of groupDocsByName.entries()) {
       // Collect all member hashes and encrypted values from all documents with this group name
@@ -468,6 +576,781 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         });
       }
     }
+
+  }
+
+  /**
+   * The head time-travel directory-state node ("now"), after ensuring the chain
+   * is current. Powers access-control evaluation (§7) and audit queries.
+   */
+  async getDirectoryStateHead(): Promise<DirectoryStateNode> {
+    const index = await this.ensureTimeTravelCurrent();
+    return index.getHead();
+  }
+
+  /**
+   * The time-travel directory-state node covering trusted time `T` (§8) — used
+   * by the evaluation algorithm and `wasAllowedAt` to judge an entry against the
+   * directory as it was at the entry's trusted time.
+   */
+  async getDirectoryStateAt(T: number): Promise<DirectoryStateNode> {
+    const index = await this.ensureTimeTravelCurrent();
+    return index.getStateAt(T);
+  }
+
+  /**
+   * Lazily create the time-travel index (restoring its persisted delta log and
+   * registering it with the tenant CacheManager on first use), then bring the
+   * directory-state chain up to date from the revision-grain changefeed
+   * (docs/accesscontrol.md §8).
+   *
+   * The (potentially expensive) feed rebuild is skipped when the directory's
+   * changefeed cursor has not advanced since the previous build and no
+   * un-witnessed revisions are pending a possible trusted-time re-stamp.
+   */
+  private async ensureTimeTravelCurrent(): Promise<DirectoryTimeTravelIndex> {
+    const directoryDB = await this.getDirectoryDB();
+
+    // Projection used to (re)build the chain from stored revisions in
+    // trusted-time order. Captures this directory's group-name normalization.
+    const project: ProjectRevisionFn = (builder, revision) =>
+      projectDirectoryRevision(builder, {
+        docId: revision.docId,
+        data: revision.data,
+        deleted: revision.deleted,
+        trustedTime: revision.trustedTime,
+        normalizeGroupName: (name) => this.normalizeGroupName(name),
+      });
+
+    if (!this.timeTravel) {
+      const index = new DirectoryTimeTravelIndex(`${this.tenant.getId()}/directory`);
+      const cacheManager = this.tenant.getCacheManager();
+      if (cacheManager) {
+        // Warm start: restore the persisted revisions (no decryption / Automerge)
+        // and replay them into the chain, then extend via the changefeed below.
+        await index.restoreFromCache(cacheManager.getStore());
+        index.rebuild(project);
+        cacheManager.register(index);
+      }
+      // Seed the in-memory gate cursor from the restored chain so a cold start
+      // can short-circuit when the directory has not advanced since the chain
+      // was flushed (otherwise the first call after every restart redundantly
+      // rebuilds the feed). `null` keeps the legacy behavior (force a build).
+      this.lastTimeTravelChangeSeq = index.lastChangeSeq;
+      this.timeTravel = index;
+    }
+    const index = this.timeTravel;
+
+    // Gate the (potentially expensive) feed rebuild on the in-memory changefeed
+    // cursor. We deliberately do NOT call syncStoreChanges() here: like the
+    // legacy updateUnifiedCache read path, this method must not trigger network
+    // pulls or re-entrant directory syncing when invoked from server-side entry
+    // validation. The revision feed reads the directory store directly, so it
+    // already observes every persisted entry; the cursor is only used to decide
+    // when a rebuild is worthwhile.
+    const latest = directoryDB.getLatestChangeCursor?.() ?? null;
+    const latestSeq = latest?.changeSeq ?? null;
+
+    // Fast path: the directory has not advanced since the last build. The
+    // un-witnessed head overlay is refreshed when `changeSeq` next advances
+    // (notably when a re-stamped entry is re-discovered with a `receivedAt`), so
+    // we do not need to re-run the feed on every call just to refresh the
+    // provisional `now` of un-witnessed entries.
+    if (this.lastTimeTravelChangeSeq !== null && latestSeq === this.lastTimeTravelChangeSeq) {
+      return index;
+    }
+
+    // Incrementally advance the feed from the persisted cursor; the feed parks
+    // the cursor before the earliest un-witnessed entry so those revisions are
+    // re-discovered (and re-stamped/superseded as needed) on this resume.
+    let changed = false;
+    for await (const rev of directoryDB.iterateChangeRevisionsSince(index.cursor)) {
+      const revChanged = index.upsertRevision(
+        {
+          entryId: rev.entryId,
+          docId: rev.docId,
+          data: rev.doc.getData(),
+          deleted: rev.doc.isDeleted(),
+          trustedTime: rev.trustedTime,
+          witnessed: rev.witnessed,
+        },
+        rev.cursor,
+      );
+      changed = changed || revChanged;
+    }
+
+    // Replay all revisions into the chain in trusted-time order. This absorbs
+    // out-of-order arrivals and supersessions (a re-emitted revision replaced its
+    // prior record above) without any special-casing in the chain builder.
+    if (changed) {
+      index.rebuild(project);
+    }
+
+    this.lastTimeTravelChangeSeq = latestSeq;
+    // Persist the observed changeSeq with the chain so the gate survives restart.
+    index.recordChangeSeq(latestSeq);
+    if (index.hasDirtyState()) {
+      this.tenant.getCacheManager()?.markDirty();
+    }
+    return index;
+  }
+
+  /**
+   * The set of witness public keys trusted at trusted time `T`
+   * (docs/accesscontrol.md §6.4), used by the client to validate witness
+   * receipts on incoming entries during materialization (§5.4).
+   */
+  async getTrustedWitnessKeysAt(T: number): Promise<Set<string>> {
+    const node = await this.getDirectoryStateAt(T);
+    return new Set(node.trustedWitnessKeys.keys());
+  }
+
+  /**
+   * Resolve the acting user's identity set for access-control evaluation
+   * (docs/accesscontrol.md §7 step 3): username hash (v1 + v2), every group hash
+   * (including nested groups), the user's resolved usernames/groups for
+   * placeholder expansion, and the applicable pseudo-tokens (`$everyone` always;
+   * `$admin`/`$author` when the caller indicates they apply).
+   *
+   * @param username The acting user's canonical username.
+   * @param opts.isAdmin Whether the acting signing key is the tenant admin key.
+   * @param opts.isAuthor Whether the acting user authored the target document
+   *   (the caller resolves this by mapping the document's creator key and the
+   *   change signer key to the same grant; see §6.3 `$author`).
+   */
+  async buildIdentitySet(
+    username: string,
+    opts: { isAdmin?: boolean; isAuthor?: boolean } = {},
+  ): Promise<IdentitySet> {
+    await this.updateUnifiedCache();
+    const usernames = await this.getUserNamesList(username);
+    const groups = await this.resolveGroupsForUser(username);
+
+    const hashes = new Set<string>();
+    for (const h of await this.usernameHashCandidates(username)) {
+      hashes.add(h);
+    }
+    // Group membership: rules target group-name hashes, so the identity set
+    // must include the hash of every group the user belongs to.
+    for (const group of groups) {
+      for (const h of await this.usernameHashCandidates(group)) {
+        hashes.add(h);
+      }
+    }
+    hashes.add(PSEUDO_TOKEN_EVERYONE);
+    if (opts.isAdmin) hashes.add(PSEUDO_TOKEN_ADMIN);
+    if (opts.isAuthor) hashes.add(PSEUDO_TOKEN_AUTHOR);
+
+    return { username, usernames, groups, hashes };
+  }
+
+  /**
+   * Server-side Tier 1 evaluation for a pushed entry (docs/accesscontrol.md §7,
+   * §10). The server identifies the author by signing key (it cannot read
+   * encrypted content), resolves their identity set, and evaluates the identity
+   * tier of the policy at `trustedTime`. Tier 2 (content) rules are deferred to
+   * clients — `evaluateAccess` is called with `isServer: true`, so a gate that
+   * only a Tier 2 rule could decide is treated as allowed here.
+   *
+   * @param input.op The operation (entry type) being pushed.
+   * @param input.dbid The database the entry targets (witness binds this).
+   * @param input.signingKey The author's Ed25519 signing public key (PEM).
+   * @param input.trustedTime The trusted time to evaluate at (the witness's
+   *   acceptance time for an inbound push).
+   * @param input.isAuthor Whether the author is the document's original creator
+   *   (resolved by the caller for `$author`; see §6.3). For `doc_create` the
+   *   author is always the creator.
+   */
+  async evaluateAccessForSigningKey(input: {
+    op: RuleType;
+    dbid: string;
+    signingKey: string;
+    trustedTime: number;
+    isAuthor?: boolean;
+  }): Promise<AccessDecision> {
+    const node = await this.getDirectoryStateAt(input.trustedTime);
+    const identity = await this.identitySetForSigningKey(input.signingKey, {
+      isAuthor: input.op === "doc_create" || !!input.isAuthor,
+    });
+    return evaluateAccess({ op: input.op, dbid: input.dbid, identity, node, isServer: true });
+  }
+
+  /**
+   * Client-side (Tier 1 + Tier 2) evaluation for a single entry during
+   * materialization (docs/accesscontrol.md §7, §10). Unlike the server path,
+   * the client can read decrypted content, so it evaluates `withfields` clauses
+   * against the supplied `before`/`after` document states.
+   */
+  async evaluateClientAccess(input: {
+    op: RuleType;
+    dbid: string;
+    signingKey: string;
+    trustedTime: number;
+    isAuthor: boolean;
+    beforeDoc: Record<string, unknown> | null;
+    afterDoc: Record<string, unknown> | null;
+  }): Promise<AccessDecision> {
+    const node = await this.getDirectoryStateAt(input.trustedTime);
+    const identity = await this.identitySetForSigningKey(input.signingKey, {
+      isAuthor: input.op === "doc_create" || input.isAuthor,
+    });
+    return evaluateAccess({
+      op: input.op,
+      dbid: input.dbid,
+      identity,
+      node,
+      beforeDoc: input.beforeDoc,
+      afterDoc: input.afterDoc,
+      isServer: false,
+    });
+  }
+
+  /**
+   * Whether access control is active for this tenant right now: a default
+   * policy exists and the master kill-switch is not engaged
+   * (docs/accesscontrol.md §6.1, §7 step 0). When false, callers can skip the
+   * (more expensive) per-entry access evaluation entirely.
+   */
+  async isAccessControlActive(): Promise<boolean> {
+    const head = await this.getDirectoryStateHead();
+    if (head.defaultPolicy === null) return false;
+    return head.defaultPolicy.disableAllAccessChecksAndPolicies !== true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Access-control authoring API (docs/accesscontrol.md §6). All writes are
+  // admin-signed and encrypted with `$publicinfos` so the sync server can read
+  // the Tier 1-relevant policy. Creating `acl_defaultpolicy` is what activates
+  // access control for the tenant (§6.1).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Create or update the tenant-wide default policy (§6.1). The mere existence
+   * of this document activates access control. Only the fields supplied are
+   * written; omit a field to leave it unset (interpreted as its default).
+   */
+  async setDefaultAccessPolicy(
+    policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.writePolicyDoc(
+      ACL_DEFAULT_POLICY_DOC_ID,
+      policy,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /**
+   * Create or update a per-database policy override (§6.2). Fields set here
+   * override the tenant default for `dbid`; unset fields inherit it.
+   */
+  async setDatabaseAccessPolicy(
+    dbid: string,
+    policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.writePolicyDoc(
+      aclDbPolicyDocId(dbid),
+      policy,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /** Shared writer for default / per-db policy documents. */
+  private async writePolicyDoc(
+    docId: string,
+    policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      docId,
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = "defaultpolicy";
+        for (const [key, value] of Object.entries(policy)) {
+          if (value !== undefined) data[key] = value;
+        }
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Create or replace an access-control rule (§6.3). A rule with `withfields`
+   * is Tier 2 (client-enforced); otherwise it is Tier 1 (server-enforced). The
+   * spec is validated before writing.
+   */
+  async createAccessRule(
+    rule: {
+      ruleId: string;
+      type: RuleType;
+      dbid?: string;
+      action?: "allow" | "deny";
+      users_hashes?: string[];
+      /** Usernames to target; resolved to their (salted v2) hashes. */
+      usernames?: string[];
+      /** Group names to target; resolved to their (salted v2) hashes. */
+      groups?: string[];
+      withfields?: WithFieldClause[];
+      description?: string;
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    // Resolve any username/group names into hashes and merge with explicit
+    // hashes / pseudo-tokens (§6.3). Names are hashed the same way as
+    // membership entries so they intersect the acting user's identity set.
+    const resolvedHashes = new Set<string>(rule.users_hashes ?? []);
+    for (const name of [...(rule.usernames ?? []), ...(rule.groups ?? [])]) {
+      resolvedHashes.add(await this.hashUsernameForWrite(name));
+    }
+
+    const ruleDoc: AclRuleDoc = {
+      form: ACCESS_CONTROL_FORM,
+      type: rule.type,
+      ruleId: rule.ruleId,
+      description: rule.description,
+      dbid: rule.dbid ?? "*",
+      withfields: rule.withfields,
+      users_hashes: Array.from(resolvedHashes),
+      users_encrypted: "",
+      action: rule.action ?? "allow",
+    };
+    // Fail fast on malformed clauses / operators (§6.3 closed set).
+    validateAclRule(ruleDoc);
+
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      aclRuleDocId(rule.ruleId),
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = ruleDoc.type;
+        data.ruleId = ruleDoc.ruleId;
+        data.dbid = ruleDoc.dbid;
+        data.action = ruleDoc.action;
+        data.users_hashes = ruleDoc.users_hashes;
+        data.users_encrypted = ruleDoc.users_encrypted;
+        if (ruleDoc.description !== undefined) data.description = ruleDoc.description;
+        if (ruleDoc.withfields !== undefined) data.withfields = ruleDoc.withfields;
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * List access-control rules currently in effect (§9), optionally filtered by
+   * operation type and/or database. Rules with `dbid: "*"` match any database.
+   */
+  async listRules(filter?: { type?: RuleType; dbid?: string }): Promise<AclRuleDoc[]> {
+    const head = await this.getDirectoryStateHead();
+    const out: AclRuleDoc[] = [];
+    for (const [type, rules] of head.rulesByType) {
+      if (filter?.type && filter.type !== type) continue;
+      for (const rule of rules) {
+        if (filter?.dbid && rule.dbid !== filter.dbid && rule.dbid !== "*") continue;
+        out.push(rule);
+      }
+    }
+    return out;
+  }
+
+  /** Delete an access-control rule by id (§9): a soft-delete of its document. */
+  async deleteRule(
+    ruleId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    try {
+      await directoryDB.deleteDocument(aclRuleDocId(ruleId), {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
+    } catch (error) {
+      this.logger.debug(`deleteRule: rule ${ruleId} not found or already deleted: ${error}`);
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Add (or refresh) a trusted witness (§6.4). The witness document is keyed by
+   * a fingerprint of its public key so add/remove are symmetric.
+   */
+  async addTrustedWitness(
+    witness: { witnessPublicKey: string; serverUrl?: string; notBefore?: number; notAfter?: number },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const fingerprint = await this.sha256Hex(witness.witnessPublicKey);
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      aclTrustedWitnessDocId(fingerprint),
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = "trustedwitness";
+        data.witnessPublicKey = witness.witnessPublicKey;
+        if (witness.serverUrl !== undefined) data.serverUrl = witness.serverUrl;
+        if (witness.notBefore !== undefined) data.notBefore = witness.notBefore;
+        if (witness.notAfter !== undefined) data.notAfter = witness.notAfter;
+      },
+      { signingKeyPair: adminSigningKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
+    );
+    await this.updateUnifiedCache();
+  }
+
+  /** Remove a trusted witness by its public key (§6.4): soft-deletes its document. */
+  async removeTrustedWitness(
+    witnessPublicKey: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const fingerprint = await this.sha256Hex(witnessPublicKey);
+    try {
+      await directoryDB.deleteDocument(aclTrustedWitnessDocId(fingerprint), {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
+    } catch (error) {
+      this.logger.debug(`removeTrustedWitness: witness not found: ${error}`);
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Add device key pairs to a user's grant (§6.5 key rollover / new device).
+   * Pairs are merged by signing key (a pair with an already-present signing key
+   * updates its encryption key/label). See {@link mergeKeyPairs}.
+   */
+  async addUserKeys(
+    username: string,
+    keyPairs: GrantKeyPair[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const additions = keyPairs.map((pair) => {
+      const trimmedLabel = typeof pair.label === "string" ? pair.label.trim() : "";
+      return trimmedLabel.length > 0
+        ? { ...pair, label: trimmedLabel }
+        : { signingPublicKey: pair.signingPublicKey, encryptionPublicKey: pair.encryptionPublicKey };
+    });
+    await this.editGrantArrays(
+      username,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      (data) => {
+        applyKeyPairFields(data, mergeKeyPairs(extractKeyPairs(data), additions));
+      },
+    );
+  }
+
+  /**
+   * Remove keys from a user's grant (§6.5 revoke a device/key). A device is
+   * identified by its signing key; removing a signing key removes its entire
+   * paired entry. `encryptionKeys` additionally drops any pair whose encryption
+   * key matches (kept for callers that target encryption keys directly).
+   */
+  async removeUserKeys(
+    username: string,
+    signingKeys: string[],
+    encryptionKeys: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const signingToRemove = new Set(signingKeys);
+    const encToRemove = new Set(encryptionKeys);
+    await this.editGrantArrays(
+      username,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      (data) => {
+        const remaining = extractKeyPairs(data).filter(
+          (pair) =>
+            !signingToRemove.has(pair.signingPublicKey) &&
+            !(pair.encryptionPublicKey.length > 0 && encToRemove.has(pair.encryptionPublicKey)),
+        );
+        applyKeyPairFields(data, remaining);
+      },
+    );
+  }
+
+  /**
+   * Set or clear the label of a device's key pair, identified by its signing
+   * public key (§6.5). An empty/whitespace `label` clears it. No-op if no pair
+   * with that signing key exists on the user's grant.
+   */
+  async setKeyPairLabel(
+    username: string,
+    signingPublicKey: string,
+    label: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const trimmedLabel = typeof label === "string" ? label.trim() : "";
+    await this.editGrantArrays(
+      username,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      (data) => {
+        const pairs = extractKeyPairs(data);
+        let changed = false;
+        const next = pairs.map((pair) => {
+          if (pair.signingPublicKey !== signingPublicKey) return pair;
+          changed = true;
+          if (trimmedLabel.length > 0) {
+            return { ...pair, label: trimmedLabel };
+          }
+          // Clear the label by dropping the field entirely.
+          return {
+            signingPublicKey: pair.signingPublicKey,
+            encryptionPublicKey: pair.encryptionPublicKey,
+          };
+        });
+        // Only rewrite when this grant actually carries the targeted key, to
+        // avoid touching other grant documents for the same user.
+        if (changed) applyKeyPairFields(data, next);
+      },
+    );
+  }
+
+  /**
+   * Request a remote wipe of specific devices (§6.5). Targets devices by signing
+   * public key; the values are stored self-contained in
+   * `wipeRequestedForSigningKeys` so they survive key removal. This is an
+   * explicit, opt-in directive and is independent of revocation.
+   */
+  async requestDeviceWipe(
+    username: string,
+    signingKeys: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.editGrantArrays(
+      username,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      (data) => {
+        data.wipeRequestedForSigningKeys = unionStrings(
+          extractWipeRequestedSigningKeys(data),
+          signingKeys,
+        );
+      },
+    );
+  }
+
+  /** Cancel a previously-requested device wipe for the given signing keys (§6.5). */
+  async cancelDeviceWipe(
+    username: string,
+    signingKeys: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const toCancel = new Set(signingKeys);
+    await this.editGrantArrays(
+      username,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      (data) => {
+        data.wipeRequestedForSigningKeys = extractWipeRequestedSigningKeys(data).filter(
+          (k) => !toCancel.has(k),
+        );
+      },
+    );
+  }
+
+  /**
+   * Predict whether the current user may perform `op` on `dbid` (§9). Pure read;
+   * evaluates Tier 1 + Tier 2 against the head directory state, treating the
+   * caller as the prospective author. `candidateDoc` supplies the content that
+   * `withfields` clauses are checked against.
+   */
+  async canDo(op: RuleType, dbid: string, candidateDoc?: Record<string, unknown>): Promise<AccessDecision> {
+    const currentUser = await this.tenant.getCurrentUserId();
+    return this.evaluateClientAccess({
+      op,
+      dbid,
+      signingKey: currentUser.userSigningPublicKey,
+      trustedTime: Date.now(),
+      isAuthor: true,
+      beforeDoc: candidateDoc ?? null,
+      afterDoc: candidateDoc ?? null,
+    });
+  }
+
+  /**
+   * Audit query (§9): would `username` have been allowed to perform `op` on
+   * `dbid` at trusted time `at`? Evaluates against the directory state as it was
+   * at `at`, so historical decisions can be explained.
+   */
+  async wasAllowedAt(
+    op: RuleType,
+    username: string,
+    dbid: string,
+    at: number,
+    candidateDoc?: Record<string, unknown>,
+  ): Promise<AccessDecision> {
+    const node = await this.getDirectoryStateAt(at);
+    const identity = await this.buildIdentitySet(username, { isAuthor: op === "doc_create" });
+    return evaluateAccess({
+      op,
+      dbid,
+      identity,
+      node,
+      beforeDoc: candidateDoc ?? null,
+      afterDoc: candidateDoc ?? null,
+      isServer: false,
+    });
+  }
+
+  /**
+   * Load the user's active grant document and apply an admin-signed edit to its
+   * key/wipe arrays. Shared by {@link addUserKeys}, {@link removeUserKeys},
+   * {@link requestDeviceWipe}, and {@link cancelDeviceWipe}.
+   */
+  private async editGrantArrays(
+    username: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+    mutate: (data: Record<string, unknown>) => void,
+  ): Promise<void> {
+    const grants = await this.findGrantAccessDocuments(username);
+    if (grants.length === 0) {
+      throw new Error(`No active grant found for user "${username}"`);
+    }
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    for (const grant of grants) {
+      const doc = await directoryDB.getDocument(grant.getId());
+      await directoryDB.changeDoc(
+        doc,
+        async (d: MindooDoc) => {
+          mutate(d.getData());
+        },
+        { signingKeyPair: adminSigningKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
+      );
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /** Load an ACL document by its fixed id, creating it (admin-signed) if absent. */
+  private async getOrCreateAclDoc(
+    directoryDB: MindooDB,
+    docId: string,
+    adminSigningKeyPair: SigningKeyPair,
+    administrationPrivateKeyPassword: string,
+  ): Promise<MindooDoc> {
+    try {
+      const existing = await directoryDB.getDocument(docId);
+      if (existing) return existing;
+    } catch {
+      // Not found; fall through to create.
+    }
+    return directoryDB.createDocument({
+      id: docId,
+      signingKeyPair: adminSigningKeyPair,
+      signingKeyPassword: administrationPrivateKeyPassword,
+      decryptionKeyId: PUBLIC_INFOS_KEY_ID,
+    });
+  }
+
+  /**
+   * Resolve the identity set for a signing key (admin, granted user, or trusted
+   * non-user key), shared by the server and client evaluation paths.
+   */
+  private async identitySetForSigningKey(
+    signingKey: string,
+    opts: { isAuthor?: boolean },
+  ): Promise<IdentitySet> {
+    // The tenant admin key is the root of trust and is resolved even without a
+    // grant document (it authors the directory itself).
+    const adminKey = this.tenant.getAdministrationPublicKey();
+    const isAdmin = signingKey === adminKey;
+
+    // Resolve the author's username from their signing key. Trusted non-user
+    // keys (e.g. server-to-server sync identities) have no grant; treat them as
+    // an empty identity that still carries `$everyone`/`$author`.
+    const lookup = isAdmin ? null : await this.getUserBySigningPublicKey(signingKey);
+    const username = lookup?.username ?? "";
+
+    return username
+      ? this.buildIdentitySet(username, { isAdmin, isAuthor: opts.isAuthor })
+      : this.minimalIdentitySet({ isAdmin, isAuthor: opts.isAuthor });
+  }
+
+  /**
+   * The identity set for a key with no resolvable username (admin or a trusted
+   * service key): only the pseudo-tokens apply.
+   */
+  private minimalIdentitySet(opts: { isAdmin?: boolean; isAuthor?: boolean }): IdentitySet {
+    const hashes = new Set<string>();
+    hashes.add(PSEUDO_TOKEN_EVERYONE);
+    if (opts.isAdmin) hashes.add(PSEUDO_TOKEN_ADMIN);
+    if (opts.isAuthor) hashes.add(PSEUDO_TOKEN_AUTHOR);
+    return { username: "", usernames: [], groups: [], hashes };
   }
   
   /**
@@ -521,8 +1404,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // Generate username variants for matching and compute their hashes
     const usernameVariants = this.generateUsernameVariants(username);
     // Hash all variants for comparison with members_hashes
+    // Include both legacy (v1) and salted (v2) hash forms for every variant so
+    // membership written under either scheme is matched (docs/accesscontrol.md §6.5).
     const variantHashes = new Set(
-      await Promise.all(usernameVariants.map(v => this.hashUsername(v)))
+      (await Promise.all(usernameVariants.map(v => this.usernameHashCandidates(v)))).flat()
     );
     
     // First pass: find all groups that directly contain the user or username variants (by hash)
@@ -554,8 +1439,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         }
         visitedGroups.add(childGroup);
         
-        // Hash the child group name for comparison
-        const childGroupHash = await this.hashUsername(childGroup);
+        // Hash the child group name for comparison (both legacy + salted forms).
+        const childGroupHashes = await this.usernameHashCandidates(childGroup);
         
         // Find all groups that contain this child group as a member (by hash)
         for (const [parentGroupName, parentGroupData] of this.groupsCache.entries()) {
@@ -563,7 +1448,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
             continue; // Already found this group
           }
           
-          if (parentGroupData.members_hashes.includes(childGroupHash)) {
+          if (childGroupHashes.some(h => parentGroupData.members_hashes.includes(h))) {
             resultGroups.add(parentGroupName);
             nextGroups.add(parentGroupName);
           }
@@ -590,21 +1475,27 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   } | null> {
     this.logger.debug(`Getting public keys for username: ${username}`);
     
-    // Find all active (non-revoked) grant access documents for this user
-    const activeDocs = await this.findGrantAccessDocuments(username);
+    // Find all grant access documents for this user, then keep only those that
+    // still carry signing keys. Revocation removes keys in place (§6.5), so a
+    // grant with an empty key array is a revoked grant and must be ignored.
+    const grantDocs = await this.findGrantAccessDocuments(username);
+    const activeDocs = grantDocs.filter(
+      (doc) => extractSigningPublicKeys(doc.getData()).length > 0,
+    );
     
     if (activeDocs.length === 0) {
       this.logger.debug(`No active grant access documents found for username: ${username}`);
       return null;
     }
     
-    // Use the last active grant access document (most recent registration)
-    // In most cases there should only be one active grant access document per user
+    // Use the most recent active grant access document (most recent registration).
+    // In most cases there should only be one active grant access document per user.
     const doc = activeDocs[activeDocs.length - 1];
     const data = doc.getData();
     
-    const signingPublicKey = data.userSigningPublicKey;
-    const encryptionPublicKey = data.userEncryptionPublicKey;
+    // Prefer the array key form, falling back to the legacy scalar fields (§6.5).
+    const signingPublicKey = extractSigningPublicKeys(data)[0] ?? null;
+    const encryptionPublicKey = extractEncryptionPublicKeys(data)[0] ?? null;
     
     if (typeof signingPublicKey !== "string" || typeof encryptionPublicKey !== "string") {
       this.logger.error(`Invalid key data in grant access document for username: ${username}`);
@@ -628,6 +1519,67 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   /**
+   * Resolve the full set of signing keys relevant to authenticating a device for
+   * `username` (docs/accesscontrol.md §6.5):
+   *  - `active`: keys currently granted (the device may sync normally), and
+   *  - `wipeRequested`: keys an admin has targeted for remote wipe.
+   *
+   * The two sets are independent: a stolen device may still be active yet
+   * wipe-targeted, or revoked (removed from `active`) yet still wipe-targeted.
+   * The server uses this to let a wipe-targeted (possibly revoked) device
+   * authenticate just far enough to receive the wipe directive.
+   */
+  async getUserSigningKeyUniverse(
+    username: string,
+  ): Promise<{ active: string[]; wipeRequested: string[] }> {
+    const grants = await this.findGrantAccessDocuments(username);
+    const active = new Set<string>();
+    const wipeRequested = new Set<string>();
+    for (const grant of grants) {
+      const data = grant.getData();
+      for (const key of extractSigningPublicKeys(data)) active.add(key);
+      for (const key of extractWipeRequestedSigningKeys(data)) wipeRequested.add(key);
+    }
+    return { active: Array.from(active), wipeRequested: Array.from(wipeRequested) };
+  }
+
+  /**
+   * List a user's currently-granted device key pairs (§6.5), each with its
+   * optional label and current remote-wipe status. Returns one entry per
+   * signing key (revoked keys are excluded). Used by admin UIs to pick specific
+   * devices to revoke or relabel. Grant documents are processed oldest→newest,
+   * so the most recent label/encryption key for a signing key wins.
+   */
+  async getUserKeyPairs(username: string): Promise<GrantKeyPairInfo[]> {
+    const grants = await this.findGrantAccessDocuments(username);
+    const bySigningKey = new Map<string, GrantKeyPairInfo>();
+    for (const grant of grants) {
+      const data = grant.getData();
+      const wipeRequestedKeys = new Set(extractWipeRequestedSigningKeys(data));
+      for (const pair of extractKeyPairs(data)) {
+        bySigningKey.set(pair.signingPublicKey, {
+          ...pair,
+          wipeRequested: wipeRequestedKeys.has(pair.signingPublicKey),
+        });
+      }
+    }
+    return Array.from(bySigningKey.values());
+  }
+
+  /**
+   * If `signingKey` is the target of an admin-requested remote wipe (§6.5),
+   * return the id of the admin-signed grant document carrying the directive so
+   * the sync server can serve only that document to the targeted device. Returns
+   * null when the key is not wipe-targeted.
+   */
+  async getWipeGrantDocId(signingKey: string): Promise<string | null> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    return this.wipeKeyToGrantDocId.get(signingKey) ?? null;
+  }
+
+  /**
    * Check if a user has been revoked.
    * A user is considered revoked if they have no active (non-revoked) grant access documents.
    * 
@@ -636,13 +1588,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
    */
   async isUserRevoked(username: string): Promise<boolean> {
     this.logger.debug(`Checking if user is revoked: ${username}`);
-    
-    // Find all active grant access documents for this user
-    const activeDocs = await this.findGrantAccessDocuments(username);
-    
-    // User is revoked if they have no active grant access documents
-    const isRevoked = activeDocs.length === 0;
-    
+
+    // Revocation removes the signing keys from the grant document(s) rather
+    // than creating a separate revoke document (docs/accesscontrol.md §6.5).
+    // A user is revoked when no grant document retains any signing key. Users
+    // who were never granted access (no grant documents at all) are likewise
+    // reported as having no active access.
+    const grantDocs = await this.findGrantAccessDocuments(username);
+    const hasActiveKey = grantDocs.some(
+      (doc) => extractSigningPublicKeys(doc.getData()).length > 0,
+    );
+    const isRevoked = !hasActiveKey;
+
     this.logger.debug(`User ${username} revoked: ${isRevoked}`);
     return isRevoked;
   }
@@ -911,8 +1868,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
     
-    // Compute hashes and encrypted values for all new usernames
-    const newMembersHashes = await Promise.all(username.map(u => this.hashUsername(u)));
+    // Compute hashes (salted v2 for new writes) and encrypted values for all
+    // new usernames. Reads match both v1 and v2 forms (docs/accesscontrol.md §6.5).
+    const newMembersHashes = await Promise.all(username.map(u => this.hashUsernameForWrite(u)));
     const newMembersEncrypted = await Promise.all(username.map(u => this.encryptGroupMemberForTenant(u)));
     
     // Get the actual document from the database (using cached docId if available)
@@ -1008,8 +1966,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       privateKey: administrationPrivateKey,
     };
     
-    // Compute hashes of usernames to remove
-    const hashesToRemove = new Set(await Promise.all(username.map(u => this.hashUsername(u))));
+    // Compute hashes of usernames to remove. Include both legacy (v1) and
+    // salted (v2) forms so members stored under either scheme are removed.
+    const hashesToRemove = new Set(
+      (await Promise.all(username.map(u => this.usernameHashCandidates(u)))).flat()
+    );
     
     // Remove users from members arrays
     await directoryDB.changeDoc(
@@ -1106,15 +2067,60 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   /**
-   * Compute SHA-256 hash of lowercase username for lookups.
-   * This enables searching for users without exposing the actual username.
-   * 
+   * Current username-hash scheme version written on new directory documents.
+   * v1 = unsalted `SHA-256(lower(username))` (legacy);
+   * v2 = tenant-salted `SHA-256(tenantId + "/" + lower(username))`.
+   * See docs/accesscontrol.md §6.5 ("Username hashing").
+   */
+  private static readonly USERNAME_HASH_VERSION = 2;
+
+  /**
+   * Legacy (v1) username hash: `SHA-256(lower(username))`, hex-encoded.
+   *
+   * Retained because pre-existing directory documents (and clients that predate
+   * the salted scheme) store this form, and lookups must keep matching them.
+   *
    * @param username The username to hash
    * @return The hex-encoded SHA-256 hash of the lowercase username
    */
   private async hashUsername(username: string): Promise<string> {
+    return this.sha256Hex(username.toLowerCase());
+  }
+
+  /**
+   * Salted (v2) username hash: `SHA-256(tenantId + "/" + lower(username))`,
+   * hex-encoded. The tenant id salt prevents precomputed/rainbow-table attacks
+   * and cross-tenant hash correlation. New documents write this form
+   * (docs/accesscontrol.md §6.5).
+   */
+  private async hashUsernameSalted(username: string): Promise<string> {
+    return this.sha256Hex(`${this.tenant.getId()}/${username.toLowerCase()}`);
+  }
+
+  /**
+   * The canonical hash to WRITE on new directory documents (currently v2).
+   */
+  private async hashUsernameForWrite(username: string): Promise<string> {
+    return this.hashUsernameSalted(username);
+  }
+
+  /**
+   * All hash forms a given username could be stored as, for MATCHING/lookup.
+   * Returns both the legacy (v1) and salted (v2) hashes so that documents
+   * written under either scheme are found. Deduplicated.
+   */
+  private async usernameHashCandidates(username: string): Promise<string[]> {
+    const [legacy, salted] = await Promise.all([
+      this.hashUsername(username),
+      this.hashUsernameSalted(username),
+    ]);
+    return legacy === salted ? [legacy] : [legacy, salted];
+  }
+
+  /** Hex-encoded SHA-256 of a UTF-8 string. */
+  private async sha256Hex(value: string): Promise<string> {
     const encoder = new TextEncoder();
-    const data = encoder.encode(username.toLowerCase());
+    const data = encoder.encode(value);
     const subtle = this.tenant.getCryptoAdapter().getSubtle();
     const hashBuffer = await subtle.digest('SHA-256', data);
     return Array.from(new Uint8Array(hashBuffer))
@@ -1173,8 +2179,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   private async buildUserLookup(data: Record<string, unknown>): Promise<DirectoryUserLookup | null> {
-    const signingPublicKey = typeof data.userSigningPublicKey === "string" ? data.userSigningPublicKey : null;
-    const encryptionPublicKey = typeof data.userEncryptionPublicKey === "string" ? data.userEncryptionPublicKey : null;
+    // Prefer the array key form (key rollover / multiple devices) and fall back
+    // to the legacy scalar fields (§6.5).
+    const signingPublicKey = extractSigningPublicKeys(data)[0] ?? null;
+    const encryptionPublicKey = extractEncryptionPublicKeys(data)[0] ?? null;
     if (!signingPublicKey || !encryptionPublicKey) {
       return null;
     }

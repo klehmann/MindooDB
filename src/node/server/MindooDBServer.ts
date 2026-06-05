@@ -117,6 +117,13 @@ interface SerializedEntryMetadata {
   signature: string;
   originalSize: number;
   encryptedSize: number;
+  // Access-control witness receipt (docs/accesscontrol.md §5). The Ed25519
+  // signature is base64 on the wire; the other two fields are plain JSON.
+  receivedAt?: number;
+  receivedByPublicKey?: string;
+  receivedDateSignature?: string; // base64
+  // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
+  entryVersion?: number;
 }
 
 interface SerializedEntry extends SerializedEntryMetadata {
@@ -1459,10 +1466,16 @@ export class MindooDBServer {
       );
 
       stage = "store-entries";
-      await serverStore.handlePutEntries(token, deserializedEntries);
+      const stampedMetadata = await serverStore.handlePutEntries(token, deserializedEntries);
       stage = "respond-success";
 
-      res.json({ success: true });
+      // Return witness receipts for accepted entries so the pushing client (and
+      // every replica it later syncs with) can persist the attestation
+      // (docs/accesscontrol.md §5.3). Older clients ignore the extra field.
+      res.json({
+        success: true,
+        receipts: stampedMetadata.map((e) => this.serializeEntryMetadata(e)),
+      });
     } catch (error) {
       console.error("[MindooDBServer] putEntries failed", {
         stage,
@@ -1664,6 +1677,8 @@ export class MindooDBServer {
         return 403;
       case "CHALLENGE_EXPIRED":
         return 401;
+      case "ACCESS_DENIED":
+        return 403;
       default:
         return 500;
     }
@@ -1735,6 +1750,12 @@ export class MindooDBServer {
       signature: this.uint8ArrayToBase64(metadata.signature),
       originalSize: metadata.originalSize,
       encryptedSize: metadata.encryptedSize,
+      receivedAt: metadata.receivedAt,
+      receivedByPublicKey: metadata.receivedByPublicKey,
+      receivedDateSignature: metadata.receivedDateSignature
+        ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
+        : undefined,
+      entryVersion: metadata.entryVersion,
     };
   }
 
@@ -1752,6 +1773,14 @@ export class MindooDBServer {
       signature: this.base64ToUint8Array(serialized.signature),
       originalSize: serialized.originalSize,
       encryptedSize: serialized.encryptedSize,
+      // Preserve any pre-existing witness receipt (e.g. on re-sync or
+      // server-to-server forwarding); a fresh local push has none.
+      receivedAt: serialized.receivedAt,
+      receivedByPublicKey: serialized.receivedByPublicKey,
+      receivedDateSignature: serialized.receivedDateSignature
+        ? this.base64ToUint8Array(serialized.receivedDateSignature)
+        : undefined,
+      entryVersion: serialized.entryVersion,
       encryptedData: this.base64ToUint8Array(serialized.encryptedData),
     };
   }

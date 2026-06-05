@@ -763,6 +763,70 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     });
   }
 
+  /**
+   * Apply witness receipts to already-stored entries (docs/accesscontrol.md §5.3).
+   *
+   * Updates the witness fields on the affected entry metadata and assigns each a
+   * fresh `receiptOrder` (from the persisted counter) so the revision feed's
+   * `scanEntriesSince` cursor re-discovers the now-witnessed entries. Receipts
+   * whose entry is absent locally, or that match the stored witness, are skipped.
+   */
+  async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
+    if (receipts.length === 0) return;
+
+    return this.runWithReconnect("applyWitnessReceipts", async () => {
+      const db = await this.ensureOpen();
+      const tx = db.transaction([ENTRIES_STORE, META_STORE], "readwrite");
+      const entriesOS = tx.objectStore(ENTRIES_STORE);
+      const metaOS = tx.objectStore(META_STORE);
+
+      const counterRecord = (await reqToPromise(
+        metaOS.get(RECEIPT_ORDER_COUNTER_KEY)
+      )) as MetaValueRecord | undefined;
+      let nextReceiptOrder =
+        typeof counterRecord?.value === "number" ? counterRecord.value + 1 : 1;
+
+      let mutated = false;
+      for (const receipt of receipts) {
+        if (receipt.receivedAt === undefined) {
+          continue;
+        }
+        const existing = (await reqToPromise(
+          entriesOS.get(receipt.id)
+        )) as StoreEntryMetadata | undefined;
+        if (!existing) {
+          continue;
+        }
+        if (
+          existing.receivedAt === receipt.receivedAt &&
+          existing.receivedByPublicKey === receipt.receivedByPublicKey
+        ) {
+          continue;
+        }
+        const updated: StoreEntryMetadata = {
+          ...existing,
+          receivedAt: receipt.receivedAt,
+          receivedByPublicKey: receipt.receivedByPublicKey,
+          receivedDateSignature: receipt.receivedDateSignature,
+          receiptScheme: receipt.receiptScheme,
+          receiptOrder: nextReceiptOrder++,
+        };
+        await reqToPromise(entriesOS.put(updated));
+        mutated = true;
+      }
+
+      if (mutated) {
+        await writeNumericMetaValue(
+          metaOS,
+          RECEIPT_ORDER_COUNTER_KEY,
+          nextReceiptOrder - 1
+        );
+      }
+
+      await txToPromise(tx);
+    });
+  }
+
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
     if (ids.length === 0) return [];
 

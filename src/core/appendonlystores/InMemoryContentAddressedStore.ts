@@ -137,6 +137,47 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
   }
 
   /**
+   * Apply witness receipts to already-stored entries (docs/accesscontrol.md §5.3).
+   *
+   * Copies the witness fields onto the local metadata and assigns a fresh
+   * `receiptOrder` so the revision feed's `scanEntriesSince` cursor re-discovers
+   * the entry and re-anchors it from the provisional head to its committed
+   * `receivedAt`. Receipts whose entry is absent locally are ignored.
+   */
+  async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
+    let mutated = false;
+    for (const receipt of receipts) {
+      if (receipt.receivedAt === undefined) {
+        continue;
+      }
+      const existing = this.entries.get(receipt.id);
+      if (!existing) {
+        continue;
+      }
+      // Already witnessed with the same receipt: nothing to do (idempotent).
+      if (
+        existing.receivedAt === receipt.receivedAt &&
+        existing.receivedByPublicKey === receipt.receivedByPublicKey
+      ) {
+        continue;
+      }
+      this.entries.set(receipt.id, {
+        ...existing,
+        receivedAt: receipt.receivedAt,
+        receivedByPublicKey: receipt.receivedByPublicKey,
+        receivedDateSignature: receipt.receivedDateSignature,
+        receiptScheme: receipt.receiptScheme,
+        // Fresh receipt order so the gap-free scan cursor re-delivers it.
+        receiptOrder: this.nextReceiptOrder++,
+      });
+      mutated = true;
+    }
+    if (mutated) {
+      this.sortedEntriesCache = null;
+    }
+  }
+
+  /**
    * Get entries by their IDs.
    * Returns only entries that exist in this store.
    *

@@ -615,6 +615,31 @@ export class KeyBag {
   }
 
   /**
+   * Deletes every key belonging to a tenant, leaving keys for other tenants
+   * intact. Used by remote wipe (docs/accesscontrol.md §6.5) to remove a tenant
+   * from a multi-tenant device as a unit.
+   *
+   * @param tenantId The tenant whose keys should be removed
+   */
+  async deleteTenantKeys(tenantId: string): Promise<void> {
+    // Scoped key ids have the form `${type}:${tenantId}:${id}` (see KeyContext).
+    for (const scopedKeyId of Array.from(this.keys.keys())) {
+      const firstColon = scopedKeyId.indexOf(":");
+      const secondColon = scopedKeyId.indexOf(":", firstColon + 1);
+      if (firstColon < 0 || secondColon < 0) {
+        continue;
+      }
+      const type = scopedKeyId.slice(0, firstColon) as KeyType;
+      const keyTenantId = scopedKeyId.slice(firstColon + 1, secondColon);
+      const id = scopedKeyId.slice(secondColon + 1);
+      if (keyTenantId === tenantId) {
+        this.keys.delete(scopedKeyId);
+        this.recordKeyChange(type, tenantId, id, "remove", 0);
+      }
+    }
+  }
+
+  /**
    * Lists all key IDs in the key bag.
    * 
    * @return A promise that resolves to an array of key IDs
