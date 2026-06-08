@@ -215,6 +215,35 @@ describe("remote wipe — authentication identifies the device key (§6.5)", () 
     expect(payload!.wipe).toBe(true);
   });
 
+  it("authenticates a username-omitted, key-based challenge (§6.5)", async () => {
+    const device = await makeDeviceKey();
+    // A key-aware directory: the client identifies by its signing key and the
+    // server resolves the principal without ever seeing a cleartext username.
+    const dir = {
+      getUserPublicKeys: async () => ({ signingPublicKey: device.pem, encryptionPublicKey: "y" }),
+      getUserBySigningPublicKey: async (key: string) =>
+        key === device.pem
+          ? { username: "CN=alice", signingPublicKey: device.pem, encryptionPublicKey: "y" }
+          : null,
+      getUserSigningKeyUniverse: async () => ({ active: [device.pem], wipeRequested: [] }),
+      isUserRevoked: async () => false,
+    } as unknown as MindooTenantDirectory;
+    const auth = new AuthenticationService(cryptoAdapter, dir, "t");
+
+    // No username — only the signing public key.
+    const challenge = await auth.generateChallenge(undefined, { signingPublicKey: device.pem });
+    const result = await auth.authenticate(challenge, await sign(challenge, device.privateKey));
+    expect(result.success).toBe(true);
+
+    const payload = await auth.validateToken(result.token!);
+    expect(payload).not.toBeNull();
+    expect(payload!.deviceSigningKey).toBe(device.pem);
+    // The client sent no username on the wire; the server resolved the principal
+    // from the signing key alone (recorded on the challenge), so the read gate
+    // can still key off `deviceSigningKey`.
+    expect(payload!.sub).toBe("CN=alice");
+  });
+
   it("issues a non-wipe token for an active, non-targeted device", async () => {
     const device = await makeDeviceKey();
     const auth = new AuthenticationService(

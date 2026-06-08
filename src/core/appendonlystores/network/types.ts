@@ -48,7 +48,12 @@ export interface UserPublicKeys {
  */
 export interface NetworkAuthTokenPayload {
   /**
-   * Subject: the username of the authenticated user
+   * Subject of the authenticated session. Historically the cleartext username
+   * the client posted to `/auth/challenge`. With key-based challenges the
+   * username is optional, so `sub` may instead carry the authenticated device
+   * signing key (Ed25519, PEM) when no username was supplied. Treat it as an
+   * opaque principal id; identity for the read gate is resolved from
+   * {@link deviceSigningKey} where present.
    */
   sub: string;
 
@@ -100,9 +105,19 @@ export interface AuthChallenge {
   challenge: string;
 
   /**
-   * The username this challenge was issued for
+   * The username this challenge was issued for. Optional: with key-based
+   * challenges the client may identify itself by its signing public key
+   * instead (see {@link signingPublicKey}), so the server no longer requires
+   * the cleartext username.
    */
-  username: string;
+  username?: string;
+
+  /**
+   * The device signing public key (Ed25519, PEM) this challenge was issued for,
+   * when the client identified itself by key rather than username. Used by
+   * {@link AuthenticationService.authenticate} to scope candidate keys.
+   */
+  signingPublicKey?: string;
 
   /**
    * Timestamp when the challenge was created (Unix epoch milliseconds)

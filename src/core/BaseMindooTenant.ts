@@ -411,53 +411,65 @@ export class BaseMindooTenant implements MindooTenant {
     const iv = encryptedPayload.slice(0, 12);
     const encryptedData = encryptedPayload.slice(12);
 
-    // Get the symmetric key for this key ID
-    let symmetricKey: Uint8Array;
-    if (decryptionKeyId === "default") {
-      // Use cached tenant encryption key if available
-      if (this.decryptedTenantKeyCache) {
-        symmetricKey = this.decryptedTenantKeyCache;
-      } else {
-        const tenantKey = await this.keyBag.get("doc", this.tenantId, DEFAULT_TENANT_KEY_ID);
-        if (!tenantKey) {
-          throw new SymmetricKeyNotFoundError(`doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}`);
-        }
-        symmetricKey = tenantKey;
-        this.decryptedTenantKeyCache = symmetricKey;
-      }
-    } else {
-      // Get the decrypted key from KeyBag
-      const decryptedKey = await this.keyBag.get("doc", this.tenantId, decryptionKeyId);
-      if (!decryptedKey) {
-        throw new SymmetricKeyNotFoundError(decryptionKeyId);
-      }
-      symmetricKey = decryptedKey;
+    // Gather ALL stored versions of the key (newest first). Key rotation keeps
+    // several versions under one keyId, and a payload may have been encrypted
+    // under any of them, so we must try each — not just the newest. The newest
+    // version is overwhelmingly the common case, so it is tried first.
+    const candidates = await this.getDecryptionKeyCandidates(decryptionKeyId);
+    if (candidates.length === 0) {
+      throw new SymmetricKeyNotFoundError(
+        decryptionKeyId === "default" ? `doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}` : decryptionKeyId,
+      );
     }
-    
+
     const subtle = this.cryptoAdapter.getSubtle();
+    let lastError: unknown = undefined;
+    for (const symmetricKey of candidates) {
+      try {
+        const cryptoKey = await subtle.importKey(
+          "raw",
+          new Uint8Array(symmetricKey).buffer,
+          { name: "AES-GCM" },
+          false, // not extractable
+          ["decrypt"],
+        );
+        const decrypted = await subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: iv as BufferSource,
+            tagLength: 128, // 128-bit authentication tag
+          },
+          cryptoKey,
+          encryptedData as BufferSource,
+        );
+        this.logger.debug(`Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
+        return new Uint8Array(decrypted);
+      } catch (error) {
+        // AES-GCM authentication failure means this version was not the one used
+        // to encrypt; fall through and try the next version.
+        lastError = error;
+      }
+    }
+    this.logger.debug(`Decrypt failed against all ${candidates.length} version(s) of key "${decryptionKeyId}"`);
+    throw lastError ?? new SymmetricKeyNotFoundError(decryptionKeyId);
+  }
 
-    // Import the symmetric key
-    const cryptoKey = await subtle.importKey(
-      "raw",
-      symmetricKey.buffer as ArrayBuffer,
-      { name: "AES-GCM" },
-      false, // not extractable
-      ["decrypt"]
-    );
-
-    // Decrypt the payload
-    const decrypted = await subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv: iv,
-        tagLength: 128, // 128-bit authentication tag
-      },
-      cryptoKey,
-      encryptedData.buffer as ArrayBuffer
-    );
-
-    this.logger.debug(`Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
-    return new Uint8Array(decrypted);
+  /**
+   * Return every stored version of the symmetric key for `decryptionKeyId`,
+   * newest first, mapping the `"default"` alias to the tenant default key id.
+   * Used by the decryption paths to support key rotation (a payload may have
+   * been encrypted under an older version than the current newest one).
+   *
+   * As a side effect, refreshes {@link decryptedTenantKeyCache} to the newest
+   * tenant-default version so encryption keeps using the latest key.
+   */
+  private async getDecryptionKeyCandidates(decryptionKeyId: string): Promise<Uint8Array[]> {
+    const id = decryptionKeyId === "default" ? DEFAULT_TENANT_KEY_ID : decryptionKeyId;
+    const versions = await this.keyBag.getAllKeys("doc", this.tenantId, id);
+    if (decryptionKeyId === "default" && versions.length > 0) {
+      this.decryptedTenantKeyCache = versions[0];
+    }
+    return versions;
   }
 
   async signPayload(payload: Uint8Array): Promise<Uint8Array> {
@@ -1491,6 +1503,104 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   /**
+   * Remove a **named** document key from the local KeyBag (read-side
+   * crypto-shred on read-entitlement loss). Refuses to delete the shared tenant
+   * default key (`"default"` / {@link DEFAULT_TENANT_KEY_ID}), which is required
+   * for the tenant to function and is not a fine-grained read-scoping key.
+   * Returns true if a key was removed.
+   */
+  async removeNamedDecryptionKey(decryptionKeyId: string): Promise<boolean> {
+    if (decryptionKeyId === "default" || decryptionKeyId === DEFAULT_TENANT_KEY_ID) {
+      this.logger.debug(`removeNamedDecryptionKey: refusing to delete the tenant default key`);
+      return false;
+    }
+    try {
+      await this.keyBag.deleteKey("doc", this.tenantId, decryptionKeyId);
+      this.invalidateDecryptedKeyCaches();
+      return true;
+    } catch (error) {
+      this.logger.warn(`removeNamedDecryptionKey: failed to delete key ${decryptionKeyId}: ${error}`);
+      return false;
+    }
+  }
+
+  /**
+   * Export **all** stored versions of a document key for an admin-blind key
+   * delivery (read-side key push). A rotated key keeps multiple versions in the
+   * KeyBag and decryption tries them all, so a delivery must carry every version
+   * - otherwise the recipient could not read documents encrypted under an
+   * earlier version. Each entry pairs the raw key bytes with the version's
+   * `createdAt` (used as `keyVersionCreatedAt`); versions are newest-first.
+   * Returns null when the caller's KeyBag lacks the key. Only a key-holder can
+   * run this — never the admin who later publishes the wrapped bytes.
+   */
+  async exportDecryptionKeyForDelivery(
+    decryptionKeyId: string,
+  ): Promise<Array<{ bytes: Uint8Array; keyVersionCreatedAt: number }> | null> {
+    const id = decryptionKeyId === "default" ? DEFAULT_TENANT_KEY_ID : decryptionKeyId;
+    const versions = await this.keyBag.getAllKeyVersions("doc", this.tenantId, id);
+    if (versions.length === 0) {
+      return null;
+    }
+    return versions.map((v) => ({ bytes: v.key, keyVersionCreatedAt: v.createdAt ?? 0 }));
+  }
+
+  /**
+   * Import a delivered document key into the local KeyBag (read-side key push,
+   * recipient side). Writing the key triggers the existing KeyBag change
+   * listener -> {@link reconcileKeyBagChanges} -> per-database reveal-on-add, so
+   * documents encrypted with it surface automatically. Idempotent: a key
+   * version with the same `keyVersionCreatedAt` is not duplicated.
+   */
+  async importDeliveredDecryptionKey(
+    keyId: string,
+    bytes: Uint8Array,
+    keyVersionCreatedAt: number,
+  ): Promise<void> {
+    await this.importDeliveredDecryptionKeyVersions(keyId, [{ bytes, keyVersionCreatedAt }]);
+  }
+
+  /**
+   * Import several delivered versions of one document key at once (read-side key
+   * push, recipient side). Each version absent from the KeyBag (matched by
+   * `keyVersionCreatedAt`) is added; already-present versions are skipped so the
+   * call is idempotent. Caches are invalidated and reveal-on-add reconciliation
+   * runs once, after all new versions are written. Returns the number of
+   * versions actually imported.
+   */
+  async importDeliveredDecryptionKeyVersions(
+    keyId: string,
+    versions: Array<{ bytes: Uint8Array; keyVersionCreatedAt: number }>,
+  ): Promise<number> {
+    const id = keyId === "default" ? DEFAULT_TENANT_KEY_ID : keyId;
+    const scopedKeyId = `doc:${this.tenantId}:${id}`;
+    const existing = await this.keyBag.listKeyDetails();
+    const haveStamps = new Set(
+      existing.filter((d) => d.scopedKeyId === scopedKeyId).map((d) => d.createdAt ?? 0),
+    );
+    let importedCount = 0;
+    for (const version of versions) {
+      if (haveStamps.has(version.keyVersionCreatedAt)) {
+        this.logger.debug(`importDeliveredDecryptionKeyVersions: ${keyId}@${version.keyVersionCreatedAt} already present`);
+        continue;
+      }
+      await this.keyBag.set("doc", this.tenantId, id, version.bytes, version.keyVersionCreatedAt || undefined);
+      haveStamps.add(version.keyVersionCreatedAt);
+      importedCount++;
+    }
+    if (importedCount > 0) {
+      this.invalidateDecryptedKeyCaches();
+      await this.reconcileKeyBagChanges();
+    }
+    return importedCount;
+  }
+
+  /** Clear in-memory decrypted-key caches after a KeyBag mutation. */
+  private invalidateDecryptedKeyCaches(): void {
+    this.decryptedTenantKeyCache = undefined;
+  }
+
+  /**
    * Get the symmetric key for a given key ID.
    * This is a protected helper method that can be used by subclasses.
    * 
@@ -1649,33 +1759,43 @@ export class BaseMindooTenant implements MindooTenant {
     // Extract ciphertext (bytes 13 onwards)
     const ciphertext = encryptedPayload.slice(13);
 
-    const symmetricKey = await this.getSymmetricKey(decryptionKeyId);
+    // Try every stored version of the key (newest first) so attachments
+    // encrypted under an earlier rotation of the key still decrypt.
+    const candidates = await this.getDecryptionKeyCandidates(decryptionKeyId);
+    if (candidates.length === 0) {
+      throw new SymmetricKeyNotFoundError(
+        decryptionKeyId === "default" ? `doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}` : decryptionKeyId,
+      );
+    }
     const subtle = this.cryptoAdapter.getSubtle();
-
-    // Import the symmetric key
-    const keyArray = new Uint8Array(symmetricKey);
-    const cryptoKey = await subtle.importKey(
-      "raw",
-      keyArray.buffer,
-      { name: "AES-GCM" },
-      false,
-      ["decrypt"]
-    );
-
-    // Decrypt
-    const decrypted = await subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv: iv as BufferSource,
-        tagLength: 128,
-      },
-      cryptoKey,
-      ciphertext
-    );
-
-    const result = new Uint8Array(decrypted);
-    this.logger.debug(`Decrypted attachment (${encryptedPayload.length} -> ${result.length} bytes)`);
-    return result;
+    let lastError: unknown = undefined;
+    for (const symmetricKey of candidates) {
+      try {
+        const cryptoKey = await subtle.importKey(
+          "raw",
+          new Uint8Array(symmetricKey).buffer,
+          { name: "AES-GCM" },
+          false,
+          ["decrypt"],
+        );
+        const decrypted = await subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: iv as BufferSource,
+            tagLength: 128,
+          },
+          cryptoKey,
+          ciphertext as BufferSource,
+        );
+        const result = new Uint8Array(decrypted);
+        this.logger.debug(`Decrypted attachment (${encryptedPayload.length} -> ${result.length} bytes)`);
+        return result;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    this.logger.debug(`Attachment decrypt failed against all ${candidates.length} version(s) of key "${decryptionKeyId}"`);
+    throw lastError ?? new SymmetricKeyNotFoundError(decryptionKeyId);
   }
 }
 

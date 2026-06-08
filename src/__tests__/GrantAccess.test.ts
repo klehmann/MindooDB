@@ -151,7 +151,7 @@ describe("granting tenant access", () => {
 
     const userLookup = await directory.getUserBySigningPublicKey(regularUser.userSigningKeyPair.publicKey);
 
-    expect(userLookup).toEqual({
+    expect(userLookup).toMatchObject({
       username: regularUser.username,
       signingPublicKey: regularUser.userSigningKeyPair.publicKey,
       encryptionPublicKey: regularUser.userEncryptionKeyPair.publicKey,
@@ -160,6 +160,10 @@ describe("granting tenant access", () => {
         email: "regularuser@example.com",
       },
     });
+    // New grants carry the current identity-hash bundle (§6.5).
+    expect(Array.isArray(userLookup!.identityHashes)).toBe(true);
+    expect(userLookup!.identityHashes!.length).toBeGreaterThan(0);
+    expect(userLookup!.identityHashesV).toBe(1);
   });
 
   it("should gracefully handle legacy grant documents without tenant-readable user details", async () => {
@@ -192,12 +196,146 @@ describe("granting tenant access", () => {
 
     const userLookup = await directory.getUserBySigningPublicKey(regularUser.userSigningKeyPair.publicKey);
 
-    expect(userLookup).toEqual({
+    expect(userLookup).toMatchObject({
       username: legacyUsernameHash,
       signingPublicKey: regularUser.userSigningKeyPair.publicKey,
       encryptionPublicKey: regularUser.userEncryptionKeyPair.publicKey,
       details: null,
     });
+    // Legacy grants lack the bundle: it degrades to exact-match [username_hash]
+    // at version 0 (flagged for backfill, §6.5).
+    expect(userLookup!.identityHashes).toEqual([legacyUsernameHash]);
+    expect(userLookup!.identityHashesV).toBe(0);
+  });
+
+  async function findGrantDoc(
+    tenantRef: MindooTenant,
+    signingPublicKey: string,
+  ): Promise<MindooDoc | undefined> {
+    const directoryDB = await tenantRef.openDB("directory");
+    await directoryDB.syncStoreChanges();
+    for await (const { doc } of directoryDB.iterateChangesSince(null)) {
+      const data = doc.getData();
+      if (data.form !== "useroperation" || data.type !== "grantaccess") continue;
+      const pairs = [
+        ...(Array.isArray(data.userKeyPairs) ? data.userKeyPairs : []),
+        ...(Array.isArray(data.revokedUserKeyPairs) ? data.revokedUserKeyPairs : []),
+      ];
+      if (pairs.some((p) => (p as { signingPublicKey?: string }).signingPublicKey === signingPublicKey)) {
+        return doc;
+      }
+    }
+    return undefined;
+  }
+
+  it("retains a revoked device on the grant doc (revoked + revokedAt), excluded from active keys (§6.5)", async () => {
+    const directory = await tenant.openDirectory();
+    const publicRegularUser = factory.toPublicUserId(regularUser);
+    const signingKey = regularUser.userSigningKeyPair.publicKey;
+
+    await directory.registerUser(
+      publicRegularUser,
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+      { email: "regularuser@example.com" },
+    );
+
+    // Sanity: active before revoke.
+    expect(await directory.getUserPublicKeys(regularUser.username)).not.toBeNull();
+
+    const before = Date.now();
+    await directory.revokeUser(
+      regularUser.username,
+      { signingKeys: [signingKey] },
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+    );
+    const after = Date.now();
+
+    // Active key lookups no longer see the device.
+    expect(await directory.getUserPublicKeys(regularUser.username)).toBeNull();
+    expect(await directory.getUserKeyPairs!(regularUser.username)).toEqual([]);
+
+    // The grant overview surfaces it as a revoked device with a timestamp.
+    const overview = await directory.getUserGrantOverview!(regularUser.username);
+    expect(overview.activeDevices).toEqual([]);
+    expect(overview.revokedDevices).toHaveLength(1);
+    expect(overview.revokedDevices[0].signingPublicKey).toBe(signingKey);
+    expect(overview.revokedDevices[0].revoked).toBe(true);
+    expect(overview.revokedDevices[0].revokedAt).toBeGreaterThanOrEqual(before);
+    expect(overview.revokedDevices[0].revokedAt).toBeLessThanOrEqual(after);
+
+    // The pair is RETAINED on the doc in the separate revoked list (§6.5);
+    // the active list and the mirror arrays exclude it.
+    const grantDoc = await findGrantDoc(tenant, signingKey);
+    expect(grantDoc).toBeDefined();
+    const data = grantDoc!.getData();
+    const active = (Array.isArray(data.userKeyPairs) ? data.userKeyPairs : []) as Array<{
+      signingPublicKey: string;
+    }>;
+    const revoked = (Array.isArray(data.revokedUserKeyPairs)
+      ? data.revokedUserKeyPairs
+      : []) as Array<{ signingPublicKey: string; revokedAt?: number }>;
+    expect(active.find((p) => p.signingPublicKey === signingKey)).toBeUndefined();
+    const revokedEntry = revoked.find((p) => p.signingPublicKey === signingKey);
+    expect(revokedEntry).toBeDefined();
+    expect(revokedEntry!.revokedAt).toBeGreaterThanOrEqual(before);
+    expect(revokedEntry!.revokedAt).toBeLessThanOrEqual(after);
+    expect(data.userSigningPublicKeys).toEqual([]);
+  });
+
+  it("updateUserGrant batches details + labels + revoke + restore and recomputes identity_hashes (§6.5)", async () => {
+    const directory = await tenant.openDirectory();
+    const publicRegularUser = factory.toPublicUserId(regularUser);
+    const signingKey = regularUser.userSigningKeyPair.publicKey;
+
+    await directory.registerUser(
+      publicRegularUser,
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+      { email: "regularuser@example.com" },
+    );
+
+    // Batch: rewrite details, label the device, and revoke it — in one change.
+    await directory.updateUserGrant!(
+      regularUser.username,
+      {
+        details: { email: "new@example.com", city: "Berlin" },
+        deviceLabels: { [signingKey]: "Work laptop" },
+        revokeSigningKeys: [signingKey],
+      },
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+    );
+
+    const afterRevoke = await directory.getUserGrantOverview!(regularUser.username);
+    expect(afterRevoke.details?.email).toBe("new@example.com");
+    expect(afterRevoke.details?.city).toBe("Berlin");
+    expect(afterRevoke.activeDevices).toEqual([]);
+    expect(afterRevoke.revokedDevices).toHaveLength(1);
+    expect(afterRevoke.revokedDevices[0].label).toBe("Work laptop");
+    expect(afterRevoke.revokedDevices[0].revoked).toBe(true);
+
+    // The identity-hash bundle was (re)written at the current version.
+    const grantDoc = await findGrantDoc(tenant, signingKey);
+    const data = grantDoc!.getData();
+    expect(Array.isArray(data.identity_hashes)).toBe(true);
+    expect((data.identity_hashes as string[]).length).toBeGreaterThan(0);
+    expect(data.identity_hashes_v).toBe(1);
+
+    // Restore the device: it returns to the active list.
+    await directory.updateUserGrant!(
+      regularUser.username,
+      { restoreSigningKeys: [signingKey] },
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+    );
+
+    const afterRestore = await directory.getUserGrantOverview!(regularUser.username);
+    expect(afterRestore.revokedDevices).toEqual([]);
+    expect(afterRestore.activeDevices).toHaveLength(1);
+    expect(afterRestore.activeDevices[0].signingPublicKey).toBe(signingKey);
+    expect(await directory.getUserPublicKeys(regularUser.username)).not.toBeNull();
   });
 });
 

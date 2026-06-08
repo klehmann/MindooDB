@@ -38,6 +38,7 @@ export {
   type UserGrantSnapshot,
   type GroupSnapshot,
 } from "./accesscontrol/DirectoryStateNode";
+export { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
 
 // User ID types
 export type { PublicUserId, PrivateUserId } from "./userid";

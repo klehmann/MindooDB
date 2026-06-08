@@ -6,8 +6,12 @@ import {
 import {
   ACCESS_CONTROL_FORM,
   ACL_DEFAULT_POLICY_DOC_ID,
+  ACL_READ_POLICY_DOC_ID,
   AclRuleDoc,
   DefaultAccessPolicyDoc,
+  DefaultReadPolicyDoc,
+  READ_RULE_TYPE,
+  ReadRuleDoc,
   RULE_TYPES,
   RuleType,
   TrustedWitnessDoc,
@@ -20,10 +24,15 @@ import {
 } from "./DirectoryStateNode";
 
 const ACL_DB_POLICY_PREFIX = "acl_dbpolicy_";
+const ACL_DB_READ_POLICY_PREFIX = "acl_dbreadpolicy_";
 
 /** Parse a policy document's fields into a {@link DefaultAccessPolicyDoc}. */
 export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPolicyDoc {
   const bool = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : undefined);
+  // An array of strings, or undefined when absent/malformed (treated as
+  // unconstrained). Non-string members are dropped defensively.
+  const stringArray = (v: unknown): string[] | undefined =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : undefined;
   return {
     form: ACCESS_CONTROL_FORM,
     type: "defaultpolicy",
@@ -34,6 +43,7 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
     denyDocUndelete: bool(data.denyDocUndelete),
     denyDocSnapshot: bool(data.denyDocSnapshot),
     denyDocPurge: bool(data.denyDocPurge),
+    allowedCreateKeyIds: stringArray(data.allowedCreateKeyIds),
   };
 }
 
@@ -53,6 +63,38 @@ export function parseRuleDoc(data: Record<string, unknown>, ruleType: RuleType):
     description: typeof data.description === "string" ? data.description : undefined,
     dbid: typeof data.dbid === "string" ? data.dbid : "*",
     withfields,
+    users_hashes: usersHashes,
+    users_encrypted: typeof data.users_encrypted === "string" ? data.users_encrypted : "",
+    action: data.action === "deny" ? "deny" : "allow",
+  };
+}
+
+/** Parse a read-policy document's fields into a {@link DefaultReadPolicyDoc}. */
+export function parseReadPolicyDoc(data: Record<string, unknown>): DefaultReadPolicyDoc {
+  const access = data.defaultReadAccess;
+  return {
+    form: ACCESS_CONTROL_FORM,
+    type: "readpolicy",
+    defaultReadAccess: access === "deny" ? "deny" : access === "allow" ? "allow" : undefined,
+    disableAllReadChecks: typeof data.disableAllReadChecks === "boolean" ? data.disableAllReadChecks : undefined,
+  };
+}
+
+/** Parse a read-rule document's fields into a {@link ReadRuleDoc}. */
+export function parseReadRuleDoc(data: Record<string, unknown>): ReadRuleDoc {
+  const usersHashes = Array.isArray(data.users_hashes)
+    ? data.users_hashes.filter((h): h is string => typeof h === "string")
+    : [];
+  const decryptionKeyIds = Array.isArray(data.decryptionKeyIds)
+    ? data.decryptionKeyIds.filter((k): k is string => typeof k === "string")
+    : undefined;
+  return {
+    form: ACCESS_CONTROL_FORM,
+    type: READ_RULE_TYPE,
+    ruleId: data.ruleId as string,
+    description: typeof data.description === "string" ? data.description : undefined,
+    dbid: typeof data.dbid === "string" ? data.dbid : "*",
+    decryptionKeyIds,
     users_hashes: usersHashes,
     users_encrypted: typeof data.users_encrypted === "string" ? data.users_encrypted : "",
     action: data.action === "deny" ? "deny" : "allow",
@@ -143,6 +185,36 @@ function projectAccessControlDoc(
       const dbid = decodeAclIdComponent(docId.slice(ACL_DB_POLICY_PREFIX.length));
       builder.applyDbPolicy(dbid, policy, trustedTime);
     }
+    return;
+  }
+
+  // Default tenant read policy / per-database read policy (read-side). Same
+  // shape, distinguished by fixed document id.
+  if (data.type === "readpolicy") {
+    if (deleted) return;
+    const policy = parseReadPolicyDoc(data);
+    if (docId === ACL_READ_POLICY_DOC_ID) {
+      builder.applyReadPolicy(policy, trustedTime);
+    } else if (docId.startsWith(ACL_DB_READ_POLICY_PREFIX)) {
+      const dbid = decodeAclIdComponent(docId.slice(ACL_DB_READ_POLICY_PREFIX.length));
+      builder.applyDbReadPolicy(dbid, policy, trustedTime);
+    }
+    return;
+  }
+
+  // Read rule (read-side). Metadata-only; deletions remove.
+  if (data.type === READ_RULE_TYPE && typeof data.ruleId === "string") {
+    if (deleted) {
+      builder.removeReadRule(data.ruleId, trustedTime);
+    } else {
+      builder.applyReadRule(parseReadRuleDoc(data), trustedTime);
+    }
+    return;
+  }
+
+  // Key-delivery documents carry no directory-state projection (they are read
+  // directly by recipient clients during sync); skip them here.
+  if (data.type === "keydelivery") {
     return;
   }
 

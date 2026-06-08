@@ -333,4 +333,145 @@ describe("evaluateAccess", () => {
       expect(d.tier).toBe("tier1");
     });
   });
+
+  // Create-key allowlist (docs/accesscontrol.md §6.6). A Tier 1 gate on
+  // doc_create: only listed decryptionKeyIds may be used. Hard deny that
+  // overrides allow rules; metadata-only so server and client agree.
+  describe("create-key allowlist (allowedCreateKeyIds)", () => {
+    const createKeyNode = (allowedCreateKeyIds: string[] | undefined) =>
+      nodeWith((b) => b.applyDefaultPolicy(policy({ allowedCreateKeyIds }), 1));
+
+    it("denies a doc_create whose key is not in the allowlist", () => {
+      const node = createKeyNode(["projkey"]);
+      const d = evaluateAccess({
+        op: "doc_create",
+        dbid: "db",
+        identity: identity(),
+        node,
+        decryptionKeyId: "default",
+      });
+      expect(d.allowed).toBe(false);
+      expect(d.tier).toBe("tier1");
+    });
+
+    it("allows a doc_create whose key is in the allowlist", () => {
+      const node = createKeyNode(["projkey"]);
+      const d = evaluateAccess({
+        op: "doc_create",
+        dbid: "db",
+        identity: identity(),
+        node,
+        decryptionKeyId: "projkey",
+      });
+      expect(d.allowed).toBe(true);
+    });
+
+    it("denies when no decryptionKeyId is supplied but an allowlist is set", () => {
+      const node = createKeyNode(["projkey"]);
+      const d = evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node });
+      expect(d.allowed).toBe(false);
+    });
+
+    it("is unconstrained when the allowlist is empty or undefined", () => {
+      for (const allow of [undefined, [] as string[]]) {
+        const node = createKeyNode(allow);
+        const d = evaluateAccess({
+          op: "doc_create",
+          dbid: "db",
+          identity: identity(),
+          node,
+          decryptionKeyId: "anything",
+        });
+        expect(d.allowed).toBe(true);
+      }
+    });
+
+    it("forbids the default key by simply omitting it", () => {
+      const node = createKeyNode(["named-key"]);
+      expect(
+        evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node, decryptionKeyId: "default" }).allowed,
+      ).toBe(false);
+      expect(
+        evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node, decryptionKeyId: "named-key" }).allowed,
+      ).toBe(true);
+    });
+
+    it("only gates doc_create; other ops with the same key are unaffected", () => {
+      const node = createKeyNode(["projkey"]);
+      for (const op of ["doc_change", "doc_delete", "doc_undelete"] as RuleType[]) {
+        const d = evaluateAccess({ op, dbid: "db", identity: identity(), node, decryptionKeyId: "default" });
+        expect(d.allowed).toBe(true);
+      }
+    });
+
+    it("is a hard gate: an allow rule cannot rescue a disallowed key", () => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocCreate: true, allowedCreateKeyIds: ["projkey"] }), 1);
+        b.applyRule(rule({ ruleId: "a", type: "doc_create", action: "allow", users_hashes: ["hashAlice"] }), 2);
+      });
+      // The allow rule would otherwise permit the create, but the wrong key
+      // is a hard Tier 1 deny.
+      expect(
+        evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node, decryptionKeyId: "default" }).allowed,
+      ).toBe(false);
+      // With the allowed key, the allow rule applies and the create succeeds.
+      expect(
+        evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node, decryptionKeyId: "projkey" }).allowed,
+      ).toBe(true);
+    });
+
+    it("a per-db allowlist overrides the tenant default", () => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ allowedCreateKeyIds: ["tenantkey"] }), 1);
+        b.applyDbPolicy("db", policy({ allowedCreateKeyIds: ["dbkey"] }), 2);
+      });
+      // In "db", only dbkey is allowed (tenant default does not union in).
+      expect(
+        evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node, decryptionKeyId: "tenantkey" }).allowed,
+      ).toBe(false);
+      expect(
+        evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node, decryptionKeyId: "dbkey" }).allowed,
+      ).toBe(true);
+      // A different db falls back to the tenant default allowlist.
+      expect(
+        evaluateAccess({ op: "doc_create", dbid: "other", identity: identity(), node, decryptionKeyId: "tenantkey" }).allowed,
+      ).toBe(true);
+    });
+
+    it("enforces identically in server mode (metadata-only Tier 1)", () => {
+      const node = createKeyNode(["projkey"]);
+      const denied = evaluateAccess({
+        op: "doc_create",
+        dbid: "db",
+        identity: identity(),
+        node,
+        decryptionKeyId: "default",
+        isServer: true,
+      });
+      expect(denied.allowed).toBe(false);
+      expect(denied.tier).toBe("tier1");
+    });
+
+    it("time-travel: rotation by policy revision changes the verdict per trusted-time window", () => {
+      // t=10 require projkey; t=20 rotate to projkey2.
+      const b = new DirectoryStateChainBuilder();
+      b.applyDefaultPolicy(policy({ allowedCreateKeyIds: ["projkey"] }), 10);
+      b.applyDefaultPolicy(policy({ allowedCreateKeyIds: ["projkey2"] }), 20);
+      const decideAt = (T: number, keyId: string) =>
+        evaluateAccess({
+          op: "doc_create",
+          dbid: "db",
+          identity: identity(),
+          node: b.getStateAt(T),
+          decryptionKeyId: keyId,
+        }).allowed;
+      // A doc created at t=15 with projkey was valid then, and replaying at its
+      // own trusted time stays valid even after the t=20 rotation.
+      expect(decideAt(15, "projkey")).toBe(true);
+      expect(decideAt(15, "projkey2")).toBe(false);
+      // New creates after the rotation must use projkey2.
+      expect(decideAt(25, "projkey")).toBe(false);
+      expect(decideAt(25, "projkey2")).toBe(true);
+    });
+  });
 });

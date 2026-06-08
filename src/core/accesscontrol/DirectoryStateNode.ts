@@ -1,6 +1,8 @@
 import {
   AclRuleDoc,
   DefaultAccessPolicyDoc,
+  DefaultReadPolicyDoc,
+  ReadRuleDoc,
   RuleType,
   TrustedWitnessDoc,
 } from "./types";
@@ -61,6 +63,12 @@ export interface DirectoryStateNode {
   defaultPolicy: DefaultAccessPolicyDoc | null;
   dbPolicies: Map<string, DefaultAccessPolicyDoc>;
   rulesByType: Map<RuleType, AclRuleDoc[]>;
+  /** Tenant default read policy (read-side), or null when none is configured. */
+  readPolicy: DefaultReadPolicyDoc | null;
+  /** Per-database read policies, keyed by dbid. */
+  dbReadPolicies: Map<string, DefaultReadPolicyDoc>;
+  /** All read rules (`type: "doc_read"`) currently in effect. */
+  readRules: ReadRuleDoc[];
   groupsByName: Map<string, GroupSnapshot>;
   /** Keyed by `username_hash`. */
   usersByHash: Map<string, UserGrantSnapshot>;
@@ -80,6 +88,9 @@ export function createGenesisNode(): DirectoryStateNode {
     defaultPolicy: null,
     dbPolicies: new Map(),
     rulesByType: new Map(),
+    readPolicy: null,
+    dbReadPolicies: new Map(),
+    readRules: [],
     groupsByName: new Map(),
     usersByHash: new Map(),
     bySigningKey: new Map(),
@@ -130,6 +141,10 @@ export type DirectoryRevisionDelta =
   | { op: "dbPolicy"; t: number; dbid: string; policy: DefaultAccessPolicyDoc }
   | { op: "rule"; t: number; rule: AclRuleDoc }
   | { op: "removeRule"; t: number; ruleId: string; ruleType: RuleType }
+  | { op: "readPolicy"; t: number; policy: DefaultReadPolicyDoc }
+  | { op: "dbReadPolicy"; t: number; dbid: string; policy: DefaultReadPolicyDoc }
+  | { op: "readRule"; t: number; rule: ReadRuleDoc }
+  | { op: "removeReadRule"; t: number; ruleId: string }
   | { op: "trustedWitness"; t: number; witness: TrustedWitnessDoc }
   | { op: "removeTrustedWitness"; t: number; witnessPublicKey: string }
   | { op: "grant"; t: number; grant: UserGrantSnapshot }
@@ -210,6 +225,18 @@ export class DirectoryStateChainBuilder {
         case "removeRule":
           this.removeRule(d.ruleId, d.ruleType, d.t);
           break;
+        case "readPolicy":
+          this.applyReadPolicy(d.policy, d.t);
+          break;
+        case "dbReadPolicy":
+          this.applyDbReadPolicy(d.dbid, d.policy, d.t);
+          break;
+        case "readRule":
+          this.applyReadRule(d.rule, d.t);
+          break;
+        case "removeReadRule":
+          this.removeReadRule(d.ruleId, d.t);
+          break;
         case "trustedWitness":
           this.applyTrustedWitness(d.witness, d.t);
           break;
@@ -251,6 +278,9 @@ export class DirectoryStateChainBuilder {
       defaultPolicy: this.head.defaultPolicy,
       dbPolicies: this.head.dbPolicies,
       rulesByType: this.head.rulesByType,
+      readPolicy: this.head.readPolicy,
+      dbReadPolicies: this.head.dbReadPolicies,
+      readRules: this.head.readRules,
       groupsByName: this.head.groupsByName,
       usersByHash: this.head.usersByHash,
       bySigningKey: this.head.bySigningKey,
@@ -300,6 +330,40 @@ export class DirectoryStateChainBuilder {
         ruleType,
         existing.filter((r) => r.ruleId !== ruleId)
       );
+    });
+  }
+
+  /** Apply the tenant default read policy document. */
+  applyReadPolicy(policy: DefaultReadPolicyDoc, trustedTime: number): void {
+    this.deltaLog.push({ op: "readPolicy", t: trustedTime, policy });
+    this.push(trustedTime, (next) => {
+      next.readPolicy = policy;
+    });
+  }
+
+  /** Apply a per-database read policy document. */
+  applyDbReadPolicy(dbid: string, policy: DefaultReadPolicyDoc, trustedTime: number): void {
+    this.deltaLog.push({ op: "dbReadPolicy", t: trustedTime, dbid, policy });
+    this.push(trustedTime, (next) => {
+      next.dbReadPolicies = new Map(this.head.dbReadPolicies);
+      next.dbReadPolicies.set(dbid, policy);
+    });
+  }
+
+  /** Apply a read rule document (replaces any read rule with the same id). */
+  applyReadRule(rule: ReadRuleDoc, trustedTime: number): void {
+    this.deltaLog.push({ op: "readRule", t: trustedTime, rule });
+    this.push(trustedTime, (next) => {
+      next.readRules = this.head.readRules.filter((r) => r.ruleId !== rule.ruleId);
+      next.readRules.push(rule);
+    });
+  }
+
+  /** Remove a read rule (e.g. its document was deleted). */
+  removeReadRule(ruleId: string, trustedTime: number): void {
+    this.deltaLog.push({ op: "removeReadRule", t: trustedTime, ruleId });
+    this.push(trustedTime, (next) => {
+      next.readRules = this.head.readRules.filter((r) => r.ruleId !== ruleId);
     });
   }
 

@@ -56,6 +56,7 @@ describe("key visibility reconciliation", () => {
   let creatorDb: MindooDB;
   let readerDb: MindooDB;
   let secretDocId: string;
+  let adminUser: PrivateUserId;
   let adminSigningPublicKey: string;
   let adminEncryptionPublicKey: string;
   let readerUserId: PrivateUserId;
@@ -66,7 +67,7 @@ describe("key visibility reconciliation", () => {
     creatorFactory = new BaseMindooTenantFactory(storeFactory, crypto);
     readerFactory = new BaseMindooTenantFactory(storeFactory, crypto, undefined, cacheStore);
 
-    const adminUser = await creatorFactory.createUserId("CN=admin/O=keyvis", adminPassword);
+    adminUser = await creatorFactory.createUserId("CN=admin/O=keyvis", adminPassword);
     const creatorUser = await creatorFactory.createUserId("CN=creator/O=keyvis", creatorPassword);
     const readerUser = await readerFactory.createUserId("CN=reader/O=keyvis", readerPassword);
     adminSigningPublicKey = adminUser.userSigningKeyPair.publicKey;
@@ -229,6 +230,46 @@ describe("key visibility reconciliation", () => {
     const restrictedCategory = view.getRoot().getChildCategories()[0];
     expect(restrictedCategory.getCategoryValue()).toBe("Restricted");
     expect(restrictedCategory.getChildDocuments().map((entry) => entry.docId)).toEqual([secretDocId]);
+  }, 30000);
+
+  it("purges a doc and crypto-shreds its named key when a read policy revokes entitlement", async () => {
+    // Reveal the named-key doc on the reader: it holds the key AND (with no
+    // read policy yet) is read-entitled, so the doc is visible.
+    await readerKeyBag.set("doc", tenantId, namedKeyId, (await creatorKeyBag.get("doc", tenantId, namedKeyId))!);
+    await readerTenant.reconcileKeyBagChanges?.();
+    expect(await readerDb.getAllDocumentIds()).toEqual([secretDocId]);
+    expect(await readerKeyBag.get("doc", tenantId, namedKeyId)).toBeTruthy();
+
+    // Admin flips the tenant to default-deny reads (revocation by policy
+    // revision — no client-trusted clock involved). Authored on the creator's
+    // directory but admin-signed; visible to the reader via the shared store.
+    const adminDir = (await creatorTenant.openDirectory()) as unknown as {
+      setDefaultReadPolicy: (
+        policy: { defaultReadAccess: "allow" | "deny" },
+        adminKey: PrivateUserId["userSigningKeyPair"]["privateKey"],
+        adminPassword: string,
+      ) => Promise<void>;
+    };
+    await adminDir.setDefaultReadPolicy(
+      { defaultReadAccess: "deny" },
+      adminUser.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+
+    // Force the reader's directory to ingest the new policy, then run the
+    // visibility reconcile (the directory-sync path drives this in production).
+    const readerDir = (await readerTenant.openDirectory()) as unknown as {
+      listKnownDBIds: () => Promise<string[]>;
+    };
+    await readerDir.listKnownDBIds();
+    await (readerDb as unknown as { reconcileKeyVisibility: () => Promise<void> }).reconcileKeyVisibility();
+
+    // The doc is purged locally and its named key is crypto-shredded from the
+    // KeyBag so it cannot be re-materialized; the tenant default key is intact.
+    expect(await readerDb.getAllDocumentIds()).toEqual([]);
+    await expect(readerDb.getDocument(secretDocId)).rejects.toThrow(`Document ${secretDocId} not found`);
+    expect(await readerKeyBag.get("doc", tenantId, namedKeyId)).toBeFalsy();
+    expect(await readerKeyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID)).toBeTruthy();
   }, 30000);
 
   it("skips the visibility scan on a warm restart with an unchanged KeyBag", async () => {

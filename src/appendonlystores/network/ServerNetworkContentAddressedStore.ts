@@ -45,6 +45,21 @@ export type ServerTier1Evaluator = (
 ) => Promise<AccessDecision>;
 
 /**
+ * Server-side read evaluator (read-side of docs/accesscontrol.md). Given the
+ * authenticated reader, the store's database, and an entry's cleartext
+ * `decryptionKeyId`, returns whether the entry may be delivered to that reader.
+ * The verdict is a pure function of admin-signed read policy/rules at server
+ * time — no client clock is involved — so a revoked reader is cut off from new
+ * data on their very next sync regardless of their local clock. Supplied by the
+ * host server; kept as a callback so this transport layer stays decoupled.
+ */
+export type ServerReadEvaluator = (
+  principal: { signingKey?: string; username?: string },
+  dbid: string,
+  decryptionKeyId: string
+) => Promise<boolean>;
+
+/**
  * Resolves a wipe-targeted signing key to the id of the admin-signed grant
  * document carrying its remote-wipe directive (docs/accesscontrol.md §6.5), or
  * null if the key is not wipe-targeted. Supplied by the host server from the
@@ -60,6 +75,13 @@ export interface ServerAccessControlOptions {
   witnessDbid?: string;
   /** Tier 1 evaluator; when present, denied pushes are rejected with ACCESS_DENIED. */
   tier1Evaluator?: ServerTier1Evaluator;
+  /**
+   * Read evaluator (read-side). When present, every served entry/metadata/id is
+   * filtered by the reader's read entitlement at server time; disallowed
+   * entries are silently omitted. Absent keeps the legacy behavior (read access
+   * governed by key possession alone).
+   */
+  readEvaluator?: ServerReadEvaluator;
   /**
    * Remote-wipe resolver (§6.5). When present, a wipe-scoped token is served
    * only the admin-signed grant document carrying its directive (on the
@@ -93,6 +115,8 @@ export class ServerNetworkContentAddressedStore {
   private witnessDbid?: string;
   /** Optional Tier 1 evaluator; undefined keeps the legacy membership-only check. */
   private tier1Evaluator?: ServerTier1Evaluator;
+  /** Optional read evaluator; undefined keeps key-possession as the only read gate. */
+  private readEvaluator?: ServerReadEvaluator;
   /** Optional remote-wipe resolver; undefined disables wipe-scoped serving. */
   private wipeGrantDocIdResolver?: WipeGrantDocIdResolver;
   /** The directory database id, where grant documents live (§6.5). */
@@ -128,6 +152,93 @@ export class ServerNetworkContentAddressedStore {
     this.witnessDbid = accessControl?.witnessDbid;
     this.tier1Evaluator = accessControl?.tier1Evaluator;
     this.wipeGrantDocIdResolver = accessControl?.wipeGrantDocIdResolver;
+    this.readEvaluator = accessControl?.readEvaluator;
+  }
+
+  /**
+   * Filter a list of entry metadata down to those the reader may receive under
+   * the read policy (read-side of docs/accesscontrol.md). Decisions are
+   * memoized per `decryptionKeyId` within the call, because all entries sharing
+   * a key in this database share a verdict. A no-op when no read evaluator is
+   * wired.
+   */
+  private async filterReadableMetas<T extends StoreEntryMetadata>(
+    principal: { signingKey?: string; username?: string },
+    metas: T[],
+  ): Promise<T[]> {
+    if (!this.readEvaluator || metas.length === 0) return metas;
+    const dbid = this.witnessDbid ?? this.localStore.getId();
+    const decisionByKey = new Map<string, boolean>();
+    const out: T[] = [];
+    for (const meta of metas) {
+      const keyId = meta.decryptionKeyId ?? "";
+      let allowed = decisionByKey.get(keyId);
+      if (allowed === undefined) {
+        allowed = await this.readEvaluator(principal, dbid, keyId);
+        decisionByKey.set(keyId, allowed);
+      }
+      if (allowed) out.push(meta);
+    }
+    return out;
+  }
+
+  /**
+   * Resolve the entry ids a reader may receive from a candidate id list, by
+   * looking up each id's `decryptionKeyId` and applying the read evaluator.
+   * Used by id-only endpoints (`getAllIds`, `hasEntries`).
+   */
+  private async filterReadableIds(
+    principal: { signingKey?: string; username?: string },
+    ids: string[],
+  ): Promise<string[]> {
+    if (!this.readEvaluator || ids.length === 0) return ids;
+    const dbid = this.witnessDbid ?? this.localStore.getId();
+    const decisionByKey = new Map<string, boolean>();
+    const out: string[] = [];
+    for (const id of ids) {
+      const meta = await this.localStore.getEntryMetadata(id);
+      if (!meta) continue;
+      const keyId = meta.decryptionKeyId ?? "";
+      let allowed = decisionByKey.get(keyId);
+      if (allowed === undefined) {
+        allowed = await this.readEvaluator(principal, dbid, keyId);
+        decisionByKey.set(keyId, allowed);
+      }
+      if (allowed) out.push(id);
+    }
+    return out;
+  }
+
+  /**
+   * Build the read-gate principal from a validated token. The read evaluator
+   * prefers the authenticated device signing key (resolving identity from the
+   * grant's `identity_hashes` bundle without any cleartext name) and falls back
+   * to the `sub` username for legacy tokens that carry no device key.
+   */
+  private readPrincipal(
+    payload: NetworkAuthTokenPayload,
+  ): { signingKey?: string; username?: string } {
+    return { signingKey: payload.deviceSigningKey, username: payload.sub };
+  }
+
+  /**
+   * Resolve the reader's RSA encryption public key for transport encryption.
+   * Prefers the authenticated device signing key (so key-based tokens whose
+   * `sub` is a key, not a username, still resolve), falling back to a
+   * username-based lookup for legacy tokens. Returns null when no active grant
+   * is found.
+   */
+  private async resolveReaderEncryptionKey(
+    payload: NetworkAuthTokenPayload,
+  ): Promise<string | null> {
+    if (payload.deviceSigningKey && typeof this.directory.getUserBySigningPublicKey === "function") {
+      const lookup = await this.directory.getUserBySigningPublicKey(payload.deviceSigningKey);
+      if (lookup?.encryptionPublicKey) {
+        return lookup.encryptionPublicKey;
+      }
+    }
+    const userKeys = await this.directory.getUserPublicKeys(payload.sub);
+    return userKeys?.encryptionPublicKey ?? null;
   }
 
   /**
@@ -165,13 +276,21 @@ export class ServerNetworkContentAddressedStore {
 
   /**
    * Handle a challenge request from a client.
-   * 
-   * @param username The username requesting authentication
+   *
+   * The username is optional: a client may identify itself by its device
+   * signing public key instead, so the server never needs the cleartext name.
+   *
+   * @param username The username requesting authentication (optional)
+   * @param options.signingPublicKey The device signing public key the client is
+   *        identifying with, when no username is supplied
    * @returns The challenge string
    */
-  async handleChallengeRequest(username: string): Promise<string> {
-    this.logger.debug(`Handling challenge request for user: ${username}`);
-    return this.authService.generateChallenge(username);
+  async handleChallengeRequest(
+    username?: string,
+    options?: { signingPublicKey?: string },
+  ): Promise<string> {
+    this.logger.debug(`Handling challenge request${username ? ` for user: ${username}` : " by signing key"}`);
+    return this.authService.generateChallenge(username, options);
   }
 
   /**
@@ -212,7 +331,8 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Found ${newEntries.length} new entries`);
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
-    return allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
+    const scoped = allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
+    return this.filterReadableMetas(this.readPrincipal(tokenPayload), scoped);
   }
 
   /**
@@ -240,7 +360,8 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Found ${newEntries.length} new entries for doc ${docId}`);
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
-    return allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
+    const scoped = allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
+    return this.filterReadableMetas(this.readPrincipal(tokenPayload), scoped);
   }
 
   /**
@@ -273,7 +394,8 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Found ${entries.length} entries`);
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
-    return allowed ? entries.filter((e) => allowed.has(e.id)) : entries;
+    const scoped = allowed ? entries.filter((e) => allowed.has(e.id)) : entries;
+    return this.filterReadableMetas(this.readPrincipal(tokenPayload), scoped);
   }
 
   /**
@@ -306,7 +428,11 @@ export class ServerNetworkContentAddressedStore {
     }
 
     if (this.localStore.scanEntriesSince) {
-      return this.localStore.scanEntriesSince(cursor, limit, filters);
+      const result = await this.localStore.scanEntriesSince(cursor, limit, filters);
+      return {
+        ...result,
+        entries: await this.filterReadableMetas(this.readPrincipal(tokenPayload), result.entries),
+      };
     }
 
     // Fallback: emulate cursor scan using existing metadata query.
@@ -350,7 +476,7 @@ export class ServerNetworkContentAddressedStore {
     const page = sorted.slice(startIndex, startIndex + max);
     const last = page.length > 0 ? page[page.length - 1] : null;
     return {
-      entries: page,
+      entries: await this.filterReadableMetas(this.readPrincipal(tokenPayload), page),
       nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
       hasMore: startIndex + page.length < sorted.length,
     };
@@ -446,10 +572,13 @@ export class ServerNetworkContentAddressedStore {
     const tokenPayload = await this.validateToken(token);
     const username = tokenPayload.sub;
     this.logger.debug(`Token validated for user: ${username}`);
-    
-    // Get user's public encryption key
-    const userKeys = await this.directory.getUserPublicKeys(username);
-    if (!userKeys) {
+
+    // Resolve the reader's RSA encryption public key for transport encryption.
+    // Prefer the authenticated device signing key, which works for key-based
+    // tokens whose `sub` is a key rather than a cleartext username; fall back to
+    // the username for legacy tokens.
+    const encryptionPublicKey = await this.resolveReaderEncryptionKey(tokenPayload);
+    if (!encryptionPublicKey) {
       throw new NetworkError(
         NetworkErrorType.USER_NOT_FOUND,
         `User "${username}" is not found, or has no active access grant on this server. `
@@ -467,11 +596,16 @@ export class ServerNetworkContentAddressedStore {
     // Get the entries from local store
     const entries = await this.localStore.getEntries(requestedIds);
     this.logger.debug(`Retrieved ${entries.length} entries from local store`);
-    
+
+    // Read gate: omit entries the reader is not entitled to under the read
+    // policy (read-side of docs/accesscontrol.md). StoreEntry extends
+    // StoreEntryMetadata, so the same filter applies.
+    const readable = await this.filterReadableMetas(this.readPrincipal(tokenPayload), entries);
+
     // Encrypt each entry with the user's RSA public key
     const encryptedEntries = await this.encryptEntriesForUser(
-      entries,
-      userKeys.encryptionPublicKey
+      readable,
+      encryptionPublicKey
     );
     
     this.logger.debug(`Encrypted ${encryptedEntries.length} entries for user: ${username}`);
@@ -491,7 +625,10 @@ export class ServerNetworkContentAddressedStore {
     if (allowed && !allowed.has(id)) {
       return null;
     }
-    return this.localStore.getEntryMetadata(id);
+    const meta = await this.localStore.getEntryMetadata(id);
+    if (!meta) return null;
+    const readable = await this.filterReadableMetas(this.readPrincipal(tokenPayload), [meta]);
+    return readable.length > 0 ? meta : null;
   }
 
   /**
@@ -606,7 +743,8 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Found ${existingIds.length} existing entries out of ${ids.length} checked`);
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
-    return allowed ? existingIds.filter((id) => allowed.has(id)) : existingIds;
+    const scoped = allowed ? existingIds.filter((id) => allowed.has(id)) : existingIds;
+    return this.filterReadableIds(this.readPrincipal(tokenPayload), scoped);
   }
 
   /**
@@ -628,7 +766,8 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Returning ${allIds.length} entry IDs`);
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
-    return allowed ? allIds.filter((id) => allowed.has(id)) : allIds;
+    const scoped = allowed ? allIds.filter((id) => allowed.has(id)) : allIds;
+    return this.filterReadableIds(this.readPrincipal(tokenPayload), scoped);
   }
 
   /**

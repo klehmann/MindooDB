@@ -156,6 +156,26 @@ export interface DefaultAccessPolicyDoc {
   denyDocUndelete?: boolean; // default false
   denyDocSnapshot?: boolean; // default true (admin-only by default)
   denyDocPurge?: boolean; // default true (admin-only by default)
+  /**
+   * Optional allowlist of `decryptionKeyId`s that a `doc_create` may use in the
+   * governed scope (tenant default, or a single database when set on a per-db
+   * policy). This is a **Tier 1** write constraint: `decryptionKeyId` is
+   * cleartext entry metadata the server already reads, so it is enforced at the
+   * witness and re-checked on every honest client — unlike `withfields` (Tier
+   * 2). Absent/empty = unconstrained (backward compatible). Non-empty = a
+   * `doc_create` whose `decryptionKeyId` is not in the set is denied, even if an
+   * allow rule would otherwise match (a hard create-key gate).
+   *
+   * Use cases: forbid the shared `default` key (omit `"default"` to require a
+   * named key), or enforce a rotating key by pointing the allowlist at the
+   * current rotation key. Rotation is just a new policy revision on the
+   * directory time-travel chain, so each change is auditable via
+   * {@link AccessDecision} replay and `wasAllowedAt`. Because evaluation runs
+   * against the directory state at each entry's trusted time, documents created
+   * under an earlier policy are grandfathered automatically — tightening the
+   * allowlist never retroactively invalidates valid history.
+   */
+  allowedCreateKeyIds?: string[];
 }
 
 /**
@@ -163,7 +183,10 @@ export interface DefaultAccessPolicyDoc {
  * field (§6.1). Snapshot and purge default to denied (admin-only).
  */
 export const DEFAULT_POLICY_DEFAULTS: Required<
-  Omit<DefaultAccessPolicyDoc, "form" | "type" | "disableAllAccessChecksAndPolicies">
+  Omit<
+    DefaultAccessPolicyDoc,
+    "form" | "type" | "disableAllAccessChecksAndPolicies" | "allowedCreateKeyIds"
+  >
 > = {
   denyDocCreate: false,
   denyDocChange: false,
@@ -199,9 +222,26 @@ export interface AclRuleDoc {
   withfields?: WithFieldClause[];
   /** User + group hashes, plus reserved pseudo-tokens. */
   users_hashes: string[];
-  /** Usernames encrypted with `$publicinfos` (audit/debug aid). */
+  /**
+   * Targeted usernames/groups (JSON {@link RuleTargets}) encrypted with the
+   * tenant default key, base64-encoded — a display aid for admin UIs so they can
+   * show who a rule targets without reversing the salted hashes. Encrypted with
+   * the tenant default key (not `$publicinfos`), so it stays opaque to the sync
+   * server while remaining readable by tenant clients. Empty when the rule was
+   * authored from raw hashes / pseudo-tokens only (nothing cleartext to show).
+   */
   users_encrypted: string;
   action: "allow" | "deny";
+}
+
+/**
+ * Decrypted targets of a rule, for admin-UI display only (never serialized to
+ * the directory). Populated by {@link AclRuleDoc.users_encrypted} /
+ * {@link ReadRuleDoc.users_encrypted} on the listing APIs.
+ */
+export interface RuleTargets {
+  usernames: string[];
+  groups: string[];
 }
 
 /** A trusted timestamping witness (sync server), §6.4. */
@@ -377,7 +417,9 @@ export function validateAclRule(rule: {
 export function effectivePolicy(
   tenantDefault: DefaultAccessPolicyDoc | null | undefined,
   dbPolicy: DefaultAccessPolicyDoc | null | undefined
-): Required<Omit<DefaultAccessPolicyDoc, "form" | "type">> {
+): Required<Omit<DefaultAccessPolicyDoc, "form" | "type" | "allowedCreateKeyIds">> & {
+  allowedCreateKeyIds?: string[];
+} {
   const pick = <K extends keyof typeof DEFAULT_POLICY_DEFAULTS>(field: K): boolean => {
     if (dbPolicy && dbPolicy[field] !== undefined) return dbPolicy[field] as boolean;
     if (tenantDefault && tenantDefault[field] !== undefined) return tenantDefault[field] as boolean;
@@ -386,6 +428,13 @@ export function effectivePolicy(
   const disable =
     (dbPolicy?.disableAllAccessChecksAndPolicies ?? tenantDefault?.disableAllAccessChecksAndPolicies) ===
     true;
+  // Per-db precedence: a database policy's allowlist (when defined) fully
+  // overrides the tenant default's — it is not merged/unioned, so a database
+  // can both tighten and loosen the tenant-wide create-key constraint.
+  const allowedCreateKeyIds =
+    (dbPolicy && dbPolicy.allowedCreateKeyIds) ??
+    (tenantDefault && tenantDefault.allowedCreateKeyIds) ??
+    undefined;
   return {
     disableAllAccessChecksAndPolicies: disable,
     denyDocCreate: pick("denyDocCreate"),
@@ -394,5 +443,246 @@ export function effectivePolicy(
     denyDocUndelete: pick("denyDocUndelete"),
     denyDocSnapshot: pick("denyDocSnapshot"),
     denyDocPurge: pick("denyDocPurge"),
+    allowedCreateKeyIds,
+  };
+}
+
+// ===========================================================================
+// Read access control (docs/accesscontrol.md — read-side).
+//
+// The read-side mirrors the write-side two-tier model but is intentionally
+// **metadata-only**: a read rule may scope by author identity, target database
+// and `decryptionKeyId`, but never by document content (`withfields`). That
+// keeps every read decision evaluable by the zero-trust sync server from the
+// cleartext entry metadata it already holds, so the server can gate delivery.
+//
+// There are deliberately NO client-trusted dates (`notBefore`/`notAfter`) on
+// read rules. A client-evaluated validity window would be clock-spoofable and
+// would reintroduce the wall-clock dependency the write side forbids (see the
+// no-`${now}` note above). Time-bound access is therefore expressed as
+// **revocation by policy revision**: an admin (or a scheduled automation)
+// flips the allow rule to deny / removes the user, and on the next directory
+// sync the server stops delivering and the client purges the scope.
+//
+// All read-side documents share `form: "accesscontrol"` and are
+// `$publicinfos`-encrypted so the server can read them.
+// ===========================================================================
+
+/** The `type` value of a read rule document (read-side analogue of {@link RuleType}). */
+export const READ_RULE_TYPE = "doc_read" as const;
+export type ReadRuleType = typeof READ_RULE_TYPE;
+
+/**
+ * The default tenant read policy, or a per-database read policy (same shape).
+ *
+ * Unlike the write side, the **absence** of any read policy document means
+ * "read access is unrestricted" — preserving today's behavior where read
+ * access is governed purely by key possession. Creating an `acl_readpolicy`
+ * with `defaultReadAccess: "deny"` is what switches a tenant to a default-deny
+ * read posture.
+ */
+export interface DefaultReadPolicyDoc {
+  form: typeof ACCESS_CONTROL_FORM;
+  type: "readpolicy";
+  /**
+   * Baseline read access when no rule matches. `"allow"` (the implicit default
+   * when the document is absent) keeps key-possession as the only gate;
+   * `"deny"` requires an explicit allow rule to read.
+   */
+  defaultReadAccess?: "allow" | "deny";
+  /**
+   * Master off switch for read checks. When true, the server delivers and the
+   * client retains everything regardless of read rules (key possession still
+   * applies). Mirrors {@link DefaultAccessPolicyDoc.disableAllAccessChecksAndPolicies}.
+   */
+  disableAllReadChecks?: boolean;
+}
+
+/**
+ * A single read rule (read-side analogue of {@link AclRuleDoc}). Metadata-only:
+ * it gates by target database, optional `decryptionKeyId` scope, and the acting
+ * user's identity. No `withfields`, no `notBefore`/`notAfter`.
+ */
+export interface ReadRuleDoc {
+  form: typeof ACCESS_CONTROL_FORM;
+  type: ReadRuleType;
+  /** Stable id, surfaced in {@link AccessDecision.matchedRuleId}. */
+  ruleId: string;
+  description?: string;
+  /** Target database, or `"*"` for all databases in the tenant. */
+  dbid: string | "*";
+  /**
+   * Optional key scope: the rule only applies to entries whose
+   * `decryptionKeyId` is in this list. Absent/empty = applies to every key in
+   * the database (document-level read control).
+   */
+  decryptionKeyIds?: string[];
+  /** User + group hashes, plus reserved pseudo-tokens (`$everyone`, `$admin`). */
+  users_hashes: string[];
+  /**
+   * Targeted usernames/groups (JSON {@link RuleTargets}) encrypted with the
+   * tenant default key, base64-encoded — a display aid for admin UIs (see
+   * {@link AclRuleDoc.users_encrypted}). Opaque to the sync server. Empty when
+   * the rule was authored from raw hashes / pseudo-tokens only.
+   */
+  users_encrypted: string;
+  action: "allow" | "deny";
+}
+
+/**
+ * One wrapped version of a rotated key inside a {@link KeyDeliveryRecipient}.
+ *
+ * A `keyId` can hold several versions in the KeyBag after rotation, and
+ * decryption tries them all. Delivering only the newest version would leave a
+ * recipient unable to read documents encrypted under an earlier version, so a
+ * delivery carries every version the preparer holds.
+ */
+export interface KeyDeliveryVersion {
+  /** The KeyBag version timestamp (`createdAt`) of this key version; 0 if unknown. */
+  keyVersionCreatedAt: number;
+  /**
+   * This version's symmetric key bytes wrapped to the recipient's RSA-OAEP
+   * encryption public key (see `RSAEncryption.encrypt`), base64-encoded. Only
+   * the holder of the matching private key — never the admin who publishes the
+   * doc — can unwrap it.
+   */
+  wrappedKey: string;
+}
+
+/** One recipient of a wrapped key inside a {@link KeyDeliveryDoc}. */
+export interface KeyDeliveryRecipient {
+  /** `username_hash` (salted v2) of the recipient. */
+  username_hash: string;
+  /**
+   * Every stored version of the key, wrapped to this recipient (newest first).
+   * Includes all rotation versions so previously-encrypted documents remain
+   * decryptable after the recipient imports the delivery.
+   */
+  versions: KeyDeliveryVersion[];
+}
+
+/**
+ * An admin-published, admin-blind key delivery document (read-side key push).
+ *
+ * The wrapped bytes are produced by a key-*holder* (a regular user who already
+ * has the key) using each recipient's public encryption key; the admin merely
+ * signs and writes the directory document. An admin outside the recipient set
+ * therefore never sees the plaintext key. On sync, a recipient client detects
+ * a delivery targeting it, RSA-unwraps the key, imports it into its KeyBag, and
+ * the existing reveal-on-add visibility path surfaces the now-readable docs.
+ */
+export interface KeyDeliveryDoc {
+  form: typeof ACCESS_CONTROL_FORM;
+  type: "keydelivery";
+  /** The symmetric key id being delivered (matches `decryptionKeyId`). */
+  keyId: string;
+  /** The key-holder's signing public key that prepared the wrapped bytes (audit). */
+  preparedByPublicKey: string;
+  /** One entry per recipient, each carrying all wrapped key versions. */
+  recipients: KeyDeliveryRecipient[];
+}
+
+/**
+ * The output of preparing a key delivery (the key-holder step), handed to an
+ * admin to {@link KeyDeliveryDoc | publish}. It carries everything the
+ * directory document needs except the admin signature.
+ */
+export interface KeyDeliveryPayload {
+  keyId: string;
+  preparedByPublicKey: string;
+  recipients: KeyDeliveryRecipient[];
+}
+
+// ---------------------------------------------------------------------------
+// Read-side fixed/pattern document IDs
+// ---------------------------------------------------------------------------
+
+/** Singleton id of the tenant default read policy document. */
+export const ACL_READ_POLICY_DOC_ID = "acl_readpolicy";
+
+const ACL_DB_READ_POLICY_PREFIX = "acl_dbreadpolicy_";
+const ACL_READ_RULE_PREFIX = "acl_readrule_";
+const ACL_KEY_DELIVERY_PREFIX = "acl_keydelivery_";
+
+/** Document id for a per-database read policy. */
+export function aclDbReadPolicyDocId(dbid: string): string {
+  return assertValidDocId(ACL_DB_READ_POLICY_PREFIX + encodeAclIdComponent(dbid));
+}
+
+/** Document id for a single read rule, keyed by its stable `ruleId`. */
+export function aclReadRuleDocId(ruleId: string): string {
+  return assertValidDocId(ACL_READ_RULE_PREFIX + encodeAclIdComponent(ruleId));
+}
+
+/**
+ * Document id for a key delivery, keyed by the delivered key id and a
+ * fingerprint that disambiguates concurrent deliveries (e.g. a hash of the
+ * recipient set or the key version). Keying by `keyId_fingerprint` lets several
+ * deliveries of the same key (to different audiences/versions) coexist.
+ */
+export function aclKeyDeliveryDocId(keyId: string, fingerprint: string): string {
+  return assertValidDocId(
+    ACL_KEY_DELIVERY_PREFIX + encodeAclIdComponent(keyId) + "_" + encodeAclIdComponent(fingerprint)
+  );
+}
+
+/**
+ * Validate a {@link ReadRuleDoc} (minus the assigned `form`/`ruleId`, which the
+ * directory sets). Read rules are metadata-only: they must not carry
+ * `withfields`, and the closed action set applies. Throws on the first
+ * violation.
+ */
+export function validateReadRule(rule: {
+  type: ReadRuleType;
+  dbid: string;
+  action: "allow" | "deny";
+  users_hashes: string[];
+  decryptionKeyIds?: string[];
+}): void {
+  if (rule.type !== READ_RULE_TYPE) {
+    throw new Error(`read rule has unknown type "${rule.type}" (expected "${READ_RULE_TYPE}")`);
+  }
+  if (rule.action !== "allow" && rule.action !== "deny") {
+    throw new Error(`read rule has invalid action "${rule.action}" (expected "allow" or "deny")`);
+  }
+  if (typeof rule.dbid !== "string" || rule.dbid.length === 0) {
+    throw new Error('read rule requires a non-empty `dbid` (or "*")');
+  }
+  if (!Array.isArray(rule.users_hashes) || rule.users_hashes.length === 0) {
+    throw new Error("read rule requires a non-empty `users_hashes` array");
+  }
+  if (
+    rule.decryptionKeyIds !== undefined &&
+    (!Array.isArray(rule.decryptionKeyIds) ||
+      rule.decryptionKeyIds.some((k) => typeof k !== "string"))
+  ) {
+    throw new Error("read rule `decryptionKeyIds` must be an array of strings when present");
+  }
+}
+
+/** Fully-resolved read policy: baseline access plus the master switch. */
+export interface EffectiveReadPolicy {
+  /** Baseline access when no rule matches. */
+  defaultReadAccess: "allow" | "deny";
+  /** When true, read checks are bypassed entirely. */
+  disableAllReadChecks: boolean;
+}
+
+/**
+ * Compute the effective read policy by layering a per-db read policy over the
+ * tenant default. An absent tenant default means read access is unrestricted,
+ * which is represented as `defaultReadAccess: "allow"`.
+ */
+export function effectiveReadPolicy(
+  tenantDefault: DefaultReadPolicyDoc | null | undefined,
+  dbPolicy: DefaultReadPolicyDoc | null | undefined
+): EffectiveReadPolicy {
+  const access =
+    dbPolicy?.defaultReadAccess ?? tenantDefault?.defaultReadAccess ?? "allow";
+  const disable =
+    (dbPolicy?.disableAllReadChecks ?? tenantDefault?.disableAllReadChecks) === true;
+  return {
+    defaultReadAccess: access === "deny" ? "deny" : "allow",
+    disableAllReadChecks: disable,
   };
 }

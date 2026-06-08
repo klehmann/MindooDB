@@ -87,9 +87,16 @@ export class HttpTransport implements NetworkTransport {
   /**
    * Request a challenge string for authentication.
    */
-  async requestChallenge(username: string): Promise<string> {
-    this.logger.debug(`Requesting challenge for user: ${username}`);
-    
+  async requestChallenge(
+    username?: string,
+    options?: { signingPublicKey?: string },
+  ): Promise<string> {
+    this.logger.debug(`Requesting challenge${username ? ` for user: ${username}` : " by signing key"}`);
+
+    const body: { username?: string; signingPublicKey?: string } = {};
+    if (username) body.username = username;
+    if (options?.signingPublicKey) body.signingPublicKey = options.signingPublicKey;
+
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/auth/challenge`,
       {
@@ -97,7 +104,7 @@ export class HttpTransport implements NetworkTransport {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ username }),
+        body: JSON.stringify(body),
       }
     );
     

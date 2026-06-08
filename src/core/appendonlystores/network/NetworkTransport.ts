@@ -50,12 +50,21 @@ export interface NetworkTransport {
    * The server generates a unique challenge (UUID v7) that the client
    * must sign with their private signing key to prove identity.
    * 
-   * @param username The username requesting authentication
+   * The username is optional: a client may identify itself by its device
+   * signing public key (`options.signingPublicKey`) instead, so the server
+   * never needs the cleartext name.
+   *
+   * @param username The username requesting authentication (optional)
+   * @param options.signingPublicKey The device signing public key the client is
+   *        identifying with, when no username is supplied
    * @returns The challenge string (UUID v7) to be signed
    * @throws NetworkError with type USER_NOT_FOUND if user doesn't exist
    * @throws NetworkError with type USER_REVOKED if user has been revoked
    */
-  requestChallenge(username: string): Promise<string>;
+  requestChallenge(
+    username?: string,
+    options?: { signingPublicKey?: string },
+  ): Promise<string>;
 
   /**
    * Authenticate by providing a signed challenge.

@@ -12,14 +12,28 @@ export type StoreType = "inmemory" | "file";
 /**
  * Configuration for a user registered in the tenant.
  * Users can be human clients or other servers (for server-to-server sync).
+ *
+ * The canonical identity of an entry is its `signingPublicKey`: the server
+ * matches and authorizes by key, never by name. `username` is optional and
+ * documentation-only (a human-readable label); it is ignored for matching.
+ * Arbitrary extra fields (e.g. `comment`) are allowed and ignored by the server.
  */
 export interface UserConfig {
-  /** Username identifier (e.g., "alice" or "server-eu-west") */
-  username: string;
-  /** Ed25519 public key in PEM format for signature verification */
+  /**
+   * Optional, documentation-only label for this key (e.g. "alice" or
+   * "server-eu-west"). Ignored for identity matching — the server identifies
+   * users by `signingPublicKey`. Kept for backward compatibility with
+   * config-based username authentication.
+   */
+  username?: string;
+  /** Ed25519 public key in PEM format for signature verification (the identity). */
   signingPublicKey: string;
   /** RSA-OAEP public key in PEM format for encryption */
   encryptionPublicKey: string;
+  /** Optional free-form note describing this entry (ignored by the server). */
+  comment?: string;
+  /** Arbitrary extra documentation fields are tolerated and ignored. */
+  [key: string]: unknown;
 }
 
 /**

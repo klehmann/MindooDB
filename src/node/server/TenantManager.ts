@@ -23,7 +23,7 @@ import { join, resolve, sep } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
-import type { ServerTier1Evaluator } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { ServerTier1Evaluator, ServerReadEvaluator } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import { Ed25519WitnessProvider } from "../../core/accesscontrol/timestamp/Ed25519WitnessProvider";
@@ -42,7 +42,10 @@ import type {
   OpenTenantOptions,
   EncryptedPrivateKey,
   StoreKind,
+  DirectoryUserLookup,
+  GrantKeyPairInfo,
 } from "../../core/types";
+import type { AccessDecision } from "../../core/accesscontrol/types";
 import { PUBLIC_INFOS_KEY_ID } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
 
@@ -92,10 +95,17 @@ class StoreFactoryAdapter implements ContentAddressedStoreFactory {
 // SimpleMindooDirectory — config-based fallback
 // ---------------------------------------------------------------------------
 
-class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
-  "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey"
+export class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
+  "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey" | "getUserBySigningPublicKey"
 > {
-  private users: Map<string, UserConfig> = new Map();
+  /** Canonical index: entries are identified by their signing public key. */
+  private usersByKey: Map<string, UserConfig> = new Map();
+  /**
+   * Backward-compat index by documentation-only username, populated only for
+   * config entries that carry a `username`. Lets legacy username-based
+   * challenges keep resolving; `username` is never required.
+   */
+  private usersByUsername: Map<string, UserConfig> = new Map();
   private revokedUsers: Set<string> = new Set();
   private adminSigningPublicKey: string;
 
@@ -104,7 +114,12 @@ class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
 
     if (config.users) {
       for (const user of config.users) {
-        this.users.set(user.username.toLowerCase(), user);
+        // Identity is the signing key. `username` is documentation-only and
+        // ignored for matching; index it only as a legacy convenience.
+        this.usersByKey.set(user.signingPublicKey, user);
+        if (typeof user.username === "string" && user.username.trim()) {
+          this.usersByUsername.set(user.username.toLowerCase(), user);
+        }
       }
     }
   }
@@ -117,13 +132,32 @@ class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
     if (this.revokedUsers.has(normalizedUsername)) {
       return null;
     }
-    const user = this.users.get(normalizedUsername);
+    const user = this.usersByUsername.get(normalizedUsername);
     if (!user) {
       return null;
     }
     return {
       signingPublicKey: user.signingPublicKey,
       encryptionPublicKey: user.encryptionPublicKey,
+    };
+  }
+
+  async getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null> {
+    const user = this.usersByKey.get(publicKey);
+    if (!user) {
+      return null;
+    }
+    if (
+      typeof user.username === "string" &&
+      this.revokedUsers.has(user.username.toLowerCase())
+    ) {
+      return null;
+    }
+    return {
+      username: typeof user.username === "string" ? user.username : "",
+      signingPublicKey: user.signingPublicKey,
+      encryptionPublicKey: user.encryptionPublicKey,
+      details: null,
     };
   }
 
@@ -135,14 +169,17 @@ class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
     if (publicKey === this.adminSigningPublicKey) {
       return true;
     }
-    for (const [, user] of this.users) {
-      if (user.signingPublicKey === publicKey) {
-        if (!this.revokedUsers.has(user.username.toLowerCase())) {
-          return true;
-        }
-      }
+    const user = this.usersByKey.get(publicKey);
+    if (!user) {
+      return false;
     }
-    return false;
+    if (
+      typeof user.username === "string" &&
+      this.revokedUsers.has(user.username.toLowerCase())
+    ) {
+      return false;
+    }
+    return true;
   }
 }
 
@@ -162,7 +199,14 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
 
   constructor(
     private inner: Pick<MindooTenantDirectory,
-      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">,
+      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">
+      & Partial<Pick<MindooTenantDirectory,
+        "getUserBySigningPublicKey"
+        | "getUserSigningKeyUniverse"
+        | "getUserKeyPairs"
+        | "getWipeGrantDocId"
+        | "evaluateReadAccessForUser"
+        | "evaluateReadAccessForSigningKey">>,
     private trustedServers: TrustedServer[],
     private adminBootstrapIdentity?: {
       username: string;
@@ -235,6 +279,71 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
       }
     }
     return false;
+  }
+
+  // -----------------------------------------------------------------------
+  // Advanced directory features forwarded to the inner directory. Config-based
+  // inner directories (SimpleMindooDirectory) do not implement these, so the
+  // composite degrades gracefully (no key-based identity, no read policy, no
+  // wipe directives) — preserving legacy config-only behavior — while a real
+  // BaseMindooTenantDirectory inner enables the key-based auth, read gate, and
+  // remote-wipe paths (docs/accesscontrol.md §6.5).
+  // -----------------------------------------------------------------------
+
+  async getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null> {
+    if (typeof this.inner.getUserBySigningPublicKey === "function") {
+      return this.inner.getUserBySigningPublicKey(publicKey);
+    }
+    return null;
+  }
+
+  async getUserSigningKeyUniverse(
+    username: string,
+  ): Promise<{ active: string[]; wipeRequested: string[] }> {
+    if (typeof this.inner.getUserSigningKeyUniverse === "function") {
+      return this.inner.getUserSigningKeyUniverse(username);
+    }
+    return { active: [], wipeRequested: [] };
+  }
+
+  async getUserKeyPairs(username: string): Promise<GrantKeyPairInfo[]> {
+    if (typeof this.inner.getUserKeyPairs === "function") {
+      return this.inner.getUserKeyPairs(username);
+    }
+    return [];
+  }
+
+  async getWipeGrantDocId(signingKey: string): Promise<string | null> {
+    if (typeof this.inner.getWipeGrantDocId === "function") {
+      return this.inner.getWipeGrantDocId(signingKey);
+    }
+    return null;
+  }
+
+  async evaluateReadAccessForUser(input: {
+    username: string;
+    dbid: string;
+    decryptionKeyId: string;
+    at?: number;
+  }): Promise<AccessDecision> {
+    if (typeof this.inner.evaluateReadAccessForUser === "function") {
+      return this.inner.evaluateReadAccessForUser(input);
+    }
+    // Config-based directories never carry read policies -> unrestricted.
+    return { allowed: true, reason: "read access control not enabled", tier: "tier1" };
+  }
+
+  async evaluateReadAccessForSigningKey(input: {
+    signingKey: string;
+    dbid: string;
+    decryptionKeyId: string;
+    at?: number;
+  }): Promise<AccessDecision> {
+    if (typeof this.inner.evaluateReadAccessForSigningKey === "function") {
+      return this.inner.evaluateReadAccessForSigningKey(input);
+    }
+    // Config-based directories never carry read policies -> unrestricted.
+    return { allowed: true, reason: "read access control not enabled", tier: "tier1" };
   }
 }
 
@@ -763,6 +872,11 @@ export class TenantManager {
     const directory = tenant.directory as unknown as MindooTenantDirectory;
     const tier1Evaluator = this.buildTier1Evaluator(directory, localStore);
     const wipeGrantDocIdResolver = this.buildWipeGrantDocIdResolver(directory);
+    // Read gate is never applied to the directory store itself: every
+    // participant must always be able to sync grants, policies, groups and read
+    // rules, otherwise read access could never be evaluated at all.
+    const readEvaluator =
+      dbId === "directory" ? undefined : this.buildReadEvaluator(directory);
 
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
@@ -770,7 +884,7 @@ export class TenantManager {
       tenant.authService,
       this.cryptoAdapter,
       undefined,
-      { timestampProvider, witnessDbid: dbId, tier1Evaluator, wipeGrantDocIdResolver },
+      { timestampProvider, witnessDbid: dbId, tier1Evaluator, wipeGrantDocIdResolver, readEvaluator },
     );
 
     tenant.serverStores.set(cacheKey, serverStore);
@@ -824,7 +938,61 @@ export class TenantManager {
         signingKey: entry.createdByPublicKey,
         trustedTime,
         isAuthor,
+        // Cleartext metadata the witness already holds; enables the create-key
+        // allowlist gate to be enforced at push time (Tier 1).
+        decryptionKeyId: entry.decryptionKeyId,
       });
+    };
+  }
+
+  /**
+   * Build a read evaluator closure for a data server store, or undefined when
+   * the directory cannot evaluate read access (read-side of
+   * docs/accesscontrol.md). The closure resolves the reader's identity at
+   * server time and returns whether an entry with the given cleartext
+   * `decryptionKeyId` may be delivered. Failures fail-closed (deny) so a
+   * transient directory error never leaks data past a deny policy.
+   */
+  private buildReadEvaluator(
+    directory: MindooTenantDirectory,
+  ): ServerReadEvaluator | undefined {
+    const evaluable = directory as unknown as {
+      evaluateReadAccessForUser?: BaseMindooTenantDirectory["evaluateReadAccessForUser"];
+      evaluateReadAccessForSigningKey?: BaseMindooTenantDirectory["evaluateReadAccessForSigningKey"];
+    };
+    const hasKeyEval = typeof evaluable.evaluateReadAccessForSigningKey === "function";
+    const hasUserEval = typeof evaluable.evaluateReadAccessForUser === "function";
+    if (!hasKeyEval && !hasUserEval) {
+      return undefined;
+    }
+    return async (principal, dbid, decryptionKeyId) => {
+      try {
+        // Prefer the key-based gate: it resolves identity from the grant's
+        // `identity_hashes` bundle without any cleartext username
+        // (docs/accesscontrol.md §6.5). Fall back to the username path only for
+        // legacy tokens that carry no device signing key.
+        if (hasKeyEval && principal.signingKey) {
+          const decision = await evaluable.evaluateReadAccessForSigningKey!({
+            signingKey: principal.signingKey,
+            dbid,
+            decryptionKeyId,
+          });
+          return decision.allowed;
+        }
+        if (hasUserEval && principal.username) {
+          const decision = await evaluable.evaluateReadAccessForUser!({
+            username: principal.username,
+            dbid,
+            decryptionKeyId,
+          });
+          return decision.allowed;
+        }
+        // Neither identifier resolvable -> fail-closed.
+        return false;
+      } catch {
+        // Fail-closed: if the read policy cannot be evaluated, do not deliver.
+        return false;
+      }
     };
   }
 

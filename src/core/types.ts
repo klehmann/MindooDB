@@ -7,6 +7,10 @@ import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import type {
   DefaultAccessPolicyDoc,
+  DefaultReadPolicyDoc,
+  KeyDeliveryPayload,
+  ReadRuleDoc,
+  RuleTargets,
   RuleType,
   WithFieldClause,
   AclRuleDoc,
@@ -1367,6 +1371,17 @@ export interface CreateOptions {
    * ancestry change; initial values are applied on top of it.
    */
   initialValues?: Record<string, unknown>;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the create
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only. This does NOT weaken security: the server
+   * witness (Tier 1) and quarantine-on-materialization (Tier 2) still enforce
+   * the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1385,6 +1400,16 @@ export interface DeleteOptions {
    * `signingKeyPair` is provided.
    */
   signingKeyPassword?: string;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the delete
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only; the server witness and
+   * quarantine-on-materialization still enforce the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1402,6 +1427,16 @@ export interface UndeleteOptions {
    * `signingKeyPair` is provided.
    */
   signingKeyPassword?: string;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the undelete
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only; the server witness and
+   * quarantine-on-materialization still enforce the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1420,6 +1455,16 @@ export interface ChangeOptions {
    * `signingKeyPair` is provided.
    */
   signingKeyPassword?: string;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the change
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only; the server witness and
+   * quarantine-on-materialization still enforce the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1989,6 +2034,22 @@ export interface DirectoryUserLookup {
   signingPublicKey: string;
   encryptionPublicKey: string;
   details: DirectoryUserDetails | null;
+  /**
+   * Precomputed `$publicinfos`-readable identity-hash bundle for the grant
+   * (docs/accesscontrol.md §6.5): the v1+v2 hashes of every DN-hierarchy
+   * username variant, computed from the cleartext name at grant time. Lets the
+   * server resolve wildcard/group read rules purely in hash space, without ever
+   * needing the cleartext username. Absent on legacy grants written before the
+   * bundle existed (treated as version 0, exact-match only).
+   */
+  identityHashes?: string[];
+  /**
+   * Version of the variant-generation algorithm used to compute
+   * {@link identityHashes}. `0`/absent means the bundle is missing (legacy
+   * grant) and the reader must degrade to exact `username_hash` matching and
+   * flag the grant for backfill.
+   */
+  identityHashesV?: number;
 }
 
 /**
@@ -1999,6 +2060,13 @@ export interface DirectoryUserLookup {
  * each device's signing and encryption keys stay paired and can carry an
  * optional human-readable `label` (e.g. a date or a note about the device
  * type). Readers remain backward-compatible with the older array/scalar forms.
+ *
+ * On disk, active and revoked devices live in two separate lists: `userKeyPairs`
+ * holds the ACTIVE devices, and `revokedUserKeyPairs` holds the RETAINED revoked
+ * devices (docs/accesscontrol.md §6.5). The {@link revoked}/{@link revokedAt}
+ * fields below are the in-memory representation produced by the grant-key
+ * extractors regardless of which list a pair came from; writers partition pairs
+ * back into the two lists by their {@link revoked} flag.
  */
 export interface GrantKeyPair {
   /** Ed25519 signing public key (PEM) — the device's identity. */
@@ -2007,6 +2075,19 @@ export interface GrantKeyPair {
   encryptionPublicKey: string;
   /** Optional human-readable label for this device/key pair. */
   label?: string;
+  /**
+   * When true, this device's access has been revoked but the pair is RETAINED
+   * on the grant document (docs/accesscontrol.md §6.5) so admin UIs can list
+   * revoked devices and optionally restore them. Revoked pairs are excluded
+   * from the active key arrays the server/auth read, so they cannot
+   * authenticate or decrypt new data. Absent/false means active.
+   */
+  revoked?: boolean;
+  /**
+   * Trusted-time (ms since Unix epoch) at which this device was revoked. Set
+   * together with {@link revoked}; cleared when the device is restored.
+   */
+  revokedAt?: number;
 }
 
 /** A {@link GrantKeyPair} enriched with its current remote-wipe status (§6.5). */
@@ -2116,8 +2197,15 @@ export interface MindooTenantDirectory {
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** List access-control rules in effect (§9), optionally filtered. */
-  listRules?(filter?: { type?: RuleType; dbid?: string }): Promise<AclRuleDoc[]>;
+  /**
+   * List access-control rules in effect (§9), optionally filtered. Each rule
+   * may carry decrypted `targets` (usernames/groups) for admin-UI display when
+   * the rule was authored with cleartext names and the caller holds the tenant
+   * default key; otherwise only the raw `users_hashes` are available.
+   */
+  listRules?(
+    filter?: { type?: RuleType; dbid?: string },
+  ): Promise<Array<AclRuleDoc & { targets?: RuleTargets }>>;
 
   /** Delete an access-control rule by id (§9). */
   deleteRule?(
@@ -2191,6 +2279,38 @@ export interface MindooTenantDirectory {
    */
   getUserKeyPairs?(username: string): Promise<GrantKeyPairInfo[]>;
 
+  /**
+   * Read a user's grant overview for an admin "manage user" UI (§6.5): the
+   * decrypted user-details payload, the active device key pairs, and the
+   * retained revoked device key pairs (each with `revokedAt` + remote-wipe
+   * status). Requires the tenant default key to decrypt details.
+   */
+  getUserGrantOverview?(username: string): Promise<{
+    details: DirectoryUserDetails | null;
+    activeDevices: GrantKeyPairInfo[];
+    revokedDevices: Array<GrantKeyPair & { wipeRequested: boolean }>;
+  }>;
+
+  /**
+   * Apply a batch of admin-signed edits to a user's grant in a single change per
+   * grant document (§6.5): rewrite `details`, recompute the `identity_hashes`
+   * bundle, set per-device labels, revoke/restore devices (retaining revoked
+   * pairs with `revoked`/`revokedAt`), and set the remote-wipe set. Backs the
+   * Haven "Manage user" dialog's batched Save.
+   */
+  updateUserGrant?(
+    username: string,
+    changes: {
+      details?: DirectoryUserDetails;
+      deviceLabels?: Record<string, string>;
+      revokeSigningKeys?: string[];
+      restoreSigningKeys?: string[];
+      wipeSigningKeys?: string[];
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
   /** Request a remote wipe of specific devices by signing public key (§6.5). */
   requestDeviceWipe?(
     username: string,
@@ -2213,14 +2333,148 @@ export interface MindooTenantDirectory {
   /** Predict whether the current user may perform `op` on `dbid` (§9). */
   canDo?(op: RuleType, dbid: string, candidateDoc?: Record<string, unknown>): Promise<AccessDecision>;
 
-  /** Audit: was `username` allowed to perform `op` on `dbid` at trusted time `at`? (§9) */
+  /**
+   * Audit: was `username` allowed to perform `op` on `dbid` at trusted time
+   * `at`? (§9) `options.decryptionKeyId` reproduces the create-key allowlist
+   * verdict (§6.6) for a `doc_create` as it would have been decided at `at`.
+   */
   wasAllowedAt?(
     op: RuleType,
     username: string,
     dbid: string,
     at: number,
     candidateDoc?: Record<string, unknown>,
+    options?: { decryptionKeyId?: string },
   ): Promise<AccessDecision>;
+
+  // -----------------------------------------------------------------------
+  // Read access control (read-side). Optional: only the directory
+  // implementation supports them.
+  // -----------------------------------------------------------------------
+
+  /** Create or update the tenant default read policy. */
+  setDefaultReadPolicy?(
+    policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /** Create or update a per-database read policy override. */
+  setDatabaseReadPolicy?(
+    dbid: string,
+    policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /** Create or replace a metadata-only read rule; returns the rule id. */
+  createReadRule?(
+    rule: {
+      ruleId?: string;
+      dbid?: string;
+      action?: "allow" | "deny";
+      decryptionKeyIds?: string[];
+      users_hashes?: string[];
+      usernames?: string[];
+      groups?: string[];
+      description?: string;
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<string>;
+
+  /**
+   * List read rules in effect, optionally filtered by database. Each rule may
+   * carry decrypted `targets` (usernames/groups) for admin-UI display (see
+   * {@link MindooTenantDirectory.listRules}).
+   */
+  listReadRules?(
+    filter?: { dbid?: string },
+  ): Promise<Array<ReadRuleDoc & { targets?: RuleTargets }>>;
+
+  /** Delete a read rule by id. */
+  deleteReadRule?(
+    ruleId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /** Predict whether the current user may read in `dbid` (optionally key-scoped). */
+  canRead?(dbid: string, decryptionKeyId?: string): Promise<AccessDecision>;
+
+  /** Audit: was `username` allowed to read `dbid`/`decryptionKeyId` at trusted time `at`? */
+  wasAllowedToReadAt?(
+    username: string,
+    dbid: string,
+    decryptionKeyId: string,
+    at: number,
+  ): Promise<AccessDecision>;
+
+  /**
+   * Resolve `username`'s identity and evaluate read access against the
+   * directory state at `at` (or head). Used by the server read gate.
+   */
+  evaluateReadAccessForUser?(input: {
+    username: string;
+    dbid: string;
+    decryptionKeyId: string;
+    at?: number;
+  }): Promise<AccessDecision>;
+
+  /**
+   * Key-based read gate: resolve the reader's identity from the authenticated
+   * device signing key plus the grant's precomputed `identity_hashes` bundle
+   * (docs/accesscontrol.md §6.5) and evaluate read access — entirely in hash
+   * space, so the server never needs the cleartext username. Preferred over
+   * {@link evaluateReadAccessForUser} when the authenticated device key is known.
+   */
+  evaluateReadAccessForSigningKey?(input: {
+    signingKey: string;
+    dbid: string;
+    decryptionKeyId: string;
+    at?: number;
+  }): Promise<AccessDecision>;
+
+  /**
+   * Prepare an admin-blind key delivery: wrap the symmetric key `keyId` to each
+   * target's RSA encryption public key. Run by a key-holding user; the returned
+   * payload is handed to an admin to publish. Throws if the caller's KeyBag
+   * lacks the key.
+   */
+  prepareKeyDelivery?(
+    keyId: string,
+    targets: string[],
+  ): Promise<KeyDeliveryPayload>;
+
+  /** Admin-sign and write a prepared key delivery to the directory. */
+  publishKeyDelivery?(
+    payload: KeyDeliveryPayload,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Convenience for when the admin legitimately holds the key: prepare and
+   * publish in one step.
+   */
+  pushKey?(
+    keyId: string,
+    targets: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Import any key-delivery documents in the directory targeting `username`:
+   * RSA-unwrap with the user's encryption private key and write into the
+   * KeyBag, surfacing newly-readable documents via reveal-on-add. Returns the
+   * set of key ids imported.
+   */
+  importKeyDeliveriesForUser?(
+    username: string,
+    encryptionPrivateKey: EncryptedPrivateKey,
+    encryptionPrivateKeyPassword: string,
+  ): Promise<string[]>;
 
   /**
    * Audit / time travel (§8): the head time-travel directory-state node ("now"),
@@ -3531,6 +3785,45 @@ export interface MindooDB {
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
     options?: ChangeOptions
   ): Promise<void>;
+
+  /**
+   * Predict whether a `createDocument` with these options would be allowed by
+   * the active access control write policy, without writing anything
+   * (docs/accesscontrol.md §9). Lets a UI disable a Save action and surface the
+   * reason up front. When access control is not enforced, returns an
+   * `allowed: true` decision. The actual `createDocument` throws
+   * {@link AccessDeniedError} for the same denial.
+   *
+   * @param options The same options that would be passed to `createDocument`.
+   *   Only `initialValues`, `decryptionKeyId`, and the signing key are used.
+   */
+  canCreate(options?: CreateOptions): Promise<AccessDecision>;
+
+  /**
+   * Predict whether applying `candidateAfter` as `doc`'s next state via
+   * `changeDoc` would be allowed by the active write policy, without writing.
+   *
+   * @param doc The document that would be changed.
+   * @param candidateAfter The intended full "after" document state.
+   * @param signingKeyPair Optional custom signing key (matches `changeDoc`).
+   */
+  canChange(
+    doc: MindooDoc,
+    candidateAfter: Record<string, unknown>,
+    signingKeyPair?: SigningKeyPair
+  ): Promise<AccessDecision>;
+
+  /**
+   * Predict whether deleting `doc` via `deleteDocument` would be allowed by the
+   * active write policy, without writing.
+   *
+   * @param doc The document that would be deleted.
+   * @param signingKeyPair Optional custom signing key (matches `deleteDocument`).
+   */
+  canDelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair
+  ): Promise<AccessDecision>;
 
   /**
    * Apply granular text edits at a document path.

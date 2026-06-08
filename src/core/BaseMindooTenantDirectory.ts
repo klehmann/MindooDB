@@ -21,6 +21,8 @@ import {
   extractEncryptionPublicKeys,
   extractWipeRequestedSigningKeys,
   extractKeyPairs,
+  extractActiveKeyPairs,
+  extractRevokedKeyPairs,
   applyKeyPairFields,
   mergeKeyPairs,
 } from "./accesscontrol/grantKeys";
@@ -33,19 +35,33 @@ import { projectDirectoryRevision } from "./accesscontrol/directoryProjection";
 import {
   ACCESS_CONTROL_FORM,
   ACL_DEFAULT_POLICY_DOC_ID,
+  ACL_READ_POLICY_DOC_ID,
   AclRuleDoc,
   DefaultAccessPolicyDoc,
+  DefaultReadPolicyDoc,
+  KeyDeliveryPayload,
+  KeyDeliveryRecipient,
+  KeyDeliveryVersion,
   PSEUDO_TOKEN_ADMIN,
   PSEUDO_TOKEN_AUTHOR,
   PSEUDO_TOKEN_EVERYONE,
+  READ_RULE_TYPE,
+  ReadRuleDoc,
+  RuleTargets,
   RuleType,
   WithFieldClause,
   aclRuleDocId,
   aclDbPolicyDocId,
+  aclDbReadPolicyDocId,
+  aclKeyDeliveryDocId,
+  aclReadRuleDocId,
+  effectivePolicy,
   validateAclRule,
+  validateReadRule,
 } from "./accesscontrol/types";
-import { IdentitySet, evaluateAccess } from "./accesscontrol/evaluate";
+import { IdentitySet, evaluateAccess, evaluateReadAccess } from "./accesscontrol/evaluate";
 import { AccessDecision } from "./accesscontrol/types";
+import { RSAEncryption } from "./crypto/RSAEncryption";
 
 const DIRECTORY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -178,6 +194,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const userDetailsEncrypted = await this.encryptUserDetailsForTenant(
       this.buildUserDetailsPayload(userId.username, userDetails),
     );
+    // Precompute the identity-hash bundle from the cleartext name (the only
+    // place it exists) so the server can match wildcard/group read rules in
+    // hash space without the cleartext (docs/accesscontrol.md §6.5). The bundle
+    // is the v1+v2 hashes of every DN-hierarchy variant: e.g. for
+    // "CN=Karsten Lehmann/OU=CEO/OU=Management/O=Mindoo" the variants are the
+    // exact name plus the wildcards
+    //   "*/OU=CEO/OU=Management/O=Mindoo",
+    //   "*/OU=Management/O=Mindoo",
+    //   "*/O=Mindoo", and
+    //   "*"
+    // so a read rule like "*/O=Mindoo" matches this user purely in hash space.
+    const identityHashes = await this.computeIdentityHashes(userId.username);
 
     // Add user to directory database
     this.logger.debug(`Creating document for user registration`);
@@ -200,6 +228,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.username_hash = usernameHash;
         data.username_hash_v = BaseMindooTenantDirectory.USERNAME_HASH_VERSION;
         data.user_details_encrypted = userDetailsEncrypted;
+        // $publicinfos-readable identity-hash bundle (§6.5): the grant doc is
+        // encrypted under PUBLIC_INFOS_KEY_ID, so these plain fields are
+        // server-readable without the default tenant key.
+        data.identity_hashes = identityHashes;
+        data.identity_hashes_v = BaseMindooTenantDirectory.IDENTITY_VARIANTS_VERSION;
         // New grants write the canonical `userKeyPairs` form (§6.5), pairing
         // the device's signing+encryption keys with an optional label, while
         // applyKeyPairFields mirrors the legacy array/scalar fields so older
@@ -745,6 +778,37 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   /**
+   * Build an {@link IdentitySet} directly from a precomputed username-variant
+   * hash bundle (the grant doc's `identity_hashes`), without any cleartext name.
+   * Mirrors {@link buildIdentitySet} but in hash space: seeds the hash set from
+   * the bundle, adds the hashes of every group resolved from those variant
+   * hashes, and the applicable pseudo-tokens. Used by the server read gate,
+   * which identifies the reader by device signing key (docs/accesscontrol.md
+   * §6.5). The cleartext `username`/`usernames` fields are left empty because
+   * read rules (Tier 1) match on hashes only and never expand placeholders.
+   */
+  async buildIdentitySetFromHashes(
+    variantHashes: string[],
+    opts: { isAdmin?: boolean; isAuthor?: boolean } = {},
+  ): Promise<IdentitySet> {
+    await this.updateUnifiedCache();
+    const hashes = new Set<string>(variantHashes);
+    const groups = await this.resolveGroupsFromVariantHashes(new Set(variantHashes));
+    // Group membership: rules target group-name hashes, so the identity set
+    // must include the hash of every group the user belongs to.
+    for (const group of groups) {
+      for (const h of await this.usernameHashCandidates(group)) {
+        hashes.add(h);
+      }
+    }
+    hashes.add(PSEUDO_TOKEN_EVERYONE);
+    if (opts.isAdmin) hashes.add(PSEUDO_TOKEN_ADMIN);
+    if (opts.isAuthor) hashes.add(PSEUDO_TOKEN_AUTHOR);
+
+    return { username: "", usernames: [], groups, hashes };
+  }
+
+  /**
    * Server-side Tier 1 evaluation for a pushed entry (docs/accesscontrol.md §7,
    * §10). The server identifies the author by signing key (it cannot read
    * encrypted content), resolves their identity set, and evaluates the identity
@@ -767,12 +831,25 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     signingKey: string;
     trustedTime: number;
     isAuthor?: boolean;
+    /**
+     * The entry's `decryptionKeyId` (cleartext metadata). Required for the
+     * create-key allowlist gate on `doc_create`; the server already holds this,
+     * so the gate is Tier 1.
+     */
+    decryptionKeyId?: string;
   }): Promise<AccessDecision> {
     const node = await this.getDirectoryStateAt(input.trustedTime);
     const identity = await this.identitySetForSigningKey(input.signingKey, {
       isAuthor: input.op === "doc_create" || !!input.isAuthor,
     });
-    return evaluateAccess({ op: input.op, dbid: input.dbid, identity, node, isServer: true });
+    return evaluateAccess({
+      op: input.op,
+      dbid: input.dbid,
+      identity,
+      node,
+      isServer: true,
+      decryptionKeyId: input.decryptionKeyId,
+    });
   }
 
   /**
@@ -789,6 +866,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     isAuthor: boolean;
     beforeDoc: Record<string, unknown> | null;
     afterDoc: Record<string, unknown> | null;
+    /**
+     * The entry's `decryptionKeyId` (cleartext metadata). Required for the
+     * create-key allowlist gate on `doc_create`; the client re-checks it as
+     * defense in depth so a tampered author cannot bypass the witness.
+     */
+    decryptionKeyId?: string;
   }): Promise<AccessDecision> {
     const node = await this.getDirectoryStateAt(input.trustedTime);
     const identity = await this.identitySetForSigningKey(input.signingKey, {
@@ -802,7 +885,23 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       beforeDoc: input.beforeDoc,
       afterDoc: input.afterDoc,
       isServer: false,
+      decryptionKeyId: input.decryptionKeyId,
     });
+  }
+
+  /**
+   * Whether the active policy has any Tier 2 (`withfields`) content rule for
+   * operation `op` in database `dbid` at the current head state. Lets the
+   * client write prechecks skip the (potentially costly) Automerge -> JS
+   * materialization of the before/after document when only Tier 1
+   * (identity/op/create-key) checks could apply (docs/accesscontrol.md §9).
+   */
+  async hasWriteContentRules(op: RuleType, dbid: string): Promise<boolean> {
+    const node = await this.getDirectoryStateHead();
+    const rules = node.rulesByType.get(op) ?? [];
+    return rules.some(
+      (r) => (r.dbid === dbid || r.dbid === "*") && (r.withfields?.length ?? 0) > 0,
+    );
   }
 
   /**
@@ -815,6 +914,24 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const head = await this.getDirectoryStateHead();
     if (head.defaultPolicy === null) return false;
     return head.defaultPolicy.disableAllAccessChecksAndPolicies !== true;
+  }
+
+  /**
+   * The effective create-key allowlist for `dbid` at the current head state, or
+   * `undefined` when unconstrained (no policy, master switch on, or no
+   * `allowedCreateKeyIds` set). Lets the client fail a `doc_create` fast when
+   * its `decryptionKeyId` is not allowed, instead of building an entry the
+   * server witness will reject (the witness remains authoritative — this is a
+   * UX pre-check). Returns `undefined` rather than throwing on no-policy.
+   */
+  async getEffectiveCreateKeyAllowlist(dbid: string): Promise<string[] | undefined> {
+    const head = await this.getDirectoryStateHead();
+    if (head.defaultPolicy === null) return undefined;
+    const eff = effectivePolicy(head.defaultPolicy, head.dbPolicies.get(dbid) ?? null);
+    if (eff.disableAllAccessChecksAndPolicies) return undefined;
+    return eff.allowedCreateKeyIds && eff.allowedCreateKeyIds.length > 0
+      ? eff.allowedCreateKeyIds
+      : undefined;
   }
 
   // -------------------------------------------------------------------------
@@ -922,10 +1039,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // Resolve any username/group names into hashes and merge with explicit
     // hashes / pseudo-tokens (§6.3). Names are hashed the same way as
     // membership entries so they intersect the acting user's identity set.
-    const resolvedHashes = new Set<string>(rule.users_hashes ?? []);
-    for (const name of [...(rule.usernames ?? []), ...(rule.groups ?? [])]) {
-      resolvedHashes.add(await this.hashUsernameForWrite(name));
-    }
+    const resolvedHashes = await this.resolveRuleTargetHashes(rule);
 
     const ruleDoc: AclRuleDoc = {
       form: ACCESS_CONTROL_FORM,
@@ -935,7 +1049,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       dbid: rule.dbid ?? "*",
       withfields: rule.withfields,
       users_hashes: Array.from(resolvedHashes),
-      users_encrypted: "",
+      users_encrypted: await this.encryptRuleTargetsForTenant({
+        usernames: rule.usernames ?? [],
+        groups: rule.groups ?? [],
+      }),
       action: rule.action ?? "allow",
     };
     // Fail fast on malformed clauses / operators (§6.3 closed set).
@@ -979,14 +1096,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
    * List access-control rules currently in effect (§9), optionally filtered by
    * operation type and/or database. Rules with `dbid: "*"` match any database.
    */
-  async listRules(filter?: { type?: RuleType; dbid?: string }): Promise<AclRuleDoc[]> {
+  async listRules(
+    filter?: { type?: RuleType; dbid?: string },
+  ): Promise<Array<AclRuleDoc & { targets?: RuleTargets }>> {
     const head = await this.getDirectoryStateHead();
-    const out: AclRuleDoc[] = [];
+    const out: Array<AclRuleDoc & { targets?: RuleTargets }> = [];
     for (const [type, rules] of head.rulesByType) {
       if (filter?.type && filter.type !== type) continue;
       for (const rule of rules) {
         if (filter?.dbid && rule.dbid !== filter.dbid && rule.dbid !== "*") continue;
-        out.push(rule);
+        const targets = await this.decryptRuleTargetsForTenant(rule.users_encrypted);
+        out.push(targets ? { ...rule, targets } : rule);
       }
     }
     return out;
@@ -1105,10 +1225,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   /**
-   * Remove keys from a user's grant (§6.5 revoke a device/key). A device is
-   * identified by its signing key; removing a signing key removes its entire
-   * paired entry. `encryptionKeys` additionally drops any pair whose encryption
-   * key matches (kept for callers that target encryption keys directly).
+   * Revoke keys from a user's grant (§6.5 revoke a device/key). A device is
+   * identified by its signing key; revoking a signing key marks its entire
+   * paired entry revoked. `encryptionKeys` additionally targets any pair whose
+   * encryption key matches (kept for callers that target encryption keys
+   * directly).
+   *
+   * Revoked pairs are RETAINED on the grant document with `revoked: true` and a
+   * `revokedAt` timestamp (instead of being deleted), so admin UIs can list and
+   * optionally restore revoked devices. They are excluded from the active key
+   * arrays (via {@link applyKeyPairFields}), so the server/auth treat them as
+   * having no access — identical observable behavior to the previous
+   * delete-based revocation.
    */
   async removeUserKeys(
     username: string,
@@ -1119,17 +1247,21 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   ): Promise<void> {
     const signingToRemove = new Set(signingKeys);
     const encToRemove = new Set(encryptionKeys);
+    const revokedAt = Date.now();
     await this.editGrantArrays(
       username,
       administrationPrivateKey,
       administrationPrivateKeyPassword,
       (data) => {
-        const remaining = extractKeyPairs(data).filter(
-          (pair) =>
-            !signingToRemove.has(pair.signingPublicKey) &&
-            !(pair.encryptionPublicKey.length > 0 && encToRemove.has(pair.encryptionPublicKey)),
-        );
-        applyKeyPairFields(data, remaining);
+        const next = extractKeyPairs(data).map((pair) => {
+          if (pair.revoked) return pair; // already revoked; keep timestamp
+          const targeted =
+            signingToRemove.has(pair.signingPublicKey) ||
+            (pair.encryptionPublicKey.length > 0 && encToRemove.has(pair.encryptionPublicKey));
+          if (!targeted) return pair;
+          return { ...pair, revoked: true, revokedAt };
+        });
+        applyKeyPairFields(data, next);
       },
     );
   }
@@ -1160,11 +1292,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
           if (trimmedLabel.length > 0) {
             return { ...pair, label: trimmedLabel };
           }
-          // Clear the label by dropping the field entirely.
-          return {
-            signingPublicKey: pair.signingPublicKey,
-            encryptionPublicKey: pair.encryptionPublicKey,
-          };
+          // Clear the label by dropping the field entirely, preserving any
+          // retained-revocation flags (§6.5).
+          const { label: _dropLabel, ...rest } = pair;
+          return rest;
         });
         // Only rewrite when this grant actually carries the targeted key, to
         // avoid touching other grant documents for the same user.
@@ -1219,6 +1350,141 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   /**
+   * Read the current grant overview for a user, for prefilling an admin
+   * "manage user" UI: the decrypted user-details payload (requires the tenant
+   * default key, which the admin client holds), the active device key pairs,
+   * and the retained revoked device key pairs (each with its `revokedAt` and
+   * remote-wipe status). Devices are de-duplicated by signing key across the
+   * user's grant documents (most recent wins).
+   */
+  async getUserGrantOverview(username: string): Promise<{
+    details: DirectoryUserDetails | null;
+    activeDevices: GrantKeyPairInfo[];
+    revokedDevices: Array<GrantKeyPair & { wipeRequested: boolean }>;
+  }> {
+    const grants = await this.findGrantAccessDocuments(username);
+    const active = new Map<string, GrantKeyPairInfo>();
+    const revoked = new Map<string, GrantKeyPair & { wipeRequested: boolean }>();
+    let details: DirectoryUserDetails | null = null;
+    for (const grant of grants) {
+      const data = grant.getData();
+      const wipeRequestedKeys = new Set(extractWipeRequestedSigningKeys(data));
+      for (const pair of extractActiveKeyPairs(data)) {
+        active.set(pair.signingPublicKey, {
+          ...pair,
+          wipeRequested: wipeRequestedKeys.has(pair.signingPublicKey),
+        });
+        revoked.delete(pair.signingPublicKey);
+      }
+      for (const pair of extractRevokedKeyPairs(data)) {
+        if (active.has(pair.signingPublicKey)) continue;
+        revoked.set(pair.signingPublicKey, {
+          ...pair,
+          wipeRequested: wipeRequestedKeys.has(pair.signingPublicKey),
+        });
+      }
+      const encryptedDetails =
+        typeof data.user_details_encrypted === "string" ? data.user_details_encrypted : null;
+      if (encryptedDetails) {
+        const decoded = await this.decryptUserDetailsForTenant(encryptedDetails);
+        if (decoded) details = decoded;
+      }
+    }
+    return {
+      details,
+      activeDevices: Array.from(active.values()),
+      revokedDevices: Array.from(revoked.values()),
+    };
+  }
+
+  /**
+   * Apply a batch of admin-signed edits to a user's grant in a single change per
+   * grant document (docs/accesscontrol.md §6.5). In one pass this:
+   *  - rewrites `user_details_encrypted` (when `changes.details` is supplied),
+   *  - recomputes the `identity_hashes` bundle + version (the per-user backfill
+   *    trigger for grants written before the bundle existed),
+   *  - sets per-device labels (`deviceLabels`: signing key → label; empty clears),
+   *  - revokes devices (`revokeSigningKeys`: marks `revoked:true` + `revokedAt`,
+   *    retaining the pair) and restores devices (`restoreSigningKeys`: clears the
+   *    revoked flags, moving the key back to active and dropping any wipe flag),
+   *  - and sets the remote-wipe set (`wipeSigningKeys`, authoritative when
+   *    supplied) minus any restored keys.
+   *
+   * This is the SDK primitive behind the Haven "Manage user" dialog's batched
+   * Save: every staged change is committed atomically per grant document.
+   */
+  async updateUserGrant(
+    username: string,
+    changes: {
+      details?: DirectoryUserDetails;
+      deviceLabels?: Record<string, string>;
+      revokeSigningKeys?: string[];
+      restoreSigningKeys?: string[];
+      wipeSigningKeys?: string[];
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const revokeSet = new Set(changes.revokeSigningKeys ?? []);
+    const restoreSet = new Set(changes.restoreSigningKeys ?? []);
+    const labels = changes.deviceLabels ?? {};
+    const now = Date.now();
+
+    // Precompute async-derived fields before the (sync) per-doc mutate.
+    const userDetailsEncrypted = changes.details
+      ? await this.encryptUserDetailsForTenant(
+          this.buildUserDetailsPayload(username, changes.details),
+        )
+      : null;
+    const identityHashes = await this.computeIdentityHashes(username);
+
+    await this.editGrantArrays(
+      username,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      (data) => {
+        if (userDetailsEncrypted !== null) {
+          data.user_details_encrypted = userDetailsEncrypted;
+        }
+        // Recompute the $publicinfos-readable identity-hash bundle (§6.5).
+        data.identity_hashes = identityHashes;
+        data.identity_hashes_v = BaseMindooTenantDirectory.IDENTITY_VARIANTS_VERSION;
+
+        // Per-device labels + revoke/restore flags, preserving retention.
+        const next = extractKeyPairs(data).map((pair) => {
+          let p: GrantKeyPair = pair;
+          if (Object.prototype.hasOwnProperty.call(labels, pair.signingPublicKey)) {
+            const trimmed = (labels[pair.signingPublicKey] ?? "").trim();
+            if (trimmed.length > 0) {
+              p = { ...p, label: trimmed };
+            } else {
+              const { label: _dropLabel, ...rest } = p;
+              p = rest;
+            }
+          }
+          if (restoreSet.has(pair.signingPublicKey)) {
+            // Un-revoke: clear the retention flags, moving the key back to active.
+            const { revoked: _r, revokedAt: _ra, ...rest } = p;
+            p = rest;
+          } else if (revokeSet.has(pair.signingPublicKey) && !p.revoked) {
+            p = { ...p, revoked: true, revokedAt: now };
+          }
+          return p;
+        });
+        applyKeyPairFields(data, next);
+
+        // Remote-wipe set: authoritative when supplied (else preserve existing),
+        // restricted to keys present on this grant doc and never for restored keys.
+        const present = new Set(next.map((p) => p.signingPublicKey));
+        const desiredWipe = changes.wipeSigningKeys ?? extractWipeRequestedSigningKeys(data);
+        data.wipeRequestedForSigningKeys = Array.from(
+          new Set(desiredWipe.filter((k) => present.has(k) && !restoreSet.has(k))),
+        );
+      },
+    );
+  }
+
+  /**
    * Predict whether the current user may perform `op` on `dbid` (§9). Pure read;
    * evaluates Tier 1 + Tier 2 against the head directory state, treating the
    * caller as the prospective author. `candidateDoc` supplies the content that
@@ -1248,6 +1514,15 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     dbid: string,
     at: number,
     candidateDoc?: Record<string, unknown>,
+    options?: {
+      /**
+       * The `decryptionKeyId` the (hypothetical) entry uses. Supply it to
+       * reproduce the create-key allowlist verdict for a `doc_create` as it
+       * would have been decided at `at` — the policy in force then governs, so
+       * historical decisions are explained exactly, not against today's policy.
+       */
+      decryptionKeyId?: string;
+    },
   ): Promise<AccessDecision> {
     const node = await this.getDirectoryStateAt(at);
     const identity = await this.buildIdentitySet(username, { isAuthor: op === "doc_create" });
@@ -1259,7 +1534,546 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       beforeDoc: candidateDoc ?? null,
       afterDoc: candidateDoc ?? null,
       isServer: false,
+      decryptionKeyId: options?.decryptionKeyId,
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Read access control authoring API (read-side of docs/accesscontrol.md).
+  // All writes are admin-signed and `$publicinfos`-encrypted so the sync server
+  // can read the read policy/rules to gate delivery. Read rules are
+  // metadata-only (no withfields) and carry no client-trusted dates: time-bound
+  // access is revocation-by-policy-revision.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Create or update the tenant-wide default read policy. Setting
+   * `defaultReadAccess: "deny"` switches the tenant to a default-deny read
+   * posture (explicit allow rules then grant read access). Absent document =
+   * read access is unrestricted (key possession only).
+   */
+  async setDefaultReadPolicy(
+    policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.writeReadPolicyDoc(
+      ACL_READ_POLICY_DOC_ID,
+      policy,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /** Create or update a per-database read policy override. */
+  async setDatabaseReadPolicy(
+    dbid: string,
+    policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.writeReadPolicyDoc(
+      aclDbReadPolicyDocId(dbid),
+      policy,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /** Shared writer for default / per-db read policy documents. */
+  private async writeReadPolicyDoc(
+    docId: string,
+    policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      docId,
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = "readpolicy";
+        for (const [key, value] of Object.entries(policy)) {
+          if (value !== undefined) data[key] = value;
+        }
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Create or replace a read rule. Metadata-only: scopes by `dbid`, optional
+   * `decryptionKeyIds`, and identity (usernames/groups/hashes/pseudo-tokens).
+   * Revoking read access = delete the allow rule (see {@link deleteReadRule}) or
+   * add a deny rule. Returns the rule's id (generated when not supplied).
+   */
+  async createReadRule(
+    rule: {
+      ruleId?: string;
+      dbid?: string;
+      action?: "allow" | "deny";
+      decryptionKeyIds?: string[];
+      users_hashes?: string[];
+      /** Usernames to target; resolved to their (salted v2) hashes. */
+      usernames?: string[];
+      /** Group names to target; resolved to their (salted v2) hashes. */
+      groups?: string[];
+      description?: string;
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<string> {
+    const ruleId = rule.ruleId ?? `read_${await this.sha256Hex(`${Date.now()}_${Math.random()}`)}`.slice(0, 48);
+
+    const resolvedHashes = await this.resolveRuleTargetHashes(rule);
+
+    const ruleDoc: ReadRuleDoc = {
+      form: ACCESS_CONTROL_FORM,
+      type: READ_RULE_TYPE,
+      ruleId,
+      description: rule.description,
+      dbid: rule.dbid ?? "*",
+      decryptionKeyIds:
+        rule.decryptionKeyIds && rule.decryptionKeyIds.length > 0
+          ? Array.from(new Set(rule.decryptionKeyIds))
+          : undefined,
+      users_hashes: Array.from(resolvedHashes),
+      users_encrypted: await this.encryptRuleTargetsForTenant({
+        usernames: rule.usernames ?? [],
+        groups: rule.groups ?? [],
+      }),
+      action: rule.action ?? "allow",
+    };
+    validateReadRule(ruleDoc);
+
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      aclReadRuleDocId(ruleId),
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = READ_RULE_TYPE;
+        data.ruleId = ruleDoc.ruleId;
+        data.dbid = ruleDoc.dbid;
+        data.action = ruleDoc.action;
+        data.users_hashes = ruleDoc.users_hashes;
+        data.users_encrypted = ruleDoc.users_encrypted;
+        if (ruleDoc.description !== undefined) data.description = ruleDoc.description;
+        if (ruleDoc.decryptionKeyIds !== undefined) data.decryptionKeyIds = ruleDoc.decryptionKeyIds;
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    await this.updateUnifiedCache();
+    return ruleId;
+  }
+
+  /** List read rules currently in effect, optionally filtered by database. */
+  async listReadRules(
+    filter?: { dbid?: string },
+  ): Promise<Array<ReadRuleDoc & { targets?: RuleTargets }>> {
+    const head = await this.getDirectoryStateHead();
+    const out: Array<ReadRuleDoc & { targets?: RuleTargets }> = [];
+    for (const rule of head.readRules) {
+      if (filter?.dbid && rule.dbid !== filter.dbid && rule.dbid !== "*") continue;
+      const targets = await this.decryptRuleTargetsForTenant(rule.users_encrypted);
+      out.push(targets ? { ...rule, targets } : rule);
+    }
+    return out;
+  }
+
+  /** Delete a read rule by id: a soft-delete of its document. */
+  async deleteReadRule(
+    ruleId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    try {
+      await directoryDB.deleteDocument(aclReadRuleDocId(ruleId), {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
+    } catch (error) {
+      this.logger.debug(`deleteReadRule: rule ${ruleId} not found or already deleted: ${error}`);
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Predict whether the current user may read entries in `dbid` (optionally
+   * scoped to `decryptionKeyId`). Pure read against head directory state.
+   */
+  async canRead(dbid: string, decryptionKeyId?: string): Promise<AccessDecision> {
+    const currentUser = await this.tenant.getCurrentUserId();
+    return this.evaluateReadAccessForUser({
+      username: currentUser.username,
+      dbid,
+      decryptionKeyId: decryptionKeyId ?? "",
+    });
+  }
+
+  /**
+   * Audit query: would `username` have been allowed to read entries in `dbid`
+   * (scoped to `decryptionKeyId`) at trusted time `at`? Evaluates against the
+   * directory state as it was at `at`, so historical read decisions can be
+   * explained exactly like {@link wasAllowedAt} does for writes.
+   */
+  async wasAllowedToReadAt(
+    username: string,
+    dbid: string,
+    decryptionKeyId: string,
+    at: number,
+  ): Promise<AccessDecision> {
+    return this.evaluateReadAccessForUser({ username, dbid, decryptionKeyId, at });
+  }
+
+  /**
+   * Resolve `username`'s identity set and evaluate read access against the
+   * directory-state node at `at` (or head when omitted). Shared by
+   * {@link canRead}, {@link wasAllowedToReadAt}, and the server read gate.
+   */
+  async evaluateReadAccessForUser(input: {
+    username: string;
+    dbid: string;
+    decryptionKeyId: string;
+    at?: number;
+  }): Promise<AccessDecision> {
+    const node = input.at !== undefined
+      ? await this.getDirectoryStateAt(input.at)
+      : await this.getDirectoryStateHead();
+
+    // Fast path: when no read access control is configured at this point in
+    // time, read access is unrestricted. Short-circuit BEFORE the (relatively
+    // expensive) identity-set resolution so the read gate adds no measurable
+    // overhead to tenants that never enabled read policies.
+    if (!node.readPolicy && node.dbReadPolicies.size === 0 && node.readRules.length === 0) {
+      return { allowed: true, reason: "read access control not enabled", tier: "tier1" };
+    }
+
+    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+    const userKeys = await this.getUserPublicKeys(input.username);
+    const isAdmin = !!userKeys && userKeys.signingPublicKey === adminKey;
+    const identity = await this.buildIdentitySet(input.username, { isAdmin });
+    return evaluateReadAccess({
+      dbid: input.dbid,
+      decryptionKeyId: input.decryptionKeyId,
+      identity,
+      node,
+    });
+  }
+
+  /**
+   * Key-based variant of {@link evaluateReadAccessForUser} for the server read
+   * gate (docs/accesscontrol.md §6.5): resolve the reader's identity from the
+   * authenticated device signing key plus the grant's precomputed
+   * `identity_hashes` bundle, entirely in hash space — the server never needs
+   * the cleartext username. Falls back gracefully (only `$everyone`) when the
+   * key has no resolvable grant, and degrades to whatever hashes the bundle
+   * carries (exact-match for legacy grants whose bundle is just the
+   * `username_hash`).
+   *
+   * @param input.signingKey - The reader's authenticated device signing public
+   *   key (PEM), taken from the verified network auth token. Used to resolve the
+   *   grant (and its `identity_hashes` bundle) and to detect the admin key.
+   * @param input.dbid - Id of the database the read targets; selects the
+   *   applicable per-database read policy/rules (falls back to the tenant
+   *   default policy when no db-specific policy exists).
+   * @param input.decryptionKeyId - Id of the decryption key the read would use
+   *   (e.g. `"default"`, `"$publicinfos"`); checked against the policy/rules that
+   *   gate which identities may read documents under that key.
+   * @param input.at - Optional trusted-time (ms since Unix epoch) to evaluate
+   *   against a historical directory state. Omit to use the current head state.
+   * @returns An {@link AccessDecision}: `allowed` with a `reason`/`tier`, or a
+   *   denial. Returns allowed early (tier1) when no read access control is
+   *   configured for the tenant.
+   */
+  async evaluateReadAccessForSigningKey(input: {
+    signingKey: string;
+    dbid: string;
+    decryptionKeyId: string;
+    at?: number;
+  }): Promise<AccessDecision> {
+    const node = input.at !== undefined
+      ? await this.getDirectoryStateAt(input.at)
+      : await this.getDirectoryStateHead();
+
+    // Fast path: unrestricted when no read access control is configured.
+    if (!node.readPolicy && node.dbReadPolicies.size === 0 && node.readRules.length === 0) {
+      return { allowed: true, reason: "read access control not enabled", tier: "tier1" };
+    }
+
+    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+    const isAdmin = input.signingKey === adminKey;
+    const lookup = await this.getUserBySigningPublicKey(input.signingKey);
+    const variantHashes = lookup?.identityHashes ?? [];
+    const identity = await this.buildIdentitySetFromHashes(variantHashes, { isAdmin });
+    return evaluateReadAccess({
+      dbid: input.dbid,
+      decryptionKeyId: input.decryptionKeyId,
+      identity,
+      node,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Read-side key delivery (admin-blind key push). A key-HOLDER wraps the key
+  // to each recipient's RSA encryption public key; an ADMIN merely signs and
+  // writes the directory document. An admin outside the recipient set therefore
+  // never sees the plaintext key. On sync, recipient clients RSA-unwrap and
+  // import the key, surfacing newly-readable documents via reveal-on-add.
+  // -------------------------------------------------------------------------
+
+  /** Document id prefix for key-delivery documents. */
+  private static readonly KEY_DELIVERY_PREFIX = "acl_keydelivery_";
+
+  /**
+   * Prepare an admin-blind key delivery: wrap the symmetric key `keyId` to each
+   * target user's RSA encryption public key. Run by a key-holder; the caller's
+   * KeyBag must contain `keyId`. The returned payload is handed to an admin to
+   * {@link publishKeyDelivery}.
+   */
+  async prepareKeyDelivery(keyId: string, targets: string[]): Promise<KeyDeliveryPayload> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    // Export ALL stored versions of the key, not just the latest: a rotated key
+    // keeps several versions and documents may be encrypted under any of them,
+    // so the recipient needs every version to decrypt the full history.
+    const exportedVersions = await baseTenant.exportDecryptionKeyForDelivery(keyId);
+    if (!exportedVersions || exportedVersions.length === 0) {
+      throw new Error(`Cannot prepare key delivery: key "${keyId}" is not in your KeyBag`);
+    }
+    const rsa = new RSAEncryption(this.tenant.getCryptoAdapter(), this.logger.createChild("RSAEncryption"));
+    const recipients: KeyDeliveryRecipient[] = [];
+    for (const username of targets) {
+      const userKeys = await this.getUserPublicKeys(username);
+      if (!userKeys) {
+        throw new Error(`Cannot prepare key delivery: recipient "${username}" has no active grant`);
+      }
+      const versions: KeyDeliveryVersion[] = [];
+      for (const exported of exportedVersions) {
+        const wrapped = await rsa.encrypt(exported.bytes, userKeys.encryptionPublicKey);
+        versions.push({
+          keyVersionCreatedAt: exported.keyVersionCreatedAt,
+          wrappedKey: this.bytesToBase64(wrapped),
+        });
+      }
+      recipients.push({
+        username_hash: await this.hashUsernameForWrite(username),
+        versions,
+      });
+    }
+    const currentUser = await this.tenant.getCurrentUserId();
+    return {
+      keyId,
+      preparedByPublicKey: currentUser.userSigningPublicKey,
+      recipients,
+    };
+  }
+
+  /** Admin-sign and write a prepared key delivery to the directory. */
+  async publishKeyDelivery(
+    payload: KeyDeliveryPayload,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const versionStamps = Array.from(
+      new Set(payload.recipients.flatMap((r) => r.versions.map((v) => v.keyVersionCreatedAt))),
+    )
+      .sort((a, b) => a - b)
+      .join(",");
+    const fingerprint = await this.sha256Hex(
+      payload.recipients.map((r) => r.username_hash).sort().join(",") + ":" + versionStamps,
+    );
+    const docId = aclKeyDeliveryDocId(payload.keyId, fingerprint);
+
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      docId,
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = "keydelivery";
+        data.keyId = payload.keyId;
+        data.preparedByPublicKey = payload.preparedByPublicKey;
+        data.recipients = payload.recipients.map((r) => ({
+          username_hash: r.username_hash,
+          versions: r.versions.map((v) => ({
+            keyVersionCreatedAt: v.keyVersionCreatedAt,
+            wrappedKey: v.wrappedKey,
+          })),
+        }));
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Convenience for when the admin legitimately holds the key: prepare and
+   * publish in one step.
+   */
+  async pushKey(
+    keyId: string,
+    targets: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const payload = await this.prepareKeyDelivery(keyId, targets);
+    await this.publishKeyDelivery(payload, administrationPrivateKey, administrationPrivateKeyPassword);
+  }
+
+  /**
+   * Import any key-delivery documents in the directory targeting `username`:
+   * RSA-unwrap with the user's encryption private key and write into the
+   * KeyBag, surfacing newly-readable documents via the existing reveal-on-add
+   * path. Returns the set of key ids imported. Idempotent.
+   */
+  async importKeyDeliveriesForUser(
+    username: string,
+    encryptionPrivateKey: EncryptedPrivateKey,
+    encryptionPrivateKeyPassword: string,
+  ): Promise<string[]> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+
+    const allIds = await directoryDB.getAllDocumentIds();
+    const deliveryIds = allIds.filter((id) =>
+      id.startsWith(BaseMindooTenantDirectory.KEY_DELIVERY_PREFIX),
+    );
+    if (deliveryIds.length === 0) return [];
+
+    const myHashes = new Set(await this.usernameHashCandidates(username));
+
+    // Decrypt the user's RSA encryption private key once into a non-extractable
+    // CryptoKey for unwrapping.
+    const subtle = this.tenant.getCryptoAdapter().getSubtle();
+    const der = await (this.tenant as BaseMindooTenant).decryptPrivateKey(
+      encryptionPrivateKey,
+      encryptionPrivateKeyPassword,
+      "encryption",
+    );
+    const privateKey = await subtle.importKey(
+      "pkcs8",
+      der,
+      { name: "RSA-OAEP", hash: "SHA-256" },
+      false,
+      ["decrypt"],
+    );
+    const rsa = new RSAEncryption(this.tenant.getCryptoAdapter(), this.logger.createChild("RSAEncryption"));
+
+    const imported: string[] = [];
+    for (const id of deliveryIds) {
+      let doc: MindooDoc;
+      try {
+        doc = await directoryDB.getDocument(id);
+      } catch {
+        continue;
+      }
+      if (!doc) continue;
+      const data = doc.getData();
+      if (data.type !== "keydelivery" || typeof data.keyId !== "string") continue;
+      const recipients = Array.isArray(data.recipients) ? data.recipients : [];
+      const mine = recipients.find(
+        (r): r is KeyDeliveryRecipient =>
+          !!r &&
+          typeof (r as KeyDeliveryRecipient).username_hash === "string" &&
+          Array.isArray((r as KeyDeliveryRecipient).versions) &&
+          myHashes.has((r as KeyDeliveryRecipient).username_hash),
+      );
+      if (!mine) continue;
+      try {
+        // Unwrap EVERY delivered version so documents encrypted under any past
+        // rotation of this key become decryptable, not just the newest one.
+        const unwrapped: Array<{ bytes: Uint8Array; keyVersionCreatedAt: number }> = [];
+        for (const version of mine.versions) {
+          if (!version || typeof version.wrappedKey !== "string") continue;
+          const wrapped = this.base64ToBytes(version.wrappedKey);
+          const keyBytes = await rsa.decrypt(wrapped, privateKey);
+          unwrapped.push({
+            bytes: keyBytes,
+            keyVersionCreatedAt:
+              typeof version.keyVersionCreatedAt === "number" ? version.keyVersionCreatedAt : 0,
+          });
+        }
+        if (unwrapped.length === 0) continue;
+        await (this.tenant as BaseMindooTenant).importDeliveredDecryptionKeyVersions(
+          data.keyId,
+          unwrapped,
+        );
+        imported.push(data.keyId);
+      } catch (error) {
+        this.logger.warn(`importKeyDeliveriesForUser: failed to import ${data.keyId}: ${error}`);
+      }
+    }
+    return imported;
+  }
+
+  /** Encode bytes as base64 (mirrors RSAEncryption's transport encoding). */
+  private bytesToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  }
+
+  /** Decode a base64 string into bytes. */
+  private base64ToBytes(base64: string): Uint8Array {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
   }
 
   /**
@@ -1394,22 +2208,32 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
    * Stops on cycles with a console warning.
    */
   private async resolveGroupsForUser(username: string): Promise<string[]> {
+    // Generate username variants for matching and compute their hashes.
+    // Include both legacy (v1) and salted (v2) hash forms for every variant so
+    // membership written under either scheme is matched (docs/accesscontrol.md §6.5).
+    const usernameVariants = this.generateUsernameVariants(username);
+    const variantHashes = new Set(
+      (await Promise.all(usernameVariants.map(v => this.usernameHashCandidates(v)))).flat()
+    );
+    return this.resolveGroupsFromVariantHashes(variantHashes);
+  }
+
+  /**
+   * Hash-space core of {@link resolveGroupsForUser}: given the set of a user's
+   * username-variant hashes (v1+v2 of every DN-hierarchy variant), recursively
+   * resolve all groups that contain the user (directly or via nested groups).
+   * Works purely from hashes, so the server can resolve group membership for a
+   * key-based reader using the precomputed `identity_hashes` bundle — no
+   * cleartext username required (docs/accesscontrol.md §6.5).
+   */
+  private async resolveGroupsFromVariantHashes(variantHashes: Set<string>): Promise<string[]> {
     const resultGroups = new Set<string>();
-    
+
     // Sync changes and update cache
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     await this.updateUnifiedCache();
-    
-    // Generate username variants for matching and compute their hashes
-    const usernameVariants = this.generateUsernameVariants(username);
-    // Hash all variants for comparison with members_hashes
-    // Include both legacy (v1) and salted (v2) hash forms for every variant so
-    // membership written under either scheme is matched (docs/accesscontrol.md §6.5).
-    const variantHashes = new Set(
-      (await Promise.all(usernameVariants.map(v => this.usernameHashCandidates(v)))).flat()
-    );
-    
+
     // First pass: find all groups that directly contain the user or username variants (by hash)
     const directGroups = new Set<string>();
     for (const [groupName, groupData] of this.groupsCache.entries()) {
@@ -1556,7 +2380,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     for (const grant of grants) {
       const data = grant.getData();
       const wipeRequestedKeys = new Set(extractWipeRequestedSigningKeys(data));
-      for (const pair of extractKeyPairs(data)) {
+      // Active devices only: revoked pairs are retained on the document but
+      // excluded here, preserving the "currently-granted devices" semantics.
+      for (const pair of extractActiveKeyPairs(data)) {
         bySigningKey.set(pair.signingPublicKey, {
           ...pair,
           wipeRequested: wipeRequestedKeys.has(pair.signingPublicKey),
@@ -2075,6 +2901,35 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   private static readonly USERNAME_HASH_VERSION = 2;
 
   /**
+   * Version of the identity-hash bundle (`identity_hashes`) variant-generation
+   * algorithm (docs/accesscontrol.md §6.5). This is a SEPARATE axis from
+   * {@link USERNAME_HASH_VERSION} (which versions only the hash scheme): it
+   * tracks how completely {@link generateUsernameVariants} enumerated the
+   * DN-hierarchy wildcards. Bump it whenever `generateUsernameVariants` is
+   * extended so readers can detect stale bundles and trigger a backfill.
+   */
+  private static readonly IDENTITY_VARIANTS_VERSION = 1;
+
+  /**
+   * Compute the precomputed identity-hash bundle for a cleartext username
+   * (docs/accesscontrol.md §6.5): the flattened, deduped v1+v2 hashes of every
+   * DN-hierarchy variant from {@link generateUsernameVariants}. Stored on the
+   * grant doc so the server can match wildcard/group read rules in hash space
+   * without ever holding the cleartext name. Only username variant hashes are
+   * included; group membership stays dynamic (resolved at read time).
+   */
+  private async computeIdentityHashes(username: string): Promise<string[]> {
+    const variants = this.generateUsernameVariants(username);
+    const hashes = new Set<string>();
+    for (const variant of variants) {
+      for (const h of await this.usernameHashCandidates(variant)) {
+        hashes.add(h);
+      }
+    }
+    return Array.from(hashes);
+  }
+
+  /**
    * Legacy (v1) username hash: `SHA-256(lower(username))`, hex-encoded.
    *
    * Retained because pre-existing directory documents (and clients that predate
@@ -2192,11 +3047,27 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const username = details?.username
       ?? (typeof data.username_hash === "string" ? data.username_hash : "");
 
+    // Surface the precomputed identity-hash bundle (§6.5). Legacy grants written
+    // before the bundle existed have neither field; fall back to the single
+    // username_hash (exact-match only, version 0) so the reader can flag the
+    // grant for backfill.
+    const usernameHash = typeof data.username_hash === "string" ? data.username_hash : null;
+    const identityHashes = Array.isArray(data.identity_hashes)
+      ? data.identity_hashes.filter((h): h is string => typeof h === "string" && h.length > 0)
+      : usernameHash
+        ? [usernameHash]
+        : [];
+    const identityHashesV = typeof data.identity_hashes_v === "number"
+      ? data.identity_hashes_v
+      : 0;
+
     return {
       username,
       signingPublicKey,
       encryptionPublicKey,
       details,
+      identityHashes,
+      identityHashesV,
     };
   }
 
@@ -2204,6 +3075,73 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const encoder = new TextEncoder();
     const encrypted = await this.tenant.encryptPayload(encoder.encode(plaintext), DEFAULT_TENANT_KEY_ID);
     return this.uint8ArrayToBase64(encrypted);
+  }
+
+  /**
+   * Encrypt a rule's cleartext targets (usernames + groups) with the tenant
+   * default key so admin UIs can display who a rule targets without reversing
+   * the salted hashes. Mirrors {@link encryptUserDetailsForTenant}: the blob is
+   * opaque to the sync server (it never holds the tenant key) but readable by
+   * tenant clients. Returns "" when there is nothing cleartext to store (e.g. a
+   * rule authored from raw hashes / pseudo-tokens only).
+   */
+  /**
+   * Resolve a rule's targets (explicit `users_hashes` + named `usernames` /
+   * `groups`) to the salted hash set evaluation matches against. Usernames are
+   * hashed as-is; **group names are normalized (lowercased) first** so they
+   * match the identity set, which hashes the normalized group names returned by
+   * {@link resolveGroupsForUser} (the group cache is keyed by
+   * {@link normalizeGroupName}). Without this, a mixed-case group target like
+   * "Analysts" would never intersect a member's identity (hashed as "analysts").
+   */
+  private async resolveRuleTargetHashes(rule: {
+    users_hashes?: string[];
+    usernames?: string[];
+    groups?: string[];
+  }): Promise<Set<string>> {
+    const resolvedHashes = new Set<string>(rule.users_hashes ?? []);
+    for (const name of rule.usernames ?? []) {
+      resolvedHashes.add(await this.hashUsernameForWrite(name));
+    }
+    for (const group of rule.groups ?? []) {
+      resolvedHashes.add(await this.hashUsernameForWrite(this.normalizeGroupName(group)));
+    }
+    return resolvedHashes;
+  }
+
+  private async encryptRuleTargetsForTenant(targets: RuleTargets): Promise<string> {
+    const usernames = targets.usernames.filter((u) => typeof u === "string" && u.trim());
+    const groups = targets.groups.filter((g) => typeof g === "string" && g.trim());
+    if (usernames.length === 0 && groups.length === 0) {
+      return "";
+    }
+    const payload = new TextEncoder().encode(JSON.stringify({ usernames, groups }));
+    const encrypted = await this.tenant.encryptPayload(payload, DEFAULT_TENANT_KEY_ID);
+    return this.uint8ArrayToBase64(encrypted);
+  }
+
+  /**
+   * Decrypt a rule's {@link RuleTargets} display blob. Returns `null` for an
+   * empty/unreadable blob (e.g. a client lacking the tenant default key), in
+   * which case callers fall back to showing the raw `users_hashes`.
+   */
+  private async decryptRuleTargetsForTenant(encryptedBase64: string): Promise<RuleTargets | null> {
+    if (!encryptedBase64) return null;
+    try {
+      const encrypted = this.base64ToUint8Array(encryptedBase64);
+      const decrypted = await this.tenant.decryptPayload(encrypted, DEFAULT_TENANT_KEY_ID);
+      const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as Record<string, unknown>;
+      const usernames = Array.isArray(parsed.usernames)
+        ? parsed.usernames.filter((u): u is string => typeof u === "string")
+        : [];
+      const groups = Array.isArray(parsed.groups)
+        ? parsed.groups.filter((g): g is string => typeof g === "string")
+        : [];
+      return { usernames, groups };
+    } catch (error) {
+      this.logger.debug("Could not decrypt rule targets, falling back to hashes", error);
+      return null;
+    }
   }
 
   private async decryptGroupMemberForTenant(encryptedBase64: string): Promise<string | null> {

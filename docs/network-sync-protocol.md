@@ -364,10 +364,22 @@ All examples use the same scenario: syncing a database called `contacts`.
 
 #### Authenticating
 
-Request:
+Request (`POST /auth/challenge`):
 ```json
 { "username": "CN=alice/O=acme-corp" }
 ```
+
+The `username` is **optional**. To avoid sending the cleartext name, a client
+may instead identify itself by its device signing public key — the server
+resolves the principal from the key:
+```json
+{ "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----" }
+```
+The server never requires the cleartext username: read access is resolved from
+the authenticated device signing key (carried in the JWT as `deviceSigningKey`)
+plus the grant document's precomputed `identity_hashes` bundle, so wildcard and
+group read rules keep working in hash space. See
+[Access Control](accesscontrol.md).
 
 Response:
 ```json

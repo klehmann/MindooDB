@@ -6,10 +6,12 @@ import {
   PSEUDO_TOKEN_AUTHOR,
   PSEUDO_TOKEN_EVERYONE,
   Placeholder,
+  ReadRuleDoc,
   RuleType,
   WithFieldClause,
   WithFieldWhen,
   effectivePolicy,
+  effectiveReadPolicy,
   isPlaceholder,
 } from "./types";
 import { DirectoryStateNode } from "./DirectoryStateNode";
@@ -75,6 +77,14 @@ export interface EvaluateAccessInput {
    * rule — leaving that check to clients (§7, §10).
    */
   isServer?: boolean;
+  /**
+   * The entry's `decryptionKeyId` (cleartext metadata). Used only by the
+   * create-key allowlist gate on `doc_create`: because the key id is metadata
+   * the server already reads, this is a Tier 1 constraint enforced identically
+   * on server and client. Omitted/undefined is treated as "no key", which fails
+   * a non-empty allowlist.
+   */
+  decryptionKeyId?: string;
 }
 
 /** The default `when` for a clause, given the operation (§6.3). */
@@ -110,6 +120,22 @@ export function evaluateAccess(input: EvaluateAccessInput): AccessDecision {
   // rules (§7 step 0).
   if (eff.disableAllAccessChecksAndPolicies) {
     return allow("access control disabled by master switch", "tier1");
+  }
+
+  // Step 1: create-key allowlist gate (Tier 1). When a non-empty
+  // `allowedCreateKeyIds` is in effect for this scope, a `doc_create` may only
+  // use one of those `decryptionKeyId`s. This is a HARD deny that an allow rule
+  // cannot override (it is a necessary condition, additive to the normal
+  // baseline/rule check below). It evaluates identically on server and client
+  // because `decryptionKeyId` is cleartext metadata.
+  if (op === "doc_create" && eff.allowedCreateKeyIds && eff.allowedCreateKeyIds.length > 0) {
+    const keyId = input.decryptionKeyId;
+    if (keyId === undefined || !eff.allowedCreateKeyIds.includes(keyId)) {
+      return deny(
+        `doc_create key "${keyId ?? "(none)"}" not in allowed create-key set [${eff.allowedCreateKeyIds.join(", ")}]`,
+        "tier1"
+      );
+    }
   }
 
   // Step 2: baseline from the effective deny<Op> flag.
@@ -181,6 +207,93 @@ export function evaluateAccess(input: EvaluateAccessInput): AccessDecision {
   return baselineDenied
     ? deny(`denied by baseline policy for ${op}`, "tier1")
     : allow(`allowed by baseline policy for ${op}`, "tier1");
+}
+
+/** Inputs to {@link evaluateReadAccess}. */
+export interface EvaluateReadAccessInput {
+  /** Target database id of the entry being read/delivered. */
+  dbid: string;
+  /**
+   * The entry's `decryptionKeyId` (cleartext metadata). This is what lets the
+   * zero-trust server gate read delivery without decrypting the payload.
+   */
+  decryptionKeyId: string;
+  /** The acting (reading) user's identity set. */
+  identity: IdentitySet;
+  /** Directory-state node covering the point in time to evaluate at (§8). */
+  node: DirectoryStateNode;
+}
+
+/**
+ * Evaluate read access for an entry (read-side analogue of
+ * {@link evaluateAccess}). Like the write evaluator, this is a **pure,
+ * deterministic function** of policy state at the given directory-state node
+ * plus the entry's cleartext metadata — there is no wall-clock input, so the
+ * server and every honest client compute the identical verdict. Time-bound
+ * access is therefore expressed as revocation by policy revision (flip the rule
+ * / remove the user), never by a client-trusted date.
+ *
+ * Read rules are always Tier 1 (metadata-only): they scope by `dbid`,
+ * optional `decryptionKeyId`, and identity. Deny overrides allow.
+ */
+export function evaluateReadAccess(input: EvaluateReadAccessInput): AccessDecision {
+  const { dbid, decryptionKeyId, identity, node } = input;
+
+  const tenantReadPolicy = node.readPolicy ?? null;
+  const dbReadPolicy = node.dbReadPolicies.get(dbid) ?? null;
+  const readRules = node.readRules ?? [];
+
+  // Read access control was never configured -> unrestricted (key possession
+  // remains the only gate), preserving pre-read-control behavior.
+  if (!tenantReadPolicy && !dbReadPolicy && readRules.length === 0) {
+    return allow("read access control not enabled", "tier1");
+  }
+
+  const eff = effectiveReadPolicy(tenantReadPolicy, dbReadPolicy);
+  if (eff.disableAllReadChecks) {
+    return allow("read checks disabled by master switch", "tier1");
+  }
+
+  const baselineDenied = eff.defaultReadAccess === "deny";
+
+  // Candidate rules: doc_read rules whose db matches (or `*`), whose key scope
+  // covers this `decryptionKeyId` (or is unscoped), and whose target hashes
+  // intersect the reader's identity set.
+  const candidateRules = readRules.filter(
+    (r) =>
+      (r.dbid === dbid || r.dbid === "*") &&
+      readKeyScopeMatches(r, decryptionKeyId) &&
+      intersects(r.users_hashes, identity.hashes)
+  );
+
+  let denyMatched: ReadRuleDoc | null = null;
+  let allowMatched: ReadRuleDoc | null = null;
+  for (const rule of candidateRules) {
+    if (rule.action === "deny" && !denyMatched) denyMatched = rule;
+    if (rule.action === "allow" && !allowMatched) allowMatched = rule;
+  }
+
+  // Deny-overrides-allow (set-based, order-independent).
+  if (denyMatched) {
+    return deny(`read denied by rule ${denyMatched.ruleId}`, "tier1", denyMatched.ruleId);
+  }
+  if (allowMatched) {
+    return allow(`read allowed by rule ${allowMatched.ruleId}`, "tier1", allowMatched.ruleId);
+  }
+
+  return baselineDenied
+    ? deny(`read denied by baseline policy for ${dbid}`, "tier1")
+    : allow(`read allowed by baseline policy for ${dbid}`, "tier1");
+}
+
+/**
+ * Whether a read rule's optional key scope covers `decryptionKeyId`. An
+ * absent/empty `decryptionKeyIds` means the rule applies to every key in the
+ * database (document-level read control).
+ */
+function readKeyScopeMatches(rule: ReadRuleDoc, decryptionKeyId: string): boolean {
+  if (!rule.decryptionKeyIds || rule.decryptionKeyIds.length === 0) return true;
+  return rule.decryptionKeyIds.includes(decryptionKeyId);
 }
 
 /** Returns true if any element of `hashes` is in `set`. */

@@ -17,6 +17,8 @@ import {
   extractEncryptionPublicKeys,
   extractWipeRequestedSigningKeys,
   extractKeyPairs,
+  extractActiveKeyPairs,
+  extractRevokedKeyPairs,
   applyKeyPairFields,
   mergeKeyPairs,
   primarySigningPublicKey,
@@ -285,6 +287,60 @@ describe("access-control schema", () => {
       expect(merged).toEqual([
         { signingPublicKey: "sign1", encryptionPublicKey: "enc1", label: "Relabeled" },
         { signingPublicKey: "sign2", encryptionPublicKey: "enc2" },
+      ]);
+    });
+  });
+
+  describe("two-list active/revoked form (userKeyPairs + revokedUserKeyPairs)", () => {
+    it("applyKeyPairFields partitions pairs into userKeyPairs (active) and revokedUserKeyPairs", () => {
+      const data: Record<string, unknown> = {};
+      applyKeyPairFields(data, [
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1", label: "Phone" },
+        { signingPublicKey: "revoked1", encryptionPublicKey: "enc2", label: "Old laptop", revoked: true, revokedAt: 1234 },
+      ]);
+      // Active list carries no `revoked` flag; revoked list carries revokedAt.
+      expect(data.userKeyPairs).toEqual([
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1", label: "Phone" },
+      ]);
+      expect(data.revokedUserKeyPairs).toEqual([
+        { signingPublicKey: "revoked1", encryptionPublicKey: "enc2", label: "Old laptop", revokedAt: 1234 },
+      ]);
+      // Legacy mirrors expose ACTIVE only.
+      expect(data.userSigningPublicKeys).toEqual(["active1"]);
+      expect(data.userEncryptionPublicKeys).toEqual(["enc1"]);
+      expect(data.userSigningPublicKey).toBe("active1");
+    });
+
+    it("round-trips active and revoked pairs through the extractors", () => {
+      const data: Record<string, unknown> = {};
+      applyKeyPairFields(data, [
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1" },
+        { signingPublicKey: "revoked1", encryptionPublicKey: "enc2", revoked: true, revokedAt: 99 },
+      ]);
+      expect(extractActiveKeyPairs(data)).toEqual([
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1" },
+      ]);
+      expect(extractRevokedKeyPairs(data)).toEqual([
+        { signingPublicKey: "revoked1", encryptionPublicKey: "enc2", revoked: true, revokedAt: 99 },
+      ]);
+      expect(extractSigningPublicKeys(data)).toEqual(["active1"]);
+      // extractKeyPairs returns the full set, active first then revoked.
+      expect(extractKeyPairs(data)).toEqual([
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1" },
+        { signingPublicKey: "revoked1", encryptionPublicKey: "enc2", revoked: true, revokedAt: 99 },
+      ]);
+    });
+
+    it("treats userKeyPairs as authoritative for active keys even when only revokedUserKeyPairs has entries", () => {
+      const data = {
+        userKeyPairs: [],
+        revokedUserKeyPairs: [{ signingPublicKey: "revoked1", encryptionPublicKey: "enc2", revokedAt: 5 }],
+        userSigningPublicKeys: ["stale"],
+      };
+      expect(extractActiveKeyPairs(data)).toEqual([]);
+      expect(extractSigningPublicKeys(data)).toEqual([]);
+      expect(extractRevokedKeyPairs(data)).toEqual([
+        { signingPublicKey: "revoked1", encryptionPublicKey: "enc2", revoked: true, revokedAt: 5 },
       ]);
     });
   });

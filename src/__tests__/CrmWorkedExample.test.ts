@@ -228,13 +228,16 @@ describe("§11 CRM worked example (end-to-end)", () => {
     const docId = contact.getId();
 
     // A tampered client (Bob) authors a change despite not being an editor.
+    // `bypassAccessControlPrecheck` simulates a tampered client that does not
+    // run the honest-client write precheck; the server witness and the fresh
+    // replica's materialization remain the authoritative enforcers.
     const forBob = await crm.getDocument(docId);
     await crm.changeDoc(
       forBob,
       async (d) => {
         d.getData().rev = 999;
       },
-      { signingKeyPair: bobSigning, signingKeyPassword: bobPassword },
+      { signingKeyPair: bobSigning, signingKeyPassword: bobPassword, bypassAccessControlPrecheck: true },
     );
 
     // Fresh replica materializes: Bob's change is quarantined, the contact keeps rev 1.

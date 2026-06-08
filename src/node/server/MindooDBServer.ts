@@ -1131,10 +1131,15 @@ export class MindooDBServer {
     const clientIp = this.getClientIpForRateLimit(req);
 
     if (phase === "challenge") {
-      const username = typeof req.body?.username === "string"
+      // Bucket by username when supplied, otherwise by the signing public key a
+      // key-based client identifies with, so key-based clients still get a
+      // stable per-principal bucket instead of all sharing "-".
+      const principal = typeof req.body?.username === "string" && req.body.username.trim()
         ? req.body.username.trim().toLowerCase()
-        : "-";
-      return `${scope}:${tenantId}:${phase}:${clientIp}:${username}`;
+        : typeof req.body?.signingPublicKey === "string" && req.body.signingPublicKey.trim()
+          ? req.body.signingPublicKey.trim()
+          : "-";
+      return `${scope}:${tenantId}:${phase}:${clientIp}:${principal}`;
     }
 
     return `${scope}:${tenantId}:${phase}:${clientIp}`;
@@ -1192,12 +1197,23 @@ export class MindooDBServer {
 
   private async handleChallenge(req: Request, res: Response): Promise<void> {
     try {
-      const { username } = req.body;
+      const { username, signingPublicKey } = req.body;
 
-      validateUsername(username);
+      // The username is optional: a client may identify itself by its device
+      // signing public key instead, so the server never needs the cleartext
+      // name. Validate whichever was supplied.
+      if (username !== undefined && username !== null) {
+        validateUsername(username);
+      }
+      if (signingPublicKey !== undefined && signingPublicKey !== null) {
+        validateStringLength(signingPublicKey, MAX_SIGNATURE_LENGTH, "signingPublicKey");
+      }
 
       const authService = await this.tenantManager.getAuthService(req.tenantId!);
-      const challenge = await authService.generateChallenge(username);
+      const challenge = await authService.generateChallenge(
+        typeof username === "string" ? username : undefined,
+        typeof signingPublicKey === "string" ? { signingPublicKey } : undefined,
+      );
 
       res.json({ challenge });
     } catch (error) {

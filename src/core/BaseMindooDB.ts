@@ -111,6 +111,7 @@ import {
 } from "./accesscontrol/materializationGuard";
 import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
 import type { RuleType, AccessDecision } from "./accesscontrol/types";
+import { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 import { validateDatabaseId } from "./databaseIdValidation";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
@@ -379,6 +380,13 @@ export class BaseMindooDB implements MindooDB {
    * materialization fast-path does not re-query the directory on every load.
    */
   private aclActiveCache: { value: boolean; at: number } | null = null;
+  /**
+   * Per-document cache of the original creator's signing public key (the
+   * `doc_create` entry's `createdByPublicKey`). Used by the client write
+   * prechecks to resolve `$author` (`isAuthor`) without re-scanning metadata on
+   * every change/delete. Populated on create and lazily on first lookup.
+   */
+  private creatorKeyCache = new Map<string, string>();
   private chunkSizeBytes: number;
   
   // Admin-only mode: only entries signed by the admin key are loaded
@@ -1613,6 +1621,14 @@ export class BaseMindooDB implements MindooDB {
       metadataByDoc.set(entry.docId, entries);
     }
 
+    // Read-entitlement memo for this pass: many docs share a `decryptionKeyId`
+    // and the read policy verdict is identical for all of them, so we evaluate
+    // each key once. Empty when read access control is not active.
+    const readEntitledByKey = new Map<string, boolean>();
+    // Named keys whose scope lost read entitlement during this pass; deleted
+    // from the KeyBag afterwards (crypto-shred), never the tenant default key.
+    const keysToShred = new Set<string>();
+
     let changed = false;
     // Deterministic ordering by docId keeps the resulting changefeed
     // stable between runs, which simplifies test expectations.
@@ -1625,7 +1641,19 @@ export class BaseMindooDB implements MindooDB {
 
       const existingIndex = this.indexLookup.get(docId);
       const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
-      const canRead = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
+      const hasKey = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
+
+      // Read-side entitlement gate (read-side of docs/accesscontrol.md). When a
+      // read policy denies this (db, key) scope for the current user, the doc
+      // is treated as inaccessible even though we still hold the key — and its
+      // already-synced ciphertext is purged and the named key crypto-shredded.
+      // This is best-effort cooperative purge on honest clients; the server
+      // delivery gate is the strong layer. Evaluation is policy-state-driven
+      // (one directory sync after revocation) with no client-clock dependency.
+      const entitled = hasKey
+        ? await this.isReadEntitled(visibility.decryptionKeyId, readEntitledByKey)
+        : true;
+      const canRead = hasKey && entitled;
 
       if (canRead) {
         // Reveal-on-add only triggers when the previous state was
@@ -1639,10 +1667,18 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
+      // Entitlement loss (we hold the key but the policy now denies the scope):
+      // purge already-synced ciphertext as well, and remember the named key for
+      // crypto-shred so the doc cannot be re-materialized locally.
+      if (hasKey && !entitled) {
+        await this.purgeDocumentCiphertext(metadataByDoc.get(docId)!);
+        keysToShred.add(visibility.decryptionKeyId);
+      }
+
       if (existing?.accessState === "visible") {
-        // Key was revoked while we still had plaintext state in cache:
-        // wipe it and flip the index entry to an inaccessible tombstone
-        // with `isDeleted: true` so view feeds emit a clean removal.
+        // Key was revoked (or entitlement lost) while we still had plaintext
+        // state in cache: wipe it and flip the index entry to an inaccessible
+        // tombstone with `isDeleted: true` so view feeds emit a clean removal.
         await this.purgeMaterializedDocument(docId);
         this.updateIndex(docId, visibility.lastModified, true, visibility.decryptionKeyId, "inaccessible");
         changed = true;
@@ -1651,6 +1687,12 @@ export class BaseMindooDB implements MindooDB {
         // case a previous session left an L2 record behind.
         await this.purgeMaterializedDocument(docId);
       }
+    }
+
+    // Crypto-shred named keys whose scope lost read entitlement. Guarded inside
+    // the tenant so the shared tenant default key is never removed.
+    for (const keyId of keysToShred) {
+      await this.tenant.removeNamedDecryptionKey(keyId);
     }
 
     if (changed) {
@@ -1663,6 +1705,77 @@ export class BaseMindooDB implements MindooDB {
     // pass so a subsequent warm start with identical bag composition
     // can skip the scan.
     this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
+  }
+
+  /**
+   * Whether the current user is entitled to read entries encrypted with
+   * `decryptionKeyId` in this database under the read policy (read-side of
+   * docs/accesscontrol.md). Memoized per key for the calling reconcile pass.
+   *
+   * Fails OPEN (returns true) when read access control is not configured or the
+   * directory cannot evaluate it: the client purge is a best-effort cooperative
+   * layer, and the server delivery gate is the authoritative enforcement, so a
+   * transient evaluation error must never destroy local data.
+   */
+  private async isReadEntitled(
+    decryptionKeyId: string,
+    memo: Map<string, boolean>,
+  ): Promise<boolean> {
+    // The tenant directory is never read-gated: it carries the very policies the
+    // read gate depends on, so it must always be readable (the server delivery
+    // gate skips it for the same reason). Evaluating read access here would also
+    // re-enter directory-state building during the directory DB's own
+    // visibility reconcile on tenant open, deadlocking initialization.
+    if (this.store.getId() === "directory") return true;
+
+    const cached = memo.get(decryptionKeyId);
+    if (cached !== undefined) return cached;
+
+    let entitled = true;
+    try {
+      const directory = (await this.tenant.openDirectory()) as unknown as {
+        evaluateReadAccessForUser?: (input: {
+          username: string;
+          dbid: string;
+          decryptionKeyId: string;
+        }) => Promise<{ allowed: boolean }>;
+      };
+      if (typeof directory.evaluateReadAccessForUser === "function") {
+        const currentUser = await this.tenant.getCurrentUserId();
+        const decision = await directory.evaluateReadAccessForUser({
+          username: currentUser.username,
+          dbid: this.store.getId(),
+          decryptionKeyId,
+        });
+        entitled = decision.allowed;
+      }
+    } catch (error) {
+      this.logger.debug(`isReadEntitled: evaluation failed for ${decryptionKeyId}, failing open: ${error}`);
+      entitled = true;
+    }
+
+    memo.set(decryptionKeyId, entitled);
+    return entitled;
+  }
+
+  /**
+   * Delete a document's already-synced ciphertext entries from the local store
+   * on read-entitlement loss (validity-window purge). Best-effort: a store that
+   * does not support id-based deletion keeps the ciphertext but the doc is still
+   * hidden via the inaccessible index tombstone and the crypto-shredded key.
+   */
+  private async purgeDocumentCiphertext(metadata: StoreEntryMetadata[]): Promise<void> {
+    const deleteEntriesById = this.store.deleteEntriesById;
+    if (!deleteEntriesById) {
+      return;
+    }
+    const ids = metadata.map((m) => m.id);
+    if (ids.length === 0) return;
+    try {
+      await deleteEntriesById.call(this.store, ids);
+    } catch (error) {
+      this.logger.warn(`purgeDocumentCiphertext: failed to delete ${ids.length} entries: ${error}`);
+    }
   }
 
   private async reconcileRestoredIndexWithStore(): Promise<void> {
@@ -2746,7 +2859,27 @@ export class BaseMindooDB implements MindooDB {
       changeBytes = localChange;
     }
     this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
-    
+
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). Evaluates
+    // the full Tier 1 + Tier 2 ruleset (incl. the create-key allowlist gate)
+    // for this doc_create and throws AccessDeniedError when denied, before we
+    // spend work encrypting/signing and writing. The server witness remains
+    // authoritative; this only gives the caller an immediate, meaningful error.
+    {
+      const signerKey = useCustomSigningKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      await this.assertWriteAllowed({
+        op: "doc_create",
+        signerKey,
+        isAuthor: true,
+        decryptionKeyId: keyId,
+        bypass: options.bypassAccessControlPrecheck,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(newDoc) as unknown as Record<string, unknown>,
+      });
+    }
+
     // Decode the change to get hash and dependencies
     this.logger.debug(`Decoding change to get hash and dependencies`);
     let decodedChange: any;
@@ -2791,6 +2924,9 @@ export class BaseMindooDB implements MindooDB {
       createdByPublicKey = currentUser.userSigningPublicKey;
     }
     this.logger.debug(`Signed payload, signature length: ${signature.length} bytes`);
+    // Remember the creator's signing key so $author prechecks on subsequent
+    // change/delete operations don't need a metadata scan.
+    this.creatorKeyCache.set(docId, createdByPublicKey);
 
     // Create entry metadata
     const entryMetadata: StoreEntryMetadata = {
@@ -5331,7 +5467,12 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async deleteDocument(docId: string, options: DeleteOptions = {}): Promise<void> {
-    return this.deleteDocInternal(docId, options.signingKeyPair, options.signingKeyPassword);
+    return this.deleteDocInternal(
+      docId,
+      options.signingKeyPair,
+      options.signingKeyPassword,
+      options.bypassAccessControlPrecheck,
+    );
   }
 
   async deleteDocumentWithSigningKey(
@@ -5343,7 +5484,12 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async undeleteDocument(docId: string, options: UndeleteOptions = {}): Promise<void> {
-    return this.undeleteDocInternal(docId, options.signingKeyPair, options.signingKeyPassword);
+    return this.undeleteDocInternal(
+      docId,
+      options.signingKeyPair,
+      options.signingKeyPassword,
+      options.bypassAccessControlPrecheck,
+    );
   }
 
   private async assertLifecycleMutationAllowed(
@@ -5378,6 +5524,7 @@ export class BaseMindooDB implements MindooDB {
     entryType: "doc_delete" | "doc_undelete",
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
+    bypassPrecheck?: boolean,
   ): Promise<void> {
     // Delete and undelete are encoded as normal Automerge changes so the DAG
     // keeps causal ancestry, while the StoreEntry type carries lifecycle intent.
@@ -5448,6 +5595,26 @@ export class BaseMindooDB implements MindooDB {
       encryptedData: encryptedPayload,
     };
 
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). `internalDoc.doc`
+    // is still the pre-change state here (reassigned below, after the store
+    // write). For deletes the rules default to the "before" state; both states
+    // are supplied so either `when` resolves. Throws AccessDeniedError if denied.
+    {
+      const creatorKey = await this.resolveCreatorSigningKey(docId);
+      const beforeState = internalDoc.doc;
+      await this.assertWriteAllowed({
+        op: entryType,
+        signerKey: createdByPublicKey,
+        isAuthor: creatorKey !== null && createdByPublicKey === creatorKey,
+        decryptionKeyId: internalDoc.decryptionKeyId,
+        bypass: bypassPrecheck,
+        getBeforeDoc: () =>
+          this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(newDoc) as unknown as Record<string, unknown>,
+      });
+    }
+
     await this.store.putEntries([fullEntry]);
     this.registerAutomergeHashMapping(docId, automergeHash, entryId);
 
@@ -5475,7 +5642,8 @@ export class BaseMindooDB implements MindooDB {
   private async deleteDocInternal(
     docId: string,
     signingKeyPair?: SigningKeyPair,
-    signingKeyPassword?: string
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`Deleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
@@ -5486,14 +5654,15 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc || internalDoc.isDeleted) {
       throw new Error(`Document ${docId} not found or already deleted`);
     }
-    await this.writeLifecycleEntry(internalDoc, "doc_delete", signingKeyPair, signingKeyPassword);
+    await this.writeLifecycleEntry(internalDoc, "doc_delete", signingKeyPair, signingKeyPassword, bypassPrecheck);
     this.logger.info(`Document ${docId} deleted successfully`);
   }
 
   private async undeleteDocInternal(
     docId: string,
     signingKeyPair?: SigningKeyPair,
-    signingKeyPassword?: string
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`Undeleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
@@ -5508,7 +5677,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
 
-    await this.writeLifecycleEntry(internalDoc, "doc_undelete", signingKeyPair, signingKeyPassword);
+    await this.writeLifecycleEntry(internalDoc, "doc_undelete", signingKeyPair, signingKeyPassword, bypassPrecheck);
     this.logger.info(`Document ${docId} undeleted successfully`);
   }
 
@@ -5517,7 +5686,13 @@ export class BaseMindooDB implements MindooDB {
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
     options: ChangeOptions = {}
   ): Promise<void> {
-    return this.changeDocInternal(doc, changeFunc, options.signingKeyPair, options.signingKeyPassword);
+    return this.changeDocInternal(
+      doc,
+      changeFunc,
+      options.signingKeyPair,
+      options.signingKeyPassword,
+      options.bypassAccessControlPrecheck,
+    );
   }
 
   async changeDocWithSigningKey(
@@ -6060,7 +6235,8 @@ export class BaseMindooDB implements MindooDB {
     doc: MindooDoc,
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
     signingKeyPair?: SigningKeyPair,
-    signingKeyPassword?: string
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean
   ): Promise<void> {
     this.assertWritable("changeDoc");
     const docId = doc.getId();
@@ -6423,6 +6599,7 @@ export class BaseMindooDB implements MindooDB {
         signingKeyPassword,
         successMessage: useCustomKey ? "changed with custom signing key" : "changed",
         attachmentIds: pendingAttachmentAdditions.map((ref) => ref.attachmentId),
+        bypassPrecheck,
       });
     } catch (error) {
       await Promise.all(
@@ -7012,8 +7189,9 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string;
     successMessage: string;
     attachmentIds?: string[];
+    bypassPrecheck?: boolean;
   }): Promise<void> {
-    const { internalDoc, newDoc, now, headsBeforeChange, useCustomKey, signingKeyPair, signingKeyPassword, successMessage, attachmentIds } = options;
+    const { internalDoc, newDoc, now, headsBeforeChange, useCustomKey, signingKeyPair, signingKeyPassword, successMessage, attachmentIds, bypassPrecheck } = options;
     const docId = internalDoc.id;
     this.logger.debug(`Getting change bytes from document ${docId}`);
     const changesSincePreviousHeads = headsBeforeChange
@@ -7037,6 +7215,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPassword,
       successMessage,
       attachmentIds,
+      bypassPrecheck,
     });
   }
 
@@ -7051,6 +7230,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string;
     successMessage: string;
     attachmentIds?: string[];
+    bypassPrecheck?: boolean;
   }): Promise<void> {
     const {
       internalDoc,
@@ -7063,6 +7243,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPassword,
       successMessage,
       attachmentIds,
+      bypassPrecheck,
     } = options;
     const docId = internalDoc.id;
     const resolvedChangeBytesList = changeBytesList ?? (
@@ -7089,6 +7270,29 @@ export class BaseMindooDB implements MindooDB {
       entries.push(entry);
       const decodedChange = Automerge.decodeChange(changeBytes);
       this.registerAutomergeHashMapping(docId, decodedChange.hash, entry.id);
+    }
+
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). `internalDoc.doc`
+    // is still the pre-change state here (it is reassigned to `newDoc` below,
+    // after the store write), so before/after are both available for Tier 2
+    // (`withfields`) evaluation. Throws AccessDeniedError when denied.
+    {
+      const signerKey = useCustomKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      const creatorKey = await this.resolveCreatorSigningKey(docId);
+      const beforeState = internalDoc.doc;
+      await this.assertWriteAllowed({
+        op: "doc_change",
+        signerKey,
+        isAuthor: creatorKey !== null && signerKey === creatorKey,
+        decryptionKeyId: internalDoc.decryptionKeyId,
+        bypass: bypassPrecheck,
+        getBeforeDoc: () =>
+          this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(newDoc) as unknown as Record<string, unknown>,
+      });
     }
 
     await this.store.putEntries(entries);
@@ -8429,6 +8633,208 @@ export class BaseMindooDB implements MindooDB {
     return value;
   }
 
+  /**
+   * Synchronous client-side write-policy precheck (docs/accesscontrol.md §9).
+   * Evaluates the full Tier 1 + Tier 2 ruleset (including the create-key
+   * allowlist gate) for the candidate write and throws {@link AccessDeniedError}
+   * when it is denied, so applications get immediate, meaningful feedback at the
+   * call site instead of an optimistic local write that is later rejected by
+   * the server witness or quarantined on materialization.
+   *
+   * Fail-open on any directory/infra error: the server witness (Tier 1) and
+   * quarantine-on-materialization (Tier 2) remain the authoritative enforcers,
+   * so a transient directory error must not block a legitimate local write.
+   * Only a clean `allowed: false` verdict is surfaced (thrown).
+   *
+   * `getBeforeDoc`/`getAfterDoc` are lazy so the (potentially costly) Automerge
+   * -> JS materialization is skipped entirely when the active policy has no
+   * Tier 2 (`withfields`) content rule for this operation/database.
+   */
+  private async assertWriteAllowed(input: {
+    op: RuleType;
+    signerKey: string;
+    isAuthor: boolean;
+    decryptionKeyId?: string;
+    bypass?: boolean;
+    getBeforeDoc?: () => Record<string, unknown> | null;
+    getAfterDoc?: () => Record<string, unknown> | null;
+  }): Promise<void> {
+    if (input.bypass) return;
+    const decision = await this.evaluateClientWriteAccess(input);
+    if (decision && !decision.allowed) {
+      throw new AccessDeniedError(input.op, this.store.getId(), decision);
+    }
+  }
+
+  /**
+   * Evaluate the full client-side (Tier 1 + Tier 2) write ruleset for a
+   * candidate write, returning the {@link AccessDecision}. Returns `null` when
+   * access control is not enforced for this database or when the directory
+   * cannot be consulted (fail-open) — callers treat `null` as "allowed". The
+   * `getBeforeDoc`/`getAfterDoc` materializers are only invoked when the active
+   * policy has a Tier 2 (`withfields`) content rule for this op/db.
+   */
+  private async evaluateClientWriteAccess(input: {
+    op: RuleType;
+    signerKey: string;
+    isAuthor: boolean;
+    decryptionKeyId?: string;
+    getBeforeDoc?: () => Record<string, unknown> | null;
+    getAfterDoc?: () => Record<string, unknown> | null;
+  }): Promise<AccessDecision | null> {
+    if (!(await this.isAclEnforced())) return null;
+    const dbid = this.store.getId();
+    try {
+      const directory = (await this.tenant.openDirectory()) as unknown as {
+        evaluateClientAccess?: (input: {
+          op: RuleType;
+          dbid: string;
+          signingKey: string;
+          trustedTime: number;
+          isAuthor: boolean;
+          beforeDoc: Record<string, unknown> | null;
+          afterDoc: Record<string, unknown> | null;
+          decryptionKeyId?: string;
+        }) => Promise<AccessDecision>;
+        hasWriteContentRules?: (op: RuleType, dbid: string) => Promise<boolean>;
+      };
+      if (typeof directory.evaluateClientAccess !== "function") return null;
+      // Only materialize the before/after documents when a content rule needs
+      // them; pure Tier 1 (identity/op/create-key) checks never read the doc.
+      let needContent = true;
+      if (typeof directory.hasWriteContentRules === "function") {
+        needContent = await directory.hasWriteContentRules(input.op, dbid);
+      }
+      const beforeDoc = needContent && input.getBeforeDoc ? input.getBeforeDoc() : null;
+      const afterDoc = needContent && input.getAfterDoc ? input.getAfterDoc() : null;
+      return await directory.evaluateClientAccess({
+        op: input.op,
+        dbid,
+        signingKey: input.signerKey,
+        trustedTime: Date.now(),
+        isAuthor: input.isAuthor,
+        beforeDoc,
+        afterDoc,
+        decryptionKeyId: input.decryptionKeyId,
+      });
+    } catch (error) {
+      this.logger.debug(`[ACL] write precheck skipped (directory error): ${error}`);
+      return null;
+    }
+  }
+
+  /** The "access control not enforced" allow decision returned by the
+   * non-throwing `canCreate`/`canChange`/`canDelete` prediction helpers. */
+  private static readonly ACL_NOT_ENFORCED_DECISION: AccessDecision = {
+    allowed: true,
+    reason: "access control not enforced",
+    tier: "tier1",
+  };
+
+  /**
+   * Predict whether a `createDocument` would be allowed by the active write
+   * policy, without writing anything (docs/accesscontrol.md §9). Lets a UI
+   * disable a Save action and surface `decision.reason` up front. The returned
+   * decision mirrors what {@link createDocument} would enforce.
+   */
+  async canCreate(options: CreateOptions = {}): Promise<AccessDecision> {
+    const keyId = options.decryptionKeyId ?? "default";
+    const useCustomSigningKey =
+      options.signingKeyPair !== undefined && options.signingKeyPassword !== undefined;
+    const signerKey = useCustomSigningKey
+      ? options.signingKeyPair!.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const afterValues: Record<string, unknown> = { _attachments: [] };
+    if (options.initialValues) {
+      for (const [k, v] of Object.entries(options.initialValues)) {
+        if (!k.startsWith("_")) afterValues[k] = v;
+      }
+    }
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_create",
+      signerKey,
+      isAuthor: true,
+      decryptionKeyId: keyId,
+      getAfterDoc: () => afterValues,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
+   * Predict whether applying `candidateAfter` as the document's next state via
+   * {@link changeDoc} would be allowed by the active write policy, without
+   * writing anything. `candidateAfter` is the intended full "after" document
+   * (e.g. the edited JSON in a database-browser editor).
+   */
+  async canChange(
+    doc: MindooDoc,
+    candidateAfter: Record<string, unknown>,
+    signingKeyPair?: SigningKeyPair,
+  ): Promise<AccessDecision> {
+    const docId = doc.getId();
+    const signerKey = signingKeyPair
+      ? signingKeyPair.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const creatorKey = await this.resolveCreatorSigningKey(docId);
+    const before = doc.getData() as unknown as Record<string, unknown>;
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_change",
+      signerKey,
+      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      decryptionKeyId: doc.getDecryptionKeyId(),
+      getBeforeDoc: () => before,
+      getAfterDoc: () => candidateAfter,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
+   * Predict whether deleting `doc` via {@link deleteDocument} would be allowed
+   * by the active write policy, without writing anything.
+   */
+  async canDelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair,
+  ): Promise<AccessDecision> {
+    const docId = doc.getId();
+    const signerKey = signingKeyPair
+      ? signingKeyPair.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const creatorKey = await this.resolveCreatorSigningKey(docId);
+    const current = doc.getData() as unknown as Record<string, unknown>;
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_delete",
+      signerKey,
+      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      decryptionKeyId: doc.getDecryptionKeyId(),
+      getBeforeDoc: () => current,
+      getAfterDoc: () => current,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
+   * Resolve the signing public key of the document's original creator (the
+   * `doc_create` entry's `createdByPublicKey`), used to set `$author`
+   * (`isAuthor`) for the client write prechecks on change/delete/undelete.
+   * Cached per document; returns `null` if the create entry isn't present yet
+   * (in which case `isAuthor` is treated as false, matching materialization).
+   */
+  private async resolveCreatorSigningKey(docId: string): Promise<string | null> {
+    const cached = this.creatorKeyCache.get(docId);
+    if (cached) return cached;
+    try {
+      const metas = await this.scanAllMetadata(this.store, { docId });
+      const createKey =
+        metas.find((m) => m.entryType === "doc_create")?.createdByPublicKey ?? null;
+      if (createKey) this.creatorKeyCache.set(docId, createKey);
+      return createKey;
+    } catch (error) {
+      this.logger.debug(`[ACL] creator-key resolution failed for ${docId}: ${error}`);
+      return null;
+    }
+  }
+
   /** Append a record to the quarantine/audit log (and log it). */
   private recordQuarantine(rec: QuarantineRecord): void {
     this.quarantineLog.push(rec);
@@ -8470,6 +8876,7 @@ export class BaseMindooDB implements MindooDB {
         isAuthor: boolean;
         beforeDoc: Record<string, unknown> | null;
         afterDoc: Record<string, unknown> | null;
+        decryptionKeyId?: string;
       }) => Promise<AccessDecision>;
       getTrustedWitnessKeysAt?: (T: number) => Promise<Set<string>>;
     };
@@ -8618,6 +9025,10 @@ export class BaseMindooDB implements MindooDB {
           isAuthor,
           beforeDoc: beforeJS,
           afterDoc: afterJS,
+          // Re-check the create-key allowlist on receipt (defense in depth):
+          // evaluated against the directory state at this entry's trusted time,
+          // so docs created under an earlier policy stay valid.
+          decryptionKeyId: meta.decryptionKeyId,
         });
       } catch (error) {
         // Fail-open for availability: Tier 2 only gates honest clients, so a
