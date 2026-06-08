@@ -292,7 +292,32 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
 
   async getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null> {
     if (typeof this.inner.getUserBySigningPublicKey === "function") {
-      return this.inner.getUserBySigningPublicKey(publicKey);
+      const innerLookup = await this.inner.getUserBySigningPublicKey(publicKey);
+      if (innerLookup) return innerLookup;
+    }
+
+    // Bootstrap/config fallback: the admin and trusted-server identities can be
+    // resolved by their signing key even without a grantaccess document on this
+    // server, mirroring getUserPublicKeys. Without this, key-based identity
+    // resolution (and the validateToken active-key check below) would treat the
+    // admin's own key as unknown the moment the directory has no admin grant.
+    if (this.adminBootstrapIdentity && this.adminBootstrapIdentity.signingPublicKey === publicKey) {
+      return {
+        username: this.adminBootstrapIdentity.username,
+        signingPublicKey: this.adminBootstrapIdentity.signingPublicKey,
+        encryptionPublicKey: this.adminBootstrapIdentity.encryptionPublicKey,
+        details: null,
+      };
+    }
+    for (const server of this.trustedServers) {
+      if (server.signingPublicKey === publicKey) {
+        return {
+          username: server.name,
+          signingPublicKey: server.signingPublicKey,
+          encryptionPublicKey: server.encryptionPublicKey,
+          details: null,
+        };
+      }
     }
     return null;
   }
@@ -300,10 +325,22 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
   async getUserSigningKeyUniverse(
     username: string,
   ): Promise<{ active: string[]; wipeRequested: string[] }> {
-    if (typeof this.inner.getUserSigningKeyUniverse === "function") {
-      return this.inner.getUserSigningKeyUniverse(username);
-    }
-    return { active: [], wipeRequested: [] };
+    const base =
+      typeof this.inner.getUserSigningKeyUniverse === "function"
+        ? await this.inner.getUserSigningKeyUniverse(username)
+        : { active: [] as string[], wipeRequested: [] as string[] };
+
+    // The admin bootstrap identity, trusted servers, and config-based users are
+    // valid principals even without a grantaccess document on this server (the
+    // server config / bootstrap identity is the root of trust). Their signing
+    // key must therefore count as ACTIVE so the token-validation gate in
+    // AuthenticationService.validateToken (which requires the device key to be
+    // in this active set) does not reject a freshly-issued admin/config token.
+    // We reuse getUserPublicKeys, which already applies exactly those fallbacks.
+    const active = new Set(base.active);
+    const fallback = await this.getUserPublicKeys(username);
+    if (fallback) active.add(fallback.signingPublicKey);
+    return { active: Array.from(active), wipeRequested: base.wipeRequested };
   }
 
   async getUserKeyPairs(username: string): Promise<GrantKeyPairInfo[]> {

@@ -270,6 +270,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     // legacy (v1, unsalted) and salted (v2) forms so that documents written
     // under either scheme are found (docs/accesscontrol.md §6.5).
     const targetHashes = new Set(await this.usernameHashCandidates(username));
+    // Callers may pass an already-hashed `username_hash` rather than a cleartext
+    // name — e.g. when validateToken resolves the principal from a device key via
+    // getUserBySigningPublicKey, whose `username` is the hash when the cleartext
+    // is not recoverable on this server. Match it directly too so a key-resolved
+    // identity round-trips: a cleartext name never collides with a 64-char hex
+    // hash, so this is safe (docs/accesscontrol.md §6.5).
+    targetHashes.add(username);
     const matchesTarget = (value: unknown): boolean =>
       typeof value === "string" && targetHashes.has(value);
     
