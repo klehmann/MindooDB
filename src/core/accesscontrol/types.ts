@@ -1,4 +1,5 @@
 import { CUSTOM_DOC_ID_REGEX } from "../types";
+import { getDatabaseIdValidationError } from "../databaseIdValidation";
 
 /**
  * Access-control directory schema (docs/accesscontrol.md §6) plus the
@@ -176,6 +177,67 @@ export interface DefaultAccessPolicyDoc {
    * allowlist never retroactively invalidates valid history.
    */
   allowedCreateKeyIds?: string[];
+  /**
+   * Optional default `decryptionKeyId` for a `doc_create` that does not specify
+   * one in the governed scope (tenant default, or a single database when set on
+   * a per-db policy). Unlike {@link allowedCreateKeyIds}, this is NOT a security
+   * control: the sync server never selects keys, so this is a client-side
+   * create-time convenience that fills in the key when the caller omits it
+   * (replacing the hardcoded `"default"` fallback). The create-key gate
+   * ({@link allowedCreateKeyIds}) remains authoritative.
+   *
+   * When both fields are set on the same policy document, `defaultCreateKeyId`
+   * MUST be a member of `allowedCreateKeyIds` (enforced by
+   * {@link validateAccessPolicy} at write time), otherwise the default would be
+   * self-denying. Like every policy field it layers per-db over the tenant
+   * default in {@link effectivePolicy}.
+   */
+  defaultCreateKeyId?: string;
+  /**
+   * Governs whether tenant members may open/sync arbitrary database ids.
+   *
+   * This is a **tenant-level** control and is only read from the tenant default
+   * policy (`acl_defaultpolicy`); it is intentionally NOT layered through a
+   * per-db `acl_dbpolicy_*` document. Defaults to `"open"` when omitted.
+   *
+   * - `"open"` (default): any syntactically valid database id may be opened and
+   *   synced — today's behavior, convenient for quick experimentation.
+   * - `"directory-restricted"`: only the `"directory"` database (always
+   *   implicitly allowed) and the ids listed in {@link allowedDbIds} may be
+   *   opened or synced. The tenant admin is exempt and may use any id.
+   */
+  databaseCreationPolicy?: "open" | "directory-restricted";
+  /**
+   * The set of database ids that may be opened/synced when
+   * {@link databaseCreationPolicy} is `"directory-restricted"`. `"directory"` is
+   * always implicitly allowed and need not be listed; every other id (including
+   * `"main"`) must be listed explicitly. Ignored when the policy is `"open"`.
+   * Tenant-level only (not layered per-db).
+   */
+  allowedDbIds?: string[];
+  /**
+   * Storage-format floor: a trusted-time cutoff (ms since epoch) at and after
+   * which a store entry MUST carry the v2 metadata-binding author signature
+   * (`metadataSignature`, `entryVersion >= 2`). Entries whose trusted time is
+   * strictly BEFORE this cutoff may still verify via the legacy ciphertext-only
+   * signature, so genuine older history (and old tenants migrating in) keeps
+   * loading.
+   *
+   * This is a **tenant-level** control read only from the tenant default policy
+   * (`acl_defaultpolicy`); it is NOT layered per-db. Absent = no requirement
+   * (fully backward compatible — the legacy fallback always applies).
+   *
+   * Security model (zero-trust server): the authoritative enforcement is the
+   * sync server's push gate, which compares the cutoff against ITS OWN clock at
+   * ingest (`receivedAt = now`). After the cutoff, no new v1 entry can be
+   * accepted, so a forged v1 entry cannot bypass the floor by backdating its
+   * self-asserted `createdAt`. Honest clients additionally re-check on read
+   * using each entry's {@link entryTrustedTime} as defense in depth. Because the
+   * cutoff lives in the admin-signed policy document, a hostile relay cannot
+   * move it. New tenants are created with this set to their creation time so the
+   * whole tenant is v2-only from entry #1.
+   */
+  requireMetadataSignatureSince?: number;
 }
 
 /**
@@ -185,7 +247,14 @@ export interface DefaultAccessPolicyDoc {
 export const DEFAULT_POLICY_DEFAULTS: Required<
   Omit<
     DefaultAccessPolicyDoc,
-    "form" | "type" | "disableAllAccessChecksAndPolicies" | "allowedCreateKeyIds"
+    | "form"
+    | "type"
+    | "disableAllAccessChecksAndPolicies"
+    | "allowedCreateKeyIds"
+    | "defaultCreateKeyId"
+    | "databaseCreationPolicy"
+    | "allowedDbIds"
+    | "requireMetadataSignatureSince"
   >
 > = {
   denyDocCreate: false,
@@ -251,9 +320,6 @@ export interface TrustedWitnessDoc {
   /** Ed25519 public key, PEM. */
   witnessPublicKey: string;
   serverUrl?: string;
-  /** Optional validity window (ms epoch). */
-  notBefore?: number;
-  notAfter?: number;
 }
 
 /** Tier an {@link AccessDecision} was reached at. */
@@ -407,6 +473,69 @@ export function validateAclRule(rule: {
 }
 
 /**
+ * Validate a {@link DefaultAccessPolicyDoc} (tenant default or per-db) before
+ * it is written. Enforces that a `defaultCreateKeyId`, when set together with a
+ * non-empty `allowedCreateKeyIds` on the SAME document, is a member of that
+ * allowlist — otherwise the default would be self-denying (the create-key gate
+ * would reject every default-keyed `doc_create`). Throws on violation.
+ *
+ * This is a per-document check: the allowlist and default can in principle come
+ * from different layers (tenant vs per-db), which write-time validation cannot
+ * see; the resolver ({@link effectivePolicy} consumers, e.g.
+ * `getEffectiveDefaultCreateKeyId`) applies the cross-layer safety net.
+ */
+export function validateAccessPolicy(
+  policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>
+): void {
+  if (
+    policy.defaultCreateKeyId !== undefined &&
+    Array.isArray(policy.allowedCreateKeyIds) &&
+    policy.allowedCreateKeyIds.length > 0 &&
+    !policy.allowedCreateKeyIds.includes(policy.defaultCreateKeyId)
+  ) {
+    throw new Error(
+      `defaultCreateKeyId "${policy.defaultCreateKeyId}" must be one of allowedCreateKeyIds ` +
+        `[${policy.allowedCreateKeyIds.join(", ")}]`
+    );
+  }
+
+  if (
+    policy.databaseCreationPolicy !== undefined &&
+    policy.databaseCreationPolicy !== "open" &&
+    policy.databaseCreationPolicy !== "directory-restricted"
+  ) {
+    throw new Error(
+      `databaseCreationPolicy "${String(policy.databaseCreationPolicy)}" must be ` +
+        `"open" or "directory-restricted"`
+    );
+  }
+
+  if (policy.allowedDbIds !== undefined) {
+    if (!Array.isArray(policy.allowedDbIds)) {
+      throw new Error("allowedDbIds must be an array of database ids");
+    }
+    for (const dbId of policy.allowedDbIds) {
+      const error = getDatabaseIdValidationError(dbId, "allowedDbIds entry");
+      if (error) {
+        throw new Error(error);
+      }
+    }
+  }
+
+  if (policy.requireMetadataSignatureSince !== undefined) {
+    if (
+      typeof policy.requireMetadataSignatureSince !== "number" ||
+      !Number.isFinite(policy.requireMetadataSignatureSince) ||
+      policy.requireMetadataSignatureSince < 0
+    ) {
+      throw new Error(
+        "requireMetadataSignatureSince must be a non-negative epoch-millisecond timestamp",
+      );
+    }
+  }
+}
+
+/**
  * Compute the effective policy by layering DB policy over the tenant default
  * and filling omitted fields with {@link DEFAULT_POLICY_DEFAULTS} (§6.2, §7).
  *
@@ -417,8 +546,20 @@ export function validateAclRule(rule: {
 export function effectivePolicy(
   tenantDefault: DefaultAccessPolicyDoc | null | undefined,
   dbPolicy: DefaultAccessPolicyDoc | null | undefined
-): Required<Omit<DefaultAccessPolicyDoc, "form" | "type" | "allowedCreateKeyIds">> & {
+): Required<
+  Omit<
+    DefaultAccessPolicyDoc,
+    | "form"
+    | "type"
+    | "allowedCreateKeyIds"
+    | "defaultCreateKeyId"
+    | "databaseCreationPolicy"
+    | "allowedDbIds"
+    | "requireMetadataSignatureSince"
+  >
+> & {
   allowedCreateKeyIds?: string[];
+  defaultCreateKeyId?: string;
 } {
   const pick = <K extends keyof typeof DEFAULT_POLICY_DEFAULTS>(field: K): boolean => {
     if (dbPolicy && dbPolicy[field] !== undefined) return dbPolicy[field] as boolean;
@@ -435,6 +576,12 @@ export function effectivePolicy(
     (dbPolicy && dbPolicy.allowedCreateKeyIds) ??
     (tenantDefault && tenantDefault.allowedCreateKeyIds) ??
     undefined;
+  // Same per-db precedence for the default create key: a per-db default fully
+  // overrides the tenant default's, so a database can pick its own default key.
+  const defaultCreateKeyId =
+    (dbPolicy && dbPolicy.defaultCreateKeyId) ??
+    (tenantDefault && tenantDefault.defaultCreateKeyId) ??
+    undefined;
   return {
     disableAllAccessChecksAndPolicies: disable,
     denyDocCreate: pick("denyDocCreate"),
@@ -444,6 +591,7 @@ export function effectivePolicy(
     denyDocSnapshot: pick("denyDocSnapshot"),
     denyDocPurge: pick("denyDocPurge"),
     allowedCreateKeyIds,
+    defaultCreateKeyId,
   };
 }
 

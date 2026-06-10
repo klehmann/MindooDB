@@ -510,7 +510,10 @@ describe("Network Sync", () => {
       expect(initialHashes.length).toBe(0);
       
       // Push an entry via client store (must use trusted user's public key)
-      const entry = createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem);
+      const entry = createMockEntry(
+        "doc1", "hash1", 1000, [], userSigningPublicKeyPem,
+        await signMockCiphertext(userSigningKeyPair.privateKey),
+      );
       await clientStore.putEntries([entry]);
       
       // Server should now have the entry
@@ -914,8 +917,9 @@ describe("Network Sync", () => {
 
     test("should push entries from local to remote (simulates MindooDB.pushChangesTo)", async () => {
       // Add entries to local (must use trusted user's public key)
-      await localStore.putEntries([createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem)]);
-      await localStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"], userSigningPublicKeyPem)]);
+      const pushSig = await signMockCiphertext(userSigningKeyPair.privateKey);
+      await localStore.putEntries([createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem, pushSig)]);
+      await localStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"], userSigningPublicKeyPem, pushSig)]);
       
       // Server should be empty
       expect((await serverStore.getAllIds()).length).toBe(0);
@@ -942,10 +946,11 @@ describe("Network Sync", () => {
 
     test("should handle bidirectional sync", async () => {
       // Add some entries to server (must use trusted user's public key)
-      await serverStore.putEntries([createMockEntry("doc1", "server-hash1", 1000, [], userSigningPublicKeyPem)]);
+      const bidiSig = await signMockCiphertext(userSigningKeyPair.privateKey);
+      await serverStore.putEntries([createMockEntry("doc1", "server-hash1", 1000, [], userSigningPublicKeyPem, bidiSig)]);
       
       // Add some entries to local (must use trusted user's public key)
-      await localStore.putEntries([createMockEntry("doc2", "local-hash1", 2000, [], userSigningPublicKeyPem)]);
+      await localStore.putEntries([createMockEntry("doc2", "local-hash1", 2000, [], userSigningPublicKeyPem, bidiSig)]);
       
       // Pull from server to local
       const localHashes = await localStore.getAllIds();
@@ -1004,16 +1009,31 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Shared crypto + fixed payload so the server-side contentHash/signature checks
+// (audit findings #1/#5) can be satisfied deterministically in tests.
+const mockSubtle = new NodeCryptoAdapter().getSubtle();
+const MOCK_ENCRYPTED_DATA = new Uint8Array([10, 20, 30, 40]);
+// SHA-256(MOCK_ENCRYPTED_DATA), hex — the value the server recomputes on push.
+const MOCK_CONTENT_HASH = "5f53c0ff07ba5d9a330e68c95dabb1a9bc49e29f9ed53f6fa7c6d99abb000050";
+
+/** Produce a valid legacy author signature over the fixed mock ciphertext. */
+async function signMockCiphertext(key: CryptoKey): Promise<Uint8Array> {
+  return new Uint8Array(
+    await mockSubtle.sign({ name: "Ed25519" }, key, MOCK_ENCRYPTED_DATA.buffer as ArrayBuffer),
+  );
+}
+
 function createMockEntry(
   docId: string,
   id: string,
   createdAt: number,
   deps: string[] = [],
-  createdByPublicKey: string = "mock-public-key"
+  createdByPublicKey: string = "mock-public-key",
+  signature: Uint8Array = new Uint8Array([1, 2, 3, 4])
 ): StoreEntry {
-  const encryptedData = new Uint8Array([10, 20, 30, 40]);
-  // Simple mock content hash for testing
-  const contentHash = `contenthash-${id}`;
+  const encryptedData = MOCK_ENCRYPTED_DATA;
+  // Real content hash so the server's integrity check accepts the entry.
+  const contentHash = MOCK_CONTENT_HASH;
   return {
     entryType: "doc_change",
     id,
@@ -1023,7 +1043,7 @@ function createMockEntry(
     createdAt,
     createdByPublicKey,
     decryptionKeyId: "default",
-    signature: new Uint8Array([1, 2, 3, 4]),
+    signature,
     originalSize: 3, // Simulated original size
     encryptedSize: encryptedData.length,
     encryptedData,

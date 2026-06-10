@@ -23,7 +23,7 @@ import { join, resolve, sep } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
-import type { ServerTier1Evaluator, ServerReadEvaluator } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { ServerTier1Evaluator, ServerReadEvaluator, ServerDbAccessEvaluator } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import { Ed25519WitnessProvider } from "../../core/accesscontrol/timestamp/Ed25519WitnessProvider";
@@ -58,6 +58,8 @@ import type {
   TrustedServer,
   NamedRemoteServerConfig,
 } from "./types";
+import { ENV_VARS } from "./types";
+import { assertSafeSyncUrl } from "../../core/utils/urlSafety";
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -165,7 +167,10 @@ export class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
     return this.revokedUsers.has(username.toLowerCase());
   }
 
-  async validatePublicSigningKey(publicKey: string): Promise<boolean> {
+  async validatePublicSigningKey(
+    publicKey: string,
+    _opts?: { forceRefresh?: boolean },
+  ): Promise<boolean> {
     if (publicKey === this.adminSigningPublicKey) {
       return true;
     }
@@ -206,7 +211,8 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
         | "getUserKeyPairs"
         | "getWipeGrantDocId"
         | "evaluateReadAccessForUser"
-        | "evaluateReadAccessForSigningKey">>,
+        | "evaluateReadAccessForSigningKey">>
+      & Partial<Pick<BaseMindooTenantDirectory, "evaluateDbAccessForSigningKey">>,
     private trustedServers: TrustedServer[],
     private adminBootstrapIdentity?: {
       username: string;
@@ -265,12 +271,15 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     return this.inner.isUserRevoked(username);
   }
 
-  async validatePublicSigningKey(publicKey: string): Promise<boolean> {
+  async validatePublicSigningKey(
+    publicKey: string,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<boolean> {
     if (this.adminBootstrapIdentity && this.adminBootstrapIdentity.signingPublicKey === publicKey) {
       return true;
     }
 
-    const innerResult = await this.inner.validatePublicSigningKey(publicKey);
+    const innerResult = await this.inner.validatePublicSigningKey(publicKey, opts);
     if (innerResult) return true;
 
     for (const server of this.trustedServers) {
@@ -381,6 +390,17 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     }
     // Config-based directories never carry read policies -> unrestricted.
     return { allowed: true, reason: "read access control not enabled", tier: "tier1" };
+  }
+
+  async evaluateDbAccessForSigningKey(input: {
+    dbid: string;
+    signingKey: string;
+  }): Promise<boolean> {
+    if (typeof this.inner.evaluateDbAccessForSigningKey === "function") {
+      return this.inner.evaluateDbAccessForSigningKey(input);
+    }
+    // Config-based directories carry no database-open policy -> unrestricted.
+    return true;
   }
 }
 
@@ -835,6 +855,16 @@ export class TenantManager {
 
   addTenantSyncServer(tenantId: string, server: NamedRemoteServerConfig): void {
     const normalizedId = tenantId.toLowerCase();
+    // SSRF guard (defense in depth alongside the HTTP route): a configured sync
+    // URL is fetched server-side, so reject plaintext/internal targets unless
+    // explicitly allowed for local development.
+    const allowInsecure = /^(1|true)$/i.test(
+      process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
+    );
+    assertSafeSyncUrl(server.url, {
+      requireHttps: !allowInsecure,
+      allowPrivate: allowInsecure,
+    });
     const configPath = this.resolveTenantConfigPath(normalizedId);
     if (!existsSync(configPath)) {
       throw new Error(`Tenant ${normalizedId} not found`);
@@ -914,6 +944,10 @@ export class TenantManager {
     // rules, otherwise read access could never be evaluated at all.
     const readEvaluator =
       dbId === "directory" ? undefined : this.buildReadEvaluator(directory);
+    // Database-open gate (directory-restricted policy). Never applied to the
+    // directory store itself, which must always sync so the policy can be read.
+    const dbAccessEvaluator =
+      dbId === "directory" ? undefined : this.buildDbAccessEvaluator(directory);
 
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
@@ -921,7 +955,14 @@ export class TenantManager {
       tenant.authService,
       this.cryptoAdapter,
       undefined,
-      { timestampProvider, witnessDbid: dbId, tier1Evaluator, wipeGrantDocIdResolver, readEvaluator },
+      {
+        timestampProvider,
+        witnessDbid: dbId,
+        tier1Evaluator,
+        wipeGrantDocIdResolver,
+        readEvaluator,
+        dbAccessEvaluator,
+      },
     );
 
     tenant.serverStores.set(cacheKey, serverStore);
@@ -978,6 +1019,32 @@ export class TenantManager {
         // Cleartext metadata the witness already holds; enables the create-key
         // allowlist gate to be enforced at push time (Tier 1).
         decryptionKeyId: entry.decryptionKeyId,
+      });
+    };
+  }
+
+  /**
+   * Build a database-open evaluator closure for a server store, or undefined
+   * when the directory cannot evaluate the database-open policy (e.g. a
+   * config-based directory without the access-control state chain). When the
+   * tenant policy is `"directory-restricted"`, this rejects sync for any
+   * database id that is not in the allowlist; `"directory"` is always allowed
+   * and the tenant admin is exempt (resolved from the principal signing key).
+   */
+  private buildDbAccessEvaluator(
+    directory: MindooTenantDirectory,
+  ): ServerDbAccessEvaluator | undefined {
+    const evaluable = directory as unknown as {
+      evaluateDbAccessForSigningKey?: BaseMindooTenantDirectory["evaluateDbAccessForSigningKey"];
+    };
+    if (typeof evaluable.evaluateDbAccessForSigningKey !== "function") {
+      return undefined;
+    }
+
+    return async (principal, dbid) => {
+      return evaluable.evaluateDbAccessForSigningKey!({
+        dbid,
+        signingKey: principal.signingKey ?? "",
       });
     };
   }

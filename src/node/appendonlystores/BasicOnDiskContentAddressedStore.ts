@@ -79,8 +79,9 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
  * can be written directly to JSON files and metadata segments.
  */
 interface SerializedStoreEntryMetadata
-  extends Omit<StoreEntryMetadata, "signature" | "receivedDateSignature"> {
+  extends Omit<StoreEntryMetadata, "signature" | "metadataSignature" | "receivedDateSignature"> {
   signature: string; // base64
+  metadataSignature?: string; // base64 (author metadata-binding signature)
   receivedDateSignature?: string; // base64 (access-control witness receipt)
 }
 
@@ -129,6 +130,9 @@ function serializeMetadata(metadata: StoreEntryMetadata): SerializedStoreEntryMe
   return {
     ...metadata,
     signature: Buffer.from(metadata.signature).toString("base64"),
+    metadataSignature: metadata.metadataSignature
+      ? Buffer.from(metadata.metadataSignature).toString("base64")
+      : undefined,
     receivedDateSignature: metadata.receivedDateSignature
       ? Buffer.from(metadata.receivedDateSignature).toString("base64")
       : undefined,
@@ -143,6 +147,9 @@ function deserializeMetadata(serialized: SerializedStoreEntryMetadata): StoreEnt
   return {
     ...serialized,
     signature: new Uint8Array(Buffer.from(serialized.signature, "base64")),
+    metadataSignature: serialized.metadataSignature
+      ? new Uint8Array(Buffer.from(serialized.metadataSignature, "base64"))
+      : undefined,
     receivedDateSignature: serialized.receivedDateSignature
       ? new Uint8Array(Buffer.from(serialized.receivedDateSignature, "base64"))
       : undefined,

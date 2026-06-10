@@ -230,6 +230,68 @@ describe("CapabilityMatcher", () => {
     });
   });
 
+  describe("tenant-creation wildcard principal (audit #6)", () => {
+    // The "*"/"*" wildcard principal may ONLY authorize tenant creation, which
+    // targets exactly one segment under /system/tenants/. It must not be able to
+    // act on an existing tenant's sub-resources (sync-servers, trigger-sync).
+    const wildcardConfig: ServerConfig = {
+      capabilities: {
+        "POST:/system/tenants/*": [{ username: "*", publicsignkey: "*" }],
+      },
+    };
+
+    test("authorizes creation of a tenant (single segment)", () => {
+      const matcher = new CapabilityMatcher(wildcardConfig);
+      expect(
+        matcher.isAuthorized("POST", "/system/tenants/new-tenant", "anyone", key3),
+      ).toBe(true);
+    });
+
+    test("does NOT authorize sub-resources of an existing tenant", () => {
+      const matcher = new CapabilityMatcher(wildcardConfig);
+      expect(
+        matcher.isAuthorized(
+          "POST",
+          "/system/tenants/acme/sync-servers",
+          "anyone",
+          key3,
+        ),
+      ).toBe(false);
+      expect(
+        matcher.isAuthorized(
+          "POST",
+          "/system/tenants/acme/trigger-sync",
+          "anyone",
+          key3,
+        ),
+      ).toBe(false);
+    });
+
+    test("does NOT authorize a non-creation method on the tenant path", () => {
+      const matcher = new CapabilityMatcher(wildcardConfig);
+      expect(
+        matcher.isAuthorized("DELETE", "/system/tenants/acme", "anyone", key3),
+      ).toBe(false);
+    });
+
+    test("an explicit (non-wildcard) principal is still bound to its rule path", () => {
+      const config: ServerConfig = {
+        capabilities: {
+          "POST:/system/tenants/*": [{ username: "creator", publicsignkey: key1 }],
+        },
+      };
+      const matcher = new CapabilityMatcher(config);
+      // Explicit principal still matched only by the path pattern, not over-granted.
+      expect(
+        matcher.isAuthorized("POST", "/system/tenants/x/sync-servers", "creator", key1),
+      ).toBe(true);
+      // ...but a DIFFERENT principal cannot ride the wildcard creation path.
+      expect(
+        matcher.isAuthorized("POST", "/system/tenants/x", "other", key2),
+      ).toBe(false);
+    });
+  });
+
   describe("principalExists", () => {
     test("should return true for existing principal", () => {
       const config: ServerConfig = {

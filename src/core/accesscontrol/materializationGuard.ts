@@ -19,7 +19,12 @@ export type QuarantineReason =
   | "op_type_mismatch"
   | "cascade_dependent"
   | "invalid_signature"
-  | "invalid_witness_receipt";
+  | "invalid_witness_receipt"
+  // Transient: validation could not be completed (e.g. directory/witness
+  // adapter temporarily unavailable or threw). The entry is excluded from this
+  // materialization (fail closed), but the result is NOT cached so the next
+  // load retries and self-heals once the dependency recovers (audit finding #2).
+  | "directory_unavailable";
 
 /**
  * One entry in the per-tenant quarantine/audit log (§10). Kept deliberately

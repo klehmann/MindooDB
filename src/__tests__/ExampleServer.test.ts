@@ -445,7 +445,9 @@ describe("MindooDB Example Server", () => {
         }
       );
 
-      expect(status).toBe(200); // Auth endpoint returns 200 with success: false
+      // Hardening (audit, Low): a failed credential check now returns HTTP 401
+      // instead of 200, while still carrying the structured failure body.
+      expect(status).toBe(401);
       expect((body as { success: boolean }).success).toBe(false);
     });
   });

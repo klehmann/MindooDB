@@ -107,7 +107,13 @@ import {
 } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
 import {
+  buildEntrySigningBytes,
+  entrySignatureFieldsFromEntry,
+  verifyEntrySignatureWithImportedKey,
+} from "./crypto/EntrySignature";
+import {
   QuarantineRecord,
+  snapshotHeadsMatch,
 } from "./accesscontrol/materializationGuard";
 import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
 import type { RuleType, AccessDecision } from "./accesscontrol/types";
@@ -365,6 +371,13 @@ function getCustomIdInitialChangeBytes(): Uint8Array {
  * - Automerge.load(bytes) - verify method name for snapshots
  * - Automerge.applyChanges(doc, changes) - verify method signature
  */
+/**
+ * Read-entitlement verdict for the visibility reconcile pass (audit finding #2).
+ * `"unknown"` is the fail-closed transient state: hide the document but do not
+ * purge ciphertext or crypto-shred keys, and retry on the next reconcile.
+ */
+type ReadEntitlement = "allowed" | "denied" | "unknown";
+
 export class BaseMindooDB implements MindooDB {
   private tenant: BaseMindooTenant;
   private store: ContentAddressedStore;
@@ -1106,26 +1119,89 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Verify a signature using a pre-imported CryptoKey.
-   * This bypasses the key import step for better performance when keys are cached.
+   * Compute the author's metadata-binding signature for a new entry (audit
+   * finding #5). The signature covers the canonical, versioned, length-prefixed
+   * metadata layout (see crypto/EntrySignature.ts) rather than only the
+   * ciphertext, so the cleartext metadata cannot be tampered with after signing.
+   * Uses the supplied custom signing key when present, otherwise the current
+   * user's signing key.
    */
-  private async verifySignatureWithKey(
+  private async computeEntryMetadataSignature(
+    meta: Pick<
+      StoreEntryMetadata,
+      | "entryType"
+      | "id"
+      | "docId"
+      | "decryptionKeyId"
+      | "createdAt"
+      | "dependencyIds"
+      | "contentHash"
+      | "createdByPublicKey"
+    >,
+    signing?: { signingKeyPair?: SigningKeyPair; signingKeyPassword?: string },
+  ): Promise<Uint8Array> {
+    const bytes = buildEntrySigningBytes(entrySignatureFieldsFromEntry(meta));
+    if (signing?.signingKeyPair && signing?.signingKeyPassword) {
+      return this.tenant.signPayloadWithKey(bytes, signing.signingKeyPair, signing.signingKeyPassword);
+    }
+    return this.tenant.signPayload(bytes);
+  }
+
+  /**
+   * Verify a store entry's author signature using a pre-imported CryptoKey,
+   * version-aware (audit finding #5): prefers the metadata-binding
+   * `metadataSignature` when present, otherwise the legacy ciphertext signature,
+   * and re-verifies `SHA-256(encryptedData) === contentHash`. Returns false on
+   * any mismatch. The caller is responsible for the directory trust check.
+   */
+  private async verifyEntrySignatureWithKey(
     cryptoKey: CryptoKey,
-    payload: Uint8Array,
-    signature: Uint8Array
+    entry: StoreEntry,
   ): Promise<boolean> {
     const subtle = this.tenant.getCryptoAdapter().getSubtle();
-    
-    const isValid = await subtle.verify(
-      {
-        name: "Ed25519",
-      },
-      cryptoKey,
-      signature.buffer as ArrayBuffer,
-      payload.buffer as ArrayBuffer
-    );
+    const actualHash = await computeContentHash(entry.encryptedData, subtle);
+    if (actualHash !== entry.contentHash) {
+      this.logger.warn(`Content hash mismatch for entry ${entry.id}`);
+      return false;
+    }
+    const requireMetadataSignature = await this.requiresMetadataSignature(entry);
+    return verifyEntrySignatureWithImportedKey(entry, entry.encryptedData, cryptoKey, subtle, {
+      requireMetadataSignature,
+    });
+  }
 
-    return isValid;
+  /**
+   * Whether the tenant storage-format floor (`requireMetadataSignatureSince`)
+   * requires `entry` to carry the v2 metadata-binding signature, based on its
+   * trusted time. The `directory` store is exempt (it must always load so the
+   * policy that defines the floor can be read); entries that already carry a
+   * `metadataSignature` short-circuit. Fail-open on resolution errors is safe —
+   * the legacy signature is still cryptographically verified; the floor only
+   * refuses the weaker fallback for new entries.
+   */
+  private async requiresMetadataSignature(entry: StoreEntry): Promise<boolean> {
+    if (entry.metadataSignature) {
+      return false;
+    }
+    // Exempt the directory store from the floor: it must always materialize so
+    // the policy can be read, and resolving the floor itself loads it.
+    if (this.store.getId() === "directory") {
+      return false;
+    }
+    try {
+      const directory = await this.tenant.openDirectory();
+      if (typeof directory.getRequireMetadataSignatureSince !== "function") {
+        return false;
+      }
+      const cutoff = await directory.getRequireMetadataSignatureSince();
+      if (cutoff === undefined) {
+        return false;
+      }
+      return entryTrustedTime(entry, Date.now()) >= cutoff;
+    } catch (error) {
+      this.logger.warn(`Failed to resolve metadata-signature floor: ${String(error)}`);
+      return false;
+    }
   }
 
   /**
@@ -1624,7 +1700,7 @@ export class BaseMindooDB implements MindooDB {
     // Read-entitlement memo for this pass: many docs share a `decryptionKeyId`
     // and the read policy verdict is identical for all of them, so we evaluate
     // each key once. Empty when read access control is not active.
-    const readEntitledByKey = new Map<string, boolean>();
+    const readEntitledByKey = new Map<string, ReadEntitlement>();
     // Named keys whose scope lost read entitlement during this pass; deleted
     // from the KeyBag afterwards (crypto-shred), never the tenant default key.
     const keysToShred = new Set<string>();
@@ -1650,10 +1726,10 @@ export class BaseMindooDB implements MindooDB {
       // This is best-effort cooperative purge on honest clients; the server
       // delivery gate is the strong layer. Evaluation is policy-state-driven
       // (one directory sync after revocation) with no client-clock dependency.
-      const entitled = hasKey
+      const readState: ReadEntitlement = hasKey
         ? await this.isReadEntitled(visibility.decryptionKeyId, readEntitledByKey)
-        : true;
-      const canRead = hasKey && entitled;
+        : "allowed";
+      const canRead = hasKey && readState === "allowed";
 
       if (canRead) {
         // Reveal-on-add only triggers when the previous state was
@@ -1670,7 +1746,12 @@ export class BaseMindooDB implements MindooDB {
       // Entitlement loss (we hold the key but the policy now denies the scope):
       // purge already-synced ciphertext as well, and remember the named key for
       // crypto-shred so the doc cannot be re-materialized locally.
-      if (hasKey && !entitled) {
+      //
+      // Only act destructively on a DEFINITIVE "denied" verdict. A transient
+      // "unknown" (directory unavailable) fails closed by hiding the document
+      // below WITHOUT destroying ciphertext/keys, so a later reconcile re-reveals
+      // it once the directory is reachable again (audit finding #2).
+      if (hasKey && readState === "denied") {
         await this.purgeDocumentCiphertext(metadataByDoc.get(docId)!);
         keysToShred.add(visibility.decryptionKeyId);
       }
@@ -1712,50 +1793,50 @@ export class BaseMindooDB implements MindooDB {
    * `decryptionKeyId` in this database under the read policy (read-side of
    * docs/accesscontrol.md). Memoized per key for the calling reconcile pass.
    *
-   * Fails OPEN (returns true) when read access control is not configured or the
-   * directory cannot evaluate it: the client purge is a best-effort cooperative
-   * layer, and the server delivery gate is the authoritative enforcement, so a
-   * transient evaluation error must never destroy local data.
+   * Tri-state (audit finding #2):
+   * - `"allowed"`  — read access not configured, or the policy grants this scope.
+   * - `"denied"`   — the policy DEFINITIVELY denies this scope. The caller purges
+   *   the ciphertext and crypto-shreds the named key.
+   * - `"unknown"`  — the directory could not evaluate the policy (transient
+   *   error). The caller fails CLOSED by hiding the document but MUST NOT destroy
+   *   any ciphertext/keys, so a later reconcile re-reveals it once the directory
+   *   is reachable again. This keeps revoked readers from seeing data during an
+   *   outage without risking data loss on a transient blip.
    */
   private async isReadEntitled(
     decryptionKeyId: string,
-    memo: Map<string, boolean>,
-  ): Promise<boolean> {
+    memo: Map<string, ReadEntitlement>,
+  ): Promise<ReadEntitlement> {
     // The tenant directory is never read-gated: it carries the very policies the
     // read gate depends on, so it must always be readable (the server delivery
     // gate skips it for the same reason). Evaluating read access here would also
     // re-enter directory-state building during the directory DB's own
     // visibility reconcile on tenant open, deadlocking initialization.
-    if (this.store.getId() === "directory") return true;
+    if (this.store.getId() === "directory") return "allowed";
 
     const cached = memo.get(decryptionKeyId);
     if (cached !== undefined) return cached;
 
-    let entitled = true;
+    let result: ReadEntitlement = "allowed";
     try {
-      const directory = (await this.tenant.openDirectory()) as unknown as {
-        evaluateReadAccessForUser?: (input: {
-          username: string;
-          dbid: string;
-          decryptionKeyId: string;
-        }) => Promise<{ allowed: boolean }>;
-      };
-      if (typeof directory.evaluateReadAccessForUser === "function") {
+      const directory = await this.tenant.openDirectory();
+      const evaluateReadAccessForUser = directory.evaluateReadAccessForUser?.bind(directory);
+      if (evaluateReadAccessForUser) {
         const currentUser = await this.tenant.getCurrentUserId();
-        const decision = await directory.evaluateReadAccessForUser({
+        const decision = await evaluateReadAccessForUser({
           username: currentUser.username,
           dbid: this.store.getId(),
           decryptionKeyId,
         });
-        entitled = decision.allowed;
+        result = decision.allowed ? "allowed" : "denied";
       }
     } catch (error) {
-      this.logger.debug(`isReadEntitled: evaluation failed for ${decryptionKeyId}, failing open: ${error}`);
-      entitled = true;
+      this.logger.debug(`isReadEntitled: evaluation failed for ${decryptionKeyId}, deferring (fail closed, no purge): ${error}`);
+      result = "unknown";
     }
 
-    memo.set(decryptionKeyId, entitled);
-    return entitled;
+    memo.set(decryptionKeyId, result);
+    return result;
   }
 
   /**
@@ -2745,7 +2826,7 @@ export class BaseMindooDB implements MindooDB {
       );
     }
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
-    const keyId = options.decryptionKeyId ?? "default";
+    const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
 
     // Sanitize caller-provided initial values: internal/reserved fields (those
@@ -2943,6 +3024,11 @@ export class BaseMindooDB implements MindooDB {
       encryptedSize: encryptedPayload.length,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomSigningKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
     
     // Create full entry object
     const fullEntry: StoreEntry = {
@@ -3057,10 +3143,9 @@ export class BaseMindooDB implements MindooDB {
         if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
           this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            snapshotData,
             snapshotData.encryptedData,
-            snapshotData.signature,
-            snapshotData.createdByPublicKey,
           );
         }
 
@@ -3074,11 +3159,22 @@ export class BaseMindooDB implements MindooDB {
           );
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
 
-          const parsed = parseDocEntryId(snapshotData.id);
-          if (parsed) {
-            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          // Snapshot-head verification (docs/accesscontrol.md §10): decoded heads
+          // must equal the declared snapshotHeadHashes or the snapshot is
+          // discarded and the doc is replayed from individually-verified entries.
+          if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+            this.logger.warn(
+              `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, falling back to replay without snapshot`,
+            );
+            doc = undefined;
+            startFromSnapshot = false;
+          } else {
+            const parsed = parseDocEntryId(snapshotData.id);
+            if (parsed) {
+              this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+            }
+            this.registerSnapshotHeadHashMappings(snapshotData);
           }
-          this.registerSnapshotHeadHashMappings(snapshotData);
         }
       }
     }
@@ -3107,10 +3203,9 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
         entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
@@ -3203,10 +3298,9 @@ export class BaseMindooDB implements MindooDB {
       }
       
       // Verify signature
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
         entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
@@ -3555,10 +3649,9 @@ export class BaseMindooDB implements MindooDB {
         const batch = await this.store.getEntries(windowMetas.map((r) => r.meta.id));
         const prepared = await Promise.all(
           batch.map(async (entry) => {
-            const isValid = await this.tenant.verifySignature(
+            const isValid = await this.tenant.verifyEntrySignature(
+              entry,
               entry.encryptedData,
-              entry.signature,
-              entry.createdByPublicKey,
             );
             if (!isValid) {
               this.logger.warn(`Invalid signature for revision entry ${entry.id}, skipping`);
@@ -3748,10 +3841,9 @@ export class BaseMindooDB implements MindooDB {
       this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
       return null;
     }
-    const isValid = await this.tenant.verifySignature(
+    const isValid = await this.tenant.verifyEntrySignature(
+      snapshotData,
       snapshotData.encryptedData,
-      snapshotData.signature,
-      snapshotData.createdByPublicKey,
     );
     if (!isValid) {
       this.logger.warn(`Invalid signature for snapshot ${snapshotData.id}, falling back to replay`);
@@ -3762,6 +3854,16 @@ export class BaseMindooDB implements MindooDB {
       snapshotData.decryptionKeyId,
     );
     const doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
+    // Mandatory snapshot-head verification (docs/accesscontrol.md §10): the
+    // decoded snapshot's Automerge heads must exactly equal the covered heads
+    // declared in the signed metadata, so a snapshot cannot smuggle content the
+    // author was not allowed to write. On mismatch, fall back to replay.
+    if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+      this.logger.warn(
+        `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, falling back to replay`,
+      );
+      return null;
+    }
     const parsed = parseDocEntryId(snapshotData.id);
     if (parsed) {
       this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
@@ -3792,10 +3894,9 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Revision entry ${meta.id} not found in store, skipping`);
         continue;
       }
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
         entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for revision entry ${entryData.id}, skipping`);
@@ -3946,10 +4047,9 @@ export class BaseMindooDB implements MindooDB {
         result.set(metadata.id, null);
         continue;
       }
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entry,
         entry.encryptedData,
-        entry.signature,
-        entry.createdByPublicKey,
       );
       if (!isValid) {
         result.set(metadata.id, null);
@@ -4105,10 +4205,9 @@ export class BaseMindooDB implements MindooDB {
         if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
           this.logger.warn(`Admin-only DB: skipping DAG details for ${entry.id} not signed by admin key`);
         } else {
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            entry,
             entry.encryptedData,
-            entry.signature,
-            entry.createdByPublicKey,
           );
         }
         if (isValid) {
@@ -4912,10 +5011,9 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Admin-only DB: skipping conflict analysis entry ${entry.id} not signed by admin key`);
         continue;
       }
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entry,
         entry.encryptedData,
-        entry.signature,
-        entry.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for conflict analysis entry ${entry.id}, skipping`);
@@ -5590,6 +5688,11 @@ export class BaseMindooDB implements MindooDB {
       encryptedSize: encryptedPayload.length,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomSigningKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
     const fullEntry: StoreEntry = {
       ...entryMetadata,
       encryptedData: encryptedPayload,
@@ -7375,6 +7478,11 @@ export class BaseMindooDB implements MindooDB {
       attachmentIds: attachmentIds && attachmentIds.length > 0 ? attachmentIds : undefined,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
     return {
       ...entryMetadata,
       encryptedData: encryptedPayload,
@@ -7451,6 +7559,13 @@ export class BaseMindooDB implements MindooDB {
         encryptedSize: encryptedPayload.length,
         encryptedData: encryptedPayload,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      snapshotEntry.metadataSignature = await this.computeEntryMetadataSignature(
+        snapshotEntry,
+        options.signingKeyPair && options.signingKeyPassword
+          ? { signingKeyPair: options.signingKeyPair, signingKeyPassword: options.signingKeyPassword }
+          : undefined,
+      );
 
       await this.store.putEntries([snapshotEntry]);
       this.logger.debug(
@@ -7797,10 +7912,9 @@ export class BaseMindooDB implements MindooDB {
         if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
           this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            snapshotData,
             snapshotData.encryptedData,
-            snapshotData.signature,
-            snapshotData.createdByPublicKey,
           );
         }
         if (!isValid) {
@@ -7812,11 +7926,20 @@ export class BaseMindooDB implements MindooDB {
             snapshotData.decryptionKeyId,
           );
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
-          const parsed = parseDocEntryId(snapshotData.id);
-          if (parsed) {
-            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          // Snapshot-head verification (docs/accesscontrol.md §10).
+          if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+            this.logger.warn(
+              `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, falling back to replay without snapshot`,
+            );
+            doc = undefined;
+            startFromSnapshot = false;
+          } else {
+            const parsed = parseDocEntryId(snapshotData.id);
+            if (parsed) {
+              this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+            }
+            this.registerSnapshotHeadHashMappings(snapshotData);
           }
-          this.registerSnapshotHeadHashMappings(snapshotData);
         }
       }
     }
@@ -7842,10 +7965,9 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
         entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
@@ -8111,10 +8233,9 @@ export class BaseMindooDB implements MindooDB {
           return { entryData, isValid: false };
         }
         
-        const isValid = await this.verifySignatureWithKey(
+        const isValid = await this.verifyEntrySignatureWithKey(
           cryptoKey,
-          entryData.encryptedData,
-          entryData.signature
+          entryData,
         );
         return { entryData, isValid };
       })
@@ -8591,9 +8712,6 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Internal method to load a document from the content-addressed store
-   */
-  /**
    * The per-tenant quarantine/audit log: entries rejected during
    * materialization by the access-control layer (docs/accesscontrol.md §10).
    * Exposed for audit views (e.g. Haven). Entries remain in the append-only
@@ -8617,20 +8735,29 @@ export class BaseMindooDB implements MindooDB {
     if (this.aclActiveCache && now - this.aclActiveCache.at < 3000) {
       return this.aclActiveCache.value;
     }
-    let value = false;
     try {
-      const directory = (await this.tenant.openDirectory()) as unknown as {
-        isAccessControlActive?: () => Promise<boolean>;
-      };
+      const directory = await this.tenant.openDirectory();
+      let value = false;
       if (typeof directory.isAccessControlActive === "function") {
         value = await directory.isAccessControlActive();
       }
+      this.aclActiveCache = { value, at: now };
+      return value;
     } catch (error) {
-      this.logger.debug(`[ACL] active-check failed, treating as inactive: ${error}`);
-      value = false;
+      // Fail closed (audit finding #2): a transient directory error must never
+      // silently DISABLE access control (which would bypass the fail-closed
+      // materialization gate entirely). Reuse the last known verdict if we have
+      // one; otherwise assume enforced so the materialization path governs the
+      // load and retries once the directory is reachable again.
+      if (this.aclActiveCache) {
+        this.logger.debug(
+          `[ACL] active-check failed, reusing last known verdict (${this.aclActiveCache.value}): ${error}`,
+        );
+        return this.aclActiveCache.value;
+      }
+      this.logger.warn(`[ACL] active-check failed with no prior verdict, assuming enforced (fail closed): ${error}`);
+      return true;
     }
-    this.aclActiveCache = { value, at: now };
-    return value;
   }
 
   /**
@@ -8641,10 +8768,11 @@ export class BaseMindooDB implements MindooDB {
    * call site instead of an optimistic local write that is later rejected by
    * the server witness or quarantined on materialization.
    *
-   * Fail-open on any directory/infra error: the server witness (Tier 1) and
+   * Fails CLOSED on any directory/infra error while access control is enforced
+   * (audit finding #2): the precheck denies the write rather than letting it
+   * through optimistically. The server witness (Tier 1) and
    * quarantine-on-materialization (Tier 2) remain the authoritative enforcers,
-   * so a transient directory error must not block a legitimate local write.
-   * Only a clean `allowed: false` verdict is surfaced (thrown).
+   * and the user can retry once the directory is reachable again.
    *
    * `getBeforeDoc`/`getAfterDoc` are lazy so the (potentially costly) Automerge
    * -> JS materialization is skipped entirely when the active policy has no
@@ -8667,10 +8795,35 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Resolve the `decryptionKeyId` for a `doc_create`: the caller's explicit key
+   * when given, else the policy-configured default for this database (see
+   * `getEffectiveDefaultCreateKeyId` on the directory), else the legacy
+   * `"default"`. The policy default is a create-time convenience; the create-key
+   * allowlist gate (enforced by the witness) remains authoritative. Directory
+   * ACL writes always pass an explicit key, so this never re-enters the
+   * directory for them.
+   */
+  private async resolveCreateKeyId(options: CreateOptions): Promise<string> {
+    if (options.decryptionKeyId !== undefined) return options.decryptionKeyId;
+    try {
+      const directory = await this.tenant.openDirectory();
+      const getEffectiveDefaultCreateKeyId = directory.getEffectiveDefaultCreateKeyId?.bind(directory);
+      if (getEffectiveDefaultCreateKeyId) {
+        const fromPolicy = await getEffectiveDefaultCreateKeyId(this.store.getId());
+        if (fromPolicy !== undefined) return fromPolicy;
+      }
+    } catch (error) {
+      this.logger.debug(`[ACL] default create-key lookup skipped (directory error): ${error}`);
+    }
+    return "default";
+  }
+
+  /**
    * Evaluate the full client-side (Tier 1 + Tier 2) write ruleset for a
-   * candidate write, returning the {@link AccessDecision}. Returns `null` when
-   * access control is not enforced for this database or when the directory
-   * cannot be consulted (fail-open) — callers treat `null` as "allowed". The
+   * candidate write, returning the {@link AccessDecision}. Returns `null` only
+   * when access control is not enforced for this database (callers treat `null`
+   * as "allowed"). When access control IS enforced but the directory cannot be
+   * consulted, it returns a DENY decision (fail closed, audit finding #2). The
    * `getBeforeDoc`/`getAfterDoc` materializers are only invoked when the active
    * policy has a Tier 2 (`withfields`) content rule for this op/db.
    */
@@ -8685,20 +8838,9 @@ export class BaseMindooDB implements MindooDB {
     if (!(await this.isAclEnforced())) return null;
     const dbid = this.store.getId();
     try {
-      const directory = (await this.tenant.openDirectory()) as unknown as {
-        evaluateClientAccess?: (input: {
-          op: RuleType;
-          dbid: string;
-          signingKey: string;
-          trustedTime: number;
-          isAuthor: boolean;
-          beforeDoc: Record<string, unknown> | null;
-          afterDoc: Record<string, unknown> | null;
-          decryptionKeyId?: string;
-        }) => Promise<AccessDecision>;
-        hasWriteContentRules?: (op: RuleType, dbid: string) => Promise<boolean>;
-      };
-      if (typeof directory.evaluateClientAccess !== "function") return null;
+      const directory = await this.tenant.openDirectory();
+      const evaluateClientAccess = directory.evaluateClientAccess?.bind(directory);
+      if (!evaluateClientAccess) return null;
       // Only materialize the before/after documents when a content rule needs
       // them; pure Tier 1 (identity/op/create-key) checks never read the doc.
       let needContent = true;
@@ -8707,7 +8849,7 @@ export class BaseMindooDB implements MindooDB {
       }
       const beforeDoc = needContent && input.getBeforeDoc ? input.getBeforeDoc() : null;
       const afterDoc = needContent && input.getAfterDoc ? input.getAfterDoc() : null;
-      return await directory.evaluateClientAccess({
+      return await evaluateClientAccess({
         op: input.op,
         dbid,
         signingKey: input.signerKey,
@@ -8718,8 +8860,17 @@ export class BaseMindooDB implements MindooDB {
         decryptionKeyId: input.decryptionKeyId,
       });
     } catch (error) {
-      this.logger.debug(`[ACL] write precheck skipped (directory error): ${error}`);
-      return null;
+      // Fail closed (audit finding #2): access control IS enforced here (checked
+      // above), so a directory error during the write precheck must not let the
+      // write through optimistically. Deny now; the user can retry once the
+      // directory is reachable again. The server witness remains the
+      // authoritative backstop.
+      this.logger.warn(`[ACL] write precheck failed, denying (fail closed): ${error}`);
+      return {
+        allowed: false,
+        reason: "directory unavailable during write precheck; failing closed",
+        tier: "tier1",
+      };
     }
   }
 
@@ -8738,7 +8889,7 @@ export class BaseMindooDB implements MindooDB {
    * decision mirrors what {@link createDocument} would enforce.
    */
   async canCreate(options: CreateOptions = {}): Promise<AccessDecision> {
-    const keyId = options.decryptionKeyId ?? "default";
+    const keyId = await this.resolveCreateKeyId(options);
     const useCustomSigningKey =
       options.signingKeyPair !== undefined && options.signingKeyPassword !== undefined;
     const signerKey = useCustomSigningKey
@@ -8863,23 +9014,23 @@ export class BaseMindooDB implements MindooDB {
   private async maybeMaterializeWithAccessControl(
     docId: string,
     allEntryMetadata: StoreEntryMetadata[],
-  ): Promise<InternalDoc | null | undefined> {
+  ): Promise<{ doc: InternalDoc | null; cacheable: boolean } | undefined> {
     if (!(await this.isAclEnforced())) return undefined;
 
+    // Fail-closed self-healing (audit finding #2): when a validation step cannot
+    // be completed (directory/witness adapter threw), we quarantine the affected
+    // entry for THIS pass but must not cache the result, so the next load retries
+    // and recovers once the dependency is healthy again. `cacheable` is flipped
+    // to false the moment any transient failure occurs.
+    let cacheable = true;
+
     const dbid = this.store.getId();
-    const directory = (await this.tenant.openDirectory()) as unknown as {
-      evaluateClientAccess: (input: {
-        op: RuleType;
-        dbid: string;
-        signingKey: string;
-        trustedTime: number;
-        isAuthor: boolean;
-        beforeDoc: Record<string, unknown> | null;
-        afterDoc: Record<string, unknown> | null;
-        decryptionKeyId?: string;
-      }) => Promise<AccessDecision>;
-      getTrustedWitnessKeysAt?: (T: number) => Promise<Set<string>>;
-    };
+    const directory = await this.tenant.openDirectory();
+    // Capture bound locals: these optional members are called later inside an
+    // await-heavy loop, where TS would otherwise lose the property narrowing.
+    const evaluateClientAccess = directory.evaluateClientAccess?.bind(directory);
+    if (!evaluateClientAccess) return undefined;
+    const getTrustedWitnessKeysAt = directory.getTrustedWitnessKeysAt?.bind(directory);
 
     // One verifier per materialization enforces per-witness `receivedAt`
     // monotonicity across the entries we accept, in trusted-time order (§5.4).
@@ -8903,7 +9054,7 @@ export class BaseMindooDB implements MindooDB {
           ? a.id.localeCompare(b.id)
           : (a.receivedAt ?? a.createdAt) - (b.receivedAt ?? b.createdAt),
       );
-    if (dataEntries.length === 0) return null;
+    if (dataEntries.length === 0) return { doc: null, cacheable };
 
     const creatorKey =
       dataEntries.find((m) => m.entryType === "doc_create")?.createdByPublicKey ?? null;
@@ -8948,7 +9099,7 @@ export class BaseMindooDB implements MindooDB {
 
       // Verify the author signature over the encrypted payload.
       const cryptoKey = await this.getOrImportPublicKey(entry.createdByPublicKey);
-      if (!cryptoKey || !(await this.verifySignatureWithKey(cryptoKey, entry.encryptedData, entry.signature))) {
+      if (!cryptoKey || !(await this.verifyEntrySignatureWithKey(cryptoKey, entry))) {
         quarantine(meta, "invalid_signature", "signature verification failed");
         continue;
       }
@@ -8957,9 +9108,9 @@ export class BaseMindooDB implements MindooDB {
       // from a currently-trusted witness, carry a valid signature, and respect
       // per-witness monotonicity and the future-time bound. Entries with no
       // receipt are local/not-yet-witnessed and pass this check.
-      if (directory.getTrustedWitnessKeysAt && (meta.receivedAt !== undefined || meta.receivedByPublicKey)) {
+      if (getTrustedWitnessKeysAt && (meta.receivedAt !== undefined || meta.receivedByPublicKey)) {
         try {
-          const trustedWitnessKeys = await directory.getTrustedWitnessKeysAt(meta.receivedAt ?? meta.createdAt);
+          const trustedWitnessKeys = await getTrustedWitnessKeysAt(meta.receivedAt ?? meta.createdAt);
           const receiptResult = await receiptVerifier.validate(
             meta,
             { dbid, trustedWitnessKeys, nowMs },
@@ -8969,7 +9120,14 @@ export class BaseMindooDB implements MindooDB {
             continue;
           }
         } catch (error) {
-          this.logger.warn(`[ACL] receipt validation failed for ${meta.id}, accepting: ${error}`);
+          // Fail closed (audit finding #2): a malformed receipt or adapter bug
+          // must NOT bypass the witness check. Quarantine this entry for now and
+          // mark the result non-cacheable so a later load retries once the
+          // verifier is healthy again.
+          this.logger.warn(`[ACL] receipt validation failed for ${meta.id}, quarantining (will retry): ${error}`);
+          cacheable = false;
+          quarantine(meta, "directory_unavailable", `witness receipt validation error: ${error}`);
+          continue;
         }
       }
 
@@ -9017,7 +9175,7 @@ export class BaseMindooDB implements MindooDB {
 
       let decision: AccessDecision;
       try {
-        decision = await directory.evaluateClientAccess({
+        decision = await evaluateClientAccess({
           op: meta.entryType as RuleType,
           dbid,
           signingKey: entry.createdByPublicKey,
@@ -9031,10 +9189,14 @@ export class BaseMindooDB implements MindooDB {
           decryptionKeyId: meta.decryptionKeyId,
         });
       } catch (error) {
-        // Fail-open for availability: Tier 2 only gates honest clients, so a
-        // transient directory error should not break the document load.
-        this.logger.warn(`[ACL] evaluation failed for ${meta.id}, materializing: ${error}`);
-        decision = { allowed: true, reason: "directory unavailable; deferred", tier: "tier1" };
+        // Fail closed (audit finding #2): a transient directory error must not
+        // silently materialize an entry the policy might reject. Quarantine it
+        // for this pass and mark the result non-cacheable so the next load
+        // retries and self-heals once the directory is reachable again.
+        this.logger.warn(`[ACL] evaluation failed for ${meta.id}, quarantining (will retry): ${error}`);
+        cacheable = false;
+        quarantine(meta, "directory_unavailable", `directory unavailable during evaluation: ${error}`);
+        continue;
       }
 
       if (!decision.allowed) {
@@ -9061,7 +9223,7 @@ export class BaseMindooDB implements MindooDB {
 
     if (currentDoc === null) {
       // The create was quarantined or absent: the document is logically absent.
-      return null;
+      return { doc: null, cacheable };
     }
 
     const payload = currentDoc as unknown as MindooDocPayload;
@@ -9072,17 +9234,23 @@ export class BaseMindooDB implements MindooDB {
     const witnessState = metadataWitnessState(acceptedMeta);
 
     return {
-      id: docId,
-      doc: currentDoc,
-      createdAt: createdAt ?? lastModified,
-      lastModified,
-      decryptionKeyId,
-      isDeleted,
-      awaitingWitness: witnessState.awaitingWitness,
-      witnessed: witnessState.witnessed,
+      doc: {
+        id: docId,
+        doc: currentDoc,
+        createdAt: createdAt ?? lastModified,
+        lastModified,
+        decryptionKeyId,
+        isDeleted,
+        awaitingWitness: witnessState.awaitingWitness,
+        witnessed: witnessState.witnessed,
+      },
+      cacheable,
     };
   }
 
+  /**
+   * Internal method to load a document from the content-addressed store
+   */
   private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
     const startedAt = Date.now();
     const cacheCheckStartedAt = Date.now();
@@ -9191,8 +9359,11 @@ export class BaseMindooDB implements MindooDB {
     // in which case we fall through to the normal fast path below.
     const aclResult = await this.maybeMaterializeWithAccessControl(docId, allEntryMetadata);
     if (aclResult !== undefined) {
-      if (aclResult) {
-        await this.storeCachedDocument(aclResult);
+      const aclDoc = aclResult.doc;
+      // Only cache a fully-validated result. A transient validation failure
+      // (audit finding #2) leaves `cacheable` false so the next load retries.
+      if (aclDoc && aclResult.cacheable) {
+        await this.storeCachedDocument(aclDoc);
         this.markDocDirty(docId);
       }
       this.performanceCallback?.onDocumentLoad?.({
@@ -9209,7 +9380,7 @@ export class BaseMindooDB implements MindooDB {
         automergeTime,
         totalTime: Date.now() - startedAt,
       });
-      return aclResult;
+      return aclDoc;
     }
 
     const metadataById = new Map(allEntryMetadata.map((meta) => [meta.id, meta]));
@@ -9268,10 +9439,9 @@ export class BaseMindooDB implements MindooDB {
           // Verify signature against the encrypted snapshot (no decryption needed)
           // We sign the encrypted payload, so anyone can verify signatures without decryption keys
           const signatureStartedAt = Date.now();
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            snapshotData,
             snapshotData.encryptedData,
-            snapshotData.signature,
-            snapshotData.createdByPublicKey
           );
           signatureVerificationTime += Date.now() - signatureStartedAt;
         }
@@ -9298,13 +9468,25 @@ export class BaseMindooDB implements MindooDB {
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
           automergeTime += Date.now() - automergeStartedAt;
           this.logger.debug(`Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
-          
-          // Register the snapshot's automerge hash -> entry ID mapping
-          const parsed = parseDocEntryId(snapshotData.id);
-          if (parsed) {
-            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+
+          // Mandatory snapshot-head verification (docs/accesscontrol.md §10): the
+          // decoded heads must exactly equal the declared snapshotHeadHashes, so
+          // a snapshot cannot smuggle unauthorized content. On mismatch, discard
+          // the snapshot and load from scratch via individually-verified entries.
+          if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+            this.logger.warn(
+              `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, loading from scratch`,
+            );
+            doc = undefined;
+            startFromSnapshot = false;
+          } else {
+            // Register the snapshot's automerge hash -> entry ID mapping
+            const parsed = parseDocEntryId(snapshotData.id);
+            if (parsed) {
+              this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+            }
+            this.registerSnapshotHeadHashMappings(snapshotData);
           }
-          this.registerSnapshotHeadHashMappings(snapshotData);
         }
       }
     }
@@ -9376,10 +9558,9 @@ export class BaseMindooDB implements MindooDB {
             return { entryData, isValid: false };
           }
           
-          const isValid = await this.verifySignatureWithKey(
+          const isValid = await this.verifyEntrySignatureWithKey(
             cryptoKey,
-            entryData.encryptedData,
-            entryData.signature
+            entryData,
           );
           return { entryData, isValid };
         })
@@ -9704,10 +9885,9 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
     }
 
-    const isValid = await this.tenant.verifySignature(
+    const isValid = await this.tenant.verifyEntrySignature(
+      chunk,
       chunk.encryptedData,
-      chunk.signature,
-      chunk.createdByPublicKey
     );
     if (!isValid) {
       throw new Error(`Invalid signature for chunk ${chunk.id}`);
@@ -9946,6 +10126,8 @@ export class BaseMindooDB implements MindooDB {
         encryptedSize: encryptedData.length,
         encryptedData,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      chunkEntry.metadataSignature = await this.computeEntryMetadataSignature(chunkEntry);
       
       chunks.push(chunkEntry);
       prevChunkId = chunkId;
@@ -10009,24 +10191,27 @@ export class BaseMindooDB implements MindooDB {
     const encryptedData = new Uint8Array(0);
     const contentHash = await computeContentHash(encryptedData, this.getSubtle());
     const signature = await this.tenant.signPayload(encryptedData);
+    const ledgerEntry: StoreEntry = {
+      entryType: "pending_attachment_upload",
+      id: this.pendingAttachmentUploadLedgerId(attachmentId),
+      contentHash,
+      docId,
+      dependencyIds: [],
+      createdAt,
+      attachmentId,
+      uploadStartedAt: Date.now(),
+      createdByPublicKey,
+      decryptionKeyId,
+      signature,
+      originalSize: 0,
+      encryptedSize: 0,
+      encryptedData,
+    };
+    // Bind the metadata with the author signature (audit finding #5).
+    ledgerEntry.metadataSignature = await this.computeEntryMetadataSignature(ledgerEntry);
     await this.putEntriesWithRetry(
       this.store,
-      [{
-        entryType: "pending_attachment_upload",
-        id: this.pendingAttachmentUploadLedgerId(attachmentId),
-        contentHash,
-        docId,
-        dependencyIds: [],
-        createdAt,
-        attachmentId,
-        uploadStartedAt: Date.now(),
-        createdByPublicKey,
-        decryptionKeyId,
-        signature,
-        originalSize: 0,
-        encryptedSize: 0,
-        encryptedData,
-      }],
+      [ledgerEntry],
       `pending ledger ${attachmentId}`
     );
   }
@@ -10124,6 +10309,8 @@ export class BaseMindooDB implements MindooDB {
         encryptedSize: encryptedData.length,
         encryptedData,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      chunkEntry.metadataSignature = await this.computeEntryMetadataSignature(chunkEntry);
 
       pendingEntries.push(chunkEntry);
       pendingEncryptedBytes += encryptedData.length;
@@ -10248,6 +10435,8 @@ export class BaseMindooDB implements MindooDB {
         encryptedSize: encryptedData.length,
         encryptedData,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      chunkEntry.metadataSignature = await this.computeEntryMetadataSignature(chunkEntry);
       
       chunks.push(chunkEntry);
       prevChunkId = chunkId;

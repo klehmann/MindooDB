@@ -91,7 +91,7 @@ describe("username hashing (salted v2 with legacy fallback)", () => {
     await (tenant as unknown as { disposeCacheManager?: () => Promise<void> }).disposeCacheManager?.();
   });
 
-  it("writes new grants with the salted v2 hash and a version marker", async () => {
+  it("writes new grants with the salted, NFKC-normalized v3 hash and a version marker", async () => {
     const user = await factory.createUserId("CN=alice/O=hashtest", "alicepass");
     await directory.registerUser(
       factory.toPublicUserId(user),
@@ -102,8 +102,13 @@ describe("username hashing (salted v2 with legacy fallback)", () => {
     const docs = await (directory as DirectoryWithFind).findGrantAccessDocuments(user.username);
     expect(docs.length).toBe(1);
     const data = docs[0].getData();
-    expect(data.username_hash_v).toBe(2);
-    expect(data.username_hash).toBe(await sha256Hex(`${tenantId}/${user.username.toLowerCase()}`));
+    // Hardening (audit, Medium): the write form is now v3 — salted AND
+    // NFKC-normalized before lowercasing to defeat homoglyph spoofing. For an
+    // ASCII username NFKC is a no-op, so the digest equals the prior salted form.
+    expect(data.username_hash_v).toBe(3);
+    expect(data.username_hash).toBe(
+      await sha256Hex(`${tenantId}/${user.username.normalize("NFKC").toLowerCase()}`),
+    );
     // Must NOT be the legacy unsalted hash.
     expect(data.username_hash).not.toBe(await sha256Hex(user.username.toLowerCase()));
   }, 30000);

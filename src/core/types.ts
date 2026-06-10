@@ -203,6 +203,19 @@ interface CreateTenantPasswords {
    * encryption private keys is skipped entirely.
    */
   preDecryptedAppUserKeys?: PreDecryptedUserKeys;
+  /**
+   * Whether the new tenant should enforce the v2 storage format from creation:
+   * an admin-signed default policy is written with `requireMetadataSignatureSince`
+   * set to the creation time, so every entry created at/after now (locally and
+   * at the sync server) MUST carry the v2 metadata-binding signature and forged
+   * legacy (v1) entries are rejected. The policy sets
+   * `disableAllAccessChecksAndPolicies: true`, so this enables ONLY the
+   * storage-format floor — it does not turn on ACL deny-gates.
+   *
+   * Defaults to `true`. Set to `false` to create a tenant with no format floor
+   * (legacy behavior: v1 entries remain acceptable).
+   */
+  requireV2Entries?: boolean;
 }
 
 /**
@@ -650,6 +663,24 @@ export interface MindooTenant {
   verifySignature(payload: Uint8Array, signature: Uint8Array, publicKey: string): Promise<boolean>;
 
   /**
+   * Verify a store entry's author signature, version-aware (audit finding #5).
+   *
+   * Confirms the author key is trusted, then verifies the strong metadata-binding
+   * `metadataSignature` when present (v2+) or falls back to the legacy `signature`
+   * over the ciphertext for v1/legacy entries. Also re-verifies that
+   * `SHA-256(encryptedData) === contentHash` so a relay cannot serve bytes that
+   * disagree with the signed/hashed metadata.
+   *
+   * @param entry The entry metadata (must include signature fields)
+   * @param encryptedData The entry's encrypted payload bytes
+   * @return True if the entry is authentic and intact, false otherwise
+   */
+  verifyEntrySignature(
+    entry: StoreEntryMetadata,
+    encryptedData: Uint8Array
+  ): Promise<boolean>;
+
+  /**
    * Method to open the directory for this tenant
    *
    * @return The directory
@@ -918,8 +949,25 @@ export interface StoreEntryMetadata {
   /**
    * The signature of the entry (signed with the user's signing key over the encrypted data).
    * This allows signature verification without decryption.
+   *
+   * NOTE: this LEGACY signature covers ONLY the encrypted payload bytes, so it
+   * does not authenticate the cleartext metadata fields. New writers additionally
+   * populate {@link metadataSignature} (which binds the metadata) but keep this
+   * field for backward/forward interop with v1 readers.
    */
   signature: Uint8Array;
+
+  /**
+   * Ed25519 author signature over the canonical, versioned, length-prefixed
+   * metadata layout defined in `crypto/EntrySignature.ts`. Unlike {@link signature}
+   * it binds `entryType`, `id`, `docId`, `decryptionKeyId`, `createdAt`,
+   * `dependencyIds`, `contentHash` and `createdByPublicKey`, preventing metadata
+   * tampering on un-witnessed/legacy entries (audit finding #5).
+   *
+   * Absent on v1/legacy entries written before this field existed; verifiers
+   * fall back to {@link signature} when it is missing (backward compatible).
+   */
+  metadataSignature?: Uint8Array;
 
   /**
    * Original size of the plaintext data before encryption (in bytes).
@@ -1011,7 +1059,7 @@ export interface StoreEntryMetadata {
  * Marks the entry as written in the witness-aware era; see that field for the
  * trusted-time semantics its presence/absence selects.
  */
-export const CURRENT_STORE_ENTRY_VERSION = 1;
+export const CURRENT_STORE_ENTRY_VERSION = 2;
 
 /**
  * A complete entry stored in the ContentAddressedStore.
@@ -2150,14 +2198,26 @@ export interface MindooTenantDirectory {
    * This is used for signature verification when loading changes from the append-only store.
    * 
    * @param publicKey The public signing key to validate (Ed25519, PEM format)
+   * @param opts.forceRefresh When true, bypass the trust-cache refresh interval
+   *   and synchronize the directory state before validating. Used on the server
+   *   push path so a freshly revoked key cannot still be accepted for up to
+   *   `DIRECTORY_SYNC_INTERVAL_MS` (audit #4, revocation lag).
    * @return True if the public key belongs to a trusted (registered and not revoked) user, false otherwise
    */
-  validatePublicSigningKey(publicKey: string): Promise<boolean>;
+  validatePublicSigningKey(
+    publicKey: string,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<boolean>;
 
   /**
    * Create or update the tenant-wide default access policy
    * (docs/accesscontrol.md §6.1). Creating this document is what activates
    * access control for the tenant. Only the supplied fields are written.
+   *
+   * @param policy The policy fields to write (omitted fields keep their stored value / take their documented default).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the policy has been written.
    */
   setDefaultAccessPolicy?(
     policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>,
@@ -2168,6 +2228,12 @@ export interface MindooTenantDirectory {
   /**
    * Create or update a per-database access policy override (§6.2). Fields set
    * here override the tenant default for `dbid`; unset fields inherit it.
+   *
+   * @param dbid The database the policy override applies to.
+   * @param policy The policy fields to write (omitted fields inherit the tenant default for `dbid`).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the policy override has been written.
    */
   setDatabaseAccessPolicy?(
     dbid: string,
@@ -2180,6 +2246,20 @@ export interface MindooTenantDirectory {
    * Create or replace an access-control rule (§6.3). A rule carrying
    * `withfields` is Tier 2 (client-enforced); otherwise it is Tier 1
    * (server-enforced).
+   *
+   * @param rule The rule definition.
+   * @param rule.ruleId Stable rule id; surfaced in `AccessDecision.matchedRuleId` and used to replace an existing rule.
+   * @param rule.type The operation the rule governs (`doc_create`, `doc_change`, …).
+   * @param rule.dbid The database the rule applies to, or `"*"` for all databases (defaults to `"*"` when omitted).
+   * @param rule.action Whether the rule grants (`"allow"`) or revokes (`"deny"`) access (deny overrides allow).
+   * @param rule.users_hashes Precomputed user/group hashes plus pseudo-tokens (`$everyone`, `$admin`, `$author`) the rule targets.
+   * @param rule.usernames Cleartext usernames to target; hashed and stored, and kept (encrypted) for admin-UI display.
+   * @param rule.groups Cleartext group names to target; hashed and stored alongside `usernames`.
+   * @param rule.withfields Tier 2 content clauses; their presence makes the rule client-enforced only.
+   * @param rule.description Optional human-readable description for admin UIs.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the rule has been written.
    */
   createAccessRule?(
     rule: {
@@ -2202,26 +2282,52 @@ export interface MindooTenantDirectory {
    * may carry decrypted `targets` (usernames/groups) for admin-UI display when
    * the rule was authored with cleartext names and the caller holds the tenant
    * default key; otherwise only the raw `users_hashes` are available.
+   *
+   * @param filter Optional narrowing by rule `type` and/or `dbid`.
+   * @returns The matching rules, each optionally augmented with decrypted `targets`.
    */
   listRules?(
     filter?: { type?: RuleType; dbid?: string },
   ): Promise<Array<AclRuleDoc & { targets?: RuleTargets }>>;
 
-  /** Delete an access-control rule by id (§9). */
+  /**
+   * Delete an access-control rule by id (§9).
+   *
+   * @param ruleId The id of the rule to delete.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the rule has been deleted.
+   */
   deleteRule?(
     ruleId: string,
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Add (or refresh) a trusted witness (§6.4). */
+  /**
+   * Add (or refresh) a trusted witness (§6.4).
+   *
+   * @param witness The witness to trust.
+   * @param witness.witnessPublicKey The witness's Ed25519 signing public key (PEM).
+   * @param witness.serverUrl Optional URL of the witness/sync server, for display.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the witness has been written.
+   */
   addTrustedWitness?(
-    witness: { witnessPublicKey: string; serverUrl?: string; notBefore?: number; notAfter?: number },
+    witness: { witnessPublicKey: string; serverUrl?: string },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Remove a trusted witness by its public key (§6.4). */
+  /**
+   * Remove a trusted witness by its public key (§6.4).
+   *
+   * @param witnessPublicKey The Ed25519 signing public key (PEM) of the witness to remove.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the witness has been removed.
+   */
   removeTrustedWitness?(
     witnessPublicKey: string,
     administrationPrivateKey: EncryptedPrivateKey,
@@ -2236,6 +2342,12 @@ export interface MindooTenantDirectory {
    * signing and encryption keys stay paired and can carry an optional `label`.
    * Existing pairs are merged by signing key (a new entry with the same signing
    * key updates its encryption key/label).
+   *
+   * @param username The user whose grant to add device key pairs to (format: "CN=<username>/O=<tenantId>").
+   * @param keyPairs The device key pairs (paired signing + encryption keys, optional `label`) to add or merge.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the keys have been added.
    */
   addUserKeys?(
     username: string,
@@ -2248,6 +2360,13 @@ export interface MindooTenantDirectory {
    * Remove keys from a user's grant by signing key (and optionally encryption
    * key) (§6.5 revoke a device/key). Removing a signing key removes its entire
    * paired entry.
+   *
+   * @param username The user whose keys to remove (format: "CN=<username>/O=<tenantId>").
+   * @param signingKeys The signing public keys whose paired entries to remove.
+   * @param encryptionKeys The encryption public keys to remove (typically the pairs of `signingKeys`).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the keys have been removed.
    */
   removeUserKeys?(
     username: string,
@@ -2261,6 +2380,13 @@ export interface MindooTenantDirectory {
    * Set or clear the human-readable label of a device's key pair, identified by
    * its signing public key (§6.5). Pass an empty/whitespace label to clear it.
    * No-op if the user has no key pair with that signing key.
+   *
+   * @param username The user whose device label to set (format: "CN=<username>/O=<tenantId>").
+   * @param signingPublicKey The signing public key identifying the device key pair to label.
+   * @param label The new label; empty/whitespace clears the existing label.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the label has been written.
    */
   setKeyPairLabel?(
     username: string,
@@ -2276,6 +2402,9 @@ export interface MindooTenantDirectory {
    * signing key; revoked keys (removed from the grant) are not included.
    * Useful for admin UIs that let an operator pick specific devices to revoke
    * or relabel.
+   *
+   * @param username The user whose active device key pairs to list (format: "CN=<username>/O=<tenantId>").
+   * @returns The user's active device key pairs, each with its label and remote-wipe status.
    */
   getUserKeyPairs?(username: string): Promise<GrantKeyPairInfo[]>;
 
@@ -2284,6 +2413,9 @@ export interface MindooTenantDirectory {
    * decrypted user-details payload, the active device key pairs, and the
    * retained revoked device key pairs (each with `revokedAt` + remote-wipe
    * status). Requires the tenant default key to decrypt details.
+   *
+   * @param username The user whose grant overview to read (format: "CN=<username>/O=<tenantId>").
+   * @returns The decrypted `details` (or null), the `activeDevices`, and the retained `revokedDevices` (each with remote-wipe status).
    */
   getUserGrantOverview?(username: string): Promise<{
     details: DirectoryUserDetails | null;
@@ -2297,6 +2429,17 @@ export interface MindooTenantDirectory {
    * bundle, set per-device labels, revoke/restore devices (retaining revoked
    * pairs with `revoked`/`revokedAt`), and set the remote-wipe set. Backs the
    * Haven "Manage user" dialog's batched Save.
+   *
+   * @param username The user whose grant to update (format: "CN=<username>/O=<tenantId>").
+   * @param changes The batched edits to apply.
+   * @param changes.details Rewritten user-details payload (also recomputes the `identity_hashes` bundle).
+   * @param changes.deviceLabels Map of signing public key → new label for the user's devices.
+   * @param changes.revokeSigningKeys Signing keys whose devices to revoke (moved to the revoked list with `revokedAt`).
+   * @param changes.restoreSigningKeys Signing keys whose previously-revoked devices to restore to active.
+   * @param changes.wipeSigningKeys Signing keys whose devices to flag for remote wipe.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the grant has been updated.
    */
   updateUserGrant?(
     username: string,
@@ -2311,7 +2454,15 @@ export interface MindooTenantDirectory {
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Request a remote wipe of specific devices by signing public key (§6.5). */
+  /**
+   * Request a remote wipe of specific devices by signing public key (§6.5).
+   *
+   * @param username The user who owns the devices (format: "CN=<username>/O=<tenantId>").
+   * @param signingKeys The signing public keys of the devices to flag for remote wipe.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the wipe directive has been written.
+   */
   requestDeviceWipe?(
     username: string,
     signingKeys: string[],
@@ -2319,7 +2470,15 @@ export interface MindooTenantDirectory {
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Cancel a previously-requested device wipe (§6.5). */
+  /**
+   * Cancel a previously-requested device wipe (§6.5).
+   *
+   * @param username The user who owns the devices (format: "CN=<username>/O=<tenantId>").
+   * @param signingKeys The signing public keys whose pending wipe directive to clear.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the wipe directive has been cleared.
+   */
   cancelDeviceWipe?(
     username: string,
     signingKeys: string[],
@@ -2327,16 +2486,35 @@ export interface MindooTenantDirectory {
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Whether access control is currently active for this tenant (§6.1, §7). */
+  /**
+   * Whether access control is currently active for this tenant (§6.1, §7).
+   *
+   * @returns `true` when a default policy exists and the master kill-switch is not engaged, otherwise `false`.
+   */
   isAccessControlActive?(): Promise<boolean>;
 
-  /** Predict whether the current user may perform `op` on `dbid` (§9). */
+  /**
+   * Predict whether the current user may perform `op` on `dbid` (§9).
+   *
+   * @param op The write operation to predict (`doc_create`, `doc_change`, …).
+   * @param dbid The database the operation would target.
+   * @param candidateDoc Optional candidate document content, for evaluating Tier 2 (`withfields`) content rules.
+   * @returns The {@link AccessDecision} that would result for the current user.
+   */
   canDo?(op: RuleType, dbid: string, candidateDoc?: Record<string, unknown>): Promise<AccessDecision>;
 
   /**
    * Audit: was `username` allowed to perform `op` on `dbid` at trusted time
    * `at`? (§9) `options.decryptionKeyId` reproduces the create-key allowlist
    * verdict (§6.6) for a `doc_create` as it would have been decided at `at`.
+   *
+   * @param op The write operation to evaluate (`doc_create`, `doc_change`, …).
+   * @param username The user whose access to evaluate (format: "CN=<username>/O=<tenantId>").
+   * @param dbid The database the operation targets.
+   * @param at The trusted time (ms epoch) selecting the historical directory-state node to evaluate against.
+   * @param candidateDoc Optional candidate document content, for evaluating Tier 2 (`withfields`) content rules.
+   * @param options.decryptionKeyId Reproduces the create-key allowlist verdict (§6.6) for a `doc_create` as decided at `at`.
+   * @returns The {@link AccessDecision} that applied at `at`.
    */
   wasAllowedAt?(
     op: RuleType,
@@ -2347,19 +2525,93 @@ export interface MindooTenantDirectory {
     options?: { decryptionKeyId?: string },
   ): Promise<AccessDecision>;
 
+  /**
+   * Evaluate the full client-side write ruleset (Tier 1 + Tier 2, including the
+   * create-key allowlist gate) for a candidate write at `trustedTime`
+   * (docs/accesscontrol.md §7, §9.1). `beforeDoc`/`afterDoc` are only consulted
+   * by Tier 2 (`withfields`) content rules. Used by the SDK write prechecks and
+   * by materialization-time enforcement.
+   *
+   * @param input The candidate write to evaluate.
+   * @param input.op The write operation being evaluated (`doc_create`, `doc_change`, …).
+   * @param input.dbid The database the write targets.
+   * @param input.signingKey The author's Ed25519 signing public key (PEM); resolved to a user identity for rule matching.
+   * @param input.trustedTime The entry's trusted time (ms epoch) — selects the directory-state node the rules are evaluated against (§8).
+   * @param input.isAuthor Whether the signer is the original creator of the target document, for `$author` ownership rules.
+   * @param input.beforeDoc The document state before the change (for `when: "before"` clauses), or `null` when unavailable/not needed.
+   * @param input.afterDoc The document state with the candidate change applied (for `when: "after"` clauses), or `null` when unavailable/not needed.
+   * @param input.decryptionKeyId The entry's cleartext `decryptionKeyId`; required for the create-key allowlist gate on `doc_create`.
+   * @returns The {@link AccessDecision} (allow/deny, deciding rule id, and tier).
+   */
+  evaluateClientAccess?(input: {
+    op: RuleType;
+    dbid: string;
+    signingKey: string;
+    trustedTime: number;
+    isAuthor: boolean;
+    beforeDoc: Record<string, unknown> | null;
+    afterDoc: Record<string, unknown> | null;
+    decryptionKeyId?: string;
+  }): Promise<AccessDecision>;
+
+  /**
+   * Whether a Tier 2 (`withfields`) content rule exists for `op` on `dbid` at
+   * the current head state. Lets callers skip materializing before/after
+   * documents when only Tier 1 checks apply (§9.1).
+   *
+   * @param op The write operation to check for content rules.
+   * @param dbid The database to check (a rule with `dbid: "*"` also matches).
+   * @returns `true` if at least one matching Tier 2 (`withfields`) rule exists, otherwise `false`.
+   */
+  hasWriteContentRules?(op: RuleType, dbid: string): Promise<boolean>;
+
+  /**
+   * The effective `defaultCreateKeyId` for `dbid` at the current head state, or
+   * `undefined` when unconstrained (§6.7). A create-time convenience used to
+   * resolve the key a `doc_create` uses when the caller does not pass one.
+   *
+   * @param dbid The database whose effective default create-key to resolve (per-DB policy overrides the tenant default).
+   * @returns The configured default `decryptionKeyId`, or `undefined` when no policy applies, the master switch is engaged, or no default is set (callers fall back to `"default"`).
+   */
+  getEffectiveDefaultCreateKeyId?(dbid: string): Promise<string | undefined>;
+
+  /**
+   * The set of trusted witness signing keys (PEM) as of trusted time `T` (§5,
+   * §6.4). Used to verify witness receipts during materialization.
+   *
+   * @param T The trusted time (ms epoch) selecting the directory-state node to read the trusted-witness list from.
+   * @returns The set of trusted witness Ed25519 signing public keys (PEM) in effect at `T`.
+   */
+  getTrustedWitnessKeysAt?(T: number): Promise<Set<string>>;
+
   // -----------------------------------------------------------------------
   // Read access control (read-side). Optional: only the directory
   // implementation supports them.
   // -----------------------------------------------------------------------
 
-  /** Create or update the tenant default read policy. */
+  /**
+   * Create or update the tenant default read policy.
+   *
+   * @param policy The read-policy fields to write (omitted fields keep their stored value / take their documented default).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the read policy has been written.
+   */
   setDefaultReadPolicy?(
     policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Create or update a per-database read policy override. */
+  /**
+   * Create or update a per-database read policy override.
+   *
+   * @param dbid The database the read-policy override applies to.
+   * @param policy The read-policy fields to write (omitted fields inherit the tenant default for `dbid`).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the read-policy override has been written.
+   */
   setDatabaseReadPolicy?(
     dbid: string,
     policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
@@ -2367,7 +2619,22 @@ export interface MindooTenantDirectory {
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Create or replace a metadata-only read rule; returns the rule id. */
+  /**
+   * Create or replace a metadata-only read rule; returns the rule id.
+   *
+   * @param rule The read-rule definition.
+   * @param rule.ruleId Stable rule id; generated when omitted, or used to replace an existing rule.
+   * @param rule.dbid The database the rule applies to, or `"*"` for all databases (defaults to `"*"` when omitted).
+   * @param rule.action Whether the rule grants (`"allow"`) or revokes (`"deny"`) read access (deny overrides allow).
+   * @param rule.decryptionKeyIds Optional key scope; absent/empty applies the rule to every key in the database.
+   * @param rule.users_hashes Precomputed user/group hashes plus pseudo-tokens (`$everyone`, `$admin`) the rule targets.
+   * @param rule.usernames Cleartext usernames to target; hashed and stored, and kept (encrypted) for admin-UI display.
+   * @param rule.groups Cleartext group names to target; hashed and stored alongside `usernames`.
+   * @param rule.description Optional human-readable description for admin UIs.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns The id of the created/replaced read rule.
+   */
   createReadRule?(
     rule: {
       ruleId?: string;
@@ -2387,22 +2654,46 @@ export interface MindooTenantDirectory {
    * List read rules in effect, optionally filtered by database. Each rule may
    * carry decrypted `targets` (usernames/groups) for admin-UI display (see
    * {@link MindooTenantDirectory.listRules}).
+   *
+   * @param filter Optional narrowing by `dbid`.
+   * @returns The matching read rules, each optionally augmented with decrypted `targets`.
    */
   listReadRules?(
     filter?: { dbid?: string },
   ): Promise<Array<ReadRuleDoc & { targets?: RuleTargets }>>;
 
-  /** Delete a read rule by id. */
+  /**
+   * Delete a read rule by id.
+   *
+   * @param ruleId The id of the read rule to delete.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the read rule has been deleted.
+   */
   deleteReadRule?(
     ruleId: string,
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
-  /** Predict whether the current user may read in `dbid` (optionally key-scoped). */
+  /**
+   * Predict whether the current user may read in `dbid` (optionally key-scoped).
+   *
+   * @param dbid The database to evaluate read access for.
+   * @param decryptionKeyId Optional key scope; when given, evaluates read access for entries encrypted with that key.
+   * @returns The {@link AccessDecision} that would result for the current user.
+   */
   canRead?(dbid: string, decryptionKeyId?: string): Promise<AccessDecision>;
 
-  /** Audit: was `username` allowed to read `dbid`/`decryptionKeyId` at trusted time `at`? */
+  /**
+   * Audit: was `username` allowed to read `dbid`/`decryptionKeyId` at trusted time `at`?
+   *
+   * @param username The user whose read access to evaluate (format: "CN=<username>/O=<tenantId>").
+   * @param dbid The database the read targets.
+   * @param decryptionKeyId The key id of the entries being read.
+   * @param at The trusted time (ms epoch) selecting the historical directory-state node to evaluate against.
+   * @returns The {@link AccessDecision} that applied at `at`.
+   */
   wasAllowedToReadAt?(
     username: string,
     dbid: string,
@@ -2413,6 +2704,13 @@ export interface MindooTenantDirectory {
   /**
    * Resolve `username`'s identity and evaluate read access against the
    * directory state at `at` (or head). Used by the server read gate.
+   *
+   * @param input The read to evaluate.
+   * @param input.username The reader's username (format: "CN=<username>/O=<tenantId>").
+   * @param input.dbid The database the read targets.
+   * @param input.decryptionKeyId The key id of the entries being read.
+   * @param input.at Optional trusted time (ms epoch) selecting the directory-state node; defaults to head ("now").
+   * @returns The {@link AccessDecision} for the read.
    */
   evaluateReadAccessForUser?(input: {
     username: string;
@@ -2427,6 +2725,13 @@ export interface MindooTenantDirectory {
    * (docs/accesscontrol.md §6.5) and evaluate read access — entirely in hash
    * space, so the server never needs the cleartext username. Preferred over
    * {@link evaluateReadAccessForUser} when the authenticated device key is known.
+   *
+   * @param input The read to evaluate.
+   * @param input.signingKey The reader's authenticated device Ed25519 signing public key (PEM).
+   * @param input.dbid The database the read targets.
+   * @param input.decryptionKeyId The key id of the entries being read.
+   * @param input.at Optional trusted time (ms epoch) selecting the directory-state node; defaults to head ("now").
+   * @returns The {@link AccessDecision} for the read.
    */
   evaluateReadAccessForSigningKey?(input: {
     signingKey: string;
@@ -2440,13 +2745,24 @@ export interface MindooTenantDirectory {
    * target's RSA encryption public key. Run by a key-holding user; the returned
    * payload is handed to an admin to publish. Throws if the caller's KeyBag
    * lacks the key.
+   *
+   * @param keyId The id of the symmetric key (in the caller's KeyBag) to wrap and deliver.
+   * @param targets The usernames to wrap the key for (format: "CN=<username>/O=<tenantId>").
+   * @returns The prepared {@link KeyDeliveryPayload} (every key version RSA-wrapped per recipient) to hand to an admin.
    */
   prepareKeyDelivery?(
     keyId: string,
     targets: string[],
   ): Promise<KeyDeliveryPayload>;
 
-  /** Admin-sign and write a prepared key delivery to the directory. */
+  /**
+   * Admin-sign and write a prepared key delivery to the directory.
+   *
+   * @param payload The {@link KeyDeliveryPayload} produced by {@link prepareKeyDelivery} (already wrapped; the admin never sees plaintext).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the key-delivery document has been written.
+   */
   publishKeyDelivery?(
     payload: KeyDeliveryPayload,
     administrationPrivateKey: EncryptedPrivateKey,
@@ -2456,6 +2772,12 @@ export interface MindooTenantDirectory {
   /**
    * Convenience for when the admin legitimately holds the key: prepare and
    * publish in one step.
+   *
+   * @param keyId The id of the symmetric key (in the admin's KeyBag) to wrap and deliver.
+   * @param targets The usernames to deliver the key to (format: "CN=<username>/O=<tenantId>").
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the key-delivery document has been written.
    */
   pushKey?(
     keyId: string,
@@ -2469,6 +2791,11 @@ export interface MindooTenantDirectory {
    * RSA-unwrap with the user's encryption private key and write into the
    * KeyBag, surfacing newly-readable documents via reveal-on-add. Returns the
    * set of key ids imported.
+   *
+   * @param username The recipient whose deliveries to import (format: "CN=<username>/O=<tenantId>").
+   * @param encryptionPrivateKey The recipient's RSA encryption private key, used to unwrap the delivered key versions.
+   * @param encryptionPrivateKeyPassword The password to decrypt the encryption private key.
+   * @returns The ids of the keys imported into the KeyBag (idempotent; empty when nothing new applied).
    */
   importKeyDeliveriesForUser?(
     username: string,
@@ -2481,6 +2808,8 @@ export interface MindooTenantDirectory {
    * after bringing the directory-state chain up to date. Carries the default
    * policy, per-database policies, rules, groups, user grants, and trusted
    * witnesses as they stand now. Used to drive the Haven directory-history UI.
+   *
+   * @returns The head {@link DirectoryStateNode} covering the current time.
    */
   getDirectoryStateHead?(): Promise<DirectoryStateNode>;
 
@@ -2489,6 +2818,9 @@ export interface MindooTenantDirectory {
    * `T` — the directory exactly as it was at that point in time. Lets the Haven
    * directory-history UI inspect and diff users/groups/policies at any past
    * point between the collected trusted times of directory changes.
+   *
+   * @param T The trusted time (ms epoch) to resolve the directory state at.
+   * @returns The {@link DirectoryStateNode} covering trusted time `T`.
    */
   getDirectoryStateAt?(T: number): Promise<DirectoryStateNode>;
 
@@ -2519,6 +2851,9 @@ export interface MindooTenantDirectory {
    * (docs/accesscontrol.md §6.5): currently-granted (`active`) keys and keys an
    * admin has targeted for remote wipe (`wipeRequested`). The two are
    * independent. Optional: directories without remote-wipe support omit it.
+   *
+   * @param username The user whose signing-key universe to resolve (format: "CN=<username>/O=<tenantId>").
+   * @returns The `active` (currently-granted) and `wipeRequested` (remote-wipe-targeted) signing public keys.
    */
   getUserSigningKeyUniverse?(
     username: string,
@@ -2529,6 +2864,9 @@ export interface MindooTenantDirectory {
    * return the id of the admin-signed grant document carrying the directive
    * (else null). Used by the sync server to serve only that document to the
    * targeted device. Optional.
+   *
+   * @param signingKey The device signing public key (PEM) to check for a pending wipe directive.
+   * @returns The grant document id carrying the wipe directive, or `null` when the key is not wipe-targeted.
    */
   getWipeGrantDocId?(signingKey: string): Promise<string | null>;
 
@@ -2624,8 +2962,49 @@ export interface MindooTenantDirectory {
    * This is intended for admin tooling and overview UIs. The result always includes
    * `"directory"` and will also include `"main"` as the conventional default app DB.
    * Additional DBs are discovered from `dbsettings` documents stored in the directory.
+   *
+   * @returns The database ids known to the directory (always including `"directory"` and `"main"`).
    */
   listKnownDBIds(): Promise<string[]>;
+
+  /**
+   * Returns the tenant-wide database-open policy from the access-control default
+   * policy document.
+   *
+   * In `"open"` mode (the default, and whenever access control is off) any valid
+   * database id may be opened/synced. In `"directory-restricted"` mode only
+   * `"directory"` (always implicitly allowed) and the returned `allowedDbIds`
+   * may be opened/synced; the tenant admin is exempt.
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   *
+   * @returns The current database-open policy mode and the allowlist.
+   */
+  getDatabaseCreationPolicy?(): Promise<{
+    mode: "open" | "directory-restricted";
+    allowedDbIds: string[];
+  }>;
+
+  /**
+   * The tenant-wide storage-format floor: the trusted-time cutoff (ms since
+   * epoch) at/after which a store entry MUST carry the v2 metadata-binding
+   * author signature, or `undefined` when no floor is configured. Read from the
+   * access-control default policy (`requireMetadataSignatureSince`).
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   */
+  getRequireMetadataSignatureSince?(): Promise<number | undefined>;
+
+  /**
+   * Whether the given database id may be opened/synced under the current
+   * database-open policy. Always true for `"directory"` and in `"open"` mode.
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   *
+   * @param dbId The database id to check.
+   * @returns True when the database id may be opened/synced.
+   */
+  isDatabaseAllowed?(dbId: string): Promise<boolean>;
 
   /**
    * Create or update database-specific settings.
@@ -2655,15 +3034,12 @@ export interface MindooTenantDirectory {
   getGroups(): Promise<string[]>;
 
   /**
-   * Looks up the members of a group by name.
-   * 
-   * @param groupName The name of the group to look up (case-insensitive, converted to lowercase)
-   * @return The members of the group
-   */
-  /**
    * Get the decrypted member names for a group.
    * Entries that cannot be decrypted are skipped so callers can still work with
    * the readable subset of the group.
+   *
+   * @param groupName The name of the group to look up (case-insensitive, converted to lowercase).
+   * @returns The decrypted member names (the readable subset; undecryptable entries are skipped).
    */
   getGroupMembers(groupName: string): Promise<string[]>;
 

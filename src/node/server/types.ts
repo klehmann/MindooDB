@@ -210,4 +210,16 @@ export const ENV_VARS = {
    * Example: `127.0.0.1,::1,10.0.0.0/8,2001:db8::/32`
    */
   ADMIN_ALLOWED_IPS: "MINDOODB_ADMIN_ALLOWED_IPS",
+  /**
+   * When `true`/`1`, sync-server URLs may use plaintext http and target
+   * loopback/private/link-local hosts. Off by default so the server cannot be
+   * pointed at internal services (SSRF). Enable only for local development.
+   */
+  ALLOW_INSECURE_SYNC_URLS: "MINDOODB_ALLOW_INSECURE_SYNC_URLS",
+  /**
+   * Maximum number of database ids accepted in a single sync-server registration
+   * (`POST /tenants/:tenantId/sync-servers`). A positive integer; invalid or
+   * non-positive values fall back to {@link DEFAULT_MAX_SYNC_SERVER_DATABASES}.
+   */
+  MAX_SYNC_SERVER_DATABASES: "MINDOODB_MAX_SYNC_SERVER_DATABASES",
 } as const;

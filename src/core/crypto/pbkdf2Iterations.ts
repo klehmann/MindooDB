@@ -27,6 +27,29 @@ export function resolvePbkdf2Iterations(defaultIterations: number = DEFAULT_PBKD
   return intValue;
 }
 
+/**
+ * Resolve the PBKDF2 iteration count to use when DECRYPTING a stored key blob.
+ *
+ * Security hardening: a stored blob's `iterations` value is
+ * attacker-influenceable (a stolen identity file with `"iterations": 1` would
+ * otherwise make offline password cracking trivially cheap). We therefore floor
+ * any stored value at {@link MIN_PBKDF2_ITERATIONS}. This is backward compatible
+ * because every legitimately-written blob already used at least the floor on the
+ * encrypt path; flooring a tampered/too-low value simply derives a different key
+ * and the AES-GCM tag check then fails (a safe denial, not a downgrade).
+ */
+export function resolveStoredIterations(stored: number | undefined | null): number {
+  const fallback = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+  if (stored === undefined || stored === null) {
+    return fallback;
+  }
+  const parsed = Number(stored);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(MIN_PBKDF2_ITERATIONS, Math.floor(parsed));
+}
+
 function readOverride(): unknown {
   try {
     if (typeof globalThis !== "undefined") {

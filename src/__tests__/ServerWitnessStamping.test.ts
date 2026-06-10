@@ -9,6 +9,8 @@ import { CURRENT_STORE_ENTRY_VERSION, StoreKind } from "../core/types";
 import type { AuthenticationService } from "../core/appendonlystores/network/AuthenticationService";
 import { NetworkError } from "../core/appendonlystores/network/types";
 import type { AccessDecision } from "../core/accesscontrol/types";
+import { computeContentHash } from "../core/utils/idGeneration";
+import { buildEntrySigningBytes, entrySignatureFieldsFromEntry } from "../core/crypto/EntrySignature";
 
 /**
  * Server-store integration tests for the witness protocol and Tier 1
@@ -41,25 +43,61 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
     } as unknown as MindooTenantDirectory;
   }
 
-  function entry(overrides: Partial<StoreEntry> = {}): StoreEntry {
-    return {
+  /**
+   * Build a cryptographically valid entry: real contentHash over the payload,
+   * a real legacy signature over the ciphertext, and a real metadata-binding
+   * `metadataSignature` (audit findings #1/#5). The server now verifies all of
+   * these on push, so fixtures must be authentic. Pass `opts` to sign as a
+   * specific author (e.g. the witness itself).
+   */
+  async function makeEntry(
+    overrides: Partial<StoreEntry> = {},
+    opts?: { signingKey?: CryptoKey; publicKeyPem?: string },
+  ): Promise<StoreEntry> {
+    let signingKey = opts?.signingKey;
+    let publicKeyPem = opts?.publicKeyPem;
+    if (!signingKey || !publicKeyPem) {
+      const pair = (await subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
+      const spki = await subtle.exportKey("spki", pair.publicKey);
+      publicKeyPem = `-----BEGIN PUBLIC KEY-----\n${Buffer.from(new Uint8Array(spki)).toString("base64")}\n-----END PUBLIC KEY-----`;
+      signingKey = pair.privateKey;
+    }
+
+    const encryptedData = (overrides.encryptedData as Uint8Array) ?? new Uint8Array([9, 9, 9]);
+    const contentHash = overrides.contentHash ?? (await computeContentHash(encryptedData, subtle));
+
+    const base: StoreEntry = {
       entryType: "doc_change",
       id: `doc7_d_0_${Math.random().toString(36).slice(2)}`,
-      contentHash: "abc123",
+      contentHash,
       docId: "doc7",
       dependencyIds: [],
       createdAt: 1_700_000_000_000,
-      createdByPublicKey: "-----BEGIN PUBLIC KEY-----AUTHOR-----END PUBLIC KEY-----",
+      createdByPublicKey: publicKeyPem,
       decryptionKeyId: "default",
-      originalSize: 3,
-      encryptedSize: 3,
-      signature: new Uint8Array([1, 2, 3]),
-      encryptedData: new Uint8Array([9, 9, 9]),
+      originalSize: encryptedData.length,
+      encryptedSize: encryptedData.length,
+      signature: new Uint8Array(),
+      encryptedData,
       // Witness-era writer by default: only versioned entries are eligible for
       // a receipt. Legacy entries omit this (see the legacy test below).
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
       ...overrides,
     } as StoreEntry;
+
+    // Legacy author signature over the ciphertext.
+    base.signature = new Uint8Array(
+      await subtle.sign({ name: "Ed25519" }, signingKey, base.encryptedData.buffer as ArrayBuffer),
+    );
+    // Metadata-binding author signature (unless the caller emulates a true
+    // legacy entry by overriding metadataSignature to undefined).
+    if (!("metadataSignature" in overrides)) {
+      const metaBytes = buildEntrySigningBytes(entrySignatureFieldsFromEntry(base));
+      base.metadataSignature = new Uint8Array(
+        await subtle.sign({ name: "Ed25519" }, signingKey, metaBytes.buffer as ArrayBuffer),
+      );
+    }
+    return base;
   }
 
   it("stamps a verifiable witness receipt on accepted entries", async () => {
@@ -74,7 +112,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       { timestampProvider: new Ed25519WitnessProvider({ signer, subtle: signer.subtle }), witnessDbid: dbid },
     );
 
-    const e = entry();
+    const e = await makeEntry();
     const receipts = await server.handlePutEntries("token", [e]);
 
     // The receipt round-trips through the validator as a trusted, valid receipt.
@@ -105,7 +143,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       { timestampProvider: new Ed25519WitnessProvider({ signer, subtle: signer.subtle }), witnessDbid: dbid },
     );
 
-    const e = entry({ createdByPublicKey: signer.publicKeyPem });
+    const e = await makeEntry({}, { signingKey: signer.signingPrivateKey, publicKeyPem: signer.publicKeyPem });
     const receipts = await server.handlePutEntries("token", [e]);
     expect(receipts[0].receivedDateSignature).toBeUndefined();
   });
@@ -126,7 +164,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
     // witness era and have no entryVersion. Stamping a receivedAt = now here
     // would collapse every old doc onto "today"; the server must leave them
     // un-witnessed so they keep resolving to their stable createdAt.
-    const legacy = entry({ entryVersion: undefined });
+    const legacy = await makeEntry({ entryVersion: undefined, metadataSignature: undefined });
     const receipts = await server.handlePutEntries("token", [legacy]);
 
     expect(receipts).toHaveLength(1);
@@ -157,7 +195,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       { timestampProvider: new Ed25519WitnessProvider({ signer, subtle: signer.subtle }), witnessDbid: dbid, tier1Evaluator: denyEvaluator },
     );
 
-    await expect(server.handlePutEntries("token", [entry()])).rejects.toBeInstanceOf(NetworkError);
+    await expect(server.handlePutEntries("token", [await makeEntry()])).rejects.toBeInstanceOf(NetworkError);
     // Nothing should have been persisted.
     expect(await localStore.getAllIds()).toHaveLength(0);
   });
@@ -186,10 +224,153 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       fakeAuth(),
       cryptoAdapter,
     );
-    const e = entry();
+    const e = await makeEntry();
     const receipts = await server.handlePutEntries("token", [e]);
     expect(receipts[0].receivedDateSignature).toBeUndefined();
     const caps = await server.handleGetCapabilities("token");
     expect(caps.supportsAccessControlV1).toBe(false);
+  });
+
+  // Directory-restricted database policy: the dbAccessEvaluator gates every
+  // authenticated sync operation (reads and writes) by database id.
+  describe("database-open gate (directory-restricted policy)", () => {
+    const ADMIN_KEY = "-----BEGIN PUBLIC KEY-----ADMIN-----END PUBLIC KEY-----";
+    const allowedDbIds = ["main"];
+
+    function authWithDeviceKey(deviceSigningKey?: string): AuthenticationService {
+      return {
+        validateToken: async () => ({
+          sub: "CN=alice",
+          iat: 0,
+          exp: 0,
+          tenantId: "t",
+          deviceSigningKey,
+        }),
+      } as unknown as AuthenticationService;
+    }
+
+    // Mirrors TenantManager.buildDbAccessEvaluator -> evaluateDbAccessForSigningKey.
+    const dbAccessEvaluator = async (
+      principal: { signingKey?: string },
+      dbidArg: string,
+    ): Promise<boolean> => {
+      if (dbidArg === "directory") return true;
+      if (allowedDbIds.includes(dbidArg)) return true;
+      return principal.signingKey === ADMIN_KEY;
+    };
+
+    it("rejects a push for a non-allowed database with ACCESS_DENIED", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = new ServerNetworkContentAddressedStore(
+        localStore,
+        fakeDirectory(),
+        authWithDeviceKey("device-key"),
+        cryptoAdapter,
+        undefined,
+        { witnessDbid: dbid, dbAccessEvaluator },
+      );
+
+      await expect(server.handlePutEntries("token", [await makeEntry()])).rejects.toBeInstanceOf(NetworkError);
+      expect(await localStore.getAllIds()).toHaveLength(0);
+    });
+
+    it("rejects a read route for a non-allowed database", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = new ServerNetworkContentAddressedStore(
+        localStore,
+        fakeDirectory(),
+        authWithDeviceKey("device-key"),
+        cryptoAdapter,
+        undefined,
+        { witnessDbid: dbid, dbAccessEvaluator },
+      );
+
+      await expect(server.handleFindNewEntries("token", [])).rejects.toBeInstanceOf(NetworkError);
+    });
+
+    it("allows sync for a listed database", async () => {
+      const localStore = new InMemoryContentAddressedStore("main", StoreKind.docs);
+      const server = new ServerNetworkContentAddressedStore(
+        localStore,
+        fakeDirectory(),
+        authWithDeviceKey("device-key"),
+        cryptoAdapter,
+        undefined,
+        { witnessDbid: "main", dbAccessEvaluator },
+      );
+
+      const e = await makeEntry();
+      await expect(server.handlePutEntries("token", [e])).resolves.toHaveLength(1);
+      expect(await localStore.getAllIds()).toContain(e.id);
+      await expect(server.handleFindNewEntries("token", [])).resolves.toBeDefined();
+    });
+
+    it("bypasses the gate for the tenant admin token", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = new ServerNetworkContentAddressedStore(
+        localStore,
+        fakeDirectory(),
+        authWithDeviceKey(ADMIN_KEY),
+        cryptoAdapter,
+        undefined,
+        { witnessDbid: dbid, dbAccessEvaluator },
+      );
+
+      const e = await makeEntry();
+      // "crm" is not in allowedDbIds, but the admin signing key bypasses.
+      await expect(server.handlePutEntries("token", [e])).resolves.toHaveLength(1);
+      expect(await localStore.getAllIds()).toContain(e.id);
+    });
+  });
+
+  // Server-side cryptographic verification on push (audit findings #1 / #5):
+  // the server must reject forged/tampered entries before stamping them, even
+  // when the author key is "trusted" by the directory.
+  describe("push-time signature + contentHash verification", () => {
+    function plainServer(localStore: InMemoryContentAddressedStore, trusted = true) {
+      return new ServerNetworkContentAddressedStore(
+        localStore,
+        fakeDirectory(trusted),
+        fakeAuth(),
+        cryptoAdapter,
+      );
+    }
+
+    it("rejects an entry whose contentHash does not match the payload", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      // Valid signatures, but a contentHash that lies about the ciphertext.
+      const e = await makeEntry({ contentHash: "deadbeef".repeat(8) });
+      await expect(server.handlePutEntries("token", [e])).rejects.toBeInstanceOf(NetworkError);
+      expect(await localStore.getAllIds()).toHaveLength(0);
+    });
+
+    it("rejects an entry whose metadata was tampered after signing", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      const e = await makeEntry();
+      // Relabel the op type without re-signing: the metadataSignature no longer
+      // matches, so the server must refuse it.
+      const tampered = { ...e, entryType: "doc_delete" } as StoreEntry;
+      await expect(server.handlePutEntries("token", [tampered])).rejects.toBeInstanceOf(NetworkError);
+      expect(await localStore.getAllIds()).toHaveLength(0);
+    });
+
+    it("rejects an entry signed by an untrusted key", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore, /* trusted */ false);
+      await expect(server.handlePutEntries("token", [await makeEntry()])).rejects.toBeInstanceOf(
+        NetworkError,
+      );
+      expect(await localStore.getAllIds()).toHaveLength(0);
+    });
+
+    it("accepts a valid legacy entry (ciphertext-only signature, no metadataSignature)", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      const legacy = await makeEntry({ entryVersion: undefined, metadataSignature: undefined });
+      await expect(server.handlePutEntries("token", [legacy])).resolves.toHaveLength(1);
+      expect(await localStore.getAllIds()).toContain(legacy.id);
+    });
   });
 });

@@ -31,6 +31,14 @@ export class AuthenticationService {
   
   // In-memory challenge storage (in production, use a distributed cache)
   private challenges: Map<string, AuthChallenge> = new Map();
+
+  /**
+   * Hard cap on outstanding challenges (DoS guard). Challenges are unauthenticated
+   * to create, so an attacker could otherwise flood this map and exhaust memory.
+   * When the cap is reached we evict the oldest entries (insertion order) so a
+   * flood cannot grow the map without bound; legitimate clients simply re-request.
+   */
+  private static readonly MAX_CHALLENGES = 10_000;
   
   // JWT signing secret (in production, should be securely managed)
   private jwtSecret: Uint8Array;
@@ -184,6 +192,7 @@ export class AuthenticationService {
     if (fields.signingPublicKey) authChallenge.signingPublicKey = fields.signingPublicKey;
     this.challenges.set(challenge, authChallenge);
     this.cleanupExpiredChallenges();
+    this.evictChallengesOverCap();
     return challenge;
   }
 
@@ -494,6 +503,16 @@ export class AuthenticationService {
     const [headerB64, payloadB64, signatureB64] = parts;
     
     try {
+      // Pin the JWT algorithm to HS256 (audit, Low: alg pinning). The verifier
+      // always uses HMAC-SHA256, but explicitly rejecting any other declared
+      // `alg` (e.g. "none" or an asymmetric alg) blocks algorithm-confusion
+      // attacks rather than relying on the HMAC check to fail.
+      const header = JSON.parse(this.base64UrlDecode(headerB64)) as { alg?: string; typ?: string };
+      if (header.alg !== "HS256") {
+        this.logger.warn(`Rejecting token with unexpected alg: ${header.alg}`);
+        return null;
+      }
+
       // Verify signature
       const signingKey = await subtle.importKey(
         "raw",
@@ -537,6 +556,19 @@ export class AuthenticationService {
       if (authChallenge.expiresAt < now) {
         this.challenges.delete(challenge);
       }
+    }
+  }
+
+  /**
+   * Bound the challenge map (DoS guard): if still over the cap after expiry
+   * cleanup, drop the oldest entries (Map preserves insertion order).
+   */
+  private evictChallengesOverCap(): void {
+    let overflow = this.challenges.size - AuthenticationService.MAX_CHALLENGES;
+    if (overflow <= 0) return;
+    for (const challenge of this.challenges.keys()) {
+      if (overflow-- <= 0) break;
+      this.challenges.delete(challenge);
     }
   }
 

@@ -56,6 +56,7 @@ import {
   aclKeyDeliveryDocId,
   aclReadRuleDocId,
   effectivePolicy,
+  validateAccessPolicy,
   validateAclRule,
   validateReadRule,
 } from "./accesscontrol/types";
@@ -64,6 +65,11 @@ import { AccessDecision } from "./accesscontrol/types";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 
 const DIRECTORY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+
+// How long the resolved storage-format floor (`requireMetadataSignatureSince`)
+// is reused before re-reading the directory head. Short, because it is consulted
+// on the entry-verification hot path; the cutoff itself changes very rarely.
+const METADATA_SIGNATURE_CUTOFF_TTL_MS = 30 * 1000;
 
 /** De-duplicated union of two string lists, preserving first-seen order. */
 function unionStrings(existing: string[], added: string[]): string[] {
@@ -116,6 +122,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   // Unified cache cursor for all document types
   private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
   private lastDirectorySyncTimestamp = 0;
+  // Cached storage-format floor (`requireMetadataSignatureSince`) with re-entrancy
+  // guard; see getRequireMetadataSignatureSince.
+  private metadataSignatureCutoffCache: number | undefined = undefined;
+  private metadataSignatureCutoffCachedAt = 0;
+  private resolvingMetadataSignatureCutoff = false;
   private logger: Logger;
 
   constructor(tenant: BaseMindooTenant, logger?: Logger) {
@@ -402,7 +413,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     );
   }
 
-  async validatePublicSigningKey(publicKey: string): Promise<boolean> {
+  async validatePublicSigningKey(
+    publicKey: string,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<boolean> {
     this.logger.debug(`Validating public signing key`);
     
     // Cast to BaseMindooTenant to access protected methods
@@ -428,10 +442,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       }
     }
     
-    // Refresh directory state at most once per interval.
+    // Refresh directory state at most once per interval — unless the caller
+    // forces a refresh (audit #4): the server push path must observe a freshly
+    // pushed revocation immediately rather than lagging by up to
+    // DIRECTORY_SYNC_INTERVAL_MS, which would let a just-revoked key keep
+    // pushing entries.
     const now = Date.now();
     let didSync = false;
-    if (now - this.lastDirectorySyncTimestamp >= DIRECTORY_SYNC_INTERVAL_MS) {
+    if (
+      opts?.forceRefresh ||
+      now - this.lastDirectorySyncTimestamp >= DIRECTORY_SYNC_INTERVAL_MS
+    ) {
       const directoryDB = await this.getDirectoryDB();
       await directoryDB.syncStoreChanges();
       await this.updateUnifiedCache();
@@ -846,7 +867,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     decryptionKeyId?: string;
   }): Promise<AccessDecision> {
     const node = await this.getDirectoryStateAt(input.trustedTime);
-    const identity = await this.identitySetForSigningKey(input.signingKey, {
+    const identity = await this.identitySetForSigningKey(input.signingKey, node, {
       isAuthor: input.op === "doc_create" || !!input.isAuthor,
     });
     return evaluateAccess({
@@ -881,7 +902,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     decryptionKeyId?: string;
   }): Promise<AccessDecision> {
     const node = await this.getDirectoryStateAt(input.trustedTime);
-    const identity = await this.identitySetForSigningKey(input.signingKey, {
+    const identity = await this.identitySetForSigningKey(input.signingKey, node, {
       isAuthor: input.op === "doc_create" || input.isAuthor,
     });
     return evaluateAccess({
@@ -941,6 +962,133 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
       : undefined;
   }
 
+  /**
+   * The effective default `decryptionKeyId` for a `doc_create` in `dbid` at the
+   * current head state, or `undefined` when none is configured. Lets the client
+   * fill in the key when the caller omits one, instead of falling back to the
+   * hardcoded `"default"`. This is a create-time convenience, not a security
+   * control — the create-key allowlist gate (enforced by the witness) remains
+   * authoritative.
+   *
+   * Cross-layer safety net: when an effective `allowedCreateKeyIds` is in force
+   * and the resolved default is not a member of it (only possible when the two
+   * came from different policy layers — write-time validation rejects an
+   * in-document mismatch), we return `undefined` so creation falls back to the
+   * caller's explicit key / `"default"` and the gate produces a clear error,
+   * rather than silently selecting a key the witness will reject.
+   */
+  async getEffectiveDefaultCreateKeyId(dbid: string): Promise<string | undefined> {
+    const head = await this.getDirectoryStateHead();
+    if (head.defaultPolicy === null) return undefined;
+    const eff = effectivePolicy(head.defaultPolicy, head.dbPolicies.get(dbid) ?? null);
+    if (eff.disableAllAccessChecksAndPolicies) return undefined;
+    const defaultKey = eff.defaultCreateKeyId;
+    if (defaultKey === undefined) return undefined;
+    if (
+      eff.allowedCreateKeyIds &&
+      eff.allowedCreateKeyIds.length > 0 &&
+      !eff.allowedCreateKeyIds.includes(defaultKey)
+    ) {
+      return undefined;
+    }
+    return defaultKey;
+  }
+
+  /**
+   * The tenant-wide database-open policy at the current head state.
+   *
+   * This is a tenant-level control read only from the `acl_defaultpolicy`
+   * document (never layered per-db). When no default policy exists (access
+   * control off), or the field is omitted, the policy is `"open"`. In
+   * `"directory-restricted"` mode only `"directory"` (always implicitly
+   * allowed) and the returned `allowedDbIds` may be opened/synced.
+   */
+  async getDatabaseCreationPolicy(): Promise<{
+    mode: "open" | "directory-restricted";
+    allowedDbIds: string[];
+  }> {
+    const head = await this.getDirectoryStateHead();
+    const policy = head.defaultPolicy;
+    if (policy === null || policy.databaseCreationPolicy !== "directory-restricted") {
+      return { mode: "open", allowedDbIds: [] };
+    }
+    return {
+      mode: "directory-restricted",
+      allowedDbIds: Array.isArray(policy.allowedDbIds) ? [...policy.allowedDbIds] : [],
+    };
+  }
+
+  /**
+   * The tenant-wide storage-format floor (`requireMetadataSignatureSince`): the
+   * trusted-time cutoff at/after which entries must carry the v2 metadata-binding
+   * signature, or `undefined` when no floor is configured (fully backward
+   * compatible). Tenant-level only, read from the `acl_defaultpolicy` head.
+   *
+   * Cached with a short TTL and guarded against re-entrancy: resolving the
+   * cutoff loads the directory head, and directory materialization itself runs
+   * signature verification — without the guard a verify→resolve→materialize→
+   * verify cycle could recurse. During such re-entry we return the last known
+   * value (the directory store is anyway exempt from the floor by its callers).
+   */
+  async getRequireMetadataSignatureSince(): Promise<number | undefined> {
+    const now = Date.now();
+    if (this.resolvingMetadataSignatureCutoff) {
+      return this.metadataSignatureCutoffCache;
+    }
+    if (
+      this.metadataSignatureCutoffCachedAt !== 0 &&
+      now - this.metadataSignatureCutoffCachedAt < METADATA_SIGNATURE_CUTOFF_TTL_MS
+    ) {
+      return this.metadataSignatureCutoffCache;
+    }
+    this.resolvingMetadataSignatureCutoff = true;
+    try {
+      const head = await this.getDirectoryStateHead();
+      const since = head.defaultPolicy?.requireMetadataSignatureSince;
+      this.metadataSignatureCutoffCache =
+        typeof since === "number" && Number.isFinite(since) ? since : undefined;
+      this.metadataSignatureCutoffCachedAt = now;
+    } finally {
+      this.resolvingMetadataSignatureCutoff = false;
+    }
+    return this.metadataSignatureCutoffCache;
+  }
+
+  /**
+   * Whether `dbid` may be opened/synced under the current database-open policy.
+   *
+   * Always true for `"directory"` and in `"open"` mode. In
+   * `"directory-restricted"` mode, true only when `dbid` is in `allowedDbIds`
+   * or the optional `signingKey` is the tenant administration key (admin
+   * bypass).
+   */
+  async isDatabaseAllowed(
+    dbid: string,
+    opts?: { signingKey?: string },
+  ): Promise<boolean> {
+    if (dbid === "directory") return true;
+    const { mode, allowedDbIds } = await this.getDatabaseCreationPolicy();
+    if (mode === "open") return true;
+    if (allowedDbIds.includes(dbid)) return true;
+    if (opts?.signingKey !== undefined) {
+      const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+      if (opts.signingKey === adminKey) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Server-oriented variant of {@link isDatabaseAllowed} that resolves the
+   * admin bypass from a request principal's signing key. Used by the sync
+   * server to gate all sync operations for a database id.
+   */
+  async evaluateDbAccessForSigningKey(input: {
+    dbid: string;
+    signingKey: string;
+  }): Promise<boolean> {
+    return this.isDatabaseAllowed(input.dbid, { signingKey: input.signingKey });
+  }
+
   // -------------------------------------------------------------------------
   // Access-control authoring API (docs/accesscontrol.md §6). All writes are
   // admin-signed and encrypted with `$publicinfos` so the sync server can read
@@ -958,6 +1106,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
+    validateAccessPolicy(policy);
     await this.writePolicyDoc(
       ACL_DEFAULT_POLICY_DOC_ID,
       policy,
@@ -976,6 +1125,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
+    validateAccessPolicy(policy);
     await this.writePolicyDoc(
       aclDbPolicyDocId(dbid),
       policy,
@@ -1147,7 +1297,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
    * a fingerprint of its public key so add/remove are symmetric.
    */
   async addTrustedWitness(
-    witness: { witnessPublicKey: string; serverUrl?: string; notBefore?: number; notAfter?: number },
+    witness: { witnessPublicKey: string; serverUrl?: string },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
@@ -1172,8 +1322,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
         data.type = "trustedwitness";
         data.witnessPublicKey = witness.witnessPublicKey;
         if (witness.serverUrl !== undefined) data.serverUrl = witness.serverUrl;
-        if (witness.notBefore !== undefined) data.notBefore = witness.notBefore;
-        if (witness.notAfter !== undefined) data.notAfter = witness.notAfter;
       },
       { signingKeyPair: adminSigningKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
     );
@@ -2144,6 +2292,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
    */
   private async identitySetForSigningKey(
     signingKey: string,
+    node: DirectoryStateNode,
     opts: { isAuthor?: boolean },
   ): Promise<IdentitySet> {
     // The tenant admin key is the root of trust and is resolved even without a
@@ -2151,10 +2300,24 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
     const adminKey = this.tenant.getAdministrationPublicKey();
     const isAdmin = signingKey === adminKey;
 
+    // Audit #4 (revocation lag): resolve the acting identity strictly from the
+    // directory state at the entry's trusted time `T`. A signing key that was
+    // not an ACTIVE grant at `T` carries only the pseudo-tokens
+    // (`$everyone`/`$author`), even though the live `userLookupCache`
+    // intentionally still remembers its username/group label after revocation.
+    // Without this gate, a just-revoked key would keep matching username/group
+    // allow-rules until the trust cache refreshed (up to
+    // DIRECTORY_SYNC_INTERVAL_MS later). The `node` is the time-`T` snapshot
+    // whose `bySigningKey` only contains keys whose grant is active at `T`.
+    const grantedAtT = node.bySigningKey.has(signingKey);
+
     // Resolve the author's username from their signing key. Trusted non-user
     // keys (e.g. server-to-server sync identities) have no grant; treat them as
-    // an empty identity that still carries `$everyone`/`$author`.
-    const lookup = isAdmin ? null : await this.getUserBySigningPublicKey(signingKey);
+    // an empty identity that still carries `$everyone`/`$author`. Keys that were
+    // revoked (or not yet granted) at `T` are likewise reduced to the minimal
+    // identity so they cannot match name/group rules.
+    const lookup =
+      isAdmin || !grantedAtT ? null : await this.getUserBySigningPublicKey(signingKey);
     const username = lookup?.username ?? "";
 
     return username
@@ -2178,7 +2341,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
    * Normalize group name to lowercase for case-insensitive comparison.
    */
   private normalizeGroupName(name: string): string {
-    return name.toLowerCase();
+    // NFKC-normalize before lowercasing so visually-equivalent Unicode group
+    // names collapse to one key (homoglyph/normalization defense). ASCII names
+    // are unchanged.
+    return name.normalize("NFKC").toLowerCase();
   }
 
   /**
@@ -2902,10 +3068,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   /**
    * Current username-hash scheme version written on new directory documents.
    * v1 = unsalted `SHA-256(lower(username))` (legacy);
-   * v2 = tenant-salted `SHA-256(tenantId + "/" + lower(username))`.
-   * See docs/accesscontrol.md §6.5 ("Username hashing").
+   * v2 = tenant-salted `SHA-256(tenantId + "/" + lower(username))`;
+   * v3 = tenant-salted over the **NFKC-normalized** lowercase username,
+   *      `SHA-256(tenantId + "/" + lower(NFKC(username)))`.
+   * v3 defends against Unicode homoglyph/normalization tricks (e.g. fullwidth
+   * or decomposed forms that look identical but hash differently), so an
+   * attacker cannot register a visually-equal variant of a privileged name and
+   * have it treated as a distinct identity. See docs/accesscontrol.md §6.5
+   * ("Username hashing"). Matching keeps v1/v2/v3 candidates so documents
+   * written under any prior scheme still resolve (backward compatible).
    */
-  private static readonly USERNAME_HASH_VERSION = 2;
+  private static readonly USERNAME_HASH_VERSION = 3;
 
   /**
    * Version of the identity-hash bundle (`identity_hashes`) variant-generation
@@ -2960,23 +3133,37 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory {
   }
 
   /**
-   * The canonical hash to WRITE on new directory documents (currently v2).
+   * NFKC-normalized salted (v3) username hash:
+   * `SHA-256(tenantId + "/" + lower(NFKC(username)))`, hex-encoded. NFKC
+   * canonicalizes Unicode so visually-equivalent or differently-encoded forms
+   * collapse to one hash, blocking homoglyph/normalization impersonation. New
+   * documents write this form. For pure-ASCII usernames it equals v2, so
+   * existing common cases are unaffected.
+   */
+  private async hashUsernameSaltedNormalized(username: string): Promise<string> {
+    return this.sha256Hex(`${this.tenant.getId()}/${username.normalize("NFKC").toLowerCase()}`);
+  }
+
+  /**
+   * The canonical hash to WRITE on new directory documents (currently v3,
+   * NFKC-normalized salted).
    */
   private async hashUsernameForWrite(username: string): Promise<string> {
-    return this.hashUsernameSalted(username);
+    return this.hashUsernameSaltedNormalized(username);
   }
 
   /**
    * All hash forms a given username could be stored as, for MATCHING/lookup.
-   * Returns both the legacy (v1) and salted (v2) hashes so that documents
-   * written under either scheme are found. Deduplicated.
+   * Returns the legacy (v1), salted (v2) and NFKC-normalized salted (v3) hashes
+   * so that documents written under any scheme are found. Deduplicated.
    */
   private async usernameHashCandidates(username: string): Promise<string[]> {
-    const [legacy, salted] = await Promise.all([
+    const [legacy, salted, saltedNormalized] = await Promise.all([
       this.hashUsername(username),
       this.hashUsernameSalted(username),
+      this.hashUsernameSaltedNormalized(username),
     ]);
-    return legacy === salted ? [legacy] : [legacy, salted];
+    return Array.from(new Set([legacy, salted, saltedNormalized]));
   }
 
   /** Hex-encoded SHA-256 of a UTF-8 string. */

@@ -151,7 +151,9 @@ export class MindooDocSigner {
     
     // Create canonical JSON representation
     const canonicalJSON = this.createCanonicalJSON(docPayload, items);
-    this.logger.debug(`Canonical JSON for signing: ${canonicalJSON}`);
+    // Do NOT log the canonical JSON itself: it is the plaintext document content
+    // being signed (audit, Medium: sensitive debug logging). Log only metadata.
+    this.logger.debug(`Building canonical payload for signing: ${items.length} item(s), ${canonicalJSON.length} chars`);
     
     // Convert to bytes (UTF-8 encoding)
     const encoder = new TextEncoder();
@@ -209,7 +211,9 @@ export class MindooDocSigner {
     
     // Create the same canonical JSON representation
     const canonicalJSON = this.createCanonicalJSON(docPayload, items);
-    this.logger.debug(`Canonical JSON for verification: ${canonicalJSON}`);
+    // Do NOT log the canonical JSON itself: it is the plaintext document content
+    // being verified (audit, Medium: sensitive debug logging). Log only metadata.
+    this.logger.debug(`Building canonical payload for verification: ${items.length} item(s), ${canonicalJSON.length} chars`);
     
     // Convert to bytes (UTF-8 encoding)
     const encoder = new TextEncoder();

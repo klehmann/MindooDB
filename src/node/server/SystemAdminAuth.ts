@@ -42,6 +42,11 @@ interface StoredChallenge {
 
 export class SystemAdminAuthService {
   private challenges: Map<string, StoredChallenge> = new Map();
+  /**
+   * Hard cap on outstanding challenges (DoS guard). Challenge creation is
+   * unauthenticated, so bound the map and evict oldest-first on overflow.
+   */
+  private static readonly MAX_CHALLENGES = 10_000;
   private jwtSecret: Uint8Array;
   private challengeExpirationMs: number;
   private tokenExpirationMs: number;
@@ -112,6 +117,7 @@ export class SystemAdminAuthService {
     });
 
     this.cleanupExpiredChallenges();
+    this.evictChallengesOverCap();
     return challenge;
   }
 
@@ -165,6 +171,11 @@ export class SystemAdminAuthService {
     const [headerB64, payloadB64, signatureB64] = parts;
 
     try {
+      // Pin the JWT algorithm to HS256 (audit, Low: alg pinning): reject any
+      // other declared `alg` to block algorithm-confusion attacks.
+      const header = JSON.parse(this.base64UrlDecode(headerB64)) as { alg?: string };
+      if (header.alg !== "HS256") return null;
+
       const subtle = this.cryptoAdapter.getSubtle();
       const signingKey = await subtle.importKey(
         "raw",
@@ -291,6 +302,19 @@ export class SystemAdminAuthService {
       if (ch.expiresAt < now) {
         this.challenges.delete(key);
       }
+    }
+  }
+
+  /**
+   * Bound the challenge map (DoS guard): if still over the cap after expiry
+   * cleanup, drop the oldest entries (Map preserves insertion order).
+   */
+  private evictChallengesOverCap(): void {
+    let overflow = this.challenges.size - SystemAdminAuthService.MAX_CHALLENGES;
+    if (overflow <= 0) return;
+    for (const key of this.challenges.keys()) {
+      if (overflow-- <= 0) break;
+      this.challenges.delete(key);
     }
   }
 

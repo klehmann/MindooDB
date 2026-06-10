@@ -455,6 +455,25 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       options.adminPassword
     );
 
+    // 5. Enforce the v2 storage format from creation (default on). We write an
+    //    admin-signed default policy carrying `requireMetadataSignatureSince =
+    //    now`, but with `disableAllAccessChecksAndPolicies: true` so this turns
+    //    on ONLY the storage-format floor (no ACL deny-gates). The server push
+    //    gate compares this cutoff against its own clock, so once created the
+    //    tenant rejects any new v1 entry, while genuine pre-cutoff history (e.g.
+    //    a tenant migrated in from an older format) still loads.
+    const requireV2Entries = options.requireV2Entries ?? true;
+    if (requireV2Entries && typeof directory.setDefaultAccessPolicy === "function") {
+      await directory.setDefaultAccessPolicy(
+        {
+          disableAllAccessChecksAndPolicies: true,
+          requireMetadataSignatureSince: Date.now(),
+        },
+        adminUser.userSigningKeyPair.privateKey,
+        options.adminPassword,
+      );
+    }
+
     console.log(`[createTenant] ✓ Tenant "${tenantId}" created successfully`);
     this.logger.info(`Tenant "${tenantId}" created successfully`);
 

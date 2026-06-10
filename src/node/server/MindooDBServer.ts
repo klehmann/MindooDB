@@ -80,7 +80,10 @@ import {
   MAX_PEM_KEY_LENGTH,
   MAX_SIGNATURE_LENGTH,
   MAX_CHALLENGE_LENGTH,
+  DEFAULT_MAX_SYNC_SERVER_DATABASES,
 } from "./validation";
+import { assertSafeSyncUrl, UnsafeUrlError } from "../../core/utils/urlSafety";
+import { ENV_VARS } from "./types";
 
 /**
  * Augment Express Request with fields populated by our middleware:
@@ -115,6 +118,7 @@ interface SerializedEntryMetadata {
   createdByPublicKey: string;
   decryptionKeyId: string;
   signature: string;
+  metadataSignature?: string; // base64 (author metadata-binding signature)
   originalSize: number;
   encryptedSize: number;
   // Access-control witness receipt (docs/accesscontrol.md §5). The Ed25519
@@ -147,6 +151,26 @@ const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_SYNC_RATE_LIMIT_MAX = 1_000;
 
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
+
+/**
+ * The effective max number of database ids per sync-server registration. Reads
+ * the `MINDOODB_MAX_SYNC_SERVER_DATABASES` env override and falls back to
+ * {@link DEFAULT_MAX_SYNC_SERVER_DATABASES} when unset or invalid (non-integer
+ * or non-positive), so a typo can never silently disable the bound.
+ */
+function resolveMaxSyncServerDatabases(): number {
+  const raw = process.env[ENV_VARS.MAX_SYNC_SERVER_DATABASES]?.trim();
+  if (!raw) return DEFAULT_MAX_SYNC_SERVER_DATABASES;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.warn(
+      `[MindooDBServer] Ignoring invalid ${ENV_VARS.MAX_SYNC_SERVER_DATABASES}="${raw}" ` +
+        `(expected a positive integer); using default ${DEFAULT_MAX_SYNC_SERVER_DATABASES}`,
+    );
+    return DEFAULT_MAX_SYNC_SERVER_DATABASES;
+  }
+  return parsed;
+}
 
 /** Parse a human-readable size string ("5mb", "1024", "100kb") into bytes. */
 function parseBodySizeLimitToBytes(limit: string): number | null {
@@ -798,9 +822,35 @@ export class MindooDBServer {
           res.status(400).json({ error: "databases array is required and must not be empty" });
           return;
         }
+        // Bound and format-validate each database id (audit, Low): these are
+        // used to scope sync and must be safe identifiers, not arbitrary input.
+        // The bound is overridable per deployment via
+        // MINDOODB_MAX_SYNC_SERVER_DATABASES.
+        validateArraySize(databases, resolveMaxSyncServerDatabases(), "databases");
+        for (const db of databases) {
+          validateIdentifier(db, "databases[]");
+        }
 
         validateStringLength(name, 256, "name");
         validateStringLength(url, 2048, "url");
+
+        // SSRF guard: an admin-supplied sync URL is fetched server-side, so
+        // reject plaintext/internal targets unless explicitly allowed for dev.
+        const allowInsecure = /^(1|true)$/i.test(
+          process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
+        );
+        try {
+          assertSafeSyncUrl(url, {
+            requireHttps: !allowInsecure,
+            allowPrivate: allowInsecure,
+          });
+        } catch (e) {
+          if (e instanceof UnsafeUrlError) {
+            res.status(400).json({ error: e.message });
+            return;
+          }
+          throw e;
+        }
 
         const config: NamedRemoteServerConfig = { name, url, databases };
         if (syncIntervalMs !== undefined) {
@@ -945,6 +995,11 @@ export class MindooDBServer {
 
       const signatureBytes = this.base64ToUint8Array(signature);
       const result = await this.systemAdminAuth.authenticate(challenge, signatureBytes);
+      // Return 401 on a failed authentication instead of 200 (audit, Low).
+      if (!result.success) {
+        res.status(401).json(result);
+        return;
+      }
       res.json(result);
     } catch (error) {
       if (error instanceof ValidationError) {
@@ -1237,6 +1292,12 @@ export class MindooDBServer {
       const signatureBytes = this.base64ToUint8Array(signature);
       const result = await authService.authenticate(challenge, signatureBytes);
 
+      // Return 401 on a failed authentication instead of 200 (audit, Low): a
+      // failed credential check must not look like a success at the HTTP layer.
+      if (!result.success) {
+        res.status(401).json(result);
+        return;
+      }
       res.json(result);
     } catch (error) {
       this.handleRequestError(error, res);
@@ -1764,6 +1825,9 @@ export class MindooDBServer {
       createdByPublicKey: metadata.createdByPublicKey,
       decryptionKeyId: metadata.decryptionKeyId,
       signature: this.uint8ArrayToBase64(metadata.signature),
+      metadataSignature: metadata.metadataSignature
+        ? this.uint8ArrayToBase64(metadata.metadataSignature)
+        : undefined,
       originalSize: metadata.originalSize,
       encryptedSize: metadata.encryptedSize,
       receivedAt: metadata.receivedAt,
@@ -1787,6 +1851,9 @@ export class MindooDBServer {
       createdByPublicKey: serialized.createdByPublicKey,
       decryptionKeyId: serialized.decryptionKeyId,
       signature: this.base64ToUint8Array(serialized.signature),
+      metadataSignature: serialized.metadataSignature
+        ? this.base64ToUint8Array(serialized.metadataSignature)
+        : undefined,
       originalSize: serialized.originalSize,
       encryptedSize: serialized.encryptedSize,
       // Preserve any pre-existing witness receipt (e.g. on re-sync or

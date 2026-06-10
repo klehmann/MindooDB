@@ -1,7 +1,7 @@
 import { DEFAULT_TENANT_KEY_ID, EncryptedPrivateKey } from "../types";
 import { type KeyType, buildKeyDerivationSalt, buildScopedKeyId } from "./KeyContext";
 import { CryptoAdapter } from "../crypto/CryptoAdapter";
-import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "../crypto/pbkdf2Iterations";
+import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations, resolveStoredIterations } from "../crypto/pbkdf2Iterations";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
 /**
@@ -985,7 +985,8 @@ export class KeyBag {
       {
         name: "PBKDF2",
         salt: combinedSalt,
-        iterations: encryptedKey.iterations,
+        // Floor the stored iteration count on decrypt (audit finding #3).
+        iterations: resolveStoredIterations(encryptedKey.iterations),
         hash: "SHA-256",
       },
       passwordKey,

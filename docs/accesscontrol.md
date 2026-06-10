@@ -331,6 +331,28 @@ interface DefaultAccessPolicyDoc {
    *  decryptionKeyId is not in the set is denied (a hard Tier 1 create-key gate
    *  that an allow rule cannot override). See section 6.6. */
   allowedCreateKeyIds?: string[];
+
+  /** Optional default decryptionKeyId a doc_create uses when the caller does
+   *  not specify one in this scope (replacing the hardcoded "default" fallback).
+   *  This is a client-side convenience, NOT a security control — the server
+   *  never selects keys — so allowedCreateKeyIds remains the authoritative gate.
+   *  When set together with a non-empty allowedCreateKeyIds on the SAME document
+   *  it must be a member of that allowlist (rejected at write time otherwise).
+   *  See section 6.6. */
+  defaultCreateKeyId?: string;
+
+  /** Governs which databases tenant members may open/sync. TENANT-LEVEL ONLY —
+   *  read solely from acl_defaultpolicy, never layered through a per-db policy.
+   *  "open" (default) allows any valid database id. "directory-restricted"
+   *  allows only "directory" (always implicit) and the ids in allowedDbIds; the
+   *  tenant admin is exempt. See section 6.8. */
+  databaseCreationPolicy?: "open" | "directory-restricted";
+
+  /** The database ids permitted when databaseCreationPolicy is
+   *  "directory-restricted". "directory" is always allowed and need not be
+   *  listed; every other id (including "main") must appear explicitly. Ignored
+   *  in "open" mode. Tenant-level only. See section 6.8. */
+  allowedDbIds?: string[];
 }
 ```
 
@@ -359,7 +381,8 @@ through directory history and time travel.
 
 Same shape as the default policy but scoped to one database. Layering order during
 evaluation (section 7): tenant default → DB default → matching allow rules →
-matching deny rules.
+matching deny rules. Exception: `databaseCreationPolicy` / `allowedDbIds` are
+tenant-level only and are ignored if set on a per-database policy (see section 6.8).
 
 ### 6.3 ACL rule (`acl_rule_<ruleId>`)
 
@@ -468,8 +491,6 @@ interface TrustedWitnessDoc {
   type: "trustedwitness";
   witnessPublicKey: string;  // Ed25519 PEM
   serverUrl?: string;
-  notBefore?: number;        // optional validity window
-  notAfter?: number;
 }
 ```
 
@@ -672,6 +693,106 @@ append-only revision of `acl_defaultpolicy` / `acl_dbpolicy_<dbid>`, so the exac
 window each key was mandatory stays fully auditable, and
 `wasAllowedAt("doc_create", user, dbid, t, { decryptionKeyId })` reproduces the
 verdict that applied at `t` — not today's policy.
+
+### 6.7 Default create key (`defaultCreateKeyId`)
+
+A policy may also set a single `defaultCreateKeyId`: the `decryptionKeyId` a
+`doc_create` uses when the caller does not pass one. It replaces the historical
+hardcoded `"default"` fallback, so `createDocument()` (no key) under a policy
+that sets `defaultCreateKeyId: "projkey"` creates the document under `projkey`.
+
+This is a **client-side create-time convenience, not a security control**. The
+sync server never selects keys; it only enforces `allowedCreateKeyIds`
+(section 6.6). The resolution order at create time is:
+
+1. the caller's explicit `decryptionKeyId`, else
+2. the effective policy's `defaultCreateKeyId` for the database, else
+3. the literal `"default"`.
+
+**Where to set it (tenant-wide or a single database).** The default key can be
+configured at either scope, on the same policy documents as every other field:
+
+- **Tenant-wide** — applies to every database that has no per-db default:
+
+  ```ts
+  await directory.setDefaultAccessPolicy(
+    { defaultCreateKeyId: "tenantkey" },
+    adminPrivateKey, adminPassword,
+  );
+  ```
+
+- **A single database** — applies only to `dbid`:
+
+  ```ts
+  await directory.setDatabaseAccessPolicy(
+    "crm",
+    { defaultCreateKeyId: "crmkey" },
+    adminPrivateKey, adminPassword,
+  );
+  ```
+
+**Layering.** Like every policy field, a per-database `defaultCreateKeyId` fully
+overrides the tenant default's for that database (it is not merged). So a tenant
+can set a tenant-wide default and let individual databases opt into their own.
+
+**Must be allowed.** When a policy document sets both `defaultCreateKeyId` and a
+non-empty `allowedCreateKeyIds`, the default must be a member of the allowlist —
+otherwise the default would be self-denying. This is rejected at write time
+(`setDefaultAccessPolicy` / `setDatabaseAccessPolicy`). Because the allowlist and
+default can in principle come from different layers (a per-db default over a
+tenant allowlist), the client resolver also drops a resolved default that is not
+in the effective allowlist, falling back to step 3 so the create-key gate
+produces a clear error instead of silently choosing a key the witness rejects.
+
+### 6.8 Directory-restricted database policy (`databaseCreationPolicy` / `allowedDbIds`)
+
+By default any tenant member may open — and therefore implicitly create — a
+database with any syntactically valid id, which is convenient for experimentation
+but undesirable in a locked-down enterprise tenant. The tenant default policy can
+switch this off with two **tenant-level** fields on `acl_defaultpolicy`:
+
+- `databaseCreationPolicy: "open" | "directory-restricted"` — defaults to
+  `"open"` (today's behavior).
+- `allowedDbIds: string[]` — the databases permitted in restricted mode.
+
+In `"directory-restricted"` mode only the `"directory"` database (always
+implicitly allowed, since every participant must sync it to evaluate access
+control at all) and the ids listed in `allowedDbIds` may be opened or synced.
+Every other id — **including `"main"`** — must be listed explicitly. The tenant
+**admin is exempt** and may open/sync any id.
+
+Unlike the create-key gate, these fields are **never** layered through a per-db
+`acl_dbpolicy_<dbid>` document (a per-db restriction would be circular — you would
+have to be allowed into the database to read its own gate). They are read only
+from the tenant `acl_defaultpolicy`, which is `$publicinfos`-encrypted, so the
+sync server can evaluate them without the tenant key — no new sync plumbing.
+
+**Enforcement points (defense in depth):**
+
+1. **Client open path** — `MindooTenant.openDB` (via
+   `assertCurrentUserCanOpenDB`) rejects opening a non-allowed database for a
+   granted, non-admin user. Reading the policy opens `"directory"`, which is
+   short-circuited before the check, so there is no recursion.
+2. **Server sync choke point** — every authenticated sync operation (reads and
+   writes) passes through `ServerNetworkContentAddressedStore`; a non-allowed
+   database is rejected with `NetworkError(ACCESS_DENIED)`. Admin bypass is
+   resolved from the request principal's device signing key against the
+   administration key. The `"directory"` store is never gated.
+3. **Haven UI** — the open/add dialogs render a strict dropdown of `allowedDbIds`
+   in restricted mode instead of free-text input.
+
+**Validation & history.** `setDefaultAccessPolicy` validates the enum and that
+every `allowedDbIds` entry is a valid database id. Like every policy field, the
+restriction is just another append-only revision of `acl_defaultpolicy`, so
+tightening or relaxing the allowlist is fully auditable through directory history.
+
+**Backward compatibility.** Tenants with no `acl_defaultpolicy`, or whose policy
+omits these fields, behave exactly as before (`"open"`). Local "play" tenants
+created by users carry no restrictive policy, so they remain the intended escape
+hatch for ad-hoc data.
+
+**Out of scope.** Server-to-server `ServerSync` uses `getStore` and bypasses the
+network-store layer, so it is not gated by this policy (noted as a follow-up).
 
 ## 7. Evaluation algorithm
 

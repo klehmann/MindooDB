@@ -58,6 +58,7 @@ describe("create-key allowlist (§6.6) end-to-end", () => {
   > & {
     getUserBySigningPublicKey(key: string): Promise<{ username: string } | null>;
     getEffectiveCreateKeyAllowlist(dbid: string): Promise<string[] | undefined>;
+    getEffectiveDefaultCreateKeyId(dbid: string): Promise<string | undefined>;
   };
   let aclDir: AclDirectory;
 
@@ -174,5 +175,70 @@ describe("create-key allowlist (§6.6) end-to-end", () => {
       decryptionKeyId: "default",
     });
     expect(past.allowed).toBe(true);
+  }, 90000);
+
+  // Default create key (docs/accesscontrol.md §6.7): a policy-configured default
+  // key the client uses for a `doc_create` that omits one.
+  it("resolves the tenant default create key, overridden per-db", async () => {
+    // Tenant-wide default applies to a database with no per-db default.
+    await aclDir.setDefaultAccessPolicy(
+      { defaultCreateKeyId: "projkey" },
+      admin.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+    expect(await aclDir.getEffectiveDefaultCreateKeyId("notes")).toBe("projkey");
+
+    // A per-db default fully overrides the tenant default for that database.
+    await aclDir.setDatabaseAccessPolicy(
+      "notes",
+      { defaultCreateKeyId: "projkey2" },
+      admin.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+    expect(await aclDir.getEffectiveDefaultCreateKeyId("notes")).toBe("projkey2");
+  }, 90000);
+
+  it("createDocument without a key uses the policy default", async () => {
+    await aclDir.setDatabaseAccessPolicy(
+      "notes",
+      { defaultCreateKeyId: "projkey" },
+      admin.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+    const notes = await writerTenant.openDB("notes");
+    const doc = await notes.createDocument();
+    expect(doc.getDecryptionKeyId()).toBe("projkey");
+    const readBack = await notes.getDocument(doc.getId());
+    expect(readBack).not.toBeNull();
+  }, 90000);
+
+  it("rejects a default create key outside the allowlist at write time", async () => {
+    await expect(
+      aclDir.setDatabaseAccessPolicy(
+        "crm",
+        { allowedCreateKeyIds: ["projkey"], defaultCreateKeyId: "projkey2" },
+        admin.userSigningKeyPair.privateKey,
+        adminPassword,
+      ),
+    ).rejects.toThrow(/must be one of allowedCreateKeyIds/);
+  }, 90000);
+
+  it("drops a cross-layer default that is not in the effective allowlist", async () => {
+    // Tenant default points the default key at projkey2, but crm's per-db
+    // allowlist only permits projkey (set in beforeEach). The default and the
+    // allowlist come from different layers, so write-time validation cannot see
+    // the conflict; the resolver drops the default instead of selecting a key
+    // the create-key gate would reject.
+    await aclDir.setDefaultAccessPolicy(
+      { defaultCreateKeyId: "projkey2" },
+      admin.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+    expect(await aclDir.getEffectiveDefaultCreateKeyId("crm")).toBeUndefined();
+
+    // With no usable default, createDocument() falls back to "default", which is
+    // not in crm's allowlist, so the create-key gate produces a clear error.
+    const crm = await writerTenant.openDB("crm");
+    await expect(crm.createDocument()).rejects.toThrow(/not in allowed create-key set/);
   }, 90000);
 });

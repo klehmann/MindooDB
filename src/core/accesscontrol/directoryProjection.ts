@@ -44,6 +44,20 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
     denyDocSnapshot: bool(data.denyDocSnapshot),
     denyDocPurge: bool(data.denyDocPurge),
     allowedCreateKeyIds: stringArray(data.allowedCreateKeyIds),
+    defaultCreateKeyId:
+      typeof data.defaultCreateKeyId === "string" ? data.defaultCreateKeyId : undefined,
+    databaseCreationPolicy:
+      data.databaseCreationPolicy === "directory-restricted"
+        ? "directory-restricted"
+        : data.databaseCreationPolicy === "open"
+          ? "open"
+          : undefined,
+    allowedDbIds: stringArray(data.allowedDbIds),
+    requireMetadataSignatureSince:
+      typeof data.requireMetadataSignatureSince === "number" &&
+      Number.isFinite(data.requireMetadataSignatureSince)
+        ? data.requireMetadataSignatureSince
+        : undefined,
   };
 }
 
@@ -228,8 +242,6 @@ function projectAccessControlDoc(
         type: "trustedwitness",
         witnessPublicKey: data.witnessPublicKey,
         serverUrl: typeof data.serverUrl === "string" ? data.serverUrl : undefined,
-        notBefore: typeof data.notBefore === "number" ? data.notBefore : undefined,
-        notAfter: typeof data.notAfter === "number" ? data.notAfter : undefined,
       };
       builder.applyTrustedWitness(witness, trustedTime);
     }

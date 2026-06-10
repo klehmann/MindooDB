@@ -25,6 +25,7 @@ import type {
 } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
+import { isSameOrigin } from "../../core/utils/urlSafety";
 
 /**
  * HTTP implementation of the NetworkTransport interface.
@@ -126,21 +127,38 @@ export class HttpTransport implements NetworkTransport {
    */
   async authenticate(challenge: string, signature: Uint8Array): Promise<AuthResult> {
     this.logger.debug(`Authenticating with challenge: ${challenge}`);
-    
-    const response = await this.fetchWithRetry(
-      `${this.baseUrl}/auth/authenticate`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          challenge,
-          signature: this.uint8ArrayToBase64(signature),
-        }),
+
+    let response: Response;
+    try {
+      response = await this.fetchWithRetry(
+        `${this.baseUrl}/auth/authenticate`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            challenge,
+            signature: this.uint8ArrayToBase64(signature),
+          }),
+        }
+      );
+    } catch (error) {
+      // The server now returns HTTP 401 on a failed credential check (audit,
+      // Low). `fetchWithRetry` surfaces that as a (non-retried) INVALID_TOKEN /
+      // USER_REVOKED NetworkError; map it back to a structured AuthResult so the
+      // caller's existing `result.success` handling keeps working.
+      if (
+        error instanceof NetworkError &&
+        (error.type === NetworkErrorType.INVALID_TOKEN ||
+          error.type === NetworkErrorType.USER_REVOKED)
+      ) {
+        this.logger.debug(`Authentication result: failed (${error.type})`);
+        return { success: false, error: error.message };
       }
-    );
-    
+      throw error;
+    }
+
     const data = await response.json();
     
     this.logger.debug(`Authentication result: ${data.success ? "success" : "failed"}`);
@@ -660,7 +678,7 @@ export class HttpTransport implements NetworkTransport {
       }
 
       try {
-        const response = await fetch(url, {
+        const response = await this.safeFetch(url, {
           ...options,
           signal: controller.signal,
         });
@@ -756,6 +774,62 @@ export class HttpTransport implements NetworkTransport {
     );
   }
 
+  private static readonly MAX_REDIRECTS = 3;
+
+  /**
+   * `fetch` with manual redirect handling to mitigate redirect-based SSRF
+   * (audit, Medium): a malicious or compromised remote could answer a
+   * server-initiated request with a 3xx pointing at an internal address. We
+   * disable automatic following (`redirect: "manual"`) and only follow a
+   * redirect when it stays on the SAME origin as the original request; any
+   * cross-origin redirect is rejected. Capped at {@link MAX_REDIRECTS} hops.
+   */
+  private async safeFetch(url: string, init: RequestInit): Promise<Response> {
+    let currentUrl = url;
+    for (let hop = 0; hop <= HttpTransport.MAX_REDIRECTS; hop++) {
+      const response = await fetch(currentUrl, { ...init, redirect: "manual" });
+
+      const isRedirect =
+        response.type === "opaqueredirect" ||
+        (response.status >= 300 && response.status < 400);
+      if (!isRedirect) {
+        return response;
+      }
+
+      // Browsers return an opaque redirect with no readable Location; we cannot
+      // validate the target, so refuse to follow it.
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new NetworkError(
+          NetworkErrorType.NETWORK_ERROR,
+          "Server returned a redirect that cannot be safely followed",
+        );
+      }
+
+      let nextUrl: URL;
+      try {
+        nextUrl = new URL(location, currentUrl);
+      } catch {
+        throw new NetworkError(
+          NetworkErrorType.NETWORK_ERROR,
+          `Server returned an invalid redirect target: ${location}`,
+        );
+      }
+
+      if (!isSameOrigin(nextUrl, new URL(currentUrl))) {
+        throw new NetworkError(
+          NetworkErrorType.NETWORK_ERROR,
+          `Refusing to follow cross-origin redirect to ${nextUrl.origin}`,
+        );
+      }
+      currentUrl = nextUrl.toString();
+    }
+    throw new NetworkError(
+      NetworkErrorType.NETWORK_ERROR,
+      `Too many redirects (>${HttpTransport.MAX_REDIRECTS})`,
+    );
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -790,7 +864,7 @@ export class HttpTransport implements NetworkTransport {
     );
     try {
       const serverInfoUrl = new URL("/.well-known/mindoodb-server-info", this.baseUrl);
-      const response = await fetch(serverInfoUrl.toString(), {
+      const response = await this.safeFetch(serverInfoUrl.toString(), {
         method: "GET",
         headers: {
           Accept: "application/json",
@@ -1009,6 +1083,9 @@ export class HttpTransport implements NetworkTransport {
       snapshotHeadHashes: metadata.snapshotHeadHashes,
       snapshotHeadEntryIds: metadata.snapshotHeadEntryIds,
       signature: this.uint8ArrayToBase64(metadata.signature),
+      metadataSignature: metadata.metadataSignature
+        ? this.uint8ArrayToBase64(metadata.metadataSignature)
+        : undefined,
       originalSize: metadata.originalSize,
       encryptedSize: metadata.encryptedSize,
       receivedAt: metadata.receivedAt,
@@ -1037,6 +1114,9 @@ export class HttpTransport implements NetworkTransport {
       snapshotHeadHashes: serialized.snapshotHeadHashes,
       snapshotHeadEntryIds: serialized.snapshotHeadEntryIds,
       signature: this.base64ToUint8Array(serialized.signature),
+      metadataSignature: serialized.metadataSignature
+        ? this.base64ToUint8Array(serialized.metadataSignature)
+        : undefined,
       originalSize: serialized.originalSize,
       encryptedSize: serialized.encryptedSize,
       receivedAt: serialized.receivedAt,
@@ -1073,6 +1153,7 @@ interface SerializedEntryMetadata {
   snapshotHeadHashes?: string[];
   snapshotHeadEntryIds?: string[];
   signature: string; // base64
+  metadataSignature?: string; // base64 (author metadata-binding signature)
   originalSize: number;
   encryptedSize: number;
   // Access-control witness receipt (docs/accesscontrol.md §5).

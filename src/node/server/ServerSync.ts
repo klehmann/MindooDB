@@ -9,6 +9,7 @@ import { HttpTransport } from "../../appendonlystores/network/HttpTransport";
 import { ClientNetworkContentAddressedStore } from "../../appendonlystores/network/ClientNetworkContentAddressedStore";
 import { StoreKind, type ContentAddressedStore, type EncryptedPrivateKey } from "../../core/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import { resolveStoredIterations } from "../../core/crypto/pbkdf2Iterations";
 import type { PrivateUserId } from "../../core/userid";
 import type { RemoteServerConfig } from "./types";
 
@@ -189,7 +190,8 @@ export class ServerSync {
       {
         name: "PBKDF2",
         salt: salt,
-        iterations: encryptedKey.iterations,
+        // Floor the stored iteration count on decrypt (audit finding #3).
+        iterations: resolveStoredIterations(encryptedKey.iterations),
         hash: "SHA-256",
       },
       keyMaterial,
@@ -242,7 +244,8 @@ export class ServerSync {
       {
         name: "PBKDF2",
         salt: salt,
-        iterations: encryptedKey.iterations,
+        // Floor the stored iteration count on decrypt (audit finding #3).
+        iterations: resolveStoredIterations(encryptedKey.iterations),
         hash: "SHA-256",
       },
       keyMaterial,

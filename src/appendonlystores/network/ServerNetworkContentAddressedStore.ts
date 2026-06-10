@@ -26,6 +26,8 @@ import type {
 } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
+import { verifyEntrySignatureCrypto } from "../../core/crypto/EntrySignature";
+import { computeContentHash } from "../../core/utils/idGeneration";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
@@ -67,6 +69,19 @@ export type ServerReadEvaluator = (
  */
 export type WipeGrantDocIdResolver = (signingKey: string) => Promise<string | null>;
 
+/**
+ * Server-side database-open gate. Given the authenticated principal and the
+ * store's database id, returns whether that database may be synced at all under
+ * the tenant's `databaseCreationPolicy`. Coarser than the per-entry read
+ * evaluator: a denied database rejects every sync operation (reads and writes)
+ * for that database. `"directory"` is never gated (it must always sync), and the
+ * tenant admin is exempt. Supplied by the host server from the directory.
+ */
+export type ServerDbAccessEvaluator = (
+  principal: { signingKey?: string },
+  dbid: string
+) => Promise<boolean>;
+
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
 export interface ServerAccessControlOptions {
   /** The trusted-time provider used to stamp receipts on accepted entries (§5, §13). */
@@ -88,6 +103,12 @@ export interface ServerAccessControlOptions {
    * directory store) and nothing else (on data stores); pushes are denied.
    */
   wipeGrantDocIdResolver?: WipeGrantDocIdResolver;
+  /**
+   * Database-open gate. When present, every authenticated sync operation on a
+   * non-allowed database is rejected with ACCESS_DENIED (reads and writes).
+   * Absent keeps the legacy behavior (any synced database id is accepted).
+   */
+  dbAccessEvaluator?: ServerDbAccessEvaluator;
 }
 
 /**
@@ -119,8 +140,17 @@ export class ServerNetworkContentAddressedStore {
   private readEvaluator?: ServerReadEvaluator;
   /** Optional remote-wipe resolver; undefined disables wipe-scoped serving. */
   private wipeGrantDocIdResolver?: WipeGrantDocIdResolver;
+  /** Optional database-open gate; undefined keeps any-database serving. */
+  private dbAccessEvaluator?: ServerDbAccessEvaluator;
   /** The directory database id, where grant documents live (§6.5). */
   private static readonly DIRECTORY_DB_ID = "directory";
+  /**
+   * Server-side cap on a single `scanEntriesSince` page (DoS guard). A client
+   * may request fewer, but never more — an unbounded/huge `limit` would let a
+   * caller force the server to materialize and serialize the entire store in one
+   * response. Clients page via `nextCursor`/`hasMore` to read more.
+   */
+  static readonly MAX_SCAN_PAGE_SIZE = 1000;
 
   /**
    * Create a new ServerNetworkContentAddressedStore.
@@ -153,6 +183,7 @@ export class ServerNetworkContentAddressedStore {
     this.tier1Evaluator = accessControl?.tier1Evaluator;
     this.wipeGrantDocIdResolver = accessControl?.wipeGrantDocIdResolver;
     this.readEvaluator = accessControl?.readEvaluator;
+    this.dbAccessEvaluator = accessControl?.dbAccessEvaluator;
   }
 
   /**
@@ -427,8 +458,20 @@ export class ServerNetworkContentAddressedStore {
       return { entries, nextCursor: cursor, hasMore: false };
     }
 
+    // Clamp the page size server-side (DoS guard): never trust the client's
+    // `limit` to bound the work/response. A missing or non-finite limit falls
+    // back to the maximum page size.
+    const requestedLimit =
+      typeof limit === "number" && Number.isFinite(limit)
+        ? Math.floor(limit)
+        : ServerNetworkContentAddressedStore.MAX_SCAN_PAGE_SIZE;
+    const effectiveLimit = Math.max(
+      1,
+      Math.min(requestedLimit, ServerNetworkContentAddressedStore.MAX_SCAN_PAGE_SIZE),
+    );
+
     if (this.localStore.scanEntriesSince) {
-      const result = await this.localStore.scanEntriesSince(cursor, limit, filters);
+      const result = await this.localStore.scanEntriesSince(cursor, effectiveLimit, filters);
       return {
         ...result,
         entries: await this.filterReadableMetas(this.readPrincipal(tokenPayload), result.entries),
@@ -460,7 +503,7 @@ export class ServerNetworkContentAddressedStore {
           : leftReceiptOrder - rightReceiptOrder;
       });
 
-    const max = limit ?? Number.MAX_SAFE_INTEGER;
+    const max = effectiveLimit;
     const startIndex =
       cursor === null
         ? 0
@@ -658,15 +701,78 @@ export class ServerNetworkContentAddressedStore {
     const receivedAt = Date.now();
     const stampedMetadata: StoreEntryMetadata[] = [];
 
+    // Storage-format floor (requireMetadataSignatureSince): this is the
+    // authoritative v2 enforcement point. The server compares the admin-signed
+    // cutoff against its OWN clock (receivedAt) — never the entry's
+    // attacker-settable createdAt — so once the cutoff has passed, no new v1
+    // entry can be ingested and a forged v1 entry cannot bypass the floor by
+    // backdating. Resolved once per batch. The directory store is exempt: it
+    // must always accept so the policy that defines the floor can be read.
+    let requireMetadataSignature = false;
+    if (
+      (this.witnessDbid ?? this.localStore.getId()) !== "directory" &&
+      typeof this.directory.getRequireMetadataSignatureSince === "function"
+    ) {
+      const cutoff = await this.directory.getRequireMetadataSignatureSince();
+      requireMetadataSignature = cutoff !== undefined && receivedAt >= cutoff;
+    }
+
     // Process each entry
     const toStore: StoreEntry[] = [];
+    // Audit #4 (revocation lag): force a directory trust refresh once at the
+    // start of the batch so a just-pushed revocation is observed immediately
+    // instead of lagging by up to DIRECTORY_SYNC_INTERVAL_MS. The refresh
+    // updates the shared trust cache, so subsequent entries in the batch reuse
+    // it without re-syncing.
+    let forceTrustRefresh = true;
     for (const entry of entries) {
       // Verify the entry was created by a trusted user (baseline Tier 1).
-      const isValidKey = await this.directory.validatePublicSigningKey(entry.createdByPublicKey);
+      const isValidKey = await this.directory.validatePublicSigningKey(
+        entry.createdByPublicKey,
+        { forceRefresh: forceTrustRefresh },
+      );
+      forceTrustRefresh = false;
       if (!isValidKey) {
         throw new NetworkError(
           NetworkErrorType.INVALID_SIGNATURE,
           `Entry ${entry.id} was not signed by a trusted user`
+        );
+      }
+
+      // Zero-trust ingest (audit finding #1 & #5): the server must not witness or
+      // propagate an entry it cannot authenticate. Verify that the served bytes
+      // hash to the entry's contentHash and that the author signature (the
+      // metadata-binding signature when present, otherwise the legacy ciphertext
+      // signature) is valid. A trusted key alone is NOT sufficient: anyone
+      // holding any trusted key could otherwise push entries with mismatched or
+      // absent signatures.
+      const subtle = this.cryptoAdapter.getSubtle();
+      const actualHash = await computeContentHash(entry.encryptedData, subtle);
+      if (actualHash !== entry.contentHash) {
+        throw new NetworkError(
+          NetworkErrorType.INVALID_SIGNATURE,
+          `Entry ${entry.id} content hash does not match its payload`
+        );
+      }
+      // Enforce the v2 floor with a clear, dedicated error before the generic
+      // signature check (which would also reject it via requireMetadataSignature).
+      if (requireMetadataSignature && !entry.metadataSignature) {
+        throw new NetworkError(
+          NetworkErrorType.INVALID_SIGNATURE,
+          `Entry ${entry.id} must carry a v2 metadata signature (tenant requires v2 as of the configured cutoff)`
+        );
+      }
+      const isValidSignature = await verifyEntrySignatureCrypto(
+        entry,
+        entry.encryptedData,
+        entry.createdByPublicKey,
+        subtle,
+        { requireMetadataSignature },
+      );
+      if (!isValidSignature) {
+        throw new NetworkError(
+          NetworkErrorType.INVALID_SIGNATURE,
+          `Entry ${entry.id} has an invalid author signature`
         );
       }
 
@@ -852,6 +958,24 @@ export class ServerNetworkContentAddressedStore {
         NetworkErrorType.INVALID_TOKEN,
         "Invalid or expired token"
       );
+    }
+
+    // Database-open gate (docs/accesscontrol.md, directory-restricted policy).
+    // Applied here so it covers every authenticated sync operation (reads and
+    // writes) in one place. The directory store is never wired with an
+    // evaluator, so it always syncs.
+    if (this.dbAccessEvaluator) {
+      const dbid = this.witnessDbid ?? this.localStore.getId();
+      const allowed = await this.dbAccessEvaluator(
+        { signingKey: payload.deviceSigningKey },
+        dbid,
+      );
+      if (!allowed) {
+        throw new NetworkError(
+          NetworkErrorType.ACCESS_DENIED,
+          `Database "${dbid}" is not in the tenant's allowed database list`,
+        );
+      }
     }
     
     return payload;

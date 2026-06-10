@@ -9,6 +9,7 @@ import {
   OpenDBOptions,
   MindooTenantFactory,
   MindooTenantDirectory,
+  StoreEntryMetadata,
   SigningKeyPair,
   JoinRequest,
   JoinResponse,
@@ -28,6 +29,9 @@ import { extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
+import { verifyEntrySignatureCrypto } from "./crypto/EntrySignature";
+import { entryTrustedTime } from "./storeEntryTime";
+import { computeContentHash } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
@@ -573,6 +577,79 @@ export class BaseMindooTenant implements MindooTenant {
     return isValid;
   }
 
+  async verifyEntrySignature(entry: StoreEntryMetadata, encryptedData: Uint8Array): Promise<boolean> {
+    // The author key must be trusted by the tenant directory.
+    const directory = await this.openDirectory();
+    const isTrusted = await directory.validatePublicSigningKey(entry.createdByPublicKey);
+    if (!isTrusted) {
+      this.logger.warn(`Public key not trusted: ${entry.createdByPublicKey}`);
+      return false;
+    }
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Integrity: the served bytes must hash to the signed/hashed contentHash so
+    // a relay cannot substitute payload bytes that disagree with the metadata
+    // (audit finding #5).
+    const actualHash = await computeContentHash(encryptedData, subtle);
+    if (actualHash !== entry.contentHash) {
+      this.logger.warn(
+        `Content hash mismatch for entry ${entry.id} (expected ${entry.contentHash.substring(0, 16)}..., got ${actualHash.substring(0, 16)}...)`,
+      );
+      return false;
+    }
+
+    // Storage-format floor (requireMetadataSignatureSince): if the tenant
+    // requires the v2 metadata-binding signature for entries at/after a
+    // trusted-time cutoff, disable the legacy fallback for this entry. The
+    // cutoff is compared against the entry's trusted time so genuine older
+    // history still verifies via the legacy signature.
+    const requireMetadataSignature = await this.requiresMetadataSignature(directory, entry);
+
+    // Version-aware author signature: prefer the metadata-binding signature,
+    // fall back to the legacy ciphertext-only signature for v1/legacy entries
+    // (unless the floor above forbids the fallback for this entry).
+    const isValid = await verifyEntrySignatureCrypto(
+      entry,
+      encryptedData,
+      entry.createdByPublicKey,
+      subtle,
+      { requireMetadataSignature },
+    );
+    this.logger.debug(`Entry signature verification result: ${isValid}`);
+    return isValid;
+  }
+
+  /**
+   * Whether the storage-format floor (`requireMetadataSignatureSince`) requires
+   * `entry` to carry the v2 metadata-binding signature, based on the entry's
+   * trusted time. Returns false when no floor is configured, when the directory
+   * implementation predates the policy, or on any resolution error (fail-open
+   * here is safe: the legacy signature is still cryptographically verified — the
+   * floor only refuses the *weaker* fallback for new entries).
+   */
+  private async requiresMetadataSignature(
+    directory: MindooTenantDirectory,
+    entry: StoreEntryMetadata,
+  ): Promise<boolean> {
+    if (entry.metadataSignature) {
+      return false; // already v2 — the floor is irrelevant
+    }
+    if (typeof directory.getRequireMetadataSignatureSince !== "function") {
+      return false;
+    }
+    try {
+      const cutoff = await directory.getRequireMetadataSignatureSince();
+      if (cutoff === undefined) {
+        return false;
+      }
+      return entryTrustedTime(entry, Date.now()) >= cutoff;
+    } catch (error) {
+      this.logger.warn(`Failed to resolve metadata-signature floor: ${String(error)}`);
+      return false;
+    }
+  }
+
   async getCurrentUserId(): Promise<PublicUserId> {
     // Convert PrivateUserId to PublicUserId
     return {
@@ -729,16 +806,31 @@ export class BaseMindooTenant implements MindooTenant {
       registeredUser?.signingPublicKey === currentUser.userSigningPublicKey &&
       registeredUser?.encryptionPublicKey === currentUser.userEncryptionPublicKey;
 
-    if (hasMatchingGrant) {
-      return;
+    if (!hasMatchingGrant) {
+      this.logger.warn(
+        `Denied database open for ungranted user ${currentUser.username} on database ${id}`,
+      );
+      throw new Error(
+        `User "${currentUser.username}" does not have tenant access yet; the tenant admin must grant access first.`,
+      );
     }
 
-    this.logger.warn(
-      `Denied database open for ungranted user ${currentUser.username} on database ${id}`,
-    );
-    throw new Error(
-      `User "${currentUser.username}" does not have tenant access yet; the tenant admin must grant access first.`,
-    );
+    // Directory-restricted database policy: when the tenant's default policy
+    // restricts which databases may be opened, a granted (non-admin) user may
+    // only open a listed database. "directory" is already short-circuited above
+    // and the admin returned earlier, so this never blocks the policy read
+    // itself (which opens "directory").
+    if (typeof directory.isDatabaseAllowed === "function") {
+      const allowed = await directory.isDatabaseAllowed(id);
+      if (!allowed) {
+        this.logger.warn(
+          `Denied database open for ${currentUser.username}: database "${id}" is not in the tenant's allowed database list`,
+        );
+        throw new Error(
+          `Database "${id}" is not in the tenant's allowed database list.`,
+        );
+      }
+    }
   }
 
   async openDB(id: string, options?: OpenDBOptions): Promise<MindooDB> {
@@ -1382,10 +1474,9 @@ export class BaseMindooTenant implements MindooTenant {
     password: string,
     saltString: string
   ): Promise<ArrayBuffer> {
-    this.logger.debug(`decryptPrivateKey: Starting decryption with saltString: ${saltString}`);
-    this.logger.debug(`decryptPrivateKey: Password length: ${password.length}`);
-    this.logger.debug(`decryptPrivateKey: EncryptedKey iterations: ${encryptedKey.iterations}`);
-    
+    // Do NOT log the password length or KDF iteration count (audit, Medium:
+    // sensitive debug logging) — both narrow an offline cracking search space.
+    this.logger.debug(`decryptPrivateKey: Starting decryption (keyCategory: ${saltString})`);
     this.logger.debug(`decryptPrivateKey: Delegating PBKDF2 + AES-GCM work to shared helper`);
     try {
       const decrypted = await decryptPrivateKeyWithPassword(
