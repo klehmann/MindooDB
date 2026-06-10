@@ -1,40 +1,122 @@
-# MindooDB Access Control Layer
+# MindooDB Access Control & Governance
 
-This document describes how fine-grained, document-level access control works in
-MindooDB.
+> **A Haven Enterprise capability.** Fine-grained access control, group & identity
+> management, and cryptographic key governance ship with **Haven Enterprise
+> Edition**. Haven Community Edition gives every member of a tenant the same
+> powerful, end-to-end-encrypted, local-first database. Enterprise Edition adds the
+> *governance layer* an organization needs on top of it — so apps running inside
+> Haven behave according to your organization's rules.
 
-## 1. Goals and non-goals
+## What this layer is for
+
+MindooDB is zero-trust and local-first: data is end-to-end encrypted, the sync
+server never sees plaintext, and every device keeps working without a network. That
+foundation is identical in every edition, and it is excellent for individuals and
+small, fully-trusted teams.
+
+At organizational scale, a new need appears: **rules**. Not everyone should be able to
+create, change, delete, or read everything; encryption keys should follow a deliberate
+plan rather than "one shared key for all"; and a compliance officer must be able to
+answer *"who was allowed to do what, and when?"* long after the fact — even though
+people work offline and their device clocks cannot be taken at face value.
+
+This document describes the layer that delivers exactly that, **without giving up** the
+zero-trust-server, end-to-end-encrypted, eventually-consistent foundation. With it,
+Haven can support a whole organization in **storing, distributing, and collaborating on
+data securely and auditably** — turning a great personal database into governed,
+enterprise-ready infrastructure.
+
+## Why it is worth Enterprise Edition
+
+| Capability | Community Edition | Haven Enterprise Edition |
+|------------|:-----------------:|:------------------------:|
+| End-to-end encryption, local-first sync, zero-trust server | ✅ | ✅ |
+| Read access by key possession | ✅ | ✅ |
+| **Write governance** — who may create / change / delete / snapshot / purge, scoped to database *and* content | — | ✅ (§2–§12) |
+| **Read governance** — who may *see* which data, scoped by database and encryption key | — | ✅ (§13) |
+| **Group & identity management** — DN-hierarchy identities, nested groups, wildcard targeting | — | ✅ (§6.5, §8.1) |
+| **Cryptographic key guidelines** — pin & rotate the keys new documents use, admin-blind key distribution, crypto-shred | — | ✅ (§6.6–§6.7, §13.6) |
+| **Organizational lockdown** — control which databases may even exist | — | ✅ (§6.8) |
+| **Auditability & time travel** — reproduce any past decision; inspect the quarantine log | — | ✅ (§8, §9, §10) |
+| **Offline-honest enforcement** — decisions hold even when clients are offline and clocks are untrusted | — | ✅ (§4–§5) |
+
+In one line: **Community Edition secures the *data*; Enterprise Edition lets you govern
+*how an organization uses that data* — provably, offline, and over time.**
+
+## The mental model in one minute
+
+Four ideas carry the whole design; if you remember these, the rest reads easily:
+
+1. **Two tiers (§2).** Rules split by *what the zero-trust server can see*. **Tier 1**
+   (identity / database / key / operation) is cryptographically enforced by the server
+   against everyone. **Tier 2** (document content) is enforced by every honest client on
+   receipt. Both are real protection — see §14.1 for *when to use which*.
+2. **One new primitive: the witness receipt (§5).** When the server accepts an entry it
+   signs *"accepted at this time"*. That attestation is the trusted clock everything else
+   builds on.
+3. **Trusted time, not wall-clock (§4, §8).** Every decision is evaluated against the
+   policy that was in force at an entry's *trusted time*, so replicas always agree and
+   offline clients cannot rewind the clock to slip a change through.
+4. **It's all just signed documents.** Policies, rules, groups, and grants are
+   admin-signed entries in the directory database that everyone already syncs. The
+   complete enable / change / disable timeline is therefore inherently auditable.
+
+## How to read this document
+
+| If you want to… | Read |
+|-----------------|------|
+| Understand the design and trust model | §1 goals · §2 two-tier model · §3 trust chain · §4 clocks |
+| Understand the one new cryptographic primitive | §5 witness receipt |
+| See the configurable building blocks | §6 directory schema (policies, rules, groups, keys, DB lockdown) |
+| Understand how a decision is computed | §7 evaluation · §8 time-travel state |
+| Call it from an app | §9 public API · §9.1 client prechecks |
+| Know how it behaves during sync | §10 materialization & quarantine |
+| See it all working end-to-end | §11 worked example (CRM) |
+| Turn it on safely | §12 migration & rollout |
+| Govern *reads* | §13 read access control |
+| **Set it up well in an enterprise** | **§14 deployment guide & best practices** |
+| Know what's coming next | §15 future work |
+
+> **New to this?** Read §1–§2, then jump straight to the **§11 worked example** and the
+> **§14 best-practices guide** — those two make everything else concrete.
+
+## 1. Goals and scope
 
 MindooDB already restricts **read** access cryptographically: a document can only
 be read by someone who holds the encryption key it was encrypted with (`default`
-or a named key). That is strong but coarse — anyone who can read a database can
-also create, change and delete documents in it.
+or a named key). That is strong but coarse on its own — anyone who can read a database
+can also create, change and delete documents in it. This layer adds the *fine-grained*
+controls an organization needs on top of that solid base.
 
-The access control layer adds fine-grained control over **write** operations
+The access control layer adds governance over **write** operations
 (`doc_create`, `doc_change`, `doc_delete`, `doc_undelete`, `doc_snapshot`,
-`doc_purge`) on top of the existing encryption model.
+`doc_purge`) on top of the existing encryption model (read governance follows the same
+shape in §13).
 
 **Goals**
 
-- Restrict which users (or groups) may create, change, delete, snapshot or purge
+- Govern which users (or groups) may create, change, delete, snapshot or purge
   documents, optionally scoped to a database and to the document's content.
-- Enforce those restrictions even though users work **offline** and **cannot be
-  trusted to report an honest `createdAt`** on their store entries.
-- Make decisions **auditable and reproducible for any point in time** ("was user
+- Keep those guarantees intact even when users work **offline** and their device clock
+  cannot be taken at face value.
+- Make every decision **auditable and reproducible for any point in time** ("was user
   X allowed to change this document when the change actually entered the tenant?").
-- Stay opt-in: existing tenants behave exactly as before until an admin enables
-  access control.
+- Stay **opt-in and backward-compatible**: existing tenants behave exactly as before
+  until an admin enables governance, and pre-existing data is never retroactively
+  invalidated.
 
-**Non-goals (v1)**
+**Scope — and where each adjacent concern is handled**
 
-- This layer does **not** add cryptographic read enforcement beyond the existing
-  encryption keys. If a user can decrypt a document, they can read it.
-- It does **not** prevent a fully malicious, tampered client from *locally*
-  authoring an entry. It prevents that entry from being **accepted into the
-  tenant** (see the two-tier model below).
-- It does **not** introduce multi-key-per-user identities. That is sketched as
-  future work in section 13 and partially enabled by the join-request key-rollover
-  flow.
+- **Read confidentiality** is provided by encryption keys plus the read-governance layer
+  (§13) and **key scoping** (§14.4), rather than by re-encrypting history on every rule
+  change. Key possession stays the cryptographic read gate.
+- **A tampered client** can always author an entry on *its own* device — that is true of
+  any local-first system. What matters is the shared organizational state, and the
+  two-tier model (§2) keeps a violating entry from being **accepted into the tenant**
+  (Tier 1) or **materialized by honest clients** (Tier 2). The blast radius is bounded,
+  audited, and reversible.
+- **Full multi-key-per-user identities** are future work (§15); v1 already supports key
+  rollover today via grant-document key arrays and the join-request flow.
 
 ## 2. The two-tier model (the core idea)
 
@@ -43,23 +125,27 @@ The central design decision is to split every rule into one of two tiers, based 
 set of cleartext/`$publicinfos`-encrypted metadata fields; it can never read
 document bodies.
 
-| Tier | Checks | Enforced by | Strength |
-|------|--------|-------------|----------|
-| **Tier 1 — Identity rules** | Author identity, target database, operation type | **Server _and_ clients** | Cryptographically enforced: the server refuses to witness a violating entry, so it cannot propagate |
-| **Tier 2 — Content rules** | The actual document content (`withfields`) | **Clients only** | Policy-enforced: gates honest clients and shapes UX; a tampered client could bypass it |
+| Tier | Checks | Enforced by | What it guarantees |
+|------|--------|-------------|--------------------|
+| **Tier 1 — Identity rules** | Author identity, target database, operation type, create-key | **Server _and_ clients** | Cryptographically enforced everywhere: the server refuses to witness a violating entry, so it can never propagate — this holds even against a fully tampered client |
+| **Tier 2 — Content rules** | The actual document content (`withfields`) | **Every client, on receipt** | Protects the organization's shared data integrity: every honest client re-checks the content on materialization and quarantines a violation (§10), so it never becomes visible to anyone and cannot be built upon |
 
 A rule is **Tier 2 if and only if it has a `withfields` clause**. Everything else
 is Tier 1.
 
-This split is the whole architecture. It lets us make a clear, honest promise:
+This split is the whole architecture, and it lets us make a clear, honest promise:
 
-> MindooDB cryptographically enforces **who may write what kind of entry, and
-> where**. It enforces **what the content must look like** by policy among
-> cooperating clients.
+> MindooDB cryptographically enforces **who may write what kind of entry, and where**.
+> It enforces **what the content must look like** across every client running the
+> official software — quarantining any violation on receipt.
 
-Giving the server the ability to enforce Tier 2 would require handing it the tenant
-encryption key, which would break MindooDB's zero-trust-server promise. We
-deliberately do not do that.
+Both tiers are genuine protection; they simply do different jobs. The reason Tier 2 is
+client-enforced rather than server-enforced is a **feature, not a compromise**: enforcing
+content on the server would mean handing it the tenant encryption key, which would
+break the zero-trust-server promise that makes MindooDB safe to host anywhere. Keeping
+content checks on the clients preserves zero-trust while still protecting the honest
+organization. For practical guidance on **which tier to use for which requirement**, see
+§14.1.
 
 ## 3. Trust chain
 
@@ -758,7 +844,7 @@ switch this off with two **tenant-level** fields on `acl_defaultpolicy`:
 In `"directory-restricted"` mode only the `"directory"` database (always
 implicitly allowed, since every participant must sync it to evaluate access
 control at all) and the ids listed in `allowedDbIds` may be opened or synced.
-Every other id — **including `"main"`** — must be listed explicitly. The tenant
+Every other id must be listed explicitly. The tenant
 **admin is exempt** and may open/sync any id.
 
 Unlike the create-key gate, these fields are **never** layered through a per-db
@@ -1277,7 +1363,7 @@ revocation is consequently forward-looking and has three mechanisms:
    permanently unreadable everywhere (tenant-wide erasure; designed separately).
 
 There is no in-place re-encryption of history, and field-level read control remains
-future work (section 14).
+future work (section 15).
 
 ### 13.2 Schema (all `form: "accesscontrol"`, `$publicinfos`-encrypted)
 
@@ -1442,7 +1528,231 @@ key without ever *seeing* it:
 `listRules` (the write-side listing, section 9) gains the same decrypted `targets`
 display field for symmetry.
 
-## 14. Open questions and future work
+## 14. Enterprise deployment guide and best practices
+
+Sections 1–13 describe the *mechanism*. This section is *operational* guidance for
+rolling the policy system out in a real, locked-down enterprise tenant. It introduces
+no new primitives — it tells you which of the existing ones to reach for, in what
+order, and which mistakes turn a strong design into a false sense of security.
+
+### 14.1 The one rule that governs everything
+
+Internalize the two-tier model (section 2) before you write a single policy, because
+every good decision below follows from it:
+
+> **Tier 1 is cryptographically enforced against everyone — including a tampered
+> client. Tier 2 protects the integrity of your organization's data across every
+> client that runs the official software, and contains, audits, and lets you reverse
+> the rare violation.**
+
+Both tiers are real protection; they simply do *different jobs*, because the
+zero-trust server can never read document content.
+
+| You want to guarantee… | Tier | Enforced by | What a tampered author can do |
+|------------------------|------|-------------|-------------------------------|
+| *who* may write (user/group/`$author`) | Tier 1 | server + crypto | nothing — the push is refused and cannot propagate |
+| *which database* a write lands in | Tier 1 | server + crypto | nothing — refused at push |
+| *which encryption key* a create uses (`allowedCreateKeyIds`) | Tier 1 | server + crypto | nothing — refused at push |
+| *which databases exist* (`databaseCreationPolicy`) | Tier 1 | server + crypto | nothing — refused at push |
+| *what the content looks like* (`withfields`) | Tier 2 | every honest client, on receipt | author locally; **every honest client quarantines it on materialization**, so it never becomes visible, cascades to no dependents, is logged, and the author is revocable |
+
+**What Tier 2 genuinely buys you.** A `withfields` violation is not "caught late" — it
+is *never applied* by any honest client. On receipt the entry is routed to quarantine,
+excluded from queries and from re-sync, and every change that causally depends on it is
+quarantined too (section 10). Because the whole tenant is the official-app population,
+this keeps the organization's shared, materialized state well-formed and authorized.
+A malicious client's garbage stays inert in the append-only store, visible to no one,
+surfaced in the quarantine/audit log, and the author can be cut off at Tier 1 by
+revoking their keys. The blast radius is **bounded, isolated, auditable, and
+reversible** — which is exactly the protection an organization wants.
+
+**Where to reach for Tier 1 / key-scoping instead.** Two guarantees are *structurally*
+outside what content rules can deliver, so model them at Tier 1:
+
+- **Confidentiality.** Quarantine governs *writes/materialization*, not *reads*. "User
+  X must never *read* Y" is a key-possession / read-gate concern (section 13), never a
+  `withfields` rule.
+- **A guarantee the *server* must enforce, or that must hold even on the violator's own
+  device.** The server cannot see content, so identity / database / create-key gates
+  (Tier 1) are the lever — most powerfully by **scoping the encryption key**
+  (section 14.4), the strongest control in the system.
+
+A related subtlety to keep in mind when *designing create-time content rules*: a
+`doc_create withfields` clause is evaluated against the "after" state, which is empty
+for custom (fixed) document ids (their first change is a content-free convergence seed,
+sections 9.1, 6.3). So create-time content validation belongs on generated-id documents
+(`initialValues`) or on the first `changeDoc`; for fixed-id documents, gate creation by
+identity and key (Tier 1) instead.
+
+### 14.2 Bootstrap sequence (recommended order)
+
+Set a tenant up once, in this order, so each step rests on the previous one:
+
+1. **Publish to your server first.** The first push registers the server's signing
+   key as a trusted witness (section 6.4). Without a witness there is no trusted time,
+   and Tier 1's offline-clock guarantees (section 4) do not hold.
+2. **Turn on strict mode and a tight clock-skew tolerance.** New tenants should start
+   in strict mode (refuse pushes from clients that do not understand witness fields,
+   section 12) with a conservative `skewToleranceMs` (section 4).
+3. **Define groups and the identity model** (section 14.3) before rules, so rules can
+   target groups rather than individuals.
+4. **Create your encryption keys and key-distribution plan** (section 14.4) before
+   data is written, because keys are hard to retrofit.
+5. **Write the policies and rules**, starting from deny baselines per database
+   (section 14.5), validating each with a dry run (section 14.9) before enforcing.
+6. **Lock down database creation** with `databaseCreationPolicy: "directory-restricted"`
+   (section 6.8) once you know which databases you need.
+7. **Enable defense-in-depth re-checks** (`clientSideTier1Recheck`, section 4) for
+   high-security tenants.
+8. **Stand up your audit process** (section 14.10) so you can answer "who could do
+   what, when" from day one.
+
+### 14.3 Model identities with groups and the DN hierarchy
+
+- **Target rules at groups, never individuals.** A rule keyed to `hashGroup("hr")`
+  keeps working as people join and leave; a rule keyed to a person's hash rots. Group
+  membership lives in directory documents that merge across offline edits, names are
+  case-insensitive, and nested groups are expanded at evaluation time (section 8.1).
+- **Use DN-style usernames and lean on wildcard variants.** `cn=alice/ou=ceo/o=acme`
+  expands to `*/ou=ceo/o=acme`, `*/o=acme`, `*` (section 6.5). A single rule targeting
+  `*/ou=finance/o=acme` then covers an entire org unit without enumerating members.
+- **Least privilege by default.** Start every database from a deny baseline and grant
+  narrow allow rules. Reserve broad allows (e.g. an "HR may change anything" escape
+  hatch, section 11) for explicit supervisor groups, and keep them Tier 1.
+- **Keep `$admin` rare.** Admin bypasses many checks; it is the root of trust, not an
+  everyday role.
+
+### 14.4 Make the encryption key the primary boundary (read *and* write)
+
+Key scoping is the strongest control in the system because it is enforced by
+cryptography and the server, not by client cooperation:
+
+- **Forbid the shared default key for sensitive databases.** Set a per-database
+  `allowedCreateKeyIds` that omits `"default"` (section 6.6), so every new document
+  must use a named key with a narrower audience. This is a hard Tier 1 gate that an
+  allow rule cannot override, and it is exactly the lever to reach for when a
+  `withfields` create rule would be too weak (section 14.1).
+- **One key per sensitivity domain.** Model "who can read what" as "who holds which
+  key". Read rules are scoped by `decryptionKeyIds` (section 13.2), so a key boundary
+  is simultaneously a write-create boundary and a read boundary.
+- **Distribute keys admin-blind.** Use `prepareKeyDelivery` / `publishKeyDelivery`
+  (section 13.6) so an admin can grant read access without ever seeing the key.
+- **Set `defaultCreateKeyId` for ergonomics, not security.** It removes the hardcoded
+  `"default"` fallback so app code need not pass a key (section 6.7), but the server
+  never selects keys — `allowedCreateKeyIds` remains the authority.
+- **Understand the revocation limits.** Read revocation is forward-looking: you can
+  gate future delivery, cooperatively purge honest clients, or crypto-shred a key, but
+  you cannot re-encrypt history in place (section 13.1). Plan key boundaries up front
+  rather than relying on after-the-fact revocation.
+
+### 14.5 Write rules that hold under a malicious client
+
+- **Express ownership with `$author`** (Tier 1) rather than an `owner` content field
+  (Tier 2) wherever the model is "only the creator may change/delete" (section 6.3).
+- **Rely on deny-overrides-allow** (section 7). It is order-independent (rules merge
+  via Automerge), so a standalone `deny` rule is an effective, replica-safe kill
+  switch for a user or group that no ordering of allows can resurrect.
+- **Keep snapshot and purge admin-only** (their defaults, section 6.1). Loosen them
+  only deliberately.
+- **Use `withfields` to protect data integrity across the organization.** It greys out
+  illegal edits in the UI (`canDo` / `canChange`, section 9.1) and quarantines both
+  honest mistakes and a tampered client's content violations on receipt, so the shared
+  state every honest client sees stays valid. Reserve Tier 1 / key-scoping for the two
+  jobs content rules can't do — *confidentiality* and *server-enforced* invariants
+  (section 14.1). Pair `withfields` with `clientSideTier1Recheck` where the *identity*
+  decision should be double-checked too, remembering the re-check covers Tier 1 only.
+
+### 14.6 Lock down which databases can exist
+
+Once the database list is known, set `databaseCreationPolicy: "directory-restricted"`
+with an explicit `allowedDbIds` on `acl_defaultpolicy` (section 6.8). This is enforced
+both at the client open path and at the server sync choke point, with the admin
+exempt. It is the difference between "anyone
+can spin up an ungoverned database" and "only the databases we intended exist".
+
+### 14.7 Server and witness trust
+
+- **Run a witness you control** and add its key to the trusted-witness list; treat
+  witness rotation as "add the new, drop the old" (section 6.4).
+- **Dual-control is automatic:** a witness never stamps its own authored entries
+  (section 5.1). Keep server signing keys and admin keys separate.
+- **Receipt validation is on by default** (per-witness monotonicity + wall-clock
+  sanity, section 5.4); do not disable it. A compromised witness that backdates
+  `receivedAt` is the one thing that can subvert trusted-time, and these checks bound
+  the damage.
+- **p2p caveat:** with no server there is no inherently trusted witness (section 5.3).
+  For serverless groups, either run a small witness peer the admin signed in, or accept
+  that Tier 1 is enforced locally only.
+
+### 14.8 Lifecycle runbook: onboarding, rollover, revocation, wipe
+
+| Event | Action | Mechanism |
+|-------|--------|-----------|
+| New user / new device | `addUserKeys` (or the join-request flow) appends a key pair, optionally labeled | section 6.5 |
+| Key rollover | append the new pair, then revoke the old | section 6.5 |
+| Revoke a device | `updateUserGrant` moves the pair into `revokedUserKeyPairs` with `revokedAt` | section 6.5 |
+| Fully offboard a user | revoke all pairs; they can rejoin later with fresh keys | section 6.5 |
+| Stolen device | set `wipeRequestedForSigningKeys`; the device drops the whole local tenant on next connect | section 6.5 |
+| Lose read access | flip the read rule to deny / remove the user; honest clients purge the scope on next directory sync | sections 13.3, 13.5 |
+
+Note that **revocation and wipe are independent and both opt-in** (section 6.5): removing
+keys does not wipe a device, and wiping requires explicitly listing its signing key.
+
+### 14.9 Roll out in stages: observe before you enforce
+
+There is no built-in "report-only" mode, so simulate one:
+
+1. **Author the policy but do not enable it.** Keep `deny*` flags off (or the master
+   `disableAllAccessChecksAndPolicies: true`) while you validate.
+2. **Dry-run the decisions.** Use `wasAllowedAt` / `canDo` (section 9) against real
+   users, databases, and documents to confirm the verdicts match intent *before*
+   flipping any deny flag.
+3. **Enable per operation, per database.** Flip one `deny*` flag on one database, then
+   watch the quarantine/audit log (section 10) for unexpected Tier 2 rejections.
+4. **Keep the break-glass switch ready.** `disableAllAccessChecksAndPolicies: true`
+   instantly short-circuits all checks *and* standalone deny rules (section 7), and the
+   exact disabled window stays auditable through directory history. A baseline `deny*`
+   flip alone does **not** neutralize standalone deny rules — use the master switch for
+   a true emergency stop.
+
+Because evaluation is pinned to each entry's trusted time (section 8), tightening a
+policy never retroactively quarantines already-accepted history (section 6.6) — so you
+can ratchet restrictions up safely over time.
+
+### 14.10 Audit and compliance
+
+- **The directory history *is* the audit trail.** Every policy, rule, grant, and group
+  is an append-only, admin-signed document; the trusted-time chain (section 8) lets you
+  reconstruct the exact policy in force at any moment.
+- **Answer point-in-time questions directly** with `wasAllowedAt` (write) and
+  `wasAllowedToReadAt` (read) — "could user X change/read this at time T?" — across the
+  join → role-change → leave lifecycle (sections 9, 13.4).
+- **Monitor the quarantine log** (section 10) for Tier 2 rejections; a spike often
+  signals either an attack or a client/policy mismatch worth investigating.
+- For regulated environments, plan for the optional `acl_audit_*` records (section 15)
+  once they ship, or export the quarantine log on your own cadence.
+
+### 14.11 Anti-patterns to avoid
+
+- **Using a `withfields` rule for *confidentiality* or as a *server-side* gate.**
+  Tier 2 protects organizational data integrity well (violations are quarantined on
+  receipt), but it cannot keep data secret from a reader and the server cannot evaluate
+  it. Put confidentiality and server-enforced invariants on Tier 1 / key-scoping
+  (section 14.1).
+- **Enabling ACL with no trusted witness.** Without witnessed trusted time, the
+  offline-clock guarantees collapse to local-only enforcement.
+- **Targeting rules at individual users.** They rot on personnel changes; target
+  groups and DN wildcards instead.
+- **Relying on the shared default key for sensitive data,** then trying to revoke read
+  access later. History cannot be re-encrypted in place — scope keys up front.
+- **Treating revocation as a wipe** (or vice versa). They are independent, opt-in
+  actions.
+- **Flipping `deny*` flags blind.** Always dry-run with `wasAllowedAt` / `canDo` first
+  and watch the quarantine log after.
+- **Assuming a per-database policy can gate database *creation*.** `databaseCreationPolicy`
+  is tenant-level only (section 6.8); a per-db gate would be circular.
+
+## 15. Open questions and future work
 
 - **Multi-key user identities (full).** v1 enables key rollover via grant-doc key
   arrays and the join-request flow. A complete model (per-key revocation semantics,
@@ -1464,12 +1774,6 @@ display field for symmetry.
 - **Declarative read expiry ("expires at T").** Deferred. If added, it must be enforced
   at the **server** against trusted server time, so the client evaluator stays
   clock-free; for now, scheduled expiry = an automation that flips the policy at T.
-- **Regex / richer operators** in `withfields` (including time-based comparisons
-  bound to the entry's trusted time) once the closed v1 set proves insufficient.
-- **Independent directory timestamping witness** to further harden policy-history
-  integrity against a single compromised witness (section 5.4).
-- **Server-side audit docs.** Optional `acl_audit_*` directory entries (encrypted
-  with `$publicinfos`) recording rejections for compliance, off by default.
 - **Regex / richer operators** in `withfields` (including time-based comparisons
   bound to the entry's trusted time) once the closed v1 set proves insufficient.
 - **Independent directory timestamping witness** to further harden policy-history
