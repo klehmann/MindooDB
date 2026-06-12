@@ -412,6 +412,16 @@ interface DefaultAccessPolicyDoc {
   denyDocSnapshot: boolean;  // default true  (snapshots are admin-only by default)
   denyDocPurge: boolean;     // default true  (purge is admin-only by default)
 
+  /** Database read/sync gate. When true, members may not open or sync the
+   *  governed database(s) unless a doc_read allow rule grants them access; when
+   *  false (default) reading is open and key possession alone decides what can
+   *  actually be decrypted. This is the COARSE per-database gate in front of
+   *  every sync operation — a denied user can neither pull nor push, so they
+   *  cannot create data either (read is required to create). Layers per-db over
+   *  the tenant default like the other deny* flags; admin exempt; "directory"
+   *  never gated. See section 6.8. */
+  denyDocRead: boolean;      // default false  (reading open unless explicitly denied)
+
   /** Optional default decryptionKeyId a doc_create uses when the caller does
    *  not specify one in this scope (replacing the hardcoded "default" fallback).
    *  This is a client-side convenience, NOT a security control — the server
@@ -467,7 +477,8 @@ tenant-level only and are ignored if set on a per-database policy (see section 6
 ```ts
 type RuleType =
   | "doc_create" | "doc_change" | "doc_delete"
-  | "doc_undelete" | "doc_snapshot" | "doc_purge";
+  | "doc_undelete" | "doc_snapshot" | "doc_purge"
+  | "doc_read";  // database-level read/sync gate (section 6.8); dbid-scoped, no withfields
 
 type Operator =
   | "equals" | "notEquals"
@@ -824,6 +835,54 @@ hatch for ad-hoc data.
 
 **Out of scope.** Server-to-server `ServerSync` uses `getStore` and bypasses the
 network-store layer, so it is not gated by this policy (noted as a follow-up).
+
+### 6.8 Database read/sync access (`denyDocRead` + `doc_read` rules)
+
+§6.7 decides *which database ids exist* tenant-wide. This section decides *who*
+may open and sync a given database. It is **not** about decryption key ids
+(what a user can decrypt is still governed by key possession, §13) — it is a
+membership gate: which users and groups may read/sync a database at all.
+
+It reuses the ordinary policy + rule machinery, so it behaves exactly like the
+write side:
+
+- **Default policy.** `denyDocRead` on `acl_defaultpolicy` (and, layered per-db,
+  on `acl_dbpolicy_<dbid>`) sets the baseline. It defaults to `false` (reading
+  open), so existing tenants are unaffected until an admin opts in to
+  default-deny.
+- **Rules.** A `doc_read` rule (`acl_rule_<ruleId>`, `action: "allow" | "deny"`,
+  `dbid`, `users_hashes` + groups + `$everyone`) grants or revokes read access to
+  specific users/groups. `doc_read` is a database-level decision, so its rules
+  are always Tier 1 and **may not** carry `withfields` (rejected at authoring).
+  `deny` overrides `allow` like everywhere else.
+
+**Read is the master per-database gate, so it also gates writes.** Because the
+check sits in front of *every* sync operation for a database, a user denied read
+access can neither pull nor push it — which means they cannot create data in it
+either. This is intentional: a user who could write but not read would create
+documents they can never see. So **read access is required to create data**, and
+no separate coupling is needed — the read gate is simply the precondition for
+all sync on that database; write rules (§6.3) then apply on top for users who
+pass it.
+
+**Enforcement points (defense in depth)** — the same two choke points as §6.7,
+plus the admin/`"directory"` exemptions:
+
+1. **Client open path** — `MindooTenant.openDB` (via `assertCurrentUserCanOpenDB`
+   → `MindooTenantDirectory.canReadDatabase`) refuses to open a database the
+   current user has no read access to. `"directory"` and the tenant admin are
+   exempt.
+2. **Server sync choke point** — the database-open gate
+   (`evaluateDbAccessForSigningKey`, the same hook §6.7 uses) additionally
+   evaluates `doc_read` for the request principal's signing key and rejects
+   serving *and* accepting pushes when it denies. Evaluated server-side at
+   acceptance time (Tier 1) from the `$publicinfos`-readable policy/rules — no
+   tenant key, no new plumbing. The `"directory"` store is never gated; the admin
+   is exempt.
+
+The §6.7 database-id allowlist and the §6.8 read gate are **orthogonal**: a
+database must clear *both* — the id must be permitted, and the user must have
+read access to it.
 
 ## 7. Evaluation algorithm
 

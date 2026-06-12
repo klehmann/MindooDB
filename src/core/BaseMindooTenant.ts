@@ -840,6 +840,24 @@ export class BaseMindooTenant implements MindooTenant {
         );
       }
     }
+
+    // Database read gate (doc_read, §6.6): when the tenant policy denies read
+    // access to this database for the current user (and no doc_read allow rule
+    // grants it), refuse to open it. Because read is the coarse gate in front
+    // of every sync operation, this also prevents creating data in a database
+    // the user cannot read. "directory" and the admin are exempt (handled in
+    // canReadDatabase).
+    if (typeof directory.canReadDatabase === "function") {
+      const canRead = await directory.canReadDatabase(id);
+      if (!canRead) {
+        this.logger.warn(
+          `Denied database open for ${currentUser.username}: no read access to database "${id}"`,
+        );
+        throw new Error(
+          `User "${currentUser.username}" does not have read access to database "${id}".`,
+        );
+      }
+    }
   }
 
   async openDB(id: string, options?: OpenDBOptions): Promise<MindooDB> {

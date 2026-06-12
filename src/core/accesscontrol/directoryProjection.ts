@@ -38,6 +38,7 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
     denyDocUndelete: bool(data.denyDocUndelete),
     denyDocSnapshot: bool(data.denyDocSnapshot),
     denyDocPurge: bool(data.denyDocPurge),
+    denyDocRead: bool(data.denyDocRead),
     defaultCreateKeyId:
       typeof data.defaultCreateKeyId === "string" ? data.defaultCreateKeyId : undefined,
     databaseCreationPolicy:

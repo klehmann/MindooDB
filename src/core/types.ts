@@ -2923,6 +2923,21 @@ export interface MindooTenantDirectory {
   isDatabaseAllowed?(dbId: string): Promise<boolean>;
 
   /**
+   * Whether the current user may open and sync `dbId` under the database read
+   * gate (`doc_read`, §6.6). Evaluates the read policy for the current user
+   * against the directory head. Always true for `"directory"` and for the
+   * tenant admin. Independent of {@link isDatabaseAllowed} (the database-id
+   * allowlist) — callers that gate opening enforce both.
+   *
+   * Optional capability: implementations that predate read access control may
+   * omit it.
+   *
+   * @param dbId The database id to check read access for.
+   * @returns True when the current user may open/sync the database.
+   */
+  canReadDatabase?(dbId: string): Promise<boolean>;
+
+  /**
    * Create or update database-specific settings.
    * Automatically uses the cached settings document for the given dbId if it exists, or creates a new one.
    * 

@@ -1073,7 +1073,46 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     dbid: string;
     signingKey: string;
   }): Promise<boolean> {
-    return this.isDatabaseAllowed(input.dbid, { signingKey: input.signingKey });
+    // Gate 1 — tenant-wide database-id allowlist (`databaseCreationPolicy`).
+    // Orthogonal to read access: a database must clear BOTH gates.
+    if (!(await this.isDatabaseAllowed(input.dbid, { signingKey: input.signingKey }))) {
+      return false;
+    }
+    // The directory database is never read-gated (it must always sync so the
+    // policy that defines the read gate can be read at all).
+    if (input.dbid === "directory") return true;
+    // The tenant admin is exempt from the read gate.
+    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+    if (input.signingKey === adminKey) return true;
+    // Gate 2 — per-user/group database read gate (`doc_read`, §6.6). Evaluated
+    // server-side (Tier 1) from the principal's signing key at acceptance time.
+    // A denied principal cannot pull or push the database, which also prevents
+    // creating data in it (read is required to create).
+    const decision = await this.evaluateAccessForSigningKey({
+      op: "doc_read",
+      dbid: input.dbid,
+      signingKey: input.signingKey,
+      trustedTime: Date.now(),
+    });
+    return decision.allowed;
+  }
+
+  /**
+   * Whether the current user may open and sync `dbid` under the database read
+   * gate (`doc_read`, §6.6). The client-side counterpart of
+   * {@link evaluateDbAccessForSigningKey}'s read gate: it evaluates the
+   * `doc_read` policy for the current user against the directory head. The
+   * `"directory"` database is never gated and the tenant admin is always
+   * exempt. This does NOT apply the tenant-wide database-id allowlist
+   * ({@link isDatabaseAllowed}); callers enforce both gates.
+   */
+  async canReadDatabase(dbid: string): Promise<boolean> {
+    if (dbid === "directory") return true;
+    const currentUser = await this.tenant.getCurrentUserId();
+    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+    if (currentUser.userSigningPublicKey === adminKey) return true;
+    const decision = await this.canDo("doc_read", dbid);
+    return decision.allowed;
   }
 
   // -------------------------------------------------------------------------

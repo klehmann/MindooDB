@@ -334,4 +334,57 @@ describe("evaluateAccess", () => {
     });
   });
 
+  // The database read/sync gate (docs/accesscontrol.md §6.6). doc_read is a
+  // pure identity/db decision (no document content), so it is always Tier 1 and
+  // behaves identically on server and client.
+  describe("doc_read database read gate", () => {
+    const decideRead = (node: DirectoryStateNode, id: IdentitySet = identity()) =>
+      evaluateAccess({ op: "doc_read", dbid: "db", identity: id, node, isServer: true }).allowed;
+
+    it("reads are open by default when a policy exists but does not deny reads", () => {
+      const node = nodeWith((b) => b.applyDefaultPolicy(policy({ denyDocChange: true }), 1));
+      expect(decideRead(node)).toBe(true);
+    });
+
+    it("denyDocRead blocks reads unless an allow rule matches the identity", () => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocRead: true }), 1);
+        b.applyRule(rule({ ruleId: "r", type: "doc_read", dbid: "db", action: "allow", users_hashes: ["hashAlice"] }), 2);
+      });
+      // Alice carries hashAlice -> allowed; a stranger with neither hash -> denied.
+      expect(decideRead(node, identity())).toBe(true);
+      expect(decideRead(node, identity({ hashes: new Set(["hashBob", "$everyone"]) }))).toBe(false);
+    });
+
+    it("grants read access by group membership", () => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocRead: true }), 1);
+        b.applyRule(rule({ ruleId: "g", type: "doc_read", dbid: "db", action: "allow", users_hashes: ["hashTeam"] }), 2);
+      });
+      const member = identity({ groups: ["team"], hashes: new Set(["hashAlice", "$everyone", "hashTeam"]) });
+      expect(decideRead(node, member)).toBe(true);
+      expect(decideRead(node, identity())).toBe(false);
+    });
+
+    it("a deny rule overrides an allow rule (deny-overrides-allow)", () => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocRead: false }), 1);
+        b.applyRule(rule({ ruleId: "allow-all", type: "doc_read", dbid: "db", action: "allow", users_hashes: ["$everyone"] }), 2);
+        b.applyRule(rule({ ruleId: "deny-alice", type: "doc_read", dbid: "db", action: "deny", users_hashes: ["hashAlice"] }), 3);
+      });
+      expect(decideRead(node, identity())).toBe(false);
+      expect(decideRead(node, identity({ hashes: new Set(["hashBob", "$everyone"]) }))).toBe(true);
+    });
+
+    it("a per-db read policy overrides the tenant default", () => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocRead: true }), 1);
+        b.applyDbPolicy("db", policy({ denyDocRead: false }), 2);
+      });
+      // "db" opens up; a different db inherits the tenant-wide read deny.
+      expect(evaluateAccess({ op: "doc_read", dbid: "db", identity: identity(), node, isServer: true }).allowed).toBe(true);
+      expect(evaluateAccess({ op: "doc_read", dbid: "other", identity: identity(), node, isServer: true }).allowed).toBe(false);
+    });
+  });
+
 });

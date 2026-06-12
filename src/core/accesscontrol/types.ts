@@ -21,14 +21,24 @@ export const ACCESS_CONTROL_FORM = "accesscontrol" as const;
 // creation time — there is no regex or open-ended operator in v1.
 // ---------------------------------------------------------------------------
 
-/** Operation types a rule can govern. Mirrors the relevant `StoreEntryType`s. */
+/**
+ * Operation types a rule can govern. The `doc_*` mutation types mirror the
+ * relevant `StoreEntryType`s. `doc_read` is special: it is NOT a store entry
+ * type but a **database-level read/sync gate** (§6.6) — it decides whether a
+ * user/group may open and sync a database at all. Because it is the coarse
+ * gate in front of every sync operation for a database, it also gates writes
+ * (a user who cannot read a database cannot create data in it either); `dbid`
+ * is therefore the only scope that matters for a `doc_read` rule, and content
+ * (`withfields`) clauses are not allowed on it.
+ */
 export type RuleType =
   | "doc_create"
   | "doc_change"
   | "doc_delete"
   | "doc_undelete"
   | "doc_snapshot"
-  | "doc_purge";
+  | "doc_purge"
+  | "doc_read";
 
 /** All valid {@link RuleType} values, for validation and iteration. */
 export const RULE_TYPES: readonly RuleType[] = [
@@ -38,6 +48,7 @@ export const RULE_TYPES: readonly RuleType[] = [
   "doc_undelete",
   "doc_snapshot",
   "doc_purge",
+  "doc_read",
 ];
 
 /** Comparison operators usable in a {@link WithFieldClause}. Closed set. */
@@ -158,6 +169,21 @@ export interface DefaultAccessPolicyDoc {
   denyDocSnapshot?: boolean; // default true (admin-only by default)
   denyDocPurge?: boolean; // default true (admin-only by default)
   /**
+   * Database read/sync gate (§6.6). When true, members may NOT open or sync the
+   * governed database(s) unless an explicit `doc_read` allow rule grants them
+   * access; when false (the default), reading is open and key possession is the
+   * only thing that decides what a user can actually decrypt.
+   *
+   * This is the coarse per-database gate that sits in front of EVERY sync
+   * operation: a user denied read access can neither pull nor push (so they
+   * cannot create data in the database either — read is required to create).
+   * Like the other `deny<Op>` flags it layers per-db over the tenant default in
+   * {@link effectivePolicy}. The tenant admin is always exempt and the
+   * `"directory"` database is never gated (it must always sync so the policy
+   * itself can be read). Defaults to false.
+   */
+  denyDocRead?: boolean; // default false (reading open unless explicitly denied)
+  /**
    * Optional default `decryptionKeyId` for a `doc_create` that does not specify
    * one in the governed scope (tenant default, or a single database when set on
    * a per-db policy). This is NOT a security control: the sync server never
@@ -238,6 +264,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
   denyDocUndelete: false,
   denyDocSnapshot: true,
   denyDocPurge: true,
+  denyDocRead: false,
 };
 
 /** Map a {@link RuleType} to the policy `deny<Op>` field that gates it. */
@@ -251,6 +278,7 @@ export const RULE_TYPE_TO_DENY_FIELD: Record<
   doc_undelete: "denyDocUndelete",
   doc_snapshot: "denyDocSnapshot",
   doc_purge: "denyDocPurge",
+  doc_read: "denyDocRead",
 };
 
 /** A single access-control rule (§6.3). */
@@ -442,6 +470,12 @@ export function validateAclRule(rule: {
   if (!Array.isArray(rule.users_hashes) || rule.users_hashes.length === 0) {
     throw new Error("rule requires a non-empty `users_hashes` array");
   }
+  // `doc_read` is a database-level gate (§6.6); it has no document content to
+  // match, so content clauses are meaningless and would make the rule Tier 2
+  // (client-only) when the server must be able to enforce the read gate.
+  if (rule.type === "doc_read" && (rule.withfields?.length ?? 0) > 0) {
+    throw new Error("doc_read rules are database-level and cannot use `withfields`");
+  }
   for (const clause of rule.withfields ?? []) {
     validateWithFieldClause(clause, rule.type);
   }
@@ -536,6 +570,7 @@ export function effectivePolicy(
     denyDocUndelete: pick("denyDocUndelete"),
     denyDocSnapshot: pick("denyDocSnapshot"),
     denyDocPurge: pick("denyDocPurge"),
+    denyDocRead: pick("denyDocRead"),
     defaultCreateKeyId,
   };
 }

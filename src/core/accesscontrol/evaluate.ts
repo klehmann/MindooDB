@@ -120,6 +120,7 @@ export function evaluateAccess(input: EvaluateAccessInput): AccessDecision {
     doc_undelete: eff.denyDocUndelete,
     doc_snapshot: eff.denyDocSnapshot,
     doc_purge: eff.denyDocPurge,
+    doc_read: eff.denyDocRead,
   }[op];
   const baselineDenied = denyField === true;
 
