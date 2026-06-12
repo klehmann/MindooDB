@@ -217,6 +217,14 @@ interface InternalDoc {
    * Optional on the in-memory shape: defaults to `false` for legacy/unknown docs.
    */
   witnessed?: boolean;
+  /**
+   * Whether the current KeyBag can decrypt this document. Surfaced via
+   * {@link MindooDoc.isAccessible}. Optional on the in-memory shape: normally
+   * loaded docs omit it (treated as `true`); only the inaccessible-key
+   * changefeed tombstone built by {@link BaseMindooDB.buildInaccessibleDoc}
+   * sets it to `false` (docs/accesscontrol.md §13).
+   */
+  accessible?: boolean;
 }
 
 /**
@@ -371,13 +379,6 @@ function getCustomIdInitialChangeBytes(): Uint8Array {
  * - Automerge.load(bytes) - verify method name for snapshots
  * - Automerge.applyChanges(doc, changes) - verify method signature
  */
-/**
- * Read-entitlement verdict for the visibility reconcile pass (audit finding #2).
- * `"unknown"` is the fail-closed transient state: hide the document but do not
- * purge ciphertext or crypto-shred keys, and retry on the next reconcile.
- */
-type ReadEntitlement = "allowed" | "denied" | "unknown";
-
 export class BaseMindooDB implements MindooDB {
   private tenant: BaseMindooTenant;
   private store: ContentAddressedStore;
@@ -1697,14 +1698,6 @@ export class BaseMindooDB implements MindooDB {
       metadataByDoc.set(entry.docId, entries);
     }
 
-    // Read-entitlement memo for this pass: many docs share a `decryptionKeyId`
-    // and the read policy verdict is identical for all of them, so we evaluate
-    // each key once. Empty when read access control is not active.
-    const readEntitledByKey = new Map<string, ReadEntitlement>();
-    // Named keys whose scope lost read entitlement during this pass; deleted
-    // from the KeyBag afterwards (crypto-shred), never the tenant default key.
-    const keysToShred = new Set<string>();
-
     let changed = false;
     // Deterministic ordering by docId keeps the resulting changefeed
     // stable between runs, which simplifies test expectations.
@@ -1717,19 +1710,11 @@ export class BaseMindooDB implements MindooDB {
 
       const existingIndex = this.indexLookup.get(docId);
       const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
-      const hasKey = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
-
-      // Read-side entitlement gate (read-side of docs/accesscontrol.md). When a
-      // read policy denies this (db, key) scope for the current user, the doc
-      // is treated as inaccessible even though we still hold the key — and its
-      // already-synced ciphertext is purged and the named key crypto-shredded.
-      // This is best-effort cooperative purge on honest clients; the server
-      // delivery gate is the strong layer. Evaluation is policy-state-driven
-      // (one directory sync after revocation) with no client-clock dependency.
-      const readState: ReadEntitlement = hasKey
-        ? await this.isReadEntitled(visibility.decryptionKeyId, readEntitledByKey)
-        : "allowed";
-      const canRead = hasKey && readState === "allowed";
+      // Visibility is governed by key possession alone: documents whose
+      // decryption key is in the bag are visible; the rest are hidden. Which
+      // keys a user holds is governed by the key distribution model
+      // (docs/accesscontrol.md §13), not by a server/client read gate.
+      const canRead = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
 
       if (canRead) {
         // Reveal-on-add only triggers when the previous state was
@@ -1743,23 +1728,10 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      // Entitlement loss (we hold the key but the policy now denies the scope):
-      // purge already-synced ciphertext as well, and remember the named key for
-      // crypto-shred so the doc cannot be re-materialized locally.
-      //
-      // Only act destructively on a DEFINITIVE "denied" verdict. A transient
-      // "unknown" (directory unavailable) fails closed by hiding the document
-      // below WITHOUT destroying ciphertext/keys, so a later reconcile re-reveals
-      // it once the directory is reachable again (audit finding #2).
-      if (hasKey && readState === "denied") {
-        await this.purgeDocumentCiphertext(metadataByDoc.get(docId)!);
-        keysToShred.add(visibility.decryptionKeyId);
-      }
-
       if (existing?.accessState === "visible") {
-        // Key was revoked (or entitlement lost) while we still had plaintext
-        // state in cache: wipe it and flip the index entry to an inaccessible
-        // tombstone with `isDeleted: true` so view feeds emit a clean removal.
+        // Key was revoked while we still had plaintext state in cache: wipe it
+        // and flip the index entry to an inaccessible tombstone with
+        // `isDeleted: true` so view feeds emit a clean removal.
         await this.purgeMaterializedDocument(docId);
         this.updateIndex(docId, visibility.lastModified, true, visibility.decryptionKeyId, "inaccessible");
         changed = true;
@@ -1768,12 +1740,6 @@ export class BaseMindooDB implements MindooDB {
         // case a previous session left an L2 record behind.
         await this.purgeMaterializedDocument(docId);
       }
-    }
-
-    // Crypto-shred named keys whose scope lost read entitlement. Guarded inside
-    // the tenant so the shared tenant default key is never removed.
-    for (const keyId of keysToShred) {
-      await this.tenant.removeNamedDecryptionKey(keyId);
     }
 
     if (changed) {
@@ -1786,77 +1752,6 @@ export class BaseMindooDB implements MindooDB {
     // pass so a subsequent warm start with identical bag composition
     // can skip the scan.
     this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
-  }
-
-  /**
-   * Whether the current user is entitled to read entries encrypted with
-   * `decryptionKeyId` in this database under the read policy (read-side of
-   * docs/accesscontrol.md). Memoized per key for the calling reconcile pass.
-   *
-   * Tri-state (audit finding #2):
-   * - `"allowed"`  — read access not configured, or the policy grants this scope.
-   * - `"denied"`   — the policy DEFINITIVELY denies this scope. The caller purges
-   *   the ciphertext and crypto-shreds the named key.
-   * - `"unknown"`  — the directory could not evaluate the policy (transient
-   *   error). The caller fails CLOSED by hiding the document but MUST NOT destroy
-   *   any ciphertext/keys, so a later reconcile re-reveals it once the directory
-   *   is reachable again. This keeps revoked readers from seeing data during an
-   *   outage without risking data loss on a transient blip.
-   */
-  private async isReadEntitled(
-    decryptionKeyId: string,
-    memo: Map<string, ReadEntitlement>,
-  ): Promise<ReadEntitlement> {
-    // The tenant directory is never read-gated: it carries the very policies the
-    // read gate depends on, so it must always be readable (the server delivery
-    // gate skips it for the same reason). Evaluating read access here would also
-    // re-enter directory-state building during the directory DB's own
-    // visibility reconcile on tenant open, deadlocking initialization.
-    if (this.store.getId() === "directory") return "allowed";
-
-    const cached = memo.get(decryptionKeyId);
-    if (cached !== undefined) return cached;
-
-    let result: ReadEntitlement = "allowed";
-    try {
-      const directory = await this.tenant.openDirectory();
-      const evaluateReadAccessForUser = directory.evaluateReadAccessForUser?.bind(directory);
-      if (evaluateReadAccessForUser) {
-        const currentUser = await this.tenant.getCurrentUserId();
-        const decision = await evaluateReadAccessForUser({
-          username: currentUser.username,
-          dbid: this.store.getId(),
-          decryptionKeyId,
-        });
-        result = decision.allowed ? "allowed" : "denied";
-      }
-    } catch (error) {
-      this.logger.debug(`isReadEntitled: evaluation failed for ${decryptionKeyId}, deferring (fail closed, no purge): ${error}`);
-      result = "unknown";
-    }
-
-    memo.set(decryptionKeyId, result);
-    return result;
-  }
-
-  /**
-   * Delete a document's already-synced ciphertext entries from the local store
-   * on read-entitlement loss (validity-window purge). Best-effort: a store that
-   * does not support id-based deletion keeps the ciphertext but the doc is still
-   * hidden via the inaccessible index tombstone and the crypto-shredded key.
-   */
-  private async purgeDocumentCiphertext(metadata: StoreEntryMetadata[]): Promise<void> {
-    const deleteEntriesById = this.store.deleteEntriesById;
-    if (!deleteEntriesById) {
-      return;
-    }
-    const ids = metadata.map((m) => m.id);
-    if (ids.length === 0) return;
-    try {
-      await deleteEntriesById.call(this.store, ids);
-    } catch (error) {
-      this.logger.warn(`purgeDocumentCiphertext: failed to delete ${ids.length} entries: ${error}`);
-    }
   }
 
   private async reconcileRestoredIndexWithStore(): Promise<void> {
@@ -2942,10 +2837,10 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
 
     // Client-side write-policy precheck (docs/accesscontrol.md §9). Evaluates
-    // the full Tier 1 + Tier 2 ruleset (incl. the create-key allowlist gate)
-    // for this doc_create and throws AccessDeniedError when denied, before we
-    // spend work encrypting/signing and writing. The server witness remains
-    // authoritative; this only gives the caller an immediate, meaningful error.
+    // the full Tier 1 + Tier 2 ruleset for this doc_create and throws
+    // AccessDeniedError when denied, before we spend work encrypting/signing and
+    // writing. The server witness remains authoritative; this only gives the
+    // caller an immediate, meaningful error.
     {
       const signerKey = useCustomSigningKey
         ? signingKeyPair!.publicKey
@@ -2954,7 +2849,6 @@ export class BaseMindooDB implements MindooDB {
         op: "doc_create",
         signerKey,
         isAuthor: true,
-        decryptionKeyId: keyId,
         bypass: options.bypassAccessControlPrecheck,
         getAfterDoc: () =>
           this.convertAutomergeToJS(newDoc) as unknown as Record<string, unknown>,
@@ -5709,7 +5603,6 @@ export class BaseMindooDB implements MindooDB {
         op: entryType,
         signerKey: createdByPublicKey,
         isAuthor: creatorKey !== null && createdByPublicKey === creatorKey,
-        decryptionKeyId: internalDoc.decryptionKeyId,
         bypass: bypassPrecheck,
         getBeforeDoc: () =>
           this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
@@ -6420,6 +6313,7 @@ export class BaseMindooDB implements MindooDB {
       getLastModified: () => internalDoc.lastModified,
       getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => false,
+      isAccessible: () => true,
       isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
       isWitnessed: () => internalDoc.witnessed ?? false,
       getHeads: () => Automerge.getHeads(internalDoc.doc),
@@ -7389,7 +7283,6 @@ export class BaseMindooDB implements MindooDB {
         op: "doc_change",
         signerKey,
         isAuthor: creatorKey !== null && signerKey === creatorKey,
-        decryptionKeyId: internalDoc.decryptionKeyId,
         bypass: bypassPrecheck,
         getBeforeDoc: () =>
           this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
@@ -8084,6 +7977,23 @@ export class BaseMindooDB implements MindooDB {
       for (let i = startIndex; i < indexSnapshot.length; i++) {
         const entry = indexSnapshot[i];
         if (entry.accessState !== "visible") {
+          // The document was readable before but the current KeyBag can no
+          // longer decrypt it (e.g. a revoked key, §13). Emit a tombstone so
+          // incremental consumers get a removal signal — distinguishable from a
+          // genuine deletion via isAccessible() === false (parity with
+          // iterateChangeMetadataSince, which already emits isDeleted: true for
+          // these). The body is never materialized.
+          const inaccessibleCursor: ProcessChangesCursor = {
+            changeSeq: entry.changeSeq,
+            lastModified: entry.lastModified,
+            docId: entry.docId,
+          };
+          yieldedDocuments++;
+          yield { doc: this.buildInaccessibleDoc(entry), cursor: inaccessibleCursor };
+          prefetchedDocuments += await this.prefetchIterationWindow(
+            indexSnapshot,
+            i + 1
+          );
           continue;
         }
         
@@ -8762,11 +8672,11 @@ export class BaseMindooDB implements MindooDB {
 
   /**
    * Synchronous client-side write-policy precheck (docs/accesscontrol.md §9).
-   * Evaluates the full Tier 1 + Tier 2 ruleset (including the create-key
-   * allowlist gate) for the candidate write and throws {@link AccessDeniedError}
-   * when it is denied, so applications get immediate, meaningful feedback at the
-   * call site instead of an optimistic local write that is later rejected by
-   * the server witness or quarantined on materialization.
+   * Evaluates the full Tier 1 + Tier 2 ruleset for the candidate write and
+   * throws {@link AccessDeniedError} when it is denied, so applications get
+   * immediate, meaningful feedback at the call site instead of an optimistic
+   * local write that is later rejected by the server witness or quarantined on
+   * materialization.
    *
    * Fails CLOSED on any directory/infra error while access control is enforced
    * (audit finding #2): the precheck denies the write rather than letting it
@@ -8782,7 +8692,6 @@ export class BaseMindooDB implements MindooDB {
     op: RuleType;
     signerKey: string;
     isAuthor: boolean;
-    decryptionKeyId?: string;
     bypass?: boolean;
     getBeforeDoc?: () => Record<string, unknown> | null;
     getAfterDoc?: () => Record<string, unknown> | null;
@@ -8798,10 +8707,10 @@ export class BaseMindooDB implements MindooDB {
    * Resolve the `decryptionKeyId` for a `doc_create`: the caller's explicit key
    * when given, else the policy-configured default for this database (see
    * `getEffectiveDefaultCreateKeyId` on the directory), else the legacy
-   * `"default"`. The policy default is a create-time convenience; the create-key
-   * allowlist gate (enforced by the witness) remains authoritative. Directory
-   * ACL writes always pass an explicit key, so this never re-enters the
-   * directory for them.
+   * `"default"`. The policy default is a create-time convenience only; read/write
+   * access is governed by key possession (distribution + rotation, §13), not the
+   * server. Directory ACL writes always pass an explicit key, so this never
+   * re-enters the directory for them.
    */
   private async resolveCreateKeyId(options: CreateOptions): Promise<string> {
     if (options.decryptionKeyId !== undefined) return options.decryptionKeyId;
@@ -8831,7 +8740,6 @@ export class BaseMindooDB implements MindooDB {
     op: RuleType;
     signerKey: string;
     isAuthor: boolean;
-    decryptionKeyId?: string;
     getBeforeDoc?: () => Record<string, unknown> | null;
     getAfterDoc?: () => Record<string, unknown> | null;
   }): Promise<AccessDecision | null> {
@@ -8842,7 +8750,7 @@ export class BaseMindooDB implements MindooDB {
       const evaluateClientAccess = directory.evaluateClientAccess?.bind(directory);
       if (!evaluateClientAccess) return null;
       // Only materialize the before/after documents when a content rule needs
-      // them; pure Tier 1 (identity/op/create-key) checks never read the doc.
+      // them; pure Tier 1 (identity/op) checks never read the doc.
       let needContent = true;
       if (typeof directory.hasWriteContentRules === "function") {
         needContent = await directory.hasWriteContentRules(input.op, dbid);
@@ -8857,7 +8765,6 @@ export class BaseMindooDB implements MindooDB {
         isAuthor: input.isAuthor,
         beforeDoc,
         afterDoc,
-        decryptionKeyId: input.decryptionKeyId,
       });
     } catch (error) {
       // Fail closed (audit finding #2): access control IS enforced here (checked
@@ -8905,7 +8812,6 @@ export class BaseMindooDB implements MindooDB {
       op: "doc_create",
       signerKey,
       isAuthor: true,
-      decryptionKeyId: keyId,
       getAfterDoc: () => afterValues,
     });
     return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
@@ -8932,7 +8838,6 @@ export class BaseMindooDB implements MindooDB {
       op: "doc_change",
       signerKey,
       isAuthor: creatorKey !== null && signerKey === creatorKey,
-      decryptionKeyId: doc.getDecryptionKeyId(),
       getBeforeDoc: () => before,
       getAfterDoc: () => candidateAfter,
     });
@@ -8957,7 +8862,6 @@ export class BaseMindooDB implements MindooDB {
       op: "doc_delete",
       signerKey,
       isAuthor: creatorKey !== null && signerKey === creatorKey,
-      decryptionKeyId: doc.getDecryptionKeyId(),
       getBeforeDoc: () => current,
       getAfterDoc: () => current,
     });
@@ -9183,10 +9087,6 @@ export class BaseMindooDB implements MindooDB {
           isAuthor,
           beforeDoc: beforeJS,
           afterDoc: afterJS,
-          // Re-check the create-key allowlist on receipt (defense in depth):
-          // evaluated against the directory state at this entry's trusted time,
-          // so docs created under an earlier policy stay valid.
-          decryptionKeyId: meta.decryptionKeyId,
         });
       } catch (error) {
         // Fail closed (audit finding #2): a transient directory error must not
@@ -9764,6 +9664,7 @@ export class BaseMindooDB implements MindooDB {
       getLastModified: () => internalDoc.lastModified,
       getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => internalDoc.isDeleted,
+      isAccessible: () => internalDoc.accessible ?? true,
       isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
       isWitnessed: () => internalDoc.witnessed ?? false,
       getHeads: () => Automerge.getHeads(internalDoc.doc),
@@ -9830,6 +9731,29 @@ export class BaseMindooDB implements MindooDB {
     };
     this.wrappedInternalDocs.set(wrapped, internalDoc);
     return wrapped;
+  }
+
+  /**
+   * Build a lightweight read-only tombstone for a now-inaccessible index entry
+   * (docs/accesscontrol.md §13): a document that was readable before but whose
+   * decryption key the current KeyBag no longer holds (e.g. a revoked key).
+   * Emitted by {@link iterateChangesSince} so incremental consumers get a
+   * removal signal. Per the design rule it reports `isDeleted() === true`,
+   * `isAccessible() === false`, `getData() === {}` (the plaintext is purged,
+   * never materialized) and `getHeads() === []` — backed by an empty Automerge
+   * document so it never touches the underlying ciphertext or the document cache.
+   */
+  private buildInaccessibleDoc(entry: DocumentIndexEntry): MindooDoc {
+    const internalDoc: InternalDoc = {
+      id: entry.docId,
+      doc: Automerge.init<MindooDocPayload>(),
+      createdAt: 0,
+      lastModified: entry.lastModified,
+      decryptionKeyId: entry.decryptionKeyId,
+      isDeleted: true,
+      accessible: false,
+    };
+    return this.wrapDocument(internalDoc);
   }
 
   /**
@@ -10621,6 +10545,16 @@ export class BaseMindooDB implements MindooDB {
       }
       if (storeKind === StoreKind.docs) {
         await this.syncStoreChanges();
+        // SDK-driven key-distribution reconcile (docs/accesscontrol.md §13).
+        // After the directory pulls and processes new entries, reconcile the
+        // local KeyBag against the directory head: bulk-remove revoked keys
+        // (forgetting now-inaccessible docs) and import keys newly pushed to
+        // this user (revealing their docs on the next content-DB pull). Runs in
+        // the SDK so standalone apps get it too, not just Haven. Best-effort and
+        // single-flight; never blocks or fails the sync.
+        if (this.store.getId() === "directory") {
+          await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
+        }
       }
       if (options?.signal?.aborted) {
         this.logger.info(`Pull cancelled after local processing for ${storeKind} entries`);

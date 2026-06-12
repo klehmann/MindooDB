@@ -3,7 +3,7 @@ import type { StoreEntryMetadata } from "../types";
 /**
  * Author entry signatures (security hardening, audit finding #5).
  *
- * Historically a store entry's author signature (`StoreEntryMetadata.signature`)
+ * Historically (early betas) a store entry's author signature (`StoreEntryMetadata.signature`)
  * covered ONLY the encrypted payload bytes. That leaves every cleartext metadata
  * field (`entryType`, `docId`, `decryptionKeyId`, `createdAt`, `dependencyIds`,
  * `contentHash`, ...) unauthenticated: a relay holding any trusted key could

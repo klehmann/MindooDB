@@ -10,13 +10,14 @@ import {
   PrivateUserId,
   MindooTenant,
 } from "../core/types";
+import type { KeyDistributionRequest } from "../core/accesscontrol/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
-// A store factory that memoizes stores per dbId, so two tenants opened over the
-// same factory (Alice and Bob) share the directory store and therefore see each
-// other's published access-control documents.
-class SharedInMemoryStoreFactory implements ContentAddressedStoreFactory {
+// One isolated store namespace per tenant. Alice, Bob and Carol each get their
+// own instance, so their directories converge only through explicit pull-sync —
+// modelling three real devices that share tenant keys but not storage.
+class IsolatedStoreFactory implements ContentAddressedStoreFactory {
   private stores = new Map<string, CreateStoreResult>();
   createStore(dbId: string, options?: OpenStoreOptions): CreateStoreResult {
     if (!this.stores.has(dbId)) {
@@ -30,70 +31,118 @@ class SharedInMemoryStoreFactory implements ContentAddressedStoreFactory {
 }
 
 /**
- * Tests for the read-side access-control authoring/query API and the admin-blind
- * key delivery ceremony (read-side of docs/accesscontrol.md): read policy + rule
- * authoring, `canRead`, the `wasAllowedToReadAt` audit, and `prepareKeyDelivery`
- * / `publishKeyDelivery` / `importKeyDeliveriesForUser` with an out-of-audience
- * admin proven unable to receive the key.
+ * Ferry one isolated tenant's directory into another via the public push-changes
+ * API, then materialize. A directory PULL would fire the SDK's after-pull
+ * `reconcileKeyDistributionsForCurrentUserSafe()` (BaseMindooDB §13) and race
+ * the test's explicit, tenant-owned reconcile; a push only transfers entries, so
+ * `reconcileKeyDistributionsForCurrentUser()` stays the single authoritative
+ * reconcile whose imported/removed result we assert on.
  */
-describe("read access-control admin API + key delivery", () => {
-  let factory: BaseMindooTenantFactory;
+async function syncTenantDb(
+  target: MindooTenant,
+  source: MindooTenant,
+  dbId: string,
+): Promise<void> {
+  const targetDb = await target.openDB(dbId);
+  const sourceDb = await source.openDB(dbId);
+  await sourceDb.pushChangesTo(targetDb.getStore());
+  await targetDb.syncStoreChanges();
+}
+
+/**
+ * Tests for the admin-blind key distribution ceremony (docs/accesscontrol.md
+ * §13) across four separate identities, each on its own isolated store:
+ *
+ *  - **admin** — authorizes (signs) directory writes but NEVER opens a tenant of
+ *    its own and never holds the distributed key (structurally admin-blind).
+ *  - **alice** — the key-holder: owns `team-key`, wraps every version to each
+ *    recipient device, and prepares the distribution request.
+ *  - **bob** — the recipient (in `pushto`): reconciles his KeyBag and receives
+ *    the key, byte-identical to Alice's.
+ *  - **carol** — a regular user whose tenant session HOSTS the admin-authorized
+ *    publish, and who doubles as the out-of-audience reconciliation check: a real
+ *    user with a valid tenant + encryption key who is NOT in `pushto` and so
+ *    receives nothing.
+ */
+describe("key distribution admin API", () => {
+  const crypto = new NodeCryptoAdapter();
   const tenantId = "tenant-read-acl";
-  let admin: PrivateUserId;
+
   const adminPassword = "adminpass123";
-  let adminKeyBag: KeyBag;
-  let alice: PrivateUserId;
   const alicePassword = "alicepass123";
-  let aliceKb: KeyBag;
-  let bob: PrivateUserId;
   const bobPassword = "bobpass123";
+  const carolPassword = "carolpass123";
+
+  let aliceFactory: BaseMindooTenantFactory;
+  let bobFactory: BaseMindooTenantFactory;
+  let carolFactory: BaseMindooTenantFactory;
+
+  let admin: PrivateUserId;
+  let alice: PrivateUserId;
+  let bob: PrivateUserId;
+  let carol: PrivateUserId;
+
+  let adminKb: KeyBag;
+  let aliceKb: KeyBag;
+  let bobKb: KeyBag;
+  let carolKb: KeyBag;
+
   let publicInfosKey: Uint8Array;
   let tenantKey: Uint8Array;
-  let tenant: MindooTenant;
-  let aclDir: ReadAclDirectory;
-  let storeFactory: SharedInMemoryStoreFactory;
 
-  type ReadAclDirectory = Required<
+  let aliceTenant: MindooTenant;
+  let bobTenant: MindooTenant;
+  let carolTenant: MindooTenant;
+
+  let aliceDir: KeyDistDirectory; // key-holder: builds the wrapped request
+  let carolDir: KeyDistDirectory; // regular-user session that hosts the publish
+
+  type KeyDistDirectory = Required<
     Pick<
       Awaited<ReturnType<MindooTenant["openDirectory"]>>,
-      | "setDefaultReadPolicy"
-      | "setDatabaseReadPolicy"
-      | "createReadRule"
-      | "listReadRules"
-      | "deleteReadRule"
-      | "canRead"
-      | "wasAllowedToReadAt"
-      | "prepareKeyDelivery"
-      | "publishKeyDelivery"
-      | "pushKey"
-      | "importKeyDeliveriesForUser"
+      | "getKeyVersionManifest"
+      | "wrapKeyForUserDevices"
+      | "getUsernameHash"
+      | "publishKeyDistribution"
       | "registerUser"
-      | "addUsersToGroup"
-      | "evaluateReadAccessForUser"
     >
   >;
 
   beforeEach(async () => {
-    storeFactory = new SharedInMemoryStoreFactory();
-    factory = new BaseMindooTenantFactory(storeFactory, new NodeCryptoAdapter());
+    aliceFactory = new BaseMindooTenantFactory(new IsolatedStoreFactory(), crypto);
+    bobFactory = new BaseMindooTenantFactory(new IsolatedStoreFactory(), crypto);
+    carolFactory = new BaseMindooTenantFactory(new IsolatedStoreFactory(), crypto);
 
-    admin = await factory.createUserId("CN=admin/O=readacl", adminPassword);
-    adminKeyBag = new KeyBag(admin.userEncryptionKeyPair.privateKey, adminPassword, new NodeCryptoAdapter());
-    await adminKeyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
-    await adminKeyBag.createTenantKey(tenantId);
-    publicInfosKey = (await adminKeyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!;
-    tenantKey = (await adminKeyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID))!;
+    // The admin identity authorizes writes but never opens a tenant. Its KeyBag
+    // exists only to MINT the shared tenant keys (creating keys in a bag is not
+    // "opening a tenant"); those keys are then copied into the user bags. The
+    // admin never receives `team-key`.
+    admin = await aliceFactory.createUserId("CN=admin/O=readacl", adminPassword);
+    adminKb = new KeyBag(admin.userEncryptionKeyPair.privateKey, adminPassword, crypto);
+    await adminKb.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
+    await adminKb.createTenantKey(tenantId);
+    publicInfosKey = (await adminKb.get("doc", tenantId, PUBLIC_INFOS_KEY_ID))!;
+    tenantKey = (await adminKb.get("doc", tenantId, DEFAULT_TENANT_KEY_ID))!;
 
-    alice = await factory.createUserId("CN=alice/O=readacl", alicePassword);
-    aliceKb = new KeyBag(alice.userEncryptionKeyPair.privateKey, alicePassword, new NodeCryptoAdapter());
+    alice = await aliceFactory.createUserId("CN=alice/O=readacl", alicePassword);
+    aliceKb = new KeyBag(alice.userEncryptionKeyPair.privateKey, alicePassword, crypto);
     await aliceKb.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
     await aliceKb.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantKey);
-    // A named, fine-grained read-scoping key that Alice (a key-holder) can push.
+    // A named, fine-grained read-scoping key that Alice (the key-holder) pushes.
     await aliceKb.createDocKey(tenantId, "team-key");
 
-    bob = await factory.createUserId("CN=bob/O=readacl", bobPassword);
+    bob = await bobFactory.createUserId("CN=bob/O=readacl", bobPassword);
+    bobKb = new KeyBag(bob.userEncryptionKeyPair.privateKey, bobPassword, crypto);
+    await bobKb.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+    await bobKb.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantKey);
 
-    tenant = await factory.openTenant(
+    carol = await carolFactory.createUserId("CN=carol/O=readacl", carolPassword);
+    carolKb = new KeyBag(carol.userEncryptionKeyPair.privateKey, carolPassword, crypto);
+    await carolKb.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
+    await carolKb.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantKey);
+
+    // Alice's tenant is where users are registered and the request is wrapped.
+    aliceTenant = await aliceFactory.openTenant(
       tenantId,
       admin.userSigningKeyPair.publicKey,
       admin.userEncryptionKeyPair.publicKey,
@@ -101,142 +150,13 @@ describe("read access-control admin API + key delivery", () => {
       alicePassword,
       aliceKb,
     );
+    const aliceDirectory = await aliceTenant.openDirectory();
+    await aliceDirectory.registerUser(aliceFactory.toPublicUserId(alice), admin.userSigningKeyPair.privateKey, adminPassword);
+    await aliceDirectory.registerUser(aliceFactory.toPublicUserId(bob), admin.userSigningKeyPair.privateKey, adminPassword);
+    await aliceDirectory.registerUser(aliceFactory.toPublicUserId(carol), admin.userSigningKeyPair.privateKey, adminPassword);
+    aliceDir = aliceDirectory as unknown as KeyDistDirectory;
 
-    const directory = await tenant.openDirectory();
-    await directory.registerUser(factory.toPublicUserId(alice), admin.userSigningKeyPair.privateKey, adminPassword);
-    await directory.registerUser(factory.toPublicUserId(bob), admin.userSigningKeyPair.privateKey, adminPassword);
-    aclDir = directory as unknown as ReadAclDirectory;
-  }, 60000);
-
-  it("canRead is unrestricted until a read policy is created", async () => {
-    expect((await aclDir.canRead("crm")).allowed).toBe(true);
-  }, 60000);
-
-  it("creates, lists, and deletes read rules under a default-deny posture", async () => {
-    await aclDir.setDefaultReadPolicy({ defaultReadAccess: "deny" }, admin.userSigningKeyPair.privateKey, adminPassword);
-    // Alice is the current user; with no rule yet, default-deny applies.
-    expect((await aclDir.canRead("crm")).allowed).toBe(false);
-
-    const ruleId = await aclDir.createReadRule(
-      { dbid: "crm", action: "allow", usernames: [alice.username] },
-      admin.userSigningKeyPair.privateKey,
-      adminPassword,
-    );
-    expect(typeof ruleId).toBe("string");
-
-    const rules = await aclDir.listReadRules();
-    expect(rules.map((r) => r.ruleId)).toContain(ruleId);
-    expect((await aclDir.canRead("crm")).allowed).toBe(true);
-    // Rule is crm-scoped; another db still inherits the deny baseline.
-    expect((await aclDir.canRead("hr")).allowed).toBe(false);
-
-    // Revocation by policy revision: deleting the allow rule denies again.
-    await aclDir.deleteReadRule(ruleId, admin.userSigningKeyPair.privateKey, adminPassword);
-    expect((await aclDir.listReadRules()).map((r) => r.ruleId)).not.toContain(ruleId);
-    expect((await aclDir.canRead("crm")).allowed).toBe(false);
-  }, 60000);
-
-  it("stores targeted usernames/groups encrypted for admin-UI display, opaque to the server", async () => {
-    const ruleId = await aclDir.createReadRule(
-      { dbid: "crm", action: "allow", usernames: [alice.username], groups: ["analysts"] },
-      admin.userSigningKeyPair.privateKey,
-      adminPassword,
-    );
-
-    const rule = (await aclDir.listReadRules()).find((r) => r.ruleId === ruleId)!;
-    expect(rule).toBeDefined();
-
-    // The decrypted display targets round-trip back to the cleartext names.
-    expect(rule.targets?.usernames).toContain(alice.username);
-    expect(rule.targets?.groups).toContain("analysts");
-
-    // The on-wire blob is tenant-key ciphertext: non-empty and NOT plaintext,
-    // so the (publicinfos-only) sync server cannot read who the rule targets.
-    expect(rule.users_encrypted).not.toBe("");
-    expect(rule.users_encrypted).not.toContain(alice.username);
-    expect(rule.users_encrypted).not.toContain("analysts");
-
-    // A rule authored from pseudo-tokens only has nothing cleartext to show.
-    const everyoneRuleId = await aclDir.createReadRule(
-      { dbid: "crm", action: "allow", users_hashes: ["$everyone"] },
-      admin.userSigningKeyPair.privateKey,
-      adminPassword,
-    );
-    const everyoneRule = (await aclDir.listReadRules()).find((r) => r.ruleId === everyoneRuleId)!;
-    expect(everyoneRule.users_encrypted).toBe("");
-    expect(everyoneRule.targets).toBeUndefined();
-  }, 60000);
-
-  it("expands group-targeted read rules to members, case-insensitively", async () => {
-    await aclDir.setDefaultReadPolicy({ defaultReadAccess: "deny" }, admin.userSigningKeyPair.privateKey, adminPassword);
-
-    // Alice is a member of "Analysts"; Bob is not.
-    await aclDir.addUsersToGroup("Analysts", [alice.username], admin.userSigningKeyPair.privateKey, adminPassword);
-
-    // The rule targets the group by name with DIFFERENT casing than the member
-    // identity will resolve to ("analysts"), exercising group-name normalization.
-    await aclDir.createReadRule(
-      { dbid: "crm", action: "allow", groups: ["Analysts"] },
-      admin.userSigningKeyPair.privateKey,
-      adminPassword,
-    );
-
-    // Alice (current user) is a member -> allowed via group expansion.
-    expect((await aclDir.canRead("crm")).allowed).toBe(true);
-    // Bob is not a member -> still denied under the default-deny baseline.
-    const bobDecision = await aclDir.evaluateReadAccessForUser({
-      username: bob.username,
-      dbid: "crm",
-      decryptionKeyId: "default",
-    });
-    expect(bobDecision.allowed).toBe(false);
-  }, 60000);
-
-  it("honours a per-database read policy override", async () => {
-    await aclDir.setDefaultReadPolicy({ defaultReadAccess: "allow" }, admin.userSigningKeyPair.privateKey, adminPassword);
-    await aclDir.setDatabaseReadPolicy("crm", { defaultReadAccess: "deny" }, admin.userSigningKeyPair.privateKey, adminPassword);
-    expect((await aclDir.canRead("hr")).allowed).toBe(true);
-    expect((await aclDir.canRead("crm")).allowed).toBe(false);
-  }, 60000);
-
-  it("wasAllowedToReadAt evaluates against the directory state at a past trusted time", async () => {
-    const beforePolicy = 1;
-    await aclDir.setDefaultReadPolicy({ defaultReadAccess: "deny" }, admin.userSigningKeyPair.privateKey, adminPassword);
-    const afterPolicy = Date.now() + 60_000;
-
-    const past = await aclDir.wasAllowedToReadAt(alice.username, "crm", "default", beforePolicy);
-    expect(past.allowed).toBe(true); // no read policy existed yet
-
-    const now = await aclDir.wasAllowedToReadAt(alice.username, "crm", "default", afterPolicy);
-    expect(now.allowed).toBe(false); // default-deny is in effect
-  }, 60000);
-
-  it("delivers a key to a recipient; an out-of-audience admin cannot receive it", async () => {
-    // Alice (key-holder) wraps "team-key" to Bob; admin publishes (admin-blind).
-    const payload = await aclDir.prepareKeyDelivery("team-key", [bob.username]);
-    expect(payload.keyId).toBe("team-key");
-    expect(payload.recipients).toHaveLength(1);
-    expect(payload.recipients[0].versions).toHaveLength(1);
-    expect(payload.preparedByPublicKey).toBe(alice.userSigningKeyPair.publicKey);
-
-    await aclDir.publishKeyDelivery(payload, admin.userSigningKeyPair.privateKey, adminPassword);
-
-    // The admin is NOT in the recipient set, so importing as the admin yields
-    // nothing (admin-blind: the admin never receives the plaintext key).
-    const adminImported = await aclDir.importKeyDeliveriesForUser(
-      admin.username,
-      admin.userEncryptionKeyPair.privateKey,
-      adminPassword,
-    );
-    expect(adminImported).toEqual([]);
-    expect(await adminKeyBag.get("doc", tenantId, "team-key")).toBeFalsy();
-
-    // Bob opens the tenant and imports the delivery: he RSA-unwraps and the key
-    // lands in his KeyBag, matching Alice's original bytes.
-    const bobKb = new KeyBag(bob.userEncryptionKeyPair.privateKey, bobPassword, new NodeCryptoAdapter());
-    await bobKb.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
-    await bobKb.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantKey);
-    const bobTenant = await factory.openTenant(
+    bobTenant = await bobFactory.openTenant(
       tenantId,
       admin.userSigningKeyPair.publicKey,
       admin.userEncryptionKeyPair.publicKey,
@@ -244,68 +164,116 @@ describe("read access-control admin API + key delivery", () => {
       bobPassword,
       bobKb,
     );
-    const bobDir = (await bobTenant.openDirectory()) as unknown as ReadAclDirectory;
-
-    expect(await bobKb.get("doc", tenantId, "team-key")).toBeFalsy();
-    const bobImported = await bobDir.importKeyDeliveriesForUser(
-      bob.username,
-      bob.userEncryptionKeyPair.privateKey,
-      bobPassword,
+    carolTenant = await carolFactory.openTenant(
+      tenantId,
+      admin.userSigningKeyPair.publicKey,
+      admin.userEncryptionKeyPair.publicKey,
+      carol,
+      carolPassword,
+      carolKb,
     );
-    expect(bobImported).toEqual(["team-key"]);
+
+    // Sync the registrations (still distribution-free) into Bob's and Carol's
+    // replicas, then warm each directory once so the one-time bring-up reconcile
+    // (getDirectoryDB §13) fires here as a no-op — leaving each test's explicit
+    // reconcile as the sole authoritative one.
+    await syncTenantDb(bobTenant, aliceTenant, "directory");
+    await bobTenant.reconcileKeyDistributionsForCurrentUser?.();
+    await syncTenantDb(carolTenant, aliceTenant, "directory");
+    await carolTenant.reconcileKeyDistributionsForCurrentUser?.();
+
+    carolDir = (await carolTenant.openDirectory()) as unknown as KeyDistDirectory;
+  }, 60000);
+
+  /** Build a full distribution request for "team-key" (all versions to all devices). */
+  async function buildTeamKeyRequest(
+    pushUsernames: string[],
+    pullUsernames: string[],
+  ): Promise<KeyDistributionRequest> {
+    const keyVersions = await aliceDir.getKeyVersionManifest("team-key");
+    const pushto = [];
+    for (const username of pushUsernames) {
+      pushto.push(await aliceDir.wrapKeyForUserDevices("team-key", username));
+    }
+    const pullfrom = [];
+    for (const username of pullUsernames) {
+      pullfrom.push({ username, username_hash: await aliceDir.getUsernameHash(username) });
+    }
+    return {
+      v: 1,
+      tenantId,
+      keyId: "team-key",
+      keyVersions,
+      title: "Team key",
+      preparedByPublicKey: alice.userSigningKeyPair.publicKey,
+      pushto,
+      pullfrom,
+    };
+  }
+
+  it("distributes a key to a recipient; an out-of-audience user (and the admin) cannot receive it", async () => {
+    // Alice (key-holder) wraps "team-key" to Bob ONLY; Carol and the admin are
+    // not in the audience.
+    const request = await buildTeamKeyRequest([bob.username], []);
+    expect(request.keyId).toBe("team-key");
+    expect(request.pushto).toHaveLength(1);
+    expect(Object.keys(request.pushto[0].devices)).toHaveLength(1);
+    expect(request.preparedByPublicKey).toBe(alice.userSigningKeyPair.publicKey);
+
+    // The admin authorizes the publish through Carol's regular-user session: the
+    // admin signs the distribution but has no tenant of its own (admin-blind).
+    await carolDir.publishKeyDistribution(request, admin.userSigningKeyPair.privateKey, adminPassword);
+
+    // Bob (in audience) pulls the directory head and reconciles: he RSA-unwraps
+    // the key into his KeyBag, byte-identical to Alice's original.
+    await syncTenantDb(bobTenant, carolTenant, "directory");
+    expect(await bobKb.get("doc", tenantId, "team-key")).toBeFalsy();
+    const bobResult = await bobTenant.reconcileKeyDistributionsForCurrentUser!();
+    expect(bobResult.imported).toEqual(["team-key"]);
 
     const delivered = await bobKb.get("doc", tenantId, "team-key");
     const original = await aliceKb.get("doc", tenantId, "team-key");
     expect(delivered).toBeTruthy();
     expect(Array.from(delivered!)).toEqual(Array.from(original!));
+
+    // Carol (out-of-audience): a real user with a valid tenant + encryption key,
+    // but NOT in pushto — reconciling imports nothing. This is the admin-blind
+    // property made observable: only the wrapped recipient can receive the key.
+    const carolResult = await carolTenant.reconcileKeyDistributionsForCurrentUser!();
+    expect(carolResult.imported).toEqual([]);
+    expect(await carolKb.get("doc", tenantId, "team-key")).toBeFalsy();
+
+    // The admin, who merely signed the publish, never holds the key either.
+    expect(await adminKb.get("doc", tenantId, "team-key")).toBeFalsy();
   }, 60000);
 
-  it("delivers ALL versions of a rotated key, not just the latest", async () => {
-    // Rotate "team-key": Alice now holds two versions (the beforeEach one plus a
-    // newer rotation). Documents may be encrypted under either, so a delivery
-    // must carry both for the recipient to read the full history.
+  it("distributes ALL versions of a rotated key, not just the latest", async () => {
+    // Rotate "team-key": Alice now holds two versions. Documents may be encrypted
+    // under either, so the manifest must carry both.
     await aliceKb.set("doc", tenantId, "team-key", new Uint8Array(32).fill(7), Date.now() + 1000);
     const aliceVersions = await aliceKb.getAllKeys("doc", tenantId, "team-key");
     expect(aliceVersions).toHaveLength(2);
 
-    const payload = await aclDir.prepareKeyDelivery("team-key", [bob.username]);
-    expect(payload.recipients).toHaveLength(1);
-    // Every stored version is wrapped for the recipient.
-    expect(payload.recipients[0].versions).toHaveLength(2);
+    const request = await buildTeamKeyRequest([bob.username], []);
+    expect(request.keyVersions).toHaveLength(2);
+    // The single device entry covers both versions.
+    const onlyDevice = Object.values(request.pushto[0].devices)[0];
+    expect(Object.keys(onlyDevice)).toHaveLength(2);
 
-    await aclDir.publishKeyDelivery(payload, admin.userSigningKeyPair.privateKey, adminPassword);
+    await carolDir.publishKeyDistribution(request, admin.userSigningKeyPair.privateKey, adminPassword);
 
-    const bobKb = new KeyBag(bob.userEncryptionKeyPair.privateKey, bobPassword, new NodeCryptoAdapter());
-    await bobKb.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
-    await bobKb.set("doc", tenantId, DEFAULT_TENANT_KEY_ID, tenantKey);
-    const bobTenant = await factory.openTenant(
-      tenantId,
-      admin.userSigningKeyPair.publicKey,
-      admin.userEncryptionKeyPair.publicKey,
-      bob,
-      bobPassword,
-      bobKb,
-    );
-    const bobDir = (await bobTenant.openDirectory()) as unknown as ReadAclDirectory;
-
-    const bobImported = await bobDir.importKeyDeliveriesForUser(
-      bob.username,
-      bob.userEncryptionKeyPair.privateKey,
-      bobPassword,
-    );
-    expect(bobImported).toEqual(["team-key"]);
+    await syncTenantDb(bobTenant, carolTenant, "directory");
+    const bobResult = await bobTenant.reconcileKeyDistributionsForCurrentUser!();
+    expect(bobResult.imported).toEqual(["team-key"]);
 
     // Bob ends up with BOTH versions, byte-identical to Alice's (newest first).
     const bobVersions = await bobKb.getAllKeys("doc", tenantId, "team-key");
     expect(bobVersions).toHaveLength(2);
     expect(bobVersions.map((v) => Array.from(v))).toEqual(aliceVersions.map((v) => Array.from(v)));
 
-    // Re-importing is idempotent: no duplicate versions accumulate.
-    await bobDir.importKeyDeliveriesForUser(
-      bob.username,
-      bob.userEncryptionKeyPair.privateKey,
-      bobPassword,
-    );
+    // Re-reconciling is idempotent: nothing new imported, no duplicate versions.
+    const again = await bobTenant.reconcileKeyDistributionsForCurrentUser!();
+    expect(again.imported).toEqual([]);
     expect(await bobKb.getAllKeys("doc", tenantId, "team-key")).toHaveLength(2);
   }, 60000);
 });

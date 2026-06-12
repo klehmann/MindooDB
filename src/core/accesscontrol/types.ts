@@ -158,38 +158,14 @@ export interface DefaultAccessPolicyDoc {
   denyDocSnapshot?: boolean; // default true (admin-only by default)
   denyDocPurge?: boolean; // default true (admin-only by default)
   /**
-   * Optional allowlist of `decryptionKeyId`s that a `doc_create` may use in the
-   * governed scope (tenant default, or a single database when set on a per-db
-   * policy). This is a **Tier 1** write constraint: `decryptionKeyId` is
-   * cleartext entry metadata the server already reads, so it is enforced at the
-   * witness and re-checked on every honest client — unlike `withfields` (Tier
-   * 2). Absent/empty = unconstrained (backward compatible). Non-empty = a
-   * `doc_create` whose `decryptionKeyId` is not in the set is denied, even if an
-   * allow rule would otherwise match (a hard create-key gate).
-   *
-   * Use cases: forbid the shared `default` key (omit `"default"` to require a
-   * named key), or enforce a rotating key by pointing the allowlist at the
-   * current rotation key. Rotation is just a new policy revision on the
-   * directory time-travel chain, so each change is auditable via
-   * {@link AccessDecision} replay and `wasAllowedAt`. Because evaluation runs
-   * against the directory state at each entry's trusted time, documents created
-   * under an earlier policy are grandfathered automatically — tightening the
-   * allowlist never retroactively invalidates valid history.
-   */
-  allowedCreateKeyIds?: string[];
-  /**
    * Optional default `decryptionKeyId` for a `doc_create` that does not specify
    * one in the governed scope (tenant default, or a single database when set on
-   * a per-db policy). Unlike {@link allowedCreateKeyIds}, this is NOT a security
-   * control: the sync server never selects keys, so this is a client-side
-   * create-time convenience that fills in the key when the caller omits it
-   * (replacing the hardcoded `"default"` fallback). The create-key gate
-   * ({@link allowedCreateKeyIds}) remains authoritative.
-   *
-   * When both fields are set on the same policy document, `defaultCreateKeyId`
-   * MUST be a member of `allowedCreateKeyIds` (enforced by
-   * {@link validateAccessPolicy} at write time), otherwise the default would be
-   * self-denying. Like every policy field it layers per-db over the tenant
+   * a per-db policy). This is NOT a security control: the sync server never
+   * selects keys, so this is a client-side create-time convenience that fills in
+   * the key when the caller omits it (replacing the hardcoded `"default"`
+   * fallback). Which keys a user may create or read under is governed by **key
+   * possession** (the key distribution model, docs/accesscontrol.md §13), not by
+   * a policy gate. Like every policy field it layers per-db over the tenant
    * default in {@link effectivePolicy}.
    */
   defaultCreateKeyId?: string;
@@ -250,7 +226,6 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "form"
     | "type"
     | "disableAllAccessChecksAndPolicies"
-    | "allowedCreateKeyIds"
     | "defaultCreateKeyId"
     | "databaseCreationPolicy"
     | "allowedDbIds"
@@ -305,8 +280,8 @@ export interface AclRuleDoc {
 
 /**
  * Decrypted targets of a rule, for admin-UI display only (never serialized to
- * the directory). Populated by {@link AclRuleDoc.users_encrypted} /
- * {@link ReadRuleDoc.users_encrypted} on the listing APIs.
+ * the directory). Populated by {@link AclRuleDoc.users_encrypted} on the
+ * listing APIs.
  */
 export interface RuleTargets {
   usernames: string[];
@@ -474,31 +449,11 @@ export function validateAclRule(rule: {
 
 /**
  * Validate a {@link DefaultAccessPolicyDoc} (tenant default or per-db) before
- * it is written. Enforces that a `defaultCreateKeyId`, when set together with a
- * non-empty `allowedCreateKeyIds` on the SAME document, is a member of that
- * allowlist — otherwise the default would be self-denying (the create-key gate
- * would reject every default-keyed `doc_create`). Throws on violation.
- *
- * This is a per-document check: the allowlist and default can in principle come
- * from different layers (tenant vs per-db), which write-time validation cannot
- * see; the resolver ({@link effectivePolicy} consumers, e.g.
- * `getEffectiveDefaultCreateKeyId`) applies the cross-layer safety net.
+ * it is written. Throws on violation.
  */
 export function validateAccessPolicy(
   policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>
 ): void {
-  if (
-    policy.defaultCreateKeyId !== undefined &&
-    Array.isArray(policy.allowedCreateKeyIds) &&
-    policy.allowedCreateKeyIds.length > 0 &&
-    !policy.allowedCreateKeyIds.includes(policy.defaultCreateKeyId)
-  ) {
-    throw new Error(
-      `defaultCreateKeyId "${policy.defaultCreateKeyId}" must be one of allowedCreateKeyIds ` +
-        `[${policy.allowedCreateKeyIds.join(", ")}]`
-    );
-  }
-
   if (
     policy.databaseCreationPolicy !== undefined &&
     policy.databaseCreationPolicy !== "open" &&
@@ -551,14 +506,12 @@ export function effectivePolicy(
     DefaultAccessPolicyDoc,
     | "form"
     | "type"
-    | "allowedCreateKeyIds"
     | "defaultCreateKeyId"
     | "databaseCreationPolicy"
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
   >
 > & {
-  allowedCreateKeyIds?: string[];
   defaultCreateKeyId?: string;
 } {
   const pick = <K extends keyof typeof DEFAULT_POLICY_DEFAULTS>(field: K): boolean => {
@@ -569,14 +522,7 @@ export function effectivePolicy(
   const disable =
     (dbPolicy?.disableAllAccessChecksAndPolicies ?? tenantDefault?.disableAllAccessChecksAndPolicies) ===
     true;
-  // Per-db precedence: a database policy's allowlist (when defined) fully
-  // overrides the tenant default's — it is not merged/unioned, so a database
-  // can both tighten and loosen the tenant-wide create-key constraint.
-  const allowedCreateKeyIds =
-    (dbPolicy && dbPolicy.allowedCreateKeyIds) ??
-    (tenantDefault && tenantDefault.allowedCreateKeyIds) ??
-    undefined;
-  // Same per-db precedence for the default create key: a per-db default fully
+  // Per-db precedence for the default create key: a per-db default fully
   // overrides the tenant default's, so a database can pick its own default key.
   const defaultCreateKeyId =
     (dbPolicy && dbPolicy.defaultCreateKeyId) ??
@@ -590,247 +536,211 @@ export function effectivePolicy(
     denyDocUndelete: pick("denyDocUndelete"),
     denyDocSnapshot: pick("denyDocSnapshot"),
     denyDocPurge: pick("denyDocPurge"),
-    allowedCreateKeyIds,
     defaultCreateKeyId,
   };
 }
 
-// ===========================================================================
-// Read access control (docs/accesscontrol.md — read-side).
-//
-// The read-side mirrors the write-side two-tier model but is intentionally
-// **metadata-only**: a read rule may scope by author identity, target database
-// and `decryptionKeyId`, but never by document content (`withfields`). That
-// keeps every read decision evaluable by the zero-trust sync server from the
-// cleartext entry metadata it already holds, so the server can gate delivery.
-//
-// There are deliberately NO client-trusted dates (`notBefore`/`notAfter`) on
-// read rules. A client-evaluated validity window would be clock-spoofable and
-// would reintroduce the wall-clock dependency the write side forbids (see the
-// no-`${now}` note above). Time-bound access is therefore expressed as
-// **revocation by policy revision**: an admin (or a scheduled automation)
-// flips the allow rule to deny / removes the user, and on the next directory
-// sync the server stops delivering and the client purges the scope.
-//
-// All read-side documents share `form: "accesscontrol"` and are
-// `$publicinfos`-encrypted so the server can read them.
-// ===========================================================================
+/**
+ * Key distribution type tag (the `type` field of a {@link KeyDistributionDoc}).
+ */
+export const KEY_DISTRIBUTION_TYPE = "keydistribution" as const;
 
-/** The `type` value of a read rule document (read-side analogue of {@link RuleType}). */
-export const READ_RULE_TYPE = "doc_read" as const;
-export type ReadRuleType = typeof READ_RULE_TYPE;
+/** Key ids that may never be governed by a distribution document. */
+export const PROTECTED_DISTRIBUTION_KEY_IDS: readonly string[] = ["default", "$publicinfos"];
 
 /**
- * The default tenant read policy, or a per-database read policy (same shape).
+ * One distributed version of a key in the {@link KeyDistributionDoc.keyVersions}
+ * manifest. `fingerprint` is the SHA-256 hex of the raw symmetric key bytes and
+ * is the stable identity used to (a) verify unwrapped bytes on import and (b)
+ * scope `pullfrom` deletion to exactly the listed versions. `createdAt` is the
+ * KeyBag version timestamp, used for display and to set the imported version's
+ * stamp.
+ */
+export interface KeyVersionRef {
+  createdAt: number;
+  /** SHA-256 hex of the raw key bytes of this version. */
+  fingerprint: string;
+}
+
+/**
+ * Wrapped key material for a single recipient device: a map from version
+ * fingerprint to the base64 RSA-OAEP-wrapped raw key bytes of that version.
+ * Every entry must cover ALL of the manifest's version fingerprints (full
+ * coverage), so a recipient can decrypt documents encrypted under any version.
+ */
+export type DeviceWrappedVersions = Record<string, string>;
+
+/**
+ * The single authoritative document governing the distribution of one symmetric
+ * key (`keyId`). Stored at the fixed id `acl_keydistribution_<keyId>` (singleton
+ * per key); publish is always an upsert of the full desired state.
  *
- * Unlike the write side, the **absence** of any read policy document means
- * "read access is unrestricted" — preserving today's behavior where read
- * access is governed purely by key possession. Creating an `acl_readpolicy`
- * with `defaultReadAccess: "deny"` is what switches a tenant to a default-deny
- * read posture.
+ * The wrapped bytes (`pushto_users_keys`) are produced by a key-*holder* using
+ * each recipient device's RSA encryption public key; the admin merely signs and
+ * writes the document, so an admin outside the recipient set never sees the
+ * plaintext key. Syncing clients reconcile their KeyBags against the head state:
+ * `pushto` users unwrap+verify+merge the manifest's versions; `pullfrom` users
+ * delete exactly the manifest's versions (and purge the scope when nothing
+ * remains). Title/comment/usernames are stored under the `<field>_encrypted`
+ * convention with the tenant `default` key, so the sync server cannot read them;
+ * only the hashes + wrapped material stay `$publicinfos`-readable.
  */
-export interface DefaultReadPolicyDoc {
+export interface KeyDistributionDoc {
   form: typeof ACCESS_CONTROL_FORM;
-  type: "readpolicy";
+  type: typeof KEY_DISTRIBUTION_TYPE;
+  keyId: string;
+  /** Manifest of distributed versions. fingerprint = SHA-256 hex of raw key bytes. */
+  keyVersions: KeyVersionRef[];
+  title_encrypted: string;
+  title_encrypted_key: string; // "default"
+  comment_encrypted?: string;
+  comment_encrypted_key?: string;
+  /** The key-holder's signing public key that wrapped the material (audit trail). */
+  preparedByPublicKey: string;
+  /** Users whose KeyBags receive the key. */
+  pushto_users_hashes: string[];
   /**
-   * Baseline read access when no rule matches. `"allow"` (the implicit default
-   * when the document is absent) keeps key-possession as the only gate;
-   * `"deny"` requires an explicit allow rule to read.
+   * Display aid: ONE encrypted JSON array of usernames, index-aligned with
+   * `pushto_users_hashes`. Single blob so views can read it via
+   * `v.decryptJson("pushto_users_encrypted")` with no view-language extension;
+   * hashes stay authoritative for enforcement, alignment drift is cosmetic.
    */
-  defaultReadAccess?: "allow" | "deny";
+  pushto_users_encrypted?: string;
+  pushto_users_encrypted_key?: string; // "default"
   /**
-   * Master off switch for read checks. When true, the server delivers and the
-   * client retains everything regardless of read rules (key possession still
-   * applies). Mirrors {@link DefaultAccessPolicyDoc.disableAllAccessChecksAndPolicies}.
+   * Wrapped material: `"<userhash>|<deviceEncKeyFingerprint>"` -> { versionFingerprint -> wrappedKey (b64 RSA-OAEP) }.
+   * One entry per active device of each pushto user; every entry covers ALL manifest versions.
    */
-  disableAllReadChecks?: boolean;
+  pushto_users_keys: Record<string, DeviceWrappedVersions>;
+  /** Users whose KeyBags must NOT hold the manifest's versions (no device keys needed). */
+  pullfrom_users_hashes: string[];
+  pullfrom_users_encrypted?: string;
+  pullfrom_users_encrypted_key?: string;
 }
 
 /**
- * A single read rule (read-side analogue of {@link AclRuleDoc}). Metadata-only:
- * it gates by target database, optional `decryptionKeyId` scope, and the acting
- * user's identity. No `withfields`, no `notBefore`/`notAfter`.
+ * One `pushto` recipient inside a {@link KeyDistributionRequest}: the plaintext
+ * username (display only, the URI travels out-of-band) plus the wrapped material
+ * for each of the recipient's active devices.
  */
-export interface ReadRuleDoc {
-  form: typeof ACCESS_CONTROL_FORM;
-  type: ReadRuleType;
-  /** Stable id, surfaced in {@link AccessDecision.matchedRuleId}. */
-  ruleId: string;
-  description?: string;
-  /** Target database, or `"*"` for all databases in the tenant. */
-  dbid: string | "*";
-  /**
-   * Optional key scope: the rule only applies to entries whose
-   * `decryptionKeyId` is in this list. Absent/empty = applies to every key in
-   * the database (document-level read control).
-   */
-  decryptionKeyIds?: string[];
-  /** User + group hashes, plus reserved pseudo-tokens (`$everyone`, `$admin`). */
-  users_hashes: string[];
-  /**
-   * Targeted usernames/groups (JSON {@link RuleTargets}) encrypted with the
-   * tenant default key, base64-encoded — a display aid for admin UIs (see
-   * {@link AclRuleDoc.users_encrypted}). Opaque to the sync server. Empty when
-   * the rule was authored from raw hashes / pseudo-tokens only.
-   */
-  users_encrypted: string;
-  action: "allow" | "deny";
-}
-
-/**
- * One wrapped version of a rotated key inside a {@link KeyDeliveryRecipient}.
- *
- * A `keyId` can hold several versions in the KeyBag after rotation, and
- * decryption tries them all. Delivering only the newest version would leave a
- * recipient unable to read documents encrypted under an earlier version, so a
- * delivery carries every version the preparer holds.
- */
-export interface KeyDeliveryVersion {
-  /** The KeyBag version timestamp (`createdAt`) of this key version; 0 if unknown. */
-  keyVersionCreatedAt: number;
-  /**
-   * This version's symmetric key bytes wrapped to the recipient's RSA-OAEP
-   * encryption public key (see `RSAEncryption.encrypt`), base64-encoded. Only
-   * the holder of the matching private key — never the admin who publishes the
-   * doc — can unwrap it.
-   */
-  wrappedKey: string;
-}
-
-/** One recipient of a wrapped key inside a {@link KeyDeliveryDoc}. */
-export interface KeyDeliveryRecipient {
-  /** `username_hash` (salted v2) of the recipient. */
+export interface KeyDistributionPushRecipient {
+  username: string;
   username_hash: string;
-  /**
-   * Every stored version of the key, wrapped to this recipient (newest first).
-   * Includes all rotation versions so previously-encrypted documents remain
-   * decryptable after the recipient imports the delivery.
-   */
-  versions: KeyDeliveryVersion[];
+  /** deviceEncKeyFingerprint -> { versionFingerprint -> wrappedKey (b64) }. */
+  devices: Record<string, DeviceWrappedVersions>;
 }
 
 /**
- * An admin-published, admin-blind key delivery document (read-side key push).
+ * The full unsigned content of one key's distribution, carried by an
+ * `mdb://key-distribution/...` request URI so a key-holder without admin rights
+ * can hand a ready-to-sign request to an admin. The admin maps it to a
+ * {@link KeyDistributionDoc} on save (encrypting title/comment/usernames and
+ * folding `devices` into `pushto_users_keys`).
+ */
+export interface KeyDistributionRequest {
+  v: 1;
+  tenantId?: string;
+  keyId: string;
+  keyVersions: KeyVersionRef[];
+  /** Plaintext in the URI (sent out-of-band); the admin encrypts it on save. */
+  title: string;
+  comment?: string;
+  preparedByPublicKey: string;
+  pushto: KeyDistributionPushRecipient[];
+  pullfrom: Array<{ username: string; username_hash: string }>;
+}
+
+/**
+ * Read-side projection of a {@link KeyDistributionDoc} for list/edit UIs. Raw
+ * hashes + wrapped material are surfaced so an editor can preserve devices it
+ * cannot re-wrap; `*Usernames` are the decrypted display arrays (null when the
+ * tenant default key is not held, i.e. the blob is unreadable).
+ */
+export interface KeyDistributionView {
+  keyId: string;
+  title: string | null;
+  comment: string | null;
+  keyVersions: KeyVersionRef[];
+  preparedByPublicKey: string;
+  pushto_users_hashes: string[];
+  pushto_users_keys: Record<string, DeviceWrappedVersions>;
+  pullfrom_users_hashes: string[];
+  pushtoUsernames: string[] | null;
+  pullfromUsernames: string[] | null;
+}
+
+/** Document id prefix for the per-key distribution documents. */
+export const ACL_KEY_DISTRIBUTION_PREFIX = "acl_keydistribution_";
+
+/**
+ * Document id for a key distribution — a SINGLETON per key id, so there is one
+ * authoritative document governing each key's distribution and publish is always
+ * an upsert. The key id is encoded so arbitrary key ids stay valid doc-id
+ * components.
+ */
+export function aclKeyDistributionDocId(keyId: string): string {
+  return assertValidDocId(ACL_KEY_DISTRIBUTION_PREFIX + encodeAclIdComponent(keyId));
+}
+
+/** True when `docId` is a key-distribution document id. */
+export function isKeyDistributionDocId(docId: string): boolean {
+  return docId.startsWith(ACL_KEY_DISTRIBUTION_PREFIX);
+}
+
+/**
+ * Validate the structural invariants of a key distribution before publish
+ * (docs/accesscontrol.md §13). Throws on the first violation:
  *
- * The wrapped bytes are produced by a key-*holder* (a regular user who already
- * has the key) using each recipient's public encryption key; the admin merely
- * signs and writes the directory document. An admin outside the recipient set
- * therefore never sees the plaintext key. On sync, a recipient client detects
- * a delivery targeting it, RSA-unwraps the key, imports it into its KeyBag, and
- * the existing reveal-on-add visibility path surfaces the now-readable docs.
+ *  - `keyId` is non-empty and not a protected id (`default` / `$publicinfos`);
+ *  - `pushto` and `pullfrom` user-hash sets are disjoint;
+ *  - every `pushto` device entry covers EXACTLY the manifest's version
+ *    fingerprints (full coverage, no extras), so every recipient can decrypt
+ *    documents encrypted under any distributed version.
+ *
+ * Grant existence / active-device coverage are enforced by the directory at
+ * publish time (they need directory state), not here.
  */
-export interface KeyDeliveryDoc {
-  form: typeof ACCESS_CONTROL_FORM;
-  type: "keydelivery";
-  /** The symmetric key id being delivered (matches `decryptionKeyId`). */
+export function validateKeyDistribution(input: {
   keyId: string;
-  /** The key-holder's signing public key that prepared the wrapped bytes (audit). */
-  preparedByPublicKey: string;
-  /** One entry per recipient, each carrying all wrapped key versions. */
-  recipients: KeyDeliveryRecipient[];
-}
-
-/**
- * The output of preparing a key delivery (the key-holder step), handed to an
- * admin to {@link KeyDeliveryDoc | publish}. It carries everything the
- * directory document needs except the admin signature.
- */
-export interface KeyDeliveryPayload {
-  keyId: string;
-  preparedByPublicKey: string;
-  recipients: KeyDeliveryRecipient[];
-}
-
-// ---------------------------------------------------------------------------
-// Read-side fixed/pattern document IDs
-// ---------------------------------------------------------------------------
-
-/** Singleton id of the tenant default read policy document. */
-export const ACL_READ_POLICY_DOC_ID = "acl_readpolicy";
-
-const ACL_DB_READ_POLICY_PREFIX = "acl_dbreadpolicy_";
-const ACL_READ_RULE_PREFIX = "acl_readrule_";
-const ACL_KEY_DELIVERY_PREFIX = "acl_keydelivery_";
-
-/** Document id for a per-database read policy. */
-export function aclDbReadPolicyDocId(dbid: string): string {
-  return assertValidDocId(ACL_DB_READ_POLICY_PREFIX + encodeAclIdComponent(dbid));
-}
-
-/** Document id for a single read rule, keyed by its stable `ruleId`. */
-export function aclReadRuleDocId(ruleId: string): string {
-  return assertValidDocId(ACL_READ_RULE_PREFIX + encodeAclIdComponent(ruleId));
-}
-
-/**
- * Document id for a key delivery, keyed by the delivered key id and a
- * fingerprint that disambiguates concurrent deliveries (e.g. a hash of the
- * recipient set or the key version). Keying by `keyId_fingerprint` lets several
- * deliveries of the same key (to different audiences/versions) coexist.
- */
-export function aclKeyDeliveryDocId(keyId: string, fingerprint: string): string {
-  return assertValidDocId(
-    ACL_KEY_DELIVERY_PREFIX + encodeAclIdComponent(keyId) + "_" + encodeAclIdComponent(fingerprint)
-  );
-}
-
-/**
- * Validate a {@link ReadRuleDoc} (minus the assigned `form`/`ruleId`, which the
- * directory sets). Read rules are metadata-only: they must not carry
- * `withfields`, and the closed action set applies. Throws on the first
- * violation.
- */
-export function validateReadRule(rule: {
-  type: ReadRuleType;
-  dbid: string;
-  action: "allow" | "deny";
-  users_hashes: string[];
-  decryptionKeyIds?: string[];
+  keyVersions: KeyVersionRef[];
+  pushto_users_hashes: string[];
+  pullfrom_users_hashes: string[];
+  pushto_users_keys: Record<string, DeviceWrappedVersions>;
 }): void {
-  if (rule.type !== READ_RULE_TYPE) {
-    throw new Error(`read rule has unknown type "${rule.type}" (expected "${READ_RULE_TYPE}")`);
+  if (typeof input.keyId !== "string" || input.keyId.length === 0) {
+    throw new Error("key distribution requires a non-empty `keyId`");
   }
-  if (rule.action !== "allow" && rule.action !== "deny") {
-    throw new Error(`read rule has invalid action "${rule.action}" (expected "allow" or "deny")`);
+  if (PROTECTED_DISTRIBUTION_KEY_IDS.includes(input.keyId)) {
+    throw new Error(`key distribution cannot govern the protected key id "${input.keyId}"`);
   }
-  if (typeof rule.dbid !== "string" || rule.dbid.length === 0) {
-    throw new Error('read rule requires a non-empty `dbid` (or "*")');
+  if (!Array.isArray(input.keyVersions) || input.keyVersions.length === 0) {
+    throw new Error("key distribution requires a non-empty `keyVersions` manifest");
   }
-  if (!Array.isArray(rule.users_hashes) || rule.users_hashes.length === 0) {
-    throw new Error("read rule requires a non-empty `users_hashes` array");
+  const manifestFingerprints = input.keyVersions.map((v) => v.fingerprint);
+  if (manifestFingerprints.some((fp) => typeof fp !== "string" || fp.length === 0)) {
+    throw new Error("key distribution `keyVersions` entries require a non-empty `fingerprint`");
   }
-  if (
-    rule.decryptionKeyIds !== undefined &&
-    (!Array.isArray(rule.decryptionKeyIds) ||
-      rule.decryptionKeyIds.some((k) => typeof k !== "string"))
-  ) {
-    throw new Error("read rule `decryptionKeyIds` must be an array of strings when present");
+  const manifestSet = new Set(manifestFingerprints);
+  if (manifestSet.size !== manifestFingerprints.length) {
+    throw new Error("key distribution `keyVersions` contains duplicate fingerprints");
+  }
+
+  const pushSet = new Set(input.pushto_users_hashes);
+  for (const hash of input.pullfrom_users_hashes) {
+    if (pushSet.has(hash)) {
+      throw new Error("key distribution `pushto` and `pullfrom` user sets must be disjoint");
+    }
+  }
+
+  // Every device entry must cover exactly the manifest's version fingerprints.
+  for (const [deviceKey, wrapped] of Object.entries(input.pushto_users_keys)) {
+    const covered = Object.keys(wrapped);
+    if (covered.length !== manifestSet.size || covered.some((fp) => !manifestSet.has(fp))) {
+      throw new Error(
+        `key distribution device entry "${deviceKey}" must cover exactly the manifest versions ` +
+          `(${manifestSet.size} fingerprint(s)); got ${covered.length}`,
+      );
+    }
   }
 }
 
-/** Fully-resolved read policy: baseline access plus the master switch. */
-export interface EffectiveReadPolicy {
-  /** Baseline access when no rule matches. */
-  defaultReadAccess: "allow" | "deny";
-  /** When true, read checks are bypassed entirely. */
-  disableAllReadChecks: boolean;
-}
-
-/**
- * Compute the effective read policy by layering a per-db read policy over the
- * tenant default. An absent tenant default means read access is unrestricted,
- * which is represented as `defaultReadAccess: "allow"`.
- */
-export function effectiveReadPolicy(
-  tenantDefault: DefaultReadPolicyDoc | null | undefined,
-  dbPolicy: DefaultReadPolicyDoc | null | undefined
-): EffectiveReadPolicy {
-  const access =
-    dbPolicy?.defaultReadAccess ?? tenantDefault?.defaultReadAccess ?? "allow";
-  const disable =
-    (dbPolicy?.disableAllReadChecks ?? tenantDefault?.disableAllReadChecks) === true;
-  return {
-    defaultReadAccess: access === "deny" ? "deny" : "allow",
-    disableAllReadChecks: disable,
-  };
-}

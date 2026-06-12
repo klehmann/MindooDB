@@ -15,11 +15,12 @@
 /**
  * Supported MindooDB URI types.
  */
-export type MindooURIType = "join-request" | "join-response";
+export type MindooURIType = "join-request" | "join-response" | "key-distribution";
 
 const VALID_TYPES: ReadonlySet<string> = new Set<MindooURIType>([
   "join-request",
   "join-response",
+  "key-distribution",
 ]);
 
 const MDB_SCHEME = "mdb://";
@@ -154,6 +155,39 @@ export function isMindooURI(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ==================== Key distribution requests ====================
+
+import type { KeyDistributionRequest } from "../accesscontrol/types";
+
+/**
+ * Encode a {@link KeyDistributionRequest} as an `mdb://key-distribution/...`
+ * URI carrying the full unsigned distribution content (incl. wrapped material),
+ * so a key-holder without admin rights can hand a ready-to-sign request to an
+ * admin out-of-band (email/chat).
+ */
+export function encodeKeyDistributionRequest(request: KeyDistributionRequest): string {
+  return encodeMindooURI("key-distribution", request as unknown as Record<string, unknown>);
+}
+
+/**
+ * Decode an `mdb://key-distribution/...` URI into a {@link KeyDistributionRequest}.
+ * Throws when the URI is not a key-distribution URI or is structurally invalid.
+ */
+export function decodeKeyDistributionRequest(uri: string): KeyDistributionRequest {
+  const decoded = decodeMindooURI<KeyDistributionRequest>(uri);
+  if (decoded.type !== "key-distribution") {
+    throw new Error(`Expected a key-distribution URI, got "${decoded.type}"`);
+  }
+  const payload = decoded.payload;
+  if (typeof payload.keyId !== "string" || !payload.keyId) {
+    throw new Error("Invalid key-distribution request: missing keyId");
+  }
+  if (!Array.isArray(payload.keyVersions) || !Array.isArray(payload.pushto) || !Array.isArray(payload.pullfrom)) {
+    throw new Error("Invalid key-distribution request: missing keyVersions/pushto/pullfrom");
+  }
+  return payload;
 }
 
 // ==================== Base64url Helpers ====================

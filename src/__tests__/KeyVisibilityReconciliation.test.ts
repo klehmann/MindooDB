@@ -187,6 +187,9 @@ describe("key visibility reconciliation", () => {
     expect(await readerDb.getAllDocumentIds()).toEqual([secretDocId]);
     const revealedDoc = await readerDb.getDocument(secretDocId);
     expect(revealedDoc.getData().title).toBe("Project Alpha");
+    // A normally-loaded doc is accessible and not deleted.
+    expect(revealedDoc.isAccessible()).toBe(true);
+    expect(revealedDoc.isDeleted()).toBe(false);
     expect(view.getRoot().getChildCategories().map((entry) => entry.getCategoryValue())).toEqual(["Restricted"]);
     expect(view.getRoot().getChildCategories()[0].getChildDocuments()).toHaveLength(1);
     expect(view.getRoot().getChildCategories()[0].getChildDocuments()[0].getDecryptionKeyId()).toBe(namedKeyId);
@@ -221,6 +224,20 @@ describe("key visibility reconciliation", () => {
       expect.objectContaining({ docId: secretDocId, isDeleted: true }),
     ]);
 
+    // The full-body feed emits the now-inaccessible doc as a tombstone:
+    // isDeleted() === true, isAccessible() === false, empty data. This lets
+    // incremental consumers drop it and distinguish a missing key from a
+    // genuine deletion (docs/accesscontrol.md §13.5).
+    const purgeChanges = [];
+    for await (const change of readerDb.iterateChangesSince(beforePurgeCursor)) {
+      purgeChanges.push(change);
+    }
+    expect(purgeChanges).toHaveLength(1);
+    expect(purgeChanges[0].doc.getId()).toBe(secretDocId);
+    expect(purgeChanges[0].doc.isDeleted()).toBe(true);
+    expect(purgeChanges[0].doc.isAccessible()).toBe(false);
+    expect(purgeChanges[0].doc.getData()).toEqual({});
+
     await readerKeyBag.set("doc", tenantId, namedKeyId, (await creatorKeyBag.get("doc", tenantId, namedKeyId))!);
     await readerTenant.reconcileKeyBagChanges?.();
     await view.update();
@@ -230,46 +247,6 @@ describe("key visibility reconciliation", () => {
     const restrictedCategory = view.getRoot().getChildCategories()[0];
     expect(restrictedCategory.getCategoryValue()).toBe("Restricted");
     expect(restrictedCategory.getChildDocuments().map((entry) => entry.docId)).toEqual([secretDocId]);
-  }, 30000);
-
-  it("purges a doc and crypto-shreds its named key when a read policy revokes entitlement", async () => {
-    // Reveal the named-key doc on the reader: it holds the key AND (with no
-    // read policy yet) is read-entitled, so the doc is visible.
-    await readerKeyBag.set("doc", tenantId, namedKeyId, (await creatorKeyBag.get("doc", tenantId, namedKeyId))!);
-    await readerTenant.reconcileKeyBagChanges?.();
-    expect(await readerDb.getAllDocumentIds()).toEqual([secretDocId]);
-    expect(await readerKeyBag.get("doc", tenantId, namedKeyId)).toBeTruthy();
-
-    // Admin flips the tenant to default-deny reads (revocation by policy
-    // revision — no client-trusted clock involved). Authored on the creator's
-    // directory but admin-signed; visible to the reader via the shared store.
-    const adminDir = (await creatorTenant.openDirectory()) as unknown as {
-      setDefaultReadPolicy: (
-        policy: { defaultReadAccess: "allow" | "deny" },
-        adminKey: PrivateUserId["userSigningKeyPair"]["privateKey"],
-        adminPassword: string,
-      ) => Promise<void>;
-    };
-    await adminDir.setDefaultReadPolicy(
-      { defaultReadAccess: "deny" },
-      adminUser.userSigningKeyPair.privateKey,
-      adminPassword,
-    );
-
-    // Force the reader's directory to ingest the new policy, then run the
-    // visibility reconcile (the directory-sync path drives this in production).
-    const readerDir = (await readerTenant.openDirectory()) as unknown as {
-      listKnownDBIds: () => Promise<string[]>;
-    };
-    await readerDir.listKnownDBIds();
-    await (readerDb as unknown as { reconcileKeyVisibility: () => Promise<void> }).reconcileKeyVisibility();
-
-    // The doc is purged locally and its named key is crypto-shredded from the
-    // KeyBag so it cannot be re-materialized; the tenant default key is intact.
-    expect(await readerDb.getAllDocumentIds()).toEqual([]);
-    await expect(readerDb.getDocument(secretDocId)).rejects.toThrow(`Document ${secretDocId} not found`);
-    expect(await readerKeyBag.get("doc", tenantId, namedKeyId)).toBeFalsy();
-    expect(await readerKeyBag.get("doc", tenantId, DEFAULT_TENANT_KEY_ID)).toBeTruthy();
   }, 30000);
 
   it("skips the visibility scan on a warm restart with an unchanged KeyBag", async () => {

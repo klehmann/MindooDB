@@ -33,10 +33,10 @@ enterprise-ready infrastructure.
 | End-to-end encryption, local-first sync, zero-trust server | ✅ | ✅ |
 | Read access by key possession | ✅ | ✅ |
 | **Write governance** — who may create / change / delete / snapshot / purge, scoped to database *and* content | — | ✅ (§2–§12) |
-| **Read governance** — who may *see* which data, scoped by database and encryption key | — | ✅ (§13) |
+| **Read governance** — who may *see* which data, by encryption-key possession (admin-blind key distribution + revoke/rotate) | — | ✅ (§13) |
 | **Group & identity management** — DN-hierarchy identities, nested groups, wildcard targeting | — | ✅ (§6.5, §8.1) |
-| **Cryptographic key guidelines** — pin & rotate the keys new documents use, admin-blind key distribution, crypto-shred | — | ✅ (§6.6–§6.7, §13.6) |
-| **Organizational lockdown** — control which databases may even exist | — | ✅ (§6.8) |
+| **Cryptographic key guidelines** — choose & rotate the keys new documents use, admin-blind key distribution, crypto-shred | — | ✅ (§6.6, §13.6) |
+| **Organizational lockdown** — control which databases may even exist | — | ✅ (§6.7) |
 | **Auditability & time travel** — reproduce any past decision; inspect the quarantine log | — | ✅ (§8, §9, §10) |
 | **Offline-honest enforcement** — decisions hold even when clients are offline and clocks are untrusted | — | ✅ (§4–§5) |
 
@@ -377,19 +377,19 @@ by direct lookup without building an index/view.
 > never the `default` key — so the server can read it without holding the default tenant key.
 > `withfields` (Tier 2) is never readable by the server.
 
-> **Key-based read gate.** The server enforces read access from the
-> **authenticated device signing key** (carried in the JWT as `deviceSigningKey`),
-> not a cleartext username — the challenge username is optional and may be
-> omitted entirely. The server resolves the reader's identity by looking up the
-> grant document for that signing key and reading its precomputed,
-> `$publicinfos`-readable `identity_hashes` bundle (the v1+v2 hashes of every DN
-> wildcard variant of the name, written at grant time). Wildcard and group read
-> rules are then matched purely in hash space (set-intersection against
-> `users_hashes` / `members_hashes`), so the server never needs the cleartext
-> name. Legacy grants without the bundle (`identity_hashes_v` absent/0) degrade
-> to exact `username_hash` matching and are flagged for backfill; saving the user
-> in the admin "Manage user" dialog (or any `updateUserGrant`) recomputes and
-> stores the current bundle.
+> **Identity resolution for the revoked-key blacklist.** The server resolves the
+> caller from the **authenticated device signing key** (carried in the JWT as
+> `deviceSigningKey`), not a cleartext username — the challenge username is
+> optional and may be omitted entirely. It looks up the grant document for that
+> signing key and reads its precomputed, `$publicinfos`-readable `identity_hashes`
+> bundle (the v1+v2 hashes of every DN wildcard variant of the name, written at
+> grant time). The per-user revoked-key blacklist (§13.3) is then matched purely
+> in hash space (set-intersection of those hashes against each key distribution's
+> `pullfrom_users_hashes`), so the server never needs the cleartext name. Legacy
+> grants without the bundle (`identity_hashes_v` absent/0) degrade to exact
+> `username_hash` matching and are flagged for backfill; saving the user in the
+> admin "Manage user" dialog (or any `updateUserGrant`) recomputes and stores the
+> current bundle.
 
 ### 6.1 Default policy (`acl_defaultpolicy`)
 
@@ -412,32 +412,24 @@ interface DefaultAccessPolicyDoc {
   denyDocSnapshot: boolean;  // default true  (snapshots are admin-only by default)
   denyDocPurge: boolean;     // default true  (purge is admin-only by default)
 
-  /** Optional allowlist of decryptionKeyIds a doc_create may use in this scope.
-   *  Absent/empty = unconstrained. Non-empty = a doc_create whose
-   *  decryptionKeyId is not in the set is denied (a hard Tier 1 create-key gate
-   *  that an allow rule cannot override). See section 6.6. */
-  allowedCreateKeyIds?: string[];
-
   /** Optional default decryptionKeyId a doc_create uses when the caller does
    *  not specify one in this scope (replacing the hardcoded "default" fallback).
    *  This is a client-side convenience, NOT a security control — the server
-   *  never selects keys — so allowedCreateKeyIds remains the authoritative gate.
-   *  When set together with a non-empty allowedCreateKeyIds on the SAME document
-   *  it must be a member of that allowlist (rejected at write time otherwise).
-   *  See section 6.6. */
+   *  never selects keys; read/write access is governed by key possession
+   *  (distribution + rotation, §13). See section 6.6. */
   defaultCreateKeyId?: string;
 
   /** Governs which databases tenant members may open/sync. TENANT-LEVEL ONLY —
    *  read solely from acl_defaultpolicy, never layered through a per-db policy.
    *  "open" (default) allows any valid database id. "directory-restricted"
    *  allows only "directory" (always implicit) and the ids in allowedDbIds; the
-   *  tenant admin is exempt. See section 6.8. */
+   *  tenant admin is exempt. See section 6.7. */
   databaseCreationPolicy?: "open" | "directory-restricted";
 
   /** The database ids permitted when databaseCreationPolicy is
    *  "directory-restricted". "directory" is always allowed and need not be
    *  listed; every other id (including "main") must appear explicitly. Ignored
-   *  in "open" mode. Tenant-level only. See section 6.8. */
+   *  in "open" mode. Tenant-level only. See section 6.7. */
   allowedDbIds?: string[];
 }
 ```
@@ -468,7 +460,7 @@ through directory history and time travel.
 Same shape as the default policy but scoped to one database. Layering order during
 evaluation (section 7): tenant default → DB default → matching allow rules →
 matching deny rules. Exception: `databaseCreationPolicy` / `allowedDbIds` are
-tenant-level only and are ignored if set on a per-database policy (see section 6.8).
+tenant-level only and are ignored if set on a per-database policy (see section 6.7).
 
 ### 6.3 ACL rule (`acl_rule_<ruleId>`)
 
@@ -637,8 +629,9 @@ two refinements.
   // Precomputed, $publicinfos-readable identity-hash bundle: the v1+v2 hashes of
   // every DN-hierarchy username variant (e.g. for "cn=alice/ou=ceo/o=acme":
   // self, "*/ou=ceo/o=acme", "*/o=acme", "*"), computed from the cleartext name
-  // at grant time. Lets the server resolve wildcard/group read rules purely in
-  // hash space from the authenticated device key, without ever seeing the
+  // at grant time. Lets the server resolve wildcard/group targets (e.g. the
+  // per-user revoked-key blacklist, §13.3) purely in hash space from the
+  // authenticated device key, without ever seeing the
   // cleartext username. `identity_hashes_v` versions the variant-generation
   // algorithm (starts at 1); absent/0 means a legacy grant (exact-match only,
   // flagged for backfill).
@@ -741,46 +734,7 @@ Lookups must match against **both** the legacy unsalted hash and `hashV2` so tha
 pre-existing directory data keeps working; new documents write `hashV2`. Record the
 hash version on the document (e.g. `username_hash_v: 1 | 2`) to avoid ambiguity.
 
-### 6.6 Create-key allowlist (`allowedCreateKeyIds`)
-
-A policy may pin which encryption keys new documents are created with. When a
-policy's `allowedCreateKeyIds` is non-empty, a `doc_create` is denied unless its
-`decryptionKeyId` is in the set. This is a **Tier 1** constraint: `decryptionKeyId`
-is cleartext entry metadata the witness already reads (it is covered by the witness
-signature, section 5.2), so the server enforces it at push time and every honest
-client re-checks it on materialization — no tenant key required, unlike `withfields`
-(Tier 2). It is a **hard gate**: it overrides allow rules (a matching allow rule does
-not rescue a `doc_create` that uses a disallowed key) but is additive to the normal
-baseline/rule check (passing the gate still leaves the usual evaluation to run).
-
-Typical uses:
-
-- **Forbid the shared default key.** Omit `"default"` from the list (the stored id
-  for default-key documents is the literal `"default"`, `DEFAULT_TENANT_KEY_ID`), so
-  every new document must use a named key with a narrower audience.
-- **Enforce key rotation.** Point the allowlist at the current rotation key; when the
-  schedule advances, write a new policy revision listing the next key. Manual key
-  creation and sharing still works exactly as before — this only constrains which key
-  a *new* document may be created under.
-
-**Scope.** Only `doc_create` is gated. `doc_change`/`doc_delete`/… reuse the
-document's existing `decryptionKeyId`, so they are unaffected. A per-database policy's
-`allowedCreateKeyIds` (when set) fully overrides the tenant default's for that
-database — it is not unioned — so a database can both tighten and loosen the
-tenant-wide constraint.
-
-**No retroactive invalidation (rotation = policy revision).** Because evaluation runs
-against the directory state at each entry's *trusted time* (section 8), a document
-created under an earlier policy is judged against that earlier policy forever.
-Tightening the allowlist later never reaches back to quarantine valid history; a
-document that was compliant when it entered the tenant stays readable and valid. Only
-*new* `doc_create` entries see the new constraint. Each rotation is just another
-append-only revision of `acl_defaultpolicy` / `acl_dbpolicy_<dbid>`, so the exact
-window each key was mandatory stays fully auditable, and
-`wasAllowedAt("doc_create", user, dbid, t, { decryptionKeyId })` reproduces the
-verdict that applied at `t` — not today's policy.
-
-### 6.7 Default create key (`defaultCreateKeyId`)
+### 6.6 Default create key (`defaultCreateKeyId`)
 
 A policy may also set a single `defaultCreateKeyId`: the `decryptionKeyId` a
 `doc_create` uses when the caller does not pass one. It replaces the historical
@@ -788,8 +742,8 @@ hardcoded `"default"` fallback, so `createDocument()` (no key) under a policy
 that sets `defaultCreateKeyId: "projkey"` creates the document under `projkey`.
 
 This is a **client-side create-time convenience, not a security control**. The
-sync server never selects keys; it only enforces `allowedCreateKeyIds`
-(section 6.6). The resolution order at create time is:
+sync server never selects keys; read/write access is governed by key possession
+(§13). The resolution order at create time is:
 
 1. the caller's explicit `decryptionKeyId`, else
 2. the effective policy's `defaultCreateKeyId` for the database, else
@@ -821,16 +775,7 @@ configured at either scope, on the same policy documents as every other field:
 overrides the tenant default's for that database (it is not merged). So a tenant
 can set a tenant-wide default and let individual databases opt into their own.
 
-**Must be allowed.** When a policy document sets both `defaultCreateKeyId` and a
-non-empty `allowedCreateKeyIds`, the default must be a member of the allowlist —
-otherwise the default would be self-denying. This is rejected at write time
-(`setDefaultAccessPolicy` / `setDatabaseAccessPolicy`). Because the allowlist and
-default can in principle come from different layers (a per-db default over a
-tenant allowlist), the client resolver also drops a resolved default that is not
-in the effective allowlist, falling back to step 3 so the create-key gate
-produces a clear error instead of silently choosing a key the witness rejects.
-
-### 6.8 Directory-restricted database policy (`databaseCreationPolicy` / `allowedDbIds`)
+### 6.7 Directory-restricted database policy (`databaseCreationPolicy` / `allowedDbIds`)
 
 By default any tenant member may open — and therefore implicitly create — a
 database with any syntactically valid id, which is convenient for experimentation
@@ -847,7 +792,7 @@ control at all) and the ids listed in `allowedDbIds` may be opened or synced.
 Every other id must be listed explicitly. The tenant
 **admin is exempt** and may open/sync any id.
 
-Unlike the create-key gate, these fields are **never** layered through a per-db
+Unlike most policy fields, these fields are **never** layered through a per-db
 `acl_dbpolicy_<dbid>` document (a per-db restriction would be circular — you would
 have to be allowed into the database to read its own gate). They are read only
 from the tenant `acl_defaultpolicy`, which is `$publicinfos`-encrypted, so the
@@ -891,11 +836,6 @@ For an operation `op` on database `dbid` by user `U`, evaluated at time `T`:
    `deny` rules, but the master switch bypasses them too.
 1. **Resolve the directory state at `T`** (section 8) — default policy, DB policy,
    rules, groups, grants as they were at `T`.
-1b. **Create-key gate (Tier 1).** If `op === "doc_create"` and the effective policy's
-   `allowedCreateKeyIds` is non-empty, the entry's `decryptionKeyId` must be in that
-   set; otherwise return **denied** immediately (`tier: "tier1"`). This is a hard gate
-   that an allow rule cannot override (section 6.6). It runs identically on server and
-   client because it depends only on cleartext metadata.
 2. **Baseline** = the effective `deny<Op>` from the DB policy if present, else the
    tenant default policy. `deny = true` means "denied unless an allow rule matches".
 3. **Resolve `U`'s identity set**: `username_hash` (legacy + v2), all group hashes
@@ -1074,11 +1014,9 @@ cancelDeviceWipe(username: string, signingKeys: string[],
 // Prediction for UIs (no mutation)
 canDo(op: RuleType, dbid: string, candidateDoc?: unknown): Promise<AccessDecision>;
 
-// Audit / time travel. `options.decryptionKeyId` reproduces the create-key gate
-// (section 6.6) verdict for a doc_create as decided at `at`.
+// Audit / time travel. Reproduces the access verdict for `op` as decided at `at`.
 wasAllowedAt(op: RuleType, username: string, dbid: string,
-             at: number, candidateDoc?: unknown,
-             options?: { decryptionKeyId?: string }): Promise<AccessDecision>;
+             at: number, candidateDoc?: unknown): Promise<AccessDecision>;
 ```
 
 There is no dedicated enable/disable call: `setDefaultAccessPolicy` is the single
@@ -1118,7 +1056,6 @@ policy actually has a Tier 2 (`withfields`) content rule for that operation and
 database. It **fails open** on any directory/infra error — the server witness
 (Tier 1) and quarantine-on-materialization (Tier 2) remain the authoritative
 enforcers, so a transient directory error never blocks a legitimate local write.
-The create-key allowlist gate (section 6.6) is enforced through this same path.
 
 Each write method accepts `bypassAccessControlPrecheck?: boolean` (default
 `false`) on its options for trusted/bulk paths; it skips only the local precheck
@@ -1338,15 +1275,21 @@ violated.
 ## 13. Read access control
 
 Sections 1–12 govern **writes** (who may create/change/delete). Read access is the
-mirror image: who may *see* already-encrypted data. It reuses the same machinery —
-admin-signed, `$publicinfos`-encrypted directory documents; identity-set evaluation;
-time-travel auditability — but with three deliberate differences from the write side:
-read rules are **metadata-only** (no `withfields`), carry **no client-trusted dates**,
-and are enforced by a **server delivery gate** plus a cooperative client purge rather
-than by a per-entry materialization guard.
+mirror image: who may *see* already-encrypted data. In the current model read access is
+**key possession**: a document is readable iff the reader's `KeyBag` holds a key that
+decrypts it. There is no read-policy / read-rule subsystem and no per-entry server read
+evaluator — those were removed. Two mechanisms remain, both admin-signed and
+`$publicinfos`-encrypted so the sync server can read the metadata it needs:
 
-Read access control is **opt-in and absent by default**: with no read policy document,
-read access is unrestricted (key possession is the only gate, exactly as before).
+1. **Key distribution** (`acl_keydistribution_<keyId>`, §13.2/§13.6) — the authoritative
+   `pushto` / `pullfrom` lists and version manifest per key. Clients **reconcile** their
+   KeyBag against the directory head: import keys pushed to them, remove keys revoked from
+   them.
+2. **Per-user revoked-key blacklist** (§13.3) — derived from the `pullfrom` lists, the
+   sync server silently withholds entries for a user's revoked `decryptionKeyId`s and
+   rejects pushes carrying them. This is a defence-in-depth bandwidth/forward-secrecy
+   gate, **not** the confidentiality boundary — ciphertext without the key is unreadable
+   regardless of the server.
 
 ### 13.1 What read revocation can and cannot do
 
@@ -1355,178 +1298,253 @@ runs on the encrypted payload; verification checks the encrypted bytes). History
 therefore **cannot be re-encrypted in place** without destroying authorship. Read
 revocation is consequently forward-looking and has three mechanisms:
 
-1. **Gate future delivery** — the server stops shipping entries for a `(db, key)`
-   scope to a user who is no longer entitled (the strong layer).
-2. **Cooperative local purge** — an honest client that loses entitlement deletes the
-   already-synced ciphertext and crypto-shreds the affected key (best-effort).
-3. **Crypto-shred** — destroying a symmetric key makes every entry encrypted with it
-   permanently unreadable everywhere (tenant-wide erasure; designed separately).
+1. **Remove the key from the user** — `pullfrom` causes the client to drop the key from
+   its KeyBag; the server stops delivering (and rejects pushes of) entries under that
+   key id for that user. A removed-but-dishonest client that kept a key copy can still
+   decrypt *old* ciphertext it already holds — see rotation below.
+2. **Cooperative local purge** — dropping the key triggers `reconcileKeyVisibility`,
+   which forgets the now-inaccessible documents (purges materialized plaintext, marks the
+   index entries inaccessible) so they leave caches and views.
+3. **Rotate (the only cryptographic cutoff)** — mint a new key version and distribute it
+   to the remaining recipients only, so future writes use a version the removed user
+   never received. Destroying a symmetric key entirely (crypto-shred) makes every entry
+   under it permanently unreadable everywhere (tenant-wide erasure; designed separately).
 
 There is no in-place re-encryption of history, and field-level read control remains
 future work (section 15).
 
 ### 13.2 Schema (all `form: "accesscontrol"`, `$publicinfos`-encrypted)
 
-So the sync server can evaluate them, every read document is encrypted with
+So the sync server can read the metadata it needs, every read document is encrypted with
 `$publicinfos` (the server holds that key) and carries only **metadata** — never
-plaintext document content.
+plaintext document content. There is a single read document type:
 
-- **Default read policy** — id `acl_readpolicy` (tenant singleton); per-database
-  `acl_dbreadpolicy_<dbid>`:
-  - `type: "readpolicy"`
-  - `defaultReadAccess: "allow" | "deny"` — the baseline. **Absent document = allow**
-    (preserves today's key-only behavior). A per-DB policy overrides the tenant
-    default for that database.
-  - `disableAllReadChecks?: boolean` — master off switch (read equivalent of
-    `disableAllAccessChecksAndPolicies`).
-- **Read rule** — id `acl_readrule_<ruleId>`:
-  - `type: "doc_read"`, `ruleId`, optional `description`
-  - `dbid: string | "*"`
-  - `decryptionKeyIds?: string[]` — optional key scope. Absent/empty = the rule
-    applies to **every** key in the database (document-level read control); present =
-    the rule only covers entries encrypted with those key ids (sub-document / column
-    read control via differently-keyed fields).
-  - `users_hashes: string[]` — user + group hashes plus the pseudo-tokens
-    `$everyone` / `$admin` (same hashing as membership entries; `$author` is not
-    used on the read side in v1). A group target is **expanded to its members at
-    evaluation time** via the acting user's identity set (which carries a hash of
-    every group the user belongs to, including nested groups). Group names are
-    matched **case-insensitively** — both the rule and the identity set hash the
-    normalized (lower-cased) group name — so `"Analysts"` and `"analysts"` are the
-    same target. (The same applies to write rules, §6.3.)
-  - `users_encrypted: string` — the targeted usernames/groups, JSON-encoded and
-    encrypted with the **tenant default key** (not `$publicinfos`), base64. This is a
-    **display aid** for admin UIs (e.g. Haven) so they can show *who* a rule targets
-    without reversing the salted hashes — mirroring how `grantaccess` and group
-    documents keep an encrypted member list. Because it is under the tenant key, it
-    stays **opaque to the sync server** while remaining readable by tenant clients.
-    Empty when the rule was authored from raw hashes / pseudo-tokens only.
-  - `action: "allow" | "deny"`
-  - **No `notBefore` / `notAfter` and no `withfields`.**
-- **Key delivery** — id `acl_keydelivery_<keyId>_<fingerprint>`:
-  - `type: "keydelivery"`, `keyId`, `preparedByPublicKey` (the key-holder who
-    wrapped it; audit)
-  - `recipients: Array<{ username_hash, versions }>` where each entry carries
-    **all** stored versions of the key:
-    `versions: Array<{ keyVersionCreatedAt, wrappedKey }>` and
-    `wrappedKey = RSA-OAEP(keyBytes, recipient's encryption public key)`.
-  - **All versions are delivered, not just the latest.** A `keyId` can hold
-    several versions after rotation, and decryption tries them all; shipping only
-    the newest would leave the recipient unable to read documents encrypted under
-    an earlier version. Each version is wrapped individually per recipient, and
-    `keyVersionCreatedAt` lets the recipient re-create the rotation timeline in
-    its `KeyBag` (import is idempotent per version).
+- **Key distribution** — id `acl_keydistribution_<keyId>` (one singleton document
+  per key; supersedes the former per-recipient `acl_keydelivery_*` model). Publish
+  is always an upsert of the key's full desired distribution state. See §13.6 for
+  the authoring flow and the reconcile contract.
+  - `type: "keydistribution"`, `keyId`, `preparedByPublicKey` (the key-holder who
+    wrapped the material; audit trail).
+  - `keyVersions: Array<{ createdAt, fingerprint }>` — the **manifest** of
+    distributed versions. `fingerprint` = SHA-256 hex of the raw key bytes. It is
+    the authoritative list of what this distribution delivers on **push**: imports
+    verify unwrapped bytes against the fingerprint. (On **pull**, revocation is
+    whole-key — see §13.6 — so the manifest is not consulted for removal.)
+  - `title_encrypted` / `comment_encrypted` (+ `_key: "default"`) — display
+    metadata encrypted with the **tenant default key**, opaque to the sync server.
+  - `pushto_users_hashes: string[]` — users whose KeyBags receive the key.
+    `pushto_users_encrypted` (+ `_key: "default"`) is an index-aligned encrypted
+    JSON array of the plaintext usernames (display aid; hashes stay authoritative).
+  - `pushto_users_keys: Record<"<userHash>|<deviceEncKeyFingerprint>",
+    Record<versionFingerprint, wrappedKey>>` — the wrapped material, one entry per
+    **active device** of each pushto user, with `wrappedKey = RSA-OAEP(keyBytes,
+    device encryption public key)`. **Every device entry covers all manifest
+    versions** (validated at publish): a recipient must be able to materialize any
+    document encrypted under any distributed version.
+  - `pullfrom_users_hashes: string[]` (+ optional `pullfrom_users_encrypted`) —
+    users whose KeyBags must **not** hold the manifest's versions. No device keys
+    are needed for a revocation. `pushto` and `pullfrom` are disjoint within the
+    doc (validated; pull wins as the merge tie-break).
 
-### 13.3 No client-trusted dates — revocation by policy revision
+### 13.3 Server-side per-user revoked-key blacklist
 
-The write side forbids a client-supplied wall clock (`${now}`) because it is
-spoofable. Read rules inherit that rule: there is **no `notAfter`** a client could
-evade by setting its clock back. Instead, **time-bound access = revocation by policy
-revision**: an admin (or a scheduled automation) flips the allow rule to deny / removes
-the user, and on the next directory sync the client purges the scope. The server gate
-enforces against **trusted server time**, so a revoked user is cut off from new data
-immediately regardless of their local clock. A future declarative "expires at T" must
-likewise be enforced at the server against server time, never the client clock.
+The sync server derives, per principal, the set of **revoked decryption key ids** from
+the `pullfrom_users_hashes` lists at the directory head (matched against the
+authenticated user's `usernameHashCandidates`, excluding the protected key ids `default`
+/ `$publicinfos`). This set is the only read-side enforcement the server performs — there
+is no general read-policy evaluator. It is computed from the cached distribution state
+(see §13.6 cache), so it is O(cache size) with no per-request document scans.
 
-### 13.4 Evaluation (`evaluateReadAccess`)
+- **Pull (silent omit).** All read endpoints — `handleFindNewEntries(ForDoc)`,
+  `handleFindEntries`, `handleScanEntriesSince`, `handleGetEntries`, `handleGetAllIds`,
+  `handleHasEntries`, `handleResolveDependencies` — drop any entry/id whose cleartext
+  `decryptionKeyId` is in the caller's revoked set. Omission is silent (not an error) so
+  a revoked entry simply ceases to exist for that user. `handleGetEntryMetadata` **fails
+  closed**: it refuses metadata for a revoked entry rather than returning it.
+- **Push (reject).** `handlePutEntries` rejects any entry whose `decryptionKeyId` is in
+  the caller's revoked set with `ACCESS_DENIED`, so a revoked-but-dishonest client cannot
+  re-upload data under a key it lost.
+- **Directory is exempt.** The `directory` database is never blacklisted — it carries the
+  distribution documents the blacklist itself is derived from and must always sync.
 
-A pure function, modeled on the write evaluator and equally clock-free:
+Wiring: `TenantManager.buildRevokedKeyResolver()` provides a `ServerRevokedKeyResolver`
+to `ServerNetworkContentAddressedStore` (skipped for `dbId === "directory"`), which calls
+`directory.getRevokedDecryptionKeyIdsForSigningKey(signingKey)`.
 
-- Inputs: `{ dbid, decryptionKeyId, identity, node }` (the `DirectoryStateNode` at the
-  point in time being evaluated).
-- No read policy / rules at this node → **allow**; master switch engaged → **allow**.
-- Baseline from `defaultReadAccess`, **per-DB policy over tenant default**.
-- Candidate rules: `type: "doc_read"`, `dbid` matches or `*`, the key scope covers
-  `decryptionKeyId` (rule has no key scope, or the id is listed), and `users_hashes`
-  intersects the acting user's identity set.
-- **Deny overrides allow.** Returns the shared `AccessDecision`.
+This gate is **not** the confidentiality boundary. Ciphertext without the key is
+unreadable, so the blacklist is a forward-secrecy / bandwidth measure layered on top of
+the cryptographic cutoff (key removal + rotation, §13.1).
 
-For audit, `wasAllowedToReadAt(username, dbid, decryptionKeyId, at)` evaluates against
-the **historical** directory-state node covering trusted time `at` — `at` only selects
-which node to read, it is never compared as a `notAfter`. This is the read analogue of
-`wasAllowedAt` (section 9) and gives a reproducible answer to "could this user read
-this scope at that moment?" across the join → department-change → leave lifecycle.
+### 13.4 SDK-driven reconcile (automatic, after every directory pull and on bring-up)
 
-The directory time-travel chain (section 8) carries `readPolicy`, `dbReadPolicies`,
-and `readRules` on each node so read decisions are reconstructable at any past time,
-exactly like write decisions.
+Reconcile lives **in the SDK**, not just the Haven UI, so standalone apps using the
+`mindoodb` npm package get it for free. `BaseMindooTenant.reconcileKeyDistributionsForCurrentUser()`
+runs two independent passes against the directory head:
 
-### 13.5 Enforcement
+- **Revoke pass (no key required).** Take the revoked key-id list from the head cache
+  (`directory.getRevokedDecryptionKeyIdsForUser(username)`) and bulk-call
+  `removeNamedDecryptionKey(keyId)` for each. This is a no-op when the key is absent, so
+  it is idempotent and needs no bag-vs-head fingerprint diff. Removing a key drives
+  `reconcileKeyVisibility`, which forgets now-inaccessible documents.
+- **Import pass (needs the encryption private key).** For `pushto` entries addressed to
+  this user's devices, unwrap each manifest version, verify the bytes against the
+  fingerprint, and merge the missing versions (idempotent, never destructive). The key
+  comes from `getEncryptionPrivateKeyForReconcile()` — an injected session key
+  (`setSessionEncryptionKey`, used by live-session hosts like Haven) or the
+  password-derived key. If neither is available (locked), imports are skipped with a
+  warning; the revoke pass still runs.
 
-```
-admin signs read policy/rules + key-delivery ─┐
-key-holder wraps key to recipients ───────────┘→ directory ($publicinfos)
-                                                   │
-                          ┌────────────────────────┴───────────────────────┐
-                          ▼                                                  ▼
-                    sync server                                          client
-   evaluateReadAccess at server time:                  entitlement lost → delete keys + purge scope
-   filter entries by dbid + decryptionKeyId            key-delivery for me → RSA-unwrap → KeyBag.set
-                          │                                                  │
-                          ▼                                                  ▼
-                       client                                       reveal-on-add (existing)
-```
+**Triggers (run-always, idempotent).** A directory-only "dirty" check is insufficient:
+the regression to defend against is a user restoring an *older KeyBag backup that still
+contains revoked keys*, which happens with no directory change — and `KeyBag.load()`
+replaces keys silently (no `onChanges`, no cursor bump). So reconcile runs:
 
-- **Server delivery gate (the strong layer).** In the server store's read endpoints
-  (`handleGetEntries`, `handleScanEntriesSince`, `handleFindNewEntries(ForDoc)`,
-  `handleFindEntries`, `handleGetAllIds`, metadata/has endpoints), the server resolves
-  the authenticated user, then filters every returned entry/metadata/id by
-  `evaluateReadAccess` using the cleartext `dbid` + `decryptionKeyId` + server time.
-  Disallowed entries are silently omitted (not an error). Evaluation **fails closed**
-  on error. The **directory database is never read-gated** — it carries the policies
-  the gate itself depends on and must always be readable.
-- **Client local purge (cooperative; works in p2p too).** `reconcileKeyVisibility`
-  already hides/reveals documents as keys come and go. It is extended so that when the
-  client *holds* a key but the policy now *denies* the `(db, key)` scope
-  (`hasKey && !entitled`), it (a) purges the materialized plaintext, (b) deletes the
-  already-synced ciphertext from the local store, and (c) **crypto-shreds** the named
-  key from the `KeyBag` so the scope cannot be re-materialized. This is policy-state
-  driven (one directory sync after revocation) with no client-clock dependency. It is
-  best-effort and **fails open** (a transient evaluation error never destroys local
-  data — the server gate is the authority). The shared **tenant default key is never
-  shredded**, and the directory DB is never gated (same reason as the server).
+- on directory **bring-up / open** (first `getDirectoryDB` use), and
+- after each directory **`pullChangesFrom`** (right after `syncStoreChanges()` when
+  `store.getId() === "directory"`).
 
-### 13.6 Admin-blind key delivery (key push)
+`reconcileKeyDistributionsForCurrentUserSafe()` wraps it with a single-flight in-flight
+flag (the only guard) so reconcile's own `getDirectoryDB` / `updateUnifiedCache` /
+`syncStoreChanges` calls do not recurse. It is best-effort (`try/catch`) and never blocks
+or fails sync.
 
-Granting read access usually means giving a user a key. To let an admin *distribute* a
-key without ever *seeing* it:
+**Persistence.** Key mutations from reconcile fire `keyBag.onChanges`. Hosts must persist
+the in-memory bag on that signal — the SDK holds it in memory only. Haven subscribes via
+`registerKeyBagPersistence` (debounced save onto the identity record); this also
+self-heals a restored backup, because the revoke pass's removal emits `onChanges` and the
+cleaned bag is re-saved over the restored one.
 
-1. A **key-holder** (any regular user who has the key) runs `prepareKeyDelivery(keyId,
-   targets)`. It RSA-OAEP-wraps **every stored version** of the key bytes (not just the
-   latest — see §13.2) to each target's encryption public key, producing a
-   `KeyDeliveryPayload` with `preparedByPublicKey` set to the holder.
-2. An **admin** runs `publishKeyDelivery(payload, adminKey, adminPassword)`: it signs
-   and writes the `acl_keydelivery_*` directory document. The admin only ever handles
-   the **wrapped** bytes — an admin outside the recipient set can never unwrap the key.
-   (`pushKey(keyId, targets, …)` is a convenience for when the admin legitimately holds
-   the key and performs both steps.)
-3. On directory sync, each client runs `importKeyDeliveriesForUser(...)`: it finds
-   deliveries addressed to its `username_hash`, RSA-unwraps **all** key versions with
-   its encryption private key, and `KeyBag.set`s each new one — which triggers the
-   existing, tested **reveal-on-add** path so the newly readable documents surface
-   automatically. Import is idempotent per version, and reconciliation runs once after
-   all versions are written. Manual key sharing (`sharePassword`) continues to work
-   unchanged.
+**Backfill ordering.** A grant surfaces without an explicit re-pull by the natural sync
+sequence: sync `directory` → reconcile imports the key → the next content-DB pull (the
+server no longer blacklists it) delivers the previously-withheld entries → reveal-on-add
+surfaces them. Hosts that sync the directory and content DBs in one cycle therefore see
+newly granted documents on the following content-DB pull.
 
-### 13.7 Public API additions (`MindooTenantDirectory`)
+### 13.5 Changefeed: inaccessible vs deleted
 
-- `setDefaultReadPolicy(policy, adminKey, adminPassword)`,
-  `setDatabaseReadPolicy(dbid, policy, adminKey, adminPassword)`
-- `createReadRule({ dbid, decryptionKeyIds?, usernames?, groups?, users_hashes?,
-  action }, adminKey, adminPassword) → ruleId`, `deleteReadRule(ruleId, …)`,
-  `listReadRules(filter?)` — each listed rule carries decrypted `targets`
-  (usernames/groups) for display when authored with cleartext names; revoke = delete
-  the allow rule or add a deny rule.
-- `canRead(dbid, decryptionKeyId?) → AccessDecision`,
-  `wasAllowedToReadAt(username, dbid, decryptionKeyId, at) → AccessDecision`
-- `prepareKeyDelivery(keyId, targets) → KeyDeliveryPayload` (key-holder),
-  `publishKeyDelivery(payload, adminKey, adminPassword)` (admin-blind),
-  `pushKey(keyId, targets, adminKey, adminPassword)`,
-  `importKeyDeliveriesForUser(username, encryptionPrivateKey, password) → string[]`
-  (client; returns the key ids imported).
+Dropping a key marks the affected index entries **inaccessible** (plaintext purged). Both
+changefeeds emit a removal signal so consumers (e.g. virtual views) drop the documents:
 
-`listRules` (the write-side listing, section 9) gains the same decrypted `targets`
-display field for symmetry.
+- `iterateChangeMetadataSince` already yields every index entry with `isDeleted: true`
+  for inaccessible rows — `MindooDBVirtualViewDataProvider.update()` calls
+  `removeEntry(docId)` on those, so views update with no extra refresh.
+- `iterateChangesSince` (full-body feed) previously **skipped** a now-inaccessible doc,
+  giving incremental consumers no removal signal. It now emits an **inaccessible
+  tombstone** instead: `isDeleted() === true`, `isAccessible() === false`,
+  `getData() === {}`, `getHeads() === []`, no attachments. `getData()` returns `{}`
+  (rather than throwing) so full-scan consumers that branch on `data.form` / `data.type`
+  simply skip it.
+
+`MindooDoc.isAccessible()` lets consumers distinguish a genuine deletion
+(`isDeleted && isAccessible`) from a missing-key situation (`isDeleted && !isAccessible`).
+Normally-loaded docs report `true`.
+
+### 13.6 Admin-blind key distribution
+
+Granting read access usually means giving a user a key. The **key distribution** model
+(`acl_keydistribution_<keyId>`, §13.2) is a declarative, auditable evolution of the old
+key-push: one admin-signed document per key holds the authoritative `pushto` / `pullfrom`
+lists and a version manifest, and every syncing client **reconciles** its KeyBag against
+the directory head. A single unified dialog authors a distribution; the admin step and
+the key-holder prepare step are the same form.
+
+**Authoring (any user).** Pick a `keyId` (locked after first save), set title/comment,
+and choose recipients. A key-versions section reads `createdAt` + `fingerprint` from the
+caller's KeyBag (refreshable). If the current identity **holds** the key,
+`wrapKeyForUserDevices(keyId, username)` RSA-OAEP-wraps **every** manifest version to
+**each** of the recipient's active device encryption keys, producing the
+`"<userHash>|<deviceFingerprint>" → { versionFingerprint → wrappedKey }` map; if not, the
+versions are read-only and only **removal** (move to `pullfrom`) is possible.
+
+**Finalize, two paths from the same form:**
+
+1. **Has admin id + password** → `publishKeyDistribution(input, adminKey, adminPassword)`
+   signs and upserts the `acl_keydistribution_<keyId>` document. The admin only ever
+   handles the **wrapped** bytes — an admin outside the recipient set can never unwrap
+   the key (admin-blind).
+2. **No admin rights** → export the full unsigned document (incl. the locally wrapped
+   material) as an `mdb://key-distribution/...` **request URI**
+   (`encodeKeyDistributionRequest`). An admin imports it
+   (`decodeKeyDistributionRequest`), reviews/edits, then signs and saves — letting a
+   normal key-holder do the heavy lifting and hand a ready-to-sign request to the admin.
+
+**Reconcile (every syncing client, after each directory pull and on bring-up; §13.4).**
+A pure, idempotent function of (directory head cache, local bag). Driven from the cached
+distribution state, matched against the user's `usernameHashCandidates`:
+
+- **Me in `pullfrom`** → remove the whole key id from the bag via
+  `removeNamedDecryptionKey(keyId)` (a no-op when absent; refuses the protected
+  `default` / `$publicinfos` ids). This purges the local scope (plaintext + index
+  tombstones) through the existing key-visibility machinery. Pull wins on any list
+  overlap. (The revoke pass takes its key-id list straight from
+  `getRevokedDecryptionKeyIdsForUser`, so it needs no per-doc scan or fingerprint diff.)
+- **Me in `pushto`** → look up my `"<myHash>|<myDeviceFingerprint>"` entries, RSA-unwrap
+  each version, **verify the bytes against the manifest fingerprint** (reject + log on
+  mismatch), and merge the missing versions (idempotent, never destructive). This
+  triggers the existing **reveal-on-add** path so newly readable documents surface.
+
+Push is a version merge, never destructive; destruction happens only via explicit
+`pullfrom`. Self-healing: a locally deleted pushed key is re-imported on the next
+reconcile. `default` and `$publicinfos` are rejected as a distribution `keyId` at publish
+time and guarded again in the client reconcile. Manual key sharing (`sharePassword`)
+continues to work unchanged.
+
+**Managed status is derived, not persisted:** a key id is *managed* iff its distribution
+document exists at the local directory head and lists the user in `pushto`. The KeyBag
+format is unchanged; clients compute the badge and the export/duplicate/rotation
+guardrails from the directory. The guardrail is **UX-level only** — there is no
+cryptographic way to stop a user who legitimately holds a key from exfiltrating it.
+
+**Rotation is the only cryptographic cutoff.** The server blacklist (§13.3) withholds
+*future* delivery, but a revoked-but-dishonest client that kept a key copy can still
+decrypt
+*new* ciphertext encrypted under a version it already holds. The cryptographic remedy is
+to **rotate**: mint a new key version and distribute it to the remaining recipients only,
+so future writes use a version the removed user never received. The authoring dialog
+therefore offers "remove & rotate" as the default revocation gesture.
+
+### 13.7 Public API additions
+
+On `MindooTenantDirectory`:
+
+- `wrapKeyForUserDevices(keyId, username) → { username_hash, devices }` (key-holder;
+  wraps every manifest version to each of the user's active device encryption keys),
+  `publishKeyDistribution(input, adminKey, adminPassword)` (admin-blind upsert of
+  `acl_keydistribution_<keyId>`), `listKeyDistributions() → KeyDistributionView[]`
+  (decrypts the `*_encrypted` blobs when the tenant key is held; null-tolerant),
+  `deleteKeyDistribution(keyId, adminKey, adminPassword)`,
+  `getManagedKeyIds() → string[]` (key ids the active user receives via `pushto` at
+  head). The `mdb://key-distribution/...` request
+  URI is built/parsed with `encodeKeyDistributionRequest` /
+  `decodeKeyDistributionRequest`. The client reconcile is NOT a directory method:
+  it runs only through `MindooTenant.reconcileKeyDistributionsForCurrentUser()`
+  (below), which sources the RSA session key from the tenant itself (no foreign
+  key crosses the directory API) — see §13.4.
+- `getRevokedDecryptionKeyIdsForUser(username) → string[]` and
+  `getRevokedDecryptionKeyIdsForSigningKey(signingKey) → string[]` — the per-user
+  revoked-key set the server blacklist (§13.3) and the client revoke pass (§13.4) both
+  read; derived from the cached `pullfrom` lists, protected ids excluded.
+
+On `MindooTenant`:
+
+- `setSessionEncryptionKey(cryptoKey)` (prime the session encryption key so reconcile's
+  import pass can unwrap without a password), `reconcileKeyDistributionsForCurrentUser()`
+  and its single-flight wrapper `reconcileKeyDistributionsForCurrentUserSafe()` (the
+  SDK-driven driver, §13.4). Hosts persist the mutated bag by subscribing to
+  `keyBag.onChanges`.
+
+On `MindooDoc`:
+
+- `isAccessible() → boolean` — `false` only for changefeed tombstones whose key the
+  current KeyBag cannot resolve (§13.5); `isDeleted()` is also `true` in that case so
+  legacy consumers still drop the doc.
+
+Server wiring (`ServerNetworkContentAddressedStore` / `TenantManager`):
+`ServerRevokedKeyResolver` + `buildRevokedKeyResolver()` plumb the revoked-key set into
+the read/push handlers (skipped for the `directory` database).
+
+`listRules` (the write-side listing, section 9) carries decrypted `targets`
+(usernames/groups) for display.
 
 ## 14. Enterprise deployment guide and best practices
 
@@ -1552,8 +1570,8 @@ zero-trust server can never read document content.
 |------------------------|------|-------------|-------------------------------|
 | *who* may write (user/group/`$author`) | Tier 1 | server + crypto | nothing — the push is refused and cannot propagate |
 | *which database* a write lands in | Tier 1 | server + crypto | nothing — refused at push |
-| *which encryption key* a create uses (`allowedCreateKeyIds`) | Tier 1 | server + crypto | nothing — refused at push |
 | *which databases exist* (`databaseCreationPolicy`) | Tier 1 | server + crypto | nothing — refused at push |
+| *who may read* a document | crypto | key possession | nothing — ciphertext is unreadable without the key (§13) |
 | *what the content looks like* (`withfields`) | Tier 2 | every honest client, on receipt | author locally; **every honest client quarantines it on materialization**, so it never becomes visible, cascades to no dependents, is logged, and the author is revocable |
 
 **What Tier 2 genuinely buys you.** A `withfields` violation is not "caught late" — it
@@ -1570,12 +1588,12 @@ reversible** — which is exactly the protection an organization wants.
 outside what content rules can deliver, so model them at Tier 1:
 
 - **Confidentiality.** Quarantine governs *writes/materialization*, not *reads*. "User
-  X must never *read* Y" is a key-possession / read-gate concern (section 13), never a
-  `withfields` rule.
+  X must never *read* Y" is a key-possession concern (section 13) — give X the key or
+  not — never a `withfields` rule.
 - **A guarantee the *server* must enforce, or that must hold even on the violator's own
-  device.** The server cannot see content, so identity / database / create-key gates
-  (Tier 1) are the lever — most powerfully by **scoping the encryption key**
-  (section 14.4), the strongest control in the system.
+  device.** The server cannot see content, so identity / database gates (Tier 1) are the
+  lever — most powerfully by **scoping the encryption key** (section 14.4), the strongest
+  control in the system.
 
 A related subtlety to keep in mind when *designing create-time content rules*: a
 `doc_create withfields` clause is evaluated against the "after" state, which is empty
@@ -1601,7 +1619,7 @@ Set a tenant up once, in this order, so each step rests on the previous one:
 5. **Write the policies and rules**, starting from deny baselines per database
    (section 14.5), validating each with a dry run (section 14.9) before enforcing.
 6. **Lock down database creation** with `databaseCreationPolicy: "directory-restricted"`
-   (section 6.8) once you know which databases you need.
+   (section 6.7) once you know which databases you need.
 7. **Enable defense-in-depth re-checks** (`clientSideTier1Recheck`, section 4) for
    high-security tenants.
 8. **Stand up your audit process** (section 14.10) so you can answer "who could do
@@ -1627,23 +1645,30 @@ Set a tenant up once, in this order, so each step rests on the previous one:
 Key scoping is the strongest control in the system because it is enforced by
 cryptography and the server, not by client cooperation:
 
-- **Forbid the shared default key for sensitive databases.** Set a per-database
-  `allowedCreateKeyIds` that omits `"default"` (section 6.6), so every new document
-  must use a named key with a narrower audience. This is a hard Tier 1 gate that an
-  allow rule cannot override, and it is exactly the lever to reach for when a
-  `withfields` create rule would be too weak (section 14.1).
+- **Use a named key (not the shared default) for sensitive databases.** Set a
+  per-database `defaultCreateKeyId` to a named key with a narrower audience (section 6.6)
+  and distribute it only to that audience, so the documents are unreadable to everyone
+  else — the lever to reach for when a `withfields` create rule would be too weak
+  (section 14.1).
 - **One key per sensitivity domain.** Model "who can read what" as "who holds which
-  key". Read rules are scoped by `decryptionKeyIds` (section 13.2), so a key boundary
-  is simultaneously a write-create boundary and a read boundary.
-- **Distribute keys admin-blind.** Use `prepareKeyDelivery` / `publishKeyDelivery`
-  (section 13.6) so an admin can grant read access without ever seeing the key.
+  key" — read access *is* key possession (section 13). Distributing a key (`pushto`)
+  grants read; revoking it (`pullfrom` + rotation) removes it, and the server's
+  per-user revoked-key blacklist (section 13.3) stops delivering that key's entries.
+- **Distribute keys admin-blind.** Author an `acl_keydistribution_<keyId>` document
+  (section 13.6) — directly with admin credentials, or by importing a key-holder's
+  `mdb://key-distribution/...` request URI — so an admin can grant read access
+  without ever seeing the key. Recipients reconcile it into their KeyBags on sync;
+  revoke with `pullfrom` + rotation.
 - **Set `defaultCreateKeyId` for ergonomics, not security.** It removes the hardcoded
-  `"default"` fallback so app code need not pass a key (section 6.7), but the server
-  never selects keys — `allowedCreateKeyIds` remains the authority.
-- **Understand the revocation limits.** Read revocation is forward-looking: you can
-  gate future delivery, cooperatively purge honest clients, or crypto-shred a key, but
-  you cannot re-encrypt history in place (section 13.1). Plan key boundaries up front
-  rather than relying on after-the-fact revocation.
+  `"default"` fallback so app code need not pass a key (section 6.6), but the server
+  never selects keys — key possession (distribution + rotation) is the authority.
+- **Understand the revocation limits.** Read revocation is forward-looking: `pullfrom`
+  drops the key from honest clients on reconcile (which forgets the now-inaccessible
+  docs) and the server blacklist withholds future delivery, but a dishonest client that
+  kept a key copy can still read *old* ciphertext under a version it already holds — so
+  **rotate** to mint a version it never received, and remember history cannot be
+  re-encrypted in place (section 13.1). Plan key boundaries up front rather than relying
+  on after-the-fact revocation.
 
 ### 14.5 Write rules that hold under a malicious client
 
@@ -1665,7 +1690,7 @@ cryptography and the server, not by client cooperation:
 ### 14.6 Lock down which databases can exist
 
 Once the database list is known, set `databaseCreationPolicy: "directory-restricted"`
-with an explicit `allowedDbIds` on `acl_defaultpolicy` (section 6.8). This is enforced
+with an explicit `allowedDbIds` on `acl_defaultpolicy` (section 6.7). This is enforced
 both at the client open path and at the server sync choke point, with the admin
 exempt. It is the difference between "anyone
 can spin up an ungoverned database" and "only the databases we intended exist".
@@ -1693,7 +1718,7 @@ can spin up an ungoverned database" and "only the databases we intended exist".
 | Revoke a device | `updateUserGrant` moves the pair into `revokedUserKeyPairs` with `revokedAt` | section 6.5 |
 | Fully offboard a user | revoke all pairs; they can rejoin later with fresh keys | section 6.5 |
 | Stolen device | set `wipeRequestedForSigningKeys`; the device drops the whole local tenant on next connect | section 6.5 |
-| Lose read access | flip the read rule to deny / remove the user; honest clients purge the scope on next directory sync | sections 13.3, 13.5 |
+| Lose read access | move the user to `pullfrom` in `acl_keydistribution_<keyId>` and rotate; clients drop the key and forget its docs on reconcile, the server blacklist withholds them | sections 13.3, 13.4 |
 
 Note that **revocation and wipe are independent and both opt-in** (section 6.5): removing
 keys does not wipe a device, and wiping requires explicitly listing its signing key.
@@ -1716,7 +1741,7 @@ There is no built-in "report-only" mode, so simulate one:
    a true emergency stop.
 
 Because evaluation is pinned to each entry's trusted time (section 8), tightening a
-policy never retroactively quarantines already-accepted history (section 6.6) — so you
+policy never retroactively quarantines already-accepted history — so you
 can ratchet restrictions up safely over time.
 
 ### 14.10 Audit and compliance
@@ -1724,9 +1749,11 @@ can ratchet restrictions up safely over time.
 - **The directory history *is* the audit trail.** Every policy, rule, grant, and group
   is an append-only, admin-signed document; the trusted-time chain (section 8) lets you
   reconstruct the exact policy in force at any moment.
-- **Answer point-in-time questions directly** with `wasAllowedAt` (write) and
-  `wasAllowedToReadAt` (read) — "could user X change/read this at time T?" — across the
-  join → role-change → leave lifecycle (sections 9, 13.4).
+- **Answer point-in-time write questions directly** with `wasAllowedAt` — "could user X
+  change this at time T?" — across the join → role-change → leave lifecycle (section 9).
+  Read access is key possession, so "could X read this?" reduces to "did X hold the
+  key then?": the `acl_keydistribution_<keyId>` history (its `pushto` / `pullfrom`
+  revisions) is the auditable record (section 13).
 - **Monitor the quarantine log** (section 10) for Tier 2 rejections; a spike often
   signals either an attack or a client/policy mismatch worth investigating.
 - For regulated environments, plan for the optional `acl_audit_*` records (section 15)
@@ -1750,7 +1777,7 @@ can ratchet restrictions up safely over time.
 - **Flipping `deny*` flags blind.** Always dry-run with `wasAllowedAt` / `canDo` first
   and watch the quarantine log after.
 - **Assuming a per-database policy can gate database *creation*.** `databaseCreationPolicy`
-  is tenant-level only (section 6.8); a per-db gate would be circular.
+  is tenant-level only (section 6.7); a per-db gate would be circular.
 
 ## 15. Open questions and future work
 
@@ -1761,16 +1788,17 @@ can ratchet restrictions up safely over time.
 - **p2p witnessing.** Trusted witness peers / threshold witnessing for serverless
   groups.
 - **Field-level read access.** Document- and key-level read control ships in section
-  13 (a read rule scoped by `decryptionKeyIds`). True *field*-level read control would
-  require additional keying so different parts of one document can be encrypted with
-  different keys. The intended **naming convention** (not yet implemented) extends the
-  existing `<field>_encrypted` / `<field>_encrypted_key` pattern already used for
-  `user_details_encrypted` (section 6.5): a sensitive field is stored as a `_encrypted`
-  payload alongside a `_encrypted_key` field naming the key id it was encrypted with —
-  for example `usernames_encrypted` + `usernames_encrypted_key`. This makes it
-  explicit, per field, which key a reader needs, so a user without that key sees only
-  ciphertext for that field while still reading the rest of the document. A read rule's
-  `decryptionKeyIds` scope then governs that field's key directly.
+  13 as **key possession** (a reader sees a document iff it holds a key that decrypts
+  it). True *field*-level read control would require additional keying so different
+  parts of one document can be encrypted with different keys. The intended **naming
+  convention** (not yet implemented) extends the existing `<field>_encrypted` /
+  `<field>_encrypted_key` pattern already used for `user_details_encrypted`
+  (section 6.5): a sensitive field is stored as a `_encrypted` payload alongside a
+  `_encrypted_key` field naming the key id it was encrypted with — for example
+  `usernames_encrypted` + `usernames_encrypted_key`. This makes it explicit, per field,
+  which key a reader needs, so a user without that key sees only ciphertext for that
+  field while still reading the rest of the document — the key distribution for that
+  field's key id then governs who can read it.
 - **Declarative read expiry ("expires at T").** Deferred. If added, it must be enforced
   at the **server** against trusted server time, so the client evaluator stays
   clock-free; for now, scheduled expiry = an automation that flips the policy at T.

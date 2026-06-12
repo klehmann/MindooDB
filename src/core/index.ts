@@ -21,10 +21,12 @@ export {
   aclTrustedWitnessDocId,
   encodeAclIdComponent,
   decodeAclIdComponent,
-  READ_RULE_TYPE,
-  ACL_READ_POLICY_DOC_ID,
-  aclDbReadPolicyDocId,
-  aclReadRuleDocId,
+  aclKeyDistributionDocId,
+  isKeyDistributionDocId,
+  validateKeyDistribution,
+  KEY_DISTRIBUTION_TYPE,
+  ACL_KEY_DISTRIBUTION_PREFIX,
+  PROTECTED_DISTRIBUTION_KEY_IDS,
   type RuleType,
   type Operator,
   type WithFieldWhen,
@@ -35,9 +37,12 @@ export {
   type TrustedWitnessDoc,
   type AccessTier,
   type AccessDecision,
-  type ReadRuleType,
-  type DefaultReadPolicyDoc,
-  type ReadRuleDoc,
+  type KeyVersionRef,
+  type DeviceWrappedVersions,
+  type KeyDistributionDoc,
+  type KeyDistributionRequest,
+  type KeyDistributionPushRecipient,
+  type KeyDistributionView,
 } from "./accesscontrol/types";
 export {
   createGenesisNode,
@@ -69,6 +74,11 @@ export {
 export type { CryptoAdapter } from "./crypto/CryptoAdapter";
 export { RSAEncryption } from "./crypto/RSAEncryption";
 export { MindooDocSigner } from "./crypto/MindooDocSigner";
+export {
+  decryptEncryptedField,
+  getEncryptedFieldKeyId,
+  type EncryptedFieldDecryptor,
+} from "./crypto/encryptedFields";
 
 // Keys
 export { KeyBag, type KeyDetail } from "./keys/KeyBag";
@@ -78,6 +88,8 @@ export {
   encodeMindooURI,
   decodeMindooURI,
   isMindooURI,
+  encodeKeyDistributionRequest,
+  decodeKeyDistributionRequest,
   type MindooURIType,
   type DecodedMindooURI,
 } from "./uri/MindooURI";

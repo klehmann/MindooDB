@@ -7,9 +7,10 @@ import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import type {
   DefaultAccessPolicyDoc,
-  DefaultReadPolicyDoc,
-  KeyDeliveryPayload,
-  ReadRuleDoc,
+  KeyDistributionPushRecipient,
+  KeyDistributionRequest,
+  KeyDistributionView,
+  KeyVersionRef,
   RuleTargets,
   RuleType,
   WithFieldClause,
@@ -724,6 +725,21 @@ export interface MindooTenant {
    * is not applicable.
    */
   reconcileKeyBagChanges?(): Promise<void>;
+
+  /**
+   * Reconcile this tenant's local KeyBag against the directory head for the
+   * current user (docs/accesscontrol.md §13): remove revoked key ids and import
+   * the key versions pushed to the user. The RSA-OAEP decryption key is sourced
+   * from the tenant's own session, so callers never supply a key. Best-effort
+   * and idempotent; safe to call on every directory bring-up / pull. Optional so
+   * alternative tenant implementations (server-side, test doubles) may omit it.
+   *
+   * @returns The key ids imported and removed.
+   */
+  reconcileKeyDistributionsForCurrentUser?(): Promise<{
+    imported: string[];
+    removed: string[];
+  }>;
 
   /**
    * Return whether the current KeyBag can resolve the given document
@@ -1564,6 +1580,22 @@ export interface MindooDoc {
    * @return True if the document has been deleted, false otherwise
    */
   isDeleted(): boolean;
+
+  /**
+   * Whether the current KeyBag can decrypt this document (docs/accesscontrol.md
+   * §13). `true` for normally-loaded documents. `false` only for changefeed
+   * tombstones emitted by {@link MindooDB.iterateChangesSince} for a document
+   * that was readable before but whose decryption key the local KeyBag no longer
+   * holds (e.g. a revoked key). Such a tombstone also reports
+   * {@link isDeleted} `=== true` so legacy consumers still drop it; pair the two
+   * to distinguish a genuine deletion (`isDeleted && isAccessible`) from a
+   * missing-key situation (`isDeleted && !isAccessible`). Its {@link getData}
+   * returns `{}` (the plaintext is purged, never materialized).
+   *
+   * @return True when the document's key is available, false for an
+   *   inaccessible-key tombstone.
+   */
+  isAccessible(): boolean;
 
   /**
    * Whether this document is still "awaiting witness": it has at least one
@@ -2505,15 +2537,14 @@ export interface MindooTenantDirectory {
 
   /**
    * Audit: was `username` allowed to perform `op` on `dbid` at trusted time
-   * `at`? (§9) `options.decryptionKeyId` reproduces the create-key allowlist
-   * verdict (§6.6) for a `doc_create` as it would have been decided at `at`.
+   * `at`? (§9) Evaluates against the directory state as it was at `at`, so
+   * historical decisions can be explained.
    *
    * @param op The write operation to evaluate (`doc_create`, `doc_change`, …).
    * @param username The user whose access to evaluate (format: "CN=<username>/O=<tenantId>").
    * @param dbid The database the operation targets.
    * @param at The trusted time (ms epoch) selecting the historical directory-state node to evaluate against.
    * @param candidateDoc Optional candidate document content, for evaluating Tier 2 (`withfields`) content rules.
-   * @param options.decryptionKeyId Reproduces the create-key allowlist verdict (§6.6) for a `doc_create` as decided at `at`.
    * @returns The {@link AccessDecision} that applied at `at`.
    */
   wasAllowedAt?(
@@ -2522,15 +2553,14 @@ export interface MindooTenantDirectory {
     dbid: string,
     at: number,
     candidateDoc?: Record<string, unknown>,
-    options?: { decryptionKeyId?: string },
   ): Promise<AccessDecision>;
 
   /**
-   * Evaluate the full client-side write ruleset (Tier 1 + Tier 2, including the
-   * create-key allowlist gate) for a candidate write at `trustedTime`
-   * (docs/accesscontrol.md §7, §9.1). `beforeDoc`/`afterDoc` are only consulted
-   * by Tier 2 (`withfields`) content rules. Used by the SDK write prechecks and
-   * by materialization-time enforcement.
+   * Evaluate the full client-side write ruleset (Tier 1 + Tier 2) for a
+   * candidate write at `trustedTime` (docs/accesscontrol.md §7, §9.1).
+   * `beforeDoc`/`afterDoc` are only consulted by Tier 2 (`withfields`) content
+   * rules. Used by the SDK write prechecks and by materialization-time
+   * enforcement.
    *
    * @param input The candidate write to evaluate.
    * @param input.op The write operation being evaluated (`doc_create`, `doc_change`, …).
@@ -2540,7 +2570,6 @@ export interface MindooTenantDirectory {
    * @param input.isAuthor Whether the signer is the original creator of the target document, for `$author` ownership rules.
    * @param input.beforeDoc The document state before the change (for `when: "before"` clauses), or `null` when unavailable/not needed.
    * @param input.afterDoc The document state with the candidate change applied (for `when: "after"` clauses), or `null` when unavailable/not needed.
-   * @param input.decryptionKeyId The entry's cleartext `decryptionKeyId`; required for the create-key allowlist gate on `doc_create`.
    * @returns The {@link AccessDecision} (allow/deny, deciding rule id, and tier).
    */
   evaluateClientAccess?(input: {
@@ -2551,7 +2580,6 @@ export interface MindooTenantDirectory {
     isAuthor: boolean;
     beforeDoc: Record<string, unknown> | null;
     afterDoc: Record<string, unknown> | null;
-    decryptionKeyId?: string;
   }): Promise<AccessDecision>;
 
   /**
@@ -2584,224 +2612,112 @@ export interface MindooTenantDirectory {
    */
   getTrustedWitnessKeysAt?(T: number): Promise<Set<string>>;
 
-  // -----------------------------------------------------------------------
-  // Read access control (read-side). Optional: only the directory
-  // implementation supports them.
-  // -----------------------------------------------------------------------
+  /**
+   * The canonical write-time hash for `username` (the value stored in a
+   * distribution's `pushto`/`pullfrom` hash lists). Used to build `pullfrom`
+   * entries when removing a user.
+   *
+   * @param username The user to hash (format: "CN=<username>/O=<tenantId>").
+   * @returns The salted, normalized username hash.
+   */
+  getUsernameHash?(username: string): Promise<string>;
 
   /**
-   * Create or update the tenant default read policy.
+   * All ACTIVE (non-revoked) RSA encryption public keys (PEM) for `username` —
+   * one per active device. Used to wrap a key for every device of a recipient.
    *
-   * @param policy The read-policy fields to write (omitted fields keep their stored value / take their documented default).
+   * @param username The user to resolve (format: "CN=<username>/O=<tenantId>").
+   * @returns The de-duplicated active encryption public keys.
+   */
+  getUserEncryptionPublicKeys?(username: string): Promise<string[]>;
+
+  /**
+   * Wrap every stored version of `keyId` (from the caller's KeyBag) to ALL
+   * active encryption devices of `username`, producing the `pushto` device-map
+   * shape used by the distribution doc and request URI. Throws if the caller
+   * lacks the key or the recipient has no active encryption device.
+   *
+   * @param keyId The symmetric key (in the caller's KeyBag) to wrap.
+   * @param username The recipient (format: "CN=<username>/O=<tenantId>").
+   * @returns The recipient's wrapped device material.
+   */
+  wrapKeyForUserDevices?(keyId: string, username: string): Promise<KeyDistributionPushRecipient>;
+
+  /**
+   * The version manifest (`{createdAt, fingerprint}`) of `keyId` from the
+   * caller's KeyBag — the source of truth for a distribution's `keyVersions`.
+   *
+   * @param keyId The symmetric key to read versions for.
+   * @returns The version manifest (empty when the key is not held).
+   */
+  getKeyVersionManifest?(keyId: string): Promise<KeyVersionRef[]>;
+
+  /**
+   * Admin-sign and upsert the singleton `acl_keydistribution_<keyId>` document
+   * from a request (built in-dialog or decoded from a request URI).
+   *
+   * @param request The full desired distribution state.
    * @param administrationPrivateKey The administration private key to sign the change (signing only).
    * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
-   * @returns A promise that resolves when the read policy has been written.
    */
-  setDefaultReadPolicy?(
-    policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
+  publishKeyDistribution?(
+    request: KeyDistributionRequest,
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
   /**
-   * Create or update a per-database read policy override.
+   * List all key-distribution documents at the directory head, decrypting
+   * display fields when the tenant default key is held.
    *
-   * @param dbid The database the read-policy override applies to.
-   * @param policy The read-policy fields to write (omitted fields inherit the tenant default for `dbid`).
-   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @returns The distribution views.
+   */
+  listKeyDistributions?(): Promise<KeyDistributionView[]>;
+
+  /**
+   * Delete the singleton distribution document for `keyId` (admin-signed).
+   *
+   * @param keyId The distributed key id.
+   * @param administrationPrivateKey The administration private key to sign the change.
    * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
-   * @returns A promise that resolves when the read-policy override has been written.
    */
-  setDatabaseReadPolicy?(
-    dbid: string,
-    policy: Partial<Omit<DefaultReadPolicyDoc, "form" | "type">>,
-    administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string,
-  ): Promise<void>;
-
-  /**
-   * Create or replace a metadata-only read rule; returns the rule id.
-   *
-   * @param rule The read-rule definition.
-   * @param rule.ruleId Stable rule id; generated when omitted, or used to replace an existing rule.
-   * @param rule.dbid The database the rule applies to, or `"*"` for all databases (defaults to `"*"` when omitted).
-   * @param rule.action Whether the rule grants (`"allow"`) or revokes (`"deny"`) read access (deny overrides allow).
-   * @param rule.decryptionKeyIds Optional key scope; absent/empty applies the rule to every key in the database.
-   * @param rule.users_hashes Precomputed user/group hashes plus pseudo-tokens (`$everyone`, `$admin`) the rule targets.
-   * @param rule.usernames Cleartext usernames to target; hashed and stored, and kept (encrypted) for admin-UI display.
-   * @param rule.groups Cleartext group names to target; hashed and stored alongside `usernames`.
-   * @param rule.description Optional human-readable description for admin UIs.
-   * @param administrationPrivateKey The administration private key to sign the change (signing only).
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
-   * @returns The id of the created/replaced read rule.
-   */
-  createReadRule?(
-    rule: {
-      ruleId?: string;
-      dbid?: string;
-      action?: "allow" | "deny";
-      decryptionKeyIds?: string[];
-      users_hashes?: string[];
-      usernames?: string[];
-      groups?: string[];
-      description?: string;
-    },
-    administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string,
-  ): Promise<string>;
-
-  /**
-   * List read rules in effect, optionally filtered by database. Each rule may
-   * carry decrypted `targets` (usernames/groups) for admin-UI display (see
-   * {@link MindooTenantDirectory.listRules}).
-   *
-   * @param filter Optional narrowing by `dbid`.
-   * @returns The matching read rules, each optionally augmented with decrypted `targets`.
-   */
-  listReadRules?(
-    filter?: { dbid?: string },
-  ): Promise<Array<ReadRuleDoc & { targets?: RuleTargets }>>;
-
-  /**
-   * Delete a read rule by id.
-   *
-   * @param ruleId The id of the read rule to delete.
-   * @param administrationPrivateKey The administration private key to sign the change (signing only).
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
-   * @returns A promise that resolves when the read rule has been deleted.
-   */
-  deleteReadRule?(
-    ruleId: string,
-    administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string,
-  ): Promise<void>;
-
-  /**
-   * Predict whether the current user may read in `dbid` (optionally key-scoped).
-   *
-   * @param dbid The database to evaluate read access for.
-   * @param decryptionKeyId Optional key scope; when given, evaluates read access for entries encrypted with that key.
-   * @returns The {@link AccessDecision} that would result for the current user.
-   */
-  canRead?(dbid: string, decryptionKeyId?: string): Promise<AccessDecision>;
-
-  /**
-   * Audit: was `username` allowed to read `dbid`/`decryptionKeyId` at trusted time `at`?
-   *
-   * @param username The user whose read access to evaluate (format: "CN=<username>/O=<tenantId>").
-   * @param dbid The database the read targets.
-   * @param decryptionKeyId The key id of the entries being read.
-   * @param at The trusted time (ms epoch) selecting the historical directory-state node to evaluate against.
-   * @returns The {@link AccessDecision} that applied at `at`.
-   */
-  wasAllowedToReadAt?(
-    username: string,
-    dbid: string,
-    decryptionKeyId: string,
-    at: number,
-  ): Promise<AccessDecision>;
-
-  /**
-   * Resolve `username`'s identity and evaluate read access against the
-   * directory state at `at` (or head). Used by the server read gate.
-   *
-   * @param input The read to evaluate.
-   * @param input.username The reader's username (format: "CN=<username>/O=<tenantId>").
-   * @param input.dbid The database the read targets.
-   * @param input.decryptionKeyId The key id of the entries being read.
-   * @param input.at Optional trusted time (ms epoch) selecting the directory-state node; defaults to head ("now").
-   * @returns The {@link AccessDecision} for the read.
-   */
-  evaluateReadAccessForUser?(input: {
-    username: string;
-    dbid: string;
-    decryptionKeyId: string;
-    at?: number;
-  }): Promise<AccessDecision>;
-
-  /**
-   * Key-based read gate: resolve the reader's identity from the authenticated
-   * device signing key plus the grant's precomputed `identity_hashes` bundle
-   * (docs/accesscontrol.md §6.5) and evaluate read access — entirely in hash
-   * space, so the server never needs the cleartext username. Preferred over
-   * {@link evaluateReadAccessForUser} when the authenticated device key is known.
-   *
-   * @param input The read to evaluate.
-   * @param input.signingKey The reader's authenticated device Ed25519 signing public key (PEM).
-   * @param input.dbid The database the read targets.
-   * @param input.decryptionKeyId The key id of the entries being read.
-   * @param input.at Optional trusted time (ms epoch) selecting the directory-state node; defaults to head ("now").
-   * @returns The {@link AccessDecision} for the read.
-   */
-  evaluateReadAccessForSigningKey?(input: {
-    signingKey: string;
-    dbid: string;
-    decryptionKeyId: string;
-    at?: number;
-  }): Promise<AccessDecision>;
-
-  /**
-   * Prepare an admin-blind key delivery: wrap the symmetric key `keyId` to each
-   * target's RSA encryption public key. Run by a key-holding user; the returned
-   * payload is handed to an admin to publish. Throws if the caller's KeyBag
-   * lacks the key.
-   *
-   * @param keyId The id of the symmetric key (in the caller's KeyBag) to wrap and deliver.
-   * @param targets The usernames to wrap the key for (format: "CN=<username>/O=<tenantId>").
-   * @returns The prepared {@link KeyDeliveryPayload} (every key version RSA-wrapped per recipient) to hand to an admin.
-   */
-  prepareKeyDelivery?(
+  deleteKeyDistribution?(
     keyId: string,
-    targets: string[],
-  ): Promise<KeyDeliveryPayload>;
-
-  /**
-   * Admin-sign and write a prepared key delivery to the directory.
-   *
-   * @param payload The {@link KeyDeliveryPayload} produced by {@link prepareKeyDelivery} (already wrapped; the admin never sees plaintext).
-   * @param administrationPrivateKey The administration private key to sign the change (signing only).
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
-   * @returns A promise that resolves when the key-delivery document has been written.
-   */
-  publishKeyDelivery?(
-    payload: KeyDeliveryPayload,
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
   /**
-   * Convenience for when the admin legitimately holds the key: prepare and
-   * publish in one step.
+   * The key ids managed by a distribution at the directory head where `username`
+   * is in the `pushto` list (managed status is derived, never persisted).
    *
-   * @param keyId The id of the symmetric key (in the admin's KeyBag) to wrap and deliver.
-   * @param targets The usernames to deliver the key to (format: "CN=<username>/O=<tenantId>").
-   * @param administrationPrivateKey The administration private key to sign the change (signing only).
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
-   * @returns A promise that resolves when the key-delivery document has been written.
+   * @param username The user to resolve managed keys for.
+   * @returns The managed key ids.
    */
-  pushKey?(
-    keyId: string,
-    targets: string[],
-    administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string,
-  ): Promise<void>;
+  getManagedKeyIds?(username: string): Promise<string[]>;
 
   /**
-   * Import any key-delivery documents in the directory targeting `username`:
-   * RSA-unwrap with the user's encryption private key and write into the
-   * KeyBag, surfacing newly-readable documents via reveal-on-add. Returns the
-   * set of key ids imported.
+   * The decryption key ids revoked for `username` at the directory head (every
+   * `acl_keydistribution_<keyId>` whose `pullfrom` list matches the user).
+   * Protected ids are never reported. Used client-side to bulk-remove revoked
+   * keys from the KeyBag, and as the basis for the server's pull/push blacklist.
+   * Optional.
    *
-   * @param username The recipient whose deliveries to import (format: "CN=<username>/O=<tenantId>").
-   * @param encryptionPrivateKey The recipient's RSA encryption private key, used to unwrap the delivered key versions.
-   * @param encryptionPrivateKeyPassword The password to decrypt the encryption private key.
-   * @returns The ids of the keys imported into the KeyBag (idempotent; empty when nothing new applied).
+   * @param username The user to resolve revoked keys for.
+   * @returns The revoked decryption key ids.
    */
-  importKeyDeliveriesForUser?(
-    username: string,
-    encryptionPrivateKey: EncryptedPrivateKey,
-    encryptionPrivateKeyPassword: string,
-  ): Promise<string[]>;
+  getRevokedDecryptionKeyIdsForUser?(username: string): Promise<string[]>;
+
+  /**
+   * Signing-key variant of {@link getRevokedDecryptionKeyIdsForUser} for the
+   * sync server, which authenticates principals by signing public key. Resolves
+   * the key to its user, then derives the revoked ids in hash space. The tenant
+   * admin and non-user (service) keys are never revoked. Optional.
+   *
+   * @param signingKey The principal's signing public key (Ed25519, PEM).
+   * @returns The revoked decryption key ids for that principal.
+   */
+  getRevokedDecryptionKeyIdsForSigningKey?(signingKey: string): Promise<string[]>;
 
   /**
    * Audit / time travel (§8): the head time-travel directory-state node ("now"),

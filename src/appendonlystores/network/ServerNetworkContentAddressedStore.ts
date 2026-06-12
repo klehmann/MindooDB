@@ -47,21 +47,6 @@ export type ServerTier1Evaluator = (
 ) => Promise<AccessDecision>;
 
 /**
- * Server-side read evaluator (read-side of docs/accesscontrol.md). Given the
- * authenticated reader, the store's database, and an entry's cleartext
- * `decryptionKeyId`, returns whether the entry may be delivered to that reader.
- * The verdict is a pure function of admin-signed read policy/rules at server
- * time — no client clock is involved — so a revoked reader is cut off from new
- * data on their very next sync regardless of their local clock. Supplied by the
- * host server; kept as a callback so this transport layer stays decoupled.
- */
-export type ServerReadEvaluator = (
-  principal: { signingKey?: string; username?: string },
-  dbid: string,
-  decryptionKeyId: string
-) => Promise<boolean>;
-
-/**
  * Resolves a wipe-targeted signing key to the id of the admin-signed grant
  * document carrying its remote-wipe directive (docs/accesscontrol.md §6.5), or
  * null if the key is not wipe-targeted. Supplied by the host server from the
@@ -82,6 +67,20 @@ export type ServerDbAccessEvaluator = (
   dbid: string
 ) => Promise<boolean>;
 
+/**
+ * Resolves the per-user revoked decryption-key-id blacklist for the
+ * authenticated principal (docs/accesscontrol.md §13). Derived from the
+ * `acl_keydistribution_` `pullfrom` lists at the directory head. When present,
+ * the server silently omits store entries whose `decryptionKeyId` is revoked
+ * from every read/serve path, and refuses pushes carrying a revoked
+ * `decryptionKeyId`. Supplied by the host server from the directory; kept as a
+ * callback so this transport layer stays decoupled. The `"directory"` store is
+ * never blacklisted (it must always sync so the policy can be read).
+ */
+export type ServerRevokedKeyResolver = (
+  principal: { signingKey?: string }
+) => Promise<Set<string>>;
+
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
 export interface ServerAccessControlOptions {
   /** The trusted-time provider used to stamp receipts on accepted entries (§5, §13). */
@@ -90,13 +89,6 @@ export interface ServerAccessControlOptions {
   witnessDbid?: string;
   /** Tier 1 evaluator; when present, denied pushes are rejected with ACCESS_DENIED. */
   tier1Evaluator?: ServerTier1Evaluator;
-  /**
-   * Read evaluator (read-side). When present, every served entry/metadata/id is
-   * filtered by the reader's read entitlement at server time; disallowed
-   * entries are silently omitted. Absent keeps the legacy behavior (read access
-   * governed by key possession alone).
-   */
-  readEvaluator?: ServerReadEvaluator;
   /**
    * Remote-wipe resolver (§6.5). When present, a wipe-scoped token is served
    * only the admin-signed grant document carrying its directive (on the
@@ -109,6 +101,13 @@ export interface ServerAccessControlOptions {
    * Absent keeps the legacy behavior (any synced database id is accepted).
    */
   dbAccessEvaluator?: ServerDbAccessEvaluator;
+  /**
+   * Per-user revoked-key blacklist resolver (§13). When present, store entries
+   * whose `decryptionKeyId` is revoked for the principal are silently omitted
+   * from reads and rejected on push. Absent keeps unfiltered serving. Never
+   * wired for the `"directory"` store.
+   */
+  revokedKeyResolver?: ServerRevokedKeyResolver;
 }
 
 /**
@@ -136,12 +135,12 @@ export class ServerNetworkContentAddressedStore {
   private witnessDbid?: string;
   /** Optional Tier 1 evaluator; undefined keeps the legacy membership-only check. */
   private tier1Evaluator?: ServerTier1Evaluator;
-  /** Optional read evaluator; undefined keeps key-possession as the only read gate. */
-  private readEvaluator?: ServerReadEvaluator;
   /** Optional remote-wipe resolver; undefined disables wipe-scoped serving. */
   private wipeGrantDocIdResolver?: WipeGrantDocIdResolver;
   /** Optional database-open gate; undefined keeps any-database serving. */
   private dbAccessEvaluator?: ServerDbAccessEvaluator;
+  /** Optional per-user revoked-key blacklist resolver; undefined disables it. */
+  private revokedKeyResolver?: ServerRevokedKeyResolver;
   /** The directory database id, where grant documents live (§6.5). */
   private static readonly DIRECTORY_DB_ID = "directory";
   /**
@@ -182,74 +181,8 @@ export class ServerNetworkContentAddressedStore {
     this.witnessDbid = accessControl?.witnessDbid;
     this.tier1Evaluator = accessControl?.tier1Evaluator;
     this.wipeGrantDocIdResolver = accessControl?.wipeGrantDocIdResolver;
-    this.readEvaluator = accessControl?.readEvaluator;
     this.dbAccessEvaluator = accessControl?.dbAccessEvaluator;
-  }
-
-  /**
-   * Filter a list of entry metadata down to those the reader may receive under
-   * the read policy (read-side of docs/accesscontrol.md). Decisions are
-   * memoized per `decryptionKeyId` within the call, because all entries sharing
-   * a key in this database share a verdict. A no-op when no read evaluator is
-   * wired.
-   */
-  private async filterReadableMetas<T extends StoreEntryMetadata>(
-    principal: { signingKey?: string; username?: string },
-    metas: T[],
-  ): Promise<T[]> {
-    if (!this.readEvaluator || metas.length === 0) return metas;
-    const dbid = this.witnessDbid ?? this.localStore.getId();
-    const decisionByKey = new Map<string, boolean>();
-    const out: T[] = [];
-    for (const meta of metas) {
-      const keyId = meta.decryptionKeyId ?? "";
-      let allowed = decisionByKey.get(keyId);
-      if (allowed === undefined) {
-        allowed = await this.readEvaluator(principal, dbid, keyId);
-        decisionByKey.set(keyId, allowed);
-      }
-      if (allowed) out.push(meta);
-    }
-    return out;
-  }
-
-  /**
-   * Resolve the entry ids a reader may receive from a candidate id list, by
-   * looking up each id's `decryptionKeyId` and applying the read evaluator.
-   * Used by id-only endpoints (`getAllIds`, `hasEntries`).
-   */
-  private async filterReadableIds(
-    principal: { signingKey?: string; username?: string },
-    ids: string[],
-  ): Promise<string[]> {
-    if (!this.readEvaluator || ids.length === 0) return ids;
-    const dbid = this.witnessDbid ?? this.localStore.getId();
-    const decisionByKey = new Map<string, boolean>();
-    const out: string[] = [];
-    for (const id of ids) {
-      const meta = await this.localStore.getEntryMetadata(id);
-      if (!meta) continue;
-      const keyId = meta.decryptionKeyId ?? "";
-      let allowed = decisionByKey.get(keyId);
-      if (allowed === undefined) {
-        allowed = await this.readEvaluator(principal, dbid, keyId);
-        decisionByKey.set(keyId, allowed);
-      }
-      if (allowed) out.push(id);
-    }
-    return out;
-  }
-
-  /**
-   * Build the read-gate principal from a validated token. The read evaluator
-   * prefers the authenticated device signing key (resolving identity from the
-   * grant's `identity_hashes` bundle without any cleartext name) and falls back
-   * to the `sub` username for legacy tokens that carry no device key.
-   */
-  private readPrincipal(
-    payload: NetworkAuthTokenPayload,
-  ): { signingKey?: string; username?: string } {
-    return { signingKey: payload.deviceSigningKey, username: payload.sub };
+    this.revokedKeyResolver = accessControl?.revokedKeyResolver;
   }
 
   /**
@@ -296,6 +229,59 @@ export class ServerNetworkContentAddressedStore {
     }
     const metas = await this.localStore.findNewEntriesForDoc([], grantDocId);
     return new Set(metas.map((m) => m.id));
+  }
+
+  /**
+   * The authenticated principal used for blacklist resolution: the device
+   * signing public key carried by the token (§13).
+   */
+  private readPrincipal(payload: NetworkAuthTokenPayload): { signingKey?: string } {
+    return { signingKey: payload.deviceSigningKey };
+  }
+
+  /**
+   * The set of revoked decryption key ids for the request's principal (§13), or
+   * `null` when the blacklist is disabled (no resolver) or this is the directory
+   * store (never blacklisted, so its policy can always be read). Resolved once
+   * per request and reused across the per-entry filter.
+   */
+  private async resolveRevokedKeyIds(
+    payload: NetworkAuthTokenPayload,
+  ): Promise<Set<string> | null> {
+    if (!this.revokedKeyResolver) return null;
+    if (this.localStore.getId() === ServerNetworkContentAddressedStore.DIRECTORY_DB_ID) {
+      return null;
+    }
+    return this.revokedKeyResolver(this.readPrincipal(payload));
+  }
+
+  /** Drop metadata whose `decryptionKeyId` is in the revoked set (§13). */
+  private filterMetasByRevokedKeys<T extends { decryptionKeyId?: string }>(
+    metas: T[],
+    revoked: Set<string> | null,
+  ): T[] {
+    if (!revoked || revoked.size === 0) return metas;
+    return metas.filter((m) => !m.decryptionKeyId || !revoked.has(m.decryptionKeyId));
+  }
+
+  /**
+   * Drop ids whose entry `decryptionKeyId` is revoked (§13). Resolves each id's
+   * metadata from the local store; ids with no resolvable metadata are kept
+   * (they carry no revocable key).
+   */
+  private async filterIdsByRevokedKeys(
+    ids: string[],
+    revoked: Set<string> | null,
+  ): Promise<string[]> {
+    if (!revoked || revoked.size === 0) return ids;
+    const kept: string[] = [];
+    for (const id of ids) {
+      const meta = await this.localStore.getEntryMetadata(id);
+      if (!meta?.decryptionKeyId || !revoked.has(meta.decryptionKeyId)) {
+        kept.push(id);
+      }
+    }
+    return kept;
   }
 
   /**
@@ -363,7 +349,8 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
-    return this.filterReadableMetas(this.readPrincipal(tokenPayload), scoped);
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    return this.filterMetasByRevokedKeys(scoped, revoked);
   }
 
   /**
@@ -392,7 +379,8 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
-    return this.filterReadableMetas(this.readPrincipal(tokenPayload), scoped);
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    return this.filterMetasByRevokedKeys(scoped, revoked);
   }
 
   /**
@@ -426,7 +414,8 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? entries.filter((e) => allowed.has(e.id)) : entries;
-    return this.filterReadableMetas(this.readPrincipal(tokenPayload), scoped);
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    return this.filterMetasByRevokedKeys(scoped, revoked);
   }
 
   /**
@@ -470,12 +459,14 @@ export class ServerNetworkContentAddressedStore {
       Math.min(requestedLimit, ServerNetworkContentAddressedStore.MAX_SCAN_PAGE_SIZE),
     );
 
+    // Per-user revoked-key blacklist (§13): silently omit revoked entries from
+    // the page. Filtering after paging only shrinks a page; the store's own
+    // cursor still advances so the client keeps making progress.
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+
     if (this.localStore.scanEntriesSince) {
       const result = await this.localStore.scanEntriesSince(cursor, effectiveLimit, filters);
-      return {
-        ...result,
-        entries: await this.filterReadableMetas(this.readPrincipal(tokenPayload), result.entries),
-      };
+      return { ...result, entries: this.filterMetasByRevokedKeys(result.entries, revoked) };
     }
 
     // Fallback: emulate cursor scan using existing metadata query.
@@ -519,7 +510,7 @@ export class ServerNetworkContentAddressedStore {
     const page = sorted.slice(startIndex, startIndex + max);
     const last = page.length > 0 ? page[page.length - 1] : null;
     return {
-      entries: await this.filterReadableMetas(this.readPrincipal(tokenPayload), page),
+      entries: this.filterMetasByRevokedKeys(page, revoked),
       nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
       hasMore: startIndex + page.length < sorted.length,
     };
@@ -640,14 +631,16 @@ export class ServerNetworkContentAddressedStore {
     const entries = await this.localStore.getEntries(requestedIds);
     this.logger.debug(`Retrieved ${entries.length} entries from local store`);
 
-    // Read gate: omit entries the reader is not entitled to under the read
-    // policy (read-side of docs/accesscontrol.md). StoreEntry extends
-    // StoreEntryMetadata, so the same filter applies.
-    const readable = await this.filterReadableMetas(this.readPrincipal(tokenPayload), entries);
+    // Per-user revoked-key blacklist (§13): fail-closed on the data-serving
+    // path. Even if a client already knows a revoked entry's id, the server
+    // never hands back its bytes. A StoreEntry carries its own decryptionKeyId,
+    // so we filter without an extra metadata lookup.
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    const servableEntries = this.filterMetasByRevokedKeys(entries, revoked);
 
     // Encrypt each entry with the user's RSA public key
     const encryptedEntries = await this.encryptEntriesForUser(
-      readable,
+      servableEntries,
       encryptionPublicKey
     );
     
@@ -670,8 +663,13 @@ export class ServerNetworkContentAddressedStore {
     }
     const meta = await this.localStore.getEntryMetadata(id);
     if (!meta) return null;
-    const readable = await this.filterReadableMetas(this.readPrincipal(tokenPayload), [meta]);
-    return readable.length > 0 ? meta : null;
+    // Per-user revoked-key blacklist (§13): fail-closed — never reveal metadata
+    // for a revoked entry.
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    if (revoked && meta.decryptionKeyId && revoked.has(meta.decryptionKeyId)) {
+      return null;
+    }
+    return meta;
   }
 
   /**
@@ -695,6 +693,12 @@ export class ServerNetworkContentAddressedStore {
         "Device is targeted for remote wipe and may not push entries",
       );
     }
+
+    // Per-user revoked-key blacklist (§13): a revoked key id is also a write
+    // blacklist — the user may neither receive further updates for it nor push
+    // new ones. Resolved once per batch (null for the directory store / when the
+    // blacklist is disabled).
+    const revokedKeyIds = await this.resolveRevokedKeyIds(tokenPayload);
 
     // A single acceptance time for this batch so receipts are consistent and a
     // batch cannot interleave with the witness's own monotonic clock (§5.3).
@@ -726,6 +730,20 @@ export class ServerNetworkContentAddressedStore {
     // it without re-syncing.
     let forceTrustRefresh = true;
     for (const entry of entries) {
+      // Reject a push carrying a revoked decryptionKeyId (§13). The user has
+      // been removed from this key's distribution, so the server refuses to
+      // ingest or propagate further writes under it.
+      if (
+        revokedKeyIds &&
+        entry.decryptionKeyId &&
+        revokedKeyIds.has(entry.decryptionKeyId)
+      ) {
+        throw new NetworkError(
+          NetworkErrorType.ACCESS_DENIED,
+          `Entry ${entry.id} carries a revoked decryptionKeyId and may not be pushed`,
+        );
+      }
+
       // Verify the entry was created by a trusted user (baseline Tier 1).
       const isValidKey = await this.directory.validatePublicSigningKey(
         entry.createdByPublicKey,
@@ -850,7 +868,8 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? existingIds.filter((id) => allowed.has(id)) : existingIds;
-    return this.filterReadableIds(this.readPrincipal(tokenPayload), scoped);
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    return this.filterIdsByRevokedKeys(scoped, revoked);
   }
 
   /**
@@ -873,7 +892,8 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? allIds.filter((id) => allowed.has(id)) : allIds;
-    return this.filterReadableIds(this.readPrincipal(tokenPayload), scoped);
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    return this.filterIdsByRevokedKeys(scoped, revoked);
   }
 
   /**
@@ -906,7 +926,8 @@ export class ServerNetworkContentAddressedStore {
     const resolvedIds = await this.localStore.resolveDependencies(startId, options);
     this.logger.debug(`Resolved ${resolvedIds.length} dependencies`);
     
-    return resolvedIds;
+    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
+    return this.filterIdsByRevokedKeys(resolvedIds, revoked);
   }
 
   async handlePlanDocumentMaterialization(

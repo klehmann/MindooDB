@@ -797,6 +797,98 @@ describe("Network Sync", () => {
       expect(first).toEqual(second);
       expect(getCapabilitiesSpy).toHaveBeenCalledTimes(1);
     });
+
+    // --- Per-user revoked-key blacklist (docs/accesscontrol.md §13.3) ---
+
+    /**
+     * Build an independent server+client pair whose server enforces a fixed
+     * revoked-key set, reusing the describe's user key material. The resolver
+     * ignores the principal (returns the same set for any signing key) so the
+     * test focuses on the per-entry filtering/rejection behaviour.
+     */
+    async function buildBlacklistPair(storeId: string, revoked: string[]) {
+      const factory = new InMemoryContentAddressedStoreFactory();
+      const { docStore } = factory.createStore(storeId);
+      const dir = new MockTenantDirectory();
+      dir.addUser("testuser", userSigningPublicKeyPem, userEncryptionPublicKeyPem);
+      const auth = new AuthenticationService(cryptoAdapter, dir, "test-tenant");
+      const handler = new ServerNetworkContentAddressedStore(
+        docStore,
+        dir,
+        auth,
+        cryptoAdapter,
+        undefined,
+        { revokedKeyResolver: async () => new Set(revoked) },
+      );
+      const transport = new MockNetworkTransport(handler);
+      const client = new ClientNetworkContentAddressedStore(
+        storeId,
+        StoreKind.docs,
+        transport,
+        cryptoAdapter,
+        "testuser",
+        userSigningKeyPair.privateKey,
+        userEncryptionPrivateKeyPem,
+      );
+      return { docStore, client };
+    }
+
+    const NO_SIG = new Uint8Array([1, 2, 3, 4]);
+
+    test("silently omits entries whose decryptionKeyId is revoked on pull", async () => {
+      const { docStore, client } = await buildBlacklistPair("test-db", ["revoked-key"]);
+      await docStore.putEntries([
+        createMockEntry("doc1", "keep", 1000, [], "mock-public-key", NO_SIG, "default"),
+      ]);
+      await docStore.putEntries([
+        createMockEntry("doc2", "drop", 2000, [], "mock-public-key", NO_SIG, "revoked-key"),
+      ]);
+
+      const newEntries = await client.findNewEntries([]);
+      expect(newEntries.map((e: StoreEntryMetadata) => e.id)).toEqual(["keep"]);
+
+      expect(await client.getAllIds()).toEqual(["keep"]);
+
+      // Even when the client already knows the revoked id, the server never
+      // hands back its bytes (fail-closed on the data-serving path).
+      const fetched = await client.getEntries(["keep", "drop"]);
+      expect(fetched.map((e: StoreEntry) => e.id)).toEqual(["keep"]);
+
+      // Metadata for a revoked id is withheld too.
+      expect(await client.getEntryMetadata!("drop")).toBeNull();
+      expect((await client.getEntryMetadata!("keep"))?.id).toBe("keep");
+    });
+
+    test("rejects a push carrying a revoked decryptionKeyId", async () => {
+      const { docStore, client } = await buildBlacklistPair("test-db", ["revoked-key"]);
+      const signature = await signMockCiphertext(userSigningKeyPair.privateKey);
+
+      const revokedEntry = createMockEntry(
+        "doc1", "h1", 1000, [], userSigningPublicKeyPem, signature, "revoked-key",
+      );
+      await expect(client.putEntries([revokedEntry])).rejects.toMatchObject({
+        name: "NetworkError",
+        type: NetworkErrorType.ACCESS_DENIED,
+      });
+      expect(await docStore.getAllIds()).toEqual([]);
+
+      // A push under a non-revoked key still succeeds.
+      const okEntry = createMockEntry(
+        "doc1", "h2", 1000, [], userSigningPublicKeyPem, signature, "default",
+      );
+      await client.putEntries([okEntry]);
+      expect(await docStore.getAllIds()).toEqual(["h2"]);
+    });
+
+    test("never blacklists the directory store (its policy must always sync)", async () => {
+      const { docStore, client } = await buildBlacklistPair("directory", ["revoked-key"]);
+      await docStore.putEntries([
+        createMockEntry("doc1", "dir-entry", 1000, [], "mock-public-key", NO_SIG, "revoked-key"),
+      ]);
+      // "revoked-key" is in the set, but the directory store is exempt.
+      const newEntries = await client.findNewEntries([]);
+      expect(newEntries.map((e: StoreEntryMetadata) => e.id)).toEqual(["dir-entry"]);
+    });
   });
 
   describe("Sync-Based Usage (Local + Remote Stores)", () => {
@@ -1029,7 +1121,8 @@ function createMockEntry(
   createdAt: number,
   deps: string[] = [],
   createdByPublicKey: string = "mock-public-key",
-  signature: Uint8Array = new Uint8Array([1, 2, 3, 4])
+  signature: Uint8Array = new Uint8Array([1, 2, 3, 4]),
+  decryptionKeyId: string = "default"
 ): StoreEntry {
   const encryptedData = MOCK_ENCRYPTED_DATA;
   // Real content hash so the server's integrity check accepts the entry.
@@ -1042,7 +1135,7 @@ function createMockEntry(
     dependencyIds: deps,
     createdAt,
     createdByPublicKey,
-    decryptionKeyId: "default",
+    decryptionKeyId,
     signature,
     originalSize: 3, // Simulated original size
     encryptedSize: encryptedData.length,

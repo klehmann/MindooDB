@@ -26,6 +26,7 @@ import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
+import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
@@ -91,6 +92,14 @@ export class BaseMindooTenant implements MindooTenant {
   private decryptedUserSigningKeyCache?: CryptoKey;
   private decryptedUserEncryptionKeyCache?: CryptoKey;
   private logger: Logger;
+
+  // Single-flight guard for SDK-driven key-distribution reconcile (§13). The
+  // reconcile driver itself calls getDirectoryDB / updateUnifiedCache /
+  // syncStoreChanges, any of which can re-enter a trigger; this flag keeps the
+  // run-always trigger (directory bring-up + after each directory pull) from
+  // recursing or overlapping. Reconcile is idempotent, so a skipped overlap is
+  // harmless — the next trigger re-runs it.
+  private reconcileInFlight = false;
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -1460,6 +1469,38 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   /**
+   * Inject an already-unlocked RSA-OAEP encryption private key for the current
+   * user, priming the same cache {@link getDecryptedEncryptionKey} uses. Hosts
+   * that create the tenant password-less (e.g. Haven, which holds the unlocked
+   * key in its session rather than a password) call this so SDK-driven KeyBag
+   * reconcile can unwrap pushed key versions (docs/accesscontrol.md §13).
+   */
+  setSessionEncryptionKey(cryptoKey: CryptoKey): void {
+    this.decryptedUserEncryptionKeyCache = cryptoKey;
+  }
+
+  /**
+   * The RSA-OAEP encryption private key used by KeyBag reconcile to unwrap
+   * pushed key versions. Returns the injected/cached session key when present,
+   * else derives it from the current user password. Returns `null` when neither
+   * is available (a locked, password-less host) so reconcile can skip its import
+   * pass without throwing — the revoke pass needs no key and still runs.
+   */
+  async getEncryptionPrivateKeyForReconcile(): Promise<CryptoKey | null> {
+    if (this.decryptedUserEncryptionKeyCache) {
+      return this.decryptedUserEncryptionKeyCache;
+    }
+    try {
+      return await this.getDecryptedEncryptionKey();
+    } catch (error) {
+      this.logger.debug(
+        `getEncryptionPrivateKeyForReconcile: no encryption key available (locked host): ${error}`,
+      );
+      return null;
+    }
+  }
+
+  /**
    * Internal method to decrypt a private key using password-based key derivation.
    * Protected so that BaseMindooTenantDirectory can access it.
    * 
@@ -1594,11 +1635,10 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   /**
-   * Remove a **named** document key from the local KeyBag (read-side
-   * crypto-shred on read-entitlement loss). Refuses to delete the shared tenant
-   * default key (`"default"` / {@link DEFAULT_TENANT_KEY_ID}), which is required
-   * for the tenant to function and is not a fine-grained read-scoping key.
-   * Returns true if a key was removed.
+   * Remove a **named** document key from the local KeyBag. Refuses to delete the
+   * shared tenant default key (`"default"` / {@link DEFAULT_TENANT_KEY_ID}),
+   * which is required for the tenant to function. Returns true if a key was
+   * removed.
    */
   async removeNamedDecryptionKey(decryptionKeyId: string): Promise<boolean> {
     if (decryptionKeyId === "default" || decryptionKeyId === DEFAULT_TENANT_KEY_ID) {
@@ -1612,6 +1652,94 @@ export class BaseMindooTenant implements MindooTenant {
     } catch (error) {
       this.logger.warn(`removeNamedDecryptionKey: failed to delete key ${decryptionKeyId}: ${error}`);
       return false;
+    }
+  }
+
+  /**
+   * Reconcile the local KeyBag against the directory head for the current user
+   * (docs/accesscontrol.md §13). SDK-driven so standalone apps using the
+   * `mindoodb` package get key distribution/revocation automatically after a
+   * directory sync — not just the Haven UI. Two independent passes:
+   *
+   *  - **Revoke (no key required):** bulk-remove every revoked key id (from the
+   *    directory head cache) from the bag. Idempotent and a no-op when the bag
+   *    does not hold the key, so it also re-cleans a restored older KeyBag
+   *    backup on every run. The `deleteKey` mutation drives visibility
+   *    reconciliation (forgetting now-inaccessible docs) and emits
+   *    `keyBag.onChanges` so the host can persist the cleaned bag.
+   *  - **Import (needs the encryption private key):** unwrap and merge the key
+   *    versions pushed to this user. Skipped with a debug log when the host is
+   *    locked (no session key / password); the revoke pass still ran.
+   *
+   * Best-effort and idempotent; safe to call on every directory bring-up / pull.
+   * Returns the key ids imported and removed.
+   */
+  async reconcileKeyDistributionsForCurrentUser(): Promise<{
+    imported: string[];
+    removed: string[];
+  }> {
+    const username = this.currentUser.username;
+    const directory = await this.openDirectory();
+    const removed: string[] = [];
+    const imported: string[] = [];
+
+    // Revoke pass — no key, no comparison, idempotent.
+    if (typeof directory.getRevokedDecryptionKeyIdsForUser === "function") {
+      let revokedIds: string[] = [];
+      try {
+        revokedIds = await directory.getRevokedDecryptionKeyIdsForUser(username);
+      } catch (error) {
+        this.logger.warn(
+          `reconcileKeyDistributionsForCurrentUser: revoked-id lookup failed: ${error}`,
+        );
+      }
+      for (const keyId of revokedIds) {
+        if (await this.removeNamedDecryptionKey(keyId)) {
+          removed.push(keyId);
+        }
+      }
+    }
+
+    // Import pass — sources the encryption private key from this tenant. The
+    // directory exposes this only via the internal KeyBagReconciler contract,
+    // so the key is never passed across the public directory API.
+    const reconciler = directory as unknown as Partial<KeyBagReconciler>;
+    if (typeof reconciler.reconcileImportedKeysForCurrentUser === "function") {
+      try {
+        const result = await reconciler.reconcileImportedKeysForCurrentUser(username);
+        imported.push(...result.imported);
+        for (const id of result.removed) {
+          if (!removed.includes(id)) removed.push(id);
+        }
+      } catch (error) {
+        this.logger.warn(
+          `reconcileKeyDistributionsForCurrentUser: import pass failed: ${error}`,
+        );
+      }
+    }
+
+    return { imported, removed };
+  }
+
+  /**
+   * Single-flight, best-effort wrapper around
+   * {@link reconcileKeyDistributionsForCurrentUser} for the run-always trigger
+   * (docs/accesscontrol.md §13). Fired on directory bring-up and after every
+   * directory pull. Never throws and never blocks sync: a reconcile error is
+   * logged and swallowed. The in-flight guard prevents the driver's own
+   * directory access from re-triggering it.
+   */
+  async reconcileKeyDistributionsForCurrentUserSafe(): Promise<void> {
+    if (this.reconcileInFlight) {
+      return;
+    }
+    this.reconcileInFlight = true;
+    try {
+      await this.reconcileKeyDistributionsForCurrentUser();
+    } catch (error) {
+      this.logger.warn(`reconcileKeyDistributionsForCurrentUserSafe: ${error}`);
+    } finally {
+      this.reconcileInFlight = false;
     }
   }
 
@@ -1684,6 +1812,81 @@ export class BaseMindooTenant implements MindooTenant {
       await this.reconcileKeyBagChanges();
     }
     return importedCount;
+  }
+
+  /** SHA-256 hex of raw key bytes — the stable version fingerprint used by key distribution. */
+  async fingerprintKeyBytes(bytes: Uint8Array): Promise<string> {
+    const subtle = this.getCryptoAdapter().getSubtle();
+    const digest = await subtle.digest("SHA-256", bytes as unknown as BufferSource);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  /**
+   * All stored versions of a document key with their raw bytes, `createdAt`, and
+   * SHA-256 fingerprint (newest first). The source of truth for a key
+   * distribution's `keyVersions` manifest and per-device wrapping. Empty when the
+   * caller's KeyBag lacks the key.
+   */
+  async fingerprintKeyVersions(
+    keyId: string,
+  ): Promise<Array<{ bytes: Uint8Array; createdAt: number; fingerprint: string }>> {
+    const id = keyId === "default" ? DEFAULT_TENANT_KEY_ID : keyId;
+    const versions = await this.keyBag.getAllKeyVersions("doc", this.tenantId, id);
+    const result: Array<{ bytes: Uint8Array; createdAt: number; fingerprint: string }> = [];
+    for (const v of versions) {
+      result.push({
+        bytes: v.key,
+        createdAt: v.createdAt ?? 0,
+        fingerprint: await this.fingerprintKeyBytes(v.key),
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Remove exactly the key versions of `keyId` whose raw-bytes fingerprint is in
+   * `fingerprints` (version-scoped `pullfrom` revocation). Versions obtained
+   * elsewhere — i.e. not in the distribution manifest — survive. Refuses the
+   * protected tenant default / `$publicinfos` keys. The KeyBag change feed
+   * triggers visibility reconciliation (scope purge when nothing remains).
+   * Returns the number of versions removed.
+   */
+  async removeDecryptionKeyVersionsByFingerprint(
+    keyId: string,
+    fingerprints: string[],
+  ): Promise<number> {
+    if (keyId === "default" || keyId === DEFAULT_TENANT_KEY_ID || keyId === PUBLIC_INFOS_KEY_ID) {
+      this.logger.debug(`removeDecryptionKeyVersionsByFingerprint: refusing protected key ${keyId}`);
+      return 0;
+    }
+    const target = new Set(fingerprints);
+    if (target.size === 0) return 0;
+    const id = keyId === "default" ? DEFAULT_TENANT_KEY_ID : keyId;
+    let removed = 0;
+    // Re-read versions each pass: deleteKeyVersion is index-based against the
+    // current sorted list, which shifts as entries are removed.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const versions = await this.keyBag.getAllKeyVersions("doc", this.tenantId, id);
+      let removedThisPass = false;
+      for (let index = 0; index < versions.length; index++) {
+        const fp = await this.fingerprintKeyBytes(versions[index].key);
+        if (target.has(fp)) {
+          await this.keyBag.deleteKeyVersion("doc", this.tenantId, id, index);
+          removed++;
+          removedThisPass = true;
+          break;
+        }
+      }
+      if (!removedThisPass) break;
+    }
+    if (removed > 0) {
+      this.invalidateDecryptedKeyCaches();
+      await this.reconcileKeyBagChanges();
+    }
+    return removed;
   }
 
   /** Clear in-memory decrypted-key caches after a KeyBag mutation. */

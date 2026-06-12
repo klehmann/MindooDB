@@ -23,7 +23,7 @@ import { join, resolve, sep } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
-import type { ServerTier1Evaluator, ServerReadEvaluator, ServerDbAccessEvaluator } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import { Ed25519WitnessProvider } from "../../core/accesscontrol/timestamp/Ed25519WitnessProvider";
@@ -45,7 +45,6 @@ import type {
   DirectoryUserLookup,
   GrantKeyPairInfo,
 } from "../../core/types";
-import type { AccessDecision } from "../../core/accesscontrol/types";
 import { PUBLIC_INFOS_KEY_ID } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
 
@@ -210,8 +209,7 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
         | "getUserSigningKeyUniverse"
         | "getUserKeyPairs"
         | "getWipeGrantDocId"
-        | "evaluateReadAccessForUser"
-        | "evaluateReadAccessForSigningKey">>
+        | "getRevokedDecryptionKeyIdsForSigningKey">>
       & Partial<Pick<BaseMindooTenantDirectory, "evaluateDbAccessForSigningKey">>,
     private trustedServers: TrustedServer[],
     private adminBootstrapIdentity?: {
@@ -366,30 +364,11 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     return null;
   }
 
-  async evaluateReadAccessForUser(input: {
-    username: string;
-    dbid: string;
-    decryptionKeyId: string;
-    at?: number;
-  }): Promise<AccessDecision> {
-    if (typeof this.inner.evaluateReadAccessForUser === "function") {
-      return this.inner.evaluateReadAccessForUser(input);
+  async getRevokedDecryptionKeyIdsForSigningKey(signingKey: string): Promise<string[]> {
+    if (typeof this.inner.getRevokedDecryptionKeyIdsForSigningKey === "function") {
+      return this.inner.getRevokedDecryptionKeyIdsForSigningKey(signingKey);
     }
-    // Config-based directories never carry read policies -> unrestricted.
-    return { allowed: true, reason: "read access control not enabled", tier: "tier1" };
-  }
-
-  async evaluateReadAccessForSigningKey(input: {
-    signingKey: string;
-    dbid: string;
-    decryptionKeyId: string;
-    at?: number;
-  }): Promise<AccessDecision> {
-    if (typeof this.inner.evaluateReadAccessForSigningKey === "function") {
-      return this.inner.evaluateReadAccessForSigningKey(input);
-    }
-    // Config-based directories never carry read policies -> unrestricted.
-    return { allowed: true, reason: "read access control not enabled", tier: "tier1" };
+    return [];
   }
 
   async evaluateDbAccessForSigningKey(input: {
@@ -939,15 +918,14 @@ export class TenantManager {
     const directory = tenant.directory as unknown as MindooTenantDirectory;
     const tier1Evaluator = this.buildTier1Evaluator(directory, localStore);
     const wipeGrantDocIdResolver = this.buildWipeGrantDocIdResolver(directory);
-    // Read gate is never applied to the directory store itself: every
-    // participant must always be able to sync grants, policies, groups and read
-    // rules, otherwise read access could never be evaluated at all.
-    const readEvaluator =
-      dbId === "directory" ? undefined : this.buildReadEvaluator(directory);
     // Database-open gate (directory-restricted policy). Never applied to the
     // directory store itself, which must always sync so the policy can be read.
     const dbAccessEvaluator =
       dbId === "directory" ? undefined : this.buildDbAccessEvaluator(directory);
+    // Per-user revoked-key blacklist (§13). Never applied to the directory store
+    // itself (its policy, which defines the blacklist, must always sync).
+    const revokedKeyResolver =
+      dbId === "directory" ? undefined : this.buildRevokedKeyResolver(directory);
 
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
@@ -960,8 +938,8 @@ export class TenantManager {
         witnessDbid: dbId,
         tier1Evaluator,
         wipeGrantDocIdResolver,
-        readEvaluator,
         dbAccessEvaluator,
+        revokedKeyResolver,
       },
     );
 
@@ -1016,9 +994,6 @@ export class TenantManager {
         signingKey: entry.createdByPublicKey,
         trustedTime,
         isAuthor,
-        // Cleartext metadata the witness already holds; enables the create-key
-        // allowlist gate to be enforced at push time (Tier 1).
-        decryptionKeyId: entry.decryptionKeyId,
       });
     };
   }
@@ -1050,57 +1025,6 @@ export class TenantManager {
   }
 
   /**
-   * Build a read evaluator closure for a data server store, or undefined when
-   * the directory cannot evaluate read access (read-side of
-   * docs/accesscontrol.md). The closure resolves the reader's identity at
-   * server time and returns whether an entry with the given cleartext
-   * `decryptionKeyId` may be delivered. Failures fail-closed (deny) so a
-   * transient directory error never leaks data past a deny policy.
-   */
-  private buildReadEvaluator(
-    directory: MindooTenantDirectory,
-  ): ServerReadEvaluator | undefined {
-    const evaluable = directory as unknown as {
-      evaluateReadAccessForUser?: BaseMindooTenantDirectory["evaluateReadAccessForUser"];
-      evaluateReadAccessForSigningKey?: BaseMindooTenantDirectory["evaluateReadAccessForSigningKey"];
-    };
-    const hasKeyEval = typeof evaluable.evaluateReadAccessForSigningKey === "function";
-    const hasUserEval = typeof evaluable.evaluateReadAccessForUser === "function";
-    if (!hasKeyEval && !hasUserEval) {
-      return undefined;
-    }
-    return async (principal, dbid, decryptionKeyId) => {
-      try {
-        // Prefer the key-based gate: it resolves identity from the grant's
-        // `identity_hashes` bundle without any cleartext username
-        // (docs/accesscontrol.md §6.5). Fall back to the username path only for
-        // legacy tokens that carry no device signing key.
-        if (hasKeyEval && principal.signingKey) {
-          const decision = await evaluable.evaluateReadAccessForSigningKey!({
-            signingKey: principal.signingKey,
-            dbid,
-            decryptionKeyId,
-          });
-          return decision.allowed;
-        }
-        if (hasUserEval && principal.username) {
-          const decision = await evaluable.evaluateReadAccessForUser!({
-            username: principal.username,
-            dbid,
-            decryptionKeyId,
-          });
-          return decision.allowed;
-        }
-        // Neither identifier resolvable -> fail-closed.
-        return false;
-      } catch {
-        // Fail-closed: if the read policy cannot be evaluated, do not deliver.
-        return false;
-      }
-    };
-  }
-
-  /**
    * Build a remote-wipe resolver closure for a server store, or undefined when
    * the directory does not support wipe directives (docs/accesscontrol.md §6.5).
    * Maps a wipe-targeted signing key to the admin-signed grant document id so
@@ -1113,6 +1037,27 @@ export class TenantManager {
       return undefined;
     }
     return (signingKey: string) => directory.getWipeGrantDocId!(signingKey);
+  }
+
+  /**
+   * Build a per-user revoked-key blacklist resolver for a server store, or
+   * undefined when the directory cannot resolve revoked keys (e.g. a
+   * config-based directory). Maps the authenticated principal's signing key to
+   * the set of decryption key ids revoked for them at the directory head
+   * (docs/accesscontrol.md §13).
+   */
+  private buildRevokedKeyResolver(
+    directory: MindooTenantDirectory,
+  ): ServerRevokedKeyResolver | undefined {
+    if (typeof directory.getRevokedDecryptionKeyIdsForSigningKey !== "function") {
+      return undefined;
+    }
+    return async (principal) => {
+      const ids = await directory.getRevokedDecryptionKeyIdsForSigningKey!(
+        principal.signingKey ?? "",
+      );
+      return new Set(ids);
+    };
   }
 
   async getStore(tenantId: string, dbId: string, storeKind: StoreKind): Promise<ContentAddressedStore> {
