@@ -114,7 +114,7 @@ describe("client write-policy prechecks (§9)", () => {
     await aclDir.setDefaultAccessPolicy({}, admin.userSigningKeyPair.privateKey, adminPassword);
     await aclDir.setDatabaseAccessPolicy(
       "crm",
-      { denyDocCreate: true, denyDocChange: true, denyDocDelete: true },
+      { denyDocCreate: true, denyDocChange: true, denyDocDelete: true, denyDocUndelete: true },
       admin.userSigningKeyPair.privateKey,
       adminPassword,
     );
@@ -144,6 +144,11 @@ describe("client write-policy prechecks (§9)", () => {
     );
     await aclDir.createAccessRule(
       { ruleId: "crm_delete_by_author", type: "doc_delete", dbid: "crm", action: "allow", users_hashes: ["$author"] },
+      admin.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+    await aclDir.createAccessRule(
+      { ruleId: "crm_undelete_by_author", type: "doc_undelete", dbid: "crm", action: "allow", users_hashes: ["$author"] },
       admin.userSigningKeyPair.privateKey,
       adminPassword,
     );
@@ -294,5 +299,12 @@ describe("client write-policy prechecks (§9)", () => {
     const deleteByAlice = await crm.canDelete(doc, aliceSigning);
     expect(deleteByAlice.allowed).toBe(true);
     expect(deleteByAlice.matchedRuleId).toBe("crm_delete_by_author");
+
+    const undeleteByBob = await crm.canUndelete(doc, bobSigning);
+    expect(undeleteByBob.allowed).toBe(false);
+
+    const undeleteByAlice = await crm.canUndelete(doc, aliceSigning);
+    expect(undeleteByAlice.allowed).toBe(true);
+    expect(undeleteByAlice.matchedRuleId).toBe("crm_undelete_by_author");
   }, 90000);
 });

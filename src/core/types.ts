@@ -4133,6 +4133,18 @@ export interface MindooDB {
   ): Promise<AccessDecision>;
 
   /**
+   * Predict whether undeleting `doc` via `undeleteDocument` would be allowed by
+   * the active write policy, without writing.
+   *
+   * @param doc The document that would be undeleted.
+   * @param signingKeyPair Optional custom signing key (matches `undeleteDocument`).
+   */
+  canUndelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair
+  ): Promise<AccessDecision>;
+
+  /**
    * Apply granular text edits at a document path.
    *
    * If `baseHeads` is provided, edits are applied at that historical Automerge

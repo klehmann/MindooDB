@@ -8869,6 +8869,30 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Predict whether undeleting `doc` via {@link undeleteDocument} would be
+   * allowed by the active write policy, without writing anything.
+   */
+  async canUndelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair,
+  ): Promise<AccessDecision> {
+    const docId = doc.getId();
+    const signerKey = signingKeyPair
+      ? signingKeyPair.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const creatorKey = await this.resolveCreatorSigningKey(docId);
+    const current = doc.getData() as unknown as Record<string, unknown>;
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_undelete",
+      signerKey,
+      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      getBeforeDoc: () => current,
+      getAfterDoc: () => current,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
    * Resolve the signing public key of the document's original creator (the
    * `doc_create` entry's `createdByPublicKey`), used to set `$author`
    * (`isAuthor`) for the client write prechecks on change/delete/undelete.

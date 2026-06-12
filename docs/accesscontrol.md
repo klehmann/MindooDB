@@ -1129,6 +1129,7 @@ canCreate(options?: CreateOptions): Promise<AccessDecision>;
 canChange(doc: MindooDoc, candidateAfter: Record<string, unknown>,
           signingKeyPair?: SigningKeyPair): Promise<AccessDecision>;
 canDelete(doc: MindooDoc, signingKeyPair?: SigningKeyPair): Promise<AccessDecision>;
+canUndelete(doc: MindooDoc, signingKeyPair?: SigningKeyPair): Promise<AccessDecision>;
 ```
 
 Note on custom-id documents: they cannot take `initialValues` (their first change
