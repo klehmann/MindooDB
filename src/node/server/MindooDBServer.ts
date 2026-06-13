@@ -22,6 +22,7 @@ import rateLimit from "express-rate-limit";
 import type {
   StoreEntry,
   StoreEntryMetadata,
+  StoreEntryAttachmentRef,
   StoreEntryType,
   StoreScanCursor,
   StoreScanFilters,
@@ -126,6 +127,9 @@ interface SerializedEntryMetadata {
   receivedAt?: number;
   receivedByPublicKey?: string;
   receivedDateSignature?: string; // base64
+  // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
+  // Must round-trip so metadataSignature verification succeeds on ingest.
+  attachmentRefs?: StoreEntryAttachmentRef[];
   // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
   entryVersion?: number;
 }
@@ -1835,6 +1839,7 @@ export class MindooDBServer {
       receivedDateSignature: metadata.receivedDateSignature
         ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
         : undefined,
+      attachmentRefs: metadata.attachmentRefs,
       entryVersion: metadata.entryVersion,
     };
   }
@@ -1863,6 +1868,7 @@ export class MindooDBServer {
       receivedDateSignature: serialized.receivedDateSignature
         ? this.base64ToUint8Array(serialized.receivedDateSignature)
         : undefined,
+      attachmentRefs: serialized.attachmentRefs,
       entryVersion: serialized.entryVersion,
       encryptedData: this.base64ToUint8Array(serialized.encryptedData),
     };

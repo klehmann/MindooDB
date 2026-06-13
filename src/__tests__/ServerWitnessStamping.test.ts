@@ -372,5 +372,35 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       await expect(server.handlePutEntries("token", [legacy])).resolves.toHaveLength(1);
       expect(await localStore.getAllIds()).toContain(legacy.id);
     });
+
+    it("accepts and stores an attachment-bearing entry whose attachmentRefs are bound", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      const e = await makeEntry({
+        attachmentRefs: [
+          { attachmentId: "att-1", lastChunkId: "doc7_a_f_c1", size: 100 },
+          { attachmentId: "att-2", lastChunkId: "doc7_a_g_c2", size: 200 },
+        ],
+      });
+      await expect(server.handlePutEntries("token", [e])).resolves.toHaveLength(1);
+      const [stored] = await localStore.getEntries([e.id]);
+      // The signed attachment snapshot survives the server storage path.
+      expect(stored.attachmentRefs).toEqual(e.attachmentRefs);
+    });
+
+    it("rejects an entry whose attachmentRefs were tampered after signing", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      const e = await makeEntry({
+        attachmentRefs: [{ attachmentId: "att-1", lastChunkId: "doc7_a_f_c1", size: 100 }],
+      });
+      // Rewrite a referenced chunk without re-signing: metadataSignature no longer matches.
+      const tampered = {
+        ...e,
+        attachmentRefs: [{ attachmentId: "att-1", lastChunkId: "doc7_a_f_evil", size: 100 }],
+      } as StoreEntry;
+      await expect(server.handlePutEntries("token", [tampered])).rejects.toBeInstanceOf(NetworkError);
+      expect(await localStore.getAllIds()).toHaveLength(0);
+    });
   });
 });

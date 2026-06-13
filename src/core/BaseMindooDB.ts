@@ -33,6 +33,7 @@ import {
   MindooDocPayload,
   StoreEntry,
   StoreEntryMetadata,
+  StoreEntryAttachmentRef,
   StoreEntryType,
   CURRENT_STORE_ENTRY_VERSION,
   MindooTenant,
@@ -1138,6 +1139,7 @@ export class BaseMindooDB implements MindooDB {
       | "dependencyIds"
       | "contentHash"
       | "createdByPublicKey"
+      | "attachmentRefs"
     >,
     signing?: { signingKeyPair?: SigningKeyPair; signingKeyPassword?: string },
   ): Promise<Uint8Array> {
@@ -1146,6 +1148,30 @@ export class BaseMindooDB implements MindooDB {
       return this.tenant.signPayloadWithKey(bytes, signing.signingKeyPair, signing.signingKeyPassword);
     }
     return this.tenant.signPayload(bytes);
+  }
+
+  /**
+   * Collect the full set of attachment references a document holds right now,
+   * for the signed {@link StoreEntryMetadata.attachmentRefs} snapshot.
+   *
+   * Refs are sorted by `attachmentId` to give a canonical, deterministic order
+   * so the bytes signed by the writer match the bytes a verifier reconstructs
+   * (see crypto/EntrySignature.ts). Reads the merged `_attachments` array, so
+   * additions, removals, and appends are all reflected.
+   */
+  private collectAttachmentRefs(
+    doc: AutomergeTypes.Doc<MindooDocPayload> | MindooDocPayload,
+  ): StoreEntryAttachmentRef[] {
+    const atts = ((doc as MindooDocPayload)._attachments as AttachmentReference[] | undefined) ?? [];
+    return atts
+      .map((a) => ({
+        attachmentId: a.attachmentId,
+        lastChunkId: a.lastChunkId,
+        size: a.size,
+      }))
+      .sort((x, y) =>
+        x.attachmentId < y.attachmentId ? -1 : x.attachmentId > y.attachmentId ? 1 : 0,
+      );
   }
 
   /**
@@ -2903,6 +2929,10 @@ export class BaseMindooDB implements MindooDB {
     // change/delete operations don't need a metadata scan.
     this.creatorKeyCache.set(docId, createdByPublicKey);
 
+    // Snapshot of attachments referenced by the freshly created doc (normally
+    // empty; the public create API does not add attachments inline).
+    const createAttachmentRefs = this.collectAttachmentRefs(newDoc);
+
     // Create entry metadata
     const entryMetadata: StoreEntryMetadata = {
       entryType: "doc_create",
@@ -2916,6 +2946,7 @@ export class BaseMindooDB implements MindooDB {
       signature,
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
+      attachmentRefs: createAttachmentRefs.length > 0 ? createAttachmentRefs : undefined,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     // Bind the metadata with the author signature (audit finding #5).
@@ -5566,6 +5597,12 @@ export class BaseMindooDB implements MindooDB {
       createdByPublicKey = currentUser.userSigningPublicKey;
     }
 
+    // Attachment snapshot for lifecycle entries: a delete marks the document
+    // inactive, so its attachments are no longer referenced (empty set -> their
+    // chunks become reclaim candidates); an undelete restores the current set.
+    const lifecycleAttachmentRefs =
+      entryType === "doc_delete" ? [] : this.collectAttachmentRefs(newDoc);
+
     // The encrypted Automerge change is the payload; the metadata classifies it
     // as a delete or undelete lifecycle entry for fast history/view queries.
     const entryMetadata: StoreEntryMetadata = {
@@ -5580,6 +5617,7 @@ export class BaseMindooDB implements MindooDB {
       signature,
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
+      attachmentRefs: lifecycleAttachmentRefs.length > 0 ? lifecycleAttachmentRefs : undefined,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     // Bind the metadata with the author signature (audit finding #5).
@@ -7252,6 +7290,11 @@ export class BaseMindooDB implements MindooDB {
       throw new Error("No Automerge changes to persist");
     }
 
+    // Signed snapshot of the document's attachments after this change, computed
+    // once from the resulting document state so EVERY change path (changeDoc,
+    // text patches, merges, ...) carries it consistently on each produced entry.
+    const attachmentRefs = this.collectAttachmentRefs(newDoc);
+
     const entries: StoreEntry[] = [];
     for (let index = 0; index < resolvedChangeBytesList.length; index += 1) {
       const changeBytes = resolvedChangeBytesList[index];
@@ -7263,6 +7306,9 @@ export class BaseMindooDB implements MindooDB {
         signingKeyPair,
         signingKeyPassword,
         attachmentIds: index === 0 ? attachmentIds : undefined,
+        // The full attachment snapshot describes the document's resulting state,
+        // so it goes on every produced entry (unlike the add-only attachmentIds).
+        attachmentRefs,
       });
       entries.push(entry);
       const decodedChange = Automerge.decodeChange(changeBytes);
@@ -7328,8 +7374,9 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair;
     signingKeyPassword?: string;
     attachmentIds?: string[];
+    attachmentRefs?: StoreEntryAttachmentRef[];
   }): Promise<StoreEntry> {
-    const { internalDoc, changeBytes, now, useCustomKey, signingKeyPair, signingKeyPassword, attachmentIds } = options;
+    const { internalDoc, changeBytes, now, useCustomKey, signingKeyPair, signingKeyPassword, attachmentIds, attachmentRefs } = options;
     const docId = internalDoc.id;
     this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
 
@@ -7369,6 +7416,7 @@ export class BaseMindooDB implements MindooDB {
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
       attachmentIds: attachmentIds && attachmentIds.length > 0 ? attachmentIds : undefined,
+      attachmentRefs: attachmentRefs && attachmentRefs.length > 0 ? attachmentRefs : undefined,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     // Bind the metadata with the author signature (audit finding #5).
@@ -7436,6 +7484,10 @@ export class BaseMindooDB implements MindooDB {
         signature = await this.tenant.signPayload(encryptedPayload);
       }
 
+      // Carry the live attachment snapshot so the referenced set survives history
+      // compaction (a snapshot may be the only entry a peer retains for the doc).
+      const snapshotAttachmentRefs = this.collectAttachmentRefs(internalDoc.doc);
+
       const snapshotEntry: StoreEntry = {
         entryType: "doc_snapshot",
         id: entryId,
@@ -7450,6 +7502,7 @@ export class BaseMindooDB implements MindooDB {
         signature,
         originalSize: snapshotBytes.length,
         encryptedSize: encryptedPayload.length,
+        attachmentRefs: snapshotAttachmentRefs.length > 0 ? snapshotAttachmentRefs : undefined,
         encryptedData: encryptedPayload,
       };
       // Bind the metadata with the author signature (audit finding #5).

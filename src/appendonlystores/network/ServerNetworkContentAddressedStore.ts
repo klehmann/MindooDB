@@ -1037,6 +1037,7 @@ export class ServerNetworkContentAddressedStore {
         signature: entry.signature,
         originalSize: entry.originalSize,
         encryptedSize: entry.encryptedSize,
+        attachmentRefs: entry.attachmentRefs,
         rsaEncryptedPayload,
       };
       

@@ -186,6 +186,31 @@ interface ContentAddressedStore {
 }
 ```
 
+### Signed Reference Snapshot on Document Entries (`attachmentRefs`)
+
+Every document store entry (`doc_create`, `doc_change`, `doc_snapshot`; `doc_undelete` restores the set, `doc_delete` writes an empty set) carries an `attachmentRefs` snapshot of the attachments the document references **as of that revision**:
+
+```typescript
+interface StoreEntryAttachmentRef {
+  attachmentId: string;   // Attachment instance id (UUID7)
+  lastChunkId: string;    // Head of the attachment's chunk chain
+  size: number;           // Total attachment size in bytes
+}
+```
+
+Key properties:
+
+- **Signed**: bound into the author `metadataSignature` via a backward-compatible trailing block in the canonical signing layout. Attachment-free entries (every entry written before this field existed) contribute zero trailing bytes, so their existing signatures keep verifying with no migration. A relay cannot add, remove, reorder, or rewrite refs without breaking verification.
+- **Full snapshot, not a delta**: reflects the merged `_attachments` array (additions, removals, and appends), so the latest revision of a document gives its complete live reference set directly.
+- **Canonical order**: refs are sorted by `attachmentId` so the signed bytes are deterministic across replicas and the wire.
+
+This enables a sync server **without decryption keys** to:
+
+- Determine attachment **liveness** for garbage collection / external-storage tiering: union `attachmentRefs[].lastChunkId` across each document's latest revision(s), traverse each chunk chain with `resolveDependencies()`, and treat unreferenced chunks as reclaim candidates.
+- Compute **storage statistics**: total number of attachments, average attachments per document, average file size (from `size`), and deduplication effectiveness (from the chunk entries' `contentHash` / `encryptedSize`) — all without reading payloads.
+
+`attachmentRefs` is independent of the unsigned, add-only `attachmentIds` field, which exists only for local incomplete-upload recovery.
+
 ### Encryption
 
 Each chunk is encrypted independently using AES-256-GCM with two modes:

@@ -856,6 +856,23 @@ export type StoreEntryType =
   | "attachment_chunk"; // File attachment chunk
 
 /**
+ * A single entry in {@link StoreEntryMetadata.attachmentRefs}: a reference to one
+ * attachment the document holds as of a given revision. Carries just enough for a
+ * keyless server to act:
+ * - {@link lastChunkId} resolves the full chunk chain via `resolveDependencies()`
+ *   (liveness / GC / tiering),
+ * - {@link size} enables size/average statistics without fetching chunk payloads.
+ */
+export interface StoreEntryAttachmentRef {
+  /** Unique id of the attachment instance (UUID7), as in `AttachmentReference`. */
+  attachmentId: string;
+  /** Entry id of the attachment's last chunk; head of the chunk dependency chain. */
+  lastChunkId: string;
+  /** Total attachment size in bytes (mirrors `AttachmentReference.size`). */
+  size: number;
+}
+
+/**
  * Metadata for entries stored in the ContentAddressedStore.
  * This contains all information except the actual encrypted payload,
  * making it efficient for synchronization negotiations.
@@ -943,6 +960,24 @@ export interface StoreEntryMetadata {
    * distinguish never-committed uploads from attachments required by history.
    */
   attachmentIds?: string[];
+
+  /**
+   * Full snapshot of all attachments the document references AS OF this revision
+   * (`doc_create`/`doc_change`/`doc_snapshot`; `doc_undelete` restores the set).
+   * Empty/absent means "no live attachments" (and `doc_delete` writes an empty
+   * set, since a deleted document is no longer active).
+   *
+   * Unlike {@link attachmentIds} (an add-only, by-id local recovery hint, written
+   * only on the first entry of a change), this is the complete set of references
+   * after removals/appends are merged, written on every produced document entry.
+   *
+   * It is bound into {@link metadataSignature} (see `crypto/EntrySignature.ts`),
+   * so a relay cannot rewrite it. This lets a sync server WITHOUT decryption keys
+   * determine which `attachment_chunk` chains are still live (GC/tiering, by
+   * traversing dependencies from each {@link StoreEntryAttachmentRef.lastChunkId})
+   * and compute storage statistics without decrypting content.
+   */
+  attachmentRefs?: StoreEntryAttachmentRef[];
 
   /**
    * Start timestamp for `pending_attachment_upload` recovery ledgers.

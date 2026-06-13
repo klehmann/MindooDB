@@ -2,6 +2,7 @@ import type {
   MindooDBServerInfo,
   StoreEntry,
   StoreEntryMetadata,
+  StoreEntryAttachmentRef,
   StoreEntryType,
   StoreScanCursor,
   StoreScanFilters,
@@ -1093,6 +1094,9 @@ export class HttpTransport implements NetworkTransport {
       receivedDateSignature: metadata.receivedDateSignature
         ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
         : undefined,
+      // Signed attachment snapshot (plain JSON, no binary). Must survive the
+      // round-trip or metadataSignature verification fails on the receiver.
+      attachmentRefs: metadata.attachmentRefs,
       entryVersion: metadata.entryVersion,
     };
   }
@@ -1124,6 +1128,7 @@ export class HttpTransport implements NetworkTransport {
       receivedDateSignature: serialized.receivedDateSignature
         ? this.base64ToUint8Array(serialized.receivedDateSignature)
         : undefined,
+      attachmentRefs: serialized.attachmentRefs,
       entryVersion: serialized.entryVersion,
     };
   }
@@ -1160,6 +1165,8 @@ interface SerializedEntryMetadata {
   receivedAt?: number;
   receivedByPublicKey?: string;
   receivedDateSignature?: string; // base64
+  // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
+  attachmentRefs?: StoreEntryAttachmentRef[];
   // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
   entryVersion?: number;
 }

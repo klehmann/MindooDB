@@ -1,4 +1,4 @@
-import type { StoreEntryMetadata } from "../types";
+import type { StoreEntryAttachmentRef, StoreEntryMetadata } from "../types";
 
 /**
  * Author entry signatures (security hardening, audit finding #5).
@@ -28,6 +28,14 @@ import type { StoreEntryMetadata } from "../types";
  * Version byte of the canonical entry-signature layout. Any change to the field
  * set or ordering MUST bump this value (and verifiers MUST reject unknown
  * versions).
+ *
+ * Exception — backward-compatible trailing extensions: a strictly trailing,
+ * optional block whose absence produces ZERO bytes (so the layout is
+ * byte-identical to the prior version for entries that do not carry the new
+ * data) does NOT bump this value. The `attachmentRefs` block (see
+ * {@link buildEntrySigningBytes}) is such an extension: attachment-free entries —
+ * including every entry signed before the field existed — are unaffected and
+ * keep verifying.
  */
 export const ENTRY_SIGNATURE_LAYOUT_VERSION = 0x01;
 
@@ -46,6 +54,14 @@ export interface EntrySignatureFields {
   contentHash: string;
   /** Ed25519 public key (PEM) of the author. */
   createdByPublicKey: string;
+  /**
+   * Optional snapshot of the document's attachment references as of this entry
+   * (see {@link StoreEntryMetadata.attachmentRefs}). Encoded as a backward-compatible
+   * TRAILING block (see {@link buildEntrySigningBytes}): when absent or empty it
+   * contributes ZERO bytes, so attachment-free entries (every legacy entry) keep
+   * the original v1 signing input and verify unchanged. Treat empty as absent.
+   */
+  attachmentRefs?: StoreEntryAttachmentRef[];
 }
 
 /** Options for the version-aware entry-signature verifiers. */
@@ -102,7 +118,23 @@ function pushInt64BE(parts: Uint8Array[], value: number): void {
  *  || ( len(dep) || dep ) *   (in array order)
  *  || len(contentHash)        || contentHash
  *  || len(createdByPublicKey) || createdByPublicKey
+ *  -- trailing attachmentRefs block, PRESENT ONLY IF attachmentRefs.length > 0 --
+ *  || uint32BE(attachmentRefs.length)
+ *  || ( len(attachmentId) || attachmentId
+ *       || len(lastChunkId) || lastChunkId
+ *       || int64BE(size) ) * (one triple per ref, in array order)
  * ```
+ *
+ * The attachmentRefs block is a deliberately backward-compatible TRAILING
+ * extension: it is appended ONLY when there is at least one ref, so an
+ * attachment-free entry (every entry written before this field existed, and
+ * every future text-only revision) produces byte-for-byte the same input as the
+ * original layout and its existing signature still verifies. This is why the
+ * version byte intentionally stays `0x01` and is NOT bumped despite the new
+ * field: absence is byte-identical to the prior layout. Callers MUST treat an
+ * empty array as absent (the canonicalization in {@link entrySignatureFieldsFromEntry}
+ * guarantees this) and emit refs in a stable order (the writer sorts by
+ * `attachmentId`) so signing and verification produce identical bytes.
  */
 export function buildEntrySigningBytes(
   fields: EntrySignatureFields,
@@ -121,6 +153,18 @@ export function buildEntrySigningBytes(
   }
   pushString(parts, fields.contentHash);
   pushString(parts, fields.createdByPublicKey);
+
+  // Backward-compatible trailing block: appended only when non-empty so that
+  // attachment-free entries remain byte-identical to the original v1 layout.
+  const attachmentRefs = fields.attachmentRefs;
+  if (attachmentRefs && attachmentRefs.length > 0) {
+    pushUint32BE(parts, attachmentRefs.length);
+    for (const ref of attachmentRefs) {
+      pushString(parts, ref.attachmentId);
+      pushString(parts, ref.lastChunkId);
+      pushInt64BE(parts, ref.size);
+    }
+  }
 
   const total = parts.reduce((sum, p) => sum + p.length, 0);
   const out = new Uint8Array(total);
@@ -144,6 +188,7 @@ export function entrySignatureFieldsFromEntry(
     | "dependencyIds"
     | "contentHash"
     | "createdByPublicKey"
+    | "attachmentRefs"
   >,
 ): EntrySignatureFields {
   return {
@@ -155,6 +200,12 @@ export function entrySignatureFieldsFromEntry(
     dependencyIds: entry.dependencyIds,
     contentHash: entry.contentHash,
     createdByPublicKey: entry.createdByPublicKey,
+    // Canonicalize empty -> undefined so "no attachments" has a single byte
+    // representation (zero trailing bytes); see buildEntrySigningBytes.
+    attachmentRefs:
+      entry.attachmentRefs && entry.attachmentRefs.length > 0
+        ? entry.attachmentRefs
+        : undefined,
   };
 }
 
@@ -209,6 +260,7 @@ export async function verifyEntrySignatureWithImportedKey(
     | "dependencyIds"
     | "contentHash"
     | "createdByPublicKey"
+    | "attachmentRefs"
     | "signature"
   > & { metadataSignature?: Uint8Array },
   encryptedData: Uint8Array,
@@ -256,6 +308,7 @@ export async function verifyEntrySignatureCrypto(
     | "dependencyIds"
     | "contentHash"
     | "createdByPublicKey"
+    | "attachmentRefs"
     | "signature"
   > & { metadataSignature?: Uint8Array },
   encryptedData: Uint8Array,

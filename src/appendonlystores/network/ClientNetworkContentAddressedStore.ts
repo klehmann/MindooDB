@@ -677,6 +677,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         signature: enc.signature,
         originalSize: enc.originalSize,
         encryptedSize: enc.encryptedSize,
+        attachmentRefs: enc.attachmentRefs,
         encryptedData,
       };
       

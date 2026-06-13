@@ -137,6 +137,152 @@ describe("entry author signatures (audit #5)", () => {
   });
 });
 
+describe("attachmentRefs signed trailing block (backward-compatible extension)", () => {
+  const encryptedData = new Uint8Array([7, 7, 7]);
+  const toHex = (u: Uint8Array) =>
+    Array.from(u).map((x) => x.toString(16).padStart(2, "0")).join("");
+
+  async function baseFields(): Promise<
+    Pick<
+      StoreEntryMetadata,
+      | "entryType"
+      | "id"
+      | "docId"
+      | "decryptionKeyId"
+      | "createdAt"
+      | "dependencyIds"
+      | "contentHash"
+      | "createdByPublicKey"
+    >
+  > {
+    return {
+      entryType: "doc_change",
+      id: "entry-1",
+      docId: "doc-1",
+      decryptionKeyId: "default",
+      createdAt: 1_700_000_000_000,
+      dependencyIds: ["dep-a"],
+      contentHash: await sha256Hex(encryptedData),
+      createdByPublicKey: "k",
+    };
+  }
+
+  test("empty, undefined, and absent attachmentRefs all produce identical (legacy) bytes", async () => {
+    const fields = await baseFields();
+    const absent = toHex(buildEntrySigningBytes(entrySignatureFieldsFromEntry({ ...fields })));
+    const emptyArr = toHex(
+      buildEntrySigningBytes(entrySignatureFieldsFromEntry({ ...fields, attachmentRefs: [] })),
+    );
+    const undef = toHex(
+      buildEntrySigningBytes(
+        entrySignatureFieldsFromEntry({ ...fields, attachmentRefs: undefined }),
+      ),
+    );
+    expect(emptyArr).toEqual(absent);
+    expect(undef).toEqual(absent);
+  });
+
+  test("non-empty attachmentRefs change the signed bytes (the block is bound)", async () => {
+    const fields = await baseFields();
+    const without = toHex(buildEntrySigningBytes(entrySignatureFieldsFromEntry({ ...fields })));
+    const withRefs = toHex(
+      buildEntrySigningBytes(
+        entrySignatureFieldsFromEntry({
+          ...fields,
+          attachmentRefs: [{ attachmentId: "att-1", lastChunkId: "chunk-1", size: 42 }],
+        }),
+      ),
+    );
+    expect(withRefs).not.toEqual(without);
+  });
+
+  test("ref order, ids, and size are all order/content sensitive", async () => {
+    const fields = await baseFields();
+    const a = { attachmentId: "att-a", lastChunkId: "chunk-a", size: 10 };
+    const b = { attachmentId: "att-b", lastChunkId: "chunk-b", size: 20 };
+    const ab = toHex(
+      buildEntrySigningBytes(entrySignatureFieldsFromEntry({ ...fields, attachmentRefs: [a, b] })),
+    );
+    const ba = toHex(
+      buildEntrySigningBytes(entrySignatureFieldsFromEntry({ ...fields, attachmentRefs: [b, a] })),
+    );
+    expect(ab).not.toEqual(ba);
+
+    const sizeChanged = toHex(
+      buildEntrySigningBytes(
+        entrySignatureFieldsFromEntry({
+          ...fields,
+          attachmentRefs: [{ ...a, size: 11 }, b],
+        }),
+      ),
+    );
+    expect(sizeChanged).not.toEqual(ab);
+
+    const chunkChanged = toHex(
+      buildEntrySigningBytes(
+        entrySignatureFieldsFromEntry({
+          ...fields,
+          attachmentRefs: [{ ...a, lastChunkId: "chunk-evil" }, b],
+        }),
+      ),
+    );
+    expect(chunkChanged).not.toEqual(ab);
+  });
+
+  test("a signed attachment-bearing entry verifies; tampering or stripping refs fails", async () => {
+    const { privateKey, publicKeyPem } = await generateEd25519();
+    const fields = await baseFields();
+    const meta = {
+      ...fields,
+      createdByPublicKey: publicKeyPem,
+      signature: new Uint8Array(),
+      originalSize: 3,
+      encryptedSize: encryptedData.length,
+      attachmentRefs: [{ attachmentId: "att-1", lastChunkId: "chunk-1", size: 42 }],
+    } as unknown as StoreEntryMetadata;
+    meta.metadataSignature = await signEntryMetadata(
+      entrySignatureFieldsFromEntry(meta),
+      privateKey,
+      subtle,
+    );
+
+    expect(await verifyEntrySignatureCrypto(meta, encryptedData, publicKeyPem, subtle)).toBe(true);
+
+    // Tamper a ref's lastChunkId.
+    const tampered = {
+      ...meta,
+      attachmentRefs: [{ attachmentId: "att-1", lastChunkId: "chunk-evil", size: 42 }],
+    } as StoreEntryMetadata;
+    expect(
+      await verifyEntrySignatureCrypto(tampered, encryptedData, publicKeyPem, subtle),
+    ).toBe(false);
+
+    // Strip the refs entirely (relay claims the doc references nothing).
+    const stripped = { ...meta, attachmentRefs: undefined } as StoreEntryMetadata;
+    expect(
+      await verifyEntrySignatureCrypto(stripped, encryptedData, publicKeyPem, subtle),
+    ).toBe(false);
+  });
+
+  test("a legacy entry (no attachmentRefs) still verifies after the layout extension", async () => {
+    const { privateKey, publicKeyPem } = await generateEd25519();
+    const fields = await baseFields();
+    const meta = {
+      ...fields,
+      createdByPublicKey: publicKeyPem,
+      signature: new Uint8Array(),
+      originalSize: 3,
+      encryptedSize: encryptedData.length,
+    } as unknown as StoreEntryMetadata;
+    meta.metadataSignature = await signEntryMetadata(
+      entrySignatureFieldsFromEntry(meta),
+      privateKey,
+      subtle,
+    );
+    expect(await verifyEntrySignatureCrypto(meta, encryptedData, publicKeyPem, subtle)).toBe(true);
+  });
+});
+
 describe("PBKDF2 stored-iteration floor (audit #3)", () => {
   test("floors an attacker-lowered iteration count to the minimum", () => {
     expect(resolveStoredIterations(1)).toBe(MIN_PBKDF2_ITERATIONS);
