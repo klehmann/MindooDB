@@ -779,3 +779,184 @@ export function validateKeyDistribution(input: {
   }
 }
 
+// ---------------------------------------------------------------------------
+// App distribution (docs/accesscontrol.md §13). Mirrors key distribution but
+// the distributed payload is a Haven application registration
+// (`appdata_encrypted`) rather than wrapped key bytes, and the recipient lists
+// support both users AND groups. Apps live only in the Haven client, so the
+// install/update/remove reconcile runs in Haven after the directory syncs;
+// there is no server-side enforcement (apps carry no secret key).
+// ---------------------------------------------------------------------------
+
+/**
+ * App distribution type tag (the `type` field of an {@link AppDistributionDoc}).
+ */
+export const APP_DISTRIBUTION_TYPE = "appdistribution" as const;
+
+/**
+ * The single authoritative document governing the distribution of one Haven
+ * application (`appId`). Stored at the fixed id `acl_appdistribution_<appId>`
+ * (singleton per app); publish is always an upsert of the full desired state.
+ *
+ * Unlike key distribution there is no cryptographic key material: the payload
+ * is the application registration JSON (`appdata_encrypted`). Recipient
+ * membership (`pushto` / `pullfrom`) is a UX-level governance gesture resolved
+ * client-side at reconcile time against the directory head, with `pullfrom`
+ * winning on any list overlap. Title/comment/appid/version/appdata are stored
+ * under the `<field>_encrypted` convention with the tenant `default` key, so
+ * the sync server cannot read them.
+ */
+export interface AppDistributionDoc {
+  form: typeof ACCESS_CONTROL_FORM;
+  type: typeof APP_DISTRIBUTION_TYPE;
+  /** Bare app id; the document identity (one doc per app). */
+  appId: string;
+  /** Display aid: the app id re-stated under the tenant default key. */
+  appid_encrypted: string;
+  appid_encrypted_key: string; // "default"
+  /** The distributed version string (encrypted); drives the reconcile diff. */
+  version_encrypted: string;
+  version_encrypted_key: string; // "default"
+  title_encrypted: string;
+  title_encrypted_key: string; // "default"
+  comment_encrypted?: string;
+  comment_encrypted_key?: string;
+  /** The application registration JSON payload, encrypted with the default key. */
+  appdata_encrypted: string;
+  appdata_encrypted_key: string; // "default"
+  /** The author's signing public key that prepared the distribution (audit). */
+  preparedByPublicKey: string;
+  /** Users whose Haven client should install the app. */
+  pushto_users_hashes: string[];
+  pushto_users_encrypted?: string;
+  pushto_users_encrypted_key?: string; // "default"
+  /** Groups whose members should install the app (resolved at reconcile time). */
+  pushto_groups_hashes: string[];
+  pushto_groups_encrypted?: string;
+  pushto_groups_encrypted_key?: string; // "default"
+  /** Users whose Haven client must NOT have the app. */
+  pullfrom_users_hashes: string[];
+  pullfrom_users_encrypted?: string;
+  pullfrom_users_encrypted_key?: string;
+  /** Groups whose members must NOT have the app. */
+  pullfrom_groups_hashes: string[];
+  pullfrom_groups_encrypted?: string;
+  pullfrom_groups_encrypted_key?: string;
+}
+
+/**
+ * The full unsigned content of one app's distribution, built in the authoring
+ * dialog (or carried by an `mdb://app-distribution/...` request URI). The admin
+ * maps it to an {@link AppDistributionDoc} on save (encrypting the display +
+ * payload fields and hashing the user/group names).
+ */
+export interface AppDistributionRequest {
+  v: 1;
+  tenantId?: string;
+  appId: string;
+  version: string;
+  /** Plaintext (encrypted on save). */
+  title: string;
+  comment?: string;
+  /** The application registration JSON payload (serialized + encrypted on save). */
+  appData: unknown;
+  preparedByPublicKey: string;
+  pushtoUsernames: string[];
+  pushtoGroups: string[];
+  pullfromUsernames: string[];
+  pullfromGroups: string[];
+}
+
+/**
+ * Read-side projection of an {@link AppDistributionDoc} for list/edit UIs. The
+ * `*Usernames` / `*Groups` are the decrypted display arrays (null when the
+ * tenant default key is not held); `appData` is the parsed payload (null when
+ * unreadable).
+ */
+export interface AppDistributionView {
+  appId: string;
+  title: string | null;
+  comment: string | null;
+  version: string | null;
+  appData: unknown | null;
+  preparedByPublicKey: string;
+  pushto_users_hashes: string[];
+  pushto_groups_hashes: string[];
+  pullfrom_users_hashes: string[];
+  pullfrom_groups_hashes: string[];
+  pushtoUsernames: string[] | null;
+  pushtoGroups: string[] | null;
+  pullfromUsernames: string[] | null;
+  pullfromGroups: string[] | null;
+}
+
+/** One app the active user is entitled to (the install/update side of reconcile). */
+export interface AppDistributionInstall {
+  appId: string;
+  /** The policy's display title — authoritative for the installed app's label. */
+  title: string;
+  version: string;
+  appData: unknown;
+}
+
+/**
+ * The per-user reconcile plan computed from the directory head: `have` is the
+ * set of apps the user is entitled to (install or update on version change),
+ * `notHave` is the set of distributed app ids the user is NOT entitled to
+ * (remove if locally present).
+ */
+export interface AppDistributionReconcilePlan {
+  have: AppDistributionInstall[];
+  notHave: string[];
+}
+
+/** Document id prefix for the per-app distribution documents. */
+export const ACL_APP_DISTRIBUTION_PREFIX = "acl_appdistribution_";
+
+/**
+ * Document id for an app distribution — a SINGLETON per app id, so there is one
+ * authoritative document governing each app's distribution and publish is
+ * always an upsert. The app id is encoded so arbitrary ids stay valid doc-id
+ * components.
+ */
+export function aclAppDistributionDocId(appId: string): string {
+  return assertValidDocId(ACL_APP_DISTRIBUTION_PREFIX + encodeAclIdComponent(appId));
+}
+
+/** True when `docId` is an app-distribution document id. */
+export function isAppDistributionDocId(docId: string): boolean {
+  return docId.startsWith(ACL_APP_DISTRIBUTION_PREFIX);
+}
+
+/**
+ * Validate the structural invariants of an app distribution before publish
+ * (docs/accesscontrol.md §13). Throws on the first violation:
+ *
+ *  - `appId` is non-empty;
+ *  - `pushto` and `pullfrom` user-hash sets are disjoint;
+ *  - `pushto` and `pullfrom` group-hash sets are disjoint.
+ */
+export function validateAppDistribution(input: {
+  appId: string;
+  pushto_users_hashes: string[];
+  pullfrom_users_hashes: string[];
+  pushto_groups_hashes: string[];
+  pullfrom_groups_hashes: string[];
+}): void {
+  if (typeof input.appId !== "string" || input.appId.length === 0) {
+    throw new Error("app distribution requires a non-empty `appId`");
+  }
+  const pushUsers = new Set(input.pushto_users_hashes);
+  for (const hash of input.pullfrom_users_hashes) {
+    if (pushUsers.has(hash)) {
+      throw new Error("app distribution `pushto` and `pullfrom` user sets must be disjoint");
+    }
+  }
+  const pushGroups = new Set(input.pushto_groups_hashes);
+  for (const hash of input.pullfrom_groups_hashes) {
+    if (pushGroups.has(hash)) {
+      throw new Error("app distribution `pushto` and `pullfrom` group sets must be disjoint");
+    }
+  }
+}
+

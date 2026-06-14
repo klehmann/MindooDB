@@ -171,6 +171,13 @@ function projectAccessControlDoc(
     return;
   }
 
+  // App-distribution documents likewise carry no directory-state projection
+  // (recipient Haven clients read them directly during the post-sync reconcile);
+  // skip them here.
+  if (data.type === "appdistribution") {
+    return;
+  }
+
   // Trusted witness (§6.4).
   if (data.type === "trustedwitness" && typeof data.witnessPublicKey === "string") {
     if (deleted) {

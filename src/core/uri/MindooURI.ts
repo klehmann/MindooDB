@@ -15,12 +15,17 @@
 /**
  * Supported MindooDB URI types.
  */
-export type MindooURIType = "join-request" | "join-response" | "key-distribution";
+export type MindooURIType =
+  | "join-request"
+  | "join-response"
+  | "key-distribution"
+  | "app-distribution";
 
 const VALID_TYPES: ReadonlySet<string> = new Set<MindooURIType>([
   "join-request",
   "join-response",
   "key-distribution",
+  "app-distribution",
 ]);
 
 const MDB_SCHEME = "mdb://";
@@ -186,6 +191,46 @@ export function decodeKeyDistributionRequest(uri: string): KeyDistributionReques
   }
   if (!Array.isArray(payload.keyVersions) || !Array.isArray(payload.pushto) || !Array.isArray(payload.pullfrom)) {
     throw new Error("Invalid key-distribution request: missing keyVersions/pushto/pullfrom");
+  }
+  return payload;
+}
+
+// ==================== App distribution requests ====================
+
+import type { AppDistributionRequest } from "../accesscontrol/types";
+
+/**
+ * Encode an {@link AppDistributionRequest} as an `mdb://app-distribution/...`
+ * URI carrying the full unsigned distribution content (incl. the app payload),
+ * so an app author without admin rights can hand a ready-to-sign request to an
+ * admin out-of-band (email/chat).
+ */
+export function encodeAppDistributionRequest(request: AppDistributionRequest): string {
+  return encodeMindooURI("app-distribution", request as unknown as Record<string, unknown>);
+}
+
+/**
+ * Decode an `mdb://app-distribution/...` URI into an {@link AppDistributionRequest}.
+ * Throws when the URI is not an app-distribution URI or is structurally invalid.
+ */
+export function decodeAppDistributionRequest(uri: string): AppDistributionRequest {
+  const decoded = decodeMindooURI<AppDistributionRequest>(uri);
+  if (decoded.type !== "app-distribution") {
+    throw new Error(`Expected an app-distribution URI, got "${decoded.type}"`);
+  }
+  const payload = decoded.payload;
+  if (typeof payload.appId !== "string" || !payload.appId) {
+    throw new Error("Invalid app-distribution request: missing appId");
+  }
+  if (
+    !Array.isArray(payload.pushtoUsernames) ||
+    !Array.isArray(payload.pushtoGroups) ||
+    !Array.isArray(payload.pullfromUsernames) ||
+    !Array.isArray(payload.pullfromGroups)
+  ) {
+    throw new Error(
+      "Invalid app-distribution request: missing pushto/pullfrom user/group lists",
+    );
   }
   return payload;
 }

@@ -1606,6 +1606,56 @@ the read/push handlers (skipped for the `directory` database).
 `listRules` (the write-side listing, section 9) carries decrypted `targets`
 (usernames/groups) for display.
 
+### 13.8 App distribution
+
+App distribution reuses the key-distribution machinery to push **Haven
+application registrations** to a tenant's members. One admin-signed document per
+app (`acl_appdistribution_<appId>`, §13.2-style singleton) holds the
+authoritative `pushto` / `pullfrom` lists plus the encrypted app payload, and
+every Haven client reconciles its local applications list against the directory
+head after the directory database syncs.
+
+The payload is **not** key material — apps carry no secret — so there is no
+RSA-wrapping and no server-side blacklist. Instead the document stores the
+registration JSON in `appdata_encrypted` and the display fields
+(`appid_encrypted`, `version_encrypted`, `title_encrypted`, `comment_encrypted`)
+under the tenant `default` key, so the sync server sees only ciphertext. The
+document envelope is `$publicinfos` like every ACL doc, which keeps the recipient
+hash lists server-readable (harmless: the server never serves apps).
+
+**Recipients support users *and* groups.** Each of `pushto` / `pullfrom` carries
+a user-hash list and a group-hash list (with `*_encrypted` display companions).
+Group hashes are written as the v3 hash of the normalized group name — the same
+value a member's group-name candidate produces — so membership is resolved
+**client-side at reconcile time** against the directory head: changing a group's
+membership changes who installs the app without re-publishing. As with keys,
+`pullfrom` wins on any overlap.
+
+**Authoring (admin).** `publishAppDistribution(request, adminKey, adminPassword)`
+validates the structural invariants (non-empty `appId`; `pushto`/`pullfrom`
+disjoint per user and per group), checks every `pushto` user has an active grant,
+encrypts the fields, hashes the user/group names, and admin-signs the upsert. The
+unsigned request can also travel as an `mdb://app-distribution/...` URI
+(`encodeAppDistributionRequest` / `decodeAppDistributionRequest`) so a non-admin
+app author can hand a ready-to-sign request to an admin.
+
+**Reconcile (every Haven client, after each directory sync).**
+`getAppDistributionsForCurrentUser(username)` returns a plan `{ have, notHave }`:
+`have` lists the apps the user is entitled to (matched by `pushto`
+user/group and not by `pullfrom`) with their decrypted `version` and `appData`;
+`notHave` lists every other distributed app id. Haven then installs missing apps,
+replaces an app whose distributed `version` differs from the local one, and
+removes any policy-managed app the user is no longer entitled to. In the local
+applications list the registration's app id is prefixed `tenantId\appId` so its
+origin tenant is clear, and policy-managed apps cannot be edited or removed (only
+duplicated, which produces an unmanaged local copy with a fresh random id).
+
+**Public API additions.** On `MindooTenantDirectory`:
+`publishAppDistribution`, `listAppDistributions` (decrypts the `*_encrypted`
+blobs when the tenant key is held; null-tolerant), `deleteAppDistribution`,
+`getAppDistributionsForCurrentUser` (the reconcile plan), and `getManagedAppIds`
+(the `have` app ids; managed status is derived, never persisted).
+
 ## 14. Enterprise deployment guide and best practices
 
 Sections 1–13 describe the *mechanism*. This section is *operational* guidance for

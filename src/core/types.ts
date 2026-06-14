@@ -11,6 +11,9 @@ import type {
   KeyDistributionRequest,
   KeyDistributionView,
   KeyVersionRef,
+  AppDistributionRequest,
+  AppDistributionView,
+  AppDistributionReconcilePlan,
   RuleTargets,
   RuleType,
   WithFieldClause,
@@ -2753,6 +2756,63 @@ export interface MindooTenantDirectory {
    * @returns The revoked decryption key ids for that principal.
    */
   getRevokedDecryptionKeyIdsForSigningKey?(signingKey: string): Promise<string[]>;
+
+  /**
+   * Admin-sign and upsert the singleton `acl_appdistribution_<appId>` document
+   * from a request (built in-dialog or decoded from a request URI). The payload
+   * is a Haven application registration; recipient lists support users and
+   * groups (docs/accesscontrol.md §13).
+   *
+   * @param request The full desired distribution state.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  publishAppDistribution?(
+    request: AppDistributionRequest,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * List all app-distribution documents at the directory head, decrypting
+   * display + payload fields when the tenant default key is held.
+   *
+   * @returns The app-distribution views.
+   */
+  listAppDistributions?(): Promise<AppDistributionView[]>;
+
+  /**
+   * Delete the singleton app-distribution document for `appId` (admin-signed).
+   *
+   * @param appId The distributed app id.
+   * @param administrationPrivateKey The administration private key to sign the change.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  deleteAppDistribution?(
+    appId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * The per-user app-distribution reconcile plan at the directory head: `have`
+   * is every app the user is entitled to (pushto user/group, pull wins), and
+   * `notHave` is every other distributed app id. Drives the Haven post-sync
+   * install/update/remove pass (docs/accesscontrol.md §13).
+   *
+   * @param username The user to resolve the plan for.
+   * @returns The reconcile plan.
+   */
+  getAppDistributionsForCurrentUser?(username: string): Promise<AppDistributionReconcilePlan>;
+
+  /**
+   * The app ids `username` is entitled to receive via `pushto` at the directory
+   * head (managed status is derived, never persisted).
+   *
+   * @param username The user to resolve managed apps for.
+   * @returns The managed app ids.
+   */
+  getManagedAppIds?(username: string): Promise<string[]>;
 
   /**
    * Audit / time travel (§8): the head time-travel directory-state node ("now"),

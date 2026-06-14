@@ -27,6 +27,11 @@ export {
   KEY_DISTRIBUTION_TYPE,
   ACL_KEY_DISTRIBUTION_PREFIX,
   PROTECTED_DISTRIBUTION_KEY_IDS,
+  aclAppDistributionDocId,
+  isAppDistributionDocId,
+  validateAppDistribution,
+  APP_DISTRIBUTION_TYPE,
+  ACL_APP_DISTRIBUTION_PREFIX,
   type RuleType,
   type Operator,
   type WithFieldWhen,
@@ -43,6 +48,11 @@ export {
   type KeyDistributionRequest,
   type KeyDistributionPushRecipient,
   type KeyDistributionView,
+  type AppDistributionDoc,
+  type AppDistributionRequest,
+  type AppDistributionView,
+  type AppDistributionInstall,
+  type AppDistributionReconcilePlan,
 } from "./accesscontrol/types";
 export {
   createGenesisNode,
@@ -90,6 +100,8 @@ export {
   isMindooURI,
   encodeKeyDistributionRequest,
   decodeKeyDistributionRequest,
+  encodeAppDistributionRequest,
+  decodeAppDistributionRequest,
   type MindooURIType,
   type DecodedMindooURI,
 } from "./uri/MindooURI";

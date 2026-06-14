@@ -59,6 +59,13 @@ import {
   validateAccessPolicy,
   validateAclRule,
   validateKeyDistribution,
+  ACL_APP_DISTRIBUTION_PREFIX,
+  APP_DISTRIBUTION_TYPE,
+  AppDistributionRequest,
+  AppDistributionView,
+  AppDistributionReconcilePlan,
+  aclAppDistributionDocId,
+  validateAppDistribution,
 } from "./accesscontrol/types";
 import { IdentitySet, evaluateAccess } from "./accesscontrol/evaluate";
 import { AccessDecision } from "./accesscontrol/types";
@@ -120,6 +127,23 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       pullfrom_users_hashes: string[];
       pushto_users_hashes: string[];
       pushto_users_keys: Record<string, DeviceWrappedVersions>;
+    }
+  > = new Map();
+
+  // Cache for app-distribution documents (acl_appdistribution_<appId>), keyed by
+  // appId. Folded incrementally in updateUnifiedCache (singleton per appId,
+  // last-seen-wins; a deleted doc removes its entry). Holds only the
+  // server-readable recipient hash lists so the per-user reconcile can compute
+  // membership (have / notHave) without re-scanning directory docs; the
+  // encrypted payload (version / appData) is read from the doc when needed
+  // (docs/accesscontrol.md §13).
+  private appDistributionCache: Map<
+    string,
+    {
+      pushto_users_hashes: string[];
+      pushto_groups_hashes: string[];
+      pullfrom_users_hashes: string[];
+      pullfrom_groups_hashes: string[];
     }
   > = new Map();
 
@@ -634,6 +658,26 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
               data.pushto_users_keys && typeof data.pushto_users_keys === "object"
                 ? (data.pushto_users_keys as Record<string, DeviceWrappedVersions>)
                 : {},
+          });
+        }
+      }
+
+      // Process app-distribution documents (acl_appdistribution_<appId>); a
+      // singleton per appId. Cache the recipient hash lists so the per-user
+      // reconcile reads membership without re-scanning directory docs
+      // (docs/accesscontrol.md §13). A deleted distribution drops its entry.
+      if (data.type === APP_DISTRIBUTION_TYPE && typeof data.appId === "string") {
+        const appId = data.appId;
+        if (doc.isDeleted()) {
+          this.appDistributionCache.delete(appId);
+        } else {
+          const stringArray = (value: unknown): string[] =>
+            Array.isArray(value) ? value.filter((h): h is string => typeof h === "string") : [];
+          this.appDistributionCache.set(appId, {
+            pushto_users_hashes: stringArray(data.pushto_users_hashes),
+            pushto_groups_hashes: stringArray(data.pushto_groups_hashes),
+            pullfrom_users_hashes: stringArray(data.pullfrom_users_hashes),
+            pullfrom_groups_hashes: stringArray(data.pullfrom_groups_hashes),
           });
         }
       }
@@ -2182,6 +2226,286 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return views
       .filter((v) => v.pushto_users_hashes.some((h) => myHashes.has(h)))
       .map((v) => v.keyId);
+  }
+
+  // -------------------------------------------------------------------------
+  // App distribution (docs/accesscontrol.md §13). Mirrors key distribution; the
+  // payload is a Haven application registration and recipient lists support
+  // both users and groups, resolved client-side at reconcile time.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Admin-sign and upsert the singleton `acl_appdistribution_<appId>` document
+   * from an {@link AppDistributionRequest} (built in-dialog or decoded from a
+   * request URI). The full desired state is written each time. Validates the
+   * structural invariants plus, against the directory, that every `pushto` user
+   * has an active grant.
+   */
+  async publishAppDistribution(
+    request: AppDistributionRequest,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const appId = request.appId;
+
+    const pushtoUserHashes = await Promise.all(
+      request.pushtoUsernames.map((u) => this.hashUsernameForWrite(u)),
+    );
+    const pullfromUserHashes = await Promise.all(
+      request.pullfromUsernames.map((u) => this.hashUsernameForWrite(u)),
+    );
+    const pushtoGroupHashes = await Promise.all(
+      request.pushtoGroups.map((g) => this.hashUsernameForWrite(this.normalizeGroupName(g))),
+    );
+    const pullfromGroupHashes = await Promise.all(
+      request.pullfromGroups.map((g) => this.hashUsernameForWrite(this.normalizeGroupName(g))),
+    );
+
+    validateAppDistribution({
+      appId,
+      pushto_users_hashes: pushtoUserHashes,
+      pullfrom_users_hashes: pullfromUserHashes,
+      pushto_groups_hashes: pushtoGroupHashes,
+      pullfrom_groups_hashes: pullfromGroupHashes,
+    });
+
+    // Directory-level validation: every pushto user must have an active grant.
+    for (const username of request.pushtoUsernames) {
+      const userKeys = await this.getUserPublicKeys(username);
+      if (!userKeys) {
+        throw new Error(`Cannot publish: pushto user "${username}" has no active grant`);
+      }
+    }
+
+    const appidEncrypted = await this.encryptToDefaultField(appId);
+    const versionEncrypted = await this.encryptToDefaultField(request.version ?? "");
+    const titleEncrypted = await this.encryptToDefaultField(request.title ?? appId);
+    const commentEncrypted = request.comment
+      ? await this.encryptToDefaultField(request.comment)
+      : undefined;
+    const appdataEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.appData ?? {}),
+    );
+    const pushtoUsernamesEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pushtoUsernames),
+    );
+    const pushtoGroupsEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pushtoGroups),
+    );
+    const pullfromUsernamesEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pullfromUsernames),
+    );
+    const pullfromGroupsEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pullfromGroups),
+    );
+
+    const docId = aclAppDistributionDocId(appId);
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      docId,
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = APP_DISTRIBUTION_TYPE;
+        data.appId = appId;
+        data.appid_encrypted = appidEncrypted;
+        data.appid_encrypted_key = "default";
+        data.version_encrypted = versionEncrypted;
+        data.version_encrypted_key = "default";
+        data.title_encrypted = titleEncrypted;
+        data.title_encrypted_key = "default";
+        if (commentEncrypted !== undefined) {
+          data.comment_encrypted = commentEncrypted;
+          data.comment_encrypted_key = "default";
+        } else {
+          delete data.comment_encrypted;
+          delete data.comment_encrypted_key;
+        }
+        data.appdata_encrypted = appdataEncrypted;
+        data.appdata_encrypted_key = "default";
+        data.preparedByPublicKey = request.preparedByPublicKey;
+        data.pushto_users_hashes = pushtoUserHashes;
+        data.pushto_users_encrypted = pushtoUsernamesEncrypted;
+        data.pushto_users_encrypted_key = "default";
+        data.pushto_groups_hashes = pushtoGroupHashes;
+        data.pushto_groups_encrypted = pushtoGroupsEncrypted;
+        data.pushto_groups_encrypted_key = "default";
+        data.pullfrom_users_hashes = pullfromUserHashes;
+        data.pullfrom_users_encrypted = pullfromUsernamesEncrypted;
+        data.pullfrom_users_encrypted_key = "default";
+        data.pullfrom_groups_hashes = pullfromGroupHashes;
+        data.pullfrom_groups_encrypted = pullfromGroupsEncrypted;
+        data.pullfrom_groups_encrypted_key = "default";
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    await this.updateUnifiedCache();
+  }
+
+  /** Parse a raw app-distribution doc's data into an {@link AppDistributionView}. */
+  private async toAppDistributionView(
+    data: Record<string, unknown>,
+  ): Promise<AppDistributionView | null> {
+    if (data.type !== APP_DISTRIBUTION_TYPE || typeof data.appId !== "string") return null;
+    const stringArray = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((h): h is string => typeof h === "string") : [];
+    const title = await decryptEncryptedField(this.tenant, data, "title_encrypted");
+    const comment = await decryptEncryptedField(this.tenant, data, "comment_encrypted");
+    const version = await decryptEncryptedField(this.tenant, data, "version_encrypted");
+    let appData: unknown | null = null;
+    const appdataDecoded = await decryptEncryptedField(this.tenant, data, "appdata_encrypted");
+    if (appdataDecoded !== null) {
+      try {
+        appData = JSON.parse(appdataDecoded);
+      } catch {
+        appData = null;
+      }
+    }
+    return {
+      appId: data.appId,
+      title,
+      comment,
+      version,
+      appData,
+      preparedByPublicKey:
+        typeof data.preparedByPublicKey === "string" ? data.preparedByPublicKey : "",
+      pushto_users_hashes: stringArray(data.pushto_users_hashes),
+      pushto_groups_hashes: stringArray(data.pushto_groups_hashes),
+      pullfrom_users_hashes: stringArray(data.pullfrom_users_hashes),
+      pullfrom_groups_hashes: stringArray(data.pullfrom_groups_hashes),
+      pushtoUsernames: await this.decryptUsernameArray(data, "pushto_users_encrypted"),
+      pushtoGroups: await this.decryptUsernameArray(data, "pushto_groups_encrypted"),
+      pullfromUsernames: await this.decryptUsernameArray(data, "pullfrom_users_encrypted"),
+      pullfromGroups: await this.decryptUsernameArray(data, "pullfrom_groups_encrypted"),
+    };
+  }
+
+  /**
+   * List all app-distribution documents at the directory head as
+   * {@link AppDistributionView}s (decrypting display fields when the tenant
+   * default key is held; null-tolerant otherwise).
+   */
+  async listAppDistributions(): Promise<AppDistributionView[]> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    const allIds = await directoryDB.getAllDocumentIds();
+    const ids = allIds.filter((id) => id.startsWith(ACL_APP_DISTRIBUTION_PREFIX));
+    const views: AppDistributionView[] = [];
+    for (const id of ids) {
+      let doc: MindooDoc;
+      try {
+        doc = await directoryDB.getDocument(id);
+      } catch {
+        continue;
+      }
+      if (!doc) continue;
+      const view = await this.toAppDistributionView(doc.getData());
+      if (view) views.push(view);
+    }
+    return views;
+  }
+
+  /** Delete the singleton distribution document for `appId` (admin-signed). */
+  async deleteAppDistribution(
+    appId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    try {
+      await directoryDB.deleteDocument(aclAppDistributionDocId(appId), {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
+    } catch (error) {
+      this.logger.debug(`deleteAppDistribution: ${appId} not found or already deleted: ${error}`);
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Build the set of recipient-matching hashes for `username`: the user's own
+   * username-hash candidates plus the hash candidates of every group the user
+   * belongs to (resolved against the directory head). App-distribution
+   * `pushto`/`pullfrom` group hashes are written as the v3 hash of the
+   * normalized group name, which is exactly the v3 candidate of the group name,
+   * so a member intersects a group target here.
+   */
+  private async appDistributionIdentityHashes(username: string): Promise<Set<string>> {
+    const hashes = new Set<string>(await this.usernameHashCandidates(username));
+    const groups = await this.resolveGroupsForUser(username);
+    for (const group of groups) {
+      for (const h of await this.usernameHashCandidates(group)) {
+        hashes.add(h);
+      }
+    }
+    return hashes;
+  }
+
+  /**
+   * The per-user app-distribution reconcile plan at the directory head
+   * (docs/accesscontrol.md §13): `have` is every app the user is entitled to
+   * (matched by `pushto` user/group and NOT by `pullfrom` — pull wins on any
+   * overlap), `notHave` is every other distributed app id (the user must not
+   * keep it). Drives the Haven install/update/remove pass after a directory
+   * sync. Idempotent and convergent.
+   */
+  async getAppDistributionsForCurrentUser(
+    username: string,
+  ): Promise<AppDistributionReconcilePlan> {
+    const myHashes = await this.appDistributionIdentityHashes(username);
+    const views = await this.listAppDistributions();
+    const have: AppDistributionReconcilePlan["have"] = [];
+    const notHave: string[] = [];
+    for (const view of views) {
+      const meInPull =
+        view.pullfrom_users_hashes.some((h) => myHashes.has(h)) ||
+        view.pullfrom_groups_hashes.some((h) => myHashes.has(h));
+      const meInPush =
+        view.pushto_users_hashes.some((h) => myHashes.has(h)) ||
+        view.pushto_groups_hashes.some((h) => myHashes.has(h));
+      if (meInPush && !meInPull) {
+        have.push({
+          appId: view.appId,
+          title: view.title ?? "",
+          version: view.version ?? "",
+          appData: view.appData,
+        });
+      } else {
+        notHave.push(view.appId);
+      }
+    }
+    return { have, notHave };
+  }
+
+  /**
+   * The app ids the active/given user is entitled to receive via `pushto` at the
+   * directory head (status is derived, never persisted). Convenience wrapper
+   * over {@link getAppDistributionsForCurrentUser}.
+   */
+  async getManagedAppIds(username: string): Promise<string[]> {
+    const plan = await this.getAppDistributionsForCurrentUser(username);
+    return plan.have.map((entry) => entry.appId);
   }
 
   /**
