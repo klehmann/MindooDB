@@ -123,12 +123,11 @@ describe("access-control schema", () => {
   });
 
   describe("policy defaults and layering", () => {
-    it("defaults snapshot/purge to denied and the rest to allowed", () => {
+    it("defaults snapshot to denied and the rest to allowed", () => {
       const eff = effectivePolicy({ form: "accesscontrol", type: "defaultpolicy" }, null);
       expect(eff.denyDocCreate).toBe(false);
       expect(eff.denyDocSnapshot).toBe(DEFAULT_POLICY_DEFAULTS.denyDocSnapshot);
       expect(eff.denyDocSnapshot).toBe(true);
-      expect(eff.denyDocPurge).toBe(true);
       expect(eff.disableAllAccessChecksAndPolicies).toBe(false);
     });
 

@@ -37,7 +37,6 @@ export type RuleType =
   | "doc_delete"
   | "doc_undelete"
   | "doc_snapshot"
-  | "doc_purge"
   | "doc_read";
 
 /** All valid {@link RuleType} values, for validation and iteration. */
@@ -47,7 +46,6 @@ export const RULE_TYPES: readonly RuleType[] = [
   "doc_delete",
   "doc_undelete",
   "doc_snapshot",
-  "doc_purge",
   "doc_read",
 ];
 
@@ -167,7 +165,6 @@ export interface DefaultAccessPolicyDoc {
   denyDocDelete?: boolean; // default false
   denyDocUndelete?: boolean; // default false
   denyDocSnapshot?: boolean; // default true (admin-only by default)
-  denyDocPurge?: boolean; // default true (admin-only by default)
   /**
    * Database read/sync gate (§6.6). When true, members may NOT open or sync the
    * governed database(s) unless an explicit `doc_read` allow rule grants them
@@ -263,7 +260,6 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
   denyDocDelete: false,
   denyDocUndelete: false,
   denyDocSnapshot: true,
-  denyDocPurge: true,
   denyDocRead: false,
 };
 
@@ -277,7 +273,6 @@ export const RULE_TYPE_TO_DENY_FIELD: Record<
   doc_delete: "denyDocDelete",
   doc_undelete: "denyDocUndelete",
   doc_snapshot: "denyDocSnapshot",
-  doc_purge: "denyDocPurge",
   doc_read: "denyDocRead",
 };
 
@@ -569,7 +564,6 @@ export function effectivePolicy(
     denyDocDelete: pick("denyDocDelete"),
     denyDocUndelete: pick("denyDocUndelete"),
     denyDocSnapshot: pick("denyDocSnapshot"),
-    denyDocPurge: pick("denyDocPurge"),
     denyDocRead: pick("denyDocRead"),
     defaultCreateKeyId,
   };
@@ -957,6 +951,334 @@ export function validateAppDistribution(input: {
     if (pushGroups.has(hash)) {
       throw new Error("app distribution `pushto` and `pullfrom` group sets must be disjoint");
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sync setup policies. An onboarding/governance aid that pre-configures (and
+// optionally permanently enforces) a set of databases on a targeted user's or
+// group's Haven Sync page, so a client has a known sync configuration without
+// the user having to open each database locally first. Mirrors app
+// distribution: admin-signed directory documents with hashed `pushto`/
+// `pullfrom` user/group targeting, reconciled client-side after the directory
+// syncs. There is no server-side enforcement (the policy carries no secret
+// key); the per-policy `mode` ("initial" vs "permanent") is a client-side UX/
+// runner gesture, not a cryptographic guarantee.
+// ---------------------------------------------------------------------------
+
+/**
+ * Sync setup policy type tag (the `type` field of a {@link SyncSetupPolicyDoc}).
+ */
+export const SYNC_SETUP_POLICY_TYPE = "syncsetuppolicy" as const;
+
+/**
+ * Enforcement mode of a sync setup policy:
+ *  - `"initial"`: the listed databases are seeded onto the targeted user's Sync
+ *    page once; the user remains free to change the sync direction or disable
+ *    them (onboarding aid only).
+ *  - `"permanent"`: the listed databases stay on the Sync page and their sync
+ *    direction is forced to bidirectional; the user cannot change the direction
+ *    or disable them (unless released via `pullfrom`).
+ */
+export type SyncSetupPolicyMode = "initial" | "permanent";
+
+/** All valid {@link SyncSetupPolicyMode} values, for validation. */
+export const SYNC_SETUP_POLICY_MODES: readonly SyncSetupPolicyMode[] = ["initial", "permanent"];
+
+/**
+ * The authoritative document governing one sync setup policy (`policyId`).
+ * Stored at the fixed id `acl_syncsetuppolicy_<policyId>` (one doc per policy;
+ * a tenant may have several). Publish is always an upsert of the full desired
+ * state.
+ *
+ * Like app distribution there is no key material: the payload is the list of
+ * database ids the targeted clients should have on their Sync page. Recipient
+ * membership (`pushto` / `pullfrom`) is resolved client-side at reconcile time
+ * against the directory head. `pushto` means "targeted" (seed the databases);
+ * `pullfrom` releases any `permanent` lock for that user/group while keeping the
+ * databases seeded (it does NOT remove them). Display fields are stored under
+ * the `<field>_encrypted` convention with the tenant `default` key, so the sync
+ * server cannot read them.
+ */
+export interface SyncSetupPolicyDoc {
+  form: typeof ACCESS_CONTROL_FORM;
+  type: typeof SYNC_SETUP_POLICY_TYPE;
+  /** Bare policy id; the document identity (one doc per policy). */
+  policyId: string;
+  /** Display aid: the policy id re-stated under the tenant default key. */
+  policyid_encrypted: string;
+  policyid_encrypted_key: string; // "default"
+  /** Enforcement mode; cleartext is fine (not a secret), but kept simple. */
+  mode: SyncSetupPolicyMode;
+  title_encrypted: string;
+  title_encrypted_key: string; // "default"
+  comment_encrypted?: string;
+  comment_encrypted_key?: string;
+  /** JSON array of database ids the targeted clients should sync, encrypted. */
+  databaseids_encrypted: string;
+  databaseids_encrypted_key: string; // "default"
+  /** The author's signing public key that prepared the policy (audit). */
+  preparedByPublicKey: string;
+  /** Users whose Haven client should seed the databases. */
+  pushto_users_hashes: string[];
+  pushto_users_encrypted?: string;
+  pushto_users_encrypted_key?: string; // "default"
+  /** Groups whose members should seed the databases (resolved at reconcile). */
+  pushto_groups_hashes: string[];
+  pushto_groups_encrypted?: string;
+  pushto_groups_encrypted_key?: string; // "default"
+  /** Users for whom any `permanent` lock is released (databases stay seeded). */
+  pullfrom_users_hashes: string[];
+  pullfrom_users_encrypted?: string;
+  pullfrom_users_encrypted_key?: string;
+  /** Groups for whom any `permanent` lock is released. */
+  pullfrom_groups_hashes: string[];
+  pullfrom_groups_encrypted?: string;
+  pullfrom_groups_encrypted_key?: string;
+}
+
+/**
+ * The full unsigned content of one sync setup policy, built in the authoring
+ * dialog (or carried by an `mdb://sync-setup-policy/...` request URI). The admin
+ * maps it to a {@link SyncSetupPolicyDoc} on save (encrypting the display +
+ * database fields and hashing the user/group names).
+ */
+export interface SyncSetupPolicyRequest {
+  v: 1;
+  tenantId?: string;
+  policyId: string;
+  mode: SyncSetupPolicyMode;
+  /** Plaintext (encrypted on save). */
+  title: string;
+  comment?: string;
+  /** The database ids the targeted clients should sync (encrypted on save). */
+  databaseIds: string[];
+  preparedByPublicKey: string;
+  pushtoUsernames: string[];
+  pushtoGroups: string[];
+  pullfromUsernames: string[];
+  pullfromGroups: string[];
+}
+
+/**
+ * Read-side projection of a {@link SyncSetupPolicyDoc} for list/edit UIs. The
+ * `*Usernames` / `*Groups` are the decrypted display arrays (null when the
+ * tenant default key is not held); `databaseIds` is the parsed list (null when
+ * unreadable).
+ */
+export interface SyncSetupPolicyView {
+  policyId: string;
+  mode: SyncSetupPolicyMode;
+  title: string | null;
+  comment: string | null;
+  databaseIds: string[] | null;
+  preparedByPublicKey: string;
+  pushto_users_hashes: string[];
+  pushto_groups_hashes: string[];
+  pullfrom_users_hashes: string[];
+  pullfrom_groups_hashes: string[];
+  pushtoUsernames: string[] | null;
+  pushtoGroups: string[] | null;
+  pullfromUsernames: string[] | null;
+  pullfromGroups: string[] | null;
+}
+
+/** One database the active user should have on the Sync page, with its lock state. */
+export interface SyncSetupPolicyDatabase {
+  databaseId: string;
+  /** True when a `permanent` policy targets this database for the user (and is not released). */
+  locked: boolean;
+}
+
+/**
+ * The per-user reconcile plan computed from the directory head: the union of
+ * databases the user is targeted for across all policies, each carrying the
+ * effective lock state (locked wins on overlap).
+ */
+export interface SyncSetupPolicyReconcilePlan {
+  databases: SyncSetupPolicyDatabase[];
+}
+
+/** Document id prefix for the per-policy sync setup policy documents. */
+export const ACL_SYNC_SETUP_POLICY_PREFIX = "acl_syncsetuppolicy_";
+
+/**
+ * Document id for a sync setup policy — one doc per `policyId`, so publish is
+ * always an upsert of that policy's full desired state. The policy id is
+ * encoded so arbitrary ids stay valid doc-id components.
+ */
+export function aclSyncSetupPolicyDocId(policyId: string): string {
+  return assertValidDocId(ACL_SYNC_SETUP_POLICY_PREFIX + encodeAclIdComponent(policyId));
+}
+
+/** True when `docId` is a sync-setup-policy document id. */
+export function isSyncSetupPolicyDocId(docId: string): boolean {
+  return docId.startsWith(ACL_SYNC_SETUP_POLICY_PREFIX);
+}
+
+/**
+ * Validate the structural invariants of a sync setup policy before publish.
+ * Throws on the first violation:
+ *
+ *  - `policyId` is non-empty;
+ *  - `mode` is a valid {@link SyncSetupPolicyMode};
+ *  - `databaseIds` is non-empty;
+ *  - `pushto` and `pullfrom` user-hash sets are disjoint;
+ *  - `pushto` and `pullfrom` group-hash sets are disjoint.
+ */
+export function validateSyncSetupPolicy(input: {
+  policyId: string;
+  mode: SyncSetupPolicyMode;
+  databaseIds: string[];
+  pushto_users_hashes: string[];
+  pullfrom_users_hashes: string[];
+  pushto_groups_hashes: string[];
+  pullfrom_groups_hashes: string[];
+}): void {
+  if (typeof input.policyId !== "string" || input.policyId.length === 0) {
+    throw new Error("sync setup policy requires a non-empty `policyId`");
+  }
+  if (!SYNC_SETUP_POLICY_MODES.includes(input.mode)) {
+    throw new Error(
+      "sync setup policy `mode` must be one of " + SYNC_SETUP_POLICY_MODES.join(", "),
+    );
+  }
+  if (!Array.isArray(input.databaseIds) || input.databaseIds.length === 0) {
+    throw new Error("sync setup policy requires at least one database id");
+  }
+  const pushUsers = new Set(input.pushto_users_hashes);
+  for (const hash of input.pullfrom_users_hashes) {
+    if (pushUsers.has(hash)) {
+      throw new Error("sync setup policy `pushto` and `pullfrom` user sets must be disjoint");
+    }
+  }
+  const pushGroups = new Set(input.pushto_groups_hashes);
+  for (const hash of input.pullfrom_groups_hashes) {
+    if (pushGroups.has(hash)) {
+      throw new Error("sync setup policy `pushto` and `pullfrom` group sets must be disjoint");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Document history purge requests (docs/accesscontrol.md §13). Unlike key/app
+// distribution there is no recipient list: a purge applies tenant-wide. The
+// request names a database and one or more documents whose entire history must
+// be physically deleted from every replica (GDPR/erasure). The document is
+// encrypted under `$publicinfos` with `dbId` + `docIds` kept as CLEARTEXT
+// fields so the sync server can read the routing info and execute the purge on
+// its own stores; only the human-readable `reason` is encrypted with the tenant
+// `default` key. Each request is an immutable audit record keyed by `requestId`
+// (one doc per request); a still-pending request may be deleted by an admin.
+// ---------------------------------------------------------------------------
+
+/**
+ * Document history purge request type tag (the `type` field of a
+ * {@link DocHistoryPurgeDoc}).
+ */
+export const DOC_HISTORY_PURGE_TYPE = "dochistorypurge" as const;
+
+/**
+ * The admin-signed document requesting the physical purge of one or more
+ * documents' history from a database. Stored at the fixed id
+ * `acl_dochistorypurge_<requestId>` (one doc per request; append-only audit
+ * record). The doc shell is `$publicinfos`-readable so the server can read the
+ * cleartext `dbId` + `docIds` routing fields and execute the purge; `reason` is
+ * stored under the `<field>_encrypted` convention with the tenant `default` key,
+ * so the server cannot read it.
+ */
+export interface DocHistoryPurgeDoc {
+  form: typeof ACCESS_CONTROL_FORM;
+  type: typeof DOC_HISTORY_PURGE_TYPE;
+  /** Stable request id; the document identity (one doc per request). */
+  requestId: string;
+  /** Cleartext (server-readable) id of the database whose docs are purged. */
+  dbId: string;
+  /** Cleartext (server-readable) ids of the documents to purge. */
+  docIds: string[];
+  /** Optional human-readable reason, encrypted with the tenant default key. */
+  reason_encrypted?: string;
+  reason_encrypted_key?: string; // "default"
+  /** The requesting user's signing public key that prepared the request (audit). */
+  preparedByPublicKey: string;
+  /** Epoch millis the request was prepared/signed. */
+  requestedAt: number;
+}
+
+/**
+ * The full unsigned content of one purge request, built in the authoring dialog
+ * (or carried by an `mdb://doc-history-purge/...` request URI). The admin maps
+ * it to a {@link DocHistoryPurgeDoc} on save (encrypting `reason`). A
+ * `requestId` is generated at prepare time and carried through so admin import +
+ * sign is idempotent (the doc id is derived from it).
+ */
+export interface DocHistoryPurgeRequest {
+  v: 1;
+  tenantId?: string;
+  requestId: string;
+  dbId: string;
+  docIds: string[];
+  /** Plaintext in the URI (sent out-of-band); the admin encrypts it on save. */
+  reason?: string;
+  preparedByPublicKey: string;
+}
+
+/**
+ * Read-side projection of a {@link DocHistoryPurgeDoc} for list UIs. `reason` is
+ * the decrypted value (null when the tenant default key is not held).
+ */
+export interface DocHistoryPurgeView {
+  requestId: string;
+  dbId: string;
+  docIds: string[];
+  reason: string | null;
+  preparedByPublicKey: string;
+  requestedAt: number;
+  /** The directory document id that carries this request. */
+  purgeRequestDocId: string;
+}
+
+/** Document id prefix for the per-request purge documents. */
+export const ACL_DOC_HISTORY_PURGE_PREFIX = "acl_dochistorypurge_";
+
+/**
+ * Document id for a purge request — one doc per request, keyed by `requestId`
+ * (append-only audit record). The request id is encoded so arbitrary ids stay
+ * valid doc-id components.
+ */
+export function aclDocHistoryPurgeDocId(requestId: string): string {
+  return assertValidDocId(ACL_DOC_HISTORY_PURGE_PREFIX + encodeAclIdComponent(requestId));
+}
+
+/** True when `docId` is a purge-request document id. */
+export function isDocHistoryPurgeDocId(docId: string): boolean {
+  return docId.startsWith(ACL_DOC_HISTORY_PURGE_PREFIX);
+}
+
+/**
+ * Validate the structural invariants of a purge request before publish. Throws
+ * on the first violation:
+ *
+ *  - `requestId` is non-empty;
+ *  - `dbId` is non-empty;
+ *  - `docIds` is a non-empty array of non-empty strings.
+ */
+export function validateDocHistoryPurge(input: {
+  requestId: string;
+  dbId: string;
+  docIds: string[];
+}): void {
+  if (typeof input.requestId !== "string" || input.requestId.length === 0) {
+    throw new Error("doc history purge request requires a non-empty `requestId`");
+  }
+  if (typeof input.dbId !== "string" || input.dbId.length === 0) {
+    throw new Error("doc history purge request requires a non-empty `dbId`");
+  }
+  if (!Array.isArray(input.docIds) || input.docIds.length === 0) {
+    throw new Error("doc history purge request requires a non-empty `docIds` array");
+  }
+  if (input.docIds.some((id) => typeof id !== "string" || id.length === 0)) {
+    throw new Error("doc history purge request `docIds` entries must be non-empty strings");
   }
 }
 

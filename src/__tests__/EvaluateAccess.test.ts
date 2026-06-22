@@ -126,10 +126,9 @@ describe("evaluateAccess", () => {
       expect(evaluateAccess({ op: "doc_change", dbid: "other", identity: identity(), node }).allowed).toBe(false);
     });
 
-    it("snapshot and purge are denied by default", () => {
+    it("snapshot is denied by default", () => {
       const node = nodeWith((b) => b.applyDefaultPolicy(policy({}), 1));
       expect(evaluateAccess({ op: "doc_snapshot", dbid: "db", identity: identity(), node }).allowed).toBe(false);
-      expect(evaluateAccess({ op: "doc_purge", dbid: "db", identity: identity(), node }).allowed).toBe(false);
     });
   });
 

@@ -66,6 +66,20 @@ import {
   AppDistributionReconcilePlan,
   aclAppDistributionDocId,
   validateAppDistribution,
+  ACL_SYNC_SETUP_POLICY_PREFIX,
+  SYNC_SETUP_POLICY_TYPE,
+  SyncSetupPolicyMode,
+  SyncSetupPolicyRequest,
+  SyncSetupPolicyView,
+  SyncSetupPolicyReconcilePlan,
+  aclSyncSetupPolicyDocId,
+  validateSyncSetupPolicy,
+  ACL_DOC_HISTORY_PURGE_PREFIX,
+  DOC_HISTORY_PURGE_TYPE,
+  DocHistoryPurgeRequest,
+  DocHistoryPurgeView,
+  aclDocHistoryPurgeDocId,
+  validateDocHistoryPurge,
 } from "./accesscontrol/types";
 import { IdentitySet, evaluateAccess } from "./accesscontrol/evaluate";
 import { AccessDecision } from "./accesscontrol/types";
@@ -140,6 +154,21 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   private appDistributionCache: Map<
     string,
     {
+      pushto_users_hashes: string[];
+      pushto_groups_hashes: string[];
+      pullfrom_users_hashes: string[];
+      pullfrom_groups_hashes: string[];
+    }
+  > = new Map();
+
+  // Incremental cache of sync-setup-policy recipient hash lists + enforcement
+  // mode, maintained by updateUnifiedCache (mirrors appDistributionCache). The
+  // encrypted database id list is read from the doc when the per-user reconcile
+  // runs (getSyncSetupForCurrentUser → listSyncSetupPolicies).
+  private syncSetupPolicyCache: Map<
+    string,
+    {
+      mode: SyncSetupPolicyMode;
       pushto_users_hashes: string[];
       pushto_groups_hashes: string[];
       pullfrom_users_hashes: string[];
@@ -674,6 +703,27 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
           const stringArray = (value: unknown): string[] =>
             Array.isArray(value) ? value.filter((h): h is string => typeof h === "string") : [];
           this.appDistributionCache.set(appId, {
+            pushto_users_hashes: stringArray(data.pushto_users_hashes),
+            pushto_groups_hashes: stringArray(data.pushto_groups_hashes),
+            pullfrom_users_hashes: stringArray(data.pullfrom_users_hashes),
+            pullfrom_groups_hashes: stringArray(data.pullfrom_groups_hashes),
+          });
+        }
+      }
+
+      // Process sync-setup-policy documents (acl_syncsetuppolicy_<policyId>); one
+      // doc per policy. Cache the recipient hash lists + enforcement mode so the
+      // per-user reconcile reads membership without re-scanning directory docs.
+      // A deleted policy drops its entry.
+      if (data.type === SYNC_SETUP_POLICY_TYPE && typeof data.policyId === "string") {
+        const policyId = data.policyId;
+        if (doc.isDeleted()) {
+          this.syncSetupPolicyCache.delete(policyId);
+        } else {
+          const stringArray = (value: unknown): string[] =>
+            Array.isArray(value) ? value.filter((h): h is string => typeof h === "string") : [];
+          this.syncSetupPolicyCache.set(policyId, {
+            mode: data.mode === "permanent" ? "permanent" : "initial",
             pushto_users_hashes: stringArray(data.pushto_users_hashes),
             pushto_groups_hashes: stringArray(data.pushto_groups_hashes),
             pullfrom_users_hashes: stringArray(data.pullfrom_users_hashes),
@@ -2508,6 +2558,264 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return plan.have.map((entry) => entry.appId);
   }
 
+  // -------------------------------------------------------------------------
+  // Sync setup policy. Mirrors app distribution; the payload is a list of
+  // database ids the targeted clients should have on their Haven Sync page,
+  // and the per-policy `mode` controls whether the seeding is just initial
+  // (user may change/disable) or permanently enforced (locked to bidirectional).
+  // Reconciled client-side after the directory syncs; no server enforcement.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Admin-sign and upsert the `acl_syncsetuppolicy_<policyId>` document from a
+   * {@link SyncSetupPolicyRequest} (built in-dialog or decoded from a request
+   * URI). The full desired state is written each time. Validates the structural
+   * invariants plus, against the directory, that every `pushto` user has an
+   * active grant.
+   */
+  async publishSyncSetupPolicy(
+    request: SyncSetupPolicyRequest,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const policyId = request.policyId;
+    const mode: SyncSetupPolicyMode = request.mode === "permanent" ? "permanent" : "initial";
+    const databaseIds = Array.isArray(request.databaseIds)
+      ? request.databaseIds.map((id) => id.trim()).filter((id) => id.length > 0)
+      : [];
+
+    const pushtoUserHashes = await Promise.all(
+      request.pushtoUsernames.map((u) => this.hashUsernameForWrite(u)),
+    );
+    const pullfromUserHashes = await Promise.all(
+      request.pullfromUsernames.map((u) => this.hashUsernameForWrite(u)),
+    );
+    const pushtoGroupHashes = await Promise.all(
+      request.pushtoGroups.map((g) => this.hashUsernameForWrite(this.normalizeGroupName(g))),
+    );
+    const pullfromGroupHashes = await Promise.all(
+      request.pullfromGroups.map((g) => this.hashUsernameForWrite(this.normalizeGroupName(g))),
+    );
+
+    validateSyncSetupPolicy({
+      policyId,
+      mode,
+      databaseIds,
+      pushto_users_hashes: pushtoUserHashes,
+      pullfrom_users_hashes: pullfromUserHashes,
+      pushto_groups_hashes: pushtoGroupHashes,
+      pullfrom_groups_hashes: pullfromGroupHashes,
+    });
+
+    // Directory-level validation: every pushto user must have an active grant.
+    for (const username of request.pushtoUsernames) {
+      const userKeys = await this.getUserPublicKeys(username);
+      if (!userKeys) {
+        throw new Error(`Cannot publish: pushto user "${username}" has no active grant`);
+      }
+    }
+
+    const policyidEncrypted = await this.encryptToDefaultField(policyId);
+    const titleEncrypted = await this.encryptToDefaultField(request.title ?? policyId);
+    const commentEncrypted = request.comment
+      ? await this.encryptToDefaultField(request.comment)
+      : undefined;
+    const databaseidsEncrypted = await this.encryptToDefaultField(JSON.stringify(databaseIds));
+    const pushtoUsernamesEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pushtoUsernames),
+    );
+    const pushtoGroupsEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pushtoGroups),
+    );
+    const pullfromUsernamesEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pullfromUsernames),
+    );
+    const pullfromGroupsEncrypted = await this.encryptToDefaultField(
+      JSON.stringify(request.pullfromGroups),
+    );
+
+    const docId = aclSyncSetupPolicyDocId(policyId);
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      docId,
+      adminSigningKeyPair,
+      administrationPrivateKeyPassword,
+    );
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = SYNC_SETUP_POLICY_TYPE;
+        data.policyId = policyId;
+        data.policyid_encrypted = policyidEncrypted;
+        data.policyid_encrypted_key = "default";
+        data.mode = mode;
+        data.title_encrypted = titleEncrypted;
+        data.title_encrypted_key = "default";
+        if (commentEncrypted !== undefined) {
+          data.comment_encrypted = commentEncrypted;
+          data.comment_encrypted_key = "default";
+        } else {
+          delete data.comment_encrypted;
+          delete data.comment_encrypted_key;
+        }
+        data.databaseids_encrypted = databaseidsEncrypted;
+        data.databaseids_encrypted_key = "default";
+        data.preparedByPublicKey = request.preparedByPublicKey;
+        data.pushto_users_hashes = pushtoUserHashes;
+        data.pushto_users_encrypted = pushtoUsernamesEncrypted;
+        data.pushto_users_encrypted_key = "default";
+        data.pushto_groups_hashes = pushtoGroupHashes;
+        data.pushto_groups_encrypted = pushtoGroupsEncrypted;
+        data.pushto_groups_encrypted_key = "default";
+        data.pullfrom_users_hashes = pullfromUserHashes;
+        data.pullfrom_users_encrypted = pullfromUsernamesEncrypted;
+        data.pullfrom_users_encrypted_key = "default";
+        data.pullfrom_groups_hashes = pullfromGroupHashes;
+        data.pullfrom_groups_encrypted = pullfromGroupsEncrypted;
+        data.pullfrom_groups_encrypted_key = "default";
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    await this.updateUnifiedCache();
+  }
+
+  /** Parse a raw sync-setup-policy doc's data into a {@link SyncSetupPolicyView}. */
+  private async toSyncSetupPolicyView(
+    data: Record<string, unknown>,
+  ): Promise<SyncSetupPolicyView | null> {
+    if (data.type !== SYNC_SETUP_POLICY_TYPE || typeof data.policyId !== "string") return null;
+    const stringArray = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((h): h is string => typeof h === "string") : [];
+    const title = await decryptEncryptedField(this.tenant, data, "title_encrypted");
+    const comment = await decryptEncryptedField(this.tenant, data, "comment_encrypted");
+    let databaseIds: string[] | null = null;
+    const databaseIdsDecoded = await decryptEncryptedField(this.tenant, data, "databaseids_encrypted");
+    if (databaseIdsDecoded !== null) {
+      try {
+        const parsed = JSON.parse(databaseIdsDecoded);
+        databaseIds = Array.isArray(parsed)
+          ? parsed.filter((id): id is string => typeof id === "string")
+          : null;
+      } catch {
+        databaseIds = null;
+      }
+    }
+    return {
+      policyId: data.policyId,
+      mode: data.mode === "permanent" ? "permanent" : "initial",
+      title,
+      comment,
+      databaseIds,
+      preparedByPublicKey:
+        typeof data.preparedByPublicKey === "string" ? data.preparedByPublicKey : "",
+      pushto_users_hashes: stringArray(data.pushto_users_hashes),
+      pushto_groups_hashes: stringArray(data.pushto_groups_hashes),
+      pullfrom_users_hashes: stringArray(data.pullfrom_users_hashes),
+      pullfrom_groups_hashes: stringArray(data.pullfrom_groups_hashes),
+      pushtoUsernames: await this.decryptUsernameArray(data, "pushto_users_encrypted"),
+      pushtoGroups: await this.decryptUsernameArray(data, "pushto_groups_encrypted"),
+      pullfromUsernames: await this.decryptUsernameArray(data, "pullfrom_users_encrypted"),
+      pullfromGroups: await this.decryptUsernameArray(data, "pullfrom_groups_encrypted"),
+    };
+  }
+
+  /**
+   * List all sync-setup-policy documents at the directory head as
+   * {@link SyncSetupPolicyView}s (decrypting display fields when the tenant
+   * default key is held; null-tolerant otherwise).
+   */
+  async listSyncSetupPolicies(): Promise<SyncSetupPolicyView[]> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    const allIds = await directoryDB.getAllDocumentIds();
+    const ids = allIds.filter((id) => id.startsWith(ACL_SYNC_SETUP_POLICY_PREFIX));
+    const views: SyncSetupPolicyView[] = [];
+    for (const id of ids) {
+      let doc: MindooDoc;
+      try {
+        doc = await directoryDB.getDocument(id);
+      } catch {
+        continue;
+      }
+      if (!doc) continue;
+      const view = await this.toSyncSetupPolicyView(doc.getData());
+      if (view) views.push(view);
+    }
+    return views;
+  }
+
+  /** Delete the sync-setup-policy document for `policyId` (admin-signed). */
+  async deleteSyncSetupPolicy(
+    policyId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    try {
+      await directoryDB.deleteDocument(aclSyncSetupPolicyDocId(policyId), {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
+    } catch (error) {
+      this.logger.debug(`deleteSyncSetupPolicy: ${policyId} not found or already deleted: ${error}`);
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * The per-user sync-setup reconcile plan at the directory head: the union of
+   * databases the user is targeted for across all policies (matched by `pushto`
+   * user/group), each carrying the effective lock state. A database is locked
+   * when a `permanent` policy targets it AND the user is not released via
+   * `pullfrom`; lock wins on overlap. A user only present in `pullfrom` (never
+   * in `pushto`) is not targeted. Drives the Haven Sync-page seed/lock pass
+   * after a directory sync. Idempotent and convergent.
+   */
+  async getSyncSetupForCurrentUser(
+    username: string,
+  ): Promise<SyncSetupPolicyReconcilePlan> {
+    const myHashes = await this.appDistributionIdentityHashes(username);
+    const views = await this.listSyncSetupPolicies();
+    const lockByDb = new Map<string, boolean>();
+    for (const view of views) {
+      const meInPush =
+        view.pushto_users_hashes.some((h) => myHashes.has(h)) ||
+        view.pushto_groups_hashes.some((h) => myHashes.has(h));
+      if (!meInPush) continue;
+      const meInPull =
+        view.pullfrom_users_hashes.some((h) => myHashes.has(h)) ||
+        view.pullfrom_groups_hashes.some((h) => myHashes.has(h));
+      const locked = view.mode === "permanent" && !meInPull;
+      for (const databaseId of view.databaseIds ?? []) {
+        const id = databaseId.trim();
+        if (!id) continue;
+        lockByDb.set(id, (lockByDb.get(id) ?? false) || locked);
+      }
+    }
+    const databases = Array.from(lockByDb.entries()).map(([databaseId, locked]) => ({
+      databaseId,
+      locked,
+    }));
+    return { databases };
+  }
+
   /**
    * The decryption key ids revoked for `username` at the directory head: every
    * `acl_keydistribution_<keyId>` whose `pullfrom_users_hashes` matches one of
@@ -3032,89 +3340,168 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return isRevoked;
   }
 
-  async requestDocHistoryPurge(
-    dbId: string,
-    docId: string,
-    reason: string | undefined,
+  /**
+   * Publish an admin-signed document-history purge request (docs/accesscontrol.md
+   * §13). Maps an unsigned {@link DocHistoryPurgeRequest} (built in-dialog or
+   * decoded from an `mdb://doc-history-purge/...` URI) to a
+   * {@link DocHistoryPurgeDoc} stored at the fixed id
+   * `acl_dochistorypurge_<requestId>` (one doc per request; append-only audit
+   * record). The doc shell is `$publicinfos`-readable so the sync server can read
+   * the cleartext `dbId` + `docIds` routing fields and execute the purge on its
+   * own stores; only `reason` is encrypted with the tenant `default` key.
+   */
+  async publishDocHistoryPurge(
+    request: DocHistoryPurgeRequest,
     administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
+    administrationPrivateKeyPassword: string,
   ): Promise<void> {
-    this.logger.info(`Requesting purge for document: ${docId} in ${dbId}`);
-    
+    validateDocHistoryPurge({
+      requestId: request.requestId,
+      dbId: request.dbId,
+      docIds: request.docIds,
+    });
+
+    this.logger.info(
+      `Publishing doc history purge request ${request.requestId} for ${request.docIds.length} doc(s) in ${request.dbId}`,
+    );
+
+    const reasonEncrypted = request.reason
+      ? await this.encryptToDefaultField(request.reason)
+      : undefined;
+
+    const docId = aclDocHistoryPurgeDocId(request.requestId);
+    const requestedAt = Date.now();
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    
     const adminSigningKeyPair: SigningKeyPair = {
       publicKey: baseTenant.getAdministrationPublicKey(),
       privateKey: administrationPrivateKey,
     };
-    
-    // Create document with admin signing key so the initial entry is trusted
-    const newDoc = await directoryDB.createDocumentWithSigningKey(
+    const doc = await this.getOrCreateAclDoc(
+      directoryDB,
+      docId,
       adminSigningKeyPair,
-      administrationPrivateKeyPassword
+      administrationPrivateKeyPassword,
     );
-    
-    // Set the document data fields with the admin key at entry level
-    await directoryDB.changeDoc(newDoc, async (doc: MindooDoc) => {
-      const data = doc.getData();
-      data.form = "useroperation";
-      data.type = "requestdochistorypurge";
-      data.dbId = dbId;
-      data.docId = docId;
-      if (reason) {
-        data.reason = reason;
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = DOC_HISTORY_PURGE_TYPE;
+        data.requestId = request.requestId;
+        data.dbId = request.dbId;
+        data.docIds = [...request.docIds];
+        if (reasonEncrypted !== undefined) {
+          data.reason_encrypted = reasonEncrypted;
+          data.reason_encrypted_key = "default";
+        } else {
+          delete data.reason_encrypted;
+          delete data.reason_encrypted_key;
+        }
+        data.preparedByPublicKey = request.preparedByPublicKey;
+        data.requestedAt = requestedAt;
+      },
+      {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      },
+    );
+    this.logger.info(`Created purge request ${request.requestId} in ${request.dbId}`);
+  }
+
+  /** Parse a raw purge-request doc's data into a {@link DocHistoryPurgeView}. */
+  private async toDocHistoryPurgeView(
+    data: Record<string, unknown>,
+    purgeRequestDocId: string,
+  ): Promise<DocHistoryPurgeView | null> {
+    if (data.type !== DOC_HISTORY_PURGE_TYPE) return null;
+    const dbId = data.dbId;
+    if (typeof dbId !== "string") return null;
+    const docIds = Array.isArray(data.docIds)
+      ? data.docIds.filter((id): id is string => typeof id === "string")
+      : [];
+    if (docIds.length === 0) return null;
+    const reason = await decryptEncryptedField(this.tenant, data, "reason_encrypted");
+    return {
+      requestId:
+        typeof data.requestId === "string" ? data.requestId : purgeRequestDocId,
+      dbId,
+      docIds,
+      reason,
+      preparedByPublicKey:
+        typeof data.preparedByPublicKey === "string" ? data.preparedByPublicKey : "",
+      requestedAt: typeof data.requestedAt === "number" ? data.requestedAt : 0,
+      purgeRequestDocId,
+    };
+  }
+
+  /**
+   * List all purge-request documents at the directory head as
+   * {@link DocHistoryPurgeView}s (decrypting `reason` when the tenant default
+   * key is held; null-tolerant otherwise).
+   */
+  async listDocHistoryPurges(): Promise<DocHistoryPurgeView[]> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    const allIds = await directoryDB.getAllDocumentIds();
+    const ids = allIds.filter((id) => id.startsWith(ACL_DOC_HISTORY_PURGE_PREFIX));
+    const views: DocHistoryPurgeView[] = [];
+    for (const id of ids) {
+      let doc: MindooDoc;
+      try {
+        doc = await directoryDB.getDocument(id);
+      } catch {
+        continue;
       }
-      data.requestedAt = Date.now();
-    }, {
-      signingKeyPair: adminSigningKeyPair,
-      signingKeyPassword: administrationPrivateKeyPassword,
-    });
-    
-    this.logger.info(`Created purge request for ${docId} in ${dbId}`);
+      if (!doc) continue;
+      const view = await this.toDocHistoryPurgeView(doc.getData(), id);
+      if (view) views.push(view);
+    }
+    return views;
+  }
+
+  /** Delete a still-pending purge request document (admin-signed). */
+  async deleteDocHistoryPurge(
+    requestId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = {
+      publicKey: baseTenant.getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    try {
+      await directoryDB.deleteDocument(aclDocHistoryPurgeDocId(requestId), {
+        signingKeyPair: adminSigningKeyPair,
+        signingKeyPassword: administrationPrivateKeyPassword,
+      });
+    } catch (error) {
+      this.logger.debug(
+        `deleteDocHistoryPurge: ${requestId} not found or already deleted: ${error}`,
+      );
+    }
   }
 
   async getRequestedDocHistoryPurges(): Promise<Array<{
+    requestId: string;
     dbId: string;
-    docId: string;
+    docIds: string[];
     reason?: string;
     requestedAt: number;
     purgeRequestDocId: string;
   }>> {
-    const directoryDB = await this.getDirectoryDB();
-    await directoryDB.syncStoreChanges();
-    
-    const purgeRequests: Array<{
-      dbId: string;
-      docId: string;
-      reason?: string;
-      requestedAt: number;
-      purgeRequestDocId: string;
-    }> = [];
-    
-    // No signature verification needed - DB already enforces admin-only
-    for await (const { doc } of directoryDB.iterateChangesSince(null)) {
-      const data = doc.getData();
-      
-      if (data.form === "useroperation" && data.type === "requestdochistorypurge") {
-              const dbId = data.dbId;
-              const docId = data.docId;
-              const reason = data.reason;
-              const requestedAt = data.requestedAt;
-              
-              if (typeof dbId === "string" && typeof docId === "string") {
-                purgeRequests.push({
-                  dbId: dbId,
-                  docId: docId,
-                  reason: typeof reason === "string" ? reason : undefined,
-                  requestedAt: typeof requestedAt === "number" ? requestedAt : Date.now(),
-                  purgeRequestDocId: doc.getId(),
-                });
-        }
-      }
-    }
-    
-    return purgeRequests;
+    const views = await this.listDocHistoryPurges();
+    return views.map((view) => ({
+      requestId: view.requestId,
+      dbId: view.dbId,
+      docIds: view.docIds,
+      reason: view.reason ?? undefined,
+      requestedAt: view.requestedAt,
+      purgeRequestDocId: view.purgeRequestDocId,
+    }));
   }
 
   async getTenantSettings(): Promise<MindooDoc | null> {

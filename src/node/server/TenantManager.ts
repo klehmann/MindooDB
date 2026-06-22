@@ -23,7 +23,8 @@ import { join, resolve, sep } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
-import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver, ServerPurgedDocResolver } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import { PurgedDocRegistry } from "./PurgedDocRegistry";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import { Ed25519WitnessProvider } from "../../core/accesscontrol/timestamp/Ed25519WitnessProvider";
@@ -41,11 +42,10 @@ import type {
   OpenStoreOptions,
   OpenTenantOptions,
   EncryptedPrivateKey,
-  StoreKind,
   DirectoryUserLookup,
   GrantKeyPairInfo,
 } from "../../core/types";
-import { PUBLIC_INFOS_KEY_ID } from "../../core/types";
+import { PUBLIC_INFOS_KEY_ID, StoreKind } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
 
 import { StoreFactory } from "./StoreFactory";
@@ -407,6 +407,10 @@ export class TenantManager {
   private trustedServers: TrustedServer[] = [];
   /** Lazily-built, cached witness signer (server's Ed25519 signing identity). */
   private witnessSigner: WitnessSigner | undefined;
+  /** Per-tenant persistent registry of executed purges (docs/accesscontrol.md §13). */
+  private purgedDocRegistries: Map<string, PurgedDocRegistry> = new Map();
+  /** In-flight purge executions, keyed by normalized tenant id (serializes runs). */
+  private purgeInFlight: Map<string, Promise<void>> = new Map();
 
   constructor(dataDir: string, serverPassword?: string) {
     this.dataDir = dataDir;
@@ -926,6 +930,12 @@ export class TenantManager {
     // itself (its policy, which defines the blacklist, must always sync).
     const revokedKeyResolver =
       dbId === "directory" ? undefined : this.buildRevokedKeyResolver(directory);
+    // Purged-document denylist (§13). Never applied to the directory store (purge
+    // requests themselves live there and must always sync).
+    const purgedDocResolver: ServerPurgedDocResolver | undefined =
+      dbId === "directory"
+        ? undefined
+        : () => this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
 
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
@@ -940,6 +950,7 @@ export class TenantManager {
         wipeGrantDocIdResolver,
         dbAccessEvaluator,
         revokedKeyResolver,
+        purgedDocResolver,
       },
     );
 
@@ -1063,6 +1074,104 @@ export class TenantManager {
   async getStore(tenantId: string, dbId: string, storeKind: StoreKind): Promise<ContentAddressedStore> {
     const tenant = await this.getTenant(tenantId);
     return tenant.storeFactory.getStore(dbId, storeKind);
+  }
+
+  /** The (lazily-loaded, cached) purge registry for a tenant. */
+  private getPurgedDocRegistry(tenantId: string): PurgedDocRegistry {
+    const normalizedId = tenantId.toLowerCase();
+    let registry = this.purgedDocRegistries.get(normalizedId);
+    if (!registry) {
+      registry = new PurgedDocRegistry(
+        join(this.resolveTenantDir(normalizedId), "purged-docs.json"),
+      );
+      this.purgedDocRegistries.set(normalizedId, registry);
+    }
+    return registry;
+  }
+
+  /**
+   * Execute any not-yet-processed document-history purge requests for a tenant
+   * (docs/accesscontrol.md §13). Reads the admin-signed purge requests from the
+   * tenant directory (server-readable `$publicinfos` envelope), physically
+   * purges each requested document's history from the tenant's `docs` and
+   * `attachments` stores, and records the purge in the persistent registry so
+   * (a) it is never executed twice and (b) re-pushes of the purged docs are
+   * rejected at sync time.
+   *
+   * No-op when the server cannot read the directory (config-based fallback, or
+   * the directory does not expose the purge reader). Runs are serialized per
+   * tenant; concurrent callers share the in-flight promise.
+   */
+  async executePendingPurges(tenantId: string): Promise<void> {
+    const normalizedId = tenantId.toLowerCase();
+    const existing = this.purgeInFlight.get(normalizedId);
+    if (existing) return existing;
+    const run = this.executePendingPurgesInternal(normalizedId).finally(() => {
+      this.purgeInFlight.delete(normalizedId);
+    });
+    this.purgeInFlight.set(normalizedId, run);
+    return run;
+  }
+
+  private async executePendingPurgesInternal(normalizedId: string): Promise<void> {
+    const tenant = await this.getTenant(normalizedId);
+    if (!tenant.mindooTenant) {
+      // Config-based fallback: the server holds no $publicinfos directory and
+      // cannot read purge requests. Clients still purge locally on reconcile.
+      return;
+    }
+
+    let directory: MindooTenantDirectory;
+    try {
+      directory = await tenant.mindooTenant.openDirectory();
+    } catch (error) {
+      console.error(`[TenantManager] executePendingPurges: cannot open directory for ${normalizedId}:`, error);
+      return;
+    }
+
+    if (typeof directory.getRequestedDocHistoryPurges !== "function") {
+      return;
+    }
+
+    let requests: Awaited<ReturnType<NonNullable<MindooTenantDirectory["getRequestedDocHistoryPurges"]>>>;
+    try {
+      requests = await directory.getRequestedDocHistoryPurges();
+    } catch (error) {
+      console.error(`[TenantManager] executePendingPurges: cannot read purge requests for ${normalizedId}:`, error);
+      return;
+    }
+    if (requests.length === 0) return;
+
+    const registry = this.getPurgedDocRegistry(normalizedId);
+    for (const request of requests) {
+      if (registry.isRequestProcessed(request.purgeRequestDocId)) {
+        continue;
+      }
+      if (typeof request.dbId !== "string" || request.dbId.length === 0) {
+        continue;
+      }
+      for (const docId of request.docIds) {
+        if (typeof docId !== "string" || docId.length === 0) continue;
+        for (const storeKind of [StoreKind.docs, StoreKind.attachments]) {
+          try {
+            const store = await this.getStore(normalizedId, request.dbId, storeKind);
+            await store.purgeDocHistory(docId);
+          } catch (error) {
+            console.error(
+              `[TenantManager] executePendingPurges: failed to purge ${docId} in ${normalizedId}/${request.dbId}/${storeKind}:`,
+              error,
+            );
+          }
+        }
+        // Record on the denylist regardless of per-store outcome so re-pushes of
+        // this docId are rejected even if one store had nothing to purge.
+        registry.recordPurgedDoc(request.dbId, docId);
+      }
+      registry.markRequestProcessed(request.purgeRequestDocId);
+      console.log(
+        `[TenantManager] Executed purge request ${request.purgeRequestDocId} (${request.docIds.length} doc(s)) for ${normalizedId}/${request.dbId}`,
+      );
+    }
   }
 
   async getAuthService(tenantId: string): Promise<AuthenticationService> {

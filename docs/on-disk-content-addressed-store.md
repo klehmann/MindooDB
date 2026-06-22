@@ -262,7 +262,7 @@ When a GDPR purge is requested for a document, the store performs the following 
 
 This operation is intentionally thorough: once a purge completes, no metadata or payload data for the affected document remains on disk.
 
-**When to use:** GDPR purge is triggered through the tenant directory's `requestDocHistoryPurge` API. Clients receiving a purge request from the directory will invoke `purgeDocHistory` on their local stores. You do not typically call this method directly -- the sync protocol handles propagation.
+**When to use:** GDPR purge is triggered through the tenant directory's `publishDocHistoryPurge` API (an admin-signed purge request document). Clients receiving a purge request from the directory will invoke `purgeDocHistory` on their local stores, and the sync server runs the same purge server-side and rejects re-pushes of the removed documents. You do not typically call this method directly -- the sync protocol handles propagation.
 
 ### Important consistency note
 

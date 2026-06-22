@@ -1231,19 +1231,10 @@ class MockTenantDirectory implements MindooTenantDirectory {
   }
 
   // GDPR methods - not used in tests
-  async requestDocHistoryPurge(
-    _dbId: string,
-    _docId: string,
-    _reason: string | undefined,
-    _administrationPrivateKey: EncryptedPrivateKey,
-    _administrationPrivateKeyPassword: string
-  ): Promise<void> {
-    // Not needed for tests
-  }
-
   async getRequestedDocHistoryPurges(): Promise<Array<{
+    requestId: string;
     dbId: string;
-    docId: string;
+    docIds: string[];
     reason?: string;
     requestedAt: number;
     purgeRequestDocId: string;

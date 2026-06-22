@@ -1557,6 +1557,18 @@ export class MindooDBServer {
         success: true,
         receipts: stampedMetadata.map((e) => this.serializeEntryMetadata(e)),
       });
+
+      // A directory push may carry new admin-signed purge requests
+      // (docs/accesscontrol.md §13). Execute any pending purges after the
+      // response so the server physically removes purged history from its own
+      // stores and arms the re-push denylist. Fire-and-forget: failures are
+      // logged and retried on the next directory push.
+      if (validDbId === "directory") {
+        const tenantId = req.tenantId!;
+        void this.tenantManager.executePendingPurges(tenantId).catch((error) => {
+          console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
+        });
+      }
     } catch (error) {
       console.error("[MindooDBServer] putEntries failed", {
         stage,

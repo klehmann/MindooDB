@@ -569,7 +569,6 @@ describe("protocol compatibility", () => {
     async isUserRevoked(username: string): Promise<boolean> {
       return this.users.get(username)?.revoked ?? true;
     }
-    async requestDocHistoryPurge(..._a: any[]): Promise<void> {}
     async getRequestedDocHistoryPurges(): Promise<any[]> { return []; }
     async getTenantSettings(): Promise<MindooDoc | null> { return null; }
     async changeTenantSettings(..._a: any[]): Promise<void> {}

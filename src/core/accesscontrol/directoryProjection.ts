@@ -37,7 +37,6 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
     denyDocDelete: bool(data.denyDocDelete),
     denyDocUndelete: bool(data.denyDocUndelete),
     denyDocSnapshot: bool(data.denyDocSnapshot),
-    denyDocPurge: bool(data.denyDocPurge),
     denyDocRead: bool(data.denyDocRead),
     defaultCreateKeyId:
       typeof data.defaultCreateKeyId === "string" ? data.defaultCreateKeyId : undefined,
@@ -175,6 +174,20 @@ function projectAccessControlDoc(
   // (recipient Haven clients read them directly during the post-sync reconcile);
   // skip them here.
   if (data.type === "appdistribution") {
+    return;
+  }
+
+  // Sync-setup-policy documents likewise carry no directory-state projection
+  // (recipient Haven clients read them directly during the post-sync Sync-page
+  // reconcile); skip them here.
+  if (data.type === "syncsetuppolicy") {
+    return;
+  }
+
+  // Document-history purge requests carry no directory-state projection (clients
+  // and the sync server read them directly during the post-sync purge reconcile);
+  // skip them here.
+  if (data.type === "dochistorypurge") {
     return;
   }
 

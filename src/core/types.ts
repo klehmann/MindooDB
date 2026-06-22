@@ -14,6 +14,11 @@ import type {
   AppDistributionRequest,
   AppDistributionView,
   AppDistributionReconcilePlan,
+  SyncSetupPolicyRequest,
+  SyncSetupPolicyView,
+  SyncSetupPolicyReconcilePlan,
+  DocHistoryPurgeRequest,
+  DocHistoryPurgeView,
   RuleTargets,
   RuleType,
   WithFieldClause,
@@ -2815,6 +2820,54 @@ export interface MindooTenantDirectory {
   getManagedAppIds?(username: string): Promise<string[]>;
 
   /**
+   * Admin-sign and upsert the `acl_syncsetuppolicy_<policyId>` document from a
+   * sync setup policy request. Pre-configures (and optionally permanently
+   * enforces) a set of databases on the targeted users'/groups' Haven Sync page.
+   *
+   * @param request The sync setup policy request (built in-dialog or decoded from a request URI).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  publishSyncSetupPolicy?(
+    request: SyncSetupPolicyRequest,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * List all sync-setup-policy documents at the directory head as views
+   * (decrypting display fields when the tenant default key is held).
+   *
+   * @returns The sync setup policy views.
+   */
+  listSyncSetupPolicies?(): Promise<SyncSetupPolicyView[]>;
+
+  /**
+   * Delete the sync-setup-policy document for `policyId` (admin-signed).
+   *
+   * @param policyId The sync setup policy id.
+   * @param administrationPrivateKey The administration private key to sign the change.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  deleteSyncSetupPolicy?(
+    policyId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * The per-user sync-setup reconcile plan at the directory head: the union of
+   * databases the user is targeted for across all policies, each carrying the
+   * effective lock state (locked when a `permanent` policy targets it and the
+   * user is not released via `pullfrom`). Drives the Haven post-sync Sync-page
+   * seed/lock pass.
+   *
+   * @param username The user to resolve the plan for.
+   * @returns The reconcile plan.
+   */
+  getSyncSetupForCurrentUser?(username: string): Promise<SyncSetupPolicyReconcilePlan>;
+
+  /**
    * Audit / time travel (§8): the head time-travel directory-state node ("now"),
    * after bringing the directory-state chain up to date. Carries the default
    * policy, per-database policies, rules, groups, user grants, and trusted
@@ -2890,41 +2943,61 @@ export interface MindooTenantDirectory {
   isUserRevoked(username: string): Promise<boolean>;
 
   /**
-   * Requests that a document's change history be purged from all client stores.
-   * Creates a purge request record in the directory that clients will process when they
-   * sync directory changes. Clients receiving this directory update will purge all
-   * changes for the specified document from their local stores.
-   * 
-   * This is useful for GDPR compliance (right to be forgotten) and other scenarios
-   * where document data must be removed from all systems.
-   * 
-   * @param dbId The database ID containing the document
-   * @param docId The document ID whose change history should be purged
-   * @param reason Optional reason for the purge request (e.g., "GDPR right to be forgotten")
-   * @param administrationPrivateKey The administration private key to sign the request
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
-   * @return A promise that resolves when the purge request record is created
+   * Admin-sign and write a document-history purge request to the directory from
+   * a request (built in-dialog or decoded from an `mdb://doc-history-purge/...`
+   * URI). Stored at the fixed id `acl_dochistorypurge_<requestId>` (one doc per
+   * request; append-only audit record). The doc shell is `$publicinfos`-readable
+   * so the sync server can read the cleartext `dbId` + `docIds` routing fields
+   * and execute the purge; only `reason` is encrypted with the tenant default
+   * key. Clients (and the server) process the request after a directory sync and
+   * purge the requested documents from their stores (docs/accesscontrol.md §13).
+   *
+   * This is useful for GDPR compliance (right to be forgotten) and other
+   * scenarios where document data must be removed from all systems.
+   *
+   * @param request The full unsigned purge request (db + doc ids + optional reason).
+   * @param administrationPrivateKey The administration private key to sign the request.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @return A promise that resolves when the purge request record is created.
    */
-  requestDocHistoryPurge(
-    dbId: string,
-    docId: string,
-    reason: string | undefined,
+  publishDocHistoryPurge?(
+    request: DocHistoryPurgeRequest,
     administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
+    administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
   /**
-   * Get all pending document history purge requests that clients should process.
-   * Returns purge requests with verified admin signatures that clients have not yet processed.
-   * 
-   * Clients should call this method periodically (e.g., after directory sync) and
-   * purge the requested documents from their local stores.
-   * 
-   * @return Array of purge request records with verified admin signatures
+   * List all purge-request documents at the directory head, decrypting `reason`
+   * when the tenant default key is held.
+   *
+   * @returns The purge-request views.
+   */
+  listDocHistoryPurges?(): Promise<DocHistoryPurgeView[]>;
+
+  /**
+   * Delete a still-pending purge request document (admin-signed).
+   *
+   * @param requestId The purge request id.
+   * @param administrationPrivateKey The administration private key to sign the change.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  deleteDocHistoryPurge?(
+    requestId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Get all document history purge requests that clients (and the server) should
+   * process. Returns the requests' routing info; clients/servers purge the
+   * requested documents from their stores after a directory sync.
+   *
+   * @return Array of purge request records.
    */
   getRequestedDocHistoryPurges(): Promise<Array<{
+    requestId: string;
     dbId: string;
-    docId: string;
+    docIds: string[];
     reason?: string;
     requestedAt: number;
     purgeRequestDocId: string;  // ID of the purge request document in directory

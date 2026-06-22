@@ -32,7 +32,7 @@ enterprise-ready infrastructure.
 |------------|:-----------------:|:------------------------:|
 | End-to-end encryption, local-first sync, zero-trust server | ✅ | ✅ |
 | Read access by key possession | ✅ | ✅ |
-| **Write governance** — who may create / change / delete / snapshot / purge, scoped to database *and* content | — | ✅ (§2–§12) |
+| **Write governance** — who may create / change / delete / snapshot, scoped to database *and* content | — | ✅ (§2–§12) |
 | **Read governance** — who may *see* which data, by encryption-key possession (admin-blind key distribution + revoke/rotate) | — | ✅ (§13) |
 | **Group & identity management** — DN-hierarchy identities, nested groups, wildcard targeting | — | ✅ (§6.5, §8.1) |
 | **Cryptographic key guidelines** — choose & rotate the keys new documents use, admin-blind key distribution, crypto-shred | — | ✅ (§6.6, §13.6) |
@@ -89,13 +89,12 @@ can also create, change and delete documents in it. This layer adds the *fine-gr
 controls an organization needs on top of that solid base.
 
 The access control layer adds governance over **write** operations
-(`doc_create`, `doc_change`, `doc_delete`, `doc_undelete`, `doc_snapshot`,
-`doc_purge`) on top of the existing encryption model (read governance follows the same
-shape in §13).
+(`doc_create`, `doc_change`, `doc_delete`, `doc_undelete`, `doc_snapshot`) on top
+of the existing encryption model (read governance follows the same shape in §13).
 
 **Goals**
 
-- Govern which users (or groups) may create, change, delete, snapshot or purge
+- Govern which users (or groups) may create, change, delete or snapshot
   documents, optionally scoped to a database and to the document's content.
 - Keep those guarantees intact even when users work **offline** and their device clock
   cannot be taken at face value.
@@ -410,7 +409,6 @@ interface DefaultAccessPolicyDoc {
   denyDocDelete: boolean;    // default false
   denyDocUndelete: boolean;  // default false
   denyDocSnapshot: boolean;  // default true  (snapshots are admin-only by default)
-  denyDocPurge: boolean;     // default true  (purge is admin-only by default)
 
   /** Database read/sync gate. When true, members may not open or sync the
    *  governed database(s) unless a doc_read allow rule grants them access; when
@@ -450,7 +448,7 @@ interface DefaultAccessPolicyDoc {
   Access control has never been enabled, so there is nothing to evaluate and all
   operations are allowed. This — not a field default — is why a new tenant has no
   checks. The implicit behavior is equivalent to all `deny*` set to `false` for the
-  lifecycle operations and `true` for snapshot/purge.
+  lifecycle operations and `true` for snapshot.
 - **The document exists** (an admin has started configuring ACL). Now the document's
   fields govern enforcement, and any omitted field takes its stated default. In
   particular `disableAllAccessChecksAndPolicies` defaults to `false` here, because an
@@ -477,7 +475,7 @@ tenant-level only and are ignored if set on a per-database policy (see section 6
 ```ts
 type RuleType =
   | "doc_create" | "doc_change" | "doc_delete"
-  | "doc_undelete" | "doc_snapshot" | "doc_purge"
+  | "doc_undelete" | "doc_snapshot"
   | "doc_read";  // database-level read/sync gate (section 6.8); dbid-scoped, no withfields
 
 type Operator =
@@ -1184,8 +1182,19 @@ on the first `changeDoc` (which also throws synchronously).
   and the underlying heads are materialized from their individual trusted entries
   instead. Authoring a snapshot is governed by `denyDocSnapshot` (admin-only by
   default).
-- **Purge (`doc_purge`).** `purgeDocHistory()` is gated by a `doc_purge` rule;
-  default is admin-only. A purge instruction from a non-authorized signer is ignored.
+- **Purge.** Purging document history (`purgeDocHistory()` /
+  `publishDocHistoryPurge()`) is an inherently admin-only operation: a purge
+  request is only honored when it carries the tenant admin's signature, so it
+  is authorized by the admin key directly rather than by a policy `deny*` flag or
+  ACL rule. A purge request from a non-authorized signer is ignored. A purge
+  request is published as an access-control document
+  (`acl_dochistorypurge_<requestId>`) whose `dbId` and `docIds` are stored in
+  cleartext inside the `$publicinfos` envelope so the sync server can execute the
+  purge and reject re-pushes of the removed documents; the optional `reason` is
+  encrypted with the tenant key. Anyone may prepare a request (and export an
+  `mdb://doc-history-purge/...` URI), but only the admin signature makes it
+  effective. Use `listDocHistoryPurges()` to enumerate pending requests and
+  `deleteDocHistoryPurge(requestId, ...)` to withdraw one before it is acted on.
 
 ## 11. Worked example: a CRM with per-record editors
 
@@ -1787,8 +1796,9 @@ cryptography and the server, not by client cooperation:
 - **Rely on deny-overrides-allow** (section 7). It is order-independent (rules merge
   via Automerge), so a standalone `deny` rule is an effective, replica-safe kill
   switch for a user or group that no ordering of allows can resurrect.
-- **Keep snapshot and purge admin-only** (their defaults, section 6.1). Loosen them
-  only deliberately.
+- **Keep snapshot admin-only** (its default, section 6.1). Loosen it only
+  deliberately. (Purge is always admin-only: it is authorized by the admin
+  signature, not by a policy flag.)
 - **Use `withfields` to protect data integrity across the organization.** It greys out
   illegal edits in the UI (`canDo` / `canChange`, section 9.1) and quarantines both
   honest mistakes and a tampered client's content violations on receipt, so the shared

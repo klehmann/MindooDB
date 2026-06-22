@@ -81,6 +81,16 @@ export type ServerRevokedKeyResolver = (
   principal: { signingKey?: string }
 ) => Promise<Set<string>>;
 
+/**
+ * Resolves the set of docIds whose history has been purged for this store's
+ * database (docs/accesscontrol.md §13). When present, the server refuses to
+ * ingest any pushed entry belonging to a purged document, so a stale client
+ * that has not yet reconciled cannot re-introduce purged data. Supplied by the
+ * host server from its persistent purge registry; kept as a callback so this
+ * transport layer stays decoupled. Never wired for the `"directory"` store.
+ */
+export type ServerPurgedDocResolver = () => Promise<Set<string>> | Set<string>;
+
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
 export interface ServerAccessControlOptions {
   /** The trusted-time provider used to stamp receipts on accepted entries (§5, §13). */
@@ -108,6 +118,13 @@ export interface ServerAccessControlOptions {
    * wired for the `"directory"` store.
    */
   revokedKeyResolver?: ServerRevokedKeyResolver;
+  /**
+   * Purged-document denylist resolver (§13). When present, pushed entries
+   * belonging to a purged document are rejected with ACCESS_DENIED so a stale
+   * client cannot re-introduce purged history. Never wired for the
+   * `"directory"` store.
+   */
+  purgedDocResolver?: ServerPurgedDocResolver;
 }
 
 /**
@@ -141,6 +158,8 @@ export class ServerNetworkContentAddressedStore {
   private dbAccessEvaluator?: ServerDbAccessEvaluator;
   /** Optional per-user revoked-key blacklist resolver; undefined disables it. */
   private revokedKeyResolver?: ServerRevokedKeyResolver;
+  /** Optional purged-document denylist resolver; undefined disables it. */
+  private purgedDocResolver?: ServerPurgedDocResolver;
   /** The directory database id, where grant documents live (§6.5). */
   private static readonly DIRECTORY_DB_ID = "directory";
   /**
@@ -183,6 +202,7 @@ export class ServerNetworkContentAddressedStore {
     this.wipeGrantDocIdResolver = accessControl?.wipeGrantDocIdResolver;
     this.dbAccessEvaluator = accessControl?.dbAccessEvaluator;
     this.revokedKeyResolver = accessControl?.revokedKeyResolver;
+    this.purgedDocResolver = accessControl?.purgedDocResolver;
   }
 
   /**
@@ -700,6 +720,14 @@ export class ServerNetworkContentAddressedStore {
     // blacklist is disabled).
     const revokedKeyIds = await this.resolveRevokedKeyIds(tokenPayload);
 
+    // Purged-document denylist (§13): entries belonging to a document whose
+    // history was purged on the server may never be re-ingested, so a stale
+    // client cannot resurrect purged data. Resolved once per batch (null when
+    // disabled / for the directory store).
+    const purgedDocIds = this.purgedDocResolver
+      ? await this.purgedDocResolver()
+      : null;
+
     // A single acceptance time for this batch so receipts are consistent and a
     // batch cannot interleave with the witness's own monotonic clock (§5.3).
     const receivedAt = Date.now();
@@ -741,6 +769,16 @@ export class ServerNetworkContentAddressedStore {
         throw new NetworkError(
           NetworkErrorType.ACCESS_DENIED,
           `Entry ${entry.id} carries a revoked decryptionKeyId and may not be pushed`,
+        );
+      }
+
+      // Reject a push for a purged document (§13). The document's history was
+      // physically purged on the server; re-ingesting these entries would
+      // resurrect data that must stay deleted.
+      if (purgedDocIds && entry.docId && purgedDocIds.has(entry.docId)) {
+        throw new NetworkError(
+          NetworkErrorType.ACCESS_DENIED,
+          `Entry ${entry.id} belongs to a purged document and may not be pushed`,
         );
       }
 

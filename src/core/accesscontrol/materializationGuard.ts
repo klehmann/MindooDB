@@ -108,9 +108,8 @@ export interface OpTypeDerivationInput {
  * - deleted → not-deleted → `doc_undelete`
  * - otherwise → `doc_change`
  *
- * `doc_snapshot` and `doc_purge` are not data-changes and are derived/validated
- * separately (snapshot head match; purge rule gating), so they are not produced
- * here.
+ * `doc_snapshot` is not a data-change and is derived/validated separately
+ * (snapshot head match), so it is not produced here.
  */
 export function deriveDataOpType(input: OpTypeDerivationInput): RuleType {
   if (input.isGenesis) return "doc_create";
