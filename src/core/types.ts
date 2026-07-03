@@ -3961,6 +3961,31 @@ export interface MindooDB {
   createDocument(options?: CreateOptions): Promise<MindooDoc>;
 
   /**
+   * Bulk-create documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling `createDocument()` once per input, but
+   * all produced store entries are persisted through one `putEntries()` batch
+   * (a single readwrite transaction on IndexedDB-backed stores), which is
+   * dramatically faster for large imports.
+   *
+   * Unlike the single-create path, a custom `id` MAY be combined with
+   * `initialValues`: the values are applied as a follow-up `doc_change` entry
+   * on top of the deterministic seed change, and both entries land in the same
+   * batch. Existing custom-id documents keep the idempotent create semantics
+   * (the existing document is returned and `initialValues` are applied as a
+   * regular change).
+   *
+   * Fail-fast: invalid inputs are rejected up front, and a denied
+   * access-control precheck rejects the whole call before any fresh document
+   * is written.
+   *
+   * @param inputs One `CreateOptions` per document to create.
+   * @return The created (or, for existing custom ids, existing) documents in
+   *   input order.
+   */
+  createDocuments(inputs: CreateOptions[]): Promise<MindooDoc[]>;
+
+  /**
    * Create a new document with optional encryption using a named symmetric key.
    *
    * @deprecated Use `createDocument({ decryptionKeyId })` instead.
@@ -4204,6 +4229,22 @@ export interface MindooDB {
    * @return A promise that resolves when the document is deleted
    */
   deleteDocument(docId: string, options?: DeleteOptions): Promise<void>;
+
+  /**
+   * Bulk-delete documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling `deleteDocument()` once per id, but all
+   * `doc_delete` lifecycle entries are persisted through one `putEntries()`
+   * batch (a single readwrite transaction on IndexedDB-backed stores).
+   *
+   * Documents that are missing or already deleted are skipped (idempotent bulk
+   * semantics). Any other failure, including a denied access-control precheck,
+   * rejects the whole call before anything is written.
+   *
+   * @param docIds IDs of the documents to delete.
+   * @param options Optional signing options applied to every delete entry.
+   */
+  deleteDocuments(docIds: string[], options?: DeleteOptions): Promise<void>;
 
   /**
    * Delete a document using a specific signing key.

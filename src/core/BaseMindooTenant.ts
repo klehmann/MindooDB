@@ -30,11 +30,11 @@ import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
-import { verifyEntrySignatureCrypto } from "./crypto/EntrySignature";
+import { verifyEntrySignatureWithImportedKey } from "./crypto/EntrySignature";
 import { entryTrustedTime } from "./storeEntryTime";
 import { computeContentHash } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
-import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
@@ -91,6 +91,21 @@ export class BaseMindooTenant implements MindooTenant {
   private decryptedTenantKeyCache?: Uint8Array;
   private decryptedUserSigningKeyCache?: CryptoKey;
   private decryptedUserEncryptionKeyCache?: CryptoKey;
+  /**
+   * Cache of imported AES-GCM `CryptoKey`s, keyed by usage + raw key bytes
+   * (hex). `subtle.importKey` costs a WebCrypto round trip per call, which
+   * adds up on bulk writes/reads (one import per store entry). Because the
+   * cache is content-addressed by the key bytes, rotated key versions miss
+   * the cache naturally — no explicit invalidation is needed.
+   */
+  private readonly importedAesKeyCache = new Map<string, CryptoKey>();
+  /**
+   * Cache of imported Ed25519 verify `CryptoKey`s, keyed by the PEM public
+   * key. Signature verification runs once per entry when materializing
+   * documents, so the per-call SPKI import is on the hot read path.
+   */
+  private readonly importedVerifyKeyCache = new Map<string, CryptoKey>();
+  private static readonly MAX_IMPORTED_KEY_CACHE_ENTRIES = 128;
   private logger: Logger;
 
   // Single-flight guard for SDK-driven key-distribution reconcile (§13). The
@@ -292,65 +307,90 @@ export class BaseMindooTenant implements MindooTenant {
     return this.administrationEncryptionPublicKey;
   }
 
+  /**
+   * Import an AES-GCM key for `usage`, memoized on the raw key bytes. See
+   * {@link importedAesKeyCache}. On overflow the cache is simply cleared —
+   * refilling it costs one import per active key, which is negligible.
+   */
+  private async importAesKeyCached(
+    symmetricKey: Uint8Array,
+    usage: "encrypt" | "decrypt",
+  ): Promise<CryptoKey> {
+    let cacheKey = usage + ":";
+    for (let i = 0; i < symmetricKey.length; i++) {
+      cacheKey += symmetricKey[i].toString(16).padStart(2, "0");
+    }
+    const cached = this.importedAesKeyCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const subtle = this.cryptoAdapter.getSubtle();
+    // Create a new Uint8Array to ensure we have a proper ArrayBuffer
+    const keyArray = new Uint8Array(symmetricKey);
+    const cryptoKey = await subtle.importKey(
+      "raw",
+      keyArray.buffer,
+      { name: "AES-GCM" },
+      false, // not extractable
+      [usage]
+    );
+    if (this.importedAesKeyCache.size >= BaseMindooTenant.MAX_IMPORTED_KEY_CACHE_ENTRIES) {
+      this.importedAesKeyCache.clear();
+    }
+    this.importedAesKeyCache.set(cacheKey, cryptoKey);
+    return cryptoKey;
+  }
+
   async encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
-    this.logger.debug(`Encrypting payload with key: ${decryptionKeyId}`);
-    this.logger.debug(`Payload size: ${payload.length} bytes`);
+    // The per-step debug logs below are on the hot write path (one call per
+    // store entry); skip building the interpolated strings when debug is off.
+    const debugEnabled = this.logger.isLevelEnabled(LogLevel.DEBUG);
+    if (debugEnabled) {
+      this.logger.debug(`Encrypting payload with key: ${decryptionKeyId}`);
+      this.logger.debug(`Payload size: ${payload.length} bytes`);
+    }
 
     // Get the symmetric key for this key ID
     let symmetricKey: Uint8Array;
     try {
       if (decryptionKeyId === "default") {
-        this.logger.debug(`Using default key (tenant encryption key)`);
         // Use cached tenant encryption key if available
         if (this.decryptedTenantKeyCache) {
           symmetricKey = this.decryptedTenantKeyCache;
-          this.logger.debug(`Using cached tenant key, length: ${symmetricKey.length} bytes`);
+          if (debugEnabled) this.logger.debug(`Using cached tenant key, length: ${symmetricKey.length} bytes`);
         } else {
-          this.logger.debug(`Resolving tenant encryption key from KeyBag`);
+          if (debugEnabled) this.logger.debug(`Resolving tenant encryption key from KeyBag`);
           const tenantKey = await this.keyBag.get("doc", this.tenantId, DEFAULT_TENANT_KEY_ID);
           if (!tenantKey) {
             throw new SymmetricKeyNotFoundError(`doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}`);
           }
           symmetricKey = tenantKey;
           this.decryptedTenantKeyCache = symmetricKey;
-          this.logger.debug(`Loaded tenant key from KeyBag, length: ${symmetricKey.length} bytes`);
+          if (debugEnabled) this.logger.debug(`Loaded tenant key from KeyBag, length: ${symmetricKey.length} bytes`);
         }
       } else {
-        this.logger.debug(`Getting named key from KeyBag: ${decryptionKeyId}`);
+        if (debugEnabled) this.logger.debug(`Getting named key from KeyBag: ${decryptionKeyId}`);
         // Get the decrypted key from KeyBag
         const decryptedKey = await this.keyBag.get("doc", this.tenantId, decryptionKeyId);
         if (!decryptedKey) {
           throw new SymmetricKeyNotFoundError(decryptionKeyId);
         }
         symmetricKey = decryptedKey;
-        this.logger.debug(`Got named key, length: ${symmetricKey.length} bytes`);
+        if (debugEnabled) this.logger.debug(`Got named key, length: ${symmetricKey.length} bytes`);
       }
     } catch (error) {
       this.logger.error(`Error getting symmetric key:`, error);
       throw error;
     }
-    
-    this.logger.debug(`Got symmetric key, length: ${symmetricKey.length} bytes`);
-    
+
     const subtle = this.cryptoAdapter.getSubtle();
     // Bind getRandomValues to maintain 'this' context
     const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
 
-    // Import the symmetric key
-    this.logger.debug(`Importing symmetric key for AES-GCM`);
+    // Import the symmetric key (memoized; see importAesKeyCached)
     let cryptoKey: CryptoKey;
     try {
-      // Create a new Uint8Array to ensure we have a proper ArrayBuffer
-      const keyArray = new Uint8Array(symmetricKey);
-      this.logger.debug(`Key buffer size: ${keyArray.buffer.byteLength} bytes`);
-      cryptoKey = await subtle.importKey(
-        "raw",
-        keyArray.buffer,
-        { name: "AES-GCM" },
-        false, // not extractable
-        ["encrypt"]
-      );
-      this.logger.debug(`Successfully imported key`);
+      cryptoKey = await this.importAesKeyCached(symmetricKey, "encrypt");
     } catch (error) {
       this.logger.error(`Error importing key:`, error);
       this.logger.error(`Key length: ${symmetricKey.length}, expected: 32 bytes for AES-256`);
@@ -358,27 +398,21 @@ export class BaseMindooTenant implements MindooTenant {
     }
 
     // Generate IV (12 bytes for AES-GCM)
-    this.logger.debug(`Generating IV`);
     let iv: Uint8Array;
     try {
       const ivArray = new Uint8Array(12);
       randomValues(ivArray);
       iv = new Uint8Array(ivArray.buffer, ivArray.byteOffset, ivArray.byteLength);
-      this.logger.debug(`Generated IV: ${iv.length} bytes`);
     } catch (error) {
       this.logger.error(`Error generating IV:`, error);
       throw error;
     }
 
     // Encrypt the payload
-    this.logger.debug(`Encrypting payload with AES-GCM`);
-    this.logger.debug(`Payload buffer size: ${payload.buffer.byteLength} bytes`);
-    this.logger.debug(`Payload byteOffset: ${payload.byteOffset}, byteLength: ${payload.byteLength}`);
     let encrypted: ArrayBuffer;
     try {
       // Create a new Uint8Array to ensure we have a proper ArrayBuffer
       const payloadArray = new Uint8Array(payload);
-      this.logger.debug(`Using payload array: ${payloadArray.length} bytes`);
       encrypted = await subtle.encrypt(
         {
           name: "AES-GCM",
@@ -388,7 +422,6 @@ export class BaseMindooTenant implements MindooTenant {
         cryptoKey,
         payloadArray
       );
-      this.logger.debug(`Successfully encrypted payload, encrypted size: ${encrypted.byteLength} bytes`);
     } catch (error) {
       this.logger.error(`Error encrypting payload:`, error);
       this.logger.error(`Error details:`, {
@@ -403,18 +436,19 @@ export class BaseMindooTenant implements MindooTenant {
 
     // Combine IV and encrypted data
     // Format: IV (12 bytes) + encrypted data (includes authentication tag)
-    this.logger.debug(`Combining IV and encrypted data`);
     const encryptedArray = new Uint8Array(encrypted);
     const result = new Uint8Array(12 + encryptedArray.length);
     result.set(iv, 0);
     result.set(encryptedArray, 12);
 
-    this.logger.debug(`Encrypted payload (${payload.length} -> ${result.length} bytes)`);
+    if (debugEnabled) this.logger.debug(`Encrypted payload (${payload.length} -> ${result.length} bytes)`);
     return result;
   }
 
   async decryptPayload(encryptedPayload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
-    this.logger.debug(`Decrypting payload with key: ${decryptionKeyId}`);
+    // Hot read path (one call per store entry): skip interpolations when off.
+    const debugEnabled = this.logger.isLevelEnabled(LogLevel.DEBUG);
+    if (debugEnabled) this.logger.debug(`Decrypting payload with key: ${decryptionKeyId}`);
 
     if (encryptedPayload.length < 12) {
       throw new Error("Encrypted payload too short (missing IV)");
@@ -439,13 +473,7 @@ export class BaseMindooTenant implements MindooTenant {
     let lastError: unknown = undefined;
     for (const symmetricKey of candidates) {
       try {
-        const cryptoKey = await subtle.importKey(
-          "raw",
-          new Uint8Array(symmetricKey).buffer,
-          { name: "AES-GCM" },
-          false, // not extractable
-          ["decrypt"],
-        );
+        const cryptoKey = await this.importAesKeyCached(symmetricKey, "decrypt");
         const decrypted = await subtle.decrypt(
           {
             name: "AES-GCM",
@@ -455,7 +483,9 @@ export class BaseMindooTenant implements MindooTenant {
           cryptoKey,
           encryptedData as BufferSource,
         );
-        this.logger.debug(`Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
+        if (debugEnabled) {
+          this.logger.debug(`Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
+        }
         return new Uint8Array(decrypted);
       } catch (error) {
         // AES-GCM authentication failure means this version was not the one used
@@ -558,19 +588,8 @@ export class BaseMindooTenant implements MindooTenant {
 
     const subtle = this.cryptoAdapter.getSubtle();
 
-    // Convert PEM format to ArrayBuffer
-    const publicKeyBuffer = this.pemToArrayBuffer(publicKey);
-
-    // Import the public key from SPKI format
-    const cryptoKey = await subtle.importKey(
-      "spki",
-      publicKeyBuffer,
-      {
-        name: "Ed25519",
-      },
-      false, // not extractable
-      ["verify"]
-    );
+    // Import the public key from SPKI format (memoized per PEM string)
+    const cryptoKey = await this.importVerifyKeyCached(publicKey);
 
     // Verify the signature
     const isValid = await subtle.verify(
@@ -582,8 +601,37 @@ export class BaseMindooTenant implements MindooTenant {
       payload.buffer as ArrayBuffer
     );
 
-    this.logger.info(`Signature verification result: ${isValid}`);
+    // Debug (not info): this runs once per verified entry on the read path.
+    if (this.logger.isLevelEnabled(LogLevel.DEBUG)) {
+      this.logger.debug(`Signature verification result: ${isValid}`);
+    }
     return isValid;
+  }
+
+  /**
+   * Import an Ed25519 verify key from its PEM SPKI form, memoized per PEM
+   * string. See {@link importedVerifyKeyCache}.
+   */
+  private async importVerifyKeyCached(publicKeyPem: string): Promise<CryptoKey> {
+    const cached = this.importedVerifyKeyCache.get(publicKeyPem);
+    if (cached) {
+      return cached;
+    }
+    const subtle = this.cryptoAdapter.getSubtle();
+    const cryptoKey = await subtle.importKey(
+      "spki",
+      this.pemToArrayBuffer(publicKeyPem),
+      {
+        name: "Ed25519",
+      },
+      false, // not extractable
+      ["verify"]
+    );
+    if (this.importedVerifyKeyCache.size >= BaseMindooTenant.MAX_IMPORTED_KEY_CACHE_ENTRIES) {
+      this.importedVerifyKeyCache.clear();
+    }
+    this.importedVerifyKeyCache.set(publicKeyPem, cryptoKey);
+    return cryptoKey;
   }
 
   async verifyEntrySignature(entry: StoreEntryMetadata, encryptedData: Uint8Array): Promise<boolean> {
@@ -617,15 +665,20 @@ export class BaseMindooTenant implements MindooTenant {
 
     // Version-aware author signature: prefer the metadata-binding signature,
     // fall back to the legacy ciphertext-only signature for v1/legacy entries
-    // (unless the floor above forbids the fallback for this entry).
-    const isValid = await verifyEntrySignatureCrypto(
+    // (unless the floor above forbids the fallback for this entry). The
+    // author's verify key is imported once per PEM and cached — this runs for
+    // every entry a document replays.
+    const authorKey = await this.importVerifyKeyCached(entry.createdByPublicKey);
+    const isValid = await verifyEntrySignatureWithImportedKey(
       entry,
       encryptedData,
-      entry.createdByPublicKey,
+      authorKey,
       subtle,
       { requireMetadataSignature },
     );
-    this.logger.debug(`Entry signature verification result: ${isValid}`);
+    if (this.logger.isLevelEnabled(LogLevel.DEBUG)) {
+      this.logger.debug(`Entry signature verification result: ${isValid}`);
+    }
     return isValid;
   }
 

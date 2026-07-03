@@ -131,7 +131,12 @@ export {
 } from "./uri/MindooURI";
 
 // Errors
-export { SymmetricKeyNotFoundError } from "./errors";
+export {
+  SymmetricKeyNotFoundError,
+  DocumentNotFoundError,
+  DocumentDeletedError,
+  isDocumentMissingError,
+} from "./errors";
 
 // Cache
 export type { LocalCacheStore } from "./cache/LocalCacheStore";

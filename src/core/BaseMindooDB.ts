@@ -106,7 +106,7 @@ import {
   generateAttachmentChunkId,
   generateFileUuid7,
 } from "./utils/idGeneration";
-import { SymmetricKeyNotFoundError } from "./errors";
+import { DocumentDeletedError, DocumentNotFoundError, SymmetricKeyNotFoundError } from "./errors";
 import {
   buildEntrySigningBytes,
   entrySignatureFieldsFromEntry,
@@ -119,7 +119,7 @@ import {
 import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
 import type { RuleType, AccessDecision } from "./accesscontrol/types";
 import { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
-import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { validateDatabaseId } from "./databaseIdValidation";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import type { ICacheable } from "./cache/CacheManager";
@@ -592,6 +592,16 @@ export class BaseMindooDB implements MindooDB {
     this.performanceCallback = performanceCallback;
   }
   
+  /**
+   * Whether debug logging is enabled. Used to guard hot-path debug statements
+   * whose message interpolation is itself expensive (e.g.
+   * `JSON.stringify(Automerge.getHeads(...))` — a WASM call plus stringify per
+   * document), so bulk operations don't pay for logging that is discarded.
+   */
+  private isDebugEnabled(): boolean {
+    return this.logger.isLevelEnabled(LogLevel.DEBUG);
+  }
+
   /**
    * Get the admin public key from the tenant.
    * Only used when adminOnlyDb is true.
@@ -2724,6 +2734,141 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<MindooDoc> {
     return this.createDocumentInternal({ signingKeyPair, signingKeyPassword, decryptionKeyId });
   }
+
+  /**
+   * Bulk-create documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling {@link createDocument} once per input,
+   * with these bulk-oriented differences:
+   * - All produced store entries are written through ONE `putEntries()` call,
+   *   so IndexedDB-backed stores commit the whole batch in a single readwrite
+   *   transaction instead of one per document.
+   * - Custom-id documents MAY combine `id` with `initialValues`: the values are
+   *   applied as a separate `doc_change` entry on top of the deterministic
+   *   seed change, and both entries land in the same batch. (The single-create
+   *   path rejects this combination and requires a follow-up `changeDoc()`.)
+   * - Freshly created documents are cached but intentionally NOT added to the
+   *   dirty-doc tracking: their entries are already durable in the store, so
+   *   an L1 eviction can always re-materialize them. This avoids the per-doc
+   *   flush-before-evict L2 write storm during large imports.
+   * - Snapshot scheduling is skipped (fresh documents cannot exceed the
+   *   snapshot threshold).
+   *
+   * Existing custom-id documents keep the idempotent single-create semantics:
+   * the existing document is returned (tombstones are undeleted first) and any
+   * `initialValues` are applied as a follow-up change.
+   *
+   * Fail-fast: invalid inputs are rejected up front, and a denied ACL
+   * precheck rejects the whole call before any fresh document is written.
+   */
+  async createDocuments(inputs: CreateOptions[]): Promise<MindooDoc[]> {
+    this.assertWritable("createDocuments");
+    if (inputs.length === 0) {
+      return [];
+    }
+    this.logger.info(`Bulk-creating ${inputs.length} documents`);
+
+    // Fail-fast input validation BEFORE any write: an invalid input anywhere
+    // in the batch must reject the whole call without side effects.
+    for (const input of inputs) {
+      const options = input ?? {};
+      if ((options.signingKeyPair !== undefined) !== (options.signingKeyPassword !== undefined)) {
+        throw new Error(
+          "createDocuments: signingKeyPair and signingKeyPassword must be provided together"
+        );
+      }
+      if (options.id !== undefined && !CUSTOM_DOC_ID_REGEX.test(options.id)) {
+        throw new Error(
+          `createDocuments: invalid document id "${options.id}". ` +
+          `Custom document IDs must match ${CUSTOM_DOC_ID_REGEX.source}.`
+        );
+      }
+    }
+
+    const results: Array<MindooDoc | null> = new Array(inputs.length).fill(null);
+    const prepared: Array<{
+      index: number;
+      internalDoc: InternalDoc;
+      entries: StoreEntry[];
+    }> = [];
+
+    for (let index = 0; index < inputs.length; index++) {
+      const options = inputs[index] ?? {};
+
+      if (options.id !== undefined) {
+        // Metadata-only existence probe via the store's docId index (cheap even
+        // on IndexedDB); avoids a full materialization for the common
+        // fresh-document case.
+        const existingMetadata = await this.store.findNewEntriesForDoc([], options.id);
+        if (existingMetadata.length > 0) {
+          // Idempotent path (rare during bulk imports): reuse the single-create
+          // semantics (returns the existing doc, undeletes tombstones) and
+          // apply initialValues as a follow-up change, mirroring the non-bulk
+          // create + changeDoc flow.
+          const { initialValues, ...rest } = options;
+          const existingDoc = await this.createDocumentInternal(rest);
+          const valueEntries = initialValues
+            ? Object.entries(initialValues).filter(
+                ([k, v]) => !k.startsWith("_") && v !== undefined
+              )
+            : [];
+          if (valueEntries.length > 0) {
+            await this.changeDocInternal(
+              existingDoc,
+              (mutable) => {
+                const data = mutable.getData() as Record<string, unknown>;
+                for (const [key, value] of valueEntries) {
+                  data[key] = value;
+                }
+              },
+              options.signingKeyPair,
+              options.signingKeyPassword,
+              options.bypassAccessControlPrecheck,
+            );
+          }
+          results[index] = existingDoc;
+          continue;
+        }
+      }
+
+      const preparedDoc = await this.prepareFreshDocumentCreate(options);
+      prepared.push({ index, ...preparedDoc });
+    }
+
+    const allEntries: StoreEntry[] = [];
+    for (const preparedDoc of prepared) {
+      allEntries.push(...preparedDoc.entries);
+    }
+    if (allEntries.length > 0) {
+      await this.store.putEntries(allEntries);
+    }
+
+    for (const { index, internalDoc } of prepared) {
+      await this.storeCachedDocument(internalDoc);
+      this.updateIndex(
+        internalDoc.id,
+        internalDoc.lastModified,
+        false,
+        internalDoc.decryptionKeyId,
+        "visible",
+        internalDoc.awaitingWitness ?? false,
+        internalDoc.witnessed ?? false,
+      );
+      results[index] = this.wrapDocument(internalDoc);
+    }
+
+    if (prepared.length > 0) {
+      // One metadata-checkpoint invalidation for the whole batch. The created
+      // docs are intentionally NOT added to dirtyDocIds (see method docs).
+      this.cacheMetaDirty = true;
+      this.cacheManager?.markDirty();
+    }
+
+    this.logger.info(
+      `Bulk-created ${prepared.length} documents (${inputs.length - prepared.length} already existed)`
+    );
+    return results as MindooDoc[];
+  }
   
   /**
    * Internal method to create a new document.
@@ -2752,9 +2897,12 @@ export class BaseMindooDB implements MindooDB {
 
     // Sanitize caller-provided initial values: internal/reserved fields (those
     // starting with "_", e.g. "_attachments") are managed by MindooDB and must
-    // not be seeded by callers.
+    // not be seeded by callers. `undefined` values are treated as "not set"
+    // (Automerge cannot represent undefined).
     const initialValueEntries = options.initialValues
-      ? Object.entries(options.initialValues).filter(([k]) => !k.startsWith("_"))
+      ? Object.entries(options.initialValues).filter(
+          ([k, v]) => !k.startsWith("_") && v !== undefined
+        )
       : [];
     const hasInitialValues = initialValueEntries.length > 0;
 
@@ -2828,7 +2976,7 @@ export class BaseMindooDB implements MindooDB {
         const fresh = Automerge.init<MindooDocPayload>();
         const [appliedDoc] = Automerge.applyChanges(fresh, [changeBytes]);
         newDoc = appliedDoc;
-        this.logger.debug(`Applied hard-coded initial change, heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+        if (this.isDebugEnabled()) this.logger.debug(`Applied hard-coded initial change, heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
       } catch (error) {
         this.logger.error(`Error applying hard-coded initial change for document ${docId}:`, error);
         throw error;
@@ -2848,7 +2996,7 @@ export class BaseMindooDB implements MindooDB {
             (doc as Record<string, unknown>)[key] = value;
           }
         });
-        this.logger.debug(`Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+        if (this.isDebugEnabled()) this.logger.debug(`Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
       } catch (error) {
         this.logger.error(`Error in Automerge.change for document ${docId}:`, error);
         throw error;
@@ -2997,15 +3145,220 @@ export class BaseMindooDB implements MindooDB {
     return this.wrapDocument(internalDoc);
   }
 
+  /**
+   * Build the store entries and in-memory state for one fresh document of a
+   * {@link createDocuments} batch WITHOUT writing anything. The caller is
+   * responsible for persisting the returned entries (batched `putEntries`)
+   * and for cache/index registration afterwards.
+   *
+   * Mirrors {@link createDocumentInternal} for the fresh-document case, with
+   * one bulk-only extension: a custom-id document MAY carry `initialValues`,
+   * which are emitted as an extra `doc_change` entry on top of the
+   * deterministic seed change so both land in the same store batch.
+   */
+  private async prepareFreshDocumentCreate(options: CreateOptions): Promise<{
+    internalDoc: InternalDoc;
+    entries: StoreEntry[];
+  }> {
+    const { signingKeyPair, signingKeyPassword } = options;
+    if ((signingKeyPair !== undefined) !== (signingKeyPassword !== undefined)) {
+      throw new Error(
+        "createDocuments: signingKeyPair and signingKeyPassword must be provided together"
+      );
+    }
+    const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
+    const keyId = await this.resolveCreateKeyId(options);
+    const useCustomDocId = options.id !== undefined;
+
+    // Sanitize caller-provided initial values: internal/reserved fields are
+    // managed by MindooDB and must not be seeded by callers. `undefined`
+    // values are treated as "not set" (Automerge cannot represent undefined).
+    const initialValueEntries = options.initialValues
+      ? Object.entries(options.initialValues).filter(
+          ([k, v]) => !k.startsWith("_") && v !== undefined
+        )
+      : [];
+
+    // Admin-only validation: only admin key can modify data in admin-only databases
+    if (this._isAdminOnlyDb) {
+      const adminPublicKey = this.getAdminPublicKey();
+      const signerPublicKey = useCustomSigningKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      if (signerPublicKey !== adminPublicKey) {
+        throw new Error("Admin-only database: only the admin key can modify data");
+      }
+    }
+
+    const docId = useCustomDocId ? options.id! : uuidv7();
+    const now = Date.now();
+
+    // Build the initial Automerge document and its first change bytes,
+    // following the same seeding rules as the single-create path.
+    let seedDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    let createChangeBytes: Uint8Array;
+    if (useCustomDocId) {
+      createChangeBytes = getCustomIdInitialChangeBytes();
+      const fresh = Automerge.init<MindooDocPayload>();
+      const [appliedDoc] = Automerge.applyChanges(fresh, [createChangeBytes]);
+      seedDoc = appliedDoc;
+    } else {
+      const initialDoc = Automerge.init<MindooDocPayload>();
+      seedDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
+        doc._attachments = [];
+        // Seed caller-provided initial values within the same doc_create change
+        // so a doc_create Tier 2 rule can evaluate them in the "after" state.
+        for (const [key, value] of initialValueEntries) {
+          (doc as Record<string, unknown>)[key] = value;
+        }
+      });
+      const localChange = Automerge.getLastLocalChange(seedDoc);
+      if (!localChange) {
+        throw new Error("Failed to get change bytes from Automerge document");
+      }
+      createChangeBytes = localChange;
+    }
+
+    // Custom-id + initialValues (bulk-only): the deterministic seed change must
+    // stay byte-identical across replicas, so the values go into a separate
+    // follow-up change that ships in the same batch.
+    let finalDoc = seedDoc;
+    let valueChangeBytes: Uint8Array | null = null;
+    if (useCustomDocId && initialValueEntries.length > 0) {
+      finalDoc = Automerge.change(seedDoc, { time: now }, (doc: MindooDocPayload) => {
+        for (const [key, value] of initialValueEntries) {
+          (doc as Record<string, unknown>)[key] = value;
+        }
+      });
+      const localChange = Automerge.getLastLocalChange(finalDoc);
+      if (!localChange) {
+        throw new Error("Failed to get change bytes from Automerge document");
+      }
+      valueChangeBytes = localChange;
+    }
+
+    // Client-side write-policy precheck (docs/accesscontrol.md §9) against the
+    // document's final after-state (seed + initial values), so a doc_create
+    // Tier 2 rule sees the same state it would see on the single-create path.
+    {
+      const signerKey = useCustomSigningKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      const afterDoc = finalDoc;
+      await this.assertWriteAllowed({
+        op: "doc_create",
+        signerKey,
+        isAuthor: true,
+        bypass: options.bypassAccessControlPrecheck,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(afterDoc) as unknown as Record<string, unknown>,
+      });
+    }
+
+    // Build the doc_create entry.
+    const decodedCreate = Automerge.decodeChange(createChangeBytes);
+    const createHash = decodedCreate.hash;
+    const createDepHashes: string[] = decodedCreate.deps || [];
+    const encryptedPayload = await this.tenant.encryptPayload(createChangeBytes, keyId);
+    const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
+    const entryId = await generateDocEntryId(docId, createHash, createDepHashes, this.getSubtle());
+    const dependencyIds = await this.ensureAutomergeDepsResolved(docId, createDepHashes);
+
+    let signature: Uint8Array;
+    let createdByPublicKey: string;
+    if (useCustomSigningKey) {
+      signature = await this.tenant.signPayloadWithKey(encryptedPayload, signingKeyPair!, signingKeyPassword!);
+      createdByPublicKey = signingKeyPair!.publicKey;
+    } else {
+      const currentUser = await this.tenant.getCurrentUserId();
+      signature = await this.tenant.signPayload(encryptedPayload);
+      createdByPublicKey = currentUser.userSigningPublicKey;
+    }
+    // Remember the creator's signing key so $author prechecks on subsequent
+    // change/delete operations don't need a metadata scan.
+    this.creatorKeyCache.set(docId, createdByPublicKey);
+
+    const createAttachmentRefs = this.collectAttachmentRefs(finalDoc);
+    const entryMetadata: StoreEntryMetadata = {
+      entryType: "doc_create",
+      id: entryId,
+      contentHash,
+      docId,
+      dependencyIds,
+      createdAt: now,
+      createdByPublicKey,
+      decryptionKeyId: keyId,
+      signature,
+      originalSize: createChangeBytes.length,
+      encryptedSize: encryptedPayload.length,
+      attachmentRefs: createAttachmentRefs.length > 0 ? createAttachmentRefs : undefined,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
+    };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomSigningKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
+
+    const entries: StoreEntry[] = [{
+      ...entryMetadata,
+      encryptedData: encryptedPayload,
+    }];
+    // Register the mapping BEFORE building the follow-up change entry so its
+    // dependency resolution finds the doc_create parent.
+    this.registerAutomergeHashMapping(docId, createHash, entryId);
+
+    if (valueChangeBytes) {
+      const tempInternalDoc: InternalDoc = {
+        id: docId,
+        doc: finalDoc,
+        createdAt: now,
+        lastModified: now,
+        decryptionKeyId: keyId,
+        isDeleted: false,
+      };
+      const changeEntry = await this.buildDocChangeStoreEntry({
+        internalDoc: tempInternalDoc,
+        changeBytes: valueChangeBytes,
+        now,
+        useCustomKey: useCustomSigningKey,
+        signingKeyPair,
+        signingKeyPassword,
+        attachmentRefs: createAttachmentRefs,
+      });
+      entries.push(changeEntry);
+      const decodedValueChange = Automerge.decodeChange(valueChangeBytes);
+      this.registerAutomergeHashMapping(docId, decodedValueChange.hash, changeEntry.id);
+    }
+
+    // Freshly created entries are versioned and un-witnessed, so the document
+    // is awaiting witness until pushed and stamped with a receipt.
+    const awaitingWitness = entries.some(isProvisional);
+    const witnessed = entries.some(isVersioned) && !awaitingWitness;
+
+    const internalDoc: InternalDoc = {
+      id: docId,
+      doc: finalDoc,
+      createdAt: now,
+      lastModified: now,
+      decryptionKeyId: keyId,
+      isDeleted: false,
+      awaitingWitness,
+      witnessed,
+    };
+
+    return { internalDoc, entries };
+  }
+
   async getDocument(docId: string): Promise<MindooDoc> {
     const internalDoc = await this.loadDocumentInternal(docId);
     
     if (!internalDoc) {
-      throw new Error(`Document ${docId} not found`);
+      throw new DocumentNotFoundError(docId);
     }
     
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     
     return this.wrapDocument(internalDoc);
@@ -5498,6 +5851,82 @@ export class BaseMindooDB implements MindooDB {
     );
   }
 
+  /**
+   * Bulk-delete documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling {@link deleteDocument} once per id, but
+   * all `doc_delete` lifecycle entries are written through ONE `putEntries()`
+   * call (a single readwrite transaction on IndexedDB-backed stores), and the
+   * deleted documents are dropped from the L1 cache instead of being
+   * dirty-tracked (the entries are already durable, so no L2 flush is needed).
+   *
+   * Documents that are missing or already deleted are skipped (idempotent
+   * bulk semantics: a re-run of a destructive import must not fail because a
+   * previous run already removed some documents). Any other failure, including
+   * a denied ACL precheck, rejects the whole call before anything is written.
+   */
+  async deleteDocuments(docIds: string[], options: DeleteOptions = {}): Promise<void> {
+    this.assertWritable("deleteDocuments");
+    if (docIds.length === 0) {
+      return;
+    }
+    await this.assertLifecycleMutationAllowed(options.signingKeyPair, options.signingKeyPassword);
+    this.logger.info(`Bulk-deleting ${docIds.length} documents`);
+
+    // Unlike creation, a delete must first materialize the CURRENT document
+    // (the doc_delete entry is an Automerge change on its heads), which costs
+    // an IndexedDB metadata scan plus per-entry decrypt + signature verify.
+    // Those are independent per document and dominated by IndexedDB/WebCrypto
+    // latency (both run off the JS thread), so prepare with bounded
+    // concurrency instead of strictly sequentially. Results keep input order;
+    // any failure rejects the whole batch before anything is written
+    // (fail-fast, same as the sequential version).
+    const preparedByIndex: Array<
+      Awaited<ReturnType<BaseMindooDB["prepareLifecycleEntry"]>> | null
+    > = new Array(docIds.length).fill(null);
+    const concurrency = Math.min(8, docIds.length);
+    let nextIndex = 0;
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (true) {
+          const index = nextIndex++;
+          if (index >= docIds.length) {
+            return;
+          }
+          const docId = docIds[index];
+          const internalDoc = await this.loadDocumentInternal(docId);
+          if (!internalDoc || internalDoc.isDeleted) {
+            this.logger.debug(`Skipping bulk delete for ${docId} — not found or already deleted`);
+            continue;
+          }
+          preparedByIndex[index] = await this.prepareLifecycleEntry(
+            internalDoc,
+            "doc_delete",
+            options.signingKeyPair,
+            options.signingKeyPassword,
+            options.bypassAccessControlPrecheck,
+          );
+        }
+      }),
+    );
+    const prepared = preparedByIndex.filter(
+      (p): p is NonNullable<(typeof preparedByIndex)[number]> => p !== null,
+    );
+
+    if (prepared.length === 0) {
+      return;
+    }
+
+    await this.store.putEntries(prepared.map((p) => p.fullEntry));
+    for (const p of prepared) {
+      await this.applyLifecycleEntryLocally(p, { markDirty: false });
+    }
+    // One metadata-checkpoint invalidation for the whole batch.
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+    this.logger.info(`Bulk-deleted ${prepared.length} documents (${docIds.length - prepared.length} skipped)`);
+  }
+
   async deleteDocumentWithSigningKey(
     docId: string,
     signingKeyPair: SigningKeyPair,
@@ -5549,6 +5978,39 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string,
     bypassPrecheck?: boolean,
   ): Promise<void> {
+    const prepared = await this.prepareLifecycleEntry(
+      internalDoc,
+      entryType,
+      signingKeyPair,
+      signingKeyPassword,
+      bypassPrecheck,
+    );
+    await this.store.putEntries([prepared.fullEntry]);
+    await this.applyLifecycleEntryLocally(prepared, { markDirty: true });
+  }
+
+  /**
+   * Build (but do not persist) a delete/undelete lifecycle entry for an
+   * existing document, including the ACL precheck. Callers persist the
+   * returned `fullEntry` (single or batched `putEntries`) and then call
+   * {@link applyLifecycleEntryLocally} to update caches and indexes.
+   */
+  private async prepareLifecycleEntry(
+    internalDoc: InternalDoc,
+    entryType: "doc_delete" | "doc_undelete",
+    signingKeyPair?: SigningKeyPair,
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean,
+  ): Promise<{
+    internalDoc: InternalDoc;
+    entryType: "doc_delete" | "doc_undelete";
+    newDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    automergeHash: string;
+    entryId: string;
+    entryMetadata: StoreEntryMetadata;
+    fullEntry: StoreEntry;
+    now: number;
+  }> {
     // Delete and undelete are encoded as normal Automerge changes so the DAG
     // keeps causal ancestry, while the StoreEntry type carries lifecycle intent.
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
@@ -5631,9 +6093,10 @@ export class BaseMindooDB implements MindooDB {
     };
 
     // Client-side write-policy precheck (docs/accesscontrol.md §9). `internalDoc.doc`
-    // is still the pre-change state here (reassigned below, after the store
-    // write). For deletes the rules default to the "before" state; both states
-    // are supplied so either `when` resolves. Throws AccessDeniedError if denied.
+    // is still the pre-change state here (reassigned in
+    // applyLifecycleEntryLocally, after the store write). For deletes the rules
+    // default to the "before" state; both states are supplied so either `when`
+    // resolves. Throws AccessDeniedError if denied.
     {
       const creatorKey = await this.resolveCreatorSigningKey(docId);
       const beforeState = internalDoc.doc;
@@ -5649,7 +6112,42 @@ export class BaseMindooDB implements MindooDB {
       });
     }
 
-    await this.store.putEntries([fullEntry]);
+    return {
+      internalDoc,
+      entryType,
+      newDoc,
+      automergeHash,
+      entryId,
+      entryMetadata,
+      fullEntry,
+      now,
+    };
+  }
+
+  /**
+   * Apply a persisted lifecycle entry (see {@link prepareLifecycleEntry}) to
+   * the in-memory document, cache, and changefeed index. Must be called after
+   * the entry was written to the store.
+   *
+   * With `markDirty: false` (bulk path) the document is dropped from the L1
+   * cache instead of being dirty-tracked: the lifecycle entry is already
+   * durable in the append-only store, so skipping the L2 flush avoids the
+   * per-document flush-before-evict write storm during large batches.
+   */
+  private async applyLifecycleEntryLocally(
+    prepared: {
+      internalDoc: InternalDoc;
+      entryType: "doc_delete" | "doc_undelete";
+      newDoc: AutomergeTypes.Doc<MindooDocPayload>;
+      automergeHash: string;
+      entryId: string;
+      entryMetadata: StoreEntryMetadata;
+      now: number;
+    },
+    options: { markDirty: boolean },
+  ): Promise<void> {
+    const { internalDoc, entryType, newDoc, automergeHash, entryId, entryMetadata, now } = prepared;
+    const docId = internalDoc.id;
     this.registerAutomergeHashMapping(docId, automergeHash, entryId);
 
     // Keep the loaded document, cache, index, and sync dirty tracking in step
@@ -5663,9 +6161,15 @@ export class BaseMindooDB implements MindooDB {
     // The doc is now witness-era (we just wrote a versioned entry), so it is
     // witnessed iff it is no longer awaiting a receipt.
     internalDoc.witnessed = isVersioned(entryMetadata) && !internalDoc.awaitingWitness;
-    await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
-    this.markDocDirty(docId);
+    if (options.markDirty) {
+      await this.storeCachedDocument(internalDoc);
+      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
+      this.markDocDirty(docId);
+    } else {
+      this.docCache.delete(docId);
+      this.dirtyDocIds.delete(docId);
+      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
+    }
   }
 
   /**
@@ -5704,7 +6208,7 @@ export class BaseMindooDB implements MindooDB {
 
     const internalDoc = await this.loadDocumentInternal(docId);
     if (!internalDoc) {
-      throw new Error(`Document ${docId} not found`);
+      throw new DocumentNotFoundError(docId);
     }
     if (!internalDoc.isDeleted) {
       this.logger.debug(`Document ${docId} is already alive; undelete is a no-op`);
@@ -5755,13 +6259,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateTextPatch(patch);
@@ -5795,7 +6299,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applyEdits);
       });
-      this.logger.debug(`Successfully applied text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying text patch for document ${docId}:`, error);
       throw error;
@@ -5835,13 +6339,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateRichTextPatch(patch);
@@ -5892,7 +6396,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applySpans);
       });
-      this.logger.debug(`Successfully applied rich-text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied rich-text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying rich-text patch for document ${docId}:`, error);
       throw error;
@@ -5932,13 +6436,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateRichTextStepPatch(patch);
@@ -6001,7 +6505,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applySteps);
       });
-      this.logger.debug(`Successfully applied rich-text steps, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied rich-text steps, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying rich-text steps for document ${docId}:`, error);
       throw error;
@@ -6034,12 +6538,12 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     const spans = (Automerge as any).spans(
       internalDoc.doc as AutomergeTypes.Doc<MindooDocPayload>,
@@ -6085,13 +6589,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     await this.hydrateAutomergeHashMappingsFromStore(docId);
@@ -6117,9 +6621,11 @@ export class BaseMindooDB implements MindooDB {
         );
         return mergedDoc;
       });
-      this.logger.debug(
-        `Successfully applied Automerge changes, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`,
-      );
+      if (this.isDebugEnabled()) {
+        this.logger.debug(
+          `Successfully applied Automerge changes, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`,
+        );
+      }
     } catch (error) {
       this.logger.error(`Error applying Automerge changes for document ${docId}:`, error);
       throw error;
@@ -6185,12 +6691,12 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     return internalDoc;
   }
@@ -6212,13 +6718,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateJsonPatch(patch);
@@ -6242,7 +6748,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applyPatch);
       });
-      this.logger.debug(`Successfully applied JSON patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied JSON patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying JSON patch for document ${docId}:`, error);
       throw error;
@@ -6297,7 +6803,7 @@ export class BaseMindooDB implements MindooDB {
       this.logger.debug(`Document ${docId} not in cache, loading from store`);
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
       this.logger.debug(`Successfully loaded document ${docId} from store for ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'}`);
@@ -6306,13 +6812,13 @@ export class BaseMindooDB implements MindooDB {
     }
     
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     
     // Apply the change function
     const now = Date.now();
     this.logger.debug(`Applying change function to document ${docId}`);
-    this.logger.debug(`Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
+    if (this.isDebugEnabled()) this.logger.debug(`Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
     
     // For async callbacks, we need to handle document modifications carefully.
     // Automerge.change() requires synchronous modifications, so we'll:
@@ -6612,7 +7118,7 @@ export class BaseMindooDB implements MindooDB {
           automergeDoc._lastModified = now;
         }),
       );
-      this.logger.debug(`Successfully applied change function, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied change function, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error in Automerge.change for document ${docId}:`, error);
       await Promise.all(
@@ -8273,7 +8779,7 @@ export class BaseMindooDB implements MindooDB {
       return null; // Document didn't actually change
     }
 
-    this.logger.debug(`Document ${docId} changed: heads before=${JSON.stringify(headsBefore)}, after=${JSON.stringify(headsAfter)}, awaitingWitness=${awaitingWitness}`);
+    if (this.isDebugEnabled()) this.logger.debug(`Document ${docId} changed: heads before=${JSON.stringify(headsBefore)}, after=${JSON.stringify(headsAfter)}, awaitingWitness=${awaitingWitness}`);
 
     // Update metadata
     const payload = updatedDoc as unknown as MindooDocPayload;
@@ -9444,7 +9950,7 @@ export class BaseMindooDB implements MindooDB {
           const automergeStartedAt = Date.now();
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
           automergeTime += Date.now() - automergeStartedAt;
-          this.logger.debug(`Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
+          if (this.isDebugEnabled()) this.logger.debug(`Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
 
           // Mandatory snapshot-head verification (docs/accesscontrol.md §10): the
           // decoded heads must exactly equal the declared snapshotHeadHashes, so
@@ -9472,7 +9978,7 @@ export class BaseMindooDB implements MindooDB {
     if (!doc) {
       this.logger.debug(`Initializing new Automerge document for ${docId}`);
       doc = Automerge.init<MindooDocPayload>();
-      this.logger.debug(`Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
     }
     
     // Load and apply all entries
@@ -9484,7 +9990,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Loading document ${docId}: found ${entries.length} entries to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);
     
     // Log current document state before applying entries
-    this.logger.debug(`Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+    if (this.isDebugEnabled()) this.logger.debug(`Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
     
     // Filter entries for admin-only mode first
     const validEntries = entries.filter(entryData => {
@@ -9593,7 +10099,7 @@ export class BaseMindooDB implements MindooDB {
             doc = result[0] as AutomergeTypes.Doc<MindooDocPayload>;
             automergeTime += Date.now() - automergeStartedAt;
             this.logger.debug(`Successfully applied ${changeBytes.length} changes to document ${docId}`);
-            this.logger.debug(`Document state after applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+            if (this.isDebugEnabled()) this.logger.debug(`Document state after applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
           } catch (error) {
             this.logger.error(`Error applying changes to document ${docId}:`, error);
             this.logger.error(`Number of changes: ${changeBytes.length}`);
@@ -9605,7 +10111,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Extract metadata from document (doc is guaranteed to be defined at this point)
     this.logger.debug(`All entries applied successfully for document ${docId}`);
-    this.logger.debug(`Final document heads: ${JSON.stringify(Automerge.getHeads(doc!))}`);
+    if (this.isDebugEnabled()) this.logger.debug(`Final document heads: ${JSON.stringify(Automerge.getHeads(doc!))}`);
     const payload = doc! as unknown as MindooDocPayload;
     
     const isDeleted = this.computeIsDeletedFromMetadata(allEntryMetadata);
