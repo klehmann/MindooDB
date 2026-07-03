@@ -406,7 +406,7 @@ Haven is an active product and it is also the public face of MindooDB. A few res
 
 The easiest way to actually try Haven is to open [haven.mindoodb.com](https://haven.mindoodb.com) in a modern browser — it is the live Community client.
 
-The product pages at [mindoodb.com/haven](https://mindoodb.com/haven) go into more detail on the positioning and the security model, and cover the parts of the story that a handbook cannot — screenshots, roadmap, and the wider MindooDB platform.
+The product pages at [mindoodb.com](https://mindoodb.com) go into more detail on the positioning and the security model, and cover the parts of the story that a handbook cannot — screenshots, roadmap, and the wider MindooDB platform.
 
 The [MindooDB App SDK on GitHub](https://github.com/klehmann/mindoodb-app-sdk) is the TypeScript library for building apps that run inside Haven. Two companion open-source projects show what production-quality apps built on it look like: the [example project](https://github.com/klehmann/mindoodb-app-example) is a Vue 3 reference app that demonstrates every SDK feature across three tabs (Databases, Views, Events) — its live demo is at [app-example.mindoodb.com](https://app-example.mindoodb.com) and can be registered in Haven with an external URL for a few minutes of hands-on exploration; and [`mindoodb-app-weather`](https://github.com/klehmann/mindoodb-app-weather) focuses on the UX side of the SDK, showing launch parameters, viewport events, and responsive embedding through a polished iOS-Weather-style tile.
 
