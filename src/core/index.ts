@@ -216,4 +216,48 @@ export {
   type ScopedDocId,
   type ColumnValueFunction,
   type DocumentFilterFunction,
+  type VirtualViewUpdateStats,
 } from "./indexing/virtualviews";
+
+// Expression language (formerly mindoodb-view-language; that package
+// re-exports these symbols as a compatibility wrapper)
+export * from "./expressions";
+
+// Ad-hoc query engine over the document summary buffer
+export {
+  executeQuery,
+  executeQueryLive,
+  MindooQueryError,
+  EphemeralSummaryView,
+  createEphemeralSummaryView,
+  queryViewAcross,
+  type EphemeralViewSource,
+  type MindooQuerySubscription,
+  type MindooQueryViewDefinition,
+  type MindooQuery,
+  type MindooQuerySortKey,
+  type MindooQueryOptions,
+  type MindooQueryRow,
+  type MindooQueryCoverage,
+  type MindooQueryResult,
+} from "./query";
+
+// Indexing - Document summary buffer (ad-hoc query substrate)
+export {
+  DocumentSummaryStore,
+  SummaryVirtualViewDataProvider,
+  type SummaryVirtualViewDataProviderOptions,
+  resolveSummaryConfig,
+  computeSummaryConfigFingerprint,
+  sanitizeSummaryConfig,
+  extractSummaryFields,
+  getSummaryFieldValue,
+  isFieldPathCovered,
+  DEFAULT_SUMMARY_MAX_VALUE_BYTES,
+  DB_SETUP_DOC_ID,
+  SUMMARY_SETUP_FIELD,
+  type SummaryConfig,
+  type ResolvedSummaryConfig,
+  type DocumentSummaryEntry,
+  type SummaryCoverage,
+} from "./indexing/summary";

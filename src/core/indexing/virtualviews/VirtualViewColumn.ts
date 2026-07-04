@@ -1,4 +1,5 @@
 import { ColumnSorting, TotalMode, ColumnValueFunction } from "./types";
+import type { MindooDBAppExpression } from "../../expressions/types";
 
 /**
  * Options for creating a VirtualViewColumn
@@ -24,6 +25,16 @@ export interface VirtualViewColumnOptions {
   
   /** Function to compute column value from document data */
   valueFunction?: ColumnValueFunction;
+
+  /**
+   * Declarative alternative to {@link valueFunction}: a MindooDB
+   * expression-language expression evaluated per document/summary entry.
+   * Unlike a JS function it is plain JSON, making the whole view
+   * definition serializable (e.g. for view designs stored as documents).
+   * When both are set, `valueFunction` wins for providers that support it;
+   * summary-backed providers only evaluate `expression`.
+   */
+  expression?: MindooDBAppExpression;
 }
 
 /**
@@ -52,6 +63,9 @@ export class VirtualViewColumn {
   /** Function to compute column value from document data */
   readonly valueFunction: ColumnValueFunction | undefined;
 
+  /** Declarative expression alternative to {@link valueFunction} (JSON-serializable). */
+  readonly expression: MindooDBAppExpression | undefined;
+
   constructor(options: VirtualViewColumnOptions) {
     this.name = options.name;
     this.title = options.title ?? options.name;
@@ -60,6 +74,7 @@ export class VirtualViewColumn {
     this.sorting = options.sorting ?? ColumnSorting.NONE;
     this.totalMode = options.totalMode ?? TotalMode.NONE;
     this.valueFunction = options.valueFunction;
+    this.expression = options.expression;
 
     // Validation: Category columns must be sorted
     if (this.isCategory && this.sorting === ColumnSorting.NONE) {

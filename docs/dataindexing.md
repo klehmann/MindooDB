@@ -32,8 +32,22 @@ Both cases signal "remove this document from your external index". Use `isAccess
 
 Because tombstones skip body materialization, delete-heavy changefeed runs are cheap: neither the document history nor its decrypted content is loaded. If a consumer needs the **last state of a deleted document** (e.g. to display "what was removed"), use the escape hatches `iterateDocumentHistory()` or `getDocumentAtTimestamp()` with a timestamp before the deletion.
 
+## Implemented on top of this foundation
+
+Two indexing systems ship with MindooDB, both maintained incrementally via
+`iterateChangesSince()`:
+
+- **[Virtual Views](virtualview.md)** — persistent, hierarchical, sorted views
+  with categories and totals.
+- **[Summary buffer, ad-hoc queries and reactive updates](adhoc-queries.md)** —
+  a changefeed-maintained `DocumentSummaryStore` of queryable field values plus
+  `db.query()` (expression filter/sort/paging without document materialization),
+  `db.queryView()` (ephemeral views with dynamic re-sorting), `db.queryLive()`
+  (live queries with result fingerprinting) and `db.addChangeListener()`
+  (coalesced change events).
+
 ## Indexing Approaches
-The following sections discuss various indexing approaches for NoSQL databases. We currently have implemented the `Virtual Views` API.
+The following sections discuss various indexing approaches for NoSQL databases. We currently have implemented the `Virtual Views` API and the summary-buffer based query engine described above.
 
 ### 1. Map/Reduce (CouchDB-inspired)
 

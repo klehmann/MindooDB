@@ -72,6 +72,9 @@ import {
   WarmerScheduler,
   StartBackgroundWarmerOptions,
   BackgroundWarmerProgress,
+  DbChange,
+  DbChangeEvent,
+  DbChangeListener,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import {
@@ -124,6 +127,20 @@ import { validateDatabaseId } from "./databaseIdValidation";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import type { ICacheable } from "./cache/CacheManager";
 import type { CacheManager } from "./cache/CacheManager";
+import { DocumentSummaryStore } from "./indexing/summary/DocumentSummaryStore";
+import type { SummaryConfig } from "./indexing/summary/types";
+import {
+  sanitizeSummaryConfig,
+  DB_SETUP_DOC_ID,
+  SUMMARY_SETUP_FIELD,
+} from "./indexing/summary/types";
+import { executeQuery } from "./query/executeQuery";
+import type { MindooQuery, MindooQueryOptions, MindooQueryResult } from "./query/types";
+import { createEphemeralSummaryView } from "./query/queryView";
+import type { EphemeralSummaryView, MindooQueryViewDefinition } from "./query/queryView";
+import { executeQueryLive } from "./query/queryLive";
+import type { MindooQuerySubscription } from "./query/queryLive";
+import type { VirtualViewUpdateOptions } from "./indexing/virtualviews/IVirtualViewDataProvider";
 
 /**
  * Default chunk size for attachments: 256KB
@@ -499,6 +516,23 @@ export class BaseMindooDB implements MindooDB {
   // Local cache support
   private cacheManager: CacheManager | null = null;
   private cachePrefix: string | null = null;
+  /**
+   * Lazily created document summary buffer backing ad-hoc queries and
+   * summary-based views. `null` until {@link getSummaryStore} is first
+   * called, so databases that never query pay no cost.
+   */
+  private summaryStore: DocumentSummaryStore | null = null;
+
+  // ---------------------------------------------------------------------------
+  // Change notification state (see addChangeListener). `updateIndex` is the
+  // common choke point of all mutation paths, so it only records pending
+  // docIds; emission is coalesced per sync batch / event-loop turn.
+  // ---------------------------------------------------------------------------
+  private changeListeners: Set<DbChangeListener> = new Set();
+  private pendingChangeNotifications: Map<string, DbChange> = new Map();
+  private changeNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  /** While > 0, timer-based emission is suppressed (e.g. during a sync batch). */
+  private changeNotificationHolds: number = 0;
   private dirtyDocIds: Set<string> = new Set();
   private cacheMetaDirty: boolean = false;
   /**
@@ -703,6 +737,206 @@ export class BaseMindooDB implements MindooDB {
     const cacheIdentity = this.store.getCacheIdentity?.() ?? this.store.getId();
     this.cachePrefix = `${this.tenant.getId()}/${cacheIdentity}`;
     cacheManager.register(this as unknown as ICacheable);
+    // A summary store created before the cache manager was attached picks
+    // up persistence now.
+    this.summaryStore?.attachCache(cacheManager, `${this.getCachePrefix()}/summary`);
+  }
+
+  /**
+   * Get (lazily creating) the document summary buffer for this database.
+   *
+   * The summary is a changefeed-maintained map of queryable field values
+   * per document — the substrate for `query()`/`queryView()` (see
+   * docs/adhoc-queries.md). Passing a `config` on a later call replaces the
+   * configuration; if it differs from the active one, a resumable backfill
+   * re-extracts all documents on the next `update()` (documents are never
+   * rewritten).
+   */
+  getSummaryStore(config?: SummaryConfig): DocumentSummaryStore {
+    if (!this.summaryStore) {
+      this.summaryStore = new DocumentSummaryStore(this as unknown as MindooDB, config);
+      if (this.cacheManager) {
+        this.summaryStore.attachCache(this.cacheManager, `${this.getCachePrefix()}/summary`);
+      }
+    } else if (config !== undefined) {
+      this.summaryStore.setConfig(config);
+    }
+    return this.summaryStore;
+  }
+
+  /**
+   * Read the summary configuration stored in the synced setup document
+   * (`dbsetup`, field `summarySetup`) — the "design document" that lets
+   * users/apps (e.g. the Haven UI) configure the summary fields in one
+   * place for all replicas. Returns `null` when no setup document or no
+   * configuration exists.
+   */
+  async getSummarySetup(): Promise<SummaryConfig | null> {
+    try {
+      const doc = await this.getDocument(DB_SETUP_DOC_ID);
+      return sanitizeSummaryConfig(doc.getData()[SUMMARY_SETUP_FIELD]) ?? null;
+    } catch (error) {
+      if (error instanceof DocumentNotFoundError || error instanceof DocumentDeletedError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Write the summary configuration into the synced setup document
+   * (creating `dbsetup` idempotently when missing; custom-ID documents
+   * share seeded Automerge ancestry, so concurrent creates on different
+   * replicas merge). Passing `null` removes the configuration (replicas
+   * fall back to the default auto-include config).
+   *
+   * Summary stores without an explicit code-provided configuration pick
+   * the change up through the changefeed and re-extract via a resumable
+   * backfill — locally and, after sync, on every other replica.
+   */
+  async setSummarySetup(config: SummaryConfig | null): Promise<void> {
+    const doc = await this.createDocument({ id: DB_SETUP_DOC_ID });
+    await this.changeDoc(doc, (d) => {
+      const data = d.getData();
+      if (config === null) {
+        delete data[SUMMARY_SETUP_FIELD];
+      } else {
+        data[SUMMARY_SETUP_FIELD] = sanitizeSummaryConfig(config) ?? {};
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Change notifications (reactive support)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a listener notified after documents change (local writes,
+   * sync ingest, access flips, witness updates). Events are coalesced:
+   * one event per sync batch, one per event-loop turn for local writes.
+   * The event carries only lightweight metadata plus the latest change
+   * cursor — no replay guarantee; consumers needing completeness read
+   * {@link iterateChangesSince} from their own cursor.
+   *
+   * @returns An unsubscribe function.
+   */
+  addChangeListener(listener: DbChangeListener): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  /** Record a document transition for the coalesced change event. */
+  private noteChangeForListeners(docId: string, lastModified: number, isDeleted: boolean): void {
+    if (this.changeListeners.size === 0) {
+      return;
+    }
+    this.pendingChangeNotifications.set(docId, { docId, isDeleted, lastModified });
+    this.scheduleChangeNotification();
+  }
+
+  private scheduleChangeNotification(): void {
+    if (this.changeNotifyTimer !== null || this.changeNotificationHolds > 0) {
+      return;
+    }
+    this.changeNotifyTimer = setTimeout(() => {
+      this.changeNotifyTimer = null;
+      this.emitPendingChangeEvent();
+    }, 0);
+  }
+
+  /**
+   * Suppress timer-based change emission for the duration of a batch
+   * operation (sync ingest); the release emits one coalesced event.
+   */
+  private beginChangeNotificationHold(): void {
+    this.changeNotificationHolds++;
+  }
+
+  private endChangeNotificationHold(): void {
+    this.changeNotificationHolds = Math.max(0, this.changeNotificationHolds - 1);
+    if (this.changeNotificationHolds === 0) {
+      this.emitPendingChangeEvent();
+    }
+  }
+
+  private emitPendingChangeEvent(): void {
+    if (this.changeNotificationHolds > 0) {
+      return;
+    }
+    if (this.changeNotifyTimer !== null) {
+      clearTimeout(this.changeNotifyTimer);
+      this.changeNotifyTimer = null;
+    }
+    if (this.pendingChangeNotifications.size === 0) {
+      return;
+    }
+    const changes = Array.from(this.pendingChangeNotifications.values());
+    this.pendingChangeNotifications.clear();
+    if (this.changeListeners.size === 0) {
+      return;
+    }
+    const event: DbChangeEvent = {
+      changes,
+      cursor: this.getLatestChangeCursor(),
+    };
+    for (const listener of this.changeListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        // Listener errors must never propagate into write/sync paths.
+        this.logger.warn(`Change listener threw: ${error}`);
+      }
+    }
+  }
+
+  /**
+   * Run an ad-hoc query against the document summary buffer (see
+   * docs/adhoc-queries.md). Filters and expression sort keys use the
+   * MindooDB expression language; documents are never materialized unless
+   * `options.allowFullScan` is set.
+   */
+  async query(query: MindooQuery, options?: MindooQueryOptions): Promise<MindooQueryResult> {
+    return executeQuery(this as unknown as MindooDB, this.getSummaryStore(), query, options);
+  }
+
+  /**
+   * Build an ephemeral, summary-backed VirtualView (categories, sorting,
+   * totals as usual — but fed from the summary buffer, so no documents are
+   * materialized and re-sorting via `resort()` is a pure in-memory
+   * operation). The view is not cached; call `dispose()` when done.
+   */
+  async queryView(
+    definition: MindooQueryViewDefinition,
+    options?: VirtualViewUpdateOptions
+  ): Promise<EphemeralSummaryView> {
+    return createEphemeralSummaryView(
+      this as unknown as MindooDB,
+      this.getSummaryStore(),
+      definition,
+      options
+    );
+  }
+
+  /**
+   * Live query: delivers the initial result asynchronously, then keeps
+   * re-evaluating after coalesced change events. `onResult` only fires
+   * when the result fingerprint (docIds + lastModified of the matches)
+   * actually changed.
+   */
+  queryLive(
+    query: MindooQuery,
+    onResult: (result: MindooQueryResult) => void,
+    options?: MindooQueryOptions & { onError?: (error: unknown) => void }
+  ): MindooQuerySubscription {
+    return executeQueryLive(
+      this as unknown as MindooDB,
+      this.getSummaryStore(),
+      query,
+      onResult,
+      options
+    );
   }
 
   getCachePrefix(): string {
@@ -1408,6 +1642,11 @@ export class BaseMindooDB implements MindooDB {
         : Math.min(this.indexLookupStaleFrom, shiftedFrom);
     }
 
+    // Reactive support: record the transition for coalesced change events.
+    // Reached only when the index actually changed (identical replays
+    // returned early above).
+    this.noteChangeForListeners(docId, lastModified, isDeleted);
+
     this.performanceCallback?.onIndexUpdate?.({
       docId,
       operation: existingIndex === undefined ? "insert" : "update",
@@ -1751,6 +1990,8 @@ export class BaseMindooDB implements MindooDB {
     this.dirtyDocIds.delete(docId);
     this.lastFlushedDocState.delete(docId);
     this.automergeHashToEntryId.delete(docId);
+    // Plaintext summary values must not outlive the purge either.
+    this.summaryStore?.removeDocument(docId);
 
     const store = this.cacheManager?.getStore();
     if (store) {
@@ -1927,6 +2168,17 @@ export class BaseMindooDB implements MindooDB {
    * the workload is about to benefit from it.
    */
   async syncStoreChanges(): Promise<void> {
+    // Hold change-notification emission for the whole batch so listeners
+    // receive one coalesced event per sync run instead of one per document.
+    this.beginChangeNotificationHold();
+    try {
+      await this.syncStoreChangesInternal();
+    } finally {
+      this.endChangeNotificationHold();
+    }
+  }
+
+  private async syncStoreChangesInternal(): Promise<void> {
     const syncStartedAt = Date.now();
     this.logger.debug(`Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
     this.logger.debug(`Already processed ${this.processedEntryIds.length} entry IDs`);

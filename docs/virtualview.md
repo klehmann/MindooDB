@@ -288,6 +288,38 @@ const view = VirtualViewFactory.createView()
   .build();
 ```
 
+### Declarative Expression Columns
+
+As a JSON-serializable alternative to JS value functions, columns can carry an
+`expression` in the MindooDB expression language (built with `createViewLanguage()`
+or parsed from formula text):
+
+```typescript
+import { createViewLanguage } from "mindoodb";
+const v = createViewLanguage<{ firstName: string; lastName: string }>();
+
+new VirtualViewColumn({
+  name: "fullName",
+  expression: v.concat(v.field("firstName"), " ", v.field("lastName")),
+});
+```
+
+When both are set, `valueFunction` wins for document-backed providers. Summary-backed
+providers (see below) only evaluate `expression` — JS functions are rejected there
+because no materialized document exists to pass them. Expression columns make a whole
+view definition serializable, the basis for view designs stored/synchronized as data.
+
+### Ephemeral Summary-Backed Views
+
+For ad-hoc UI grids with dynamic re-sorting, `db.queryView()` builds an ephemeral
+VirtualView over the document summary buffer instead of materialized documents —
+constructing it is a pure in-memory sort, and `resort()` swaps column sets without
+reloading anything. Like persistent views, ephemeral views can span multiple
+databases and tenants: `queryViewAcross([{ db: dbA }, { db: dbB }], definition)`
+adds one summary-backed data provider per source under its own origin. See
+[Ad-hoc Queries](adhoc-queries.md) for the full picture (summary configuration,
+coverage rules, cost model).
+
 ### Nested Categories with Backslash Separator
 
 Use backslash (`\`) in category values to create nested subcategories:
@@ -507,6 +539,26 @@ Key behaviors:
 - **Resumption is automatic**: the provider cursor points at the last applied document, so the next `update()` call continues exactly where the interrupted run stopped — no work is repeated. This also holds across app restarts when the provider state is persisted via `exportCacheState()` / `importCacheState()` (which the view cache does automatically).
 
 `countChangesSince(cursor)` is also available directly on the database for building "N documents pending" indicators before starting an update.
+
+### Live Views (`bindTo` / `onDidUpdate`)
+
+Instead of polling, a view can bind to the database's change feed and update itself:
+
+```typescript
+const offUpdate = view.onDidUpdate(({ addedCount, removedCount }) => {
+  rerenderUI();   // fires after every applied change batch
+});
+const unbind = view.bindTo(db);   // auto-runs update() on coalesced change events
+// ...
+unbind();
+offUpdate();
+```
+
+`bindTo` uses coalesced scheduling — while an update runs, further change events only
+set a pending flag and one follow-up update runs afterwards, so there is never an
+update backlog. Ephemeral views (`db.queryView()`) support the same API. See
+[Ad-hoc Queries — Reactive updates](adhoc-queries.md#reactive-updates) for the
+underlying change-listener contract and live queries (`db.queryLive()`).
 
 ### View Cache Flush Behavior
 

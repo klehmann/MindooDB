@@ -4,6 +4,7 @@ import type { VirtualView } from "./VirtualView";
 import type { VirtualViewColumn } from "./VirtualViewColumn";
 import { VirtualViewDataChange } from "./VirtualViewDataChange";
 import type { DocumentFilterFunction } from "./types";
+import { evaluateExpression } from "../../expressions/evaluateExpression";
 
 /**
  * Options for creating a MindooDBVirtualViewDataProvider
@@ -183,6 +184,19 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
       if (column.valueFunction) {
         const computedValue = column.valueFunction(doc, values, this.origin);
         values[column.name] = computedValue;
+      } else if (column.expression) {
+        // Declarative expression columns (JSON-serializable view designs):
+        // evaluated against the full document payload plus metadata.
+        values[column.name] = evaluateExpression(column.expression, {
+          doc: docData as Record<string, unknown>,
+          values,
+          origin: this.origin,
+          createdAt: new Date(doc.getCreatedAt()).toISOString(),
+          decryptionKeyId: doc.getDecryptionKeyId(),
+          witnessed: doc.isWitnessed(),
+          awaitingWitness: doc.isAwaitingWitness(),
+          variables: {},
+        });
       } else if (values[column.name] === undefined) {
         // If no value function and no value from doc, use the document data directly
         // This handles the case where the column name matches a document field

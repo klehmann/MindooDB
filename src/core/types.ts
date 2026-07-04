@@ -26,6 +26,12 @@ import type {
   AccessDecision,
 } from "./accesscontrol/types";
 import type { DirectoryStateNode } from "./accesscontrol/DirectoryStateNode";
+import type { SummaryConfig } from "./indexing/summary/types";
+import type { DocumentSummaryStore } from "./indexing/summary/DocumentSummaryStore";
+import type { MindooQuery, MindooQueryOptions, MindooQueryResult } from "./query/types";
+import type { EphemeralSummaryView, MindooQueryViewDefinition } from "./query/queryView";
+import type { MindooQuerySubscription } from "./query/queryLive";
+import type { VirtualViewUpdateOptions } from "./indexing/virtualviews/IVirtualViewDataProvider";
 
 /**
  * Well-known key ID for access control documents (grantaccess, revokeaccess, groups).
@@ -3888,6 +3894,28 @@ export interface SyncResult {
   cancelled: boolean;
 }
 
+/** One changed document in a {@link DbChangeEvent} (lightweight metadata only). */
+export interface DbChange {
+  docId: string;
+  isDeleted: boolean;
+  lastModified: number;
+}
+
+/**
+ * Coalesced change notification emitted to {@link DbChangeListener}s.
+ *
+ * The event is a "there is news up to `cursor`" signal, not a replay
+ * mechanism: listeners registered late simply miss earlier events, and
+ * consumers that need completeness read `iterateChangesSince` from their
+ * own persisted cursor (which stays correct regardless of missed events).
+ */
+export interface DbChangeEvent {
+  changes: DbChange[];
+  cursor: ProcessChangesCursor | null;
+}
+
+export type DbChangeListener = (event: DbChangeEvent) => void;
+
 export interface MindooDB {
 
   /**
@@ -4510,6 +4538,73 @@ export interface MindooDB {
    * @param cursor The cursor to count from. Use `null` to count all entries.
    */
   countChangesSince?(cursor: ProcessChangesCursor | null): number;
+
+  /**
+   * Get (lazily creating) the document summary buffer for this database —
+   * the changefeed-maintained field-value index backing ad-hoc queries and
+   * summary-based views (see docs/adhoc-queries.md).
+   *
+   * @param config Optional summary configuration. On a later call with a
+   *   different configuration, a resumable backfill re-extracts all
+   *   documents (documents themselves are never rewritten).
+   */
+  getSummaryStore?(config?: SummaryConfig): DocumentSummaryStore;
+
+  /**
+   * Read the summary configuration from the synced setup document
+   * (`dbsetup`, field `summarySetup`). Returns `null` when no setup
+   * document or no configuration exists. See docs/adhoc-queries.md.
+   */
+  getSummarySetup?(): Promise<SummaryConfig | null>;
+
+  /**
+   * Write the summary configuration into the synced setup document
+   * (created idempotently when missing). `null` removes the configuration
+   * (fallback to the default auto-include config). Summary stores without
+   * an explicit code-provided configuration follow this document via the
+   * changefeed and re-extract through a resumable backfill.
+   */
+  setSummarySetup?(config: SummaryConfig | null): Promise<void>;
+
+  /**
+   * Run an ad-hoc query against the document summary buffer (see
+   * docs/adhoc-queries.md). The filter is a MindooDB expression-language
+   * expression; documents are never materialized unless
+   * `options.allowFullScan` is set.
+   */
+  query?(query: MindooQuery, options?: MindooQueryOptions): Promise<MindooQueryResult>;
+
+  /**
+   * Build an ephemeral, summary-backed VirtualView (categories, sorting,
+   * totals as usual — fed from the summary buffer, no document
+   * materialization). Not cached; call `dispose()` when done.
+   */
+  queryView?(
+    definition: MindooQueryViewDefinition,
+    options?: VirtualViewUpdateOptions
+  ): Promise<EphemeralSummaryView>;
+
+  /**
+   * Register a listener notified after documents change (local writes,
+   * sync ingest, access flips, witness updates). Events are coalesced —
+   * one event per sync batch / local commit — and carry only lightweight
+   * metadata; consumers needing full replay semantics should read
+   * {@link iterateChangesSince} from their own cursor instead.
+   *
+   * @returns An unsubscribe function.
+   */
+  addChangeListener?(listener: DbChangeListener): () => void;
+
+  /**
+   * Live query: delivers the initial result asynchronously, re-evaluates
+   * after coalesced change events, and calls `onResult` only when the
+   * result actually changed.
+   */
+  queryLive?(
+    query: MindooQuery,
+    onResult: (result: MindooQueryResult) => void,
+    options?: MindooQueryOptions & { onError?: (error: unknown) => void }
+  ): MindooQuerySubscription;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.

@@ -257,6 +257,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Architecture Specification](./docs/specification.md) — Full technical details
 - [React Native Guide](./docs/reactnative.md) — Native Automerge setup and troubleshooting
 - [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
+- [Ad-hoc Queries & Reactive Updates](./docs/adhoc-queries.md) — Summary buffer, `db.query()`, ephemeral views, live queries and change listeners
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization

@@ -16,6 +16,15 @@ import {
 import type { LocalCacheStore } from "../../cache/LocalCacheStore";
 import type { ICacheable } from "../../cache/CacheManager";
 import type { CacheManager } from "../../cache/CacheManager";
+import type { MindooDB } from "../../types";
+
+/** Statistics passed to {@link VirtualView.onDidUpdate} listeners. */
+export interface VirtualViewUpdateStats {
+  /** Entries added or replaced by the applied change batch. */
+  addedCount: number;
+  /** Entries removed by the applied change batch. */
+  removedCount: number;
+}
 
 /**
  * Compact serialized sort key stored in the virtual-view tree cache.
@@ -141,6 +150,12 @@ export class VirtualView {
   private lastCacheFlushAt: number = 0;
   /** Whether the most recent flush attempt was deferred by the min interval. */
   private lastFlushDeferred: boolean = false;
+
+  // Live-view support (see bindTo/onDidUpdate)
+  private updateListeners: Set<(stats: VirtualViewUpdateStats) => void> = new Set();
+  private liveUnsubscribes: Array<() => void> = [];
+  private liveUpdateRunning: boolean = false;
+  private liveUpdatePending: boolean = false;
 
   constructor(columns: VirtualViewColumn[]) {
     this.columns = [...columns];
@@ -411,6 +426,99 @@ export class VirtualView {
     if (indexChanged) {
       this.lastIndexUpdateTime = Date.now();
       this.markViewDirty();
+    }
+
+    // Notify live-view listeners after every applied change batch (this
+    // covers both full updates and the intermediate batches produced by
+    // `VirtualViewUpdateOptions.applyBatchSize`).
+    if (this.updateListeners.size > 0) {
+      const stats: VirtualViewUpdateStats = {
+        addedCount: change.getAdditions().size,
+        removedCount: change.getRemovals().size,
+      };
+      for (const listener of this.updateListeners) {
+        try {
+          listener(stats);
+        } catch (error) {
+          // Listener errors must not disturb view maintenance.
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Live views (reactive support)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a listener fired after every applied change batch with
+   * `{ addedCount, removedCount }` — the hook point for UI re-rendering.
+   * Also fires for the intermediate batches of interruptible updates.
+   *
+   * @returns An unsubscribe function.
+   */
+  onDidUpdate(listener: (stats: VirtualViewUpdateStats) => void): () => void {
+    this.updateListeners.add(listener);
+    return () => {
+      this.updateListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Bind this view to a database's change feed: whenever the database
+   * reports changes, `update()` runs automatically (coalesced — while an
+   * update is running further events only set a pending flag, and one
+   * follow-up update runs afterwards, so there is never an update
+   * backlog). Providers are cursor-based and idempotent, so no event
+   * payload inspection is needed.
+   *
+   * An initial update is scheduled immediately. Call the returned
+   * function (or {@link unbind}) to detach.
+   */
+  bindTo(db: MindooDB): () => void {
+    if (!db.addChangeListener) {
+      throw new Error("This MindooDB instance does not support change listeners.");
+    }
+    const unsubscribe = db.addChangeListener(() => {
+      this.scheduleLiveUpdate();
+    });
+    this.liveUnsubscribes.push(unsubscribe);
+    this.scheduleLiveUpdate();
+    return () => {
+      unsubscribe();
+      this.liveUnsubscribes = this.liveUnsubscribes.filter((fn) => fn !== unsubscribe);
+    };
+  }
+
+  /** Detach all change-feed bindings created via {@link bindTo}. */
+  unbind(): void {
+    for (const unsubscribe of this.liveUnsubscribes) {
+      unsubscribe();
+    }
+    this.liveUnsubscribes = [];
+  }
+
+  private scheduleLiveUpdate(): void {
+    if (this.liveUpdateRunning) {
+      this.liveUpdatePending = true;
+      return;
+    }
+    void this.runLiveUpdate();
+  }
+
+  private async runLiveUpdate(): Promise<void> {
+    this.liveUpdateRunning = true;
+    try {
+      do {
+        this.liveUpdatePending = false;
+        try {
+          await this.update();
+        } catch (error) {
+          // Live updates are fire-and-forget; the next change event retries.
+        }
+      } while (this.liveUpdatePending);
+    } finally {
+      this.liveUpdateRunning = false;
     }
   }
 
