@@ -1,6 +1,6 @@
 import { ViewEntrySortKey } from "./ViewEntrySortKey";
 import { ViewEntrySortKeyComparator } from "./ViewEntrySortKeyComparator";
-import { LOW_SORTVAL, HIGH_SORTVAL, LOW_ORIGIN, HIGH_ORIGIN } from "./types";
+import { LOW_SORTVAL, HIGH_SORTVAL, LOW_ORIGIN, HIGH_ORIGIN, baseSensitivityCollator } from "./types";
 import type { VirtualView } from "./VirtualView";
 
 /**
@@ -272,7 +272,12 @@ export class VirtualViewEntryData {
       return false;
     }
     this.childEntriesBySortKey.set(key, entry);
-    this.sortedChildrenCache = null; // Invalidate cache
+    if (this.sortedChildrenCache !== null) {
+      // Maintain the sorted cache incrementally: O(log n) position lookup +
+      // one splice instead of invalidation + full re-sort on next read.
+      const insertAt = this.findSortedInsertIndex(entry);
+      this.sortedChildrenCache.splice(insertAt, 0, entry);
+    }
     this._childCount++;
     if (entry.isCategory()) {
       this._childCategoryCount++;
@@ -293,7 +298,15 @@ export class VirtualViewEntryData {
       return false;
     }
     this.childEntriesBySortKey.delete(key);
-    this.sortedChildrenCache = null; // Invalidate cache
+    if (this.sortedChildrenCache !== null) {
+      const removeAt = this.findSortedEntryIndex(entry);
+      if (removeAt >= 0) {
+        this.sortedChildrenCache.splice(removeAt, 1);
+      } else {
+        // Should not happen; fall back to a full re-sort on next read.
+        this.sortedChildrenCache = null;
+      }
+    }
     this._childCount--;
     if (entry.isCategory()) {
       this._childCategoryCount--;
@@ -301,6 +314,56 @@ export class VirtualViewEntryData {
       this._childDocumentCount--;
     }
     return true;
+  }
+
+  /**
+   * Binary search for the insertion position of `entry` in the sorted
+   * children cache (first index whose sort key compares greater).
+   */
+  private findSortedInsertIndex(entry: VirtualViewEntryData): number {
+    const sorted = this.sortedChildrenCache!;
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.childrenComparator.compare(sorted[mid].sortKey, entry.sortKey) <= 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  /**
+   * Locate an existing entry in the sorted children cache: binary search to
+   * the equal-compare range, then scan it for the exact instance (distinct
+   * sort keys can compare equal, e.g. case-insensitive collation ties).
+   * Returns -1 when not found.
+   */
+  private findSortedEntryIndex(entry: VirtualViewEntryData): number {
+    const sorted = this.sortedChildrenCache!;
+    // Lower bound: first index with compare >= 0
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.childrenComparator.compare(sorted[mid].sortKey, entry.sortKey) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    for (
+      let i = lo;
+      i < sorted.length && this.childrenComparator.compare(sorted[i].sortKey, entry.sortKey) === 0;
+      i++
+    ) {
+      if (sorted[i] === entry) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   /**
@@ -330,17 +393,18 @@ export class VirtualViewEntryData {
       if (e.isCategory() !== isCategory) return false;
       const val = e.sortKey.values.length > 0 ? e.sortKey.values[0] : null;
       
-      // Simple range check (could be optimized with binary search)
+      // Range check using the shared collator (constructing a collator per
+      // localeCompare call dominates the cost of large range scans).
       if (startValue !== LOW_SORTVAL && val !== null && val !== undefined) {
         if (typeof val === "string" && typeof startValue === "string") {
-          if (val.localeCompare(startValue, undefined, { sensitivity: "base" }) < 0) return false;
+          if (baseSensitivityCollator.compare(val, startValue) < 0) return false;
         } else if (typeof val === "number" && typeof startValue === "number") {
           if (val < startValue) return false;
         }
       }
       if (endValue !== HIGH_SORTVAL && val !== null && val !== undefined) {
         if (typeof val === "string" && typeof endValue === "string") {
-          if (val.localeCompare(endValue, undefined, { sensitivity: "base" }) > 0) return false;
+          if (baseSensitivityCollator.compare(val, endValue) > 0) return false;
         } else if (typeof val === "number" && typeof endValue === "number") {
           if (val > endValue) return false;
         }

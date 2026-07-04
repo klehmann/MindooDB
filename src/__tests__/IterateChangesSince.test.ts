@@ -525,6 +525,34 @@ describe("iterateChangesSince", () => {
       expect(nonDeletedInResults.length).toBe(numDocs - docsToDelete.length);
     }, 60000);
 
+    it("yields deleted documents as lightweight tombstones without materialized data", async () => {
+      const db = await tenant.openDB("test-db-deleted-tombstones");
+
+      const doc = await db.createDocument();
+      const docId = doc.getId();
+      await db.changeDoc(doc, (d) => {
+        const data = d.getData();
+        data.title = "will be deleted";
+      });
+      await db.deleteDocument(docId);
+      await db.syncStoreChanges();
+
+      let tombstone: MindooDoc | null = null;
+      for await (const { doc: changedDoc } of db.iterateChangesSince(null)) {
+        if (changedDoc.getId() === docId) {
+          tombstone = changedDoc;
+        }
+      }
+
+      expect(tombstone).not.toBeNull();
+      // Uniform tombstone contract: deleted docs are not materialized.
+      // isAccessible() distinguishes them from inaccessible-key tombstones.
+      expect(tombstone!.isDeleted()).toBe(true);
+      expect(tombstone!.isAccessible()).toBe(true);
+      expect(tombstone!.getData()).toEqual({});
+      expect(tombstone!.getHeads()).toEqual([]);
+    });
+
     it("should allow external indexes to handle deletions incrementally", async () => {
       const db = await tenant.openDB("test-db");
       

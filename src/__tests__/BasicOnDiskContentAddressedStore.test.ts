@@ -105,6 +105,38 @@ describe.each([true, false])(
       expect(page2.hasMore).toBe(false);
     });
 
+    test("supports doc-scoped cursor scan with pagination and filters", async () => {
+      const now = Date.now();
+      const e1 = createTestEntry("docA", "id1", "c1");
+      const e2 = createTestEntry("docB", "id2", "c2");
+      const e3 = createTestEntry("docA", "id3", "c3");
+      const e4 = createTestEntry("docA", "id4", "c4");
+      e1.createdAt = now;
+      e2.createdAt = now + 1;
+      e3.createdAt = now + 2;
+      e4.createdAt = now + 3;
+
+      const store = new BasicOnDiskContentAddressedStore("test-db", StoreKind.docs, undefined, {
+        basePath,
+        indexingEnabled,
+      });
+      await store.putEntries([e1, e2, e3, e4]);
+
+      const page1 = await store.scanEntriesSince!(null, 2, { docId: "docA" });
+      expect(page1.entries.map((e) => e.id)).toEqual(["id1", "id3"]);
+      expect(page1.hasMore).toBe(true);
+
+      const page2 = await store.scanEntriesSince!(page1.nextCursor, 2, { docId: "docA" });
+      expect(page2.entries.map((e) => e.id)).toEqual(["id4"]);
+      expect(page2.hasMore).toBe(false);
+
+      const filtered = await store.scanEntriesSince!(null, 100, {
+        docId: "docA",
+        creationDateFrom: now + 1,
+      });
+      expect(filtered.entries.map((e) => e.id)).toEqual(["id3", "id4"]);
+    });
+
     test("scan pagination remains correct after restart and append", async () => {
       const now = Date.now();
       const e1 = createTestEntry("doc1", "id1", "c1");

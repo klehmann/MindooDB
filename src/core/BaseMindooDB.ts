@@ -226,6 +226,17 @@ interface InternalDoc {
    * sets it to `false` (docs/accesscontrol.md §13).
    */
   accessible?: boolean;
+  /**
+   * Memoized result of converting {@link doc} to a plain JS object
+   * ({@link BaseMindooDB.convertAutomergeToJS}), keyed by the Automerge heads
+   * that produced it ({@link jsCacheHeads}). Repeated `getData()` calls on an
+   * unchanged document (view indexing, formulas, consumers iterating the same
+   * doc) then skip the full re-materialization. Never mutated: `getData()`
+   * always hands out a read-only proxy over this object.
+   */
+  jsCache?: MindooDocPayload;
+  /** Automerge heads (joined) that {@link jsCache} was computed from. */
+  jsCacheHeads?: string;
 }
 
 /**
@@ -414,6 +425,17 @@ export class BaseMindooDB implements MindooDB {
   
   // Lookup map for O(1) access to index entries by docId
   private indexLookup: Map<string, number> = new Map(); // Map<docId, arrayIndex>
+  /**
+   * Lazily-deferred repair marker for {@link indexLookup}: when set, positions
+   * stored in the map for array indices >= this value may be stale (entries
+   * shifted by an {@link updateIndex} splice). Key presence is always exact.
+   * Reads go through {@link getDocIndexPosition}, which validates a hit
+   * against {@link index} and triggers {@link flushIndexLookupPatch} only when
+   * the position actually moved. This turns the per-update O(index size)
+   * lookup rewrite into a single deferred pass — bulk syncs that append at the
+   * index tail never pay it at all.
+   */
+  private indexLookupStaleFrom: number | null = null;
   private nextChangeSeq: number = 1;
   
   // Cache of loaded documents: Map<docId, InternalDoc>
@@ -432,6 +454,13 @@ export class BaseMindooDB implements MindooDB {
   private readonly restoreToL2: boolean;
   private readonly snapshotMinChanges: number;
   private readonly snapshotCooldownMs: number;
+  /**
+   * Per-document count of local writes since the last snapshot eligibility
+   * check that scanned the store. Lets {@link maybeWriteSnapshotForDocument}
+   * skip the per-doc metadata scan entirely while a document is still far
+   * below {@link snapshotMinChanges}. Absent key = unknown (scan once).
+   */
+  private writesSinceSnapshotCheck = new Map<string, number>();
   
   // Track which entry IDs we've already processed
   private processedEntryIds: string[] = [];
@@ -472,6 +501,14 @@ export class BaseMindooDB implements MindooDB {
   private cachePrefix: string | null = null;
   private dirtyDocIds: Set<string> = new Set();
   private cacheMetaDirty: boolean = false;
+  /**
+   * Per-document fingerprint (`changeSeq:automergeHeads`) of the state last
+   * written to the L2 cache by {@link flushDirtyDocToCache}. Lets the periodic
+   * flush skip the expensive `Automerge.save` + L2 write for documents that
+   * were marked dirty but whose persisted state is already current (e.g. docs
+   * that were merely loaded and cached, not changed).
+   */
+  private lastFlushedDocState = new Map<string, string>();
 
   /**
    * Tenant KeyBag fingerprint observed at the time the in-memory index
@@ -838,13 +875,20 @@ export class BaseMindooDB implements MindooDB {
     docId: string,
     internal: InternalDoc,
   ): Promise<void> {
-    const amBinary = Automerge.save(internal.doc);
-
-    const indexEntryIdx = this.indexLookup.get(docId);
+    const indexEntryIdx = this.getDocIndexPosition(docId);
     const changeSeq = indexEntryIdx === undefined
       ? 0
       : this.index[indexEntryIdx].changeSeq;
     const automergeHeads = Automerge.getHeads(internal.doc);
+
+    // Skip the Automerge.save + L2 write when the exact same state was
+    // already flushed (docs marked dirty by a load rather than a change).
+    const flushKey = `${changeSeq}:${automergeHeads.join(",")}`;
+    if (this.lastFlushedDocState.get(docId) === flushKey) {
+      return;
+    }
+
+    const amBinary = Automerge.save(internal.doc);
 
     const header = JSON.stringify({
       version: DOC_CACHE_HEADER_VERSION,
@@ -868,6 +912,7 @@ export class BaseMindooDB implements MindooDB {
     value.set(amBinary, 4 + headerBytes.length);
 
     await store.put("doc", `${prefix}/${docId}`, value);
+    this.lastFlushedDocState.set(docId, flushKey);
   }
 
   private exportMetadataCheckpoint(): Uint8Array {
@@ -932,6 +977,7 @@ export class BaseMindooDB implements MindooDB {
         typeof checkpoint.keyBagFingerprint === "string" ? checkpoint.keyBagFingerprint : null;
       // Rebuild indexLookup from index
       this.indexLookup.clear();
+      this.indexLookupStaleFrom = null;
       for (let i = 0; i < this.index.length; i++) {
         if (typeof this.index[i].changeSeq !== "number") {
           this.index[i].changeSeq = i + 1;
@@ -1024,6 +1070,7 @@ export class BaseMindooDB implements MindooDB {
               const docId = batch[i].slice(docPrefix.length);
               await store.delete("doc", batch[i]);
               this.docCache.delete(docId);
+              this.lastFlushedDocState.delete(docId);
               continue;
             }
             await this.storeCachedDocument(deserialized.internal);
@@ -1298,7 +1345,7 @@ export class BaseMindooDB implements MindooDB {
       awaitingWitness,
       witnessed,
     };
-    const existingIndex = this.indexLookup.get(docId);
+    const existingIndex = this.getDocIndexPosition(docId);
     
     // Check if the entry already exists and hasn't changed position
     if (existingIndex !== undefined) {
@@ -1318,15 +1365,9 @@ export class BaseMindooDB implements MindooDB {
         return; // No change needed
       }
       
-      // Remove from current position
+      // Remove from current position; positions after it are repaired lazily
+      // via indexLookupStaleFrom below.
       this.index.splice(existingIndex, 1);
-      
-      // Update lookup map for entries that moved (only those after the removed position)
-      // We'll update the full range after insertion to be safe
-      const minAffectedIndex = Math.min(existingIndex, this.index.length);
-      for (let i = minAffectedIndex; i < this.index.length; i++) {
-        this.indexLookup.set(this.index[i].docId, i);
-      }
       this.indexLookup.delete(docId);
     }
     
@@ -1351,11 +1392,20 @@ export class BaseMindooDB implements MindooDB {
     // Insert at the correct position
     this.index.splice(insertIndex, 0, newEntry);
     this.nextChangeSeq = assignedSeq + 1;
-    
-    // Update lookup map for entries from insertion point onwards
-    // Only update entries that actually moved (from insertIndex to end)
-    for (let i = insertIndex; i < this.index.length; i++) {
-      this.indexLookup.set(this.index[i].docId, i);
+    this.indexLookup.set(docId, insertIndex);
+
+    // Entries at/after the first splice point may have shifted. Instead of
+    // rewriting the lookup map here (O(index size) per update — twice, in the
+    // old implementation), record the dirty range and let readers repair it
+    // lazily. A fresh insert at the tail (the common bulk-sync case) shifts
+    // nothing and stays clean.
+    const shiftedFrom = existingIndex !== undefined
+      ? Math.min(existingIndex, insertIndex)
+      : insertIndex;
+    if (shiftedFrom < this.index.length - 1) {
+      this.indexLookupStaleFrom = this.indexLookupStaleFrom === null
+        ? shiftedFrom
+        : Math.min(this.indexLookupStaleFrom, shiftedFrom);
     }
 
     this.performanceCallback?.onIndexUpdate?.({
@@ -1363,6 +1413,35 @@ export class BaseMindooDB implements MindooDB {
       operation: existingIndex === undefined ? "insert" : "update",
       time: Date.now() - startedAt,
     });
+  }
+
+  /**
+   * Resolve a document's position in the sorted {@link index} through the
+   * lookup map, repairing lazily-deferred staleness (see
+   * {@link indexLookupStaleFrom}) only when the cached position no longer
+   * matches. All `indexLookup.get` reads must go through this accessor.
+   */
+  private getDocIndexPosition(docId: string): number | undefined {
+    const pos = this.indexLookup.get(docId);
+    if (pos === undefined) {
+      return undefined;
+    }
+    if (this.index[pos]?.docId === docId) {
+      return pos;
+    }
+    this.flushIndexLookupPatch();
+    return this.indexLookup.get(docId);
+  }
+
+  /** Rewrite the stale tail of {@link indexLookup} recorded by {@link updateIndex}. */
+  private flushIndexLookupPatch(): void {
+    if (this.indexLookupStaleFrom === null) {
+      return;
+    }
+    for (let i = this.indexLookupStaleFrom; i < this.index.length; i++) {
+      this.indexLookup.set(this.index[i].docId, i);
+    }
+    this.indexLookupStaleFrom = null;
   }
 
   /**
@@ -1670,6 +1749,7 @@ export class BaseMindooDB implements MindooDB {
   private async purgeMaterializedDocument(docId: string): Promise<void> {
     this.docCache.delete(docId);
     this.dirtyDocIds.delete(docId);
+    this.lastFlushedDocState.delete(docId);
     this.automergeHashToEntryId.delete(docId);
 
     const store = this.cacheManager?.getStore();
@@ -1744,7 +1824,7 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      const existingIndex = this.indexLookup.get(docId);
+      const existingIndex = this.getDocIndexPosition(docId);
       const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
       // Visibility is governed by key possession alone: documents whose
       // decryption key is in the bag are visible; the rest are hidden. Which
@@ -1817,7 +1897,9 @@ export class BaseMindooDB implements MindooDB {
 
     this.index = [];
     this.indexLookup.clear();
+    this.indexLookupStaleFrom = null;
     this.docCache.clear();
+    this.lastFlushedDocState.clear();
     this.automergeHashToEntryId.clear();
     this.processedEntryIds = [];
     this.processedEntryCursor = null;
@@ -1979,7 +2061,7 @@ export class BaseMindooDB implements MindooDB {
           // existing index entry (if any). We do NOT need a second pass
           // over the underlying store - the key is missing, so we just
           // record an inaccessibility tombstone.
-          const existingIndex = this.indexLookup.get(docId);
+          const existingIndex = this.getDocIndexPosition(docId);
           const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
           if (existing?.accessState === "visible") {
             const lifecycleEntriesInBatch = entryMetadataList.filter((entry) =>
@@ -2006,7 +2088,9 @@ export class BaseMindooDB implements MindooDB {
             this.cacheMetaDirty = true;
             this.cacheManager?.markDirty();
           }
-          this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
+          if (!this.supportsCursorScan(this.store)) {
+            this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
+          }
           return;
         }
         
@@ -2041,8 +2125,13 @@ export class BaseMindooDB implements MindooDB {
       await processDocument(docId, entryMetadataList);
     }
     
-    // Append new entry IDs to our processed list
-    this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
+    // Append new entry IDs to our processed list. Only needed for stores
+    // without cursor scan (the checkpoint persists them only in that case);
+    // cursor-capable stores track progress via processedEntryCursor, so we
+    // avoid growing an unbounded in-memory id list.
+    if (!this.supportsCursorScan(this.store)) {
+      this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
+    }
     this.processedEntryCursor = nextCursor;
     this.cacheMetaDirty = true;
     this.cacheManager?.markDirty();
@@ -7951,6 +8040,19 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<void> {
     const docId = internalDoc.id;
     try {
+      // Cheap pre-filter: while the in-memory write counter says the doc is
+      // still below the snapshot threshold, skip the metadata scan entirely.
+      // An absent counter (first write this session) forces one scan to learn
+      // the real backlog, after which the counter tracks it incrementally.
+      const knownWrites = this.writesSinceSnapshotCheck.get(docId);
+      if (knownWrites !== undefined) {
+        const writes = knownWrites + 1;
+        if (writes < this.snapshotMinChanges) {
+          this.writesSinceSnapshotCheck.set(docId, writes);
+          return;
+        }
+      }
+
       const allMetadata = await this.scanAllMetadata(this.store, { docId });
       const replayEntries = allMetadata.filter(
         (em) => this.isDocumentReplayEntry(em),
@@ -7961,6 +8063,7 @@ export class BaseMindooDB implements MindooDB {
       const latestSnapshot = snapshots[0] || null;
       const latestSnapshotAt = latestSnapshot?.createdAt ?? 0;
       const changesSinceSnapshot = replayEntries.filter((em) => em.createdAt > latestSnapshotAt).length;
+      this.writesSinceSnapshotCheck.set(docId, changesSinceSnapshot);
       if (changesSinceSnapshot < this.snapshotMinChanges) {
         return;
       }
@@ -8020,6 +8123,7 @@ export class BaseMindooDB implements MindooDB {
       );
 
       await this.store.putEntries([snapshotEntry]);
+      this.writesSinceSnapshotCheck.set(docId, 0);
       this.logger.debug(
         `Created snapshot for document ${docId} with ${headHashes.length} heads and ${changesSinceSnapshot} changes since previous snapshot`,
       );
@@ -8052,7 +8156,10 @@ export class BaseMindooDB implements MindooDB {
       i++
     ) {
       const entry = indexSnapshot[i];
-      if (entry.accessState === "inaccessible") {
+      // Skip docs that iterateChangesSince will emit as lightweight
+      // tombstones anyway: inaccessible docs are never materialized, and
+      // deleted docs are yielded without body materialization.
+      if (entry.accessState === "inaccessible" || entry.isDeleted) {
         continue;
       }
       const docId = entry.docId;
@@ -8507,6 +8614,21 @@ export class BaseMindooDB implements MindooDB {
     };
   }
 
+  /**
+   * Count the changefeed entries after the given cursor without iterating
+   * them. O(log n) binary search on the internal `(changeSeq, docId)` index —
+   * used for progress reporting around {@link iterateChangesSince}.
+   */
+  countChangesSince(cursor: ProcessChangesCursor | null): number {
+    const actualCursor: ProcessChangesCursor = cursor ?? {
+      changeSeq: 0,
+      lastModified: 0,
+      docId: "",
+    };
+    const startIndex = this.getStartIndexForCursor(this.index, actualCursor);
+    return this.index.length - startIndex;
+  }
+
   async *iterateChangesSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
@@ -8555,7 +8677,28 @@ export class BaseMindooDB implements MindooDB {
           );
           continue;
         }
-        
+
+        if (entry.isDeleted) {
+          // Deleted documents are emitted as lightweight tombstones without
+          // materializing the body — consistent with the inaccessible case
+          // above (isDeleted() === true, getData() === {}), distinguishable
+          // via isAccessible() === true. Consumers that need the last state
+          // of a deleted doc can use iterateDocumentHistory /
+          // getDocumentAtTimestamp.
+          const deletedCursor: ProcessChangesCursor = {
+            changeSeq: entry.changeSeq,
+            lastModified: entry.lastModified,
+            docId: entry.docId,
+          };
+          yieldedDocuments++;
+          yield { doc: this.buildDeletedDoc(entry), cursor: deletedCursor };
+          prefetchedDocuments += await this.prefetchIterationWindow(
+            indexSnapshot,
+            i + 1
+          );
+          continue;
+        }
+
         try {
           this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
           
@@ -8859,6 +9002,7 @@ export class BaseMindooDB implements MindooDB {
       this.logger.warn(`L2 deserialize failed for ${docId}, evicting stale record: ${e}`);
       try {
         await store.delete("doc", key);
+        this.lastFlushedDocState.delete(docId);
       } catch (deleteError) {
         this.logger.warn(`Failed to evict corrupt L2 record for ${docId}: ${deleteError}`);
       }
@@ -8879,13 +9023,14 @@ export class BaseMindooDB implements MindooDB {
       return null;
     }
 
-    const indexEntryIdx = this.indexLookup.get(docId);
+    const indexEntryIdx = this.getDocIndexPosition(docId);
     if (indexEntryIdx === undefined) {
       // Doc isn't in the in-memory changefeed index. Either the cache is
       // ahead of the index (very rare race during initial restore) or the
       // L2 record is orphaned. Drop and fall through.
       try {
         await store.delete("doc", key);
+        this.lastFlushedDocState.delete(docId);
       } catch (deleteError) {
         this.logger.warn(`Failed to evict orphaned L2 record for ${docId}: ${deleteError}`);
       }
@@ -8896,6 +9041,12 @@ export class BaseMindooDB implements MindooDB {
 
     // Fresh hit: index agrees with the persisted state.
     if (persistedChangeSeq === currentChangeSeq) {
+      // Seed the flush-skip fingerprint with the state just read from L2 so
+      // the next periodic flush doesn't rewrite an identical record.
+      this.lastFlushedDocState.set(
+        docId,
+        `${persistedChangeSeq}:${Automerge.getHeads(internal.doc).join(",")}`,
+      );
       await this.storeCachedDocument(internal);
       return internal;
     }
@@ -9742,7 +9893,7 @@ export class BaseMindooDB implements MindooDB {
     // of whether L1/L2 still hold a cached copy. This keeps the public
     // contract of `loadDocumentInternal` aligned with `getDocument` /
     // `getAllDocumentIds`.
-    const indexEntryIdx = this.indexLookup.get(docId);
+    const indexEntryIdx = this.getDocIndexPosition(docId);
     if (indexEntryIdx !== undefined && this.index[indexEntryIdx].accessState === "inaccessible") {
       return null;
     }
@@ -10252,9 +10403,16 @@ export class BaseMindooDB implements MindooDB {
       isWitnessed: () => internalDoc.witnessed ?? false,
       getHeads: () => Automerge.getHeads(internalDoc.doc),
       getData: () => {
-        // Convert Automerge document to plain JS object, converting Text objects to strings
-        const jsDoc = this.convertAutomergeToJS(internalDoc.doc);
-        return createReadOnlyProxy(jsDoc);
+        // Convert Automerge document to plain JS object, converting Text
+        // objects to strings. Memoized per InternalDoc and invalidated via
+        // the document's Automerge heads, so repeated getData() calls on an
+        // unchanged doc skip the full re-materialization.
+        const headsKey = Automerge.getHeads(internalDoc.doc).join(",");
+        if (internalDoc.jsCache === undefined || internalDoc.jsCacheHeads !== headsKey) {
+          internalDoc.jsCache = this.convertAutomergeToJS(internalDoc.doc);
+          internalDoc.jsCacheHeads = headsKey;
+        }
+        return createReadOnlyProxy(internalDoc.jsCache);
       },
       
       // ========== Attachment Write Methods ==========
@@ -10335,6 +10493,29 @@ export class BaseMindooDB implements MindooDB {
       decryptionKeyId: entry.decryptionKeyId,
       isDeleted: true,
       accessible: false,
+    };
+    return this.wrapDocument(internalDoc);
+  }
+
+  /**
+   * Build a lightweight read-only tombstone for a deleted document, emitted
+   * by {@link iterateChangesSince} instead of materializing the deleted
+   * body. Reports `isDeleted() === true`, `isAccessible() === true` and
+   * `getData() === {}` — the counterpart to {@link buildInaccessibleDoc} for
+   * genuine deletions (distinguish the two via `isAccessible()`). Consumers
+   * that need the last state of a deleted document can use
+   * {@link iterateDocumentHistory} or {@link getDocumentAtTimestamp}.
+   */
+  private buildDeletedDoc(entry: DocumentIndexEntry): MindooDoc {
+    const internalDoc: InternalDoc = {
+      id: entry.docId,
+      doc: Automerge.init<MindooDocPayload>(),
+      createdAt: 0,
+      lastModified: entry.lastModified,
+      decryptionKeyId: entry.decryptionKeyId,
+      isDeleted: true,
+      awaitingWitness: entry.awaitingWitness ?? false,
+      witnessed: entry.witnessed ?? false,
     };
     return this.wrapDocument(internalDoc);
   }

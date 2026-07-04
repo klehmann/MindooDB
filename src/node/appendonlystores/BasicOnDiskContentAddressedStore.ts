@@ -64,6 +64,7 @@ import {
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
+import { scanDocScopedEntries } from "../../core/appendonlystores/scanUtils";
 import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 
@@ -814,6 +815,25 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   }
 
   /**
+   * Resolve all metadata entries for a document through the `docIndex`.
+   * O(entries of the doc); used by the doc-scoped scan fast path.
+   */
+  private collectDocMetadata(docId: string): StoreEntryMetadata[] {
+    const ids = this.docIndex.get(docId);
+    if (!ids || ids.size === 0) {
+      return [];
+    }
+    const result: StoreEntryMetadata[] = [];
+    for (const id of ids) {
+      const meta = this.entries.get(id);
+      if (meta) {
+        result.push(meta);
+      }
+    }
+    return result;
+  }
+
+  /**
    * Test whether a metadata entry passes the given scan filters.
    * Evaluates docId, entryTypes whitelist, and creationDate range.
    * Returns `true` when no filters are provided or all checks pass.
@@ -1271,22 +1291,38 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    */
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
     await this.ensureInitialized();
+
+    // Read metadata/content files in parallel chunks: sequential awaits pay
+    // one full disk round trip per entry, which dominates bulk hydration
+    // (document materialization, sync batches). Chunking bounds the number
+    // of concurrently open file handles.
+    const concurrency = 16;
     const result: StoreEntry[] = [];
 
-    for (const id of ids) {
+    const loadOne = async (id: string): Promise<StoreEntry | null> => {
       const metadata = await this.readMetadataById(id);
       if (!metadata) {
-        continue;
+        return null;
       }
 
       const contentPath = this.contentPathForHash(metadata.contentHash);
       if (!(await this.fileExists(contentPath))) {
         this.logger.warn(`Content ${metadata.contentHash} not found for entry ${id}`);
-        continue;
+        return null;
       }
 
       const encryptedData = new Uint8Array(await readFile(contentPath));
-      result.push({ ...metadata, encryptedData });
+      return { ...metadata, encryptedData };
+    };
+
+    for (let offset = 0; offset < ids.length; offset += concurrency) {
+      const chunk = ids.slice(offset, offset + concurrency);
+      const loaded = await Promise.all(chunk.map(loadOne));
+      for (const entry of loaded) {
+        if (entry) {
+          result.push(entry);
+        }
+      }
     }
     return result;
   }
@@ -1446,6 +1482,17 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   ): Promise<StoreScanResult> {
     await this.ensureInitialized();
     if (this.indexingEnabled) {
+      // Doc-scoped fast path: resolve the docId through the secondary index so
+      // the scan cost is O(entries of this doc) instead of O(entries in store).
+      if (filters?.docId) {
+        return scanDocScopedEntries(
+          this.collectDocMetadata(filters.docId),
+          cursor,
+          limit,
+          filters,
+        );
+      }
+
       // Indexed path: O(logN) lower-bound + O(pageSize) slice/filter.
       const startIndex = this.lowerBoundForCursor(cursor);
 

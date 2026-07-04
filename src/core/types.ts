@@ -4501,6 +4501,17 @@ export interface MindooDB {
   getLatestChangeCursor?(): ProcessChangesCursor | null;
 
   /**
+   * Count the number of changefeed entries after the given cursor without
+   * iterating them (O(log n) binary search on the internal change index).
+   *
+   * Useful for progress reporting before/while consuming
+   * {@link iterateChangesSince} — e.g. "processed X of Y documents".
+   *
+   * @param cursor The cursor to count from. Use `null` to count all entries.
+   */
+  countChangesSince?(cursor: ProcessChangesCursor | null): number;
+
+  /**
    * Sync changes from the append-only store by finding new changes and processing them.
    * This method can be called multiple times to incrementally sync new changes.
    * On first call (when processedChangeHashes is empty), it will process all changes.

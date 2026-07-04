@@ -19,6 +19,7 @@ import {
 import { planAttachmentReadByWalkingMetadata } from "./AttachmentReadPlanner";
 import { createIdBloomSummary } from "./bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "./MaterializationPlanner";
+import { scanDocScopedEntries } from "./scanUtils";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -416,6 +417,22 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     limit: number = Number.MAX_SAFE_INTEGER,
     filters?: StoreScanFilters
   ): Promise<StoreScanResult> {
+    // Doc-scoped fast path: resolve the docId through the secondary index so
+    // the scan cost is O(entries of this doc) instead of O(entries in store).
+    if (filters?.docId) {
+      const docEntries: StoreEntryMetadata[] = [];
+      const ids = this.docIndex.get(filters.docId);
+      if (ids) {
+        for (const id of ids) {
+          const meta = this.entries.get(id);
+          if (meta) {
+            docEntries.push(meta);
+          }
+        }
+      }
+      return scanDocScopedEntries(docEntries, cursor, limit, filters);
+    }
+
     const sorted = this.getSortedEntries();
     const startIdx =
       cursor === null

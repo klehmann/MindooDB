@@ -17,10 +17,13 @@ export interface ICacheable {
    * Export the current dirty state to the cache store.
    * Called by CacheManager during flush.
    *
-   * @param store  The cache store to write to
+   * @param store   The cache store to write to
+   * @param options `force: true` on shutdown/deregister paths — implementations
+   *                must persist immediately and may not defer (e.g. a
+   *                VirtualView's minimum flush interval is bypassed)
    * @returns The number of entries written
    */
-  flushToCache(store: LocalCacheStore): Promise<number>;
+  flushToCache(store: LocalCacheStore, options?: { force?: boolean }): Promise<number>;
 
   /**
    * Clear the dirty tracking state after a successful flush.
@@ -77,7 +80,7 @@ export class CacheManager {
   async deregister(cacheable: ICacheable): Promise<void> {
     if (cacheable.hasDirtyState()) {
       try {
-        await cacheable.flushToCache(this.store);
+        await cacheable.flushToCache(this.store, { force: true });
         cacheable.clearDirty();
       } catch (e) {
         this.logger.warn(`Failed to flush cache for ${cacheable.getCachePrefix()} on deregister: ${e}`);
@@ -105,8 +108,11 @@ export class CacheManager {
 
   /**
    * Immediately flush all dirty cacheables.
+   *
+   * @param options `force: true` bypasses per-cacheable flush deferral
+   *   (used on dispose so shutdown never skips pending state)
    */
-  async flush(): Promise<void> {
+  async flush(options?: { force?: boolean }): Promise<void> {
     if (this.flushInProgress) return;
     this.flushInProgress = true;
 
@@ -115,7 +121,7 @@ export class CacheManager {
         if (!cacheable.hasDirtyState()) continue;
 
         try {
-          const count = await cacheable.flushToCache(this.store);
+          const count = await cacheable.flushToCache(this.store, options);
           cacheable.clearDirty();
           this.logger.debug(`Flushed ${count} entries for ${cacheable.getCachePrefix()}`);
         } catch (e) {
@@ -136,6 +142,6 @@ export class CacheManager {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    await this.flush();
+    await this.flush({ force: true });
   }
 }

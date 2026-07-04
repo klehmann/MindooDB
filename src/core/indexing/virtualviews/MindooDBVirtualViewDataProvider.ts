@@ -1,5 +1,5 @@
 import type { MindooDB, MindooDoc, ProcessChangesCursor } from "../../types";
-import type { IVirtualViewDataProvider } from "./IVirtualViewDataProvider";
+import type { IVirtualViewDataProvider, VirtualViewUpdateOptions } from "./IVirtualViewDataProvider";
 import type { VirtualView } from "./VirtualView";
 import type { VirtualViewColumn } from "./VirtualViewColumn";
 import { VirtualViewDataChange } from "./VirtualViewDataChange";
@@ -17,21 +17,31 @@ export interface MindooDBVirtualViewDataProviderOptions {
   
   /** Optional filter function to select which documents to include */
   filterFunction?: DocumentFilterFunction;
-  
-  /** Page size for incremental processing (default: 100) */
-  pageSize?: number;
+
+  /**
+   * When `true`, every (non-underscore) document field is copied into the
+   * view entry's column values, mirroring the legacy behavior. Defaults to
+   * `false`: only the fields the view's columns reference are kept, which
+   * significantly reduces memory usage and view-cache size for documents
+   * with large payloads. Enable this for consumers that need free-form
+   * field access on view entries (e.g. formula languages evaluating
+   * arbitrary fields at read time).
+   */
+  includeAllDocumentFields?: boolean;
 }
 
 /**
  * Data provider that reads documents from a MindooDB and provides them
- * to a VirtualView. It uses metadata-first incremental updates so delete-only
- * changes can be handled without materializing document bodies.
+ * to a VirtualView. Incremental updates are driven by
+ * `iterateChangesSince`, which prefetches upcoming documents in parallel
+ * and emits lightweight tombstones for deleted and inaccessible documents,
+ * so removals never pay document materialization.
  */
 export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider {
   private readonly origin: string;
   private readonly db: MindooDB;
   private readonly filterFunction: DocumentFilterFunction | null;
-  private readonly pageSize: number;
+  private readonly includeAllDocumentFields: boolean;
   
   private view: VirtualView | null = null;
   private cursor: ProcessChangesCursor | null = null;
@@ -43,7 +53,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     this.origin = options.origin;
     this.db = options.db;
     this.filterFunction = options.filterFunction ?? null;
-    this.pageSize = options.pageSize ?? 100;
+    this.includeAllDocumentFields = options.includeAllDocumentFields ?? false;
   }
 
   getOrigin(): string {
@@ -54,62 +64,103 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     this.view = view;
   }
 
-  async update(): Promise<void> {
+  async update(options?: VirtualViewUpdateOptions): Promise<void> {
     if (!this.view) {
       throw new Error("Data provider not initialized - call init() first");
     }
+    const view = this.view;
 
-    const change = new VirtualViewDataChange(this.origin);
-    const columns = this.view.getColumns();
+    const applyBatchSize = options?.applyBatchSize ?? 100;
+    const onProgress = options?.onProgress;
+    const signal = options?.signal;
+    // Best-effort total for progress reporting; changes arriving mid-run
+    // are not counted. Only computed when someone listens for progress.
+    const total = onProgress ? (this.db.countChangesSince?.(this.cursor) ?? 0) : 0;
 
-    // Drive incremental updates from metadata first so deleted documents can be
-    // removed from the view without paying the cost to materialize them.
-    for await (const { docId, isDeleted, cursor } of this.db.iterateChangeMetadataSince(this.cursor)) {
-      if (isDeleted) {
+    const columns = view.getColumns();
+    let change = new VirtualViewDataChange(this.origin);
+    let processed = 0;
+    let processedInBatch = 0;
+
+    const applyPendingChanges = () => {
+      if (change.hasChanges()) {
+        view.applyChanges(change);
+        change = new VirtualViewDataChange(this.origin);
+      }
+    };
+
+    // Returns true when the run should stop after the just-applied batch.
+    // At this point `this.cursor` matches the applied view state, so a
+    // subsequent update() resumes exactly where this run left off.
+    // The signal is checked after the callback so an abort triggered inside
+    // `onProgress` takes effect at the same batch boundary.
+    const stopRequested = (): boolean => {
+      const callbackStop =
+        onProgress?.({ processed, total, origin: this.origin }) === false;
+      return callbackStop || signal?.aborted === true;
+    };
+
+    if (signal?.aborted) {
+      return;
+    }
+
+    // Drive incremental updates from the document changefeed. Deleted and
+    // inaccessible documents arrive as lightweight tombstones (never
+    // materialized), and upcoming live documents are prefetched in parallel
+    // by the iterator's built-in prefetch window.
+    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor)) {
+      const docId = doc.getId();
+
+      if (doc.isDeleted()) {
         if (this.knownDocIds.has(docId)) {
           change.removeEntry(docId);
           this.knownDocIds.delete(docId);
         }
-        this.cursor = cursor;
-        continue;
-      }
+      } else {
+        const passesFilter = !this.filterFunction || this.filterFunction(doc);
 
-      const doc = await this.db.getDocument(docId);
-      if (!doc || doc.isDeleted()) {
-        if (this.knownDocIds.has(docId)) {
+        if (passesFilter) {
+          const columnValues = this.computeColumnValues(doc, columns);
+          // Propagate the source document's encryption key id into the
+          // view entry. This metadata is later used by
+          // `VirtualView.purgeEntriesByDecryptionKeyId` to drop entries in
+          // bulk when a key is revoked, without re-reading the database.
+          change.addEntry(docId, columnValues, doc.getDecryptionKeyId());
+          this.knownDocIds.add(docId);
+        } else if (this.knownDocIds.has(docId)) {
           change.removeEntry(docId);
           this.knownDocIds.delete(docId);
         }
-        this.cursor = cursor;
-        continue;
-      }
-
-      const passesFilter = !this.filterFunction || this.filterFunction(doc);
-
-      if (passesFilter) {
-        const columnValues = this.computeColumnValues(doc, columns);
-        // Propagate the source document's encryption key id into the
-        // view entry. This metadata is later used by
-        // `VirtualView.purgeEntriesByDecryptionKeyId` to drop entries in
-        // bulk when a key is revoked, without re-reading the database.
-        change.addEntry(docId, columnValues, doc.getDecryptionKeyId());
-        this.knownDocIds.add(docId);
-      } else if (this.knownDocIds.has(docId)) {
-        change.removeEntry(docId);
-        this.knownDocIds.delete(docId);
       }
 
       this.cursor = cursor;
+      processed++;
+      processedInBatch++;
+
+      if (processedInBatch >= applyBatchSize) {
+        applyPendingChanges();
+        processedInBatch = 0;
+        if (stopRequested()) {
+          return;
+        }
+      }
     }
 
-    // Apply changes to the view if there are any
-    if (change.hasChanges()) {
-      this.view.applyChanges(change);
+    // Apply any remaining changes and emit a final progress report.
+    applyPendingChanges();
+    if (onProgress) {
+      onProgress({ processed, total, origin: this.origin });
     }
   }
 
   /**
-   * Compute column values for a document using column value functions
+   * Compute column values for a document using column value functions.
+   *
+   * By default only the fields the view's columns reference are copied into
+   * the result, keeping view entries (and the serialized view cache) small.
+   * With `includeAllDocumentFields: true` every non-underscore document
+   * field is copied first, mirroring the legacy behavior for consumers that
+   * need free-form field access on view entries.
    */
   private computeColumnValues(
     doc: MindooDoc,
@@ -118,15 +169,16 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     const values: Record<string, unknown> = {};
     const docData = doc.getData();
 
-    // First, copy all fields from the document
-    for (const [key, value] of Object.entries(docData)) {
-      // Skip internal fields
-      if (!key.startsWith("_")) {
-        values[key] = value;
+    if (this.includeAllDocumentFields) {
+      // Copy all fields from the document (skipping internal fields)
+      for (const [key, value] of Object.entries(docData)) {
+        if (!key.startsWith("_")) {
+          values[key] = value;
+        }
       }
     }
 
-    // Then, apply column value functions (which may override or add values)
+    // Apply column value functions (which may override or add values)
     for (const column of columns) {
       if (column.valueFunction) {
         const computedValue = column.valueFunction(doc, values, this.origin);

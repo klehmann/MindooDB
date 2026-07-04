@@ -167,6 +167,16 @@ export function getDataTypeSortOrder(val: unknown): number {
 }
 
 /**
+ * Shared collator for locale-aware, case-insensitive string comparison.
+ * Reused module-wide because `localeCompare` with options constructs a new
+ * collator on every call, which dominates sort-heavy view operations.
+ */
+export const baseSensitivityCollator = new Intl.Collator(undefined, { sensitivity: "base" });
+
+/** Shared collator with default sensitivity (fallback string comparison). */
+const defaultCollator = new Intl.Collator();
+
+/**
  * Compare two values for sorting, handling different types
  */
 export function compareValues(a: unknown, b: unknown, descending: boolean): number {
@@ -209,14 +219,14 @@ export function compareValues(a: unknown, b: unknown, descending: boolean): numb
   // Same type comparison
   let result = 0;
   if (typeof a === "string" && typeof b === "string") {
-    result = a.localeCompare(b, undefined, { sensitivity: "base" });
+    result = baseSensitivityCollator.compare(a, b);
   } else if (typeof a === "number" && typeof b === "number") {
     result = a - b;
   } else if (a instanceof Date && b instanceof Date) {
     result = a.getTime() - b.getTime();
   } else {
     // Fallback: convert to string and compare
-    result = String(a).localeCompare(String(b));
+    result = defaultCollator.compare(String(a), String(b));
   }
 
   return descending ? -result : result;

@@ -451,12 +451,66 @@ await view.updateOrigin("tasks");
 ### How Incremental Updates Work
 
 1. **Data provider tracks cursor**: Each `MindooDBVirtualViewDataProvider` maintains a cursor from the last processed position
-2. **Process changes**: On `update()`, the provider calls `iterateChangesSince()` to get changed documents
+2. **Process changes**: On `update()`, the provider calls `iterateChangesSince()` to get changed documents. The iterator prefetches upcoming documents in parallel and emits deleted/inaccessible documents as lightweight tombstones (never materialized), so removals are cheap
 3. **Generate changes**: For each document:
    - If deleted or no longer matches filter → add to removals
    - If new or modified → compute column values, add to additions
 4. **Apply changes**: `VirtualView.applyChanges()` removes old entries, adds new ones, cleans up empty categories
 5. **Update totals**: Category totals are incrementally updated (add new values, subtract removed values)
+
+### Column Scoping (`includeAllDocumentFields`)
+
+By default, the data provider stores **only the fields referenced by the view's columns** in each view entry. This keeps memory usage and the serialized view cache small, especially for documents with large payloads.
+
+Consumers that need free-form access to arbitrary document fields on view entries (e.g. a formula language evaluating fields at read time) can opt back into the legacy behavior:
+
+```typescript
+const view = await VirtualViewFactory.createView()
+  .addCategoryColumn("status")
+  .addSortedColumn("name")
+  .withMindooDB({
+    origin: "tasks",
+    db: taskDatabase,
+    includeAllDocumentFields: true, // copy all non-underscore doc fields into entries
+  })
+  .buildAndUpdate();
+```
+
+### Progress Reporting & Interruptible Updates
+
+Long-running update runs (e.g. the initial population of a view over a large database) can be observed and interrupted. `view.update()`, `view.updateOrigin()`, and `provider.update()` accept an optional `VirtualViewUpdateOptions` object:
+
+```typescript
+const controller = new AbortController();
+
+await view.update({
+  // Apply accumulated changes to the view after this many processed
+  // documents (default: 100). Use Infinity for one atomic apply at the end.
+  applyBatchSize: 200,
+
+  // Called at every batch boundary and once at the end of the run.
+  // Return false to stop cleanly after the current batch.
+  onProgress: ({ processed, total, origin }) => {
+    progressDialog.update(processed, total);
+    return !progressDialog.cancelRequested;
+  },
+
+  // Alternative cancellation mechanism, checked at every batch boundary.
+  signal: controller.signal,
+});
+```
+
+Key behaviors:
+
+- **`total`** is computed once at the start of the run via `db.countChangesSince(cursor)` — an O(log n) binary search on the change index, so progress reporting adds no meaningful overhead. Changes arriving mid-run are not included in `total`.
+- **Interruption is always clean**: the current batch is applied to the view before the run stops, so the view state and the provider cursor stay consistent. Nothing is half-applied.
+- **Resumption is automatic**: the provider cursor points at the last applied document, so the next `update()` call continues exactly where the interrupted run stopped — no work is repeated. This also holds across app restarts when the provider state is persisted via `exportCacheState()` / `importCacheState()` (which the view cache does automatically).
+
+`countChangesSince(cursor)` is also available directly on the database for building "N documents pending" indicators before starting an update.
+
+### View Cache Flush Behavior
+
+When a `CacheManager` is attached via `view.setCacheManager()`, the view periodically serializes its full tree to the local cache store. Because full-tree serialization is expensive, flushes are throttled: a minimum interval (default **15 seconds**, configurable via `setCacheManager(..., { minCacheFlushIntervalMs })`) must elapse between two serializations. A flush attempt inside that window is deferred — the view stays dirty and the flush lands on a later cycle. Shutdown paths (`CacheManager.dispose()` / `deregister()`) always flush immediately, so no state is lost on close.
 
 ## API Reference
 
@@ -498,8 +552,10 @@ view.getCategoryColumns(): VirtualViewColumn[]
 view.getSortColumns(): VirtualViewColumn[]
 view.getTotalColumns(): VirtualViewColumn[]
 view.getRoot(): VirtualViewEntryData
-view.update(): Promise<void>             // Update all data providers
-view.updateOrigin(origin): Promise<void> // Update specific provider
+view.update(options?): Promise<void>             // Update all data providers
+view.updateOrigin(origin, options?): Promise<void> // Update specific provider
+// options: { applyBatchSize?, onProgress?, signal? } — see
+// "Progress Reporting & Interruptible Updates" above
 view.applyChanges(change): void          // Apply a VirtualViewDataChange
 view.getEntries(origin, docId): VirtualViewEntryData[]
 ```

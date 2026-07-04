@@ -131,6 +131,8 @@ await db.pushChangesTo(remote);
 
 Every document change is automatically signed with the user's Ed25519 key and encrypted with the tenant's default encryption key (AES-256-GCM) before it is stored. When you push to the server, only the encrypted entries travel over the wire.
 
+> **Change granularity:** Inside a `changeDoc()` callback, assigning a top-level field (e.g. `d.getData().title = "..."` or replacing a whole array/object) records the replacement of that entire value in the change history. For small values this is fine, but repeatedly rewriting large fields (long strings, big arrays) produces large change entries and grows the document history quickly. For fine-grained edits, use the dedicated patch APIs instead: `db.applyTextPatch()` for character-level text edits and `db.applyJsonPatch()` for granular object/list operations at specific paths. These record only the actual delta and merge cleanly with concurrent edits.
+
 `connectToServer` creates a remote store backed by an HTTP transport. It handles authentication (challenge-response using your signing key), encryption of the sync payload, and capability negotiation with the server. You can use the returned store with `pushChangesTo` and `pullChangesFrom` just like any local store.
 
 ---

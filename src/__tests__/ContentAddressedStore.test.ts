@@ -165,6 +165,49 @@ describe("InMemoryContentAddressedStore", () => {
       expect(scanned.entries.length).toBe(2);
       expect(scanned.entries.every((e) => e.docId === "docA")).toBe(true);
     });
+
+    test("should paginate doc-filtered scan with cursor in (receiptOrder, id) order", async () => {
+      await store.putEntries([
+        createTestEntry("docA", "id1", "c1"),
+        createTestEntry("docB", "id2", "c2"),
+        createTestEntry("docA", "id3", "c3"),
+        createTestEntry("docA", "id4", "c4"),
+        createTestEntry("docB", "id5", "c5"),
+      ]);
+
+      const page1 = await store.scanEntriesSince!(null, 2, { docId: "docA" });
+      expect(page1.entries.map((e) => e.id)).toEqual(["id1", "id3"]);
+      expect(page1.hasMore).toBe(true);
+
+      const page2 = await store.scanEntriesSince!(page1.nextCursor, 2, { docId: "docA" });
+      expect(page2.entries.map((e) => e.id)).toEqual(["id4"]);
+      expect(page2.hasMore).toBe(false);
+
+      const page3 = await store.scanEntriesSince!(page2.nextCursor, 2, { docId: "docA" });
+      expect(page3.entries).toEqual([]);
+      expect(page3.hasMore).toBe(false);
+    });
+
+    test("should combine doc filter with entryTypes and date range filters", async () => {
+      const now = Date.now();
+      const create = createTestEntry("docA", "id1", "c1", [], "doc_create");
+      const change = createTestEntry("docA", "id2", "c2", [], "doc_change");
+      const late = createTestEntry("docA", "id3", "c3", [], "doc_change");
+      const other = createTestEntry("docB", "id4", "c4", [], "doc_change");
+      create.createdAt = now;
+      change.createdAt = now + 10;
+      late.createdAt = now + 1000;
+      other.createdAt = now + 10;
+      await store.putEntries([create, change, late, other]);
+
+      const scanned = await store.scanEntriesSince!(null, 100, {
+        docId: "docA",
+        entryTypes: ["doc_change"],
+        creationDateUntil: now + 500,
+      });
+      expect(scanned.entries.map((e) => e.id)).toEqual(["id2"]);
+      expect(scanned.hasMore).toBe(false);
+    });
   });
 
   describe("bloom summary", () => {

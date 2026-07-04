@@ -75,7 +75,11 @@ export { ViewEntrySortKeyComparator } from "./ViewEntrySortKeyComparator";
 export { VirtualViewNavigator } from "./VirtualViewNavigator";
 
 // Data providers
-export { type IVirtualViewDataProvider } from "./IVirtualViewDataProvider";
+export {
+  type IVirtualViewDataProvider,
+  type VirtualViewUpdateOptions,
+  type VirtualViewUpdateProgress,
+} from "./IVirtualViewDataProvider";
 export {
   MindooDBVirtualViewDataProvider,
   type MindooDBVirtualViewDataProviderOptions,
