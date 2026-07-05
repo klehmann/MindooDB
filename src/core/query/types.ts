@@ -3,13 +3,47 @@ import type { SummaryCoverage } from "../indexing/summary/types";
 import type { VirtualViewUpdateOptions } from "../indexing/virtualviews/IVirtualViewDataProvider";
 
 /**
- * One sort key of a {@link MindooQuery}. Either a plain summary field path
- * or a computed expression (evaluated per row before comparison).
+ * One sort key of a {@link MindooQuery}. Either a plain summary field
+ * path, a computed expression (evaluated per row before comparison), or a
+ * special pseudo-key (`{ special: "textScore" }` sorts by the full-text
+ * relevance score of the {@link MindooQuery.text} clause).
  */
 export interface MindooQuerySortKey {
   field?: string;
   expression?: MindooDBAppExpression;
+  /**
+   * `"textScore"`: sort by the relevance score of the query's `text`
+   * clause (only meaningful together with one). Direction defaults to the
+   * regular `direction` field — note that for pure relevance ranking you
+   * usually want `descending` (best match first), which is also the
+   * implicit default ordering when a `text` clause is present and no
+   * `sortBy` was given.
+   */
+  special?: "textScore";
   direction?: "ascending" | "descending";
+}
+
+/**
+ * Full-text clause of a {@link MindooQuery}: matches documents through
+ * the database's full-text index (see docs/fulltext-search.md) and makes
+ * a relevance score available for sorting (`{ special: "textScore" }`).
+ * Requires full-text indexing to be enabled for the database — otherwise
+ * the query fails with `fulltext-not-enabled` (no silent full scan).
+ */
+export interface MindooQueryTextClause {
+  /** The search string (tokenized like indexed content). */
+  query: string;
+  /**
+   * Restrict matching to these index fields (document field paths, plus
+   * the synthetic `_attachments` field). Default: all indexed fields.
+   */
+  fields?: string[];
+  /** Match term prefixes (`"drag"` matches `"dragon"`). Default: `true`. */
+  prefix?: boolean;
+  /** Fuzzy matching tolerance (see `FulltextSearchOptions.fuzzy`). Default: `false`. */
+  fuzzy?: boolean | number;
+  /** How multiple terms combine: `"AND"` (default) or `"OR"`. */
+  combineWith?: "AND" | "OR";
 }
 
 /**
@@ -23,6 +57,13 @@ export interface MindooQuerySortKey {
  */
 export interface MindooQuery {
   filter?: MindooDBAppBooleanExpression;
+  /**
+   * Full-text clause: additionally require documents to match this
+   * full-text search (combined with `filter` as a logical AND). Adds a
+   * relevance score per row (`MindooQueryRow.textScore`); without an
+   * explicit `sortBy`, results are ordered best score first.
+   */
+  text?: MindooQueryTextClause;
   sortBy?: MindooQuerySortKey[];
   limit?: number;
   offset?: number;
@@ -47,6 +88,11 @@ export interface MindooQueryRow {
   docId: string;
   fields: Record<string, unknown>;
   lastModified: number;
+  /**
+   * Relevance score of the query's `text` clause (higher = better
+   * match). Only present when the query had a `text` clause.
+   */
+  textScore?: number;
 }
 
 /**
@@ -64,13 +110,25 @@ export interface MindooQueryResult {
 }
 
 /**
+ * Machine-readable reason codes for {@link MindooQueryError}. Currently
+ * only `"fulltext-not-enabled"` (a `text` clause on a database without an
+ * enabled full-text index) is distinguished; other failures carry no code.
+ */
+export type MindooQueryErrorCode = "fulltext-not-enabled";
+
+/**
  * Thrown for queries that cannot be answered: referenced fields outside the
  * summary coverage, `decrypt`/view-tree expressions without
- * `allowFullScan`, or an aborted run.
+ * `allowFullScan`, a `text` clause without an enabled full-text index,
+ * or an aborted run.
  */
 export class MindooQueryError extends Error {
-  constructor(message: string) {
+  /** Machine-readable reason, when one is defined for the failure. */
+  readonly code?: MindooQueryErrorCode;
+
+  constructor(message: string, code?: MindooQueryErrorCode) {
     super(message);
     this.name = "MindooQueryError";
+    this.code = code;
   }
 }

@@ -43,6 +43,8 @@ import {
   RevisionCursor,
   ChangeRevisionResult,
   AttachmentReference,
+  AttachmentExtractionStatus,
+  ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS,
   AttachmentConfig,
   DocumentCacheConfig,
   SnapshotConfig,
@@ -134,6 +136,15 @@ import {
   DB_SETUP_DOC_ID,
   SUMMARY_SETUP_FIELD,
 } from "./indexing/summary/types";
+import { DocumentFullTextIndex } from "./indexing/fulltext/DocumentFullTextIndex";
+import type {
+  AttachmentTextExtractor,
+  FulltextConfig,
+  FulltextSearchOptions,
+  FulltextSearchResult,
+} from "./indexing/fulltext/types";
+import { sanitizeFulltextConfig, FULLTEXT_SETUP_FIELD } from "./indexing/fulltext/types";
+import { sanitizeExtractionConfig, EXTRACTION_SETUP_FIELD, ExtractionConfig } from "./extraction/types";
 import { executeQuery } from "./query/executeQuery";
 import type { MindooQuery, MindooQueryOptions, MindooQueryResult } from "./query/types";
 import { createEphemeralSummaryView } from "./query/queryView";
@@ -522,6 +533,18 @@ export class BaseMindooDB implements MindooDB {
    * called, so databases that never query pay no cost.
    */
   private summaryStore: DocumentSummaryStore | null = null;
+  /**
+   * Lazily created full-text index (opt-in via `fulltextSetup` or an
+   * explicit config). `null` until {@link getFullTextIndex} is first
+   * called or the setup document enables indexing.
+   */
+  private fulltextIndex: DocumentFullTextIndex | null = null;
+  /**
+   * Attachment text extractors registered by the host environment (see
+   * {@link registerAttachmentTextExtractor}). Consulted lazily by the
+   * full-text index while documents with attachments are indexed.
+   */
+  private attachmentTextExtractors: AttachmentTextExtractor[] = [];
 
   // ---------------------------------------------------------------------------
   // Change notification state (see addChangeListener). `updateIndex` is the
@@ -545,6 +568,17 @@ export class BaseMindooDB implements MindooDB {
   private summaryAutoUpdatePending: boolean = false;
   /** Whether the setup document was already probed for auto-activation. */
   private summarySetupProbed: boolean = false;
+
+  // ---------------------------------------------------------------------------
+  // Full-text auto-follow: mirrors the summary auto-follow, but the index
+  // is opt-in — auto-activation only happens when the setup document has
+  // `fulltextSetup.enabled: true`.
+  // ---------------------------------------------------------------------------
+  private fulltextAutoUpdateEnabled: boolean = true;
+  private fulltextAutoUpdateRunning: boolean = false;
+  private fulltextAutoUpdatePending: boolean = false;
+  /** Whether the setup document was already probed for FTS auto-activation. */
+  private fulltextSetupProbed: boolean = false;
   private dirtyDocIds: Set<string> = new Set();
   private cacheMetaDirty: boolean = false;
   /**
@@ -680,6 +714,11 @@ export class BaseMindooDB implements MindooDB {
     this.addChangeListener((event) => {
       this.handleChangesForSummaryAutoUpdate(event.changes);
     });
+
+    // Full-text auto-follow: same coalesced events, opt-in activation.
+    this.addChangeListener((event) => {
+      this.handleChangesForFulltextAutoUpdate(event.changes);
+    });
   }
   
   /**
@@ -759,6 +798,7 @@ export class BaseMindooDB implements MindooDB {
     // A summary store created before the cache manager was attached picks
     // up persistence now.
     this.summaryStore?.attachCache(cacheManager, `${this.getCachePrefix()}/summary`);
+    this.fulltextIndex?.attachCache(cacheManager, `${this.getCachePrefix()}/fulltext`);
   }
 
   /**
@@ -909,6 +949,248 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Summary auto-update failed: ${error}`);
       } finally {
         this.summaryAutoUpdateRunning = false;
+      }
+    })();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Full-text index (see docs/fulltext-search.md)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Get (lazily creating) the full-text index for this database.
+   *
+   * The index is a changefeed-maintained, encrypted-at-rest search index
+   * over extracted document text — configured via the synced setup
+   * document (`dbsetup`, field `fulltextSetup`) or an explicit `config`.
+   * Passing a `config` on a later call replaces the configuration; if it
+   * differs from the active one, the engine is recreated and a resumable
+   * backfill re-indexes all documents on the next `update()`.
+   *
+   * Note that indexing is OPT-IN: without `enabled: true` (in the setup
+   * document or the explicit config) the index stays empty and
+   * {@link searchText} throws.
+   */
+  getFullTextIndex(config?: FulltextConfig): DocumentFullTextIndex {
+    if (!this.fulltextIndex) {
+      this.fulltextIndex = new DocumentFullTextIndex(this as unknown as MindooDB, config, {
+        getAttachmentExtractors: () => this.attachmentTextExtractors,
+      });
+      if (this.cacheManager) {
+        this.fulltextIndex.attachCache(this.cacheManager, `${this.getCachePrefix()}/fulltext`);
+      }
+    } else if (config !== undefined) {
+      this.fulltextIndex.setConfig(config);
+    }
+    return this.fulltextIndex;
+  }
+
+  /**
+   * Read the full-text configuration stored in the synced setup document
+   * (`dbsetup`, field `fulltextSetup`). Returns `null` when no setup
+   * document or no configuration exists.
+   */
+  async getFulltextSetup(): Promise<FulltextConfig | null> {
+    try {
+      const doc = await this.getDocument(DB_SETUP_DOC_ID);
+      return sanitizeFulltextConfig(doc.getData()[FULLTEXT_SETUP_FIELD]) ?? null;
+    } catch (error) {
+      if (error instanceof DocumentNotFoundError || error instanceof DocumentDeletedError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Write the full-text configuration into the synced setup document
+   * (creating `dbsetup` idempotently when missing). Passing `null`
+   * removes the configuration (indexing falls back to disabled).
+   *
+   * Idempotent: when the sanitized config equals what is already stored,
+   * no change is written — apps can safely call this on every start
+   * without producing changefeed/sync churn.
+   *
+   * Full-text indexes without an explicit code-provided configuration
+   * pick the change up through the changefeed and re-index via a
+   * resumable backfill — locally and, after sync, on every other replica.
+   */
+  async setFulltextSetup(config: FulltextConfig | null): Promise<void> {
+    const sanitized = config === null ? null : sanitizeFulltextConfig(config) ?? {};
+    const current = await this.getFulltextSetup();
+    if (JSON.stringify(current) === JSON.stringify(sanitized)) {
+      return;
+    }
+    const doc = await this.createDocument({ id: DB_SETUP_DOC_ID });
+    await this.changeDoc(doc, (d) => {
+      const data = d.getData();
+      if (sanitized === null) {
+        delete data[FULLTEXT_SETUP_FIELD];
+      } else {
+        data[FULLTEXT_SETUP_FIELD] = sanitized;
+      }
+    });
+  }
+
+  /**
+   * Read the attachment extraction configuration stored in the synced
+   * setup document (`dbsetup`, field `extractionSetup`). Configures
+   * host-side extraction services (e.g. Haven's OCR service) that persist
+   * results at the attachment entry via
+   * {@link MindooDoc.setAttachmentExtractedText}. Returns `null` when no
+   * setup document or no configuration exists.
+   */
+  async getExtractionSetup(): Promise<ExtractionConfig | null> {
+    try {
+      const doc = await this.getDocument(DB_SETUP_DOC_ID);
+      return sanitizeExtractionConfig(doc.getData()[EXTRACTION_SETUP_FIELD]) ?? null;
+    } catch (error) {
+      if (error instanceof DocumentNotFoundError || error instanceof DocumentDeletedError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Write the attachment extraction configuration into the synced setup
+   * document (creating `dbsetup` idempotently when missing). Passing
+   * `null` removes the configuration (extraction services stay idle).
+   *
+   * Idempotent: when the sanitized config equals what is already stored,
+   * no change is written — services can safely call this on every start
+   * without producing changefeed/sync churn.
+   */
+  async setExtractionSetup(config: ExtractionConfig | null): Promise<void> {
+    const sanitized = config === null ? null : sanitizeExtractionConfig(config) ?? {};
+    const current = await this.getExtractionSetup();
+    if (JSON.stringify(current) === JSON.stringify(sanitized)) {
+      return;
+    }
+    const doc = await this.createDocument({ id: DB_SETUP_DOC_ID });
+    await this.changeDoc(doc, (d) => {
+      const data = d.getData();
+      if (sanitized === null) {
+        delete data[EXTRACTION_SETUP_FIELD];
+      } else {
+        data[EXTRACTION_SETUP_FIELD] = sanitized;
+      }
+    });
+  }
+
+  /**
+   * Register an attachment text extractor for full-text indexing (see
+   * {@link AttachmentTextExtractor}). Host environments call this when
+   * opening the database (e.g. Haven registers text/PDF/Office extractors
+   * from its preview parsers). Extraction only happens for databases
+   * whose `fulltextSetup` has `attachments: true`.
+   *
+   * @returns An unregister function.
+   */
+  registerAttachmentTextExtractor(extractor: AttachmentTextExtractor): () => void {
+    this.attachmentTextExtractors.push(extractor);
+    return () => {
+      const index = this.attachmentTextExtractors.indexOf(extractor);
+      if (index >= 0) {
+        this.attachmentTextExtractors.splice(index, 1);
+      }
+    };
+  }
+
+  /**
+   * Full-text search over the document full-text index (see
+   * docs/fulltext-search.md). Brings the index up to date first, then
+   * returns matching documents best-score-first. Results are
+   * device-specific under E2EE: documents whose decryption keys are
+   * missing from the local KeyBag are not indexed and cannot match.
+   *
+   * @throws Error when full-text indexing is not enabled for this
+   *   database (see {@link setFulltextSetup} / {@link getFullTextIndex}).
+   */
+  async searchText(query: string, options?: FulltextSearchOptions): Promise<FulltextSearchResult> {
+    return this.getFullTextIndex().search(query, options);
+  }
+
+  /**
+   * Enable/disable full-text auto-follow (default: enabled). Mirrors
+   * {@link setSummaryAutoUpdateEnabled}: when enabled, an ACTIVE full-text
+   * index catches up in the background after every coalesced change
+   * event, so the first search after a large sync doesn't stall.
+   * Databases without an enabled `fulltextSetup` never pay any cost.
+   */
+  setFulltextAutoUpdateEnabled(enabled: boolean): void {
+    this.fulltextAutoUpdateEnabled = enabled;
+    if (enabled && this.fulltextIndex) {
+      this.scheduleFulltextAutoUpdate();
+    }
+  }
+
+  /**
+   * Change-event hook for full-text auto-follow. While no index exists,
+   * the setup document decides whether to activate one — probed on the
+   * first event and re-checked whenever a `dbsetup` change arrives
+   * (mirrors {@link handleChangesForSummaryAutoUpdate}).
+   */
+  private handleChangesForFulltextAutoUpdate(changes: DbChange[]): void {
+    if (!this.fulltextAutoUpdateEnabled) {
+      return;
+    }
+    if (this.fulltextIndex) {
+      this.scheduleFulltextAutoUpdate();
+      return;
+    }
+    // Same system-database exclusion as the summary auto-activation.
+    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    const hasSetupChange = changes.some((change) => change.docId === DB_SETUP_DOC_ID);
+    if (!hasSetupChange && this.fulltextSetupProbed) {
+      return;
+    }
+    this.fulltextSetupProbed = true;
+    void this.activateFulltextFromSetupDoc();
+  }
+
+  /** Create the full-text index when the setup document enables one. */
+  private async activateFulltextFromSetupDoc(): Promise<void> {
+    try {
+      const config = await this.getFulltextSetup();
+      if (
+        config?.enabled !== true ||
+        this.fulltextIndex ||
+        !this.fulltextAutoUpdateEnabled
+      ) {
+        return;
+      }
+      // No explicit config: the index adopts the setup-document config on
+      // its first update run (seedConfigFromSetupDoc).
+      this.getFullTextIndex();
+      this.scheduleFulltextAutoUpdate();
+    } catch (error) {
+      this.logger.warn(`Full-text auto-activation failed: ${error}`);
+    }
+  }
+
+  /**
+   * Run a background full-text catch-up, coalescing further requests into
+   * one follow-up run (mirrors {@link scheduleSummaryAutoUpdate}).
+   */
+  private scheduleFulltextAutoUpdate(): void {
+    if (this.fulltextAutoUpdateRunning) {
+      this.fulltextAutoUpdatePending = true;
+      return;
+    }
+    this.fulltextAutoUpdateRunning = true;
+    void (async () => {
+      try {
+        do {
+          this.fulltextAutoUpdatePending = false;
+          await this.fulltextIndex?.update();
+        } while (this.fulltextAutoUpdatePending && this.fulltextAutoUpdateEnabled);
+      } catch (error) {
+        this.logger.warn(`Full-text auto-update failed: ${error}`);
+      } finally {
+        this.fulltextAutoUpdateRunning = false;
       }
     })();
   }
@@ -1991,6 +2273,7 @@ export class BaseMindooDB implements MindooDB {
         if (this.reconcileRestoredIndexOnInit) {
           await this.reconcileRestoredIndexWithStore();
         }
+        this.probeFulltextSetupAtOpen();
         return;
       }
     }
@@ -2000,6 +2283,30 @@ export class BaseMindooDB implements MindooDB {
     // docs whose keys are unavailable, so the only thing left to do is
     // record the current fingerprint for the next warm start.
     this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
+    this.probeFulltextSetupAtOpen();
+  }
+
+  /**
+   * Open-time probe for full-text auto-activation. Without it, a
+   * database whose synced `fulltextSetup` is already enabled would not
+   * build its index until the first change event arrives or the first
+   * search runs. Fired once (fire-and-forget) at the end of
+   * {@link initialize}; uses the same system-database exclusions and
+   * activation path as the change-event probe (see
+   * {@link handleChangesForFulltextAutoUpdate}).
+   */
+  private probeFulltextSetupAtOpen(): void {
+    if (!this.fulltextAutoUpdateEnabled || this.fulltextSetupProbed || this.fulltextIndex) {
+      return;
+    }
+    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    if (this.isTimeTravelMode()) {
+      return;
+    }
+    this.fulltextSetupProbed = true;
+    void this.activateFulltextFromSetupDoc();
   }
 
   /**
@@ -2099,6 +2406,8 @@ export class BaseMindooDB implements MindooDB {
     this.automergeHashToEntryId.delete(docId);
     // Plaintext summary values must not outlive the purge either.
     this.summaryStore?.removeDocument(docId);
+    // Nor extracted plaintext tokens in the full-text index.
+    this.fulltextIndex?.removeDocument(docId);
 
     const store = this.cacheManager?.getStore();
     if (store) {
@@ -7283,6 +7592,13 @@ export class BaseMindooDB implements MindooDB {
     const pendingAttachmentRemovals = new Set<string>();
     // Map of attachmentId -> {lastChunkId, sizeIncrease} for appends
     const pendingAttachmentAppends = new Map<string, { lastChunkId: string; sizeIncrease: number }>();
+    // Map of attachmentId -> extraction result for setAttachmentExtractedText
+    const pendingAttachmentTextUpdates = new Map<string, {
+      text: string | null;
+      status?: AttachmentExtractionStatus;
+      engine?: string;
+      extractedAt?: number;
+    }>();
     
     // Reference to db for closures
     const db = this;
@@ -7427,6 +7743,56 @@ export class BaseMindooDB implements MindooDB {
         }
       },
       
+      /**
+       * Store the result of an external text extraction (e.g. OCR) at the
+       * attachment entry in `_attachments`. See the full contract on
+       * {@link MindooDoc.setAttachmentExtractedText} in types.ts.
+       *
+       * Behavior inside this changeDoc draft:
+       * - Only records a pending update here; the `_attachments` array is
+       *   mutated once in the surrounding Automerge.change block when the
+       *   callback completes, alongside pending adds/removals/appends.
+       * - The target attachment must exist in the current document or among
+       *   attachments added earlier in this same changeDoc call; attachments
+       *   already marked for removal in this call don't count.
+       * - `text` is capped at ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS before
+       *   being persisted. `text: null` clears a previous result including
+       *   its status/engine/extractedAt metadata.
+       * - Calling this repeatedly for the same attachmentId within one
+       *   changeDoc keeps only the last result (map semantics).
+       *
+       * @param attachmentId ID of an attachment of this document.
+       * @param result Extraction outcome; `status` defaults to "done" when
+       *   text is provided (applied in the change block).
+       * @throws Error if the attachment does not exist (or was removed in
+       *   this changeDoc call), or when invoked after the callback finished.
+       */
+      setAttachmentExtractedText: (
+        attachmentId: string,
+        result: {
+          text: string | null;
+          status?: AttachmentExtractionStatus;
+          engine?: string;
+          extractedAt?: number;
+        }
+      ): void => {
+        throwIfCallbackInactive('setAttachmentExtractedText');
+        const payload = internalDoc.doc as unknown as MindooDocPayload;
+        const existingAttachments = (payload._attachments as AttachmentReference[]) || [];
+        const existsInDoc = existingAttachments.some(
+          (a) => a.attachmentId === attachmentId && !pendingAttachmentRemovals.has(attachmentId)
+        );
+        const existsInPending = pendingAttachmentAdditions.some((a) => a.attachmentId === attachmentId);
+        if (!existsInDoc && !existsInPending) {
+          throw new Error(`Attachment ${attachmentId} not found in document ${docId}`);
+        }
+        const cappedText =
+          typeof result.text === "string" && result.text.length > ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS
+            ? result.text.slice(0, ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS)
+            : result.text;
+        pendingAttachmentTextUpdates.set(attachmentId, { ...result, text: cappedText });
+      },
+
       appendToAttachment: async (attachmentId: string, data: Uint8Array): Promise<void> => {
         throwIfCallbackInactive('appendToAttachment');
         // Find the attachment reference
@@ -7532,7 +7898,12 @@ export class BaseMindooDB implements MindooDB {
           }
 
           // Apply pending attachment changes
-          if (pendingAttachmentAdditions.length > 0 || pendingAttachmentRemovals.size > 0 || pendingAttachmentAppends.size > 0) {
+          if (
+            pendingAttachmentAdditions.length > 0 ||
+            pendingAttachmentRemovals.size > 0 ||
+            pendingAttachmentAppends.size > 0 ||
+            pendingAttachmentTextUpdates.size > 0
+          ) {
             // Initialize _attachments array if needed
             if (!automergeDoc._attachments) {
               automergeDoc._attachments = [];
@@ -7559,6 +7930,34 @@ export class BaseMindooDB implements MindooDB {
             // Add new attachments
             for (const ref of pendingAttachmentAdditions) {
               attachments.push(ref);
+            }
+
+            // Apply extraction results (setAttachmentExtractedText)
+            for (const [attachmentId, update] of pendingAttachmentTextUpdates) {
+              const attachment = attachments.find(a => a.attachmentId === attachmentId);
+              if (!attachment) {
+                continue; // removed in the same changeDoc call
+              }
+              const isFullClear = update.text === null && update.status === undefined;
+              if (isFullClear) {
+                // `text: null` without a status resets the entry entirely
+                // (e.g. before a re-extraction).
+                delete attachment.extractedText;
+                delete attachment.extractionStatus;
+                delete attachment.extractionEngine;
+                delete attachment.extractedAt;
+                continue;
+              }
+              if (update.text === null) {
+                delete attachment.extractedText;
+              } else {
+                attachment.extractedText = update.text;
+              }
+              attachment.extractionStatus = update.status ?? "done";
+              if (update.engine !== undefined) {
+                attachment.extractionEngine = update.engine;
+              }
+              attachment.extractedAt = update.extractedAt ?? now;
             }
           }
 
@@ -10791,6 +11190,10 @@ export class BaseMindooDB implements MindooDB {
       
       appendToAttachment: async () => {
         throw new Error("appendToAttachment() can only be called within changeDoc() callback");
+      },
+      
+      setAttachmentExtractedText: () => {
+        throw new Error("setAttachmentExtractedText() can only be called within changeDoc() callback");
       },
       
       // ========== Attachment Read Methods ==========

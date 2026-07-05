@@ -86,8 +86,10 @@ export const ATTACHMENTS_FIELD = "_attachments";
  * Slim projection of one `_attachments` entry: enough for attachment
  * expressions, "has a PDF > 5 MB" style queries, and loading the
  * attachment from a view row (`attachmentId`). Deliberately omits
- * `lastChunkId`/`decryptionKeyId` (internal plumbing) and `createdBy`
- * (the creator's full PEM signing key — ~800 chars per attachment).
+ * `lastChunkId`/`decryptionKeyId` (internal plumbing), `createdBy`
+ * (the creator's full PEM signing key — ~800 chars per attachment) and
+ * `extractedText` (potentially ~100k chars of OCR output — projected
+ * only as the `hasExtractedText` flag).
  */
 export interface SummaryAttachmentInfo {
   attachmentId?: string;
@@ -95,6 +97,8 @@ export interface SummaryAttachmentInfo {
   size?: number;
   mimeType?: string;
   createdAt?: number;
+  /** True when a persisted extraction result (e.g. OCR text) exists. */
+  hasExtractedText?: boolean;
 }
 
 function projectAttachments(value: unknown): SummaryAttachmentInfo[] | undefined {
@@ -114,6 +118,9 @@ function projectAttachments(value: unknown): SummaryAttachmentInfo[] | undefined
     if (typeof raw.mimeType === "string") info.mimeType = raw.mimeType;
     if (typeof raw.createdAt === "number" && Number.isFinite(raw.createdAt)) {
       info.createdAt = raw.createdAt;
+    }
+    if (typeof raw.extractedText === "string" && raw.extractedText.length > 0) {
+      info.hasExtractedText = true;
     }
     projected.push(info);
   }

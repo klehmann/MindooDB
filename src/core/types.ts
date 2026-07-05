@@ -28,6 +28,14 @@ import type {
 import type { DirectoryStateNode } from "./accesscontrol/DirectoryStateNode";
 import type { SummaryConfig } from "./indexing/summary/types";
 import type { DocumentSummaryStore } from "./indexing/summary/DocumentSummaryStore";
+import type {
+  AttachmentTextExtractor,
+  FulltextConfig,
+  FulltextSearchOptions,
+  FulltextSearchResult,
+} from "./indexing/fulltext/types";
+import type { DocumentFullTextIndex } from "./indexing/fulltext/DocumentFullTextIndex";
+import type { ExtractionConfig } from "./extraction/types";
 import type { MindooQuery, MindooQueryOptions, MindooQueryResult } from "./query/types";
 import type { EphemeralSummaryView, MindooQueryViewDefinition } from "./query/queryView";
 import type { MindooQuerySubscription } from "./query/queryLive";
@@ -1188,7 +1196,52 @@ export interface AttachmentReference {
    * Public signing key of the user who created this attachment (Ed25519, PEM format)
    */
   createdBy: string;
+
+  // ---------------------------------------------------------------------------
+  // Optional extraction result (docs/fulltext-search.md): plain text extracted
+  // from the attachment content (e.g. OCR), persisted next to the attachment
+  // it belongs to and synced with the document. Written exclusively through
+  // MindooDoc.setAttachmentExtractedText() inside changeDoc(); removing the
+  // attachment removes the text with it. The full-text index feeds persisted
+  // text into the synthetic `_attachments` search field without running any
+  // extractor. Excluded from the slim summary projection (only a
+  // hasExtractedText flag is projected).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Plain text extracted from the attachment content (capped at
+   * {@link ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS}).
+   */
+  extractedText?: string;
+
+  /** Outcome of the last extraction attempt for this attachment. */
+  extractionStatus?: AttachmentExtractionStatus;
+
+  /**
+   * Identifier of the extraction engine/config that produced the result
+   * (e.g. "tesseract.js@7:deu+eng"). Lets services re-extract when the
+   * engine or language set changes.
+   */
+  extractionEngine?: string;
+
+  /** Timestamp of the last extraction attempt (ms since Unix epoch). */
+  extractedAt?: number;
 }
+
+/**
+ * Outcome of an attachment text extraction attempt (see
+ * {@link MindooDoc.setAttachmentExtractedText}). "failed"/"skipped" markers
+ * are persisted so other devices do not retry a broken or deliberately
+ * skipped attachment over and over.
+ */
+export type AttachmentExtractionStatus = "done" | "failed" | "skipped";
+
+/**
+ * Upper bound on persisted extracted text per attachment. The text lives
+ * inside the synced CRDT document, so a single giant scan must not bloat
+ * the document and every future sync delta.
+ */
+export const ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS = 100_000;
 
 export interface IncompleteAttachmentUploadReclaimResult {
   scannedLedgers: number;
@@ -1763,6 +1816,36 @@ export interface MindooDoc {
    * @throws Error if called outside of changeDoc() callback or if attachment not found
    */
   appendToAttachment(attachmentId: string, data: Uint8Array): Promise<void>;
+
+  /**
+   * Persist extracted plain text (e.g. from OCR) at the attachment it
+   * belongs to. The text is stored as optional fields on the attachment's
+   * `_attachments` entry, syncs with the document, and disappears together
+   * with the attachment on removeAttachment(). The full-text index picks
+   * persisted text up automatically (synthetic `_attachments` field) —
+   * no extractor run needed.
+   *
+   * This method only works within the changeDoc() callback. `_`-prefixed
+   * fields are managed by MindooDB; this is the sanctioned write path for
+   * extraction results.
+   *
+   * @param attachmentId The ID of the attachment the text was extracted from
+   * @param result Extraction outcome: `text` is capped at
+   *   {@link ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS}; pass `text: null` to
+   *   clear a previous result (e.g. before re-extraction). `status`
+   *   defaults to "done" when text is provided. `engine`/`extractedAt`
+   *   let services detect stale results after engine upgrades.
+   * @throws Error if called outside of changeDoc() callback or if attachment not found
+   */
+  setAttachmentExtractedText(
+    attachmentId: string,
+    result: {
+      text: string | null;
+      status?: AttachmentExtractionStatus;
+      engine?: string;
+      extractedAt?: number;
+    }
+  ): void;
 
   // ========== Attachment Read Methods ==========
   // These methods work both inside and outside of changeDoc().
@@ -4573,6 +4656,80 @@ export interface MindooDB {
    * don't stall after receiving many documents.
    */
   setSummaryAutoUpdateEnabled?(enabled: boolean): void;
+
+  /**
+   * Get (lazily creating) the full-text index for this database — a
+   * changefeed-maintained, encrypted-at-rest search index over extracted
+   * document text (see docs/fulltext-search.md). Indexing is OPT-IN:
+   * without `enabled: true` (setup document or explicit `config`) the
+   * index stays empty.
+   *
+   * @param config Optional full-text configuration. On a later call with
+   *   a different configuration, the engine is recreated and a resumable
+   *   backfill re-indexes all documents.
+   */
+  getFullTextIndex?(config?: FulltextConfig): DocumentFullTextIndex;
+
+  /**
+   * Read the full-text configuration from the synced setup document
+   * (`dbsetup`, field `fulltextSetup`). Returns `null` when no setup
+   * document or no configuration exists. See docs/fulltext-search.md.
+   */
+  getFulltextSetup?(): Promise<FulltextConfig | null>;
+
+  /**
+   * Write the full-text configuration into the synced setup document
+   * (created idempotently when missing). `null` removes the configuration
+   * (indexing falls back to disabled). Indexes without an explicit
+   * code-provided configuration follow this document via the changefeed
+   * and re-index through a resumable backfill.
+   */
+  setFulltextSetup?(config: FulltextConfig | null): Promise<void>;
+
+  /**
+   * Register an attachment text extractor for full-text indexing.
+   * Host environments call this when opening the database; extraction
+   * only happens for databases whose `fulltextSetup` has
+   * `attachments: true`.
+   *
+   * @returns An unregister function.
+   */
+  registerAttachmentTextExtractor?(extractor: AttachmentTextExtractor): () => void;
+
+  /**
+   * Read the attachment extraction configuration from the synced setup
+   * document (`dbsetup`, field `extractionSetup`). Configures host-side
+   * extraction services (e.g. OCR) that persist results at the attachment
+   * entry via {@link MindooDoc.setAttachmentExtractedText}. Returns `null`
+   * when no setup document or no configuration exists.
+   */
+  getExtractionSetup?(): Promise<ExtractionConfig | null>;
+
+  /**
+   * Write the attachment extraction configuration into the synced setup
+   * document (created idempotently when missing). `null` removes the
+   * configuration (extraction services stay idle). Idempotent: writing an
+   * unchanged configuration produces no new document revision.
+   */
+  setExtractionSetup?(config: ExtractionConfig | null): Promise<void>;
+
+  /**
+   * Full-text search over the document full-text index (see
+   * docs/fulltext-search.md). Brings the index up to date first, then
+   * returns matching documents best-score-first. Results are
+   * device-specific under E2EE: documents whose decryption keys are
+   * missing locally are not indexed and cannot match.
+   *
+   * @throws Error when full-text indexing is not enabled for this database.
+   */
+  searchText?(query: string, options?: FulltextSearchOptions): Promise<FulltextSearchResult>;
+
+  /**
+   * Enable/disable full-text auto-follow (default: enabled). Mirrors
+   * {@link setSummaryAutoUpdateEnabled} for the full-text index; only
+   * databases with an ACTIVE full-text index pay any cost.
+   */
+  setFulltextAutoUpdateEnabled?(enabled: boolean): void;
 
   /**
    * Run an ad-hoc query against the document summary buffer (see

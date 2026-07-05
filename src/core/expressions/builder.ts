@@ -257,17 +257,39 @@ export function createViewLanguage<
     json(field: string, path?: string): MindooDBAppExpression<unknown> {
       return { kind: "json", field, path };
     },
+    /**
+     * Branching in the style of Domino's `@If`: any number of
+     * condition/value pairs followed by one final default value —
+     * `ifElse(cond1, val1, cond2, val2, ..., default)`. Conditions are
+     * checked in order; the value of the first matching condition wins,
+     * otherwise the default. The classic three-argument form
+     * `ifElse(condition, whenTrue, whenFalse)` is the smallest case.
+     *
+     * Multi-branch calls desugar into nested `if` AST nodes, so the
+     * serialized expression format is unchanged.
+     */
     ifElse<T>(
       condition: MindooDBAppExpressionInput<boolean>,
       whenTrue: MindooDBAppExpressionInput<T>,
-      whenFalse: MindooDBAppExpressionInput<T>,
+      ...moreBranchesAndDefault: MindooDBAppExpressionInput[]
     ): MindooDBAppExpression<T> {
-      return {
-        kind: "if",
-        condition: toExpression(condition),
-        whenTrue: toExpression(whenTrue),
-        whenFalse: toExpression(whenFalse),
-      };
+      const args: MindooDBAppExpressionInput[] = [condition, whenTrue, ...moreBranchesAndDefault];
+      if (args.length < 3 || args.length % 2 === 0) {
+        throw new Error(
+          "ifElse expects condition/value pairs followed by one default value " +
+          "(odd argument count >= 3), e.g. ifElse(cond1, val1, cond2, val2, default).",
+        );
+      }
+      let result = toExpression(args[args.length - 1]);
+      for (let i = args.length - 3; i >= 0; i -= 2) {
+        result = {
+          kind: "if",
+          condition: toExpression(args[i]) as MindooDBAppBooleanExpression,
+          whenTrue: toExpression(args[i + 1]),
+          whenFalse: result,
+        };
+      }
+      return result as MindooDBAppExpression<T>;
     },
     let<TBindings extends LetBindings, TResult>(
       bindings: TBindings,

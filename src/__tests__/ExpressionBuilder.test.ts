@@ -122,6 +122,54 @@ describe("createViewLanguage", () => {
     });
   });
 
+  it("desugars multi-branch ifElse into nested if nodes (Domino @If style)", () => {
+    const v = createViewLanguage<{ score: number }>();
+
+    const expression = v.ifElse(
+      v.gt(v.field("score"), 0.8), "sehr guter Treffer",
+      v.gt(v.field("score"), 0.5), "guter Treffer",
+      "schlechter Treffer",
+    );
+
+    expect(expression).toEqual({
+      kind: "if",
+      condition: {
+        kind: "operation",
+        op: "gt",
+        args: [
+          { kind: "field", path: "score" },
+          { kind: "literal", value: 0.8 },
+        ],
+      },
+      whenTrue: { kind: "literal", value: "sehr guter Treffer" },
+      whenFalse: {
+        kind: "if",
+        condition: {
+          kind: "operation",
+          op: "gt",
+          args: [
+            { kind: "field", path: "score" },
+            { kind: "literal", value: 0.5 },
+          ],
+        },
+        whenTrue: { kind: "literal", value: "guter Treffer" },
+        whenFalse: { kind: "literal", value: "schlechter Treffer" },
+      },
+    });
+  });
+
+  it("rejects ifElse calls with an even argument count", () => {
+    const v = createViewLanguage<{ score: number }>();
+
+    expect(() =>
+      // Malformed: two condition/value pairs but no default value.
+      v.ifElse(
+        v.gt(v.field("score"), 0.8), "high",
+        v.gt(v.field("score"), 0.5), "medium",
+      ),
+    ).toThrowError(/condition\/value pairs/);
+  });
+
   it("builds left and right string helper expressions", () => {
     const v = createViewLanguage<{ code: string }>();
 

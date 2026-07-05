@@ -146,14 +146,23 @@ function formatExpression(expression: MindooDBAppExpression, level: number, inde
       return "v.origin()";
     case "variable":
       return expression.name;
-    case "if":
+    case "if": {
+      // Flatten else-if chains into the variadic Domino-style form:
+      // v.ifElse(cond1, val1, cond2, val2, ..., default).
+      const parts: MindooDBAppExpression[] = [];
+      let current: MindooDBAppExpression = expression;
+      while (current.kind === "if") {
+        parts.push(current.condition, current.whenTrue);
+        current = current.whenFalse;
+      }
+      parts.push(current);
       return [
         "v.ifElse(",
-        `${repeatIndent(level + 1, indent)}${formatExpression(expression.condition, level + 1, indent)},`,
-        `${repeatIndent(level + 1, indent)}${formatExpression(expression.whenTrue, level + 1, indent)},`,
-        `${repeatIndent(level + 1, indent)}${formatExpression(expression.whenFalse, level + 1, indent)},`,
+        ...parts.map((part) =>
+          `${repeatIndent(level + 1, indent)}${formatExpression(part, level + 1, indent)},`),
         `${repeatIndent(level, indent)})`,
       ].join("\n");
+    }
     case "let": {
       const entries = Object.entries(expression.bindings);
       const bindingBlock = entries.length === 0
@@ -368,14 +377,38 @@ class FormulaParser {
         return { kind: "origin" };
       }
       case "ifElse": {
-        const condition = this.parseExpression();
-        this.expectChar(",");
-        const whenTrue = this.parseExpression();
-        this.expectChar(",");
-        const whenFalse = this.parseExpression();
-        this.consumeOptionalComma();
+        // Domino-@If-style variadic form: cond1, val1, [cond2, val2, ...], default.
+        // Desugars right-to-left into nested `if` nodes.
+        const args: MindooDBAppExpression[] = [this.parseExpression()];
+        while (true) {
+          this.skipWhitespace();
+          if (this.peek() === ",") {
+            this.index += 1;
+            this.skipWhitespace();
+            if (this.peek() === ")") {
+              break;
+            }
+            args.push(this.parseExpression());
+            continue;
+          }
+          break;
+        }
         this.expectChar(")");
-        return { kind: "if", condition: condition as MindooDBAppBooleanExpression, whenTrue, whenFalse };
+        if (args.length < 3 || args.length % 2 === 0) {
+          throw this.error(
+            "ifElse expects condition/value pairs followed by one default value (odd argument count >= 3)",
+          );
+        }
+        let result = args[args.length - 1]!;
+        for (let i = args.length - 3; i >= 0; i -= 2) {
+          result = {
+            kind: "if",
+            condition: args[i] as MindooDBAppBooleanExpression,
+            whenTrue: args[i + 1]!,
+            whenFalse: result,
+          };
+        }
+        return result;
       }
       case "let": {
         const bindings = this.parseBindingsObject();

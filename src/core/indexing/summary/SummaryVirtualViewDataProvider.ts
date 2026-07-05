@@ -9,6 +9,8 @@ import {
   expressionToBoolean,
   type ExpressionEvaluationContext,
 } from "../../expressions/evaluateExpression";
+import { MindooQueryError, type MindooQueryTextClause } from "../../query/types";
+import type { DocumentFullTextIndex } from "../fulltext/DocumentFullTextIndex";
 import type { DocumentSummaryStore } from "./DocumentSummaryStore";
 import { buildSummaryEvaluationDoc, getSummaryFieldValue } from "./extractSummaryFields";
 
@@ -24,6 +26,21 @@ export interface SummaryVirtualViewDataProviderOptions {
    * which summary entries appear in the view.
    */
   filter?: MindooDBAppBooleanExpression;
+
+  /**
+   * Optional full-text pre-filter: only documents matching this search in
+   * the given full-text index appear in the view (combined with `filter`
+   * as a logical AND). The index is brought up to date on every provider
+   * update; documents whose match state or normalized score changes are
+   * re-evaluated even when their summary entry is unchanged. Matching
+   * documents expose the pseudo-fields `_textScore` (normalized 0..1
+   * relative to the best hit, rounded to 2 decimals) and `_textScoreRaw`
+   * (engine-specific raw score) to filter and column expressions.
+   */
+  text?: {
+    index: DocumentFullTextIndex;
+    clause: MindooQueryTextClause;
+  };
 }
 
 /**
@@ -43,17 +60,27 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
   private readonly origin: string;
   private readonly summary: DocumentSummaryStore;
   private readonly filter: MindooDBAppBooleanExpression | null;
+  private readonly text: SummaryVirtualViewDataProviderOptions["text"] | null;
 
   private view: VirtualView | null = null;
   /** Highest summary entry changeSeq already applied to the view. */
   private appliedChangeSeq: number = -1;
   /** Documents currently present in the view from this provider. */
   private knownDocIds: Set<string> = new Set();
+  /**
+   * Full-text scores of the previous update run (docId → rounded
+   * normalized score). Needed to detect membership flips AND score changes
+   * that happen WITHOUT a summary entry change (e.g. the index backfilling
+   * after a config change, or a new top hit shifting the normalization),
+   * which the changeSeq watermark alone would skip.
+   */
+  private lastTextScores: Map<string, number> | null = null;
 
   constructor(options: SummaryVirtualViewDataProviderOptions) {
     this.origin = options.origin;
     this.summary = options.summary;
     this.filter = options.filter ?? null;
+    this.text = options.text ?? null;
   }
 
   getOrigin(): string {
@@ -85,6 +112,63 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
       return;
     }
 
+    // Full-text pre-filter: bring the index up to date and resolve the
+    // match set once per run. Documents whose membership flipped OR whose
+    // normalized score changed since the last run must be re-evaluated
+    // even when their summary entry is unchanged (index backfills change
+    // matches without changeSeq bumps; a new top hit shifts the
+    // normalization of every other score).
+    let textScores: Map<string, number> | null = null;
+    let textScoresRaw: Map<string, number> | null = null;
+    let flippedTextMatches: Set<string> | null = null;
+    if (this.text) {
+      await this.text.index.update(options);
+      if (options?.signal?.aborted) {
+        return;
+      }
+      if (!this.text.index.isEnabled()) {
+        throw new MindooQueryError(
+          `View has a text clause, but full-text indexing is not enabled for this database ` +
+          `(enable it via setFulltextSetup({ enabled: true }), see docs/fulltext-search.md).`,
+          "fulltext-not-enabled"
+        );
+      }
+      const clause = this.text.clause;
+      const { hits } = this.text.index.searchSync(clause.query, {
+        fields: clause.fields,
+        prefix: clause.prefix,
+        fuzzy: clause.fuzzy,
+        combineWith: clause.combineWith,
+      });
+      // Normalize relative to the best hit of this run (hits are sorted
+      // best-first): the top hit scores 1.0, everything else 0..1. Clamped
+      // defensively (BM25 IDF can go negative in degenerate corpora) and
+      // rounded to 2 decimals so tiny BM25 shifts don't churn
+      // threshold-based category formulas on every update.
+      const maxScore = hits.length > 0 ? hits[0].score : 0;
+      textScores = new Map();
+      textScoresRaw = new Map();
+      for (const hit of hits) {
+        const ratio = maxScore > 0 ? hit.score / maxScore : hit.score === maxScore ? 1 : 0;
+        const normalized = Math.round(Math.min(1, Math.max(0, ratio)) * 100) / 100;
+        textScores.set(hit.docId, normalized);
+        textScoresRaw.set(hit.docId, hit.score);
+      }
+      if (this.lastTextScores) {
+        flippedTextMatches = new Set<string>();
+        for (const [docId, score] of textScores) {
+          if (this.lastTextScores.get(docId) !== score) {
+            flippedTextMatches.add(docId);
+          }
+        }
+        for (const docId of this.lastTextScores.keys()) {
+          if (!textScores.has(docId)) {
+            flippedTextMatches.add(docId);
+          }
+        }
+      }
+    }
+
     const columns = view.getColumns();
     const change = new VirtualViewDataChange(this.origin);
     let maxSeenChangeSeq = this.appliedChangeSeq;
@@ -98,13 +182,29 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
       // Incremental watermark: entries at or below the already-applied
       // changefeed sequence are unchanged and already sit in the view with
       // correct column values — recomputing them would make every update a
-      // full rebuild.
-      if (entry.changeSeq <= this.appliedChangeSeq) {
+      // full rebuild. Text-membership flips bypass the watermark.
+      if (
+        entry.changeSeq <= this.appliedChangeSeq &&
+        !(flippedTextMatches?.has(entry.docId) ?? false)
+      ) {
         continue;
       }
       maxSeenChangeSeq = Math.max(maxSeenChangeSeq, entry.changeSeq);
 
-      const evaluationDoc = buildSummaryEvaluationDoc(entry.fields, entry.lastModified);
+      let evaluationDoc = buildSummaryEvaluationDoc(entry.fields, entry.lastModified);
+      // Mirror the full-text relevance as managed pseudo-fields (like
+      // `_lastModified`), so column/category formulas can grade match
+      // quality: `_textScore` is normalized 0..1 relative to the best hit
+      // of this search run, `_textScoreRaw` is the engine's raw score.
+      // Copy before extending — buildSummaryEvaluationDoc may return the
+      // stored field map itself.
+      if (textScores !== null && textScores.has(entry.docId)) {
+        evaluationDoc = {
+          ...evaluationDoc,
+          _textScore: textScores.get(entry.docId),
+          _textScoreRaw: textScoresRaw!.get(entry.docId),
+        };
+      }
       const context: ExpressionEvaluationContext = {
         doc: evaluationDoc,
         values: {},
@@ -114,7 +214,8 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
       };
 
       const passesFilter =
-        !this.filter || expressionToBoolean(evaluateExpression(this.filter, context));
+        (textScores === null || textScores.has(entry.docId)) &&
+        (!this.filter || expressionToBoolean(evaluateExpression(this.filter, context)));
 
       if (passesFilter) {
         change.addEntry(
@@ -144,6 +245,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
       view.applyChanges(change);
     }
     this.appliedChangeSeq = maxSeenChangeSeq;
+    this.lastTextScores = textScores;
   }
 
   private computeColumnValues(
@@ -166,6 +268,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
   reset(): void {
     this.appliedChangeSeq = -1;
     this.knownDocIds.clear();
+    this.lastTextScores = null;
   }
 
   // ---------------------------------------------------------------------------

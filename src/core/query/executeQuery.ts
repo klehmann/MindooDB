@@ -12,6 +12,7 @@ import {
 import { decryptEncryptedField } from "../crypto/encryptedFields";
 import type { DocumentSummaryStore } from "../indexing/summary/DocumentSummaryStore";
 import { buildSummaryEvaluationDoc, getSummaryFieldValue } from "../indexing/summary/extractSummaryFields";
+import type { DocumentFullTextIndex } from "../indexing/fulltext/DocumentFullTextIndex";
 import { compareValues } from "../indexing/virtualviews/types";
 import {
   MindooQueryError,
@@ -25,6 +26,65 @@ import {
 type CandidateRow = MindooQueryRow & {
   sortValues: unknown[];
 };
+
+/**
+ * Resolve and prepare the full-text index for a query with a `text`
+ * clause: brings the index up to date, verifies indexing is enabled, and
+ * returns the docId→score map of the matching documents. Queries on
+ * databases without an enabled full-text index fail with
+ * `fulltext-not-enabled` — there is deliberately no silent fallback scan
+ * over document bodies.
+ */
+async function resolveTextClauseScores(
+  db: MindooDB,
+  query: MindooQuery,
+  options?: MindooQueryOptions
+): Promise<{ scores: Map<string, number>; index: DocumentFullTextIndex } | null> {
+  const text = query.text;
+  if (!text) {
+    return null;
+  }
+  if (!db.getFullTextIndex) {
+    throw new MindooQueryError(
+      `This MindooDB instance does not support full-text search.`,
+      "fulltext-not-enabled"
+    );
+  }
+  const index = db.getFullTextIndex();
+  await index.update(options);
+  if (!index.isEnabled()) {
+    throw new MindooQueryError(
+      `Query has a text clause, but full-text indexing is not enabled for this database ` +
+      `(enable it via setFulltextSetup({ enabled: true }), see docs/fulltext-search.md).`,
+      "fulltext-not-enabled"
+    );
+  }
+  const { hits } = index.searchSync(text.query, {
+    fields: text.fields,
+    prefix: text.prefix,
+    fuzzy: text.fuzzy,
+    combineWith: text.combineWith,
+  });
+  const scores = new Map<string, number>();
+  for (const hit of hits) {
+    scores.set(hit.docId, hit.score);
+  }
+  return { scores, index };
+}
+
+/**
+ * Effective sort keys of a query: an explicit `sortBy` wins; a `text`
+ * clause without one defaults to relevance ranking (best score first).
+ */
+function effectiveSortKeys(query: MindooQuery): MindooQuerySortKey[] {
+  if (query.sortBy && query.sortBy.length > 0) {
+    return query.sortBy;
+  }
+  if (query.text) {
+    return [{ special: "textScore", direction: "descending" }];
+  }
+  return [];
+}
 
 /** All expressions a query references (filter + expression sort keys). */
 function collectQueryExpressions(query: MindooQuery): MindooDBAppExpression[] {
@@ -68,9 +128,13 @@ function sortDirectionDescending(sortKey: MindooQuerySortKey): boolean {
 
 function computeSortValues(
   sortKeys: MindooQuerySortKey[],
-  context: ExpressionEvaluationContext
+  context: ExpressionEvaluationContext,
+  textScore?: number
 ): unknown[] {
   return sortKeys.map((sortKey) => {
+    if (sortKey.special === "textScore") {
+      return textScore ?? 0;
+    }
     if (sortKey.expression) {
       return evaluateExpression(sortKey.expression, context);
     }
@@ -80,8 +144,11 @@ function computeSortValues(
   });
 }
 
-function sortAndPage(candidates: CandidateRow[], query: MindooQuery): { rows: MindooQueryRow[]; total: number } {
-  const sortKeys = query.sortBy ?? [];
+function sortAndPage(
+  candidates: CandidateRow[],
+  query: MindooQuery,
+  sortKeys: MindooQuerySortKey[]
+): { rows: MindooQueryRow[]; total: number } {
   if (sortKeys.length > 0) {
     candidates.sort((left, right) => {
       for (let i = 0; i < sortKeys.length; i++) {
@@ -106,7 +173,11 @@ function sortAndPage(candidates: CandidateRow[], query: MindooQuery): { rows: Mi
     : candidates.slice(offset, offset + Math.max(0, limit));
 
   return {
-    rows: paged.map(({ docId, fields, lastModified }) => ({ docId, fields, lastModified })),
+    rows: paged.map(({ docId, fields, lastModified, textScore }) =>
+      textScore === undefined
+        ? { docId, fields, lastModified }
+        : { docId, fields, lastModified, textScore }
+    ),
     total,
   };
 }
@@ -136,6 +207,11 @@ function queryOrigin(db: MindooDB): string {
  * options), verifies that every referenced field is covered by the summary
  * configuration, then filters/sorts/pages the in-memory summary entries.
  * Documents are never materialized on this path.
+ *
+ * A `text` clause additionally restricts matches through the full-text
+ * index (which is brought up to date first) and provides the relevance
+ * score for `{ special: "textScore" }` sorting — the default ordering
+ * when a `text` clause is present without an explicit `sortBy`.
  */
 export async function executeQuery(
   db: MindooDB,
@@ -174,16 +250,29 @@ export async function executeQuery(
     }
   }
 
+  const textMatch = await resolveTextClauseScores(db, query, options);
+  if (options?.signal?.aborted) {
+    throw new MindooQueryError("Query aborted while updating the full-text index.");
+  }
+
   await summary.update(options);
   if (options?.signal?.aborted) {
     throw new MindooQueryError("Query aborted while updating the summary buffer.");
   }
 
   const origin = queryOrigin(db);
-  const sortKeys = query.sortBy ?? [];
+  const sortKeys = effectiveSortKeys(query);
   const candidates: CandidateRow[] = [];
 
   for (const entry of summary.getAllEntries()) {
+    let textScore: number | undefined;
+    if (textMatch) {
+      textScore = textMatch.scores.get(entry.docId);
+      if (textScore === undefined) {
+        continue;
+      }
+    }
+
     const evaluationDoc = buildSummaryEvaluationDoc(entry.fields, entry.lastModified);
     const context: ExpressionEvaluationContext = {
       doc: evaluationDoc,
@@ -201,12 +290,19 @@ export async function executeQuery(
       docId: entry.docId,
       fields: projectFields(evaluationDoc, query.fields),
       lastModified: entry.lastModified,
-      sortValues: computeSortValues(sortKeys, context),
+      textScore,
+      sortValues: computeSortValues(sortKeys, context, textScore),
     });
   }
 
-  const { rows, total } = sortAndPage(candidates, query);
-  return { rows, total, coverage: summary.getCoverage() };
+  const { rows, total } = sortAndPage(candidates, query, sortKeys);
+  // Coverage is the minimum of the summary and full-text coverage: while
+  // either side is still backfilling, results may be incomplete.
+  const coverage =
+    textMatch && textMatch.index.getCoverage() === "rebuilding"
+      ? "rebuilding"
+      : summary.getCoverage();
+  return { rows, total, coverage };
 }
 
 /** Resolve the plaintext for every `decrypt` node before evaluating a document. */
@@ -249,8 +345,13 @@ async function executeFullScanQuery(
   expressions: MindooDBAppExpression[],
   options?: MindooQueryOptions
 ): Promise<MindooQueryResult> {
+  // The text clause is answered by the full-text index even on the
+  // full-scan path — scanning document bodies cannot compute relevance
+  // scores, and the index requirement stays consistent between paths.
+  const textMatch = await resolveTextClauseScores(db, query, options);
+
   const origin = queryOrigin(db);
-  const sortKeys = query.sortBy ?? [];
+  const sortKeys = effectiveSortKeys(query);
   const decryptRequests: DecryptRequest[] = [];
   for (const expression of expressions) {
     decryptRequests.push(...collectDecryptRequests(expression));
@@ -276,6 +377,15 @@ async function executeFullScanQuery(
     }
 
     const mindooDoc = doc as MindooDoc;
+
+    let textScore: number | undefined;
+    if (textMatch) {
+      textScore = textMatch.scores.get(mindooDoc.getId());
+      if (textScore === undefined) {
+        continue;
+      }
+    }
+
     const data = mindooDoc.getData() as Record<string, unknown>;
     const baseContext: ExpressionEvaluationContext = {
       doc: data,
@@ -298,10 +408,11 @@ async function executeFullScanQuery(
       docId: mindooDoc.getId(),
       fields: projectFields(data, query.fields),
       lastModified: mindooDoc.getLastModified(),
-      sortValues: computeSortValues(sortKeys, context),
+      textScore,
+      sortValues: computeSortValues(sortKeys, context, textScore),
     });
   }
 
-  const { rows, total: matchTotal } = sortAndPage(candidates, query);
+  const { rows, total: matchTotal } = sortAndPage(candidates, query, sortKeys);
   return { rows, total: matchTotal, coverage: "full-scan" };
 }

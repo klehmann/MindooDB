@@ -421,6 +421,13 @@ for await (const entry of nav.entriesForward()) {
 
 ### 3. Full-Text Search with FlexSearch
 
+> **Update:** MindooDB now ships a **built-in full-text index**
+> (`DocumentFullTextIndex`, MiniSearch-based, encrypted persistence,
+> integrated into `db.query({ text: ... })` and `db.searchText()`) — see
+> [Full-Text Search](fulltext-search.md). The FlexSearch approach below
+> remains valid as an **app-side alternative** for cases needing custom
+> tokenization or app-specific index shapes.
+
 **Concept:**
 [FlexSearch](https://github.com/nextapps-de/flexsearch) is a high-performance, memory-efficient full-text search library that supports incremental indexing and real-time search.
 

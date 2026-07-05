@@ -1,5 +1,6 @@
 import type { MindooDB } from "../types";
 import type { MindooDBAppBooleanExpression } from "../expressions/types";
+import type { DocumentFullTextIndex } from "../indexing/fulltext/DocumentFullTextIndex";
 import { analyzeExpressionRequirements, getReferencedFields } from "../expressions";
 import type { DocumentSummaryStore } from "../indexing/summary/DocumentSummaryStore";
 import { SummaryVirtualViewDataProvider } from "../indexing/summary/SummaryVirtualViewDataProvider";
@@ -7,7 +8,7 @@ import { VirtualView } from "../indexing/virtualviews/VirtualView";
 import { VirtualViewColumn, type VirtualViewColumnOptions } from "../indexing/virtualviews/VirtualViewColumn";
 import type { VirtualViewUpdateOptions } from "../indexing/virtualviews/IVirtualViewDataProvider";
 import type { CategorizationStyle } from "../indexing/virtualviews/types";
-import { MindooQueryError } from "./types";
+import { MindooQueryError, type MindooQueryTextClause } from "./types";
 
 /**
  * Declarative definition of an ephemeral, summary-backed view. Fully
@@ -21,6 +22,20 @@ export interface MindooQueryViewDefinition {
    * Applies to every source unless a source provides its own filter.
    */
   filter?: MindooDBAppBooleanExpression;
+  /**
+   * Full-text pre-filter: only documents matching this search (in each
+   * source's full-text index) appear in the view, combined with `filter`
+   * as a logical AND. Applies to every source unless a source provides
+   * its own `text` clause. Requires full-text indexing to be enabled for
+   * each source database (`fulltext-not-enabled` otherwise) — see
+   * docs/fulltext-search.md.
+   *
+   * Matching documents expose the relevance as pseudo-fields to filter
+   * and column expressions: `_textScore` (0..1, normalized to the best
+   * hit of the current search, rounded to 2 decimals) and
+   * `_textScoreRaw` (engine-specific raw score).
+   */
+  text?: MindooQueryTextClause;
   /** View columns (categories/sorting/totals work as in persistent views). */
   columns: Array<VirtualViewColumn | VirtualViewColumnOptions>;
   categorizationStyle?: CategorizationStyle;
@@ -43,6 +58,12 @@ export interface EphemeralViewSource {
   filter?: MindooDBAppBooleanExpression;
 
   /**
+   * Per-source full-text pre-filter. When set it replaces the
+   * definition-level `text` clause for this source.
+   */
+  text?: MindooQueryTextClause;
+
+  /**
    * Origin identifier for entries of this source. Must be unique within
    * the view. Defaults to `<tenantId>/<storeId>#ephemeral`, which is
    * already unique across databases and tenants.
@@ -56,6 +77,7 @@ interface ResolvedViewSource {
   summary: DocumentSummaryStore;
   origin: string;
   filter?: MindooDBAppBooleanExpression;
+  text?: MindooQueryTextClause;
 }
 
 function defaultEphemeralOrigin(db: MindooDB): string {
@@ -84,6 +106,7 @@ function resolveSources(sources: EphemeralViewSource[]): ResolvedViewSource[] {
       summary: source.db.getSummaryStore(),
       origin,
       filter: source.filter,
+      text: source.text,
     });
   }
   return resolved;
@@ -124,10 +147,22 @@ export class EphemeralSummaryView {
     }
     this.providers = [];
     for (const source of this.sources) {
+      const textClause = source.text ?? definition.text;
+      let text: { index: DocumentFullTextIndex; clause: MindooQueryTextClause } | undefined;
+      if (textClause) {
+        if (!source.db.getFullTextIndex) {
+          throw new MindooQueryError(
+            `View source "${source.origin}" does not support full-text search.`,
+            "fulltext-not-enabled"
+          );
+        }
+        text = { index: source.db.getFullTextIndex(), clause: textClause };
+      }
       const provider = new SummaryVirtualViewDataProvider({
         origin: source.origin,
         summary: source.summary,
         filter: source.filter ?? definition.filter,
+        text,
       });
       provider.init(view);
       view.addDataProvider(provider);
@@ -149,10 +184,10 @@ export class EphemeralSummaryView {
   }
 
   /**
-   * Replace the column set (and optionally the filter) and rebuild the
-   * view from the summaries — dynamic re-sorting without touching
-   * documents. A live binding created via {@link bindTo} carries over to
-   * the new view.
+   * Replace the column set (and optionally the filter and/or full-text
+   * clause) and rebuild the view from the summaries — dynamic re-sorting
+   * without touching documents. A live binding created via {@link bindTo}
+   * carries over to the new view.
    */
   async resort(
     definition: Partial<MindooQueryViewDefinition> & Pick<MindooQueryViewDefinition, "columns">,
@@ -228,9 +263,18 @@ export class EphemeralSummaryView {
 }
 
 /**
+ * Managed pseudo-fields provided by the full-text pre-filter (not stored
+ * in the summary buffer): `_textScore` is the normalized 0..1 relevance of
+ * the match, `_textScoreRaw` the engine's raw score.
+ */
+const TEXT_SCORE_FIELDS = new Set(["_textScore", "_textScoreRaw"]);
+
+/**
  * Guardrails mirroring `db.query()`: expressions must be answerable from
  * the summary buffers (no decrypt, no view-tree operations in filters,
  * referenced fields covered by EACH source's summary configuration).
+ * The text-score pseudo-fields are exempt from coverage but require an
+ * effective `text` clause on the source.
  */
 function validateViewDefinition(sources: ResolvedViewSource[], definition: MindooQueryViewDefinition): void {
   const columnPaths = new Set<string>();
@@ -272,7 +316,17 @@ function validateViewDefinition(sources: ResolvedViewSource[], definition: Mindo
       }
     }
 
+    const hasTextClause = (source.text ?? definition.text) !== undefined;
     for (const path of referencedPaths) {
+      if (TEXT_SCORE_FIELDS.has(path)) {
+        if (!hasTextClause) {
+          throw new MindooQueryError(
+            `Expression references "${path}", but source "${source.origin}" has no 'text' clause — ` +
+            `text scores only exist for full-text pre-filtered views.`
+          );
+        }
+        continue;
+      }
       if (!source.summary.isFieldCovered(path)) {
         throw new MindooQueryError(
           `Field "${path}" is not covered by the summary configuration of source "${source.origin}" ` +

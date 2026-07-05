@@ -211,11 +211,14 @@ export const mindooDBViewLanguageHelpers = [
   helper("pathJoin", "path", "Join path segments with backslashes.", "Stringifies, trims, and joins non-empty segments into a path-like string.", "pathJoin(...parts)", "Expression<string>", [
     { name: "parts", kind: "expression", description: "The path segments to join.", variadic: true },
   ], ["v.pathJoin(v.field(\"project.code\"), v.field(\"employee\"))"]),
-  helper("ifElse", "control-flow", "Branch between two expressions.", "Evaluates the condition and returns either the true branch or the false branch expression.", "ifElse(condition, whenTrue, whenFalse)", "Expression<T>", [
-    { name: "condition", kind: "boolean-expression", description: "The condition that controls the branch." },
-    { name: "whenTrue", kind: "expression", description: "The expression returned when the condition is truthy." },
-    { name: "whenFalse", kind: "expression", description: "The expression returned when the condition is falsy." },
-  ], ["v.ifElse(v.exists(v.field(\"note\")), v.field(\"note\"), v.string(\"(none)\"))"]),
+  helper("ifElse", "control-flow", "Branch between expressions (multi-branch, like Domino @If).", "Accepts any number of condition/value pairs followed by one final default value. Conditions are checked in order and the value of the first matching condition is returned; when none match, the default is returned. The classic three-argument form ifElse(condition, whenTrue, whenFalse) is the smallest case.", "ifElse(cond1, val1, cond2, val2, ..., default)", "Expression<T>", [
+    { name: "condition", kind: "boolean-expression", description: "A condition checked in order; paired with the value that follows it.", variadic: true },
+    { name: "value", kind: "expression", description: "The expression returned when the preceding condition is truthy.", variadic: true },
+    { name: "default", kind: "expression", description: "The expression returned when no condition matches." },
+  ], [
+    "v.ifElse(v.exists(v.field(\"note\")), v.field(\"note\"), v.string(\"(none)\"))",
+    "v.ifElse(v.gt(v.field(\"score\"), 0.8), \"high\", v.gt(v.field(\"score\"), 0.5), \"medium\", \"low\")",
+  ]),
   helper("let", "control-flow", "Bind intermediate expressions to names.", "Creates named intermediate expressions and exposes them to a builder callback for reuse.", "let(bindings, build)", "Expression<T>", [
     { name: "bindings", kind: "bindings", description: "An object of named intermediate expressions." },
     { name: "build", kind: "builder", description: "A callback that receives typed references to the bindings and returns the final expression." },

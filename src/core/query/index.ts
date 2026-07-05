@@ -2,6 +2,8 @@ export {
   MindooQueryError,
   type MindooQuery,
   type MindooQuerySortKey,
+  type MindooQueryTextClause,
+  type MindooQueryErrorCode,
   type MindooQueryOptions,
   type MindooQueryRow,
   type MindooQueryCoverage,

@@ -19,11 +19,20 @@ export interface MindooQuerySubscription {
  * Any membership, ordering, or content change (content changes bump
  * `lastModified`) alters the fingerprint; changes to non-matching
  * documents cost only the scan, never an `onResult` call.
+ *
+ * Full-text relevance scores participate ROUNDED (two decimals): adding
+ * or removing documents shifts BM25 statistics slightly for every other
+ * match, and re-pushing an unchanged result list over marginal score
+ * drift would spam subscribers.
  */
 function fingerprintResult(result: MindooQueryResult): string {
   const parts: string[] = [String(result.total)];
   for (const row of result.rows) {
-    parts.push(`${row.docId}:${row.lastModified}`);
+    parts.push(
+      row.textScore === undefined
+        ? `${row.docId}:${row.lastModified}`
+        : `${row.docId}:${row.lastModified}:${row.textScore.toFixed(2)}`
+    );
   }
   return parts.join("|");
 }

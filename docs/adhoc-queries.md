@@ -251,6 +251,25 @@ definitions are plain JSON and can be stored or transmitted safely.
 Sort keys are either summary field paths or expressions
 (`{ expression: v.mul(v.field("amount"), -1) }`).
 
+### Full-text search: the `text` clause
+
+Queries can combine the summary filter with the client-side full-text index
+(see [Full-Text Search](fulltext-search.md)):
+
+```typescript
+const result = await db.query({
+  text: { query: "solar panels" },            // full-text membership + relevance
+  filter: v.eq(v.field("type"), "article"),   // ANDed with the text clause
+});
+// rows carry textScore; without sortBy, best score comes first
+```
+
+The `text` clause requires full-text indexing to be enabled for the database
+(`db.setFulltextSetup({ enabled: true })`), otherwise the query throws a
+`MindooQueryError` with `code: "fulltext-not-enabled"`. Sorting can reference
+the relevance score explicitly via `{ special: "textScore", direction: "descending" }`;
+`db.queryLive()` supports `text` clauses unchanged.
+
 ### Cost model
 
 - `db.query()` first brings the summary up to date (incremental changefeed
@@ -349,6 +368,12 @@ view.dispose();
   re-sorting without reloading anything.
 - Ephemeral views are not registered with the CacheManager; `dispose()` releases
   them.
+- An optional **`text` clause** pre-filters the view source with a full-text
+  search (ANDed with the filter), so categories/totals aggregate only the
+  matching documents. Matching documents expose their relevance to
+  expressions as the pseudo-fields `_textScore` (normalized 0..1) and
+  `_textScoreRaw` — see
+  ["Pre-filtering ephemeral views"](fulltext-search.md#pre-filtering-ephemeral-views).
 
 The same guardrails as `db.query()` apply (coverage check, no decrypt, no view-tree
 operations in filters).
@@ -459,12 +484,39 @@ subscription.unsubscribe();
 - React/Vue hooks (`useQuery`, `useView`) are intentionally left to the app SDK;
   the subscription signature above is the connection point.
 
+## How bridge apps reach the query engine
+
+Hosted apps built with `mindoodb-app-sdk` get this whole surface over the Haven
+bridge — they never call `db.query()` directly:
+
+- **`db.documents.query(query)`** (SDK) → `documents.query` RPC → `db.query()`
+  on the host. Formula-string filters are parsed app-side; only the JSON
+  expression AST crosses the bridge. The host caps `limit` (default 200,
+  max 1000) and maps `MindooQueryError` to a `query-not-supported` bridge error
+  (`fulltext-not-enabled` keeps its own code so apps can hide search UI).
+  Full-text `text` clauses pass through unchanged (query strings are capped
+  host-side).
+- **`db.documents.liveQuery(query, onResult)`** (SDK) → `documents.liveQuery.*`
+  RPCs → `db.queryLive()` on the host. Fingerprinted results are pushed to the
+  app as `query-result` port messages — the coalescing and single-flight
+  semantics described above apply unchanged.
+- **View navigators** are built host-side via `VirtualViewFactory.withDB`
+  (summary-first with automatic document fallback, `useFullDocuments` escape
+  hatch) and bound to the source databases with `view.bindTo(db)`; update
+  events reach the app as `view-changed` push messages
+  (`navigator.onDidUpdate`).
+
+See the `mindoodb-app-sdk` README ("Queries & Live Queries") for the app-facing
+documentation.
+
 ## Deliberate non-goals
 
 - **No per-field secondary indexes** (B-tree/inverted): the linear in-memory scan
   is sufficient for the target scale and keeps write paths cheap.
-- The `dbsetup` design document intentionally stays **minimal**: one document, one
-  `summarySetup` field, last-writer-wins per Automerge merge semantics. There is no
-  per-user or per-device configuration layering in this iteration.
-- **Full-text search** stays out of scope, but the summary store is a suitable
-  future data source for it.
+- The `dbsetup` design document intentionally stays **minimal**: one document with
+  a `summarySetup` and a `fulltextSetup` field, last-writer-wins per Automerge
+  merge semantics. There is no per-user or per-device configuration layering in
+  this iteration.
+- **Full-text search** is not part of the summary scan itself — it runs as a
+  separate derived index integrated via the `text` clause; see
+  [Full-Text Search](fulltext-search.md).

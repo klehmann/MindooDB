@@ -35,6 +35,40 @@ describe("formulaSource", () => {
     expect(formatted).toContain("v.ifElse(");
   });
 
+  it("parses, evaluates, and round-trips multi-branch ifElse (Domino @If style)", () => {
+    const source = `v.ifElse(
+  v.gt(v.field("score"), 0.8),
+  "sehr guter Treffer",
+  v.gt(v.field("score"), 0.5),
+  "guter Treffer",
+  "schlechter Treffer",
+)`;
+
+    const expression = parseMindooDBFormulaExpression(source);
+
+    const evaluate = (score: number) =>
+      evaluateExpression(expression, {
+        doc: { score },
+        values: {},
+        origin: "local:replica-1:main",
+        variables: {},
+      });
+    expect(evaluate(0.9)).toBe("sehr guter Treffer");
+    expect(evaluate(0.6)).toBe("guter Treffer");
+    expect(evaluate(0.3)).toBe("schlechter Treffer");
+
+    // The formatter flattens the nested `if` chain back into the variadic form.
+    expect(formatMindooDBFormulaExpression(expression)).toBe(source);
+  });
+
+  it("rejects ifElse formula calls with an even argument count", () => {
+    expect(() =>
+      parseMindooDBFormulaExpression(
+        'v.ifElse(v.gt(v.field("score"), 0.8), "high", v.gt(v.field("score"), 0.5), "medium")',
+      ),
+    ).toThrowError(MindooDBFormulaSyntaxError);
+  });
+
   it("supports literal objects and arrays in formula source", () => {
     const expression = parseMindooDBFormulaExpression(
       'v.literal({ status: "draft", totals: [1, 2], nested: { active: true } })',

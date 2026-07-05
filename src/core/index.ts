@@ -249,6 +249,8 @@ export {
   type MindooQueryViewDefinition,
   type MindooQuery,
   type MindooQuerySortKey,
+  type MindooQueryTextClause,
+  type MindooQueryErrorCode,
   type MindooQueryOptions,
   type MindooQueryRow,
   type MindooQueryCoverage,
@@ -276,3 +278,35 @@ export {
   type DocumentSummaryEntry,
   type SummaryCoverage,
 } from "./indexing/summary";
+
+// Indexing - Document full-text index (opt-in, see docs/fulltext-search.md)
+export {
+  DocumentFullTextIndex,
+  MiniSearchAdapter,
+  createTokenizer,
+  resolveFulltextConfig,
+  sanitizeFulltextConfig,
+  computeFulltextConfigFingerprint,
+  collectPlainText,
+  extractFulltextFields,
+  FULLTEXT_SETUP_FIELD,
+  FULLTEXT_ATTACHMENT_FIELD,
+  FULLTEXT_INDEX_FORMAT_VERSION,
+  DEFAULT_FULLTEXT_MAX_FIELD_BYTES,
+  type SearchEngineAdapter,
+  type FulltextConfig,
+  type ResolvedFulltextConfig,
+  type FulltextCoverage,
+  type FulltextSearchHit,
+  type FulltextSearchOptions,
+  type FulltextSearchResult,
+  type AttachmentTextExtractor,
+} from "./indexing/fulltext";
+
+// Attachment text extraction setup (host-side services like Haven's OCR;
+// results are persisted at the attachment entry, see docs/fulltext-search.md)
+export {
+  EXTRACTION_SETUP_FIELD,
+  sanitizeExtractionConfig,
+  type ExtractionConfig,
+} from "./extraction/types";
