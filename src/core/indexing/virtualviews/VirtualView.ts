@@ -27,6 +27,21 @@ export interface VirtualViewUpdateStats {
 }
 
 /**
+ * How a `withDB` data source was resolved at build time (see
+ * `createViewDataProvider`): read via {@link VirtualView.getDataSourceInfo}
+ * to log or surface in a UI why a view runs on the slow document path.
+ */
+export interface ViewDataSourceInfo {
+  /** The data path chosen for this origin. */
+  source: "summary" | "documents";
+  /**
+   * When `source` is `"documents"`, the reasons why the summary path was
+   * not usable (empty for an explicit `useFullDocuments` request).
+   */
+  fallbackReasons: string[];
+}
+
+/**
  * Compact serialized sort key stored in the virtual-view tree cache.
  */
 interface SerializedVirtualViewSortKey {
@@ -126,6 +141,9 @@ export class VirtualView {
   
   /** Data providers */
   private dataProviderByOrigin: Map<string, IVirtualViewDataProvider> = new Map();
+
+  /** Build-time data-source decision per origin (only for builder `withDB` sources) */
+  private dataSourceInfoByOrigin: Map<string, ViewDataSourceInfo> = new Map();
   
   /** Entries pending sibling index recalculation */
   private pendingSiblingIndexFlush: Set<VirtualViewEntryData> = new Set();
@@ -248,6 +266,41 @@ export class VirtualView {
    */
   getDataProvider(origin: string): IVirtualViewDataProvider | undefined {
     return this.dataProviderByOrigin.get(origin);
+  }
+
+  /**
+   * Record how a data source was resolved at build time (summary vs
+   * documents). Called by the view builder; not intended for user code.
+   */
+  setDataSourceInfo(origin: string, info: ViewDataSourceInfo): this {
+    this.dataSourceInfoByOrigin.set(origin, { ...info, fallbackReasons: [...info.fallbackReasons] });
+    return this;
+  }
+
+  /**
+   * How the `withDB` source with the given origin was resolved at build
+   * time: `"summary"` (fast path, no document materialization) or
+   * `"documents"` with the {@link ViewDataSourceInfo.fallbackReasons}
+   * explaining why the summary path was not usable. Returns `undefined`
+   * for sources that were not resolved by the builder (custom providers,
+   * `withMindooDB`, unknown origins).
+   */
+  getDataSourceInfo(origin: string): ViewDataSourceInfo | undefined {
+    const info = this.dataSourceInfoByOrigin.get(origin);
+    return info ? { ...info, fallbackReasons: [...info.fallbackReasons] } : undefined;
+  }
+
+  /**
+   * The build-time data-source decision for every `withDB` origin (see
+   * {@link getDataSourceInfo}).
+   */
+  getAllDataSourceInfos(): Map<string, ViewDataSourceInfo> {
+    return new Map(
+      Array.from(this.dataSourceInfoByOrigin, ([origin, info]) => [
+        origin,
+        { ...info, fallbackReasons: [...info.fallbackReasons] },
+      ])
+    );
   }
 
   /**

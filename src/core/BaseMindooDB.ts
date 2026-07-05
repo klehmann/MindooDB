@@ -533,6 +533,18 @@ export class BaseMindooDB implements MindooDB {
   private changeNotifyTimer: ReturnType<typeof setTimeout> | null = null;
   /** While > 0, timer-based emission is suppressed (e.g. during a sync batch). */
   private changeNotificationHolds: number = 0;
+
+  // ---------------------------------------------------------------------------
+  // Summary auto-follow (see setSummaryAutoUpdateEnabled): keeps the summary
+  // buffer current as changes arrive (local writes and sync batches), so the
+  // first query after receiving thousands of documents doesn't stall on a
+  // full catch-up run.
+  // ---------------------------------------------------------------------------
+  private summaryAutoUpdateEnabled: boolean = true;
+  private summaryAutoUpdateRunning: boolean = false;
+  private summaryAutoUpdatePending: boolean = false;
+  /** Whether the setup document was already probed for auto-activation. */
+  private summarySetupProbed: boolean = false;
   private dirtyDocIds: Set<string> = new Set();
   private cacheMetaDirty: boolean = false;
   /**
@@ -661,6 +673,13 @@ export class BaseMindooDB implements MindooDB {
       logger ||
       new MindooLogger(getDefaultLogLevel(), "BaseMindooDB", true);
     this.performanceCallback = performanceCallback;
+
+    // Summary auto-follow: piggybacks on the coalesced change events (one
+    // per sync batch / event-loop turn). Costs a docId check per event for
+    // databases that never use summaries.
+    this.addChangeListener((event) => {
+      this.handleChangesForSummaryAutoUpdate(event.changes);
+    });
   }
   
   /**
@@ -804,6 +823,94 @@ export class BaseMindooDB implements MindooDB {
         data[SUMMARY_SETUP_FIELD] = sanitizeSummaryConfig(config) ?? {};
       }
     });
+  }
+
+  /**
+   * Enable/disable summary auto-follow (default: enabled). When enabled,
+   * the summary buffer is brought up to date in the background after every
+   * coalesced change event — one catch-up run per sync batch, one per
+   * event-loop turn for local writes — so queries don't stall on a full
+   * catch-up after receiving many documents. Compared to the network I/O
+   * of a sync the incremental extraction is cheap; disable it for
+   * bulk-import scenarios where even that is unwanted (the next query
+   * catches up lazily as before).
+   */
+  setSummaryAutoUpdateEnabled(enabled: boolean): void {
+    this.summaryAutoUpdateEnabled = enabled;
+    if (enabled && this.summaryStore) {
+      this.scheduleSummaryAutoUpdate();
+    }
+  }
+
+  /**
+   * Change-event hook for summary auto-follow. While no summary store
+   * exists, the setup document decides whether to activate one: it is
+   * probed on the first event (covers reopening a database whose `dbsetup`
+   * synced earlier) and re-checked whenever a `dbsetup` change arrives
+   * (covers the configuration being created/updated locally or via sync).
+   */
+  private handleChangesForSummaryAutoUpdate(changes: DbChange[]): void {
+    if (!this.summaryAutoUpdateEnabled) {
+      return;
+    }
+    if (this.summaryStore) {
+      this.scheduleSummaryAutoUpdate();
+      return;
+    }
+    // Never auto-activate on system databases: the directory has its own
+    // indexing (DirectoryTimeTravelIndex) and its change events interleave
+    // with access-control evaluation; admin-only databases hold no user
+    // data worth summarizing. Explicit getSummaryStore() calls still work.
+    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    const hasSetupChange = changes.some((change) => change.docId === DB_SETUP_DOC_ID);
+    if (!hasSetupChange && this.summarySetupProbed) {
+      return;
+    }
+    this.summarySetupProbed = true;
+    void this.activateSummaryFromSetupDoc();
+  }
+
+  /** Create the summary store when the setup document configures one. */
+  private async activateSummaryFromSetupDoc(): Promise<void> {
+    try {
+      const config = await this.getSummarySetup();
+      if (config === null || this.summaryStore || !this.summaryAutoUpdateEnabled) {
+        return;
+      }
+      // No explicit config: the store adopts the setup-document config on
+      // its first update run (seedConfigFromSetupDoc).
+      this.getSummaryStore();
+      this.scheduleSummaryAutoUpdate();
+    } catch (error) {
+      this.logger.warn(`Summary auto-activation failed: ${error}`);
+    }
+  }
+
+  /**
+   * Run a background summary catch-up, coalescing further requests into
+   * one follow-up run (mirrors the live-view scheduling in VirtualView).
+   * Errors are logged and never propagate into write/sync paths.
+   */
+  private scheduleSummaryAutoUpdate(): void {
+    if (this.summaryAutoUpdateRunning) {
+      this.summaryAutoUpdatePending = true;
+      return;
+    }
+    this.summaryAutoUpdateRunning = true;
+    void (async () => {
+      try {
+        do {
+          this.summaryAutoUpdatePending = false;
+          await this.summaryStore?.update();
+        } while (this.summaryAutoUpdatePending && this.summaryAutoUpdateEnabled);
+      } catch (error) {
+        this.logger.warn(`Summary auto-update failed: ${error}`);
+      } finally {
+        this.summaryAutoUpdateRunning = false;
+      }
+    })();
   }
 
   // ---------------------------------------------------------------------------

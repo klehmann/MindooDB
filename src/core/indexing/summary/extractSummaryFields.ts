@@ -69,6 +69,58 @@ function isExcluded(path: string, exclude: string[]): boolean {
 }
 
 /**
+ * Fields following the encrypted-field convention (`*_encrypted` plus the
+ * `*_encrypted_key` companion). Their values are ciphertext — useless in
+ * the summary (evaluating them requires `decrypt`, which needs the
+ * materialized document anyway), so auto-include skips them. An explicit
+ * `include` still wins for callers who really want the raw ciphertext.
+ */
+function isEncryptedConventionField(key: string): boolean {
+  return key.endsWith("_encrypted") || key.endsWith("_encrypted_key");
+}
+
+/** Attachment metadata field managed by MindooDB on every document. */
+export const ATTACHMENTS_FIELD = "_attachments";
+
+/**
+ * Slim projection of one `_attachments` entry: enough for attachment
+ * expressions, "has a PDF > 5 MB" style queries, and loading the
+ * attachment from a view row (`attachmentId`). Deliberately omits
+ * `lastChunkId`/`decryptionKeyId` (internal plumbing) and `createdBy`
+ * (the creator's full PEM signing key — ~800 chars per attachment).
+ */
+export interface SummaryAttachmentInfo {
+  attachmentId?: string;
+  fileName?: string;
+  size?: number;
+  mimeType?: string;
+  createdAt?: number;
+}
+
+function projectAttachments(value: unknown): SummaryAttachmentInfo[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) {
+    return undefined;
+  }
+  const projected: SummaryAttachmentInfo[] = [];
+  for (const item of value) {
+    if (item === null || typeof item !== "object") {
+      continue;
+    }
+    const raw = item as Record<string, unknown>;
+    const info: SummaryAttachmentInfo = {};
+    if (typeof raw.attachmentId === "string") info.attachmentId = raw.attachmentId;
+    if (typeof raw.fileName === "string") info.fileName = raw.fileName;
+    if (typeof raw.size === "number" && Number.isFinite(raw.size)) info.size = raw.size;
+    if (typeof raw.mimeType === "string") info.mimeType = raw.mimeType;
+    if (typeof raw.createdAt === "number" && Number.isFinite(raw.createdAt)) {
+      info.createdAt = raw.createdAt;
+    }
+    projected.push(info);
+  }
+  return projected.length > 0 ? projected : undefined;
+}
+
+/**
  * Extract the summary field map for one document payload according to the
  * resolved configuration:
  *
@@ -88,6 +140,9 @@ export function extractSummaryFields(
   if (config.autoInclude) {
     for (const [key, value] of Object.entries(data)) {
       if (key.startsWith("_")) {
+        continue;
+      }
+      if (isEncryptedConventionField(key)) {
         continue;
       }
       if (isExcluded(key, config.exclude)) {
@@ -110,6 +165,16 @@ export function extractSummaryFields(
     const value = resolveFieldPath(data, path);
     if (value !== undefined) {
       fields[path] = value;
+    }
+  }
+
+  // Managed attachment metadata: stored as a slim projection so attachment
+  // expressions work on the summary path without dragging internal
+  // plumbing or the creator's signing key into every bucket.
+  if (config.includeAttachments && !isExcluded(ATTACHMENTS_FIELD, config.exclude)) {
+    const attachments = projectAttachments(data[ATTACHMENTS_FIELD]);
+    if (attachments !== undefined) {
+      fields[ATTACHMENTS_FIELD] = attachments;
     }
   }
 
@@ -137,8 +202,15 @@ export function getSummaryFieldValue(
  * their full dot-path (`"meta.owner"`); expression evaluation resolves
  * `field` paths by object traversal, so dot-keys are expanded into nested
  * objects here. Maps without dot-keys are returned as-is (no copy).
+ *
+ * When `lastModified` is passed, it is mirrored as `_lastModified` (the
+ * managed timestamp field of the materialized document), so expressions
+ * referencing it behave identically on the summary and document paths.
  */
-export function buildSummaryEvaluationDoc(fields: Record<string, unknown>): Record<string, unknown> {
+export function buildSummaryEvaluationDoc(
+  fields: Record<string, unknown>,
+  lastModified?: number
+): Record<string, unknown> {
   let hasDotKey = false;
   for (const key of Object.keys(fields)) {
     if (key.includes(".")) {
@@ -147,10 +219,16 @@ export function buildSummaryEvaluationDoc(fields: Record<string, unknown>): Reco
     }
   }
   if (!hasDotKey) {
-    return fields;
+    if (lastModified === undefined) {
+      return fields;
+    }
+    return { ...fields, _lastModified: lastModified };
   }
 
   const doc: Record<string, unknown> = {};
+  if (lastModified !== undefined) {
+    doc._lastModified = lastModified;
+  }
   for (const [key, value] of Object.entries(fields)) {
     if (!key.includes(".")) {
       doc[key] = value;
@@ -192,11 +270,22 @@ export function isFieldPathCovered(path: string, config: ResolvedSummaryConfig):
       return true;
     }
   }
-  if (config.autoInclude) {
-    const topLevel = path.includes(".") ? path.slice(0, path.indexOf(".")) : path;
-    if (!topLevel.startsWith("_")) {
-      return true;
+  const topLevel = path.includes(".") ? path.slice(0, path.indexOf(".")) : path;
+  // Managed fields with special handling: the slim attachment projection
+  // (when enabled) and the always-mirrored modification timestamp.
+  if (topLevel === ATTACHMENTS_FIELD) {
+    return config.includeAttachments;
+  }
+  if (path === "_lastModified") {
+    return true;
+  }
+  if (config.autoInclude && !topLevel.startsWith("_")) {
+    // Encrypted-convention fields are skipped by auto-include (ciphertext
+    // is not queryable); only an explicit include covers them (above).
+    if (isEncryptedConventionField(topLevel)) {
+      return false;
     }
+    return true;
   }
   return false;
 }

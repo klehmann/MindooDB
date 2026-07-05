@@ -157,6 +157,18 @@ export class DocumentSummaryStore implements ICacheable {
   }
 
   /**
+   * Make sure the effective configuration is settled: consults the
+   * {@link DB_SETUP_DOC_ID} document once (unless the config was provided
+   * in code) and returns the resolved configuration. Callers that make
+   * decisions based on coverage (e.g. the view data-provider factory)
+   * should await this before calling {@link isFieldCovered}.
+   */
+  async ensureConfigLoaded(): Promise<ResolvedSummaryConfig> {
+    await this.seedConfigFromSetupDoc();
+    return this.config;
+  }
+
+  /**
    * Whether a field path can be answered from this summary (see
    * {@link isFieldPathCovered}). Coverage is configuration-level; individual
    * documents may still lack a value.

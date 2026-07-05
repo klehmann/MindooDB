@@ -53,6 +53,17 @@ export interface SummaryConfig {
    * an exclude also covers all nested paths below it.
    */
   exclude?: string[];
+
+  /**
+   * When `true` (default), a slim projection of the document's
+   * `_attachments` array (`fileName`, `size`, `mimeType`, `createdAt` per
+   * attachment) is stored in the summary, so attachment expressions
+   * (`attachmentNames()`, `attachmentLengths()`, `attachmentCount()`) work
+   * on the summary path. Internal plumbing (`lastChunkId`,
+   * `decryptionKeyId`) and the creator's full signing key (`createdBy`)
+   * are deliberately not copied.
+   */
+  includeAttachments?: boolean;
 }
 
 /** {@link SummaryConfig} with all defaults applied. */
@@ -61,6 +72,7 @@ export interface ResolvedSummaryConfig {
   maxValueBytes: number;
   include: string[];
   exclude: string[];
+  includeAttachments: boolean;
 }
 
 export const DEFAULT_SUMMARY_MAX_VALUE_BYTES = 1024;
@@ -71,6 +83,7 @@ export function resolveSummaryConfig(config?: SummaryConfig): ResolvedSummaryCon
     maxValueBytes: Math.max(0, config?.maxValueBytes ?? DEFAULT_SUMMARY_MAX_VALUE_BYTES),
     include: [...(config?.include ?? [])],
     exclude: [...(config?.exclude ?? [])],
+    includeAttachments: config?.includeAttachments ?? true,
   };
 }
 
@@ -106,6 +119,9 @@ export function sanitizeSummaryConfig(value: unknown): SummaryConfig | undefined
   if (exclude) {
     config.exclude = exclude;
   }
+  if (typeof raw.includeAttachments === "boolean") {
+    config.includeAttachments = raw.includeAttachments;
+  }
   return config;
 }
 
@@ -120,6 +136,7 @@ export function computeSummaryConfigFingerprint(config: ResolvedSummaryConfig): 
     maxValueBytes: config.maxValueBytes,
     include: [...config.include].sort(),
     exclude: [...config.exclude].sort(),
+    includeAttachments: config.includeAttachments,
   });
 }
 

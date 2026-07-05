@@ -103,6 +103,95 @@ describe("summary field extraction", () => {
     expect(isFieldPathCovered("meta.owner", noAuto)).toBe(true);
   });
 
+  it("skips encrypted-convention fields in auto-include; explicit include wins", () => {
+    const fields = extractSummaryFields(
+      {
+        name: "Alice",
+        notes_encrypted: "AAAA-ciphertext",
+        notes_encrypted_key: "projectKey",
+      },
+      resolveSummaryConfig()
+    );
+    expect(fields).toEqual({ name: "Alice" });
+
+    const explicit = extractSummaryFields(
+      { notes_encrypted: "AAAA-ciphertext" },
+      resolveSummaryConfig({ include: ["notes_encrypted"] })
+    );
+    expect(explicit.notes_encrypted).toBe("AAAA-ciphertext");
+  });
+
+  it("stores a slim _attachments projection (no createdBy/lastChunkId/decryptionKeyId)", () => {
+    const fields = extractSummaryFields(
+      {
+        name: "Alice",
+        _attachments: [
+          {
+            attachmentId: "att-1",
+            fileName: "report.pdf",
+            mimeType: "application/pdf",
+            size: 1234,
+            createdAt: 111,
+            createdBy: "-----BEGIN PUBLIC KEY-----\n...",
+            lastChunkId: "chunk-9",
+            decryptionKeyId: "default",
+          },
+        ],
+      },
+      resolveSummaryConfig()
+    );
+
+    expect(fields._attachments).toEqual([
+      {
+        attachmentId: "att-1",
+        fileName: "report.pdf",
+        mimeType: "application/pdf",
+        size: 1234,
+        createdAt: 111,
+      },
+    ]);
+  });
+
+  it("omits the attachment projection when disabled, excluded, or empty", () => {
+    const doc = { _attachments: [{ fileName: "a.txt", size: 1 }] };
+
+    expect(
+      extractSummaryFields(doc, resolveSummaryConfig({ includeAttachments: false }))._attachments
+    ).toBeUndefined();
+    expect(
+      extractSummaryFields(doc, resolveSummaryConfig({ exclude: ["_attachments"] }))._attachments
+    ).toBeUndefined();
+    expect(
+      extractSummaryFields({ _attachments: [] }, resolveSummaryConfig())._attachments
+    ).toBeUndefined();
+  });
+
+  it("covers managed fields and uncovers ciphertext fields", () => {
+    const config = resolveSummaryConfig();
+    expect(isFieldPathCovered("_attachments", config)).toBe(true);
+    expect(isFieldPathCovered("_lastModified", config)).toBe(true);
+    expect(isFieldPathCovered("notes_encrypted", config)).toBe(false);
+    expect(isFieldPathCovered("notes_encrypted_key", config)).toBe(false);
+    expect(
+      isFieldPathCovered("notes_encrypted", resolveSummaryConfig({ include: ["notes_encrypted"] }))
+    ).toBe(true);
+
+    const noAttachments = resolveSummaryConfig({ includeAttachments: false });
+    expect(isFieldPathCovered("_attachments", noAttachments)).toBe(false);
+  });
+
+  it("mirrors lastModified as _lastModified in the evaluation doc", () => {
+    expect(buildSummaryEvaluationDoc({ name: "x" }, 123)).toEqual({
+      name: "x",
+      _lastModified: 123,
+    });
+    expect(buildSummaryEvaluationDoc({ name: "x", "meta.owner": "bob" }, 123)).toEqual({
+      name: "x",
+      meta: { owner: "bob" },
+      _lastModified: 123,
+    });
+  });
+
   it("expands dot-path keys into nested objects for expression evaluation", () => {
     const flat = { name: "x", "meta.owner": "bob", "meta.tags": ["a"] };
     const doc = buildSummaryEvaluationDoc(flat);
@@ -133,12 +222,14 @@ describe("summary field extraction", () => {
         maxValueBytes: 512,
         include: ["meta.owner", 42, "tags"],
         exclude: "not-an-array",
+        includeAttachments: false,
         unknownProp: true,
       })
     ).toEqual({
       autoInclude: false,
       maxValueBytes: 512,
       include: ["meta.owner", "tags"],
+      includeAttachments: false,
     });
   });
 });
@@ -311,6 +402,32 @@ describe("DocumentSummaryStore", () => {
     }
 
     await cacheManager.dispose();
+  }, 30000);
+
+  it("stores the slim attachment projection for real attachments", async () => {
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, async (d) => {
+      d.getData().name = "WithFile";
+      await d.addAttachment(new Uint8Array([1, 2, 3]), "test.bin", "application/octet-stream");
+    });
+
+    const summary = new DocumentSummaryStore(db);
+    await summary.update();
+
+    const attachments = summary.getEntry(doc.getId())?.fields._attachments as Array<
+      Record<string, unknown>
+    >;
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]).toMatchObject({
+      fileName: "test.bin",
+      mimeType: "application/octet-stream",
+      size: 3,
+    });
+    expect(typeof attachments[0].attachmentId).toBe("string");
+    // Internal plumbing and the creator's signing key stay out of the bucket
+    expect(attachments[0].createdBy).toBeUndefined();
+    expect(attachments[0].lastChunkId).toBeUndefined();
+    expect(attachments[0].decryptionKeyId).toBeUndefined();
   }, 30000);
 
   it("is lazily attached to BaseMindooDB via getSummaryStore", async () => {

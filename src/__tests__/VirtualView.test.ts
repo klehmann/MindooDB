@@ -405,8 +405,8 @@ describe("VirtualView", () => {
   });
 
   describe("VirtualViewFactory", () => {
-    it("should build a view using the factory", () => {
-      const view = VirtualViewFactory.createView()
+    it("should build a view using the factory", async () => {
+      const view = await VirtualViewFactory.createView()
         .addCategoryColumn("category", { title: "Category" })
         .addSortedColumn("name")
         .addTotalColumn("amount", TotalMode.SUM)
@@ -417,8 +417,8 @@ describe("VirtualView", () => {
       expect(view.getCategorizationStyle()).toBe(CategorizationStyle.CATEGORY_THEN_DOCUMENT);
     });
 
-    it("should create a navigator using the factory", () => {
-      const view = VirtualViewFactory.createView()
+    it("should create a navigator using the factory", async () => {
+      const view = await VirtualViewFactory.createView()
         .addCategoryColumn("category")
         .addSortedColumn("name")
         .build();

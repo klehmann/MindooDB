@@ -4567,6 +4567,14 @@ export interface MindooDB {
   setSummarySetup?(config: SummaryConfig | null): Promise<void>;
 
   /**
+   * Enable/disable summary auto-follow (default: enabled). When enabled,
+   * the summary buffer catches up in the background after every coalesced
+   * change event (one run per sync batch / event-loop turn), so queries
+   * don't stall after receiving many documents.
+   */
+  setSummaryAutoUpdateEnabled?(enabled: boolean): void;
+
+  /**
    * Run an ad-hoc query against the document summary buffer (see
    * docs/adhoc-queries.md). The filter is a MindooDB expression-language
    * expression; documents are never materialized unless

@@ -68,14 +68,15 @@ function sortDirectionDescending(sortKey: MindooQuerySortKey): boolean {
 
 function computeSortValues(
   sortKeys: MindooQuerySortKey[],
-  fields: Record<string, unknown>,
   context: ExpressionEvaluationContext
 ): unknown[] {
   return sortKeys.map((sortKey) => {
     if (sortKey.expression) {
       return evaluateExpression(sortKey.expression, context);
     }
-    return getSummaryFieldValue(fields, sortKey.field ?? "");
+    // Plain field sort keys resolve against the evaluation doc, which also
+    // carries the mirrored managed fields (`_lastModified`, `_attachments`).
+    return getSummaryFieldValue(context.doc, sortKey.field ?? "");
   });
 }
 
@@ -183,7 +184,7 @@ export async function executeQuery(
   const candidates: CandidateRow[] = [];
 
   for (const entry of summary.getAllEntries()) {
-    const evaluationDoc = buildSummaryEvaluationDoc(entry.fields);
+    const evaluationDoc = buildSummaryEvaluationDoc(entry.fields, entry.lastModified);
     const context: ExpressionEvaluationContext = {
       doc: evaluationDoc,
       values: {},
@@ -198,9 +199,9 @@ export async function executeQuery(
 
     candidates.push({
       docId: entry.docId,
-      fields: projectFields(entry.fields, query.fields),
+      fields: projectFields(evaluationDoc, query.fields),
       lastModified: entry.lastModified,
-      sortValues: computeSortValues(sortKeys, entry.fields, context),
+      sortValues: computeSortValues(sortKeys, context),
     });
   }
 
@@ -297,7 +298,7 @@ async function executeFullScanQuery(
       docId: mindooDoc.getId(),
       fields: projectFields(data, query.fields),
       lastModified: mindooDoc.getLastModified(),
-      sortValues: computeSortValues(sortKeys, data, context),
+      sortValues: computeSortValues(sortKeys, context),
     });
   }
 

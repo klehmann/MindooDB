@@ -148,6 +148,50 @@ describe("MindooQuery (db.query)", () => {
     expect(result.rows.map((r) => r.fields.name)).toEqual(["Alpha", "Gamma"]);
   }, 30000);
 
+  it("answers attachment expressions from the slim summary projection", async () => {
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, async (d) => {
+      Object.assign(d.getData(), { type: "task", name: "WithFile", amount: 1 });
+      await d.addAttachment(new Uint8Array([1, 2, 3]), "spec.pdf", "application/pdf");
+    });
+
+    const result = await db.query!({
+      filter: v.gt(v.attachmentCount(), 0),
+    });
+
+    expect(result.total).toBe(1);
+    expect(result.rows[0].fields.name).toBe("WithFile");
+    const attachments = result.rows[0].fields._attachments as Array<Record<string, unknown>>;
+    expect(attachments[0]).toMatchObject({ fileName: "spec.pdf", size: 3 });
+  }, 30000);
+
+  it("rejects attachment expressions when the projection is disabled", async () => {
+    db.getSummaryStore!({ includeAttachments: false });
+
+    await expect(
+      db.query!({ filter: v.gt(v.attachmentCount(), 0) })
+    ).rejects.toThrow(/_attachments/);
+  }, 30000);
+
+  it("exposes _lastModified on the summary path", async () => {
+    const result = await db.query!({
+      filter: v.gt(v.field("_lastModified"), 0),
+      sortBy: [{ field: "_lastModified", direction: "descending" }],
+      fields: ["name", "_lastModified"],
+    });
+
+    expect(result.total).toBe(4);
+    for (const row of result.rows) {
+      expect(row.fields._lastModified).toBe(row.lastModified);
+    }
+  }, 30000);
+
+  it("does not cover ciphertext fields (encrypted-field convention)", async () => {
+    await expect(
+      db.query!({ filter: v.eq(v.field("notes_encrypted"), "x") })
+    ).rejects.toThrow(/notes_encrypted/);
+  }, 30000);
+
   it("drops deleted documents from query results", async () => {
     const before = await db.query!({ filter: v.eq(v.field("type"), "task") });
     expect(before.total).toBe(3);

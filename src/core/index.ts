@@ -217,7 +217,20 @@ export {
   type ColumnValueFunction,
   type DocumentFilterFunction,
   type VirtualViewUpdateStats,
+  type ViewDataSourceInfo,
+  type WithDBOptions,
 } from "./indexing/virtualviews";
+
+// Summary-first data provider factory (summary buffer when possible,
+// materialized documents on request/fallback)
+export {
+  createViewDataProvider,
+  collectSummaryFallbackReasons,
+  filterExpressionToDocumentFilter,
+  type CreateViewDataProviderOptions,
+  type CreateViewDataProviderResult,
+  type ViewDataProviderSource,
+} from "./indexing/createViewDataProvider";
 
 // Expression language (formerly mindoodb-view-language; that package
 // re-exports these symbols as a compatibility wrapper)
@@ -256,6 +269,8 @@ export {
   DEFAULT_SUMMARY_MAX_VALUE_BYTES,
   DB_SETUP_DOC_ID,
   SUMMARY_SETUP_FIELD,
+  ATTACHMENTS_FIELD,
+  type SummaryAttachmentInfo,
   type SummaryConfig,
   type ResolvedSummaryConfig,
   type DocumentSummaryEntry,

@@ -10,7 +10,6 @@ import {
   type ExpressionEvaluationContext,
 } from "../../expressions/evaluateExpression";
 import type { DocumentSummaryStore } from "./DocumentSummaryStore";
-import type { DocumentSummaryEntry } from "./types";
 import { buildSummaryEvaluationDoc, getSummaryFieldValue } from "./extractSummaryFields";
 
 export interface SummaryVirtualViewDataProviderOptions {
@@ -105,7 +104,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
       }
       maxSeenChangeSeq = Math.max(maxSeenChangeSeq, entry.changeSeq);
 
-      const evaluationDoc = buildSummaryEvaluationDoc(entry.fields);
+      const evaluationDoc = buildSummaryEvaluationDoc(entry.fields, entry.lastModified);
       const context: ExpressionEvaluationContext = {
         doc: evaluationDoc,
         values: {},
@@ -120,7 +119,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
       if (passesFilter) {
         change.addEntry(
           entry.docId,
-          this.computeColumnValues(entry, columns, context),
+          this.computeColumnValues(columns, context),
           entry.decryptionKeyId ?? undefined
         );
         this.knownDocIds.add(entry.docId);
@@ -148,7 +147,6 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
   }
 
   private computeColumnValues(
-    entry: DocumentSummaryEntry,
     columns: VirtualViewColumn[],
     context: ExpressionEvaluationContext
   ): Record<string, unknown> {
@@ -157,7 +155,9 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
       if (column.expression) {
         values[column.name] = evaluateExpression(column.expression, { ...context, values });
       } else {
-        values[column.name] = getSummaryFieldValue(entry.fields, column.name);
+        // The evaluation doc carries the extracted fields plus the mirrored
+        // managed fields (`_lastModified`, slim `_attachments`).
+        values[column.name] = getSummaryFieldValue(context.doc, column.name);
       }
     }
     return values;

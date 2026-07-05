@@ -26,6 +26,11 @@ The key idea: ad-hoc queries **never touch documents** — they only read the su
 buffer. The summary is built once (interruptible, with progress reporting) and then
 maintained incrementally from the changefeed.
 
+Persistent [VirtualViews](virtualview.md) benefit too: their async builds resolve
+`withDB` sources **summary-first** and only fall back to materialized documents
+when the view definition requires them (or `useFullDocuments` forces it) — see
+"Data Sources: Summary Buffer First" in the VirtualView docs.
+
 ## The Document Summary Store
 
 The `DocumentSummaryStore` keeps one lightweight entry per live document:
@@ -48,6 +53,7 @@ const summary = db.getSummaryStore({
   maxValueBytes: 1024,        // size cap for auto-included values
   include: ["meta.owner"],    // nested/large paths, stored under the dot-path key
   exclude: ["draftBody"],     // wins over everything, covers nested paths
+  includeAttachments: true,   // default: slim _attachments projection
 });
 ```
 
@@ -58,13 +64,34 @@ Extraction rules:
 
 1. **Auto-include** (default on): every non-underscore top-level field whose value is
    a scalar (string/number/boolean/null) or an array of scalars, as long as its
-   JSON-serialized size stays within `maxValueBytes`.
+   JSON-serialized size stays within `maxValueBytes`. Fields following the
+   encrypted-field convention (`*_encrypted`, `*_encrypted_key`) are skipped —
+   their values are ciphertext, useless for querying, and would waste bucket
+   space. (An explicit `include` still wins for the rare case that wants the
+   raw ciphertext.)
 2. **`include` paths**: may be nested (`"meta.owner"`), may resolve to non-scalar
    values, and bypass the size cap. Stored under the full dot-path as key.
 3. **`exclude` paths**: win over both and also cover all nested paths below them.
 
-Encrypted field values are **never** stored in the summary (they only exist inside
-the encrypted document payload); see `allowFullScan` below for queries that need them.
+Two managed underscore fields get special treatment so summary-backed
+expressions behave like their document-backed counterparts:
+
+- **`_attachments`** (default on via `includeAttachments`): a slim projection of
+  each attachment — `attachmentId`, `fileName`, `size`, `mimeType`, `createdAt` —
+  is stored, so `v.attachmentNames()` / `v.attachmentLengths()` /
+  `v.attachmentCount()` and queries like "has a PDF larger than 5 MB" work on
+  the summary path. Internal plumbing (`lastChunkId`, `decryptionKeyId`) and
+  the creator's full PEM signing key (`createdBy`, ~800 chars per attachment)
+  are deliberately dropped. With `includeAttachments: false`, attachment
+  expressions are rejected by the coverage guardrails instead of silently
+  returning zero/empty.
+- **`_lastModified`**: always available — the summary entry's `lastModified`
+  metadata is mirrored into the evaluation document, so
+  `v.field("_lastModified")` filters and sort keys work without configuration.
+
+*Plaintext* of encrypted field values is **never** stored in the summary (it only
+exists inside the encrypted document payload); see `allowFullScan` below for
+queries that need it.
 
 ### The "Notes problem" — changing the field selection
 
@@ -127,6 +154,72 @@ app restart restores the summary and continues incrementally instead of rebuildi
 The store registers with the tenant's `CacheManager` like other caches and is
 restored lazily on first use. Purge paths (`purgeDocument`, key revocation) also
 remove summary entries immediately, so plaintext values never outlive access.
+
+### Auto-follow: the summary keeps up with sync
+
+Building the summary requires materializing every document once to extract its
+fields. To avoid paying that as one big stall on the **first query** (receive
+10k documents via sync, then wait), the summary is pulled along automatically as
+changes arrive:
+
+- Every coalesced change event (one per sync batch, one per event-loop turn for
+  local writes) schedules a **background catch-up run** of the summary store.
+  Runs are single-flight; further events during a run coalesce into one
+  follow-up. Compared to the network I/O of a sync, the incremental extraction
+  is cheap — and the first query afterwards finds the summary already current.
+- A database that has no summary store yet **auto-activates** one when its
+  `dbsetup` document carries a `summarySetup` configuration — whether the
+  configuration was just written locally, arrived via sync, or synced long ago
+  (probed once on the first change event after opening). Databases without a
+  `dbsetup` configuration and without any query/`getSummaryStore()` usage never
+  build a summary. System databases (the directory, admin-only databases) are
+  never auto-activated — they have their own indexing and hold no user data
+  worth summarizing.
+- Errors in the background runs are logged and never propagate into write/sync
+  paths.
+
+```typescript
+db.setSummaryAutoUpdateEnabled(false);  // e.g. around a bulk import
+// ... import thousands of documents ...
+db.setSummaryAutoUpdateEnabled(true);   // schedules one catch-up run
+```
+
+### Cold start / initial replication
+
+Consider a user joining an existing app with a large dataset (say a CRM with
+10,000 documents): they import the app definition, replicate the data — and the
+first query should be fast. If the team never persisted a `summarySetup`
+configuration (the lazy `db.query()` defaults were always good enough), there is
+no `dbsetup` document that would auto-activate the summary, so the whole
+extraction cost would fall on that first query.
+
+The fix is **local activation, not a persisted document**: call
+
+```typescript
+db.getSummaryStore();   // activate before / when starting the initial sync
+```
+
+once when opening an app database (or right before kicking off the initial
+replication). That single call is cheap, writes nothing into the database, and
+turns on the auto-follow — the summary is then extracted batch by batch **while
+documents stream in**, and it is already warm when the sync completes.
+
+Why this is always safe:
+
+- **Nothing is written**, so there is nothing that could race with or overwrite
+  a curated configuration another replica may have created. (Do NOT write
+  default settings into `dbsetup` during provisioning/open for exactly that
+  reason: a fresh replica cannot know whether a curated `dbsetup` simply has
+  not synced yet, and its "defaults" would conflict with it.)
+- **Self-healing**: the store starts with the auto-include defaults; if a
+  curated `summarySetup` arrives mid-sync or later, it comes through the same
+  changefeed, changes the config fingerprint and triggers the usual resumable
+  backfill. Starting with defaults always converges to the synced
+  configuration.
+
+Reserve the `dbsetup` document for *deliberate* configuration (an app's
+include/exclude needs, edits in a settings UI) — not as a provisioning
+side-effect.
 
 ## Ad-hoc queries: `db.query()`
 
@@ -200,9 +293,11 @@ yields the decrypted plaintext — or `null` when the field is missing or the ke
 not in the current user's KeyBag, so unreadable values behave as absent instead of
 failing the query.
 
-Because the summary buffer never stores plaintext of encrypted fields, expressions
+Because the summary buffer never stores plaintext of encrypted fields (and skips
+the ciphertext fields entirely — see the extraction rules above), expressions
 containing `decrypt` nodes cannot run on the summary path — `db.query()` rejects
-them with a `MindooQueryError` unless `allowFullScan` is set.
+them with a `MindooQueryError` unless `allowFullScan` is set. The same applies to
+plain `v.field("x_encrypted")` references: the field is not covered.
 
 ### Escape hatch: `allowFullScan`
 

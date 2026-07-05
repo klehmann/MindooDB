@@ -22,4 +22,6 @@ export {
   resolveFieldPath,
   estimateValueSize,
   buildSummaryEvaluationDoc,
+  ATTACHMENTS_FIELD,
+  type SummaryAttachmentInfo,
 } from "./extractSummaryFields";

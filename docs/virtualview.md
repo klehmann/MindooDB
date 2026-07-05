@@ -84,6 +84,59 @@ A VirtualView is an **in-memory tree structure** that organizes documents into c
 └─────────────────────┘      └─────────────────────┘
 ```
 
+## Data Sources: Summary Buffer First
+
+The builds (`build()` / `buildAndUpdate()` — both async) resolve every `withDB`
+source **summary-first**: whenever the view definition can be answered from the
+[document summary buffer](adhoc-queries.md) — declarative expression/field
+columns, an expression filter (or none), all referenced fields covered by the
+summary configuration — the view is fed from the summary, so **no documents are
+materialized** and index builds are as fast as possible. Otherwise the source
+transparently falls back to materialized documents. The fallback is forced by:
+
+- a JS `filterFunction` or a column `valueFunction` (they need the document),
+- expressions using decrypt or view-tree operations,
+- referenced fields not covered by the summary configuration (see the
+  [`dbsetup` design document](adhoc-queries.md)) — attachment expressions
+  (`attachmentNames()`, `attachmentCount()`, …) count as references to
+  `_attachments` and are summary-capable via the slim attachment projection
+  (default on; `includeAttachments: false` forces the fallback),
+- `includeAllDocumentFields`,
+- the explicit **`useFullDocuments`** flag:
+
+```typescript
+// Force materialized documents for this source (expensive by design):
+.withDB("employees", employeeDatabase, filter, { useFullDocuments: true })
+```
+
+`withDB` accepts a declarative expression filter (summary-capable) or a legacy
+JS filter function (forces the document path — existing code keeps its exact
+behavior):
+
+```typescript
+const v = createViewLanguage<Employee>();
+.withDB("employees", employeeDatabase, v.eq(v.field("type"), "employee"))
+```
+
+`build()` is async because choosing the summary buffer requires loading the
+(possibly synced) summary configuration; `buildAndUpdate()` additionally runs
+the initial `update()`.
+
+The decision is recorded on the built view and can be read back per origin —
+useful for logging or a UI that explains why a view runs on the slow path:
+
+```typescript
+const info = view.getDataSourceInfo("employees");
+// { source: "summary", fallbackReasons: [] }
+// or { source: "documents", fallbackReasons: ["the filter is a JS function ..."] }
+view.getAllDataSourceInfos(); // Map<origin, ViewDataSourceInfo>
+```
+
+For manual provider wiring, `createViewDataProvider()` exposes the same
+decision (returning the chosen `source` and, on fallback, the reasons) and
+`collectSummaryFallbackReasons()` lets UIs explain why a view runs on the slow
+path.
+
 ## Getting Started
 
 ### Basic Example: Simple Categorized View
@@ -260,7 +313,7 @@ for await (const entry of nav.entriesForward()) {
 Value functions compute column values dynamically from document data:
 
 ```typescript
-const view = VirtualViewFactory.createView()
+const view = await VirtualViewFactory.createView()
   .addCategoryColumn("yearMonth", {
     // Compute year-month from a date field
     valueFunction: (doc, values, origin) => {
@@ -325,7 +378,7 @@ coverage rules, cost model).
 Use backslash (`\`) in category values to create nested subcategories:
 
 ```typescript
-const view = VirtualViewFactory.createView()
+const view = await VirtualViewFactory.createView()
   .addCategoryColumn("datePath", {
     valueFunction: (doc, values, origin) => {
       const date = new Date(doc.getData().createdAt);
@@ -589,11 +642,12 @@ builder
   .addTotalColumn(name, totalMode, options?)  // Add total column
   .addColumnFromOptions(options)         // Add column with full options
   .withCategorizationStyle(style)        // Categories before/after documents
-  .withDB(origin, db, filterFunction?)   // Add MindooDB data source
-  .withMindooDB(options)                 // Add MindooDB with full options
+  .withDB(origin, db, filter?, options?) // Add MindooDB data source (expression or JS filter;
+                                         // options: { useFullDocuments, includeAllDocumentFields })
+  .withMindooDB(options)                 // Add MindooDB with full options (always document path)
   .withDataProvider(provider)            // Add custom data provider
-  .build(): VirtualView                  // Build the view
-  .buildAndUpdate(): Promise<VirtualView>  // Build and fetch data
+  .build(): Promise<VirtualView>         // Build the view (summary-first for withDB sources)
+  .buildAndUpdate(): Promise<VirtualView>  // Build (summary-first) and fetch data
 ```
 
 ### VirtualView
@@ -610,6 +664,9 @@ view.updateOrigin(origin, options?): Promise<void> // Update specific provider
 // "Progress Reporting & Interruptible Updates" above
 view.applyChanges(change): void          // Apply a VirtualViewDataChange
 view.getEntries(origin, docId): VirtualViewEntryData[]
+view.getDataSourceInfo(origin): ViewDataSourceInfo | undefined
+                                         // Build-time summary-vs-documents decision
+view.getAllDataSourceInfos(): Map<string, ViewDataSourceInfo>
 ```
 
 ### VirtualViewNavigatorBuilder

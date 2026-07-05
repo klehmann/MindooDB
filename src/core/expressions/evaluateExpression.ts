@@ -393,9 +393,18 @@ export function collectDecryptRequests(expression: MindooDBAppExpression): Decry
 }
 
 /**
+ * Operations reading the document's managed `_attachments` array. They are
+ * "context" operations (no `field` node), so the coverage machinery must
+ * account for them explicitly: on the summary path they only work when the
+ * summary stores the attachment projection.
+ */
+const ATTACHMENT_OPERATIONS = new Set(["attachmentNames", "attachmentLengths", "attachmentCount"]);
+
+/**
  * Collects every document field path (`field` and `json` nodes) an
  * expression references. Basis of the query engine's coverage check against
- * the summary configuration.
+ * the summary configuration. Attachment operations count as a reference to
+ * `_attachments` — they read that managed field even without a field node.
  */
 export function getReferencedFields(expression: MindooDBAppExpression): string[] {
   const paths = new Set<string>();
@@ -404,6 +413,8 @@ export function getReferencedFields(expression: MindooDBAppExpression): string[]
       paths.add(node.path);
     } else if (node.kind === "json") {
       paths.add(node.field);
+    } else if (node.kind === "operation" && ATTACHMENT_OPERATIONS.has(node.op)) {
+      paths.add("_attachments");
     }
   });
   return Array.from(paths);

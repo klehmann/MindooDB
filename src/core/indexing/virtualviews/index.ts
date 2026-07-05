@@ -64,7 +64,11 @@ export {
 } from "./types";
 
 // Core classes
-export { VirtualView, type VirtualViewUpdateStats } from "./VirtualView";
+export {
+  VirtualView,
+  type VirtualViewUpdateStats,
+  type ViewDataSourceInfo,
+} from "./VirtualView";
 export { VirtualViewColumn, type VirtualViewColumnOptions } from "./VirtualViewColumn";
 export { VirtualViewEntryData } from "./VirtualViewEntryData";
 export { VirtualViewDataChange } from "./VirtualViewDataChange";
@@ -97,4 +101,5 @@ export {
   VirtualViewFactory,
   VirtualViewBuilder,
   VirtualViewNavigatorBuilder,
+  type WithDBOptions,
 } from "./VirtualViewFactory";
