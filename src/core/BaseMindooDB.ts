@@ -10250,7 +10250,11 @@ export class BaseMindooDB implements MindooDB {
         op: input.op,
         dbid,
         signingKey: input.signerKey,
-        trustedTime: Date.now(),
+        // Head selector, NOT Date.now(): un-witnessed directory revisions get a
+        // provisional trusted time stamped at fold time, which can land AFTER a
+        // wall clock captured here; an at-`now` node would then miss just-written
+        // policy docs. Same rationale as the provisional-entry judgment below.
+        trustedTime: Number.MAX_SAFE_INTEGER,
         isAuthor: input.isAuthor,
         beforeDoc,
         afterDoc,

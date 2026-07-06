@@ -1186,7 +1186,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       op: "doc_read",
       dbid: input.dbid,
       signingKey: input.signingKey,
-      trustedTime: Date.now(),
+      // Head selector, NOT Date.now() — see canDo for the provisional
+      // trusted-time race this avoids.
+      trustedTime: Number.MAX_SAFE_INTEGER,
     });
     return decision.allowed;
   }
@@ -1770,7 +1772,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       op,
       dbid,
       signingKey: currentUser.userSigningPublicKey,
-      trustedTime: Date.now(),
+      // Head selector, NOT Date.now(): un-witnessed directory revisions carry a
+      // provisional trusted time stamped at fold time, which can land a tick
+      // AFTER a wall clock captured here — an at-`now` query would then miss
+      // just-synced policy docs and default-allow. Same rationale as the
+      // provisional-entry judgment in BaseMindooDB materialization.
+      trustedTime: Number.MAX_SAFE_INTEGER,
       isAuthor: true,
       beforeDoc: candidateDoc ?? null,
       afterDoc: candidateDoc ?? null,
