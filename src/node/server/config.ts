@@ -38,7 +38,11 @@ export function isTenantCreationCapabilityRule(ruleKey: string): boolean {
   const method = ruleKey.substring(0, colonIdx).toUpperCase();
   const pathPattern = ruleKey.substring(colonIdx + 1);
 
-  return method === "POST" && pathPattern.startsWith("/system/tenants/");
+  // Segment-exact: tenant creation targets exactly one segment under
+  // `/system/tenants/` (the tenant id, which may itself be a `*` pattern). A
+  // prefix test would let a wildcard `*` principal be configured on an existing
+  // tenant's sub-resource (e.g. `.../sync-servers`), an over-grant (audit #6).
+  return method === "POST" && /^\/system\/tenants\/[^/]+\/?$/.test(pathPattern);
 }
 
 export function isWildcardSystemAdminPrincipal(

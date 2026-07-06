@@ -901,4 +901,116 @@ describe("Attachments", () => {
       expect(data1).toEqual(testData);
     }, 60000);
   });
+
+  describe("signed attachmentRefs snapshot on doc entries", () => {
+    // Fetch all document store entries (doc_create/doc_change/doc_snapshot/
+    // doc_delete) for a docId, newest first.
+    async function docEntriesNewestFirst(database: MindooDB, docId: string) {
+      const store = database.getStore();
+      const ids = (await store.getAllIds()).filter((id) => id.startsWith(`${docId}_d_`));
+      const entries = await store.getEntries(ids);
+      return entries.sort((a, b) => b.createdAt - a.createdAt);
+    }
+
+    it("records the full attachment set on the change entry", async () => {
+      const doc = await db.createDocument();
+      let ref: AttachmentReference | undefined;
+      await db.changeDoc(doc, async (d) => {
+        ref = await d.addAttachment(new Uint8Array([1, 2, 3, 4, 5]), "a.bin", "application/octet-stream");
+      });
+
+      const [latest] = await docEntriesNewestFirst(db, doc.getId());
+      expect(latest.attachmentRefs).toBeDefined();
+      expect(latest.attachmentRefs!.length).toBe(1);
+      expect(latest.attachmentRefs![0].attachmentId).toBe(ref!.attachmentId);
+      expect(latest.attachmentRefs![0].lastChunkId).toBe(ref!.lastChunkId);
+      expect(latest.attachmentRefs![0].size).toBe(ref!.size);
+    }, 30000);
+
+    it("is sorted by attachmentId for canonical signing order", async () => {
+      const doc = await db.createDocument();
+      await db.changeDoc(doc, async (d) => {
+        await d.addAttachment(new Uint8Array([1]), "a.bin", "application/octet-stream");
+        await d.addAttachment(new Uint8Array([2]), "b.bin", "application/octet-stream");
+        await d.addAttachment(new Uint8Array([3]), "c.bin", "application/octet-stream");
+      });
+
+      const [latest] = await docEntriesNewestFirst(db, doc.getId());
+      const ids = latest.attachmentRefs!.map((r) => r.attachmentId);
+      const sorted = [...ids].sort();
+      expect(ids).toEqual(sorted);
+    }, 30000);
+
+    it("reflects removals in a later revision", async () => {
+      const doc = await db.createDocument();
+      let ref: AttachmentReference | undefined;
+      await db.changeDoc(doc, async (d) => {
+        ref = await d.addAttachment(new Uint8Array([1, 2, 3]), "a.bin", "application/octet-stream");
+      });
+      await db.changeDoc(doc, async (d) => {
+        await d.removeAttachment(ref!.attachmentId);
+      });
+
+      const [latest] = await docEntriesNewestFirst(db, doc.getId());
+      // Empty set is canonicalized to undefined (omit-when-empty).
+      expect(latest.attachmentRefs ?? []).toEqual([]);
+    }, 30000);
+
+    it("updates lastChunkId and size after appendToAttachment", async () => {
+      const doc = await db.createDocument();
+      let ref: AttachmentReference | undefined;
+      await db.changeDoc(doc, async (d) => {
+        ref = await d.addAttachment(new Uint8Array([1, 2, 3]), "log.bin", "application/octet-stream");
+      });
+      await db.changeDoc(doc, async (d) => {
+        await d.appendToAttachment(ref!.attachmentId, new Uint8Array([4, 5, 6, 7]));
+      });
+
+      const [latest] = await docEntriesNewestFirst(db, doc.getId());
+      expect(latest.attachmentRefs!.length).toBe(1);
+      expect(latest.attachmentRefs![0].attachmentId).toBe(ref!.attachmentId);
+      expect(latest.attachmentRefs![0].size).toBe(7);
+      // The append produced a new last chunk, so lastChunkId moved past the original.
+      expect(latest.attachmentRefs![0].lastChunkId).not.toBe(ref!.lastChunkId);
+    }, 30000);
+
+    it("writes an empty set on doc_delete", async () => {
+      const doc = await db.createDocument();
+      await db.changeDoc(doc, async (d) => {
+        await d.addAttachment(new Uint8Array([1, 2, 3]), "a.bin", "application/octet-stream");
+      });
+      await db.deleteDocument(doc.getId());
+
+      const entries = await docEntriesNewestFirst(db, doc.getId());
+      const deleteEntry = entries.find((e) => e.entryType === "doc_delete");
+      expect(deleteEntry).toBeDefined();
+      expect(deleteEntry!.attachmentRefs ?? []).toEqual([]);
+    }, 30000);
+
+    it("carries the live set onto a doc_snapshot", async () => {
+      // A dedicated DB with aggressive snapshot settings to force a snapshot.
+      const snapDb = await tenant.openDB("test-db-snapshot", {
+        attachmentConfig: { chunkSizeBytes: 128 },
+        snapshotConfig: { minChanges: 1, cooldownMs: 0 },
+      });
+      const doc = await snapDb.createDocument();
+      let ref: AttachmentReference | undefined;
+      await snapDb.changeDoc(doc, async (d) => {
+        ref = await d.addAttachment(new Uint8Array([1, 2, 3, 4]), "a.bin", "application/octet-stream");
+      });
+      // A couple more changes to trigger the snapshot heuristic.
+      await snapDb.changeDoc(doc, (d) => {
+        d.getData().n = 1;
+      });
+      await snapDb.changeDoc(doc, (d) => {
+        d.getData().n = 2;
+      });
+
+      const entries = await docEntriesNewestFirst(snapDb, doc.getId());
+      const snapshot = entries.find((e) => e.entryType === "doc_snapshot");
+      expect(snapshot).toBeDefined();
+      expect(snapshot!.attachmentRefs).toBeDefined();
+      expect(snapshot!.attachmentRefs!.some((r) => r.attachmentId === ref!.attachmentId)).toBe(true);
+    }, 30000);
+  });
 });

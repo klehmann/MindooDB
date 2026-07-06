@@ -2,7 +2,7 @@
 
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
-MindooDB is an **end-to-end encrypted, offline-first sync database**.
+MindooDB is an **end-to-end encrypted, local-first sync database**.
 It lets apps collaborate and sync data without giving servers access to the contents.
 
 Even if someone has full access to your infrastructure — database dumps, backups, logs — all they get is ciphertext.
@@ -54,7 +54,7 @@ Traditional databases trust the server. If your hosting provider is compromised,
 | Feature | What It Means |
 |---------|---------------|
 | 🛡️ **End-to-End Encrypted** | Data encrypted on client before sync. Servers can't decrypt. |
-| 📴 **Offline-First** | Create and edit documents without network. Sync when online. |
+| 📴 **Local-First** | Create and edit documents without network. Sync when online. |
 | ✍️ **Signed Changes** | Every change is digitally signed. Proves authorship, prevents tampering. |
 | 🔗 **Tamperproof History** | Append-only, cryptographically chained. Like a blockchain for your docs. |
 | 🤝 **Real-time Collaboration** | Built on [Automerge](https://automerge.org/) CRDTs. Conflicts resolve automatically. |
@@ -245,7 +245,7 @@ Append-only storage means nothing is ever deleted:
 - **Collaborative Editing**: Real-time co-editing with signed changes
 - **Secure File Sharing**: Named keys for need-to-know access
 - **Audit-Critical Systems**: Tamperproof history meets compliance requirements
-- **Offline-First Apps**: Full functionality without network; sync when connected
+- **Local-First Apps**: Full functionality without network; sync when connected
 - **Mobile Apps**: End-to-end encrypted sync with native performance
 
 See: [Use Cases Documentation](./docs/usecases/README.md)
@@ -257,6 +257,8 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Architecture Specification](./docs/specification.md) — Full technical details
 - [React Native Guide](./docs/reactnative.md) — Native Automerge setup and troubleshooting
 - [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
+- [Ad-hoc Queries & Reactive Updates](./docs/adhoc-queries.md) — Summary buffer, `db.query()`, ephemeral views, live queries and change listeners
+- [Full-Text Search](./docs/fulltext-search.md) — Client-side encrypted full-text index, `db.searchText()`, the query `text` clause, attachment text extraction
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization

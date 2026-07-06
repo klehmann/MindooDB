@@ -19,6 +19,7 @@ import {
 import { planAttachmentReadByWalkingMetadata } from "./AttachmentReadPlanner";
 import { createIdBloomSummary } from "./bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "./MaterializationPlanner";
+import { scanDocScopedEntries } from "./scanUtils";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -134,6 +135,47 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
 
     // Invalidate sorted entries cache since new entries were added
     this.sortedEntriesCache = null;
+  }
+
+  /**
+   * Apply witness receipts to already-stored entries (docs/accesscontrol.md §5.3).
+   *
+   * Copies the witness fields onto the local metadata and assigns a fresh
+   * `receiptOrder` so the revision feed's `scanEntriesSince` cursor re-discovers
+   * the entry and re-anchors it from the provisional head to its committed
+   * `receivedAt`. Receipts whose entry is absent locally are ignored.
+   */
+  async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
+    let mutated = false;
+    for (const receipt of receipts) {
+      if (receipt.receivedAt === undefined) {
+        continue;
+      }
+      const existing = this.entries.get(receipt.id);
+      if (!existing) {
+        continue;
+      }
+      // Already witnessed with the same receipt: nothing to do (idempotent).
+      if (
+        existing.receivedAt === receipt.receivedAt &&
+        existing.receivedByPublicKey === receipt.receivedByPublicKey
+      ) {
+        continue;
+      }
+      this.entries.set(receipt.id, {
+        ...existing,
+        receivedAt: receipt.receivedAt,
+        receivedByPublicKey: receipt.receivedByPublicKey,
+        receivedDateSignature: receipt.receivedDateSignature,
+        receiptScheme: receipt.receiptScheme,
+        // Fresh receipt order so the gap-free scan cursor re-delivers it.
+        receiptOrder: this.nextReceiptOrder++,
+      });
+      mutated = true;
+    }
+    if (mutated) {
+      this.sortedEntriesCache = null;
+    }
   }
 
   /**
@@ -375,6 +417,22 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     limit: number = Number.MAX_SAFE_INTEGER,
     filters?: StoreScanFilters
   ): Promise<StoreScanResult> {
+    // Doc-scoped fast path: resolve the docId through the secondary index so
+    // the scan cost is O(entries of this doc) instead of O(entries in store).
+    if (filters?.docId) {
+      const docEntries: StoreEntryMetadata[] = [];
+      const ids = this.docIndex.get(filters.docId);
+      if (ids) {
+        for (const id of ids) {
+          const meta = this.entries.get(id);
+          if (meta) {
+            docEntries.push(meta);
+          }
+        }
+      }
+      return scanDocScopedEntries(docEntries, cursor, limit, filters);
+    }
+
     const sorted = this.getSortedEntries();
     const startIdx =
       cursor === null

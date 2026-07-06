@@ -192,7 +192,7 @@ describe("Trust Model Security", () => {
 
       await directory.revokeUser(
         trustedUser.username,
-        false,
+        {},
         adminUser.userSigningKeyPair.privateKey,
         adminUserPassword
       );
@@ -209,7 +209,7 @@ describe("Trust Model Security", () => {
 
       await directory.revokeUser(
         currentUser.username,
-        false,
+        {},
         adminUser.userSigningKeyPair.privateKey,
         adminUserPassword
       );
@@ -420,7 +420,7 @@ describe("Trust Model Security", () => {
       // Revoke the user
       await directory.revokeUser(
         publicRevokedUser.username,
-        false, // requestDataWipe
+        {}, // full revocation
         adminUser.userSigningKeyPair.privateKey,
         adminUserPassword
       );

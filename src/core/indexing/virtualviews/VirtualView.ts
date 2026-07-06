@@ -3,7 +3,7 @@ import { VirtualViewEntryData } from "./VirtualViewEntryData";
 import { VirtualViewDataChange } from "./VirtualViewDataChange";
 import { ViewEntrySortKey } from "./ViewEntrySortKey";
 import { ViewEntrySortKeyComparator } from "./ViewEntrySortKeyComparator";
-import type { IVirtualViewDataProvider } from "./IVirtualViewDataProvider";
+import type { IVirtualViewDataProvider, VirtualViewUpdateOptions } from "./IVirtualViewDataProvider";
 import {
   CategorizationStyle,
   ColumnSorting,
@@ -16,6 +16,30 @@ import {
 import type { LocalCacheStore } from "../../cache/LocalCacheStore";
 import type { ICacheable } from "../../cache/CacheManager";
 import type { CacheManager } from "../../cache/CacheManager";
+import type { MindooDB } from "../../types";
+
+/** Statistics passed to {@link VirtualView.onDidUpdate} listeners. */
+export interface VirtualViewUpdateStats {
+  /** Entries added or replaced by the applied change batch. */
+  addedCount: number;
+  /** Entries removed by the applied change batch. */
+  removedCount: number;
+}
+
+/**
+ * How a `withDB` data source was resolved at build time (see
+ * `createViewDataProvider`): read via {@link VirtualView.getDataSourceInfo}
+ * to log or surface in a UI why a view runs on the slow document path.
+ */
+export interface ViewDataSourceInfo {
+  /** The data path chosen for this origin. */
+  source: "summary" | "documents";
+  /**
+   * When `source` is `"documents"`, the reasons why the summary path was
+   * not usable (empty for an explicit `useFullDocuments` request).
+   */
+  fallbackReasons: string[];
+}
 
 /**
  * Compact serialized sort key stored in the virtual-view tree cache.
@@ -117,9 +141,12 @@ export class VirtualView {
   
   /** Data providers */
   private dataProviderByOrigin: Map<string, IVirtualViewDataProvider> = new Map();
+
+  /** Build-time data-source decision per origin (only for builder `withDB` sources) */
+  private dataSourceInfoByOrigin: Map<string, ViewDataSourceInfo> = new Map();
   
   /** Entries pending sibling index recalculation */
-  private pendingSiblingIndexFlush: Map<string, VirtualViewEntryData[]> = new Map();
+  private pendingSiblingIndexFlush: Set<VirtualViewEntryData> = new Set();
   
   /** Last index update timestamp */
   private lastIndexUpdateTime: number | null = null;
@@ -129,6 +156,24 @@ export class VirtualView {
   private viewCacheId: string | null = null;
   private viewCacheVersion: string | null = null;
   private isDirty: boolean = false;
+  /**
+   * Minimum time between full serializations of the view cache. Serializing
+   * the whole tree is expensive, so active editing sessions should not pay
+   * it on every periodic cache flush (default flush interval is 5 s). A
+   * deferred flush keeps the dirty flag set and lands once the interval has
+   * elapsed; shutdown/deregister flushes bypass the interval (`force`).
+   */
+  private minCacheFlushIntervalMs: number = 15000;
+  /** Timestamp of the last completed cache serialization. */
+  private lastCacheFlushAt: number = 0;
+  /** Whether the most recent flush attempt was deferred by the min interval. */
+  private lastFlushDeferred: boolean = false;
+
+  // Live-view support (see bindTo/onDidUpdate)
+  private updateListeners: Set<(stats: VirtualViewUpdateStats) => void> = new Set();
+  private liveUnsubscribes: Array<() => void> = [];
+  private liveUpdateRunning: boolean = false;
+  private liveUpdatePending: boolean = false;
 
   constructor(columns: VirtualViewColumn[]) {
     this.columns = [...columns];
@@ -224,21 +269,62 @@ export class VirtualView {
   }
 
   /**
-   * Update all data providers (async)
+   * Record how a data source was resolved at build time (summary vs
+   * documents). Called by the view builder; not intended for user code.
    */
-  async update(): Promise<void> {
+  setDataSourceInfo(origin: string, info: ViewDataSourceInfo): this {
+    this.dataSourceInfoByOrigin.set(origin, { ...info, fallbackReasons: [...info.fallbackReasons] });
+    return this;
+  }
+
+  /**
+   * How the `withDB` source with the given origin was resolved at build
+   * time: `"summary"` (fast path, no document materialization) or
+   * `"documents"` with the {@link ViewDataSourceInfo.fallbackReasons}
+   * explaining why the summary path was not usable. Returns `undefined`
+   * for sources that were not resolved by the builder (custom providers,
+   * `withMindooDB`, unknown origins).
+   */
+  getDataSourceInfo(origin: string): ViewDataSourceInfo | undefined {
+    const info = this.dataSourceInfoByOrigin.get(origin);
+    return info ? { ...info, fallbackReasons: [...info.fallbackReasons] } : undefined;
+  }
+
+  /**
+   * The build-time data-source decision for every `withDB` origin (see
+   * {@link getDataSourceInfo}).
+   */
+  getAllDataSourceInfos(): Map<string, ViewDataSourceInfo> {
+    return new Map(
+      Array.from(this.dataSourceInfoByOrigin, ([origin, info]) => [
+        origin,
+        { ...info, fallbackReasons: [...info.fallbackReasons] },
+      ])
+    );
+  }
+
+  /**
+   * Update all data providers (async)
+   *
+   * @param options Optional batching/progress/cancellation options,
+   *   forwarded to each data provider (see {@link VirtualViewUpdateOptions}).
+   */
+  async update(options?: VirtualViewUpdateOptions): Promise<void> {
     for (const provider of this.dataProviderByOrigin.values()) {
-      await provider.update();
+      await provider.update(options);
     }
   }
 
   /**
    * Update a specific data provider by origin
+   *
+   * @param options Optional batching/progress/cancellation options,
+   *   forwarded to the data provider (see {@link VirtualViewUpdateOptions}).
    */
-  async updateOrigin(origin: string): Promise<void> {
+  async updateOrigin(origin: string, options?: VirtualViewUpdateOptions): Promise<void> {
     const provider = this.dataProviderByOrigin.get(origin);
     if (provider) {
-      await provider.update();
+      await provider.update(options);
     }
   }
 
@@ -393,6 +479,99 @@ export class VirtualView {
     if (indexChanged) {
       this.lastIndexUpdateTime = Date.now();
       this.markViewDirty();
+    }
+
+    // Notify live-view listeners after every applied change batch (this
+    // covers both full updates and the intermediate batches produced by
+    // `VirtualViewUpdateOptions.applyBatchSize`).
+    if (this.updateListeners.size > 0) {
+      const stats: VirtualViewUpdateStats = {
+        addedCount: change.getAdditions().size,
+        removedCount: change.getRemovals().size,
+      };
+      for (const listener of this.updateListeners) {
+        try {
+          listener(stats);
+        } catch (error) {
+          // Listener errors must not disturb view maintenance.
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Live views (reactive support)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a listener fired after every applied change batch with
+   * `{ addedCount, removedCount }` — the hook point for UI re-rendering.
+   * Also fires for the intermediate batches of interruptible updates.
+   *
+   * @returns An unsubscribe function.
+   */
+  onDidUpdate(listener: (stats: VirtualViewUpdateStats) => void): () => void {
+    this.updateListeners.add(listener);
+    return () => {
+      this.updateListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Bind this view to a database's change feed: whenever the database
+   * reports changes, `update()` runs automatically (coalesced — while an
+   * update is running further events only set a pending flag, and one
+   * follow-up update runs afterwards, so there is never an update
+   * backlog). Providers are cursor-based and idempotent, so no event
+   * payload inspection is needed.
+   *
+   * An initial update is scheduled immediately. Call the returned
+   * function (or {@link unbind}) to detach.
+   */
+  bindTo(db: MindooDB): () => void {
+    if (!db.addChangeListener) {
+      throw new Error("This MindooDB instance does not support change listeners.");
+    }
+    const unsubscribe = db.addChangeListener(() => {
+      this.scheduleLiveUpdate();
+    });
+    this.liveUnsubscribes.push(unsubscribe);
+    this.scheduleLiveUpdate();
+    return () => {
+      unsubscribe();
+      this.liveUnsubscribes = this.liveUnsubscribes.filter((fn) => fn !== unsubscribe);
+    };
+  }
+
+  /** Detach all change-feed bindings created via {@link bindTo}. */
+  unbind(): void {
+    for (const unsubscribe of this.liveUnsubscribes) {
+      unsubscribe();
+    }
+    this.liveUnsubscribes = [];
+  }
+
+  private scheduleLiveUpdate(): void {
+    if (this.liveUpdateRunning) {
+      this.liveUpdatePending = true;
+      return;
+    }
+    void this.runLiveUpdate();
+  }
+
+  private async runLiveUpdate(): Promise<void> {
+    this.liveUpdateRunning = true;
+    try {
+      do {
+        this.liveUpdatePending = false;
+        try {
+          await this.update();
+        } catch (error) {
+          // Live updates are fire-and-forget; the next change event retries.
+        }
+      } while (this.liveUpdatePending);
+    } finally {
+      this.liveUpdateRunning = false;
     }
   }
 
@@ -752,25 +931,15 @@ export class VirtualView {
   }
 
   private markEntryForSiblingIndexFlush(entry: VirtualViewEntryData): void {
-    const key = scopedDocIdKey(createScopedDocId(entry.origin, entry.docId));
-    let entries = this.pendingSiblingIndexFlush.get(key);
-    if (!entries) {
-      entries = [];
-      this.pendingSiblingIndexFlush.set(key, entries);
-    }
-    if (!entries.includes(entry)) {
-      entries.push(entry);
-    }
+    this.pendingSiblingIndexFlush.add(entry);
   }
 
   private processPendingSiblingIndexUpdates(): void {
-    for (const entries of this.pendingSiblingIndexFlush.values()) {
-      for (const entry of entries) {
-        const children = entry.getChildEntries();
-        let pos = 1;
-        for (const child of children) {
-          child.setSiblingIndex(pos++);
-        }
+    for (const entry of this.pendingSiblingIndexFlush) {
+      const children = entry.getChildEntries();
+      let pos = 1;
+      for (const child of children) {
+        child.setSiblingIndex(pos++);
       }
     }
     this.pendingSiblingIndexFlush.clear();
@@ -796,10 +965,18 @@ export class VirtualView {
    * @param version      Schema/config version for cache invalidation
    * @returns `true` if the view was successfully restored from cache
    */
-  async setCacheManager(cacheManager: CacheManager, viewId: string, version: string): Promise<boolean> {
+  async setCacheManager(
+    cacheManager: CacheManager,
+    viewId: string,
+    version: string,
+    options?: { minCacheFlushIntervalMs?: number },
+  ): Promise<boolean> {
     this.cacheManager = cacheManager;
     this.viewCacheId = viewId;
     this.viewCacheVersion = version;
+    if (options?.minCacheFlushIntervalMs !== undefined) {
+      this.minCacheFlushIntervalMs = Math.max(0, options.minCacheFlushIntervalMs);
+    }
     cacheManager.register(this as unknown as ICacheable);
     return this.restoreFromCache(cacheManager.getStore());
   }
@@ -813,15 +990,39 @@ export class VirtualView {
   }
 
   clearDirty(): void {
+    if (this.lastFlushDeferred) {
+      // The last flush attempt was deferred by the min flush interval: keep
+      // the dirty flag and re-arm the cache manager so the deferred state
+      // lands on a later flush cycle.
+      this.lastFlushDeferred = false;
+      this.cacheManager?.markDirty();
+      return;
+    }
     this.isDirty = false;
   }
 
   /**
    * Export the view state to the cache store.
+   *
+   * Full-tree serialization is throttled by {@link minCacheFlushIntervalMs}
+   * so active editing sessions don't serialize the entire view on every
+   * periodic flush; `force: true` (shutdown/deregister) bypasses the
+   * throttle.
    */
-  async flushToCache(store: LocalCacheStore): Promise<number> {
+  async flushToCache(store: LocalCacheStore, options?: { force?: boolean }): Promise<number> {
+    const now = Date.now();
+    if (
+      !options?.force
+      && this.lastCacheFlushAt > 0
+      && now - this.lastCacheFlushAt < this.minCacheFlushIntervalMs
+    ) {
+      this.lastFlushDeferred = true;
+      return 0;
+    }
+    this.lastFlushDeferred = false;
     const state = this.exportCacheState();
     await store.put("vv", this.getCachePrefix(), state);
+    this.lastCacheFlushAt = now;
     return 1;
   }
 
@@ -852,41 +1053,55 @@ export class VirtualView {
     return new TextEncoder().encode(JSON.stringify(snapshot));
   }
 
+  /**
+   * Serialize a subtree iteratively (explicit stack) so deep trees cannot
+   * overflow the call stack.
+   */
   private serializeNode(entry: VirtualViewEntryData): SerializedVirtualViewNode {
-    const sk = entry.getSortKey();
-    const comp = entry.getChildrenComparator();
-
-    const children = entry.getChildEntries();
-    const serializedChildren = children.map(c => this.serializeNode(c));
-
-    const node: SerializedVirtualViewNode = {
-      o: entry.origin,
-      d: entry.docId,
-      sk: { c: sk.isCategory, v: [...sk.values], o: sk.origin, d: sk.docId },
-      cv: entry.getColumnValues(),
-      il: entry.getIndentLevels(),
-      si: entry.getSiblingIndex(),
-      cod: comp.getCategoryOrderDescending(),
-      cnt: [
-        entry.getChildCount(),
-        entry.getChildCategoryCount(),
-        entry.getChildDocumentCount(),
-        entry.getDescendantCount(),
-        entry.getDescendantDocumentCount(),
-        entry.getDescendantCategoryCount(),
-      ],
-      ch: serializedChildren,
+    const buildNode = (e: VirtualViewEntryData): SerializedVirtualViewNode => {
+      const sk = e.getSortKey();
+      const comp = e.getChildrenComparator();
+      const node: SerializedVirtualViewNode = {
+        o: e.origin,
+        d: e.docId,
+        sk: { c: sk.isCategory, v: [...sk.values], o: sk.origin, d: sk.docId },
+        cv: e.getColumnValues(),
+        il: e.getIndentLevels(),
+        si: e.getSiblingIndex(),
+        cod: comp.getCategoryOrderDescending(),
+        cnt: [
+          e.getChildCount(),
+          e.getChildCategoryCount(),
+          e.getChildDocumentCount(),
+          e.getDescendantCount(),
+          e.getDescendantDocumentCount(),
+          e.getDescendantCategoryCount(),
+        ],
+        ch: [],
+      };
+      const tv = e.getTotalValues();
+      if (tv && Object.keys(tv).length > 0) {
+        node.tv = tv;
+      }
+      if (e.isDocument() && e.getDecryptionKeyId()) {
+        node.dk = e.getDecryptionKeyId();
+      }
+      return node;
     };
 
-    const tv = entry.getTotalValues();
-    if (tv && Object.keys(tv).length > 0) {
-      node.tv = tv;
+    const rootNode = buildNode(entry);
+    const stack: Array<{ entry: VirtualViewEntryData; node: SerializedVirtualViewNode }> = [
+      { entry, node: rootNode },
+    ];
+    while (stack.length > 0) {
+      const { entry: currentEntry, node } = stack.pop()!;
+      for (const child of currentEntry.getChildEntries()) {
+        const childNode = buildNode(child);
+        node.ch.push(childNode);
+        stack.push({ entry: child, node: childNode });
+      }
     }
-    if (entry.isDocument() && entry.getDecryptionKeyId()) {
-      node.dk = entry.getDecryptionKeyId();
-    }
-
-    return node;
+    return rootNode;
   }
 
   /**
@@ -941,59 +1156,73 @@ export class VirtualView {
     return true;
   }
 
+  /**
+   * Restore a subtree iteratively (explicit stack) so deep trees cannot
+   * overflow the call stack.
+   */
   private deserializeNode(
     data: any,
     parent: VirtualViewEntryData | null,
     docOrderDesc: boolean[],
   ): VirtualViewEntryData {
-    const sk = ViewEntrySortKey.createSortKey(
-      data.sk.c,
-      data.sk.v,
-      data.sk.o,
-      data.sk.d,
-    );
-    const comparator = new ViewEntrySortKeyComparator(
-      this.categorizationStyle,
-      data.cod,
-      docOrderDesc,
-    );
+    const buildEntry = (nodeData: any, nodeParent: VirtualViewEntryData | null): VirtualViewEntryData => {
+      const sk = ViewEntrySortKey.createSortKey(
+        nodeData.sk.c,
+        nodeData.sk.v,
+        nodeData.sk.o,
+        nodeData.sk.d,
+      );
+      const comparator = new ViewEntrySortKeyComparator(
+        this.categorizationStyle,
+        nodeData.cod,
+        docOrderDesc,
+      );
 
-    const entry = new VirtualViewEntryData(
-      this,
-      parent,
-      data.o,
-      data.d,
-      sk,
-      comparator,
-      data.dk,
-    );
-    entry.setColumnValues(data.cv ?? {});
-    entry.setIndentLevels(data.il ?? 0);
-    entry.setSiblingIndex(data.si ?? 0);
+      const entry = new VirtualViewEntryData(
+        this,
+        nodeParent,
+        nodeData.o,
+        nodeData.d,
+        sk,
+        comparator,
+        nodeData.dk,
+      );
+      entry.setColumnValues(nodeData.cv ?? {});
+      entry.setIndentLevels(nodeData.il ?? 0);
+      entry.setSiblingIndex(nodeData.si ?? 0);
 
-    if (data.tv) {
-      entry._restoreTotalValues(data.tv);
-    }
+      if (nodeData.tv) {
+        entry._restoreTotalValues(nodeData.tv);
+      }
 
-    const cnt: number[] = data.cnt ?? [0, 0, 0, 0, 0, 0];
-    entry._restoreCounts(cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5]);
+      const cnt: number[] = nodeData.cnt ?? [0, 0, 0, 0, 0, 0];
+      entry._restoreCounts(cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5]);
 
-    const scopedKey = scopedDocIdKey(createScopedDocId(data.o, data.d));
-    const existing = this.entriesByDocId.get(scopedKey);
-    if (existing) {
-      existing.push(entry);
-    } else {
-      this.entriesByDocId.set(scopedKey, [entry]);
-    }
+      const scopedKey = scopedDocIdKey(createScopedDocId(nodeData.o, nodeData.d));
+      const existing = this.entriesByDocId.get(scopedKey);
+      if (existing) {
+        existing.push(entry);
+      } else {
+        this.entriesByDocId.set(scopedKey, [entry]);
+      }
+      return entry;
+    };
 
-    if (data.ch) {
-      for (const childData of data.ch) {
-        const child = this.deserializeNode(childData, entry, docOrderDesc);
-        entry._addRestoredChild(child);
+    const rootEntry = buildEntry(data, parent);
+    const stack: Array<{ data: any; entry: VirtualViewEntryData }> = [
+      { data, entry: rootEntry },
+    ];
+    while (stack.length > 0) {
+      const { data: nodeData, entry } = stack.pop()!;
+      if (nodeData.ch) {
+        for (const childData of nodeData.ch) {
+          const child = buildEntry(childData, entry);
+          entry._addRestoredChild(child);
+          stack.push({ data: childData, entry: child });
+        }
       }
     }
-
-    return entry;
+    return rootEntry;
   }
 
   /**

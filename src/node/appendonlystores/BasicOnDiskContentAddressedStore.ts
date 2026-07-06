@@ -64,6 +64,7 @@ import {
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
+import { scanDocScopedEntries } from "../../core/appendonlystores/scanUtils";
 import type { StoreEntry, StoreEntryMetadata, StoreEntryType } from "../../core/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 
@@ -78,8 +79,11 @@ import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
  * (a `Uint8Array` at runtime) is stored as a base64-encoded string so it
  * can be written directly to JSON files and metadata segments.
  */
-interface SerializedStoreEntryMetadata extends Omit<StoreEntryMetadata, "signature"> {
+interface SerializedStoreEntryMetadata
+  extends Omit<StoreEntryMetadata, "signature" | "metadataSignature" | "receivedDateSignature"> {
   signature: string; // base64
+  metadataSignature?: string; // base64 (author metadata-binding signature)
+  receivedDateSignature?: string; // base64 (access-control witness receipt)
 }
 
 /**
@@ -127,6 +131,12 @@ function serializeMetadata(metadata: StoreEntryMetadata): SerializedStoreEntryMe
   return {
     ...metadata,
     signature: Buffer.from(metadata.signature).toString("base64"),
+    metadataSignature: metadata.metadataSignature
+      ? Buffer.from(metadata.metadataSignature).toString("base64")
+      : undefined,
+    receivedDateSignature: metadata.receivedDateSignature
+      ? Buffer.from(metadata.receivedDateSignature).toString("base64")
+      : undefined,
   };
 }
 
@@ -138,6 +148,12 @@ function deserializeMetadata(serialized: SerializedStoreEntryMetadata): StoreEnt
   return {
     ...serialized,
     signature: new Uint8Array(Buffer.from(serialized.signature, "base64")),
+    metadataSignature: serialized.metadataSignature
+      ? new Uint8Array(Buffer.from(serialized.metadataSignature, "base64"))
+      : undefined,
+    receivedDateSignature: serialized.receivedDateSignature
+      ? new Uint8Array(Buffer.from(serialized.receivedDateSignature, "base64"))
+      : undefined,
   };
 }
 
@@ -799,6 +815,25 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   }
 
   /**
+   * Resolve all metadata entries for a document through the `docIndex`.
+   * O(entries of the doc); used by the doc-scoped scan fast path.
+   */
+  private collectDocMetadata(docId: string): StoreEntryMetadata[] {
+    const ids = this.docIndex.get(docId);
+    if (!ids || ids.size === 0) {
+      return [];
+    }
+    const result: StoreEntryMetadata[] = [];
+    for (const id of ids) {
+      const meta = this.entries.get(id);
+      if (meta) {
+        result.push(meta);
+      }
+    }
+    return result;
+  }
+
+  /**
    * Test whether a metadata entry passes the given scan filters.
    * Evaluates docId, entryTypes whitelist, and creationDate range.
    * Returns `true` when no filters are provided or all checks pass.
@@ -1197,6 +1232,57 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   }
 
   /**
+   * Apply witness receipts to already-stored entries (docs/accesscontrol.md §5.3).
+   *
+   * Rewrites the affected metadata files with the witness fields and a fresh
+   * `receiptOrder` so the revision feed's `scanEntriesSince` cursor re-discovers
+   * the now-witnessed entries. Receipts whose entry is absent locally, or that
+   * match the already-stored witness, are skipped (idempotent).
+   */
+  async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
+    await this.ensureInitialized();
+    const segmentRecords: SerializedMetadataSegmentRecord[] = [];
+
+    for (const receipt of receipts) {
+      if (receipt.receivedAt === undefined) {
+        continue;
+      }
+      const existing = await this.readMetadataById(receipt.id);
+      if (!existing) {
+        continue;
+      }
+      if (
+        existing.receivedAt === receipt.receivedAt &&
+        existing.receivedByPublicKey === receipt.receivedByPublicKey
+      ) {
+        continue;
+      }
+
+      const updated: StoreEntryMetadata = {
+        ...existing,
+        receivedAt: receipt.receivedAt,
+        receivedByPublicKey: receipt.receivedByPublicKey,
+        receivedDateSignature: receipt.receivedDateSignature,
+        receiptScheme: receipt.receiptScheme,
+        receiptOrder: this.nextReceiptOrder++,
+      };
+      await this.writeFileAtomic(
+        this.metadataPathForId(receipt.id),
+        JSON.stringify(serializeMetadata(updated)),
+      );
+
+      if (this.indexingEnabled) {
+        this.applyMetadataUpsert(updated);
+        segmentRecords.push({ op: "upsert", metadata: serializeMetadata(updated) });
+      }
+    }
+
+    if (segmentRecords.length > 0 && this.indexingEnabled) {
+      await this.appendMetadataSegment(segmentRecords);
+    }
+  }
+
+  /**
    * Retrieve full entries (metadata + encrypted payload) by id.
    *
    * IDs that are not found or whose content file is missing are silently
@@ -1205,22 +1291,38 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    */
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
     await this.ensureInitialized();
+
+    // Read metadata/content files in parallel chunks: sequential awaits pay
+    // one full disk round trip per entry, which dominates bulk hydration
+    // (document materialization, sync batches). Chunking bounds the number
+    // of concurrently open file handles.
+    const concurrency = 16;
     const result: StoreEntry[] = [];
 
-    for (const id of ids) {
+    const loadOne = async (id: string): Promise<StoreEntry | null> => {
       const metadata = await this.readMetadataById(id);
       if (!metadata) {
-        continue;
+        return null;
       }
 
       const contentPath = this.contentPathForHash(metadata.contentHash);
       if (!(await this.fileExists(contentPath))) {
         this.logger.warn(`Content ${metadata.contentHash} not found for entry ${id}`);
-        continue;
+        return null;
       }
 
       const encryptedData = new Uint8Array(await readFile(contentPath));
-      result.push({ ...metadata, encryptedData });
+      return { ...metadata, encryptedData };
+    };
+
+    for (let offset = 0; offset < ids.length; offset += concurrency) {
+      const chunk = ids.slice(offset, offset + concurrency);
+      const loaded = await Promise.all(chunk.map(loadOne));
+      for (const entry of loaded) {
+        if (entry) {
+          result.push(entry);
+        }
+      }
     }
     return result;
   }
@@ -1380,6 +1482,17 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   ): Promise<StoreScanResult> {
     await this.ensureInitialized();
     if (this.indexingEnabled) {
+      // Doc-scoped fast path: resolve the docId through the secondary index so
+      // the scan cost is O(entries of this doc) instead of O(entries in store).
+      if (filters?.docId) {
+        return scanDocScopedEntries(
+          this.collectDocMetadata(filters.docId),
+          cursor,
+          limit,
+          filters,
+        );
+      }
+
       // Indexed path: O(logN) lower-bound + O(pageSize) slice/filter.
       const startIndex = this.lowerBoundForCursor(cursor);
 

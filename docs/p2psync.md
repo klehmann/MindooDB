@@ -210,9 +210,9 @@ Before two peers can sync, they need to find each other. MindooDB does not presc
 
 ## 10) Practical Considerations
 
-### Offline-first behavior
+### Local-first behavior
 
-Every peer should maintain a local store that works independently of network connectivity. When a connection is available, sync transfers missing entries. When the connection drops, the peer continues working with its local data. This is the same offline-first model used in client-server sync — P2P simply adds more sync targets.
+Every peer should maintain a local store that works independently of network connectivity. When a connection is available, sync transfers missing entries. When the connection drops, the peer continues working with its local data. This is the same local-first model used in client-server sync — P2P simply adds more sync targets.
 
 ### Conflict resolution
 

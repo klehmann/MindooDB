@@ -27,6 +27,7 @@ import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
+import { negotiateSync } from "../../core/accesscontrol/receiptValidation";
 
 type SharedAuthenticationState = {
   accessToken: string | null;
@@ -143,16 +144,20 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * Store entries to the remote store.
    * The entries are pushed to the server immediately.
    */
-  async putEntries(entries: StoreEntry[]): Promise<void> {
+  async putEntries(entries: StoreEntry[]): Promise<void | StoreEntryMetadata[]> {
     if (entries.length === 0) {
-      return;
+      return [];
     }
 
-    await this.withTransparentReauth("putEntries", async () => {
+    return this.withTransparentReauth("putEntries", async () => {
       this.logger.debug(`Pushing ${entries.length} entries to remote`);
       const token = await this.ensureAuthenticated();
-      await this.transport.putEntries(token, entries);
-      this.logger.debug(`Successfully pushed ${entries.length} entries`);
+      // The server stamps witness receipts onto accepted entries and returns
+      // them so the pushing client can persist the attestation locally
+      // (docs/accesscontrol.md §5.3). Surface them to the sync orchestrator.
+      const receipts = await this.transport.putEntries(token, entries);
+      this.logger.debug(`Successfully pushed ${entries.length} entries (${receipts.length} receipts)`);
+      return receipts;
     });
   }
 
@@ -396,7 +401,23 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.capabilitiesPromise = this.withTransparentReauth("getCapabilities", async () => {
       const token = await this.ensureAuthenticated();
       if (this.transport.getCapabilities) {
-        this.capabilitiesCache = await this.transport.getCapabilities(token);
+        const capabilities = await this.transport.getCapabilities(token);
+        // Clock-skew guard (docs/accesscontrol.md §4): if the server reports its
+        // time and our local clock diverges beyond tolerance, refuse to sync —
+        // a wrong local clock would make `createdAt`/trusted-time decisions
+        // unsafe. Only the clock-skew arm is enforced here (no strict mode), so
+        // servers that do not report `serverTime` are unaffected.
+        const negotiation = negotiateSync(Date.now(), {
+          serverTime: capabilities.serverTime,
+          supportsAccessControlV1: capabilities.supportsAccessControlV1,
+        });
+        if (!negotiation.ok) {
+          throw new NetworkError(
+            NetworkErrorType.SERVER_ERROR,
+            `Refusing to sync: ${negotiation.reason}`,
+          );
+        }
+        this.capabilitiesCache = capabilities;
         return this.capabilitiesCache;
       }
       this.capabilitiesCache = {
@@ -656,6 +677,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         signature: enc.signature,
         originalSize: enc.originalSize,
         encryptedSize: enc.encryptedSize,
+        attachmentRefs: enc.attachmentRefs,
         encryptedData,
       };
       

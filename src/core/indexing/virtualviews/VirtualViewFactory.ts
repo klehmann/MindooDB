@@ -1,5 +1,6 @@
 import type { MindooDB, MindooDoc } from "../../types";
-import { VirtualView } from "./VirtualView";
+import type { MindooDBAppBooleanExpression } from "../../expressions/types";
+import { VirtualView, type ViewDataSourceInfo } from "./VirtualView";
 import { VirtualViewColumn, VirtualViewColumnOptions } from "./VirtualViewColumn";
 import type { VirtualViewEntryData } from "./VirtualViewEntryData";
 import { VirtualViewNavigator } from "./VirtualViewNavigator";
@@ -7,6 +8,7 @@ import type { IVirtualViewDataProvider } from "./IVirtualViewDataProvider";
 import { MindooDBVirtualViewDataProvider, MindooDBVirtualViewDataProviderOptions } from "./MindooDBVirtualViewDataProvider";
 import type { IViewEntryAccessCheck } from "./IViewEntryAccessCheck";
 import { AllowAllAccessCheck, CallbackAccessCheck } from "./IViewEntryAccessCheck";
+import { createViewDataProvider } from "../createViewDataProvider";
 import {
   CategorizationStyle,
   ColumnSorting,
@@ -16,6 +18,34 @@ import {
   DocumentFilterFunction,
 } from "./types";
 
+/** Per-database options for {@link VirtualViewBuilder.withDB}. */
+export interface WithDBOptions {
+  /**
+   * Force materialized documents for this database instead of the summary
+   * buffer — the escape hatch for views that need data the summary cannot
+   * deliver (decrypted fields, uncovered fields, per-document JS
+   * evaluation). Expensive by design; without it `build()` /
+   * `buildAndUpdate()` pick the summary buffer whenever the view
+   * definition allows it.
+   */
+  useFullDocuments?: boolean;
+
+  /**
+   * Copy every (non-underscore) document field into the view entries.
+   * Implies the full-document path (see
+   * {@link MindooDBVirtualViewDataProviderOptions}).
+   */
+  includeAllDocumentFields?: boolean;
+}
+
+/** A `withDB` source awaiting summary-vs-documents resolution at build time. */
+interface PendingDbSource {
+  origin: string;
+  db: MindooDB;
+  filter?: MindooDBAppBooleanExpression | DocumentFilterFunction;
+  options?: WithDBOptions;
+}
+
 /**
  * Builder for creating VirtualView instances with a fluent API
  */
@@ -23,6 +53,11 @@ export class VirtualViewBuilder {
   private columns: VirtualViewColumn[] = [];
   private categorizationStyle: CategorizationStyle = CategorizationStyle.DOCUMENT_THEN_CATEGORY;
   private dataProviders: IVirtualViewDataProvider[] = [];
+  /**
+   * `withDB` sources are resolved lazily at build time: `build()` decides
+   * summary-vs-documents per source (summary-first).
+   */
+  private pendingDbSources: PendingDbSource[] = [];
 
   /**
    * Add a column to the view
@@ -103,20 +138,27 @@ export class VirtualViewBuilder {
   }
 
   /**
-   * Add a MindooDB with simplified options
+   * Add a MindooDB with simplified options.
+   *
+   * The data source is chosen at build time: `build()` / `buildAndUpdate()`
+   * read from the document summary buffer whenever the view definition
+   * allows it (declarative expression/field columns, expression or no
+   * filter, all referenced fields covered by the summary configuration) —
+   * the fastest indexing path, since no documents are materialized. They
+   * fall back to materialized documents otherwise, or when
+   * `options.useFullDocuments` is set.
+   *
+   * @param filter Either a declarative expression (summary-capable) or a
+   *   JS function receiving the materialized document (forces the
+   *   full-document path).
    */
   withDB(
     origin: string,
     db: MindooDB,
-    filterFunction?: DocumentFilterFunction
+    filter?: MindooDBAppBooleanExpression | DocumentFilterFunction,
+    options?: WithDBOptions
   ): this {
-    this.dataProviders.push(
-      new MindooDBVirtualViewDataProvider({
-        origin,
-        db,
-        filterFunction,
-      })
-    );
+    this.pendingDbSources.push({ origin, db, filter, options });
     return this;
   }
 
@@ -129,9 +171,37 @@ export class VirtualViewBuilder {
   }
 
   /**
-   * Build the VirtualView
+   * Build the VirtualView, resolving each `withDB` source summary-first:
+   * the summary buffer is used whenever the view definition allows it,
+   * materialized documents otherwise (or when `useFullDocuments` was set
+   * for that source).
+   *
+   * Async because choosing the summary buffer requires loading the
+   * (possibly synced) summary configuration.
    */
-  build(): VirtualView {
+  async build(): Promise<VirtualView> {
+    const providers = [...this.dataProviders];
+    const dataSourceInfos = new Map<string, ViewDataSourceInfo>();
+    for (const source of this.pendingDbSources) {
+      const { provider, source: chosenSource, fallbackReasons } = await createViewDataProvider({
+        origin: source.origin,
+        db: source.db,
+        columns: this.columns,
+        filter: source.filter,
+        useFullDocuments: source.options?.useFullDocuments,
+        includeAllDocumentFields: source.options?.includeAllDocumentFields,
+      });
+      providers.push(provider);
+      dataSourceInfos.set(source.origin, { source: chosenSource, fallbackReasons });
+    }
+    const view = this.assembleView(providers);
+    for (const [origin, info] of dataSourceInfos) {
+      view.setDataSourceInfo(origin, info);
+    }
+    return view;
+  }
+
+  private assembleView(providers: IVirtualViewDataProvider[]): VirtualView {
     if (this.columns.length === 0) {
       throw new Error("At least one column is required");
     }
@@ -139,7 +209,7 @@ export class VirtualViewBuilder {
     const view = new VirtualView(this.columns);
     view.setCategorizationStyle(this.categorizationStyle);
 
-    for (const provider of this.dataProviders) {
+    for (const provider of providers) {
       provider.init(view);
       view.addDataProvider(provider);
     }
@@ -148,10 +218,11 @@ export class VirtualViewBuilder {
   }
 
   /**
-   * Build the VirtualView and run initial update
+   * Build the VirtualView (summary-first, see `build`) and run the
+   * initial update.
    */
   async buildAndUpdate(): Promise<VirtualView> {
-    const view = this.build();
+    const view = await this.build();
     await view.update();
     return view;
   }

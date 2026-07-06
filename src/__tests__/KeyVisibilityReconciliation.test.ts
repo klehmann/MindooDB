@@ -56,6 +56,7 @@ describe("key visibility reconciliation", () => {
   let creatorDb: MindooDB;
   let readerDb: MindooDB;
   let secretDocId: string;
+  let adminUser: PrivateUserId;
   let adminSigningPublicKey: string;
   let adminEncryptionPublicKey: string;
   let readerUserId: PrivateUserId;
@@ -66,7 +67,7 @@ describe("key visibility reconciliation", () => {
     creatorFactory = new BaseMindooTenantFactory(storeFactory, crypto);
     readerFactory = new BaseMindooTenantFactory(storeFactory, crypto, undefined, cacheStore);
 
-    const adminUser = await creatorFactory.createUserId("CN=admin/O=keyvis", adminPassword);
+    adminUser = await creatorFactory.createUserId("CN=admin/O=keyvis", adminPassword);
     const creatorUser = await creatorFactory.createUserId("CN=creator/O=keyvis", creatorPassword);
     const readerUser = await readerFactory.createUserId("CN=reader/O=keyvis", readerPassword);
     adminSigningPublicKey = adminUser.userSigningKeyPair.publicKey;
@@ -186,6 +187,9 @@ describe("key visibility reconciliation", () => {
     expect(await readerDb.getAllDocumentIds()).toEqual([secretDocId]);
     const revealedDoc = await readerDb.getDocument(secretDocId);
     expect(revealedDoc.getData().title).toBe("Project Alpha");
+    // A normally-loaded doc is accessible and not deleted.
+    expect(revealedDoc.isAccessible()).toBe(true);
+    expect(revealedDoc.isDeleted()).toBe(false);
     expect(view.getRoot().getChildCategories().map((entry) => entry.getCategoryValue())).toEqual(["Restricted"]);
     expect(view.getRoot().getChildCategories()[0].getChildDocuments()).toHaveLength(1);
     expect(view.getRoot().getChildCategories()[0].getChildDocuments()[0].getDecryptionKeyId()).toBe(namedKeyId);
@@ -219,6 +223,20 @@ describe("key visibility reconciliation", () => {
     expect(purgeMetadata).toEqual([
       expect.objectContaining({ docId: secretDocId, isDeleted: true }),
     ]);
+
+    // The full-body feed emits the now-inaccessible doc as a tombstone:
+    // isDeleted() === true, isAccessible() === false, empty data. This lets
+    // incremental consumers drop it and distinguish a missing key from a
+    // genuine deletion (docs/accesscontrol.md §13.5).
+    const purgeChanges = [];
+    for await (const change of readerDb.iterateChangesSince(beforePurgeCursor)) {
+      purgeChanges.push(change);
+    }
+    expect(purgeChanges).toHaveLength(1);
+    expect(purgeChanges[0].doc.getId()).toBe(secretDocId);
+    expect(purgeChanges[0].doc.isDeleted()).toBe(true);
+    expect(purgeChanges[0].doc.isAccessible()).toBe(false);
+    expect(purgeChanges[0].doc.getData()).toEqual({});
 
     await readerKeyBag.set("doc", tenantId, namedKeyId, (await creatorKeyBag.get("doc", tenantId, namedKeyId))!);
     await readerTenant.reconcileKeyBagChanges?.();

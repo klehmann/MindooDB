@@ -2,6 +2,7 @@ import type {
   MindooDBServerInfo,
   StoreEntry,
   StoreEntryMetadata,
+  StoreEntryAttachmentRef,
   StoreEntryType,
   StoreScanCursor,
   StoreScanFilters,
@@ -25,6 +26,7 @@ import type {
 } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
+import { isSameOrigin } from "../../core/utils/urlSafety";
 
 /**
  * HTTP implementation of the NetworkTransport interface.
@@ -87,9 +89,16 @@ export class HttpTransport implements NetworkTransport {
   /**
    * Request a challenge string for authentication.
    */
-  async requestChallenge(username: string): Promise<string> {
-    this.logger.debug(`Requesting challenge for user: ${username}`);
-    
+  async requestChallenge(
+    username?: string,
+    options?: { signingPublicKey?: string },
+  ): Promise<string> {
+    this.logger.debug(`Requesting challenge${username ? ` for user: ${username}` : " by signing key"}`);
+
+    const body: { username?: string; signingPublicKey?: string } = {};
+    if (username) body.username = username;
+    if (options?.signingPublicKey) body.signingPublicKey = options.signingPublicKey;
+
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/auth/challenge`,
       {
@@ -97,7 +106,7 @@ export class HttpTransport implements NetworkTransport {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ username }),
+        body: JSON.stringify(body),
       }
     );
     
@@ -119,21 +128,38 @@ export class HttpTransport implements NetworkTransport {
    */
   async authenticate(challenge: string, signature: Uint8Array): Promise<AuthResult> {
     this.logger.debug(`Authenticating with challenge: ${challenge}`);
-    
-    const response = await this.fetchWithRetry(
-      `${this.baseUrl}/auth/authenticate`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          challenge,
-          signature: this.uint8ArrayToBase64(signature),
-        }),
+
+    let response: Response;
+    try {
+      response = await this.fetchWithRetry(
+        `${this.baseUrl}/auth/authenticate`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            challenge,
+            signature: this.uint8ArrayToBase64(signature),
+          }),
+        }
+      );
+    } catch (error) {
+      // The server now returns HTTP 401 on a failed credential check (audit,
+      // Low). `fetchWithRetry` surfaces that as a (non-retried) INVALID_TOKEN /
+      // USER_REVOKED NetworkError; map it back to a structured AuthResult so the
+      // caller's existing `result.success` handling keeps working.
+      if (
+        error instanceof NetworkError &&
+        (error.type === NetworkErrorType.INVALID_TOKEN ||
+          error.type === NetworkErrorType.USER_REVOKED)
+      ) {
+        this.logger.debug(`Authentication result: failed (${error.type})`);
+        return { success: false, error: error.message };
       }
-    );
-    
+      throw error;
+    }
+
     const data = await response.json();
     
     this.logger.debug(`Authentication result: ${data.success ? "success" : "failed"}`);
@@ -516,10 +542,10 @@ export class HttpTransport implements NetworkTransport {
   /**
    * Push entries to the remote store.
    */
-  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
+  async putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
     this.logger.debug(`Pushing ${entries.length} entries`);
     if (entries.length === 0) {
-      return;
+      return [];
     }
 
     const serializedEntries = entries.map((entry) => this.serializeEntry(entry));
@@ -527,9 +553,10 @@ export class HttpTransport implements NetworkTransport {
     if (maxBodyBytes) {
       this.logger.debug(`Remote JSON body limit advertised as ${maxBodyBytes} bytes`);
     }
-    await this.pushSerializedEntries(token, serializedEntries, maxBodyBytes);
+    const receipts = await this.pushSerializedEntries(token, serializedEntries, maxBodyBytes);
 
-    this.logger.debug(`Successfully pushed ${entries.length} entries`);
+    this.logger.debug(`Successfully pushed ${entries.length} entries (${receipts.length} receipts)`);
+    return receipts;
   }
 
   /**
@@ -652,7 +679,7 @@ export class HttpTransport implements NetworkTransport {
       }
 
       try {
-        const response = await fetch(url, {
+        const response = await this.safeFetch(url, {
           ...options,
           signal: controller.signal,
         });
@@ -748,6 +775,62 @@ export class HttpTransport implements NetworkTransport {
     );
   }
 
+  private static readonly MAX_REDIRECTS = 3;
+
+  /**
+   * `fetch` with manual redirect handling to mitigate redirect-based SSRF
+   * (audit, Medium): a malicious or compromised remote could answer a
+   * server-initiated request with a 3xx pointing at an internal address. We
+   * disable automatic following (`redirect: "manual"`) and only follow a
+   * redirect when it stays on the SAME origin as the original request; any
+   * cross-origin redirect is rejected. Capped at {@link MAX_REDIRECTS} hops.
+   */
+  private async safeFetch(url: string, init: RequestInit): Promise<Response> {
+    let currentUrl = url;
+    for (let hop = 0; hop <= HttpTransport.MAX_REDIRECTS; hop++) {
+      const response = await fetch(currentUrl, { ...init, redirect: "manual" });
+
+      const isRedirect =
+        response.type === "opaqueredirect" ||
+        (response.status >= 300 && response.status < 400);
+      if (!isRedirect) {
+        return response;
+      }
+
+      // Browsers return an opaque redirect with no readable Location; we cannot
+      // validate the target, so refuse to follow it.
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new NetworkError(
+          NetworkErrorType.NETWORK_ERROR,
+          "Server returned a redirect that cannot be safely followed",
+        );
+      }
+
+      let nextUrl: URL;
+      try {
+        nextUrl = new URL(location, currentUrl);
+      } catch {
+        throw new NetworkError(
+          NetworkErrorType.NETWORK_ERROR,
+          `Server returned an invalid redirect target: ${location}`,
+        );
+      }
+
+      if (!isSameOrigin(nextUrl, new URL(currentUrl))) {
+        throw new NetworkError(
+          NetworkErrorType.NETWORK_ERROR,
+          `Refusing to follow cross-origin redirect to ${nextUrl.origin}`,
+        );
+      }
+      currentUrl = nextUrl.toString();
+    }
+    throw new NetworkError(
+      NetworkErrorType.NETWORK_ERROR,
+      `Too many redirects (>${HttpTransport.MAX_REDIRECTS})`,
+    );
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -782,7 +865,7 @@ export class HttpTransport implements NetworkTransport {
     );
     try {
       const serverInfoUrl = new URL("/.well-known/mindoodb-server-info", this.baseUrl);
-      const response = await fetch(serverInfoUrl.toString(), {
+      const response = await this.safeFetch(serverInfoUrl.toString(), {
         method: "GET",
         headers: {
           Accept: "application/json",
@@ -839,9 +922,9 @@ export class HttpTransport implements NetworkTransport {
     token: string,
     serializedEntries: SerializedEntry[],
     maxBodyBytes: number | null,
-  ): Promise<void> {
+  ): Promise<StoreEntryMetadata[]> {
     if (serializedEntries.length === 0) {
-      return;
+      return [];
     }
 
     if (maxBodyBytes !== null) {
@@ -849,22 +932,23 @@ export class HttpTransport implements NetworkTransport {
       if (batches.length > 1) {
         this.logger.debug(`Split putEntries payload into ${batches.length} batch(es) for body limit ${maxBodyBytes}`);
       }
+      const receipts: StoreEntryMetadata[] = [];
       for (const batch of batches) {
-        await this.sendSerializedEntriesBatch(token, batch, maxBodyBytes);
+        receipts.push(...await this.sendSerializedEntriesBatch(token, batch, maxBodyBytes));
       }
-      return;
+      return receipts;
     }
 
-    await this.sendSerializedEntriesBatch(token, serializedEntries, null);
+    return this.sendSerializedEntriesBatch(token, serializedEntries, null);
   }
 
   private async sendSerializedEntriesBatch(
     token: string,
     serializedEntries: SerializedEntry[],
     maxBodyBytes: number | null,
-  ): Promise<void> {
+  ): Promise<StoreEntryMetadata[]> {
     try {
-      await this.postSerializedEntries(token, serializedEntries);
+      return await this.postSerializedEntries(token, serializedEntries);
     } catch (error) {
       if (
         error instanceof NetworkError
@@ -877,9 +961,9 @@ export class HttpTransport implements NetworkTransport {
         this.logger.warn(
           `putEntries batch with ${serializedEntries.length} entries exceeded remote limit; retrying as ${left.length} + ${right.length} batches.`,
         );
-        await this.pushSerializedEntries(token, left, maxBodyBytes);
-        await this.pushSerializedEntries(token, right, maxBodyBytes);
-        return;
+        const leftReceipts = await this.pushSerializedEntries(token, left, maxBodyBytes);
+        const rightReceipts = await this.pushSerializedEntries(token, right, maxBodyBytes);
+        return [...leftReceipts, ...rightReceipts];
       }
       throw error;
     }
@@ -931,8 +1015,8 @@ export class HttpTransport implements NetworkTransport {
   private async postSerializedEntries(
     token: string,
     serializedEntries: SerializedEntry[],
-  ): Promise<void> {
-    await this.fetchWithRetry(
+  ): Promise<StoreEntryMetadata[]> {
+    const response = await this.fetchWithRetry(
       `${this.getSyncBasePath()}/putEntries`,
       {
         method: "POST",
@@ -947,6 +1031,19 @@ export class HttpTransport implements NetworkTransport {
         }),
       }
     );
+
+    // The server returns witness receipts (stamped metadata) for accepted
+    // entries (docs/accesscontrol.md §5.3). Older servers omit the field.
+    let receipts: StoreEntryMetadata[] = [];
+    try {
+      const data = await response.json();
+      const serialized = (data?.receipts as SerializedEntryMetadata[] | undefined) ?? [];
+      receipts = serialized.map((e) => this.deserializeEntryMetadata(e));
+    } catch {
+      // Non-JSON / empty body from a legacy server: no receipts to apply.
+      receipts = [];
+    }
+    return receipts;
   }
 
   private measureBodyBytes(value: string): number {
@@ -987,8 +1084,20 @@ export class HttpTransport implements NetworkTransport {
       snapshotHeadHashes: metadata.snapshotHeadHashes,
       snapshotHeadEntryIds: metadata.snapshotHeadEntryIds,
       signature: this.uint8ArrayToBase64(metadata.signature),
+      metadataSignature: metadata.metadataSignature
+        ? this.uint8ArrayToBase64(metadata.metadataSignature)
+        : undefined,
       originalSize: metadata.originalSize,
       encryptedSize: metadata.encryptedSize,
+      receivedAt: metadata.receivedAt,
+      receivedByPublicKey: metadata.receivedByPublicKey,
+      receivedDateSignature: metadata.receivedDateSignature
+        ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
+        : undefined,
+      // Signed attachment snapshot (plain JSON, no binary). Must survive the
+      // round-trip or metadataSignature verification fails on the receiver.
+      attachmentRefs: metadata.attachmentRefs,
+      entryVersion: metadata.entryVersion,
     };
   }
 
@@ -1009,8 +1118,18 @@ export class HttpTransport implements NetworkTransport {
       snapshotHeadHashes: serialized.snapshotHeadHashes,
       snapshotHeadEntryIds: serialized.snapshotHeadEntryIds,
       signature: this.base64ToUint8Array(serialized.signature),
+      metadataSignature: serialized.metadataSignature
+        ? this.base64ToUint8Array(serialized.metadataSignature)
+        : undefined,
       originalSize: serialized.originalSize,
       encryptedSize: serialized.encryptedSize,
+      receivedAt: serialized.receivedAt,
+      receivedByPublicKey: serialized.receivedByPublicKey,
+      receivedDateSignature: serialized.receivedDateSignature
+        ? this.base64ToUint8Array(serialized.receivedDateSignature)
+        : undefined,
+      attachmentRefs: serialized.attachmentRefs,
+      entryVersion: serialized.entryVersion,
     };
   }
 
@@ -1039,8 +1158,17 @@ interface SerializedEntryMetadata {
   snapshotHeadHashes?: string[];
   snapshotHeadEntryIds?: string[];
   signature: string; // base64
+  metadataSignature?: string; // base64 (author metadata-binding signature)
   originalSize: number;
   encryptedSize: number;
+  // Access-control witness receipt (docs/accesscontrol.md §5).
+  receivedAt?: number;
+  receivedByPublicKey?: string;
+  receivedDateSignature?: string; // base64
+  // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
+  attachmentRefs?: StoreEntryAttachmentRef[];
+  // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
+  entryVersion?: number;
 }
 
 interface SerializedEntry extends SerializedEntryMetadata {

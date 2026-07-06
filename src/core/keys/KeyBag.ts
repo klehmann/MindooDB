@@ -1,7 +1,7 @@
 import { DEFAULT_TENANT_KEY_ID, EncryptedPrivateKey } from "../types";
 import { type KeyType, buildKeyDerivationSalt, buildScopedKeyId } from "./KeyContext";
 import { CryptoAdapter } from "../crypto/CryptoAdapter";
-import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "../crypto/pbkdf2Iterations";
+import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations, resolveStoredIterations } from "../crypto/pbkdf2Iterations";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
 /**
@@ -414,6 +414,32 @@ export class KeyBag {
   }
 
   /**
+   * Gets all stored versions of a key together with their creation timestamps,
+   * sorted by createdAt (newest first).
+   *
+   * Unlike {@link getAllKeys}, which returns only the raw bytes, this preserves
+   * the per-version `createdAt` so callers can reproduce the rotation timeline -
+   * notably read-side key delivery, which must hand a recipient *every* version
+   * of a key (not just the latest) so previously-encrypted documents stay
+   * decryptable after a key rotation.
+   *
+   * @param id The key id whose versions to read
+   * @return Array of `{ key, createdAt }` newest first, or empty when not found
+   */
+  async getAllKeyVersions(type: KeyType, tenantId: string, id: string): Promise<Array<{ key: Uint8Array; createdAt?: number }>>;
+  async getAllKeyVersions(type: KeyType, tenantId: string, id: string): Promise<Array<{ key: Uint8Array; createdAt?: number }>> {
+    const scopedKeyId = buildScopedKeyId(type, tenantId, id);
+    const keyEntries = this.keys.get(scopedKeyId);
+    if (!keyEntries || keyEntries.length === 0) {
+      return [];
+    }
+    return this.sortKeyEntries(keyEntries).map((entry) => ({
+      key: entry.key,
+      createdAt: entry.createdAt,
+    }));
+  }
+
+  /**
    * Sets a key in the key bag.
    * Adds the key to the array of keys for this keyId (supports key rotation).
    * 
@@ -612,6 +638,31 @@ export class KeyBag {
 
     this.keys.set(scopedKeyId, remainingEntries);
     this.recordKeyChange(type, tenantId, id, "remove", remainingEntries.length);
+  }
+
+  /**
+   * Deletes every key belonging to a tenant, leaving keys for other tenants
+   * intact. Used by remote wipe (docs/accesscontrol.md §6.5) to remove a tenant
+   * from a multi-tenant device as a unit.
+   *
+   * @param tenantId The tenant whose keys should be removed
+   */
+  async deleteTenantKeys(tenantId: string): Promise<void> {
+    // Scoped key ids have the form `${type}:${tenantId}:${id}` (see KeyContext).
+    for (const scopedKeyId of Array.from(this.keys.keys())) {
+      const firstColon = scopedKeyId.indexOf(":");
+      const secondColon = scopedKeyId.indexOf(":", firstColon + 1);
+      if (firstColon < 0 || secondColon < 0) {
+        continue;
+      }
+      const type = scopedKeyId.slice(0, firstColon) as KeyType;
+      const keyTenantId = scopedKeyId.slice(firstColon + 1, secondColon);
+      const id = scopedKeyId.slice(secondColon + 1);
+      if (keyTenantId === tenantId) {
+        this.keys.delete(scopedKeyId);
+        this.recordKeyChange(type, tenantId, id, "remove", 0);
+      }
+    }
   }
 
   /**
@@ -934,7 +985,8 @@ export class KeyBag {
       {
         name: "PBKDF2",
         salt: combinedSalt,
-        iterations: encryptedKey.iterations,
+        // Floor the stored iteration count on decrypt (audit finding #3).
+        iterations: resolveStoredIterations(encryptedKey.iterations),
         hash: "SHA-256",
       },
       passwordKey,

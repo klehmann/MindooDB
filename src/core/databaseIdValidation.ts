@@ -4,10 +4,10 @@
  * Database IDs are embedded in server routes and storage names, so keep the
  * accepted character set intentionally narrow and consistent everywhere.
  */
-export const DATABASE_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9.-]*$/;
+export const DATABASE_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export const MAX_DATABASE_ID_LENGTH = 64;
 export const DATABASE_ID_REQUIREMENTS =
-  "Database IDs must be 1-64 characters, start with a letter or digit, and contain only letters, digits, dots, and hyphens.";
+  "Database IDs must be 1-64 characters, start with a letter or digit, and contain only letters, digits, dots, hyphens, and underscores.";
 
 export function getDatabaseIdValidationError(value: unknown, fieldName = "dbId"): string | null {
   if (typeof value !== "string" || value.length === 0) {
@@ -15,11 +15,11 @@ export function getDatabaseIdValidationError(value: unknown, fieldName = "dbId")
   }
 
   if (value.length > MAX_DATABASE_ID_LENGTH) {
-    return `${fieldName} must be at most ${MAX_DATABASE_ID_LENGTH} characters`;
+    return `${fieldName} ${JSON.stringify(value.slice(0, MAX_DATABASE_ID_LENGTH))}… must be at most ${MAX_DATABASE_ID_LENGTH} characters`;
   }
 
   if (!DATABASE_ID_REGEX.test(value)) {
-    return `${fieldName} must start with a letter or digit and contain only letters, digits, dots, and hyphens`;
+    return `${fieldName} ${JSON.stringify(value)} must start with a letter or digit and contain only letters, digits, dots, hyphens, and underscores`;
   }
 
   return null;

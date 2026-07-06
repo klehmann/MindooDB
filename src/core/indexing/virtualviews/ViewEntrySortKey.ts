@@ -22,6 +22,9 @@ export class ViewEntrySortKey {
   /** Cached hash code */
   private _hashCode: number | null = null;
 
+  /** Cached result of {@link toKey} (the class is immutable) */
+  private _key: string | null = null;
+
   private constructor(
     isCategory: boolean,
     values: unknown[],
@@ -64,9 +67,12 @@ export class ViewEntrySortKey {
    * Generates a unique string key for use in Maps/Sets
    */
   toKey(): string {
-    const typePrefix = this.isCategory ? "C" : "D";
-    const valuesStr = JSON.stringify(this.values);
-    return `${typePrefix}:${valuesStr}:${this.origin}:${this.docId}`;
+    if (this._key === null) {
+      const typePrefix = this.isCategory ? "C" : "D";
+      const valuesStr = JSON.stringify(this.values);
+      this._key = `${typePrefix}:${valuesStr}:${this.origin}:${this.docId}`;
+    }
+    return this._key;
   }
 
   /**

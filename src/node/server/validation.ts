@@ -115,3 +115,9 @@ export const MAX_PUT_ENTRIES = 10_000;
 export const MAX_PEM_KEY_LENGTH = 8_192;
 export const MAX_SIGNATURE_LENGTH = 4_096;
 export const MAX_CHALLENGE_LENGTH = 4_096;
+/**
+ * Default upper bound on the number of database ids accepted in a single
+ * sync-server registration (`POST /tenants/:tenantId/sync-servers`). Overridable
+ * per deployment via the `MINDOODB_MAX_SYNC_SERVER_DATABASES` env var.
+ */
+export const DEFAULT_MAX_SYNC_SERVER_DATABASES = 2_000;

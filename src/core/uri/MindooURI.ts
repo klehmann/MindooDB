@@ -15,11 +15,21 @@
 /**
  * Supported MindooDB URI types.
  */
-export type MindooURIType = "join-request" | "join-response";
+export type MindooURIType =
+  | "join-request"
+  | "join-response"
+  | "key-distribution"
+  | "app-distribution"
+  | "sync-setup-policy"
+  | "doc-history-purge";
 
 const VALID_TYPES: ReadonlySet<string> = new Set<MindooURIType>([
   "join-request",
   "join-response",
+  "key-distribution",
+  "app-distribution",
+  "sync-setup-policy",
+  "doc-history-purge",
 ]);
 
 const MDB_SCHEME = "mdb://";
@@ -154,6 +164,161 @@ export function isMindooURI(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ==================== Key distribution requests ====================
+
+import type { KeyDistributionRequest } from "../accesscontrol/types";
+
+/**
+ * Encode a {@link KeyDistributionRequest} as an `mdb://key-distribution/...`
+ * URI carrying the full unsigned distribution content (incl. wrapped material),
+ * so a key-holder without admin rights can hand a ready-to-sign request to an
+ * admin out-of-band (email/chat).
+ */
+export function encodeKeyDistributionRequest(request: KeyDistributionRequest): string {
+  return encodeMindooURI("key-distribution", request as unknown as Record<string, unknown>);
+}
+
+/**
+ * Decode an `mdb://key-distribution/...` URI into a {@link KeyDistributionRequest}.
+ * Throws when the URI is not a key-distribution URI or is structurally invalid.
+ */
+export function decodeKeyDistributionRequest(uri: string): KeyDistributionRequest {
+  const decoded = decodeMindooURI<KeyDistributionRequest>(uri);
+  if (decoded.type !== "key-distribution") {
+    throw new Error(`Expected a key-distribution URI, got "${decoded.type}"`);
+  }
+  const payload = decoded.payload;
+  if (typeof payload.keyId !== "string" || !payload.keyId) {
+    throw new Error("Invalid key-distribution request: missing keyId");
+  }
+  if (!Array.isArray(payload.keyVersions) || !Array.isArray(payload.pushto) || !Array.isArray(payload.pullfrom)) {
+    throw new Error("Invalid key-distribution request: missing keyVersions/pushto/pullfrom");
+  }
+  return payload;
+}
+
+// ==================== App distribution requests ====================
+
+import type { AppDistributionRequest } from "../accesscontrol/types";
+
+/**
+ * Encode an {@link AppDistributionRequest} as an `mdb://app-distribution/...`
+ * URI carrying the full unsigned distribution content (incl. the app payload),
+ * so an app author without admin rights can hand a ready-to-sign request to an
+ * admin out-of-band (email/chat).
+ */
+export function encodeAppDistributionRequest(request: AppDistributionRequest): string {
+  return encodeMindooURI("app-distribution", request as unknown as Record<string, unknown>);
+}
+
+/**
+ * Decode an `mdb://app-distribution/...` URI into an {@link AppDistributionRequest}.
+ * Throws when the URI is not an app-distribution URI or is structurally invalid.
+ */
+export function decodeAppDistributionRequest(uri: string): AppDistributionRequest {
+  const decoded = decodeMindooURI<AppDistributionRequest>(uri);
+  if (decoded.type !== "app-distribution") {
+    throw new Error(`Expected an app-distribution URI, got "${decoded.type}"`);
+  }
+  const payload = decoded.payload;
+  if (typeof payload.appId !== "string" || !payload.appId) {
+    throw new Error("Invalid app-distribution request: missing appId");
+  }
+  if (
+    !Array.isArray(payload.pushtoUsernames) ||
+    !Array.isArray(payload.pushtoGroups) ||
+    !Array.isArray(payload.pullfromUsernames) ||
+    !Array.isArray(payload.pullfromGroups)
+  ) {
+    throw new Error(
+      "Invalid app-distribution request: missing pushto/pullfrom user/group lists",
+    );
+  }
+  return payload;
+}
+
+// ==================== Sync setup policy requests ====================
+
+import type { SyncSetupPolicyRequest } from "../accesscontrol/types";
+
+/**
+ * Encode a {@link SyncSetupPolicyRequest} as an `mdb://sync-setup-policy/...`
+ * URI carrying the full unsigned policy content (database ids + targeting +
+ * mode), so a user without admin rights can prepare a ready-to-sign request and
+ * hand it to an admin out-of-band (email/chat). The payload contains no secrets
+ * and no admin signature.
+ */
+export function encodeSyncSetupPolicyRequest(request: SyncSetupPolicyRequest): string {
+  return encodeMindooURI("sync-setup-policy", request as unknown as Record<string, unknown>);
+}
+
+/**
+ * Decode an `mdb://sync-setup-policy/...` URI into a {@link SyncSetupPolicyRequest}.
+ * Throws when the URI is not a sync-setup-policy URI or is structurally invalid.
+ */
+export function decodeSyncSetupPolicyRequest(uri: string): SyncSetupPolicyRequest {
+  const decoded = decodeMindooURI<SyncSetupPolicyRequest>(uri);
+  if (decoded.type !== "sync-setup-policy") {
+    throw new Error(`Expected a sync-setup-policy URI, got "${decoded.type}"`);
+  }
+  const payload = decoded.payload;
+  if (typeof payload.policyId !== "string" || !payload.policyId) {
+    throw new Error("Invalid sync-setup-policy request: missing policyId");
+  }
+  if (payload.mode !== "initial" && payload.mode !== "permanent") {
+    throw new Error("Invalid sync-setup-policy request: mode must be 'initial' or 'permanent'");
+  }
+  if (!Array.isArray(payload.databaseIds) || payload.databaseIds.length === 0) {
+    throw new Error("Invalid sync-setup-policy request: missing databaseIds");
+  }
+  if (
+    !Array.isArray(payload.pushtoUsernames) ||
+    !Array.isArray(payload.pushtoGroups) ||
+    !Array.isArray(payload.pullfromUsernames) ||
+    !Array.isArray(payload.pullfromGroups)
+  ) {
+    throw new Error(
+      "Invalid sync-setup-policy request: missing pushto/pullfrom user/group lists",
+    );
+  }
+  return payload;
+}
+
+// ==================== Document history purge requests ====================
+
+import type { DocHistoryPurgeRequest } from "../accesscontrol/types";
+
+/**
+ * Encode a {@link DocHistoryPurgeRequest} as an `mdb://doc-history-purge/...`
+ * URI carrying the full unsigned purge content, so a user without admin rights
+ * can hand a ready-to-sign request to an admin out-of-band (email/chat).
+ */
+export function encodeDocHistoryPurgeRequest(request: DocHistoryPurgeRequest): string {
+  return encodeMindooURI("doc-history-purge", request as unknown as Record<string, unknown>);
+}
+
+/**
+ * Decode an `mdb://doc-history-purge/...` URI into a {@link DocHistoryPurgeRequest}.
+ * Throws when the URI is not a doc-history-purge URI or is structurally invalid.
+ */
+export function decodeDocHistoryPurgeRequest(uri: string): DocHistoryPurgeRequest {
+  const decoded = decodeMindooURI<DocHistoryPurgeRequest>(uri);
+  if (decoded.type !== "doc-history-purge") {
+    throw new Error(`Expected a doc-history-purge URI, got "${decoded.type}"`);
+  }
+  const payload = decoded.payload;
+  if (typeof payload.requestId !== "string" || !payload.requestId) {
+    throw new Error("Invalid doc-history-purge request: missing requestId");
+  }
+  if (typeof payload.dbId !== "string" || !payload.dbId) {
+    throw new Error("Invalid doc-history-purge request: missing dbId");
+  }
+  if (!Array.isArray(payload.docIds) || payload.docIds.length === 0) {
+    throw new Error("Invalid doc-history-purge request: missing docIds");
+  }
+  return payload;
 }
 
 // ==================== Base64url Helpers ====================

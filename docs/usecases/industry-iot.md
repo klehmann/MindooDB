@@ -2,7 +2,7 @@
 
 ## Overview
 
-IoT and edge computing require efficient data collection, offline operation, bandwidth optimization, and device management. MindooDB's offline-first architecture, incremental sync, and time-series data patterns make it well-suited for IoT applications.
+IoT and edge computing require efficient data collection, offline operation, bandwidth optimization, and device management. MindooDB's local-first architecture, incremental sync, and time-series data patterns make it well-suited for IoT applications.
 
 ## Key Requirements
 
@@ -92,7 +92,7 @@ class SensorDataCollection {
 - **Time-Sharded**: Monthly databases per device
 - **Device-Based**: Separate databases per device
 - **Time-Series**: Efficient storage of readings
-- **Offline-First**: Devices work independently
+- **Local-First**: Devices work independently
 
 ### Device Management
 

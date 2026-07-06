@@ -2,6 +2,7 @@
 // React Native: native Rust (react-native-automerge-generated)
 // Browser/Node.js: WASM (@automerge/automerge/slim)
 import { Automerge } from "./automerge-adapter";
+import { entryTrustedTime, isProvisional, isVersioned, metadataWitnessState } from "./storeEntryTime";
 // Import types from WASM package (types are compatible across implementations)
 import type * as AutomergeTypes from "@automerge/automerge/slim";
 import { v7 as uuidv7 } from "uuid";
@@ -32,12 +33,18 @@ import {
   MindooDocPayload,
   StoreEntry,
   StoreEntryMetadata,
+  StoreEntryAttachmentRef,
   StoreEntryType,
+  CURRENT_STORE_ENTRY_VERSION,
   MindooTenant,
   ProcessChangesCursor,
   ProcessChangesResult,
   DocumentHistoryResult,
+  RevisionCursor,
+  ChangeRevisionResult,
   AttachmentReference,
+  AttachmentExtractionStatus,
+  ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS,
   AttachmentConfig,
   DocumentCacheConfig,
   SnapshotConfig,
@@ -67,6 +74,9 @@ import {
   WarmerScheduler,
   StartBackgroundWarmerOptions,
   BackgroundWarmerProgress,
+  DbChange,
+  DbChangeEvent,
+  DbChangeListener,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import {
@@ -101,12 +111,47 @@ import {
   generateAttachmentChunkId,
   generateFileUuid7,
 } from "./utils/idGeneration";
-import { SymmetricKeyNotFoundError } from "./errors";
-import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import { DocumentDeletedError, DocumentNotFoundError, SymmetricKeyNotFoundError } from "./errors";
+import {
+  buildEntrySigningBytes,
+  entrySignatureFieldsFromEntry,
+  verifyEntrySignatureWithImportedKey,
+} from "./crypto/EntrySignature";
+import {
+  QuarantineRecord,
+  snapshotHeadsMatch,
+} from "./accesscontrol/materializationGuard";
+import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
+import type { RuleType, AccessDecision } from "./accesscontrol/types";
+import { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
+import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { validateDatabaseId } from "./databaseIdValidation";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import type { ICacheable } from "./cache/CacheManager";
 import type { CacheManager } from "./cache/CacheManager";
+import { DocumentSummaryStore } from "./indexing/summary/DocumentSummaryStore";
+import type { SummaryConfig } from "./indexing/summary/types";
+import {
+  sanitizeSummaryConfig,
+  DB_SETUP_DOC_ID,
+  SUMMARY_SETUP_FIELD,
+} from "./indexing/summary/types";
+import { DocumentFullTextIndex } from "./indexing/fulltext/DocumentFullTextIndex";
+import type {
+  AttachmentTextExtractor,
+  FulltextConfig,
+  FulltextSearchOptions,
+  FulltextSearchResult,
+} from "./indexing/fulltext/types";
+import { sanitizeFulltextConfig, FULLTEXT_SETUP_FIELD } from "./indexing/fulltext/types";
+import { sanitizeExtractionConfig, EXTRACTION_SETUP_FIELD, ExtractionConfig } from "./extraction/types";
+import { executeQuery } from "./query/executeQuery";
+import type { MindooQuery, MindooQueryOptions, MindooQueryResult } from "./query/types";
+import { createEphemeralSummaryView } from "./query/queryView";
+import type { EphemeralSummaryView, MindooQueryViewDefinition } from "./query/queryView";
+import { executeQueryLive } from "./query/queryLive";
+import type { MindooQuerySubscription } from "./query/queryLive";
+import type { VirtualViewUpdateOptions } from "./indexing/virtualviews/IVirtualViewDataProvider";
 
 /**
  * Default chunk size for attachments: 256KB
@@ -185,6 +230,55 @@ interface InternalDoc {
   lastModified: number;
   decryptionKeyId: string;
   isDeleted: boolean;
+  /**
+   * Whether any of this document's store entries is versioned but not yet
+   * witnessed ({@link isProvisional}). Surfaced via
+   * {@link MindooDoc.isAwaitingWitness}. Optional on the in-memory shape:
+   * construction sites that have the document's metadata compute it; the rest
+   * default to `false` (legacy / unknown docs are never awaiting witness).
+   */
+  awaitingWitness?: boolean;
+  /**
+   * Whether this document is witness-era (has a versioned store entry) AND fully
+   * witnessed (no entry still provisional). Surfaced via
+   * {@link MindooDoc.isWitnessed}. Mutually exclusive with
+   * {@link awaitingWitness}; legacy docs (no versioned entries) are neither.
+   * Optional on the in-memory shape: defaults to `false` for legacy/unknown docs.
+   */
+  witnessed?: boolean;
+  /**
+   * Whether the current KeyBag can decrypt this document. Surfaced via
+   * {@link MindooDoc.isAccessible}. Optional on the in-memory shape: normally
+   * loaded docs omit it (treated as `true`); only the inaccessible-key
+   * changefeed tombstone built by {@link BaseMindooDB.buildInaccessibleDoc}
+   * sets it to `false` (docs/accesscontrol.md §13).
+   */
+  accessible?: boolean;
+  /**
+   * Memoized result of converting {@link doc} to a plain JS object
+   * ({@link BaseMindooDB.convertAutomergeToJS}), keyed by the Automerge heads
+   * that produced it ({@link jsCacheHeads}). Repeated `getData()` calls on an
+   * unchanged document (view indexing, formulas, consumers iterating the same
+   * doc) then skip the full re-materialization. Never mutated: `getData()`
+   * always hands out a read-only proxy over this object.
+   */
+  jsCache?: MindooDocPayload;
+  /** Automerge heads (joined) that {@link jsCache} was computed from. */
+  jsCacheHeads?: string;
+}
+
+/**
+ * Cached per-document merged state for the revision-grain changefeed LRU
+ * (see {@link BaseMindooDB.revisionFeedDocCache}). `doc` is the merge of exactly
+ * the replay entries in `coveredIds`; `createdAt`/`decryptionKeyId` come from the
+ * document's `doc_create` entry.
+ */
+interface RevisionFeedDocState {
+  doc: AutomergeTypes.Doc<MindooDocPayload>;
+  /** Replay entry ids whose merge `doc` represents. */
+  coveredIds: Set<string>;
+  createdAt: number;
+  decryptionKeyId: string;
 }
 
 /**
@@ -230,6 +324,21 @@ interface DocumentIndexEntry {
   decryptionKeyId: string;
   /** See {@link DocumentAccessState}. */
   accessState: DocumentAccessState;
+  /**
+   * Whether the document has a versioned-but-un-witnessed entry
+   * ({@link isProvisional}). Part of the change identity so a witness receipt
+   * (which flips this from `true`→`false` without touching Automerge content)
+   * bumps {@link changeSeq} and re-emits the doc on the metadata feed, letting
+   * VirtualViews filtered on witness status re-evaluate it.
+   */
+  awaitingWitness: boolean;
+  /**
+   * Whether the document is witness-era and fully witnessed (see
+   * {@link InternalDoc.witnessed}). Part of the change identity alongside
+   * {@link awaitingWitness} so a witness receipt re-emits the doc on the
+   * metadata feed.
+   */
+  witnessed: boolean;
 }
 
 interface VerifiedReplayChange {
@@ -314,6 +423,24 @@ export class BaseMindooDB implements MindooDB {
   private tenant: BaseMindooTenant;
   private store: ContentAddressedStore;
   private attachmentStore: ContentAddressedStore;
+  /**
+   * Per-tenant quarantine/audit log of entries rejected during materialization
+   * (docs/accesscontrol.md §10). In-memory; surfaced via {@link getQuarantineLog}
+   * for Haven's audit view.
+   */
+  private quarantineLog: QuarantineRecord[] = [];
+  /**
+   * Short-TTL cache of "is access control active for this tenant?" so the
+   * materialization fast-path does not re-query the directory on every load.
+   */
+  private aclActiveCache: { value: boolean; at: number } | null = null;
+  /**
+   * Per-document cache of the original creator's signing public key (the
+   * `doc_create` entry's `createdByPublicKey`). Used by the client write
+   * prechecks to resolve `$author` (`isAuthor`) without re-scanning metadata on
+   * every change/delete. Populated on create and lazily on first lookup.
+   */
+  private creatorKeyCache = new Map<string, string>();
   private chunkSizeBytes: number;
   
   // Admin-only mode: only entries signed by the admin key are loaded
@@ -326,6 +453,17 @@ export class BaseMindooDB implements MindooDB {
   
   // Lookup map for O(1) access to index entries by docId
   private indexLookup: Map<string, number> = new Map(); // Map<docId, arrayIndex>
+  /**
+   * Lazily-deferred repair marker for {@link indexLookup}: when set, positions
+   * stored in the map for array indices >= this value may be stale (entries
+   * shifted by an {@link updateIndex} splice). Key presence is always exact.
+   * Reads go through {@link getDocIndexPosition}, which validates a hit
+   * against {@link index} and triggers {@link flushIndexLookupPatch} only when
+   * the position actually moved. This turns the per-update O(index size)
+   * lookup rewrite into a single deferred pass — bulk syncs that append at the
+   * index tail never pay it at all.
+   */
+  private indexLookupStaleFrom: number | null = null;
   private nextChangeSeq: number = 1;
   
   // Cache of loaded documents: Map<docId, InternalDoc>
@@ -344,10 +482,37 @@ export class BaseMindooDB implements MindooDB {
   private readonly restoreToL2: boolean;
   private readonly snapshotMinChanges: number;
   private readonly snapshotCooldownMs: number;
+  /**
+   * Per-document count of local writes since the last snapshot eligibility
+   * check that scanned the store. Lets {@link maybeWriteSnapshotForDocument}
+   * skip the per-doc metadata scan entirely while a document is still far
+   * below {@link snapshotMinChanges}. Absent key = unknown (scan once).
+   */
+  private writesSinceSnapshotCheck = new Map<string, number>();
   
   // Track which entry IDs we've already processed
   private processedEntryIds: string[] = [];
   private processedEntryCursor: StoreScanCursor | null = null;
+
+  /**
+   * In-memory LRU of per-document merged state used by the revision-grain
+   * changefeed ({@link iterateRevisionsInternal}). Each entry holds a document's
+   * fully-merged Automerge doc together with the exact set of replay entry ids
+   * that merge covers, so an incremental feed advance can seed the next fold
+   * from the cached state (applying only the newly-arrived suffix) instead of
+   * re-decrypting and re-folding the document's whole history. Bounded by
+   * {@link revisionFeedCacheLimit}; least-recently-used docs are evicted and
+   * reconstructed from the best snapshot on the next touch.
+   */
+  private revisionFeedDocCache = new Map<string, RevisionFeedDocState>();
+  private readonly revisionFeedCacheLimit = 256;
+  /**
+   * Window size for batching encrypted-payload loads while folding a document's
+   * revision suffix ({@link foldDocRevisions}): one {@link ContentAddressedStore.getEntries}
+   * round trip per window instead of one per revision, while bounding peak
+   * memory and response size on a snapshot-less cold-start re-fold.
+   */
+  private readonly revisionFoldLoadWindow = 256;
   
   // Index: automergeHash -> entryId for each document
   // Used for resolving Automerge dependency hashes to entry IDs
@@ -362,8 +527,68 @@ export class BaseMindooDB implements MindooDB {
   // Local cache support
   private cacheManager: CacheManager | null = null;
   private cachePrefix: string | null = null;
+  /**
+   * Lazily created document summary buffer backing ad-hoc queries and
+   * summary-based views. `null` until {@link getSummaryStore} is first
+   * called, so databases that never query pay no cost.
+   */
+  private summaryStore: DocumentSummaryStore | null = null;
+  /**
+   * Lazily created full-text index (opt-in via `fulltextSetup` or an
+   * explicit config). `null` until {@link getFullTextIndex} is first
+   * called or the setup document enables indexing.
+   */
+  private fulltextIndex: DocumentFullTextIndex | null = null;
+  /**
+   * Attachment text extractors registered by the host environment (see
+   * {@link registerAttachmentTextExtractor}). Consulted lazily by the
+   * full-text index while documents with attachments are indexed.
+   */
+  private attachmentTextExtractors: AttachmentTextExtractor[] = [];
+
+  // ---------------------------------------------------------------------------
+  // Change notification state (see addChangeListener). `updateIndex` is the
+  // common choke point of all mutation paths, so it only records pending
+  // docIds; emission is coalesced per sync batch / event-loop turn.
+  // ---------------------------------------------------------------------------
+  private changeListeners: Set<DbChangeListener> = new Set();
+  private pendingChangeNotifications: Map<string, DbChange> = new Map();
+  private changeNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  /** While > 0, timer-based emission is suppressed (e.g. during a sync batch). */
+  private changeNotificationHolds: number = 0;
+
+  // ---------------------------------------------------------------------------
+  // Summary auto-follow (see setSummaryAutoUpdateEnabled): keeps the summary
+  // buffer current as changes arrive (local writes and sync batches), so the
+  // first query after receiving thousands of documents doesn't stall on a
+  // full catch-up run.
+  // ---------------------------------------------------------------------------
+  private summaryAutoUpdateEnabled: boolean = true;
+  private summaryAutoUpdateRunning: boolean = false;
+  private summaryAutoUpdatePending: boolean = false;
+  /** Whether the setup document was already probed for auto-activation. */
+  private summarySetupProbed: boolean = false;
+
+  // ---------------------------------------------------------------------------
+  // Full-text auto-follow: mirrors the summary auto-follow, but the index
+  // is opt-in — auto-activation only happens when the setup document has
+  // `fulltextSetup.enabled: true`.
+  // ---------------------------------------------------------------------------
+  private fulltextAutoUpdateEnabled: boolean = true;
+  private fulltextAutoUpdateRunning: boolean = false;
+  private fulltextAutoUpdatePending: boolean = false;
+  /** Whether the setup document was already probed for FTS auto-activation. */
+  private fulltextSetupProbed: boolean = false;
   private dirtyDocIds: Set<string> = new Set();
   private cacheMetaDirty: boolean = false;
+  /**
+   * Per-document fingerprint (`changeSeq:automergeHeads`) of the state last
+   * written to the L2 cache by {@link flushDirtyDocToCache}. Lets the periodic
+   * flush skip the expensive `Automerge.save` + L2 write for documents that
+   * were marked dirty but whose persisted state is already current (e.g. docs
+   * that were merely loaded and cached, not changed).
+   */
+  private lastFlushedDocState = new Map<string, string>();
 
   /**
    * Tenant KeyBag fingerprint observed at the time the in-memory index
@@ -482,8 +707,30 @@ export class BaseMindooDB implements MindooDB {
       logger ||
       new MindooLogger(getDefaultLogLevel(), "BaseMindooDB", true);
     this.performanceCallback = performanceCallback;
+
+    // Summary auto-follow: piggybacks on the coalesced change events (one
+    // per sync batch / event-loop turn). Costs a docId check per event for
+    // databases that never use summaries.
+    this.addChangeListener((event) => {
+      this.handleChangesForSummaryAutoUpdate(event.changes);
+    });
+
+    // Full-text auto-follow: same coalesced events, opt-in activation.
+    this.addChangeListener((event) => {
+      this.handleChangesForFulltextAutoUpdate(event.changes);
+    });
   }
   
+  /**
+   * Whether debug logging is enabled. Used to guard hot-path debug statements
+   * whose message interpolation is itself expensive (e.g.
+   * `JSON.stringify(Automerge.getHeads(...))` — a WASM call plus stringify per
+   * document), so bulk operations don't pay for logging that is discarded.
+   */
+  private isDebugEnabled(): boolean {
+    return this.logger.isLevelEnabled(LogLevel.DEBUG);
+  }
+
   /**
    * Get the admin public key from the tenant.
    * Only used when adminOnlyDb is true.
@@ -548,6 +795,537 @@ export class BaseMindooDB implements MindooDB {
     const cacheIdentity = this.store.getCacheIdentity?.() ?? this.store.getId();
     this.cachePrefix = `${this.tenant.getId()}/${cacheIdentity}`;
     cacheManager.register(this as unknown as ICacheable);
+    // A summary store created before the cache manager was attached picks
+    // up persistence now.
+    this.summaryStore?.attachCache(cacheManager, `${this.getCachePrefix()}/summary`);
+    this.fulltextIndex?.attachCache(cacheManager, `${this.getCachePrefix()}/fulltext`);
+  }
+
+  /**
+   * Get (lazily creating) the document summary buffer for this database.
+   *
+   * The summary is a changefeed-maintained map of queryable field values
+   * per document — the substrate for `query()`/`queryView()` (see
+   * docs/adhoc-queries.md). Passing a `config` on a later call replaces the
+   * configuration; if it differs from the active one, a resumable backfill
+   * re-extracts all documents on the next `update()` (documents are never
+   * rewritten).
+   */
+  getSummaryStore(config?: SummaryConfig): DocumentSummaryStore {
+    if (!this.summaryStore) {
+      this.summaryStore = new DocumentSummaryStore(this as unknown as MindooDB, config);
+      if (this.cacheManager) {
+        this.summaryStore.attachCache(this.cacheManager, `${this.getCachePrefix()}/summary`);
+      }
+    } else if (config !== undefined) {
+      this.summaryStore.setConfig(config);
+    }
+    return this.summaryStore;
+  }
+
+  /**
+   * Read the summary configuration stored in the synced setup document
+   * (`dbsetup`, field `summarySetup`) — the "design document" that lets
+   * users/apps (e.g. the Haven UI) configure the summary fields in one
+   * place for all replicas. Returns `null` when no setup document or no
+   * configuration exists.
+   */
+  async getSummarySetup(): Promise<SummaryConfig | null> {
+    try {
+      const doc = await this.getDocument(DB_SETUP_DOC_ID);
+      return sanitizeSummaryConfig(doc.getData()[SUMMARY_SETUP_FIELD]) ?? null;
+    } catch (error) {
+      if (error instanceof DocumentNotFoundError || error instanceof DocumentDeletedError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Write the summary configuration into the synced setup document
+   * (creating `dbsetup` idempotently when missing; custom-ID documents
+   * share seeded Automerge ancestry, so concurrent creates on different
+   * replicas merge). Passing `null` removes the configuration (replicas
+   * fall back to the default auto-include config).
+   *
+   * Summary stores without an explicit code-provided configuration pick
+   * the change up through the changefeed and re-extract via a resumable
+   * backfill — locally and, after sync, on every other replica.
+   */
+  async setSummarySetup(config: SummaryConfig | null): Promise<void> {
+    const doc = await this.createDocument({ id: DB_SETUP_DOC_ID });
+    await this.changeDoc(doc, (d) => {
+      const data = d.getData();
+      if (config === null) {
+        delete data[SUMMARY_SETUP_FIELD];
+      } else {
+        data[SUMMARY_SETUP_FIELD] = sanitizeSummaryConfig(config) ?? {};
+      }
+    });
+  }
+
+  /**
+   * Enable/disable summary auto-follow (default: enabled). When enabled,
+   * the summary buffer is brought up to date in the background after every
+   * coalesced change event — one catch-up run per sync batch, one per
+   * event-loop turn for local writes — so queries don't stall on a full
+   * catch-up after receiving many documents. Compared to the network I/O
+   * of a sync the incremental extraction is cheap; disable it for
+   * bulk-import scenarios where even that is unwanted (the next query
+   * catches up lazily as before).
+   */
+  setSummaryAutoUpdateEnabled(enabled: boolean): void {
+    this.summaryAutoUpdateEnabled = enabled;
+    if (enabled && this.summaryStore) {
+      this.scheduleSummaryAutoUpdate();
+    }
+  }
+
+  /**
+   * Change-event hook for summary auto-follow. While no summary store
+   * exists, the setup document decides whether to activate one: it is
+   * probed on the first event (covers reopening a database whose `dbsetup`
+   * synced earlier) and re-checked whenever a `dbsetup` change arrives
+   * (covers the configuration being created/updated locally or via sync).
+   */
+  private handleChangesForSummaryAutoUpdate(changes: DbChange[]): void {
+    if (!this.summaryAutoUpdateEnabled) {
+      return;
+    }
+    if (this.summaryStore) {
+      this.scheduleSummaryAutoUpdate();
+      return;
+    }
+    // Never auto-activate on system databases: the directory has its own
+    // indexing (DirectoryTimeTravelIndex) and its change events interleave
+    // with access-control evaluation; admin-only databases hold no user
+    // data worth summarizing. Explicit getSummaryStore() calls still work.
+    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    const hasSetupChange = changes.some((change) => change.docId === DB_SETUP_DOC_ID);
+    if (!hasSetupChange && this.summarySetupProbed) {
+      return;
+    }
+    this.summarySetupProbed = true;
+    void this.activateSummaryFromSetupDoc();
+  }
+
+  /** Create the summary store when the setup document configures one. */
+  private async activateSummaryFromSetupDoc(): Promise<void> {
+    try {
+      const config = await this.getSummarySetup();
+      if (config === null || this.summaryStore || !this.summaryAutoUpdateEnabled) {
+        return;
+      }
+      // No explicit config: the store adopts the setup-document config on
+      // its first update run (seedConfigFromSetupDoc).
+      this.getSummaryStore();
+      this.scheduleSummaryAutoUpdate();
+    } catch (error) {
+      this.logger.warn(`Summary auto-activation failed: ${error}`);
+    }
+  }
+
+  /**
+   * Run a background summary catch-up, coalescing further requests into
+   * one follow-up run (mirrors the live-view scheduling in VirtualView).
+   * Errors are logged and never propagate into write/sync paths.
+   */
+  private scheduleSummaryAutoUpdate(): void {
+    if (this.summaryAutoUpdateRunning) {
+      this.summaryAutoUpdatePending = true;
+      return;
+    }
+    this.summaryAutoUpdateRunning = true;
+    void (async () => {
+      try {
+        do {
+          this.summaryAutoUpdatePending = false;
+          await this.summaryStore?.update();
+        } while (this.summaryAutoUpdatePending && this.summaryAutoUpdateEnabled);
+      } catch (error) {
+        this.logger.warn(`Summary auto-update failed: ${error}`);
+      } finally {
+        this.summaryAutoUpdateRunning = false;
+      }
+    })();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Full-text index (see docs/fulltext-search.md)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Get (lazily creating) the full-text index for this database.
+   *
+   * The index is a changefeed-maintained, encrypted-at-rest search index
+   * over extracted document text — configured via the synced setup
+   * document (`dbsetup`, field `fulltextSetup`) or an explicit `config`.
+   * Passing a `config` on a later call replaces the configuration; if it
+   * differs from the active one, the engine is recreated and a resumable
+   * backfill re-indexes all documents on the next `update()`.
+   *
+   * Note that indexing is OPT-IN: without `enabled: true` (in the setup
+   * document or the explicit config) the index stays empty and
+   * {@link searchText} throws.
+   */
+  getFullTextIndex(config?: FulltextConfig): DocumentFullTextIndex {
+    if (!this.fulltextIndex) {
+      this.fulltextIndex = new DocumentFullTextIndex(this as unknown as MindooDB, config, {
+        getAttachmentExtractors: () => this.attachmentTextExtractors,
+      });
+      if (this.cacheManager) {
+        this.fulltextIndex.attachCache(this.cacheManager, `${this.getCachePrefix()}/fulltext`);
+      }
+    } else if (config !== undefined) {
+      this.fulltextIndex.setConfig(config);
+    }
+    return this.fulltextIndex;
+  }
+
+  /**
+   * Read the full-text configuration stored in the synced setup document
+   * (`dbsetup`, field `fulltextSetup`). Returns `null` when no setup
+   * document or no configuration exists.
+   */
+  async getFulltextSetup(): Promise<FulltextConfig | null> {
+    try {
+      const doc = await this.getDocument(DB_SETUP_DOC_ID);
+      return sanitizeFulltextConfig(doc.getData()[FULLTEXT_SETUP_FIELD]) ?? null;
+    } catch (error) {
+      if (error instanceof DocumentNotFoundError || error instanceof DocumentDeletedError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Write the full-text configuration into the synced setup document
+   * (creating `dbsetup` idempotently when missing). Passing `null`
+   * removes the configuration (indexing falls back to disabled).
+   *
+   * Idempotent: when the sanitized config equals what is already stored,
+   * no change is written — apps can safely call this on every start
+   * without producing changefeed/sync churn.
+   *
+   * Full-text indexes without an explicit code-provided configuration
+   * pick the change up through the changefeed and re-index via a
+   * resumable backfill — locally and, after sync, on every other replica.
+   */
+  async setFulltextSetup(config: FulltextConfig | null): Promise<void> {
+    const sanitized = config === null ? null : sanitizeFulltextConfig(config) ?? {};
+    const current = await this.getFulltextSetup();
+    if (JSON.stringify(current) === JSON.stringify(sanitized)) {
+      return;
+    }
+    const doc = await this.createDocument({ id: DB_SETUP_DOC_ID });
+    await this.changeDoc(doc, (d) => {
+      const data = d.getData();
+      if (sanitized === null) {
+        delete data[FULLTEXT_SETUP_FIELD];
+      } else {
+        data[FULLTEXT_SETUP_FIELD] = sanitized;
+      }
+    });
+  }
+
+  /**
+   * Read the attachment extraction configuration stored in the synced
+   * setup document (`dbsetup`, field `extractionSetup`). Configures
+   * host-side extraction services (e.g. Haven's OCR service) that persist
+   * results at the attachment entry via
+   * {@link MindooDoc.setAttachmentExtractedText}. Returns `null` when no
+   * setup document or no configuration exists.
+   */
+  async getExtractionSetup(): Promise<ExtractionConfig | null> {
+    try {
+      const doc = await this.getDocument(DB_SETUP_DOC_ID);
+      return sanitizeExtractionConfig(doc.getData()[EXTRACTION_SETUP_FIELD]) ?? null;
+    } catch (error) {
+      if (error instanceof DocumentNotFoundError || error instanceof DocumentDeletedError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Write the attachment extraction configuration into the synced setup
+   * document (creating `dbsetup` idempotently when missing). Passing
+   * `null` removes the configuration (extraction services stay idle).
+   *
+   * Idempotent: when the sanitized config equals what is already stored,
+   * no change is written — services can safely call this on every start
+   * without producing changefeed/sync churn.
+   */
+  async setExtractionSetup(config: ExtractionConfig | null): Promise<void> {
+    const sanitized = config === null ? null : sanitizeExtractionConfig(config) ?? {};
+    const current = await this.getExtractionSetup();
+    if (JSON.stringify(current) === JSON.stringify(sanitized)) {
+      return;
+    }
+    const doc = await this.createDocument({ id: DB_SETUP_DOC_ID });
+    await this.changeDoc(doc, (d) => {
+      const data = d.getData();
+      if (sanitized === null) {
+        delete data[EXTRACTION_SETUP_FIELD];
+      } else {
+        data[EXTRACTION_SETUP_FIELD] = sanitized;
+      }
+    });
+  }
+
+  /**
+   * Register an attachment text extractor for full-text indexing (see
+   * {@link AttachmentTextExtractor}). Host environments call this when
+   * opening the database (e.g. Haven registers text/PDF/Office extractors
+   * from its preview parsers). Extraction only happens for databases
+   * whose `fulltextSetup` has `attachments: true`.
+   *
+   * @returns An unregister function.
+   */
+  registerAttachmentTextExtractor(extractor: AttachmentTextExtractor): () => void {
+    this.attachmentTextExtractors.push(extractor);
+    return () => {
+      const index = this.attachmentTextExtractors.indexOf(extractor);
+      if (index >= 0) {
+        this.attachmentTextExtractors.splice(index, 1);
+      }
+    };
+  }
+
+  /**
+   * Full-text search over the document full-text index (see
+   * docs/fulltext-search.md). Brings the index up to date first, then
+   * returns matching documents best-score-first. Results are
+   * device-specific under E2EE: documents whose decryption keys are
+   * missing from the local KeyBag are not indexed and cannot match.
+   *
+   * @throws Error when full-text indexing is not enabled for this
+   *   database (see {@link setFulltextSetup} / {@link getFullTextIndex}).
+   */
+  async searchText(query: string, options?: FulltextSearchOptions): Promise<FulltextSearchResult> {
+    return this.getFullTextIndex().search(query, options);
+  }
+
+  /**
+   * Enable/disable full-text auto-follow (default: enabled). Mirrors
+   * {@link setSummaryAutoUpdateEnabled}: when enabled, an ACTIVE full-text
+   * index catches up in the background after every coalesced change
+   * event, so the first search after a large sync doesn't stall.
+   * Databases without an enabled `fulltextSetup` never pay any cost.
+   */
+  setFulltextAutoUpdateEnabled(enabled: boolean): void {
+    this.fulltextAutoUpdateEnabled = enabled;
+    if (enabled && this.fulltextIndex) {
+      this.scheduleFulltextAutoUpdate();
+    }
+  }
+
+  /**
+   * Change-event hook for full-text auto-follow. While no index exists,
+   * the setup document decides whether to activate one — probed on the
+   * first event and re-checked whenever a `dbsetup` change arrives
+   * (mirrors {@link handleChangesForSummaryAutoUpdate}).
+   */
+  private handleChangesForFulltextAutoUpdate(changes: DbChange[]): void {
+    if (!this.fulltextAutoUpdateEnabled) {
+      return;
+    }
+    if (this.fulltextIndex) {
+      this.scheduleFulltextAutoUpdate();
+      return;
+    }
+    // Same system-database exclusion as the summary auto-activation.
+    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    const hasSetupChange = changes.some((change) => change.docId === DB_SETUP_DOC_ID);
+    if (!hasSetupChange && this.fulltextSetupProbed) {
+      return;
+    }
+    this.fulltextSetupProbed = true;
+    void this.activateFulltextFromSetupDoc();
+  }
+
+  /** Create the full-text index when the setup document enables one. */
+  private async activateFulltextFromSetupDoc(): Promise<void> {
+    try {
+      const config = await this.getFulltextSetup();
+      if (
+        config?.enabled !== true ||
+        this.fulltextIndex ||
+        !this.fulltextAutoUpdateEnabled
+      ) {
+        return;
+      }
+      // No explicit config: the index adopts the setup-document config on
+      // its first update run (seedConfigFromSetupDoc).
+      this.getFullTextIndex();
+      this.scheduleFulltextAutoUpdate();
+    } catch (error) {
+      this.logger.warn(`Full-text auto-activation failed: ${error}`);
+    }
+  }
+
+  /**
+   * Run a background full-text catch-up, coalescing further requests into
+   * one follow-up run (mirrors {@link scheduleSummaryAutoUpdate}).
+   */
+  private scheduleFulltextAutoUpdate(): void {
+    if (this.fulltextAutoUpdateRunning) {
+      this.fulltextAutoUpdatePending = true;
+      return;
+    }
+    this.fulltextAutoUpdateRunning = true;
+    void (async () => {
+      try {
+        do {
+          this.fulltextAutoUpdatePending = false;
+          await this.fulltextIndex?.update();
+        } while (this.fulltextAutoUpdatePending && this.fulltextAutoUpdateEnabled);
+      } catch (error) {
+        this.logger.warn(`Full-text auto-update failed: ${error}`);
+      } finally {
+        this.fulltextAutoUpdateRunning = false;
+      }
+    })();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Change notifications (reactive support)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a listener notified after documents change (local writes,
+   * sync ingest, access flips, witness updates). Events are coalesced:
+   * one event per sync batch, one per event-loop turn for local writes.
+   * The event carries only lightweight metadata plus the latest change
+   * cursor — no replay guarantee; consumers needing completeness read
+   * {@link iterateChangesSince} from their own cursor.
+   *
+   * @returns An unsubscribe function.
+   */
+  addChangeListener(listener: DbChangeListener): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  /** Record a document transition for the coalesced change event. */
+  private noteChangeForListeners(docId: string, lastModified: number, isDeleted: boolean): void {
+    if (this.changeListeners.size === 0) {
+      return;
+    }
+    this.pendingChangeNotifications.set(docId, { docId, isDeleted, lastModified });
+    this.scheduleChangeNotification();
+  }
+
+  private scheduleChangeNotification(): void {
+    if (this.changeNotifyTimer !== null || this.changeNotificationHolds > 0) {
+      return;
+    }
+    this.changeNotifyTimer = setTimeout(() => {
+      this.changeNotifyTimer = null;
+      this.emitPendingChangeEvent();
+    }, 0);
+  }
+
+  /**
+   * Suppress timer-based change emission for the duration of a batch
+   * operation (sync ingest); the release emits one coalesced event.
+   */
+  private beginChangeNotificationHold(): void {
+    this.changeNotificationHolds++;
+  }
+
+  private endChangeNotificationHold(): void {
+    this.changeNotificationHolds = Math.max(0, this.changeNotificationHolds - 1);
+    if (this.changeNotificationHolds === 0) {
+      this.emitPendingChangeEvent();
+    }
+  }
+
+  private emitPendingChangeEvent(): void {
+    if (this.changeNotificationHolds > 0) {
+      return;
+    }
+    if (this.changeNotifyTimer !== null) {
+      clearTimeout(this.changeNotifyTimer);
+      this.changeNotifyTimer = null;
+    }
+    if (this.pendingChangeNotifications.size === 0) {
+      return;
+    }
+    const changes = Array.from(this.pendingChangeNotifications.values());
+    this.pendingChangeNotifications.clear();
+    if (this.changeListeners.size === 0) {
+      return;
+    }
+    const event: DbChangeEvent = {
+      changes,
+      cursor: this.getLatestChangeCursor(),
+    };
+    for (const listener of this.changeListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        // Listener errors must never propagate into write/sync paths.
+        this.logger.warn(`Change listener threw: ${error}`);
+      }
+    }
+  }
+
+  /**
+   * Run an ad-hoc query against the document summary buffer (see
+   * docs/adhoc-queries.md). Filters and expression sort keys use the
+   * MindooDB expression language; documents are never materialized unless
+   * `options.allowFullScan` is set.
+   */
+  async query(query: MindooQuery, options?: MindooQueryOptions): Promise<MindooQueryResult> {
+    return executeQuery(this as unknown as MindooDB, this.getSummaryStore(), query, options);
+  }
+
+  /**
+   * Build an ephemeral, summary-backed VirtualView (categories, sorting,
+   * totals as usual — but fed from the summary buffer, so no documents are
+   * materialized and re-sorting via `resort()` is a pure in-memory
+   * operation). The view is not cached; call `dispose()` when done.
+   */
+  async queryView(
+    definition: MindooQueryViewDefinition,
+    options?: VirtualViewUpdateOptions
+  ): Promise<EphemeralSummaryView> {
+    return createEphemeralSummaryView(
+      this as unknown as MindooDB,
+      this.getSummaryStore(),
+      definition,
+      options
+    );
+  }
+
+  /**
+   * Live query: delivers the initial result asynchronously, then keeps
+   * re-evaluating after coalesced change events. `onResult` only fires
+   * when the result fingerprint (docIds + lastModified of the matches)
+   * actually changed.
+   */
+  queryLive(
+    query: MindooQuery,
+    onResult: (result: MindooQueryResult) => void,
+    options?: MindooQueryOptions & { onError?: (error: unknown) => void }
+  ): MindooQuerySubscription {
+    return executeQueryLive(
+      this as unknown as MindooDB,
+      this.getSummaryStore(),
+      query,
+      onResult,
+      options
+    );
   }
 
   getCachePrefix(): string {
@@ -720,13 +1498,20 @@ export class BaseMindooDB implements MindooDB {
     docId: string,
     internal: InternalDoc,
   ): Promise<void> {
-    const amBinary = Automerge.save(internal.doc);
-
-    const indexEntryIdx = this.indexLookup.get(docId);
+    const indexEntryIdx = this.getDocIndexPosition(docId);
     const changeSeq = indexEntryIdx === undefined
       ? 0
       : this.index[indexEntryIdx].changeSeq;
     const automergeHeads = Automerge.getHeads(internal.doc);
+
+    // Skip the Automerge.save + L2 write when the exact same state was
+    // already flushed (docs marked dirty by a load rather than a change).
+    const flushKey = `${changeSeq}:${automergeHeads.join(",")}`;
+    if (this.lastFlushedDocState.get(docId) === flushKey) {
+      return;
+    }
+
+    const amBinary = Automerge.save(internal.doc);
 
     const header = JSON.stringify({
       version: DOC_CACHE_HEADER_VERSION,
@@ -735,6 +1520,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified: internal.lastModified,
       decryptionKeyId: internal.decryptionKeyId,
       isDeleted: internal.isDeleted,
+      awaitingWitness: internal.awaitingWitness ?? false,
+      witnessed: internal.witnessed ?? false,
       changeSeq,
       automergeHeads,
     });
@@ -748,6 +1535,7 @@ export class BaseMindooDB implements MindooDB {
     value.set(amBinary, 4 + headerBytes.length);
 
     await store.put("doc", `${prefix}/${docId}`, value);
+    this.lastFlushedDocState.set(docId, flushKey);
   }
 
   private exportMetadataCheckpoint(): Uint8Array {
@@ -812,6 +1600,7 @@ export class BaseMindooDB implements MindooDB {
         typeof checkpoint.keyBagFingerprint === "string" ? checkpoint.keyBagFingerprint : null;
       // Rebuild indexLookup from index
       this.indexLookup.clear();
+      this.indexLookupStaleFrom = null;
       for (let i = 0; i < this.index.length; i++) {
         if (typeof this.index[i].changeSeq !== "number") {
           this.index[i].changeSeq = i + 1;
@@ -821,6 +1610,14 @@ export class BaseMindooDB implements MindooDB {
         }
         if (!this.index[i].accessState) {
           this.index[i].accessState = "visible";
+        }
+        if (typeof this.index[i].awaitingWitness !== "boolean") {
+          // Caches written before the witness-aware flag: treat as not awaiting.
+          this.index[i].awaitingWitness = false;
+        }
+        if (typeof this.index[i].witnessed !== "boolean") {
+          // Caches written before the witness-aware flag: treat as not witnessed.
+          this.index[i].witnessed = false;
         }
         this.indexLookup.set(this.index[i].docId, i);
       }
@@ -896,6 +1693,7 @@ export class BaseMindooDB implements MindooDB {
               const docId = batch[i].slice(docPrefix.length);
               await store.delete("doc", batch[i]);
               this.docCache.delete(docId);
+              this.lastFlushedDocState.delete(docId);
               continue;
             }
             await this.storeCachedDocument(deserialized.internal);
@@ -954,6 +1752,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified: header.lastModified,
       decryptionKeyId: header.decryptionKeyId,
       isDeleted: header.isDeleted,
+      awaitingWitness: typeof header.awaitingWitness === "boolean" ? header.awaitingWitness : false,
+      witnessed: typeof header.witnessed === "boolean" ? header.witnessed : false,
     };
 
     return {
@@ -1001,26 +1801,114 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Verify a signature using a pre-imported CryptoKey.
-   * This bypasses the key import step for better performance when keys are cached.
+   * Compute the author's metadata-binding signature for a new entry (audit
+   * finding #5). The signature covers the canonical, versioned, length-prefixed
+   * metadata layout (see crypto/EntrySignature.ts) rather than only the
+   * ciphertext, so the cleartext metadata cannot be tampered with after signing.
+   * Uses the supplied custom signing key when present, otherwise the current
+   * user's signing key.
    */
-  private async verifySignatureWithKey(
+  private async computeEntryMetadataSignature(
+    meta: Pick<
+      StoreEntryMetadata,
+      | "entryType"
+      | "id"
+      | "docId"
+      | "decryptionKeyId"
+      | "createdAt"
+      | "dependencyIds"
+      | "contentHash"
+      | "createdByPublicKey"
+      | "attachmentRefs"
+    >,
+    signing?: { signingKeyPair?: SigningKeyPair; signingKeyPassword?: string },
+  ): Promise<Uint8Array> {
+    const bytes = buildEntrySigningBytes(entrySignatureFieldsFromEntry(meta));
+    if (signing?.signingKeyPair && signing?.signingKeyPassword) {
+      return this.tenant.signPayloadWithKey(bytes, signing.signingKeyPair, signing.signingKeyPassword);
+    }
+    return this.tenant.signPayload(bytes);
+  }
+
+  /**
+   * Collect the full set of attachment references a document holds right now,
+   * for the signed {@link StoreEntryMetadata.attachmentRefs} snapshot.
+   *
+   * Refs are sorted by `attachmentId` to give a canonical, deterministic order
+   * so the bytes signed by the writer match the bytes a verifier reconstructs
+   * (see crypto/EntrySignature.ts). Reads the merged `_attachments` array, so
+   * additions, removals, and appends are all reflected.
+   */
+  private collectAttachmentRefs(
+    doc: AutomergeTypes.Doc<MindooDocPayload> | MindooDocPayload,
+  ): StoreEntryAttachmentRef[] {
+    const atts = ((doc as MindooDocPayload)._attachments as AttachmentReference[] | undefined) ?? [];
+    return atts
+      .map((a) => ({
+        attachmentId: a.attachmentId,
+        lastChunkId: a.lastChunkId,
+        size: a.size,
+      }))
+      .sort((x, y) =>
+        x.attachmentId < y.attachmentId ? -1 : x.attachmentId > y.attachmentId ? 1 : 0,
+      );
+  }
+
+  /**
+   * Verify a store entry's author signature using a pre-imported CryptoKey,
+   * version-aware (audit finding #5): prefers the metadata-binding
+   * `metadataSignature` when present, otherwise the legacy ciphertext signature,
+   * and re-verifies `SHA-256(encryptedData) === contentHash`. Returns false on
+   * any mismatch. The caller is responsible for the directory trust check.
+   */
+  private async verifyEntrySignatureWithKey(
     cryptoKey: CryptoKey,
-    payload: Uint8Array,
-    signature: Uint8Array
+    entry: StoreEntry,
   ): Promise<boolean> {
     const subtle = this.tenant.getCryptoAdapter().getSubtle();
-    
-    const isValid = await subtle.verify(
-      {
-        name: "Ed25519",
-      },
-      cryptoKey,
-      signature.buffer as ArrayBuffer,
-      payload.buffer as ArrayBuffer
-    );
+    const actualHash = await computeContentHash(entry.encryptedData, subtle);
+    if (actualHash !== entry.contentHash) {
+      this.logger.warn(`Content hash mismatch for entry ${entry.id}`);
+      return false;
+    }
+    const requireMetadataSignature = await this.requiresMetadataSignature(entry);
+    return verifyEntrySignatureWithImportedKey(entry, entry.encryptedData, cryptoKey, subtle, {
+      requireMetadataSignature,
+    });
+  }
 
-    return isValid;
+  /**
+   * Whether the tenant storage-format floor (`requireMetadataSignatureSince`)
+   * requires `entry` to carry the v2 metadata-binding signature, based on its
+   * trusted time. The `directory` store is exempt (it must always load so the
+   * policy that defines the floor can be read); entries that already carry a
+   * `metadataSignature` short-circuit. Fail-open on resolution errors is safe —
+   * the legacy signature is still cryptographically verified; the floor only
+   * refuses the weaker fallback for new entries.
+   */
+  private async requiresMetadataSignature(entry: StoreEntry): Promise<boolean> {
+    if (entry.metadataSignature) {
+      return false;
+    }
+    // Exempt the directory store from the floor: it must always materialize so
+    // the policy can be read, and resolving the floor itself loads it.
+    if (this.store.getId() === "directory") {
+      return false;
+    }
+    try {
+      const directory = await this.tenant.openDirectory();
+      if (typeof directory.getRequireMetadataSignatureSince !== "function") {
+        return false;
+      }
+      const cutoff = await directory.getRequireMetadataSignatureSince();
+      if (cutoff === undefined) {
+        return false;
+      }
+      return entryTrustedTime(entry, Date.now()) >= cutoff;
+    } catch (error) {
+      this.logger.warn(`Failed to resolve metadata-signature floor: ${String(error)}`);
+      return false;
+    }
   }
 
   /**
@@ -1065,6 +1953,8 @@ export class BaseMindooDB implements MindooDB {
     isDeleted: boolean,
     decryptionKeyId: string = "default",
     accessState: DocumentAccessState = "visible",
+    awaitingWitness: boolean = false,
+    witnessed: boolean = false,
   ): void {
     const startedAt = Date.now();
     const assignedSeq = this.nextChangeSeq;
@@ -1075,31 +1965,32 @@ export class BaseMindooDB implements MindooDB {
       isDeleted,
       decryptionKeyId,
       accessState,
+      awaitingWitness,
+      witnessed,
     };
-    const existingIndex = this.indexLookup.get(docId);
+    const existingIndex = this.getDocIndexPosition(docId);
     
     // Check if the entry already exists and hasn't changed position
     if (existingIndex !== undefined) {
       const existingEntry = this.index[existingIndex];
       // If only metadata flags stayed identical and caller replays same state, skip.
+      // `awaitingWitness` is part of this identity so a witness receipt (which
+      // changes only `receivedAt`, not Automerge content) still bumps changeSeq
+      // and re-emits the doc on the metadata feed.
       if (
         existingEntry.lastModified === lastModified
         && existingEntry.isDeleted === isDeleted
         && existingEntry.decryptionKeyId === decryptionKeyId
         && existingEntry.accessState === accessState
+        && existingEntry.awaitingWitness === awaitingWitness
+        && existingEntry.witnessed === witnessed
       ) {
         return; // No change needed
       }
       
-      // Remove from current position
+      // Remove from current position; positions after it are repaired lazily
+      // via indexLookupStaleFrom below.
       this.index.splice(existingIndex, 1);
-      
-      // Update lookup map for entries that moved (only those after the removed position)
-      // We'll update the full range after insertion to be safe
-      const minAffectedIndex = Math.min(existingIndex, this.index.length);
-      for (let i = minAffectedIndex; i < this.index.length; i++) {
-        this.indexLookup.set(this.index[i].docId, i);
-      }
       this.indexLookup.delete(docId);
     }
     
@@ -1124,18 +2015,61 @@ export class BaseMindooDB implements MindooDB {
     // Insert at the correct position
     this.index.splice(insertIndex, 0, newEntry);
     this.nextChangeSeq = assignedSeq + 1;
-    
-    // Update lookup map for entries from insertion point onwards
-    // Only update entries that actually moved (from insertIndex to end)
-    for (let i = insertIndex; i < this.index.length; i++) {
-      this.indexLookup.set(this.index[i].docId, i);
+    this.indexLookup.set(docId, insertIndex);
+
+    // Entries at/after the first splice point may have shifted. Instead of
+    // rewriting the lookup map here (O(index size) per update — twice, in the
+    // old implementation), record the dirty range and let readers repair it
+    // lazily. A fresh insert at the tail (the common bulk-sync case) shifts
+    // nothing and stays clean.
+    const shiftedFrom = existingIndex !== undefined
+      ? Math.min(existingIndex, insertIndex)
+      : insertIndex;
+    if (shiftedFrom < this.index.length - 1) {
+      this.indexLookupStaleFrom = this.indexLookupStaleFrom === null
+        ? shiftedFrom
+        : Math.min(this.indexLookupStaleFrom, shiftedFrom);
     }
+
+    // Reactive support: record the transition for coalesced change events.
+    // Reached only when the index actually changed (identical replays
+    // returned early above).
+    this.noteChangeForListeners(docId, lastModified, isDeleted);
 
     this.performanceCallback?.onIndexUpdate?.({
       docId,
       operation: existingIndex === undefined ? "insert" : "update",
       time: Date.now() - startedAt,
     });
+  }
+
+  /**
+   * Resolve a document's position in the sorted {@link index} through the
+   * lookup map, repairing lazily-deferred staleness (see
+   * {@link indexLookupStaleFrom}) only when the cached position no longer
+   * matches. All `indexLookup.get` reads must go through this accessor.
+   */
+  private getDocIndexPosition(docId: string): number | undefined {
+    const pos = this.indexLookup.get(docId);
+    if (pos === undefined) {
+      return undefined;
+    }
+    if (this.index[pos]?.docId === docId) {
+      return pos;
+    }
+    this.flushIndexLookupPatch();
+    return this.indexLookup.get(docId);
+  }
+
+  /** Rewrite the stale tail of {@link indexLookup} recorded by {@link updateIndex}. */
+  private flushIndexLookupPatch(): void {
+    if (this.indexLookupStaleFrom === null) {
+      return;
+    }
+    for (let i = this.indexLookupStaleFrom; i < this.index.length; i++) {
+      this.indexLookup.set(this.index[i].docId, i);
+    }
+    this.indexLookupStaleFrom = null;
   }
 
   /**
@@ -1339,6 +2273,7 @@ export class BaseMindooDB implements MindooDB {
         if (this.reconcileRestoredIndexOnInit) {
           await this.reconcileRestoredIndexWithStore();
         }
+        this.probeFulltextSetupAtOpen();
         return;
       }
     }
@@ -1348,6 +2283,30 @@ export class BaseMindooDB implements MindooDB {
     // docs whose keys are unavailable, so the only thing left to do is
     // record the current fingerprint for the next warm start.
     this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
+    this.probeFulltextSetupAtOpen();
+  }
+
+  /**
+   * Open-time probe for full-text auto-activation. Without it, a
+   * database whose synced `fulltextSetup` is already enabled would not
+   * build its index until the first change event arrives or the first
+   * search runs. Fired once (fire-and-forget) at the end of
+   * {@link initialize}; uses the same system-database exclusions and
+   * activation path as the change-event probe (see
+   * {@link handleChangesForFulltextAutoUpdate}).
+   */
+  private probeFulltextSetupAtOpen(): void {
+    if (!this.fulltextAutoUpdateEnabled || this.fulltextSetupProbed || this.fulltextIndex) {
+      return;
+    }
+    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    if (this.isTimeTravelMode()) {
+      return;
+    }
+    this.fulltextSetupProbed = true;
+    void this.activateFulltextFromSetupDoc();
   }
 
   /**
@@ -1443,7 +2402,12 @@ export class BaseMindooDB implements MindooDB {
   private async purgeMaterializedDocument(docId: string): Promise<void> {
     this.docCache.delete(docId);
     this.dirtyDocIds.delete(docId);
+    this.lastFlushedDocState.delete(docId);
     this.automergeHashToEntryId.delete(docId);
+    // Plaintext summary values must not outlive the purge either.
+    this.summaryStore?.removeDocument(docId);
+    // Nor extracted plaintext tokens in the full-text index.
+    this.fulltextIndex?.removeDocument(docId);
 
     const store = this.cacheManager?.getStore();
     if (store) {
@@ -1517,8 +2481,12 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      const existingIndex = this.indexLookup.get(docId);
+      const existingIndex = this.getDocIndexPosition(docId);
       const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
+      // Visibility is governed by key possession alone: documents whose
+      // decryption key is in the bag are visible; the rest are hidden. Which
+      // keys a user holds is governed by the key distribution model
+      // (docs/accesscontrol.md §13), not by a server/client read gate.
       const canRead = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
 
       if (canRead) {
@@ -1526,16 +2494,17 @@ export class BaseMindooDB implements MindooDB {
         // missing or inaccessible; visible->visible transitions stay
         // idempotent via the existing `updateIndex` short-circuit.
         if (!existing || existing.accessState === "inaccessible") {
-          this.updateIndex(docId, visibility.lastModified, visibility.isDeleted, visibility.decryptionKeyId, "visible");
+          const { awaitingWitness, witnessed } = metadataWitnessState(metadataByDoc.get(docId)!);
+          this.updateIndex(docId, visibility.lastModified, visibility.isDeleted, visibility.decryptionKeyId, "visible", awaitingWitness, witnessed);
           changed = true;
         }
         continue;
       }
 
       if (existing?.accessState === "visible") {
-        // Key was revoked while we still had plaintext state in cache:
-        // wipe it and flip the index entry to an inaccessible tombstone
-        // with `isDeleted: true` so view feeds emit a clean removal.
+        // Key was revoked while we still had plaintext state in cache: wipe it
+        // and flip the index entry to an inaccessible tombstone with
+        // `isDeleted: true` so view feeds emit a clean removal.
         await this.purgeMaterializedDocument(docId);
         this.updateIndex(docId, visibility.lastModified, true, visibility.decryptionKeyId, "inaccessible");
         changed = true;
@@ -1585,7 +2554,9 @@ export class BaseMindooDB implements MindooDB {
 
     this.index = [];
     this.indexLookup.clear();
+    this.indexLookupStaleFrom = null;
     this.docCache.clear();
+    this.lastFlushedDocState.clear();
     this.automergeHashToEntryId.clear();
     this.processedEntryIds = [];
     this.processedEntryCursor = null;
@@ -1613,6 +2584,17 @@ export class BaseMindooDB implements MindooDB {
    * the workload is about to benefit from it.
    */
   async syncStoreChanges(): Promise<void> {
+    // Hold change-notification emission for the whole batch so listeners
+    // receive one coalesced event per sync run instead of one per document.
+    this.beginChangeNotificationHold();
+    try {
+      await this.syncStoreChangesInternal();
+    } finally {
+      this.endChangeNotificationHold();
+    }
+  }
+
+  private async syncStoreChangesInternal(): Promise<void> {
     const syncStartedAt = Date.now();
     this.logger.debug(`Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
     this.logger.debug(`Already processed ${this.processedEntryIds.length} entry IDs`);
@@ -1668,8 +2650,8 @@ export class BaseMindooDB implements MindooDB {
             if (updatedDoc) {
               this.logger.debug(`Successfully updated cached document ${docId} incrementally`);
               // Only update index if document actually changed
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible");
-              this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted})`);
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false);
+              this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted}, awaitingWitness: ${updatedDoc.awaitingWitness ?? false})`);
             } else {
               this.logger.debug(`Document ${docId} unchanged after applying new entries, skipping index update`);
             }
@@ -1679,7 +2661,7 @@ export class BaseMindooDB implements MindooDB {
             this.docCache.delete(docId);
             updatedDoc = await this.loadDocumentInternal(docId);
             if (updatedDoc) {
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible");
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false);
             }
           }
         } else {
@@ -1719,9 +2701,10 @@ export class BaseMindooDB implements MindooDB {
                 ...entriesForLastModified.map((e) => e.createdAt),
               );
               const isDeleted = this.computeIsDeletedFromMetadata(allDocMetadata);
-              this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible");
+              const { awaitingWitness, witnessed } = metadataWitnessState(allDocMetadata);
+              this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible", awaitingWitness, witnessed);
               this.logger.debug(
-                `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted})`,
+                `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted}, awaitingWitness: ${awaitingWitness})`,
               );
             }
           }
@@ -1746,7 +2729,7 @@ export class BaseMindooDB implements MindooDB {
           // existing index entry (if any). We do NOT need a second pass
           // over the underlying store - the key is missing, so we just
           // record an inaccessibility tombstone.
-          const existingIndex = this.indexLookup.get(docId);
+          const existingIndex = this.getDocIndexPosition(docId);
           const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
           if (existing?.accessState === "visible") {
             const lifecycleEntriesInBatch = entryMetadataList.filter((entry) =>
@@ -1773,7 +2756,9 @@ export class BaseMindooDB implements MindooDB {
             this.cacheMetaDirty = true;
             this.cacheManager?.markDirty();
           }
-          this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
+          if (!this.supportsCursorScan(this.store)) {
+            this.processedEntryIds.push(...entryMetadataList.map(em => em.id));
+          }
           return;
         }
         
@@ -1808,8 +2793,13 @@ export class BaseMindooDB implements MindooDB {
       await processDocument(docId, entryMetadataList);
     }
     
-    // Append new entry IDs to our processed list
-    this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
+    // Append new entry IDs to our processed list. Only needed for stores
+    // without cursor scan (the checkpoint persists them only in that case);
+    // cursor-capable stores track progress via processedEntryCursor, so we
+    // avoid growing an unbounded in-memory id list.
+    if (!this.supportsCursorScan(this.store)) {
+      this.processedEntryIds.push(...newEntryMetadata.map(em => em.id));
+    }
     this.processedEntryCursor = nextCursor;
     this.cacheMetaDirty = true;
     this.cacheManager?.markDirty();
@@ -2062,7 +3052,14 @@ export class BaseMindooDB implements MindooDB {
         if (signal?.aborted) {
           return { transferred, cancelled: true };
         }
-        await targetStore.putEntries(batchEntries);
+        const putResult = await targetStore.putEntries(batchEntries);
+        // On push, the remote (witnessing) target returns receipts for accepted
+        // entries; persist them back onto the local source so the revision feed
+        // re-anchors them from the provisional head to their committed
+        // `receivedAt` (docs/accesscontrol.md §5.3). Pull targets return void.
+        if (Array.isArray(putResult) && putResult.length > 0 && sourceStore.applyWitnessReceipts) {
+          await sourceStore.applyWitnessReceipts(putResult);
+        }
         transferred += batchEntries.length;
       } catch (error) {
         if (signal?.aborted) {
@@ -2379,7 +3376,12 @@ export class BaseMindooDB implements MindooDB {
 
       const batch = missingIds.slice(offset, offset + pageSize);
       const entries = await sourceStore.getEntries(batch);
-      await targetStore.putEntries(entries);
+      const putResult = await targetStore.putEntries(entries);
+      // Persist any witness receipts back onto the local source (see push path
+      // in transferEntriesInBatches; docs/accesscontrol.md §5.3).
+      if (Array.isArray(putResult) && putResult.length > 0 && sourceStore.applyWitnessReceipts) {
+        await sourceStore.applyWitnessReceipts(putResult);
+      }
       transferred += entries.length;
 
       onProgress?.({
@@ -2489,6 +3491,141 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<MindooDoc> {
     return this.createDocumentInternal({ signingKeyPair, signingKeyPassword, decryptionKeyId });
   }
+
+  /**
+   * Bulk-create documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling {@link createDocument} once per input,
+   * with these bulk-oriented differences:
+   * - All produced store entries are written through ONE `putEntries()` call,
+   *   so IndexedDB-backed stores commit the whole batch in a single readwrite
+   *   transaction instead of one per document.
+   * - Custom-id documents MAY combine `id` with `initialValues`: the values are
+   *   applied as a separate `doc_change` entry on top of the deterministic
+   *   seed change, and both entries land in the same batch. (The single-create
+   *   path rejects this combination and requires a follow-up `changeDoc()`.)
+   * - Freshly created documents are cached but intentionally NOT added to the
+   *   dirty-doc tracking: their entries are already durable in the store, so
+   *   an L1 eviction can always re-materialize them. This avoids the per-doc
+   *   flush-before-evict L2 write storm during large imports.
+   * - Snapshot scheduling is skipped (fresh documents cannot exceed the
+   *   snapshot threshold).
+   *
+   * Existing custom-id documents keep the idempotent single-create semantics:
+   * the existing document is returned (tombstones are undeleted first) and any
+   * `initialValues` are applied as a follow-up change.
+   *
+   * Fail-fast: invalid inputs are rejected up front, and a denied ACL
+   * precheck rejects the whole call before any fresh document is written.
+   */
+  async createDocuments(inputs: CreateOptions[]): Promise<MindooDoc[]> {
+    this.assertWritable("createDocuments");
+    if (inputs.length === 0) {
+      return [];
+    }
+    this.logger.info(`Bulk-creating ${inputs.length} documents`);
+
+    // Fail-fast input validation BEFORE any write: an invalid input anywhere
+    // in the batch must reject the whole call without side effects.
+    for (const input of inputs) {
+      const options = input ?? {};
+      if ((options.signingKeyPair !== undefined) !== (options.signingKeyPassword !== undefined)) {
+        throw new Error(
+          "createDocuments: signingKeyPair and signingKeyPassword must be provided together"
+        );
+      }
+      if (options.id !== undefined && !CUSTOM_DOC_ID_REGEX.test(options.id)) {
+        throw new Error(
+          `createDocuments: invalid document id "${options.id}". ` +
+          `Custom document IDs must match ${CUSTOM_DOC_ID_REGEX.source}.`
+        );
+      }
+    }
+
+    const results: Array<MindooDoc | null> = new Array(inputs.length).fill(null);
+    const prepared: Array<{
+      index: number;
+      internalDoc: InternalDoc;
+      entries: StoreEntry[];
+    }> = [];
+
+    for (let index = 0; index < inputs.length; index++) {
+      const options = inputs[index] ?? {};
+
+      if (options.id !== undefined) {
+        // Metadata-only existence probe via the store's docId index (cheap even
+        // on IndexedDB); avoids a full materialization for the common
+        // fresh-document case.
+        const existingMetadata = await this.store.findNewEntriesForDoc([], options.id);
+        if (existingMetadata.length > 0) {
+          // Idempotent path (rare during bulk imports): reuse the single-create
+          // semantics (returns the existing doc, undeletes tombstones) and
+          // apply initialValues as a follow-up change, mirroring the non-bulk
+          // create + changeDoc flow.
+          const { initialValues, ...rest } = options;
+          const existingDoc = await this.createDocumentInternal(rest);
+          const valueEntries = initialValues
+            ? Object.entries(initialValues).filter(
+                ([k, v]) => !k.startsWith("_") && v !== undefined
+              )
+            : [];
+          if (valueEntries.length > 0) {
+            await this.changeDocInternal(
+              existingDoc,
+              (mutable) => {
+                const data = mutable.getData() as Record<string, unknown>;
+                for (const [key, value] of valueEntries) {
+                  data[key] = value;
+                }
+              },
+              options.signingKeyPair,
+              options.signingKeyPassword,
+              options.bypassAccessControlPrecheck,
+            );
+          }
+          results[index] = existingDoc;
+          continue;
+        }
+      }
+
+      const preparedDoc = await this.prepareFreshDocumentCreate(options);
+      prepared.push({ index, ...preparedDoc });
+    }
+
+    const allEntries: StoreEntry[] = [];
+    for (const preparedDoc of prepared) {
+      allEntries.push(...preparedDoc.entries);
+    }
+    if (allEntries.length > 0) {
+      await this.store.putEntries(allEntries);
+    }
+
+    for (const { index, internalDoc } of prepared) {
+      await this.storeCachedDocument(internalDoc);
+      this.updateIndex(
+        internalDoc.id,
+        internalDoc.lastModified,
+        false,
+        internalDoc.decryptionKeyId,
+        "visible",
+        internalDoc.awaitingWitness ?? false,
+        internalDoc.witnessed ?? false,
+      );
+      results[index] = this.wrapDocument(internalDoc);
+    }
+
+    if (prepared.length > 0) {
+      // One metadata-checkpoint invalidation for the whole batch. The created
+      // docs are intentionally NOT added to dirtyDocIds (see method docs).
+      this.cacheMetaDirty = true;
+      this.cacheManager?.markDirty();
+    }
+
+    this.logger.info(
+      `Bulk-created ${prepared.length} documents (${inputs.length - prepared.length} already existed)`
+    );
+    return results as MindooDoc[];
+  }
   
   /**
    * Internal method to create a new document.
@@ -2512,14 +3649,36 @@ export class BaseMindooDB implements MindooDB {
       );
     }
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
-    const keyId = options.decryptionKeyId ?? "default";
+    const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
+
+    // Sanitize caller-provided initial values: internal/reserved fields (those
+    // starting with "_", e.g. "_attachments") are managed by MindooDB and must
+    // not be seeded by callers. `undefined` values are treated as "not set"
+    // (Automerge cannot represent undefined).
+    const initialValueEntries = options.initialValues
+      ? Object.entries(options.initialValues).filter(
+          ([k, v]) => !k.startsWith("_") && v !== undefined
+        )
+      : [];
+    const hasInitialValues = initialValueEntries.length > 0;
 
     if (useCustomDocId) {
       if (!CUSTOM_DOC_ID_REGEX.test(options.id!)) {
         throw new Error(
           `createDocument: invalid document id "${options.id}". ` +
           `Custom document IDs must match ${CUSTOM_DOC_ID_REGEX.source}.`
+        );
+      }
+      // Custom-ID documents are seeded with a hard-coded initial change so that
+      // independent replicas converge on the same Automerge hash. Baking
+      // caller values into that change would diverge the hash per content, so
+      // initialValues is unsupported on the custom-ID path in v1. Create the
+      // document first, then apply values via changeDoc().
+      if (hasInitialValues) {
+        throw new Error(
+          "createDocument: initialValues is not supported together with a custom id; " +
+          "create the document, then apply values with changeDoc()."
         );
       }
     }
@@ -2574,7 +3733,7 @@ export class BaseMindooDB implements MindooDB {
         const fresh = Automerge.init<MindooDocPayload>();
         const [appliedDoc] = Automerge.applyChanges(fresh, [changeBytes]);
         newDoc = appliedDoc;
-        this.logger.debug(`Applied hard-coded initial change, heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+        if (this.isDebugEnabled()) this.logger.debug(`Applied hard-coded initial change, heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
       } catch (error) {
         this.logger.error(`Error applying hard-coded initial change for document ${docId}:`, error);
         throw error;
@@ -2587,8 +3746,14 @@ export class BaseMindooDB implements MindooDB {
           // Store metadata in the document payload
           // We need to modify the document to ensure a change is created
           doc._attachments = [];
+          // Seed caller-provided initial values within the same doc_create
+          // change so a doc_create Tier 2 rule can evaluate them in the
+          // "after" state (docs/accesscontrol.md §6.3, §9).
+          for (const [key, value] of initialValueEntries) {
+            (doc as Record<string, unknown>)[key] = value;
+          }
         });
-        this.logger.debug(`Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+        if (this.isDebugEnabled()) this.logger.debug(`Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
       } catch (error) {
         this.logger.error(`Error in Automerge.change for document ${docId}:`, error);
         throw error;
@@ -2601,7 +3766,26 @@ export class BaseMindooDB implements MindooDB {
       changeBytes = localChange;
     }
     this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
-    
+
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). Evaluates
+    // the full Tier 1 + Tier 2 ruleset for this doc_create and throws
+    // AccessDeniedError when denied, before we spend work encrypting/signing and
+    // writing. The server witness remains authoritative; this only gives the
+    // caller an immediate, meaningful error.
+    {
+      const signerKey = useCustomSigningKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      await this.assertWriteAllowed({
+        op: "doc_create",
+        signerKey,
+        isAuthor: true,
+        bypass: options.bypassAccessControlPrecheck,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(newDoc) as unknown as Record<string, unknown>,
+      });
+    }
+
     // Decode the change to get hash and dependencies
     this.logger.debug(`Decoding change to get hash and dependencies`);
     let decodedChange: any;
@@ -2646,6 +3830,13 @@ export class BaseMindooDB implements MindooDB {
       createdByPublicKey = currentUser.userSigningPublicKey;
     }
     this.logger.debug(`Signed payload, signature length: ${signature.length} bytes`);
+    // Remember the creator's signing key so $author prechecks on subsequent
+    // change/delete operations don't need a metadata scan.
+    this.creatorKeyCache.set(docId, createdByPublicKey);
+
+    // Snapshot of attachments referenced by the freshly created doc (normally
+    // empty; the public create API does not add attachments inline).
+    const createAttachmentRefs = this.collectAttachmentRefs(newDoc);
 
     // Create entry metadata
     const entryMetadata: StoreEntryMetadata = {
@@ -2660,7 +3851,14 @@ export class BaseMindooDB implements MindooDB {
       signature,
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
+      attachmentRefs: createAttachmentRefs.length > 0 ? createAttachmentRefs : undefined,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomSigningKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
     
     // Create full entry object
     const fullEntry: StoreEntry = {
@@ -2674,6 +3872,13 @@ export class BaseMindooDB implements MindooDB {
     // Register automerge hash -> entry ID mapping
     this.registerAutomergeHashMapping(docId, automergeHash, entryId);
     
+    // A freshly created entry is versioned and un-witnessed, so the document is
+    // awaiting witness until it is pushed and stamped with a `receivedAt`.
+    const awaitingWitness = isProvisional(entryMetadata);
+    // Witnessed only once a versioned entry carries a `receivedAt`; a brand-new
+    // local create is versioned-but-provisional, so it is not yet witnessed.
+    const witnessed = isVersioned(entryMetadata) && !awaitingWitness;
+
     // Create internal document representation
     const internalDoc: InternalDoc = {
       id: docId,
@@ -2682,11 +3887,13 @@ export class BaseMindooDB implements MindooDB {
       lastModified: now,
       decryptionKeyId: keyId,
       isDeleted: false,
+      awaitingWitness,
+      witnessed,
     };
     
     // Update cache and index
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, false, internalDoc.decryptionKeyId, "visible");
+    this.updateIndex(docId, internalDoc.lastModified, false, internalDoc.decryptionKeyId, "visible", awaitingWitness, witnessed);
     this.markDocDirty(docId);
     
     this.logger.info(`Document ${docId} created successfully`);
@@ -2695,15 +3902,220 @@ export class BaseMindooDB implements MindooDB {
     return this.wrapDocument(internalDoc);
   }
 
+  /**
+   * Build the store entries and in-memory state for one fresh document of a
+   * {@link createDocuments} batch WITHOUT writing anything. The caller is
+   * responsible for persisting the returned entries (batched `putEntries`)
+   * and for cache/index registration afterwards.
+   *
+   * Mirrors {@link createDocumentInternal} for the fresh-document case, with
+   * one bulk-only extension: a custom-id document MAY carry `initialValues`,
+   * which are emitted as an extra `doc_change` entry on top of the
+   * deterministic seed change so both land in the same store batch.
+   */
+  private async prepareFreshDocumentCreate(options: CreateOptions): Promise<{
+    internalDoc: InternalDoc;
+    entries: StoreEntry[];
+  }> {
+    const { signingKeyPair, signingKeyPassword } = options;
+    if ((signingKeyPair !== undefined) !== (signingKeyPassword !== undefined)) {
+      throw new Error(
+        "createDocuments: signingKeyPair and signingKeyPassword must be provided together"
+      );
+    }
+    const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
+    const keyId = await this.resolveCreateKeyId(options);
+    const useCustomDocId = options.id !== undefined;
+
+    // Sanitize caller-provided initial values: internal/reserved fields are
+    // managed by MindooDB and must not be seeded by callers. `undefined`
+    // values are treated as "not set" (Automerge cannot represent undefined).
+    const initialValueEntries = options.initialValues
+      ? Object.entries(options.initialValues).filter(
+          ([k, v]) => !k.startsWith("_") && v !== undefined
+        )
+      : [];
+
+    // Admin-only validation: only admin key can modify data in admin-only databases
+    if (this._isAdminOnlyDb) {
+      const adminPublicKey = this.getAdminPublicKey();
+      const signerPublicKey = useCustomSigningKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      if (signerPublicKey !== adminPublicKey) {
+        throw new Error("Admin-only database: only the admin key can modify data");
+      }
+    }
+
+    const docId = useCustomDocId ? options.id! : uuidv7();
+    const now = Date.now();
+
+    // Build the initial Automerge document and its first change bytes,
+    // following the same seeding rules as the single-create path.
+    let seedDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    let createChangeBytes: Uint8Array;
+    if (useCustomDocId) {
+      createChangeBytes = getCustomIdInitialChangeBytes();
+      const fresh = Automerge.init<MindooDocPayload>();
+      const [appliedDoc] = Automerge.applyChanges(fresh, [createChangeBytes]);
+      seedDoc = appliedDoc;
+    } else {
+      const initialDoc = Automerge.init<MindooDocPayload>();
+      seedDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
+        doc._attachments = [];
+        // Seed caller-provided initial values within the same doc_create change
+        // so a doc_create Tier 2 rule can evaluate them in the "after" state.
+        for (const [key, value] of initialValueEntries) {
+          (doc as Record<string, unknown>)[key] = value;
+        }
+      });
+      const localChange = Automerge.getLastLocalChange(seedDoc);
+      if (!localChange) {
+        throw new Error("Failed to get change bytes from Automerge document");
+      }
+      createChangeBytes = localChange;
+    }
+
+    // Custom-id + initialValues (bulk-only): the deterministic seed change must
+    // stay byte-identical across replicas, so the values go into a separate
+    // follow-up change that ships in the same batch.
+    let finalDoc = seedDoc;
+    let valueChangeBytes: Uint8Array | null = null;
+    if (useCustomDocId && initialValueEntries.length > 0) {
+      finalDoc = Automerge.change(seedDoc, { time: now }, (doc: MindooDocPayload) => {
+        for (const [key, value] of initialValueEntries) {
+          (doc as Record<string, unknown>)[key] = value;
+        }
+      });
+      const localChange = Automerge.getLastLocalChange(finalDoc);
+      if (!localChange) {
+        throw new Error("Failed to get change bytes from Automerge document");
+      }
+      valueChangeBytes = localChange;
+    }
+
+    // Client-side write-policy precheck (docs/accesscontrol.md §9) against the
+    // document's final after-state (seed + initial values), so a doc_create
+    // Tier 2 rule sees the same state it would see on the single-create path.
+    {
+      const signerKey = useCustomSigningKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      const afterDoc = finalDoc;
+      await this.assertWriteAllowed({
+        op: "doc_create",
+        signerKey,
+        isAuthor: true,
+        bypass: options.bypassAccessControlPrecheck,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(afterDoc) as unknown as Record<string, unknown>,
+      });
+    }
+
+    // Build the doc_create entry.
+    const decodedCreate = Automerge.decodeChange(createChangeBytes);
+    const createHash = decodedCreate.hash;
+    const createDepHashes: string[] = decodedCreate.deps || [];
+    const encryptedPayload = await this.tenant.encryptPayload(createChangeBytes, keyId);
+    const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
+    const entryId = await generateDocEntryId(docId, createHash, createDepHashes, this.getSubtle());
+    const dependencyIds = await this.ensureAutomergeDepsResolved(docId, createDepHashes);
+
+    let signature: Uint8Array;
+    let createdByPublicKey: string;
+    if (useCustomSigningKey) {
+      signature = await this.tenant.signPayloadWithKey(encryptedPayload, signingKeyPair!, signingKeyPassword!);
+      createdByPublicKey = signingKeyPair!.publicKey;
+    } else {
+      const currentUser = await this.tenant.getCurrentUserId();
+      signature = await this.tenant.signPayload(encryptedPayload);
+      createdByPublicKey = currentUser.userSigningPublicKey;
+    }
+    // Remember the creator's signing key so $author prechecks on subsequent
+    // change/delete operations don't need a metadata scan.
+    this.creatorKeyCache.set(docId, createdByPublicKey);
+
+    const createAttachmentRefs = this.collectAttachmentRefs(finalDoc);
+    const entryMetadata: StoreEntryMetadata = {
+      entryType: "doc_create",
+      id: entryId,
+      contentHash,
+      docId,
+      dependencyIds,
+      createdAt: now,
+      createdByPublicKey,
+      decryptionKeyId: keyId,
+      signature,
+      originalSize: createChangeBytes.length,
+      encryptedSize: encryptedPayload.length,
+      attachmentRefs: createAttachmentRefs.length > 0 ? createAttachmentRefs : undefined,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
+    };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomSigningKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
+
+    const entries: StoreEntry[] = [{
+      ...entryMetadata,
+      encryptedData: encryptedPayload,
+    }];
+    // Register the mapping BEFORE building the follow-up change entry so its
+    // dependency resolution finds the doc_create parent.
+    this.registerAutomergeHashMapping(docId, createHash, entryId);
+
+    if (valueChangeBytes) {
+      const tempInternalDoc: InternalDoc = {
+        id: docId,
+        doc: finalDoc,
+        createdAt: now,
+        lastModified: now,
+        decryptionKeyId: keyId,
+        isDeleted: false,
+      };
+      const changeEntry = await this.buildDocChangeStoreEntry({
+        internalDoc: tempInternalDoc,
+        changeBytes: valueChangeBytes,
+        now,
+        useCustomKey: useCustomSigningKey,
+        signingKeyPair,
+        signingKeyPassword,
+        attachmentRefs: createAttachmentRefs,
+      });
+      entries.push(changeEntry);
+      const decodedValueChange = Automerge.decodeChange(valueChangeBytes);
+      this.registerAutomergeHashMapping(docId, decodedValueChange.hash, changeEntry.id);
+    }
+
+    // Freshly created entries are versioned and un-witnessed, so the document
+    // is awaiting witness until pushed and stamped with a receipt.
+    const awaitingWitness = entries.some(isProvisional);
+    const witnessed = entries.some(isVersioned) && !awaitingWitness;
+
+    const internalDoc: InternalDoc = {
+      id: docId,
+      doc: finalDoc,
+      createdAt: now,
+      lastModified: now,
+      decryptionKeyId: keyId,
+      isDeleted: false,
+      awaitingWitness,
+      witnessed,
+    };
+
+    return { internalDoc, entries };
+  }
+
   async getDocument(docId: string): Promise<MindooDoc> {
     const internalDoc = await this.loadDocumentInternal(docId);
     
     if (!internalDoc) {
-      throw new Error(`Document ${docId} not found`);
+      throw new DocumentNotFoundError(docId);
     }
     
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     
     return this.wrapDocument(internalDoc);
@@ -2766,10 +4178,9 @@ export class BaseMindooDB implements MindooDB {
         if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
           this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            snapshotData,
             snapshotData.encryptedData,
-            snapshotData.signature,
-            snapshotData.createdByPublicKey,
           );
         }
 
@@ -2783,11 +4194,22 @@ export class BaseMindooDB implements MindooDB {
           );
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
 
-          const parsed = parseDocEntryId(snapshotData.id);
-          if (parsed) {
-            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          // Snapshot-head verification (docs/accesscontrol.md §10): decoded heads
+          // must equal the declared snapshotHeadHashes or the snapshot is
+          // discarded and the doc is replayed from individually-verified entries.
+          if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+            this.logger.warn(
+              `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, falling back to replay without snapshot`,
+            );
+            doc = undefined;
+            startFromSnapshot = false;
+          } else {
+            const parsed = parseDocEntryId(snapshotData.id);
+            if (parsed) {
+              this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+            }
+            this.registerSnapshotHeadHashMappings(snapshotData);
           }
-          this.registerSnapshotHeadHashMappings(snapshotData);
         }
       }
     }
@@ -2816,10 +4238,9 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
         entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
@@ -2912,10 +4333,9 @@ export class BaseMindooDB implements MindooDB {
       }
       
       // Verify signature
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
         entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
@@ -2997,6 +4417,563 @@ export class BaseMindooDB implements MindooDB {
         };
       }
       
+    }
+  }
+
+  async *iterateChangeRevisionsSince(
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    yield* this.iterateRevisionsInternal(null, cursor);
+  }
+
+  async *iterateDocRevisionsSince(
+    docId: string,
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    yield* this.iterateRevisionsInternal(docId, cursor);
+  }
+
+  /**
+   * Shared implementation of the revision-grain changefeed
+   * ({@link iterateChangeRevisionsSince} / {@link iterateDocRevisionsSince}).
+   *
+   * Two distinct orderings drive the feed (docs/accesscontrol.md §8):
+   *
+   * - **Discovery (receiptOrder).** New entries are discovered via the store's
+   *   gap-free `scanEntriesSince(cursor)` scan in `(receiptOrder, id)` order, so
+   *   an incremental advance reads only entries appended since the cursor and
+   *   never re-scans cold documents. The resumable {@link RevisionCursor} is this
+   *   scan position, parked just before the earliest un-witnessed entry so the
+   *   provisional head overlay is re-evaluated on every resume.
+   * - **Materialization (trusted time).** Each affected document's changes are
+   *   folded in trusted-time order, so every yielded revision carries the
+   *   document's *trusted-time-bounded merge* — the merge of all of the doc's
+   *   changes with `trustedTime <= this revision's trustedTime`. This is correct
+   *   at the head and at every intermediate node, and concurrent same-base
+   *   changes merge from the larger-trusted-time instant onward.
+   *
+   * Trusted-time rule: witnessed entries use their witness `receivedAt`;
+   * un-witnessed local entries use the current wall clock, so they always sit at
+   * the provisional head and never appear in past-time reads until witnessed.
+   *
+   * An in-memory per-doc LRU ({@link revisionFeedDocCache}) lets the common
+   * in-order advance seed from cached state and decrypt only the new suffix; a
+   * cache miss reconstructs the seed from the best snapshot whose coverage is
+   * within the fold prefix via {@link computeDocumentMaterializationPlan}.
+   */
+  private async *iterateRevisionsInternal(
+    docIdFilter: string | null,
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    // ── Phase 1: discover new entries in receiptOrder ─────────────────────
+    const { newEntries, resumeCursor } = await this.discoverRevisionEntries(
+      docIdFilter,
+      cursor,
+    );
+    if (newEntries.length === 0) {
+      return;
+    }
+
+    // Trusted time for un-witnessed entries is the current wall clock, computed
+    // once per run so all un-witnessed entries share a stable head instant.
+    const now = Date.now();
+
+    // Affected documents (those with at least one newly-discovered entry), and
+    // the set of new entry ids per doc (the trusted-time positions from which the
+    // doc's merged state may have changed and must be re-folded / re-emitted).
+    const newIdsByDoc = new Map<string, Set<string>>();
+    for (const em of newEntries) {
+      let set = newIdsByDoc.get(em.docId);
+      if (!set) {
+        set = new Set<string>();
+        newIdsByDoc.set(em.docId, set);
+      }
+      set.add(em.id);
+    }
+
+    // ── Phase 2: per affected doc, fold in trusted-time order, emit suffix ──
+    for (const docId of Array.from(newIdsByDoc.keys()).sort()) {
+      yield* this.foldDocRevisions(docId, newIdsByDoc.get(docId)!, now, resumeCursor);
+    }
+  }
+
+  /**
+   * Discovery phase of {@link iterateRevisionsInternal}: walk the store in
+   * `(receiptOrder, id)` order from `cursor`, collecting the newly-appended
+   * replay entries and computing the resume cursor.
+   *
+   * The resume cursor is the witnessed stable-prefix watermark: it advances over
+   * leading witnessed entries but stops just before the first un-witnessed entry,
+   * so un-witnessed entries (whose trusted time is provisional `now`) are
+   * re-discovered and re-evaluated as a head overlay on the next resume.
+   */
+  private async discoverRevisionEntries(
+    docIdFilter: string | null,
+    cursor: RevisionCursor | null,
+  ): Promise<{ newEntries: StoreEntryMetadata[]; resumeCursor: RevisionCursor | null }> {
+    const replayTypes: StoreEntryType[] = [
+      "doc_create",
+      "doc_change",
+      "doc_delete",
+      "doc_undelete",
+    ];
+    const newEntries: StoreEntryMetadata[] = [];
+    // Never regress below the input cursor; only advance while still in the
+    // leading witnessed prefix.
+    let stableCursor: RevisionCursor | null = cursor;
+    let sawProvisional = false;
+
+    const consider = (em: StoreEntryMetadata): void => {
+      if (!this.isDocumentReplayEntry(em)) {
+        return;
+      }
+      // Admin-only mode: only accept entries signed by the admin key (mirrors
+      // materialization / iterateDocumentHistory). Non-admin entries are
+      // permanently ignored and do not gate the stable cursor.
+      if (this._isAdminOnlyDb && em.createdByPublicKey !== this.getAdminPublicKey()) {
+        return;
+      }
+      newEntries.push(em);
+      // The resume cursor may only advance through the leading prefix of
+      // STABLE entries (whose trusted time never moves): witnessed entries and
+      // legacy un-witnessed entries (stable at createdAt). It must park before
+      // the first PROVISIONAL entry (versioned + un-witnessed, trusted time =
+      // now), because that entry's position will change once it is witnessed
+      // and re-delivered with a fresh receiptOrder. See {@link isProvisional}.
+      const provisional = isProvisional(em);
+      if (!sawProvisional) {
+        if (!provisional && em.receiptOrder !== undefined) {
+          stableCursor = { receiptOrder: em.receiptOrder, id: em.id };
+        } else if (provisional) {
+          sawProvisional = true;
+        }
+      }
+    };
+
+    if (this.supportsCursorScan(this.store)) {
+      const baseFilters: StoreScanFilters = { entryTypes: replayTypes };
+      if (docIdFilter) {
+        baseFilters.docId = docIdFilter;
+      }
+      const scanFilters = this.mergeTimeTravelScanFilters(baseFilters);
+      let scanCursor: StoreScanCursor | null = cursor
+        ? { receiptOrder: cursor.receiptOrder, id: cursor.id }
+        : null;
+      while (true) {
+        const page = await this.store.scanEntriesSince!(scanCursor, 1000, scanFilters);
+        for (const em of page.entries) {
+          consider(em);
+        }
+        scanCursor = page.nextCursor;
+        if (!page.hasMore) {
+          break;
+        }
+      }
+    } else {
+      // Fallback for stores without cursor scan: scan all metadata, order by
+      // (receiptOrder, id), and take entries strictly after the cursor.
+      const filters: StoreScanFilters | undefined = docIdFilter
+        ? { docId: docIdFilter }
+        : undefined;
+      const all = (await this.scanAllMetadata(this.store, filters))
+        .filter((em) => this.isDocumentReplayEntry(em))
+        .sort((a, b) => this.compareReceiptOrder(a, b));
+      for (const em of all) {
+        if (cursor && !this.isAfterReceiptCursor(em, cursor)) {
+          continue;
+        }
+        consider(em);
+      }
+    }
+
+    return { newEntries, resumeCursor: stableCursor };
+  }
+
+  /** Compare two entries by `(receiptOrder, id)` ascending. */
+  private compareReceiptOrder(a: StoreEntryMetadata, b: StoreEntryMetadata): number {
+    const ra = a.receiptOrder ?? 0;
+    const rb = b.receiptOrder ?? 0;
+    return ra !== rb ? ra - rb : a.id.localeCompare(b.id);
+  }
+
+  /** True when `em` is strictly after `cursor` in `(receiptOrder, id)` order. */
+  private isAfterReceiptCursor(em: StoreEntryMetadata, cursor: RevisionCursor): boolean {
+    const ro = em.receiptOrder ?? 0;
+    if (ro !== cursor.receiptOrder) {
+      return ro > cursor.receiptOrder;
+    }
+    return em.id.localeCompare(cursor.id) > 0;
+  }
+
+  /**
+   * Materialization phase for a single affected document: fold its changes in
+   * trusted-time order and yield one revision per change from the earliest
+   * newly-discovered (or superseded) position onward, each carrying the
+   * trusted-time-bounded merged document state.
+   */
+  private async *foldDocRevisions(
+    docId: string,
+    newIds: Set<string>,
+    now: number,
+    resumeCursor: RevisionCursor | null,
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown> {
+    // All metadata for this doc (metadata only, cheap). Includes snapshots, used
+    // for cache-miss seed reconstruction.
+    const docAllMeta = await this.scanAllMetadata(this.store, { docId });
+    let replayMeta = docAllMeta.filter((em) => this.isDocumentReplayEntry(em));
+    if (this._isAdminOnlyDb) {
+      const adminKey = this.getAdminPublicKey();
+      replayMeta = replayMeta.filter((em) => em.createdByPublicKey === adminKey);
+    }
+    if (replayMeta.length === 0) {
+      return;
+    }
+
+    // Order the doc's changes by trusted time (version-aware rule, see
+    // {@link entryTrustedTime}): witnessed -> receivedAt; versioned un-witnessed
+    // floats to the provisional head (now); legacy un-witnessed stays at its
+    // stable createdAt.
+    const ttSorted = replayMeta
+      .map((meta) => ({
+        meta,
+        tt: entryTrustedTime(meta, now),
+        witnessed: meta.receivedAt !== undefined,
+      }))
+      .sort((a, b) => (a.tt !== b.tt ? a.tt - b.tt : a.meta.id.localeCompare(b.meta.id)));
+
+    // First trusted-time position touched by a newly-discovered entry. From here
+    // the doc's merged state (and every later revision) may have changed, so we
+    // re-fold and re-emit the suffix; earlier revisions are unchanged.
+    const firstChangedIdx = ttSorted.findIndex((r) => newIds.has(r.meta.id));
+    if (firstChangedIdx < 0) {
+      return;
+    }
+
+    // Origin time and key id come from the document's create entry, independent
+    // of fold order (under the trusted-time rule un-witnessed entries can sort
+    // before the create, so we must not rely on seeing the create first).
+    const createMeta = replayMeta.find((m) => m.entryType === "doc_create");
+
+    // Seed the running doc to the merge of the unchanged prefix.
+    const prefix = ttSorted.slice(0, firstChangedIdx).map((r) => r.meta);
+    const seed = await this.seedRevisionFold(docId, prefix, docAllMeta);
+    let doc: AutomergeTypes.Doc<MindooDocPayload> =
+      seed.doc ?? Automerge.init<MindooDocPayload>();
+    const createdAt = createMeta?.createdAt ?? seed.createdAt ?? 0;
+    const decryptionKeyId = createMeta?.decryptionKeyId ?? seed.decryptionKeyId ?? "default";
+
+    // Cumulative metadata up to and including each revision (deletion state).
+    const seenMeta: StoreEntryMetadata[] = [...prefix];
+
+    // Load + verify + decrypt the suffix in trusted-time-order windows: one
+    // getEntries round trip per window instead of one per revision (a real win
+    // for network/on-disk stores), and verify/decrypt the whole window in
+    // parallel (independent per-entry crypto). Folding (applyChanges) below
+    // still runs strictly sequentially in trusted-time order. The window also
+    // bounds peak memory and response size (the suffix is the whole history on a
+    // snapshot-less cold-start re-fold).
+    let preparedById = new Map<string, { entry: StoreEntry; payload: Uint8Array }>();
+    let windowEnd = firstChangedIdx;
+    for (let i = firstChangedIdx; i < ttSorted.length; i++) {
+      const rev = ttSorted[i];
+      const meta = rev.meta;
+
+      if (i >= windowEnd) {
+        const windowMetas = ttSorted.slice(i, i + this.revisionFoldLoadWindow);
+        windowEnd = i + windowMetas.length;
+        const batch = await this.store.getEntries(windowMetas.map((r) => r.meta.id));
+        const prepared = await Promise.all(
+          batch.map(async (entry) => {
+            const isValid = await this.tenant.verifyEntrySignature(
+              entry,
+              entry.encryptedData,
+            );
+            if (!isValid) {
+              this.logger.warn(`Invalid signature for revision entry ${entry.id}, skipping`);
+              return null;
+            }
+            const payload = await this.tenant.decryptPayload(
+              entry.encryptedData,
+              entry.decryptionKeyId,
+            );
+            return { entry, payload };
+          }),
+        );
+        preparedById = new Map();
+        for (const p of prepared) {
+          if (p) {
+            preparedById.set(p.entry.id, p);
+          }
+        }
+      }
+
+      const ready = preparedById.get(meta.id);
+      if (!ready) {
+        // Absent from the loaded window means missing in the store or it failed
+        // signature verification (already logged during the parallel prepare).
+        this.logger.warn(`Revision entry ${meta.id} unavailable (missing or invalid), skipping`);
+        continue;
+      }
+      const entryData = ready.entry;
+      const decryptedPayload = ready.payload;
+
+      // applyChanges buffers changes with unmet causal deps until they arrive,
+      // so a change folded before its doc_create (possible under the trusted-time
+      // rule for same-instant un-witnessed entries) still converges.
+      const [appliedDoc] = Automerge.applyChanges(doc, [decryptedPayload]);
+      doc = appliedDoc;
+
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
+
+      seenMeta.push(meta);
+
+      const internalDoc: InternalDoc = {
+        id: docId,
+        doc: Automerge.clone(doc),
+        createdAt,
+        lastModified: meta.createdAt,
+        decryptionKeyId,
+        // Deletion as of this revision = latest reachable lifecycle entry among
+        // this document's replay entries seen up to and including this one.
+        isDeleted: this.computeIsDeletedFromMetadata([...seenMeta]),
+      };
+
+      yield {
+        docId,
+        entryId: meta.id,
+        doc: this.wrapDocument(internalDoc),
+        entryType: meta.entryType,
+        trustedTime: rev.tt,
+        witnessed: rev.witnessed,
+        createdByPublicKey: meta.createdByPublicKey,
+        cursor: resumeCursor,
+      };
+    }
+
+    // Cache the doc's full merged state for the next incremental advance.
+    this.putRevisionFeedCache(docId, {
+      doc,
+      coveredIds: new Set(ttSorted.map((r) => r.meta.id)),
+      createdAt,
+      decryptionKeyId,
+    });
+  }
+
+  /**
+   * Reconstruct the merged state of a document covering exactly the replay
+   * entries in `prefix` (the unchanged head of a trusted-time fold).
+   *
+   * Fast path: if the LRU holds a merged doc whose coverage is a subset of the
+   * prefix, clone it and apply only the missing entries. Otherwise reconstruct
+   * from the best snapshot whose coverage is fully within the prefix (so the
+   * snapshot can never pull in changes beyond the fold point) plus the uncovered
+   * prefix tail, via {@link computeDocumentMaterializationPlan}.
+   */
+  private async seedRevisionFold(
+    docId: string,
+    prefix: StoreEntryMetadata[],
+    docAllMeta: StoreEntryMetadata[],
+  ): Promise<{
+    doc: AutomergeTypes.Doc<MindooDocPayload> | null;
+    createdAt: number | null;
+    decryptionKeyId: string | null;
+  }> {
+    if (prefix.length === 0) {
+      return { doc: null, createdAt: null, decryptionKeyId: null };
+    }
+
+    const createEntry = prefix.find((m) => m.entryType === "doc_create");
+    const createdAt = createEntry ? createEntry.createdAt : null;
+    const decryptionKeyId = createEntry ? createEntry.decryptionKeyId : null;
+    const prefixIds = new Set(prefix.map((m) => m.id));
+
+    // LRU fast path: cached coverage is a subset of the prefix -> reuse + apply
+    // only the missing entries (no snapshot/genesis reconstruction).
+    const cached = this.getRevisionFeedCache(docId);
+    if (cached && this.isIdSubset(cached.coveredIds, prefixIds)) {
+      const missing = prefix.filter((m) => !cached.coveredIds.has(m.id));
+      const doc = await this.applyChangeEntries(docId, Automerge.clone(cached.doc), missing);
+      return {
+        doc,
+        createdAt: createdAt ?? cached.createdAt,
+        decryptionKeyId: decryptionKeyId ?? cached.decryptionKeyId,
+      };
+    }
+
+    // Cache miss: reconstruct from the best in-prefix snapshot + uncovered tail.
+    const prefixSnapshots = docAllMeta.filter(
+      (m) => m.entryType === "doc_snapshot" && this.snapshotRootsWithin(m, prefixIds),
+    );
+    const planInput = [...prefix, ...prefixSnapshots];
+    const plan = computeDocumentMaterializationPlan(docId, planInput);
+    const metadataById = new Map(planInput.map((m) => [m.id, m]));
+
+    let doc: AutomergeTypes.Doc<MindooDocPayload> | null = null;
+    if (plan.snapshotEntryId) {
+      const snapMeta = metadataById.get(plan.snapshotEntryId);
+      if (snapMeta) {
+        doc = await this.loadSnapshotForFold(docId, snapMeta);
+      }
+    }
+    if (!doc) {
+      doc = Automerge.init<MindooDocPayload>();
+    }
+
+    const tail = plan.entryIdsToApply
+      .map((id) => metadataById.get(id))
+      .filter((m): m is StoreEntryMetadata => m !== undefined);
+    doc = await this.applyChangeEntries(docId, doc, tail);
+
+    return { doc, createdAt, decryptionKeyId };
+  }
+
+  /** True when every id in `sub` is contained in `sup`. */
+  private isIdSubset(sub: Set<string>, sup: Set<string>): boolean {
+    if (sub.size > sup.size) {
+      return false;
+    }
+    for (const id of sub) {
+      if (!sup.has(id)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * True when all of a snapshot's coverage roots are within `idSet`, i.e. the
+   * snapshot represents a state reachable from entries inside the set (safe to
+   * use as a seed without pulling in later changes).
+   */
+  private snapshotRootsWithin(
+    snapshotMeta: StoreEntryMetadata,
+    idSet: Set<string>,
+  ): boolean {
+    const roots =
+      snapshotMeta.snapshotHeadEntryIds && snapshotMeta.snapshotHeadEntryIds.length > 0
+        ? snapshotMeta.snapshotHeadEntryIds
+        : snapshotMeta.dependencyIds;
+    if (!roots || roots.length === 0) {
+      return false;
+    }
+    return roots.every((r) => idSet.has(r));
+  }
+
+  /** Load, verify, and decrypt a snapshot into an Automerge doc, or `null`. */
+  private async loadSnapshotForFold(
+    docId: string,
+    snapshotMeta: StoreEntryMetadata,
+  ): Promise<AutomergeTypes.Doc<MindooDocPayload> | null> {
+    const entries = await this.store.getEntries([snapshotMeta.id]);
+    if (entries.length === 0) {
+      return null;
+    }
+    const snapshotData = entries[0];
+    if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+      this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
+      return null;
+    }
+    const isValid = await this.tenant.verifyEntrySignature(
+      snapshotData,
+      snapshotData.encryptedData,
+    );
+    if (!isValid) {
+      this.logger.warn(`Invalid signature for snapshot ${snapshotData.id}, falling back to replay`);
+      return null;
+    }
+    const decryptedSnapshot = await this.tenant.decryptPayload(
+      snapshotData.encryptedData,
+      snapshotData.decryptionKeyId,
+    );
+    const doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
+    // Mandatory snapshot-head verification (docs/accesscontrol.md §10): the
+    // decoded snapshot's Automerge heads must exactly equal the covered heads
+    // declared in the signed metadata, so a snapshot cannot smuggle content the
+    // author was not allowed to write. On mismatch, fall back to replay.
+    if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+      this.logger.warn(
+        `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, falling back to replay`,
+      );
+      return null;
+    }
+    const parsed = parseDocEntryId(snapshotData.id);
+    if (parsed) {
+      this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+    }
+    this.registerSnapshotHeadHashMappings(snapshotData);
+    return doc;
+  }
+
+  /**
+   * Load, verify, decrypt, and apply a set of replay change entries onto `doc`.
+   * `Automerge.applyChanges` buffers changes whose causal dependencies are not
+   * yet present, so the entries need not be supplied in dependency order.
+   */
+  private async applyChangeEntries(
+    docId: string,
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    metas: StoreEntryMetadata[],
+  ): Promise<AutomergeTypes.Doc<MindooDocPayload>> {
+    if (metas.length === 0) {
+      return doc;
+    }
+    const loaded = await this.store.getEntries(metas.map((m) => m.id));
+    const byId = new Map(loaded.map((e) => [e.id, e]));
+    const changes: Uint8Array[] = [];
+    for (const meta of metas) {
+      const entryData = byId.get(meta.id);
+      if (!entryData) {
+        this.logger.warn(`Revision entry ${meta.id} not found in store, skipping`);
+        continue;
+      }
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
+        entryData.encryptedData,
+      );
+      if (!isValid) {
+        this.logger.warn(`Invalid signature for revision entry ${entryData.id}, skipping`);
+        continue;
+      }
+      const decrypted = await this.tenant.decryptPayload(
+        entryData.encryptedData,
+        entryData.decryptionKeyId,
+      );
+      changes.push(decrypted);
+      const parsed = parseDocEntryId(entryData.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entryData.id);
+      }
+    }
+    if (changes.length === 0) {
+      return doc;
+    }
+    const [applied] = Automerge.applyChanges(doc, changes);
+    return applied;
+  }
+
+  /** Touch the revision-feed LRU, moving `docId` to most-recently-used. */
+  private getRevisionFeedCache(docId: string): RevisionFeedDocState | undefined {
+    const state = this.revisionFeedDocCache.get(docId);
+    if (state) {
+      this.revisionFeedDocCache.delete(docId);
+      this.revisionFeedDocCache.set(docId, state);
+    }
+    return state;
+  }
+
+  /** Insert/update the revision-feed LRU, evicting the least-recently-used. */
+  private putRevisionFeedCache(docId: string, state: RevisionFeedDocState): void {
+    this.revisionFeedDocCache.delete(docId);
+    this.revisionFeedDocCache.set(docId, state);
+    while (this.revisionFeedDocCache.size > this.revisionFeedCacheLimit) {
+      const oldest = this.revisionFeedDocCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.revisionFeedDocCache.delete(oldest);
     }
   }
 
@@ -3105,10 +5082,9 @@ export class BaseMindooDB implements MindooDB {
         result.set(metadata.id, null);
         continue;
       }
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entry,
         entry.encryptedData,
-        entry.signature,
-        entry.createdByPublicKey,
       );
       if (!isValid) {
         result.set(metadata.id, null);
@@ -3264,10 +5240,9 @@ export class BaseMindooDB implements MindooDB {
         if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
           this.logger.warn(`Admin-only DB: skipping DAG details for ${entry.id} not signed by admin key`);
         } else {
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            entry,
             entry.encryptedData,
-            entry.signature,
-            entry.createdByPublicKey,
           );
         }
         if (isValid) {
@@ -4071,10 +6046,9 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Admin-only DB: skipping conflict analysis entry ${entry.id} not signed by admin key`);
         continue;
       }
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entry,
         entry.encryptedData,
-        entry.signature,
-        entry.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for conflict analysis entry ${entry.id}, skipping`);
@@ -4626,7 +6600,88 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async deleteDocument(docId: string, options: DeleteOptions = {}): Promise<void> {
-    return this.deleteDocInternal(docId, options.signingKeyPair, options.signingKeyPassword);
+    return this.deleteDocInternal(
+      docId,
+      options.signingKeyPair,
+      options.signingKeyPassword,
+      options.bypassAccessControlPrecheck,
+    );
+  }
+
+  /**
+   * Bulk-delete documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling {@link deleteDocument} once per id, but
+   * all `doc_delete` lifecycle entries are written through ONE `putEntries()`
+   * call (a single readwrite transaction on IndexedDB-backed stores), and the
+   * deleted documents are dropped from the L1 cache instead of being
+   * dirty-tracked (the entries are already durable, so no L2 flush is needed).
+   *
+   * Documents that are missing or already deleted are skipped (idempotent
+   * bulk semantics: a re-run of a destructive import must not fail because a
+   * previous run already removed some documents). Any other failure, including
+   * a denied ACL precheck, rejects the whole call before anything is written.
+   */
+  async deleteDocuments(docIds: string[], options: DeleteOptions = {}): Promise<void> {
+    this.assertWritable("deleteDocuments");
+    if (docIds.length === 0) {
+      return;
+    }
+    await this.assertLifecycleMutationAllowed(options.signingKeyPair, options.signingKeyPassword);
+    this.logger.info(`Bulk-deleting ${docIds.length} documents`);
+
+    // Unlike creation, a delete must first materialize the CURRENT document
+    // (the doc_delete entry is an Automerge change on its heads), which costs
+    // an IndexedDB metadata scan plus per-entry decrypt + signature verify.
+    // Those are independent per document and dominated by IndexedDB/WebCrypto
+    // latency (both run off the JS thread), so prepare with bounded
+    // concurrency instead of strictly sequentially. Results keep input order;
+    // any failure rejects the whole batch before anything is written
+    // (fail-fast, same as the sequential version).
+    const preparedByIndex: Array<
+      Awaited<ReturnType<BaseMindooDB["prepareLifecycleEntry"]>> | null
+    > = new Array(docIds.length).fill(null);
+    const concurrency = Math.min(8, docIds.length);
+    let nextIndex = 0;
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (true) {
+          const index = nextIndex++;
+          if (index >= docIds.length) {
+            return;
+          }
+          const docId = docIds[index];
+          const internalDoc = await this.loadDocumentInternal(docId);
+          if (!internalDoc || internalDoc.isDeleted) {
+            this.logger.debug(`Skipping bulk delete for ${docId} — not found or already deleted`);
+            continue;
+          }
+          preparedByIndex[index] = await this.prepareLifecycleEntry(
+            internalDoc,
+            "doc_delete",
+            options.signingKeyPair,
+            options.signingKeyPassword,
+            options.bypassAccessControlPrecheck,
+          );
+        }
+      }),
+    );
+    const prepared = preparedByIndex.filter(
+      (p): p is NonNullable<(typeof preparedByIndex)[number]> => p !== null,
+    );
+
+    if (prepared.length === 0) {
+      return;
+    }
+
+    await this.store.putEntries(prepared.map((p) => p.fullEntry));
+    for (const p of prepared) {
+      await this.applyLifecycleEntryLocally(p, { markDirty: false });
+    }
+    // One metadata-checkpoint invalidation for the whole batch.
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+    this.logger.info(`Bulk-deleted ${prepared.length} documents (${docIds.length - prepared.length} skipped)`);
   }
 
   async deleteDocumentWithSigningKey(
@@ -4638,7 +6693,12 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async undeleteDocument(docId: string, options: UndeleteOptions = {}): Promise<void> {
-    return this.undeleteDocInternal(docId, options.signingKeyPair, options.signingKeyPassword);
+    return this.undeleteDocInternal(
+      docId,
+      options.signingKeyPair,
+      options.signingKeyPassword,
+      options.bypassAccessControlPrecheck,
+    );
   }
 
   private async assertLifecycleMutationAllowed(
@@ -4673,7 +6733,41 @@ export class BaseMindooDB implements MindooDB {
     entryType: "doc_delete" | "doc_undelete",
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
+    bypassPrecheck?: boolean,
   ): Promise<void> {
+    const prepared = await this.prepareLifecycleEntry(
+      internalDoc,
+      entryType,
+      signingKeyPair,
+      signingKeyPassword,
+      bypassPrecheck,
+    );
+    await this.store.putEntries([prepared.fullEntry]);
+    await this.applyLifecycleEntryLocally(prepared, { markDirty: true });
+  }
+
+  /**
+   * Build (but do not persist) a delete/undelete lifecycle entry for an
+   * existing document, including the ACL precheck. Callers persist the
+   * returned `fullEntry` (single or batched `putEntries`) and then call
+   * {@link applyLifecycleEntryLocally} to update caches and indexes.
+   */
+  private async prepareLifecycleEntry(
+    internalDoc: InternalDoc,
+    entryType: "doc_delete" | "doc_undelete",
+    signingKeyPair?: SigningKeyPair,
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean,
+  ): Promise<{
+    internalDoc: InternalDoc;
+    entryType: "doc_delete" | "doc_undelete";
+    newDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    automergeHash: string;
+    entryId: string;
+    entryMetadata: StoreEntryMetadata;
+    fullEntry: StoreEntry;
+    now: number;
+  }> {
     // Delete and undelete are encoded as normal Automerge changes so the DAG
     // keeps causal ancestry, while the StoreEntry type carries lifecycle intent.
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
@@ -4722,6 +6816,12 @@ export class BaseMindooDB implements MindooDB {
       createdByPublicKey = currentUser.userSigningPublicKey;
     }
 
+    // Attachment snapshot for lifecycle entries: a delete marks the document
+    // inactive, so its attachments are no longer referenced (empty set -> their
+    // chunks become reclaim candidates); an undelete restores the current set.
+    const lifecycleAttachmentRefs =
+      entryType === "doc_delete" ? [] : this.collectAttachmentRefs(newDoc);
+
     // The encrypted Automerge change is the payload; the metadata classifies it
     // as a delete or undelete lifecycle entry for fast history/view queries.
     const entryMetadata: StoreEntryMetadata = {
@@ -4736,13 +6836,75 @@ export class BaseMindooDB implements MindooDB {
       signature,
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
+      attachmentRefs: lifecycleAttachmentRefs.length > 0 ? lifecycleAttachmentRefs : undefined,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomSigningKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
     const fullEntry: StoreEntry = {
       ...entryMetadata,
       encryptedData: encryptedPayload,
     };
 
-    await this.store.putEntries([fullEntry]);
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). `internalDoc.doc`
+    // is still the pre-change state here (reassigned in
+    // applyLifecycleEntryLocally, after the store write). For deletes the rules
+    // default to the "before" state; both states are supplied so either `when`
+    // resolves. Throws AccessDeniedError if denied.
+    {
+      const creatorKey = await this.resolveCreatorSigningKey(docId);
+      const beforeState = internalDoc.doc;
+      await this.assertWriteAllowed({
+        op: entryType,
+        signerKey: createdByPublicKey,
+        isAuthor: creatorKey !== null && createdByPublicKey === creatorKey,
+        bypass: bypassPrecheck,
+        getBeforeDoc: () =>
+          this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(newDoc) as unknown as Record<string, unknown>,
+      });
+    }
+
+    return {
+      internalDoc,
+      entryType,
+      newDoc,
+      automergeHash,
+      entryId,
+      entryMetadata,
+      fullEntry,
+      now,
+    };
+  }
+
+  /**
+   * Apply a persisted lifecycle entry (see {@link prepareLifecycleEntry}) to
+   * the in-memory document, cache, and changefeed index. Must be called after
+   * the entry was written to the store.
+   *
+   * With `markDirty: false` (bulk path) the document is dropped from the L1
+   * cache instead of being dirty-tracked: the lifecycle entry is already
+   * durable in the append-only store, so skipping the L2 flush avoids the
+   * per-document flush-before-evict write storm during large batches.
+   */
+  private async applyLifecycleEntryLocally(
+    prepared: {
+      internalDoc: InternalDoc;
+      entryType: "doc_delete" | "doc_undelete";
+      newDoc: AutomergeTypes.Doc<MindooDocPayload>;
+      automergeHash: string;
+      entryId: string;
+      entryMetadata: StoreEntryMetadata;
+      now: number;
+    },
+    options: { markDirty: boolean },
+  ): Promise<void> {
+    const { internalDoc, entryType, newDoc, automergeHash, entryId, entryMetadata, now } = prepared;
+    const docId = internalDoc.id;
     this.registerAutomergeHashMapping(docId, automergeHash, entryId);
 
     // Keep the loaded document, cache, index, and sync dirty tracking in step
@@ -4750,9 +6912,21 @@ export class BaseMindooDB implements MindooDB {
     internalDoc.doc = newDoc;
     internalDoc.isDeleted = entryType === "doc_delete";
     internalDoc.lastModified = now;
-    await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible");
-    this.markDocDirty(docId);
+    // The delete/undelete entry just written is versioned and un-witnessed, so
+    // the document is awaiting witness until pushed + stamped with a receipt.
+    internalDoc.awaitingWitness = isProvisional(entryMetadata) || (internalDoc.awaitingWitness ?? false);
+    // The doc is now witness-era (we just wrote a versioned entry), so it is
+    // witnessed iff it is no longer awaiting a receipt.
+    internalDoc.witnessed = isVersioned(entryMetadata) && !internalDoc.awaitingWitness;
+    if (options.markDirty) {
+      await this.storeCachedDocument(internalDoc);
+      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
+      this.markDocDirty(docId);
+    } else {
+      this.docCache.delete(docId);
+      this.dirtyDocIds.delete(docId);
+      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
+    }
   }
 
   /**
@@ -4763,7 +6937,8 @@ export class BaseMindooDB implements MindooDB {
   private async deleteDocInternal(
     docId: string,
     signingKeyPair?: SigningKeyPair,
-    signingKeyPassword?: string
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`Deleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
@@ -4774,14 +6949,15 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc || internalDoc.isDeleted) {
       throw new Error(`Document ${docId} not found or already deleted`);
     }
-    await this.writeLifecycleEntry(internalDoc, "doc_delete", signingKeyPair, signingKeyPassword);
+    await this.writeLifecycleEntry(internalDoc, "doc_delete", signingKeyPair, signingKeyPassword, bypassPrecheck);
     this.logger.info(`Document ${docId} deleted successfully`);
   }
 
   private async undeleteDocInternal(
     docId: string,
     signingKeyPair?: SigningKeyPair,
-    signingKeyPassword?: string
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`Undeleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
@@ -4789,14 +6965,14 @@ export class BaseMindooDB implements MindooDB {
 
     const internalDoc = await this.loadDocumentInternal(docId);
     if (!internalDoc) {
-      throw new Error(`Document ${docId} not found`);
+      throw new DocumentNotFoundError(docId);
     }
     if (!internalDoc.isDeleted) {
       this.logger.debug(`Document ${docId} is already alive; undelete is a no-op`);
       return;
     }
 
-    await this.writeLifecycleEntry(internalDoc, "doc_undelete", signingKeyPair, signingKeyPassword);
+    await this.writeLifecycleEntry(internalDoc, "doc_undelete", signingKeyPair, signingKeyPassword, bypassPrecheck);
     this.logger.info(`Document ${docId} undeleted successfully`);
   }
 
@@ -4805,7 +6981,13 @@ export class BaseMindooDB implements MindooDB {
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
     options: ChangeOptions = {}
   ): Promise<void> {
-    return this.changeDocInternal(doc, changeFunc, options.signingKeyPair, options.signingKeyPassword);
+    return this.changeDocInternal(
+      doc,
+      changeFunc,
+      options.signingKeyPair,
+      options.signingKeyPassword,
+      options.bypassAccessControlPrecheck,
+    );
   }
 
   async changeDocWithSigningKey(
@@ -4834,13 +7016,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateTextPatch(patch);
@@ -4874,7 +7056,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applyEdits);
       });
-      this.logger.debug(`Successfully applied text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying text patch for document ${docId}:`, error);
       throw error;
@@ -4914,13 +7096,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateRichTextPatch(patch);
@@ -4971,7 +7153,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applySpans);
       });
-      this.logger.debug(`Successfully applied rich-text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied rich-text patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying rich-text patch for document ${docId}:`, error);
       throw error;
@@ -5011,13 +7193,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateRichTextStepPatch(patch);
@@ -5080,7 +7262,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applySteps);
       });
-      this.logger.debug(`Successfully applied rich-text steps, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied rich-text steps, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying rich-text steps for document ${docId}:`, error);
       throw error;
@@ -5113,12 +7295,12 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     const spans = (Automerge as any).spans(
       internalDoc.doc as AutomergeTypes.Doc<MindooDocPayload>,
@@ -5164,13 +7346,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     await this.hydrateAutomergeHashMappingsFromStore(docId);
@@ -5196,9 +7378,11 @@ export class BaseMindooDB implements MindooDB {
         );
         return mergedDoc;
       });
-      this.logger.debug(
-        `Successfully applied Automerge changes, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`,
-      );
+      if (this.isDebugEnabled()) {
+        this.logger.debug(
+          `Successfully applied Automerge changes, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`,
+        );
+      }
     } catch (error) {
       this.logger.error(`Error applying Automerge changes for document ${docId}:`, error);
       throw error;
@@ -5264,12 +7448,12 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     return internalDoc;
   }
@@ -5291,13 +7475,13 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
     }
 
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
 
     this.validateJsonPatch(patch);
@@ -5321,7 +7505,7 @@ export class BaseMindooDB implements MindooDB {
         }
         return Automerge.change(doc, applyPatch);
       });
-      this.logger.debug(`Successfully applied JSON patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied JSON patch, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error applying JSON patch for document ${docId}:`, error);
       throw error;
@@ -5348,7 +7532,8 @@ export class BaseMindooDB implements MindooDB {
     doc: MindooDoc,
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
     signingKeyPair?: SigningKeyPair,
-    signingKeyPassword?: string
+    signingKeyPassword?: string,
+    bypassPrecheck?: boolean
   ): Promise<void> {
     this.assertWritable("changeDoc");
     const docId = doc.getId();
@@ -5375,7 +7560,7 @@ export class BaseMindooDB implements MindooDB {
       this.logger.debug(`Document ${docId} not in cache, loading from store`);
       const loadedDoc = await this.loadDocumentInternal(docId);
       if (!loadedDoc) {
-        throw new Error(`Document ${docId} not found`);
+        throw new DocumentNotFoundError(docId);
       }
       internalDoc = loadedDoc;
       this.logger.debug(`Successfully loaded document ${docId} from store for ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'}`);
@@ -5384,13 +7569,13 @@ export class BaseMindooDB implements MindooDB {
     }
     
     if (internalDoc.isDeleted) {
-      throw new Error(`Document ${docId} has been deleted`);
+      throw new DocumentDeletedError(docId);
     }
     
     // Apply the change function
     const now = Date.now();
     this.logger.debug(`Applying change function to document ${docId}`);
-    this.logger.debug(`Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
+    if (this.isDebugEnabled()) this.logger.debug(`Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
     
     // For async callbacks, we need to handle document modifications carefully.
     // Automerge.change() requires synchronous modifications, so we'll:
@@ -5407,6 +7592,13 @@ export class BaseMindooDB implements MindooDB {
     const pendingAttachmentRemovals = new Set<string>();
     // Map of attachmentId -> {lastChunkId, sizeIncrease} for appends
     const pendingAttachmentAppends = new Map<string, { lastChunkId: string; sizeIncrease: number }>();
+    // Map of attachmentId -> extraction result for setAttachmentExtractedText
+    const pendingAttachmentTextUpdates = new Map<string, {
+      text: string | null;
+      status?: AttachmentExtractionStatus;
+      engine?: string;
+      extractedAt?: number;
+    }>();
     
     // Reference to db for closures
     const db = this;
@@ -5429,6 +7621,9 @@ export class BaseMindooDB implements MindooDB {
       getLastModified: () => internalDoc.lastModified,
       getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => false,
+      isAccessible: () => true,
+      isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
+      isWitnessed: () => internalDoc.witnessed ?? false,
       getHeads: () => Automerge.getHeads(internalDoc.doc),
       getData: () => {
         // Return a proxy that collects property assignments and deletions
@@ -5548,6 +7743,56 @@ export class BaseMindooDB implements MindooDB {
         }
       },
       
+      /**
+       * Store the result of an external text extraction (e.g. OCR) at the
+       * attachment entry in `_attachments`. See the full contract on
+       * {@link MindooDoc.setAttachmentExtractedText} in types.ts.
+       *
+       * Behavior inside this changeDoc draft:
+       * - Only records a pending update here; the `_attachments` array is
+       *   mutated once in the surrounding Automerge.change block when the
+       *   callback completes, alongside pending adds/removals/appends.
+       * - The target attachment must exist in the current document or among
+       *   attachments added earlier in this same changeDoc call; attachments
+       *   already marked for removal in this call don't count.
+       * - `text` is capped at ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS before
+       *   being persisted. `text: null` clears a previous result including
+       *   its status/engine/extractedAt metadata.
+       * - Calling this repeatedly for the same attachmentId within one
+       *   changeDoc keeps only the last result (map semantics).
+       *
+       * @param attachmentId ID of an attachment of this document.
+       * @param result Extraction outcome; `status` defaults to "done" when
+       *   text is provided (applied in the change block).
+       * @throws Error if the attachment does not exist (or was removed in
+       *   this changeDoc call), or when invoked after the callback finished.
+       */
+      setAttachmentExtractedText: (
+        attachmentId: string,
+        result: {
+          text: string | null;
+          status?: AttachmentExtractionStatus;
+          engine?: string;
+          extractedAt?: number;
+        }
+      ): void => {
+        throwIfCallbackInactive('setAttachmentExtractedText');
+        const payload = internalDoc.doc as unknown as MindooDocPayload;
+        const existingAttachments = (payload._attachments as AttachmentReference[]) || [];
+        const existsInDoc = existingAttachments.some(
+          (a) => a.attachmentId === attachmentId && !pendingAttachmentRemovals.has(attachmentId)
+        );
+        const existsInPending = pendingAttachmentAdditions.some((a) => a.attachmentId === attachmentId);
+        if (!existsInDoc && !existsInPending) {
+          throw new Error(`Attachment ${attachmentId} not found in document ${docId}`);
+        }
+        const cappedText =
+          typeof result.text === "string" && result.text.length > ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS
+            ? result.text.slice(0, ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS)
+            : result.text;
+        pendingAttachmentTextUpdates.set(attachmentId, { ...result, text: cappedText });
+      },
+
       appendToAttachment: async (attachmentId: string, data: Uint8Array): Promise<void> => {
         throwIfCallbackInactive('appendToAttachment');
         // Find the attachment reference
@@ -5653,7 +7898,12 @@ export class BaseMindooDB implements MindooDB {
           }
 
           // Apply pending attachment changes
-          if (pendingAttachmentAdditions.length > 0 || pendingAttachmentRemovals.size > 0 || pendingAttachmentAppends.size > 0) {
+          if (
+            pendingAttachmentAdditions.length > 0 ||
+            pendingAttachmentRemovals.size > 0 ||
+            pendingAttachmentAppends.size > 0 ||
+            pendingAttachmentTextUpdates.size > 0
+          ) {
             // Initialize _attachments array if needed
             if (!automergeDoc._attachments) {
               automergeDoc._attachments = [];
@@ -5681,13 +7931,41 @@ export class BaseMindooDB implements MindooDB {
             for (const ref of pendingAttachmentAdditions) {
               attachments.push(ref);
             }
+
+            // Apply extraction results (setAttachmentExtractedText)
+            for (const [attachmentId, update] of pendingAttachmentTextUpdates) {
+              const attachment = attachments.find(a => a.attachmentId === attachmentId);
+              if (!attachment) {
+                continue; // removed in the same changeDoc call
+              }
+              const isFullClear = update.text === null && update.status === undefined;
+              if (isFullClear) {
+                // `text: null` without a status resets the entry entirely
+                // (e.g. before a re-extraction).
+                delete attachment.extractedText;
+                delete attachment.extractionStatus;
+                delete attachment.extractionEngine;
+                delete attachment.extractedAt;
+                continue;
+              }
+              if (update.text === null) {
+                delete attachment.extractedText;
+              } else {
+                attachment.extractedText = update.text;
+              }
+              attachment.extractionStatus = update.status ?? "done";
+              if (update.engine !== undefined) {
+                attachment.extractionEngine = update.engine;
+              }
+              attachment.extractedAt = update.extractedAt ?? now;
+            }
           }
 
           // Update lastModified timestamp
           automergeDoc._lastModified = now;
         }),
       );
-      this.logger.debug(`Successfully applied change function, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Successfully applied change function, new document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`);
     } catch (error) {
       this.logger.error(`Error in Automerge.change for document ${docId}:`, error);
       await Promise.all(
@@ -5709,6 +7987,7 @@ export class BaseMindooDB implements MindooDB {
         signingKeyPassword,
         successMessage: useCustomKey ? "changed with custom signing key" : "changed",
         attachmentIds: pendingAttachmentAdditions.map((ref) => ref.attachmentId),
+        bypassPrecheck,
       });
     } catch (error) {
       await Promise.all(
@@ -6298,8 +8577,9 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string;
     successMessage: string;
     attachmentIds?: string[];
+    bypassPrecheck?: boolean;
   }): Promise<void> {
-    const { internalDoc, newDoc, now, headsBeforeChange, useCustomKey, signingKeyPair, signingKeyPassword, successMessage, attachmentIds } = options;
+    const { internalDoc, newDoc, now, headsBeforeChange, useCustomKey, signingKeyPair, signingKeyPassword, successMessage, attachmentIds, bypassPrecheck } = options;
     const docId = internalDoc.id;
     this.logger.debug(`Getting change bytes from document ${docId}`);
     const changesSincePreviousHeads = headsBeforeChange
@@ -6323,6 +8603,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPassword,
       successMessage,
       attachmentIds,
+      bypassPrecheck,
     });
   }
 
@@ -6337,6 +8618,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string;
     successMessage: string;
     attachmentIds?: string[];
+    bypassPrecheck?: boolean;
   }): Promise<void> {
     const {
       internalDoc,
@@ -6349,6 +8631,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPassword,
       successMessage,
       attachmentIds,
+      bypassPrecheck,
     } = options;
     const docId = internalDoc.id;
     const resolvedChangeBytesList = changeBytesList ?? (
@@ -6359,6 +8642,11 @@ export class BaseMindooDB implements MindooDB {
     if (resolvedChangeBytesList.length === 0) {
       throw new Error("No Automerge changes to persist");
     }
+
+    // Signed snapshot of the document's attachments after this change, computed
+    // once from the resulting document state so EVERY change path (changeDoc,
+    // text patches, merges, ...) carries it consistently on each produced entry.
+    const attachmentRefs = this.collectAttachmentRefs(newDoc);
 
     const entries: StoreEntry[] = [];
     for (let index = 0; index < resolvedChangeBytesList.length; index += 1) {
@@ -6371,18 +8659,52 @@ export class BaseMindooDB implements MindooDB {
         signingKeyPair,
         signingKeyPassword,
         attachmentIds: index === 0 ? attachmentIds : undefined,
+        // The full attachment snapshot describes the document's resulting state,
+        // so it goes on every produced entry (unlike the add-only attachmentIds).
+        attachmentRefs,
       });
       entries.push(entry);
       const decodedChange = Automerge.decodeChange(changeBytes);
       this.registerAutomergeHashMapping(docId, decodedChange.hash, entry.id);
     }
 
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). `internalDoc.doc`
+    // is still the pre-change state here (it is reassigned to `newDoc` below,
+    // after the store write), so before/after are both available for Tier 2
+    // (`withfields`) evaluation. Throws AccessDeniedError when denied.
+    {
+      const signerKey = useCustomKey
+        ? signingKeyPair!.publicKey
+        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      const creatorKey = await this.resolveCreatorSigningKey(docId);
+      const beforeState = internalDoc.doc;
+      await this.assertWriteAllowed({
+        op: "doc_change",
+        signerKey,
+        isAuthor: creatorKey !== null && signerKey === creatorKey,
+        bypass: bypassPrecheck,
+        getBeforeDoc: () =>
+          this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
+        getAfterDoc: () =>
+          this.convertAutomergeToJS(newDoc) as unknown as Record<string, unknown>,
+      });
+    }
+
     await this.store.putEntries(entries);
 
     internalDoc.doc = newDoc;
     internalDoc.lastModified = now;
+    // The change entries just written are versioned and un-witnessed, so the
+    // document is awaiting witness (until pushed + stamped with a receipt).
+    internalDoc.awaitingWitness = entries.some(isProvisional) || (internalDoc.awaitingWitness ?? false);
+    // `versioned` is sticky: any versioned entry (new or already reflected by a
+    // prior awaiting/witnessed flag) keeps the doc in the witness-aware era.
+    const versioned = entries.some(isVersioned)
+      || internalDoc.awaitingWitness
+      || (internalDoc.witnessed ?? false);
+    internalDoc.witnessed = versioned && !internalDoc.awaitingWitness;
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible");
+    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
     this.markDocDirty(docId);
 
     this.logger.info(`Document ${docId} ${successMessage} successfully`);
@@ -6405,8 +8727,9 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair;
     signingKeyPassword?: string;
     attachmentIds?: string[];
+    attachmentRefs?: StoreEntryAttachmentRef[];
   }): Promise<StoreEntry> {
-    const { internalDoc, changeBytes, now, useCustomKey, signingKeyPair, signingKeyPassword, attachmentIds } = options;
+    const { internalDoc, changeBytes, now, useCustomKey, signingKeyPair, signingKeyPassword, attachmentIds, attachmentRefs } = options;
     const docId = internalDoc.id;
     this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
 
@@ -6446,7 +8769,14 @@ export class BaseMindooDB implements MindooDB {
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
       attachmentIds: attachmentIds && attachmentIds.length > 0 ? attachmentIds : undefined,
+      attachmentRefs: attachmentRefs && attachmentRefs.length > 0 ? attachmentRefs : undefined,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
+    // Bind the metadata with the author signature (audit finding #5).
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(
+      entryMetadata,
+      useCustomKey ? { signingKeyPair, signingKeyPassword } : undefined,
+    );
     return {
       ...entryMetadata,
       encryptedData: encryptedPayload,
@@ -6468,6 +8798,19 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<void> {
     const docId = internalDoc.id;
     try {
+      // Cheap pre-filter: while the in-memory write counter says the doc is
+      // still below the snapshot threshold, skip the metadata scan entirely.
+      // An absent counter (first write this session) forces one scan to learn
+      // the real backlog, after which the counter tracks it incrementally.
+      const knownWrites = this.writesSinceSnapshotCheck.get(docId);
+      if (knownWrites !== undefined) {
+        const writes = knownWrites + 1;
+        if (writes < this.snapshotMinChanges) {
+          this.writesSinceSnapshotCheck.set(docId, writes);
+          return;
+        }
+      }
+
       const allMetadata = await this.scanAllMetadata(this.store, { docId });
       const replayEntries = allMetadata.filter(
         (em) => this.isDocumentReplayEntry(em),
@@ -6478,6 +8821,7 @@ export class BaseMindooDB implements MindooDB {
       const latestSnapshot = snapshots[0] || null;
       const latestSnapshotAt = latestSnapshot?.createdAt ?? 0;
       const changesSinceSnapshot = replayEntries.filter((em) => em.createdAt > latestSnapshotAt).length;
+      this.writesSinceSnapshotCheck.set(docId, changesSinceSnapshot);
       if (changesSinceSnapshot < this.snapshotMinChanges) {
         return;
       }
@@ -6507,6 +8851,10 @@ export class BaseMindooDB implements MindooDB {
         signature = await this.tenant.signPayload(encryptedPayload);
       }
 
+      // Carry the live attachment snapshot so the referenced set survives history
+      // compaction (a snapshot may be the only entry a peer retains for the doc).
+      const snapshotAttachmentRefs = this.collectAttachmentRefs(internalDoc.doc);
+
       const snapshotEntry: StoreEntry = {
         entryType: "doc_snapshot",
         id: entryId,
@@ -6521,10 +8869,19 @@ export class BaseMindooDB implements MindooDB {
         signature,
         originalSize: snapshotBytes.length,
         encryptedSize: encryptedPayload.length,
+        attachmentRefs: snapshotAttachmentRefs.length > 0 ? snapshotAttachmentRefs : undefined,
         encryptedData: encryptedPayload,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      snapshotEntry.metadataSignature = await this.computeEntryMetadataSignature(
+        snapshotEntry,
+        options.signingKeyPair && options.signingKeyPassword
+          ? { signingKeyPair: options.signingKeyPair, signingKeyPassword: options.signingKeyPassword }
+          : undefined,
+      );
 
       await this.store.putEntries([snapshotEntry]);
+      this.writesSinceSnapshotCheck.set(docId, 0);
       this.logger.debug(
         `Created snapshot for document ${docId} with ${headHashes.length} heads and ${changesSinceSnapshot} changes since previous snapshot`,
       );
@@ -6557,7 +8914,10 @@ export class BaseMindooDB implements MindooDB {
       i++
     ) {
       const entry = indexSnapshot[i];
-      if (entry.accessState === "inaccessible") {
+      // Skip docs that iterateChangesSince will emit as lightweight
+      // tombstones anyway: inaccessible docs are never materialized, and
+      // deleted docs are yielded without body materialization.
+      if (entry.accessState === "inaccessible" || entry.isDeleted) {
         continue;
       }
       const docId = entry.docId;
@@ -6869,10 +9229,9 @@ export class BaseMindooDB implements MindooDB {
         if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
           this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            snapshotData,
             snapshotData.encryptedData,
-            snapshotData.signature,
-            snapshotData.createdByPublicKey,
           );
         }
         if (!isValid) {
@@ -6884,11 +9243,20 @@ export class BaseMindooDB implements MindooDB {
             snapshotData.decryptionKeyId,
           );
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
-          const parsed = parseDocEntryId(snapshotData.id);
-          if (parsed) {
-            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          // Snapshot-head verification (docs/accesscontrol.md §10).
+          if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+            this.logger.warn(
+              `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, falling back to replay without snapshot`,
+            );
+            doc = undefined;
+            startFromSnapshot = false;
+          } else {
+            const parsed = parseDocEntryId(snapshotData.id);
+            if (parsed) {
+              this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+            }
+            this.registerSnapshotHeadHashMappings(snapshotData);
           }
-          this.registerSnapshotHeadHashMappings(snapshotData);
         }
       }
     }
@@ -6914,10 +9282,9 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
-      const isValid = await this.tenant.verifySignature(
+      const isValid = await this.tenant.verifyEntrySignature(
+        entryData,
         entryData.encryptedData,
-        entryData.signature,
-        entryData.createdByPublicKey,
       );
       if (!isValid) {
         this.logger.warn(`Invalid signature for entry ${entryData.id}, skipping`);
@@ -6939,6 +9306,7 @@ export class BaseMindooDB implements MindooDB {
     );
     const firstReplayEntry = orderedReplayEntries[0] ?? null;
     const lastReplayEntry = orderedReplayEntries[orderedReplayEntries.length - 1] ?? null;
+    const witnessState = metadataWitnessState(replayEntriesForState);
     return {
       id: docId,
       doc,
@@ -6946,6 +9314,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified: lastReplayEntry?.createdAt ?? snapshotMeta?.createdAt ?? fallbackTimestamp,
       decryptionKeyId: firstReplayEntry?.decryptionKeyId ?? snapshotMeta?.decryptionKeyId ?? "default",
       isDeleted: this.computeIsDeletedFromMetadata(replayEntriesForState),
+      awaitingWitness: witnessState.awaitingWitness,
+      witnessed: witnessState.witnessed,
     };
   }
 
@@ -7002,6 +9372,21 @@ export class BaseMindooDB implements MindooDB {
     };
   }
 
+  /**
+   * Count the changefeed entries after the given cursor without iterating
+   * them. O(log n) binary search on the internal `(changeSeq, docId)` index —
+   * used for progress reporting around {@link iterateChangesSince}.
+   */
+  countChangesSince(cursor: ProcessChangesCursor | null): number {
+    const actualCursor: ProcessChangesCursor = cursor ?? {
+      changeSeq: 0,
+      lastModified: 0,
+      docId: "",
+    };
+    const startIndex = this.getStartIndexForCursor(this.index, actualCursor);
+    return this.index.length - startIndex;
+  }
+
   async *iterateChangesSince(
     cursor: ProcessChangesCursor | null
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
@@ -7031,9 +9416,47 @@ export class BaseMindooDB implements MindooDB {
       for (let i = startIndex; i < indexSnapshot.length; i++) {
         const entry = indexSnapshot[i];
         if (entry.accessState !== "visible") {
+          // The document was readable before but the current KeyBag can no
+          // longer decrypt it (e.g. a revoked key, §13). Emit a tombstone so
+          // incremental consumers get a removal signal — distinguishable from a
+          // genuine deletion via isAccessible() === false (parity with
+          // iterateChangeMetadataSince, which already emits isDeleted: true for
+          // these). The body is never materialized.
+          const inaccessibleCursor: ProcessChangesCursor = {
+            changeSeq: entry.changeSeq,
+            lastModified: entry.lastModified,
+            docId: entry.docId,
+          };
+          yieldedDocuments++;
+          yield { doc: this.buildInaccessibleDoc(entry), cursor: inaccessibleCursor };
+          prefetchedDocuments += await this.prefetchIterationWindow(
+            indexSnapshot,
+            i + 1
+          );
           continue;
         }
-        
+
+        if (entry.isDeleted) {
+          // Deleted documents are emitted as lightweight tombstones without
+          // materializing the body — consistent with the inaccessible case
+          // above (isDeleted() === true, getData() === {}), distinguishable
+          // via isAccessible() === true. Consumers that need the last state
+          // of a deleted doc can use iterateDocumentHistory /
+          // getDocumentAtTimestamp.
+          const deletedCursor: ProcessChangesCursor = {
+            changeSeq: entry.changeSeq,
+            lastModified: entry.lastModified,
+            docId: entry.docId,
+          };
+          yieldedDocuments++;
+          yield { doc: this.buildDeletedDoc(entry), cursor: deletedCursor };
+          prefetchedDocuments += await this.prefetchIterationWindow(
+            indexSnapshot,
+            i + 1
+          );
+          continue;
+        }
+
         try {
           this.logger.debug(`Yielding document ${entry.docId} from index (lastModified: ${entry.lastModified}, isDeleted: ${entry.isDeleted})`);
           
@@ -7180,10 +9603,9 @@ export class BaseMindooDB implements MindooDB {
           return { entryData, isValid: false };
         }
         
-        const isValid = await this.verifySignatureWithKey(
+        const isValid = await this.verifyEntrySignatureWithKey(
           cryptoKey,
-          entryData.encryptedData,
-          entryData.signature
+          entryData,
         );
         return { entryData, isValid };
       })
@@ -7239,14 +9661,27 @@ export class BaseMindooDB implements MindooDB {
     // Check if document actually changed
     const headsAfter = Automerge.getHeads(updatedDoc);
     const headsChanged = JSON.stringify(headsBefore) !== JSON.stringify(headsAfter);
-    
-    if (!headsChanged) {
-      this.logger.debug(`Document ${docId} heads unchanged after applying new entries`);
+
+    // A witness receipt changes only an entry's `receivedAt` (metadata), not the
+    // Automerge content, so a freshly-witnessed entry re-delivered by the cursor
+    // scan leaves the heads UNCHANGED. We must still recompute the per-doc
+    // "awaiting witness" flag and refresh the index/cache so the doc is
+    // re-delivered on the metadata feed and re-evaluated by VirtualViews;
+    // otherwise the flag would never clear. So we compute it up front (reusing
+    // the metadata scan we need anyway) and only bail when NOTHING observable
+    // changed — neither the content nor the witness status.
+    const allDocMetadata = await this.scanAllMetadata(this.store, { docId });
+    const { awaitingWitness, witnessed } = metadataWitnessState(allDocMetadata);
+    const awaitingWitnessChanged = awaitingWitness !== (cachedDoc.awaitingWitness ?? false);
+    const witnessedChanged = witnessed !== (cachedDoc.witnessed ?? false);
+
+    if (!headsChanged && !awaitingWitnessChanged && !witnessedChanged) {
+      this.logger.debug(`Document ${docId} heads and witness status unchanged after applying new entries`);
       return null; // Document didn't actually change
     }
-    
-    this.logger.debug(`Document ${docId} changed: heads before=${JSON.stringify(headsBefore)}, after=${JSON.stringify(headsAfter)}`);
-    
+
+    if (this.isDebugEnabled()) this.logger.debug(`Document ${docId} changed: heads before=${JSON.stringify(headsBefore)}, after=${JSON.stringify(headsAfter)}, awaitingWitness=${awaitingWitness}`);
+
     // Update metadata
     const payload = updatedDoc as unknown as MindooDocPayload;
     const lastEntryCreatedAt = entries.reduce(
@@ -7255,8 +9690,7 @@ export class BaseMindooDB implements MindooDB {
     );
     const lastModified = (payload._lastModified as number) || 
                          lastEntryCreatedAt;
-    
-    const allDocMetadata = await this.scanAllMetadata(this.store, { docId });
+
     const isDeleted = this.computeIsDeletedFromMetadata(allDocMetadata);
     
     const updatedInternalDoc: InternalDoc = {
@@ -7266,6 +9700,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified,
       decryptionKeyId: cachedDoc.decryptionKeyId,
       isDeleted,
+      awaitingWitness,
+      witnessed,
     };
     // Update cache
     await this.storeCachedDocument(updatedInternalDoc);
@@ -7324,6 +9760,7 @@ export class BaseMindooDB implements MindooDB {
       this.logger.warn(`L2 deserialize failed for ${docId}, evicting stale record: ${e}`);
       try {
         await store.delete("doc", key);
+        this.lastFlushedDocState.delete(docId);
       } catch (deleteError) {
         this.logger.warn(`Failed to evict corrupt L2 record for ${docId}: ${deleteError}`);
       }
@@ -7344,13 +9781,14 @@ export class BaseMindooDB implements MindooDB {
       return null;
     }
 
-    const indexEntryIdx = this.indexLookup.get(docId);
+    const indexEntryIdx = this.getDocIndexPosition(docId);
     if (indexEntryIdx === undefined) {
       // Doc isn't in the in-memory changefeed index. Either the cache is
       // ahead of the index (very rare race during initial restore) or the
       // L2 record is orphaned. Drop and fall through.
       try {
         await store.delete("doc", key);
+        this.lastFlushedDocState.delete(docId);
       } catch (deleteError) {
         this.logger.warn(`Failed to evict orphaned L2 record for ${docId}: ${deleteError}`);
       }
@@ -7361,6 +9799,12 @@ export class BaseMindooDB implements MindooDB {
 
     // Fresh hit: index agrees with the persisted state.
     if (persistedChangeSeq === currentChangeSeq) {
+      // Seed the flush-skip fingerprint with the state just read from L2 so
+      // the next periodic flush doesn't rewrite an identical record.
+      this.lastFlushedDocState.set(
+        docId,
+        `${persistedChangeSeq}:${Automerge.getHeads(internal.doc).join(",")}`,
+      );
       await this.storeCachedDocument(internal);
       return internal;
     }
@@ -7646,6 +10090,557 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * The per-tenant quarantine/audit log: entries rejected during
+   * materialization by the access-control layer (docs/accesscontrol.md §10).
+   * Exposed for audit views (e.g. Haven). Entries remain in the append-only
+   * store but are excluded from materialized state and queries.
+   */
+  getQuarantineLog(): readonly QuarantineRecord[] {
+    return this.quarantineLog;
+  }
+
+  /**
+   * Whether access control is active for this tenant and should gate
+   * materialization. Admin-only databases (incl. the directory itself) are
+   * always exempt — admin is the root of trust, and exempting the directory DB
+   * also avoids re-entrancy. Cached briefly to keep the load fast-path cheap.
+   * Fails closed-to-disabled on any directory error so document loads never
+   * break due to a transient directory issue (Tier 2 only gates honest clients).
+   */
+  private async isAclEnforced(): Promise<boolean> {
+    if (this._isAdminOnlyDb) return false;
+    const now = Date.now();
+    if (this.aclActiveCache && now - this.aclActiveCache.at < 3000) {
+      return this.aclActiveCache.value;
+    }
+    try {
+      const directory = await this.tenant.openDirectory();
+      let value = false;
+      if (typeof directory.isAccessControlActive === "function") {
+        value = await directory.isAccessControlActive();
+      }
+      this.aclActiveCache = { value, at: now };
+      return value;
+    } catch (error) {
+      // Fail closed (audit finding #2): a transient directory error must never
+      // silently DISABLE access control (which would bypass the fail-closed
+      // materialization gate entirely). Reuse the last known verdict if we have
+      // one; otherwise assume enforced so the materialization path governs the
+      // load and retries once the directory is reachable again.
+      if (this.aclActiveCache) {
+        this.logger.debug(
+          `[ACL] active-check failed, reusing last known verdict (${this.aclActiveCache.value}): ${error}`,
+        );
+        return this.aclActiveCache.value;
+      }
+      this.logger.warn(`[ACL] active-check failed with no prior verdict, assuming enforced (fail closed): ${error}`);
+      return true;
+    }
+  }
+
+  /**
+   * Synchronous client-side write-policy precheck (docs/accesscontrol.md §9).
+   * Evaluates the full Tier 1 + Tier 2 ruleset for the candidate write and
+   * throws {@link AccessDeniedError} when it is denied, so applications get
+   * immediate, meaningful feedback at the call site instead of an optimistic
+   * local write that is later rejected by the server witness or quarantined on
+   * materialization.
+   *
+   * Fails CLOSED on any directory/infra error while access control is enforced
+   * (audit finding #2): the precheck denies the write rather than letting it
+   * through optimistically. The server witness (Tier 1) and
+   * quarantine-on-materialization (Tier 2) remain the authoritative enforcers,
+   * and the user can retry once the directory is reachable again.
+   *
+   * `getBeforeDoc`/`getAfterDoc` are lazy so the (potentially costly) Automerge
+   * -> JS materialization is skipped entirely when the active policy has no
+   * Tier 2 (`withfields`) content rule for this operation/database.
+   */
+  private async assertWriteAllowed(input: {
+    op: RuleType;
+    signerKey: string;
+    isAuthor: boolean;
+    bypass?: boolean;
+    getBeforeDoc?: () => Record<string, unknown> | null;
+    getAfterDoc?: () => Record<string, unknown> | null;
+  }): Promise<void> {
+    if (input.bypass) return;
+    const decision = await this.evaluateClientWriteAccess(input);
+    if (decision && !decision.allowed) {
+      throw new AccessDeniedError(input.op, this.store.getId(), decision);
+    }
+  }
+
+  /**
+   * Resolve the `decryptionKeyId` for a `doc_create`: the caller's explicit key
+   * when given, else the policy-configured default for this database (see
+   * `getEffectiveDefaultCreateKeyId` on the directory), else the legacy
+   * `"default"`. The policy default is a create-time convenience only; read/write
+   * access is governed by key possession (distribution + rotation, §13), not the
+   * server. Directory ACL writes always pass an explicit key, so this never
+   * re-enters the directory for them.
+   */
+  private async resolveCreateKeyId(options: CreateOptions): Promise<string> {
+    if (options.decryptionKeyId !== undefined) return options.decryptionKeyId;
+    try {
+      const directory = await this.tenant.openDirectory();
+      const getEffectiveDefaultCreateKeyId = directory.getEffectiveDefaultCreateKeyId?.bind(directory);
+      if (getEffectiveDefaultCreateKeyId) {
+        const fromPolicy = await getEffectiveDefaultCreateKeyId(this.store.getId());
+        if (fromPolicy !== undefined) return fromPolicy;
+      }
+    } catch (error) {
+      this.logger.debug(`[ACL] default create-key lookup skipped (directory error): ${error}`);
+    }
+    return "default";
+  }
+
+  /**
+   * Evaluate the full client-side (Tier 1 + Tier 2) write ruleset for a
+   * candidate write, returning the {@link AccessDecision}. Returns `null` only
+   * when access control is not enforced for this database (callers treat `null`
+   * as "allowed"). When access control IS enforced but the directory cannot be
+   * consulted, it returns a DENY decision (fail closed, audit finding #2). The
+   * `getBeforeDoc`/`getAfterDoc` materializers are only invoked when the active
+   * policy has a Tier 2 (`withfields`) content rule for this op/db.
+   */
+  private async evaluateClientWriteAccess(input: {
+    op: RuleType;
+    signerKey: string;
+    isAuthor: boolean;
+    getBeforeDoc?: () => Record<string, unknown> | null;
+    getAfterDoc?: () => Record<string, unknown> | null;
+  }): Promise<AccessDecision | null> {
+    if (!(await this.isAclEnforced())) return null;
+    const dbid = this.store.getId();
+    try {
+      const directory = await this.tenant.openDirectory();
+      const evaluateClientAccess = directory.evaluateClientAccess?.bind(directory);
+      if (!evaluateClientAccess) return null;
+      // Only materialize the before/after documents when a content rule needs
+      // them; pure Tier 1 (identity/op) checks never read the doc.
+      let needContent = true;
+      if (typeof directory.hasWriteContentRules === "function") {
+        needContent = await directory.hasWriteContentRules(input.op, dbid);
+      }
+      const beforeDoc = needContent && input.getBeforeDoc ? input.getBeforeDoc() : null;
+      const afterDoc = needContent && input.getAfterDoc ? input.getAfterDoc() : null;
+      return await evaluateClientAccess({
+        op: input.op,
+        dbid,
+        signingKey: input.signerKey,
+        trustedTime: Date.now(),
+        isAuthor: input.isAuthor,
+        beforeDoc,
+        afterDoc,
+      });
+    } catch (error) {
+      // Fail closed (audit finding #2): access control IS enforced here (checked
+      // above), so a directory error during the write precheck must not let the
+      // write through optimistically. Deny now; the user can retry once the
+      // directory is reachable again. The server witness remains the
+      // authoritative backstop.
+      this.logger.warn(`[ACL] write precheck failed, denying (fail closed): ${error}`);
+      return {
+        allowed: false,
+        reason: "directory unavailable during write precheck; failing closed",
+        tier: "tier1",
+      };
+    }
+  }
+
+  /** The "access control not enforced" allow decision returned by the
+   * non-throwing `canCreate`/`canChange`/`canDelete` prediction helpers. */
+  private static readonly ACL_NOT_ENFORCED_DECISION: AccessDecision = {
+    allowed: true,
+    reason: "access control not enforced",
+    tier: "tier1",
+  };
+
+  /**
+   * Predict whether a `createDocument` would be allowed by the active write
+   * policy, without writing anything (docs/accesscontrol.md §9). Lets a UI
+   * disable a Save action and surface `decision.reason` up front. The returned
+   * decision mirrors what {@link createDocument} would enforce.
+   */
+  async canCreate(options: CreateOptions = {}): Promise<AccessDecision> {
+    const keyId = await this.resolveCreateKeyId(options);
+    const useCustomSigningKey =
+      options.signingKeyPair !== undefined && options.signingKeyPassword !== undefined;
+    const signerKey = useCustomSigningKey
+      ? options.signingKeyPair!.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const afterValues: Record<string, unknown> = { _attachments: [] };
+    if (options.initialValues) {
+      for (const [k, v] of Object.entries(options.initialValues)) {
+        if (!k.startsWith("_")) afterValues[k] = v;
+      }
+    }
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_create",
+      signerKey,
+      isAuthor: true,
+      getAfterDoc: () => afterValues,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
+   * Predict whether applying `candidateAfter` as the document's next state via
+   * {@link changeDoc} would be allowed by the active write policy, without
+   * writing anything. `candidateAfter` is the intended full "after" document
+   * (e.g. the edited JSON in a database-browser editor).
+   */
+  async canChange(
+    doc: MindooDoc,
+    candidateAfter: Record<string, unknown>,
+    signingKeyPair?: SigningKeyPair,
+  ): Promise<AccessDecision> {
+    const docId = doc.getId();
+    const signerKey = signingKeyPair
+      ? signingKeyPair.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const creatorKey = await this.resolveCreatorSigningKey(docId);
+    const before = doc.getData() as unknown as Record<string, unknown>;
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_change",
+      signerKey,
+      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      getBeforeDoc: () => before,
+      getAfterDoc: () => candidateAfter,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
+   * Predict whether deleting `doc` via {@link deleteDocument} would be allowed
+   * by the active write policy, without writing anything.
+   */
+  async canDelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair,
+  ): Promise<AccessDecision> {
+    const docId = doc.getId();
+    const signerKey = signingKeyPair
+      ? signingKeyPair.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const creatorKey = await this.resolveCreatorSigningKey(docId);
+    const current = doc.getData() as unknown as Record<string, unknown>;
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_delete",
+      signerKey,
+      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      getBeforeDoc: () => current,
+      getAfterDoc: () => current,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
+   * Predict whether undeleting `doc` via {@link undeleteDocument} would be
+   * allowed by the active write policy, without writing anything.
+   */
+  async canUndelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair,
+  ): Promise<AccessDecision> {
+    const docId = doc.getId();
+    const signerKey = signingKeyPair
+      ? signingKeyPair.publicKey
+      : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const creatorKey = await this.resolveCreatorSigningKey(docId);
+    const current = doc.getData() as unknown as Record<string, unknown>;
+    const decision = await this.evaluateClientWriteAccess({
+      op: "doc_undelete",
+      signerKey,
+      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      getBeforeDoc: () => current,
+      getAfterDoc: () => current,
+    });
+    return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  /**
+   * Resolve the signing public key of the document's original creator (the
+   * `doc_create` entry's `createdByPublicKey`), used to set `$author`
+   * (`isAuthor`) for the client write prechecks on change/delete/undelete.
+   * Cached per document; returns `null` if the create entry isn't present yet
+   * (in which case `isAuthor` is treated as false, matching materialization).
+   */
+  private async resolveCreatorSigningKey(docId: string): Promise<string | null> {
+    const cached = this.creatorKeyCache.get(docId);
+    if (cached) return cached;
+    try {
+      const metas = await this.scanAllMetadata(this.store, { docId });
+      const createKey =
+        metas.find((m) => m.entryType === "doc_create")?.createdByPublicKey ?? null;
+      if (createKey) this.creatorKeyCache.set(docId, createKey);
+      return createKey;
+    } catch (error) {
+      this.logger.debug(`[ACL] creator-key resolution failed for ${docId}: ${error}`);
+      return null;
+    }
+  }
+
+  /** Append a record to the quarantine/audit log (and log it). */
+  private recordQuarantine(rec: QuarantineRecord): void {
+    this.quarantineLog.push(rec);
+    console.log(
+      `[MindooDB][ACL] Quarantined entry ${rec.entryId} (doc ${rec.docId}): ${rec.reason} — ${rec.detail}`,
+    );
+  }
+
+  /**
+   * Materialize a document through the access-control (Tier 2) path
+   * (docs/accesscontrol.md §10). Entries are evaluated deterministically in
+   * trusted-time order; an entry is quarantined if it violates a rule, fails
+   * op-type re-derivation, or causally depends on a quarantined entry
+   * (cascade). The accepted set is therefore a causally-closed prefix identical
+   * across replicas, which is what makes "quarantine on receipt" safe under
+   * eventual consistency.
+   *
+   * Snapshots are intentionally bypassed here and the document is rebuilt from
+   * individually-verified lifecycle entries (the spec's fallback), so a snapshot
+   * can never smuggle content past Tier 2.
+   *
+   * @returns the materialized {@link InternalDoc} (or `null` if nothing is
+   *   accepted / the document is absent), or `undefined` when access control is
+   *   not enforced (caller uses the optimized fast path).
+   */
+  private async maybeMaterializeWithAccessControl(
+    docId: string,
+    allEntryMetadata: StoreEntryMetadata[],
+  ): Promise<{ doc: InternalDoc | null; cacheable: boolean } | undefined> {
+    if (!(await this.isAclEnforced())) return undefined;
+
+    // Fail-closed self-healing (audit finding #2): when a validation step cannot
+    // be completed (directory/witness adapter threw), we quarantine the affected
+    // entry for THIS pass but must not cache the result, so the next load retries
+    // and recovers once the dependency is healthy again. `cacheable` is flipped
+    // to false the moment any transient failure occurs.
+    let cacheable = true;
+
+    const dbid = this.store.getId();
+    const directory = await this.tenant.openDirectory();
+    // Capture bound locals: these optional members are called later inside an
+    // await-heavy loop, where TS would otherwise lose the property narrowing.
+    const evaluateClientAccess = directory.evaluateClientAccess?.bind(directory);
+    if (!evaluateClientAccess) return undefined;
+    const getTrustedWitnessKeysAt = directory.getTrustedWitnessKeysAt?.bind(directory);
+
+    // One verifier per materialization enforces per-witness `receivedAt`
+    // monotonicity across the entries we accept, in trusted-time order (§5.4).
+    // A verify-only provider (no signer) routes receipts to the right scheme.
+    const subtle = this.getSubtle();
+    const receiptVerifier = new Ed25519WitnessProvider({ subtle }).createVerifier();
+    const nowMs = Date.now();
+
+    // Lifecycle entries only, folded in deterministic causal order. Un-witnessed
+    // entries (versioned or legacy) order by their author time `createdAt`, NOT
+    // the provisional `now`: this fold computes per-step before/after states for
+    // Tier 2 evaluation, so it must preserve authoring order rather than
+    // collapsing every still-provisional entry onto a single `now` (which would
+    // tie-break by entry id and scramble causal sequence). The version-aware
+    // head/`now` selection only matters for the changefeed stamp and the
+    // judgment-site node selection below, not for this fold order.
+    const dataEntries = allEntryMetadata
+      .filter((m) => this.isDocumentReplayEntry(m))
+      .sort((a, b) =>
+        (a.receivedAt ?? a.createdAt) === (b.receivedAt ?? b.createdAt)
+          ? a.id.localeCompare(b.id)
+          : (a.receivedAt ?? a.createdAt) - (b.receivedAt ?? b.createdAt),
+      );
+    if (dataEntries.length === 0) return { doc: null, cacheable };
+
+    const creatorKey =
+      dataEntries.find((m) => m.entryType === "doc_create")?.createdByPublicKey ?? null;
+
+    const fetched = await this.store.getEntries(dataEntries.map((m) => m.id));
+    const entryById = new Map(fetched.map((e) => [e.id, e]));
+
+    let currentDoc: AutomergeTypes.Doc<MindooDocPayload> | null = null;
+    let createdAt: number | null = null;
+    let decryptionKeyId = "default";
+    const acceptedMeta: StoreEntryMetadata[] = [];
+    const quarantined = new Set<string>();
+
+    const quarantine = (meta: StoreEntryMetadata, reason: QuarantineRecord["reason"], detail: string): void => {
+      quarantined.add(meta.id);
+      this.recordQuarantine({
+        entryId: meta.id,
+        docId,
+        dbid,
+        entryType: meta.entryType,
+        reason,
+        detail,
+        // Audit record: the entry's own (stable) time — receipt time if
+        // witnessed, else author time. Not the provisional head `now`.
+        trustedTime: meta.receivedAt ?? meta.createdAt,
+        recordedAt: Date.now(),
+      });
+    };
+
+    for (const meta of dataEntries) {
+      const entry = entryById.get(meta.id);
+      if (!entry) continue;
+
+      // Admin-only DBs are exempt (handled by isAclEnforced); here we honor the
+      // tenant admin key as always-trusted via the directory identity set.
+
+      // Cascade: any quarantined dependency taints this entry (§10).
+      if (meta.dependencyIds.some((dep) => quarantined.has(dep))) {
+        quarantine(meta, "cascade_dependent", "causally depends on a quarantined entry");
+        continue;
+      }
+
+      // Verify the author signature over the encrypted payload.
+      const cryptoKey = await this.getOrImportPublicKey(entry.createdByPublicKey);
+      if (!cryptoKey || !(await this.verifyEntrySignatureWithKey(cryptoKey, entry))) {
+        quarantine(meta, "invalid_signature", "signature verification failed");
+        continue;
+      }
+
+      // Validate the witness receipt, if any (§5.4): a present receipt must come
+      // from a currently-trusted witness, carry a valid signature, and respect
+      // per-witness monotonicity and the future-time bound. Entries with no
+      // receipt are local/not-yet-witnessed and pass this check.
+      if (getTrustedWitnessKeysAt && (meta.receivedAt !== undefined || meta.receivedByPublicKey)) {
+        try {
+          const trustedWitnessKeys = await getTrustedWitnessKeysAt(meta.receivedAt ?? meta.createdAt);
+          const receiptResult = await receiptVerifier.validate(
+            meta,
+            { dbid, trustedWitnessKeys, nowMs },
+          );
+          if (!receiptResult.ok) {
+            quarantine(meta, "invalid_witness_receipt", receiptResult.reason ?? "invalid witness receipt");
+            continue;
+          }
+        } catch (error) {
+          // Fail closed (audit finding #2): a malformed receipt or adapter bug
+          // must NOT bypass the witness check. Quarantine this entry for now and
+          // mark the result non-cacheable so a later load retries once the
+          // verifier is healthy again.
+          this.logger.warn(`[ACL] receipt validation failed for ${meta.id}, quarantining (will retry): ${error}`);
+          cacheable = false;
+          quarantine(meta, "directory_unavailable", `witness receipt validation error: ${error}`);
+          continue;
+        }
+      }
+
+      const isGenesis = currentDoc === null;
+      if (isGenesis && meta.entryType !== "doc_create") {
+        // Not a valid document start (mirrors the fast path); skip.
+        continue;
+      }
+      // Op-type defense in depth (§10): a doc_create must be a genesis change.
+      if (meta.entryType === "doc_create" && !isGenesis) {
+        quarantine(meta, "op_type_mismatch", "signed doc_create but not a genesis change");
+        continue;
+      }
+
+      // Decrypt and compute the candidate (after) state.
+      const decrypted = await this.tenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId);
+      const baseDoc = currentDoc ?? Automerge.init<MindooDocPayload>();
+      let afterDoc: AutomergeTypes.Doc<MindooDocPayload>;
+      try {
+        afterDoc = Automerge.loadIncremental(Automerge.clone(baseDoc), decrypted);
+      } catch (error) {
+        quarantine(meta, "op_type_mismatch", `failed to decode change: ${error}`);
+        continue;
+      }
+
+      const beforeJS = currentDoc
+        ? (this.convertAutomergeToJS(currentDoc) as unknown as Record<string, unknown>)
+        : null;
+      const afterJS = this.convertAutomergeToJS(afterDoc) as unknown as Record<string, unknown>;
+
+      const isAuthor = creatorKey !== null && entry.createdByPublicKey === creatorKey;
+      // Trusted-time rule (docs/accesscontrol.md §8, version-aware): a witnessed
+      // entry is judged against the directory as it provably was at its
+      // `receivedAt`. A versioned un-witnessed entry (provisional) has no
+      // provable position, so it is judged against the current directory HEAD —
+      // `MAX_SAFE_INTEGER` selects the head node deterministically regardless of
+      // where the directory's own provisional (un-witnessed) entries currently
+      // float, which a wall-clock `now` would not (those entries can sit at a
+      // later `now`). A legacy un-witnessed entry predates witnessing and is
+      // stable at its `createdAt`, so it is judged against the historical
+      // directory state in effect then. See {@link isProvisional}.
+      const trustedTime = isProvisional(meta)
+        ? Number.MAX_SAFE_INTEGER
+        : (meta.receivedAt ?? meta.createdAt);
+
+      let decision: AccessDecision;
+      try {
+        decision = await evaluateClientAccess({
+          op: meta.entryType as RuleType,
+          dbid,
+          signingKey: entry.createdByPublicKey,
+          trustedTime,
+          isAuthor,
+          beforeDoc: beforeJS,
+          afterDoc: afterJS,
+        });
+      } catch (error) {
+        // Fail closed (audit finding #2): a transient directory error must not
+        // silently materialize an entry the policy might reject. Quarantine it
+        // for this pass and mark the result non-cacheable so the next load
+        // retries and self-heals once the directory is reachable again.
+        this.logger.warn(`[ACL] evaluation failed for ${meta.id}, quarantining (will retry): ${error}`);
+        cacheable = false;
+        quarantine(meta, "directory_unavailable", `directory unavailable during evaluation: ${error}`);
+        continue;
+      }
+
+      if (!decision.allowed) {
+        quarantine(
+          meta,
+          decision.tier === "tier2" ? "tier2_denied" : "tier1_recheck_denied",
+          decision.reason,
+        );
+        continue;
+      }
+
+      // Accept the entry.
+      currentDoc = afterDoc;
+      if (isGenesis) {
+        createdAt = meta.createdAt;
+        decryptionKeyId = meta.decryptionKeyId;
+      }
+      acceptedMeta.push(meta);
+      const parsed = parseDocEntryId(entry.id);
+      if (parsed) {
+        this.registerAutomergeHashMapping(docId, parsed.automergeHash, entry.id);
+      }
+    }
+
+    if (currentDoc === null) {
+      // The create was quarantined or absent: the document is logically absent.
+      return { doc: null, cacheable };
+    }
+
+    const payload = currentDoc as unknown as MindooDocPayload;
+    const isDeleted = this.computeIsDeletedFromMetadata(acceptedMeta);
+    const lastAccepted = acceptedMeta[acceptedMeta.length - 1];
+    const lastModified =
+      (payload._lastModified as number) || (lastAccepted ? lastAccepted.createdAt : Date.now());
+    const witnessState = metadataWitnessState(acceptedMeta);
+
+    return {
+      doc: {
+        id: docId,
+        doc: currentDoc,
+        createdAt: createdAt ?? lastModified,
+        lastModified,
+        decryptionKeyId,
+        isDeleted,
+        awaitingWitness: witnessState.awaitingWitness,
+        witnessed: witnessState.witnessed,
+      },
+      cacheable,
+    };
+  }
+
+  /**
    * Internal method to load a document from the content-addressed store
    */
   private async loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
@@ -7656,7 +10651,7 @@ export class BaseMindooDB implements MindooDB {
     // of whether L1/L2 still hold a cached copy. This keeps the public
     // contract of `loadDocumentInternal` aligned with `getDocument` /
     // `getAllDocumentIds`.
-    const indexEntryIdx = this.indexLookup.get(docId);
+    const indexEntryIdx = this.getDocIndexPosition(docId);
     if (indexEntryIdx !== undefined && this.index[indexEntryIdx].accessState === "inaccessible") {
       return null;
     }
@@ -7748,7 +10743,38 @@ export class BaseMindooDB implements MindooDB {
     // Log all entry types
     const entryTypes = allEntryMetadata.map(em => `${em.entryType}@${em.createdAt}`).join(', ');
     this.logger.debug(`Entry types for ${docId}: ${entryTypes}`);
-    
+
+    // Access-control materialization (docs/accesscontrol.md §10): when the
+    // tenant has access control active, materialize through the Tier 2
+    // quarantine path (deterministic per-entry evaluation + cascade) instead of
+    // the optimized batch path. Returns `undefined` when ACL is not enforced,
+    // in which case we fall through to the normal fast path below.
+    const aclResult = await this.maybeMaterializeWithAccessControl(docId, allEntryMetadata);
+    if (aclResult !== undefined) {
+      const aclDoc = aclResult.doc;
+      // Only cache a fully-validated result. A transient validation failure
+      // (audit finding #2) leaves `cacheable` false so the next load retries.
+      if (aclDoc && aclResult.cacheable) {
+        await this.storeCachedDocument(aclDoc);
+        this.markDocDirty(docId);
+      }
+      this.performanceCallback?.onDocumentLoad?.({
+        docId,
+        cacheHit: false,
+        metadataEntriesScanned: allEntryMetadata.length,
+        replayEntriesLoaded: allEntryMetadata.length,
+        snapshotUsed: false,
+        cacheCheckTime,
+        storeQueryTime,
+        entryLoadTime,
+        signatureVerificationTime,
+        decryptionTime,
+        automergeTime,
+        totalTime: Date.now() - startedAt,
+      });
+      return aclDoc;
+    }
+
     const metadataById = new Map(allEntryMetadata.map((meta) => [meta.id, meta]));
     const planStartedAt = Date.now();
     const materializationPlan = computeDocumentMaterializationPlan(docId, allEntryMetadata, {
@@ -7805,10 +10831,9 @@ export class BaseMindooDB implements MindooDB {
           // Verify signature against the encrypted snapshot (no decryption needed)
           // We sign the encrypted payload, so anyone can verify signatures without decryption keys
           const signatureStartedAt = Date.now();
-          isValid = await this.tenant.verifySignature(
+          isValid = await this.tenant.verifyEntrySignature(
+            snapshotData,
             snapshotData.encryptedData,
-            snapshotData.signature,
-            snapshotData.createdByPublicKey
           );
           signatureVerificationTime += Date.now() - signatureStartedAt;
         }
@@ -7834,14 +10859,26 @@ export class BaseMindooDB implements MindooDB {
           const automergeStartedAt = Date.now();
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
           automergeTime += Date.now() - automergeStartedAt;
-          this.logger.debug(`Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
-          
-          // Register the snapshot's automerge hash -> entry ID mapping
-          const parsed = parseDocEntryId(snapshotData.id);
-          if (parsed) {
-            this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+          if (this.isDebugEnabled()) this.logger.debug(`Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
+
+          // Mandatory snapshot-head verification (docs/accesscontrol.md §10): the
+          // decoded heads must exactly equal the declared snapshotHeadHashes, so
+          // a snapshot cannot smuggle unauthorized content. On mismatch, discard
+          // the snapshot and load from scratch via individually-verified entries.
+          if (!snapshotHeadsMatch(Automerge.getHeads(doc), snapshotData.snapshotHeadHashes)) {
+            this.logger.warn(
+              `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, loading from scratch`,
+            );
+            doc = undefined;
+            startFromSnapshot = false;
+          } else {
+            // Register the snapshot's automerge hash -> entry ID mapping
+            const parsed = parseDocEntryId(snapshotData.id);
+            if (parsed) {
+              this.registerAutomergeHashMapping(docId, parsed.automergeHash, snapshotData.id);
+            }
+            this.registerSnapshotHeadHashMappings(snapshotData);
           }
-          this.registerSnapshotHeadHashMappings(snapshotData);
         }
       }
     }
@@ -7850,7 +10887,7 @@ export class BaseMindooDB implements MindooDB {
     if (!doc) {
       this.logger.debug(`Initializing new Automerge document for ${docId}`);
       doc = Automerge.init<MindooDocPayload>();
-      this.logger.debug(`Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
+      if (this.isDebugEnabled()) this.logger.debug(`Initialized empty document, heads: ${JSON.stringify(Automerge.getHeads(doc))}`);
     }
     
     // Load and apply all entries
@@ -7862,7 +10899,7 @@ export class BaseMindooDB implements MindooDB {
     this.logger.debug(`Loading document ${docId}: found ${entries.length} entries to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);
     
     // Log current document state before applying entries
-    this.logger.debug(`Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+    if (this.isDebugEnabled()) this.logger.debug(`Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
     
     // Filter entries for admin-only mode first
     const validEntries = entries.filter(entryData => {
@@ -7913,10 +10950,9 @@ export class BaseMindooDB implements MindooDB {
             return { entryData, isValid: false };
           }
           
-          const isValid = await this.verifySignatureWithKey(
+          const isValid = await this.verifyEntrySignatureWithKey(
             cryptoKey,
-            entryData.encryptedData,
-            entryData.signature
+            entryData,
           );
           return { entryData, isValid };
         })
@@ -7972,7 +11008,7 @@ export class BaseMindooDB implements MindooDB {
             doc = result[0] as AutomergeTypes.Doc<MindooDocPayload>;
             automergeTime += Date.now() - automergeStartedAt;
             this.logger.debug(`Successfully applied ${changeBytes.length} changes to document ${docId}`);
-            this.logger.debug(`Document state after applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
+            if (this.isDebugEnabled()) this.logger.debug(`Document state after applying changes: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
           } catch (error) {
             this.logger.error(`Error applying changes to document ${docId}:`, error);
             this.logger.error(`Number of changes: ${changeBytes.length}`);
@@ -7984,7 +11020,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Extract metadata from document (doc is guaranteed to be defined at this point)
     this.logger.debug(`All entries applied successfully for document ${docId}`);
-    this.logger.debug(`Final document heads: ${JSON.stringify(Automerge.getHeads(doc!))}`);
+    if (this.isDebugEnabled()) this.logger.debug(`Final document heads: ${JSON.stringify(Automerge.getHeads(doc!))}`);
     const payload = doc! as unknown as MindooDocPayload;
     
     const isDeleted = this.computeIsDeletedFromMetadata(allEntryMetadata);
@@ -8004,6 +11040,7 @@ export class BaseMindooDB implements MindooDB {
     
     this.logger.debug(`Document ${docId} metadata: createdAt=${createdAt}, lastModified=${lastModified}, decryptionKeyId=${decryptionKeyId}`);
     
+    const witnessState = metadataWitnessState(allEntryMetadata);
     const internalDoc: InternalDoc = {
       id: docId,
       doc: doc!, // doc is guaranteed to be defined at this point
@@ -8011,6 +11048,8 @@ export class BaseMindooDB implements MindooDB {
       lastModified,
       decryptionKeyId,
       isDeleted,
+      awaitingWitness: witnessState.awaitingWitness,
+      witnessed: witnessState.witnessed,
     };
     
     // Update cache
@@ -8117,11 +11156,21 @@ export class BaseMindooDB implements MindooDB {
       getLastModified: () => internalDoc.lastModified,
       getDecryptionKeyId: () => internalDoc.decryptionKeyId,
       isDeleted: () => internalDoc.isDeleted,
+      isAccessible: () => internalDoc.accessible ?? true,
+      isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
+      isWitnessed: () => internalDoc.witnessed ?? false,
       getHeads: () => Automerge.getHeads(internalDoc.doc),
       getData: () => {
-        // Convert Automerge document to plain JS object, converting Text objects to strings
-        const jsDoc = this.convertAutomergeToJS(internalDoc.doc);
-        return createReadOnlyProxy(jsDoc);
+        // Convert Automerge document to plain JS object, converting Text
+        // objects to strings. Memoized per InternalDoc and invalidated via
+        // the document's Automerge heads, so repeated getData() calls on an
+        // unchanged doc skip the full re-materialization.
+        const headsKey = Automerge.getHeads(internalDoc.doc).join(",");
+        if (internalDoc.jsCache === undefined || internalDoc.jsCacheHeads !== headsKey) {
+          internalDoc.jsCache = this.convertAutomergeToJS(internalDoc.doc);
+          internalDoc.jsCacheHeads = headsKey;
+        }
+        return createReadOnlyProxy(internalDoc.jsCache);
       },
       
       // ========== Attachment Write Methods ==========
@@ -8141,6 +11190,10 @@ export class BaseMindooDB implements MindooDB {
       
       appendToAttachment: async () => {
         throw new Error("appendToAttachment() can only be called within changeDoc() callback");
+      },
+      
+      setAttachmentExtractedText: () => {
+        throw new Error("setAttachmentExtractedText() can only be called within changeDoc() callback");
       },
       
       // ========== Attachment Read Methods ==========
@@ -8181,6 +11234,52 @@ export class BaseMindooDB implements MindooDB {
     };
     this.wrappedInternalDocs.set(wrapped, internalDoc);
     return wrapped;
+  }
+
+  /**
+   * Build a lightweight read-only tombstone for a now-inaccessible index entry
+   * (docs/accesscontrol.md §13): a document that was readable before but whose
+   * decryption key the current KeyBag no longer holds (e.g. a revoked key).
+   * Emitted by {@link iterateChangesSince} so incremental consumers get a
+   * removal signal. Per the design rule it reports `isDeleted() === true`,
+   * `isAccessible() === false`, `getData() === {}` (the plaintext is purged,
+   * never materialized) and `getHeads() === []` — backed by an empty Automerge
+   * document so it never touches the underlying ciphertext or the document cache.
+   */
+  private buildInaccessibleDoc(entry: DocumentIndexEntry): MindooDoc {
+    const internalDoc: InternalDoc = {
+      id: entry.docId,
+      doc: Automerge.init<MindooDocPayload>(),
+      createdAt: 0,
+      lastModified: entry.lastModified,
+      decryptionKeyId: entry.decryptionKeyId,
+      isDeleted: true,
+      accessible: false,
+    };
+    return this.wrapDocument(internalDoc);
+  }
+
+  /**
+   * Build a lightweight read-only tombstone for a deleted document, emitted
+   * by {@link iterateChangesSince} instead of materializing the deleted
+   * body. Reports `isDeleted() === true`, `isAccessible() === true` and
+   * `getData() === {}` — the counterpart to {@link buildInaccessibleDoc} for
+   * genuine deletions (distinguish the two via `isAccessible()`). Consumers
+   * that need the last state of a deleted document can use
+   * {@link iterateDocumentHistory} or {@link getDocumentAtTimestamp}.
+   */
+  private buildDeletedDoc(entry: DocumentIndexEntry): MindooDoc {
+    const internalDoc: InternalDoc = {
+      id: entry.docId,
+      doc: Automerge.init<MindooDocPayload>(),
+      createdAt: 0,
+      lastModified: entry.lastModified,
+      decryptionKeyId: entry.decryptionKeyId,
+      isDeleted: true,
+      awaitingWitness: entry.awaitingWitness ?? false,
+      witnessed: entry.witnessed ?? false,
+    };
+    return this.wrapDocument(internalDoc);
   }
 
   /**
@@ -8236,10 +11335,9 @@ export class BaseMindooDB implements MindooDB {
       throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
     }
 
-    const isValid = await this.tenant.verifySignature(
+    const isValid = await this.tenant.verifyEntrySignature(
+      chunk,
       chunk.encryptedData,
-      chunk.signature,
-      chunk.createdByPublicKey
     );
     if (!isValid) {
       throw new Error(`Invalid signature for chunk ${chunk.id}`);
@@ -8478,6 +11576,8 @@ export class BaseMindooDB implements MindooDB {
         encryptedSize: encryptedData.length,
         encryptedData,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      chunkEntry.metadataSignature = await this.computeEntryMetadataSignature(chunkEntry);
       
       chunks.push(chunkEntry);
       prevChunkId = chunkId;
@@ -8541,24 +11641,27 @@ export class BaseMindooDB implements MindooDB {
     const encryptedData = new Uint8Array(0);
     const contentHash = await computeContentHash(encryptedData, this.getSubtle());
     const signature = await this.tenant.signPayload(encryptedData);
+    const ledgerEntry: StoreEntry = {
+      entryType: "pending_attachment_upload",
+      id: this.pendingAttachmentUploadLedgerId(attachmentId),
+      contentHash,
+      docId,
+      dependencyIds: [],
+      createdAt,
+      attachmentId,
+      uploadStartedAt: Date.now(),
+      createdByPublicKey,
+      decryptionKeyId,
+      signature,
+      originalSize: 0,
+      encryptedSize: 0,
+      encryptedData,
+    };
+    // Bind the metadata with the author signature (audit finding #5).
+    ledgerEntry.metadataSignature = await this.computeEntryMetadataSignature(ledgerEntry);
     await this.putEntriesWithRetry(
       this.store,
-      [{
-        entryType: "pending_attachment_upload",
-        id: this.pendingAttachmentUploadLedgerId(attachmentId),
-        contentHash,
-        docId,
-        dependencyIds: [],
-        createdAt,
-        attachmentId,
-        uploadStartedAt: Date.now(),
-        createdByPublicKey,
-        decryptionKeyId,
-        signature,
-        originalSize: 0,
-        encryptedSize: 0,
-        encryptedData,
-      }],
+      [ledgerEntry],
       `pending ledger ${attachmentId}`
     );
   }
@@ -8656,6 +11759,8 @@ export class BaseMindooDB implements MindooDB {
         encryptedSize: encryptedData.length,
         encryptedData,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      chunkEntry.metadataSignature = await this.computeEntryMetadataSignature(chunkEntry);
 
       pendingEntries.push(chunkEntry);
       pendingEncryptedBytes += encryptedData.length;
@@ -8780,6 +11885,8 @@ export class BaseMindooDB implements MindooDB {
         encryptedSize: encryptedData.length,
         encryptedData,
       };
+      // Bind the metadata with the author signature (audit finding #5).
+      chunkEntry.metadataSignature = await this.computeEntryMetadataSignature(chunkEntry);
       
       chunks.push(chunkEntry);
       prevChunkId = chunkId;
@@ -8964,6 +12071,16 @@ export class BaseMindooDB implements MindooDB {
       }
       if (storeKind === StoreKind.docs) {
         await this.syncStoreChanges();
+        // SDK-driven key-distribution reconcile (docs/accesscontrol.md §13).
+        // After the directory pulls and processes new entries, reconcile the
+        // local KeyBag against the directory head: bulk-remove revoked keys
+        // (forgetting now-inaccessible docs) and import keys newly pushed to
+        // this user (revealing their docs on the next content-DB pull). Runs in
+        // the SDK so standalone apps get it too, not just Haven. Best-effort and
+        // single-flight; never blocks or fails the sync.
+        if (this.store.getId() === "directory") {
+          await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
+        }
       }
       if (options?.signal?.aborted) {
         this.logger.info(`Pull cancelled after local processing for ${storeKind} entries`);

@@ -12,12 +12,42 @@ MindooDB maintains an internal index that tracks documents sorted by `(lastModif
 - Processes documents in modification order (oldest first)
 - Supports consumer-driven batching: as an async generator, you can stop iterating at any time and resume later from the last cursor you observed
 - Returns (or exposes) the cursor of the each processed document for continuation
-- Handles deleted documents (they remain in the index and are marked with `MindooDoc.idDeleted()==true`, useful to remove them from external indexes)
+- Emits **tombstones** for documents that should be removed from external indexes (see below)
+- Prefetches upcoming live documents in parallel (bounded window, see `DocumentCacheConfig.iteratePrefetchWindowDocs`), so consumers that materialize documents sequentially still benefit from parallel store reads
 
 This mechanism provides the foundation for building persistent indexes that can be incrementally updated as documents change, without requiring full database scans.
 
+### Tombstone contract
+
+Two kinds of documents are emitted as lightweight **tombstones** — read-only `MindooDoc` objects whose body is never materialized:
+
+| | Deleted document | Inaccessible document (key revoked/missing) |
+|---|---|---|
+| `isDeleted()` | `true` | `true` |
+| `isAccessible()` | `true` | `false` |
+| `getData()` | `{}` | `{}` |
+| `getHeads()` | `[]` | `[]` |
+
+Both cases signal "remove this document from your external index". Use `isAccessible()` to distinguish a genuine deletion from a document that merely became unreadable for the current KeyBag.
+
+Because tombstones skip body materialization, delete-heavy changefeed runs are cheap: neither the document history nor its decrypted content is loaded. If a consumer needs the **last state of a deleted document** (e.g. to display "what was removed"), use the escape hatches `iterateDocumentHistory()` or `getDocumentAtTimestamp()` with a timestamp before the deletion.
+
+## Implemented on top of this foundation
+
+Two indexing systems ship with MindooDB, both maintained incrementally via
+`iterateChangesSince()`:
+
+- **[Virtual Views](virtualview.md)** — persistent, hierarchical, sorted views
+  with categories and totals.
+- **[Summary buffer, ad-hoc queries and reactive updates](adhoc-queries.md)** —
+  a changefeed-maintained `DocumentSummaryStore` of queryable field values plus
+  `db.query()` (expression filter/sort/paging without document materialization),
+  `db.queryView()` (ephemeral views with dynamic re-sorting), `db.queryLive()`
+  (live queries with result fingerprinting) and `db.addChangeListener()`
+  (coalesced change events).
+
 ## Indexing Approaches
-The following sections discuss various indexing approaches for NoSQL databases. We currently have implemented the `Virtual Views` API.
+The following sections discuss various indexing approaches for NoSQL databases. We currently have implemented the `Virtual Views` API and the summary-buffer based query engine described above.
 
 ### 1. Map/Reduce (CouchDB-inspired)
 
@@ -390,6 +420,13 @@ for await (const entry of nav.entriesForward()) {
 - Inspired by [Domino JNA VirtualView](https://github.com/klehmann/domino-jna)
 
 ### 3. Full-Text Search with FlexSearch
+
+> **Update:** MindooDB now ships a **built-in full-text index**
+> (`DocumentFullTextIndex`, MiniSearch-based, encrypted persistence,
+> integrated into `db.query({ text: ... })` and `db.searchText()`) — see
+> [Full-Text Search](fulltext-search.md). The FlexSearch approach below
+> remains valid as an **app-side alternative** for cases needing custom
+> tokenization or app-specific index shapes.
 
 **Concept:**
 [FlexSearch](https://github.com/nextapps-de/flexsearch) is a high-performance, memory-efficient full-text search library that supports incremental indexing and real-time search.

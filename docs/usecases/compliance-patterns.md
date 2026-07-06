@@ -97,7 +97,7 @@ class GDPRCompliance {
 
 **Pattern B (Coordinated erasure)**: Use directory-based purge requests to remove document change history from all synced clients.
 
-MindooDB provides a coordinated erasure mechanism for GDPR "right to be forgotten" through directory-based purge requests. Administrators create a signed purge request in the directory database, which propagates to all clients during their next directory sync. Clients then execute the purge locally.
+MindooDB provides a coordinated erasure mechanism for GDPR "right to be forgotten" through directory-based purge requests. Anyone can prepare a request, but only a tenant admin can sign it. The signed request is published as an access-control document (`acl_dochistorypurge_<requestId>`) and propagates to all clients during their next directory sync; clients then execute the purge locally. Because the request's `dbId` and `docIds` are stored in cleartext inside the `$publicinfos` envelope, the sync server can also execute the purge server-side and reject re-pushes of the removed documents (the optional `reason` stays encrypted with the tenant key).
 
 **Architecture Flow**:
 
@@ -110,31 +110,36 @@ sequenceDiagram
     participant Store1 as Local Store 1
     participant Store2 as Local Store 2
 
-    Admin->>Directory: requestDocHistoryPurge(dbId, docId, reason)
-    Directory->>Directory: Create signed purge request document
+    Admin->>Directory: publishDocHistoryPurge({ dbId, docIds, reason })
+    Directory->>Directory: Create admin-signed purge request document
     
     Client1->>Directory: Sync directory changes
     Directory->>Client1: Purge request document
     Client1->>Client1: getRequestedDocHistoryPurges()
-    Client1->>Store1: purgeDocHistory(docId)
-    Store1->>Store1: Remove all changes for docId
+    Client1->>Store1: purgeDocHistory(docId) for each docId
+    Store1->>Store1: Remove all changes for the docIds
     
     Client2->>Directory: Sync directory changes
     Directory->>Client2: Purge request document
     Client2->>Client2: getRequestedDocHistoryPurges()
-    Client2->>Store2: purgeDocHistory(docId)
-    Store2->>Store2: Remove all changes for docId
+    Client2->>Store2: purgeDocHistory(docId) for each docId
+    Store2->>Store2: Remove all changes for the docIds
 ```
 
 **Implementation**:
 
 ```typescript
-// Administrator requests purge
+// Administrator publishes an admin-signed purge request
 const directory = await tenant.openDirectory();
-await directory.requestDocHistoryPurge(
-  "user-data",
-  "doc-123",
-  "GDPR right to be forgotten",
+await directory.publishDocHistoryPurge(
+  {
+    v: 1,
+    requestId: crypto.randomUUID(),
+    dbId: "user-data",
+    docIds: ["doc-123"],
+    reason: "GDPR right to be forgotten",
+    preparedByPublicKey: "",
+  },
   adminPrivateKey,
   adminPassword
 );
@@ -144,8 +149,10 @@ const purgeRequests = await directory.getRequestedDocHistoryPurges();
 for (const request of purgeRequests) {
   const db = await tenant.openDB(request.dbId);
   const store = db.getStore();
-  await store.purgeDocHistory(request.docId);
-  console.log(`Purged document ${request.docId} from ${request.dbId}`);
+  for (const docId of request.docIds) {
+    await store.purgeDocHistory(docId);
+    console.log(`Purged document ${docId} from ${request.dbId}`);
+  }
 }
 ```
 

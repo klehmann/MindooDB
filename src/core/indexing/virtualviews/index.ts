@@ -64,7 +64,11 @@ export {
 } from "./types";
 
 // Core classes
-export { VirtualView } from "./VirtualView";
+export {
+  VirtualView,
+  type VirtualViewUpdateStats,
+  type ViewDataSourceInfo,
+} from "./VirtualView";
 export { VirtualViewColumn, type VirtualViewColumnOptions } from "./VirtualViewColumn";
 export { VirtualViewEntryData } from "./VirtualViewEntryData";
 export { VirtualViewDataChange } from "./VirtualViewDataChange";
@@ -75,7 +79,11 @@ export { ViewEntrySortKeyComparator } from "./ViewEntrySortKeyComparator";
 export { VirtualViewNavigator } from "./VirtualViewNavigator";
 
 // Data providers
-export { type IVirtualViewDataProvider } from "./IVirtualViewDataProvider";
+export {
+  type IVirtualViewDataProvider,
+  type VirtualViewUpdateOptions,
+  type VirtualViewUpdateProgress,
+} from "./IVirtualViewDataProvider";
 export {
   MindooDBVirtualViewDataProvider,
   type MindooDBVirtualViewDataProviderOptions,
@@ -93,4 +101,5 @@ export {
   VirtualViewFactory,
   VirtualViewBuilder,
   VirtualViewNavigatorBuilder,
+  type WithDBOptions,
 } from "./VirtualViewFactory";

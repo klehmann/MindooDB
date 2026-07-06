@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB is an **End-to-End Encrypted, Offline-first Sync Database** for secure, distributed document storage. Clients create tenants locally and synchronize through content-addressed stores containing cryptographically signed and encrypted document histories.
+MindooDB is an **End-to-End Encrypted, Local-first Sync Database** for secure, distributed document storage. Clients create tenants locally and synchronize through content-addressed stores containing cryptographically signed and encrypted document histories.
 
 **Design Principles:**
 - No central authority required—tenants created entirely client-side
@@ -124,6 +124,13 @@ interface StoreEntryMetadata {
   signature: Uint8Array;          // Ed25519 signature over encrypted data
   originalSize: number;           // Plaintext size before encryption (bytes)
   encryptedSize: number;          // Encrypted payload size (bytes)
+  attachmentRefs?: StoreEntryAttachmentRef[]; // Signed snapshot of referenced attachments (see below)
+}
+
+interface StoreEntryAttachmentRef {
+  attachmentId: string;           // Attachment instance id (UUID7)
+  lastChunkId: string;            // Entry id of the attachment's last chunk (head of its chunk chain)
+  size: number;                   // Total attachment size in bytes
 }
 
 interface StoreEntry extends StoreEntryMetadata {
@@ -625,6 +632,17 @@ const range = await doc.getAttachmentRange(attachmentId, 0, 1024);
 for await (const chunk of doc.streamAttachment(attachmentId)) { ... }
 ```
 
+### Referenced-Attachment Snapshot (`attachmentRefs`)
+
+Every document store entry (`doc_create`, `doc_change`, `doc_snapshot`; `doc_undelete` restores the set, `doc_delete` writes an empty set) carries `attachmentRefs`: a snapshot of all attachments the document references **as of that revision**, each as `{ attachmentId, lastChunkId, size }`.
+
+It is **bound into the author `metadataSignature`** (a backward-compatible trailing block in the canonical signing layout — absent/empty contributes zero bytes, so pre-existing attachment-free entries verify unchanged), so a relay cannot rewrite it. This lets a sync server **without decryption keys**:
+
+- Decide attachment **liveness** for GC / tiering: union `attachmentRefs[].lastChunkId` across each document's latest revision(s), then walk each chunk chain via `resolveDependencies()`; unreferenced chunks are reclaim candidates.
+- Compute **storage statistics** (total attachments, average per document, average file size from `size`, and deduplication quality from chunk `contentHash` / `encryptedSize`) without reading payloads.
+
+This is distinct from the unsigned, add-only `attachmentIds` hint, which exists solely for local incomplete-upload recovery.
+
 See: [Attachments Documentation](./attachments.md)
 
 ---
@@ -701,7 +719,7 @@ Multiple keys per user (signing, encryption, named symmetric keys) require:
 | **Collaborative Editing** | Automerge CRDTs + signed changes |
 | **Secure File Sharing** | Named keys for need-to-know access |
 | **Audit-Compliant Systems** | Append-only, signed, timestamped history |
-| **Offline-First Apps** | Full functionality without network |
+| **Local-First Apps** | Full functionality without network |
 
 ---
 

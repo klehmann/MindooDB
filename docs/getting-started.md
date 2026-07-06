@@ -1,6 +1,6 @@
 # Getting Started with MindooDB
 
-MindooDB is an end-to-end encrypted, offline-first sync database that runs on Node.js, web browsers, and React Native. You create tenants and users entirely on the client — private keys never leave the device, and the server only ever sees encrypted blobs. This guide walks you through the complete setup: creating a tenant, publishing it to a server, inviting a second user, and collaborating on shared encrypted data.
+MindooDB is an end-to-end encrypted, local-first sync database that runs on Node.js, web browsers, and React Native. You create tenants and users entirely on the client — private keys never leave the device, and the server only ever sees encrypted blobs. This guide walks you through the complete setup: creating a tenant, publishing it to a server, inviting a second user, and collaborating on shared encrypted data.
 
 If you have used traditional databases before, MindooDB will feel familiar in terms of reading and writing documents. The difference is that everything is cryptographically signed, encrypted, and designed for multi-device sync without trusting the server.
 
@@ -130,6 +130,8 @@ await db.pushChangesTo(remote);
 ```
 
 Every document change is automatically signed with the user's Ed25519 key and encrypted with the tenant's default encryption key (AES-256-GCM) before it is stored. When you push to the server, only the encrypted entries travel over the wire.
+
+> **Change granularity:** Inside a `changeDoc()` callback, assigning a top-level field (e.g. `d.getData().title = "..."` or replacing a whole array/object) records the replacement of that entire value in the change history. For small values this is fine, but repeatedly rewriting large fields (long strings, big arrays) produces large change entries and grows the document history quickly. For fine-grained edits, use the dedicated patch APIs instead: `db.applyTextPatch()` for character-level text edits and `db.applyJsonPatch()` for granular object/list operations at specific paths. These record only the actual delta and merge cleanly with concurrent edits.
 
 `connectToServer` creates a remote store backed by an HTTP transport. It handles authentication (challenge-response using your signing key), encryption of the sync payload, and capability negotiation with the server. You can use the returned store with `pushChangesTo` and `pullChangesFrom` just like any local store.
 

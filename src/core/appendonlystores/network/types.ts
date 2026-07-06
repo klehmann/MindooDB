@@ -48,7 +48,12 @@ export interface UserPublicKeys {
  */
 export interface NetworkAuthTokenPayload {
   /**
-   * Subject: the username of the authenticated user
+   * Subject of the authenticated session. Historically the cleartext username
+   * the client posted to `/auth/challenge`. With key-based challenges the
+   * username is optional, so `sub` may instead carry the authenticated device
+   * signing key (Ed25519, PEM) when no username was supplied. Treat it as an
+   * opaque principal id; identity for the read gate is resolved from
+   * {@link deviceSigningKey} where present.
    */
   sub: string;
 
@@ -71,6 +76,23 @@ export interface NetworkAuthTokenPayload {
    * Optional: database ID if token is scoped to a specific database
    */
   dbId?: string;
+
+  /**
+   * Optional: the signing public key (Ed25519, PEM) the device actually
+   * authenticated with (docs/accesscontrol.md §6.5). Determined by the server
+   * from which of the user's granted/wipe-targeted keys verified the challenge.
+   * Used to target a specific device for remote wipe.
+   */
+  deviceSigningKey?: string;
+
+  /**
+   * Optional: set when the authenticating device's signing key is the target of
+   * an admin-requested remote wipe (`wipeRequestedForSigningKeys`, §6.5). A
+   * wipe-scoped token may only fetch the admin-signed grant document carrying
+   * the directive, and bypasses the normal revocation check so a revoked device
+   * can still learn it must wipe.
+   */
+  wipe?: boolean;
 }
 
 /**
@@ -83,9 +105,19 @@ export interface AuthChallenge {
   challenge: string;
 
   /**
-   * The username this challenge was issued for
+   * The username this challenge was issued for. Optional: with key-based
+   * challenges the client may identify itself by its signing public key
+   * instead (see {@link signingPublicKey}), so the server no longer requires
+   * the cleartext username.
    */
-  username: string;
+  username?: string;
+
+  /**
+   * The device signing public key (Ed25519, PEM) this challenge was issued for,
+   * when the client identified itself by key rather than username. Used by
+   * {@link AuthenticationService.authenticate} to scope candidate keys.
+   */
+  signingPublicKey?: string;
 
   /**
    * Timestamp when the challenge was created (Unix epoch milliseconds)
@@ -165,6 +197,27 @@ export interface NetworkSyncCapabilities {
    * walking attachment chunk metadata over the network.
    */
   supportsAttachmentReadPlanning: boolean;
+  /**
+   * Server's current wall-clock time (ms since Unix epoch) at the moment it
+   * answered the capabilities request. Clients use this for the clock-skew
+   * guard before syncing against an access-controlled tenant
+   * (docs/accesscontrol.md §4 "Clock-skew guard"), so a client with a wrong
+   * local clock cannot mis-stamp `createdAt`/trusted-time decisions.
+   */
+  serverTime?: number;
+  /**
+   * Whether the server implements the v1 access-control protocol (witness
+   * receipts + Tier 1 enforcement, docs/accesscontrol.md §5–§7). Clients use
+   * this to negotiate whether to enforce the clock-skew guard and to expect
+   * witness receipts on accepted entries.
+   */
+  supportsAccessControlV1?: boolean;
+  /**
+   * Whether the server enforces remote-wipe serving (docs/accesscontrol.md
+   * §6.5): a device whose signing key is wipe-targeted is served only the
+   * admin-signed grant document carrying the directive and no other data.
+   */
+  supportsRemoteWipeV1?: boolean;
 }
 
 /**
@@ -189,6 +242,10 @@ export enum NetworkErrorType {
   SERVER_ERROR = "SERVER_ERROR",
   /** User not found in directory */
   USER_NOT_FOUND = "USER_NOT_FOUND",
+  /** Entry was denied by a Tier 1 access-control rule (docs/accesscontrol.md §7) */
+  ACCESS_DENIED = "ACCESS_DENIED",
+  /** Local/server clock skew exceeded tolerance during sync (§4 clock-skew guard) */
+  CLOCK_SKEW = "CLOCK_SKEW",
 }
 
 /**

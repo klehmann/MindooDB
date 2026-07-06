@@ -84,6 +84,59 @@ A VirtualView is an **in-memory tree structure** that organizes documents into c
 └─────────────────────┘      └─────────────────────┘
 ```
 
+## Data Sources: Summary Buffer First
+
+The builds (`build()` / `buildAndUpdate()` — both async) resolve every `withDB`
+source **summary-first**: whenever the view definition can be answered from the
+[document summary buffer](adhoc-queries.md) — declarative expression/field
+columns, an expression filter (or none), all referenced fields covered by the
+summary configuration — the view is fed from the summary, so **no documents are
+materialized** and index builds are as fast as possible. Otherwise the source
+transparently falls back to materialized documents. The fallback is forced by:
+
+- a JS `filterFunction` or a column `valueFunction` (they need the document),
+- expressions using decrypt or view-tree operations,
+- referenced fields not covered by the summary configuration (see the
+  [`dbsetup` design document](adhoc-queries.md)) — attachment expressions
+  (`attachmentNames()`, `attachmentCount()`, …) count as references to
+  `_attachments` and are summary-capable via the slim attachment projection
+  (default on; `includeAttachments: false` forces the fallback),
+- `includeAllDocumentFields`,
+- the explicit **`useFullDocuments`** flag:
+
+```typescript
+// Force materialized documents for this source (expensive by design):
+.withDB("employees", employeeDatabase, filter, { useFullDocuments: true })
+```
+
+`withDB` accepts a declarative expression filter (summary-capable) or a legacy
+JS filter function (forces the document path — existing code keeps its exact
+behavior):
+
+```typescript
+const v = createViewLanguage<Employee>();
+.withDB("employees", employeeDatabase, v.eq(v.field("type"), "employee"))
+```
+
+`build()` is async because choosing the summary buffer requires loading the
+(possibly synced) summary configuration; `buildAndUpdate()` additionally runs
+the initial `update()`.
+
+The decision is recorded on the built view and can be read back per origin —
+useful for logging or a UI that explains why a view runs on the slow path:
+
+```typescript
+const info = view.getDataSourceInfo("employees");
+// { source: "summary", fallbackReasons: [] }
+// or { source: "documents", fallbackReasons: ["the filter is a JS function ..."] }
+view.getAllDataSourceInfos(); // Map<origin, ViewDataSourceInfo>
+```
+
+For manual provider wiring, `createViewDataProvider()` exposes the same
+decision (returning the chosen `source` and, on fallback, the reasons) and
+`collectSummaryFallbackReasons()` lets UIs explain why a view runs on the slow
+path.
+
 ## Getting Started
 
 ### Basic Example: Simple Categorized View
@@ -260,7 +313,7 @@ for await (const entry of nav.entriesForward()) {
 Value functions compute column values dynamically from document data:
 
 ```typescript
-const view = VirtualViewFactory.createView()
+const view = await VirtualViewFactory.createView()
   .addCategoryColumn("yearMonth", {
     // Compute year-month from a date field
     valueFunction: (doc, values, origin) => {
@@ -288,12 +341,44 @@ const view = VirtualViewFactory.createView()
   .build();
 ```
 
+### Declarative Expression Columns
+
+As a JSON-serializable alternative to JS value functions, columns can carry an
+`expression` in the MindooDB expression language (built with `createViewLanguage()`
+or parsed from formula text):
+
+```typescript
+import { createViewLanguage } from "mindoodb";
+const v = createViewLanguage<{ firstName: string; lastName: string }>();
+
+new VirtualViewColumn({
+  name: "fullName",
+  expression: v.concat(v.field("firstName"), " ", v.field("lastName")),
+});
+```
+
+When both are set, `valueFunction` wins for document-backed providers. Summary-backed
+providers (see below) only evaluate `expression` — JS functions are rejected there
+because no materialized document exists to pass them. Expression columns make a whole
+view definition serializable, the basis for view designs stored/synchronized as data.
+
+### Ephemeral Summary-Backed Views
+
+For ad-hoc UI grids with dynamic re-sorting, `db.queryView()` builds an ephemeral
+VirtualView over the document summary buffer instead of materialized documents —
+constructing it is a pure in-memory sort, and `resort()` swaps column sets without
+reloading anything. Like persistent views, ephemeral views can span multiple
+databases and tenants: `queryViewAcross([{ db: dbA }, { db: dbB }], definition)`
+adds one summary-backed data provider per source under its own origin. See
+[Ad-hoc Queries](adhoc-queries.md) for the full picture (summary configuration,
+coverage rules, cost model).
+
 ### Nested Categories with Backslash Separator
 
 Use backslash (`\`) in category values to create nested subcategories:
 
 ```typescript
-const view = VirtualViewFactory.createView()
+const view = await VirtualViewFactory.createView()
   .addCategoryColumn("datePath", {
     valueFunction: (doc, values, origin) => {
       const date = new Date(doc.getData().createdAt);
@@ -451,12 +536,86 @@ await view.updateOrigin("tasks");
 ### How Incremental Updates Work
 
 1. **Data provider tracks cursor**: Each `MindooDBVirtualViewDataProvider` maintains a cursor from the last processed position
-2. **Process changes**: On `update()`, the provider calls `iterateChangesSince()` to get changed documents
+2. **Process changes**: On `update()`, the provider calls `iterateChangesSince()` to get changed documents. The iterator prefetches upcoming documents in parallel and emits deleted/inaccessible documents as lightweight tombstones (never materialized), so removals are cheap
 3. **Generate changes**: For each document:
    - If deleted or no longer matches filter → add to removals
    - If new or modified → compute column values, add to additions
 4. **Apply changes**: `VirtualView.applyChanges()` removes old entries, adds new ones, cleans up empty categories
 5. **Update totals**: Category totals are incrementally updated (add new values, subtract removed values)
+
+### Column Scoping (`includeAllDocumentFields`)
+
+By default, the data provider stores **only the fields referenced by the view's columns** in each view entry. This keeps memory usage and the serialized view cache small, especially for documents with large payloads.
+
+Consumers that need free-form access to arbitrary document fields on view entries (e.g. a formula language evaluating fields at read time) can opt back into the legacy behavior:
+
+```typescript
+const view = await VirtualViewFactory.createView()
+  .addCategoryColumn("status")
+  .addSortedColumn("name")
+  .withMindooDB({
+    origin: "tasks",
+    db: taskDatabase,
+    includeAllDocumentFields: true, // copy all non-underscore doc fields into entries
+  })
+  .buildAndUpdate();
+```
+
+### Progress Reporting & Interruptible Updates
+
+Long-running update runs (e.g. the initial population of a view over a large database) can be observed and interrupted. `view.update()`, `view.updateOrigin()`, and `provider.update()` accept an optional `VirtualViewUpdateOptions` object:
+
+```typescript
+const controller = new AbortController();
+
+await view.update({
+  // Apply accumulated changes to the view after this many processed
+  // documents (default: 100). Use Infinity for one atomic apply at the end.
+  applyBatchSize: 200,
+
+  // Called at every batch boundary and once at the end of the run.
+  // Return false to stop cleanly after the current batch.
+  onProgress: ({ processed, total, origin }) => {
+    progressDialog.update(processed, total);
+    return !progressDialog.cancelRequested;
+  },
+
+  // Alternative cancellation mechanism, checked at every batch boundary.
+  signal: controller.signal,
+});
+```
+
+Key behaviors:
+
+- **`total`** is computed once at the start of the run via `db.countChangesSince(cursor)` — an O(log n) binary search on the change index, so progress reporting adds no meaningful overhead. Changes arriving mid-run are not included in `total`.
+- **Interruption is always clean**: the current batch is applied to the view before the run stops, so the view state and the provider cursor stay consistent. Nothing is half-applied.
+- **Resumption is automatic**: the provider cursor points at the last applied document, so the next `update()` call continues exactly where the interrupted run stopped — no work is repeated. This also holds across app restarts when the provider state is persisted via `exportCacheState()` / `importCacheState()` (which the view cache does automatically).
+
+`countChangesSince(cursor)` is also available directly on the database for building "N documents pending" indicators before starting an update.
+
+### Live Views (`bindTo` / `onDidUpdate`)
+
+Instead of polling, a view can bind to the database's change feed and update itself:
+
+```typescript
+const offUpdate = view.onDidUpdate(({ addedCount, removedCount }) => {
+  rerenderUI();   // fires after every applied change batch
+});
+const unbind = view.bindTo(db);   // auto-runs update() on coalesced change events
+// ...
+unbind();
+offUpdate();
+```
+
+`bindTo` uses coalesced scheduling — while an update runs, further change events only
+set a pending flag and one follow-up update runs afterwards, so there is never an
+update backlog. Ephemeral views (`db.queryView()`) support the same API. See
+[Ad-hoc Queries — Reactive updates](adhoc-queries.md#reactive-updates) for the
+underlying change-listener contract and live queries (`db.queryLive()`).
+
+### View Cache Flush Behavior
+
+When a `CacheManager` is attached via `view.setCacheManager()`, the view periodically serializes its full tree to the local cache store. Because full-tree serialization is expensive, flushes are throttled: a minimum interval (default **15 seconds**, configurable via `setCacheManager(..., { minCacheFlushIntervalMs })`) must elapse between two serializations. A flush attempt inside that window is deferred — the view stays dirty and the flush lands on a later cycle. Shutdown paths (`CacheManager.dispose()` / `deregister()`) always flush immediately, so no state is lost on close.
 
 ## API Reference
 
@@ -483,11 +642,12 @@ builder
   .addTotalColumn(name, totalMode, options?)  // Add total column
   .addColumnFromOptions(options)         // Add column with full options
   .withCategorizationStyle(style)        // Categories before/after documents
-  .withDB(origin, db, filterFunction?)   // Add MindooDB data source
-  .withMindooDB(options)                 // Add MindooDB with full options
+  .withDB(origin, db, filter?, options?) // Add MindooDB data source (expression or JS filter;
+                                         // options: { useFullDocuments, includeAllDocumentFields })
+  .withMindooDB(options)                 // Add MindooDB with full options (always document path)
   .withDataProvider(provider)            // Add custom data provider
-  .build(): VirtualView                  // Build the view
-  .buildAndUpdate(): Promise<VirtualView>  // Build and fetch data
+  .build(): Promise<VirtualView>         // Build the view (summary-first for withDB sources)
+  .buildAndUpdate(): Promise<VirtualView>  // Build (summary-first) and fetch data
 ```
 
 ### VirtualView
@@ -498,10 +658,15 @@ view.getCategoryColumns(): VirtualViewColumn[]
 view.getSortColumns(): VirtualViewColumn[]
 view.getTotalColumns(): VirtualViewColumn[]
 view.getRoot(): VirtualViewEntryData
-view.update(): Promise<void>             // Update all data providers
-view.updateOrigin(origin): Promise<void> // Update specific provider
+view.update(options?): Promise<void>             // Update all data providers
+view.updateOrigin(origin, options?): Promise<void> // Update specific provider
+// options: { applyBatchSize?, onProgress?, signal? } — see
+// "Progress Reporting & Interruptible Updates" above
 view.applyChanges(change): void          // Apply a VirtualViewDataChange
 view.getEntries(origin, docId): VirtualViewEntryData[]
+view.getDataSourceInfo(origin): ViewDataSourceInfo | undefined
+                                         // Build-time summary-vs-documents decision
+view.getAllDataSourceInfos(): Map<string, ViewDataSourceInfo>
 ```
 
 ### VirtualViewNavigatorBuilder

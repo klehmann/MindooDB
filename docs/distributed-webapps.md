@@ -134,7 +134,7 @@ The tradeoff is that there is no cross-version deduplication. If 90% of files ar
 
 ## 4) The bootstrap: first load
 
-Every offline-first web application faces a chicken-and-egg problem on the very first load. The service worker that serves the application from IndexedDB does not exist yet, and IndexedDB contains no data. Something has to serve the initial page that registers the service worker and triggers the first sync.
+Every local-first web application faces a chicken-and-egg problem on the very first load. The service worker that serves the application from IndexedDB does not exist yet, and IndexedDB contains no data. Something has to serve the initial page that registers the service worker and triggers the first sync.
 
 The MindooDB example server solves this with the `--static-dir` option, which serves files from a local directory at the `/statics/` URL prefix. When a user navigates to the server's root URL, the server redirects to `/statics/index.html` if the file exists. This bootstrap page is the only part of the system that requires a traditional server -- after the first sync, the service worker takes over and the bootstrap is never used again.
 

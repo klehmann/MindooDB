@@ -22,6 +22,7 @@ import rateLimit from "express-rate-limit";
 import type {
   StoreEntry,
   StoreEntryMetadata,
+  StoreEntryAttachmentRef,
   StoreEntryType,
   StoreScanCursor,
   StoreScanFilters,
@@ -80,7 +81,10 @@ import {
   MAX_PEM_KEY_LENGTH,
   MAX_SIGNATURE_LENGTH,
   MAX_CHALLENGE_LENGTH,
+  DEFAULT_MAX_SYNC_SERVER_DATABASES,
 } from "./validation";
+import { assertSafeSyncUrl, UnsafeUrlError } from "../../core/utils/urlSafety";
+import { ENV_VARS } from "./types";
 
 /**
  * Augment Express Request with fields populated by our middleware:
@@ -115,8 +119,19 @@ interface SerializedEntryMetadata {
   createdByPublicKey: string;
   decryptionKeyId: string;
   signature: string;
+  metadataSignature?: string; // base64 (author metadata-binding signature)
   originalSize: number;
   encryptedSize: number;
+  // Access-control witness receipt (docs/accesscontrol.md §5). The Ed25519
+  // signature is base64 on the wire; the other two fields are plain JSON.
+  receivedAt?: number;
+  receivedByPublicKey?: string;
+  receivedDateSignature?: string; // base64
+  // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
+  // Must round-trip so metadataSignature verification succeeds on ingest.
+  attachmentRefs?: StoreEntryAttachmentRef[];
+  // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
+  entryVersion?: number;
 }
 
 interface SerializedEntry extends SerializedEntryMetadata {
@@ -140,6 +155,26 @@ const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_SYNC_RATE_LIMIT_MAX = 1_000;
 
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
+
+/**
+ * The effective max number of database ids per sync-server registration. Reads
+ * the `MINDOODB_MAX_SYNC_SERVER_DATABASES` env override and falls back to
+ * {@link DEFAULT_MAX_SYNC_SERVER_DATABASES} when unset or invalid (non-integer
+ * or non-positive), so a typo can never silently disable the bound.
+ */
+function resolveMaxSyncServerDatabases(): number {
+  const raw = process.env[ENV_VARS.MAX_SYNC_SERVER_DATABASES]?.trim();
+  if (!raw) return DEFAULT_MAX_SYNC_SERVER_DATABASES;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.warn(
+      `[MindooDBServer] Ignoring invalid ${ENV_VARS.MAX_SYNC_SERVER_DATABASES}="${raw}" ` +
+        `(expected a positive integer); using default ${DEFAULT_MAX_SYNC_SERVER_DATABASES}`,
+    );
+    return DEFAULT_MAX_SYNC_SERVER_DATABASES;
+  }
+  return parsed;
+}
 
 /** Parse a human-readable size string ("5mb", "1024", "100kb") into bytes. */
 function parseBodySizeLimitToBytes(limit: string): number | null {
@@ -791,9 +826,35 @@ export class MindooDBServer {
           res.status(400).json({ error: "databases array is required and must not be empty" });
           return;
         }
+        // Bound and format-validate each database id (audit, Low): these are
+        // used to scope sync and must be safe identifiers, not arbitrary input.
+        // The bound is overridable per deployment via
+        // MINDOODB_MAX_SYNC_SERVER_DATABASES.
+        validateArraySize(databases, resolveMaxSyncServerDatabases(), "databases");
+        for (const db of databases) {
+          validateIdentifier(db, "databases[]");
+        }
 
         validateStringLength(name, 256, "name");
         validateStringLength(url, 2048, "url");
+
+        // SSRF guard: an admin-supplied sync URL is fetched server-side, so
+        // reject plaintext/internal targets unless explicitly allowed for dev.
+        const allowInsecure = /^(1|true)$/i.test(
+          process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
+        );
+        try {
+          assertSafeSyncUrl(url, {
+            requireHttps: !allowInsecure,
+            allowPrivate: allowInsecure,
+          });
+        } catch (e) {
+          if (e instanceof UnsafeUrlError) {
+            res.status(400).json({ error: e.message });
+            return;
+          }
+          throw e;
+        }
 
         const config: NamedRemoteServerConfig = { name, url, databases };
         if (syncIntervalMs !== undefined) {
@@ -938,6 +999,11 @@ export class MindooDBServer {
 
       const signatureBytes = this.base64ToUint8Array(signature);
       const result = await this.systemAdminAuth.authenticate(challenge, signatureBytes);
+      // Return 401 on a failed authentication instead of 200 (audit, Low).
+      if (!result.success) {
+        res.status(401).json(result);
+        return;
+      }
       res.json(result);
     } catch (error) {
       if (error instanceof ValidationError) {
@@ -1124,10 +1190,15 @@ export class MindooDBServer {
     const clientIp = this.getClientIpForRateLimit(req);
 
     if (phase === "challenge") {
-      const username = typeof req.body?.username === "string"
+      // Bucket by username when supplied, otherwise by the signing public key a
+      // key-based client identifies with, so key-based clients still get a
+      // stable per-principal bucket instead of all sharing "-".
+      const principal = typeof req.body?.username === "string" && req.body.username.trim()
         ? req.body.username.trim().toLowerCase()
-        : "-";
-      return `${scope}:${tenantId}:${phase}:${clientIp}:${username}`;
+        : typeof req.body?.signingPublicKey === "string" && req.body.signingPublicKey.trim()
+          ? req.body.signingPublicKey.trim()
+          : "-";
+      return `${scope}:${tenantId}:${phase}:${clientIp}:${principal}`;
     }
 
     return `${scope}:${tenantId}:${phase}:${clientIp}`;
@@ -1185,12 +1256,23 @@ export class MindooDBServer {
 
   private async handleChallenge(req: Request, res: Response): Promise<void> {
     try {
-      const { username } = req.body;
+      const { username, signingPublicKey } = req.body;
 
-      validateUsername(username);
+      // The username is optional: a client may identify itself by its device
+      // signing public key instead, so the server never needs the cleartext
+      // name. Validate whichever was supplied.
+      if (username !== undefined && username !== null) {
+        validateUsername(username);
+      }
+      if (signingPublicKey !== undefined && signingPublicKey !== null) {
+        validateStringLength(signingPublicKey, MAX_SIGNATURE_LENGTH, "signingPublicKey");
+      }
 
       const authService = await this.tenantManager.getAuthService(req.tenantId!);
-      const challenge = await authService.generateChallenge(username);
+      const challenge = await authService.generateChallenge(
+        typeof username === "string" ? username : undefined,
+        typeof signingPublicKey === "string" ? { signingPublicKey } : undefined,
+      );
 
       res.json({ challenge });
     } catch (error) {
@@ -1214,6 +1296,12 @@ export class MindooDBServer {
       const signatureBytes = this.base64ToUint8Array(signature);
       const result = await authService.authenticate(challenge, signatureBytes);
 
+      // Return 401 on a failed authentication instead of 200 (audit, Low): a
+      // failed credential check must not look like a success at the HTTP layer.
+      if (!result.success) {
+        res.status(401).json(result);
+        return;
+      }
       res.json(result);
     } catch (error) {
       this.handleRequestError(error, res);
@@ -1459,10 +1547,28 @@ export class MindooDBServer {
       );
 
       stage = "store-entries";
-      await serverStore.handlePutEntries(token, deserializedEntries);
+      const stampedMetadata = await serverStore.handlePutEntries(token, deserializedEntries);
       stage = "respond-success";
 
-      res.json({ success: true });
+      // Return witness receipts for accepted entries so the pushing client (and
+      // every replica it later syncs with) can persist the attestation
+      // (docs/accesscontrol.md §5.3). Older clients ignore the extra field.
+      res.json({
+        success: true,
+        receipts: stampedMetadata.map((e) => this.serializeEntryMetadata(e)),
+      });
+
+      // A directory push may carry new admin-signed purge requests
+      // (docs/accesscontrol.md §13). Execute any pending purges after the
+      // response so the server physically removes purged history from its own
+      // stores and arms the re-push denylist. Fire-and-forget: failures are
+      // logged and retried on the next directory push.
+      if (validDbId === "directory") {
+        const tenantId = req.tenantId!;
+        void this.tenantManager.executePendingPurges(tenantId).catch((error) => {
+          console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
+        });
+      }
     } catch (error) {
       console.error("[MindooDBServer] putEntries failed", {
         stage,
@@ -1664,6 +1770,8 @@ export class MindooDBServer {
         return 403;
       case "CHALLENGE_EXPIRED":
         return 401;
+      case "ACCESS_DENIED":
+        return 403;
       default:
         return 500;
     }
@@ -1733,8 +1841,18 @@ export class MindooDBServer {
       createdByPublicKey: metadata.createdByPublicKey,
       decryptionKeyId: metadata.decryptionKeyId,
       signature: this.uint8ArrayToBase64(metadata.signature),
+      metadataSignature: metadata.metadataSignature
+        ? this.uint8ArrayToBase64(metadata.metadataSignature)
+        : undefined,
       originalSize: metadata.originalSize,
       encryptedSize: metadata.encryptedSize,
+      receivedAt: metadata.receivedAt,
+      receivedByPublicKey: metadata.receivedByPublicKey,
+      receivedDateSignature: metadata.receivedDateSignature
+        ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
+        : undefined,
+      attachmentRefs: metadata.attachmentRefs,
+      entryVersion: metadata.entryVersion,
     };
   }
 
@@ -1750,8 +1868,20 @@ export class MindooDBServer {
       createdByPublicKey: serialized.createdByPublicKey,
       decryptionKeyId: serialized.decryptionKeyId,
       signature: this.base64ToUint8Array(serialized.signature),
+      metadataSignature: serialized.metadataSignature
+        ? this.base64ToUint8Array(serialized.metadataSignature)
+        : undefined,
       originalSize: serialized.originalSize,
       encryptedSize: serialized.encryptedSize,
+      // Preserve any pre-existing witness receipt (e.g. on re-sync or
+      // server-to-server forwarding); a fresh local push has none.
+      receivedAt: serialized.receivedAt,
+      receivedByPublicKey: serialized.receivedByPublicKey,
+      receivedDateSignature: serialized.receivedDateSignature
+        ? this.base64ToUint8Array(serialized.receivedDateSignature)
+        : undefined,
+      attachmentRefs: serialized.attachmentRefs,
+      entryVersion: serialized.entryVersion,
       encryptedData: this.base64ToUint8Array(serialized.encryptedData),
     };
   }

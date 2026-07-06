@@ -12,14 +12,28 @@ export type StoreType = "inmemory" | "file";
 /**
  * Configuration for a user registered in the tenant.
  * Users can be human clients or other servers (for server-to-server sync).
+ *
+ * The canonical identity of an entry is its `signingPublicKey`: the server
+ * matches and authorizes by key, never by name. `username` is optional and
+ * documentation-only (a human-readable label); it is ignored for matching.
+ * Arbitrary extra fields (e.g. `comment`) are allowed and ignored by the server.
  */
 export interface UserConfig {
-  /** Username identifier (e.g., "alice" or "server-eu-west") */
-  username: string;
-  /** Ed25519 public key in PEM format for signature verification */
+  /**
+   * Optional, documentation-only label for this key (e.g. "alice" or
+   * "server-eu-west"). Ignored for identity matching — the server identifies
+   * users by `signingPublicKey`. Kept for backward compatibility with
+   * config-based username authentication.
+   */
+  username?: string;
+  /** Ed25519 public key in PEM format for signature verification (the identity). */
   signingPublicKey: string;
   /** RSA-OAEP public key in PEM format for encryption */
   encryptionPublicKey: string;
+  /** Optional free-form note describing this entry (ignored by the server). */
+  comment?: string;
+  /** Arbitrary extra documentation fields are tolerated and ignored. */
+  [key: string]: unknown;
 }
 
 /**
@@ -196,4 +210,16 @@ export const ENV_VARS = {
    * Example: `127.0.0.1,::1,10.0.0.0/8,2001:db8::/32`
    */
   ADMIN_ALLOWED_IPS: "MINDOODB_ADMIN_ALLOWED_IPS",
+  /**
+   * When `true`/`1`, sync-server URLs may use plaintext http and target
+   * loopback/private/link-local hosts. Off by default so the server cannot be
+   * pointed at internal services (SSRF). Enable only for local development.
+   */
+  ALLOW_INSECURE_SYNC_URLS: "MINDOODB_ALLOW_INSECURE_SYNC_URLS",
+  /**
+   * Maximum number of database ids accepted in a single sync-server registration
+   * (`POST /tenants/:tenantId/sync-servers`). A positive integer; invalid or
+   * non-positive values fall back to {@link DEFAULT_MAX_SYNC_SERVER_DATABASES}.
+   */
+  MAX_SYNC_SERVER_DATABASES: "MINDOODB_MAX_SYNC_SERVER_DATABASES",
 } as const;

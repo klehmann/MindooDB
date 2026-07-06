@@ -303,20 +303,27 @@ describe("BaseMindooTenant", () => {
       expect(db.getTenant()).toBe(tenant);
     });
 
-    it.each(["test_database", "test database", "-test", ".test", ""])(
+    it("should open a database id containing underscores", async () => {
+      const db = await tenant.openDB("test_database");
+
+      expect(db).toBeDefined();
+      expect(db.getTenant()).toBe(tenant);
+    });
+
+    it.each(["test database", "-test", ".test", "_test", ""])(
       "should reject invalid database id %j",
       async (dbId) => {
         await expect(tenant.openDB(dbId)).rejects.toThrow(
-          /contain only letters, digits, dots, and hyphens|required/i,
+          /contain only letters, digits, dots, hyphens, and underscores|required/i,
         );
       },
     );
 
     it("should reject invalid database ids during direct BaseMindooDB creation", () => {
-      const { docStore, attachmentStore } = storeFactory.createStore("test_database");
+      const { docStore, attachmentStore } = storeFactory.createStore("test$database");
 
       expect(() => new BaseMindooDB(tenant as BaseMindooTenant, docStore, attachmentStore)).toThrow(
-        /contain only letters, digits, dots, and hyphens/i,
+        /contain only letters, digits, dots, hyphens, and underscores/i,
       );
     });
 

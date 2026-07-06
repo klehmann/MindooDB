@@ -9,6 +9,7 @@ import {
   OpenDBOptions,
   MindooTenantFactory,
   MindooTenantDirectory,
+  StoreEntryMetadata,
   SigningKeyPair,
   JoinRequest,
   JoinResponse,
@@ -24,11 +25,16 @@ import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
+import { extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
+import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
+import { verifyEntrySignatureWithImportedKey } from "./crypto/EntrySignature";
+import { entryTrustedTime } from "./storeEntryTime";
+import { computeContentHash } from "./utils/idGeneration";
 import { SymmetricKeyNotFoundError } from "./errors";
-import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
+import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
@@ -85,7 +91,30 @@ export class BaseMindooTenant implements MindooTenant {
   private decryptedTenantKeyCache?: Uint8Array;
   private decryptedUserSigningKeyCache?: CryptoKey;
   private decryptedUserEncryptionKeyCache?: CryptoKey;
+  /**
+   * Cache of imported AES-GCM `CryptoKey`s, keyed by usage + raw key bytes
+   * (hex). `subtle.importKey` costs a WebCrypto round trip per call, which
+   * adds up on bulk writes/reads (one import per store entry). Because the
+   * cache is content-addressed by the key bytes, rotated key versions miss
+   * the cache naturally — no explicit invalidation is needed.
+   */
+  private readonly importedAesKeyCache = new Map<string, CryptoKey>();
+  /**
+   * Cache of imported Ed25519 verify `CryptoKey`s, keyed by the PEM public
+   * key. Signature verification runs once per entry when materializing
+   * documents, so the per-call SPKI import is on the hot read path.
+   */
+  private readonly importedVerifyKeyCache = new Map<string, CryptoKey>();
+  private static readonly MAX_IMPORTED_KEY_CACHE_ENTRIES = 128;
   private logger: Logger;
+
+  // Single-flight guard for SDK-driven key-distribution reconcile (§13). The
+  // reconcile driver itself calls getDirectoryDB / updateUnifiedCache /
+  // syncStoreChanges, any of which can re-enter a trigger; this flag keeps the
+  // run-always trigger (directory bring-up + after each directory pull) from
+  // recursing or overlapping. Reconcile is idempotent, so a skipped overlap is
+  // harmless — the next trigger re-runs it.
+  private reconcileInFlight = false;
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -278,65 +307,90 @@ export class BaseMindooTenant implements MindooTenant {
     return this.administrationEncryptionPublicKey;
   }
 
+  /**
+   * Import an AES-GCM key for `usage`, memoized on the raw key bytes. See
+   * {@link importedAesKeyCache}. On overflow the cache is simply cleared —
+   * refilling it costs one import per active key, which is negligible.
+   */
+  private async importAesKeyCached(
+    symmetricKey: Uint8Array,
+    usage: "encrypt" | "decrypt",
+  ): Promise<CryptoKey> {
+    let cacheKey = usage + ":";
+    for (let i = 0; i < symmetricKey.length; i++) {
+      cacheKey += symmetricKey[i].toString(16).padStart(2, "0");
+    }
+    const cached = this.importedAesKeyCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const subtle = this.cryptoAdapter.getSubtle();
+    // Create a new Uint8Array to ensure we have a proper ArrayBuffer
+    const keyArray = new Uint8Array(symmetricKey);
+    const cryptoKey = await subtle.importKey(
+      "raw",
+      keyArray.buffer,
+      { name: "AES-GCM" },
+      false, // not extractable
+      [usage]
+    );
+    if (this.importedAesKeyCache.size >= BaseMindooTenant.MAX_IMPORTED_KEY_CACHE_ENTRIES) {
+      this.importedAesKeyCache.clear();
+    }
+    this.importedAesKeyCache.set(cacheKey, cryptoKey);
+    return cryptoKey;
+  }
+
   async encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
-    this.logger.debug(`Encrypting payload with key: ${decryptionKeyId}`);
-    this.logger.debug(`Payload size: ${payload.length} bytes`);
+    // The per-step debug logs below are on the hot write path (one call per
+    // store entry); skip building the interpolated strings when debug is off.
+    const debugEnabled = this.logger.isLevelEnabled(LogLevel.DEBUG);
+    if (debugEnabled) {
+      this.logger.debug(`Encrypting payload with key: ${decryptionKeyId}`);
+      this.logger.debug(`Payload size: ${payload.length} bytes`);
+    }
 
     // Get the symmetric key for this key ID
     let symmetricKey: Uint8Array;
     try {
       if (decryptionKeyId === "default") {
-        this.logger.debug(`Using default key (tenant encryption key)`);
         // Use cached tenant encryption key if available
         if (this.decryptedTenantKeyCache) {
           symmetricKey = this.decryptedTenantKeyCache;
-          this.logger.debug(`Using cached tenant key, length: ${symmetricKey.length} bytes`);
+          if (debugEnabled) this.logger.debug(`Using cached tenant key, length: ${symmetricKey.length} bytes`);
         } else {
-          this.logger.debug(`Resolving tenant encryption key from KeyBag`);
+          if (debugEnabled) this.logger.debug(`Resolving tenant encryption key from KeyBag`);
           const tenantKey = await this.keyBag.get("doc", this.tenantId, DEFAULT_TENANT_KEY_ID);
           if (!tenantKey) {
             throw new SymmetricKeyNotFoundError(`doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}`);
           }
           symmetricKey = tenantKey;
           this.decryptedTenantKeyCache = symmetricKey;
-          this.logger.debug(`Loaded tenant key from KeyBag, length: ${symmetricKey.length} bytes`);
+          if (debugEnabled) this.logger.debug(`Loaded tenant key from KeyBag, length: ${symmetricKey.length} bytes`);
         }
       } else {
-        this.logger.debug(`Getting named key from KeyBag: ${decryptionKeyId}`);
+        if (debugEnabled) this.logger.debug(`Getting named key from KeyBag: ${decryptionKeyId}`);
         // Get the decrypted key from KeyBag
         const decryptedKey = await this.keyBag.get("doc", this.tenantId, decryptionKeyId);
         if (!decryptedKey) {
           throw new SymmetricKeyNotFoundError(decryptionKeyId);
         }
         symmetricKey = decryptedKey;
-        this.logger.debug(`Got named key, length: ${symmetricKey.length} bytes`);
+        if (debugEnabled) this.logger.debug(`Got named key, length: ${symmetricKey.length} bytes`);
       }
     } catch (error) {
       this.logger.error(`Error getting symmetric key:`, error);
       throw error;
     }
-    
-    this.logger.debug(`Got symmetric key, length: ${symmetricKey.length} bytes`);
-    
+
     const subtle = this.cryptoAdapter.getSubtle();
     // Bind getRandomValues to maintain 'this' context
     const randomValues = this.cryptoAdapter.getRandomValues.bind(this.cryptoAdapter);
 
-    // Import the symmetric key
-    this.logger.debug(`Importing symmetric key for AES-GCM`);
+    // Import the symmetric key (memoized; see importAesKeyCached)
     let cryptoKey: CryptoKey;
     try {
-      // Create a new Uint8Array to ensure we have a proper ArrayBuffer
-      const keyArray = new Uint8Array(symmetricKey);
-      this.logger.debug(`Key buffer size: ${keyArray.buffer.byteLength} bytes`);
-      cryptoKey = await subtle.importKey(
-        "raw",
-        keyArray.buffer,
-        { name: "AES-GCM" },
-        false, // not extractable
-        ["encrypt"]
-      );
-      this.logger.debug(`Successfully imported key`);
+      cryptoKey = await this.importAesKeyCached(symmetricKey, "encrypt");
     } catch (error) {
       this.logger.error(`Error importing key:`, error);
       this.logger.error(`Key length: ${symmetricKey.length}, expected: 32 bytes for AES-256`);
@@ -344,27 +398,21 @@ export class BaseMindooTenant implements MindooTenant {
     }
 
     // Generate IV (12 bytes for AES-GCM)
-    this.logger.debug(`Generating IV`);
     let iv: Uint8Array;
     try {
       const ivArray = new Uint8Array(12);
       randomValues(ivArray);
       iv = new Uint8Array(ivArray.buffer, ivArray.byteOffset, ivArray.byteLength);
-      this.logger.debug(`Generated IV: ${iv.length} bytes`);
     } catch (error) {
       this.logger.error(`Error generating IV:`, error);
       throw error;
     }
 
     // Encrypt the payload
-    this.logger.debug(`Encrypting payload with AES-GCM`);
-    this.logger.debug(`Payload buffer size: ${payload.buffer.byteLength} bytes`);
-    this.logger.debug(`Payload byteOffset: ${payload.byteOffset}, byteLength: ${payload.byteLength}`);
     let encrypted: ArrayBuffer;
     try {
       // Create a new Uint8Array to ensure we have a proper ArrayBuffer
       const payloadArray = new Uint8Array(payload);
-      this.logger.debug(`Using payload array: ${payloadArray.length} bytes`);
       encrypted = await subtle.encrypt(
         {
           name: "AES-GCM",
@@ -374,7 +422,6 @@ export class BaseMindooTenant implements MindooTenant {
         cryptoKey,
         payloadArray
       );
-      this.logger.debug(`Successfully encrypted payload, encrypted size: ${encrypted.byteLength} bytes`);
     } catch (error) {
       this.logger.error(`Error encrypting payload:`, error);
       this.logger.error(`Error details:`, {
@@ -389,18 +436,19 @@ export class BaseMindooTenant implements MindooTenant {
 
     // Combine IV and encrypted data
     // Format: IV (12 bytes) + encrypted data (includes authentication tag)
-    this.logger.debug(`Combining IV and encrypted data`);
     const encryptedArray = new Uint8Array(encrypted);
     const result = new Uint8Array(12 + encryptedArray.length);
     result.set(iv, 0);
     result.set(encryptedArray, 12);
 
-    this.logger.debug(`Encrypted payload (${payload.length} -> ${result.length} bytes)`);
+    if (debugEnabled) this.logger.debug(`Encrypted payload (${payload.length} -> ${result.length} bytes)`);
     return result;
   }
 
   async decryptPayload(encryptedPayload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array> {
-    this.logger.debug(`Decrypting payload with key: ${decryptionKeyId}`);
+    // Hot read path (one call per store entry): skip interpolations when off.
+    const debugEnabled = this.logger.isLevelEnabled(LogLevel.DEBUG);
+    if (debugEnabled) this.logger.debug(`Decrypting payload with key: ${decryptionKeyId}`);
 
     if (encryptedPayload.length < 12) {
       throw new Error("Encrypted payload too short (missing IV)");
@@ -410,53 +458,61 @@ export class BaseMindooTenant implements MindooTenant {
     const iv = encryptedPayload.slice(0, 12);
     const encryptedData = encryptedPayload.slice(12);
 
-    // Get the symmetric key for this key ID
-    let symmetricKey: Uint8Array;
-    if (decryptionKeyId === "default") {
-      // Use cached tenant encryption key if available
-      if (this.decryptedTenantKeyCache) {
-        symmetricKey = this.decryptedTenantKeyCache;
-      } else {
-        const tenantKey = await this.keyBag.get("doc", this.tenantId, DEFAULT_TENANT_KEY_ID);
-        if (!tenantKey) {
-          throw new SymmetricKeyNotFoundError(`doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}`);
-        }
-        symmetricKey = tenantKey;
-        this.decryptedTenantKeyCache = symmetricKey;
-      }
-    } else {
-      // Get the decrypted key from KeyBag
-      const decryptedKey = await this.keyBag.get("doc", this.tenantId, decryptionKeyId);
-      if (!decryptedKey) {
-        throw new SymmetricKeyNotFoundError(decryptionKeyId);
-      }
-      symmetricKey = decryptedKey;
+    // Gather ALL stored versions of the key (newest first). Key rotation keeps
+    // several versions under one keyId, and a payload may have been encrypted
+    // under any of them, so we must try each — not just the newest. The newest
+    // version is overwhelmingly the common case, so it is tried first.
+    const candidates = await this.getDecryptionKeyCandidates(decryptionKeyId);
+    if (candidates.length === 0) {
+      throw new SymmetricKeyNotFoundError(
+        decryptionKeyId === "default" ? `doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}` : decryptionKeyId,
+      );
     }
-    
+
     const subtle = this.cryptoAdapter.getSubtle();
+    let lastError: unknown = undefined;
+    for (const symmetricKey of candidates) {
+      try {
+        const cryptoKey = await this.importAesKeyCached(symmetricKey, "decrypt");
+        const decrypted = await subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: iv as BufferSource,
+            tagLength: 128, // 128-bit authentication tag
+          },
+          cryptoKey,
+          encryptedData as BufferSource,
+        );
+        if (debugEnabled) {
+          this.logger.debug(`Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
+        }
+        return new Uint8Array(decrypted);
+      } catch (error) {
+        // AES-GCM authentication failure means this version was not the one used
+        // to encrypt; fall through and try the next version.
+        lastError = error;
+      }
+    }
+    this.logger.debug(`Decrypt failed against all ${candidates.length} version(s) of key "${decryptionKeyId}"`);
+    throw lastError ?? new SymmetricKeyNotFoundError(decryptionKeyId);
+  }
 
-    // Import the symmetric key
-    const cryptoKey = await subtle.importKey(
-      "raw",
-      symmetricKey.buffer as ArrayBuffer,
-      { name: "AES-GCM" },
-      false, // not extractable
-      ["decrypt"]
-    );
-
-    // Decrypt the payload
-    const decrypted = await subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv: iv,
-        tagLength: 128, // 128-bit authentication tag
-      },
-      cryptoKey,
-      encryptedData.buffer as ArrayBuffer
-    );
-
-    this.logger.debug(`Decrypted payload (${encryptedPayload.length} -> ${decrypted.byteLength} bytes)`);
-    return new Uint8Array(decrypted);
+  /**
+   * Return every stored version of the symmetric key for `decryptionKeyId`,
+   * newest first, mapping the `"default"` alias to the tenant default key id.
+   * Used by the decryption paths to support key rotation (a payload may have
+   * been encrypted under an older version than the current newest one).
+   *
+   * As a side effect, refreshes {@link decryptedTenantKeyCache} to the newest
+   * tenant-default version so encryption keeps using the latest key.
+   */
+  private async getDecryptionKeyCandidates(decryptionKeyId: string): Promise<Uint8Array[]> {
+    const id = decryptionKeyId === "default" ? DEFAULT_TENANT_KEY_ID : decryptionKeyId;
+    const versions = await this.keyBag.getAllKeys("doc", this.tenantId, id);
+    if (decryptionKeyId === "default" && versions.length > 0) {
+      this.decryptedTenantKeyCache = versions[0];
+    }
+    return versions;
   }
 
   async signPayload(payload: Uint8Array): Promise<Uint8Array> {
@@ -532,19 +588,8 @@ export class BaseMindooTenant implements MindooTenant {
 
     const subtle = this.cryptoAdapter.getSubtle();
 
-    // Convert PEM format to ArrayBuffer
-    const publicKeyBuffer = this.pemToArrayBuffer(publicKey);
-
-    // Import the public key from SPKI format
-    const cryptoKey = await subtle.importKey(
-      "spki",
-      publicKeyBuffer,
-      {
-        name: "Ed25519",
-      },
-      false, // not extractable
-      ["verify"]
-    );
+    // Import the public key from SPKI format (memoized per PEM string)
+    const cryptoKey = await this.importVerifyKeyCached(publicKey);
 
     // Verify the signature
     const isValid = await subtle.verify(
@@ -556,8 +601,115 @@ export class BaseMindooTenant implements MindooTenant {
       payload.buffer as ArrayBuffer
     );
 
-    this.logger.info(`Signature verification result: ${isValid}`);
+    // Debug (not info): this runs once per verified entry on the read path.
+    if (this.logger.isLevelEnabled(LogLevel.DEBUG)) {
+      this.logger.debug(`Signature verification result: ${isValid}`);
+    }
     return isValid;
+  }
+
+  /**
+   * Import an Ed25519 verify key from its PEM SPKI form, memoized per PEM
+   * string. See {@link importedVerifyKeyCache}.
+   */
+  private async importVerifyKeyCached(publicKeyPem: string): Promise<CryptoKey> {
+    const cached = this.importedVerifyKeyCache.get(publicKeyPem);
+    if (cached) {
+      return cached;
+    }
+    const subtle = this.cryptoAdapter.getSubtle();
+    const cryptoKey = await subtle.importKey(
+      "spki",
+      this.pemToArrayBuffer(publicKeyPem),
+      {
+        name: "Ed25519",
+      },
+      false, // not extractable
+      ["verify"]
+    );
+    if (this.importedVerifyKeyCache.size >= BaseMindooTenant.MAX_IMPORTED_KEY_CACHE_ENTRIES) {
+      this.importedVerifyKeyCache.clear();
+    }
+    this.importedVerifyKeyCache.set(publicKeyPem, cryptoKey);
+    return cryptoKey;
+  }
+
+  async verifyEntrySignature(entry: StoreEntryMetadata, encryptedData: Uint8Array): Promise<boolean> {
+    // The author key must be trusted by the tenant directory.
+    const directory = await this.openDirectory();
+    const isTrusted = await directory.validatePublicSigningKey(entry.createdByPublicKey);
+    if (!isTrusted) {
+      this.logger.warn(`Public key not trusted: ${entry.createdByPublicKey}`);
+      return false;
+    }
+
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    // Integrity: the served bytes must hash to the signed/hashed contentHash so
+    // a relay cannot substitute payload bytes that disagree with the metadata
+    // (audit finding #5).
+    const actualHash = await computeContentHash(encryptedData, subtle);
+    if (actualHash !== entry.contentHash) {
+      this.logger.warn(
+        `Content hash mismatch for entry ${entry.id} (expected ${entry.contentHash.substring(0, 16)}..., got ${actualHash.substring(0, 16)}...)`,
+      );
+      return false;
+    }
+
+    // Storage-format floor (requireMetadataSignatureSince): if the tenant
+    // requires the v2 metadata-binding signature for entries at/after a
+    // trusted-time cutoff, disable the legacy fallback for this entry. The
+    // cutoff is compared against the entry's trusted time so genuine older
+    // history still verifies via the legacy signature.
+    const requireMetadataSignature = await this.requiresMetadataSignature(directory, entry);
+
+    // Version-aware author signature: prefer the metadata-binding signature,
+    // fall back to the legacy ciphertext-only signature for v1/legacy entries
+    // (unless the floor above forbids the fallback for this entry). The
+    // author's verify key is imported once per PEM and cached — this runs for
+    // every entry a document replays.
+    const authorKey = await this.importVerifyKeyCached(entry.createdByPublicKey);
+    const isValid = await verifyEntrySignatureWithImportedKey(
+      entry,
+      encryptedData,
+      authorKey,
+      subtle,
+      { requireMetadataSignature },
+    );
+    if (this.logger.isLevelEnabled(LogLevel.DEBUG)) {
+      this.logger.debug(`Entry signature verification result: ${isValid}`);
+    }
+    return isValid;
+  }
+
+  /**
+   * Whether the storage-format floor (`requireMetadataSignatureSince`) requires
+   * `entry` to carry the v2 metadata-binding signature, based on the entry's
+   * trusted time. Returns false when no floor is configured, when the directory
+   * implementation predates the policy, or on any resolution error (fail-open
+   * here is safe: the legacy signature is still cryptographically verified — the
+   * floor only refuses the *weaker* fallback for new entries).
+   */
+  private async requiresMetadataSignature(
+    directory: MindooTenantDirectory,
+    entry: StoreEntryMetadata,
+  ): Promise<boolean> {
+    if (entry.metadataSignature) {
+      return false; // already v2 — the floor is irrelevant
+    }
+    if (typeof directory.getRequireMetadataSignatureSince !== "function") {
+      return false;
+    }
+    try {
+      const cutoff = await directory.getRequireMetadataSignatureSince();
+      if (cutoff === undefined) {
+        return false;
+      }
+      return entryTrustedTime(entry, Date.now()) >= cutoff;
+    } catch (error) {
+      this.logger.warn(`Failed to resolve metadata-signature floor: ${String(error)}`);
+      return false;
+    }
   }
 
   async getCurrentUserId(): Promise<PublicUserId> {
@@ -585,6 +737,121 @@ export class BaseMindooTenant implements MindooTenant {
     return this.directoryCache;
   }
 
+  /**
+   * Check whether an admin has requested a remote wipe of THIS device and, if
+   * so, delete the entire local tenant (docs/accesscontrol.md §6.5).
+   *
+   * The directive lives in the current user's admin-signed `grantaccess`
+   * document as `wipeRequestedForSigningKeys`. Because the directory database is
+   * admin-only, any grant document that materializes there is already verified
+   * as admin-signed — so finding this device's signing key in that list is a
+   * genuine, admin-issued directive (the server, which may be hostile, cannot
+   * forge it). Sync the directory before calling this so the latest directive is
+   * visible.
+   *
+   * @returns true if a wipe was applied (the tenant is now gone locally), false
+   *   if this device is not targeted.
+   */
+  async checkAndApplyRemoteWipe(): Promise<boolean> {
+    const directory = await this.openDirectory();
+    const myKey = this.currentUser.userSigningKeyPair.publicKey;
+
+    const finder = directory as unknown as {
+      findGrantAccessDocuments?: (username: string) => Promise<Array<{ getData(): Record<string, unknown> }>>;
+    };
+    if (typeof finder.findGrantAccessDocuments !== "function") {
+      return false;
+    }
+
+    const grants = await finder.findGrantAccessDocuments(this.currentUser.username);
+    const targeted = grants.some((grant) =>
+      extractWipeRequestedSigningKeys(grant.getData()).includes(myKey),
+    );
+    if (!targeted) {
+      return false;
+    }
+
+    this.logger.warn(
+      `Remote-wipe directive found for this device; deleting local tenant "${this.tenantId}".`,
+    );
+    await this.wipeLocalTenant();
+    return true;
+  }
+
+  /**
+   * Delete all local data for this tenant from the device (docs/accesscontrol.md
+   * §6.5): every local database (the directory database plus all known data
+   * databases), this tenant's keys in the (multi-tenant) KeyBag, and all
+   * in-memory caches. Other tenants on the same device are untouched.
+   *
+   * Idempotent and best-effort: once the local tenant is gone there is nothing
+   * left to delete. Pass extra database ids for databases that exist locally but
+   * have not been opened in this session.
+   *
+   * @param additionalDbIds Optional extra local database ids to wipe.
+   */
+  async wipeLocalTenant(additionalDbIds?: string[]): Promise<void> {
+    // Every local database belonging to this tenant: the directory plus any
+    // opened/known data databases. Wipe is a whole-tenant operation.
+    const dbIds = new Set<string>([
+      "directory",
+      ...this.databaseCache.keys(),
+      ...(additionalDbIds ?? []),
+    ]);
+
+    for (const dbId of dbIds) {
+      await this.clearLocalStoresForDb(dbId);
+    }
+
+    // Drop in-memory caches and decrypted key material so nothing lingers.
+    this.databaseCache.clear();
+    this.directoryCache = null;
+    this.remoteStoreCache.clear();
+    this.decryptedTenantKeyCache = undefined;
+    this.decryptedUserSigningKeyCache = undefined;
+    this.decryptedUserEncryptionKeyCache = undefined;
+    this.disposeCacheManager();
+
+    // Remove this tenant's keys from the multi-tenant KeyBag, leaving other
+    // tenants intact.
+    try {
+      await this.keyBag.deleteTenantKeys(this.tenantId);
+    } catch (error) {
+      this.logger.warn(`wipeLocalTenant: failed to delete KeyBag keys: ${error}`);
+    }
+  }
+
+  /** Clear the document and attachment stores for one local database. */
+  private async clearLocalStoresForDb(dbId: string): Promise<void> {
+    let docStore: ContentAddressedStore | undefined;
+    let attachmentStore: ContentAddressedStore | undefined;
+
+    const opened = this.databaseCache.get(dbId);
+    if (opened) {
+      docStore = opened.getStore();
+      attachmentStore = opened.getAttachmentStore();
+    } else {
+      try {
+        const created = this.storeFactory.createStore(dbId);
+        docStore = created.docStore;
+        attachmentStore = created.attachmentStore;
+      } catch (error) {
+        this.logger.warn(`wipeLocalTenant: could not open stores for db "${dbId}": ${error}`);
+        return;
+      }
+    }
+
+    for (const store of [docStore, attachmentStore]) {
+      if (store && typeof store.clearAllLocalData === "function") {
+        try {
+          await store.clearAllLocalData();
+        } catch (error) {
+          this.logger.warn(`wipeLocalTenant: clearAllLocalData failed for db "${dbId}": ${error}`);
+        }
+      }
+    }
+  }
+
   private async assertCurrentUserCanOpenDB(id: string): Promise<void> {
     if (id === "directory") {
       return;
@@ -601,16 +868,49 @@ export class BaseMindooTenant implements MindooTenant {
       registeredUser?.signingPublicKey === currentUser.userSigningPublicKey &&
       registeredUser?.encryptionPublicKey === currentUser.userEncryptionPublicKey;
 
-    if (hasMatchingGrant) {
-      return;
+    if (!hasMatchingGrant) {
+      this.logger.warn(
+        `Denied database open for ungranted user ${currentUser.username} on database ${id}`,
+      );
+      throw new Error(
+        `User "${currentUser.username}" does not have tenant access yet; the tenant admin must grant access first.`,
+      );
     }
 
-    this.logger.warn(
-      `Denied database open for ungranted user ${currentUser.username} on database ${id}`,
-    );
-    throw new Error(
-      `User "${currentUser.username}" does not have tenant access yet; the tenant admin must grant access first.`,
-    );
+    // Directory-restricted database policy: when the tenant's default policy
+    // restricts which databases may be opened, a granted (non-admin) user may
+    // only open a listed database. "directory" is already short-circuited above
+    // and the admin returned earlier, so this never blocks the policy read
+    // itself (which opens "directory").
+    if (typeof directory.isDatabaseAllowed === "function") {
+      const allowed = await directory.isDatabaseAllowed(id);
+      if (!allowed) {
+        this.logger.warn(
+          `Denied database open for ${currentUser.username}: database "${id}" is not in the tenant's allowed database list`,
+        );
+        throw new Error(
+          `Database "${id}" is not in the tenant's allowed database list.`,
+        );
+      }
+    }
+
+    // Database read gate (doc_read, §6.6): when the tenant policy denies read
+    // access to this database for the current user (and no doc_read allow rule
+    // grants it), refuse to open it. Because read is the coarse gate in front
+    // of every sync operation, this also prevents creating data in a database
+    // the user cannot read. "directory" and the admin are exempt (handled in
+    // canReadDatabase).
+    if (typeof directory.canReadDatabase === "function") {
+      const canRead = await directory.canReadDatabase(id);
+      if (!canRead) {
+        this.logger.warn(
+          `Denied database open for ${currentUser.username}: no read access to database "${id}"`,
+        );
+        throw new Error(
+          `User "${currentUser.username}" does not have read access to database "${id}".`,
+        );
+      }
+    }
   }
 
   async openDB(id: string, options?: OpenDBOptions): Promise<MindooDB> {
@@ -863,10 +1163,18 @@ export class BaseMindooTenant implements MindooTenant {
       userSigningPublicKey: request.signingPublicKey,
       userEncryptionPublicKey: request.encryptionPublicKey,
     };
+    // Device label for this key pair (§6.5): an explicit admin-provided label
+    // overrides the one suggested by the joining user in the request.
+    const deviceLabel =
+      typeof options.label === "string" && options.label.trim().length > 0
+        ? options.label.trim()
+        : request.label;
     await directory.registerUser(
       publicUserId,
       options.adminSigningKey,
-      options.adminPassword
+      options.adminPassword,
+      undefined,
+      deviceLabel,
     );
 
     // 2. Export selected document keys encrypted with the share password.
@@ -1232,6 +1540,38 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   /**
+   * Inject an already-unlocked RSA-OAEP encryption private key for the current
+   * user, priming the same cache {@link getDecryptedEncryptionKey} uses. Hosts
+   * that create the tenant password-less (e.g. Haven, which holds the unlocked
+   * key in its session rather than a password) call this so SDK-driven KeyBag
+   * reconcile can unwrap pushed key versions (docs/accesscontrol.md §13).
+   */
+  setSessionEncryptionKey(cryptoKey: CryptoKey): void {
+    this.decryptedUserEncryptionKeyCache = cryptoKey;
+  }
+
+  /**
+   * The RSA-OAEP encryption private key used by KeyBag reconcile to unwrap
+   * pushed key versions. Returns the injected/cached session key when present,
+   * else derives it from the current user password. Returns `null` when neither
+   * is available (a locked, password-less host) so reconcile can skip its import
+   * pass without throwing — the revoke pass needs no key and still runs.
+   */
+  async getEncryptionPrivateKeyForReconcile(): Promise<CryptoKey | null> {
+    if (this.decryptedUserEncryptionKeyCache) {
+      return this.decryptedUserEncryptionKeyCache;
+    }
+    try {
+      return await this.getDecryptedEncryptionKey();
+    } catch (error) {
+      this.logger.debug(
+        `getEncryptionPrivateKeyForReconcile: no encryption key available (locked host): ${error}`,
+      );
+      return null;
+    }
+  }
+
+  /**
    * Internal method to decrypt a private key using password-based key derivation.
    * Protected so that BaseMindooTenantDirectory can access it.
    * 
@@ -1246,10 +1586,9 @@ export class BaseMindooTenant implements MindooTenant {
     password: string,
     saltString: string
   ): Promise<ArrayBuffer> {
-    this.logger.debug(`decryptPrivateKey: Starting decryption with saltString: ${saltString}`);
-    this.logger.debug(`decryptPrivateKey: Password length: ${password.length}`);
-    this.logger.debug(`decryptPrivateKey: EncryptedKey iterations: ${encryptedKey.iterations}`);
-    
+    // Do NOT log the password length or KDF iteration count (audit, Medium:
+    // sensitive debug logging) — both narrow an offline cracking search space.
+    this.logger.debug(`decryptPrivateKey: Starting decryption (keyCategory: ${saltString})`);
     this.logger.debug(`decryptPrivateKey: Delegating PBKDF2 + AES-GCM work to shared helper`);
     try {
       const decrypted = await decryptPrivateKeyWithPassword(
@@ -1364,6 +1703,266 @@ export class BaseMindooTenant implements MindooTenant {
    */
   async getDocKeyFingerprint(): Promise<string> {
     return this.keyBag.getDocKeyFingerprint(this.tenantId);
+  }
+
+  /**
+   * Remove a **named** document key from the local KeyBag. Refuses to delete the
+   * shared tenant default key (`"default"` / {@link DEFAULT_TENANT_KEY_ID}),
+   * which is required for the tenant to function. Returns true if a key was
+   * removed.
+   */
+  async removeNamedDecryptionKey(decryptionKeyId: string): Promise<boolean> {
+    if (decryptionKeyId === "default" || decryptionKeyId === DEFAULT_TENANT_KEY_ID) {
+      this.logger.debug(`removeNamedDecryptionKey: refusing to delete the tenant default key`);
+      return false;
+    }
+    try {
+      await this.keyBag.deleteKey("doc", this.tenantId, decryptionKeyId);
+      this.invalidateDecryptedKeyCaches();
+      return true;
+    } catch (error) {
+      this.logger.warn(`removeNamedDecryptionKey: failed to delete key ${decryptionKeyId}: ${error}`);
+      return false;
+    }
+  }
+
+  /**
+   * Reconcile the local KeyBag against the directory head for the current user
+   * (docs/accesscontrol.md §13). SDK-driven so standalone apps using the
+   * `mindoodb` package get key distribution/revocation automatically after a
+   * directory sync — not just the Haven UI. Two independent passes:
+   *
+   *  - **Revoke (no key required):** bulk-remove every revoked key id (from the
+   *    directory head cache) from the bag. Idempotent and a no-op when the bag
+   *    does not hold the key, so it also re-cleans a restored older KeyBag
+   *    backup on every run. The `deleteKey` mutation drives visibility
+   *    reconciliation (forgetting now-inaccessible docs) and emits
+   *    `keyBag.onChanges` so the host can persist the cleaned bag.
+   *  - **Import (needs the encryption private key):** unwrap and merge the key
+   *    versions pushed to this user. Skipped with a debug log when the host is
+   *    locked (no session key / password); the revoke pass still ran.
+   *
+   * Best-effort and idempotent; safe to call on every directory bring-up / pull.
+   * Returns the key ids imported and removed.
+   */
+  async reconcileKeyDistributionsForCurrentUser(): Promise<{
+    imported: string[];
+    removed: string[];
+  }> {
+    const username = this.currentUser.username;
+    const directory = await this.openDirectory();
+    const removed: string[] = [];
+    const imported: string[] = [];
+
+    // Revoke pass — no key, no comparison, idempotent.
+    if (typeof directory.getRevokedDecryptionKeyIdsForUser === "function") {
+      let revokedIds: string[] = [];
+      try {
+        revokedIds = await directory.getRevokedDecryptionKeyIdsForUser(username);
+      } catch (error) {
+        this.logger.warn(
+          `reconcileKeyDistributionsForCurrentUser: revoked-id lookup failed: ${error}`,
+        );
+      }
+      for (const keyId of revokedIds) {
+        if (await this.removeNamedDecryptionKey(keyId)) {
+          removed.push(keyId);
+        }
+      }
+    }
+
+    // Import pass — sources the encryption private key from this tenant. The
+    // directory exposes this only via the internal KeyBagReconciler contract,
+    // so the key is never passed across the public directory API.
+    const reconciler = directory as unknown as Partial<KeyBagReconciler>;
+    if (typeof reconciler.reconcileImportedKeysForCurrentUser === "function") {
+      try {
+        const result = await reconciler.reconcileImportedKeysForCurrentUser(username);
+        imported.push(...result.imported);
+        for (const id of result.removed) {
+          if (!removed.includes(id)) removed.push(id);
+        }
+      } catch (error) {
+        this.logger.warn(
+          `reconcileKeyDistributionsForCurrentUser: import pass failed: ${error}`,
+        );
+      }
+    }
+
+    return { imported, removed };
+  }
+
+  /**
+   * Single-flight, best-effort wrapper around
+   * {@link reconcileKeyDistributionsForCurrentUser} for the run-always trigger
+   * (docs/accesscontrol.md §13). Fired on directory bring-up and after every
+   * directory pull. Never throws and never blocks sync: a reconcile error is
+   * logged and swallowed. The in-flight guard prevents the driver's own
+   * directory access from re-triggering it.
+   */
+  async reconcileKeyDistributionsForCurrentUserSafe(): Promise<void> {
+    if (this.reconcileInFlight) {
+      return;
+    }
+    this.reconcileInFlight = true;
+    try {
+      await this.reconcileKeyDistributionsForCurrentUser();
+    } catch (error) {
+      this.logger.warn(`reconcileKeyDistributionsForCurrentUserSafe: ${error}`);
+    } finally {
+      this.reconcileInFlight = false;
+    }
+  }
+
+  /**
+   * Export **all** stored versions of a document key for an admin-blind key
+   * delivery (read-side key push). A rotated key keeps multiple versions in the
+   * KeyBag and decryption tries them all, so a delivery must carry every version
+   * - otherwise the recipient could not read documents encrypted under an
+   * earlier version. Each entry pairs the raw key bytes with the version's
+   * `createdAt` (used as `keyVersionCreatedAt`); versions are newest-first.
+   * Returns null when the caller's KeyBag lacks the key. Only a key-holder can
+   * run this — never the admin who later publishes the wrapped bytes.
+   */
+  async exportDecryptionKeyForDelivery(
+    decryptionKeyId: string,
+  ): Promise<Array<{ bytes: Uint8Array; keyVersionCreatedAt: number }> | null> {
+    const id = decryptionKeyId === "default" ? DEFAULT_TENANT_KEY_ID : decryptionKeyId;
+    const versions = await this.keyBag.getAllKeyVersions("doc", this.tenantId, id);
+    if (versions.length === 0) {
+      return null;
+    }
+    return versions.map((v) => ({ bytes: v.key, keyVersionCreatedAt: v.createdAt ?? 0 }));
+  }
+
+  /**
+   * Import a delivered document key into the local KeyBag (read-side key push,
+   * recipient side). Writing the key triggers the existing KeyBag change
+   * listener -> {@link reconcileKeyBagChanges} -> per-database reveal-on-add, so
+   * documents encrypted with it surface automatically. Idempotent: a key
+   * version with the same `keyVersionCreatedAt` is not duplicated.
+   */
+  async importDeliveredDecryptionKey(
+    keyId: string,
+    bytes: Uint8Array,
+    keyVersionCreatedAt: number,
+  ): Promise<void> {
+    await this.importDeliveredDecryptionKeyVersions(keyId, [{ bytes, keyVersionCreatedAt }]);
+  }
+
+  /**
+   * Import several delivered versions of one document key at once (read-side key
+   * push, recipient side). Each version absent from the KeyBag (matched by
+   * `keyVersionCreatedAt`) is added; already-present versions are skipped so the
+   * call is idempotent. Caches are invalidated and reveal-on-add reconciliation
+   * runs once, after all new versions are written. Returns the number of
+   * versions actually imported.
+   */
+  async importDeliveredDecryptionKeyVersions(
+    keyId: string,
+    versions: Array<{ bytes: Uint8Array; keyVersionCreatedAt: number }>,
+  ): Promise<number> {
+    const id = keyId === "default" ? DEFAULT_TENANT_KEY_ID : keyId;
+    const scopedKeyId = `doc:${this.tenantId}:${id}`;
+    const existing = await this.keyBag.listKeyDetails();
+    const haveStamps = new Set(
+      existing.filter((d) => d.scopedKeyId === scopedKeyId).map((d) => d.createdAt ?? 0),
+    );
+    let importedCount = 0;
+    for (const version of versions) {
+      if (haveStamps.has(version.keyVersionCreatedAt)) {
+        this.logger.debug(`importDeliveredDecryptionKeyVersions: ${keyId}@${version.keyVersionCreatedAt} already present`);
+        continue;
+      }
+      await this.keyBag.set("doc", this.tenantId, id, version.bytes, version.keyVersionCreatedAt || undefined);
+      haveStamps.add(version.keyVersionCreatedAt);
+      importedCount++;
+    }
+    if (importedCount > 0) {
+      this.invalidateDecryptedKeyCaches();
+      await this.reconcileKeyBagChanges();
+    }
+    return importedCount;
+  }
+
+  /** SHA-256 hex of raw key bytes — the stable version fingerprint used by key distribution. */
+  async fingerprintKeyBytes(bytes: Uint8Array): Promise<string> {
+    const subtle = this.getCryptoAdapter().getSubtle();
+    const digest = await subtle.digest("SHA-256", bytes as unknown as BufferSource);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  /**
+   * All stored versions of a document key with their raw bytes, `createdAt`, and
+   * SHA-256 fingerprint (newest first). The source of truth for a key
+   * distribution's `keyVersions` manifest and per-device wrapping. Empty when the
+   * caller's KeyBag lacks the key.
+   */
+  async fingerprintKeyVersions(
+    keyId: string,
+  ): Promise<Array<{ bytes: Uint8Array; createdAt: number; fingerprint: string }>> {
+    const id = keyId === "default" ? DEFAULT_TENANT_KEY_ID : keyId;
+    const versions = await this.keyBag.getAllKeyVersions("doc", this.tenantId, id);
+    const result: Array<{ bytes: Uint8Array; createdAt: number; fingerprint: string }> = [];
+    for (const v of versions) {
+      result.push({
+        bytes: v.key,
+        createdAt: v.createdAt ?? 0,
+        fingerprint: await this.fingerprintKeyBytes(v.key),
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Remove exactly the key versions of `keyId` whose raw-bytes fingerprint is in
+   * `fingerprints` (version-scoped `pullfrom` revocation). Versions obtained
+   * elsewhere — i.e. not in the distribution manifest — survive. Refuses the
+   * protected tenant default / `$publicinfos` keys. The KeyBag change feed
+   * triggers visibility reconciliation (scope purge when nothing remains).
+   * Returns the number of versions removed.
+   */
+  async removeDecryptionKeyVersionsByFingerprint(
+    keyId: string,
+    fingerprints: string[],
+  ): Promise<number> {
+    if (keyId === "default" || keyId === DEFAULT_TENANT_KEY_ID || keyId === PUBLIC_INFOS_KEY_ID) {
+      this.logger.debug(`removeDecryptionKeyVersionsByFingerprint: refusing protected key ${keyId}`);
+      return 0;
+    }
+    const target = new Set(fingerprints);
+    if (target.size === 0) return 0;
+    const id = keyId === "default" ? DEFAULT_TENANT_KEY_ID : keyId;
+    let removed = 0;
+    // Re-read versions each pass: deleteKeyVersion is index-based against the
+    // current sorted list, which shifts as entries are removed.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const versions = await this.keyBag.getAllKeyVersions("doc", this.tenantId, id);
+      let removedThisPass = false;
+      for (let index = 0; index < versions.length; index++) {
+        const fp = await this.fingerprintKeyBytes(versions[index].key);
+        if (target.has(fp)) {
+          await this.keyBag.deleteKeyVersion("doc", this.tenantId, id, index);
+          removed++;
+          removedThisPass = true;
+          break;
+        }
+      }
+      if (!removedThisPass) break;
+    }
+    if (removed > 0) {
+      this.invalidateDecryptedKeyCaches();
+      await this.reconcileKeyBagChanges();
+    }
+    return removed;
+  }
+
+  /** Clear in-memory decrypted-key caches after a KeyBag mutation. */
+  private invalidateDecryptedKeyCaches(): void {
+    this.decryptedTenantKeyCache = undefined;
   }
 
   /**
@@ -1525,33 +2124,43 @@ export class BaseMindooTenant implements MindooTenant {
     // Extract ciphertext (bytes 13 onwards)
     const ciphertext = encryptedPayload.slice(13);
 
-    const symmetricKey = await this.getSymmetricKey(decryptionKeyId);
+    // Try every stored version of the key (newest first) so attachments
+    // encrypted under an earlier rotation of the key still decrypt.
+    const candidates = await this.getDecryptionKeyCandidates(decryptionKeyId);
+    if (candidates.length === 0) {
+      throw new SymmetricKeyNotFoundError(
+        decryptionKeyId === "default" ? `doc:${this.tenantId}:${DEFAULT_TENANT_KEY_ID}` : decryptionKeyId,
+      );
+    }
     const subtle = this.cryptoAdapter.getSubtle();
-
-    // Import the symmetric key
-    const keyArray = new Uint8Array(symmetricKey);
-    const cryptoKey = await subtle.importKey(
-      "raw",
-      keyArray.buffer,
-      { name: "AES-GCM" },
-      false,
-      ["decrypt"]
-    );
-
-    // Decrypt
-    const decrypted = await subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv: iv as BufferSource,
-        tagLength: 128,
-      },
-      cryptoKey,
-      ciphertext
-    );
-
-    const result = new Uint8Array(decrypted);
-    this.logger.debug(`Decrypted attachment (${encryptedPayload.length} -> ${result.length} bytes)`);
-    return result;
+    let lastError: unknown = undefined;
+    for (const symmetricKey of candidates) {
+      try {
+        const cryptoKey = await subtle.importKey(
+          "raw",
+          new Uint8Array(symmetricKey).buffer,
+          { name: "AES-GCM" },
+          false,
+          ["decrypt"],
+        );
+        const decrypted = await subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: iv as BufferSource,
+            tagLength: 128,
+          },
+          cryptoKey,
+          ciphertext as BufferSource,
+        );
+        const result = new Uint8Array(decrypted);
+        this.logger.debug(`Decrypted attachment (${encryptedPayload.length} -> ${result.length} bytes)`);
+        return result;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    this.logger.debug(`Attachment decrypt failed against all ${candidates.length} version(s) of key "${decryptionKeyId}"`);
+    throw lastError ?? new SymmetricKeyNotFoundError(decryptionKeyId);
   }
 }
 

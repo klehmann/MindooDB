@@ -455,6 +455,25 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       options.adminPassword
     );
 
+    // 5. Enforce the v2 storage format from creation (default on). We write an
+    //    admin-signed default policy carrying `requireMetadataSignatureSince =
+    //    now`, but with `disableAllAccessChecksAndPolicies: true` so this turns
+    //    on ONLY the storage-format floor (no ACL deny-gates). The server push
+    //    gate compares this cutoff against its own clock, so once created the
+    //    tenant rejects any new v1 entry, while genuine pre-cutoff history (e.g.
+    //    a tenant migrated in from an older format) still loads.
+    const requireV2Entries = options.requireV2Entries ?? true;
+    if (requireV2Entries && typeof directory.setDefaultAccessPolicy === "function") {
+      await directory.setDefaultAccessPolicy(
+        {
+          disableAllAccessChecksAndPolicies: true,
+          requireMetadataSignatureSince: Date.now(),
+        },
+        adminUser.userSigningKeyPair.privateKey,
+        options.adminPassword,
+      );
+    }
+
     console.log(`[createTenant] ✓ Tenant "${tenantId}" created successfully`);
     this.logger.info(`Tenant "${tenantId}" created successfully`);
 
@@ -464,9 +483,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   /**
    * Create a join request from a user's private identity.
    */
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" }): JoinRequest;
-  createJoinRequest(user: PrivateUserId, options: { format: "uri" }): string;
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri" }): JoinRequest | string {
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object"; label?: string }): JoinRequest;
+  createJoinRequest(user: PrivateUserId, options: { format: "uri"; label?: string }): string;
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri"; label?: string }): JoinRequest | string {
     const publicUser = this.toPublicUserId(user);
 
     const joinRequest: JoinRequest = {
@@ -475,6 +494,13 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       signingPublicKey: publicUser.userSigningPublicKey,
       encryptionPublicKey: publicUser.userEncryptionPublicKey,
     };
+
+    // Optional device label the joining user suggests for this key pair (§6.5).
+    // The approving admin may override it via ApproveJoinRequestOptions.label.
+    const trimmedLabel = typeof options?.label === "string" ? options.label.trim() : "";
+    if (trimmedLabel.length > 0) {
+      joinRequest.label = trimmedLabel;
+    }
 
     if (options?.format === "uri") {
       return encodeMindooURI("join-request", joinRequest as unknown as Record<string, unknown>);

@@ -1,6 +1,6 @@
 import type { EncryptedPrivateKey } from "../types";
 import type { CryptoAdapter } from "./CryptoAdapter";
-import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./pbkdf2Iterations";
+import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations, resolveStoredIterations } from "./pbkdf2Iterations";
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -108,7 +108,9 @@ export async function decryptPrivateKey(
   const iv = base64ToUint8Array(encryptedKey.iv);
   const tag = base64ToUint8Array(encryptedKey.tag);
   const saltBytes = base64ToUint8Array(encryptedKey.salt);
-  const iterations = encryptedKey.iterations || resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+  // Floor the stored iteration count (audit finding #3): a tampered identity
+  // blob with a too-low value must not weaken the KDF on decrypt.
+  const iterations = resolveStoredIterations(encryptedKey.iterations);
 
   const combinedSalt = buildCombinedSalt(saltBytes, saltString);
   const passwordKey = await subtle.importKey(

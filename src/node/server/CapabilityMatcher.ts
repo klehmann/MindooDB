@@ -143,11 +143,24 @@ export class CapabilityMatcher {
   }
 
   private isTenantCreationRule(method: string, pathPattern: string): boolean {
-    return method === "POST" && pathPattern.startsWith("/system/tenants/");
+    return method === "POST" && CapabilityMatcher.isTenantCreationPath(pathPattern);
   }
 
   private isTenantCreationRequest(method: string, path: string): boolean {
-    return method === "POST" && path.startsWith("/system/tenants/");
+    return method === "POST" && CapabilityMatcher.isTenantCreationPath(path);
+  }
+
+  /**
+   * Tenant creation targets exactly one path segment under `/system/tenants/`
+   * (the new tenant id) — e.g. `/system/tenants/acme`. A prefix (`startsWith`)
+   * test over-grants the wildcard tenant-creation principal to sub-resources of
+   * an *existing* tenant such as `/system/tenants/acme/sync-servers` or
+   * `/system/tenants/acme/trigger-sync` (audit #6). Require a segment-exact
+   * match so the wildcard authorizes creation only. A trailing slash is allowed
+   * but no further path segment.
+   */
+  private static isTenantCreationPath(path: string): boolean {
+    return /^\/system\/tenants\/[^/]+\/?$/.test(path);
   }
 
   /**

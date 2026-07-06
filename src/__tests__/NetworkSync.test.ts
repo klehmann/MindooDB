@@ -81,7 +81,7 @@ class MockNetworkTransport implements NetworkTransport {
     return this.server.handleGetEntryMetadata(token, id);
   }
 
-  async putEntries(token: string, entries: StoreEntry[]): Promise<void> {
+  async putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
     return this.server.handlePutEntries(token, entries);
   }
 
@@ -510,7 +510,10 @@ describe("Network Sync", () => {
       expect(initialHashes.length).toBe(0);
       
       // Push an entry via client store (must use trusted user's public key)
-      const entry = createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem);
+      const entry = createMockEntry(
+        "doc1", "hash1", 1000, [], userSigningPublicKeyPem,
+        await signMockCiphertext(userSigningKeyPair.privateKey),
+      );
       await clientStore.putEntries([entry]);
       
       // Server should now have the entry
@@ -794,6 +797,98 @@ describe("Network Sync", () => {
       expect(first).toEqual(second);
       expect(getCapabilitiesSpy).toHaveBeenCalledTimes(1);
     });
+
+    // --- Per-user revoked-key blacklist (docs/accesscontrol.md §13.3) ---
+
+    /**
+     * Build an independent server+client pair whose server enforces a fixed
+     * revoked-key set, reusing the describe's user key material. The resolver
+     * ignores the principal (returns the same set for any signing key) so the
+     * test focuses on the per-entry filtering/rejection behaviour.
+     */
+    async function buildBlacklistPair(storeId: string, revoked: string[]) {
+      const factory = new InMemoryContentAddressedStoreFactory();
+      const { docStore } = factory.createStore(storeId);
+      const dir = new MockTenantDirectory();
+      dir.addUser("testuser", userSigningPublicKeyPem, userEncryptionPublicKeyPem);
+      const auth = new AuthenticationService(cryptoAdapter, dir, "test-tenant");
+      const handler = new ServerNetworkContentAddressedStore(
+        docStore,
+        dir,
+        auth,
+        cryptoAdapter,
+        undefined,
+        { revokedKeyResolver: async () => new Set(revoked) },
+      );
+      const transport = new MockNetworkTransport(handler);
+      const client = new ClientNetworkContentAddressedStore(
+        storeId,
+        StoreKind.docs,
+        transport,
+        cryptoAdapter,
+        "testuser",
+        userSigningKeyPair.privateKey,
+        userEncryptionPrivateKeyPem,
+      );
+      return { docStore, client };
+    }
+
+    const NO_SIG = new Uint8Array([1, 2, 3, 4]);
+
+    test("silently omits entries whose decryptionKeyId is revoked on pull", async () => {
+      const { docStore, client } = await buildBlacklistPair("test-db", ["revoked-key"]);
+      await docStore.putEntries([
+        createMockEntry("doc1", "keep", 1000, [], "mock-public-key", NO_SIG, "default"),
+      ]);
+      await docStore.putEntries([
+        createMockEntry("doc2", "drop", 2000, [], "mock-public-key", NO_SIG, "revoked-key"),
+      ]);
+
+      const newEntries = await client.findNewEntries([]);
+      expect(newEntries.map((e: StoreEntryMetadata) => e.id)).toEqual(["keep"]);
+
+      expect(await client.getAllIds()).toEqual(["keep"]);
+
+      // Even when the client already knows the revoked id, the server never
+      // hands back its bytes (fail-closed on the data-serving path).
+      const fetched = await client.getEntries(["keep", "drop"]);
+      expect(fetched.map((e: StoreEntry) => e.id)).toEqual(["keep"]);
+
+      // Metadata for a revoked id is withheld too.
+      expect(await client.getEntryMetadata!("drop")).toBeNull();
+      expect((await client.getEntryMetadata!("keep"))?.id).toBe("keep");
+    });
+
+    test("rejects a push carrying a revoked decryptionKeyId", async () => {
+      const { docStore, client } = await buildBlacklistPair("test-db", ["revoked-key"]);
+      const signature = await signMockCiphertext(userSigningKeyPair.privateKey);
+
+      const revokedEntry = createMockEntry(
+        "doc1", "h1", 1000, [], userSigningPublicKeyPem, signature, "revoked-key",
+      );
+      await expect(client.putEntries([revokedEntry])).rejects.toMatchObject({
+        name: "NetworkError",
+        type: NetworkErrorType.ACCESS_DENIED,
+      });
+      expect(await docStore.getAllIds()).toEqual([]);
+
+      // A push under a non-revoked key still succeeds.
+      const okEntry = createMockEntry(
+        "doc1", "h2", 1000, [], userSigningPublicKeyPem, signature, "default",
+      );
+      await client.putEntries([okEntry]);
+      expect(await docStore.getAllIds()).toEqual(["h2"]);
+    });
+
+    test("never blacklists the directory store (its policy must always sync)", async () => {
+      const { docStore, client } = await buildBlacklistPair("directory", ["revoked-key"]);
+      await docStore.putEntries([
+        createMockEntry("doc1", "dir-entry", 1000, [], "mock-public-key", NO_SIG, "revoked-key"),
+      ]);
+      // "revoked-key" is in the set, but the directory store is exempt.
+      const newEntries = await client.findNewEntries([]);
+      expect(newEntries.map((e: StoreEntryMetadata) => e.id)).toEqual(["dir-entry"]);
+    });
   });
 
   describe("Sync-Based Usage (Local + Remote Stores)", () => {
@@ -914,8 +1009,9 @@ describe("Network Sync", () => {
 
     test("should push entries from local to remote (simulates MindooDB.pushChangesTo)", async () => {
       // Add entries to local (must use trusted user's public key)
-      await localStore.putEntries([createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem)]);
-      await localStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"], userSigningPublicKeyPem)]);
+      const pushSig = await signMockCiphertext(userSigningKeyPair.privateKey);
+      await localStore.putEntries([createMockEntry("doc1", "hash1", 1000, [], userSigningPublicKeyPem, pushSig)]);
+      await localStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"], userSigningPublicKeyPem, pushSig)]);
       
       // Server should be empty
       expect((await serverStore.getAllIds()).length).toBe(0);
@@ -942,10 +1038,11 @@ describe("Network Sync", () => {
 
     test("should handle bidirectional sync", async () => {
       // Add some entries to server (must use trusted user's public key)
-      await serverStore.putEntries([createMockEntry("doc1", "server-hash1", 1000, [], userSigningPublicKeyPem)]);
+      const bidiSig = await signMockCiphertext(userSigningKeyPair.privateKey);
+      await serverStore.putEntries([createMockEntry("doc1", "server-hash1", 1000, [], userSigningPublicKeyPem, bidiSig)]);
       
       // Add some entries to local (must use trusted user's public key)
-      await localStore.putEntries([createMockEntry("doc2", "local-hash1", 2000, [], userSigningPublicKeyPem)]);
+      await localStore.putEntries([createMockEntry("doc2", "local-hash1", 2000, [], userSigningPublicKeyPem, bidiSig)]);
       
       // Pull from server to local
       const localHashes = await localStore.getAllIds();
@@ -1004,16 +1101,32 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Shared crypto + fixed payload so the server-side contentHash/signature checks
+// (audit findings #1/#5) can be satisfied deterministically in tests.
+const mockSubtle = new NodeCryptoAdapter().getSubtle();
+const MOCK_ENCRYPTED_DATA = new Uint8Array([10, 20, 30, 40]);
+// SHA-256(MOCK_ENCRYPTED_DATA), hex — the value the server recomputes on push.
+const MOCK_CONTENT_HASH = "5f53c0ff07ba5d9a330e68c95dabb1a9bc49e29f9ed53f6fa7c6d99abb000050";
+
+/** Produce a valid legacy author signature over the fixed mock ciphertext. */
+async function signMockCiphertext(key: CryptoKey): Promise<Uint8Array> {
+  return new Uint8Array(
+    await mockSubtle.sign({ name: "Ed25519" }, key, MOCK_ENCRYPTED_DATA.buffer as ArrayBuffer),
+  );
+}
+
 function createMockEntry(
   docId: string,
   id: string,
   createdAt: number,
   deps: string[] = [],
-  createdByPublicKey: string = "mock-public-key"
+  createdByPublicKey: string = "mock-public-key",
+  signature: Uint8Array = new Uint8Array([1, 2, 3, 4]),
+  decryptionKeyId: string = "default"
 ): StoreEntry {
-  const encryptedData = new Uint8Array([10, 20, 30, 40]);
-  // Simple mock content hash for testing
-  const contentHash = `contenthash-${id}`;
+  const encryptedData = MOCK_ENCRYPTED_DATA;
+  // Real content hash so the server's integrity check accepts the entry.
+  const contentHash = MOCK_CONTENT_HASH;
   return {
     entryType: "doc_change",
     id,
@@ -1022,8 +1135,8 @@ function createMockEntry(
     dependencyIds: deps,
     createdAt,
     createdByPublicKey,
-    decryptionKeyId: "default",
-    signature: new Uint8Array([1, 2, 3, 4]),
+    decryptionKeyId,
+    signature,
     originalSize: 3, // Simulated original size
     encryptedSize: encryptedData.length,
     encryptedData,
@@ -1064,7 +1177,7 @@ class MockTenantDirectory implements MindooTenantDirectory {
   // Interface method - not used in tests  
   async revokeUser(
     _username: string,
-    _requestDataWipe: boolean,
+    _options: { signingKeys?: string[]; encryptionKeys?: string[]; requestDataWipe?: boolean },
     _administrationPrivateKey: EncryptedPrivateKey,
     _administrationPrivateKeyPassword: string
   ): Promise<void> {
@@ -1118,19 +1231,10 @@ class MockTenantDirectory implements MindooTenantDirectory {
   }
 
   // GDPR methods - not used in tests
-  async requestDocHistoryPurge(
-    _dbId: string,
-    _docId: string,
-    _reason: string | undefined,
-    _administrationPrivateKey: EncryptedPrivateKey,
-    _administrationPrivateKeyPassword: string
-  ): Promise<void> {
-    // Not needed for tests
-  }
-
   async getRequestedDocHistoryPurges(): Promise<Array<{
+    requestId: string;
     dbId: string;
-    docId: string;
+    docIds: string[];
     reason?: string;
     requestedAt: number;
     purgeRequestDocId: string;

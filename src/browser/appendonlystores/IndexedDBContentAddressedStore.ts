@@ -36,6 +36,7 @@ import type {
 } from "../../core/appendonlystores/types";
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
+import { scanDocScopedEntries } from "../../core/appendonlystores/scanUtils";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -763,6 +764,70 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     });
   }
 
+  /**
+   * Apply witness receipts to already-stored entries (docs/accesscontrol.md §5.3).
+   *
+   * Updates the witness fields on the affected entry metadata and assigns each a
+   * fresh `receiptOrder` (from the persisted counter) so the revision feed's
+   * `scanEntriesSince` cursor re-discovers the now-witnessed entries. Receipts
+   * whose entry is absent locally, or that match the stored witness, are skipped.
+   */
+  async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
+    if (receipts.length === 0) return;
+
+    return this.runWithReconnect("applyWitnessReceipts", async () => {
+      const db = await this.ensureOpen();
+      const tx = db.transaction([ENTRIES_STORE, META_STORE], "readwrite");
+      const entriesOS = tx.objectStore(ENTRIES_STORE);
+      const metaOS = tx.objectStore(META_STORE);
+
+      const counterRecord = (await reqToPromise(
+        metaOS.get(RECEIPT_ORDER_COUNTER_KEY)
+      )) as MetaValueRecord | undefined;
+      let nextReceiptOrder =
+        typeof counterRecord?.value === "number" ? counterRecord.value + 1 : 1;
+
+      let mutated = false;
+      for (const receipt of receipts) {
+        if (receipt.receivedAt === undefined) {
+          continue;
+        }
+        const existing = (await reqToPromise(
+          entriesOS.get(receipt.id)
+        )) as StoreEntryMetadata | undefined;
+        if (!existing) {
+          continue;
+        }
+        if (
+          existing.receivedAt === receipt.receivedAt &&
+          existing.receivedByPublicKey === receipt.receivedByPublicKey
+        ) {
+          continue;
+        }
+        const updated: StoreEntryMetadata = {
+          ...existing,
+          receivedAt: receipt.receivedAt,
+          receivedByPublicKey: receipt.receivedByPublicKey,
+          receivedDateSignature: receipt.receivedDateSignature,
+          receiptScheme: receipt.receiptScheme,
+          receiptOrder: nextReceiptOrder++,
+        };
+        await reqToPromise(entriesOS.put(updated));
+        mutated = true;
+      }
+
+      if (mutated) {
+        await writeNumericMetaValue(
+          metaOS,
+          RECEIPT_ORDER_COUNTER_KEY,
+          nextReceiptOrder - 1
+        );
+      }
+
+      await txToPromise(tx);
+    });
+  }
+
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
     if (ids.length === 0) return [];
 
@@ -772,22 +837,38 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     const entriesOS = tx.objectStore(ENTRIES_STORE);
     const contentOS = tx.objectStore(CONTENT_STORE);
 
-    const result: StoreEntry[] = [];
+    // Pipeline all IDB requests inside the transaction instead of awaiting
+    // each get sequentially (one event-loop turn per request). All metadata
+    // gets are issued up front, then one content get per unique contentHash.
+    const metadataResults = (await Promise.all(
+      ids.map((id) => reqToPromise(entriesOS.get(id)))
+    )) as Array<StoreEntryMetadata | undefined>;
 
-    for (const id of ids) {
-      const metadata = (await reqToPromise(
-        entriesOS.get(id)
-      )) as StoreEntryMetadata | undefined;
+    const uniqueHashes: string[] = [];
+    const hashSeen = new Set<string>();
+    for (const metadata of metadataResults) {
+      if (metadata && !hashSeen.has(metadata.contentHash)) {
+        hashSeen.add(metadata.contentHash);
+        uniqueHashes.push(metadata.contentHash);
+      }
+    }
+    const contentResults = await Promise.all(
+      uniqueHashes.map((hash) => reqToPromise(contentOS.get(hash)))
+    );
+    const contentByHash = new Map<string, { data: ArrayBuffer } | undefined>();
+    uniqueHashes.forEach((hash, i) => contentByHash.set(hash, contentResults[i]));
+
+    const result: StoreEntry[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      const metadata = metadataResults[i];
       if (!metadata) {
-        this.logger.warn(`Entry ${id} not found`);
+        this.logger.warn(`Entry ${ids[i]} not found`);
         continue;
       }
-      const contentRecord = await reqToPromise(
-        contentOS.get(metadata.contentHash)
-      );
+      const contentRecord = contentByHash.get(metadata.contentHash);
       if (!contentRecord) {
         this.logger.warn(
-          `Content ${metadata.contentHash} not found for entry ${id}`
+          `Content ${metadata.contentHash} not found for entry ${ids[i]}`
         );
         continue;
       }
@@ -983,6 +1064,15 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
     filters?: StoreScanFilters
   ): Promise<StoreScanResult> {
     return this.runWithReconnect("scanEntriesSince", async () => {
+    // Doc-scoped fast path: stream the document's entries through the docId
+    // index instead of cursoring over the whole entries store (one event-loop
+    // round trip per record). Entry counts per document are small, so sorting
+    // and filtering in JS is cheap.
+    if (filters?.docId) {
+      const docEntries = await this.readEntriesForDoc(filters.docId);
+      return scanDocScopedEntries(docEntries, cursor, limit, filters);
+    }
+
     const db = await this.ensureOpen();
     const tx = db.transaction(ENTRIES_STORE, "readonly");
     const entriesOS = tx.objectStore(ENTRIES_STORE);

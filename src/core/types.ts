@@ -5,6 +5,41 @@ import { StoreKind } from "./appendonlystores/types";
 import type { ContentAddressedStore, OpenStoreOptions, StoreScanCursor } from "./appendonlystores/types";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
+import type {
+  DefaultAccessPolicyDoc,
+  KeyDistributionPushRecipient,
+  KeyDistributionRequest,
+  KeyDistributionView,
+  KeyVersionRef,
+  AppDistributionRequest,
+  AppDistributionView,
+  AppDistributionReconcilePlan,
+  SyncSetupPolicyRequest,
+  SyncSetupPolicyView,
+  SyncSetupPolicyReconcilePlan,
+  DocHistoryPurgeRequest,
+  DocHistoryPurgeView,
+  RuleTargets,
+  RuleType,
+  WithFieldClause,
+  AclRuleDoc,
+  AccessDecision,
+} from "./accesscontrol/types";
+import type { DirectoryStateNode } from "./accesscontrol/DirectoryStateNode";
+import type { SummaryConfig } from "./indexing/summary/types";
+import type { DocumentSummaryStore } from "./indexing/summary/DocumentSummaryStore";
+import type {
+  AttachmentTextExtractor,
+  FulltextConfig,
+  FulltextSearchOptions,
+  FulltextSearchResult,
+} from "./indexing/fulltext/types";
+import type { DocumentFullTextIndex } from "./indexing/fulltext/DocumentFullTextIndex";
+import type { ExtractionConfig } from "./extraction/types";
+import type { MindooQuery, MindooQueryOptions, MindooQueryResult } from "./query/types";
+import type { EphemeralSummaryView, MindooQueryViewDefinition } from "./query/queryView";
+import type { MindooQuerySubscription } from "./query/queryLive";
+import type { VirtualViewUpdateOptions } from "./indexing/virtualviews/IVirtualViewDataProvider";
 
 /**
  * Well-known key ID for access control documents (grantaccess, revokeaccess, groups).
@@ -191,6 +226,19 @@ interface CreateTenantPasswords {
    * encryption private keys is skipped entirely.
    */
   preDecryptedAppUserKeys?: PreDecryptedUserKeys;
+  /**
+   * Whether the new tenant should enforce the v2 storage format from creation:
+   * an admin-signed default policy is written with `requireMetadataSignatureSince`
+   * set to the creation time, so every entry created at/after now (locally and
+   * at the sync server) MUST carry the v2 metadata-binding signature and forged
+   * legacy (v1) entries are rejected. The policy sets
+   * `disableAllAccessChecksAndPolicies: true`, so this enables ONLY the
+   * storage-format floor — it does not turn on ACL deny-gates.
+   *
+   * Defaults to `true`. Set to `false` to create a tenant with no format floor
+   * (legacy behavior: v1 entries remain acceptable).
+   */
+  requireV2Entries?: boolean;
 }
 
 /**
@@ -248,6 +296,14 @@ export interface JoinRequest {
   signingPublicKey: string;
   /** RSA-OAEP public encryption key (PEM format) */
   encryptionPublicKey: string;
+  /**
+   * Optional human-readable label for this device's signing/encryption key
+   * pair (e.g. a date or a note about the device type). Suggested by the
+   * joining user; the approving admin may override it (see
+   * {@link ApproveJoinRequestOptions.label}). Stored on the grant document's
+   * key-pair entry and editable later (docs/accesscontrol.md §6.5).
+   */
+  label?: string;
 }
 
 /**
@@ -272,6 +328,13 @@ export interface ApproveJoinRequestOptions {
    * default set: `$publicinfos` and `default`.
    */
   sharedDocKeyIds?: string[];
+  /**
+   * Optional human-readable label for the joining device's key pair. When set,
+   * it overrides any label the joining user suggested in the join request and
+   * is stored on the grant document's key-pair entry (docs/accesscontrol.md
+   * §6.5). Useful for recording a date or a note about the device type.
+   */
+  label?: string;
   /** If "uri", approveJoinRequest returns a mdb://join-response/... URI string instead of an object */
   format?: "object" | "uri";
 }
@@ -493,9 +556,9 @@ export interface MindooTenantFactory {
    * @param options Optional. Set format to "uri" to get a mdb://join-request/... URI string.
    * @return A JoinRequest object or a mdb://join-request/... URI string
    */
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" }): JoinRequest;
-  createJoinRequest(user: PrivateUserId, options: { format: "uri" }): string;
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri" }): JoinRequest | string;
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object"; label?: string }): JoinRequest;
+  createJoinRequest(user: PrivateUserId, options: { format: "uri"; label?: string }): string;
+  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri"; label?: string }): JoinRequest | string;
 
   /**
    * Join a tenant using a join response from an admin.
@@ -623,11 +686,46 @@ export interface MindooTenant {
   verifySignature(payload: Uint8Array, signature: Uint8Array, publicKey: string): Promise<boolean>;
 
   /**
+   * Verify a store entry's author signature, version-aware (audit finding #5).
+   *
+   * Confirms the author key is trusted, then verifies the strong metadata-binding
+   * `metadataSignature` when present (v2+) or falls back to the legacy `signature`
+   * over the ciphertext for v1/legacy entries. Also re-verifies that
+   * `SHA-256(encryptedData) === contentHash` so a relay cannot serve bytes that
+   * disagree with the signed/hashed metadata.
+   *
+   * @param entry The entry metadata (must include signature fields)
+   * @param encryptedData The entry's encrypted payload bytes
+   * @return True if the entry is authentic and intact, false otherwise
+   */
+  verifyEntrySignature(
+    entry: StoreEntryMetadata,
+    encryptedData: Uint8Array
+  ): Promise<boolean>;
+
+  /**
    * Method to open the directory for this tenant
    *
    * @return The directory
    */
   openDirectory(): Promise<MindooTenantDirectory>;
+
+  /**
+   * Check whether an admin has requested a remote wipe of this device and, if
+   * so, delete the entire local tenant (docs/accesscontrol.md §6.5). Returns
+   * true if a wipe was applied. Sync the directory first so the latest directive
+   * is visible. Optional: not all tenant implementations support remote wipe.
+   */
+  checkAndApplyRemoteWipe?(): Promise<boolean>;
+
+  /**
+   * Delete all local data for this tenant from the device (docs/accesscontrol.md
+   * §6.5): every local database (directory + data), this tenant's KeyBag keys,
+   * and in-memory caches. Other tenants on the device are untouched. Optional.
+   *
+   * @param additionalDbIds Optional extra local database ids to wipe.
+   */
+  wipeLocalTenant?(additionalDbIds?: string[]): Promise<void>;
 
   /**
    * Opens a database for this tenant.
@@ -649,6 +747,21 @@ export interface MindooTenant {
    * is not applicable.
    */
   reconcileKeyBagChanges?(): Promise<void>;
+
+  /**
+   * Reconcile this tenant's local KeyBag against the directory head for the
+   * current user (docs/accesscontrol.md §13): remove revoked key ids and import
+   * the key versions pushed to the user. The RSA-OAEP decryption key is sourced
+   * from the tenant's own session, so callers never supply a key. Best-effort
+   * and idempotent; safe to call on every directory bring-up / pull. Optional so
+   * alternative tenant implementations (server-side, test doubles) may omit it.
+   *
+   * @returns The key ids imported and removed.
+   */
+  reconcileKeyDistributionsForCurrentUser?(): Promise<{
+    imported: string[];
+    removed: string[];
+  }>;
 
   /**
    * Return whether the current KeyBag can resolve the given document
@@ -765,6 +878,23 @@ export type StoreEntryType =
   | "attachment_chunk"; // File attachment chunk
 
 /**
+ * A single entry in {@link StoreEntryMetadata.attachmentRefs}: a reference to one
+ * attachment the document holds as of a given revision. Carries just enough for a
+ * keyless server to act:
+ * - {@link lastChunkId} resolves the full chunk chain via `resolveDependencies()`
+ *   (liveness / GC / tiering),
+ * - {@link size} enables size/average statistics without fetching chunk payloads.
+ */
+export interface StoreEntryAttachmentRef {
+  /** Unique id of the attachment instance (UUID7), as in `AttachmentReference`. */
+  attachmentId: string;
+  /** Entry id of the attachment's last chunk; head of the chunk dependency chain. */
+  lastChunkId: string;
+  /** Total attachment size in bytes (mirrors `AttachmentReference.size`). */
+  size: number;
+}
+
+/**
  * Metadata for entries stored in the ContentAddressedStore.
  * This contains all information except the actual encrypted payload,
  * making it efficient for synchronization negotiations.
@@ -854,6 +984,24 @@ export interface StoreEntryMetadata {
   attachmentIds?: string[];
 
   /**
+   * Full snapshot of all attachments the document references AS OF this revision
+   * (`doc_create`/`doc_change`/`doc_snapshot`; `doc_undelete` restores the set).
+   * Empty/absent means "no live attachments" (and `doc_delete` writes an empty
+   * set, since a deleted document is no longer active).
+   *
+   * Unlike {@link attachmentIds} (an add-only, by-id local recovery hint, written
+   * only on the first entry of a change), this is the complete set of references
+   * after removals/appends are merged, written on every produced document entry.
+   *
+   * It is bound into {@link metadataSignature} (see `crypto/EntrySignature.ts`),
+   * so a relay cannot rewrite it. This lets a sync server WITHOUT decryption keys
+   * determine which `attachment_chunk` chains are still live (GC/tiering, by
+   * traversing dependencies from each {@link StoreEntryAttachmentRef.lastChunkId})
+   * and compute storage statistics without decrypting content.
+   */
+  attachmentRefs?: StoreEntryAttachmentRef[];
+
+  /**
    * Start timestamp for `pending_attachment_upload` recovery ledgers.
    */
   uploadStartedAt?: number;
@@ -874,8 +1022,25 @@ export interface StoreEntryMetadata {
   /**
    * The signature of the entry (signed with the user's signing key over the encrypted data).
    * This allows signature verification without decryption.
+   *
+   * NOTE: this LEGACY signature covers ONLY the encrypted payload bytes, so it
+   * does not authenticate the cleartext metadata fields. New writers additionally
+   * populate {@link metadataSignature} (which binds the metadata) but keep this
+   * field for backward/forward interop with v1 readers.
    */
   signature: Uint8Array;
+
+  /**
+   * Ed25519 author signature over the canonical, versioned, length-prefixed
+   * metadata layout defined in `crypto/EntrySignature.ts`. Unlike {@link signature}
+   * it binds `entryType`, `id`, `docId`, `decryptionKeyId`, `createdAt`,
+   * `dependencyIds`, `contentHash` and `createdByPublicKey`, preventing metadata
+   * tampering on un-witnessed/legacy entries (audit finding #5).
+   *
+   * Absent on v1/legacy entries written before this field existed; verifiers
+   * fall back to {@link signature} when it is missing (backward compatible).
+   */
+  metadataSignature?: Uint8Array;
 
   /**
    * Original size of the plaintext data before encryption (in bytes).
@@ -890,7 +1055,84 @@ export interface StoreEntryMetadata {
    * Useful for download time estimation, storage space checks, and progress indicators.
    */
   encryptedSize: number;
+
+  // --- Access control: witness receipt (see docs/accesscontrol.md §5) -------
+  // These three fields form a "witness receipt": a signed attestation by a
+  // trusted sync server that this entry was accepted into the tenant at a
+  // specific time and satisfied the Tier 1 (identity) access policy at that
+  // moment. They are absent on purely local, not-yet-synced entries and are
+  // set ONCE by the first trusted witness, then never modified.
+
+  /**
+   * Time the entry was accepted into the tenant by a trusted witness
+   * (milliseconds since Unix epoch, witness-local clock). Set once by the first
+   * witness that accepts the entry; never modified on subsequent syncs.
+   *
+   * The "trusted time" of an entry — used for all access-control time-travel
+   * evaluation — is `receivedAt` when present, otherwise `createdAt`.
+   * See docs/accesscontrol.md §5.1 and §8.
+   */
+  receivedAt?: number;
+
+  /**
+   * Ed25519 public key (PEM) of the witness (sync server) that accepted and
+   * stamped the entry. Receivers verify {@link receivedDateSignature} against
+   * the tenant's trusted-witness list using this key. See docs/accesscontrol.md §5.1.
+   */
+  receivedByPublicKey?: string;
+
+  /**
+   * Ed25519 signature, produced by the witness identified by
+   * {@link receivedByPublicKey}, over the canonical, versioned, length-prefixed
+   * byte layout defined in docs/accesscontrol.md §5.2. The layout binds
+   * `entryType`, `dbid`, `contentHash`, `id`, `docId`, `decryptionKeyId`,
+   * `createdAt`, `createdByPublicKey`, `receivedAt` and `receivedByPublicKey`,
+   * so the receipt cannot be transplanted onto a different entry, database, or
+   * operation type. See {@link buildWitnessSigningBytes}.
+   */
+  receivedDateSignature?: Uint8Array;
+
+  /**
+   * The timestamping scheme that produced this receipt (the issuing
+   * {@link TimestampProvider}'s `kind`), e.g. `"ed25519-witness"`. Lets a
+   * receiver route the receipt to the right verifier once more than one scheme
+   * exists (e.g. an RFC 3161 TSA, docs/accesscontrol.md §13).
+   *
+   * Absence means the default/legacy Ed25519 witness scheme — entries stamped
+   * before this field existed carry no value. It is intentionally NOT bound
+   * into {@link receivedDateSignature}: a tampered tag merely routes to the
+   * wrong verifier, which then fails verification (a denial, not a forgery).
+   */
+  receiptScheme?: string;
+
+  /**
+   * Writer-era version of this store entry, set to {@link CURRENT_STORE_ENTRY_VERSION}
+   * by the writer that created it. Its presence is a safe discriminator between
+   * pre-witness legacy entries and witness-aware entries:
+   *
+   * - **Absent (legacy / pre-feature):** the entry was written before the
+   *   witness era. Its trusted time is stable at {@link createdAt} when
+   *   un-witnessed — it was already synced within the tenant and will never
+   *   receive a {@link receivedAt}.
+   * - **Present (witness-era):** the entry was written by a witness-aware
+   *   client. While un-witnessed its trusted time stays provisional at the
+   *   wall-clock `now` (it is "waiting to be pushed" and will eventually be
+   *   witnessed), so it cannot claim a historical time slot.
+   *
+   * See {@link entryTrustedTime} / {@link isProvisional}. Like
+   * {@link receiptScheme}, this is intentionally NOT bound into
+   * {@link receivedDateSignature} (it describes the local writer, not the
+   * witness attestation, and keeps existing receipts stable).
+   */
+  entryVersion?: number;
 }
+
+/**
+ * Version stamped onto every newly created store entry's {@link StoreEntryMetadata.entryVersion}.
+ * Marks the entry as written in the witness-aware era; see that field for the
+ * trusted-time semantics its presence/absence selects.
+ */
+export const CURRENT_STORE_ENTRY_VERSION = 2;
 
 /**
  * A complete entry stored in the ContentAddressedStore.
@@ -954,7 +1196,52 @@ export interface AttachmentReference {
    * Public signing key of the user who created this attachment (Ed25519, PEM format)
    */
   createdBy: string;
+
+  // ---------------------------------------------------------------------------
+  // Optional extraction result (docs/fulltext-search.md): plain text extracted
+  // from the attachment content (e.g. OCR), persisted next to the attachment
+  // it belongs to and synced with the document. Written exclusively through
+  // MindooDoc.setAttachmentExtractedText() inside changeDoc(); removing the
+  // attachment removes the text with it. The full-text index feeds persisted
+  // text into the synthetic `_attachments` search field without running any
+  // extractor. Excluded from the slim summary projection (only a
+  // hasExtractedText flag is projected).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Plain text extracted from the attachment content (capped at
+   * {@link ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS}).
+   */
+  extractedText?: string;
+
+  /** Outcome of the last extraction attempt for this attachment. */
+  extractionStatus?: AttachmentExtractionStatus;
+
+  /**
+   * Identifier of the extraction engine/config that produced the result
+   * (e.g. "tesseract.js@7:deu+eng"). Lets services re-extract when the
+   * engine or language set changes.
+   */
+  extractionEngine?: string;
+
+  /** Timestamp of the last extraction attempt (ms since Unix epoch). */
+  extractedAt?: number;
 }
+
+/**
+ * Outcome of an attachment text extraction attempt (see
+ * {@link MindooDoc.setAttachmentExtractedText}). "failed"/"skipped" markers
+ * are persisted so other devices do not retry a broken or deliberately
+ * skipped attachment over and over.
+ */
+export type AttachmentExtractionStatus = "done" | "failed" | "skipped";
+
+/**
+ * Upper bound on persisted extracted text per attachment. The text lives
+ * inside the synced CRDT document, so a single giant scan must not bloat
+ * the document and every future sync delta.
+ */
+export const ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS = 100_000;
 
 export interface IncompleteAttachmentUploadReclaimResult {
   scannedLedgers: number;
@@ -1234,6 +1521,33 @@ export interface CreateOptions {
    * `signingKeyPair` is provided.
    */
   signingKeyPassword?: string;
+
+  /**
+   * Optional initial field values applied within the document's very first
+   * Automerge change (the `doc_create` entry).
+   *
+   * This matters for access control: a `doc_create` Tier 2 rule (e.g. "the
+   * creator must add themselves to `myeditors`") is evaluated against the
+   * document's "after" state — the state produced by the create. Seeding those
+   * values here lets the create entry itself satisfy the rule, instead of
+   * requiring a separate follow-up change (docs/accesscontrol.md §6.3, §9).
+   *
+   * Reserved/internal fields (e.g. `_attachments`) are managed by MindooDB and
+   * must not be supplied here. Custom-ID documents still receive their seeded
+   * ancestry change; initial values are applied on top of it.
+   */
+  initialValues?: Record<string, unknown>;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the create
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only. This does NOT weaken security: the server
+   * witness (Tier 1) and quarantine-on-materialization (Tier 2) still enforce
+   * the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1252,6 +1566,16 @@ export interface DeleteOptions {
    * `signingKeyPair` is provided.
    */
   signingKeyPassword?: string;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the delete
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only; the server witness and
+   * quarantine-on-materialization still enforce the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1269,6 +1593,16 @@ export interface UndeleteOptions {
    * `signingKeyPair` is provided.
    */
   signingKeyPassword?: string;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the undelete
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only; the server witness and
+   * quarantine-on-materialization still enforce the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1287,6 +1621,16 @@ export interface ChangeOptions {
    * `signingKeyPair` is provided.
    */
   signingKeyPassword?: string;
+
+  /**
+   * Skip the synchronous client-side write-policy precheck (Tier 1 + Tier 2)
+   * that would otherwise throw {@link AccessDeniedError} when the change
+   * violates the active access control rules (docs/accesscontrol.md §9).
+   *
+   * For trusted/bulk paths only; the server witness and
+   * quarantine-on-materialization still enforce the rules. Defaults to `false`.
+   */
+  bypassAccessControlPrecheck?: boolean;
 }
 
 /**
@@ -1338,7 +1682,57 @@ export interface MindooDoc {
    * @return True if the document has been deleted, false otherwise
    */
   isDeleted(): boolean;
-  
+
+  /**
+   * Whether the current KeyBag can decrypt this document (docs/accesscontrol.md
+   * §13). `true` for normally-loaded documents. `false` only for changefeed
+   * tombstones emitted by {@link MindooDB.iterateChangesSince} for a document
+   * that was readable before but whose decryption key the local KeyBag no longer
+   * holds (e.g. a revoked key). Such a tombstone also reports
+   * {@link isDeleted} `=== true` so legacy consumers still drop it; pair the two
+   * to distinguish a genuine deletion (`isDeleted && isAccessible`) from a
+   * missing-key situation (`isDeleted && !isAccessible`). Its {@link getData}
+   * returns `{}` (the plaintext is purged, never materialized).
+   *
+   * @return True when the document's key is available, false for an
+   *   inaccessible-key tombstone.
+   */
+  isAccessible(): boolean;
+
+  /**
+   * Whether this document is still "awaiting witness": it has at least one
+   * versioned store entry (written in the witness-aware era) that has not yet
+   * been witnessed by a trusted server (no `receivedAt`) — i.e. it was created
+   * or edited locally and is still waiting to be pushed and stamped with a
+   * provable receipt. Built on the same `isProvisional` predicate as the
+   * version-aware trusted-time rule (see `core/storeEntryTime.ts`), so it can
+   * never diverge from it.
+   *
+   * Legacy documents (whose entries predate the witness era and carry no
+   * `entryVersion`) are never awaiting witness. Once every entry of a document
+   * has a `receivedAt`, the flag clears.
+   *
+   * @return True if any of the document's entries is versioned-but-un-witnessed.
+   */
+  isAwaitingWitness(): boolean;
+
+  /**
+   * Whether this document has been witnessed by a trusted server: it is
+   * witness-era (has at least one versioned store entry) AND every versioned
+   * entry now carries a `receivedAt`. Mutually exclusive with
+   * {@link isAwaitingWitness}: a versioned document starts out awaiting witness
+   * and flips to witnessed once its entries are stamped with a provable receipt.
+   *
+   * Legacy documents (whose entries predate the witness era and carry no
+   * `entryVersion`) are never witnessed — they return `false` here and from
+   * {@link isAwaitingWitness}. Built on the same `isVersioned`/`isProvisional`
+   * predicates as the version-aware trusted-time rule (see
+   * `core/storeEntryTime.ts`), so it can never diverge from it.
+   *
+   * @return True for a witness-era document whose entries are all witnessed.
+   */
+  isWitnessed(): boolean;
+
   /*
    * Get the payload of the document
    *
@@ -1422,6 +1816,36 @@ export interface MindooDoc {
    * @throws Error if called outside of changeDoc() callback or if attachment not found
    */
   appendToAttachment(attachmentId: string, data: Uint8Array): Promise<void>;
+
+  /**
+   * Persist extracted plain text (e.g. from OCR) at the attachment it
+   * belongs to. The text is stored as optional fields on the attachment's
+   * `_attachments` entry, syncs with the document, and disappears together
+   * with the attachment on removeAttachment(). The full-text index picks
+   * persisted text up automatically (synthetic `_attachments` field) —
+   * no extractor run needed.
+   *
+   * This method only works within the changeDoc() callback. `_`-prefixed
+   * fields are managed by MindooDB; this is the sanctioned write path for
+   * extraction results.
+   *
+   * @param attachmentId The ID of the attachment the text was extracted from
+   * @param result Extraction outcome: `text` is capped at
+   *   {@link ATTACHMENT_EXTRACTED_TEXT_MAX_CHARS}; pass `text: null` to
+   *   clear a previous result (e.g. before re-extraction). `status`
+   *   defaults to "done" when text is provided. `engine`/`extractedAt`
+   *   let services detect stale results after engine upgrades.
+   * @throws Error if called outside of changeDoc() callback or if attachment not found
+   */
+  setAttachmentExtractedText(
+    attachmentId: string,
+    result: {
+      text: string | null;
+      status?: AttachmentExtractionStatus;
+      engine?: string;
+      extractedAt?: number;
+    }
+  ): void;
 
   // ========== Attachment Read Methods ==========
   // These methods work both inside and outside of changeDoc().
@@ -1822,6 +2246,66 @@ export interface DirectoryUserLookup {
   signingPublicKey: string;
   encryptionPublicKey: string;
   details: DirectoryUserDetails | null;
+  /**
+   * Precomputed `$publicinfos`-readable identity-hash bundle for the grant
+   * (docs/accesscontrol.md §6.5): the v1+v2 hashes of every DN-hierarchy
+   * username variant, computed from the cleartext name at grant time. Lets the
+   * server resolve wildcard/group read rules purely in hash space, without ever
+   * needing the cleartext username. Absent on legacy grants written before the
+   * bundle existed (treated as version 0, exact-match only).
+   */
+  identityHashes?: string[];
+  /**
+   * Version of the variant-generation algorithm used to compute
+   * {@link identityHashes}. `0`/absent means the bundle is missing (legacy
+   * grant) and the reader must degrade to exact `username_hash` matching and
+   * flag the grant for backfill.
+   */
+  identityHashesV?: number;
+}
+
+/**
+ * A single device's key pair on a grant document (docs/accesscontrol.md §6.5).
+ *
+ * Newer grants store an array of these objects (`userKeyPairs`) instead of two
+ * parallel `userSigningPublicKeys` / `userEncryptionPublicKeys` arrays, so that
+ * each device's signing and encryption keys stay paired and can carry an
+ * optional human-readable `label` (e.g. a date or a note about the device
+ * type). Readers remain backward-compatible with the older array/scalar forms.
+ *
+ * On disk, active and revoked devices live in two separate lists: `userKeyPairs`
+ * holds the ACTIVE devices, and `revokedUserKeyPairs` holds the RETAINED revoked
+ * devices (docs/accesscontrol.md §6.5). The {@link revoked}/{@link revokedAt}
+ * fields below are the in-memory representation produced by the grant-key
+ * extractors regardless of which list a pair came from; writers partition pairs
+ * back into the two lists by their {@link revoked} flag.
+ */
+export interface GrantKeyPair {
+  /** Ed25519 signing public key (PEM) — the device's identity. */
+  signingPublicKey: string;
+  /** RSA-OAEP encryption public key (PEM) paired with the signing key. */
+  encryptionPublicKey: string;
+  /** Optional human-readable label for this device/key pair. */
+  label?: string;
+  /**
+   * When true, this device's access has been revoked but the pair is RETAINED
+   * on the grant document (docs/accesscontrol.md §6.5) so admin UIs can list
+   * revoked devices and optionally restore them. Revoked pairs are excluded
+   * from the active key arrays the server/auth read, so they cannot
+   * authenticate or decrypt new data. Absent/false means active.
+   */
+  revoked?: boolean;
+  /**
+   * Trusted-time (ms since Unix epoch) at which this device was revoked. Set
+   * together with {@link revoked}; cleared when the device is restored.
+   */
+  revokedAt?: number;
+}
+
+/** A {@link GrantKeyPair} enriched with its current remote-wipe status (§6.5). */
+export interface GrantKeyPairInfo extends GrantKeyPair {
+  /** True when this device's signing key is flagged for a remote wipe. */
+  wipeRequested: boolean;
 }
 
 export interface MindooTenantDirectory {
@@ -1833,25 +2317,43 @@ export interface MindooTenantDirectory {
    * @param userId The user ID to register
    * @param administrationPrivateKey The administration private key to sign the registration operation with (signing only)
    * @param administrationPrivateKeyPassword The password to decrypt the administration private key
+   * @param userDetails The user details to register
+   * @param label The label to register the user with
    * @return A promise that resolves when the user is registered
    */
   registerUser(userId: PublicUserId, administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
     userDetails?: DirectoryUserDetails,
+    label?: string,
   ): Promise<void>;
 
   /**
-   * Revokes a user's access to the tenant by adding a revocation record to the directory.
-   * This prevents the user from decrypting future changes, but they retain access to previously
-   * decrypted changes (append-only limitation).
-   * 
-   * @param username The username of the user to revoke (format: "CN=<username>/O=<tenantId>")
-   * @param requestDataWipe If true, the next time the user syncs the directory, the locally cached data on the user's machine will be wiped.
-   * @param administrationPrivateKey The administration private key to sign the revocation (signing only)
+   * Revokes a user's access by removing their keys from the grant document
+   * (docs/accesscontrol.md §6.5). Revocation is an in-place edit of the grant
+   * document's key arrays; there is no separate revocation document. This
+   * prevents the user from decrypting future changes, but they retain access to
+   * previously decrypted changes (append-only limitation).
+   *
+   * By default (no `options.signingKeys`) the user is fully revoked: all of
+   * their signing and encryption keys are removed. To revoke a single
+   * device/key, pass the specific keys to remove.
+   *
+   * BREAKING CHANGE: the previous signature took a positional `requestDataWipe`
+   * boolean. It now takes an options object so that specific keys can be
+   * targeted instead of always removing all access.
+   *
+   * @param username The username to revoke (format: "CN=<username>/O=<tenantId>")
+   * @param options.signingKeys Specific signing keys to remove; omit/empty to fully revoke the user.
+   * @param options.encryptionKeys Specific encryption keys to remove; ignored on a full revocation (all are removed).
+   * @param options.requestDataWipe If true, the removed devices are flagged for a remote wipe so their locally cached data is deleted on next sync.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only)
    * @param administrationPrivateKeyPassword The password to decrypt the administration private key
    * @return A promise that resolves when the user is revoked
    */
-  revokeUser(username: string, requestDataWipe: boolean, administrationPrivateKey: EncryptedPrivateKey,
+  revokeUser(
+    username: string,
+    options: { signingKeys?: string[]; encryptionKeys?: string[]; requestDataWipe?: boolean },
+    administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string
   ): Promise<void>;
 
@@ -1860,9 +2362,620 @@ export interface MindooTenantDirectory {
    * This is used for signature verification when loading changes from the append-only store.
    * 
    * @param publicKey The public signing key to validate (Ed25519, PEM format)
+   * @param opts.forceRefresh When true, bypass the trust-cache refresh interval
+   *   and synchronize the directory state before validating. Used on the server
+   *   push path so a freshly revoked key cannot still be accepted for up to
+   *   `DIRECTORY_SYNC_INTERVAL_MS` (audit #4, revocation lag).
    * @return True if the public key belongs to a trusted (registered and not revoked) user, false otherwise
    */
-  validatePublicSigningKey(publicKey: string): Promise<boolean>;
+  validatePublicSigningKey(
+    publicKey: string,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<boolean>;
+
+  /**
+   * Create or update the tenant-wide default access policy
+   * (docs/accesscontrol.md §6.1). Creating this document is what activates
+   * access control for the tenant. Only the supplied fields are written.
+   *
+   * @param policy The policy fields to write (omitted fields keep their stored value / take their documented default).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the policy has been written.
+   */
+  setDefaultAccessPolicy?(
+    policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Create or update a per-database access policy override (§6.2). Fields set
+   * here override the tenant default for `dbid`; unset fields inherit it.
+   *
+   * @param dbid The database the policy override applies to.
+   * @param policy The policy fields to write (omitted fields inherit the tenant default for `dbid`).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the policy override has been written.
+   */
+  setDatabaseAccessPolicy?(
+    dbid: string,
+    policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Create or replace an access-control rule (§6.3). A rule carrying
+   * `withfields` is Tier 2 (client-enforced); otherwise it is Tier 1
+   * (server-enforced).
+   *
+   * @param rule The rule definition.
+   * @param rule.ruleId Stable rule id; surfaced in `AccessDecision.matchedRuleId` and used to replace an existing rule.
+   * @param rule.type The operation the rule governs (`doc_create`, `doc_change`, …).
+   * @param rule.dbid The database the rule applies to, or `"*"` for all databases (defaults to `"*"` when omitted).
+   * @param rule.action Whether the rule grants (`"allow"`) or revokes (`"deny"`) access (deny overrides allow).
+   * @param rule.users_hashes Precomputed user/group hashes plus pseudo-tokens (`$everyone`, `$admin`, `$author`) the rule targets.
+   * @param rule.usernames Cleartext usernames to target; hashed and stored, and kept (encrypted) for admin-UI display.
+   * @param rule.groups Cleartext group names to target; hashed and stored alongside `usernames`.
+   * @param rule.withfields Tier 2 content clauses; their presence makes the rule client-enforced only.
+   * @param rule.description Optional human-readable description for admin UIs.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the rule has been written.
+   */
+  createAccessRule?(
+    rule: {
+      ruleId: string;
+      type: RuleType;
+      dbid?: string;
+      action?: "allow" | "deny";
+      users_hashes?: string[];
+      usernames?: string[];
+      groups?: string[];
+      withfields?: WithFieldClause[];
+      description?: string;
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * List access-control rules in effect (§9), optionally filtered. Each rule
+   * may carry decrypted `targets` (usernames/groups) for admin-UI display when
+   * the rule was authored with cleartext names and the caller holds the tenant
+   * default key; otherwise only the raw `users_hashes` are available.
+   *
+   * @param filter Optional narrowing by rule `type` and/or `dbid`.
+   * @returns The matching rules, each optionally augmented with decrypted `targets`.
+   */
+  listRules?(
+    filter?: { type?: RuleType; dbid?: string },
+  ): Promise<Array<AclRuleDoc & { targets?: RuleTargets }>>;
+
+  /**
+   * Delete an access-control rule by id (§9).
+   *
+   * @param ruleId The id of the rule to delete.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the rule has been deleted.
+   */
+  deleteRule?(
+    ruleId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Add (or refresh) a trusted witness (§6.4).
+   *
+   * @param witness The witness to trust.
+   * @param witness.witnessPublicKey The witness's Ed25519 signing public key (PEM).
+   * @param witness.serverUrl Optional URL of the witness/sync server, for display.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the witness has been written.
+   */
+  addTrustedWitness?(
+    witness: { witnessPublicKey: string; serverUrl?: string },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Remove a trusted witness by its public key (§6.4).
+   *
+   * @param witnessPublicKey The Ed25519 signing public key (PEM) of the witness to remove.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the witness has been removed.
+   */
+  removeTrustedWitness?(
+    witnessPublicKey: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Add device key pairs to a user's grant (§6.5 key rollover / new device).
+   *
+   * BREAKING CHANGE: previously took parallel `signingKeys` / `encryptionKeys`
+   * string arrays. It now takes an array of {@link GrantKeyPair} objects so the
+   * signing and encryption keys stay paired and can carry an optional `label`.
+   * Existing pairs are merged by signing key (a new entry with the same signing
+   * key updates its encryption key/label).
+   *
+   * @param username The user whose grant to add device key pairs to (format: "CN=<username>/O=<tenantId>").
+   * @param keyPairs The device key pairs (paired signing + encryption keys, optional `label`) to add or merge.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the keys have been added.
+   */
+  addUserKeys?(
+    username: string,
+    keyPairs: GrantKeyPair[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Remove keys from a user's grant by signing key (and optionally encryption
+   * key) (§6.5 revoke a device/key). Removing a signing key removes its entire
+   * paired entry.
+   *
+   * @param username The user whose keys to remove (format: "CN=<username>/O=<tenantId>").
+   * @param signingKeys The signing public keys whose paired entries to remove.
+   * @param encryptionKeys The encryption public keys to remove (typically the pairs of `signingKeys`).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the keys have been removed.
+   */
+  removeUserKeys?(
+    username: string,
+    signingKeys: string[],
+    encryptionKeys: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Set or clear the human-readable label of a device's key pair, identified by
+   * its signing public key (§6.5). Pass an empty/whitespace label to clear it.
+   * No-op if the user has no key pair with that signing key.
+   *
+   * @param username The user whose device label to set (format: "CN=<username>/O=<tenantId>").
+   * @param signingPublicKey The signing public key identifying the device key pair to label.
+   * @param label The new label; empty/whitespace clears the existing label.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the label has been written.
+   */
+  setKeyPairLabel?(
+    username: string,
+    signingPublicKey: string,
+    label: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * List a user's currently-granted device key pairs (§6.5), each with its
+   * optional label and current remote-wipe status. Returns one entry per
+   * signing key; revoked keys (removed from the grant) are not included.
+   * Useful for admin UIs that let an operator pick specific devices to revoke
+   * or relabel.
+   *
+   * @param username The user whose active device key pairs to list (format: "CN=<username>/O=<tenantId>").
+   * @returns The user's active device key pairs, each with its label and remote-wipe status.
+   */
+  getUserKeyPairs?(username: string): Promise<GrantKeyPairInfo[]>;
+
+  /**
+   * Read a user's grant overview for an admin "manage user" UI (§6.5): the
+   * decrypted user-details payload, the active device key pairs, and the
+   * retained revoked device key pairs (each with `revokedAt` + remote-wipe
+   * status). Requires the tenant default key to decrypt details.
+   *
+   * @param username The user whose grant overview to read (format: "CN=<username>/O=<tenantId>").
+   * @returns The decrypted `details` (or null), the `activeDevices`, and the retained `revokedDevices` (each with remote-wipe status).
+   */
+  getUserGrantOverview?(username: string): Promise<{
+    details: DirectoryUserDetails | null;
+    activeDevices: GrantKeyPairInfo[];
+    revokedDevices: Array<GrantKeyPair & { wipeRequested: boolean }>;
+  }>;
+
+  /**
+   * Apply a batch of admin-signed edits to a user's grant in a single change per
+   * grant document (§6.5): rewrite `details`, recompute the `identity_hashes`
+   * bundle, set per-device labels, revoke/restore devices (retaining revoked
+   * pairs with `revoked`/`revokedAt`), and set the remote-wipe set. Backs the
+   * Haven "Manage user" dialog's batched Save.
+   *
+   * @param username The user whose grant to update (format: "CN=<username>/O=<tenantId>").
+   * @param changes The batched edits to apply.
+   * @param changes.details Rewritten user-details payload (also recomputes the `identity_hashes` bundle).
+   * @param changes.deviceLabels Map of signing public key → new label for the user's devices.
+   * @param changes.revokeSigningKeys Signing keys whose devices to revoke (moved to the revoked list with `revokedAt`).
+   * @param changes.restoreSigningKeys Signing keys whose previously-revoked devices to restore to active.
+   * @param changes.wipeSigningKeys Signing keys whose devices to flag for remote wipe.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the grant has been updated.
+   */
+  updateUserGrant?(
+    username: string,
+    changes: {
+      details?: DirectoryUserDetails;
+      deviceLabels?: Record<string, string>;
+      revokeSigningKeys?: string[];
+      restoreSigningKeys?: string[];
+      wipeSigningKeys?: string[];
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Request a remote wipe of specific devices by signing public key (§6.5).
+   *
+   * @param username The user who owns the devices (format: "CN=<username>/O=<tenantId>").
+   * @param signingKeys The signing public keys of the devices to flag for remote wipe.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the wipe directive has been written.
+   */
+  requestDeviceWipe?(
+    username: string,
+    signingKeys: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Cancel a previously-requested device wipe (§6.5).
+   *
+   * @param username The user who owns the devices (format: "CN=<username>/O=<tenantId>").
+   * @param signingKeys The signing public keys whose pending wipe directive to clear.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @returns A promise that resolves when the wipe directive has been cleared.
+   */
+  cancelDeviceWipe?(
+    username: string,
+    signingKeys: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Whether access control is currently active for this tenant (§6.1, §7).
+   *
+   * @returns `true` when a default policy exists and the master kill-switch is not engaged, otherwise `false`.
+   */
+  isAccessControlActive?(): Promise<boolean>;
+
+  /**
+   * Predict whether the current user may perform `op` on `dbid` (§9).
+   *
+   * @param op The write operation to predict (`doc_create`, `doc_change`, …).
+   * @param dbid The database the operation would target.
+   * @param candidateDoc Optional candidate document content, for evaluating Tier 2 (`withfields`) content rules.
+   * @returns The {@link AccessDecision} that would result for the current user.
+   */
+  canDo?(op: RuleType, dbid: string, candidateDoc?: Record<string, unknown>): Promise<AccessDecision>;
+
+  /**
+   * Audit: was `username` allowed to perform `op` on `dbid` at trusted time
+   * `at`? (§9) Evaluates against the directory state as it was at `at`, so
+   * historical decisions can be explained.
+   *
+   * @param op The write operation to evaluate (`doc_create`, `doc_change`, …).
+   * @param username The user whose access to evaluate (format: "CN=<username>/O=<tenantId>").
+   * @param dbid The database the operation targets.
+   * @param at The trusted time (ms epoch) selecting the historical directory-state node to evaluate against.
+   * @param candidateDoc Optional candidate document content, for evaluating Tier 2 (`withfields`) content rules.
+   * @returns The {@link AccessDecision} that applied at `at`.
+   */
+  wasAllowedAt?(
+    op: RuleType,
+    username: string,
+    dbid: string,
+    at: number,
+    candidateDoc?: Record<string, unknown>,
+  ): Promise<AccessDecision>;
+
+  /**
+   * Evaluate the full client-side write ruleset (Tier 1 + Tier 2) for a
+   * candidate write at `trustedTime` (docs/accesscontrol.md §7, §9.1).
+   * `beforeDoc`/`afterDoc` are only consulted by Tier 2 (`withfields`) content
+   * rules. Used by the SDK write prechecks and by materialization-time
+   * enforcement.
+   *
+   * @param input The candidate write to evaluate.
+   * @param input.op The write operation being evaluated (`doc_create`, `doc_change`, …).
+   * @param input.dbid The database the write targets.
+   * @param input.signingKey The author's Ed25519 signing public key (PEM); resolved to a user identity for rule matching.
+   * @param input.trustedTime The entry's trusted time (ms epoch) — selects the directory-state node the rules are evaluated against (§8).
+   * @param input.isAuthor Whether the signer is the original creator of the target document, for `$author` ownership rules.
+   * @param input.beforeDoc The document state before the change (for `when: "before"` clauses), or `null` when unavailable/not needed.
+   * @param input.afterDoc The document state with the candidate change applied (for `when: "after"` clauses), or `null` when unavailable/not needed.
+   * @returns The {@link AccessDecision} (allow/deny, deciding rule id, and tier).
+   */
+  evaluateClientAccess?(input: {
+    op: RuleType;
+    dbid: string;
+    signingKey: string;
+    trustedTime: number;
+    isAuthor: boolean;
+    beforeDoc: Record<string, unknown> | null;
+    afterDoc: Record<string, unknown> | null;
+  }): Promise<AccessDecision>;
+
+  /**
+   * Whether a Tier 2 (`withfields`) content rule exists for `op` on `dbid` at
+   * the current head state. Lets callers skip materializing before/after
+   * documents when only Tier 1 checks apply (§9.1).
+   *
+   * @param op The write operation to check for content rules.
+   * @param dbid The database to check (a rule with `dbid: "*"` also matches).
+   * @returns `true` if at least one matching Tier 2 (`withfields`) rule exists, otherwise `false`.
+   */
+  hasWriteContentRules?(op: RuleType, dbid: string): Promise<boolean>;
+
+  /**
+   * The effective `defaultCreateKeyId` for `dbid` at the current head state, or
+   * `undefined` when unconstrained (§6.7). A create-time convenience used to
+   * resolve the key a `doc_create` uses when the caller does not pass one.
+   *
+   * @param dbid The database whose effective default create-key to resolve (per-DB policy overrides the tenant default).
+   * @returns The configured default `decryptionKeyId`, or `undefined` when no policy applies, the master switch is engaged, or no default is set (callers fall back to `"default"`).
+   */
+  getEffectiveDefaultCreateKeyId?(dbid: string): Promise<string | undefined>;
+
+  /**
+   * The set of trusted witness signing keys (PEM) as of trusted time `T` (§5,
+   * §6.4). Used to verify witness receipts during materialization.
+   *
+   * @param T The trusted time (ms epoch) selecting the directory-state node to read the trusted-witness list from.
+   * @returns The set of trusted witness Ed25519 signing public keys (PEM) in effect at `T`.
+   */
+  getTrustedWitnessKeysAt?(T: number): Promise<Set<string>>;
+
+  /**
+   * The canonical write-time hash for `username` (the value stored in a
+   * distribution's `pushto`/`pullfrom` hash lists). Used to build `pullfrom`
+   * entries when removing a user.
+   *
+   * @param username The user to hash (format: "CN=<username>/O=<tenantId>").
+   * @returns The salted, normalized username hash.
+   */
+  getUsernameHash?(username: string): Promise<string>;
+
+  /**
+   * All ACTIVE (non-revoked) RSA encryption public keys (PEM) for `username` —
+   * one per active device. Used to wrap a key for every device of a recipient.
+   *
+   * @param username The user to resolve (format: "CN=<username>/O=<tenantId>").
+   * @returns The de-duplicated active encryption public keys.
+   */
+  getUserEncryptionPublicKeys?(username: string): Promise<string[]>;
+
+  /**
+   * Wrap every stored version of `keyId` (from the caller's KeyBag) to ALL
+   * active encryption devices of `username`, producing the `pushto` device-map
+   * shape used by the distribution doc and request URI. Throws if the caller
+   * lacks the key or the recipient has no active encryption device.
+   *
+   * @param keyId The symmetric key (in the caller's KeyBag) to wrap.
+   * @param username The recipient (format: "CN=<username>/O=<tenantId>").
+   * @returns The recipient's wrapped device material.
+   */
+  wrapKeyForUserDevices?(keyId: string, username: string): Promise<KeyDistributionPushRecipient>;
+
+  /**
+   * The version manifest (`{createdAt, fingerprint}`) of `keyId` from the
+   * caller's KeyBag — the source of truth for a distribution's `keyVersions`.
+   *
+   * @param keyId The symmetric key to read versions for.
+   * @returns The version manifest (empty when the key is not held).
+   */
+  getKeyVersionManifest?(keyId: string): Promise<KeyVersionRef[]>;
+
+  /**
+   * Admin-sign and upsert the singleton `acl_keydistribution_<keyId>` document
+   * from a request (built in-dialog or decoded from a request URI).
+   *
+   * @param request The full desired distribution state.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  publishKeyDistribution?(
+    request: KeyDistributionRequest,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * List all key-distribution documents at the directory head, decrypting
+   * display fields when the tenant default key is held.
+   *
+   * @returns The distribution views.
+   */
+  listKeyDistributions?(): Promise<KeyDistributionView[]>;
+
+  /**
+   * Delete the singleton distribution document for `keyId` (admin-signed).
+   *
+   * @param keyId The distributed key id.
+   * @param administrationPrivateKey The administration private key to sign the change.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  deleteKeyDistribution?(
+    keyId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * The key ids managed by a distribution at the directory head where `username`
+   * is in the `pushto` list (managed status is derived, never persisted).
+   *
+   * @param username The user to resolve managed keys for.
+   * @returns The managed key ids.
+   */
+  getManagedKeyIds?(username: string): Promise<string[]>;
+
+  /**
+   * The decryption key ids revoked for `username` at the directory head (every
+   * `acl_keydistribution_<keyId>` whose `pullfrom` list matches the user).
+   * Protected ids are never reported. Used client-side to bulk-remove revoked
+   * keys from the KeyBag, and as the basis for the server's pull/push blacklist.
+   * Optional.
+   *
+   * @param username The user to resolve revoked keys for.
+   * @returns The revoked decryption key ids.
+   */
+  getRevokedDecryptionKeyIdsForUser?(username: string): Promise<string[]>;
+
+  /**
+   * Signing-key variant of {@link getRevokedDecryptionKeyIdsForUser} for the
+   * sync server, which authenticates principals by signing public key. Resolves
+   * the key to its user, then derives the revoked ids in hash space. The tenant
+   * admin and non-user (service) keys are never revoked. Optional.
+   *
+   * @param signingKey The principal's signing public key (Ed25519, PEM).
+   * @returns The revoked decryption key ids for that principal.
+   */
+  getRevokedDecryptionKeyIdsForSigningKey?(signingKey: string): Promise<string[]>;
+
+  /**
+   * Admin-sign and upsert the singleton `acl_appdistribution_<appId>` document
+   * from a request (built in-dialog or decoded from a request URI). The payload
+   * is a Haven application registration; recipient lists support users and
+   * groups (docs/accesscontrol.md §13).
+   *
+   * @param request The full desired distribution state.
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  publishAppDistribution?(
+    request: AppDistributionRequest,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * List all app-distribution documents at the directory head, decrypting
+   * display + payload fields when the tenant default key is held.
+   *
+   * @returns The app-distribution views.
+   */
+  listAppDistributions?(): Promise<AppDistributionView[]>;
+
+  /**
+   * Delete the singleton app-distribution document for `appId` (admin-signed).
+   *
+   * @param appId The distributed app id.
+   * @param administrationPrivateKey The administration private key to sign the change.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  deleteAppDistribution?(
+    appId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * The per-user app-distribution reconcile plan at the directory head: `have`
+   * is every app the user is entitled to (pushto user/group, pull wins), and
+   * `notHave` is every other distributed app id. Drives the Haven post-sync
+   * install/update/remove pass (docs/accesscontrol.md §13).
+   *
+   * @param username The user to resolve the plan for.
+   * @returns The reconcile plan.
+   */
+  getAppDistributionsForCurrentUser?(username: string): Promise<AppDistributionReconcilePlan>;
+
+  /**
+   * The app ids `username` is entitled to receive via `pushto` at the directory
+   * head (managed status is derived, never persisted).
+   *
+   * @param username The user to resolve managed apps for.
+   * @returns The managed app ids.
+   */
+  getManagedAppIds?(username: string): Promise<string[]>;
+
+  /**
+   * Admin-sign and upsert the `acl_syncsetuppolicy_<policyId>` document from a
+   * sync setup policy request. Pre-configures (and optionally permanently
+   * enforces) a set of databases on the targeted users'/groups' Haven Sync page.
+   *
+   * @param request The sync setup policy request (built in-dialog or decoded from a request URI).
+   * @param administrationPrivateKey The administration private key to sign the change (signing only).
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  publishSyncSetupPolicy?(
+    request: SyncSetupPolicyRequest,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * List all sync-setup-policy documents at the directory head as views
+   * (decrypting display fields when the tenant default key is held).
+   *
+   * @returns The sync setup policy views.
+   */
+  listSyncSetupPolicies?(): Promise<SyncSetupPolicyView[]>;
+
+  /**
+   * Delete the sync-setup-policy document for `policyId` (admin-signed).
+   *
+   * @param policyId The sync setup policy id.
+   * @param administrationPrivateKey The administration private key to sign the change.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  deleteSyncSetupPolicy?(
+    policyId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * The per-user sync-setup reconcile plan at the directory head: the union of
+   * databases the user is targeted for across all policies, each carrying the
+   * effective lock state (locked when a `permanent` policy targets it and the
+   * user is not released via `pullfrom`). Drives the Haven post-sync Sync-page
+   * seed/lock pass.
+   *
+   * @param username The user to resolve the plan for.
+   * @returns The reconcile plan.
+   */
+  getSyncSetupForCurrentUser?(username: string): Promise<SyncSetupPolicyReconcilePlan>;
+
+  /**
+   * Audit / time travel (§8): the head time-travel directory-state node ("now"),
+   * after bringing the directory-state chain up to date. Carries the default
+   * policy, per-database policies, rules, groups, user grants, and trusted
+   * witnesses as they stand now. Used to drive the Haven directory-history UI.
+   *
+   * @returns The head {@link DirectoryStateNode} covering the current time.
+   */
+  getDirectoryStateHead?(): Promise<DirectoryStateNode>;
+
+  /**
+   * Audit / time travel (§8): the directory-state node covering trusted time
+   * `T` — the directory exactly as it was at that point in time. Lets the Haven
+   * directory-history UI inspect and diff users/groups/policies at any past
+   * point between the collected trusted times of directory changes.
+   *
+   * @param T The trusted time (ms epoch) to resolve the directory state at.
+   * @returns The {@link DirectoryStateNode} covering trusted time `T`.
+   */
+  getDirectoryStateAt?(T: number): Promise<DirectoryStateNode>;
 
   /**
    * Get a user's public keys from the directory.
@@ -1887,6 +3000,30 @@ export interface MindooTenantDirectory {
   getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null>;
 
   /**
+   * Resolve the signing keys relevant to authenticating a device for `username`
+   * (docs/accesscontrol.md §6.5): currently-granted (`active`) keys and keys an
+   * admin has targeted for remote wipe (`wipeRequested`). The two are
+   * independent. Optional: directories without remote-wipe support omit it.
+   *
+   * @param username The user whose signing-key universe to resolve (format: "CN=<username>/O=<tenantId>").
+   * @returns The `active` (currently-granted) and `wipeRequested` (remote-wipe-targeted) signing public keys.
+   */
+  getUserSigningKeyUniverse?(
+    username: string,
+  ): Promise<{ active: string[]; wipeRequested: string[] }>;
+
+  /**
+   * If `signingKey` is the target of an admin-requested remote wipe (§6.5),
+   * return the id of the admin-signed grant document carrying the directive
+   * (else null). Used by the sync server to serve only that document to the
+   * targeted device. Optional.
+   *
+   * @param signingKey The device signing public key (PEM) to check for a pending wipe directive.
+   * @returns The grant document id carrying the wipe directive, or `null` when the key is not wipe-targeted.
+   */
+  getWipeGrantDocId?(signingKey: string): Promise<string | null>;
+
+  /**
    * Check if a user has been revoked.
    * 
    * @param username The username to check (format: "CN=<username>/O=<tenantId>")
@@ -1895,41 +3032,61 @@ export interface MindooTenantDirectory {
   isUserRevoked(username: string): Promise<boolean>;
 
   /**
-   * Requests that a document's change history be purged from all client stores.
-   * Creates a purge request record in the directory that clients will process when they
-   * sync directory changes. Clients receiving this directory update will purge all
-   * changes for the specified document from their local stores.
-   * 
-   * This is useful for GDPR compliance (right to be forgotten) and other scenarios
-   * where document data must be removed from all systems.
-   * 
-   * @param dbId The database ID containing the document
-   * @param docId The document ID whose change history should be purged
-   * @param reason Optional reason for the purge request (e.g., "GDPR right to be forgotten")
-   * @param administrationPrivateKey The administration private key to sign the request
-   * @param administrationPrivateKeyPassword The password to decrypt the administration private key
-   * @return A promise that resolves when the purge request record is created
+   * Admin-sign and write a document-history purge request to the directory from
+   * a request (built in-dialog or decoded from an `mdb://doc-history-purge/...`
+   * URI). Stored at the fixed id `acl_dochistorypurge_<requestId>` (one doc per
+   * request; append-only audit record). The doc shell is `$publicinfos`-readable
+   * so the sync server can read the cleartext `dbId` + `docIds` routing fields
+   * and execute the purge; only `reason` is encrypted with the tenant default
+   * key. Clients (and the server) process the request after a directory sync and
+   * purge the requested documents from their stores (docs/accesscontrol.md §13).
+   *
+   * This is useful for GDPR compliance (right to be forgotten) and other
+   * scenarios where document data must be removed from all systems.
+   *
+   * @param request The full unsigned purge request (db + doc ids + optional reason).
+   * @param administrationPrivateKey The administration private key to sign the request.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   * @return A promise that resolves when the purge request record is created.
    */
-  requestDocHistoryPurge(
-    dbId: string,
-    docId: string,
-    reason: string | undefined,
+  publishDocHistoryPurge?(
+    request: DocHistoryPurgeRequest,
     administrationPrivateKey: EncryptedPrivateKey,
-    administrationPrivateKeyPassword: string
+    administrationPrivateKeyPassword: string,
   ): Promise<void>;
 
   /**
-   * Get all pending document history purge requests that clients should process.
-   * Returns purge requests with verified admin signatures that clients have not yet processed.
-   * 
-   * Clients should call this method periodically (e.g., after directory sync) and
-   * purge the requested documents from their local stores.
-   * 
-   * @return Array of purge request records with verified admin signatures
+   * List all purge-request documents at the directory head, decrypting `reason`
+   * when the tenant default key is held.
+   *
+   * @returns The purge-request views.
+   */
+  listDocHistoryPurges?(): Promise<DocHistoryPurgeView[]>;
+
+  /**
+   * Delete a still-pending purge request document (admin-signed).
+   *
+   * @param requestId The purge request id.
+   * @param administrationPrivateKey The administration private key to sign the change.
+   * @param administrationPrivateKeyPassword The password to decrypt the administration private key.
+   */
+  deleteDocHistoryPurge?(
+    requestId: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Get all document history purge requests that clients (and the server) should
+   * process. Returns the requests' routing info; clients/servers purge the
+   * requested documents from their stores after a directory sync.
+   *
+   * @return Array of purge request records.
    */
   getRequestedDocHistoryPurges(): Promise<Array<{
+    requestId: string;
     dbId: string;
-    docId: string;
+    docIds: string[];
     reason?: string;
     requestedAt: number;
     purgeRequestDocId: string;  // ID of the purge request document in directory
@@ -1978,8 +3135,64 @@ export interface MindooTenantDirectory {
    * This is intended for admin tooling and overview UIs. The result always includes
    * `"directory"` and will also include `"main"` as the conventional default app DB.
    * Additional DBs are discovered from `dbsettings` documents stored in the directory.
+   *
+   * @returns The database ids known to the directory (always including `"directory"` and `"main"`).
    */
   listKnownDBIds(): Promise<string[]>;
+
+  /**
+   * Returns the tenant-wide database-open policy from the access-control default
+   * policy document.
+   *
+   * In `"open"` mode (the default, and whenever access control is off) any valid
+   * database id may be opened/synced. In `"directory-restricted"` mode only
+   * `"directory"` (always implicitly allowed) and the returned `allowedDbIds`
+   * may be opened/synced; the tenant admin is exempt.
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   *
+   * @returns The current database-open policy mode and the allowlist.
+   */
+  getDatabaseCreationPolicy?(): Promise<{
+    mode: "open" | "directory-restricted";
+    allowedDbIds: string[];
+  }>;
+
+  /**
+   * The tenant-wide storage-format floor: the trusted-time cutoff (ms since
+   * epoch) at/after which a store entry MUST carry the v2 metadata-binding
+   * author signature, or `undefined` when no floor is configured. Read from the
+   * access-control default policy (`requireMetadataSignatureSince`).
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   */
+  getRequireMetadataSignatureSince?(): Promise<number | undefined>;
+
+  /**
+   * Whether the given database id may be opened/synced under the current
+   * database-open policy. Always true for `"directory"` and in `"open"` mode.
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   *
+   * @param dbId The database id to check.
+   * @returns True when the database id may be opened/synced.
+   */
+  isDatabaseAllowed?(dbId: string): Promise<boolean>;
+
+  /**
+   * Whether the current user may open and sync `dbId` under the database read
+   * gate (`doc_read`, §6.6). Evaluates the read policy for the current user
+   * against the directory head. Always true for `"directory"` and for the
+   * tenant admin. Independent of {@link isDatabaseAllowed} (the database-id
+   * allowlist) — callers that gate opening enforce both.
+   *
+   * Optional capability: implementations that predate read access control may
+   * omit it.
+   *
+   * @param dbId The database id to check read access for.
+   * @returns True when the current user may open/sync the database.
+   */
+  canReadDatabase?(dbId: string): Promise<boolean>;
 
   /**
    * Create or update database-specific settings.
@@ -2009,15 +3222,12 @@ export interface MindooTenantDirectory {
   getGroups(): Promise<string[]>;
 
   /**
-   * Looks up the members of a group by name.
-   * 
-   * @param groupName The name of the group to look up (case-insensitive, converted to lowercase)
-   * @return The members of the group
-   */
-  /**
    * Get the decrypted member names for a group.
    * Entries that cannot be decrypted are skipped so callers can still work with
    * the readable subset of the group.
+   *
+   * @param groupName The name of the group to look up (case-insensitive, converted to lowercase).
+   * @returns The decrypted member names (the readable subset; undecryptable entries are skipped).
    */
   getGroupMembers(groupName: string): Promise<string[]>;
 
@@ -2168,6 +3378,82 @@ export interface DocumentHistoryResult {
    * The public signing key of the user who created this change (Ed25519, PEM format).
    */
   changeCreatedByPublicKey: string;
+}
+
+/**
+ * Resumable position in a revision-grain changefeed
+ * ({@link MindooDB.iterateChangeRevisionsSince}).
+ *
+ * The feed discovers entries in the store's local `(receiptOrder, id)` order
+ * (the gap-free, append-stable order of {@link ContentAddressedStore.scanEntriesSince}),
+ * so the cursor is a store scan position. It points at the witnessed stable
+ * prefix: it does not advance past the earliest un-witnessed entry, so
+ * un-witnessed entries (whose trusted time is provisional) are re-evaluated as a
+ * head overlay on every resume. Passing the cursor back resumes discovery
+ * strictly after that position.
+ *
+ * Note: revisions are *materialized and projected* in trusted-time order
+ * (`receivedAt` for witnessed entries, the current wall clock for un-witnessed
+ * local entries), which is distinct from the receiptOrder discovery order; see
+ * {@link ChangeRevisionResult.trustedTime}.
+ */
+export interface RevisionCursor {
+  /** Store receipt-order watermark of the witnessed stable prefix. */
+  receiptOrder: number;
+  /** Store entry id at the watermark (tie-breaker within a receiptOrder). */
+  id: string;
+}
+
+/**
+ * Result yielded by the revision-grain changefeed generators
+ * ({@link MindooDB.iterateChangeRevisionsSince} /
+ * {@link MindooDB.iterateDocRevisionsSince}).
+ *
+ * Unlike {@link ProcessChangesResult} (one merged head per document), this is
+ * emitted once per persisted change entry: it carries the document's merged
+ * state as of that revision's trusted-time frontier, so consumers can rebuild a
+ * true per-revision history (e.g. the access-control time-travel chain, §8).
+ */
+export interface ChangeRevisionResult {
+  /** Document this revision belongs to. */
+  docId: string;
+  /**
+   * Store entry id of the change this revision corresponds to. Stable across
+   * re-emissions, so consumers key revisions by it (replacing a prior emission
+   * when a concurrent sibling arrives or the entry is later witnessed).
+   */
+  entryId: string;
+  /**
+   * The document's merged state including every change to `docId` whose trusted
+   * time is `<= trustedTime`. An independent clone, safe to retain.
+   */
+  doc: MindooDoc;
+  /** The store entry type of this revision (`doc_create`/`doc_change`/...). */
+  entryType: StoreEntryType;
+  /**
+   * Trusted time of this revision: the witness `receivedAt` for witnessed
+   * entries, or the current wall clock for un-witnessed local entries (which
+   * therefore always sit at the provisional head of the timeline). The
+   * document's merged state is bounded by this time.
+   */
+  trustedTime: number;
+  /**
+   * True when `trustedTime` came from a witness `receivedAt`; false for an
+   * un-witnessed local entry whose trusted time is the (provisional) current
+   * wall clock. Consumers treat un-witnessed revisions as a recomputed head
+   * overlay until the entry is witnessed.
+   */
+  witnessed: boolean;
+  /** Ed25519 public key (PEM) of the change author. */
+  createdByPublicKey: string;
+  /**
+   * Resumable discovery cursor (the witnessed stable-prefix watermark). The same
+   * watermark is stamped on every revision in a batch; consumers persist it to
+   * resume the next scan. `null` when there is no witnessed stable prefix yet
+   * (e.g. the only entries so far are un-witnessed local ones), meaning the next
+   * resume re-scans from the beginning.
+   */
+  cursor: RevisionCursor | null;
 }
 
 /**
@@ -2691,6 +3977,28 @@ export interface SyncResult {
   cancelled: boolean;
 }
 
+/** One changed document in a {@link DbChangeEvent} (lightweight metadata only). */
+export interface DbChange {
+  docId: string;
+  isDeleted: boolean;
+  lastModified: number;
+}
+
+/**
+ * Coalesced change notification emitted to {@link DbChangeListener}s.
+ *
+ * The event is a "there is news up to `cursor`" signal, not a replay
+ * mechanism: listeners registered late simply miss earlier events, and
+ * consumers that need completeness read `iterateChangesSince` from their
+ * own persisted cursor (which stays correct regardless of missed events).
+ */
+export interface DbChangeEvent {
+  changes: DbChange[];
+  cursor: ProcessChangesCursor | null;
+}
+
+export type DbChangeListener = (event: DbChangeEvent) => void;
+
 export interface MindooDB {
 
   /**
@@ -2764,6 +4072,31 @@ export interface MindooDB {
   createDocument(options?: CreateOptions): Promise<MindooDoc>;
 
   /**
+   * Bulk-create documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling `createDocument()` once per input, but
+   * all produced store entries are persisted through one `putEntries()` batch
+   * (a single readwrite transaction on IndexedDB-backed stores), which is
+   * dramatically faster for large imports.
+   *
+   * Unlike the single-create path, a custom `id` MAY be combined with
+   * `initialValues`: the values are applied as a follow-up `doc_change` entry
+   * on top of the deterministic seed change, and both entries land in the same
+   * batch. Existing custom-id documents keep the idempotent create semantics
+   * (the existing document is returned and `initialValues` are applied as a
+   * regular change).
+   *
+   * Fail-fast: invalid inputs are rejected up front, and a denied
+   * access-control precheck rejects the whole call before any fresh document
+   * is written.
+   *
+   * @param inputs One `CreateOptions` per document to create.
+   * @return The created (or, for existing custom ids, existing) documents in
+   *   input order.
+   */
+  createDocuments(inputs: CreateOptions[]): Promise<MindooDoc[]>;
+
+  /**
    * Create a new document with optional encryption using a named symmetric key.
    *
    * @deprecated Use `createDocument({ decryptionKeyId })` instead.
@@ -2834,6 +4167,40 @@ export interface MindooDB {
    * @return An async generator that yields DocumentHistoryResult objects containing the document state and change metadata, in chronological order from oldest to newest
    */
   iterateDocumentHistory(docId: string): AsyncGenerator<DocumentHistoryResult, void, unknown>;
+
+  /**
+   * Iterate the database's changes at **revision grain** in trusted-time order.
+   *
+   * Unlike {@link iterateChangesSince} (which yields one merged head per
+   * document), this yields once per persisted change entry across all
+   * documents, ordered by `(trustedTime, id)` where `trustedTime` is the
+   * access-control trusted time (`receivedAt ?? createdAt`). Each result carries
+   * the document's merged state as of that revision's trusted-time frontier, so
+   * intermediate states of in-place-edited documents are preserved.
+   *
+   * This powers the access-control time-travel directory-state chain
+   * (docs/accesscontrol.md §8), which must observe every policy/grant revision
+   * — not just the final merged document.
+   *
+   * @param cursor Resume position; `null` to start from the beginning.
+   */
+  iterateChangeRevisionsSince(
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown>;
+
+  /**
+   * Like {@link iterateChangeRevisionsSince} but restricted to a single
+   * document, with the `docId` filter pushed down to the store scan so
+   * unrelated entries are never loaded or decrypted. Useful for a
+   * trusted-time-ordered per-document history view.
+   *
+   * @param docId The document whose revisions to iterate.
+   * @param cursor Resume position; `null` to start from the beginning.
+   */
+  iterateDocRevisionsSince(
+    docId: string,
+    cursor: RevisionCursor | null
+  ): AsyncGenerator<ChangeRevisionResult, void, unknown>;
 
   /**
    * Return bounded history metadata for a document without materializing every
@@ -2975,6 +4342,22 @@ export interface MindooDB {
   deleteDocument(docId: string, options?: DeleteOptions): Promise<void>;
 
   /**
+   * Bulk-delete documents in a single append-only store write.
+   *
+   * Semantically equivalent to calling `deleteDocument()` once per id, but all
+   * `doc_delete` lifecycle entries are persisted through one `putEntries()`
+   * batch (a single readwrite transaction on IndexedDB-backed stores).
+   *
+   * Documents that are missing or already deleted are skipped (idempotent bulk
+   * semantics). Any other failure, including a denied access-control precheck,
+   * rejects the whole call before anything is written.
+   *
+   * @param docIds IDs of the documents to delete.
+   * @param options Optional signing options applied to every delete entry.
+   */
+  deleteDocuments(docIds: string[], options?: DeleteOptions): Promise<void>;
+
+  /**
    * Delete a document using a specific signing key.
    * This is like deleteDocument but allows signing with a different key than the current user's.
    * Used for directory operations that must be signed with the administration key.
@@ -3029,6 +4412,57 @@ export interface MindooDB {
     changeFunc: (doc: MindooDoc) => void | Promise<void>,
     options?: ChangeOptions
   ): Promise<void>;
+
+  /**
+   * Predict whether a `createDocument` with these options would be allowed by
+   * the active access control write policy, without writing anything
+   * (docs/accesscontrol.md §9). Lets a UI disable a Save action and surface the
+   * reason up front. When access control is not enforced, returns an
+   * `allowed: true` decision. The actual `createDocument` throws
+   * {@link AccessDeniedError} for the same denial.
+   *
+   * @param options The same options that would be passed to `createDocument`.
+   *   Only `initialValues`, `decryptionKeyId`, and the signing key are used.
+   */
+  canCreate(options?: CreateOptions): Promise<AccessDecision>;
+
+  /**
+   * Predict whether applying `candidateAfter` as `doc`'s next state via
+   * `changeDoc` would be allowed by the active write policy, without writing.
+   *
+   * @param doc The document that would be changed.
+   * @param candidateAfter The intended full "after" document state.
+   * @param signingKeyPair Optional custom signing key (matches `changeDoc`).
+   */
+  canChange(
+    doc: MindooDoc,
+    candidateAfter: Record<string, unknown>,
+    signingKeyPair?: SigningKeyPair
+  ): Promise<AccessDecision>;
+
+  /**
+   * Predict whether deleting `doc` via `deleteDocument` would be allowed by the
+   * active write policy, without writing.
+   *
+   * @param doc The document that would be deleted.
+   * @param signingKeyPair Optional custom signing key (matches `deleteDocument`).
+   */
+  canDelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair
+  ): Promise<AccessDecision>;
+
+  /**
+   * Predict whether undeleting `doc` via `undeleteDocument` would be allowed by
+   * the active write policy, without writing.
+   *
+   * @param doc The document that would be undeleted.
+   * @param signingKeyPair Optional custom signing key (matches `undeleteDocument`).
+   */
+  canUndelete(
+    doc: MindooDoc,
+    signingKeyPair?: SigningKeyPair
+  ): Promise<AccessDecision>;
 
   /**
    * Apply granular text edits at a document path.
@@ -3176,6 +4610,166 @@ export interface MindooDB {
    * change index. Returns `null` when the database has no indexed changes yet.
    */
   getLatestChangeCursor?(): ProcessChangesCursor | null;
+
+  /**
+   * Count the number of changefeed entries after the given cursor without
+   * iterating them (O(log n) binary search on the internal change index).
+   *
+   * Useful for progress reporting before/while consuming
+   * {@link iterateChangesSince} — e.g. "processed X of Y documents".
+   *
+   * @param cursor The cursor to count from. Use `null` to count all entries.
+   */
+  countChangesSince?(cursor: ProcessChangesCursor | null): number;
+
+  /**
+   * Get (lazily creating) the document summary buffer for this database —
+   * the changefeed-maintained field-value index backing ad-hoc queries and
+   * summary-based views (see docs/adhoc-queries.md).
+   *
+   * @param config Optional summary configuration. On a later call with a
+   *   different configuration, a resumable backfill re-extracts all
+   *   documents (documents themselves are never rewritten).
+   */
+  getSummaryStore?(config?: SummaryConfig): DocumentSummaryStore;
+
+  /**
+   * Read the summary configuration from the synced setup document
+   * (`dbsetup`, field `summarySetup`). Returns `null` when no setup
+   * document or no configuration exists. See docs/adhoc-queries.md.
+   */
+  getSummarySetup?(): Promise<SummaryConfig | null>;
+
+  /**
+   * Write the summary configuration into the synced setup document
+   * (created idempotently when missing). `null` removes the configuration
+   * (fallback to the default auto-include config). Summary stores without
+   * an explicit code-provided configuration follow this document via the
+   * changefeed and re-extract through a resumable backfill.
+   */
+  setSummarySetup?(config: SummaryConfig | null): Promise<void>;
+
+  /**
+   * Enable/disable summary auto-follow (default: enabled). When enabled,
+   * the summary buffer catches up in the background after every coalesced
+   * change event (one run per sync batch / event-loop turn), so queries
+   * don't stall after receiving many documents.
+   */
+  setSummaryAutoUpdateEnabled?(enabled: boolean): void;
+
+  /**
+   * Get (lazily creating) the full-text index for this database — a
+   * changefeed-maintained, encrypted-at-rest search index over extracted
+   * document text (see docs/fulltext-search.md). Indexing is OPT-IN:
+   * without `enabled: true` (setup document or explicit `config`) the
+   * index stays empty.
+   *
+   * @param config Optional full-text configuration. On a later call with
+   *   a different configuration, the engine is recreated and a resumable
+   *   backfill re-indexes all documents.
+   */
+  getFullTextIndex?(config?: FulltextConfig): DocumentFullTextIndex;
+
+  /**
+   * Read the full-text configuration from the synced setup document
+   * (`dbsetup`, field `fulltextSetup`). Returns `null` when no setup
+   * document or no configuration exists. See docs/fulltext-search.md.
+   */
+  getFulltextSetup?(): Promise<FulltextConfig | null>;
+
+  /**
+   * Write the full-text configuration into the synced setup document
+   * (created idempotently when missing). `null` removes the configuration
+   * (indexing falls back to disabled). Indexes without an explicit
+   * code-provided configuration follow this document via the changefeed
+   * and re-index through a resumable backfill.
+   */
+  setFulltextSetup?(config: FulltextConfig | null): Promise<void>;
+
+  /**
+   * Register an attachment text extractor for full-text indexing.
+   * Host environments call this when opening the database; extraction
+   * only happens for databases whose `fulltextSetup` has
+   * `attachments: true`.
+   *
+   * @returns An unregister function.
+   */
+  registerAttachmentTextExtractor?(extractor: AttachmentTextExtractor): () => void;
+
+  /**
+   * Read the attachment extraction configuration from the synced setup
+   * document (`dbsetup`, field `extractionSetup`). Configures host-side
+   * extraction services (e.g. OCR) that persist results at the attachment
+   * entry via {@link MindooDoc.setAttachmentExtractedText}. Returns `null`
+   * when no setup document or no configuration exists.
+   */
+  getExtractionSetup?(): Promise<ExtractionConfig | null>;
+
+  /**
+   * Write the attachment extraction configuration into the synced setup
+   * document (created idempotently when missing). `null` removes the
+   * configuration (extraction services stay idle). Idempotent: writing an
+   * unchanged configuration produces no new document revision.
+   */
+  setExtractionSetup?(config: ExtractionConfig | null): Promise<void>;
+
+  /**
+   * Full-text search over the document full-text index (see
+   * docs/fulltext-search.md). Brings the index up to date first, then
+   * returns matching documents best-score-first. Results are
+   * device-specific under E2EE: documents whose decryption keys are
+   * missing locally are not indexed and cannot match.
+   *
+   * @throws Error when full-text indexing is not enabled for this database.
+   */
+  searchText?(query: string, options?: FulltextSearchOptions): Promise<FulltextSearchResult>;
+
+  /**
+   * Enable/disable full-text auto-follow (default: enabled). Mirrors
+   * {@link setSummaryAutoUpdateEnabled} for the full-text index; only
+   * databases with an ACTIVE full-text index pay any cost.
+   */
+  setFulltextAutoUpdateEnabled?(enabled: boolean): void;
+
+  /**
+   * Run an ad-hoc query against the document summary buffer (see
+   * docs/adhoc-queries.md). The filter is a MindooDB expression-language
+   * expression; documents are never materialized unless
+   * `options.allowFullScan` is set.
+   */
+  query?(query: MindooQuery, options?: MindooQueryOptions): Promise<MindooQueryResult>;
+
+  /**
+   * Build an ephemeral, summary-backed VirtualView (categories, sorting,
+   * totals as usual — fed from the summary buffer, no document
+   * materialization). Not cached; call `dispose()` when done.
+   */
+  queryView?(
+    definition: MindooQueryViewDefinition,
+    options?: VirtualViewUpdateOptions
+  ): Promise<EphemeralSummaryView>;
+
+  /**
+   * Register a listener notified after documents change (local writes,
+   * sync ingest, access flips, witness updates). Events are coalesced —
+   * one event per sync batch / local commit — and carry only lightweight
+   * metadata; consumers needing full replay semantics should read
+   * {@link iterateChangesSince} from their own cursor instead.
+   *
+   * @returns An unsubscribe function.
+   */
+  addChangeListener?(listener: DbChangeListener): () => void;
+
+  /**
+   * Live query: delivers the initial result asynchronously, re-evaluates
+   * after coalesced change events, and calls `onResult` only when the
+   * result actually changed.
+   */
+  queryLive?(
+    query: MindooQuery,
+    onResult: (result: MindooQueryResult) => void,
+    options?: MindooQueryOptions & { onError?: (error: unknown) => void }
+  ): MindooQuerySubscription;
 
   /**
    * Sync changes from the append-only store by finding new changes and processing them.

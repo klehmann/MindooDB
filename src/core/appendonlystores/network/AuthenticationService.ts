@@ -31,6 +31,14 @@ export class AuthenticationService {
   
   // In-memory challenge storage (in production, use a distributed cache)
   private challenges: Map<string, AuthChallenge> = new Map();
+
+  /**
+   * Hard cap on outstanding challenges (DoS guard). Challenges are unauthenticated
+   * to create, so an attacker could otherwise flood this map and exhaust memory.
+   * When the cap is reached we evict the oldest entries (insertion order) so a
+   * flood cannot grow the map without bound; legitimate clients simply re-request.
+   */
+  private static readonly MAX_CHALLENGES = 10_000;
   
   // JWT signing secret (in production, should be securely managed)
   private jwtSecret: Uint8Array;
@@ -75,16 +83,50 @@ export class AuthenticationService {
    * and we return USER_REVOKED with a message that mentions both possibilities so
    * admins can diagnose the issue.
    *
-   * @param username The username requesting authentication
+   * The username is optional: a client may instead identify itself by its
+   * device signing public key (`options.signingPublicKey`), in which case the
+   * server resolves the grant by key and never needs the cleartext name.
+   *
+   * @param username The username requesting authentication (optional)
+   * @param options.signingPublicKey The device signing public key (Ed25519, PEM)
+   *        the client is identifying with, when no username is supplied
    * @returns The challenge string (UUID v7)
    * @throws NetworkError if user not found or has no active access grant
    */
-  async generateChallenge(username: string): Promise<string> {
+  async generateChallenge(
+    username?: string,
+    options?: { signingPublicKey?: string },
+  ): Promise<string> {
+    const signingPublicKey = options?.signingPublicKey;
+    if (username) {
+      return this.generateChallengeForUsername(username, signingPublicKey);
+    }
+    if (signingPublicKey) {
+      return this.generateChallengeForKey(signingPublicKey);
+    }
+    throw new NetworkError(
+      NetworkErrorType.USER_NOT_FOUND,
+      `A username or signing public key is required to request a challenge.`,
+    );
+  }
+
+  /** Username-based challenge (legacy path; the client still sends a username). */
+  private async generateChallengeForUsername(
+    username: string,
+    signingPublicKey?: string,
+  ): Promise<string> {
     this.logger.debug(`Generating challenge for user: ${username}`);
-    
+
     // Check if user exists and is not revoked
     const userKeys = await this.directory.getUserPublicKeys(username);
     if (!userKeys) {
+      // A revoked device may still need to authenticate far enough to learn it
+      // must wipe (docs/accesscontrol.md §6.5). Allow the challenge if any of the
+      // user's keys is the target of a remote-wipe directive.
+      const universe = await this.getSigningKeyUniverse(username);
+      if (universe.wipeRequested.length > 0) {
+        return this.storeChallenge({ username, signingPublicKey });
+      }
       // Check if user was revoked or never existed
       const isRevoked = await this.directory.isUserRevoked(username);
       if (isRevoked) {
@@ -102,26 +144,55 @@ export class AuthenticationService {
           + `not have been synced to this server yet. Ask the tenant administrator to sync the directory.`,
       );
     }
-    
-    // Generate UUID v7 challenge
+
+    const challenge = this.storeChallenge({ username, signingPublicKey });
+    this.logger.debug(`Generated challenge for user ${username}: ${challenge}`);
+    return challenge;
+  }
+
+  /**
+   * Key-based challenge: the client identifies by its device signing public key
+   * and the server resolves the grant without a cleartext username. The grant's
+   * username (resolved from the directory) is recorded on the challenge so
+   * downstream identity/wipe resolution keeps working.
+   */
+  private async generateChallengeForKey(signingPublicKey: string): Promise<string> {
+    this.logger.debug(`Generating challenge for signing key`);
+
+    if (typeof this.directory.getUserBySigningPublicKey === "function") {
+      const lookup = await this.directory.getUserBySigningPublicKey(signingPublicKey);
+      if (lookup) {
+        // An entry in the lookup means the key is on an active grant.
+        return this.storeChallenge({ username: lookup.username, signingPublicKey });
+      }
+    }
+
+    // No active grant for this key. It may still be the target of a remote-wipe
+    // directive on a revoked grant; if the directory can resolve that, allow the
+    // challenge so the device can learn it must wipe (§6.5).
+    throw new NetworkError(
+      NetworkErrorType.USER_NOT_FOUND,
+      `No active access grant is known for the provided signing key on this server. `
+        + `The access may have been revoked, or the tenant's directory database may not have `
+        + `been synced to this server yet. Ask the tenant administrator to sync the directory.`,
+    );
+  }
+
+  /** Persist a fresh challenge and return its string. */
+  private storeChallenge(fields: { username?: string; signingPublicKey?: string }): string {
     const challenge = uuidv7();
     const now = Date.now();
-    
-    // Store challenge
     const authChallenge: AuthChallenge = {
       challenge,
-      username,
       createdAt: now,
       expiresAt: now + this.challengeExpirationMs,
       used: false,
     };
-    
+    if (fields.username) authChallenge.username = fields.username;
+    if (fields.signingPublicKey) authChallenge.signingPublicKey = fields.signingPublicKey;
     this.challenges.set(challenge, authChallenge);
-    
-    // Clean up expired challenges periodically
     this.cleanupExpiredChallenges();
-    
-    this.logger.debug(`Generated challenge for user ${username}: ${challenge}`);
+    this.evictChallengesOverCap();
     return challenge;
   }
 
@@ -168,43 +239,102 @@ export class AuthenticationService {
     authChallenge.used = true;
     
     const username = authChallenge.username;
-    
-    // Get user's public signing key
-    const userKeys = await this.directory.getUserPublicKeys(username);
-    if (!userKeys) {
-      this.logger.debug(`User not found or has no active access grant on this server: ${username}`);
+    // Resolve the principal: a username (legacy) or the device signing key the
+    // client identified with. When only the key is known, resolve its grant's
+    // username so wipe/identity lookups (which key by username) keep working.
+    let resolvedUsername = username;
+    if (
+      !resolvedUsername &&
+      authChallenge.signingPublicKey &&
+      typeof this.directory.getUserBySigningPublicKey === "function"
+    ) {
+      const lookup = await this.directory.getUserBySigningPublicKey(
+        authChallenge.signingPublicKey,
+      );
+      resolvedUsername = lookup?.username;
+    }
+    const principalLabel = username ?? authChallenge.signingPublicKey ?? "unknown";
+
+    // Build the set of candidate signing keys this device could be using: the
+    // user's active (granted) keys plus any keys targeted for remote wipe
+    // (§6.5). The wipe set lets a revoked-by-key-removal device authenticate
+    // just far enough to receive the directive.
+    const universe = resolvedUsername
+      ? await this.getSigningKeyUniverse(resolvedUsername)
+      : { active: [] as string[], wipeRequested: [] as string[] };
+    const candidateKeys = new Set<string>([...universe.active, ...universe.wipeRequested]);
+    // Legacy fallback: directories without the wipe API expose only the primary
+    // key via getUserPublicKeys.
+    if (candidateKeys.size === 0 && resolvedUsername) {
+      const userKeys = await this.directory.getUserPublicKeys(resolvedUsername);
+      if (userKeys) candidateKeys.add(userKeys.signingPublicKey);
+    }
+    // Key-based challenge with no resolvable grant: the only candidate is the
+    // key the client identified with.
+    if (candidateKeys.size === 0 && authChallenge.signingPublicKey) {
+      candidateKeys.add(authChallenge.signingPublicKey);
+    }
+    if (candidateKeys.size === 0) {
+      this.logger.debug(`User not found or has no active access grant on this server: ${principalLabel}`);
       return {
         success: false,
         error:
-          `User "${username}" is not found, or has no active access grant on this server. `
+          `User "${principalLabel}" is not found, or has no active access grant on this server. `
             + `The tenant's directory database may not have been synced to this server yet, `
             + `or the access was revoked.`,
       };
     }
-    
-    // Verify signature
-    const isValid = await this.verifySignature(
-      challenge,
-      signature,
-      userKeys.signingPublicKey
-    );
-    
-    if (!isValid) {
-      this.logger.debug(`Invalid signature for user: ${username}`);
+
+    // Find which candidate key produced the signature; that is the device's key.
+    let matchedKey: string | null = null;
+    for (const key of candidateKeys) {
+      if (await this.verifySignature(challenge, signature, key)) {
+        matchedKey = key;
+        break;
+      }
+    }
+
+    if (!matchedKey) {
+      this.logger.debug(`Invalid signature for user: ${principalLabel}`);
       return {
         success: false,
         error: "Invalid signature",
       };
     }
+
+    const wipe = universe.wipeRequested.includes(matchedKey);
+    // The subject is the cleartext username when one was supplied, otherwise the
+    // authenticated device key (an opaque principal id; the read gate resolves
+    // identity from deviceSigningKey).
+    const sub = username ?? matchedKey;
+    // Generate JWT token, recording the authenticated device key and whether it
+    // is wipe-targeted so sync handlers can serve only the grant directive.
+    const token = await this.generateToken(sub, { deviceSigningKey: matchedKey, wipe });
     
-    // Generate JWT token
-    const token = await this.generateToken(username);
-    
-    this.logger.info(`Authentication successful for user: ${username}`);
+    this.logger.info(
+      `Authentication successful for user: ${principalLabel}${wipe ? " (remote-wipe directive pending)" : ""}`,
+    );
     return {
       success: true,
       token,
     };
+  }
+
+  /**
+   * Resolve the user's signing-key universe (active + wipe-targeted) via the
+   * optional directory API, returning empty sets when unsupported.
+   */
+  private async getSigningKeyUniverse(
+    username: string,
+  ): Promise<{ active: string[]; wipeRequested: string[] }> {
+    if (typeof this.directory.getUserSigningKeyUniverse === "function") {
+      try {
+        return await this.directory.getUserSigningKeyUniverse(username);
+      } catch (error) {
+        this.logger.debug(`getUserSigningKeyUniverse failed for ${username}: ${error}`);
+      }
+    }
+    return { active: [], wipeRequested: [] };
   }
 
   /**
@@ -231,11 +361,40 @@ export class AuthenticationService {
         return null;
       }
       
-      // Check if user is still valid (not revoked)
-      const isRevoked = await this.directory.isUserRevoked(payload.sub);
-      if (isRevoked) {
-        this.logger.debug(`User revoked: ${payload.sub}`);
-        return null;
+      // Check if user is still valid (not revoked). A wipe-scoped token is the
+      // deliberate exception (§6.5): a revoked device must still be able to fetch
+      // the admin-signed grant doc carrying its wipe directive, so we honor the
+      // token but downstream sync handlers restrict it to that single document.
+      if (!payload.wipe) {
+        const deviceKey = payload.deviceSigningKey;
+        if (deviceKey && typeof this.directory.getUserSigningKeyUniverse === "function") {
+          // Key-based revocation: the device key is valid only while it is in the
+          // user's ACTIVE signing-key set. This is more precise than the
+          // username-level check (it cuts off a single revoked device) and works
+          // when `sub` is a key rather than a cleartext username. We resolve the
+          // username from the device key when possible (the reverse lookup cache
+          // intentionally survives revocation for historical display, so it
+          // alone cannot prove the key is still active — hence the universe
+          // check).
+          let username = payload.sub;
+          if (typeof this.directory.getUserBySigningPublicKey === "function") {
+            const lookup = await this.directory.getUserBySigningPublicKey(deviceKey);
+            if (lookup?.username) username = lookup.username;
+          }
+          const universe = await this.directory.getUserSigningKeyUniverse(username);
+          const keyInactive = !universe.active.includes(deviceKey);
+          const userRevoked = await this.directory.isUserRevoked(username);
+          if (keyInactive || userRevoked) {
+            this.logger.debug(`Device key no longer active (revoked): ${payload.sub}`);
+            return null;
+          }
+        } else {
+          const isRevoked = await this.directory.isUserRevoked(payload.sub);
+          if (isRevoked) {
+            this.logger.debug(`User revoked: ${payload.sub}`);
+            return null;
+          }
+        }
       }
       
       this.logger.debug(`Token valid for user: ${payload.sub}`);
@@ -293,16 +452,21 @@ export class AuthenticationService {
    * Generate a JWT token.
    * Uses HMAC-SHA256 for signing.
    */
-  private async generateToken(username: string): Promise<string> {
+  private async generateToken(
+    sub: string,
+    options?: { deviceSigningKey?: string; wipe?: boolean },
+  ): Promise<string> {
     const subtle = this.cryptoAdapter.getSubtle();
     
     const now = Math.floor(Date.now() / 1000);
     const payload: NetworkAuthTokenPayload = {
-      sub: username,
+      sub,
       iat: now,
       exp: now + Math.floor(this.tokenExpirationMs / 1000),
       tenantId: this.tenantId,
     };
+    if (options?.deviceSigningKey) payload.deviceSigningKey = options.deviceSigningKey;
+    if (options?.wipe) payload.wipe = true;
     
     // Create JWT header and payload
     const header = { alg: "HS256", typ: "JWT" };
@@ -339,6 +503,16 @@ export class AuthenticationService {
     const [headerB64, payloadB64, signatureB64] = parts;
     
     try {
+      // Pin the JWT algorithm to HS256 (audit, Low: alg pinning). The verifier
+      // always uses HMAC-SHA256, but explicitly rejecting any other declared
+      // `alg` (e.g. "none" or an asymmetric alg) blocks algorithm-confusion
+      // attacks rather than relying on the HMAC check to fail.
+      const header = JSON.parse(this.base64UrlDecode(headerB64)) as { alg?: string; typ?: string };
+      if (header.alg !== "HS256") {
+        this.logger.warn(`Rejecting token with unexpected alg: ${header.alg}`);
+        return null;
+      }
+
       // Verify signature
       const signingKey = await subtle.importKey(
         "raw",
@@ -382,6 +556,19 @@ export class AuthenticationService {
       if (authChallenge.expiresAt < now) {
         this.challenges.delete(challenge);
       }
+    }
+  }
+
+  /**
+   * Bound the challenge map (DoS guard): if still over the cap after expiry
+   * cleanup, drop the oldest entries (Map preserves insertion order).
+   */
+  private evictChallengesOverCap(): void {
+    let overflow = this.challenges.size - AuthenticationService.MAX_CHALLENGES;
+    if (overflow <= 0) return;
+    for (const challenge of this.challenges.keys()) {
+      if (overflow-- <= 0) break;
+      this.challenges.delete(challenge);
     }
   }
 

@@ -1,7 +1,14 @@
 /**
  * Unit tests for the MindooDB URI scheme (mdb://).
  */
-import { encodeMindooURI, decodeMindooURI, isMindooURI } from "../core/uri/MindooURI";
+import {
+  encodeMindooURI,
+  decodeMindooURI,
+  isMindooURI,
+  encodeKeyDistributionRequest,
+  decodeKeyDistributionRequest,
+} from "../core/uri/MindooURI";
+import type { KeyDistributionRequest } from "../core/accesscontrol/types";
 
 describe("MindooURI", () => {
   describe("encodeMindooURI", () => {
@@ -201,6 +208,65 @@ describe("MindooURI", () => {
     it("should return false for malformed payload", () => {
       expect(isMindooURI("mdb://join-request/not-base64!!!")).toBe(false);
       expect(isMindooURI("mdb://join-request/")).toBe(false);
+    });
+  });
+
+  describe("key-distribution requests", () => {
+    const request: KeyDistributionRequest = {
+      v: 1,
+      tenantId: "acme",
+      keyId: "team-key",
+      keyVersions: [
+        { createdAt: 1000, fingerprint: "aa".repeat(32) },
+        { createdAt: 2000, fingerprint: "bb".repeat(32) },
+      ],
+      title: "Team key",
+      comment: "Quarterly rotation",
+      preparedByPublicKey: "-----BEGIN PUBLIC KEY-----\nMCo...\n-----END PUBLIC KEY-----",
+      pushto: [
+        {
+          username: "CN=alice/O=acme",
+          username_hash: "hash-alice",
+          devices: {
+            "aa:bb:cc:dd:ee:ff:00:11": {
+              ["aa".repeat(32)]: "wrapped-v1-d1",
+              ["bb".repeat(32)]: "wrapped-v2-d1",
+            },
+            "11:22:33:44:55:66:77:88": {
+              ["aa".repeat(32)]: "wrapped-v1-d2",
+              ["bb".repeat(32)]: "wrapped-v2-d2",
+            },
+          },
+        },
+      ],
+      pullfrom: [{ username: "CN=mallory/O=acme", username_hash: "hash-mallory" }],
+    };
+
+    it("round-trips a full request through the URI", () => {
+      const uri = encodeKeyDistributionRequest(request);
+      expect(uri).toMatch(/^mdb:\/\/key-distribution\//);
+      expect(isMindooURI(uri)).toBe(true);
+
+      const decoded = decodeKeyDistributionRequest(uri);
+      expect(decoded).toEqual(request);
+    });
+
+    it("decodes via the generic decoder with the right type", () => {
+      const uri = encodeKeyDistributionRequest(request);
+      const decoded = decodeMindooURI<KeyDistributionRequest>(uri);
+      expect(decoded.type).toBe("key-distribution");
+      expect(decoded.version).toBe(1);
+      expect(decoded.payload.keyId).toBe("team-key");
+    });
+
+    it("rejects a non key-distribution URI", () => {
+      const joinUri = encodeMindooURI("join-request", { v: 1, username: "x" });
+      expect(() => decodeKeyDistributionRequest(joinUri)).toThrow();
+    });
+
+    it("rejects a structurally invalid request payload", () => {
+      const bad = encodeMindooURI("key-distribution", { v: 1, keyId: "" });
+      expect(() => decodeKeyDistributionRequest(bad)).toThrow();
     });
   });
 });

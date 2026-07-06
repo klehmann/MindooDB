@@ -541,7 +541,7 @@ describe("protocol compatibility", () => {
     }
 
     async registerUser(_u: PublicUserId, _k: EncryptedPrivateKey, _p: string): Promise<void> {}
-    async revokeUser(_u: string, _r: boolean, _k: EncryptedPrivateKey, _p: string): Promise<void> {}
+    async revokeUser(_u: string, _o: { signingKeys?: string[]; encryptionKeys?: string[]; requestDataWipe?: boolean }, _k: EncryptedPrivateKey, _p: string): Promise<void> {}
     async validatePublicSigningKey(publicKey: string): Promise<boolean> {
       for (const user of this.users.values()) {
         if (user.signingKey === publicKey && !user.revoked) return true;
@@ -569,7 +569,6 @@ describe("protocol compatibility", () => {
     async isUserRevoked(username: string): Promise<boolean> {
       return this.users.get(username)?.revoked ?? true;
     }
-    async requestDocHistoryPurge(..._a: any[]): Promise<void> {}
     async getRequestedDocHistoryPurges(): Promise<any[]> { return []; }
     async getTenantSettings(): Promise<MindooDoc | null> { return null; }
     async changeTenantSettings(..._a: any[]): Promise<void> {}
@@ -612,7 +611,9 @@ describe("protocol compatibility", () => {
     async getEntryMetadata(_t: string, _id: string): Promise<StoreEntryMetadata | null> {
       return null;
     }
-    async putEntries(_t: string, _entries: StoreEntry[]): Promise<void> {}
+    async putEntries(_t: string, _entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
+      return [];
+    }
     async hasEntries(_t: string, _ids: string[]): Promise<string[]> {
       return [];
     }

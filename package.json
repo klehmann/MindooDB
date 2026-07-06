@@ -1,11 +1,11 @@
 {
   "name": "mindoodb",
-  "version": "0.0.24",
+  "version": "0.0.32",
   "packageManager": "pnpm@11.1.1",
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "End-to-End Encrypted, Offline-first Sync Database",
+  "description": "End-to-End Encrypted, Local-first Sync Database",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.mjs",
   "react-native": "./dist/reactnative/index.js",
@@ -17,7 +17,7 @@
   "keywords": [
     "database",
     "e2e-encryption",
-    "offline-first",
+    "local-first",
     "sync",
     "crdt",
     "automerge",
@@ -76,6 +76,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "@automerge/automerge": "^3.2.1",
+    "minisearch": "^7.2.0",
     "uuid": "^10.0.0"
   },
   "devDependencies": {
