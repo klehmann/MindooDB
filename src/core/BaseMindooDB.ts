@@ -2910,19 +2910,21 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Fetch the target store's bloom filter summary, returning null if
-   * unsupported or on error (callers fall back to exact checks).
+   * Fetch a store's bloom filter summary, returning null if unsupported or on
+   * error. Used on the target for missing-id pre-screening (callers fall back
+   * to exact checks) and on the source for the total-entry-count progress
+   * denominator.
    */
-  private async getTargetBloomSummary(
-    targetStore: ContentAddressedStore,
+  private async getStoreBloomSummary(
+    store: ContentAddressedStore,
   ): Promise<StoreIdBloomSummary | null> {
-    if (typeof targetStore.getIdBloomSummary !== "function") {
+    if (typeof store.getIdBloomSummary !== "function") {
       return null;
     }
     try {
-      return await targetStore.getIdBloomSummary();
+      return await store.getIdBloomSummary();
     } catch (error) {
-      this.logger.warn("Failed to get bloom summary from target store, falling back to exact checks", error);
+      this.logger.warn("Failed to get bloom summary from store, falling back to exact checks", error);
       return null;
     }
   }
@@ -2975,8 +2977,18 @@ export class BaseMindooDB implements MindooDB {
    * payload downloads use a smaller batch to keep progress responsive and
    * cancellation timely.
    *
-   * Priority: explicit option > attachment default (100) > pageSize fallback.
+   * Priority: explicit option > attachment default (100) > docs default (250,
+   * capped by pageSize).
+   *
+   * The docs default is intentionally smaller than the metadata scan pageSize
+   * (1000): a full scan page transferred as one `putEntries` call serializes
+   * to a multi-megabyte JSON body whose upload cannot report progress, risks
+   * the HTTP timeout on slow uplinks (each retry restarts the whole body),
+   * and can exceed the remote JSON body limit. Smaller batches keep progress
+   * events frequent and make each POST cheap to retry.
    */
+  private static readonly DEFAULT_DOCS_TRANSFER_BATCH_SIZE = 250;
+
   private resolveTransferBatchSize(options?: SyncOptions): number {
     if (options?.transferBatchSize && options.transferBatchSize > 0) {
       return options.transferBatchSize;
@@ -2984,7 +2996,10 @@ export class BaseMindooDB implements MindooDB {
     if (options?.storeKind === StoreKind.attachments) {
       return 100;
     }
-    return options?.pageSize ?? 1000;
+    return Math.min(
+      options?.pageSize ?? 1000,
+      BaseMindooDB.DEFAULT_DOCS_TRANSFER_BATCH_SIZE,
+    );
   }
 
   /**
@@ -3120,8 +3135,14 @@ export class BaseMindooDB implements MindooDB {
     const pageSize = options?.pageSize ?? 1000;
     const signal = options?.signal;
 
-    const targetBloom = await this.getTargetBloomSummary(targetStore);
-    const totalSourceEstimate = targetBloom?.totalIds;
+    const targetBloom = await this.getStoreBloomSummary(targetStore);
+    // Fixed progress denominator: the SOURCE's total entry count. The cursor
+    // scan below examines every source entry, so `scannedEntries/totalSourceEntries`
+    // is a real completion ratio. (Local stores serve this from a cached bloom
+    // summary; network stores answer with one extra request.) The target bloom
+    // stays dedicated to missing-id pre-screening.
+    const sourceBloom = await this.getStoreBloomSummary(sourceStore);
+    const totalSourceEstimate = sourceBloom?.totalIds;
 
     if (this.supportsCursorScan(sourceStore)) {
       onProgress?.({
@@ -3349,7 +3370,7 @@ export class BaseMindooDB implements MindooDB {
 
     // ── Phase 4: filter out entries the target already has ───────────
     const allNeededArray = Array.from(neededIds);
-    const targetBloom = await this.getTargetBloomSummary(targetStore);
+    const targetBloom = await this.getStoreBloomSummary(targetStore);
     const missingIds = await this.filterMissingIds(targetStore, allNeededArray, targetBloom);
 
     this.logger.info(

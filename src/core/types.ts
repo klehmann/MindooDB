@@ -3916,7 +3916,11 @@ export interface SyncProgress {
   transferredEntries: number;
   /** Cumulative number of source entries whose metadata has been examined. */
   scannedEntries: number;
-  /** Estimated total entry count on the source, when known (e.g. from a bloom summary). */
+  /**
+   * Total entry count on the SOURCE store, when known (from the source's bloom
+   * summary). Fixed for the whole sync run, so `scannedEntries / totalSourceEntries`
+   * is a stable completion ratio suitable for a determinate progress bar.
+   */
   totalSourceEntries?: number;
   /** 1-based index of the current metadata scan page (set during cursor-based scanning). */
   currentPage?: number;
