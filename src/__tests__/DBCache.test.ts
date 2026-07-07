@@ -542,7 +542,12 @@ describe("BaseMindooDB cache integration", () => {
         reconcileRestoredIndexOnInit: true,
       },
     });
-    expect(await db2.getAllDocumentIds()).toEqual([doc1Id, doc2Id].sort((left, right) => left.localeCompare(right)));
+    // getAllDocumentIds() returns index (changeSeq/creation) order, not a
+    // docId sort — so compare as a set by sorting both sides with the same
+    // comparator. (Sorting only the expected side with localeCompare made this
+    // flaky: base62 ids that differ in case at the first divergent char sort
+    // differently under localeCompare vs the raw index order.)
+    expect((await db2.getAllDocumentIds()).sort()).toEqual([doc1Id, doc2Id].sort());
 
     const restored1 = await db2.getDocument(doc1Id);
     expect(restored1.getData().name).toBe("Charlie");
