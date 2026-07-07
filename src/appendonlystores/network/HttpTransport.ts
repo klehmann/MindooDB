@@ -16,15 +16,30 @@ import type {
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
+  PutEntriesAck,
+  RejectedPutEntry,
+  StoreHead,
 } from "../../core/appendonlystores/types";
 import { StoreKind } from "../../core/appendonlystores/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
+  NetworkSessionEncryptedEntry,
+  SessionEncryptedEntriesBatch,
+  StoreChangeEvent,
   AuthResult,
   NetworkSyncCapabilities,
 } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
+import {
+  BINARY_ENTRIES_CONTENT_TYPE,
+  BINARY_GET_ENTRIES_FORMAT,
+  BINARY_PUT_ENTRIES_FORMAT,
+  decodeBinaryEntryMessage,
+  encodeBinaryEntryMessage,
+  measureBinaryEntryMessage,
+  type BinaryEntryFrame,
+} from "../../core/appendonlystores/network/binaryEntryFraming";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import { isSameOrigin } from "../../core/utils/urlSafety";
 
@@ -357,6 +372,30 @@ export class HttpTransport implements NetworkTransport {
   }
 
   /**
+   * Get the remote store head (`{ epoch, maxReceiptOrder }`) for
+   * persisted-cursor sync (sync-v5, phase 1).
+   */
+  async getStoreHead(token: string): Promise<StoreHead> {
+    const response = await this.fetchWithRetry(
+      `${this.getSyncBasePath()}/getStoreHead`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+        }),
+      }
+    );
+
+    const data = await response.json();
+    return data.head as StoreHead;
+  }
+
+  /**
    * Get probabilistic ID summary from remote store.
    */
   async getIdBloomSummary(token: string): Promise<StoreIdBloomSummary> {
@@ -513,6 +552,118 @@ export class HttpTransport implements NetworkTransport {
     return entries;
   }
 
+  /**
+   * Get entries in the session-key transport format (sync-v5, phase 2):
+   * one RSA-wrapped AES-256-GCM session key per response, per-entry AES-GCM
+   * payloads. Gated by the `supportsSessionKeyWrap` capability; the server
+   * switches formats on the `sessionKeyWrap` request flag.
+   */
+  async getEntriesSessionWrapped(
+    token: string,
+    ids: string[]
+  ): Promise<SessionEncryptedEntriesBatch> {
+    this.logger.debug(`Getting ${ids.length} entries (session-key format)`);
+
+    const response = await this.fetchWithRetry(
+      `${this.getSyncBasePath()}/getEntries`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          ids,
+          sessionKeyWrap: true,
+        }),
+      }
+    );
+
+    const data = await response.json();
+    if (typeof data.wrappedSessionKey !== "string") {
+      throw new NetworkError(
+        NetworkErrorType.SERVER_ERROR,
+        "Server did not return a session-key-wrapped getEntries response",
+      );
+    }
+
+    const entries: NetworkSessionEncryptedEntry[] = (data.entries || []).map(
+      (e: SerializedSessionEncryptedEntry) => ({
+        ...this.deserializeEntryMetadata(e),
+        iv: this.base64ToUint8Array(e.iv),
+        sessionEncryptedPayload: this.base64ToUint8Array(e.sessionEncryptedPayload),
+      })
+    );
+
+    this.logger.debug(`Retrieved ${entries.length} session-encrypted entries`);
+    return {
+      wrappedSessionKey: this.base64ToUint8Array(data.wrappedSessionKey),
+      entries,
+    };
+  }
+
+  /**
+   * Get entries via the binary wire format v2 (sync-v5, phase 3): same
+   * session-key encryption as getEntriesSessionWrapped, but the response is
+   * length-prefixed octet-stream framing — no base64, no large-JSON parse.
+   * Gated by the `supportsBinaryEntries` capability.
+   */
+  async getEntriesBinary(
+    token: string,
+    ids: string[]
+  ): Promise<SessionEncryptedEntriesBatch> {
+    this.logger.debug(`Getting ${ids.length} entries (binary v2 format)`);
+
+    const response = await this.fetchWithRetry(
+      `${this.getSyncBasePath()}/getEntriesBinary`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": BINARY_ENTRIES_CONTENT_TYPE,
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          tenantId: this.config.tenantId,
+          dbId: this.config.dbId,
+          ids,
+        }),
+      }
+    );
+
+    const body = new Uint8Array(await response.arrayBuffer());
+    const message = decodeBinaryEntryMessage(body);
+    if (message.header.format !== BINARY_GET_ENTRIES_FORMAT) {
+      throw new NetworkError(
+        NetworkErrorType.SERVER_ERROR,
+        `Server returned an unsupported binary entry format: ${String(message.header.format)}`,
+      );
+    }
+    if (typeof message.header.wrappedSessionKey !== "string") {
+      throw new NetworkError(
+        NetworkErrorType.SERVER_ERROR,
+        "Binary getEntries response is missing the wrapped session key",
+      );
+    }
+
+    const entries: NetworkSessionEncryptedEntry[] = message.entries.map((frame) => {
+      const meta = frame.meta as unknown as SerializedEntryMetadata & { iv: string };
+      return {
+        ...this.deserializeEntryMetadata(meta),
+        iv: this.base64ToUint8Array(meta.iv),
+        sessionEncryptedPayload: frame.payload,
+      };
+    });
+
+    this.logger.debug(`Retrieved ${entries.length} session-encrypted entries (binary)`);
+    return {
+      wrappedSessionKey: this.base64ToUint8Array(message.header.wrappedSessionKey),
+      entries,
+    };
+  }
+
   async getEntryMetadata(
     token: string,
     id: string
@@ -542,10 +693,10 @@ export class HttpTransport implements NetworkTransport {
   /**
    * Push entries to the remote store.
    */
-  async putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
+  async putEntries(token: string, entries: StoreEntry[]): Promise<PutEntriesAck> {
     this.logger.debug(`Pushing ${entries.length} entries`);
     if (entries.length === 0) {
-      return [];
+      return { receipts: [], rejected: [] };
     }
 
     const serializedEntries = entries.map((entry) => this.serializeEntry(entry));
@@ -553,10 +704,37 @@ export class HttpTransport implements NetworkTransport {
     if (maxBodyBytes) {
       this.logger.debug(`Remote JSON body limit advertised as ${maxBodyBytes} bytes`);
     }
-    const receipts = await this.pushSerializedEntries(token, serializedEntries, maxBodyBytes);
+    const ack = await this.pushSerializedEntries(token, serializedEntries, maxBodyBytes);
 
-    this.logger.debug(`Successfully pushed ${entries.length} entries (${receipts.length} receipts)`);
-    return receipts;
+    this.logger.debug(
+      `Successfully pushed ${entries.length} entries (${ack.receipts.length} receipts, ${ack.rejected.length} rejected)`,
+    );
+    return ack;
+  }
+
+  /**
+   * Push entries via the binary wire format v2 (sync-v5, phase 3): identical
+   * semantics to putEntries (same witness receipts and per-entry rejections),
+   * but the request body is length-prefixed octet-stream framing instead of
+   * JSON+base64. Gated by the `supportsBinaryEntries` capability.
+   */
+  async putEntriesBinary(token: string, entries: StoreEntry[]): Promise<PutEntriesAck> {
+    this.logger.debug(`Pushing ${entries.length} entries (binary v2 format)`);
+    if (entries.length === 0) {
+      return { receipts: [], rejected: [] };
+    }
+
+    const frames: BinaryEntryFrame[] = entries.map((entry) => ({
+      meta: this.serializeEntryMetadata(entry) as unknown as Record<string, unknown>,
+      payload: entry.encryptedData,
+    }));
+    const maxBodyBytes = await this.getRemoteJsonBodyLimitBytes();
+    const ack = await this.pushBinaryFrames(token, frames, maxBodyBytes);
+
+    this.logger.debug(
+      `Successfully pushed ${entries.length} entries (${ack.receipts.length} receipts, ${ack.rejected.length} rejected, binary)`,
+    );
+    return ack;
   }
 
   /**
@@ -647,6 +825,112 @@ export class HttpTransport implements NetworkTransport {
     
     this.logger.debug(`Resolved ${ids.length} dependencies`);
     return ids;
+  }
+
+  /**
+   * Open the server's SSE live change feed (sync-v5, phase 5) via a
+   * fetch-streaming reader — native `EventSource` cannot send the
+   * `Authorization` header, so we parse the `text/event-stream` body
+   * ourselves. The promise stays pending while the stream is open and
+   * settles when it ends (resolves on orderly close or abort).
+   */
+  async subscribeToChanges(
+    token: string,
+    onEvent: (event: StoreChangeEvent) => void,
+    options?: { signal?: AbortSignal },
+  ): Promise<void> {
+    const dbId = this.config.dbId ?? "directory";
+    const url = `${this.getSyncBasePath()}/events?dbId=${encodeURIComponent(dbId)}`;
+    this.logger.debug(`Subscribing to change events at ${url}`);
+
+    const response = await this.safeFetch(url, {
+      method: "GET",
+      headers: {
+        "Accept": "text/event-stream",
+        "Authorization": `Bearer ${token}`,
+      },
+      signal: options?.signal,
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        throw new NetworkError(NetworkErrorType.INVALID_TOKEN, errorData.error || "Unauthorized");
+      }
+      if (response.status === 403) {
+        throw new NetworkError(NetworkErrorType.USER_REVOKED, errorData.error || "Access denied");
+      }
+      throw new NetworkError(
+        NetworkErrorType.SERVER_ERROR,
+        errorData.error || `Change feed returned HTTP ${response.status}`,
+      );
+    }
+    if (!response.body) {
+      // Environments without fetch response streaming (e.g. React Native)
+      // cannot consume SSE; callers should treat this as "not supported".
+      throw new NetworkError(
+        NetworkErrorType.SERVER_ERROR,
+        "Change feed requires fetch response streaming, which this environment does not support",
+      );
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          return;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE messages are separated by a blank line.
+        let separatorIndex: number;
+        while ((separatorIndex = buffer.indexOf("\n\n")) >= 0) {
+          const rawMessage = buffer.slice(0, separatorIndex);
+          buffer = buffer.slice(separatorIndex + 2);
+          this.dispatchSseMessage(rawMessage, onEvent);
+        }
+      }
+    } catch (error) {
+      if (options?.signal?.aborted) {
+        return;
+      }
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  /** Parse one raw SSE message block and forward `change` events. */
+  private dispatchSseMessage(
+    rawMessage: string,
+    onEvent: (event: StoreChangeEvent) => void,
+  ): void {
+    let eventName = "message";
+    const dataLines: string[] = [];
+    for (const line of rawMessage.split("\n")) {
+      if (line.startsWith(":")) {
+        continue; // heartbeat / comment
+      }
+      if (line.startsWith("event:")) {
+        eventName = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    if (eventName !== "change" || dataLines.length === 0) {
+      return;
+    }
+    try {
+      const payload = JSON.parse(dataLines.join("\n")) as StoreChangeEvent;
+      if (payload && typeof payload.dbId === "string") {
+        onEvent(payload);
+      }
+    } catch (error) {
+      this.logger.warn("Ignoring malformed change event payload", error);
+    }
   }
 
   /**
@@ -918,13 +1202,21 @@ export class HttpTransport implements NetworkTransport {
     return Math.round(value * multiplier);
   }
 
+  /** Merge putEntries batch acks (receipts and rejections concatenate). */
+  private static mergePutAcks(acks: PutEntriesAck[]): PutEntriesAck {
+    return {
+      receipts: acks.flatMap((ack) => ack.receipts),
+      rejected: acks.flatMap((ack) => ack.rejected),
+    };
+  }
+
   private async pushSerializedEntries(
     token: string,
     serializedEntries: SerializedEntry[],
     maxBodyBytes: number | null,
-  ): Promise<StoreEntryMetadata[]> {
+  ): Promise<PutEntriesAck> {
     if (serializedEntries.length === 0) {
-      return [];
+      return { receipts: [], rejected: [] };
     }
 
     if (maxBodyBytes !== null) {
@@ -932,11 +1224,11 @@ export class HttpTransport implements NetworkTransport {
       if (batches.length > 1) {
         this.logger.debug(`Split putEntries payload into ${batches.length} batch(es) for body limit ${maxBodyBytes}`);
       }
-      const receipts: StoreEntryMetadata[] = [];
+      const acks: PutEntriesAck[] = [];
       for (const batch of batches) {
-        receipts.push(...await this.sendSerializedEntriesBatch(token, batch, maxBodyBytes));
+        acks.push(await this.sendSerializedEntriesBatch(token, batch, maxBodyBytes));
       }
-      return receipts;
+      return HttpTransport.mergePutAcks(acks);
     }
 
     return this.sendSerializedEntriesBatch(token, serializedEntries, null);
@@ -946,7 +1238,7 @@ export class HttpTransport implements NetworkTransport {
     token: string,
     serializedEntries: SerializedEntry[],
     maxBodyBytes: number | null,
-  ): Promise<StoreEntryMetadata[]> {
+  ): Promise<PutEntriesAck> {
     try {
       return await this.postSerializedEntries(token, serializedEntries);
     } catch (error) {
@@ -961,9 +1253,9 @@ export class HttpTransport implements NetworkTransport {
         this.logger.warn(
           `putEntries batch with ${serializedEntries.length} entries exceeded remote limit; retrying as ${left.length} + ${right.length} batches.`,
         );
-        const leftReceipts = await this.pushSerializedEntries(token, left, maxBodyBytes);
-        const rightReceipts = await this.pushSerializedEntries(token, right, maxBodyBytes);
-        return [...leftReceipts, ...rightReceipts];
+        const leftAck = await this.pushSerializedEntries(token, left, maxBodyBytes);
+        const rightAck = await this.pushSerializedEntries(token, right, maxBodyBytes);
+        return HttpTransport.mergePutAcks([leftAck, rightAck]);
       }
       throw error;
     }
@@ -1012,10 +1304,162 @@ export class HttpTransport implements NetworkTransport {
     return batches;
   }
 
+  /** Message header for binary putEntries bodies (dbId travels here — no JSON body). */
+  private binaryPutHeader(): Record<string, unknown> {
+    return {
+      format: BINARY_PUT_ENTRIES_FORMAT,
+      tenantId: this.config.tenantId,
+      dbId: this.config.dbId,
+    };
+  }
+
+  private async pushBinaryFrames(
+    token: string,
+    frames: BinaryEntryFrame[],
+    maxBodyBytes: number | null,
+  ): Promise<PutEntriesAck> {
+    if (frames.length === 0) {
+      return { receipts: [], rejected: [] };
+    }
+
+    if (maxBodyBytes !== null) {
+      const batches = this.partitionBinaryFramesForMaxBodySize(frames, maxBodyBytes);
+      if (batches.length > 1) {
+        this.logger.debug(`Split binary putEntries payload into ${batches.length} batch(es) for body limit ${maxBodyBytes}`);
+      }
+      const acks: PutEntriesAck[] = [];
+      for (const batch of batches) {
+        acks.push(await this.sendBinaryFramesBatch(token, batch, maxBodyBytes));
+      }
+      return HttpTransport.mergePutAcks(acks);
+    }
+
+    return this.sendBinaryFramesBatch(token, frames, null);
+  }
+
+  private async sendBinaryFramesBatch(
+    token: string,
+    frames: BinaryEntryFrame[],
+    maxBodyBytes: number | null,
+  ): Promise<PutEntriesAck> {
+    try {
+      return await this.postBinaryFrames(token, frames);
+    } catch (error) {
+      if (
+        error instanceof NetworkError
+        && error.type === NetworkErrorType.PAYLOAD_TOO_LARGE
+        && frames.length > 1
+      ) {
+        const midpoint = Math.ceil(frames.length / 2);
+        const left = frames.slice(0, midpoint);
+        const right = frames.slice(midpoint);
+        this.logger.warn(
+          `Binary putEntries batch with ${frames.length} entries exceeded remote limit; retrying as ${left.length} + ${right.length} batches.`,
+        );
+        const leftAck = await this.pushBinaryFrames(token, left, maxBodyBytes);
+        const rightAck = await this.pushBinaryFrames(token, right, maxBodyBytes);
+        return HttpTransport.mergePutAcks([leftAck, rightAck]);
+      }
+      throw error;
+    }
+  }
+
+  private partitionBinaryFramesForMaxBodySize(
+    frames: BinaryEntryFrame[],
+    maxBodyBytes: number,
+  ): BinaryEntryFrame[][] {
+    const header = this.binaryPutHeader();
+    const emptyBodyBytes = measureBinaryEntryMessage(header, []);
+
+    const batches: BinaryEntryFrame[][] = [];
+    let currentBatch: BinaryEntryFrame[] = [];
+    let currentBodyBytes = emptyBodyBytes;
+
+    for (const frame of frames) {
+      const frameBytes = measureBinaryEntryMessage(header, [frame]) - emptyBodyBytes;
+
+      if (emptyBodyBytes + frameBytes > maxBodyBytes) {
+        throw new NetworkError(
+          NetworkErrorType.PAYLOAD_TOO_LARGE,
+          `Single entry ${String(frame.meta.id)} exceeds remote request body limit of ${maxBodyBytes} bytes`,
+        );
+      }
+
+      if (currentBodyBytes + frameBytes > maxBodyBytes) {
+        batches.push(currentBatch);
+        currentBatch = [frame];
+        currentBodyBytes = emptyBodyBytes + frameBytes;
+      } else {
+        currentBatch.push(frame);
+        currentBodyBytes += frameBytes;
+      }
+    }
+
+    if (currentBatch.length > 0) {
+      batches.push(currentBatch);
+    }
+
+    return batches;
+  }
+
+  private async postBinaryFrames(
+    token: string,
+    frames: BinaryEntryFrame[],
+  ): Promise<PutEntriesAck> {
+    const body = encodeBinaryEntryMessage({
+      header: this.binaryPutHeader(),
+      entries: frames,
+    });
+
+    const response = await this.fetchWithRetry(
+      `${this.getSyncBasePath()}/putEntriesBinary`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": BINARY_ENTRIES_CONTENT_TYPE,
+          "Authorization": `Bearer ${token}`,
+        },
+        // encodeBinaryEntryMessage returns a freshly allocated, exact-size
+        // Uint8Array, so its backing buffer can be handed to fetch directly.
+        body: body.buffer as ArrayBuffer,
+      }
+    );
+
+    // Same JSON receipts/rejections contract as the legacy putEntries endpoint.
+    try {
+      const data = await response.json();
+      return this.parsePutEntriesAck(data);
+    } catch (error) {
+      this.logger.warn("Could not parse binary putEntries receipts; continuing without them.", error);
+      return { receipts: [], rejected: [] };
+    }
+  }
+
+  /**
+   * Parse the JSON body of a putEntries/putEntriesBinary response into a
+   * {@link PutEntriesAck}. Older servers omit `receipts` and/or `rejected`.
+   */
+  private parsePutEntriesAck(data: unknown): PutEntriesAck {
+    const body = (data ?? {}) as {
+      receipts?: SerializedEntryMetadata[];
+      rejected?: unknown;
+    };
+    const receipts = (body.receipts ?? []).map((e) => this.deserializeEntryMetadata(e));
+    const rejected: RejectedPutEntry[] = Array.isArray(body.rejected)
+      ? (body.rejected as Array<{ id?: unknown; reason?: unknown }>)
+          .filter((r) => typeof r?.id === "string")
+          .map((r) => ({
+            id: r.id as string,
+            reason: typeof r.reason === "string" ? r.reason : "rejected by remote",
+          }))
+      : [];
+    return { receipts, rejected };
+  }
+
   private async postSerializedEntries(
     token: string,
     serializedEntries: SerializedEntry[],
-  ): Promise<StoreEntryMetadata[]> {
+  ): Promise<PutEntriesAck> {
     const response = await this.fetchWithRetry(
       `${this.getSyncBasePath()}/putEntries`,
       {
@@ -1033,17 +1477,15 @@ export class HttpTransport implements NetworkTransport {
     );
 
     // The server returns witness receipts (stamped metadata) for accepted
-    // entries (docs/accesscontrol.md §5.3). Older servers omit the field.
-    let receipts: StoreEntryMetadata[] = [];
+    // entries (docs/accesscontrol.md §5.3) and per-entry rejections for
+    // signature-class failures. Older servers omit both fields.
     try {
       const data = await response.json();
-      const serialized = (data?.receipts as SerializedEntryMetadata[] | undefined) ?? [];
-      receipts = serialized.map((e) => this.deserializeEntryMetadata(e));
+      return this.parsePutEntriesAck(data);
     } catch {
       // Non-JSON / empty body from a legacy server: no receipts to apply.
-      receipts = [];
+      return { receipts: [], rejected: [] };
     }
-    return receipts;
   }
 
   private measureBodyBytes(value: string): number {
@@ -1177,4 +1619,9 @@ interface SerializedEntry extends SerializedEntryMetadata {
 
 interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
   rsaEncryptedPayload: string; // base64
+}
+
+interface SerializedSessionEncryptedEntry extends SerializedEntryMetadata {
+  iv: string; // base64
+  sessionEncryptedPayload: string; // base64
 }

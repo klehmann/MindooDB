@@ -3,9 +3,12 @@
  */
 
 export {
+  generateDocId,
+  matchesDocIdPrefix,
   generateDocEntryId,
   generateDepsFingerprint,
   generateAttachmentChunkId,
+  generateUniqueAttachmentChunkId,
   generateFileUuid7,
   generateChunkUuid7,
   parseDocEntryId,

@@ -10,6 +10,7 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "../../core/types";
+import type { PutEntriesAck, RejectedPutEntry, StoreHead } from "../../core/appendonlystores/types";
 import type {
   AttachmentReadPlan,
   AttachmentReadPlanOptions,
@@ -21,6 +22,8 @@ import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type {
   NetworkEncryptedEntry,
+  NetworkSessionEncryptedEntry,
+  SessionEncryptedEntriesBatch,
   NetworkAuthTokenPayload,
   NetworkSyncCapabilities,
 } from "../../core/appendonlystores/network/types";
@@ -561,7 +564,7 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
 
     return {
-      protocolVersion: "sync-v4",
+      protocolVersion: "sync-v5",
       supportsCursorScan: typeof this.localStore.scanEntriesSince === "function",
       supportsIdBloomSummary: typeof this.localStore.getIdBloomSummary === "function",
       supportsCompactionStatus: typeof this.localStore.getCompactionStatus === "function",
@@ -577,7 +580,31 @@ export class ServerNetworkContentAddressedStore {
       serverTime: Date.now(),
       supportsAccessControlV1: this.timestampProvider !== undefined,
       supportsRemoteWipeV1: this.wipeGrantDocIdResolver !== undefined,
+      // sync-v5 fast paths (all optional, negotiated per capability).
+      supportsStoreHead: typeof this.localStore.getStoreHead === "function",
+      supportsSessionKeyWrap: true,
+      // Note: supportsBinaryEntries and supportsChangeEvents are HTTP-layer
+      // features (octet-stream framing routes, SSE endpoint) and are added by
+      // MindooDBServer on top of this transport-agnostic set.
     };
+  }
+
+  /**
+   * Handle a getStoreHead request (sync-v5, phase 1).
+   *
+   * Returns the store's cursor epoch and highest assigned receiptOrder so a
+   * client with a persisted scan cursor can decide to skip the pull entirely.
+   * Cheap: token validation + an in-memory read on the local store.
+   */
+  async handleGetStoreHead(token: string): Promise<StoreHead> {
+    await this.validateToken(token);
+    if (!this.localStore.getStoreHead) {
+      throw new NetworkError(
+        NetworkErrorType.SERVER_ERROR,
+        "Local store does not support getStoreHead",
+      );
+    }
+    return this.localStore.getStoreHead();
   }
 
   /**
@@ -621,7 +648,88 @@ export class ServerNetworkContentAddressedStore {
     ids: string[]
   ): Promise<NetworkEncryptedEntry[]> {
     this.logger.debug(`Handling getEntries request for ${ids.length} entries`);
+
+    const { servableEntries, encryptionPublicKey, username } =
+      await this.loadServableEntriesForReader(token, ids);
+
+    // Encrypt each entry with the user's RSA public key
+    const encryptedEntries = await this.encryptEntriesForUser(
+      servableEntries,
+      encryptionPublicKey
+    );
     
+    this.logger.debug(`Encrypted ${encryptedEntries.length} entries for user: ${username}`);
+    return encryptedEntries;
+  }
+
+  /**
+   * Handle a getEntries request in the session-key format (sync-v5, phase 2).
+   *
+   * A single random AES-256-GCM key protects every payload in the response
+   * and is wrapped once with the requester's RSA public key — the same key
+   * that the per-entry format would have used for each entry, so the "only
+   * the granted user can read this" guarantee is unchanged while the RSA
+   * cost drops from O(entries) to O(1) per batch on both sides.
+   */
+  async handleGetEntriesSessionWrapped(
+    token: string,
+    ids: string[]
+  ): Promise<SessionEncryptedEntriesBatch> {
+    this.logger.debug(`Handling session-wrapped getEntries request for ${ids.length} entries`);
+
+    const { servableEntries, encryptionPublicKey, username } =
+      await this.loadServableEntriesForReader(token, ids);
+
+    const subtle = this.cryptoAdapter.getSubtle();
+    const sessionKeyBytes = this.cryptoAdapter.getRandomValues(new Uint8Array(32));
+    const wrappedSessionKey = await this.rsaEncryption.wrapKey(
+      sessionKeyBytes,
+      encryptionPublicKey,
+    );
+    const sessionKey = await subtle.importKey(
+      "raw",
+      sessionKeyBytes.buffer as ArrayBuffer,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt"],
+    );
+
+    const entries: NetworkSessionEncryptedEntry[] = [];
+    for (const entry of servableEntries) {
+      const iv = this.cryptoAdapter.getRandomValues(new Uint8Array(12));
+      const ciphertext = await subtle.encrypt(
+        { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
+        sessionKey,
+        entry.encryptedData.buffer.slice(
+          entry.encryptedData.byteOffset,
+          entry.encryptedData.byteOffset + entry.encryptedData.byteLength,
+        ) as ArrayBuffer,
+      );
+      entries.push({
+        ...this.toMetadata(entry),
+        iv,
+        sessionEncryptedPayload: new Uint8Array(ciphertext),
+      });
+    }
+
+    this.logger.debug(`Session-encrypted ${entries.length} entries for user: ${username}`);
+    return { wrappedSessionKey, entries };
+  }
+
+  /**
+   * Shared read path of both `getEntries` formats: validate the token,
+   * resolve the requester's transport-encryption public key from the
+   * directory grant, apply wipe scoping (§6.5) and the revoked-key blacklist
+   * (§13), and load the servable entries from the local store.
+   */
+  private async loadServableEntriesForReader(
+    token: string,
+    ids: string[],
+  ): Promise<{
+    servableEntries: StoreEntry[];
+    encryptionPublicKey: string;
+    username: string;
+  }> {
     // Validate token
     const tokenPayload = await this.validateToken(token);
     const username = tokenPayload.sub;
@@ -658,14 +766,7 @@ export class ServerNetworkContentAddressedStore {
     const revoked = await this.resolveRevokedKeyIds(tokenPayload);
     const servableEntries = this.filterMetasByRevokedKeys(entries, revoked);
 
-    // Encrypt each entry with the user's RSA public key
-    const encryptedEntries = await this.encryptEntriesForUser(
-      servableEntries,
-      encryptionPublicKey
-    );
-    
-    this.logger.debug(`Encrypted ${encryptedEntries.length} entries for user: ${username}`);
-    return encryptedEntries;
+    return { servableEntries, encryptionPublicKey, username };
   }
 
   async handleGetEntryMetadata(
@@ -694,11 +795,20 @@ export class ServerNetworkContentAddressedStore {
 
   /**
    * Handle a putEntries request from a client.
-   * 
+   *
+   * Signature-class validation failures (untrusted key, content-hash
+   * mismatch, missing v2 metadata signature, invalid author signature) are
+   * rejected PER ENTRY and reported in the returned ack instead of failing
+   * the whole batch: one poisoned entry must not permanently block a
+   * database's push sync. Access-denied conditions (remote wipe, revoked
+   * decryptionKeyId, purged document, Tier 1 policy denial) still fail the
+   * whole request — those are deliberate blocks, not data corruption.
+   *
    * @param token The JWT access token
    * @param entries The entries to store
+   * @returns Witness receipts for the accepted entries plus per-entry rejections
    */
-  async handlePutEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
+  async handlePutEntries(token: string, entries: StoreEntry[]): Promise<PutEntriesAck> {
     this.logger.debug(`Handling putEntries request for ${entries.length} entries`);
     
     // Validate token
@@ -751,6 +861,10 @@ export class ServerNetworkContentAddressedStore {
 
     // Process each entry
     const toStore: StoreEntry[] = [];
+    // Per-entry rejections for signature-class failures. The rejected entry is
+    // skipped (never stored, never witnessed, never propagated); everything
+    // else in the batch proceeds normally.
+    const rejected: RejectedPutEntry[] = [];
     // Audit #4 (revocation lag): force a directory trust refresh once at the
     // start of the batch so a just-pushed revocation is observed immediately
     // instead of lagging by up to DIRECTORY_SYNC_INTERVAL_MS. The refresh
@@ -789,10 +903,8 @@ export class ServerNetworkContentAddressedStore {
       );
       forceTrustRefresh = false;
       if (!isValidKey) {
-        throw new NetworkError(
-          NetworkErrorType.INVALID_SIGNATURE,
-          `Entry ${entry.id} was not signed by a trusted user`
-        );
+        this.rejectEntry(rejected, entry.id, `Entry ${entry.id} was not signed by a trusted user`);
+        continue;
       }
 
       // Zero-trust ingest (audit finding #1 & #5): the server must not witness or
@@ -805,18 +917,18 @@ export class ServerNetworkContentAddressedStore {
       const subtle = this.cryptoAdapter.getSubtle();
       const actualHash = await computeContentHash(entry.encryptedData, subtle);
       if (actualHash !== entry.contentHash) {
-        throw new NetworkError(
-          NetworkErrorType.INVALID_SIGNATURE,
-          `Entry ${entry.id} content hash does not match its payload`
-        );
+        this.rejectEntry(rejected, entry.id, `Entry ${entry.id} content hash does not match its payload`);
+        continue;
       }
       // Enforce the v2 floor with a clear, dedicated error before the generic
       // signature check (which would also reject it via requireMetadataSignature).
       if (requireMetadataSignature && !entry.metadataSignature) {
-        throw new NetworkError(
-          NetworkErrorType.INVALID_SIGNATURE,
-          `Entry ${entry.id} must carry a v2 metadata signature (tenant requires v2 as of the configured cutoff)`
+        this.rejectEntry(
+          rejected,
+          entry.id,
+          `Entry ${entry.id} must carry a v2 metadata signature (tenant requires v2 as of the configured cutoff)`,
         );
+        continue;
       }
       const isValidSignature = await verifyEntrySignatureCrypto(
         entry,
@@ -826,10 +938,8 @@ export class ServerNetworkContentAddressedStore {
         { requireMetadataSignature },
       );
       if (!isValidSignature) {
-        throw new NetworkError(
-          NetworkErrorType.INVALID_SIGNATURE,
-          `Entry ${entry.id} has an invalid author signature`
-        );
+        this.rejectEntry(rejected, entry.id, `Entry ${entry.id} has an invalid author signature`);
+        continue;
       }
 
       // Rule-based Tier 1 enforcement (docs/accesscontrol.md §7). The server can
@@ -875,8 +985,17 @@ export class ServerNetworkContentAddressedStore {
     
     // Store all entries (witnessed where applicable)
     await this.localStore.putEntries(toStore);
-    this.logger.debug(`Successfully stored ${toStore.length} entries`);
-    return stampedMetadata;
+    this.logger.debug(
+      `Successfully stored ${toStore.length} entries` +
+        (rejected.length > 0 ? ` (${rejected.length} rejected)` : ""),
+    );
+    return { receipts: stampedMetadata, rejected };
+  }
+
+  /** Record a per-entry rejection (signature-class failure) and log it. */
+  private rejectEntry(rejected: RejectedPutEntry[], id: string, reason: string): void {
+    this.logger.warn(`putEntries rejected entry: ${reason}`);
+    rejected.push({ id, reason });
   }
 
   /** Project a store entry to its metadata (including any witness fields). */

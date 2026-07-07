@@ -106,6 +106,51 @@ export interface StoreScanResult {
 }
 
 /**
+ * Lightweight head descriptor of a store's scan feed.
+ *
+ * `epoch` identifies the current cursor lineage of the store: it stays stable
+ * across normal appends but MUST change whenever previously assigned
+ * `receiptOrder` values may have been reassigned or the store was reset
+ * (clear-all, legacy receipt-order migration). A sync peer that persisted a
+ * scan cursor for an older epoch must discard it and re-scan from the start.
+ *
+ * `maxReceiptOrder` is the highest `receiptOrder` ever assigned by this store
+ * (monotonic, never decreases on purge). A peer whose persisted cursor is at
+ * or beyond this value has already scanned everything the store can offer.
+ */
+export interface StoreHead {
+  epoch: string;
+  maxReceiptOrder: number;
+}
+
+/**
+ * One entry a store refused to ingest during a putEntries batch
+ * (sync-v5, per-entry rejection).
+ *
+ * Signature-class failures (invalid author signature, content-hash mismatch,
+ * untrusted signing key, missing v2 metadata signature) are reported per
+ * entry instead of failing the whole batch, so one poisoned entry cannot
+ * permanently block a database's push sync. Access-denied conditions
+ * (remote wipe, revoked key, purged document, Tier 1 policy) still fail the
+ * whole request — those are deliberate blocks, not data corruption.
+ */
+export interface RejectedPutEntry {
+  id: string;
+  reason: string;
+}
+
+/**
+ * Structured result of a putEntries push against a witnessing (network)
+ * store: witness receipts for the accepted entries
+ * (docs/accesscontrol.md §5.3) plus the per-entry rejections the store
+ * skipped.
+ */
+export interface PutEntriesAck {
+  receipts: StoreEntryMetadata[];
+  rejected: RejectedPutEntry[];
+}
+
+/**
  * Bloom filter summary over entry IDs for sync optimization.
  * Can be exchanged between stores/transports to reduce hasEntries checks.
  */
@@ -329,11 +374,16 @@ export interface ContentAddressedStore {
    * via {@link applyWitnessReceipts} (docs/accesscontrol.md §5.3). Local stores
    * return `void`; callers that do not need receipts can ignore the result.
    *
+   * A network store may also return a structured {@link PutEntriesAck} that
+   * additionally carries per-entry rejections the remote skipped
+   * (signature-class validation failures) so the sync orchestrator can report
+   * them without failing the whole push.
+   *
    * @param entries The entries to store
    * @return A promise that resolves when all entries are stored, optionally
    *   carrying witness receipts for the accepted entries.
    */
-  putEntries(entries: StoreEntry[]): Promise<void | StoreEntryMetadata[]>;
+  putEntries(entries: StoreEntry[]): Promise<void | StoreEntryMetadata[] | PutEntriesAck>;
 
   /**
    * Apply witness receipts to entries already present in this (local) store.
@@ -463,6 +513,17 @@ export interface ContentAddressedStore {
    * Callers must still perform exact reconciliation for correctness.
    */
   getIdBloomSummary?(): Promise<StoreIdBloomSummary>;
+
+  /**
+   * Optional cheap head descriptor for incremental sync.
+   *
+   * Returns the store's current cursor epoch and the highest receiptOrder
+   * assigned so far. Sync peers persist the scan cursor together with the
+   * epoch: on the next sync, an unchanged epoch with
+   * `maxReceiptOrder <= cursor.receiptOrder` means there is nothing new to
+   * scan, and a changed epoch invalidates the persisted cursor entirely.
+   */
+  getStoreHead?(): Promise<StoreHead>;
 
   /**
    * Plan causal materialization for a single document.

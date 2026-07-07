@@ -113,9 +113,10 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
     );
 
     const e = await makeEntry();
-    const receipts = await server.handlePutEntries("token", [e]);
+    const { receipts, rejected } = await server.handlePutEntries("token", [e]);
 
     // The receipt round-trips through the validator as a trusted, valid receipt.
+    expect(rejected).toHaveLength(0);
     expect(receipts).toHaveLength(1);
     expect(receipts[0].receivedByPublicKey).toBe(signer.publicKeyPem);
     expect(receipts[0].receivedAt).toBeGreaterThan(0);
@@ -144,7 +145,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
     );
 
     const e = await makeEntry({}, { signingKey: signer.signingPrivateKey, publicKeyPem: signer.publicKeyPem });
-    const receipts = await server.handlePutEntries("token", [e]);
+    const { receipts } = await server.handlePutEntries("token", [e]);
     expect(receipts[0].receivedDateSignature).toBeUndefined();
   });
 
@@ -165,7 +166,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
     // would collapse every old doc onto "today"; the server must leave them
     // un-witnessed so they keep resolving to their stable createdAt.
     const legacy = await makeEntry({ entryVersion: undefined, metadataSignature: undefined });
-    const receipts = await server.handlePutEntries("token", [legacy]);
+    const { receipts } = await server.handlePutEntries("token", [legacy]);
 
     expect(receipts).toHaveLength(1);
     expect(receipts[0].receivedAt).toBeUndefined();
@@ -225,7 +226,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       cryptoAdapter,
     );
     const e = await makeEntry();
-    const receipts = await server.handlePutEntries("token", [e]);
+    const { receipts } = await server.handlePutEntries("token", [e]);
     expect(receipts[0].receivedDateSignature).toBeUndefined();
     const caps = await server.handleGetCapabilities("token");
     expect(caps.supportsAccessControlV1).toBe(false);
@@ -300,7 +301,10 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       );
 
       const e = await makeEntry();
-      await expect(server.handlePutEntries("token", [e])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [e])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: e.id })],
+        rejected: [],
+      });
       expect(await localStore.getAllIds()).toContain(e.id);
       await expect(server.handleFindNewEntries("token", [])).resolves.toBeDefined();
     });
@@ -318,14 +322,20 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
 
       const e = await makeEntry();
       // "crm" is not in allowedDbIds, but the admin signing key bypasses.
-      await expect(server.handlePutEntries("token", [e])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [e])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: e.id })],
+        rejected: [],
+      });
       expect(await localStore.getAllIds()).toContain(e.id);
     });
   });
 
   // Server-side cryptographic verification on push (audit findings #1 / #5):
-  // the server must reject forged/tampered entries before stamping them, even
-  // when the author key is "trusted" by the directory.
+  // the server must refuse forged/tampered entries before stamping them, even
+  // when the author key is "trusted" by the directory. Since sync-v5 these
+  // signature-class failures are rejected PER ENTRY (reported in the ack)
+  // instead of failing the whole batch, so one poisoned entry cannot block
+  // a database's push sync.
   describe("push-time signature + contentHash verification", () => {
     function plainServer(localStore: InMemoryContentAddressedStore, trusted = true) {
       return new ServerNetworkContentAddressedStore(
@@ -341,7 +351,11 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       const server = plainServer(localStore);
       // Valid signatures, but a contentHash that lies about the ciphertext.
       const e = await makeEntry({ contentHash: "deadbeef".repeat(8) });
-      await expect(server.handlePutEntries("token", [e])).rejects.toBeInstanceOf(NetworkError);
+      const ack = await server.handlePutEntries("token", [e]);
+      expect(ack.receipts).toHaveLength(0);
+      expect(ack.rejected).toEqual([
+        { id: e.id, reason: expect.stringContaining("content hash") },
+      ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
 
@@ -352,24 +366,51 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       // Relabel the op type without re-signing: the metadataSignature no longer
       // matches, so the server must refuse it.
       const tampered = { ...e, entryType: "doc_delete" } as StoreEntry;
-      await expect(server.handlePutEntries("token", [tampered])).rejects.toBeInstanceOf(NetworkError);
+      const ack = await server.handlePutEntries("token", [tampered]);
+      expect(ack.receipts).toHaveLength(0);
+      expect(ack.rejected).toEqual([
+        { id: e.id, reason: expect.stringContaining("invalid author signature") },
+      ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
 
     it("rejects an entry signed by an untrusted key", async () => {
       const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
       const server = plainServer(localStore, /* trusted */ false);
-      await expect(server.handlePutEntries("token", [await makeEntry()])).rejects.toBeInstanceOf(
-        NetworkError,
-      );
+      const e = await makeEntry();
+      const ack = await server.handlePutEntries("token", [e]);
+      expect(ack.receipts).toHaveLength(0);
+      expect(ack.rejected).toEqual([
+        { id: e.id, reason: expect.stringContaining("not signed by a trusted user") },
+      ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
+    });
+
+    it("stores the healthy remainder of a batch containing one poisoned entry", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      const good = await makeEntry();
+      const bad = await makeEntry({ contentHash: "deadbeef".repeat(8) });
+      const good2 = await makeEntry();
+      const ack = await server.handlePutEntries("token", [good, bad, good2]);
+      expect(ack.receipts.map((r) => r.id).sort()).toEqual([good.id, good2.id].sort());
+      expect(ack.rejected).toEqual([
+        { id: bad.id, reason: expect.stringContaining("content hash") },
+      ]);
+      const storedIds = await localStore.getAllIds();
+      expect(storedIds).toContain(good.id);
+      expect(storedIds).toContain(good2.id);
+      expect(storedIds).not.toContain(bad.id);
     });
 
     it("accepts a valid legacy entry (ciphertext-only signature, no metadataSignature)", async () => {
       const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
       const server = plainServer(localStore);
       const legacy = await makeEntry({ entryVersion: undefined, metadataSignature: undefined });
-      await expect(server.handlePutEntries("token", [legacy])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [legacy])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: legacy.id })],
+        rejected: [],
+      });
       expect(await localStore.getAllIds()).toContain(legacy.id);
     });
 
@@ -382,7 +423,10 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
           { attachmentId: "att-2", lastChunkId: "doc7_a_g_c2", size: 200 },
         ],
       });
-      await expect(server.handlePutEntries("token", [e])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [e])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: e.id })],
+        rejected: [],
+      });
       const [stored] = await localStore.getEntries([e.id]);
       // The signed attachment snapshot survives the server storage path.
       expect(stored.attachmentRefs).toEqual(e.attachmentRefs);
@@ -399,7 +443,11 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
         ...e,
         attachmentRefs: [{ attachmentId: "att-1", lastChunkId: "doc7_a_f_evil", size: 100 }],
       } as StoreEntry;
-      await expect(server.handlePutEntries("token", [tampered])).rejects.toBeInstanceOf(NetworkError);
+      const ack = await server.handlePutEntries("token", [tampered]);
+      expect(ack.receipts).toHaveLength(0);
+      expect(ack.rejected).toEqual([
+        { id: e.id, reason: expect.stringContaining("invalid author signature") },
+      ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
   });

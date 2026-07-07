@@ -48,7 +48,7 @@ This separation enables:
 ```
 <docId>_d_<depsFingerprint>_<automergeHash>
 ```
-- `docId`: Document UUID7
+- `docId`: Document ID (by default a 22-char sortable base62-encoded UUID7; may also be a prefixed `<prefix>_<base62>` id via `idPrefix`, or a caller-provided custom id)
 - `d`: Type marker for "document"
 - `depsFingerprint`: First 8 chars of SHA256(sorted Automerge deps), or "0" if no deps
 - `automergeHash`: The Automerge change hash
@@ -57,10 +57,10 @@ This separation enables:
 ```
 <docId>_a_<fileUuid7>_<base62ChunkUuid7>
 ```
-- `docId`: Document UUID7 this attachment belongs to
+- `docId`: ID of the document this attachment belongs to (see above)
 - `a`: Type marker for "attachment"
 - `fileUuid7`: UUID7 for the whole file (same for all chunks)
-- `base62ChunkUuid7`: Base62-encoded UUID7 for this specific chunk
+- `base62ChunkUuid7`: Base62-encoded UUID7 for this specific chunk (ASCII-ordered alphabet, so chunk IDs sort chronologically)
 
 #### 3. MindooDB Two-Store Architecture
 
@@ -145,7 +145,7 @@ interface AttachmentReference {
       fileName: "report.pdf",
       mimeType: "application/pdf",
       size: 5242880,
-      lastChunkId: "123e4567-..._a_file-uuid_chunk-id",
+      lastChunkId: "<docId>_a_<file-uuid7>_<base62-chunk-id>",
       decryptionKeyId: "default",
       createdAt: 1234567890,
       createdBy: "-----BEGIN PUBLIC KEY-----..."

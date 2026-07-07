@@ -10,9 +10,12 @@ import {
   MindooDB,
   CreateOptions,
   DeleteOptions,
+  ListDocumentIdsOptions,
+  IterateChangesOptions,
   UndeleteOptions,
   ChangeOptions,
   CUSTOM_DOC_ID_REGEX,
+  DOC_ID_PREFIX_REGEX,
   DocumentDagAnalysisTimestamp,
   DocumentDagAnalysisResult,
   DocumentDagBranchMaterializationResult,
@@ -77,6 +80,8 @@ import {
   DbChange,
   DbChangeEvent,
   DbChangeListener,
+  RejectedPutEntry,
+  PutEntriesAck,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import {
@@ -86,7 +91,9 @@ import type {
   ContentAddressedStore,
   StoreScanCursor,
   StoreScanFilters,
+  StoreScanResult,
   StoreIdBloomSummary,
+  StoreHead,
 } from "./appendonlystores/types";
 import { bloomMightContainId } from "./appendonlystores/bloom";
 import {
@@ -108,7 +115,9 @@ import {
   generateDocEntryId, 
   computeContentHash, 
   parseDocEntryId,
-  generateAttachmentChunkId,
+  generateDocId,
+  matchesDocIdPrefix,
+  generateUniqueAttachmentChunkId,
   generateFileUuid7,
 } from "./utils/idGeneration";
 import { DocumentDeletedError, DocumentNotFoundError, SymmetricKeyNotFoundError } from "./errors";
@@ -493,6 +502,23 @@ export class BaseMindooDB implements MindooDB {
   // Track which entry IDs we've already processed
   private processedEntryIds: string[] = [];
   private processedEntryCursor: StoreScanCursor | null = null;
+
+  /**
+   * Persisted sync scan cursors (sync-v5, phase 1), keyed by
+   * `"<sourceIdentity>-><targetIdentity>/<storeKind>"` (see
+   * {@link syncScanCursorKey}). Each record remembers how far a previous
+   * pull/push already scanned the source store, together with the epochs of
+   * both stores at that time. On the next sync with the same pair the scan
+   * resumes from the cursor — or is skipped entirely when the source head
+   * shows nothing new. An epoch change on either side invalidates the record.
+   *
+   * Persisted in the metadata checkpoint when a cache store is configured;
+   * otherwise this only accelerates repeat syncs within the same session.
+   */
+  private syncScanCursors: Map<
+    string,
+    { sourceEpoch: string; targetEpoch: string; cursor: StoreScanCursor }
+  > = new Map();
 
   /**
    * In-memory LRU of per-document merged state used by the revision-grain
@@ -1553,6 +1579,12 @@ export class BaseMindooDB implements MindooDB {
     }
     checkpoint.automergeHashToEntryId = hashMap;
 
+    // Persisted sync scan cursors (sync-v5, phase 1). Additive field: older
+    // readers ignore it, older checkpoints simply restore an empty map.
+    if (this.syncScanCursors.size > 0) {
+      checkpoint.syncScanCursors = Object.fromEntries(this.syncScanCursors);
+    }
+
     // For stores without cursor scan, include processedEntryIds
     if (!this.supportsCursorScan(this.store)) {
       checkpoint.processedEntryIds = this.processedEntryIds;
@@ -1598,6 +1630,28 @@ export class BaseMindooDB implements MindooDB {
       }
       this.lastReconciledKeyBagFingerprint =
         typeof checkpoint.keyBagFingerprint === "string" ? checkpoint.keyBagFingerprint : null;
+      this.syncScanCursors.clear();
+      if (checkpoint.syncScanCursors && typeof checkpoint.syncScanCursors === "object") {
+        for (const [key, value] of Object.entries(
+          checkpoint.syncScanCursors as Record<
+            string,
+            { sourceEpoch?: unknown; targetEpoch?: unknown; cursor?: { receiptOrder?: unknown; id?: unknown } }
+          >,
+        )) {
+          if (
+            typeof value?.sourceEpoch === "string" &&
+            typeof value?.targetEpoch === "string" &&
+            typeof value?.cursor?.receiptOrder === "number" &&
+            typeof value?.cursor?.id === "string"
+          ) {
+            this.syncScanCursors.set(key, {
+              sourceEpoch: value.sourceEpoch,
+              targetEpoch: value.targetEpoch,
+              cursor: { receiptOrder: value.cursor.receiptOrder, id: value.cursor.id },
+            });
+          }
+        }
+      }
       // Rebuild indexLookup from index
       this.indexLookup.clear();
       this.indexLookupStaleFrom = null;
@@ -2936,6 +2990,57 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Fetch a store's head descriptor (`{ epoch, maxReceiptOrder }`), returning
+   * null when the store (or the remote server behind it) does not support it
+   * or the request fails. A null head simply disables the persisted-cursor
+   * fast path for this sync.
+   */
+  private async getStoreHeadSafe(store: ContentAddressedStore): Promise<StoreHead | null> {
+    if (typeof store.getStoreHead !== "function") {
+      return null;
+    }
+    try {
+      return await store.getStoreHead();
+    } catch (error) {
+      this.logger.debug("Store head unavailable, falling back to full scan", error);
+      return null;
+    }
+  }
+
+  /** Stable identity for a store in the persisted sync-cursor map. */
+  private static syncStoreIdentity(store: ContentAddressedStore): string {
+    return store.getCacheIdentity?.() ?? `${store.getId()}/${store.getStoreKind()}`;
+  }
+
+  /** Key for {@link syncScanCursors}: one record per (source, target) pair. */
+  private syncScanCursorKey(
+    sourceStore: ContentAddressedStore,
+    targetStore: ContentAddressedStore,
+  ): string {
+    return `${BaseMindooDB.syncStoreIdentity(sourceStore)}->${BaseMindooDB.syncStoreIdentity(targetStore)}`;
+  }
+
+  /** Persist a sync scan cursor and schedule a checkpoint flush. */
+  private saveSyncScanCursor(
+    key: string,
+    record: { sourceEpoch: string; targetEpoch: string; cursor: StoreScanCursor },
+  ): void {
+    const existing = this.syncScanCursors.get(key);
+    if (
+      existing &&
+      existing.sourceEpoch === record.sourceEpoch &&
+      existing.targetEpoch === record.targetEpoch &&
+      existing.cursor.receiptOrder === record.cursor.receiptOrder &&
+      existing.cursor.id === record.cursor.id
+    ) {
+      return;
+    }
+    this.syncScanCursors.set(key, record);
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
+  /**
    * From a list of candidate IDs, return only those the target store is
    * missing.  Uses bloom-filter pre-screening when available, then falls
    * back to exact `hasEntries` for the uncertain set.
@@ -2989,6 +3094,14 @@ export class BaseMindooDB implements MindooDB {
    */
   private static readonly DEFAULT_DOCS_TRANSFER_BATCH_SIZE = 250;
 
+  /**
+   * Default window of transfer batches running in parallel (sync-v5,
+   * phase 4). Kept small: each in-flight batch holds one decrypted page of
+   * entries in memory, and HTTP/2 multiplexes the requests over a single
+   * connection anyway. Overridable via `SyncOptions.maxConcurrentBatches`.
+   */
+  private static readonly DEFAULT_MAX_CONCURRENT_TRANSFER_BATCHES = 3;
+
   private resolveTransferBatchSize(options?: SyncOptions): number {
     if (options?.transferBatchSize && options.transferBatchSize > 0) {
       return options.transferBatchSize;
@@ -3031,79 +3144,144 @@ export class BaseMindooDB implements MindooDB {
       totalSourceEntries?: number;
       currentPage?: number;
     },
-  ): Promise<{ transferred: number; cancelled: boolean }> {
+  ): Promise<{ transferred: number; cancelled: boolean; rejected: RejectedPutEntry[] }> {
     if (entryIds.length === 0) {
-      return { transferred: state.transferred, cancelled: false };
+      return { transferred: state.transferred, cancelled: false, rejected: [] };
     }
 
     const onProgress = options?.onProgress;
     const signal = options?.signal;
     const transferBatchSize = this.resolveTransferBatchSize(options);
     const totalTransferBatches = Math.max(1, Math.ceil(entryIds.length / transferBatchSize));
+    // Parallel transfer window (sync-v5, phase 4): each batch is one
+    // getEntries + putEntries round trip; a small window of concurrent
+    // batches overlaps network latency and server-side crypto. Witness
+    // receipts are applied per batch and are order-independent.
+    const maxConcurrent = Math.min(
+      Math.max(1, Math.floor(options?.maxConcurrentBatches ?? BaseMindooDB.DEFAULT_MAX_CONCURRENT_TRANSFER_BATCHES)),
+      totalTransferBatches,
+    );
     let transferred = state.transferred;
+    let cancelled = false;
+    let firstError: unknown = null;
+    let nextBatchIndex = 0;
+    // Per-entry rejections reported by a witnessing target (sync-v5): the
+    // push continues, the rejected entries are surfaced to the caller.
+    const rejected: RejectedPutEntry[] = [];
 
-    for (let offset = 0; offset < entryIds.length; offset += transferBatchSize) {
-      if (signal?.aborted) {
-        return { transferred, cancelled: true };
+    const runWorker = async (): Promise<void> => {
+      while (true) {
+        if (firstError || cancelled || signal?.aborted) {
+          if (signal?.aborted) cancelled = true;
+          return;
+        }
+        const batchIndex = nextBatchIndex++;
+        const offset = batchIndex * transferBatchSize;
+        if (offset >= entryIds.length) {
+          return;
+        }
+
+        const currentTransferBatch = batchIndex + 1;
+        const batchIds = entryIds.slice(offset, offset + transferBatchSize);
+        const pageSummary = state.currentPage ? `page ${state.currentPage}, ` : "";
+        onProgress?.({
+          phase: "transferring",
+          message: `Transferring batch ${currentTransferBatch}/${totalTransferBatches} (${batchIds.length} entries, ${pageSummary}scanned ${state.scanned})...`,
+          transferredEntries: transferred,
+          scannedEntries: state.scanned,
+          totalSourceEntries: state.totalSourceEntries,
+          currentPage: state.currentPage,
+          currentTransferBatch,
+          totalTransferBatches,
+          transferBatchSize,
+        });
+
+        try {
+          const batchEntries = await sourceStore.getEntries(batchIds);
+          if (signal?.aborted) {
+            cancelled = true;
+            return;
+          }
+          const putResult = await targetStore.putEntries(batchEntries);
+          // On push, the remote (witnessing) target returns receipts for accepted
+          // entries; persist them back onto the local source so the revision feed
+          // re-anchors them from the provisional head to their committed
+          // `receivedAt` (docs/accesscontrol.md §5.3). Pull targets return void.
+          // sync-v5 targets return a structured ack that additionally carries
+          // per-entry rejections (signature-class failures the remote skipped).
+          const { receipts, batchRejected } = BaseMindooDB.normalizePutResult(putResult);
+          if (receipts.length > 0 && sourceStore.applyWitnessReceipts) {
+            await sourceStore.applyWitnessReceipts(receipts);
+          }
+          if (batchRejected.length > 0) {
+            rejected.push(...batchRejected);
+            this.logger.warn(
+              `Target rejected ${batchRejected.length} of ${batchEntries.length} entries in transfer batch ${currentTransferBatch}/${totalTransferBatches}`,
+            );
+          }
+          transferred += batchEntries.length - batchRejected.length;
+        } catch (error) {
+          if (signal?.aborted) {
+            cancelled = true;
+            return;
+          }
+          if (!firstError) {
+            firstError = error;
+          }
+          return;
+        }
+
+        onProgress?.({
+          phase: "transferring",
+          message: `Transferred ${transferred} entries after batch ${currentTransferBatch}/${totalTransferBatches}`,
+          transferredEntries: transferred,
+          scannedEntries: state.scanned,
+          totalSourceEntries: state.totalSourceEntries,
+          currentPage: state.currentPage,
+          currentTransferBatch,
+          totalTransferBatches,
+          transferBatchSize,
+        });
       }
+    };
 
-      const currentTransferBatch = Math.floor(offset / transferBatchSize) + 1;
-      const batchIds = entryIds.slice(offset, offset + transferBatchSize);
-      const pageSummary = state.currentPage ? `page ${state.currentPage}, ` : "";
-      onProgress?.({
-        phase: "transferring",
-        message: `Transferring batch ${currentTransferBatch}/${totalTransferBatches} (${batchIds.length} entries, ${pageSummary}scanned ${state.scanned})...`,
-        transferredEntries: transferred,
-        scannedEntries: state.scanned,
-        totalSourceEntries: state.totalSourceEntries,
-        currentPage: state.currentPage,
-        currentTransferBatch,
-        totalTransferBatches,
-        transferBatchSize,
-      });
+    await Promise.all(
+      Array.from({ length: maxConcurrent }, () => runWorker()),
+    );
 
-      try {
-        const batchEntries = await sourceStore.getEntries(batchIds);
-        if (signal?.aborted) {
-          return { transferred, cancelled: true };
-        }
-        const putResult = await targetStore.putEntries(batchEntries);
-        // On push, the remote (witnessing) target returns receipts for accepted
-        // entries; persist them back onto the local source so the revision feed
-        // re-anchors them from the provisional head to their committed
-        // `receivedAt` (docs/accesscontrol.md §5.3). Pull targets return void.
-        if (Array.isArray(putResult) && putResult.length > 0 && sourceStore.applyWitnessReceipts) {
-          await sourceStore.applyWitnessReceipts(putResult);
-        }
-        transferred += batchEntries.length;
-      } catch (error) {
-        if (signal?.aborted) {
-          return { transferred, cancelled: true };
-        }
-        throw error;
-      }
-
-      onProgress?.({
-        phase: "transferring",
-        message: `Transferred ${transferred} entries after batch ${currentTransferBatch}/${totalTransferBatches}`,
-        transferredEntries: transferred,
-        scannedEntries: state.scanned,
-        totalSourceEntries: state.totalSourceEntries,
-        currentPage: state.currentPage,
-        currentTransferBatch,
-        totalTransferBatches,
-        transferBatchSize,
-      });
+    if (signal?.aborted || cancelled) {
+      return { transferred, cancelled: true, rejected };
     }
+    if (firstError) {
+      throw firstError;
+    }
+    return { transferred, cancelled: false, rejected };
+  }
 
-    return { transferred, cancelled: false };
+  /**
+   * Normalize the polymorphic putEntries result (`void`, receipts array, or
+   * structured {@link PutEntriesAck}) into receipts + per-entry rejections.
+   */
+  private static normalizePutResult(
+    putResult: void | StoreEntryMetadata[] | PutEntriesAck,
+  ): { receipts: StoreEntryMetadata[]; batchRejected: RejectedPutEntry[] } {
+    if (Array.isArray(putResult)) {
+      return { receipts: putResult, batchRejected: [] };
+    }
+    if (putResult && typeof putResult === "object") {
+      return {
+        receipts: putResult.receipts ?? [],
+        batchRejected: putResult.rejected ?? [],
+      };
+    }
+    return { receipts: [], batchRejected: [] };
   }
 
   private async syncEntriesFromStore(
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions
-  ): Promise<{ transferred: number; scanned: number; cancelled: boolean }> {
+  ): Promise<{ transferred: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
     const signal = options?.signal;
     BaseMindooDB.setSyncAbortSignalOnStore(sourceStore, signal);
     BaseMindooDB.setSyncAbortSignalOnStore(targetStore, signal);
@@ -3128,23 +3306,82 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions
-  ): Promise<{ transferred: number; scanned: number; cancelled: boolean }> {
+  ): Promise<{ transferred: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
     let transferred = 0;
     let scanned = 0;
+    // Per-entry rejections reported by a witnessing target (sync-v5): the
+    // sync completes; rejected entries are surfaced to the caller as warnings.
+    const rejected: RejectedPutEntry[] = [];
     const onProgress = options?.onProgress;
     const pageSize = options?.pageSize ?? 1000;
     const signal = options?.signal;
 
-    const targetBloom = await this.getStoreBloomSummary(targetStore);
-    // Fixed progress denominator: the SOURCE's total entry count. The cursor
-    // scan below examines every source entry, so `scannedEntries/totalSourceEntries`
-    // is a real completion ratio. (Local stores serve this from a cached bloom
-    // summary; network stores answer with one extra request.) The target bloom
-    // stays dedicated to missing-id pre-screening.
-    const sourceBloom = await this.getStoreBloomSummary(sourceStore);
-    const totalSourceEstimate = sourceBloom?.totalIds;
-
     if (this.supportsCursorScan(sourceStore)) {
+      // Persisted-cursor fast path (sync-v5, phase 1): resume the metadata
+      // scan where the previous sync between this (source, target) pair left
+      // off — or skip the sync entirely when the source head shows nothing
+      // new. The heads are fetched up front (cheap; one request per side for
+      // network stores) and also anchor the epochs persisted with the cursor.
+      const cursorKey = this.syncScanCursorKey(sourceStore, targetStore);
+      const persisted = options?.forceFullScan
+        ? null
+        : this.syncScanCursors.get(cursorKey) ?? null;
+      const [sourceHead, targetHead] = await Promise.all([
+        this.getStoreHeadSafe(sourceStore),
+        this.getStoreHeadSafe(targetStore),
+      ]);
+
+      let cursor: StoreScanCursor | null = null;
+      if (persisted && sourceHead && targetHead) {
+        if (
+          persisted.sourceEpoch === sourceHead.epoch &&
+          persisted.targetEpoch === targetHead.epoch
+        ) {
+          if (sourceHead.maxReceiptOrder <= persisted.cursor.receiptOrder) {
+            this.logger.debug(
+              `Sync skip: source head ${sourceHead.maxReceiptOrder} already covered by persisted cursor (${cursorKey})`,
+            );
+            onProgress?.({
+              phase: 'preparing',
+              message: 'Source unchanged since last sync, nothing to scan',
+              transferredEntries: 0,
+              scannedEntries: 0,
+            });
+            return { transferred: 0, scanned: 0, cancelled: false };
+          }
+          cursor = persisted.cursor;
+          this.logger.debug(
+            `Resuming sync scan from persisted cursor receiptOrder=${cursor.receiptOrder} (${cursorKey})`,
+          );
+        } else {
+          // Epoch change on either side: the cursor lineage is broken
+          // (store reset / receipt-order migration) — full rescan.
+          this.logger.info(
+            `Sync cursor epoch changed for ${cursorKey}, discarding persisted cursor and re-scanning`,
+          );
+          this.syncScanCursors.delete(cursorKey);
+        }
+      }
+
+      const persistScanCursor = (finalCursor: StoreScanCursor | null): void => {
+        if (finalCursor && sourceHead && targetHead) {
+          this.saveSyncScanCursor(cursorKey, {
+            sourceEpoch: sourceHead.epoch,
+            targetEpoch: targetHead.epoch,
+            cursor: finalCursor,
+          });
+        }
+      };
+
+      const targetBloom = await this.getStoreBloomSummary(targetStore);
+      // Fixed progress denominator: the SOURCE's total entry count. The cursor
+      // scan below examines every source entry, so `scannedEntries/totalSourceEntries`
+      // is a real completion ratio. (Local stores serve this from a cached bloom
+      // summary; network stores answer with one extra request.) The target bloom
+      // stays dedicated to missing-id pre-screening.
+      const sourceBloom = await this.getStoreBloomSummary(sourceStore);
+      const totalSourceEstimate = sourceBloom?.totalIds;
+
       onProgress?.({
         phase: 'preparing',
         message: 'Preparing to sync entries...',
@@ -3153,19 +3390,36 @@ export class BaseMindooDB implements MindooDB {
         totalSourceEntries: totalSourceEstimate,
       });
 
-      let cursor: StoreScanCursor | null = null;
       let currentPage = 0;
+      // Scan-page pipelining (sync-v5, phase 4): while page N is being
+      // filtered and transferred, page N+1 is already being fetched.
+      let nextPagePromise: Promise<StoreScanResult> | null = null;
+      const discardPrefetch = (): void => {
+        // Swallow errors of an in-flight prefetch we will never consume
+        // (abort/cancel paths) to avoid unhandled rejections.
+        nextPagePromise?.catch(() => {});
+        nextPagePromise = null;
+      };
       while (true) {
         if (signal?.aborted) {
-          return { transferred, scanned, cancelled: true };
+          discardPrefetch();
+          persistScanCursor(cursor);
+          return { transferred, scanned, cancelled: true, rejected };
         }
 
-        const page = await sourceStore.scanEntriesSince!(cursor, pageSize);
+        const page: StoreScanResult = nextPagePromise
+          ? await nextPagePromise
+          : await sourceStore.scanEntriesSince!(cursor, pageSize);
+        nextPagePromise = page.hasMore
+          ? sourceStore.scanEntriesSince!(page.nextCursor, pageSize)
+          : null;
         currentPage++;
         scanned += page.entries.length;
 
         if (signal?.aborted) {
-          return { transferred, scanned, cancelled: true };
+          discardPrefetch();
+          persistScanCursor(cursor);
+          return { transferred, scanned, cancelled: true, rejected };
         }
 
         if (page.entries.length > 0) {
@@ -3182,7 +3436,9 @@ export class BaseMindooDB implements MindooDB {
           const missingIds = await this.filterMissingIds(targetStore, ids, targetBloom);
 
           if (signal?.aborted) {
-            return { transferred, scanned, cancelled: true };
+            discardPrefetch();
+            persistScanCursor(cursor);
+            return { transferred, scanned, cancelled: true, rejected };
           }
 
           if (missingIds.length > 0) {
@@ -3199,8 +3455,13 @@ export class BaseMindooDB implements MindooDB {
               },
             );
             transferred = transferResult.transferred;
+            rejected.push(...transferResult.rejected);
             if (transferResult.cancelled) {
-              return { transferred, scanned, cancelled: true };
+              // The current page's transfer did not complete: persist the
+              // boundary of the last fully transferred page instead.
+              discardPrefetch();
+              persistScanCursor(cursor);
+              return { transferred, scanned, cancelled: true, rejected };
             }
           }
         }
@@ -3219,7 +3480,8 @@ export class BaseMindooDB implements MindooDB {
           break;
         }
       }
-      return { transferred, scanned, cancelled: false };
+      persistScanCursor(cursor);
+      return { transferred, scanned, cancelled: false, rejected };
     }
 
     onProgress?.({
@@ -3259,8 +3521,9 @@ export class BaseMindooDB implements MindooDB {
       },
     );
     transferred = transferResult.transferred;
+    rejected.push(...transferResult.rejected);
     if (transferResult.cancelled) {
-      return { transferred, scanned: sourceNewMetadata.length, cancelled: true };
+      return { transferred, scanned: sourceNewMetadata.length, cancelled: true, rejected };
     }
 
     onProgress?.({
@@ -3275,6 +3538,7 @@ export class BaseMindooDB implements MindooDB {
       transferred,
       scanned: sourceNewMetadata.length,
       cancelled: false,
+      rejected,
     };
   }
 
@@ -3400,8 +3664,9 @@ export class BaseMindooDB implements MindooDB {
       const putResult = await targetStore.putEntries(entries);
       // Persist any witness receipts back onto the local source (see push path
       // in transferEntriesInBatches; docs/accesscontrol.md §5.3).
-      if (Array.isArray(putResult) && putResult.length > 0 && sourceStore.applyWitnessReceipts) {
-        await sourceStore.applyWitnessReceipts(putResult);
+      const { receipts } = BaseMindooDB.normalizePutResult(putResult);
+      if (receipts.length > 0 && sourceStore.applyWitnessReceipts) {
+        await sourceStore.applyWitnessReceipts(receipts);
       }
       transferred += entries.length;
 
@@ -3561,6 +3826,7 @@ export class BaseMindooDB implements MindooDB {
           `Custom document IDs must match ${CUSTOM_DOC_ID_REGEX.source}.`
         );
       }
+      this.validateIdPrefixOption("createDocuments", options);
     }
 
     const results: Array<MindooDoc | null> = new Array(inputs.length).fill(null);
@@ -3649,17 +3915,72 @@ export class BaseMindooDB implements MindooDB {
   }
   
   /**
+   * Validate `CreateOptions.idPrefix`: mutually exclusive with `id` and must
+   * match {@link DOC_ID_PREFIX_REGEX}.
+   */
+  private validateIdPrefixOption(methodName: string, options: CreateOptions): void {
+    if (options.idPrefix === undefined) {
+      return;
+    }
+    if (options.id !== undefined) {
+      throw new Error(`${methodName}: id and idPrefix are mutually exclusive`);
+    }
+    if (!DOC_ID_PREFIX_REGEX.test(options.idPrefix)) {
+      throw new Error(
+        `${methodName}: invalid idPrefix "${options.idPrefix}". ` +
+        `ID prefixes must match ${DOC_ID_PREFIX_REGEX.source}.`
+      );
+    }
+  }
+
+  /**
+   * Normalize a caller-supplied listing/iteration `idPrefix`, tolerating one or
+   * more trailing `_` a developer may append when they don't know the exact
+   * syntax (e.g. `"cls_"` → `"cls"`). Valid prefixes never contain `_` (see
+   * {@link DOC_ID_PREFIX_REGEX}), so trimming trailing underscores is lossless
+   * and makes `matchesDocIdPrefix` re-add the single boundary `_` consistently.
+   * Returns `undefined` for an absent or now-empty prefix (i.e. "no filter").
+   */
+  private normalizeIdPrefixFilter(idPrefix?: string): string | undefined {
+    if (idPrefix === undefined) {
+      return undefined;
+    }
+    const stripped = idPrefix.replace(/_+$/, "");
+    return stripped.length > 0 ? stripped : undefined;
+  }
+
+  /**
+   * Generate a fresh document id (`<prefix>_<22-char-base62(uuidv7)>`, or the
+   * bare base62 part without a prefix) that does not collide with any document
+   * already present in the local index. A collision is practically impossible
+   * (128-bit UUID7), so this is only a cheap O(1) safety net reusing the
+   * existing `indexLookup` map — no extra bookkeeping.
+   */
+  private generateUnusedDocId(prefix?: string): string {
+    for (;;) {
+      const candidate = generateDocId(prefix);
+      if (this.getDocIndexPosition(candidate) === undefined) {
+        return candidate;
+      }
+    }
+  }
+
+  /**
    * Internal method to create a new document.
    *
-   * Handles all four creation flavors expressible through `CreateOptions`:
-   * - generated UUID7 ID, current user signs, default tenant key
-   * - generated UUID7 ID, custom signing key (e.g. directory admin operations)
+   * Handles the creation flavors expressible through `CreateOptions`:
+   * - generated ID (time-sortable base62-encoded UUID7), current user signs,
+   *   default tenant key
+   * - generated ID with custom signing key (e.g. directory admin operations)
+   * - generated ID with a caller-provided `idPrefix` (`<prefix>_<base62>`)
    * - caller-provided ID, current user signs (idempotent on existing IDs)
    * - caller-provided ID with custom signing key
    *
    * For caller-provided IDs the initial Automerge change is seeded from a
    * deterministic, hard-coded change so that two replicas creating the same
    * custom ID converge when synced (see `getCustomIdInitialChangeBytes`).
+   * Prefix-generated IDs are unique by construction, so they take the
+   * generated-ID path: one `doc_create` entry with `initialValues` baked in.
    */
   private async createDocumentInternal(options: CreateOptions): Promise<MindooDoc> {
     this.assertWritable("createDocument");
@@ -3672,6 +3993,7 @@ export class BaseMindooDB implements MindooDB {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
+    this.validateIdPrefixOption("createDocument", options);
 
     // Sanitize caller-provided initial values: internal/reserved fields (those
     // starting with "_", e.g. "_attachments") are managed by MindooDB and must
@@ -3715,7 +4037,7 @@ export class BaseMindooDB implements MindooDB {
       }
     }
 
-    const docId = useCustomDocId ? options.id! : uuidv7();
+    const docId = useCustomDocId ? options.id! : this.generateUnusedDocId(options.idPrefix);
 
     // Idempotent create: when a caller-provided id already exists locally,
     // return the existing document instead of producing a duplicate doc_create.
@@ -3947,6 +4269,7 @@ export class BaseMindooDB implements MindooDB {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
+    this.validateIdPrefixOption("createDocuments", options);
 
     // Sanitize caller-provided initial values: internal/reserved fields are
     // managed by MindooDB and must not be seeded by callers. `undefined`
@@ -3968,7 +4291,7 @@ export class BaseMindooDB implements MindooDB {
       }
     }
 
-    const docId = useCustomDocId ? options.id! : uuidv7();
+    const docId = useCustomDocId ? options.id! : this.generateUnusedDocId(options.idPrefix);
     const now = Date.now();
 
     // Build the initial Automerge document and its first change bytes,
@@ -6534,21 +6857,26 @@ export class BaseMindooDB implements MindooDB {
     return filteredPaths.length > 0 ? filteredPaths : normalizedPaths;
   }
 
-  async getAllDocumentIds(): Promise<string[]> {
-    // Return all non-deleted document IDs from index
+  async getAllDocumentIds(options?: ListDocumentIdsOptions): Promise<string[]> {
+    // Return all non-deleted document IDs from index, optionally narrowed to a
+    // single id prefix (matched on the `<prefix>_` boundary; see matchesDocIdPrefix).
+    const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
     const docIds: string[] = [];
     for (const entry of this.index) {
       if (entry.accessState === "visible" && !entry.isDeleted) {
+        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
         docIds.push(entry.docId);
       }
     }
     return docIds;
   }
 
-  async getDeletedDocumentIds(): Promise<string[]> {
+  async getDeletedDocumentIds(options?: ListDocumentIdsOptions): Promise<string[]> {
+    const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
     const docIds: string[] = [];
     for (const entry of this.index) {
       if (entry.accessState === "visible" && entry.isDeleted) {
+        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
         docIds.push(entry.docId);
       }
     }
@@ -8919,7 +9247,8 @@ export class BaseMindooDB implements MindooDB {
       isDeleted: boolean;
       accessState?: DocumentAccessState;
     }>,
-    startIndex: number
+    startIndex: number,
+    idPrefix?: string
   ): Promise<number> {
     if (this.iteratePrefetchWindowDocs <= 0) {
       return 0;
@@ -8939,6 +9268,10 @@ export class BaseMindooDB implements MindooDB {
       // tombstones anyway: inaccessible docs are never materialized, and
       // deleted docs are yielded without body materialization.
       if (entry.accessState === "inaccessible" || entry.isDeleted) {
+        continue;
+      }
+      // Don't prefetch bodies the prefix-filtered iteration will never yield.
+      if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) {
         continue;
       }
       const docId = entry.docId;
@@ -9341,7 +9674,8 @@ export class BaseMindooDB implements MindooDB {
   }
 
   async *iterateChangeMetadataSince(
-    cursor: ProcessChangesCursor | null
+    cursor: ProcessChangesCursor | null,
+    options?: IterateChangesOptions
   ): AsyncGenerator<ProcessChangeSummaryResult, void, unknown> {
     const startedAt = Date.now();
     const actualCursor: ProcessChangesCursor = cursor ?? {
@@ -9349,6 +9683,7 @@ export class BaseMindooDB implements MindooDB {
       lastModified: 0,
       docId: "",
     };
+    const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
     const indexSnapshot = [...this.index];
     const startIndex = this.getStartIndexForCursor(indexSnapshot, actualCursor);
     let yieldedDocuments = 0;
@@ -9356,6 +9691,7 @@ export class BaseMindooDB implements MindooDB {
     try {
       for (let i = startIndex; i < indexSnapshot.length; i++) {
         const entry = indexSnapshot[i];
+        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
         const currentCursor: ProcessChangesCursor = {
           changeSeq: entry.changeSeq,
           lastModified: entry.lastModified,
@@ -9398,23 +9734,38 @@ export class BaseMindooDB implements MindooDB {
    * them. O(log n) binary search on the internal `(changeSeq, docId)` index —
    * used for progress reporting around {@link iterateChangesSince}.
    */
-  countChangesSince(cursor: ProcessChangesCursor | null): number {
+  countChangesSince(
+    cursor: ProcessChangesCursor | null,
+    options?: IterateChangesOptions
+  ): number {
     const actualCursor: ProcessChangesCursor = cursor ?? {
       changeSeq: 0,
       lastModified: 0,
       docId: "",
     };
     const startIndex = this.getStartIndexForCursor(this.index, actualCursor);
-    return this.index.length - startIndex;
+    const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
+    if (!idPrefix) {
+      return this.index.length - startIndex;
+    }
+    // Prefix-filtered count must walk the tail: the index is ordered by
+    // (changeSeq, docId), not by docId, so matches are not contiguous.
+    let count = 0;
+    for (let i = startIndex; i < this.index.length; i++) {
+      if (matchesDocIdPrefix(this.index[i].docId, idPrefix)) count++;
+    }
+    return count;
   }
 
   async *iterateChangesSince(
-    cursor: ProcessChangesCursor | null
+    cursor: ProcessChangesCursor | null,
+    options?: IterateChangesOptions
   ): AsyncGenerator<ProcessChangesResult, void, unknown> {
     const startedAt = Date.now();
     // Default to initial cursor if null is provided.
     // Prefer deterministic sequence-based cursoring; keep legacy fallback compatibility.
     const actualCursor: ProcessChangesCursor = cursor ?? { changeSeq: 0, lastModified: 0, docId: "" };
+    const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
     this.logger.debug(`Starting iteration from cursor ${JSON.stringify(actualCursor)}`);
 
     // Use a stable snapshot of the index for this generator run so concurrent
@@ -9427,7 +9778,8 @@ export class BaseMindooDB implements MindooDB {
 
     let prefetchedDocuments = await this.prefetchIterationWindow(
       indexSnapshot,
-      startIndex
+      startIndex,
+      idPrefix
     );
     let yieldedDocuments = 0;
     let loadedDocuments = 0;
@@ -9436,6 +9788,9 @@ export class BaseMindooDB implements MindooDB {
       // Iterate through the stable snapshot and yield documents one at a time.
       for (let i = startIndex; i < indexSnapshot.length; i++) {
         const entry = indexSnapshot[i];
+        // Skip entries outside the requested id prefix before any body load,
+        // so prefix-filtered iteration never decrypts/materializes unrelated docs.
+        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
         if (entry.accessState !== "visible") {
           // The document was readable before but the current KeyBag can no
           // longer decrypt it (e.g. a revoked key, §13). Emit a tombstone so
@@ -9452,7 +9807,8 @@ export class BaseMindooDB implements MindooDB {
           yield { doc: this.buildInaccessibleDoc(entry), cursor: inaccessibleCursor };
           prefetchedDocuments += await this.prefetchIterationWindow(
             indexSnapshot,
-            i + 1
+            i + 1,
+            idPrefix
           );
           continue;
         }
@@ -9473,7 +9829,8 @@ export class BaseMindooDB implements MindooDB {
           yield { doc: this.buildDeletedDoc(entry), cursor: deletedCursor };
           prefetchedDocuments += await this.prefetchIterationWindow(
             indexSnapshot,
-            i + 1
+            i + 1,
+            idPrefix
           );
           continue;
         }
@@ -9513,7 +9870,8 @@ export class BaseMindooDB implements MindooDB {
           yield { doc, cursor: currentCursor };
           prefetchedDocuments += await this.prefetchIterationWindow(
             indexSnapshot,
-            i + 1
+            i + 1,
+            idPrefix
           );
         } catch (error) {
           this.logger.error(`Error processing document ${entry.docId}:`, error);
@@ -11568,6 +11926,9 @@ export class BaseMindooDB implements MindooDB {
     const chunks: StoreEntry[] = [];
     let prevChunkId: string | null = null;
     let lastChunkId: string = "";
+    // Guards against case-folded chunk-id collisions on case-insensitive
+    // filesystems; scoped to this single attachment write.
+    const usedCaseFoldedChunkIds = new Set<string>();
     
     for (let offset = 0; offset < fileData.length; offset += this.chunkSizeBytes) {
       const chunkData = fileData.slice(offset, Math.min(offset + this.chunkSizeBytes, fileData.length));
@@ -11579,7 +11940,7 @@ export class BaseMindooDB implements MindooDB {
       const contentHash = await computeContentHash(encryptedData, this.getSubtle());
       
       // Generate chunk ID
-      const chunkId = generateAttachmentChunkId(docId, attachmentId);
+      const chunkId = generateUniqueAttachmentChunkId(docId, attachmentId, usedCaseFoldedChunkIds);
       lastChunkId = chunkId;
       
       // Sign the encrypted chunk
@@ -11737,6 +12098,9 @@ export class BaseMindooDB implements MindooDB {
     const pendingEntries: StoreEntry[] = [];
     let pendingEncryptedBytes = 0;
     let ledgerCreated = false;
+    // Guards against case-folded chunk-id collisions on case-insensitive
+    // filesystems; scoped to this single attachment write.
+    const usedCaseFoldedChunkIds = new Set<string>();
 
     const flushPendingEntries = async (force = false): Promise<void> => {
       if (pendingEntries.length === 0) {
@@ -11763,7 +12127,7 @@ export class BaseMindooDB implements MindooDB {
       const contentHash = await computeContentHash(encryptedData, this.getSubtle());
       
       // Generate chunk ID
-      const chunkId = generateAttachmentChunkId(docId, attachmentId);
+      const chunkId = generateUniqueAttachmentChunkId(docId, attachmentId, usedCaseFoldedChunkIds);
       
       // Sign the encrypted chunk
       const signature = await this.tenant.signPayload(encryptedData);
@@ -11877,6 +12241,9 @@ export class BaseMindooDB implements MindooDB {
     const chunks: StoreEntry[] = [];
     let prevChunkId = prevLastChunkId;
     let lastChunkId = prevLastChunkId;
+    // Guards against case-folded chunk-id collisions on case-insensitive
+    // filesystems; scoped to this single append.
+    const usedCaseFoldedChunkIds = new Set<string>();
     
     for (let offset = 0; offset < data.length; offset += this.chunkSizeBytes) {
       const chunkData = data.slice(offset, Math.min(offset + this.chunkSizeBytes, data.length));
@@ -11888,7 +12255,7 @@ export class BaseMindooDB implements MindooDB {
       const contentHash = await computeContentHash(encryptedData, this.getSubtle());
       
       // Generate chunk ID
-      const chunkId = generateAttachmentChunkId(docId, attachmentId);
+      const chunkId = generateUniqueAttachmentChunkId(docId, attachmentId, usedCaseFoldedChunkIds);
       lastChunkId = chunkId;
       
       // Sign the encrypted chunk
@@ -12165,6 +12532,13 @@ export class BaseMindooDB implements MindooDB {
     try {
       const syncResult = await this.syncEntriesFromStore(localStore, remoteStore, options);
       this.logger.debug(`Transferred ${syncResult.transferred} entries to remote store`);
+      const rejectedEntries = syncResult.rejected ?? [];
+      if (rejectedEntries.length > 0) {
+        this.logger.warn(
+          `Remote rejected ${rejectedEntries.length} entries during push (skipped, push continued): ` +
+            rejectedEntries.map((r) => r.reason).join("; "),
+        );
+      }
 
       if (syncResult.cancelled) {
         this.logger.info(`Push cancelled after transferring ${syncResult.transferred} entries`);
@@ -12172,6 +12546,7 @@ export class BaseMindooDB implements MindooDB {
           transferredEntries: syncResult.transferred,
           scannedEntries: syncResult.scanned,
           cancelled: true,
+          ...(rejectedEntries.length > 0 ? { rejectedEntries } : {}),
         };
       }
 
@@ -12192,6 +12567,7 @@ export class BaseMindooDB implements MindooDB {
         transferredEntries: syncResult.transferred,
         scannedEntries: syncResult.scanned,
         cancelled: false,
+        ...(rejectedEntries.length > 0 ? { rejectedEntries } : {}),
       };
     } finally {
       restoreAuthOverride();

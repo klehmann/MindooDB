@@ -10,7 +10,13 @@
 
 import { v7 as uuidv7 } from 'uuid';
 
-const BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/**
+ * Base62 alphabet in ASCII order (digits < uppercase < lowercase). The order
+ * matters: fixed-length, left-zero-padded encodings of numerically increasing
+ * values (e.g. UUID7 timestamps) then sort chronologically under plain
+ * lexicographic string comparison. Do NOT reorder.
+ */
+const BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const UUID_NO_DASH_LENGTH = 32;
 const BASE62_UUID_LENGTH = 22;
 
@@ -51,6 +57,47 @@ function hexToBase62(uuid: string): string {
   }
 
   return ensureLength(encoded, BASE62_UUID_LENGTH);
+}
+
+/**
+ * Generate a fresh, globally unique document id: a UUID7 encoded as a
+ * fixed-length (22 char), left-zero-padded base62 string, optionally prefixed
+ * with `<prefix>_`.
+ *
+ * Because the UUID7 timestamp occupies the most significant bits and the
+ * base62 alphabet is in ASCII order, ids generated later sort lexicographically
+ * after ids generated earlier (within the same prefix) — same property as raw
+ * UUID7 strings, but 14 characters shorter.
+ *
+ * The prefix (if any) is NOT validated here; callers validate it against
+ * `DOC_ID_PREFIX_REGEX` before invoking this.
+ *
+ * @param prefix Optional short application prefix (e.g. "cls"); joined with "_".
+ * @returns e.g. "0BqXa9yTFn2M4kVzR1sWpq" or "cls_0BqXa9yTFn2M4kVzR1sWpq"
+ */
+export function generateDocId(prefix?: string): string {
+  const encoded = hexToBase62(uuidv7());
+  return prefix ? `${prefix}_${encoded}` : encoded;
+}
+
+/**
+ * Boundary-aware document-id prefix match used by prefix-filtered listing and
+ * changefeed iteration.
+ *
+ * A `docId` matches `idPrefix` when it either equals the prefix exactly or
+ * begins with `<idPrefix>_`. Matching on the `_` boundary (rather than a raw
+ * `startsWith`) mirrors the `<prefix>_<base62>` id scheme, so filtering by
+ * `"cls"` returns `cls_…` documents without also catching an unrelated prefix
+ * like `classroom_…`.
+ *
+ * An empty `idPrefix` matches every id (i.e. "no filter").
+ *
+ * @param docId The document id to test.
+ * @param idPrefix The prefix to match (without the trailing `_`).
+ */
+export function matchesDocIdPrefix(docId: string, idPrefix: string): boolean {
+  if (idPrefix.length === 0) return true;
+  return docId === idPrefix || docId.startsWith(`${idPrefix}_`);
 }
 
 /**
@@ -119,6 +166,39 @@ export function generateAttachmentChunkId(
   const chunkId = chunkUuid7 || uuidv7();
   const base62Chunk = hexToBase62(chunkId);
   return `${docId}_a_${fileUuid7}_${base62Chunk}`;
+}
+
+/**
+ * Generate an attachment chunk id that is unique within one write operation
+ * even under case-insensitive comparison.
+ *
+ * Chunk entry ids become on-disk filenames (`entries/<id>.json`) and — unlike
+ * document entry ids — contain no lowercase-hex hash component, so two chunk
+ * ids differing only in the case of their base62 part would collide on
+ * case-insensitive filesystems (APFS/NTFS). The caller passes a set of
+ * case-folded ids already used in the current write; on the (astronomically
+ * unlikely) fold-collision the id is simply regenerated. The set is expected
+ * to be scoped to a single attachment write, so there is no persistent cost.
+ *
+ * @param docId The document ID this attachment belongs to
+ * @param fileUuid7 The UUID7 for the whole file (same for all chunks)
+ * @param usedCaseFoldedIds Case-folded ids already used in this write; the
+ *   returned id's folded form is added to the set.
+ * @returns The generated chunk ID
+ */
+export function generateUniqueAttachmentChunkId(
+  docId: string,
+  fileUuid7: string,
+  usedCaseFoldedIds: Set<string>,
+): string {
+  for (;;) {
+    const id = generateAttachmentChunkId(docId, fileUuid7);
+    const folded = id.toLowerCase();
+    if (!usedCaseFoldedIds.has(folded)) {
+      usedCaseFoldedIds.add(folded);
+      return id;
+    }
+  }
 }
 
 /**

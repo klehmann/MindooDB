@@ -19,6 +19,15 @@ import { readFileSync, existsSync } from "fs";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
+import { jsonCompressionMiddleware } from "./compressionMiddleware";
+import {
+  BINARY_ENTRIES_CONTENT_TYPE,
+  BINARY_GET_ENTRIES_FORMAT,
+  BINARY_PUT_ENTRIES_FORMAT,
+  decodeBinaryEntryMessage,
+  encodeBinaryEntryMessage,
+} from "../../core/appendonlystores/network/binaryEntryFraming";
+import { SyncEventBus } from "./SyncEventBus";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -203,6 +212,8 @@ function parseBodySizeLimitToBytes(limit: string): number | null {
 
 export class MindooDBServer {
   private app: express.Application;
+  /** In-process change feed backing the SSE endpoint (sync-v5, phase 5). */
+  private syncEventBus: SyncEventBus;
   private tenantManager: TenantManager;
   private capabilityMatcher: CapabilityMatcher;
   private systemAdminAuth: SystemAdminAuthService;
@@ -229,6 +240,7 @@ export class MindooDBServer {
     configPath?: string,
   ) {
     this.app = express();
+    this.syncEventBus = new SyncEventBus();
     this.tenantManager = new TenantManager(dataDir, serverPassword);
     this.staticDir = staticDir;
     this.configPath = configPath ?? path.join(dataDir, "config.json");
@@ -347,6 +359,10 @@ export class MindooDBServer {
       legacyHeaders: false,
       message: { error: "Too many requests, please try again later" },
     }));
+
+    // Response compression (sync-v5, phase 3): brotli/gzip for JSON bodies
+    // >= 1 KB. Metadata-heavy sync responses shrink 5-10x.
+    this.app.use(jsonCompressionMiddleware);
 
     this.app.use(express.json({
       limit: this.jsonBodyLimit,
@@ -1114,10 +1130,24 @@ export class MindooDBServer {
       router.post(`${syncBase}/findNewEntriesForDoc`, syncRateLimit, this.handleFindNewEntriesForDoc.bind(this));
       router.post(`${syncBase}/findEntries`, syncRateLimit, this.handleFindEntries.bind(this));
       router.post(`${syncBase}/scanEntriesSince`, syncRateLimit, this.handleScanEntriesSince.bind(this));
+      router.post(`${syncBase}/getStoreHead`, syncRateLimit, this.handleGetStoreHead.bind(this));
       router.post(`${syncBase}/getIdBloomSummary`, syncRateLimit, this.handleGetIdBloomSummary.bind(this));
       router.post(`${syncBase}/getCompactionStatus`, syncRateLimit, this.handleGetCompactionStatus.bind(this));
       router.get(`${syncBase}/capabilities`, syncRateLimit, this.handleGetCapabilities.bind(this));
+      // SSE live change feed (sync-v5, phase 5): one long-lived GET per
+      // subscriber; putEntries publishes into the in-process event bus.
+      router.get(`${syncBase}/events`, syncRateLimit, this.handleSyncEvents.bind(this));
       router.post(`${syncBase}/getEntries`, syncRateLimit, this.handleGetEntries.bind(this));
+      // Binary wire format v2 (sync-v5, phase 3): octet-stream framing for the
+      // two payload-heavy endpoints. putEntriesBinary needs its own raw body
+      // parser (the global JSON parser only handles application/json).
+      router.post(`${syncBase}/getEntriesBinary`, syncRateLimit, this.handleGetEntriesBinary.bind(this));
+      router.post(
+        `${syncBase}/putEntriesBinary`,
+        syncRateLimit,
+        express.raw({ type: BINARY_ENTRIES_CONTENT_TYPE, limit: this.jsonBodyLimit }),
+        this.handlePutEntriesBinary.bind(this),
+      );
       router.post(`${syncBase}/getEntryMetadata`, syncRateLimit, this.handleGetEntryMetadata.bind(this));
       router.post(`${syncBase}/putEntries`, syncRateLimit, this.handlePutEntries.bind(this));
       router.post(`${syncBase}/hasEntries`, syncRateLimit, this.handleHasEntries.bind(this));
@@ -1409,6 +1439,21 @@ export class MindooDBServer {
     }
   }
 
+  private async handleGetStoreHead(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId } = req.body as { dbId?: string };
+
+      const validDbId = this.validateDbId(dbId);
+
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
+      const head = await serverStore.handleGetStoreHead(token);
+      res.json({ head });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
   private async handleGetIdBloomSummary(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
@@ -1430,10 +1475,120 @@ export class MindooDBServer {
       const validDbId = this.validateDbId(req.query.dbId);
       const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const capabilities = await serverStore.handleGetCapabilities(token);
-      res.json({ capabilities: capabilities as NetworkSyncCapabilities });
+      // HTTP-layer features on top of the transport-agnostic capability set:
+      // binary octet-stream framing routes (phase 3) and the SSE change feed
+      // (phase 5) exist only in this Express host.
+      res.json({
+        capabilities: {
+          ...(capabilities as NetworkSyncCapabilities),
+          supportsBinaryEntries: true,
+          supportsChangeEvents: true,
+        },
+      });
     } catch (error) {
       this.handleRequestError(error, res);
     }
+  }
+
+  /**
+   * SSE live change feed (sync-v5, phase 5).
+   *
+   * `GET /:tenantId/sync/:storeKind/events` — Bearer-authenticated like every
+   * other sync route (fetch-streaming clients can set headers; native
+   * EventSource cannot, which is why the SDK uses a fetch reader).
+   *
+   * The subscribe-time read gate runs via `handleGetCapabilities` against the
+   * database given in `?dbId=` (default `directory`, which every tenant member
+   * can read): it validates the token and runs the database-open gate. Events
+   * carry only `{dbId, storeKind, epoch, maxReceiptOrder}` — metadata, never
+   * content. A heartbeat comment every 30 s keeps proxies from closing the
+   * stream. Token expiry does not tear down an open stream; the events are
+   * non-sensitive change hints and a reconnect re-authenticates.
+   */
+  private async handleSyncEvents(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const tenantId = req.tenantId!;
+      const storeKind = this.getStoreKindFromRequest(req);
+      const gateDbId = this.validateDbId(
+        typeof req.query.dbId === "string" && req.query.dbId ? req.query.dbId : "directory",
+      );
+
+      // Validates the token and runs the database-open/read gate before any
+      // event is delivered.
+      const serverStore = await this.tenantManager.getServerStore(tenantId, gateDbId, storeKind);
+      await serverStore.handleGetCapabilities(token);
+
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("X-Accel-Buffering", "no");
+      if (!req.httpVersion.startsWith("2")) {
+        // Forbidden (and unnecessary) on HTTP/2 streams.
+        res.setHeader("Connection", "keep-alive");
+      }
+      res.flushHeaders();
+      res.write(`event: hello\ndata: ${JSON.stringify({ protocolVersion: "sync-v5" })}\n\n`);
+
+      const unsubscribe = this.syncEventBus.subscribe((event) => {
+        if (event.tenantId !== tenantId || event.storeKind !== storeKind) {
+          return;
+        }
+        res.write(
+          `event: change\ndata: ${JSON.stringify({
+            dbId: event.dbId,
+            storeKind: event.storeKind,
+            epoch: event.epoch,
+            maxReceiptOrder: event.maxReceiptOrder,
+          })}\n\n`,
+        );
+      });
+
+      const heartbeat = setInterval(() => {
+        res.write(`: heartbeat ${Date.now()}\n\n`);
+      }, 30_000);
+
+      const cleanup = () => {
+        clearInterval(heartbeat);
+        unsubscribe();
+      };
+      req.on("close", cleanup);
+      res.on("close", cleanup);
+      console.log(
+        `[MindooDBServer] SSE subscriber connected tenant=${tenantId} storeKind=${storeKind} subscribers=${this.syncEventBus.listenerCount}`,
+      );
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
+  /**
+   * Publish a change event after an accepted putEntries write (sync-v5,
+   * phase 5). Fire-and-forget: head lookup failures must never affect the
+   * write path.
+   */
+  private publishSyncChangeEvent(
+    tenantId: string,
+    dbId: string,
+    storeKind: StoreKind,
+    serverStore: { handleGetStoreHead(token: string): Promise<{ epoch: string; maxReceiptOrder: number }> },
+    token: string,
+  ): void {
+    if (this.syncEventBus.listenerCount === 0) {
+      return;
+    }
+    void serverStore
+      .handleGetStoreHead(token)
+      .catch(() => null)
+      .then((head) => {
+        this.syncEventBus.publish({
+          tenantId,
+          dbId,
+          storeKind,
+          epoch: head?.epoch,
+          maxReceiptOrder: head?.maxReceiptOrder,
+        });
+      });
   }
 
   private async handleGetCompactionStatus(req: Request, res: Response): Promise<void> {
@@ -1454,12 +1609,29 @@ export class MindooDBServer {
   private async handleGetEntries(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
-      const { dbId, ids } = req.body;
+      const { dbId, ids, sessionKeyWrap } = req.body;
 
       const validDbId = this.validateDbId(dbId);
       validateArraySize(ids, MAX_ENTRY_IDS, "ids");
 
       const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
+
+      // Session-key transport format (sync-v5, phase 2): one RSA-wrapped
+      // AES-256-GCM key per response instead of per-entry RSA. Negotiated via
+      // the `sessionKeyWrap` request flag; legacy clients get the old format.
+      if (sessionKeyWrap === true) {
+        const batch = await serverStore.handleGetEntriesSessionWrapped(token, ids || []);
+        res.json({
+          wrappedSessionKey: this.uint8ArrayToBase64(batch.wrappedSessionKey),
+          entries: batch.entries.map((e) => ({
+            ...this.serializeEntryMetadata(e),
+            iv: this.uint8ArrayToBase64(e.iv),
+            sessionEncryptedPayload: this.uint8ArrayToBase64(e.sessionEncryptedPayload),
+          })),
+        });
+        return;
+      }
+
       const entries = await serverStore.handleGetEntries(token, ids || []);
 
       res.json({
@@ -1468,6 +1640,43 @@ export class MindooDBServer {
           rsaEncryptedPayload: this.uint8ArrayToBase64(e.rsaEncryptedPayload),
         })),
       });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
+  /**
+   * Binary variant of getEntries (sync-v5, phase 3): always session-key
+   * encrypted, response framed as `application/octet-stream` (see
+   * binaryEntryFraming.ts). The request stays JSON (small).
+   */
+  private async handleGetEntriesBinary(req: Request, res: Response): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const { dbId, ids } = req.body;
+
+      const validDbId = this.validateDbId(dbId);
+      validateArraySize(ids, MAX_ENTRY_IDS, "ids");
+
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
+      const batch = await serverStore.handleGetEntriesSessionWrapped(token, ids || []);
+
+      const body = encodeBinaryEntryMessage({
+        header: {
+          format: BINARY_GET_ENTRIES_FORMAT,
+          wrappedSessionKey: this.uint8ArrayToBase64(batch.wrappedSessionKey),
+        },
+        entries: batch.entries.map((e) => ({
+          meta: {
+            ...this.serializeEntryMetadata(e),
+            iv: this.uint8ArrayToBase64(e.iv),
+          },
+          payload: e.sessionEncryptedPayload,
+        })),
+      });
+
+      res.setHeader("Content-Type", BINARY_ENTRIES_CONTENT_TYPE);
+      res.send(Buffer.from(body.buffer, body.byteOffset, body.byteLength));
     } catch (error) {
       this.handleRequestError(error, res);
     }
@@ -1547,16 +1756,30 @@ export class MindooDBServer {
       );
 
       stage = "store-entries";
-      const stampedMetadata = await serverStore.handlePutEntries(token, deserializedEntries);
+      const ack = await serverStore.handlePutEntries(token, deserializedEntries);
       stage = "respond-success";
 
       // Return witness receipts for accepted entries so the pushing client (and
       // every replica it later syncs with) can persist the attestation
-      // (docs/accesscontrol.md §5.3). Older clients ignore the extra field.
+      // (docs/accesscontrol.md §5.3), plus per-entry rejections for
+      // signature-class failures the server skipped. Older clients ignore the
+      // extra fields.
       res.json({
         success: true,
-        receipts: stampedMetadata.map((e) => this.serializeEntryMetadata(e)),
+        receipts: ack.receipts.map((e) => this.serializeEntryMetadata(e)),
+        rejected: ack.rejected,
       });
+
+      // Announce the accepted write to SSE subscribers (sync-v5, phase 5).
+      if (ack.receipts.length > 0) {
+        this.publishSyncChangeEvent(
+          req.tenantId!,
+          validDbId,
+          this.getStoreKindFromRequest(req),
+          serverStore,
+          token,
+        );
+      }
 
       // A directory push may carry new admin-signed purge requests
       // (docs/accesscontrol.md §13). Execute any pending purges after the
@@ -1577,6 +1800,95 @@ export class MindooDBServer {
         parsedBytes: req.jsonBodyBytes ?? "-",
         contentLength: req.headers["content-length"] ?? "-",
         entryCount: Array.isArray(req.body?.entries) ? req.body.entries.length : "-",
+        error,
+      });
+      this.handleRequestError(error, res);
+    }
+  }
+
+  /**
+   * Binary variant of putEntries (sync-v5, phase 3). The request body is
+   * octet-stream framing; `dbId` travels in the message header JSON because
+   * there is no JSON body. Receipts are returned as JSON like putEntries.
+   */
+  private async handlePutEntriesBinary(req: Request, res: Response): Promise<void> {
+    let stage = "extract-token";
+    try {
+      const token = this.extractToken(req);
+      stage = "decode-body";
+      if (!Buffer.isBuffer(req.body)) {
+        res.status(400).json({ error: `putEntriesBinary requires a ${BINARY_ENTRIES_CONTENT_TYPE} body` });
+        return;
+      }
+      const message = decodeBinaryEntryMessage(new Uint8Array(req.body.buffer, req.body.byteOffset, req.body.byteLength));
+      if (message.header.format !== BINARY_PUT_ENTRIES_FORMAT) {
+        res.status(400).json({ error: `Unsupported binary entry format: ${String(message.header.format)}` });
+        return;
+      }
+
+      const validDbId = this.validateDbId(message.header.dbId);
+      validateArraySize(message.entries, MAX_PUT_ENTRIES, "entries");
+      console.log(
+        `[MindooDBServer] putEntriesBinary request tenant=${req.tenantId ?? "-"} db=${validDbId} entries=${message.entries.length} content-length=${req.headers["content-length"] ?? "-"}`,
+      );
+
+      stage = "load-server-store";
+      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
+
+      stage = "deserialize-entries";
+      const deserializedEntries = message.entries.map((frame, index) => {
+        const meta = frame.meta as unknown as SerializedEntryMetadata;
+        try {
+          return {
+            ...this.deserializeEntryMetadata(meta),
+            encryptedData: frame.payload,
+          };
+        } catch (error) {
+          console.error("[MindooDBServer] putEntriesBinary failed while deserializing entry", {
+            index,
+            id: meta?.id ?? "-",
+            type: meta?.entryType ?? "-",
+            docId: meta?.docId ?? "-",
+            payloadLength: frame.payload?.byteLength ?? "-",
+            error,
+          });
+          throw error;
+        }
+      });
+
+      stage = "store-entries";
+      const ack = await serverStore.handlePutEntries(token, deserializedEntries);
+      stage = "respond-success";
+
+      res.json({
+        success: true,
+        receipts: ack.receipts.map((e) => this.serializeEntryMetadata(e)),
+        rejected: ack.rejected,
+      });
+
+      // Announce the accepted write to SSE subscribers (sync-v5, phase 5).
+      if (ack.receipts.length > 0) {
+        this.publishSyncChangeEvent(
+          req.tenantId!,
+          validDbId,
+          this.getStoreKindFromRequest(req),
+          serverStore,
+          token,
+        );
+      }
+
+      // Same post-response purge hook as the JSON putEntries path.
+      if (validDbId === "directory") {
+        const tenantId = req.tenantId!;
+        void this.tenantManager.executePendingPurges(tenantId).catch((error) => {
+          console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
+        });
+      }
+    } catch (error) {
+      console.error("[MindooDBServer] putEntriesBinary failed", {
+        stage,
+        tenantId: req.tenantId ?? "-",
+        contentLength: req.headers["content-length"] ?? "-",
         error,
       });
       this.handleRequestError(error, res);
@@ -1856,7 +2168,7 @@ export class MindooDBServer {
     };
   }
 
-  private deserializeEntry(serialized: SerializedEntry): StoreEntry {
+  private deserializeEntryMetadata(serialized: SerializedEntryMetadata): StoreEntryMetadata {
     return {
       entryType: serialized.entryType,
       id: serialized.id,
@@ -1882,6 +2194,12 @@ export class MindooDBServer {
         : undefined,
       attachmentRefs: serialized.attachmentRefs,
       entryVersion: serialized.entryVersion,
+    };
+  }
+
+  private deserializeEntry(serialized: SerializedEntry): StoreEntry {
+    return {
+      ...this.deserializeEntryMetadata(serialized),
       encryptedData: this.base64ToUint8Array(serialized.encryptedData),
     };
   }

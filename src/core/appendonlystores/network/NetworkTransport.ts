@@ -14,9 +14,17 @@ import type {
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
+  PutEntriesAck,
+  StoreHead,
   StoreKind,
 } from "../types";
-import type { NetworkEncryptedEntry, AuthResult, NetworkSyncCapabilities } from "./types";
+import type {
+  NetworkEncryptedEntry,
+  SessionEncryptedEntriesBatch,
+  StoreChangeEvent,
+  AuthResult,
+  NetworkSyncCapabilities,
+} from "./types";
 
 /**
  * Abstract interface for network communication in MindooDB sync.
@@ -161,6 +169,13 @@ export interface NetworkTransport {
   getIdBloomSummary?(token: string): Promise<StoreIdBloomSummary>;
 
   /**
+   * Optional cheap head descriptor (`{ epoch, maxReceiptOrder }`) for
+   * persisted-cursor sync (sync-v5, phase 1). Gated by the
+   * `supportsStoreHead` capability.
+   */
+  getStoreHead?(token: string): Promise<StoreHead>;
+
+  /**
    * Optional compaction observability for remote store monitoring.
    */
   getCompactionStatus?(token: string): Promise<StoreCompactionStatus>;
@@ -215,6 +230,32 @@ export interface NetworkTransport {
   ): Promise<NetworkEncryptedEntry[]>;
 
   /**
+   * Get entries in the session-key transport format (sync-v5, phase 2).
+   *
+   * The response carries one AES-256-GCM session key, RSA-wrapped for the
+   * requesting user, plus per-entry AES-GCM payloads — one RSA operation per
+   * batch instead of one per entry. Gated by the `supportsSessionKeyWrap`
+   * capability; callers fall back to {@link getEntries} when absent.
+   */
+  getEntriesSessionWrapped?(
+    token: string,
+    ids: string[]
+  ): Promise<SessionEncryptedEntriesBatch>;
+
+  /**
+   * Get entries via the binary wire format v2 (sync-v5, phase 3).
+   *
+   * Same session-key encryption as {@link getEntriesSessionWrapped}, but the
+   * response travels as length-prefixed `application/octet-stream` framing
+   * instead of JSON+base64 — no base64 inflation, no large-JSON parse. Gated
+   * by the `supportsBinaryEntries` capability.
+   */
+  getEntriesBinary?(
+    token: string,
+    ids: string[]
+  ): Promise<SessionEncryptedEntriesBatch>;
+
+  /**
    * Get metadata for a single entry from the remote store.
    *
    * Useful for metadata-first dependency planning where the payload is not
@@ -239,16 +280,45 @@ export interface NetworkTransport {
    * Returns the witness receipts the server stamped onto the accepted entries
    * (stamped metadata carrying `receivedAt`/`receivedByPublicKey`/
    * `receivedDateSignature`), so the client can persist the attestation locally
-   * (docs/accesscontrol.md §5.3). May be empty when the server does not witness.
+   * (docs/accesscontrol.md §5.3), plus the per-entry rejections the server
+   * skipped (signature-class validation failures; see {@link PutEntriesAck}).
+   * Older servers that fail the whole batch on a signature-class failure
+   * surface as a thrown INVALID_SIGNATURE error instead.
    *
    * @param token JWT access token from authenticate()
    * @param entries The entries to push to the remote store
-   * @returns Witness receipts (stamped metadata) for the accepted entries
+   * @returns Witness receipts for the accepted entries plus per-entry rejections
    * @throws NetworkError with type INVALID_TOKEN if token is invalid or expired
    * @throws NetworkError with type USER_REVOKED if user has been revoked since token was issued
-   * @throws NetworkError with type INVALID_SIGNATURE if entry signature verification fails
+   * @throws NetworkError with type INVALID_SIGNATURE if entry signature verification fails (pre-sync-v5 servers)
    */
-  putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]>;
+  putEntries(token: string, entries: StoreEntry[]): Promise<PutEntriesAck>;
+
+  /**
+   * Push entries via the binary wire format v2 (sync-v5, phase 3).
+   *
+   * Semantically identical to {@link putEntries} (same witness receipts and
+   * per-entry rejections), but the request body is length-prefixed
+   * `application/octet-stream` framing instead of JSON+base64. Gated by the
+   * `supportsBinaryEntries` capability; callers fall back to
+   * {@link putEntries} when absent.
+   */
+  putEntriesBinary?(token: string, entries: StoreEntry[]): Promise<PutEntriesAck>;
+
+  /**
+   * Open the server's live change feed (sync-v5, phase 5, capability
+   * `supportsChangeEvents`) and invoke `onEvent` for every announced change.
+   *
+   * The returned promise stays pending while the stream is open and settles
+   * when the stream ends (resolves on orderly close or abort, rejects on
+   * transport errors). Reconnect/backoff is the caller's responsibility —
+   * see `ClientNetworkContentAddressedStore.subscribeToChanges`.
+   */
+  subscribeToChanges?(
+    token: string,
+    onEvent: (event: StoreChangeEvent) => void,
+    options?: { signal?: AbortSignal }
+  ): Promise<void>;
 
   /**
    * Check which of the provided IDs exist in the remote store.

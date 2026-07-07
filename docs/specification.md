@@ -138,6 +138,11 @@ interface StoreEntry extends StoreEntryMetadata {
 }
 ```
 
+**Document ID formats:**
+- **Default (generated):** 22-char base62-encoded UUIDv7 (e.g. `0BqXa9yTFn2M4kVzR1sWpq`). The base62 alphabet is ASCII-ordered (`0-9A-Za-z`), so generated IDs sort lexicographically by creation time.
+- **Prefixed (generated):** `CreateOptions.idPrefix` (1–10 ASCII-alphanumeric chars, starting with a letter, no `_`) yields `<prefix>_<22-char-base62>` (e.g. `cls_0BqXa9yTFn2M4kVzR1sWpq`) — debug-friendly and time-sortable within the same prefix. Because MindooDB generates the ID, `initialValues` are baked into the single `doc_create` entry.
+- **Custom (caller-provided):** `CreateOptions.id` (matching `^[A-Za-z][A-Za-z0-9_]*$`) for fixed, convergent IDs (e.g. singletons like `dbsetup`). The first change is a deterministic, content-free seed so independent replicas creating the same ID share Automerge ancestry; `initialValues` are not allowed here and data lands in a follow-up `doc_change` (two entries instead of one). Mutually exclusive with `idPrefix`.
+
 **Store entry ID formats:**
 - **Document entries** (`doc_create|doc_change|doc_snapshot|doc_delete`): `<docId>_d_<depsFingerprint>_<automergeHash>`
   - `depsFingerprint`: first 8 hex chars of SHA-256 over the **sorted Automerge dependency hashes** joined by commas; `"0"` if there are no dependencies.
@@ -545,6 +550,9 @@ The `mdb://` URIs are base64url-encoded JSON payloads with a version field for f
 ```typescript
 // Create
 const doc = await db.createDocument();  // Uses "default" key
+// or with a readable, time-sortable prefixed id + initial values
+// (single doc_create entry, e.g. id "cls_0BqXa9yTFn2M4kVzR1sWpq"):
+const doc = await db.createDocument({ idPrefix: "cls", initialValues: { title: "5b" } });
 // or
 const doc = await db.createEncryptedDocument("confidential-key");
 

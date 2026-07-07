@@ -2,7 +2,7 @@ import type { KeyBag } from "./keys/KeyBag";
 import type { KeyType } from "./keys/KeyContext";
 import type { PublicUserId, PrivateUserId } from "./userid";
 import { StoreKind } from "./appendonlystores/types";
-import type { ContentAddressedStore, OpenStoreOptions, StoreScanCursor } from "./appendonlystores/types";
+import type { ContentAddressedStore, OpenStoreOptions, RejectedPutEntry, StoreScanCursor } from "./appendonlystores/types";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import type {
@@ -851,6 +851,9 @@ export type {
   StoreScanFilters,
   StoreScanResult,
   StoreIdBloomSummary,
+  StoreHead,
+  RejectedPutEntry,
+  PutEntriesAck,
   AttachmentReadPlanOptions,
   AttachmentReadPlanChunk,
   AttachmentReadPlan,
@@ -1488,20 +1491,46 @@ export interface SnapshotConfig {
 export const CUSTOM_DOC_ID_REGEX = /^[A-Za-z][A-Za-z0-9_]*$/;
 
 /**
+ * Regex used to validate `CreateOptions.idPrefix`.
+ *
+ * A prefix is a short (1–10 chars) ASCII-alphanumeric tag starting with a
+ * letter, e.g. `"cls"`. It must NOT contain `_` — MindooDB appends the `_`
+ * separator itself when building the final id `<prefix>_<22-char-base62>`.
+ */
+export const DOC_ID_PREFIX_REGEX = /^[A-Za-z][A-Za-z0-9]{0,9}$/;
+
+/**
  * Options accepted by `MindooDB.createDocument()`.
  */
 export interface CreateOptions {
   /**
    * Caller-provided document ID. When provided it must match
    * `^[A-Za-z][A-Za-z0-9_]*$` (see `CUSTOM_DOC_ID_REGEX`). When omitted, a fresh
-   * UUID7 is generated.
+   * time-sortable ID is generated (see `idPrefix` for the format).
    *
    * If a document with this ID already exists locally, `createDocument()`
    * returns the existing document (idempotent create). For independent replicas
    * to converge on the same custom ID, MindooDB seeds custom-ID documents with
    * a hard-coded initial Automerge change so they share Automerge ancestry.
+   *
+   * Mutually exclusive with `idPrefix`.
    */
   id?: string;
+
+  /**
+   * Optional short prefix (1–10 ASCII-alphanumeric chars, starting with a
+   * letter; see `DOC_ID_PREFIX_REGEX`) for a MindooDB-generated document ID.
+   * The final ID is `<idPrefix>_<22-char-base62(uuidv7)>`, e.g.
+   * `cls_0BqXa9yTFn2M4kVzR1sWpq` — time-sortable within the same prefix.
+   *
+   * Unlike a custom `id`, uniqueness is guaranteed by MindooDB itself, so the
+   * create follows the generated-ID code path: a single `doc_create` entry
+   * with `initialValues` baked in — no deterministic seed change and no
+   * follow-up `doc_change`.
+   *
+   * Mutually exclusive with `id`.
+   */
+  idPrefix?: string;
 
   /**
    * Symmetric encryption key ID to use for this document. Defaults to `"default"`
@@ -1603,6 +1632,40 @@ export interface UndeleteOptions {
    * quarantine-on-materialization still enforce the rules. Defaults to `false`.
    */
   bypassAccessControlPrecheck?: boolean;
+}
+
+/**
+ * Options accepted by the document-id listing methods
+ * ({@link MindooDB.getAllDocumentIds}, {@link MindooDB.getDeletedDocumentIds}).
+ */
+export interface ListDocumentIdsOptions {
+  /**
+   * Restrict the result to documents whose id matches this prefix. Matching is
+   * boundary-aware: an id matches when it equals `idPrefix` exactly or begins
+   * with `<idPrefix>_`, mirroring the `<prefix>_<base62>` id scheme produced by
+   * `createDocument({ idPrefix })`. So `"cls"` matches `cls_…` documents but not
+   * an unrelated `classroom_…` id. Omit (or pass an empty string) for no filter.
+   */
+  idPrefix?: string;
+}
+
+/**
+ * Options accepted by the changefeed iteration methods
+ * ({@link MindooDB.iterateChangesSince}, {@link MindooDB.iterateChangeMetadataSince},
+ * {@link MindooDB.countChangesSince}).
+ */
+export interface IterateChangesOptions {
+  /**
+   * Restrict emitted changes to documents whose id matches this prefix (same
+   * boundary-aware semantics as {@link ListDocumentIdsOptions.idPrefix}).
+   *
+   * For {@link MindooDB.iterateChangesSince} this skips non-matching documents
+   * *before* their body is loaded or decrypted, so filtering by content-type
+   * prefix avoids materializing unrelated documents — and, across the app-SDK
+   * bridge, avoids shipping them to the client. Omit (or pass an empty string)
+   * for no filter.
+   */
+  idPrefix?: string;
 }
 
 /**
@@ -3970,6 +4033,22 @@ export interface SyncOptions {
    * metered connections) where only the current document state is needed.
    */
   mode?: SyncMode;
+  /**
+   * Ignore any persisted sync scan cursor and re-scan the source store from
+   * the beginning (sync-v5, phase 1). Escape hatch for repair scenarios; the
+   * persisted cursor is refreshed from the full scan's result.
+   */
+  forceFullScan?: boolean;
+  /**
+   * Number of transfer batches allowed to run in parallel (sync-v5, phase 4).
+   *
+   * Each batch is one `getEntries` + `putEntries` round trip; running a small
+   * window of them concurrently overlaps network latency and server-side
+   * encryption. Progress events and abort semantics are preserved; witness
+   * receipts are applied per batch (order-independent). Defaults to 3;
+   * set to 1 to restore strictly sequential transfers.
+   */
+  maxConcurrentBatches?: number;
 }
 
 /**
@@ -3979,6 +4058,14 @@ export interface SyncResult {
   transferredEntries: number;
   scannedEntries: number;
   cancelled: boolean;
+  /**
+   * Entries the remote refused to ingest during a push (signature-class
+   * validation failures, sync-v5 per-entry rejection). The push itself
+   * completes — rejected entries are skipped and reported here so callers
+   * can surface a warning. Empty/absent when nothing was rejected (and on
+   * pulls, where the target is the local store).
+   */
+  rejectedEntries?: RejectedPutEntry[];
 }
 
 /** One changed document in a {@link DbChangeEvent} (lightweight metadata only). */
@@ -4305,9 +4392,11 @@ export interface MindooDB {
   /**
    * Get all non-deleted document IDs in this database.
    *
+   * @param options Optional filtering, e.g. `{ idPrefix }` to return only ids
+   *   matching a content-type prefix (see {@link ListDocumentIdsOptions}).
    * @return A list of document IDs
    */
-  getAllDocumentIds(): Promise<string[]>;
+  getAllDocumentIds(options?: ListDocumentIdsOptions): Promise<string[]>;
 
   /**
    * Get all deleted document IDs in this database.
@@ -4315,9 +4404,11 @@ export interface MindooDB {
    * Deleted documents remain available through history/time-travel APIs until
    * their history is purged.
    *
+   * @param options Optional filtering, e.g. `{ idPrefix }` to return only ids
+   *   matching a content-type prefix (see {@link ListDocumentIdsOptions}).
    * @return A list of deleted document IDs
    */
-  getDeletedDocumentIds(): Promise<string[]>;
+  getDeletedDocumentIds(options?: ListDocumentIdsOptions): Promise<string[]>;
 
   /**
    * Get all document IDs that existed at a specific timestamp.
@@ -4591,9 +4682,14 @@ export interface MindooDB {
    * ```
    *
    * @param cursor The cursor to start processing changes from. Use `null` to start from the beginning.
+   * @param options Optional filtering, e.g. `{ idPrefix }` to skip non-matching
+   *   documents before their body is loaded/decrypted (see {@link IterateChangesOptions}).
    * @return An async generator that yields ProcessChangesResult objects containing the document and its cursor. Each document is yielded immediately after loading, enabling early termination.
    */
-  iterateChangesSince(cursor: ProcessChangesCursor | null): AsyncGenerator<ProcessChangesResult, void, unknown>;
+  iterateChangesSince(
+    cursor: ProcessChangesCursor | null,
+    options?: IterateChangesOptions
+  ): AsyncGenerator<ProcessChangesResult, void, unknown>;
 
   /**
    * Iterate over latest-state change metadata since a given cursor without
@@ -4603,10 +4699,13 @@ export interface MindooDB {
    * that only need document IDs, deletion flags, and cursors.
    *
    * @param cursor The cursor to start processing changes from. Use `null` to start from the beginning.
+   * @param options Optional filtering, e.g. `{ idPrefix }` to emit only changes
+   *   for documents matching a content-type prefix (see {@link IterateChangesOptions}).
    * @return An async generator that yields metadata-only change summaries.
    */
   iterateChangeMetadataSince(
-    cursor: ProcessChangesCursor | null
+    cursor: ProcessChangesCursor | null,
+    options?: IterateChangesOptions
   ): AsyncGenerator<ProcessChangeSummaryResult, void, unknown>;
 
   /**
@@ -4623,8 +4722,15 @@ export interface MindooDB {
    * {@link iterateChangesSince} — e.g. "processed X of Y documents".
    *
    * @param cursor The cursor to count from. Use `null` to count all entries.
+   * @param options Optional filtering, e.g. `{ idPrefix }` to count only changes
+   *   for documents matching a content-type prefix (see {@link IterateChangesOptions}).
+   *   Note: a prefix-filtered count walks the changefeed tail instead of the
+   *   O(log n) binary-search fast path.
    */
-  countChangesSince?(cursor: ProcessChangesCursor | null): number;
+  countChangesSince?(
+    cursor: ProcessChangesCursor | null,
+    options?: IterateChangesOptions
+  ): number;
 
   /**
    * Get (lazily creating) the document summary buffer for this database —

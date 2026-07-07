@@ -551,5 +551,324 @@ describe("sync test", () => {
     const contactDoc2 = await contactsDB2.getDocument(allContacts2[0]);
     expect(contactDoc2.getData().name).toBe("MindooDB Sync Test");
   });
+
+  // --- sync-v5 phase 1: persisted scan cursor + store-head skip ---
+
+  describe("persisted sync cursor (sync-v5 phase 1)", () => {
+    /** Wrap a store's scanEntriesSince with a call counter. */
+    function instrumentScan(store: ContentAddressedStore): () => number {
+      const originalScan = store.scanEntriesSince!.bind(store);
+      let calls = 0;
+      store.scanEntriesSince = async (cursor, limit, filters) => {
+        calls++;
+        return originalScan(cursor, limit, filters);
+      };
+      return () => calls;
+    }
+
+    it("idle re-sync skips the metadata scan entirely (0 scan pages)", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      const contactDoc = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(contactDoc, async (doc) => {
+        doc.getData().name = "Cursor Test";
+      });
+
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const contactsStore1 = contactsDB1.getStore();
+
+      // First pull transfers and persists the scan cursor.
+      const first = await contactsDB2.pullChangesFrom(contactsStore1);
+      expect(first.transferredEntries).toBeGreaterThan(0);
+
+      // Second pull with an unchanged source head must not scan at all.
+      const scanCalls = instrumentScan(contactsStore1);
+      const second = await contactsDB2.pullChangesFrom(contactsStore1);
+      expect(second.transferredEntries).toBe(0);
+      expect(second.cancelled).toBe(false);
+      expect(scanCalls()).toBe(0);
+    });
+
+    it("resumes the scan from the persisted cursor when the source has new entries", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      const doc1 = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(doc1, async (d) => {
+        d.getData().name = "First";
+      });
+
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const contactsStore1 = contactsDB1.getStore();
+      await contactsDB2.pullChangesFrom(contactsStore1);
+
+      // New source entries after the cursor was persisted.
+      const doc2 = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(doc2, async (d) => {
+        d.getData().name = "Second";
+      });
+
+      // The resumed scan must start at the persisted cursor, i.e. only see
+      // the entries added after the first pull.
+      const originalScan = contactsStore1.scanEntriesSince!.bind(contactsStore1);
+      const firstScanCursors: Array<number | undefined> = [];
+      contactsStore1.scanEntriesSince = async (cursor, limit, filters) => {
+        firstScanCursors.push(cursor?.receiptOrder);
+        return originalScan(cursor, limit, filters);
+      };
+
+      const result = await contactsDB2.pullChangesFrom(contactsStore1);
+      expect(result.transferredEntries).toBeGreaterThan(0);
+      expect(firstScanCursors.length).toBeGreaterThan(0);
+      // Resumed, not restarted: the first scan call carries the persisted cursor.
+      expect(firstScanCursors[0]).toBeDefined();
+      expect(firstScanCursors[0]!).toBeGreaterThan(0);
+
+      const allContacts2 = await contactsDB2.getAllDocumentIds();
+      expect(allContacts2.length).toBe(2);
+    });
+
+    it("epoch change on the source discards the cursor and forces a full re-scan", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      const contactDoc = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(contactDoc, async (doc) => {
+        doc.getData().name = "Epoch Test";
+      });
+
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const contactsStore1 = contactsDB1.getStore();
+      await contactsDB2.pullChangesFrom(contactsStore1);
+
+      // Simulate a store reset / receipt-order migration on the source:
+      // same data, new epoch.
+      const originalGetStoreHead = contactsStore1.getStoreHead!.bind(contactsStore1);
+      contactsStore1.getStoreHead = async () => {
+        const head = await originalGetStoreHead();
+        return { ...head, epoch: "rotated-epoch" };
+      };
+
+      const scanCalls = instrumentScan(contactsStore1);
+      const result = await contactsDB2.pullChangesFrom(contactsStore1);
+      // Nothing new to transfer, but the scan must run again from scratch.
+      expect(result.transferredEntries).toBe(0);
+      expect(scanCalls()).toBeGreaterThan(0);
+    });
+
+    it("forceFullScan bypasses the persisted cursor", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      const contactDoc = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(contactDoc, async (doc) => {
+        doc.getData().name = "Force Scan Test";
+      });
+
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const contactsStore1 = contactsDB1.getStore();
+      await contactsDB2.pullChangesFrom(contactsStore1);
+
+      const scanCalls = instrumentScan(contactsStore1);
+
+      // Without forceFullScan this would be a 0-scan skip (see idle test).
+      const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+        forceFullScan: true,
+      });
+      expect(result.transferredEntries).toBe(0);
+      expect(scanCalls()).toBeGreaterThan(0);
+    });
+
+    it("in-memory stores expose a store head that rotates on clearAllLocalData", async () => {
+      await setupTenant2AndPull();
+      const contactsDB1 = await tenant1.openDB("contacts");
+      const store = contactsDB1.getStore();
+
+      const headBefore = await store.getStoreHead!();
+      expect(typeof headBefore.epoch).toBe("string");
+      expect(headBefore.epoch.length).toBeGreaterThan(0);
+
+      const doc = await contactsDB1.createDocument();
+      await contactsDB1.changeDoc(doc, async (d) => {
+        d.getData().name = "Head Test";
+      });
+
+      const headAfterWrite = await store.getStoreHead!();
+      expect(headAfterWrite.epoch).toBe(headBefore.epoch);
+      expect(headAfterWrite.maxReceiptOrder).toBeGreaterThan(headBefore.maxReceiptOrder);
+
+      await store.clearAllLocalData!();
+      const headAfterReset = await store.getStoreHead!();
+      expect(headAfterReset.epoch).not.toBe(headBefore.epoch);
+    });
+  });
+
+  // --- sync-v5 phase 4: parallel transfer batches ---
+
+  describe("parallel transfer batches (sync-v5 phase 4)", () => {
+    /**
+     * Wrap a store's getEntries with an artificial delay and record the peak
+     * number of concurrent in-flight calls.
+     */
+    function instrumentGetEntries(store: ContentAddressedStore, delayMs: number) {
+      const originalGetEntries = store.getEntries.bind(store);
+      let inFlight = 0;
+      let peak = 0;
+      store.getEntries = async (ids: string[]) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          return await originalGetEntries(ids);
+        } finally {
+          inFlight--;
+        }
+      };
+      return () => peak;
+    }
+
+    async function createContacts(db: MindooDB, count: number): Promise<void> {
+      for (let i = 0; i < count; i++) {
+        const doc = await db.createDocument();
+        await db.changeDoc(doc, async (d) => {
+          d.getData().name = `Parallel Contact ${i}`;
+        });
+      }
+    }
+
+    it("runs transfer batches concurrently up to maxConcurrentBatches", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      await createContacts(contactsDB1, 6);
+
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const contactsStore1 = contactsDB1.getStore();
+      const peakConcurrency = instrumentGetEntries(contactsStore1, 25);
+
+      const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+        pageSize: 1000,
+        transferBatchSize: 1,
+        maxConcurrentBatches: 3,
+      });
+
+      expect(result.cancelled).toBe(false);
+      expect(result.transferredEntries).toBeGreaterThanOrEqual(6);
+      expect(peakConcurrency()).toBeGreaterThanOrEqual(2);
+      expect(peakConcurrency()).toBeLessThanOrEqual(3);
+
+      const allContacts2 = await contactsDB2.getAllDocumentIds();
+      expect(allContacts2.length).toBe(6);
+    });
+
+    it("maxConcurrentBatches=1 keeps transfers strictly sequential", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      await createContacts(contactsDB1, 4);
+
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const contactsStore1 = contactsDB1.getStore();
+      const peakConcurrency = instrumentGetEntries(contactsStore1, 10);
+
+      const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+        pageSize: 1000,
+        transferBatchSize: 1,
+        maxConcurrentBatches: 1,
+      });
+
+      expect(result.cancelled).toBe(false);
+      expect(peakConcurrency()).toBe(1);
+    });
+
+    it("abort during parallel batches keeps partial counts and cancels cleanly", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      await createContacts(contactsDB1, 8);
+
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const contactsStore1 = contactsDB1.getStore();
+      instrumentGetEntries(contactsStore1, 10);
+
+      const controller = new AbortController();
+      const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+        pageSize: 1000,
+        transferBatchSize: 1,
+        maxConcurrentBatches: 3,
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.transferredEntries > 0 && !controller.signal.aborted) {
+            controller.abort();
+          }
+        },
+      });
+
+      expect(result.cancelled).toBe(true);
+      expect(result.transferredEntries).toBeGreaterThan(0);
+      // Not everything can have made it across before the abort.
+      const store2Ids = await contactsDB2.getStore().getAllIds();
+      const store1Ids = await contactsStore1.getAllIds();
+      expect(store2Ids.length).toBeLessThan(store1Ids.length);
+    });
+  });
+
+  // --- sync-v5: per-entry rejection on push ---
+
+  describe("per-entry rejection on push (sync-v5)", () => {
+    it("push completes despite a rejected entry and reports it in the SyncResult", async () => {
+      // Register user1 so the tenant allows opening content databases.
+      const directory1 = await tenant1.openDirectory();
+      await directory1.registerUser(
+        factory1.toPublicUserId(user1),
+        adminUser.userSigningKeyPair.privateKey,
+        adminUserPassword,
+      );
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      for (let i = 0; i < 3; i++) {
+        const doc = await contactsDB1.createDocument();
+        await contactsDB1.changeDoc(doc, async (d) => {
+          d.getData().name = `Rejection Contact ${i}`;
+        });
+      }
+
+      const sourceStore = contactsDB1.getStore();
+      const allSourceIds = await sourceStore.getAllIds();
+      expect(allSourceIds.length).toBeGreaterThan(2);
+      // Pick one arbitrary entry the "server" will refuse (e.g. because its
+      // author signature does not verify on the remote side).
+      const rejectId = allSourceIds[1];
+
+      // Push target that behaves like a sync-v5 server: it skips the poisoned
+      // entry per entry (reporting it in the ack) instead of failing the batch.
+      const target = new InMemoryContentAddressedStoreFactory().createStore("contacts").docStore;
+      const originalPut = target.putEntries.bind(target);
+      target.putEntries = async (entries) => {
+        const accepted = entries.filter((e) => e.id !== rejectId);
+        await originalPut(accepted);
+        return {
+          receipts: [],
+          rejected: entries
+            .filter((e) => e.id === rejectId)
+            .map((e) => ({ id: e.id, reason: `Entry ${e.id} has an invalid author signature` })),
+        };
+      };
+
+      const result = await contactsDB1.pushChangesTo(target);
+
+      // The push ran to completion: everything except the rejected entry made it.
+      expect(result.cancelled).toBe(false);
+      expect(result.transferredEntries).toBe(allSourceIds.length - 1);
+      expect(result.rejectedEntries).toEqual([
+        { id: rejectId, reason: expect.stringContaining("invalid author signature") },
+      ]);
+
+      const targetIds = await target.getAllIds();
+      expect(targetIds).not.toContain(rejectId);
+      expect(targetIds.length).toBe(allSourceIds.length - 1);
+    });
+  });
 });
 

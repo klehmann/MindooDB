@@ -146,9 +146,12 @@ export { CacheManager, type ICacheable, type CacheManagerOptions } from "./cache
 
 // Utilities
 export {
+  generateDocId,
+  matchesDocIdPrefix,
   generateDocEntryId,
   generateDepsFingerprint,
   generateAttachmentChunkId,
+  generateUniqueAttachmentChunkId,
   generateFileUuid7,
   generateChunkUuid7,
   parseDocEntryId,
@@ -187,6 +190,7 @@ export {
   type AuthChallenge,
   type AuthResult,
   type NetworkSyncCapabilities,
+  type StoreChangeEvent,
   NetworkErrorType,
   NetworkError,
 } from "./appendonlystores/network/types";

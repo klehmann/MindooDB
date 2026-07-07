@@ -235,6 +235,47 @@ export class RSAEncryption {
   }
 
   /**
+   * Wrap a small secret (e.g. a 32-byte AES session key) directly with
+   * RSA-OAEP. Unlike {@link encrypt}, no hybrid framing is added — the
+   * output is the raw RSA ciphertext. Used by the sync-v5 session-key
+   * transport format, where one wrapped key covers a whole entry batch.
+   */
+  async wrapKey(
+    rawKey: Uint8Array,
+    publicKey: CryptoKey | string
+  ): Promise<Uint8Array> {
+    const cryptoKey = typeof publicKey === "string"
+      ? await this.importPublicKey(publicKey)
+      : publicKey;
+    const subtle = this.cryptoAdapter.getSubtle();
+    const wrapped = await subtle.encrypt(
+      { name: "RSA-OAEP" },
+      cryptoKey,
+      rawKey.buffer.slice(rawKey.byteOffset, rawKey.byteOffset + rawKey.byteLength) as ArrayBuffer
+    );
+    return new Uint8Array(wrapped);
+  }
+
+  /**
+   * Unwrap a secret previously wrapped with {@link wrapKey}.
+   */
+  async unwrapKey(
+    wrappedKey: Uint8Array,
+    privateKey: CryptoKey | string
+  ): Promise<Uint8Array> {
+    const cryptoKey = typeof privateKey === "string"
+      ? await this.importPrivateKey(privateKey)
+      : privateKey;
+    const subtle = this.cryptoAdapter.getSubtle();
+    const raw = await subtle.decrypt(
+      { name: "RSA-OAEP" },
+      cryptoKey,
+      wrappedKey.buffer.slice(wrappedKey.byteOffset, wrappedKey.byteOffset + wrappedKey.byteLength) as ArrayBuffer
+    );
+    return new Uint8Array(raw);
+  }
+
+  /**
    * Convert a base64 string to Uint8Array.
    */
   private base64ToUint8Array(base64: string): Uint8Array {

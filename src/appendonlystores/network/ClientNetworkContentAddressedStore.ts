@@ -15,12 +15,16 @@ import type {
   DocumentMaterializationBatchPlan,
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
+  PutEntriesAck,
+  StoreHead,
   StoreKind,
 } from "../../core/appendonlystores/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
+  SessionEncryptedEntriesBatch,
+  StoreChangeEvent,
   NetworkSyncCapabilities,
 } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
@@ -143,21 +147,42 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   /**
    * Store entries to the remote store.
    * The entries are pushed to the server immediately.
+   *
+   * Returns a {@link PutEntriesAck}: witness receipts for the accepted
+   * entries plus the per-entry rejections the server skipped
+   * (signature-class validation failures, sync-v5). The sync orchestrator
+   * applies the receipts locally and reports the rejections without failing
+   * the push.
    */
-  async putEntries(entries: StoreEntry[]): Promise<void | StoreEntryMetadata[]> {
+  async putEntries(entries: StoreEntry[]): Promise<PutEntriesAck> {
     if (entries.length === 0) {
-      return [];
+      return { receipts: [], rejected: [] };
     }
 
     return this.withTransparentReauth("putEntries", async () => {
       this.logger.debug(`Pushing ${entries.length} entries to remote`);
+      const capabilities = await this.getCapabilities();
       const token = await this.ensureAuthenticated();
       // The server stamps witness receipts onto accepted entries and returns
       // them so the pushing client can persist the attestation locally
       // (docs/accesscontrol.md §5.3). Surface them to the sync orchestrator.
-      const receipts = await this.transport.putEntries(token, entries);
-      this.logger.debug(`Successfully pushed ${entries.length} entries (${receipts.length} receipts)`);
-      return receipts;
+      //
+      // Binary wire format v2 (sync-v5, phase 3) is preferred when both sides
+      // support it: no base64 inflation, no large-JSON parse on the server.
+      const ack =
+        capabilities.supportsBinaryEntries && this.transport.putEntriesBinary
+          ? await this.transport.putEntriesBinary(token, entries)
+          : await this.transport.putEntries(token, entries);
+      if (ack.rejected.length > 0) {
+        this.logger.warn(
+          `Remote rejected ${ack.rejected.length} of ${entries.length} pushed entries: ` +
+            ack.rejected.map((r) => r.reason).join("; "),
+        );
+      }
+      this.logger.debug(
+        `Successfully pushed ${entries.length} entries (${ack.receipts.length} receipts, ${ack.rejected.length} rejected)`,
+      );
+      return ack;
     });
   }
 
@@ -175,6 +200,38 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     return this.withTransparentReauth("getEntries", async () => {
       this.logger.debug(`Getting ${ids.length} entries from remote`);
       this.throwIfSyncAborted();
+
+      // Session-key transport format (sync-v5, phase 2): one RSA decrypt per
+      // batch instead of per entry. Falls back to the legacy per-entry-RSA
+      // format when the server does not advertise support.
+      const capabilities = await this.getCapabilities();
+
+      // Binary wire format v2 (sync-v5, phase 3): same session-key encryption,
+      // but octet-stream framing instead of JSON+base64.
+      if (
+        capabilities.supportsBinaryEntries &&
+        capabilities.supportsSessionKeyWrap &&
+        this.transport.getEntriesBinary
+      ) {
+        const token = await this.ensureAuthenticated();
+        const batch = await this.transport.getEntriesBinary(token, ids);
+        this.logger.debug(`Received ${batch.entries.length} session-encrypted entries from remote (binary)`);
+        this.throwIfSyncAborted();
+        const entries = await this.decryptSessionEncryptedEntries(batch);
+        this.logger.debug(`Decrypted ${entries.length} entries (binary, session key)`);
+        return entries;
+      }
+
+      if (capabilities.supportsSessionKeyWrap && this.transport.getEntriesSessionWrapped) {
+        const token = await this.ensureAuthenticated();
+        const batch = await this.transport.getEntriesSessionWrapped(token, ids);
+        this.logger.debug(`Received ${batch.entries.length} session-encrypted entries from remote`);
+        this.throwIfSyncAborted();
+        const entries = await this.decryptSessionEncryptedEntries(batch);
+        this.logger.debug(`Decrypted ${entries.length} entries (session key)`);
+        return entries;
+      }
+
       const token = await this.ensureAuthenticated();
       const encryptedEntries = await this.transport.getEntries(token, ids);
       this.logger.debug(`Received ${encryptedEntries.length} encrypted entries from remote`);
@@ -377,6 +434,23 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     });
   }
 
+  /**
+   * Fetch the remote store head (`{ epoch, maxReceiptOrder }`) for
+   * persisted-cursor sync (sync-v5, phase 1). Throws when the remote server
+   * does not advertise `supportsStoreHead`; callers that want a soft
+   * fallback should catch and treat it as "head unknown".
+   */
+  async getStoreHead(): Promise<StoreHead> {
+    return this.withTransparentReauth("getStoreHead", async () => {
+      const capabilities = await this.getCapabilities();
+      if (!capabilities.supportsStoreHead || !this.transport.getStoreHead) {
+        throw new Error("Remote server does not support getStoreHead");
+      }
+      const token = await this.ensureAuthenticated();
+      return this.transport.getStoreHead(token);
+    });
+  }
+
   async getIdBloomSummary(): Promise<StoreIdBloomSummary> {
     return this.withTransparentReauth("getIdBloomSummary", async () => {
       const capabilities = await this.getCapabilities();
@@ -438,6 +512,91 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         this.capabilitiesPromise = null;
       }
     }
+  }
+
+  /**
+   * Subscribe to the server's live change feed (sync-v5, phase 5).
+   *
+   * Opens the SSE stream via the transport and keeps it alive with
+   * auto-reconnect and exponential backoff (1 s → 60 s, reset on every
+   * received event / orderly close). When the server does not advertise
+   * `supportsChangeEvents` (or the transport cannot stream), the
+   * subscription deactivates itself silently — callers keep their existing
+   * polling behavior.
+   *
+   * @returns an unsubscribe function that closes the stream and stops
+   *          reconnecting.
+   */
+  subscribeToChanges(onChange: (event: StoreChangeEvent) => void): () => void {
+    const controller = new AbortController();
+    void this.runChangeSubscriptionLoop(onChange, controller.signal);
+    return () => controller.abort();
+  }
+
+  private async runChangeSubscriptionLoop(
+    onChange: (event: StoreChangeEvent) => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const initialBackoffMs = 1_000;
+    const maxBackoffMs = 60_000;
+    let backoffMs = initialBackoffMs;
+
+    while (!signal.aborted) {
+      try {
+        const capabilities = await this.getCapabilities();
+        if (!capabilities.supportsChangeEvents || !this.transport.subscribeToChanges) {
+          this.logger.info(
+            "Remote does not support change events; live subscription disabled",
+          );
+          return;
+        }
+        const token = await this.ensureAuthenticated();
+        await this.transport.subscribeToChanges(
+          token,
+          (event) => {
+            backoffMs = initialBackoffMs;
+            onChange(event);
+          },
+          { signal },
+        );
+        // Orderly stream end (server restart / idle close): reconnect quickly.
+        backoffMs = initialBackoffMs;
+      } catch (error) {
+        if (signal.aborted) {
+          return;
+        }
+        // Expired token: clear the cached auth so the next attempt
+        // re-authenticates instead of failing in a loop.
+        if (this.isInvalidTokenError(error)) {
+          this.clearAuthCache();
+        }
+        this.logger.debug(
+          `Change subscription failed; reconnecting in ${backoffMs}ms`,
+          error,
+        );
+      }
+      if (signal.aborted) {
+        return;
+      }
+      await ClientNetworkContentAddressedStore.sleepWithAbort(backoffMs, signal);
+      backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
+    }
+  }
+
+  private static sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const onDone = () => {
+        signal.removeEventListener("abort", onDone);
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(onDone, ms);
+      signal.addEventListener("abort", onDone);
+    });
   }
 
   async getCompactionStatus(): Promise<StoreCompactionStatus> {
@@ -643,6 +802,56 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     );
     
     return new Uint8Array(signature);
+  }
+
+  /**
+   * Decrypt a session-key-wrapped entry batch (sync-v5, phase 2): one RSA
+   * unwrap for the AES-256-GCM session key, then AES-GCM per entry.
+   */
+  private async decryptSessionEncryptedEntries(
+    batch: SessionEncryptedEntriesBatch
+  ): Promise<StoreEntry[]> {
+    if (batch.entries.length === 0) {
+      return [];
+    }
+
+    const subtle = this.cryptoAdapter.getSubtle();
+    const sessionKeyBytes = await this.rsaEncryption.unwrapKey(
+      batch.wrappedSessionKey,
+      this.getActivePrivateEncryptionKey()
+    );
+    const sessionKey = await subtle.importKey(
+      "raw",
+      sessionKeyBytes.buffer.slice(
+        sessionKeyBytes.byteOffset,
+        sessionKeyBytes.byteOffset + sessionKeyBytes.byteLength,
+      ) as ArrayBuffer,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["decrypt"]
+    );
+
+    const results: StoreEntry[] = [];
+    for (const enc of batch.entries) {
+      this.throwIfSyncAborted();
+      const decrypted = await subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: enc.iv.buffer.slice(enc.iv.byteOffset, enc.iv.byteOffset + enc.iv.byteLength) as ArrayBuffer,
+        },
+        sessionKey,
+        enc.sessionEncryptedPayload.buffer.slice(
+          enc.sessionEncryptedPayload.byteOffset,
+          enc.sessionEncryptedPayload.byteOffset + enc.sessionEncryptedPayload.byteLength,
+        ) as ArrayBuffer,
+      );
+      const { iv: _iv, sessionEncryptedPayload: _payload, ...metadata } = enc;
+      results.push({
+        ...(metadata as StoreEntryMetadata),
+        encryptedData: new Uint8Array(decrypted),
+      });
+    }
+    return results;
   }
 
   /**

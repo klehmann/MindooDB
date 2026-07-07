@@ -11,6 +11,8 @@ import {
   type NetworkEncryptedEntry,
   type AuthResult,
   type NetworkSyncCapabilities,
+  type SessionEncryptedEntriesBatch,
+  type StoreChangeEvent,
 } from "../core/appendonlystores/network/types";
 import { StoreKind } from "../core/types";
 import type {
@@ -28,7 +30,7 @@ import type {
 } from "../core/types";
 import { bloomMightContainId } from "../core/appendonlystores/bloom";
 import type { PublicUserId } from "../core/userid";
-import type { ContentAddressedStore } from "../core/appendonlystores/types";
+import type { ContentAddressedStore, PutEntriesAck, StoreHead } from "../core/appendonlystores/types";
 
 /**
  * Mock NetworkTransport that connects directly to a ServerNetworkContentAddressedStore
@@ -77,11 +79,19 @@ class MockNetworkTransport implements NetworkTransport {
     return this.server.handleGetEntries(token, ids);
   }
 
+  async getEntriesSessionWrapped(token: string, ids: string[]): Promise<SessionEncryptedEntriesBatch> {
+    return this.server.handleGetEntriesSessionWrapped(token, ids);
+  }
+
+  async getStoreHead(token: string): Promise<StoreHead> {
+    return this.server.handleGetStoreHead(token);
+  }
+
   async getEntryMetadata(token: string, id: string): Promise<StoreEntryMetadata | null> {
     return this.server.handleGetEntryMetadata(token, id);
   }
 
-  async putEntries(token: string, entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
+  async putEntries(token: string, entries: StoreEntry[]): Promise<PutEntriesAck> {
     return this.server.handlePutEntries(token, entries);
   }
 
@@ -564,12 +574,154 @@ describe("Network Sync", () => {
 
     test("should negotiate capabilities from remote", async () => {
       const caps = await clientStore.getCapabilities();
-      expect(caps.protocolVersion).toBe("sync-v4");
+      expect(caps.protocolVersion).toBe("sync-v5");
       expect(caps.supportsCursorScan).toBe(true);
       expect(caps.supportsIdBloomSummary).toBe(true);
       expect(caps.supportsCompactionStatus).toBe(false);
       expect(caps.supportsMaterializationPlanning).toBe(true);
       expect(caps.supportsBatchMaterializationPlanning).toBe(true);
+      expect(caps.supportsStoreHead).toBe(true);
+      expect(caps.supportsSessionKeyWrap).toBe(true);
+    });
+
+    // --- sync-v5 phase 1: store head over the network ---
+
+    test("should fetch the remote store head (epoch + maxReceiptOrder)", async () => {
+      const headEmpty = await clientStore.getStoreHead();
+      expect(typeof headEmpty.epoch).toBe("string");
+      expect(headEmpty.epoch.length).toBeGreaterThan(0);
+      expect(headEmpty.maxReceiptOrder).toBe(0);
+
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"])]);
+
+      const head = await clientStore.getStoreHead();
+      expect(head.epoch).toBe(headEmpty.epoch);
+      expect(head.maxReceiptOrder).toBe(2);
+    });
+
+    // --- sync-v5 phase 2: session-key transport encryption ---
+
+    test("should get entries via the session-key format when the transport supports it", async () => {
+      const entry1 = createMockEntry("doc1", "hash1", 1000);
+      const entry2 = createMockEntry("doc1", "hash2", 2000, ["hash1"]);
+      await serverStore.putEntries([entry1]);
+      await serverStore.putEntries([entry2]);
+
+      const sessionSpy = jest.spyOn(serverHandler, "handleGetEntriesSessionWrapped");
+      const legacySpy = jest.spyOn(serverHandler, "handleGetEntries");
+
+      const retrieved = await clientStore.getEntries(["hash1", "hash2"]);
+
+      expect(sessionSpy).toHaveBeenCalledTimes(1);
+      expect(legacySpy).not.toHaveBeenCalled();
+      expect(retrieved.length).toBe(2);
+      const byId = new Map(retrieved.map((e: StoreEntry) => [e.id, e]));
+      expect(byId.get("hash1")!.encryptedData).toEqual(entry1.encryptedData);
+      expect(byId.get("hash2")!.encryptedData).toEqual(entry2.encryptedData);
+    });
+
+    test("session-key batch wraps the key once and uses a distinct IV per entry", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+      await serverStore.putEntries([createMockEntry("doc1", "hash2", 2000, ["hash1"])]);
+
+      // Capture the wire-format batch the server hands to the client while
+      // the client performs a normal (authenticated) getEntries call.
+      let batch: SessionEncryptedEntriesBatch | null = null;
+      const original = serverHandler.handleGetEntriesSessionWrapped.bind(serverHandler);
+      jest.spyOn(serverHandler, "handleGetEntriesSessionWrapped").mockImplementation(
+        async (tok: string, ids: string[]) => {
+          batch = await original(tok, ids);
+          return batch;
+        }
+      );
+      const retrieved = await clientStore.getEntries(["hash1", "hash2"]);
+      expect(retrieved.length).toBe(2);
+      expect(batch).not.toBeNull();
+      const capturedBatch = batch as unknown as SessionEncryptedEntriesBatch;
+
+      expect(capturedBatch.wrappedSessionKey.length).toBeGreaterThan(0);
+      expect(capturedBatch.entries.length).toBe(2);
+      const iv1 = Buffer.from(capturedBatch.entries[0].iv).toString("hex");
+      const iv2 = Buffer.from(capturedBatch.entries[1].iv).toString("hex");
+      expect(iv1).not.toBe(iv2);
+      // Payloads are AES-GCM ciphertexts, never the raw stored bytes.
+      for (const e of capturedBatch.entries) {
+        expect(Buffer.from(e.sessionEncryptedPayload)).not.toEqual(Buffer.from(MOCK_ENCRYPTED_DATA));
+      }
+    });
+
+    test("should fall back to the per-entry RSA format when the transport lacks session wrap", async () => {
+      const entry = createMockEntry("doc1", "hash1", 1000);
+      await serverStore.putEntries([entry]);
+
+      // Simulate an older transport: capability is advertised but the
+      // transport cannot issue the session-wrapped request.
+      (mockTransport as unknown as { getEntriesSessionWrapped?: unknown }).getEntriesSessionWrapped = undefined;
+
+      const legacySpy = jest.spyOn(serverHandler, "handleGetEntries");
+      const retrieved = await clientStore.getEntries(["hash1"]);
+
+      expect(legacySpy).toHaveBeenCalledTimes(1);
+      expect(retrieved.length).toBe(1);
+      expect(retrieved[0].encryptedData).toEqual(entry.encryptedData);
+    });
+
+    // --- sync-v5 phase 5: live change subscription via the client store ---
+
+    test("should forward change events from the transport and stop on unsubscribe", async () => {
+      const emitted: StoreChangeEvent[] = [];
+      let activeSignal: AbortSignal | null = null;
+      let openStreams = 0;
+
+      // Advertise the capability (added at the HTTP layer in production) and
+      // hand the client a controllable stream.
+      const baseGetCapabilities = mockTransport.getCapabilities.bind(mockTransport);
+      jest.spyOn(mockTransport, "getCapabilities").mockImplementation(async (token: string) => ({
+        ...(await baseGetCapabilities(token)),
+        supportsChangeEvents: true,
+      }));
+      (mockTransport as unknown as { subscribeToChanges: NetworkTransport["subscribeToChanges"] }).subscribeToChanges =
+        async (_token, onEvent, options) => {
+          openStreams++;
+          activeSignal = options?.signal ?? null;
+          onEvent({ dbId: "test-db", storeKind: "docs", maxReceiptOrder: 7 });
+          // Keep the stream open until the subscriber aborts.
+          await new Promise<void>((resolve) => {
+            if (options?.signal?.aborted) return resolve();
+            options?.signal?.addEventListener("abort", () => resolve());
+          });
+        };
+
+      const unsubscribe = clientStore.subscribeToChanges((event) => emitted.push(event));
+
+      // Wait for the first event to arrive through the async loop.
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 2000;
+        const poll = () => {
+          if (emitted.length > 0) return resolve();
+          if (Date.now() > deadline) return reject(new Error("No change event received"));
+          setTimeout(poll, 10);
+        };
+        poll();
+      });
+
+      expect(openStreams).toBe(1);
+      expect(emitted[0]).toMatchObject({ dbId: "test-db", storeKind: "docs", maxReceiptOrder: 7 });
+
+      unsubscribe();
+      expect(activeSignal).not.toBeNull();
+      expect(activeSignal!.aborted).toBe(true);
+    });
+
+    test("should silently disable the subscription when change events are unsupported", async () => {
+      // Default MockNetworkTransport: no supportsChangeEvents capability, no
+      // subscribeToChanges method — the loop must exit without retry noise.
+      const events: StoreChangeEvent[] = [];
+      const unsubscribe = clientStore.subscribeToChanges((event) => events.push(event));
+      await sleep(50);
+      expect(events.length).toBe(0);
+      unsubscribe();
     });
 
     test("should scan entries via cursor in remote receipt order", async () => {
@@ -878,6 +1030,26 @@ describe("Network Sync", () => {
       );
       await client.putEntries([okEntry]);
       expect(await docStore.getAllIds()).toEqual(["h2"]);
+    });
+
+    // --- Per-entry rejection of signature-class failures (sync-v5) ---
+
+    test("skips an entry with an invalid author signature and stores the rest of the batch", async () => {
+      const { docStore, client } = await buildBlacklistPair("test-db", []);
+      const signature = await signMockCiphertext(userSigningKeyPair.privateKey);
+
+      const good = createMockEntry("doc1", "good", 1000, [], userSigningPublicKeyPem, signature);
+      // Trusted author key, but a garbage signature: previously this failed
+      // the whole batch with INVALID_SIGNATURE and permanently blocked the
+      // push; now the server skips the entry and reports it in the ack.
+      const bad = createMockEntry("doc1", "bad", 2000, [], userSigningPublicKeyPem, NO_SIG);
+
+      const ack = await client.putEntries([good, bad]);
+      expect(ack.receipts.map((r) => r.id)).toEqual(["good"]);
+      expect(ack.rejected).toEqual([
+        { id: "bad", reason: expect.stringContaining("invalid author signature") },
+      ]);
+      expect(await docStore.getAllIds()).toEqual(["good"]);
     });
 
     test("never blacklists the directory store (its policy must always sync)", async () => {

@@ -1133,8 +1133,9 @@ canUndelete(doc: MindooDoc, signingKeyPair?: SigningKeyPair): Promise<AccessDeci
 Note on custom-id documents: they cannot take `initialValues` (their first change
 is a deterministic, content-free seed for hash convergence), so a `doc_create`
 content rule sees an empty "after" state. For create-time content validation use a
-generated UUID with `initialValues`; otherwise the meaningful content check lands
-on the first `changeDoc` (which also throws synchronously).
+generated id with `initialValues` (the default, or `idPrefix` for readable prefixed
+ids); otherwise the meaningful content check lands on the first `changeDoc` (which
+also throws synchronously).
 
 ## 10. Sync and materialization behavior
 
@@ -1718,8 +1719,8 @@ A related subtlety to keep in mind when *designing create-time content rules*: a
 `doc_create withfields` clause is evaluated against the "after" state, which is empty
 for custom (fixed) document ids (their first change is a content-free convergence seed,
 sections 9.1, 6.3). So create-time content validation belongs on generated-id documents
-(`initialValues`) or on the first `changeDoc`; for fixed-id documents, gate creation by
-identity and key (Tier 1) instead.
+(`initialValues`, with or without `idPrefix`) or on the first `changeDoc`; for fixed-id
+documents, gate creation by identity and key (Tier 1) instead.
 
 ### 14.2 Bootstrap sequence (recommended order)
 

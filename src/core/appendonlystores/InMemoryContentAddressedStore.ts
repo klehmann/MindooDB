@@ -15,7 +15,9 @@ import {
   StoreScanFilters,
   StoreScanResult,
   StoreIdBloomSummary,
+  StoreHead,
 } from "./types";
+import { v7 as uuidv7 } from "uuid";
 import { planAttachmentReadByWalkingMetadata } from "./AttachmentReadPlanner";
 import { createIdBloomSummary } from "./bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "./MaterializationPlanner";
@@ -55,6 +57,12 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
 
   /** Monotonic local insertion order assigned when entries are persisted. */
   private nextReceiptOrder = 1;
+
+  /**
+   * Cursor-lineage epoch (see {@link StoreHead}). Regenerated whenever the
+   * store is cleared so peers holding a persisted scan cursor re-scan.
+   */
+  private storeEpoch: string = uuidv7();
   
   /** Reference count per contentHash for O(1) orphan detection during purge */
   private contentRefCount: Map<string, number> = new Map();
@@ -472,6 +480,13 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     return createIdBloomSummary(ids);
   }
 
+  async getStoreHead(): Promise<StoreHead> {
+    return {
+      epoch: this.storeEpoch,
+      maxReceiptOrder: this.nextReceiptOrder - 1,
+    };
+  }
+
   async planDocumentMaterialization(
     docId: string,
     options?: MaterializationPlanOptions
@@ -646,6 +661,9 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     this.docIndex.clear();
     this.contentRefCount.clear();
     this.sortedEntriesCache = null;
+    this.nextReceiptOrder = 1;
+    // New cursor lineage: peers must discard persisted scan cursors.
+    this.storeEpoch = uuidv7();
   }
 
   /**

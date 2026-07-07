@@ -60,7 +60,9 @@ import {
   StoreScanFilters,
   StoreScanResult,
   StoreIdBloomSummary,
+  StoreHead,
 } from "../../core/appendonlystores/types";
+import { v7 as uuidv7 } from "uuid";
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
@@ -235,6 +237,9 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   /** Directory containing append-only metadata segment files. */
   private readonly metadataSegmentsDir: string;
 
+  /** Path to the persisted cursor-lineage epoch file (see {@link StoreHead}). */
+  private readonly storeEpochPath: string;
+
   /** Whether in-memory indexing is active (default true). */
   private readonly indexingEnabled: boolean;
 
@@ -299,6 +304,13 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   /** Next monotonic local receipt order assigned on insert. */
   private nextReceiptOrder = 1;
 
+  /**
+   * Cursor-lineage epoch (see {@link StoreHead}). Loaded from / persisted to
+   * `store-epoch.json`; regenerated on store reset and on legacy
+   * receipt-order migration so peers discard stale persisted scan cursors.
+   */
+  private storeEpoch: string = uuidv7();
+
   /** Current phase and progress of the index build (building / ready). */
   private indexStatus: StoreIndexBuildStatus;
 
@@ -334,6 +346,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     this.contentDir = path.join(this.storeRoot, "content");
     this.metadataIndexPath = path.join(this.storeRoot, "metadata-index.json");
     this.metadataSegmentsDir = path.join(this.storeRoot, "metadata-segments");
+    this.storeEpochPath = path.join(this.storeRoot, "store-epoch.json");
     this.indexingEnabled = options?.indexingEnabled !== false;
     const compactionOption = options?.metadataSegmentCompactionMinFiles;
     this.metadataSegmentCompactionMinFiles =
@@ -393,6 +406,9 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     await mkdir(this.metadataSegmentsDir, { recursive: true });
 
     const migratedReceiptOrder = await this.ensurePersistedReceiptOrder();
+    // A receipt-order migration reassigns receiptOrder values, so persisted
+    // scan cursors from before the migration are invalid: start a new epoch.
+    await this.loadOrCreateStoreEpoch({ forceNew: migratedReceiptOrder });
 
     if (!this.indexingEnabled) {
       this.indexStatus = {
@@ -1010,6 +1026,29 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     return true;
   }
 
+  /**
+   * Load the persisted cursor-lineage epoch, creating (and persisting) a new
+   * one when it is missing, unreadable, or `forceNew` is set (receipt-order
+   * migration). The epoch lives in its own small file so it survives index
+   * rebuilds and works with indexing disabled.
+   */
+  private async loadOrCreateStoreEpoch(options?: { forceNew?: boolean }): Promise<void> {
+    if (!options?.forceNew && (await this.fileExists(this.storeEpochPath))) {
+      try {
+        const raw = await readFile(this.storeEpochPath, "utf-8");
+        const parsed = JSON.parse(raw) as { epoch?: unknown };
+        if (typeof parsed.epoch === "string" && parsed.epoch.length > 0) {
+          this.storeEpoch = parsed.epoch;
+          return;
+        }
+      } catch (err) {
+        this.logger.warn(`Failed to read store epoch, creating a new one: ${String(err)}`);
+      }
+    }
+    this.storeEpoch = uuidv7();
+    await this.writeFileAtomic(this.storeEpochPath, JSON.stringify({ epoch: this.storeEpoch }));
+  }
+
   // ---------------------------------------------------------------------------
   // Filesystem I/O helpers
   // ---------------------------------------------------------------------------
@@ -1588,6 +1627,14 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     return createIdBloomSummary(ids);
   }
 
+  async getStoreHead(): Promise<StoreHead> {
+    await this.ensureInitialized();
+    return {
+      epoch: this.storeEpoch,
+      maxReceiptOrder: this.nextReceiptOrder - 1,
+    };
+  }
+
   async planDocumentMaterialization(
     docId: string,
     options?: MaterializationPlanOptions
@@ -1767,6 +1814,8 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     await mkdir(this.entriesDir, { recursive: true });
     await mkdir(this.contentDir, { recursive: true });
     await mkdir(this.metadataSegmentsDir, { recursive: true });
+    // New cursor lineage after a full reset (see StoreHead.epoch).
+    await this.loadOrCreateStoreEpoch({ forceNew: true });
     if (this.indexingEnabled) {
       this.indexStatus = { phase: "ready", indexingEnabled: true, progress01: 1 };
     }

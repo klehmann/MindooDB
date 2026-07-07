@@ -44,6 +44,7 @@ import type {
   ContentAddressedStoreFactory,
   CreateStoreResult,
   OpenStoreOptions,
+  PutEntriesAck,
 } from "../core/appendonlystores/types";
 import type { PublicUserId } from "../core/userid";
 import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
@@ -611,8 +612,8 @@ describe("protocol compatibility", () => {
     async getEntryMetadata(_t: string, _id: string): Promise<StoreEntryMetadata | null> {
       return null;
     }
-    async putEntries(_t: string, _entries: StoreEntry[]): Promise<StoreEntryMetadata[]> {
-      return [];
+    async putEntries(_t: string, _entries: StoreEntry[]): Promise<PutEntriesAck> {
+      return { receipts: [], rejected: [] };
     }
     async hasEntries(_t: string, _ids: string[]): Promise<string[]> {
       return [];
@@ -714,7 +715,7 @@ describe("protocol compatibility", () => {
     expect(authResult.success).toBe(true);
     const caps = await serverHandler.handleGetCapabilities(authResult.token!);
 
-    expect(caps.protocolVersion).toBe("sync-v4");
+    expect(caps.protocolVersion).toBe("sync-v5");
     expect(caps.supportsMaterializationPlanning).toBe(true);
     expect(caps.supportsBatchMaterializationPlanning).toBe(true);
     expect(caps.supportsAttachmentReadPlanning).toBe(true);

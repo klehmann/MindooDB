@@ -26,6 +26,52 @@ export interface NetworkEncryptedEntry extends StoreEntryMetadata {
 }
 
 /**
+ * Entry payload encrypted with a per-response AES-256-GCM session key
+ * (sync-v5, phase 2). The session key itself travels once per batch, wrapped
+ * with the recipient's RSA public key (see {@link SessionEncryptedEntriesBatch}).
+ */
+export interface NetworkSessionEncryptedEntry extends StoreEntryMetadata {
+  /** Fresh 96-bit AES-GCM IV for this entry. */
+  iv: Uint8Array;
+  /** The entry's stored (symmetric-encrypted) payload, AES-GCM-encrypted with the batch session key. */
+  sessionEncryptedPayload: Uint8Array;
+}
+
+/**
+ * Response format of `getEntries` when the session-key transport encryption
+ * was negotiated (capability `supportsSessionKeyWrap`, sync-v5, phase 2).
+ *
+ * Security model is unchanged from the per-entry-RSA format: the session key
+ * is wrapped with the requester's public encryption key resolved from the
+ * directory grant, so only that user can decrypt the batch. The win is one
+ * RSA operation per batch instead of one per entry (client and server).
+ */
+export interface SessionEncryptedEntriesBatch {
+  /** Random AES-256-GCM key for this response, RSA-OAEP-wrapped for the requester. */
+  wrappedSessionKey: Uint8Array;
+  entries: NetworkSessionEncryptedEntry[];
+}
+
+export type { RejectedPutEntry, PutEntriesAck } from "../types";
+
+/**
+ * One change announcement from the server's live change feed (sync-v5,
+ * phase 5, capability `supportsChangeEvents`).
+ *
+ * Carries only metadata — which database/store changed and up to which
+ * receiptOrder — never content. Clients compare `maxReceiptOrder` against
+ * their persisted scan cursor (phase 1) and trigger a pull when behind.
+ */
+export interface StoreChangeEvent {
+  dbId: string;
+  /** "docs" | "attachments" */
+  storeKind: string;
+  /** Store head after the write, when the server store supports it. */
+  epoch?: string;
+  maxReceiptOrder?: number;
+}
+
+/**
  * User public keys retrieved from the tenant directory.
  * Used for authentication (signature verification) and encryption (transport encryption).
  */
@@ -218,6 +264,32 @@ export interface NetworkSyncCapabilities {
    * admin-signed grant document carrying the directive and no other data.
    */
   supportsRemoteWipeV1?: boolean;
+  /**
+   * Remote store exposes a cheap head descriptor via `getStoreHead()`
+   * (`{ epoch, maxReceiptOrder }`). Clients persist their scan cursor together
+   * with the epoch and can skip a pull entirely when the head shows nothing
+   * new (sync-v5, phase 1).
+   */
+  supportsStoreHead?: boolean;
+  /**
+   * `getEntries` can wrap a per-response AES-256-GCM session key with the
+   * requester's RSA public key instead of RSA-encrypting every entry payload
+   * individually (sync-v5, phase 2). Negotiated via a request flag; the
+   * legacy per-entry-RSA format remains the default.
+   */
+  supportsSessionKeyWrap?: boolean;
+  /**
+   * `getEntries`/`putEntries` support the length-prefixed
+   * `application/octet-stream` binary framing (sync-v5, phase 3), which
+   * avoids Base64 and large-JSON overhead.
+   */
+  supportsBinaryEntries?: boolean;
+  /**
+   * Server exposes a Server-Sent-Events change feed (`GET .../events`) that
+   * announces new entries per database (sync-v5, phase 5). Clients can
+   * subscribe instead of polling.
+   */
+  supportsChangeEvents?: boolean;
 }
 
 /**

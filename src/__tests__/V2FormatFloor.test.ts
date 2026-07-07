@@ -159,10 +159,13 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
       const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
       const server = plainServer(localStore, Date.now() - 1000); // cutoff in the past
       const v1 = await makeEntry(author, { entryVersion: undefined, metadataSignature: undefined });
-      await expect(server.handlePutEntries("token", [v1])).rejects.toThrow(NetworkError);
-      await expect(server.handlePutEntries("token", [v1])).rejects.toMatchObject({
-        type: NetworkErrorType.INVALID_SIGNATURE,
-      });
+      // Signature-class failure: rejected per entry (sync-v5), not stored.
+      const ack = await server.handlePutEntries("token", [v1]);
+      expect(ack.receipts).toHaveLength(0);
+      expect(ack.rejected).toEqual([
+        { id: v1.id, reason: expect.stringContaining("v2 metadata signature") },
+      ]);
+      expect(await localStore.getAllIds()).toHaveLength(0);
     });
 
     it("accepts a v2 entry after the cutoff", async () => {
@@ -170,7 +173,10 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
       const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
       const server = plainServer(localStore, Date.now() - 1000);
       const v2 = await makeEntry(author);
-      await expect(server.handlePutEntries("token", [v2])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [v2])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: v2.id })],
+        rejected: [],
+      });
       expect((await localStore.getEntries([v2.id]))[0]).toBeDefined();
     });
 
@@ -179,7 +185,10 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
       const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
       const server = plainServer(localStore, Date.now() + 60_000); // cutoff in the future
       const v1 = await makeEntry(author, { entryVersion: undefined, metadataSignature: undefined });
-      await expect(server.handlePutEntries("token", [v1])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [v1])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: v1.id })],
+        rejected: [],
+      });
     });
 
     it("cannot be bypassed by backdating a forged v1 entry's createdAt", async () => {
@@ -193,7 +202,12 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
         metadataSignature: undefined,
         createdAt: 1_000_000_000_000,
       });
-      await expect(server.handlePutEntries("token", [backdated])).rejects.toThrow(NetworkError);
+      const ack = await server.handlePutEntries("token", [backdated]);
+      expect(ack.receipts).toHaveLength(0);
+      expect(ack.rejected).toEqual([
+        { id: backdated.id, reason: expect.stringContaining("v2 metadata signature") },
+      ]);
+      expect(await localStore.getAllIds()).toHaveLength(0);
     });
 
     it("exempts the directory store from the floor", async () => {
@@ -206,7 +220,10 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
         docId: "directory",
         id: `directory_d_0_${Math.random().toString(36).slice(2)}`,
       });
-      await expect(server.handlePutEntries("token", [v1])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [v1])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: v1.id })],
+        rejected: [],
+      });
     });
 
     it("imposes no floor when the directory reports no cutoff", async () => {
@@ -214,7 +231,10 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
       const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
       const server = plainServer(localStore, undefined);
       const v1 = await makeEntry(author, { entryVersion: undefined, metadataSignature: undefined });
-      await expect(server.handlePutEntries("token", [v1])).resolves.toHaveLength(1);
+      await expect(server.handlePutEntries("token", [v1])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: v1.id })],
+        rejected: [],
+      });
     });
   });
 });

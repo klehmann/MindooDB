@@ -32,8 +32,10 @@ import type {
   StoreScanFilters,
   StoreScanResult,
   StoreIdBloomSummary,
+  StoreHead,
   OpenStoreOptions,
 } from "../../core/appendonlystores/types";
+import { v7 as uuidv7 } from "uuid";
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
 import { scanDocScopedEntries } from "../../core/appendonlystores/scanUtils";
@@ -66,11 +68,17 @@ const BLOOM_CACHE_KEY = "current";
 const RECEIPT_ORDER_COUNTER_KEY = "receiptOrderCounter";
 const TOTAL_CONTENT_BYTES_KEY = "total_content_bytes";
 const TOTAL_METADATA_BYTES_KEY = "total_metadata_bytes";
+const STORE_EPOCH_KEY = "storeEpoch";
 const RECONNECT_RETRY_DELAYS_MS = [50, 250, 1000];
 
 interface MetaValueRecord {
   key: string;
   value: number;
+}
+
+interface MetaStringValueRecord {
+  key: string;
+  value: string;
 }
 
 interface ContentRecord {
@@ -1130,6 +1138,39 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
       cursorReq.onerror = () => reject(cursorReq.error);
     });
+    });
+  }
+
+  /**
+   * Cheap head descriptor for incremental sync (see {@link StoreHead}).
+   *
+   * The epoch is created lazily on first read and persisted in the meta
+   * store. `clearAllLocalData` deletes the whole IndexedDB database, so a
+   * cleared store automatically starts a fresh epoch on next access.
+   */
+  async getStoreHead(): Promise<StoreHead> {
+    return this.runWithReconnect("getStoreHead", async () => {
+      const db = await this.ensureOpen();
+      const tx = db.transaction(META_STORE, "readwrite");
+      const metaOS = tx.objectStore(META_STORE);
+
+      const epochRecord = (await reqToPromise(
+        metaOS.get(STORE_EPOCH_KEY)
+      )) as MetaStringValueRecord | undefined;
+      let epoch = typeof epochRecord?.value === "string" && epochRecord.value.length > 0
+        ? epochRecord.value
+        : null;
+      if (!epoch) {
+        epoch = uuidv7();
+        await reqToPromise(
+          metaOS.put({ key: STORE_EPOCH_KEY, value: epoch } satisfies MetaStringValueRecord)
+        );
+      }
+
+      const maxReceiptOrder =
+        (await readNumericMetaValue(metaOS, RECEIPT_ORDER_COUNTER_KEY)) ?? 0;
+      await txToPromise(tx);
+      return { epoch, maxReceiptOrder };
     });
   }
 
