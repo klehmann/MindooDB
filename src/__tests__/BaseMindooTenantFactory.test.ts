@@ -383,7 +383,9 @@ describe("BaseMindooTenantFactory", () => {
       expect(keyPair1.privateKey.salt).not.toBe(keyPair2.privateKey.salt);
       expect(keyPair1.privateKey.iv).not.toBe(keyPair2.privateKey.iv);
       expect(keyPair1.privateKey.ciphertext).not.toBe(keyPair2.privateKey.ciphertext);
-    });
+      // Two full RSA keygens + PBKDF2(310k) each; the default 5s jest timeout
+      // is too tight when CPU is contended by the parallel full-suite run.
+    }, 30000);
 
     it("should create valid RSA-OAEP public key format", async () => {
       const password = "testpassword123";
