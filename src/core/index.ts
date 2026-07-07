@@ -160,6 +160,9 @@ export {
   isAttachmentChunkId,
   extractDocIdFromEntryId,
   computeContentHash,
+  semanticNow,
+  setSemanticTimeSourceForTesting,
+  createQuantizedTimeSource,
 } from "./utils";
 
 // Content-addressed stores

@@ -390,11 +390,15 @@ describe("Document DAG analysis", () => {
     });
 
     const afterEntries = await scanDocMetadata(userDb, docId);
-    const changeEntries = afterEntries
-      .filter((entry) => entry.entryType === "doc_change")
-      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const changeEntries = afterEntries.filter((entry) => entry.entryType === "doc_change");
     expect(changeEntries).toHaveLength(2);
-    expect(changeEntries[1]!.dependencyIds).toEqual([firstChange.id]);
+    // Identify the second change causally (the one that is not the first change)
+    // instead of sorting by createdAt: both changes can share the same
+    // millisecond, in which case a (createdAt, id) sort orders them by content
+    // hash — a coin flip that made this assertion flaky.
+    const secondChange = changeEntries.find((entry) => entry.id !== firstChange.id);
+    expect(secondChange).toBeTruthy();
+    expect(secondChange!.dependencyIds).toEqual([firstChange.id]);
   });
 
   it("fails writes instead of persisting broken dependency metadata when recovery cannot find parents", async () => {

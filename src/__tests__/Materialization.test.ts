@@ -1018,6 +1018,38 @@ describe("dense sync mode", () => {
 
     // The deleted document should NOT appear in the active document list
     const ids = await targetDb.getAllDocumentIds();
+    if (ids.includes(docId)) {
+      // Diagnostic for a rare full-suite-only flake: embed the full state in
+      // the thrown error so it survives terminal-scrollback truncation and
+      // shows up verbatim in the jest failure summary.
+      const targetMeta = await targetDb.getStore().findNewEntriesForDoc([], docId);
+      const sourceMeta = await sourceDb.getStore().findNewEntriesForDoc([], docId);
+      const deletedIds = await targetDb.getDeletedDocumentIds();
+      // Distinguish a transient index race from a persistently wrong state.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const idsAfterDelay = await targetDb.getAllDocumentIds();
+      const diag = {
+        docId,
+        targetEntries: targetMeta.map((m) => ({
+          t: m.entryType,
+          id: m.id,
+          deps: m.dependencyIds,
+          createdAt: m.createdAt,
+        })),
+        sourceEntries: sourceMeta.map((m) => ({
+          t: m.entryType,
+          id: m.id,
+          deps: m.dependencyIds,
+          createdAt: m.createdAt,
+        })),
+        targetHasDocDelete: targetMeta.some((m) => m.entryType === "doc_delete"),
+        deletedIdsIncludesDoc: deletedIds.includes(docId),
+        stillListedAfter250ms: idsAfterDelay.includes(docId),
+      };
+      throw new Error(
+        `[DENSE-DELETE-REPRO] deleted doc still listed by getAllDocumentIds():\n${JSON.stringify(diag, null, 2)}`,
+      );
+    }
     expect(ids).not.toContain(docId);
   }, 30000);
 

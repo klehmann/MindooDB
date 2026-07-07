@@ -55,6 +55,158 @@ function compareEntryIdsByMetadata(
 }
 
 /**
+ * Orders DAG entries causally: an entry never appears before one of its
+ * dependencies, and concurrent entries (no path between them) are ordered by
+ * `(createdAt, id)`.
+ *
+ * A plain chronological sort is NOT sufficient here: `createdAt` has
+ * millisecond resolution, so a change and the delete that causally follows it
+ * can carry the same timestamp — the id tie-break may then place the effect
+ * before its cause, and timeline consumers (e.g. `entries.at(-1)` as "current
+ * state") would read a stale lifecycle state.
+ */
+export function orderDagEntriesCausally(dagEntries: StoreEntryMetadata[]): StoreEntryMetadata[] {
+  const byId = new Map(dagEntries.map((entry) => [entry.id, entry]));
+  const depsOf = (entry: StoreEntryMetadata): string[] =>
+    (entry.entryType === "doc_snapshot" ? getSnapshotRoots(entry) : entry.dependencyIds)
+      .filter((dependencyId) => byId.has(dependencyId));
+
+  const remainingDeps = new Map<string, number>();
+  const childIds = new Map<string, string[]>();
+  for (const entry of dagEntries) {
+    const deps = depsOf(entry);
+    remainingDeps.set(entry.id, deps.length);
+    for (const dependencyId of deps) {
+      const children = childIds.get(dependencyId) ?? [];
+      children.push(entry.id);
+      childIds.set(dependencyId, children);
+    }
+  }
+
+  const ready = dagEntries
+    .filter((entry) => remainingDeps.get(entry.id) === 0)
+    .sort(compareByCreatedAtThenId);
+  const result: StoreEntryMetadata[] = [];
+  while (ready.length > 0) {
+    const next = ready.shift()!;
+    result.push(next);
+    for (const childId of childIds.get(next.id) ?? []) {
+      const left = (remainingDeps.get(childId) ?? 1) - 1;
+      remainingDeps.set(childId, left);
+      if (left === 0) {
+        const child = byId.get(childId)!;
+        const insertAt = ready.findIndex((entry) => compareByCreatedAtThenId(child, entry) < 0);
+        if (insertAt === -1) {
+          ready.push(child);
+        } else {
+          ready.splice(insertAt, 0, child);
+        }
+      }
+    }
+  }
+  // Content-addressed DAGs cannot cycle; this only guards against malformed
+  // metadata so the analysis stays total.
+  if (result.length < dagEntries.length) {
+    const emitted = new Set(result.map((entry) => entry.id));
+    result.push(
+      ...dagEntries
+        .filter((entry) => !emitted.has(entry.id))
+        .sort(compareByCreatedAtThenId),
+    );
+  }
+  return result;
+}
+
+/**
+ * Prunes a metadata slice down to "grounded" entries: replay entries whose
+ * causal ancestry is completely present within the slice (or vouched for by an
+ * in-slice snapshot).
+ *
+ * Why: a timestamp slice (`createdAt <= t`) can contain an entry whose
+ * dependency falls OUTSIDE the slice — cross-replica clock skew can give a
+ * parent a later `createdAt` than its child, and partial syncs or rejected
+ * puts can leave a child without its parent in the store. Automerge silently
+ * stashes such changes (their payload never applies), but metadata-derived
+ * state (`isDeleted`, head detection) would still count them, so document
+ * content and lifecycle state could disagree. Pruning ungrounded entries
+ * before planning/derivation makes both views agree by construction: the
+ * state at `t` is the merge of all complete causal chains up to `t`.
+ *
+ * Snapshot handling: a `doc_snapshot` certifies the state it covers, including
+ * entries that a history purge may have physically removed. Dependency ids
+ * that resolve into snapshot-covered territory therefore count as satisfied,
+ * and entries covered by a snapshot are grounded even if their own
+ * dependencies were purged. Snapshots themselves are never pruned.
+ *
+ * @param sliceEntries All entry metadata in the slice (replay + snapshots;
+ *                     other types pass through untouched).
+ * @returns The slice with ungrounded replay entries removed. Returns the input
+ *          array unchanged when everything is grounded (the common case).
+ */
+export function pruneToGroundedEntries(sliceEntries: StoreEntryMetadata[]): StoreEntryMetadata[] {
+  const replayEntries = sliceEntries.filter(isReplayEntry);
+  const replayById = new Map(replayEntries.map((entry) => [entry.id, entry]));
+
+  // Ids vouched for by in-slice snapshots: the declared roots (which may be
+  // purged) plus everything reachable from them through in-slice entries.
+  const vouchedIds = new Set<string>();
+  for (const entry of sliceEntries) {
+    if (entry.entryType !== "doc_snapshot") {
+      continue;
+    }
+    const stack = getSnapshotRoots(entry);
+    while (stack.length > 0) {
+      const currentId = stack.pop()!;
+      if (vouchedIds.has(currentId)) {
+        continue;
+      }
+      vouchedIds.add(currentId);
+      const covered = replayById.get(currentId);
+      if (covered) {
+        stack.push(...covered.dependencyIds);
+      }
+    }
+  }
+
+  // Seed: entries with a dependency that is neither in the slice nor vouched.
+  // Then propagate ungroundedness downstream along child edges — an entry
+  // resting on an ungrounded ancestor is itself ungrounded.
+  const childIdsByEntryId = new Map<string, string[]>();
+  const ungroundedIds = new Set<string>();
+  const queue: string[] = [];
+  for (const entry of replayEntries) {
+    let hasMissingDependency = false;
+    for (const dependencyId of entry.dependencyIds) {
+      if (replayById.has(dependencyId)) {
+        const children = childIdsByEntryId.get(dependencyId) ?? [];
+        children.push(entry.id);
+        childIdsByEntryId.set(dependencyId, children);
+      } else if (!vouchedIds.has(dependencyId)) {
+        hasMissingDependency = true;
+      }
+    }
+    if (hasMissingDependency && !vouchedIds.has(entry.id)) {
+      ungroundedIds.add(entry.id);
+      queue.push(entry.id);
+    }
+  }
+  while (queue.length > 0) {
+    const currentId = queue.pop()!;
+    for (const childId of childIdsByEntryId.get(currentId) ?? []) {
+      if (!ungroundedIds.has(childId) && !vouchedIds.has(childId)) {
+        ungroundedIds.add(childId);
+        queue.push(childId);
+      }
+    }
+  }
+
+  if (ungroundedIds.size === 0) {
+    return sliceEntries;
+  }
+  return sliceEntries.filter((entry) => !ungroundedIds.has(entry.id));
+}
+
+/**
  * Resolves the replay roots covered by a snapshot.
  *
  * Newer snapshots store explicit root entry ids. Older metadata may only expose
@@ -431,9 +583,7 @@ export function computeDocumentDagAnalysis(
   allEntriesForDoc: StoreEntryMetadata[],
   timestamp: number,
 ): DocumentDagAnalysisResult {
-  const dagEntries = allEntriesForDoc
-    .filter(isDagEntry)
-    .sort(compareByCreatedAtThenId);
+  const dagEntries = orderDagEntriesCausally(allEntriesForDoc.filter(isDagEntry));
   const replayEntries = dagEntries.filter(isReplayEntry);
   const replayById = new Map(replayEntries.map((entry) => [entry.id, entry]));
   const snapshots = dagEntries.filter((entry) => entry.entryType === "doc_snapshot");

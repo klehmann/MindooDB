@@ -24,6 +24,7 @@ import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import { validateTenantId } from "./tenantIdValidation";
+import { semanticNow } from "./utils/timeSource";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 
 /**
@@ -467,7 +468,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       await directory.setDefaultAccessPolicy(
         {
           disableAllAccessChecksAndPolicies: true,
-          requireMetadataSignatureSince: Date.now(),
+          requireMetadataSignatureSince: semanticNow(),
         },
         adminUser.userSigningKeyPair.privateKey,
         options.adminPassword,

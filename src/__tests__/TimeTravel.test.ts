@@ -302,8 +302,35 @@ describe("TimeTravel", () => {
       
       // History should include deletion
       const history: MindooDoc[] = [];
-      for await (const { doc: histDoc } of db.iterateDocumentHistory(docId)) {
+      const yieldedEntryIds: string[] = [];
+      for await (const { doc: histDoc, changeEntryId } of db.iterateDocumentHistory(docId)) {
         history.push(histDoc);
+        yieldedEntryIds.push(changeEntryId);
+      }
+      
+      if (history.length < 3) {
+        // Diagnostic for a rare full-suite-only flake: embed the store state
+        // and a retry pass in the thrown error so the jest failure summary
+        // shows exactly which entry was skipped and whether it is transient.
+        const storeMeta = await db.getStore().findNewEntriesForDoc([], docId);
+        const retryEntryIds: string[] = [];
+        for await (const { changeEntryId } of db.iterateDocumentHistory(docId)) {
+          retryEntryIds.push(changeEntryId);
+        }
+        const diag = {
+          docId,
+          storeEntries: storeMeta.map((m) => ({
+            t: m.entryType,
+            id: m.id,
+            createdAt: m.createdAt,
+            receiptOrder: m.receiptOrder,
+          })),
+          firstPassYields: yieldedEntryIds,
+          retryPassYields: retryEntryIds,
+        };
+        throw new Error(
+          `[HISTORY-DELETE-REPRO] expected >=3 history states, got ${history.length}:\n${JSON.stringify(diag, null, 2)}`,
+        );
       }
       
       // History should include create, active state before deletion, and deleted state.
@@ -449,6 +476,157 @@ describe("TimeTravel", () => {
       // After delete, document should not exist
       const idsAfter = await db.getAllDocumentIdsAtTimestamp(deleteTime + 5);
       expect(idsAfter).not.toContain(doc1Id);
+    });
+  });
+
+  describe("causal determinism at tied timestamps", () => {
+    // All lifecycle entries in these tests intentionally share a single
+    // semantic instant (or carry deliberately skewed timestamps). The state at
+    // a timestamp must then be derived from the dependency DAG — never from an
+    // id tie-break — so every replica and both timestamp APIs agree.
+
+    test("same-instant delete→undelete resolves causally: undelete wins", async () => {
+      const base = Date.now();
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(base);
+      try {
+        // Several docs so an id-lexicographic "latest terminal" coin flip
+        // cannot pass by luck.
+        const docIds: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const doc = await db.createDocument();
+          docIds.push(doc.getId());
+          await db.deleteDocument(doc.getId());
+          await db.undeleteDocument(doc.getId());
+        }
+        const ids = await db.getAllDocumentIdsAtTimestamp(base);
+        for (const docId of docIds) {
+          expect(ids).toContain(docId);
+          const at = await db.getDocumentAtTimestamp(docId, base);
+          expect(at).not.toBeNull();
+          expect(at!.isDeleted()).toBe(false);
+        }
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    test("same-instant change→delete resolves causally: delete wins", async () => {
+      const base = Date.now();
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(base);
+      try {
+        const docIds: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const doc = await db.createDocument();
+          docIds.push(doc.getId());
+          await db.changeDoc(doc, (d) => {
+            d.getData().status = "active";
+          });
+          await db.deleteDocument(doc.getId());
+        }
+        const ids = await db.getAllDocumentIdsAtTimestamp(base);
+        for (const docId of docIds) {
+          expect(ids).not.toContain(docId);
+          const at = await db.getDocumentAtTimestamp(docId, base);
+          expect(at).not.toBeNull();
+          expect(at!.isDeleted()).toBe(true);
+        }
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    test("prunes entries whose causal parents lie outside the timestamp slice", async () => {
+      const base = Date.now();
+      const nowSpy = jest.spyOn(Date, "now");
+      try {
+        nowSpy.mockReturnValue(base);
+        const doc = await db.createDocument();
+        const docId = doc.getId();
+        nowSpy.mockReturnValue(base + 2000);
+        await db.changeDoc(doc, (d) => {
+          d.getData().status = "active";
+        });
+        // Skewed replica clock: the delete causally follows the change but
+        // carries an EARLIER timestamp.
+        nowSpy.mockReturnValue(base + 1000);
+        await db.deleteDocument(docId);
+
+        // At base+1500 the slice contains create(base) and delete(base+1000)
+        // but NOT the delete's parent change(base+2000). The ungrounded delete
+        // must not count: the doc is alive in its create-state, and both
+        // timestamp APIs agree.
+        const at = await db.getDocumentAtTimestamp(docId, base + 1500);
+        expect(at).not.toBeNull();
+        expect(at!.isDeleted()).toBe(false);
+        expect(await db.getAllDocumentIdsAtTimestamp(base + 1500)).toContain(docId);
+
+        // At base+2000 the full causal chain is inside the slice: delete wins.
+        const atFull = await db.getDocumentAtTimestamp(docId, base + 2000);
+        expect(atFull).not.toBeNull();
+        expect(atFull!.isDeleted()).toBe(true);
+        expect(await db.getAllDocumentIdsAtTimestamp(base + 2000)).not.toContain(docId);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    test("returns null when only ungrounded entries fall inside the slice", async () => {
+      const base = Date.now();
+      const nowSpy = jest.spyOn(Date, "now");
+      try {
+        nowSpy.mockReturnValue(base + 5000);
+        const doc = await db.createDocument();
+        const docId = doc.getId();
+        nowSpy.mockReturnValue(base + 3000);
+        await db.changeDoc(doc, (d) => {
+          d.getData().status = "active";
+        });
+
+        // At base+4000 only the change(base+3000) is inside the slice; its
+        // parent create(base+5000) is not. No complete causal chain exists at
+        // that instant, so the document did not exist yet.
+        expect(await db.getDocumentAtTimestamp(docId, base + 4000)).toBeNull();
+        expect(await db.getAllDocumentIdsAtTimestamp(base + 4000)).not.toContain(docId);
+
+        // Once the create is inside the slice, the merged state appears.
+        const atFull = await db.getDocumentAtTimestamp(docId, base + 5000);
+        expect(atFull).not.toBeNull();
+        expect(atFull!.getData().status).toBe("active");
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    test("history iteration and paging use causal order for same-instant entries", async () => {
+      const base = Date.now();
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(base);
+      try {
+        const doc = await db.createDocument();
+        const docId = doc.getId();
+        await db.changeDoc(doc, (d) => {
+          d.getData().step = 1;
+        });
+        await db.deleteDocument(docId);
+
+        const states: { entryId: string; isDeleted: boolean }[] = [];
+        for await (const { changeEntryId, doc: histDoc } of db.iterateDocumentHistory(docId)) {
+          states.push({ entryId: changeEntryId, isDeleted: histDoc.isDeleted() });
+        }
+        expect(states.length).toBeGreaterThanOrEqual(3);
+        expect(states[0].isDeleted).toBe(false);
+        expect(states[states.length - 1].isDeleted).toBe(true);
+
+        // The metadata-only paging API must agree with the iterator's order.
+        const page = await db.getDocumentHistoryPage(docId, { limit: 10 });
+        expect(page.entries.map((entry) => entry.entryId)).toEqual(
+          states.map((state) => state.entryId),
+        );
+        expect(page.entries[0].entryType).toBe("doc_create");
+        expect(page.entries[page.entries.length - 1].entryType).toBe("doc_delete");
+        expect(page.entries[page.entries.length - 1].isDeleted).toBe(true);
+      } finally {
+        nowSpy.mockRestore();
+      }
     });
   });
 });

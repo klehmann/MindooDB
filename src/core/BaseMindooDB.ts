@@ -105,6 +105,8 @@ import {
   computeDocumentDagAnalysis,
   isDeletedFromHeads,
   isDagEntry,
+  orderDagEntriesCausally,
+  pruneToGroundedEntries,
 } from "./DocumentDagAnalysis";
 import {
   computeDocumentConflictAnalysisPlan,
@@ -120,6 +122,7 @@ import {
   generateUniqueAttachmentChunkId,
   generateFileUuid7,
 } from "./utils/idGeneration";
+import { semanticNow } from "./utils/timeSource";
 import { DocumentDeletedError, DocumentNotFoundError, SymmetricKeyNotFoundError } from "./errors";
 import {
   buildEntrySigningBytes,
@@ -1958,7 +1961,7 @@ export class BaseMindooDB implements MindooDB {
       if (cutoff === undefined) {
         return false;
       }
-      return entryTrustedTime(entry, Date.now()) >= cutoff;
+      return entryTrustedTime(entry, semanticNow()) >= cutoff;
     } catch (error) {
       this.logger.warn(`Failed to resolve metadata-signature floor: ${String(error)}`);
       return false;
@@ -1994,12 +1997,21 @@ export class BaseMindooDB implements MindooDB {
    * keeps repeated visibility reconciliations from inflating the
    * changefeed.
    *
+   * `lastModified` has millisecond resolution, so two genuine content
+   * changes landing in the same millisecond are indistinguishable by the
+   * tracked fields alone. Call sites that KNOW new content entries were
+   * just written/applied (changeDoc, delete/undelete, sync ingest) must
+   * pass `forceChangeSeqBump: true` so the change is re-emitted on the
+   * changefeed instead of being swallowed by the idempotency check.
+   *
    * @param docId The document ID
    * @param lastModified The new last modified timestamp
    * @param isDeleted Whether the document is a deletion/inaccessibility tombstone
    * @param decryptionKeyId Encryption key id derived from the doc's store metadata
    * @param accessState `"visible"` for readable docs, `"inaccessible"` for
    *   tombstones produced by the key visibility layer
+   * @param forceChangeSeqBump Bypass the no-op identity check because the
+   *   caller knows the document content changed (new store entries)
    */
   private updateIndex(
     docId: string,
@@ -2009,6 +2021,7 @@ export class BaseMindooDB implements MindooDB {
     accessState: DocumentAccessState = "visible",
     awaitingWitness: boolean = false,
     witnessed: boolean = false,
+    forceChangeSeqBump: boolean = false,
   ): void {
     const startedAt = Date.now();
     const assignedSeq = this.nextChangeSeq;
@@ -2030,9 +2043,13 @@ export class BaseMindooDB implements MindooDB {
       // If only metadata flags stayed identical and caller replays same state, skip.
       // `awaitingWitness` is part of this identity so a witness receipt (which
       // changes only `receivedAt`, not Automerge content) still bumps changeSeq
-      // and re-emits the doc on the metadata feed.
+      // and re-emits the doc on the metadata feed. Content-change call sites
+      // bypass this via forceChangeSeqBump: two changes within the same
+      // millisecond would otherwise be indistinguishable here and the second
+      // one would silently vanish from the changefeed.
       if (
-        existingEntry.lastModified === lastModified
+        !forceChangeSeqBump
+        && existingEntry.lastModified === lastModified
         && existingEntry.isDeleted === isDeleted
         && existingEntry.decryptionKeyId === decryptionKeyId
         && existingEntry.accessState === accessState
@@ -2703,8 +2720,11 @@ export class BaseMindooDB implements MindooDB {
             updatedDoc = await this.applyNewEntriesToCachedDocument(cachedDoc, entryMetadataList);
             if (updatedDoc) {
               this.logger.debug(`Successfully updated cached document ${docId} incrementally`);
-              // Only update index if document actually changed
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false);
+              // Only update index if document actually changed. A non-null
+              // result means something observable changed (heads or witness
+              // state), so force the changeSeq bump — same-millisecond
+              // lastModified collisions must not swallow the re-emit.
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false, true);
               this.logger.debug(`Updated index for document ${docId} (lastModified: ${updatedDoc.lastModified}, isDeleted: ${updatedDoc.isDeleted}, awaitingWitness: ${updatedDoc.awaitingWitness ?? false})`);
             } else {
               this.logger.debug(`Document ${docId} unchanged after applying new entries, skipping index update`);
@@ -2715,7 +2735,8 @@ export class BaseMindooDB implements MindooDB {
             this.docCache.delete(docId);
             updatedDoc = await this.loadDocumentInternal(docId);
             if (updatedDoc) {
-              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false);
+              // New entries triggered this reload, so force the re-emit.
+              this.updateIndex(docId, updatedDoc.lastModified, updatedDoc.isDeleted, updatedDoc.decryptionKeyId, "visible", updatedDoc.awaitingWitness ?? false, updatedDoc.witnessed ?? false, true);
             }
           }
         } else {
@@ -2756,7 +2777,13 @@ export class BaseMindooDB implements MindooDB {
               );
               const isDeleted = this.computeIsDeletedFromMetadata(allDocMetadata);
               const { awaitingWitness, witnessed } = metadataWitnessState(allDocMetadata);
-              this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible", awaitingWitness, witnessed);
+              // Force the re-emit only when the batch contains actual replay
+              // entries (create/change/delete/undelete): a snapshot-only batch
+              // changes nothing observable and may keep the idempotent skip.
+              const batchHasReplayEntries = docLifecycleEntries.some((e) =>
+                this.isDocumentReplayEntry(e),
+              );
+              this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible", awaitingWitness, witnessed, batchHasReplayEntries);
               this.logger.debug(
                 `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted}, awaitingWitness: ${awaitingWitness})`,
               );
@@ -2834,6 +2861,16 @@ export class BaseMindooDB implements MindooDB {
     
     const documentEntries = Array.from(entriesByDoc.entries())
       .sort((a, b) => {
+        // Prefer the store's receiptOrder (unique, reflects the actual write
+        // order) so a cold rebuild assigns changeSeqs in the same order the
+        // live session did — `createdAt` has millisecond resolution and ties
+        // for same-ms writes, which would otherwise flip the feed order to
+        // the docId tie-break after a restart.
+        const aMinReceipt = Math.min(...a[1].map((e) => e.receiptOrder ?? Number.MAX_SAFE_INTEGER));
+        const bMinReceipt = Math.min(...b[1].map((e) => e.receiptOrder ?? Number.MAX_SAFE_INTEGER));
+        if (aMinReceipt !== bMinReceipt) {
+          return aMinReceipt - bMinReceipt;
+        }
         const aMinCreatedAt = Math.min(...a[1].map((e) => e.createdAt));
         const bMinCreatedAt = Math.min(...b[1].map((e) => e.createdAt));
         if (aMinCreatedAt !== bMinCreatedAt) {
@@ -3562,7 +3599,7 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions,
-  ): Promise<{ transferred: number; scanned: number; cancelled: boolean }> {
+  ): Promise<{ transferred: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
     const onProgress = options?.onProgress;
 
     onProgress?.({
@@ -3653,22 +3690,34 @@ export class BaseMindooDB implements MindooDB {
     // ── Phase 5: transfer missing entries in pages ───────────────────
     const pageSize = options?.pageSize ?? 500;
     let transferred = 0;
+    const rejected: RejectedPutEntry[] = [];
 
     for (let offset = 0; offset < missingIds.length; offset += pageSize) {
       if (options?.signal?.aborted) {
-        return { transferred, scanned: allNeededArray.length, cancelled: true };
+        return { transferred, scanned: allNeededArray.length, cancelled: true, rejected };
       }
 
       const batch = missingIds.slice(offset, offset + pageSize);
       const entries = await sourceStore.getEntries(batch);
       const putResult = await targetStore.putEntries(entries);
       // Persist any witness receipts back onto the local source (see push path
-      // in transferEntriesInBatches; docs/accesscontrol.md §5.3).
-      const { receipts } = BaseMindooDB.normalizePutResult(putResult);
+      // in transferEntriesInBatches; docs/accesscontrol.md §5.3). sync-v5
+      // targets return a structured ack that additionally carries per-entry
+      // rejections (signature-class failures the remote skipped) — surface
+      // them instead of silently counting rejected entries as transferred:
+      // a dropped lifecycle entry (e.g. doc_delete) would otherwise leave the
+      // target believing the document is still alive.
+      const { receipts, batchRejected } = BaseMindooDB.normalizePutResult(putResult);
       if (receipts.length > 0 && sourceStore.applyWitnessReceipts) {
         await sourceStore.applyWitnessReceipts(receipts);
       }
-      transferred += entries.length;
+      if (batchRejected.length > 0) {
+        rejected.push(...batchRejected);
+        this.logger.warn(
+          `Dense sync: target rejected ${batchRejected.length} of ${entries.length} entries in batch at offset ${offset}`,
+        );
+      }
+      transferred += entries.length - batchRejected.length;
 
       onProgress?.({
         phase: "transferring",
@@ -3679,8 +3728,11 @@ export class BaseMindooDB implements MindooDB {
       });
     }
 
-    this.logger.info(`Dense sync complete: transferred ${transferred} entries`);
-    return { transferred, scanned: allNeededArray.length, cancelled: false };
+    this.logger.info(
+      `Dense sync complete: transferred ${transferred} entries` +
+      (rejected.length > 0 ? `, ${rejected.length} rejected by target` : ""),
+    );
+    return { transferred, scanned: allNeededArray.length, cancelled: false, rejected };
   }
 
   getStore(): ContentAddressedStore {
@@ -3695,7 +3747,7 @@ export class BaseMindooDB implements MindooDB {
     options?: { minAgeMs?: number }
   ): Promise<IncompleteAttachmentUploadReclaimResult> {
     const minAgeMs = options?.minAgeMs ?? 5 * 60 * 1000;
-    const cutoff = Date.now() - minAgeMs;
+    const cutoff = semanticNow() - minAgeMs;
     const ledgers = await this.store.findEntries(
       "pending_attachment_upload",
       null,
@@ -4066,7 +4118,7 @@ export class BaseMindooDB implements MindooDB {
     // For custom-ID documents we apply a hard-coded initial change so that
     // independent replicas using the same id produce the same Automerge hash
     // and `doc_create` entry id, allowing later changes to merge.
-    const now = Date.now();
+    const now = semanticNow();
     let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
     let changeBytes: Uint8Array;
     if (useCustomDocId) {
@@ -4292,7 +4344,7 @@ export class BaseMindooDB implements MindooDB {
     }
 
     const docId = useCustomDocId ? options.id! : this.generateUnusedDocId(options.idPrefix);
-    const now = Date.now();
+    const now = semanticNow();
 
     // Build the initial Automerge document and its first change bytes,
     // following the same seeding rules as the single-create path.
@@ -4475,18 +4527,28 @@ export class BaseMindooDB implements MindooDB {
     // Filter to document replay metadata plus snapshots up to the timestamp.
     // Attachment chunks are not part of the Automerge replay DAG and must not
     // participate in historical materialization.
-    const relevantEntries = allEntryMetadata
-      .filter((em) =>
-        em.createdAt <= timestamp
-        && (
-          em.entryType === "doc_create"
-          || em.entryType === "doc_change"
-          || em.entryType === "doc_delete"
-          || em.entryType === "doc_undelete"
-          || em.entryType === "doc_snapshot"
+    //
+    // The slice is then pruned to grounded entries (complete causal chains
+    // within the slice). Clock skew or partial sync can put an entry inside
+    // `createdAt <= timestamp` while its dependency falls outside; Automerge
+    // would silently stash such a change, but the metadata-derived isDeleted
+    // below would still count it — pruning keeps content and lifecycle state
+    // consistent: the state at `timestamp` is the deterministic merge of all
+    // complete causal chains up to that instant.
+    const relevantEntries = pruneToGroundedEntries(
+      allEntryMetadata
+        .filter((em) =>
+          em.createdAt <= timestamp
+          && (
+            em.entryType === "doc_create"
+            || em.entryType === "doc_change"
+            || em.entryType === "doc_delete"
+            || em.entryType === "doc_undelete"
+            || em.entryType === "doc_snapshot"
+          )
         )
-      )
-      .sort((a, b) => a.createdAt - b.createdAt);
+        .sort((a, b) => a.createdAt - b.createdAt),
+    );
     
     if (relevantEntries.length === 0) {
       this.performanceCallback?.onHistoryOperation?.({
@@ -4643,10 +4705,15 @@ export class BaseMindooDB implements MindooDB {
     // Get all entry metadata for this document
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
     
-    // Filter to document replay entries (exclude snapshots)
-    const relevantEntries = allEntryMetadata
-      .filter((em) => this.isDocumentReplayEntry(em))
-      .sort((a, b) => a.createdAt - b.createdAt);
+    // Filter to document replay entries (exclude snapshots) and order them
+    // causally: a plain chronological sort can place an effect before its
+    // cause when several entries share the same millisecond (or when replica
+    // clock skew inverts timestamps along a dependency chain), which would
+    // make the history yield states out of causal order. Concurrent entries
+    // are still ordered by (createdAt, id) deterministically.
+    const relevantEntries = orderDagEntriesCausally(
+      allEntryMetadata.filter((em) => this.isDocumentReplayEntry(em)),
+    );
     
     if (relevantEntries.length === 0) {
       return; // Document has no history
@@ -4663,7 +4730,8 @@ export class BaseMindooDB implements MindooDB {
     let createdAt: number | null = null;
     let decryptionKeyId: string = "default";
     
-    for (const entryMetadata of relevantEntries) {
+    for (let entryIndex = 0; entryIndex < relevantEntries.length; entryIndex++) {
+      const entryMetadata = relevantEntries[entryIndex];
       const entryData = entryMap.get(entryMetadata.id);
       if (!entryData) {
         this.logger.warn(`Entry ${entryMetadata.id} not found in store, skipping`);
@@ -4744,10 +4812,14 @@ export class BaseMindooDB implements MindooDB {
           createdAt: createdAt!,
           lastModified: entryMetadata.createdAt,
           decryptionKeyId,
-          isDeleted: this.computeIsDeletedFromMetadata(relevantEntries.filter((entry) =>
-            entry.createdAt < entryMetadata.createdAt ||
-            (entry.createdAt === entryMetadata.createdAt && entry.id <= entryMetadata.id)
-          )),
+          // Use the exact prefix of entries applied so far. Rebuilding the
+          // prefix via a (createdAt, id) comparison can disagree with the
+          // actual iteration order when several entries share the same
+          // millisecond (e.g. a fast create→change→delete), which made
+          // intermediate history states wrongly report isDeleted.
+          isDeleted: this.computeIsDeletedFromMetadata(
+            relevantEntries.slice(0, entryIndex + 1),
+          ),
         };
         
         // Wrap and yield (including lifecycle terminal entries)
@@ -4820,7 +4892,7 @@ export class BaseMindooDB implements MindooDB {
 
     // Trusted time for un-witnessed entries is the current wall clock, computed
     // once per run so all un-witnessed entries share a stable head instant.
-    const now = Date.now();
+    const now = semanticNow();
 
     // Affected documents (those with at least one newly-discovered entry), and
     // the set of new entry ids per doc (the trusted-time positions from which the
@@ -5331,30 +5403,36 @@ export class BaseMindooDB implements MindooDB {
 
     // This API stays metadata-only so large history views can page cheaply
     // without reconstructing every historical Automerge document state.
+    // Entries are ordered causally (dependency-first, (createdAt, id) for
+    // concurrent ties) so the page timeline never shows an effect before its
+    // cause — same ordering as iterateDocumentHistory.
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
-    const relevantEntries = allEntryMetadata
-      .filter(
+    const relevantEntries = orderDagEntriesCausally(
+      allEntryMetadata.filter(
         (em) =>
           em.entryType === "doc_create" ||
           em.entryType === "doc_change" ||
           em.entryType === "doc_delete" ||
           em.entryType === "doc_undelete"
-      )
-      .sort((a, b) => a.createdAt - b.createdAt);
+      ),
+    );
 
     // Cursor paging is offset-based because the result is a bounded timeline view
     // over the doc's sorted change metadata, not a resumable store scan cursor.
     const slice = relevantEntries.slice(offset, offset + limit);
-    const entries: DocumentHistoryPageEntry[] = slice.map((entry) => ({
+    const entries: DocumentHistoryPageEntry[] = slice.map((entry, sliceIndex) => ({
       entryId: entry.id,
       entryType: entry.entryType,
       changeCreatedAt: entry.createdAt,
       changeCreatedByPublicKey: entry.createdByPublicKey,
       dependencyIds: [...entry.dependencyIds],
-      isDeleted: this.computeIsDeletedFromMetadata(relevantEntries.filter((candidate) =>
-        candidate.createdAt < entry.createdAt ||
-        (candidate.createdAt === entry.createdAt && candidate.id <= entry.id)
-      )),
+      // Deletion state as of this timeline position = derived from the exact
+      // causal prefix of entries up to and including this one. Rebuilding the
+      // prefix via a (createdAt, id) comparison could disagree with the causal
+      // order for same-millisecond entries.
+      isDeleted: this.computeIsDeletedFromMetadata(
+        relevantEntries.slice(0, offset + sliceIndex + 1),
+      ),
     }));
     const nextOffset = offset + entries.length;
     const hasMore = nextOffset < relevantEntries.length;
@@ -6067,7 +6145,7 @@ export class BaseMindooDB implements MindooDB {
     return {
       changeSeqAsOf: latestCursor?.changeSeq ?? 0,
       storeReceiptOrderAsOf: await this.getStoreMaxReceiptOrder(),
-      takenAt: Date.now(),
+      takenAt: semanticNow(),
     };
   }
 
@@ -6921,26 +6999,43 @@ export class BaseMindooDB implements MindooDB {
 
     const docIds: string[] = [];
     for (const [docId, lifecycleEntries] of lifecycleEntriesByDocId.entries()) {
-      // Sort deterministically so same-timestamp lifecycle entries resolve the
-      // same way on every replica.
-      const ordered = lifecycleEntries.sort((a, b) =>
-        a.createdAt !== b.createdAt ? a.createdAt - b.createdAt : a.id.localeCompare(b.id)
-      );
       // A document cannot exist before its create entry, even if malformed or
       // partial metadata somehow contains later lifecycle entries.
-      if (!ordered.some((entry) => entry.entryType === "doc_create" && entry.createdAt <= timestamp)) {
+      if (!lifecycleEntries.some((entry) => entry.entryType === "doc_create" && entry.createdAt <= timestamp)) {
         continue;
       }
-      const createEntry = ordered.find((entry) => entry.entryType === "doc_create");
+      const createEntry = lifecycleEntries.find((entry) => entry.entryType === "doc_create");
       if (createEntry && !(await this.tenant.hasDecryptionKey(createEntry.decryptionKeyId))) {
         continue;
       }
-      // Delete and undelete are terminal lifecycle markers. The latest one at
-      // the timestamp decides whether the document existed then.
-      const latestTerminal = ordered
-        .filter((entry) => entry.entryType === "doc_delete" || entry.entryType === "doc_undelete")
-        .at(-1);
-      if (!latestTerminal || latestTerminal.entryType === "doc_undelete") {
+      const terminalEntries = lifecycleEntries.filter(
+        (entry) =>
+          (entry.entryType === "doc_delete" || entry.entryType === "doc_undelete")
+          && entry.createdAt <= timestamp,
+      );
+      if (terminalEntries.length === 0) {
+        // Fast path (the vast majority of documents): no delete/undelete ever
+        // happened up to `timestamp`, so the document is alive and we never
+        // need its change metadata.
+        docIds.push(docId);
+        continue;
+      }
+      // Causal path: the doc has terminal lifecycle entries, so alive/deleted
+      // must be derived exactly like getDocumentAtTimestamp derives it —
+      // grounded slice, dependency-based heads, causal supersession — instead
+      // of a purely chronological "latest terminal wins". A same-instant
+      // delete→undelete pair or cross-replica clock skew would otherwise be
+      // decided by id tie-break, which can disagree with causality and with
+      // getDocumentAtTimestamp for the same instant. The extra per-doc
+      // metadata scan is bounded by the number of ever-deleted documents.
+      const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+      const relevantEntries = pruneToGroundedEntries(
+        allEntryMetadata.filter((entry) =>
+          entry.createdAt <= timestamp
+          && (this.isDocumentReplayEntry(entry) || entry.entryType === "doc_snapshot")
+        ),
+      );
+      if (!this.computeIsDeletedFromMetadata(relevantEntries)) {
         docIds.push(docId);
       }
     }
@@ -7120,13 +7215,24 @@ export class BaseMindooDB implements MindooDB {
     // Delete and undelete are encoded as normal Automerge changes so the DAG
     // keeps causal ancestry, while the StoreEntry type carries lifecycle intent.
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
-    const now = Date.now();
+    const now = semanticNow();
     const docId = internalDoc.id;
 
     // Lifecycle changes are intentionally non-destructive: they only bump
     // `_lastModified` and repair missing legacy attachment arrays. The document
     // body remains available for history and future undeletion.
-    const newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) =>
+    //
+    // Same-millisecond hazard: the change writes ONLY `_lastModified`, and
+    // Automerge dedupes a same-value assignment into an EMPTY change (heads
+    // unchanged, getLastLocalChange returns the PREVIOUS change). A delete in
+    // the same millisecond as the last change would then reuse the previous
+    // change's hash, collide with its entry id, and the doc_delete would
+    // silently never be persisted — the document resurrects on sync/reload.
+    // If the mutation dedupes to nothing, fall back to an explicit
+    // `emptyChange`, which always advances the heads with a fresh hash while
+    // keeping causal ancestry intact.
+    const headsBefore = Automerge.getHeads(internalDoc.doc);
+    let newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) =>
       Automerge.change(
         doc,
         { time: now },
@@ -7138,6 +7244,9 @@ export class BaseMindooDB implements MindooDB {
         },
       ),
     );
+    if (Automerge.getHeads(newDoc).every((head) => headsBefore.includes(head))) {
+      newDoc = Automerge.emptyChange(newDoc, { time: now }) as AutomergeTypes.Doc<MindooDocPayload>;
+    }
 
     const changeBytes = Automerge.getLastLocalChange(newDoc);
     if (!changeBytes) {
@@ -7267,14 +7376,17 @@ export class BaseMindooDB implements MindooDB {
     // The doc is now witness-era (we just wrote a versioned entry), so it is
     // witnessed iff it is no longer awaiting a receipt.
     internalDoc.witnessed = isVersioned(entryMetadata) && !internalDoc.awaitingWitness;
+    // Force the changeSeq bump: a lifecycle entry was just written, so the
+    // changefeed must re-emit the doc even if all tracked index fields happen
+    // to match the previous state in the same millisecond.
     if (options.markDirty) {
       await this.storeCachedDocument(internalDoc);
-      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
+      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed, true);
       this.markDocDirty(docId);
     } else {
       this.docCache.delete(docId);
       this.dirtyDocIds.delete(docId);
-      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
+      this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed, true);
     }
   }
 
@@ -7375,7 +7487,7 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.validateTextPatch(patch);
-    const now = Date.now();
+    const now = semanticNow();
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
     const baseHeads = patch.baseHeads;
     const applyEdits = (automergeDoc: MindooDocPayload) => {
@@ -7455,7 +7567,7 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.validateRichTextPatch(patch);
-    const now = Date.now();
+    const now = semanticNow();
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
     const spansSequence = patch.spansSequence ?? (patch.spans ? [patch.spans] : []);
     const applySpans = (automergeDoc: MindooDocPayload) => {
@@ -7552,7 +7664,7 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.validateRichTextStepPatch(patch);
-    const now = Date.now();
+    const now = semanticNow();
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
     const applySteps = (automergeDoc: MindooDocPayload) => {
       this.ensureRichTextPath(automergeDoc, patch.path);
@@ -7706,7 +7818,7 @@ export class BaseMindooDB implements MindooDB {
 
     await this.hydrateAutomergeHashMappingsFromStore(docId);
 
-    const now = Date.now();
+    const now = semanticNow();
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
     if (patch.baseHeads?.length) {
       const baseHeadsKey = [...patch.baseHeads].sort().join("|");
@@ -7834,7 +7946,7 @@ export class BaseMindooDB implements MindooDB {
     }
 
     this.validateJsonPatch(patch);
-    const now = Date.now();
+    const now = semanticNow();
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
     const applyPatch = (automergeDoc: MindooDocPayload) => {
       this.applyJsonPatchOperations(automergeDoc, patch);
@@ -7922,7 +8034,7 @@ export class BaseMindooDB implements MindooDB {
     }
     
     // Apply the change function
-    const now = Date.now();
+    const now = semanticNow();
     this.logger.debug(`Applying change function to document ${docId}`);
     if (this.isDebugEnabled()) this.logger.debug(`Document state before change: heads=${JSON.stringify(Automerge.getHeads(internalDoc.doc))}`);
     
@@ -9053,7 +9165,10 @@ export class BaseMindooDB implements MindooDB {
       || (internalDoc.witnessed ?? false);
     internalDoc.witnessed = versioned && !internalDoc.awaitingWitness;
     await this.storeCachedDocument(internalDoc);
-    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed);
+    // Force the changeSeq bump: new change entries were just written, so the
+    // changefeed must re-emit the doc even when `lastModified` collides with
+    // the previous change in the same millisecond.
+    this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed, true);
     this.markDocDirty(docId);
 
     this.logger.info(`Document ${docId} ${successMessage} successfully`);
@@ -9210,7 +9325,7 @@ export class BaseMindooDB implements MindooDB {
         contentHash,
         docId,
         dependencyIds: headEntryIds,
-        createdAt: Date.now(),
+        createdAt: semanticNow(),
         createdByPublicKey: options.createdByPublicKey,
         decryptionKeyId: internalDoc.decryptionKeyId,
         snapshotHeadHashes: headHashes,
@@ -9349,7 +9464,7 @@ export class BaseMindooDB implements MindooDB {
   }
 
   private resolveDagTimestamp(timestamp: DocumentDagAnalysisTimestamp): number {
-    return timestamp === "now" ? Date.now() : timestamp;
+    return timestamp === "now" ? semanticNow() : timestamp;
   }
 
   private previewChangeValue(value: unknown): string | null {
@@ -10816,7 +10931,7 @@ export class BaseMindooDB implements MindooDB {
     // A verify-only provider (no signer) routes receipts to the right scheme.
     const subtle = this.getSubtle();
     const receiptVerifier = new Ed25519WitnessProvider({ subtle }).createVerifier();
-    const nowMs = Date.now();
+    const nowMs = semanticNow();
 
     // Lifecycle entries only, folded in deterministic causal order. Un-witnessed
     // entries (versioned or legacy) order by their author time `createdAt`, NOT
@@ -10859,7 +10974,7 @@ export class BaseMindooDB implements MindooDB {
         // Audit record: the entry's own (stable) time — receipt time if
         // witnessed, else author time. Not the provisional head `now`.
         trustedTime: meta.receivedAt ?? meta.createdAt,
-        recordedAt: Date.now(),
+        recordedAt: semanticNow(),
       });
     };
 
@@ -11005,7 +11120,7 @@ export class BaseMindooDB implements MindooDB {
     const isDeleted = this.computeIsDeletedFromMetadata(acceptedMeta);
     const lastAccepted = acceptedMeta[acceptedMeta.length - 1];
     const lastModified =
-      (payload._lastModified as number) || (lastAccepted ? lastAccepted.createdAt : Date.now());
+      (payload._lastModified as number) || (lastAccepted ? lastAccepted.createdAt : semanticNow());
     const witnessState = metadataWitnessState(acceptedMeta);
 
     return {
@@ -11416,7 +11531,7 @@ export class BaseMindooDB implements MindooDB {
     // Get lastModified from payload, or use the timestamp of the last entry
     const lastEntry = entries.length > 0 ? entries[entries.length - 1] : null;
     const lastModified = (payload._lastModified as number) || 
-                         (lastEntry ? lastEntry.createdAt : Date.now());
+                         (lastEntry ? lastEntry.createdAt : semanticNow());
     // Get createdAt from the first entry
     const firstEntry = allEntryMetadata.length > 0 ? allEntryMetadata[0] : null;
     const createdAt = firstEntry ? firstEntry.createdAt : lastModified;
@@ -12035,7 +12150,7 @@ export class BaseMindooDB implements MindooDB {
       dependencyIds: [],
       createdAt,
       attachmentId,
-      uploadStartedAt: Date.now(),
+      uploadStartedAt: semanticNow(),
       createdByPublicKey,
       decryptionKeyId,
       signature,

@@ -18,3 +18,9 @@ export {
   extractDocIdFromEntryId,
   computeContentHash,
 } from './idGeneration';
+
+export {
+  semanticNow,
+  setSemanticTimeSourceForTesting,
+  createQuantizedTimeSource,
+} from './timeSource';

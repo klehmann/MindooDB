@@ -786,6 +786,53 @@ describe("iterateChangesSince", () => {
       }
     });
 
+    it("re-emits a document changed twice within the same millisecond", async () => {
+      const db = await tenant.openDB("test-db-same-ms-changes");
+
+      const doc = await db.createDocument();
+      const docId = doc.getId();
+      await db.changeDoc(doc, (d) => {
+        d.getData().v = 1;
+      });
+
+      // Consume the feed so the cursor sits at the doc's current changeSeq.
+      let cursor: ProcessChangesCursor | null = null;
+      for await (const { cursor: c } of db.iterateChangesSince(null)) {
+        cursor = c;
+      }
+
+      // Freeze Date.now so both following changes carry the exact same
+      // `lastModified`. Before the forceChangeSeqBump fix, the second change
+      // was indistinguishable from an idempotent replay in updateIndex and
+      // silently vanished from the changefeed.
+      const fixedNow = Date.now();
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(fixedNow);
+      try {
+        const docV2 = await db.getDocument(docId);
+        await db.changeDoc(docV2, (d) => {
+          d.getData().v = 2;
+        });
+        // Consume the v=2 emission so only the second same-ms change remains.
+        for await (const { cursor: c } of db.iterateChangesSince(cursor)) {
+          cursor = c;
+        }
+        const docV3 = await db.getDocument(docId);
+        await db.changeDoc(docV3, (d) => {
+          d.getData().v = 3;
+        });
+      } finally {
+        nowSpy.mockRestore();
+      }
+
+      const yieldedVersions: unknown[] = [];
+      for await (const { doc: changedDoc } of db.iterateChangesSince(cursor)) {
+        if (changedDoc.getId() === docId) {
+          yieldedVersions.push(changedDoc.getData().v);
+        }
+      }
+      expect(yieldedVersions).toEqual([3]);
+    }, 30000);
+
     it("should handle documents with same lastModified timestamp (verify docId ordering)", async () => {
       const db = await tenant.openDB("test-db");
       

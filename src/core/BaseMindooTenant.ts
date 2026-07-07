@@ -33,6 +33,7 @@ import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/pri
 import { verifyEntrySignatureWithImportedKey } from "./crypto/EntrySignature";
 import { entryTrustedTime } from "./storeEntryTime";
 import { computeContentHash } from "./utils/idGeneration";
+import { semanticNow } from "./utils/timeSource";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
@@ -705,7 +706,7 @@ export class BaseMindooTenant implements MindooTenant {
       if (cutoff === undefined) {
         return false;
       }
-      return entryTrustedTime(entry, Date.now()) >= cutoff;
+      return entryTrustedTime(entry, semanticNow()) >= cutoff;
     } catch (error) {
       this.logger.warn(`Failed to resolve metadata-signature floor: ${String(error)}`);
       return false;

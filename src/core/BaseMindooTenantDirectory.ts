@@ -15,6 +15,7 @@ import {
   PUBLIC_INFOS_KEY_ID,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
+import { semanticNow } from "./utils/timeSource";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 import {
   extractSigningPublicKeys,
@@ -1524,7 +1525,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const signingToRemove = new Set(signingKeys);
     const encToRemove = new Set(encryptionKeys);
-    const revokedAt = Date.now();
+    const revokedAt = semanticNow();
     await this.editGrantArrays(
       username,
       administrationPrivateKey,
@@ -1703,7 +1704,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const revokeSet = new Set(changes.revokeSigningKeys ?? []);
     const restoreSet = new Set(changes.restoreSigningKeys ?? []);
     const labels = changes.deviceLabels ?? {};
-    const now = Date.now();
+    const now = semanticNow();
 
     // Precompute async-derived fields before the (sync) per-doc mutate.
     const userDetailsEncrypted = changes.details
@@ -3377,7 +3378,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       : undefined;
 
     const docId = aclDocHistoryPurgeDocId(request.requestId);
-    const requestedAt = Date.now();
+    const requestedAt = semanticNow();
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
     const adminSigningKeyPair: SigningKeyPair = {
