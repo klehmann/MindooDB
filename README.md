@@ -60,6 +60,26 @@ Traditional databases trust the server. If your hosting provider is compromised,
 | 🤝 **Real-time Collaboration** | Built on [Automerge](https://automerge.org/) CRDTs. Conflicts resolve automatically. |
 | 🔑 **Fine-grained Access** | Named encryption keys for sensitive documents. Share with specific users. |
 
+## MindooDB Haven — the graphical client
+
+MindooDB is the database engine. **[Haven](https://haven.mindoodb.com)** is the graphical workspace you actually look at — a browser-based, installable PWA that turns MindooDB into a calm, end-to-end encrypted collaboration client you can use without writing any code.
+
+![MindooDB Haven workspace](./docs/images/haven-workspace.png)
+
+Haven is the fastest way to see MindooDB in action, and a real home for day-to-day work:
+
+- **Local-first & offline** — everything is served from a browser-local replica, so browsing, editing, and searching stay instant and keep working with no network. The server is only contacted on sync, and only ever sees ciphertext.
+- **Workspace of tiles** — arrange databases, apps, notes, web pages, videos, and live diagrams as draggable tiles across multiple pages, like home screens on a phone.
+- **App runtime** — launches MindooDB apps (built with the [App SDK](https://github.com/klehmann/mindoodb-app-sdk)) inside a sandboxed iframe, brokering every read and write through a permissioned bridge. Hosted apps can even run offline from Haven's own service worker.
+- **Virtual Views** — spreadsheet-like trees that filter, categorize, sort, and total documents across one database, several databases, or even several tenants — exportable to `.xlsx`.
+- **Database Browser & history** — inspect documents, compare any two revisions side by side, and explore the full signed change graph (DAG) of every edit.
+- **Multi-tenant by design** — run work, personal, and cross-company tenants side by side, each cryptographically independent, all in one browser.
+- **Installable PWA** — add it to an iPhone, iPad, or Android home screen and launch it in standalone mode; encrypted `.mdbhaven-backup` files move a whole environment between browsers.
+
+Haven Community is **free** (in beta) and is the same client the MindooDB team uses in-house. Try it at **[haven.mindoodb.com](https://haven.mindoodb.com)**, read the full [Haven Handbook](./docs/haven-handbook.md), or explore more at [mindoodb.com](https://www.mindoodb.com).
+
+> Prefer to build directly on the engine? Keep reading — the Quick Start below is all code.
+
 ## Quick Start
 
 ### Installation
@@ -67,6 +87,8 @@ Traditional databases trust the server. If your hosting provider is compromised,
 ```bash
 pnpm add mindoodb
 ```
+
+> 📦 **Published regularly on npm.** We ship new versions frequently to [npmjs.com/package/mindoodb](https://www.npmjs.com/package/mindoodb), so pull updates often to stay current with fixes and API changes during the beta.
 
 > 📱 **React Native / Expo?** See the [React Native setup guide](./docs/reactnative.md) for mobile-specific instructions with native performance.
 
@@ -272,6 +294,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 
 ## Documentation
 
+- [Haven Handbook](./docs/haven-handbook.md) — Complete guide to Haven, the graphical MindooDB collaboration client
 - [Getting Started](./docs/getting-started.md) — Fast setup for Node.js, Web, and React Native
 - [Example Snippets](./docs/examples/README.md) — Copy-paste Todo starters for all runtimes
 - [Architecture Specification](./docs/specification.md) — Full technical details
