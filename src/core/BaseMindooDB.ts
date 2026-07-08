@@ -1298,7 +1298,9 @@ export class BaseMindooDB implements MindooDB {
     }
     this.changeNotifyTimer = setTimeout(() => {
       this.changeNotifyTimer = null;
-      this.emitPendingChangeEvent();
+      // Timer-based emission only runs outside a change-notification hold,
+      // i.e. it coalesces local writes committed this event-loop turn.
+      this.emitPendingChangeEvent("local");
     }, 0);
   }
 
@@ -1313,11 +1315,12 @@ export class BaseMindooDB implements MindooDB {
   private endChangeNotificationHold(): void {
     this.changeNotificationHolds = Math.max(0, this.changeNotificationHolds - 1);
     if (this.changeNotificationHolds === 0) {
-      this.emitPendingChangeEvent();
+      // A hold wraps a sync-ingest batch, so the released batch is ingest.
+      this.emitPendingChangeEvent("ingest");
     }
   }
 
-  private emitPendingChangeEvent(): void {
+  private emitPendingChangeEvent(origin: DbChangeEvent["origin"]): void {
     if (this.changeNotificationHolds > 0) {
       return;
     }
@@ -1336,6 +1339,7 @@ export class BaseMindooDB implements MindooDB {
     const event: DbChangeEvent = {
       changes,
       cursor: this.getLatestChangeCursor(),
+      origin,
     };
     for (const listener of this.changeListeners) {
       try {

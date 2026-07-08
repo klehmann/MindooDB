@@ -4146,6 +4146,17 @@ export interface DbChange {
 export interface DbChangeEvent {
   changes: DbChange[];
   cursor: ProcessChangesCursor | null;
+  /**
+   * Where the change batch came from:
+   * - `"local"` — one or more writes committed on this replica (the user
+   *   edited a document); emitted on the coalesced local-write turn.
+   * - `"ingest"` — documents received while applying a sync batch (pull /
+   *   push ingest, access flips, witness updates); emitted once per batch.
+   *
+   * Consumers that trigger network sync on change (e.g. auto-push) must
+   * only react to `"local"` to avoid a push↔pull loop.
+   */
+  origin: "local" | "ingest";
 }
 
 export type DbChangeListener = (event: DbChangeEvent) => void;

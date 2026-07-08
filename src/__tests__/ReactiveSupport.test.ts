@@ -73,6 +73,30 @@ describe("change listeners (db.addChangeListener)", () => {
     unsubscribe();
   }, 30000);
 
+  it("tags local writes with origin: \"local\"", async () => {
+    const events: DbChangeEvent[] = [];
+    const unsubscribe = db.addChangeListener!((event) => {
+      events.push(event);
+    });
+
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (d) => {
+      d.getData().name = "Alice";
+    });
+    // Haven's write helpers follow every edit with an explicit
+    // syncStoreChanges(); the user's edit must still surface as a local-origin
+    // event (the trailing sync flush emits a separate ingest event we ignore).
+    await db.syncStoreChanges();
+    await flushChangeEvents();
+
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(events.some((e) => e.origin === "local")).toBe(true);
+    const localEvent = events.find((e) => e.origin === "local");
+    expect(localEvent!.changes.some((c) => c.docId === doc.getId())).toBe(true);
+
+    unsubscribe();
+  }, 30000);
+
   it("reports deletions with isDeleted: true", async () => {
     const doc = await db.createDocument();
     await db.changeDoc(doc, (d) => {
@@ -252,6 +276,9 @@ describe("one coalesced event per sync batch", () => {
     expect(events).toHaveLength(1);
     expect(events[0].changes).toHaveLength(docCount);
     expect(events[0].cursor).not.toBeNull();
+    // Documents received via a sync batch are tagged ingest, never local, so
+    // an auto-push driver never mistakes pulled data for a user edit.
+    expect(events[0].origin).toBe("ingest");
 
     unsubscribe();
   }, 60000);
