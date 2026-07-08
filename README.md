@@ -247,6 +247,7 @@ Append-only storage means nothing is ever deleted:
 - **Audit-Critical Systems**: Tamperproof history meets compliance requirements
 - **Local-First Apps**: Full functionality without network; sync when connected
 - **Mobile Apps**: End-to-end encrypted sync with native performance
+- **Data Migration**: Import existing records with their original creation dates so [Time Travel](./docs/timetravel.md) reflects real history — see the [mindoodb-data-import](https://github.com/klehmann/mindoodb-data-import) example CLI (backdated import + server push)
 
 See: [Use Cases Documentation](./docs/usecases/README.md)
 
@@ -263,6 +264,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
 - [Attachments](./docs/attachments.md) — File storage and streaming
+- [Data Import Example](https://github.com/klehmann/mindoodb-data-import) — CLI tool that imports external data into MindooDB with historical `createdAt` timestamps for Time Travel
 
 ## Testing
 

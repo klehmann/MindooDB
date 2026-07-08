@@ -26,6 +26,16 @@ The key idea: ad-hoc queries **never touch documents** — they only read the su
 buffer. The summary is built once (interruptible, with progress reporting) and then
 maintained incrementally from the changefeed.
 
+The same summary path works on **time-travel instances**
+(`tenant.openDB(id, { timeTravelDate })`): the changefeed of a snapshot is
+filtered to the cutoff, so the summary buffer reflects the historical state and
+`db.query()` / `db.queryView()` / `db.queryLive()` answer against it (a
+`queryLive` on a snapshot behaves as a one-shot result — a frozen history never
+emits change events). See
+["Time-Travel Database Instances"](timetravel.md#time-travel-database-instances)
+for details, including the optional persistent per-cutoff cache
+(`persistTimeTravelCache`).
+
 Persistent [VirtualViews](virtualview.md) benefit too: their async builds resolve
 `withDB` sources **summary-first** and only fall back to materialized documents
 when the view definition requires them (or `useFullDocuments` forces it) — see

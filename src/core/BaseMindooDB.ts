@@ -817,17 +817,55 @@ export class BaseMindooDB implements MindooDB {
   // ---------------------------------------------------------------------------
 
   /**
+   * Compute the cache prefix for this database. Time-travel instances get a
+   * cutoff-scoped prefix (`.../tt/<timeTravelDate>`) so their persisted
+   * state (doc cache, metadata checkpoint, summary buckets) is isolated per
+   * cutoff and can never collide with — or leak into — the live cache.
+   */
+  private computeCachePrefix(): string {
+    const cacheIdentity = this.store.getCacheIdentity?.() ?? this.store.getId();
+    const base = `${this.tenant.getId()}/${cacheIdentity}`;
+    return this.timeTravelDate == null ? base : `${base}/tt/${this.timeTravelDate}`;
+  }
+
+  /**
    * Attach a CacheManager so this DB participates in periodic cache flushing.
    */
   setCacheManager(cacheManager: CacheManager): void {
     this.cacheManager = cacheManager;
-    const cacheIdentity = this.store.getCacheIdentity?.() ?? this.store.getId();
-    this.cachePrefix = `${this.tenant.getId()}/${cacheIdentity}`;
+    this.cachePrefix = this.computeCachePrefix();
     cacheManager.register(this as unknown as ICacheable);
     // A summary store created before the cache manager was attached picks
     // up persistence now.
     this.summaryStore?.attachCache(cacheManager, `${this.getCachePrefix()}/summary`);
     this.fulltextIndex?.attachCache(cacheManager, `${this.getCachePrefix()}/fulltext`);
+  }
+
+  /**
+   * Detach this DB (and its summary/full-text cacheables) from the
+   * CacheManager WITHOUT flushing pending state. Used by the tenant's
+   * time-travel cache purge: the persisted records are about to be
+   * deleted, so a deregister-triggered flush would only resurrect them.
+   */
+  detachCacheManagerForPurge(): void {
+    const cacheManager = this.cacheManager;
+    if (!cacheManager) {
+      return;
+    }
+    // Drop dirty markers first so CacheManager.deregister() skips its
+    // flush-before-remove step.
+    this.dirtyDocIds.clear();
+    this.cacheMetaDirty = false;
+    this.summaryStore?.clearDirty();
+    this.fulltextIndex?.clearDirty();
+    void cacheManager.deregister(this as unknown as ICacheable);
+    if (this.summaryStore) {
+      void cacheManager.deregister(this.summaryStore);
+    }
+    if (this.fulltextIndex) {
+      void cacheManager.deregister(this.fulltextIndex);
+    }
+    this.cacheManager = null;
   }
 
   /**
@@ -1358,7 +1396,7 @@ export class BaseMindooDB implements MindooDB {
   }
 
   getCachePrefix(): string {
-    return this.cachePrefix ?? `${this.tenant.getId()}/${this.store.getId()}`;
+    return this.cachePrefix ?? this.computeCachePrefix();
   }
 
   hasDirtyState(): boolean {
@@ -2345,6 +2383,7 @@ export class BaseMindooDB implements MindooDB {
           await this.reconcileRestoredIndexWithStore();
         }
         this.probeFulltextSetupAtOpen();
+        this.probeSummarySetupAtOpen();
         return;
       }
     }
@@ -2355,6 +2394,50 @@ export class BaseMindooDB implements MindooDB {
     // record the current fingerprint for the next warm start.
     this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
     this.probeFulltextSetupAtOpen();
+    this.probeSummarySetupAtOpen();
+  }
+
+  /**
+   * Open-time probe for summary auto-activation on time-travel snapshots.
+   *
+   * Live databases activate their summary buffer through coalesced change
+   * events ({@link handleChangesForSummaryAutoUpdate}) or an explicit
+   * {@link getSummaryStore} call. A time-travel snapshot is read-only and
+   * never receives change events, so without an open-time probe a snapshot
+   * whose setup document (as of the cutoff) configures a summary would
+   * never build one — every summary-first query/view would pay the full
+   * catch-up on first use. Fired once (fire-and-forget) at the end of
+   * {@link initialize}; the single `update()` run materializes the
+   * documents at the cutoff and fills the buffer (restoring a persisted
+   * state first when a CacheManager is attached, see
+   * `persistTimeTravelCache`).
+   */
+  private probeSummarySetupAtOpen(): void {
+    if (!this.isTimeTravelMode()) {
+      return;
+    }
+    if (!this.summaryAutoUpdateEnabled || this.summarySetupProbed || this.summaryStore) {
+      return;
+    }
+    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    this.summarySetupProbed = true;
+    void (async () => {
+      try {
+        const config = await this.getSummarySetup();
+        if (config === null || this.summaryStore) {
+          return;
+        }
+        // No explicit config: the store adopts the setup-document config on
+        // its first update run (seedConfigFromSetupDoc), mirroring
+        // activateSummaryFromSetupDoc for live databases.
+        const summary = this.getSummaryStore();
+        await summary.update();
+      } catch (error) {
+        this.logger.warn(`Time-travel summary activation failed: ${error}`);
+      }
+    })();
   }
 
   /**
@@ -3177,13 +3260,14 @@ export class BaseMindooDB implements MindooDB {
     options: SyncOptions | undefined,
     state: {
       transferred: number;
+      transferredBytes: number;
       scanned: number;
       totalSourceEntries?: number;
       currentPage?: number;
     },
-  ): Promise<{ transferred: number; cancelled: boolean; rejected: RejectedPutEntry[] }> {
+  ): Promise<{ transferred: number; transferredBytes: number; cancelled: boolean; rejected: RejectedPutEntry[] }> {
     if (entryIds.length === 0) {
-      return { transferred: state.transferred, cancelled: false, rejected: [] };
+      return { transferred: state.transferred, transferredBytes: state.transferredBytes, cancelled: false, rejected: [] };
     }
 
     const onProgress = options?.onProgress;
@@ -3199,6 +3283,7 @@ export class BaseMindooDB implements MindooDB {
       totalTransferBatches,
     );
     let transferred = state.transferred;
+    let transferredBytes = state.transferredBytes;
     let cancelled = false;
     let firstError: unknown = null;
     let nextBatchIndex = 0;
@@ -3225,6 +3310,7 @@ export class BaseMindooDB implements MindooDB {
           phase: "transferring",
           message: `Transferring batch ${currentTransferBatch}/${totalTransferBatches} (${batchIds.length} entries, ${pageSummary}scanned ${state.scanned})...`,
           transferredEntries: transferred,
+          transferredBytes,
           scannedEntries: state.scanned,
           totalSourceEntries: state.totalSourceEntries,
           currentPage: state.currentPage,
@@ -3250,11 +3336,19 @@ export class BaseMindooDB implements MindooDB {
           if (receipts.length > 0 && sourceStore.applyWitnessReceipts) {
             await sourceStore.applyWitnessReceipts(receipts);
           }
-          if (batchRejected.length > 0) {
+          const rejectedIds =
+            batchRejected.length > 0 ? new Set(batchRejected.map((entry) => entry.id)) : null;
+          if (rejectedIds) {
             rejected.push(...batchRejected);
             this.logger.warn(
               `Target rejected ${batchRejected.length} of ${batchEntries.length} entries in transfer batch ${currentTransferBatch}/${totalTransferBatches}`,
             );
+          }
+          for (const entry of batchEntries) {
+            if (rejectedIds?.has(entry.id)) {
+              continue;
+            }
+            transferredBytes += entry.encryptedSize ?? entry.encryptedData.length;
           }
           transferred += batchEntries.length - batchRejected.length;
         } catch (error) {
@@ -3272,6 +3366,7 @@ export class BaseMindooDB implements MindooDB {
           phase: "transferring",
           message: `Transferred ${transferred} entries after batch ${currentTransferBatch}/${totalTransferBatches}`,
           transferredEntries: transferred,
+          transferredBytes,
           scannedEntries: state.scanned,
           totalSourceEntries: state.totalSourceEntries,
           currentPage: state.currentPage,
@@ -3287,12 +3382,12 @@ export class BaseMindooDB implements MindooDB {
     );
 
     if (signal?.aborted || cancelled) {
-      return { transferred, cancelled: true, rejected };
+      return { transferred, transferredBytes, cancelled: true, rejected };
     }
     if (firstError) {
       throw firstError;
     }
-    return { transferred, cancelled: false, rejected };
+    return { transferred, transferredBytes, cancelled: false, rejected };
   }
 
   /**
@@ -3318,7 +3413,7 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions
-  ): Promise<{ transferred: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
+  ): Promise<{ transferred: number; transferredBytes?: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
     const signal = options?.signal;
     BaseMindooDB.setSyncAbortSignalOnStore(sourceStore, signal);
     BaseMindooDB.setSyncAbortSignalOnStore(targetStore, signal);
@@ -3343,8 +3438,9 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions
-  ): Promise<{ transferred: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
+  ): Promise<{ transferred: number; transferredBytes?: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
     let transferred = 0;
+    let transferredBytes = 0;
     let scanned = 0;
     // Per-entry rejections reported by a witnessing target (sync-v5): the
     // sync completes; rejected entries are surfaced to the caller as warnings.
@@ -3441,7 +3537,7 @@ export class BaseMindooDB implements MindooDB {
         if (signal?.aborted) {
           discardPrefetch();
           persistScanCursor(cursor);
-          return { transferred, scanned, cancelled: true, rejected };
+          return { transferred, transferredBytes, scanned, cancelled: true, rejected };
         }
 
         const page: StoreScanResult = nextPagePromise
@@ -3456,7 +3552,7 @@ export class BaseMindooDB implements MindooDB {
         if (signal?.aborted) {
           discardPrefetch();
           persistScanCursor(cursor);
-          return { transferred, scanned, cancelled: true, rejected };
+          return { transferred, transferredBytes, scanned, cancelled: true, rejected };
         }
 
         if (page.entries.length > 0) {
@@ -3475,7 +3571,7 @@ export class BaseMindooDB implements MindooDB {
           if (signal?.aborted) {
             discardPrefetch();
             persistScanCursor(cursor);
-            return { transferred, scanned, cancelled: true, rejected };
+            return { transferred, transferredBytes, scanned, cancelled: true, rejected };
           }
 
           if (missingIds.length > 0) {
@@ -3486,19 +3582,21 @@ export class BaseMindooDB implements MindooDB {
               options,
               {
                 transferred,
+                transferredBytes,
                 scanned,
                 totalSourceEntries: totalSourceEstimate,
                 currentPage,
               },
             );
             transferred = transferResult.transferred;
+            transferredBytes = transferResult.transferredBytes;
             rejected.push(...transferResult.rejected);
             if (transferResult.cancelled) {
               // The current page's transfer did not complete: persist the
               // boundary of the last fully transferred page instead.
               discardPrefetch();
               persistScanCursor(cursor);
-              return { transferred, scanned, cancelled: true, rejected };
+              return { transferred, transferredBytes, scanned, cancelled: true, rejected };
             }
           }
         }
@@ -3507,6 +3605,7 @@ export class BaseMindooDB implements MindooDB {
           phase: 'transferring',
           message: `Transferred ${transferred} entries (page ${currentPage}, scanned ${scanned})`,
           transferredEntries: transferred,
+          transferredBytes,
           scannedEntries: scanned,
           totalSourceEntries: totalSourceEstimate,
           currentPage,
@@ -3518,7 +3617,7 @@ export class BaseMindooDB implements MindooDB {
         }
       }
       persistScanCursor(cursor);
-      return { transferred, scanned, cancelled: false, rejected };
+      return { transferred, transferredBytes, scanned, cancelled: false, rejected };
     }
 
     onProgress?.({
@@ -3553,26 +3652,30 @@ export class BaseMindooDB implements MindooDB {
       options,
       {
         transferred,
+        transferredBytes,
         scanned: sourceNewMetadata.length,
         totalSourceEntries: sourceNewMetadata.length,
       },
     );
     transferred = transferResult.transferred;
+    transferredBytes = transferResult.transferredBytes;
     rejected.push(...transferResult.rejected);
     if (transferResult.cancelled) {
-      return { transferred, scanned: sourceNewMetadata.length, cancelled: true, rejected };
+      return { transferred, transferredBytes, scanned: sourceNewMetadata.length, cancelled: true, rejected };
     }
 
     onProgress?.({
       phase: 'transferring',
       message: `Transferred ${transferred} entries`,
       transferredEntries: transferred,
+      transferredBytes,
       scannedEntries: sourceNewMetadata.length,
       totalSourceEntries: sourceNewMetadata.length,
     });
 
     return {
       transferred,
+      transferredBytes,
       scanned: sourceNewMetadata.length,
       cancelled: false,
       rejected,
@@ -3599,7 +3702,7 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions,
-  ): Promise<{ transferred: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
+  ): Promise<{ transferred: number; transferredBytes?: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
     const onProgress = options?.onProgress;
 
     onProgress?.({
@@ -3690,11 +3793,12 @@ export class BaseMindooDB implements MindooDB {
     // ── Phase 5: transfer missing entries in pages ───────────────────
     const pageSize = options?.pageSize ?? 500;
     let transferred = 0;
+    let transferredBytes = 0;
     const rejected: RejectedPutEntry[] = [];
 
     for (let offset = 0; offset < missingIds.length; offset += pageSize) {
       if (options?.signal?.aborted) {
-        return { transferred, scanned: allNeededArray.length, cancelled: true, rejected };
+        return { transferred, transferredBytes, scanned: allNeededArray.length, cancelled: true, rejected };
       }
 
       const batch = missingIds.slice(offset, offset + pageSize);
@@ -3711,11 +3815,19 @@ export class BaseMindooDB implements MindooDB {
       if (receipts.length > 0 && sourceStore.applyWitnessReceipts) {
         await sourceStore.applyWitnessReceipts(receipts);
       }
-      if (batchRejected.length > 0) {
+      const rejectedIds =
+        batchRejected.length > 0 ? new Set(batchRejected.map((entry) => entry.id)) : null;
+      if (rejectedIds) {
         rejected.push(...batchRejected);
         this.logger.warn(
           `Dense sync: target rejected ${batchRejected.length} of ${entries.length} entries in batch at offset ${offset}`,
         );
+      }
+      for (const entry of entries) {
+        if (rejectedIds?.has(entry.id)) {
+          continue;
+        }
+        transferredBytes += entry.encryptedSize ?? entry.encryptedData.length;
       }
       transferred += entries.length - batchRejected.length;
 
@@ -3723,6 +3835,7 @@ export class BaseMindooDB implements MindooDB {
         phase: "transferring",
         message: `Dense sync: transferred ${transferred}/${missingIds.length} entries`,
         transferredEntries: transferred,
+        transferredBytes,
         scannedEntries: allNeededArray.length,
         totalSourceEntries: allNeededArray.length,
       });
@@ -3732,7 +3845,7 @@ export class BaseMindooDB implements MindooDB {
       `Dense sync complete: transferred ${transferred} entries` +
       (rejected.length > 0 ? `, ${rejected.length} rejected by target` : ""),
     );
-    return { transferred, scanned: allNeededArray.length, cancelled: false, rejected };
+    return { transferred, transferredBytes, scanned: allNeededArray.length, cancelled: false, rejected };
   }
 
   getStore(): ContentAddressedStore {
@@ -12543,12 +12656,14 @@ export class BaseMindooDB implements MindooDB {
     const restoreAuthOverride = await this.applyNetworkAuthOverrideForSync(remoteStore, options);
     try {
       const syncResult = await this.syncEntriesFromStore(remoteStore, localStore, options);
+      const transferredBytes = syncResult.transferredBytes ?? 0;
       this.logger.debug(`Transferred ${syncResult.transferred} entries from remote store`);
 
       if (syncResult.cancelled) {
         this.logger.info(`Pull cancelled after transferring ${syncResult.transferred} entries`);
         return {
           transferredEntries: syncResult.transferred,
+          transferredBytes,
           scannedEntries: syncResult.scanned,
           cancelled: true,
         };
@@ -12556,13 +12671,14 @@ export class BaseMindooDB implements MindooDB {
 
       if (syncResult.transferred === 0) {
         this.logger.debug(`No new entries to pull`);
-        return { transferredEntries: 0, scannedEntries: syncResult.scanned, cancelled: false };
+        return { transferredEntries: 0, transferredBytes, scannedEntries: syncResult.scanned, cancelled: false };
       }
       
       options?.onProgress?.({
         phase: 'processing',
         message: `Processing ${syncResult.transferred} new entries...`,
         transferredEntries: syncResult.transferred,
+        transferredBytes,
         scannedEntries: syncResult.scanned,
       });
 
@@ -12572,6 +12688,7 @@ export class BaseMindooDB implements MindooDB {
         this.logger.info(`Pull cancelled before local processing after transferring ${syncResult.transferred} entries`);
         return {
           transferredEntries: syncResult.transferred,
+          transferredBytes,
           scannedEntries: syncResult.scanned,
           cancelled: true,
         };
@@ -12593,6 +12710,7 @@ export class BaseMindooDB implements MindooDB {
         this.logger.info(`Pull cancelled after local processing for ${storeKind} entries`);
         return {
           transferredEntries: syncResult.transferred,
+          transferredBytes,
           scannedEntries: syncResult.scanned,
           cancelled: true,
         };
@@ -12604,11 +12722,13 @@ export class BaseMindooDB implements MindooDB {
         phase: 'complete',
         message: `Pull complete: ${syncResult.transferred} ${storeKind} entries synced`,
         transferredEntries: syncResult.transferred,
+        transferredBytes,
         scannedEntries: syncResult.scanned,
       });
 
       return {
         transferredEntries: syncResult.transferred,
+        transferredBytes,
         scannedEntries: syncResult.scanned,
         cancelled: false,
       };
@@ -12646,6 +12766,7 @@ export class BaseMindooDB implements MindooDB {
     const restoreAuthOverride = await this.applyNetworkAuthOverrideForSync(remoteStore, options);
     try {
       const syncResult = await this.syncEntriesFromStore(localStore, remoteStore, options);
+      const transferredBytes = syncResult.transferredBytes ?? 0;
       this.logger.debug(`Transferred ${syncResult.transferred} entries to remote store`);
       const rejectedEntries = syncResult.rejected ?? [];
       if (rejectedEntries.length > 0) {
@@ -12659,6 +12780,7 @@ export class BaseMindooDB implements MindooDB {
         this.logger.info(`Push cancelled after transferring ${syncResult.transferred} entries`);
         return {
           transferredEntries: syncResult.transferred,
+          transferredBytes,
           scannedEntries: syncResult.scanned,
           cancelled: true,
           ...(rejectedEntries.length > 0 ? { rejectedEntries } : {}),
@@ -12675,11 +12797,13 @@ export class BaseMindooDB implements MindooDB {
         phase: 'complete',
         message: `Push complete: ${syncResult.transferred} entries transferred`,
         transferredEntries: syncResult.transferred,
+        transferredBytes,
         scannedEntries: syncResult.scanned,
       });
 
       return {
         transferredEntries: syncResult.transferred,
+        transferredBytes,
         scannedEntries: syncResult.scanned,
         cancelled: false,
         ...(rejectedEntries.length > 0 ? { rejectedEntries } : {}),

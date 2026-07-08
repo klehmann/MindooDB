@@ -738,6 +738,34 @@ export interface MindooTenant {
   openDB(id: string, options?: OpenDBOptions): Promise<MindooDB>;
 
   /**
+   * List the time-travel cutoff dates (epoch milliseconds, ascending) for
+   * which persisted cache records exist for the given database — i.e. every
+   * cutoff a previous `openDB` with `persistTimeTravelCache: true` left
+   * behind. Useful for cache-lifecycle housekeeping: callers can enumerate
+   * the persisted cutoffs and {@link purgeTimeTravelCache} the ones no
+   * longer referenced, without having to track the dates themselves.
+   * Optional so alternative tenant implementations may omit it.
+   */
+  listTimeTravelCacheDates?(dbId: string): Promise<number[]>;
+
+  /**
+   * Remove every persisted cache record of a time-travel snapshot
+   * (`openDB` with `timeTravelDate` + `persistTimeTravelCache`): the
+   * materialized-document cache, metadata checkpoint, summary buckets,
+   * full-text records, and any virtual-view state persisted under the
+   * cutoff-scoped prefix. A still-open snapshot instance for the cutoff is
+   * detached from the CacheManager and evicted from the tenant's database
+   * cache first, so no later flush can resurrect the purged records.
+   *
+   * Callers that persist time-travel caches (see
+   * {@link OpenDBOptions.persistTimeTravelCache}) own the lifecycle and
+   * call this when the cutoff is no longer referenced — e.g. the app
+   * configuration holding the date was deleted or its date changed.
+   * Optional so alternative tenant implementations may omit it.
+   */
+  purgeTimeTravelCache?(dbId: string, timeTravelDate: number | Date | string): Promise<void>;
+
+  /**
    * Replay any pending local KeyBag mutations and refresh open live
    * databases so document visibility matches the current key set.
    *
@@ -3537,6 +3565,22 @@ export interface OpenDBOptions extends OpenStoreOptions {
    * normalized value maps to store-level creationDateUntil semantics.
    */
   timeTravelDate?: number | Date | string;
+
+  /**
+   * Opt-in persistence for time-travel opens (requires `timeTravelDate`).
+   *
+   * By default a time-travel instance keeps all derived state (materialized
+   * document cache, summary buffer) in memory only, so ad-hoc historical
+   * opens never leave data behind. When `true`, the tenant's CacheManager is
+   * attached with a cutoff-scoped cache prefix
+   * (`<tenantId>/<cacheIdentity>/tt/<timeTravelDate>`), so a later open with
+   * the same cutoff restores instead of re-materializing. Callers that
+   * enable this own the cache lifecycle and must call
+   * {@link MindooTenant.purgeTimeTravelCache} when the cutoff is no longer
+   * needed (e.g. the referencing app configuration was deleted or its date
+   * changed).
+   */
+  persistTimeTravelCache?: boolean;
   
   /**
    * Configuration for attachment handling (chunk size, etc.)
@@ -3977,6 +4021,14 @@ export interface SyncProgress {
   message: string;
   /** Cumulative number of entries successfully written to the target store so far. */
   transferredEntries: number;
+  /**
+   * Cumulative encrypted payload size (in bytes) of the entries successfully
+   * written to the target store so far — the on-the-wire / on-disk volume of
+   * the transfer, summed from each entry's {@link StoreEntryMetadata.encryptedSize}.
+   * Rejected entries are excluded so this tracks `transferredEntries`. Absent
+   * on progress events emitted before any transfer batch completes.
+   */
+  transferredBytes?: number;
   /** Cumulative number of source entries whose metadata has been examined. */
   scannedEntries: number;
   /**
@@ -4056,6 +4108,14 @@ export interface SyncOptions {
  */
 export interface SyncResult {
   transferredEntries: number;
+  /**
+   * Total encrypted payload size (in bytes) of all entries written to the
+   * target during this sync — the on-the-wire / on-disk volume moved, summed
+   * from each entry's {@link StoreEntryMetadata.encryptedSize} (rejected
+   * entries excluded). Useful for surfacing "amount of data transferred" in a
+   * sync-details UI. `0` when nothing was transferred.
+   */
+  transferredBytes: number;
   scannedEntries: number;
   cancelled: boolean;
   /**

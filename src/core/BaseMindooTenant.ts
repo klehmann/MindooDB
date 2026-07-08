@@ -950,6 +950,7 @@ export class BaseMindooTenant implements MindooTenant {
     const {
       adminOnlyDb,
       timeTravelDate: _timeTravelDate,
+      persistTimeTravelCache,
       attachmentConfig,
       documentCacheConfig,
       snapshotConfig,
@@ -982,7 +983,14 @@ export class BaseMindooTenant implements MindooTenant {
       performanceCallback,
       normalizedTimeTravelDate,
     );
-    if (this.cacheManager && normalizedTimeTravelDate == null) {
+    // Live databases always persist through the tenant CacheManager. A
+    // time-travel snapshot only does so when the caller opted in via
+    // `persistTimeTravelCache` — the snapshot then writes under a
+    // cutoff-scoped prefix (see BaseMindooDB.computeCachePrefix) and the
+    // caller owns the lifecycle via `purgeTimeTravelCache`.
+    const attachCacheManager =
+      normalizedTimeTravelDate == null || persistTimeTravelCache === true;
+    if (this.cacheManager && attachCacheManager) {
       db.setCacheManager(this.cacheManager);
     }
     await db.initialize();
@@ -990,6 +998,140 @@ export class BaseMindooTenant implements MindooTenant {
     // Cache the database for future use
     this.databaseCache.set(databaseCacheKey, db);
     return db;
+  }
+
+  /**
+   * Cache record types a database (and its summary/full-text/view state)
+   * persists under its cache prefix. Kept in one place so the time-travel
+   * purge below stays complete when a new cacheable type is introduced.
+   */
+  private static readonly DB_CACHE_RECORD_TYPES = [
+    "db-meta",
+    "doc",
+    "summary",
+    "fulltext",
+    "vv",
+  ] as const;
+
+  /**
+   * Resolve the base cache prefix (`<tenantId>/<cacheIdentity>`) of a
+   * database without requiring it to be open. Prefers the open live DB's
+   * store; otherwise creates a store handle just for identity resolution —
+   * the same pattern wipeLocalTenant uses for non-open databases.
+   */
+  private resolveDbCachePrefixBase(dbId: string): string {
+    const liveDb = this.databaseCache.get(dbId);
+    let docStore: ContentAddressedStore;
+    if (liveDb) {
+      docStore = (liveDb as BaseMindooDB).getStore();
+    } else {
+      docStore = this.storeFactory.createStore(dbId).docStore;
+    }
+    const cacheIdentity = docStore.getCacheIdentity?.() ?? docStore.getId();
+    return `${this.tenantId}/${cacheIdentity}`;
+  }
+
+  /**
+   * List the time-travel cutoff dates for which persisted cache records
+   * exist for a database (see {@link MindooTenant.listTimeTravelCacheDates}).
+   * Scans all known cache record types for ids under the database's
+   * `<tenantId>/<cacheIdentity>/tt/<ms>` namespace and returns the distinct
+   * cutoffs in ascending order.
+   */
+  async listTimeTravelCacheDates(dbId: string): Promise<number[]> {
+    const validDbId = validateDatabaseId(dbId, "dbId");
+    const cacheStore = this.cacheManager?.getStore();
+    if (!cacheStore) {
+      return [];
+    }
+
+    const ttPrefix = `${this.resolveDbCachePrefixBase(validDbId)}/tt/`;
+    const cutoffs = new Set<number>();
+    for (const type of BaseMindooTenant.DB_CACHE_RECORD_TYPES) {
+      let ids: string[];
+      try {
+        ids = await cacheStore.list(type);
+      } catch (error) {
+        this.logger.warn(
+          `listTimeTravelCacheDates: listing cache type "${type}" failed: ${error}`,
+        );
+        continue;
+      }
+      for (const id of ids) {
+        if (!id.startsWith(ttPrefix)) {
+          continue;
+        }
+        // The segment right after `/tt/` is the cutoff in epoch ms; sub-cache
+        // records (`.../tt/<ms>/summary/...`) carry more segments after it.
+        const cutoffSegment = id.slice(ttPrefix.length).split("/", 1)[0];
+        const cutoff = Number(cutoffSegment);
+        if (Number.isInteger(cutoff) && cutoff > 0) {
+          cutoffs.add(cutoff);
+        }
+      }
+    }
+    return Array.from(cutoffs).sort((a, b) => a - b);
+  }
+
+  /**
+   * Remove every persisted cache record of a time-travel snapshot (see
+   * {@link MindooTenant.purgeTimeTravelCache}). Deletes all records whose id
+   * equals or lives under the cutoff-scoped prefix
+   * `<tenantId>/<cacheIdentity>/tt/<timeTravelDate>` across all known cache
+   * record types. A still-open snapshot instance is detached from the
+   * CacheManager (without flushing) and evicted from the database cache
+   * first so no later flush can resurrect the purged records.
+   */
+  async purgeTimeTravelCache(dbId: string, timeTravelDate: number | Date | string): Promise<void> {
+    const validDbId = validateDatabaseId(dbId, "dbId");
+    const normalized = this.normalizeTimeTravelDate(timeTravelDate);
+    if (normalized == null) {
+      throw new Error("purgeTimeTravelCache requires a valid timeTravelDate");
+    }
+
+    const databaseCacheKey = `${validDbId}::tt:${normalized}`;
+    const openSnapshot = this.databaseCache.get(databaseCacheKey) as BaseMindooDB | undefined;
+
+    // Resolve the cutoff-scoped cache prefix. Prefer the open snapshot's own
+    // prefix; otherwise derive it from the store's cache identity.
+    const cachePrefix = openSnapshot
+      ? openSnapshot.getCachePrefix()
+      : `${this.resolveDbCachePrefixBase(validDbId)}/tt/${normalized}`;
+
+    if (openSnapshot) {
+      openSnapshot.detachCacheManagerForPurge();
+      this.databaseCache.delete(databaseCacheKey);
+    }
+
+    const cacheStore = this.cacheManager?.getStore();
+    if (!cacheStore) {
+      return;
+    }
+
+    for (const type of BaseMindooTenant.DB_CACHE_RECORD_TYPES) {
+      let ids: string[];
+      try {
+        ids = await cacheStore.list(type);
+      } catch (error) {
+        this.logger.warn(`purgeTimeTravelCache: listing cache type "${type}" failed: ${error}`);
+        continue;
+      }
+      for (const id of ids) {
+        if (id !== cachePrefix && !id.startsWith(`${cachePrefix}/`)) {
+          continue;
+        }
+        try {
+          await cacheStore.delete(type, id);
+        } catch (error) {
+          this.logger.warn(
+            `purgeTimeTravelCache: deleting cache record "${type}/${id}" failed: ${error}`,
+          );
+        }
+      }
+    }
+    this.logger.info(
+      `Purged time-travel cache for db "${validDbId}" at cutoff ${normalized} (prefix ${cachePrefix})`,
+    );
   }
 
   /**

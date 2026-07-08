@@ -410,10 +410,15 @@ describe("sync test", () => {
     const result = await contactsDB2.pullChangesFrom(contactsStore1);
     expect(result.transferredEntries).toBeGreaterThan(0);
     expect(result.cancelled).toBe(false);
+    // Byte accounting mirrors the transferred entries: a non-empty transfer
+    // reports a positive encrypted-payload volume.
+    expect(result.transferredBytes).toBeGreaterThan(0);
 
     const result2 = await contactsDB2.pullChangesFrom(contactsStore1);
     expect(result2.transferredEntries).toBe(0);
     expect(result2.cancelled).toBe(false);
+    // A no-op sync transfers nothing, so the byte total stays at zero.
+    expect(result2.transferredBytes).toBe(0);
   });
 
   it("pullChangesFrom should emit progress callbacks", async () => {
@@ -444,6 +449,9 @@ describe("sync test", () => {
     const lastEvent = progressEvents[progressEvents.length - 1];
     expect(lastEvent.phase).toBe('complete');
     expect(lastEvent.transferredEntries).toBeGreaterThan(0);
+    // The final progress event carries the cumulative byte total alongside the
+    // entry count, so a details UI can render "data transferred" live.
+    expect(lastEvent.transferredBytes).toBeGreaterThan(0);
   });
 
   it("pullChangesFrom should expose transfer batch progress for chunked syncs", async () => {

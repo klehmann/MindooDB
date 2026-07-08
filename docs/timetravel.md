@@ -6,13 +6,14 @@ MindooDB provides time travel functionality that allows you to retrieve document
 
 ## Features
 
-MindooDB offers three main time travel capabilities:
+MindooDB offers four main time travel capabilities:
 
 1. **`getDocumentAtTimestamp()`** - Retrieve a document snapshot at a specific point in time
 2. **`getAllDocumentIdsAtTimestamp()`** - Get all document IDs that existed at a specific point in time
 3. **`iterateDocumentHistory()`** - Traverse all changes to a document chronologically
+4. **Time-travel database instances** - Open a whole database read-only as of a cutoff date via `tenant.openDB(id, { timeTravelDate })`
 
-Both methods work with MindooDB's append-only storage architecture, which maintains a complete history of all document changes.
+All of them work with MindooDB's append-only storage architecture, which maintains a complete history of all document changes.
 
 ## getDocumentAtTimestamp()
 
@@ -362,6 +363,96 @@ const createdBetween = idsAtTime2.filter(id => !idsAtTime1.includes(id));
 const deletedBetween = idsAtTime1.filter(id => !idsAtTime2.includes(id));
 ```
 
+## Time-Travel Database Instances
+
+While the per-document APIs above answer point questions, a **time-travel
+instance** opens the *entire database* as a read-only snapshot at a cutoff
+date:
+
+```typescript
+const snapshot = await tenant.openDB("crm", {
+  timeTravelDate: new Date("2026-05-01T00:00:00Z"),  // number | Date | ISO string
+});
+
+snapshot.isTimeTravelMode();  // true
+snapshot.isReadOnly();        // true — all mutating APIs throw
+```
+
+Every store scan on the instance is filtered by the cutoff
+(`creationDateUntil` semantics): entries created at or after
+`timeTravelDate` are invisible. `getDocument()`, `getAllDocumentIds()`, the
+changefeed (`iterateChangesSince`), and history APIs all return the
+historical state — the instance behaves like the live database did at that
+moment. A time-travel instance is cached separately from the live instance
+of the same database, so both can be open at the same time.
+
+### Summary queries on a snapshot
+
+Because the changefeed itself is cutoff-filtered, the
+[`DocumentSummaryStore`](adhoc-queries.md) works on time-travel instances
+exactly like on live ones — its buffer simply reflects the state at the
+cutoff. `db.query()`, `db.queryView()` and summary-first
+[VirtualViews](virtualview.md) therefore run on snapshots without
+materializing documents:
+
+```typescript
+const result = await snapshot.query({
+  filter: v.eq(v.field("status"), "open"),
+  sortBy: [{ field: "due", direction: "ascending" }],
+});
+// rows reflect the state as of the cutoff; coverage: "full"
+```
+
+A snapshot never receives change events (its history is frozen), so the
+summary store performs a single catch-up `update()` when first used and is
+complete from then on. If the database's synced `dbsetup` document
+configured a summary setup (as of the cutoff), the store is activated
+automatically at open time.
+
+### Persistent snapshot caches: `persistTimeTravelCache`
+
+By default a time-travel instance keeps all derived state (materialized
+document cache, summary buffer) **in memory only** — ad-hoc historical
+opens never leave data behind. For snapshots that are opened repeatedly
+with the same cutoff (e.g. an application pinned to a date), persistence
+can be opted in:
+
+```typescript
+const snapshot = await tenant.openDB("crm", {
+  timeTravelDate: cutoff,
+  persistTimeTravelCache: true,
+});
+```
+
+The tenant's `CacheManager` is then attached with a **cutoff-scoped cache
+prefix** (`<tenantId>/<cacheIdentity>/tt/<cutoffMs>`), fully isolated from
+the live cache and from other cutoffs. Summary buckets, the L2 document
+cache and virtual-view state are restored on the next open with the same
+cutoff, so repeated opens skip the materialization run entirely. Because
+the prefix is cutoff-scoped, the cache content is cutoff-consistent by
+construction.
+
+Callers that enable persistence own the cache lifecycle and must purge it
+when the cutoff is no longer referenced:
+
+```typescript
+// Which cutoffs have persisted cache data for this database?
+const cutoffs = await tenant.listTimeTravelCacheDates("crm");
+// -> [1746057600000, 1748736000000] (epoch ms, ascending)
+
+await tenant.purgeTimeTravelCache("crm", cutoffs[0]);
+```
+
+`listTimeTravelCacheDates()` enumerates the persisted cutoffs of a
+database, so housekeeping code does not need to track the dates itself —
+it can list what exists and purge everything that is no longer referenced.
+
+`purgeTimeTravelCache()` deletes every persisted record under the cutoff's
+prefix (document cache, metadata checkpoint, summary buckets, full-text and
+virtual-view records) and detaches a still-open snapshot instance first so
+no later flush can resurrect the purged records. Live caches and other
+cutoffs are untouched.
+
 ## Use Cases
 
 ### Audit Trails
@@ -481,7 +572,7 @@ class DocumentEditor {
 ### getDocumentAtTimestamp()
 
 - **Efficiency**: Loads and applies all changes up to the timestamp
-- **Caching**: Uses the same document cache as regular `getDocument()` calls
+- **Caching**: Replays from the store on every call — historical states are not served from the document cache used by `getDocument()`
 - **Optimization**: Consider using snapshots for frequently accessed historical points
 
 ### iterateDocumentHistory()
@@ -555,7 +646,7 @@ Time travel works seamlessly with MindooDB's sync functionality. Historical vers
 
 ### Caching
 
-The document cache used by `getDocument()` is also used by `getDocumentAtTimestamp()`, improving performance for recently accessed documents.
+`getDocumentAtTimestamp()` replays the document's change history from the store on every call; it does not use the document cache that serves `getDocument()`. If you access the same historical timestamp repeatedly, either cache the result yourself or open a [time-travel database instance](#time-travel-database-instances) at that cutoff — its materialized-document cache (optionally persisted per cutoff via `persistTimeTravelCache`) serves repeated historical reads efficiently.
 
 ### Virtual Views
 
@@ -578,5 +669,6 @@ Time travel functionality in MindooDB provides powerful capabilities for:
 - **Version comparison**: Compare different document states
 - **Time-based queries**: Find documents that existed at specific times
 - **Undo/redo**: Build undo/redo functionality
+- **Snapshot databases**: Open a whole database read-only at a cutoff via `openDB({ timeTravelDate })`, with summary-first queries and optional persistent per-cutoff caches
 
-Both `getDocumentAtTimestamp()` and `iterateDocumentHistory()` work with MindooDB's append-only storage architecture, ensuring complete historical accuracy while maintaining excellent performance characteristics.
+All time travel APIs work with MindooDB's append-only storage architecture, ensuring complete historical accuracy while maintaining excellent performance characteristics.
