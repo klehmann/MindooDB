@@ -217,20 +217,39 @@ Keys are distributed offline (e.g. password protected via email or a shared driv
 - **Signatures**: Ed25519 on every change - proves who wrote it
 - **Encryption**: AES-256-GCM - servers see only ciphertext
 - **Integrity**: Changes are hash-chained - tampering breaks the chain
+- **Trusted time**: when a sync server accepts an entry it signs a **witness receipt** attesting *when* it was accepted - a clock no client can rewind
+
+### Encryption-based Access Control
+Read access is governed by **key possession**, not server-side permissions. If you hold the key you can decrypt; if you don't, the document stays ciphertext wherever it travels (server, peer, or relay):
+
+| Key | Scope |
+|-----|-------|
+| **`default` key** | Tenant-wide data; shared with every member during onboarding |
+| **Named keys** | Need-to-know documents; shared only with the users you choose |
+| **`$publicinfos` key** | Encrypts directory access-control metadata so servers can validate signing keys without seeing usernames or business data |
+
+Rotating a named key is the cryptographic cutoff for read access: re-encrypt under a new key and withhold it from anyone who should no longer see the data.
+
+### Write Governance (opt-in)
+On top of the encryption model, MindooDB adds fine-grained, **admin-signed** control over write operations (`doc_create`, `doc_change`, `doc_delete`, `doc_undelete`, `doc_snapshot`). Policies, rules, groups, and grants are append-only documents in the directory database that every participant already syncs:
+- **Two tiers**: identity / database / operation rules are cryptographically enforced by the server *and* clients (Tier 1); document-content rules are re-checked by every honest client on receipt and a violation is quarantined, never materialized (Tier 2).
+- **Offline-honest**: every change is judged against the policy in force at its **trusted time** (from the witness receipt), so replicas always agree and an offline client cannot rewind its clock to slip a change past a rule.
+- **Reproducible & auditable**: because policy is versioned, append-only data, you can replay *who was allowed to do what, and when* for any point in the past.
+
+Governance stays **opt-in and backward-compatible**: a tenant behaves exactly as before until an admin writes a policy, and pre-existing data is never retroactively invalidated. See: [Access Control & Governance](./docs/accesscontrol.md)
 
 ### User Revocation
-Revoked users:
+Revocation is performed by **removing a user's keys** from the admin-signed grant document — there are no separate revocation records. Revoked users:
 - ❌ Cannot sync with peers or servers
-- ❌ Cannot make new changes (signatures rejected)
-- ⚠️ Can currently read previously-synced local data (planned: data wipe on first connect after revocation)
-
-MindooDB includes **revocation timestamp protection** to prevent backdated changes from revoked users. See: [Revocation Protection](./docs/revocation-timestamp-protection.md)
+- ❌ Cannot make new changes (signatures rejected; trusted time prevents backdating around the revocation)
+- ❌ Stop receiving future documents encrypted with keys they no longer hold (the server withholds them; honest clients drop revoked keys on the next directory pull)
+- ⚠️ May still hold previously-synced local data — mitigate with named keys (smaller blast radius) and key rotation, or issue an explicit **remote device wipe** that drops the tenant from a device the next time it connects
 
 ### Audit Trail
-Append-only storage means nothing is ever deleted:
-- Complete history of who changed what and when
-- Cryptographic proof of all operations
-- GDPR compliance via `purgeDocHistory()` when legally required
+Append-only storage means nothing is silently lost:
+- Complete, hash-chained history of who changed what and when
+- Cryptographic proof of all operations, reproducible for any point in time
+- GDPR-style erasure via `purgeDocHistory()` when legally required
 
 ## Supported Platforms
 
@@ -262,6 +281,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Full-Text Search](./docs/fulltext-search.md) — Client-side encrypted full-text index, `db.searchText()`, the query `text` clause, attachment text extraction
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
+- [Access Control & Governance](./docs/accesscontrol.md) — Encryption-key read access, admin-signed write policies, the two-tier model, witness receipts and trusted-time enforcement
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
 - [Attachments](./docs/attachments.md) — File storage and streaming
 - [Data Import Example](https://github.com/klehmann/mindoodb-data-import) — CLI tool that imports external data into MindooDB with historical `createdAt` timestamps for Time Travel

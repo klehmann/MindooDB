@@ -704,7 +704,7 @@ Due to append-only architecture:
 - Rotate keys when users leave
 - Accept that historical access cannot be retroactively revoked
 
-See: [Revocation Timestamp Protection](./revocation-timestamp-protection.md)
+Backdated changes from a revoked user are prevented by **trusted time**: sync servers sign a witness receipt when they accept an entry, and every authorization decision is evaluated against that time rather than the client's clock. See: [Access Control & Governance](./accesscontrol.md)
 
 ### Key Management Complexity
 
