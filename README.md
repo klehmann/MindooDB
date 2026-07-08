@@ -59,6 +59,7 @@ Traditional databases trust the server. If your hosting provider is compromised,
 | 🔗 **Tamperproof History** | Append-only, cryptographically chained. Like a blockchain for your docs. |
 | 🤝 **Real-time Collaboration** | Built on [Automerge](https://automerge.org/) CRDTs. Conflicts resolve automatically. |
 | 🔑 **Fine-grained Access** | Named encryption keys for sensitive documents. Share with specific users. |
+| 🔎 **Full-Text Search & OCR** | Built-in encrypted full-text index. The Haven client extracts text from PDF/Office files and OCRs images. |
 
 ## MindooDB Haven — the graphical client
 
@@ -199,15 +200,35 @@ Files attached to documents:
 
 See: [Attachments Documentation](./docs/attachments.md)
 
-### Document Indexing
-MindooDB provides a flexible, **incremental indexing** facility:
-- **Cursor-based processing**: Only index documents that changed since the last run—no full rescans
-- **Pluggable indexers**: Add any indexer you need (fulltext search, aggregations, custom queries)
-- **Built-in [Virtual Views](./docs/virtualview.md)**: Spreadsheet-like views that categorize, sort, and aggregate documents
-- **Cross-boundary queries**: Virtual Views can span multiple databases, mix local and remote data, or even query across tenants
+### Document Indexing & Queries
+MindooDB provides a flexible, **incremental indexing** facility plus a built-in query engine that answers dynamic filtering, sorting, grouping, and aggregation **without materializing** (loading and decrypting) documents:
+
+- **Cursor-based processing**: Only index documents that changed since the last run — no full rescans
+- **Document summary buffer**: A changefeed-maintained cache of each document's queryable field values (`DocumentSummaryStore`). It is built once (interruptible, with progress reporting) and then kept up to date incrementally. Plaintext of encrypted fields is never stored in it.
+- **Fast ad-hoc queries — `db.query()`**: Dynamic filtering, sorting, and paging answered entirely against the summary buffer, so no document is loaded or decrypted. Ideal for search-as-you-type UIs.
+- **Ad-hoc query views — `db.queryView()`**: Ephemeral [Virtual Views](./docs/virtualview.md) with grouping/categorization, aggregation (totals), and dynamic re-sorting (`resort()`), also served straight from the summary buffer.
+- **Built-in [Virtual Views](./docs/virtualview.md)**: Persistent, spreadsheet-like views that categorize, sort, and aggregate documents. They resolve **summary-first** and only fall back to the materialized full documents when the design requires it — for example to decrypt encrypted fields.
+- **View expression language**: A declarative, JSON-serializable expression language computes view columns and query filters — built with `createViewLanguage()` or parsed from formula text. Because query and view definitions are plain data, they can be stored, transmitted, and run safely.
+- **Cross-boundary queries**: Virtual Views (and `queryViewAcross()`) can span multiple databases, mix local and remote data, or even query across tenants
+- **Pluggable indexers**: Add any external indexer you need (full-text search, custom aggregations) on top of the changefeed
 
 ```typescript
-// Incremental indexing: process only what's new
+// Fast ad-hoc query — runs against the summary buffer, no documents materialized
+import { createViewLanguage } from "mindoodb";
+
+const v = createViewLanguage();
+const { rows, total, coverage } = await db.query({
+  filter: v.and(
+    v.eq(v.field("type"), "task"),
+    v.neq(v.field("status"), "done"),
+  ),
+  sortBy: [{ field: "due", direction: "ascending" }],
+  limit: 50,
+});
+```
+
+```typescript
+// Incremental indexing: process only what's new (foundation for the above)
 let cursor = null;
 while (true) {
   for await (const { doc, cursor: newCursor } of db.iterateChangesSince(cursor)) {
@@ -221,6 +242,20 @@ while (true) {
   await sleep(1000);
 }
 ```
+
+See: [Ad-hoc Queries & Reactive Updates](./docs/adhoc-queries.md) and [Data Indexing](./docs/dataindexing.md)
+
+### Full-Text Search
+
+A built-in, **client-side full-text index** (`DocumentFullTextIndex`, powered by MiniSearch) sits next to the summary buffer. It is fed from the same changefeed, persisted encrypted, and is opt-in per database:
+
+- **Standalone or combined**: search on its own with `db.searchText("solar panels")`, or blend relevance with structured filters and sorting in a single call — `db.query({ text, filter, sortBy })`.
+- **Indexes every text field**: plain strings, Automerge/rich-text, and nested content are all searchable with no schema.
+- **Attachment text extraction**: with registered extractors, attachment contents are indexed too. The **Haven client** ships extractors for plain text/CSV/JSON/Markdown/XML/SVG, PDF (pdf.js), and Office formats (docx, pptx, xlsx) on every database it opens.
+- **Image OCR**: Haven also runs an OCR extraction service (tesseract.js) for images and scanned documents. Expensive extraction results are persisted at the attachment entry, so text is extracted once on any device and then **syncs everywhere**.
+- **End-to-end encrypted**: each device builds its own local index from decrypted content — the server never sees the plaintext or the index.
+
+See: [Full-Text Search](./docs/fulltext-search.md)
 
 ### Encryption Model
 
