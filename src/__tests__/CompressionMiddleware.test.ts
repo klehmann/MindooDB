@@ -20,6 +20,22 @@ interface RawResponse {
 }
 
 /**
+ * Assert the response status, surfacing the response body on mismatch.
+ * Express (in non-production mode) puts the error stack of a 500 into the
+ * body, so when this suite flakes under full-suite load we get the actual
+ * server-side error in the jest output instead of just "expected 200, got
+ * 500".
+ */
+function expectStatus(res: RawResponse, expected: number): void {
+  if (res.status !== expected) {
+    throw new Error(
+      `Expected status ${expected}, got ${res.status}. Body:\n` +
+        res.body.toString("utf-8").slice(0, 2000),
+    );
+  }
+}
+
+/**
  * Raw HTTP GET without any client-side content negotiation or transparent
  * decompression (unlike fetch/undici), so the wire format can be asserted.
  */
@@ -92,7 +108,7 @@ describe("jsonCompressionMiddleware (sync-v5 phase 3)", () => {
   test("compresses large JSON with brotli when the client accepts br", async () => {
     const res = await rawGet(port, "/big", { "Accept-Encoding": "br, gzip" });
 
-    expect(res.status).toBe(200);
+    expectStatus(res, 200);
     expect(res.headers["content-encoding"]).toBe("br");
     expect(res.headers.vary).toContain("Accept-Encoding");
 
@@ -105,7 +121,7 @@ describe("jsonCompressionMiddleware (sync-v5 phase 3)", () => {
   test("falls back to gzip when the client only accepts gzip", async () => {
     const res = await rawGet(port, "/big", { "Accept-Encoding": "gzip" });
 
-    expect(res.status).toBe(200);
+    expectStatus(res, 200);
     expect(res.headers["content-encoding"]).toBe("gzip");
 
     const decompressed = zlib.gunzipSync(toZlibInput(res.body));
@@ -115,7 +131,7 @@ describe("jsonCompressionMiddleware (sync-v5 phase 3)", () => {
   test("sends plain JSON when the client does not accept compression", async () => {
     const res = await rawGet(port, "/big", {});
 
-    expect(res.status).toBe(200);
+    expectStatus(res, 200);
     expect(res.headers["content-encoding"]).toBeUndefined();
     expect(JSON.parse(res.body.toString("utf-8"))).toEqual(bigPayload);
   });
@@ -123,7 +139,7 @@ describe("jsonCompressionMiddleware (sync-v5 phase 3)", () => {
   test("respects an explicit q=0 opt-out", async () => {
     const res = await rawGet(port, "/big", { "Accept-Encoding": "br;q=0, gzip;q=0" });
 
-    expect(res.status).toBe(200);
+    expectStatus(res, 200);
     expect(res.headers["content-encoding"]).toBeUndefined();
     expect(JSON.parse(res.body.toString("utf-8"))).toEqual(bigPayload);
   });
@@ -131,7 +147,7 @@ describe("jsonCompressionMiddleware (sync-v5 phase 3)", () => {
   test("leaves small bodies uncompressed even when the client accepts br", async () => {
     const res = await rawGet(port, "/small", { "Accept-Encoding": "br, gzip" });
 
-    expect(res.status).toBe(200);
+    expectStatus(res, 200);
     expect(res.headers["content-encoding"]).toBeUndefined();
     expect(JSON.parse(res.body.toString("utf-8"))).toEqual(smallPayload);
   });
