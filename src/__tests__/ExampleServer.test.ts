@@ -27,7 +27,7 @@ async function httpRequest(
   method: string = "GET",
   body?: unknown,
   headers?: Record<string, string>
-): Promise<{ status: number; body: unknown }> {
+): Promise<{ status: number; body: unknown; rawText?: string }> {
   const response = await fetch(url, {
     method,
     headers: {
@@ -37,14 +37,17 @@ async function httpRequest(
     body: body ? JSON.stringify(body) : undefined,
   });
 
+  // Read as text first so non-JSON responses (rate-limiter text bodies, HTML
+  // error pages) stay inspectable instead of collapsing to `body: null`.
+  const rawText = await response.text();
   let responseBody: unknown;
   try {
-    responseBody = await response.json();
+    responseBody = JSON.parse(rawText);
   } catch {
     responseBody = null;
   }
 
-  return { status: response.status, body: responseBody };
+  return { status: response.status, body: responseBody, rawText };
 }
 
 // Shared helper: get system admin JWT token
@@ -109,13 +112,27 @@ async function getSystemAdminToken(
     username: adminUser.username,
     publicsignkey: adminUser.userSigningKeyPair.publicKey,
   });
-  const challenge = (challengeRes.body as { challenge: string }).challenge;
+  const challenge = (challengeRes.body as { challenge?: string } | null)?.challenge;
+  if (!challenge) {
+    // Surface status + raw body so a flaking run shows the actual server
+    // response (429 rate-limit text, HTML error page, ...) instead of a bare
+    // "Cannot read properties of null" TypeError.
+    throw new Error(
+      `System challenge failed: status=${challengeRes.status}, body=${(challengeRes.rawText ?? "").slice(0, 500)}`,
+    );
+  }
   const signature = await signChallenge(cryptoAdapter, signingKey, challenge);
   const authRes = await httpRequest(`${baseUrl}/system/auth/authenticate`, "POST", {
     challenge,
     signature: uint8ArrayToBase64(signature),
   });
-  return (authRes.body as { token: string }).token;
+  const token = (authRes.body as { token?: string } | null)?.token;
+  if (!token) {
+    throw new Error(
+      `System authenticate failed: status=${authRes.status}, body=${(authRes.rawText ?? "").slice(0, 500)}`,
+    );
+  }
+  return token;
 }
 
 describe("MindooDB Example Server", () => {
