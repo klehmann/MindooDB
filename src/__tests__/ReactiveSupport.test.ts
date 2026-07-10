@@ -97,6 +97,39 @@ describe("change listeners (db.addChangeListener)", () => {
     unsubscribe();
   }, 30000);
 
+  it("keeps origin: \"local\" for a change on a warm doc followed immediately by syncStoreChanges", async () => {
+    // Warm up: create + first change, then let all coalescing timers fire.
+    // This primes per-doc write counters so the next change completes without
+    // a macrotask yield between its index update and the trailing sync —
+    // exactly the Haven write-helper sequence that used to lose the race:
+    // the setTimeout(0) "local" emission was suppressed by the sync's
+    // notification hold and the write surfaced only as "ingest".
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (d) => {
+      d.getData().step = 1;
+    });
+    await db.syncStoreChanges();
+    await flushChangeEvents();
+
+    const events: DbChangeEvent[] = [];
+    const unsubscribe = db.addChangeListener!((event) => {
+      events.push(event);
+    });
+
+    await db.changeDoc(doc, (d) => {
+      d.getData().step = 2;
+    });
+    await db.syncStoreChanges();
+    await flushChangeEvents();
+
+    const localEvent = events.find(
+      (e) => e.origin === "local" && e.changes.some((c) => c.docId === doc.getId()),
+    );
+    expect(localEvent).toBeDefined();
+
+    unsubscribe();
+  }, 30000);
+
   it("reports deletions with isDeleted: true", async () => {
     const doc = await db.createDocument();
     await db.changeDoc(doc, (d) => {

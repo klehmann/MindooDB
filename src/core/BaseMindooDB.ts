@@ -1307,8 +1307,19 @@ export class BaseMindooDB implements MindooDB {
   /**
    * Suppress timer-based change emission for the duration of a batch
    * operation (sync ingest); the release emits one coalesced event.
+   *
+   * Anything already pending when the outermost hold begins can only be
+   * coalesced local writes (ingest additions happen strictly inside a hold),
+   * so it is flushed as a `"local"` event first. Without this, a write helper
+   * that follows its write with an immediate `syncStoreChanges()` — before
+   * the coalescing setTimeout(0) timer gets a macrotask to fire — would see
+   * its local write re-labeled `"ingest"` at hold release, and origin-
+   * filtering consumers (e.g. auto-push) would miss the user's edit.
    */
   private beginChangeNotificationHold(): void {
+    if (this.changeNotificationHolds === 0) {
+      this.emitPendingChangeEvent("local");
+    }
     this.changeNotificationHolds++;
   }
 
