@@ -1152,6 +1152,14 @@ export class TenantManager {
       }
       for (const docId of request.docIds) {
         if (typeof docId !== "string" || docId.length === 0) continue;
+        // Denylist BEFORE purging: the sync push path consults the registry
+        // live, so from this moment re-pushes of the doc are rejected. Doing it
+        // after the store purges would leave a window in which the entries are
+        // already gone but a stale client could still re-push (and the server
+        // would re-accept) the very history that is being purged. The record is
+        // kept regardless of per-store outcome so re-pushes are rejected even
+        // if one store had nothing to purge.
+        registry.recordPurgedDoc(request.dbId, docId);
         for (const storeKind of [StoreKind.docs, StoreKind.attachments]) {
           try {
             const store = await this.getStore(normalizedId, request.dbId, storeKind);
@@ -1163,9 +1171,6 @@ export class TenantManager {
             );
           }
         }
-        // Record on the denylist regardless of per-store outcome so re-pushes of
-        // this docId are rejected even if one store had nothing to purge.
-        registry.recordPurgedDoc(request.dbId, docId);
       }
       registry.markRequestProcessed(request.purgeRequestDocId);
       console.log(
