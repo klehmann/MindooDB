@@ -305,6 +305,33 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
   private nextReceiptOrder = 1;
 
   /**
+   * Serializes all mutations that assign `receiptOrder` values
+   * (`putEntries`, `applyWitnessReceipts`).
+   *
+   * This guards a sync-correctness invariant, not just internal state:
+   * entries MUST become visible to `scanEntriesSince` in `receiptOrder`
+   * order. Without serialization, two concurrent `putEntries` calls can
+   * interleave so that an entry with receiptOrder N+1 becomes visible
+   * (metadata written + index updated) while the entry with receiptOrder N
+   * is still inside its awaited file write. A cursor-based scan running in
+   * that window advances past N without ever seeing it — and since scan
+   * cursors only move forward, the entry is permanently skipped by that
+   * peer (observed as a client that stops receiving another user's changes
+   * until its persisted sync cursor is discarded).
+   */
+  private receiptOrderWriteChain: Promise<void> = Promise.resolve();
+
+  /** Run `fn` exclusively with respect to other receipt-order writers. */
+  private runExclusiveReceiptOrderWrite<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.receiptOrderWriteChain.then(fn, fn);
+    this.receiptOrderWriteChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
    * Cursor-lineage epoch (see {@link StoreHead}). Loaded from / persisted to
    * `store-epoch.json`; regenerated on store reset and on legacy
    * receipt-order migration so peers discard stale persisted scan cursors.
@@ -1225,9 +1252,16 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    * The commit order (content → metadata → segment) ensures that a crash at
    * any point leaves the store in a consistent state: orphaned content blobs
    * are harmless, and the index can always be rebuilt from the metadata files.
+   *
+   * Serialized via {@link runExclusiveReceiptOrderWrite} so entries become
+   * visible to `scanEntriesSince` strictly in `receiptOrder` order.
    */
   async putEntries(entries: StoreEntry[]): Promise<void> {
     await this.ensureInitialized();
+    return this.runExclusiveReceiptOrderWrite(() => this.putEntriesLocked(entries));
+  }
+
+  private async putEntriesLocked(entries: StoreEntry[]): Promise<void> {
     let hasMutation = false;
     const segmentRecords: SerializedMetadataSegmentRecord[] = [];
 
@@ -1277,9 +1311,19 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    * `receiptOrder` so the revision feed's `scanEntriesSince` cursor re-discovers
    * the now-witnessed entries. Receipts whose entry is absent locally, or that
    * match the already-stored witness, are skipped (idempotent).
+   *
+   * Serialized via {@link runExclusiveReceiptOrderWrite} so re-anchored
+   * entries become visible to `scanEntriesSince` strictly in `receiptOrder`
+   * order.
    */
   async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
     await this.ensureInitialized();
+    return this.runExclusiveReceiptOrderWrite(() =>
+      this.applyWitnessReceiptsLocked(receipts),
+    );
+  }
+
+  private async applyWitnessReceiptsLocked(receipts: StoreEntryMetadata[]): Promise<void> {
     const segmentRecords: SerializedMetadataSegmentRecord[] = [];
 
     for (const receipt of receipts) {
