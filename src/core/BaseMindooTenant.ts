@@ -1205,6 +1205,68 @@ export class BaseMindooTenant implements MindooTenant {
     }
   }
 
+  /**
+   * Author-trust reconcile across all open live databases: when the tenant
+   * directory learns about new trusted signing keys (grantaccess documents
+   * arriving on a delayed directory sync), documents whose entries were
+   * previously skipped because their author was unknown must be purged and
+   * re-materialized (see BaseMindooDB.reconcileAuthorTrust).
+   *
+   * The directory database itself is excluded (it is admin-only and never
+   * records pending untrusted authors), as are read-only time-travel views.
+   *
+   * @param newlyTrustedKeys Signing keys that just became trusted. Omit to
+   *   re-check every pending author against the directory.
+   */
+  async reconcileAuthorTrustChanges(newlyTrustedKeys?: ReadonlySet<string>): Promise<void> {
+    for (const db of this.databaseCache.values()) {
+      if (db.isTimeTravelMode()) {
+        continue;
+      }
+      if (db.getStore().getId() === "directory") {
+        continue;
+      }
+      const reconcile = (
+        db as unknown as { reconcileAuthorTrust?: (keys?: ReadonlySet<string>) => Promise<void> }
+      ).reconcileAuthorTrust;
+      if (typeof reconcile === "function") {
+        await reconcile.call(db, newlyTrustedKeys);
+      }
+    }
+  }
+
+  /**
+   * Best-effort wrapper around {@link reconcileAuthorTrustChanges} for
+   * fire-and-forget call sites (e.g. the directory cache diff): errors are
+   * logged and swallowed so the triggering path never fails or blocks.
+   */
+  async reconcileAuthorTrustChangesSafe(newlyTrustedKeys?: ReadonlySet<string>): Promise<void> {
+    try {
+      await this.reconcileAuthorTrustChanges(newlyTrustedKeys);
+    } catch (error) {
+      this.logger.warn(`reconcileAuthorTrustChangesSafe: ${error}`);
+    }
+  }
+
+  /**
+   * Deterministic post-directory-sync hook: refresh the directory trust
+   * caches immediately (bypassing the validation TTL) so newly granted
+   * authors are diffed now, then run a full author-trust reconcile across the
+   * open databases. Called by BaseMindooDB.pullChangesFrom after the
+   * directory store pulled new entries; best-effort, never throws.
+   */
+  async reconcileAuthorTrustAfterDirectorySyncSafe(): Promise<void> {
+    try {
+      const directory = await this.openDirectory();
+      if (directory instanceof BaseMindooTenantDirectory) {
+        await directory.refreshTrustCaches();
+      }
+      await this.reconcileAuthorTrustChanges();
+    } catch (error) {
+      this.logger.warn(`reconcileAuthorTrustAfterDirectorySyncSafe: ${error}`);
+    }
+  }
+
   createDocSignerFor(signKey: SigningKeyPair): MindooDocSigner {
     this.logger.debug(`Creating MindooDocSigner for signing key pair`);
     const signerLogger = this.logger.createChild("MindooDocSigner");

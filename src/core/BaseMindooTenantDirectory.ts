@@ -562,7 +562,22 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     this.logger.debug(`Public key not found in cache, returning false`);
     return false;
   }
-  
+
+  /**
+   * Force-refresh the directory trust caches from the (already synced local)
+   * directory store, bypassing the TTL used by
+   * {@link validatePublicSigningKey}. Called right after a directory pull so
+   * newly arrived grantaccess documents are diffed immediately and the
+   * author-trust reconcile of open databases fires without waiting up to
+   * DIRECTORY_SYNC_INTERVAL_MS for the next cache-miss validation.
+   */
+  async refreshTrustCaches(): Promise<void> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    this.lastDirectorySyncTimestamp = Date.now();
+  }
+
   /**
    * Update all caches (trusted keys, groups, settings) by processing new changes since the last cursor.
    * This unified method processes all document types in a single loop for efficiency.
@@ -572,6 +587,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const directoryDB = await this.getDirectoryDB();
     // Determine starting cursor (null = process all, otherwise incremental)
     const startCursor = this.unifiedCacheLastCursor;
+
+    // Snapshot the trusted signing keys BEFORE any rebuild so newly granted
+    // keys can be diffed at the end of this pass. The diff drives the
+    // author-trust reconcile of open databases (entries previously skipped
+    // because their author was unknown get re-materialized).
+    const previouslyTrustedKeys = new Set(this.trustedKeysCache.keys());
     
     // If processing from the beginning, clear all caches first
     if (startCursor === null) {
@@ -748,6 +769,22 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       for (const key of signingKeys) {
         this.trustedKeysCache.set(key, true);
       }
+    }
+
+    // Author-trust hook: keys that just became trusted (new grantaccess docs)
+    // may unblock entries that open databases skipped earlier because the
+    // author was unknown. Notify the tenant so those documents get purged and
+    // re-materialized (BaseMindooDB.reconcileAuthorTrust). Fire-and-forget:
+    // updateUnifiedCache sits on hot paths and must never block on (or fail
+    // because of) the re-materialization of other databases.
+    const newlyTrustedKeys = new Set<string>();
+    for (const key of this.trustedKeysCache.keys()) {
+      if (!previouslyTrustedKeys.has(key)) {
+        newlyTrustedKeys.add(key);
+      }
+    }
+    if (newlyTrustedKeys.size > 0) {
+      void this.tenant.reconcileAuthorTrustChangesSafe(newlyTrustedKeys);
     }
 
     // Merge group documents with the same name

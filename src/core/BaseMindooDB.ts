@@ -553,6 +553,28 @@ export class BaseMindooDB implements MindooDB {
   // Map<publicKeyPEM, CryptoKey>
   private publicKeyCache: Map<string, CryptoKey> = new Map();
 
+  /**
+   * Author signing keys whose entries were skipped during materialization
+   * because the key was not (yet) trusted by the tenant directory, mapped to
+   * the ids of the affected documents.
+   *
+   * This is the record that makes skipped entries recoverable: when the
+   * directory later learns about the author (a `grantaccess` document arrives
+   * on sync), {@link reconcileAuthorTrust} purges and force-re-emits exactly
+   * these documents so they re-materialize with the now-trusted entries and
+   * every `iterateChangesSince` consumer (views, summary, full-text) catches
+   * up. Persisted in the metadata checkpoint so the healing also works when
+   * the directory is synced in a later session while this DB is closed.
+   */
+  private pendingUntrustedAuthors: Map<string, Set<string>> = new Map();
+  /**
+   * Set while restoring a metadata checkpoint that predates the
+   * `pendingUntrustedAuthors` field. Triggers a one-time heal scan at open
+   * ({@link reconcileAuthorTrustAtOpen}) that detects store entries missing
+   * from the cached materialization and seeds the pending map from them.
+   */
+  private legacyCheckpointNeedsAuthorTrustScan = false;
+
   // Local cache support
   private cacheManager: CacheManager | null = null;
   private cachePrefix: string | null = null;
@@ -1654,6 +1676,19 @@ export class BaseMindooDB implements MindooDB {
       checkpoint.keyBagFingerprint = this.lastReconciledKeyBagFingerprint;
     }
 
+    // Persist the pending untrusted-author map (additive field). Written even
+    // when empty: the field's PRESENCE marks the checkpoint as
+    // author-trust-aware, so restore can distinguish it from a legacy
+    // checkpoint that needs the one-time heal scan (see
+    // reconcileAuthorTrustAtOpen).
+    const pendingUntrusted: Record<string, string[]> = {};
+    for (const [publicKey, docIds] of this.pendingUntrustedAuthors) {
+      if (docIds.size > 0) {
+        pendingUntrusted[publicKey] = Array.from(docIds);
+      }
+    }
+    checkpoint.pendingUntrustedAuthors = pendingUntrusted;
+
     return new TextEncoder().encode(JSON.stringify(checkpoint));
   }
 
@@ -1686,6 +1721,24 @@ export class BaseMindooDB implements MindooDB {
       }
       this.lastReconciledKeyBagFingerprint =
         typeof checkpoint.keyBagFingerprint === "string" ? checkpoint.keyBagFingerprint : null;
+      // Pending untrusted-author map. A checkpoint written before this field
+      // existed may hide entries that were silently skipped because their
+      // author was unknown at the time - flag it for the one-time heal scan.
+      this.pendingUntrustedAuthors.clear();
+      if (checkpoint.pendingUntrustedAuthors && typeof checkpoint.pendingUntrustedAuthors === "object") {
+        this.legacyCheckpointNeedsAuthorTrustScan = false;
+        for (const [publicKey, docIds] of Object.entries(
+          checkpoint.pendingUntrustedAuthors as Record<string, unknown>,
+        )) {
+          if (!Array.isArray(docIds)) continue;
+          const validIds = docIds.filter((id): id is string => typeof id === "string");
+          if (validIds.length > 0) {
+            this.pendingUntrustedAuthors.set(publicKey, new Set(validIds));
+          }
+        }
+      } else {
+        this.legacyCheckpointNeedsAuthorTrustScan = true;
+      }
       this.syncScanCursors.clear();
       if (checkpoint.syncScanCursors && typeof checkpoint.syncScanCursors === "object") {
         for (const [key, value] of Object.entries(
@@ -1908,6 +1961,31 @@ export class BaseMindooDB implements MindooDB {
     // Cache the imported key
     this.publicKeyCache.set(publicKey, cryptoKey);
     return cryptoKey;
+  }
+
+  /**
+   * Remember that entries of `publicKey` were skipped for `docId` because the
+   * key is not (yet) trusted by the tenant directory. The record is persisted
+   * in the metadata checkpoint and consumed by {@link reconcileAuthorTrust}
+   * once the directory later trusts the key (e.g. a grantaccess document
+   * arrived on a delayed directory sync), so the skipped entries get
+   * re-materialized instead of staying invisible forever.
+   */
+  private recordPendingUntrustedAuthor(publicKey: string, docId: string): void {
+    let docIds = this.pendingUntrustedAuthors.get(publicKey);
+    if (!docIds) {
+      docIds = new Set();
+      this.pendingUntrustedAuthors.set(publicKey, docIds);
+    }
+    if (docIds.has(docId)) {
+      return;
+    }
+    docIds.add(docId);
+    this.logger.info(
+      `Recorded pending untrusted author for doc ${docId}: entries skipped until the directory trusts the key`,
+    );
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
   }
 
   /**
@@ -2397,6 +2475,14 @@ export class BaseMindooDB implements MindooDB {
         if (this.reconcileRestoredIndexOnInit) {
           await this.reconcileRestoredIndexWithStore();
         }
+
+        // Author-trust healing: entries skipped in an earlier session because
+        // their author was unknown to the directory become materializable once
+        // a grantaccess arrived while this DB was closed. Also runs the
+        // one-time legacy heal scan for checkpoints that predate the
+        // pending-untrusted-author tracking.
+        await this.reconcileAuthorTrustAtOpen();
+
         this.probeFulltextSetupAtOpen();
         this.probeSummarySetupAtOpen();
         return;
@@ -2694,6 +2780,227 @@ export class BaseMindooDB implements MindooDB {
     // pass so a subsequent warm start with identical bag composition
     // can skip the scan.
     this.markKeyBagFingerprintReconciled(await this.computeCurrentKeyBagFingerprint());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Author-trust reconciliation: heal documents whose entries were skipped
+  // because their author was not yet known to the tenant directory.
+  // ---------------------------------------------------------------------------
+
+  /** Serializes concurrent author-trust reconciles (per database). */
+  private authorTrustReconcileChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Re-materialize documents whose entries were previously skipped because the
+   * author's signing key was not (yet) trusted by the tenant directory.
+   *
+   * This is the counterpart to {@link reconcileKeyVisibility} for AUTHOR trust
+   * instead of decryption keys: when a `grantaccess` document arrives on a
+   * delayed directory sync, entries that were quarantined/skipped earlier
+   * (recorded in {@link pendingUntrustedAuthors}) become valid. For each
+   * affected document we purge every cached materialization (L1/L2/summary/
+   * full-text) and force a changeSeq bump on the index so all
+   * `iterateChangesSince` consumers (virtual views, summary buffer, full-text
+   * index) re-process the doc; the body itself re-materializes lazily on the
+   * next load and now includes the previously skipped entries.
+   *
+   * Safe to call repeatedly; concurrent calls are serialized and a call with
+   * no pending or no newly-trusted keys is a fast no-op. Errors are logged,
+   * never thrown (best-effort hook semantics).
+   *
+   * @param newlyTrustedKeys Signing keys that just became trusted (directory
+   *   cache diff). When omitted, every pending key is re-checked against the
+   *   directory - used at DB open to catch trust changes that happened while
+   *   this database was closed.
+   */
+  public reconcileAuthorTrust(newlyTrustedKeys?: ReadonlySet<string>): Promise<void> {
+    const run = () =>
+      this.reconcileAuthorTrustNow(newlyTrustedKeys).catch((error) => {
+        this.logger.warn(`reconcileAuthorTrust failed: ${error}`);
+      });
+    const chained = this.authorTrustReconcileChain.then(run, run);
+    this.authorTrustReconcileChain = chained;
+    return chained;
+  }
+
+  private async reconcileAuthorTrustNow(newlyTrustedKeys?: ReadonlySet<string>): Promise<void> {
+    if (this.isTimeTravelMode()) {
+      return;
+    }
+    if (this.pendingUntrustedAuthors.size === 0) {
+      return;
+    }
+
+    const candidateKeys = Array.from(this.pendingUntrustedAuthors.keys()).filter(
+      (key) => !newlyTrustedKeys || newlyTrustedKeys.has(key),
+    );
+    if (candidateKeys.length === 0) {
+      return;
+    }
+
+    // Confirm against the directory even when the caller supplied a diff:
+    // validatePublicSigningKey is the same trust source the materialization
+    // paths use, so both stay consistent.
+    const directory = await this.tenant.openDirectory();
+    const trustedKeys: string[] = [];
+    for (const key of candidateKeys) {
+      try {
+        if (await directory.validatePublicSigningKey(key)) {
+          trustedKeys.push(key);
+        }
+      } catch (error) {
+        // Transient directory failure: keep the pending record so a later
+        // reconcile retries (fail open towards retry, never towards loss).
+        this.logger.warn(`reconcileAuthorTrust: directory validation failed for a pending key: ${error}`);
+      }
+    }
+    if (trustedKeys.length === 0) {
+      return;
+    }
+
+    const affectedDocIds = new Set<string>();
+    for (const key of trustedKeys) {
+      for (const docId of this.pendingUntrustedAuthors.get(key) ?? []) {
+        affectedDocIds.add(docId);
+      }
+      this.pendingUntrustedAuthors.delete(key);
+    }
+
+    this.logger.info(
+      `reconcileAuthorTrust: ${trustedKeys.length} author key(s) became trusted, re-materializing ${affectedDocIds.size} document(s)`,
+    );
+
+    // Deterministic ordering keeps the resulting changefeed stable between
+    // runs (mirrors reconcileKeyVisibility).
+    const docIds = Array.from(affectedDocIds).sort((left, right) => left.localeCompare(right));
+    for (const docId of docIds) {
+      // Drop every cached form of the stale materialization first so the
+      // next load rebuilds from the store with the now-trusted entries.
+      await this.purgeMaterializedDocument(docId);
+
+      const metadata = await this.scanAllMetadata(this.store, { docId });
+      const lifecycleEntries = metadata.filter(
+        (entry) =>
+          entry.entryType === "doc_create"
+          || entry.entryType === "doc_change"
+          || entry.entryType === "doc_delete"
+          || entry.entryType === "doc_undelete"
+          || entry.entryType === "doc_snapshot",
+      );
+      const visibility = this.deriveDocumentVisibilityMetadata(metadata);
+      if (!visibility) {
+        continue;
+      }
+      // Author trust and key visibility are independent layers: without the
+      // decryption key the doc stays governed by reconcileKeyVisibility.
+      if (!(await this.tenant.hasDecryptionKey(visibility.decryptionKeyId))) {
+        continue;
+      }
+      const { awaitingWitness, witnessed } = metadataWitnessState(lifecycleEntries);
+      // Force the changeSeq bump: the tracked index fields may be identical to
+      // the stale entry, but the materialized content WILL differ once the
+      // previously skipped entries are applied - consumers must re-read.
+      this.updateIndex(
+        docId,
+        visibility.lastModified,
+        visibility.isDeleted,
+        visibility.decryptionKeyId,
+        "visible",
+        awaitingWitness,
+        witnessed,
+        true,
+      );
+    }
+
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
+  /**
+   * Open-time author-trust healing, called from {@link initialize} after a
+   * cache restore. Two jobs:
+   *
+   *  1. Legacy checkpoints (written before {@link pendingUntrustedAuthors}
+   *     existed) may hide entries that were silently skipped - detect them via
+   *     the persisted automerge-hash lookup and seed the pending map.
+   *  2. Re-check all pending authors against the directory, healing documents
+   *     whose authors became trusted while this database was closed (e.g. the
+   *     directory was synced in a session that never opened this DB).
+   */
+  private async reconcileAuthorTrustAtOpen(): Promise<void> {
+    if (this.isTimeTravelMode() || this._isAdminOnlyDb || this.store.getId() === "directory") {
+      return;
+    }
+    if (this.legacyCheckpointNeedsAuthorTrustScan) {
+      this.legacyCheckpointNeedsAuthorTrustScan = false;
+      try {
+        await this.seedPendingAuthorsFromLegacyCheckpoint();
+      } catch (error) {
+        this.logger.warn(`Legacy author-trust heal scan failed: ${error}`);
+      }
+      // Whether or not entries were found, the checkpoint is upgraded on the
+      // next flush (the pendingUntrustedAuthors field is always written), so
+      // this scan runs at most once per database.
+      this.cacheMetaDirty = true;
+      this.cacheManager?.markDirty();
+    }
+    if (this.pendingUntrustedAuthors.size === 0) {
+      return;
+    }
+    await this.reconcileAuthorTrust();
+  }
+
+  /**
+   * One-time heal scan for checkpoints written before the pending
+   * untrusted-author tracking existed: entries skipped back then left no
+   * record, but the persisted automerge-hash lookup
+   * ({@link automergeHashToEntryId}) only contains changes that were actually
+   * APPLIED to a materialization. A store head entry whose hash is missing
+   * from that lookup therefore marks a document whose cached state is missing
+   * entries - seed the pending map with the authors of all unapplied entries
+   * so the regular reconcile can heal (or keep waiting for) them.
+   */
+  private async seedPendingAuthorsFromLegacyCheckpoint(): Promise<void> {
+    const allMetadata = await this.scanAllMetadata(this.store);
+    const replayByDoc = new Map<string, StoreEntryMetadata[]>();
+    for (const entry of allMetadata) {
+      if (!this.isDocumentReplayEntry(entry)) {
+        continue;
+      }
+      const entries = replayByDoc.get(entry.docId) ?? [];
+      entries.push(entry);
+      replayByDoc.set(entry.docId, entries);
+    }
+
+    let seededDocs = 0;
+    for (const [docId, replayEntries] of replayByDoc) {
+      const applied = this.automergeHashToEntryId.get(docId);
+      // Heads applied => every entry reachable from them was applied too
+      // (Automerge buffers dependents of missing changes), so checking the
+      // active DAG heads is sufficient and avoids false positives for entries
+      // that are only covered by a snapshot.
+      const headEntryIds = this.findActiveReplayHeadEntryIds(replayEntries);
+      const hasUnappliedHead = headEntryIds.some((entryId) => {
+        const parsed = parseDocEntryId(entryId);
+        return parsed !== null && !(applied?.has(parsed.automergeHash));
+      });
+      if (!hasUnappliedHead) {
+        continue;
+      }
+      seededDocs++;
+      for (const entry of replayEntries) {
+        const parsed = parseDocEntryId(entry.id);
+        if (!parsed || applied?.has(parsed.automergeHash)) {
+          continue;
+        }
+        this.recordPendingUntrustedAuthor(entry.createdByPublicKey, docId);
+      }
+    }
+    if (seededDocs > 0) {
+      this.logger.info(
+        `Legacy author-trust heal scan found ${seededDocs} document(s) with unapplied store entries`,
+      );
+    }
   }
 
   private async reconcileRestoredIndexWithStore(): Promise<void> {
@@ -10213,6 +10520,11 @@ export class BaseMindooDB implements MindooDB {
     for (const { publicKey, cryptoKey } of keyImportResults) {
       if (cryptoKey) {
         keyMap.set(publicKey, cryptoKey);
+      } else {
+        // Author key not (yet) trusted by the directory: the entries below
+        // will be skipped. Record the author so a later grantaccess sync
+        // can re-materialize this document (reconcileAuthorTrust).
+        this.recordPendingUntrustedAuthor(publicKey, docId);
       }
     }
 
@@ -11121,7 +11433,14 @@ export class BaseMindooDB implements MindooDB {
 
       // Verify the author signature over the encrypted payload.
       const cryptoKey = await this.getOrImportPublicKey(entry.createdByPublicKey);
-      if (!cryptoKey || !(await this.verifyEntrySignatureWithKey(cryptoKey, entry))) {
+      if (!cryptoKey) {
+        // Author key not (yet) trusted by the directory. Remember it so a
+        // later grantaccess sync can re-materialize the doc (reconcileAuthorTrust).
+        this.recordPendingUntrustedAuthor(entry.createdByPublicKey, docId);
+        quarantine(meta, "invalid_signature", "author key not trusted by directory");
+        continue;
+      }
+      if (!(await this.verifyEntrySignatureWithKey(cryptoKey, entry))) {
         quarantine(meta, "invalid_signature", "signature verification failed");
         continue;
       }
@@ -11563,6 +11882,11 @@ export class BaseMindooDB implements MindooDB {
       for (const { publicKey, cryptoKey } of keyImportResults) {
         if (cryptoKey) {
           keyMap.set(publicKey, cryptoKey);
+        } else {
+          // Author key not (yet) trusted by the directory: the entries below
+          // will be skipped. Record the author so a later grantaccess sync
+          // can re-materialize this document (reconcileAuthorTrust).
+          this.recordPendingUntrustedAuthor(publicKey, docId);
         }
       }
 
@@ -12719,6 +13043,13 @@ export class BaseMindooDB implements MindooDB {
         // single-flight; never blocks or fails the sync.
         if (this.store.getId() === "directory") {
           await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
+          // Author-trust reconcile: refresh the directory trust caches NOW
+          // (instead of waiting up to DIRECTORY_SYNC_INTERVAL_MS for the next
+          // cache-miss validation) so grantaccess documents that just arrived
+          // immediately unblock entries other open databases skipped while
+          // the author was still unknown. Awaited so a subsequent content-DB
+          // sync in the same flow observes the healed state.
+          await this.tenant.reconcileAuthorTrustAfterDirectorySyncSafe();
         }
       }
       if (options?.signal?.aborted) {
