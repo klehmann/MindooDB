@@ -4366,6 +4366,7 @@ export class BaseMindooDB implements MindooDB {
         );
       }
       this.validateIdPrefixOption("createDocuments", options);
+      this.validateAssumeUniqueIdOption("createDocuments", options);
     }
 
     const results: Array<MindooDoc | null> = new Array(inputs.length).fill(null);
@@ -4454,6 +4455,18 @@ export class BaseMindooDB implements MindooDB {
   }
   
   /**
+   * Validate `CreateOptions.assumeUniqueId`: only meaningful for a
+   * caller-provided `id` (generated ids are unique by construction).
+   */
+  private validateAssumeUniqueIdOption(methodName: string, options: CreateOptions): void {
+    if (options.assumeUniqueId && options.id === undefined) {
+      throw new Error(
+        `${methodName}: assumeUniqueId requires a caller-provided id`
+      );
+    }
+  }
+
+  /**
    * Validate `CreateOptions.idPrefix`: mutually exclusive with `id` and must
    * match {@link DOC_ID_PREFIX_REGEX}.
    */
@@ -4533,6 +4546,12 @@ export class BaseMindooDB implements MindooDB {
     const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
     this.validateIdPrefixOption("createDocument", options);
+    this.validateAssumeUniqueIdOption("createDocument", options);
+    // A caller-provided id needs the deterministic seed change UNLESS the
+    // caller asserts the id is random/unique (`assumeUniqueId`): convergence
+    // of concurrent same-id creates is then not a concern and the create can
+    // follow the generated-ID path (initialValues baked into doc_create).
+    const useDeterministicSeed = useCustomDocId && !options.assumeUniqueId;
 
     // Sanitize caller-provided initial values: internal/reserved fields (those
     // starting with "_", e.g. "_attachments") are managed by MindooDB and must
@@ -4552,12 +4571,13 @@ export class BaseMindooDB implements MindooDB {
           `Custom document IDs must match ${CUSTOM_DOC_ID_REGEX.source}.`
         );
       }
-      // Custom-ID documents are seeded with a hard-coded initial change so that
-      // independent replicas converge on the same Automerge hash. Baking
-      // caller values into that change would diverge the hash per content, so
-      // initialValues is unsupported on the custom-ID path in v1. Create the
-      // document first, then apply values via changeDoc().
-      if (hasInitialValues) {
+      // Convergent custom-ID documents are seeded with a hard-coded initial
+      // change so that independent replicas converge on the same Automerge
+      // hash. Baking caller values into that change would diverge the hash per
+      // content, so initialValues is unsupported on the deterministic-seed
+      // path in v1. Create the document first, then apply values via
+      // changeDoc() — or assert `assumeUniqueId` for random ids.
+      if (useDeterministicSeed && hasInitialValues) {
         throw new Error(
           "createDocument: initialValues is not supported together with a custom id; " +
           "create the document, then apply values with changeDoc()."
@@ -4601,14 +4621,15 @@ export class BaseMindooDB implements MindooDB {
     
     // Build the initial Automerge document and its first change bytes.
     //
-    // For UUID7 documents we use the historical path (Automerge.init + change).
-    // For custom-ID documents we apply a hard-coded initial change so that
-    // independent replicas using the same id produce the same Automerge hash
-    // and `doc_create` entry id, allowing later changes to merge.
+    // For UUID7 documents (and unique-by-assertion custom ids) we use the
+    // historical path (Automerge.init + change). For convergent custom-ID
+    // documents we apply a hard-coded initial change so that independent
+    // replicas using the same id produce the same Automerge hash and
+    // `doc_create` entry id, allowing later changes to merge.
     const now = semanticNow();
     let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
     let changeBytes: Uint8Array;
-    if (useCustomDocId) {
+    if (useDeterministicSeed) {
       this.logger.debug(`Seeding custom-id document ${docId} with hard-coded initial Automerge change`);
       changeBytes = getCustomIdInitialChangeBytes();
       try {
@@ -4809,6 +4830,11 @@ export class BaseMindooDB implements MindooDB {
     const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
     this.validateIdPrefixOption("createDocuments", options);
+    this.validateAssumeUniqueIdOption("createDocuments", options);
+    // See createDocumentInternal: `assumeUniqueId` opts a caller-provided id
+    // out of the deterministic seed, so initialValues fold into doc_create
+    // and the document costs a single store entry.
+    const useDeterministicSeed = useCustomDocId && !options.assumeUniqueId;
 
     // Sanitize caller-provided initial values: internal/reserved fields are
     // managed by MindooDB and must not be seeded by callers. `undefined`
@@ -4837,7 +4863,7 @@ export class BaseMindooDB implements MindooDB {
     // following the same seeding rules as the single-create path.
     let seedDoc: AutomergeTypes.Doc<MindooDocPayload>;
     let createChangeBytes: Uint8Array;
-    if (useCustomDocId) {
+    if (useDeterministicSeed) {
       createChangeBytes = getCustomIdInitialChangeBytes();
       const fresh = Automerge.init<MindooDocPayload>();
       const [appliedDoc] = Automerge.applyChanges(fresh, [createChangeBytes]);
@@ -4859,12 +4885,13 @@ export class BaseMindooDB implements MindooDB {
       createChangeBytes = localChange;
     }
 
-    // Custom-id + initialValues (bulk-only): the deterministic seed change must
-    // stay byte-identical across replicas, so the values go into a separate
-    // follow-up change that ships in the same batch.
+    // Convergent custom-id + initialValues (bulk-only): the deterministic seed
+    // change must stay byte-identical across replicas, so the values go into a
+    // separate follow-up change that ships in the same batch. Unique-by-
+    // assertion ids skip this — their values are already in doc_create.
     let finalDoc = seedDoc;
     let valueChangeBytes: Uint8Array | null = null;
-    if (useCustomDocId && initialValueEntries.length > 0) {
+    if (useDeterministicSeed && initialValueEntries.length > 0) {
       finalDoc = Automerge.change(seedDoc, { time: now }, (doc: MindooDocPayload) => {
         for (const [key, value] of initialValueEntries) {
           (doc as Record<string, unknown>)[key] = value;

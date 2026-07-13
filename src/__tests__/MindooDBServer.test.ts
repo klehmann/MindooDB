@@ -30,7 +30,7 @@ describe("MindooDBServer", () => {
 
     server = new MindooDBServer(testDataDir, "test-password");
     await new Promise<void>((resolve, reject) => {
-      httpServer = server.getApp().listen(0, () => {
+      httpServer = server.getApp().listen(0, "127.0.0.1", () => {
         const address = httpServer.address();
         if (!address || typeof address === "string") {
           reject(new Error("Failed to determine test server port"));

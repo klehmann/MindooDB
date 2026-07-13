@@ -28,7 +28,7 @@ async function startServer(
   server: MindooDBServer,
 ): Promise<{ httpServer: Server; baseUrl: string }> {
   return new Promise((resolve, reject) => {
-    const httpServer = server.getApp().listen(0, () => {
+    const httpServer = server.getApp().listen(0, "127.0.0.1", () => {
       const address = httpServer.address();
       if (!address || typeof address === "string") {
         reject(new Error("Failed to determine test server port"));

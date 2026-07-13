@@ -148,6 +148,15 @@ describe("MindooDB Example Server", () => {
   // in TIME_WAIT from a previous run, which then surfaces as a hung
   // beforeAll (the listen callback never fires) and a wall of unrelated
   // test failures.
+  //
+  // Bind explicitly to 127.0.0.1 (not the default which listens on IPv6 `::`).
+  // The IPv4 and IPv6 ephemeral ranges are independent, so a hostless listen(0)
+  // can pick an IPv6 port number that a local IPv4-only proxy (e.g. the Snyk
+  // language server, which runs many 127.0.0.1 proxy listeners) already holds.
+  // Since the client below dials the IPv4 literal 127.0.0.1, the request would
+  // then land on that foreign proxy ("This is a proxy server. Does not respond
+  // to non-proxy requests.", HTTP 500) instead of this server. Binding IPv4
+  // forces the OS to hand out a port not already taken on 127.0.0.1.
   const testDataDir = `/tmp/mindoodb-test-${Date.now()}`;
 
   // Test keys
@@ -232,7 +241,7 @@ describe("MindooDB Example Server", () => {
     // errors so we surface EADDRINUSE-style failures immediately instead
     // of timing out the hook.
     await new Promise<void>((resolve, reject) => {
-      httpServer = server.getApp().listen(0, () => {
+      httpServer = server.getApp().listen(0, "127.0.0.1", () => {
         const address = httpServer.address();
         if (!address || typeof address === "string") {
           reject(new Error("Failed to determine test server port"));
@@ -658,7 +667,7 @@ describe("MindooDB Example Server", () => {
         isolatedConfig,
       );
       const isolatedHttpServer = await new Promise<Server>((resolve, reject) => {
-        const s = isolatedServer.getApp().listen(0, () => {
+        const s = isolatedServer.getApp().listen(0, "127.0.0.1", () => {
           const address = s.address();
           if (!address || typeof address === "string") {
             reject(new Error("Failed to determine isolated test server port"));
@@ -984,7 +993,7 @@ describe("Server Network Management", () => {
     server = new MindooDBServer(testDataDir, "test-password", undefined, config);
 
     await new Promise<void>((resolve, reject) => {
-      httpServer = server.getApp().listen(0, () => {
+      httpServer = server.getApp().listen(0, "127.0.0.1", () => {
         const address = httpServer.address();
         if (!address || typeof address === "string") {
           reject(new Error("Failed to determine test server port"));

@@ -1539,11 +1539,30 @@ export interface CreateOptions {
    * If a document with this ID already exists locally, `createDocument()`
    * returns the existing document (idempotent create). For independent replicas
    * to converge on the same custom ID, MindooDB seeds custom-ID documents with
-   * a hard-coded initial Automerge change so they share Automerge ancestry.
+   * a hard-coded initial Automerge change so they share Automerge ancestry
+   * (unless the caller opts out via `assumeUniqueId`).
    *
    * Mutually exclusive with `idPrefix`.
    */
   id?: string;
+
+  /**
+   * Caller assertion that the provided `id` was generated randomly with enough
+   * entropy that no other replica can create the same ID concurrently (e.g. a
+   * `<prefix>_<uuid>` scheme). Only meaningful together with `id`.
+   *
+   * With this flag the create follows the generated-ID code path: a single
+   * `doc_create` entry with `initialValues` baked in — no deterministic seed
+   * change and no follow-up `doc_change`. This halves the store entries for
+   * bulk imports whose documents cross-reference each other by pre-generated
+   * random IDs.
+   *
+   * WARNING: do NOT set this for fixed/well-known IDs (settings singletons
+   * etc.). If two replicas create the same ID with this flag, their
+   * `doc_create` entries share no Automerge ancestry and the document forks
+   * instead of converging. Defaults to `false`.
+   */
+  assumeUniqueId?: boolean;
 
   /**
    * Optional short prefix (1–10 ASCII-alphanumeric chars, starting with a
