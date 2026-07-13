@@ -132,6 +132,49 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
     expect(result.noReceipt).toBeFalsy();
   });
 
+  it("acknowledges a re-pushed duplicate with the STORED receipt instead of re-stamping", async () => {
+    const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+    const signer = await generateSigner();
+    const server = new ServerNetworkContentAddressedStore(
+      localStore,
+      fakeDirectory(),
+      fakeAuth(),
+      cryptoAdapter,
+      undefined,
+      { timestampProvider: new Ed25519WitnessProvider({ signer, subtle: signer.subtle }), witnessDbid: dbid },
+    );
+
+    const e = await makeEntry();
+    const first = await server.handlePutEntries("token", [e]);
+    expect(first.receipts).toHaveLength(1);
+    const firstReceivedAt = first.receipts[0].receivedAt;
+    expect(firstReceivedAt).toBeGreaterThan(0);
+
+    // Re-push the same entry later (e.g. the client's sync scan re-discovered
+    // it after applyWitnessReceipts re-anchored it). A fresh receivedAt here
+    // would differ from the receipt the client already applied, causing it to
+    // re-anchor again — the first-sync infinite loop.
+    const nowSpy = jest
+      .spyOn(Date, "now")
+      .mockReturnValue((firstReceivedAt ?? 0) + 60_000);
+    try {
+      const second = await server.handlePutEntries("token", [e]);
+      expect(second.rejected).toHaveLength(0);
+      expect(second.receipts).toHaveLength(1);
+      expect(second.receipts[0].id).toBe(e.id);
+      expect(second.receipts[0].receivedAt).toBe(firstReceivedAt);
+      expect(second.receipts[0].receivedDateSignature).toEqual(
+        first.receipts[0].receivedDateSignature,
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    // The stored copy kept its original receipt as well.
+    const stored = (await localStore.getEntries([e.id]))[0];
+    expect(stored.receivedAt).toBe(firstReceivedAt);
+  });
+
   it("does not self-witness entries authored by the witness itself", async () => {
     const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
     const signer = await generateSigner();

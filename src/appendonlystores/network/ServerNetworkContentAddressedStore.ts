@@ -859,6 +859,18 @@ export class ServerNetworkContentAddressedStore {
       requireMetadataSignature = cutoff !== undefined && receivedAt >= cutoff;
     }
 
+    // Idempotent re-push: entries the store already holds are acknowledged
+    // with their STORED metadata (original witness receipt) further below
+    // instead of being re-validated and re-stamped with a fresh receivedAt.
+    // Re-stamping a duplicate would hand the pushing client a receipt that
+    // differs from the one it already applied, so applyWitnessReceipts would
+    // re-anchor the entry to a fresh receiptOrder on every push — the
+    // client's cursor scan then re-discovers (and re-pushes) the same
+    // entries indefinitely (first-sync loop).
+    const existingIds = new Set(
+      await this.localStore.hasEntries(entries.map((e) => e.id)),
+    );
+
     // Process each entry
     const toStore: StoreEntry[] = [];
     // Per-entry rejections for signature-class failures. The rejected entry is
@@ -894,6 +906,20 @@ export class ServerNetworkContentAddressedStore {
           NetworkErrorType.ACCESS_DENIED,
           `Entry ${entry.id} belongs to a purged document and may not be pushed`,
         );
+      }
+
+      // Duplicate push: acknowledge with the stored metadata (including the
+      // original witness receipt, when present) so the client's receipt
+      // application stays idempotent. The entry was fully validated when it
+      // was first accepted; content-addressed ids guarantee the payload is
+      // identical. Deliberate blocks (revoked key, purged doc, above) still
+      // apply to duplicates.
+      if (existingIds.has(entry.id)) {
+        const stored = await this.localStore.getEntryMetadata(entry.id);
+        if (stored) {
+          stampedMetadata.push(stored);
+          continue;
+        }
       }
 
       // Verify the entry was created by a trusted user (baseline Tier 1).

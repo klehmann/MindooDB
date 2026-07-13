@@ -3845,6 +3845,21 @@ export class BaseMindooDB implements MindooDB {
         totalSourceEntries: totalSourceEstimate,
       });
 
+      // Upper scan bound: the source head captured BEFORE the scan started.
+      // Pushing to a witnessing target re-anchors the just-transferred
+      // entries to a fresh receiptOrder on the source (applyWitnessReceipts),
+      // i.e. past the running cursor — without this bound the scan would
+      // re-discover its own transfers and never terminate (first-sync loop).
+      // Entries beyond the bound (re-anchored or written concurrently) are
+      // picked up by the next sync.
+      const scanUpperBound = sourceHead?.maxReceiptOrder;
+      // IDs already transferred in this sync session. Guards against
+      // re-pushing entries the scan re-discovers when the target bloom
+      // snapshot is stale (fetched once up front; empty on a first sync, so
+      // it would classify every re-discovered id as "definitely missing"
+      // and skip the exact hasEntries check).
+      const transferredThisSync = new Set<string>();
+
       let currentPage = 0;
       // Scan-page pipelining (sync-v5, phase 4): while page N is being
       // filtered and transferred, page N+1 is already being fetched.
@@ -3869,7 +3884,22 @@ export class BaseMindooDB implements MindooDB {
           ? sourceStore.scanEntriesSince!(page.nextCursor, pageSize)
           : null;
         currentPage++;
-        scanned += page.entries.length;
+
+        // Clamp the page to the scan bound. Pages are ordered by
+        // (receiptOrder, id), so everything past the first out-of-bound
+        // entry is out of bound as well.
+        let pageEntries = page.entries;
+        let reachedScanBound = false;
+        if (scanUpperBound !== undefined && pageEntries.length > 0) {
+          const inBound = pageEntries.filter(
+            (m) => (m.receiptOrder ?? 0) <= scanUpperBound,
+          );
+          if (inBound.length < pageEntries.length) {
+            reachedScanBound = true;
+            pageEntries = inBound;
+          }
+        }
+        scanned += pageEntries.length;
 
         if (signal?.aborted) {
           discardPrefetch();
@@ -3877,7 +3907,7 @@ export class BaseMindooDB implements MindooDB {
           return { transferred, transferredBytes, scanned, cancelled: true, rejected };
         }
 
-        if (page.entries.length > 0) {
+        if (pageEntries.length > 0) {
           onProgress?.({
             phase: 'transferring',
             message: `Scanned ${scanned} entries, checking for changes (page ${currentPage})...`,
@@ -3887,8 +3917,13 @@ export class BaseMindooDB implements MindooDB {
             currentPage,
           });
 
-          const ids = page.entries.map((m) => m.id);
-          const missingIds = await this.filterMissingIds(targetStore, ids, targetBloom);
+          const ids = pageEntries
+            .map((m) => m.id)
+            .filter((id) => !transferredThisSync.has(id));
+          const missingIds =
+            ids.length > 0
+              ? await this.filterMissingIds(targetStore, ids, targetBloom)
+              : [];
 
           if (signal?.aborted) {
             discardPrefetch();
@@ -3920,6 +3955,9 @@ export class BaseMindooDB implements MindooDB {
               persistScanCursor(cursor);
               return { transferred, transferredBytes, scanned, cancelled: true, rejected };
             }
+            for (const id of missingIds) {
+              transferredThisSync.add(id);
+            }
           }
         }
 
@@ -3932,6 +3970,20 @@ export class BaseMindooDB implements MindooDB {
           totalSourceEntries: totalSourceEstimate,
           currentPage,
         });
+
+        if (reachedScanBound) {
+          // Persist the last in-bound position (NOT page.nextCursor, which
+          // already points into the out-of-bound tail): a concurrent write
+          // that landed between the bound and the re-anchored tail must be
+          // scanned by the next sync.
+          const lastInBound =
+            pageEntries.length > 0 ? pageEntries[pageEntries.length - 1] : null;
+          if (lastInBound) {
+            cursor = { receiptOrder: lastInBound.receiptOrder ?? 0, id: lastInBound.id };
+          }
+          discardPrefetch();
+          break;
+        }
 
         cursor = page.nextCursor;
         if (!page.hasMore) {
