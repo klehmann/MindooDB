@@ -9359,7 +9359,16 @@ export class BaseMindooDB implements MindooDB {
   }
 
   private unsetJsonValueAtPath(target: MindooDocPayload, path: Array<string | number>): void {
-    const parent = this.readJsonParentAtPath(target, path);
+    // Idempotent: compacted attach→detach pairs (or concurrent deletes) may
+    // request an unset for a parent map that was never written. Treat that as
+    // already-absent rather than failing the whole patch.
+    let parent: any = target;
+    for (let index = 0; index < path.length - 1; index += 1) {
+      parent = parent?.[path[index]];
+      if (parent === null || typeof parent !== "object") {
+        return;
+      }
+    }
     delete parent[path[path.length - 1]];
   }
 

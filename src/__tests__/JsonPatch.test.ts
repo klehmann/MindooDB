@@ -119,6 +119,35 @@ describe("applyJsonPatch", () => {
     ).toEqual(["chart_1"]);
   }, 30000);
 
+  it("treats unset of a missing nested path as a no-op", async () => {
+    // TeamSketchbook can compact erase+undo into a lone detach before the
+    // attach was ever persisted. Unset must not throw when the parent map is absent.
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (draft) => {
+      draft.getData().bodySketch = {
+        version: 2,
+        strokes: [],
+      };
+    });
+    const baseHeads = doc.getHeads();
+
+    const result = await db.applyJsonPatch(doc, {
+      baseHeads,
+      unset: [{
+        path: [
+          "bodySketch",
+          "eraseMasksByImageId",
+          "img_missing",
+          "stroke_1:img_missing",
+        ],
+      }],
+    });
+
+    expect(result.data.bodySketch).toEqual({ version: 2, strokes: [] });
+    expect((result.data.bodySketch as { eraseMasksByImageId?: unknown }).eraseMasksByImageId)
+      .toBeUndefined();
+  }, 30000);
+
   it("rejects listInsert when the target path resolves to a non-array value", async () => {
     const doc = await db.createDocument();
     await db.changeDoc(doc, (draft) => {
