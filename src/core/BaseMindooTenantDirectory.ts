@@ -244,6 +244,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // Check if user with same username (case-insensitive) already has ACTIVE
     // access. A grant whose keys were removed (revocation, §6.5) is ignored
     // here so the user can be re-registered after being revoked.
+    //
+    // When an active grant already exists with different keys, append the new
+    // device key pair (§6.5 multi-device / join-request for a second device)
+    // instead of rejecting — one grant document holds all of a user's devices.
     const existingDocs = await this.findGrantAccessDocuments(userId.username);
     const activeDocs = existingDocs.filter(
       (doc) => extractSigningPublicKeys(doc.getData()).length > 0,
@@ -261,13 +265,25 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         // Same user with same keys - skip re-registration
         this.logger.debug(`User ${userId.username} already registered with same keys, skipping`);
         return;
-      } else {
-        // Different keys for same username - this is an error
-        throw new Error(
-          `Cannot register user "${userId.username}": a user with the same username (case-insensitive) ` +
-          `is already registered with different keys`
-        );
       }
+
+      // Same username, new device keys → append to the existing grant (§6.5).
+      this.logger.info(
+        `User ${userId.username} already registered; appending new device key pair`,
+      );
+      const trimmedLabel = typeof label === "string" ? label.trim() : "";
+      const newPair: GrantKeyPair = {
+        signingPublicKey: userId.userSigningPublicKey,
+        encryptionPublicKey: userId.userEncryptionPublicKey,
+      };
+      if (trimmedLabel.length > 0) newPair.label = trimmedLabel;
+      await this.addUserKeys(
+        userId.username,
+        [newPair],
+        administrationPrivateKey,
+        administrationPrivateKeyPassword,
+      );
+      return;
     }
 
     // Cast to BaseMindooTenant to access protected methods

@@ -465,4 +465,56 @@ describe("Join Flow (convenience API)", () => {
       expect(decoded.payload.adminUsername).toBe("cn=admin/o=test");
     }, 30000);
   });
+
+  describe("second device for existing username", () => {
+    it("should append a new device key pair when approving a join request for an already-registered username", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+
+      const result = await localFactory.createTenant({
+        tenantId: "test-second-device",
+        adminName: "cn=admin/o=test-second-device",
+        adminPassword,
+        userName: "cn=alice/o=test-second-device",
+        userPassword: user1Password,
+      });
+
+      // First device joins as bob
+      const device1 = await localFactory.createUserId("cn=bob/o=test-second-device", user2Password);
+      const joinRequest1 = localFactory.createJoinRequest(device1, { label: "desktop" });
+      const joinResponse1 = await result.tenant.approveJoinRequest(joinRequest1, {
+        adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+        sharePassword,
+      });
+      await localFactory.joinTenant(joinResponse1, {
+        user: device1,
+        password: user2Password,
+        sharePassword,
+      });
+
+      // Second device with the same username, different keys
+      const device2 = await localFactory.createUserId("cn=bob/o=test-second-device", "device2-pass");
+      const joinRequest2 = localFactory.createJoinRequest(device2, { label: "ipad" });
+      const joinResponse2 = await result.tenant.approveJoinRequest(joinRequest2, {
+        adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+        sharePassword,
+      });
+      await localFactory.joinTenant(joinResponse2, {
+        user: device2,
+        password: "device2-pass",
+        sharePassword,
+      });
+
+      const directory = await result.tenant.openDirectory();
+      const keyPairs = await directory.getUserKeyPairs!("cn=bob/o=test-second-device");
+      expect(keyPairs).toHaveLength(2);
+      const signingKeys = keyPairs.map((p) => p.signingPublicKey).sort();
+      expect(signingKeys).toEqual(
+        [device1.userSigningKeyPair.publicKey, device2.userSigningKeyPair.publicKey].sort(),
+      );
+      expect(keyPairs.map((p) => p.label).sort()).toEqual(["desktop", "ipad"]);
+    }, 120000);
+  });
 });

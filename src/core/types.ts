@@ -2421,14 +2421,20 @@ export interface GrantKeyPairInfo extends GrantKeyPair {
 export interface MindooTenantDirectory {
 
   /**
-   * Adds a new user to the tenant. The user is identified by its user ID.
-   * The registration operation is signed with the administration key (signing only, not encryption).
+   * Adds a new user to the tenant, or appends a device key pair when the same
+   * username is already registered (§6.5 multi-device). The registration
+   * operation is signed with the administration key (signing only, not encryption).
+   *
+   * If an active grant already includes these exact keys, this is a no-op.
+   * If an active grant exists for the username with different keys, the new
+   * signing+encryption pair (and optional `label`) is merged into that grant
+   * via {@link addUserKeys} — the join-request / second-device path.
    * 
    * @param userId The user ID to register
    * @param administrationPrivateKey The administration private key to sign the registration operation with (signing only)
    * @param administrationPrivateKeyPassword The password to decrypt the administration private key
-   * @param userDetails The user details to register
-   * @param label The label to register the user with
+   * @param userDetails The user details to register (ignored when appending a device to an existing grant)
+   * @param label Optional device label for this key pair (§6.5)
    * @return A promise that resolves when the user is registered
    */
   registerUser(userId: PublicUserId, administrationPrivateKey: EncryptedPrivateKey,

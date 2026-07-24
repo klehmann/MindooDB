@@ -245,7 +245,7 @@ describe("$publicinfos Key System", () => {
       expect(hashes[0]).toBe(firstHash);
     }, 60000);
     
-    it("should reject registration of same username (case-insensitive) with different keys", async () => {
+    it("should append a second device when registering same username with different keys", async () => {
       const currentUser = await factory.createUserId("CN=client/O=testtenant", "clientpass");
       const keyBag = new KeyBag(currentUser.userEncryptionKeyPair.privateKey, "clientpass", new NodeCryptoAdapter());
       await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
@@ -254,21 +254,34 @@ describe("$publicinfos Key System", () => {
       
       const directory = await tenant.openDirectory();
       
-      // Register first user
+      // Register first device
       const lowerUser = await factory.createUserId("CN=testuser/O=testtenant", "pass1");
       await directory.registerUser(
         factory.toPublicUserId(lowerUser),
         adminUser.userSigningKeyPair.privateKey,
-        adminUserPassword
+        adminUserPassword,
+        undefined,
+        "desktop",
       );
       
-      // Try to register different user with same username (different case) - should throw
+      // Register second device with same username (different case) and different keys
       const upperUser = await factory.createUserId("CN=TESTUSER/O=TESTTENANT", "pass2");
-      await expect(directory.registerUser(
+      await directory.registerUser(
         factory.toPublicUserId(upperUser),
         adminUser.userSigningKeyPair.privateKey,
-        adminUserPassword
-      )).rejects.toThrow("same username (case-insensitive)");
+        adminUserPassword,
+        undefined,
+        "ipad",
+      );
+
+      const keyPairs = await directory.getUserKeyPairs!("CN=testuser/O=testtenant");
+      expect(keyPairs).toHaveLength(2);
+      const signingKeys = keyPairs.map((p) => p.signingPublicKey).sort();
+      expect(signingKeys).toEqual(
+        [lowerUser.userSigningKeyPair.publicKey, upperUser.userSigningKeyPair.publicKey].sort(),
+      );
+      const labels = keyPairs.map((p) => p.label).sort();
+      expect(labels).toEqual(["desktop", "ipad"]);
     }, 60000);
     
     it("should skip re-registration of same user with same keys", async () => {
