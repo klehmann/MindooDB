@@ -864,10 +864,22 @@ export class BaseMindooTenant implements MindooTenant {
     }
 
     const directory = await this.openDirectory();
-    const registeredUser = await directory.getUserPublicKeys(currentUser.username);
-    const hasMatchingGrant =
-      registeredUser?.signingPublicKey === currentUser.userSigningPublicKey &&
-      registeredUser?.encryptionPublicKey === currentUser.userEncryptionPublicKey;
+    // Multi-device grants (§6.5) list several signing/encryption pairs. Matching
+    // only the primary pair from getUserPublicKeys() rejects every later device.
+    let hasMatchingGrant = false;
+    if (typeof directory.getUserKeyPairs === "function") {
+      const pairs = await directory.getUserKeyPairs(currentUser.username);
+      hasMatchingGrant = pairs.some(
+        (pair) =>
+          pair.signingPublicKey === currentUser.userSigningPublicKey &&
+          pair.encryptionPublicKey === currentUser.userEncryptionPublicKey,
+      );
+    } else {
+      const registeredUser = await directory.getUserPublicKeys(currentUser.username);
+      hasMatchingGrant =
+        registeredUser?.signingPublicKey === currentUser.userSigningPublicKey &&
+        registeredUser?.encryptionPublicKey === currentUser.userEncryptionPublicKey;
+    }
 
     if (!hasMatchingGrant) {
       this.logger.warn(

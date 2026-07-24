@@ -501,7 +501,7 @@ describe("Join Flow (convenience API)", () => {
         adminPassword,
         sharePassword,
       });
-      await localFactory.joinTenant(joinResponse2, {
+      const { tenant: device2Tenant } = await localFactory.joinTenant(joinResponse2, {
         user: device2,
         password: "device2-pass",
         sharePassword,
@@ -515,6 +515,15 @@ describe("Join Flow (convenience API)", () => {
         [device1.userSigningKeyPair.publicKey, device2.userSigningKeyPair.publicKey].sort(),
       );
       expect(keyPairs.map((p) => p.label).sort()).toEqual(["desktop", "ipad"]);
+
+      // Pull directory onto device2 (join alone does not copy grant docs).
+      const adminDirDB = await result.tenant.openDB("directory");
+      const device2DirDB = await device2Tenant.openDB("directory");
+      await device2DirDB.pullChangesFrom(adminDirDB.getStore());
+      await device2DirDB.syncStoreChanges();
+
+      // Second device must be able to open a non-directory DB (not only keys[0]).
+      await expect(device2Tenant.openDB("shared-db")).resolves.toBeDefined();
     }, 120000);
   });
 });
