@@ -4,6 +4,16 @@ import { CryptoAdapter } from "../crypto/CryptoAdapter";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations, resolveStoredIterations } from "../crypto/pbkdf2Iterations";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../logging";
 
+/** Constant-time-ish length-checked byte equality for key-material dedupe. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i]! ^ b[i]!;
+  }
+  return diff === 0;
+}
+
 /**
  * Internal structure for storing a key with optional creation timestamp.
  */
@@ -442,6 +452,9 @@ export class KeyBag {
   /**
    * Sets a key in the key bag.
    * Adds the key to the array of keys for this keyId (supports key rotation).
+   * Identical key bytes already stored under this id are ignored (no-op), so
+   * re-importing the same material (e.g. retrying a join) does not create
+   * duplicate versions.
    * 
    * @param keyId The ID of the key
    * @param key The key bytes
@@ -451,6 +464,9 @@ export class KeyBag {
   async set(type: KeyType, tenantId: string, id: string, key: Uint8Array, createdAt?: number): Promise<void> {
     const scopedKeyId = buildScopedKeyId(type, tenantId, id);
     const keyEntries = this.keys.get(scopedKeyId) || [];
+    if (keyEntries.some((entry) => bytesEqual(entry.key, key))) {
+      return;
+    }
     keyEntries.push({ key, createdAt });
     this.keys.set(scopedKeyId, keyEntries);
     this.recordKeyChange(type, tenantId, id, "add", keyEntries.length);
@@ -475,6 +491,9 @@ export class KeyBag {
   /**
    * Decrypts an encrypted private key with the given password and imports it into the key bag.
    * Adds the key to the array of keys for this keyId (supports key rotation).
+   * If the decrypted bytes already exist under this id, this is a no-op — important
+   * for join retries that mutate a shared KeyBag in place without rolling back on
+   * a later bootstrap failure.
    * 
    * @param type The key type ("doc")
    * @param id The document key identifier
@@ -492,11 +511,14 @@ export class KeyBag {
   ): Promise<void> {
     const salt = buildKeyDerivationSalt(type, tenantId, id);
     const scopedKeyId = buildScopedKeyId(type, tenantId, id);
-    const decryptedKeyBytes = await this.decryptPrivateKey(key, password, salt);
+    const decryptedKeyBytes = new Uint8Array(await this.decryptPrivateKey(key, password, salt));
     const keyEntries = this.keys.get(scopedKeyId) || [];
-    keyEntries.push({ 
-      key: new Uint8Array(decryptedKeyBytes),
-      createdAt: key.createdAt 
+    if (keyEntries.some((entry) => bytesEqual(entry.key, decryptedKeyBytes))) {
+      return;
+    }
+    keyEntries.push({
+      key: decryptedKeyBytes,
+      createdAt: key.createdAt,
     });
     this.keys.set(scopedKeyId, keyEntries);
     this.recordKeyChange(type, tenantId, id, "add", keyEntries.length);
@@ -831,6 +853,10 @@ export class KeyBag {
    * Load the key bag from a binary data blob, decrypted with the wrapping key
    * (either the {@link CryptoKey} provided to the constructor or one derived
    * on demand from the legacy password).
+   *
+   * Identical key-material versions under the same scoped id are collapsed
+   * (keeping the newest `createdAt`), so bags bloated by repeated join imports
+   * self-heal on the next unlock/load.
    * 
    * @param encryptedData The encrypted binary data to load (Uint8Array)
    * @return A promise that resolves when the keys are loaded
@@ -870,6 +896,7 @@ export class KeyBag {
     const mapArray: Array<[string, Array<{key: string, createdAt?: number}>]> = JSON.parse(jsonString);
 
     const loadedKeys = new Map<string, KeyEntry[]>();
+    let collapsedDuplicates = 0;
     for (const [scopedKeyId, keyEntries] of mapArray) {
       const normalizedScopedKeyId = this.normalizeLoadedScopedKeyId(scopedKeyId);
       const normalizedEntries = keyEntries.map(entry => ({
@@ -877,10 +904,18 @@ export class KeyBag {
         createdAt: entry.createdAt
       }));
       const existingEntries = loadedKeys.get(normalizedScopedKeyId) || [];
-      loadedKeys.set(normalizedScopedKeyId, existingEntries.concat(normalizedEntries));
+      const merged = existingEntries.concat(normalizedEntries);
+      const deduped = this.dedupeKeyEntries(merged);
+      collapsedDuplicates += merged.length - deduped.length;
+      loadedKeys.set(normalizedScopedKeyId, deduped);
     }
     this.keys = loadedKeys;
 
+    if (collapsedDuplicates > 0) {
+      this.logger.info(
+        `Collapsed ${collapsedDuplicates} duplicate key version(s) while loading key bag`
+      );
+    }
     this.logger.debug(`Loaded key bag (${encryptedData.length} -> ${this.keys.size} keys)`);
   }
 
@@ -1051,6 +1086,27 @@ export class KeyBag {
       const bTime = b.createdAt ?? 0;
       return bTime - aTime;
     });
+  }
+
+  /**
+   * Collapse identical key-material versions under one id.
+   * When duplicates differ only by `createdAt`, keep the newest timestamp.
+   */
+  private dedupeKeyEntries(entries: KeyEntry[]): KeyEntry[] {
+    const unique: KeyEntry[] = [];
+    for (const entry of entries) {
+      const existing = unique.find((candidate) => bytesEqual(candidate.key, entry.key));
+      if (!existing) {
+        unique.push({ key: entry.key, createdAt: entry.createdAt });
+        continue;
+      }
+      const existingTime = existing.createdAt ?? 0;
+      const entryTime = entry.createdAt ?? 0;
+      if (entryTime > existingTime) {
+        existing.createdAt = entry.createdAt;
+      }
+    }
+    return unique;
   }
 
   private normalizeLoadedScopedKeyId(scopedKeyId: string): string {

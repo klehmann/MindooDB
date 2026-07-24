@@ -358,12 +358,23 @@ describe("KeyBag", () => {
       await keyBag.decryptAndImportKey("doc", docTenantId, keyId, encrypted1!, exportPassword);
       await keyBag.decryptAndImportKey("doc", docTenantId, keyId, encrypted2!, exportPassword);
       
+      // Identical key material is deduped — two ciphertext wrappers of the same
+      // bytes must not create two versions.
       const allKeys = await keyBag.getAllKeys("doc", docTenantId, keyId);
-      const key1 = allKeys[0];
-      const key2 = allKeys[1];
-      
-      expect(key1).toEqual(key2);
-      expect(key1).toEqual(keyBytes);
+      expect(allKeys).toHaveLength(1);
+      expect(allKeys[0]).toEqual(keyBytes);
+    });
+
+    it("skips re-importing identical key bytes (join-retry safe)", async () => {
+      const keyId = "dedupe-import";
+      const keyPassword = "keypassword123";
+      const encryptedKey = await createEncryptedDocKey(keyId, keyPassword);
+
+      await keyBag.decryptAndImportKey("doc", docTenantId, keyId, encryptedKey, keyPassword);
+      await keyBag.decryptAndImportKey("doc", docTenantId, keyId, encryptedKey, keyPassword);
+      await keyBag.decryptAndImportKey("doc", docTenantId, keyId, encryptedKey, keyPassword);
+
+      expect(await keyBag.getAllKeys("doc", docTenantId, keyId)).toHaveLength(1);
     });
   });
 
@@ -552,6 +563,40 @@ describe("KeyBag", () => {
       expect(allKeys[2]).toEqual(key1); // oldest
     });
 
+    it("should collapse duplicate key material versions on load", async () => {
+      const keyId = "join-dupes";
+      const sharedBytes = new Uint8Array([9, 9, 9, 9]);
+      const rotatedBytes = new Uint8Array([1, 2, 3, 4]);
+
+      // Bypass set()-time dedupe to simulate a bag already bloated by join retries.
+      (keyBag as unknown as {
+        keys: Map<string, Array<{ key: Uint8Array; createdAt?: number }>>;
+      }).keys = new Map([
+        [
+          `doc:${docTenantId}:${keyId}`,
+          [
+            { key: sharedBytes, createdAt: 1000 },
+            { key: new Uint8Array(sharedBytes), createdAt: 2000 },
+            { key: new Uint8Array(sharedBytes), createdAt: 1500 },
+            { key: rotatedBytes, createdAt: 3000 },
+          ],
+        ],
+      ]);
+
+      const saved = await keyBag.save();
+      const loadedKeyBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter()
+      );
+      await loadedKeyBag.load(saved);
+
+      const versions = await loadedKeyBag.getAllKeyVersions("doc", docTenantId, keyId);
+      expect(versions).toHaveLength(2);
+      expect(versions[0]).toEqual({ key: rotatedBytes, createdAt: 3000 });
+      expect(versions[1]).toEqual({ key: sharedBytes, createdAt: 2000 });
+    });
+
     it("should throw error when loading data that is too short", async () => {
       const invalidData = new Uint8Array(10); // Too short (needs at least 28 bytes)
 
@@ -673,23 +718,22 @@ describe("KeyBag", () => {
       encryptedKey1.createdAt = 1000;
       await keyBag.decryptAndImportKey("doc", docTenantId, keyId, encryptedKey1, keyPassword);
 
-      // Rotate: export and re-import with new timestamp
+      // Re-exporting and re-importing the same bytes is a no-op (dedupe).
       const exported = await keyBag.encryptAndExportKey("doc", docTenantId, keyId, keyPassword);
       exported!.createdAt = 2000;
       await keyBag.decryptAndImportKey("doc", docTenantId, keyId, exported!, keyPassword);
+      expect(await keyBag.getAllKeys("doc", docTenantId, keyId)).toHaveLength(1);
 
-      // Add another version directly
-      const encryptedKey2 = await createEncryptedDocKey(keyId, keyPassword);
-      encryptedKey2.createdAt = 3000;
-      await keyBag.decryptAndImportKey("doc", docTenantId, keyId, encryptedKey2, keyPassword);
+      // Add another version with different key material
+      const rotatedBytes = new Uint8Array(32).map((_, i) => i + 1);
+      await keyBag.set("doc", docTenantId, keyId, rotatedBytes, 3000);
 
-      // Should have 3 versions, newest first
       const allKeys = await keyBag.getAllKeys("doc", docTenantId, keyId);
-      expect(allKeys).toHaveLength(3);
+      expect(allKeys).toHaveLength(2);
+      expect(allKeys[0]).toEqual(rotatedBytes);
 
-      // get() should return newest
       const newest = await keyBag.get("doc", docTenantId, keyId);
-      expect(newest).toBeDefined();
+      expect(newest).toEqual(rotatedBytes);
     });
 
     it("should handle save/load with encrypted keys", async () => {

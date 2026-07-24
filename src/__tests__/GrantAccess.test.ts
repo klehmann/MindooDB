@@ -166,6 +166,40 @@ describe("granting tenant access", () => {
     expect(userLookup!.identityHashesV).toBe(1);
   });
 
+  it("resolves each device signing key to its own paired encryption key", async () => {
+    const directory = await tenant.openDirectory();
+    const publicRegularUser = factory.toPublicUserId(regularUser);
+
+    await directory.registerUser(
+      publicRegularUser,
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+    );
+
+    const device2Sign = "DEVICE_2_SIGNING_KEY";
+    const device2Enc = "DEVICE_2_ENCRYPTION_KEY";
+    await directory.addUserKeys!(
+      regularUser.username,
+      [{ signingPublicKey: device2Sign, encryptionPublicKey: device2Enc }],
+      adminUser.userSigningKeyPair.privateKey,
+      adminUserPassword,
+    );
+
+    const primary = await directory.getUserBySigningPublicKey(regularUser.userSigningKeyPair.publicKey);
+    const secondary = await directory.getUserBySigningPublicKey(device2Sign);
+
+    expect(primary).toMatchObject({
+      signingPublicKey: regularUser.userSigningKeyPair.publicKey,
+      encryptionPublicKey: regularUser.userEncryptionKeyPair.publicKey,
+    });
+    expect(secondary).toMatchObject({
+      signingPublicKey: device2Sign,
+      encryptionPublicKey: device2Enc,
+    });
+    // Regression: transport wrap must not reuse the first device's encryption key.
+    expect(secondary!.encryptionPublicKey).not.toBe(primary!.encryptionPublicKey);
+  });
+
   it("should gracefully handle legacy grant documents without tenant-readable user details", async () => {
     const directory = await tenant.openDirectory();
     const directoryDB = await tenant.openDB("directory");

@@ -656,13 +656,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
               this.grantDocIdToSigningKeys.set(doc.getId(), grantedSigningKeys);
 
               if (grantedSigningKeys.length > 0) {
-                const userLookup = await this.buildUserLookup(data);
-                if (userLookup) {
-                  // Keep identity labels available even after the keys are later
-                  // revoked, so historical UIs can still resolve old authors.
-                  for (const userPublicKey of grantedSigningKeys) {
-                    this.userLookupCache.set(userPublicKey, userLookup);
-                  }
+                // One cache entry per device key pair (§6.5). Reusing a single
+                // lookup built from keys[0] for every signing key would make the
+                // server wrap transport for the first device's encryption key
+                // even when a later device authenticated — join works, pull
+                // then fails with a WebCrypto OperationError on the iPad.
+                const lookups = await this.buildUserLookups(data);
+                for (const lookup of lookups) {
+                  this.userLookupCache.set(lookup.signingPublicKey, lookup);
                 }
               }
             }
@@ -4111,13 +4112,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
   }
 
-  private async buildUserLookup(data: Record<string, unknown>): Promise<DirectoryUserLookup | null> {
-    // Prefer the array key form (key rollover / multiple devices) and fall back
-    // to the legacy scalar fields (§6.5).
-    const signingPublicKey = extractSigningPublicKeys(data)[0] ?? null;
-    const encryptionPublicKey = extractEncryptionPublicKeys(data)[0] ?? null;
-    if (!signingPublicKey || !encryptionPublicKey) {
-      return null;
+  private async buildUserLookups(data: Record<string, unknown>): Promise<DirectoryUserLookup[]> {
+    // One lookup per active device key pair so transport wrap / auth always
+    // use the encryption key that belongs to the authenticating signing key
+    // (§6.5 multi-device). extractActiveKeyPairs already falls back through
+    // the legacy array/scalar forms.
+    const pairs = extractActiveKeyPairs(data);
+    if (pairs.length === 0) {
+      return [];
     }
 
     const encryptedDetails = typeof data.user_details_encrypted === "string" ? data.user_details_encrypted : null;
@@ -4139,14 +4141,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       ? data.identity_hashes_v
       : 0;
 
-    return {
+    return pairs.map((pair) => ({
       username,
-      signingPublicKey,
-      encryptionPublicKey,
+      signingPublicKey: pair.signingPublicKey,
+      encryptionPublicKey: pair.encryptionPublicKey,
       details,
       identityHashes,
       identityHashesV,
-    };
+    }));
   }
 
   private async encryptGroupMemberForTenant(plaintext: string): Promise<string> {
