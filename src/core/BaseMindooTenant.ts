@@ -1370,13 +1370,26 @@ export class BaseMindooTenant implements MindooTenant {
       request = joinRequest;
     }
 
-    console.log(`[approveJoinRequest] Approving join request for user "${request.username}"`);
-    this.logger.info(`Approving join request for user: ${request.username}`);
+    // The admin's choice wins over the name the requester suggested: only this
+    // device can see the directory, and registering under an existing name is
+    // what makes the request a second device rather than a second person
+    // (docs/accesscontrol.md §6.5). A v2 request may carry no name at all.
+    const requestedUsername = typeof request.username === "string" ? request.username.trim() : "";
+    const overrideUsername = typeof options.username === "string" ? options.username.trim() : "";
+    const username = overrideUsername || requestedUsername;
+    if (!username) {
+      throw new Error(
+        "Cannot approve join request: it carries no username and none was supplied via options.username",
+      );
+    }
+
+    console.log(`[approveJoinRequest] Approving join request for user "${username}"`);
+    this.logger.info(`Approving join request for user: ${username}`);
 
     // 1. Register the user in the directory
     const directory = await this.openDirectory();
     const publicUserId: PublicUserId = {
-      username: request.username,
+      username,
       userSigningPublicKey: request.signingPublicKey,
       userEncryptionPublicKey: request.encryptionPublicKey,
     };
@@ -1403,12 +1416,15 @@ export class BaseMindooTenant implements MindooTenant {
       )
     );
 
-    // 3. Build the join response
+    // 3. Build the join response. It echoes the registered username so the
+    //    joining device can adopt it instead of keeping a name the directory
+    //    does not hold.
     const joinResponse: JoinResponse = {
       v: 2,
       tenantId: this.tenantId,
       adminSigningPublicKey: this.administrationPublicKey,
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
+      username,
       encryptedDocKeys,
     };
 
@@ -1419,8 +1435,8 @@ export class BaseMindooTenant implements MindooTenant {
       joinResponse.adminUsername = options.adminUsername;
     }
 
-    console.log(`[approveJoinRequest] ✓ Join request approved for user "${request.username}"`);
-    this.logger.info(`Join request approved for user: ${request.username}`);
+    console.log(`[approveJoinRequest] ✓ Join request approved for user "${username}"`);
+    this.logger.info(`Join request approved for user: ${username}`);
 
     // Return as URI string or object depending on format option
     if (options.format === "uri") {

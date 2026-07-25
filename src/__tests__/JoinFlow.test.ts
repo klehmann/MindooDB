@@ -526,4 +526,116 @@ describe("Join Flow (convenience API)", () => {
       await expect(device2Tenant.openDB("shared-db")).resolves.toBeDefined();
     }, 120000);
   });
+
+  describe("admin-supplied username", () => {
+    const localTenantId = "test-admin-supplied-username";
+    const bobName = `cn=bob/o=${localTenantId}`;
+    let localFactory: BaseMindooTenantFactory;
+    let adminResult: CreateTenantResult;
+
+    /** Approve `request` as the tenant admin, optionally renaming the joiner. */
+    function approve(request: JoinRequest, username?: string) {
+      return adminResult.tenant.approveJoinRequest(request, {
+        adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+        sharePassword,
+        ...(username ? { username } : {}),
+      });
+    }
+
+    beforeAll(async () => {
+      localFactory = new BaseMindooTenantFactory(
+        new InMemoryContentAddressedStoreFactory(),
+        new NodeCryptoAdapter(),
+      );
+      adminResult = await localFactory.createTenant({
+        tenantId: localTenantId,
+        adminName: `cn=admin/o=${localTenantId}`,
+        adminPassword,
+        userName: `cn=alice/o=${localTenantId}`,
+        userPassword: user1Password,
+      });
+    }, 120000);
+
+    it("should emit a nameless v2 request for an identity without a username", async () => {
+      const device = await localFactory.createUserId("", "device-pass");
+      const request = localFactory.createJoinRequest(device);
+
+      expect(request.v).toBe(2);
+      expect(request.username).toBeUndefined();
+      expect(request.signingPublicKey).toBe(device.userSigningKeyPair.publicKey);
+    }, 60000);
+
+    it("should still emit a v1 request when the identity has a username", async () => {
+      const device = await localFactory.createUserId(bobName, "device-pass");
+      const request = localFactory.createJoinRequest(device);
+
+      expect(request.v).toBe(1);
+      expect(request.username).toBe(bobName);
+    }, 60000);
+
+    it("should refuse to approve a nameless request without an override", async () => {
+      const device = await localFactory.createUserId("", "device-pass");
+      const request = localFactory.createJoinRequest(device);
+
+      await expect(approve(request)).rejects.toThrow(/carries no username/);
+    }, 60000);
+
+    it("should register a nameless request under the supplied name and echo it back", async () => {
+      const device = await localFactory.createUserId("", "device-pass");
+      const request = localFactory.createJoinRequest(device);
+      const response = await approve(request, bobName);
+
+      expect(response.username).toBe(bobName);
+
+      const joinResult = await localFactory.joinTenant(response, {
+        user: device,
+        password: "device-pass",
+        sharePassword,
+      });
+
+      // The joining device adopts the registered name, keeping its own keys.
+      expect(joinResult.user.username).toBe(bobName);
+      expect(joinResult.user.userSigningKeyPair.publicKey).toBe(device.userSigningKeyPair.publicKey);
+
+      const directory = await adminResult.tenant.openDirectory();
+      const keys = await directory.getUserPublicKeys(bobName);
+      expect(keys?.signingPublicKey).toBe(device.userSigningKeyPair.publicKey);
+    }, 120000);
+
+    it("should turn a mistyped request into a second device when the admin corrects the name", async () => {
+      // bob is already registered by the previous test; this device asks to be
+      // registered under a typo, which without the override would silently
+      // create a second person instead of a second device.
+      const device = await localFactory.createUserId(`cn=bobb/o=${localTenantId}`, "typo-pass");
+      const request = localFactory.createJoinRequest(device);
+      expect(request.username).toBe(`cn=bobb/o=${localTenantId}`);
+
+      const response = await approve(request, bobName);
+      expect(response.username).toBe(bobName);
+
+      const directory = await adminResult.tenant.openDirectory();
+      expect(await directory.getUserPublicKeys(`cn=bobb/o=${localTenantId}`)).toBeNull();
+
+      const keyPairs = await directory.getUserKeyPairs!(bobName);
+      expect(keyPairs).toHaveLength(2);
+      expect(keyPairs.map((pair) => pair.signingPublicKey)).toContain(
+        device.userSigningKeyPair.publicKey,
+      );
+
+      const { tenant: deviceTenant, user } = await localFactory.joinTenant(response, {
+        user: device,
+        password: "typo-pass",
+        sharePassword,
+      });
+      expect(user.username).toBe(bobName);
+
+      const adminDirDB = await adminResult.tenant.openDB("directory");
+      const deviceDirDB = await deviceTenant.openDB("directory");
+      await deviceDirDB.pullChangesFrom(adminDirDB.getStore());
+      await deviceDirDB.syncStoreChanges();
+
+      await expect(deviceTenant.openDB("shared-db")).resolves.toBeDefined();
+    }, 120000);
+  });
 });

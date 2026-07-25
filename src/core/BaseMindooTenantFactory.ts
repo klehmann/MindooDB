@@ -489,12 +489,22 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri"; label?: string }): JoinRequest | string {
     const publicUser = this.toPublicUserId(user);
 
-    const joinRequest: JoinRequest = {
-      v: 1,
-      username: publicUser.username,
-      signingPublicKey: publicUser.userSigningPublicKey,
-      encryptionPublicKey: publicUser.userEncryptionPublicKey,
-    };
+    // An identity without a username produces a nameless v2 request: the
+    // approving admin names it from the tenant directory, which is the only
+    // device that knows the authoritative spelling (§6.5).
+    const username = typeof publicUser.username === "string" ? publicUser.username.trim() : "";
+    const joinRequest: JoinRequest = username.length > 0
+      ? {
+          v: 1,
+          username,
+          signingPublicKey: publicUser.userSigningPublicKey,
+          encryptionPublicKey: publicUser.userEncryptionPublicKey,
+        }
+      : {
+          v: 2,
+          signingPublicKey: publicUser.userSigningPublicKey,
+          encryptionPublicKey: publicUser.userEncryptionPublicKey,
+        };
 
     // Optional device label the joining user suggests for this key pair (§6.5).
     // The approving admin may override it via ApproveJoinRequestOptions.label.
@@ -572,12 +582,30 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       }
     }
 
-    // 3. Open the tenant
+    // 3. Adopt the username the admin registered. It may differ from the one
+    //    this device asked for (corrected spelling, or supplied for a nameless
+    //    request), and the tenant has to be opened under the name the
+    //    directory actually holds or every access check would miss.
+    const registeredUsername =
+      typeof response.username === "string" ? response.username.trim() : "";
+    const effectiveUser: PrivateUserId =
+      registeredUsername.length > 0 && registeredUsername !== options.user.username
+        ? { ...options.user, username: registeredUsername }
+        : options.user;
+
+    if (effectiveUser !== options.user) {
+      console.log(
+        `[joinTenant] Adopting registered username "${registeredUsername}" (requested "${options.user.username}")`,
+      );
+      this.logger.info(`Adopting registered username: ${registeredUsername}`);
+    }
+
+    // 4. Open the tenant
     const tenant = await this.openTenant(
       response.tenantId,
       response.adminSigningPublicKey,
       response.adminEncryptionPublicKey,
-      options.user,
+      effectiveUser,
       options.password,
       keyBag,
       options.preDecryptedUserKeys ? { preDecryptedUserKeys: options.preDecryptedUserKeys } : undefined,
@@ -586,7 +614,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     console.log(`[joinTenant] ✓ Joined tenant "${response.tenantId}" successfully`);
     this.logger.info(`Joined tenant "${response.tenantId}" successfully`);
 
-    return { tenant, keyBag };
+    return { tenant, keyBag, user: effectiveUser };
   }
 
   /**

@@ -288,10 +288,25 @@ export interface CreateTenantResult {
  * Can be serialized to a mdb://join-request/... URI for out-of-band exchange.
  */
 export interface JoinRequest {
-  /** Protocol version (always 1 for now) */
-  v: 1;
-  /** The username the user wants to be registered as (e.g. "cn=user2/o=acme") */
-  username: string;
+  /**
+   * Protocol version. A `v: 1` request always carries {@link username}; a
+   * `v: 2` request may omit it and leave the name to the approving admin.
+   * Emitting `2` only for nameless requests keeps older readers from silently
+   * registering an undefined username — they reject the unknown version
+   * instead.
+   */
+  v: 1 | 2;
+  /**
+   * The username the user wants to be registered as (e.g. "cn=user2/o=acme").
+   *
+   * Optional from v2 on. Omitting it is the recommended path when enrolling an
+   * additional device for someone who is already in the directory: the exact
+   * spelling only exists on the admin's device, and a mistyped name here would
+   * silently register a second person rather than a second device (§6.5). The
+   * approving admin then supplies the name via
+   * {@link ApproveJoinRequestOptions.username}.
+   */
+  username?: string;
   /** Ed25519 public signing key (PEM format) */
   signingPublicKey: string;
   /** RSA-OAEP public encryption key (PEM format) */
@@ -335,6 +350,16 @@ export interface ApproveJoinRequestOptions {
    * §6.5). Useful for recording a date or a note about the device type.
    */
   label?: string;
+  /**
+   * Username to register the joining device under, overriding whatever the
+   * request suggested. Required when the request omits a username.
+   *
+   * Passing the exact spelling of an existing directory entry is what turns a
+   * join request into an additional device for that user instead of a new
+   * person, so admin UIs should offer a pick-from-directory choice here rather
+   * than trusting the requester's spelling (§6.5).
+   */
+  username?: string;
   /** If "uri", approveJoinRequest returns a mdb://join-response/... URI string instead of an object */
   format?: "object" | "uri";
 }
@@ -373,6 +398,15 @@ export interface JoinResponse {
   serverUrl?: string;
   /** Optional admin username for display purposes */
   adminUsername?: string;
+  /**
+   * The username the joining device was actually registered as.
+   *
+   * The joining device adopts this so its local identity matches the directory
+   * even when the admin corrected the requested name or supplied one for a
+   * nameless request. Absent in responses from older admins, in which case the
+   * requester keeps the name it chose itself.
+   */
+  username?: string;
   /** Selected tenant document keys, encrypted with the sharePassword. */
   encryptedDocKeys: JoinResponseEncryptedDocKey[];
 }
@@ -433,6 +467,12 @@ export interface JoinTenantResult {
   tenant: MindooTenant;
   /** The KeyBag containing the imported tenant and $publicinfos keys */
   keyBag: KeyBag;
+  /**
+   * The identity the tenant was opened with. Identical to the supplied user
+   * unless the join response carried a different username, in which case this
+   * is the renamed copy (same keys) that the caller should persist locally.
+   */
+  user: PrivateUserId;
 }
 
 /**
