@@ -19,6 +19,7 @@ import type {
   ServerConfig,
   ServerRateLimitsConfig,
   SystemAdminPrincipal,
+  TimestampRateLimitConfig,
 } from "./types";
 
 export interface ConfigBackupInfo {
@@ -161,6 +162,7 @@ function validateRateLimits(
   const obj = raw as Record<string, unknown>;
   const auth = validateRateLimitConfig(obj.auth, "auth", filePath);
   const sync = validateRateLimitConfig(obj.sync, "sync", filePath);
+  const timestamps = validateTimestampRateLimitConfig(obj.timestamps, filePath);
 
   const rateLimits: ServerRateLimitsConfig = {};
   if (auth) {
@@ -168,6 +170,9 @@ function validateRateLimits(
   }
   if (sync) {
     rateLimits.sync = sync;
+  }
+  if (timestamps) {
+    rateLimits.timestamps = timestamps;
   }
   return Object.keys(rateLimits).length > 0 ? rateLimits : {};
 }
@@ -203,6 +208,26 @@ function validateRateLimitConfig(
   }
 
   return Object.keys(config).length > 0 ? config : {};
+}
+
+function validateTimestampRateLimitConfig(
+  raw: unknown,
+  filePath: string,
+): TimestampRateLimitConfig | undefined {
+  const base = validateRateLimitConfig(raw, "timestamps", filePath);
+  if (!base) {
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  const config: TimestampRateLimitConfig = { ...base };
+  if (obj.dailyMax !== undefined) {
+    config.dailyMax = validatePositiveInteger(
+      obj.dailyMax,
+      "rateLimits.timestamps.dailyMax",
+      filePath,
+    );
+  }
+  return config;
 }
 
 function validatePositiveInteger(

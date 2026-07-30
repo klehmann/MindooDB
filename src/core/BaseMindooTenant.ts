@@ -30,7 +30,11 @@ import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
-import { verifyEntrySignatureWithImportedKey } from "./crypto/EntrySignature";
+import {
+  importEd25519PublicKeyFromPem,
+  verifyEntrySignatureWithImportedKey,
+} from "./crypto/EntrySignature";
+import { buildDomainStatementBytes } from "./crypto/DomainStatement";
 import { entryTrustedTime } from "./storeEntryTime";
 import { computeContentHash } from "./utils/idGeneration";
 import { semanticNow } from "./utils/timeSource";
@@ -535,6 +539,54 @@ export class BaseMindooTenant implements MindooTenant {
 
     this.logger.debug(`Signed payload (signature: ${signature.byteLength} bytes)`);
     return new Uint8Array(signature);
+  }
+
+  /**
+   * Sign an application-supplied statement under a fixed, allowlisted domain.
+   *
+   * This is the only path by which an app may have the user's identity key sign
+   * bytes it chose. The domain prefix (see `crypto/DomainStatement.ts`) keeps
+   * those bytes out of the store-entry and auth-challenge input spaces, so a
+   * signature obtained here can never be replayed as either.
+   *
+   * @param domain     One of {@link SIGNING_DOMAINS}.
+   * @param statement  Canonical statement bytes (JCS-canonical JSON for seals).
+   * @returns The Ed25519 signature over `utf8(domain) || 0x00 || statement`.
+   */
+  async signDomainStatement(domain: string, statement: Uint8Array): Promise<Uint8Array> {
+    const bytes = buildDomainStatementBytes(domain, statement);
+    this.logger.debug(`Signing ${statement.byteLength}-byte statement under domain "${domain}"`);
+    return this.signPayload(bytes);
+  }
+
+  /**
+   * Verify a domain-separated statement signature against a specific public key.
+   *
+   * Unlike {@link verifySignature} this does not consult the directory: the
+   * caller is checking a claim about a named key (possibly a former member's,
+   * or one from another tenant in an evidence bundle), and whether that key is
+   * currently trusted is a separate question with a separate answer.
+   */
+  async verifyDomainStatement(
+    domain: string,
+    statement: Uint8Array,
+    signature: Uint8Array,
+    publicKeyPem: string,
+  ): Promise<boolean> {
+    const bytes = buildDomainStatementBytes(domain, statement);
+    const subtle = this.cryptoAdapter.getSubtle();
+    try {
+      const key = await importEd25519PublicKeyFromPem(publicKeyPem, subtle);
+      return await subtle.verify(
+        { name: "Ed25519" },
+        key,
+        signature.buffer as ArrayBuffer,
+        bytes.buffer as ArrayBuffer,
+      );
+    } catch (error) {
+      this.logger.warn(`Domain statement verification failed: ${String(error)}`);
+      return false;
+    }
   }
 
   async signPayloadWithKey(

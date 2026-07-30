@@ -20,6 +20,7 @@ import type {
   RejectedPutEntry,
   StoreHead,
 } from "../../core/appendonlystores/types";
+import type { EntryProvenance } from "../../core/crypto/EntrySignature";
 import { StoreKind } from "../../core/appendonlystores/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
@@ -1539,6 +1540,9 @@ export class HttpTransport implements NetworkTransport {
       // Signed attachment snapshot (plain JSON, no binary). Must survive the
       // round-trip or metadataSignature verification fails on the receiver.
       attachmentRefs: metadata.attachmentRefs,
+      // Copy provenance (plain JSON, base64 signature inside). Also bound into
+      // metadataSignature, so the same round-trip requirement applies.
+      provenance: metadata.provenance,
       entryVersion: metadata.entryVersion,
     };
   }
@@ -1571,6 +1575,7 @@ export class HttpTransport implements NetworkTransport {
         ? this.base64ToUint8Array(serialized.receivedDateSignature)
         : undefined,
       attachmentRefs: serialized.attachmentRefs,
+      provenance: serialized.provenance,
       entryVersion: serialized.entryVersion,
     };
   }
@@ -1609,6 +1614,8 @@ interface SerializedEntryMetadata {
   receivedDateSignature?: string; // base64
   // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
   attachmentRefs?: StoreEntryAttachmentRef[];
+  // Copy provenance (plain JSON; see StoreEntryMetadata.provenance).
+  provenance?: EntryProvenance;
   // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
   entryVersion?: number;
 }

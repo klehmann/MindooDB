@@ -129,6 +129,18 @@ import {
   entrySignatureFieldsFromEntry,
   verifyEntrySignatureWithImportedKey,
 } from "./crypto/EntrySignature";
+import type { EntryProvenance } from "./crypto/EntrySignature";
+import type { CopyEngineHost } from "./copy/host";
+import { canCopyDocument, copyDocument } from "./copy/copyDocument";
+import { copyDocuments } from "./copy/copyDocuments";
+import type {
+  CopyDocumentOptions,
+  CopyDocumentResult,
+  CopyDocumentSelector,
+  CopyDocumentsOptions,
+  CopyDocumentsResult,
+  CopyFeasibility,
+} from "./copy/types";
 import {
   QuarantineRecord,
   snapshotHeadsMatch,
@@ -2008,7 +2020,7 @@ export class BaseMindooDB implements MindooDB {
       | "contentHash"
       | "createdByPublicKey"
       | "attachmentRefs"
-    >,
+    > & { provenance?: EntryProvenance },
     signing?: { signingKeyPair?: SigningKeyPair; signingKeyPassword?: string },
   ): Promise<Uint8Array> {
     const bytes = buildEntrySigningBytes(entrySignatureFieldsFromEntry(meta));
@@ -13051,6 +13063,214 @@ export class BaseMindooDB implements MindooDB {
         overrideCapableStore.setSyncAuthOverride?.(null);
       }
     };
+  }
+
+  // ==========================================================================
+  // Document copy across databases (src/core/copy/, docs/document-copy.md)
+  // ==========================================================================
+
+  /**
+   * The seam the copy engine reaches this database through.
+   *
+   * The engine lives in `src/core/copy/` rather than as more methods on this
+   * already-large class, and needs a few things that are private here (entry
+   * signing, the attachment-ref snapshot, the attachment crypto envelope). This
+   * hands them over as one narrow object instead of widening their visibility.
+   *
+   * @internal Not part of the supported API; may change without notice.
+   */
+  getCopyEngineHost(): CopyEngineHost {
+    return {
+      db: this,
+      tenant: this.tenant,
+      store: this.store,
+      attachmentStore: this.getEffectiveAttachmentStore(),
+      computeEntryMetadataSignature: (meta, signing) =>
+        this.computeEntryMetadataSignature(meta, signing),
+      collectAttachmentRefs: (doc) => this.collectAttachmentRefs(doc),
+      decryptAttachmentPayload: (payload, keyId) =>
+        this.tenant.decryptAttachmentPayload(payload, keyId),
+      encryptAttachmentPayload: (payload, keyId) =>
+        this.tenant.encryptAttachmentPayload(payload, keyId),
+      syncStoreChanges: () => this.syncStoreChanges(),
+      evaluateWriteAccess: (op, signerKey, isAuthor) =>
+        this.evaluateClientWriteAccess({ op, signerKey, isAuthor }),
+      hasWriteContentRules: async (op) => {
+        const directory = await this.tenant.openDirectory();
+        return (await directory.hasWriteContentRules?.(op, this.store.getId())) ?? false;
+      },
+      remapAttachmentPointers: (docId, lastChunkIdByAttachmentId, signing) =>
+        this.remapAttachmentPointers(docId, lastChunkIdByAttachmentId, signing),
+    };
+  }
+
+  /** Obtain the copy seam from another database, with a clear error if absent. */
+  private resolveCopyHost(db: MindooDB, role: "source" | "target"): CopyEngineHost {
+    const host = (db as Partial<BaseMindooDB>).getCopyEngineHost?.();
+    if (!host) {
+      throw new Error(
+        `The ${role} database does not support document copying (expected a BaseMindooDB instance).`,
+      );
+    }
+    return host;
+  }
+
+  /**
+   * Re-point `_attachments[].lastChunkId` at a different set of chunks, as one
+   * `doc_change`.
+   *
+   * Only used when a document is duplicated inside its own database: the copied
+   * chunks had to be renamed to avoid colliding with the source's (see
+   * `copy/attachments.ts`), so the copy's current revision has to be told where
+   * its own chunks are. `changeDoc` deliberately offers no way to write
+   * `_attachments` directly, hence this internal path.
+   */
+  private async remapAttachmentPointers(
+    docId: string,
+    lastChunkIdByAttachmentId: Map<string, string>,
+    signing?: { signingKeyPair: SigningKeyPair; signingKeyPassword: string },
+  ): Promise<void> {
+    if (lastChunkIdByAttachmentId.size === 0) {
+      return;
+    }
+    const internalDoc = this.getCachedDocument(docId) ?? (await this.loadDocumentInternal(docId));
+    if (!internalDoc) {
+      throw new Error(`Cannot remap attachment pointers: document ${docId} was not found.`);
+    }
+
+    const now = semanticNow();
+    let changed = false;
+    const newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) =>
+      Automerge.change(doc, { time: now }, (mutableDoc: MindooDocPayload) => {
+        const attachments = (mutableDoc._attachments as AttachmentReference[]) ?? [];
+        for (const attachment of attachments) {
+          const nextChunkId = lastChunkIdByAttachmentId.get(attachment.attachmentId);
+          if (nextChunkId && attachment.lastChunkId !== nextChunkId) {
+            attachment.lastChunkId = nextChunkId;
+            changed = true;
+          }
+        }
+        if (changed) {
+          mutableDoc._lastModified = now;
+        }
+      }),
+    );
+    if (!changed) {
+      return;
+    }
+
+    const changeBytes = Automerge.getLastLocalChange(newDoc);
+    if (!changeBytes) {
+      throw new Error("Failed to get change bytes while remapping attachment pointers");
+    }
+    const entry = await this.buildDocChangeStoreEntry({
+      internalDoc,
+      changeBytes,
+      now,
+      useCustomKey: signing !== undefined,
+      signingKeyPair: signing?.signingKeyPair,
+      signingKeyPassword: signing?.signingKeyPassword,
+      attachmentRefs: this.collectAttachmentRefs(newDoc),
+    });
+    await this.store.putEntries([entry]);
+    this.registerAutomergeHashMapping(docId, Automerge.decodeChange(changeBytes).hash, entry.id);
+
+    internalDoc.doc = newDoc;
+    internalDoc.lastModified = now;
+    internalDoc.awaitingWitness = isProvisional(entry) || (internalDoc.awaitingWitness ?? false);
+    const versioned =
+      isVersioned(entry) || internalDoc.awaitingWitness || (internalDoc.witnessed ?? false);
+    internalDoc.witnessed = versioned && !internalDoc.awaitingWitness;
+    await this.storeCachedDocument(internalDoc);
+    this.updateIndex(
+      docId,
+      internalDoc.lastModified,
+      internalDoc.isDeleted,
+      internalDoc.decryptionKeyId,
+      "visible",
+      internalDoc.awaitingWitness,
+      internalDoc.witnessed,
+      true,
+    );
+    this.markDocDirty(docId);
+  }
+
+  /**
+   * Report what {@link copyDocumentTo} would do with these options — the chosen
+   * strategy, whether the original authors' signatures would survive, whether
+   * the copy would merge into an existing document — without writing anything.
+   *
+   * The returned `reasons` explain a refusal, and also explain why a permitted
+   * copy has to re-author, so a caller can distinguish an unavoidable
+   * re-authoring from an accidental one.
+   *
+   * @param docId The document to copy.
+   * @param target The database the copy would be written to.
+   * @param options The same options that would be passed to {@link copyDocumentTo}.
+   */
+  async canCopyDocumentTo(
+    docId: string,
+    target: MindooDB,
+    options?: CopyDocumentOptions,
+  ): Promise<CopyFeasibility> {
+    return canCopyDocument(
+      this.getCopyEngineHost(),
+      this.resolveCopyHost(target, "target"),
+      docId,
+      options,
+    );
+  }
+
+  /**
+   * Copy one document into another database, either flattened to a single
+   * revision or with its full history.
+   *
+   * See `docs/document-copy.md` for the strategy matrix. In short: the default
+   * writes a flattened copy under a fresh id; `mode: "history"` carries the
+   * whole revision graph; and adding `targetDocId: "same"` with
+   * `authorship: "preserve"` (same tenant, same key, different database) keeps
+   * the original signers, which is what makes sharding possible.
+   *
+   * @param docId The document to copy.
+   * @param target The database to copy into.
+   * @param options See {@link CopyDocumentOptions}; every default is documented there.
+   * @return What was copied, including the target document id — returned even on
+   *   cancellation, so a resumed run can target the same id.
+   */
+  async copyDocumentTo(
+    docId: string,
+    target: MindooDB,
+    options?: CopyDocumentOptions,
+  ): Promise<CopyDocumentResult> {
+    const targetHost = this.resolveCopyHost(target, "target");
+    this.assertWritable("copyDocumentTo");
+    return copyDocument(this.getCopyEngineHost(), targetHost, docId, options);
+  }
+
+  /**
+   * Copy many documents into another database in one pass.
+   *
+   * With `mode: "history"`, `targetDocId: "same"` and `authorship: "preserve"`
+   * this is the database sharding primitive: document ids, full history and the
+   * original signers all survive the split, and nothing is decrypted or
+   * re-signed along the way. Repeated runs are safe and transfer only the delta,
+   * so a shard can proceed against a live database.
+   *
+   * Per-document failures do not abort the run; they are collected in
+   * {@link CopyDocumentsResult.failed}.
+   *
+   * @param selector Which documents to copy — explicit ids, id prefixes, or both.
+   * @param target The database to copy into.
+   * @param options See {@link CopyDocumentsOptions}.
+   */
+  async copyDocumentsTo(
+    selector: CopyDocumentSelector,
+    target: MindooDB,
+    options?: CopyDocumentsOptions,
+  ): Promise<CopyDocumentsResult> {
+    const targetHost = this.resolveCopyHost(target, "target");
+    this.assertWritable("copyDocumentsTo");
+    return copyDocuments(this.getCopyEngineHost(), targetHost, selector, options);
   }
 
   /**

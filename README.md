@@ -186,6 +186,14 @@ const invoices = await tenant.openDB("invoices");
 ```
 A special **directory** database stores user registrations (admin-only).
 
+Databases that outgrow their store can be split. `copyDocumentsTo()` moves whole
+document histories into a new database with every original signature still
+valid — and does it **without any encryption key**, because entry signatures
+don't bind the database id, so the entries move as ciphertext. An operator who
+cannot read a single document can still shard the database, which keeps
+"administer the data" and "read the data" as separate privileges. See
+[Document Copy & Sharding](./docs/document-copy.md).
+
 ### Documents
 [Automerge](https://automerge.org/) CRDTs with full history:
 - Every change is signed and encrypted
@@ -339,6 +347,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Full-Text Search](./docs/fulltext-search.md) — Client-side encrypted full-text index, `db.searchText()`, the query `text` clause, attachment text extraction
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
+- [Document Copy & Sharding](./docs/document-copy.md) — Copying documents between databases with or without history, verifiable provenance, and splitting a growing database into shards as a keyless operation
 - [Access Control & Governance](./docs/accesscontrol.md) — Encryption-key read access, admin-signed write policies, the two-tier model, witness receipts and trusted-time enforcement
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
 - [Attachments](./docs/attachments.md) — File storage and streaming
