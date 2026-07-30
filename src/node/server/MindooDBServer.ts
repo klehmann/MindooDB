@@ -27,6 +27,7 @@ import {
   decodeBinaryEntryMessage,
   encodeBinaryEntryMessage,
 } from "../../core/appendonlystores/network/binaryEntryFraming";
+import type { EntryProvenance } from "../../core/crypto/EntrySignature";
 import { SyncEventBus } from "./SyncEventBus";
 import type {
   StoreEntry,
@@ -94,6 +95,16 @@ import {
 } from "./validation";
 import { assertSafeSyncUrl, UnsafeUrlError } from "../../core/utils/urlSafety";
 import { ENV_VARS } from "./types";
+import {
+  MAX_TIMESTAMP_REQUEST_BYTES,
+  parseTsaProviders,
+  requestTimestampToken,
+  toPublicTsaProviders,
+  TimestampProxyError,
+  TIMESTAMP_QUERY_CONTENT_TYPE,
+  TIMESTAMP_REPLY_CONTENT_TYPE,
+  type TsaProviderConfig,
+} from "./timestampProxy";
 
 /**
  * Augment Express Request with fields populated by our middleware:
@@ -107,6 +118,8 @@ declare global {
       tenantId?: string;
       systemAdmin?: { username: string; publicsignkey: string };
       jsonBodyBytes?: number;
+      /** Set by timestampAuthMiddleware; identifies the caller for per-identity throttling. */
+      timestampPrincipal?: string;
     }
   }
 }
@@ -139,6 +152,9 @@ interface SerializedEntryMetadata {
   // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
   // Must round-trip so metadataSignature verification succeeds on ingest.
   attachmentRefs?: StoreEntryAttachmentRef[];
+  // Copy provenance (plain JSON; see StoreEntryMetadata.provenance). Also bound
+  // into metadataSignature, so it must round-trip.
+  provenance?: EntryProvenance;
   // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
   entryVersion?: number;
 }
@@ -162,6 +178,21 @@ const DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_AUTH_RATE_LIMIT_MAX = 120;
 const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_SYNC_RATE_LIMIT_MAX = 1_000;
+
+/**
+ * Timestamping gets its own budget rather than sharing the sync one. Sync is
+ * chatty and high-volume; sealing a document is a deliberate, rare user action.
+ * Sharing a bucket would let ordinary sync traffic starve the seal endpoint, and
+ * a runaway seal loop degrade sync.
+ *
+ * The daily cap matters more than the burst cap: proxying collapses every user
+ * onto the server's IP, so one tenant can exhaust an upstream's per-IP allowance
+ * (open-tsa.eu publishes 60/minute) and lock out everyone else on this server.
+ */
+const DEFAULT_TIMESTAMP_RATE_LIMIT_WINDOW_MS = 60_000;
+const DEFAULT_TIMESTAMP_RATE_LIMIT_MAX = 10;
+const DEFAULT_TIMESTAMP_DAILY_LIMIT_MAX = 500;
+const TIMESTAMP_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
 
@@ -222,6 +253,12 @@ export class MindooDBServer {
   private configPath: string;
   private readonly jsonBodyLimit: string;
   private readonly jsonBodyLimitBytes: number | null;
+  /**
+   * Upstream TSAs the proxy may contact. Populated only from server env config —
+   * a client names a provider by id, never by URL, so this list is the whole
+   * SSRF boundary for {@link handleTimestampRequest}.
+   */
+  private readonly tsaProviders: TsaProviderConfig[];
 
   /**
    * @param dataDir      Root directory for on-disk tenant data and server identity
@@ -246,6 +283,17 @@ export class MindooDBServer {
     this.configPath = configPath ?? path.join(dataDir, "config.json");
     this.jsonBodyLimit = process.env.MINDOODB_JSON_BODY_LIMIT?.trim() || "5mb";
     this.jsonBodyLimitBytes = parseBodySizeLimitToBytes(this.jsonBodyLimit);
+
+    this.tsaProviders = parseTsaProviders(process.env[ENV_VARS.TSA_PROVIDERS], {
+      allowInsecureUrls: /^(1|true)$/i.test(process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? ""),
+    });
+    if (this.tsaProviders.length > 0) {
+      console.log(
+        `[MindooDBServer] RFC 3161 timestamp proxy enabled with providers: ${this.tsaProviders
+          .map((provider) => provider.id)
+          .join(", ")}`,
+      );
+    }
 
     this.serverConfig = config ?? { capabilities: {} };
     this.capabilityMatcher = new CapabilityMatcher(this.serverConfig);
@@ -431,6 +479,12 @@ export class MindooDBServer {
         ...info,
         maxJsonRequestBodyLimit: this.jsonBodyLimit,
         maxJsonRequestBodyBytes: this.jsonBodyLimitBytes ?? undefined,
+        // Lets a client decide between calling a browser-reachable TSA directly
+        // and routing through this server, per tenant and without a probe.
+        timestamping: {
+          enabled: this.tsaProviders.length > 0,
+          providers: toPublicTsaProviders(this.tsaProviders),
+        },
       });
     });
     this.app.get("/.well-known/mindoodb-tenants/:tenantId/publicinfos-fingerprints", async (req, res) => {
@@ -1124,6 +1178,18 @@ export class MindooDBServer {
     router.post("/auth/challenge", challengeRateLimit, this.handleChallenge.bind(this));
     router.post("/auth/authenticate", authenticateRateLimit, this.handleAuthenticate.bind(this));
 
+    // RFC 3161 proxy. Authentication runs *before* the limiters so they can key
+    // on the identity rather than only the IP — otherwise everyone behind one
+    // NAT shares a budget, and a single tenant can lock out the rest.
+    router.post(
+      "/timestamps/rfc3161",
+      this.timestampAuthMiddleware.bind(this),
+      this.createTimestampRateLimit("burst"),
+      this.createTimestampRateLimit("daily"),
+      express.raw({ type: TIMESTAMP_QUERY_CONTENT_TYPE, limit: MAX_TIMESTAMP_REQUEST_BYTES }),
+      this.handleTimestampRequest.bind(this),
+    );
+
     for (const storeKind of ["docs", "attachments"] as const) {
       const syncBase = `/sync/${storeKind}`;
       router.post(`${syncBase}/findNewEntries`, syncRateLimit, this.handleFindNewEntries.bind(this));
@@ -1175,6 +1241,145 @@ export class MindooDBServer {
       windowMs: this.serverConfig.rateLimits?.sync?.windowMs ?? DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS,
       max: this.serverConfig.rateLimits?.sync?.max ?? DEFAULT_SYNC_RATE_LIMIT_MAX,
     };
+  }
+
+  /** Resolved timestamp rate-limit config; falls back to defaults when not set in config.json. */
+  private getTimestampRateLimitConfig(): {
+    windowMs: number;
+    max: number;
+    dailyMax: number;
+  } {
+    const configured = this.serverConfig.rateLimits?.timestamps;
+    return {
+      windowMs: configured?.windowMs ?? DEFAULT_TIMESTAMP_RATE_LIMIT_WINDOW_MS,
+      max: configured?.max ?? DEFAULT_TIMESTAMP_RATE_LIMIT_MAX,
+      dailyMax: configured?.dailyMax ?? DEFAULT_TIMESTAMP_DAILY_LIMIT_MAX,
+    };
+  }
+
+  /**
+   * Two limiters guard the timestamp proxy: a short burst window that keeps a
+   * misbehaving client from hammering an upstream, and a daily cap that bounds
+   * total consumption of a shared (often free) upstream allowance.
+   *
+   * Both key on tenant + principal + IP. The principal is present because
+   * {@link timestampAuthMiddleware} runs first.
+   */
+  private createTimestampRateLimit(tier: "burst" | "daily") {
+    const config = this.getTimestampRateLimitConfig();
+    const windowMs = tier === "burst" ? config.windowMs : TIMESTAMP_DAILY_WINDOW_MS;
+    const max = tier === "burst" ? config.max : config.dailyMax;
+    return rateLimit({
+      windowMs,
+      max,
+      standardHeaders: true,
+      legacyHeaders: false,
+      keyGenerator: (req: Request) => {
+        const tenantId = req.tenantId ?? "unknown";
+        const principal = req.timestampPrincipal ?? "anonymous";
+        return `timestamp:${tier}:${tenantId}:${principal}:${req.ip}`;
+      },
+      handler: (req, res, _next, options) => {
+        console.warn(
+          `[MindooDBServer] Timestamp rate limit hit (${tier}) tenant=${req.tenantId} ip=${req.ip}`,
+        );
+        res.status(options.statusCode).json(options.message);
+      },
+      message: {
+        error:
+          tier === "burst"
+            ? "Too many timestamp requests, please try again shortly"
+            : "Daily timestamp quota exhausted for this server",
+      },
+    });
+  }
+
+  /**
+   * Authenticate a timestamp request with the tenant's existing bearer token and
+   * record the principal for rate-limit bucketing.
+   *
+   * The proxy makes outbound requests on the caller's behalf, so it must never
+   * be open: unauthenticated it would be a free relay to third-party services.
+   */
+  private async timestampAuthMiddleware(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const authService = await this.tenantManager.getAuthService(req.tenantId!);
+      const payload = await authService.validateToken(token);
+      if (!payload || payload.tenantId !== req.tenantId) {
+        res.status(401).json({ error: "Invalid or expired token" });
+        return;
+      }
+      req.timestampPrincipal = payload.deviceSigningKey ?? payload.sub;
+      next();
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
+  /**
+   * Forward a DER TimeStampReq to a configured TSA and return the DER
+   * TimeStampResp verbatim.
+   *
+   * The server neither parses nor validates the ASN.1: the client checks that
+   * the returned token's `messageImprint` matches the digest it sent and that
+   * the token chains to a trusted root. That is what reduces a hostile proxy —
+   * ours or anyone's — from a forgery risk to a denial-of-service risk.
+   */
+  private async handleTimestampRequest(req: Request, res: Response): Promise<void> {
+    if (this.tsaProviders.length === 0) {
+      res.status(503).json({ error: "Timestamping is not enabled on this server" });
+      return;
+    }
+
+    const body = req.body;
+    if (!Buffer.isBuffer(body)) {
+      res.status(415).json({
+        error: `Timestamp requests must be sent as ${TIMESTAMP_QUERY_CONTENT_TYPE}`,
+      });
+      return;
+    }
+
+    // The provider is named by id and resolved against the env allowlist; a
+    // client-supplied URL would make this an SSRF gadget.
+    const requestedProvider = req.query.provider;
+    let preferredProviderId: string | undefined;
+    if (typeof requestedProvider === "string" && requestedProvider.length > 0) {
+      preferredProviderId = requestedProvider.toLowerCase();
+    } else if (requestedProvider !== undefined) {
+      res.status(400).json({ error: "provider must be a single string value" });
+      return;
+    }
+
+    try {
+      const result = await requestTimestampToken({
+        providers: this.tsaProviders,
+        request: new Uint8Array(body),
+        preferredProviderId,
+      });
+
+      res.setHeader("content-type", TIMESTAMP_REPLY_CONTENT_TYPE);
+      res.setHeader("x-mindoodb-tsa-provider", result.providerId);
+      res.status(200).send(Buffer.from(result.response));
+    } catch (error) {
+      if (error instanceof TimestampProxyError) {
+        if (error.attempts.length > 0) {
+          console.warn(
+            `[MindooDBServer] Timestamp request failed for tenant ${req.tenantId}: ${error.attempts
+              .map((attempt) => `${attempt.providerId}=${attempt.error ?? "ok"}`)
+              .join("; ")}`,
+          );
+        }
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      console.error("[MindooDBServer] Unexpected timestamp proxy error:", error);
+      res.status(500).json({ error: "Failed to obtain a timestamp" });
+    }
   }
 
   /**
@@ -2164,6 +2369,8 @@ export class MindooDBServer {
         ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
         : undefined,
       attachmentRefs: metadata.attachmentRefs,
+      // Bound into metadataSignature, so it must survive the round-trip.
+      provenance: metadata.provenance,
       entryVersion: metadata.entryVersion,
     };
   }
@@ -2193,6 +2400,7 @@ export class MindooDBServer {
         ? this.base64ToUint8Array(serialized.receivedDateSignature)
         : undefined,
       attachmentRefs: serialized.attachmentRefs,
+      provenance: serialized.provenance,
       entryVersion: serialized.entryVersion,
     };
   }

@@ -4,6 +4,15 @@ import type { PublicUserId, PrivateUserId } from "./userid";
 import { StoreKind } from "./appendonlystores/types";
 import type { ContentAddressedStore, OpenStoreOptions, RejectedPutEntry, StoreScanCursor } from "./appendonlystores/types";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
+import type { EntryProvenance } from "./crypto/EntrySignature";
+import type {
+  CopyDocumentOptions,
+  CopyDocumentResult,
+  CopyDocumentSelector,
+  CopyDocumentsOptions,
+  CopyDocumentsResult,
+  CopyFeasibility,
+} from "./copy/types";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import type {
   DefaultAccessPolicyDoc,
@@ -716,6 +725,35 @@ export interface MindooTenant {
   ): Promise<Uint8Array>;
 
   /**
+   * Sign application-supplied bytes under an allowlisted domain, signing
+   * `utf8(domain) || 0x00 || statement`.
+   *
+   * The only sanctioned way to have the identity key sign content an
+   * application chose. The domain prefix keeps such bytes disjoint from the
+   * store-entry and auth-challenge layouts, so a signature obtained here cannot
+   * be replayed as either (see `crypto/DomainStatement.ts`).
+   *
+   * @param domain One of `SIGNING_DOMAINS`; anything else is rejected.
+   * @param statement Canonical statement bytes.
+   * @return The Ed25519 signature over the domain-prefixed bytes.
+   */
+  signDomainStatement(domain: string, statement: Uint8Array): Promise<Uint8Array>;
+
+  /**
+   * Verify a domain-separated statement signature against a named public key.
+   *
+   * Does not consult the directory: whether that key is *currently trusted* is
+   * a separate question from whether it made this signature, and an evidence
+   * verifier legitimately asks only the second one.
+   */
+  verifyDomainStatement(
+    domain: string,
+    statement: Uint8Array,
+    signature: Uint8Array,
+    publicKeyPem: string,
+  ): Promise<boolean>;
+
+  /**
    * Verify a signature for a payload with a public key.
    *
    * @param payload The payload to verify the signature for (binary data)
@@ -1112,6 +1150,22 @@ export interface StoreEntryMetadata {
    * fall back to {@link signature} when it is missing (backward compatible).
    */
   metadataSignature?: Uint8Array;
+
+  /**
+   * Set on entries produced by copying a document into another database with
+   * `mode: "history"` and re-authored signatures (see `copyDocumentTo`). Records
+   * where the entry came from and who originally authored it, in a form a reader
+   * can verify rather than merely trust.
+   *
+   * Bound into {@link metadataSignature} as a tagged trailing block (see
+   * `crypto/EntrySignature.ts`), so a relay can neither attach, strip nor rewrite
+   * it. Absent on every entry that is not the product of such a copy, in which
+   * case the signing input is byte-identical to the original layout.
+   *
+   * Plain JSON by design (the signature inside is base64) so it survives the
+   * on-disk, IndexedDB and network serializers without per-field binary handling.
+   */
+  provenance?: EntryProvenance;
 
   /**
    * Original size of the plaintext data before encryption (in bytes).
@@ -5113,6 +5167,72 @@ export interface MindooDB {
    * call.
    */
   getBackgroundWarmerProgress?(): BackgroundWarmerProgress | null;
+
+  /**
+   * Copy one document into another database, either flattened to a single
+   * revision or with its full revision history.
+   *
+   * Unlike {@link pullChangesFrom} / {@link pushChangesTo}, which replicate one
+   * database between peers, this moves content ACROSS databases — and, with
+   * `signingKeyPair` unset and the right options, across tenants too.
+   *
+   * The default is a flattened copy under a freshly generated document id,
+   * authored by the current user. `mode: "history"` carries the whole revision
+   * graph instead; adding `targetDocId: "same"` and `authorship: "preserve"`
+   * (only legal within one tenant, under the same encryption key, into a
+   * different database) keeps the original signers' signatures valid, which is
+   * what makes {@link copyDocumentsTo} usable as a sharding tool.
+   *
+   * See `docs/document-copy.md` for the full strategy matrix and caveats.
+   *
+   * @param docId The document to copy.
+   * @param target The database to copy into.
+   * @param options See {@link CopyDocumentOptions}.
+   * @return What was copied, including the resulting target document id.
+   */
+  copyDocumentTo(
+    docId: string,
+    target: MindooDB,
+    options?: CopyDocumentOptions,
+  ): Promise<CopyDocumentResult>;
+
+  /**
+   * Report what {@link copyDocumentTo} would do with these options, without
+   * writing anything: the strategy it would use, whether the original authors'
+   * signatures would survive, whether it would merge into an existing document,
+   * and — via `reasons` — why not, when the answer is no.
+   *
+   * @param docId The document that would be copied.
+   * @param target The database it would be copied into.
+   * @param options The same options that would be passed to {@link copyDocumentTo}.
+   */
+  canCopyDocumentTo(
+    docId: string,
+    target: MindooDB,
+    options?: CopyDocumentOptions,
+  ): Promise<CopyFeasibility>;
+
+  /**
+   * Copy many documents into another database in one pass.
+   *
+   * With `mode: "history"`, `targetDocId: "same"` and `authorship: "preserve"`
+   * this splits a database into shards with document ids, full history and
+   * original signers intact, without decrypting or re-signing anything.
+   * Repeated runs transfer only the delta, so a shard can proceed while users
+   * keep working; see the migration playbook in `docs/document-copy.md`.
+   *
+   * A failure on one document does not abort the run — failures are collected
+   * in {@link CopyDocumentsResult.failed}.
+   *
+   * @param selector Which documents to copy: explicit ids, id prefixes, or both.
+   * @param target The database to copy into.
+   * @param options See {@link CopyDocumentsOptions}.
+   */
+  copyDocumentsTo(
+    selector: CopyDocumentSelector,
+    target: MindooDB,
+    options?: CopyDocumentsOptions,
+  ): Promise<CopyDocumentsResult>;
 
   /**
    * Pull changes from a remote content-addressed store or another MindooDB instance.

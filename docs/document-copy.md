@@ -64,6 +64,43 @@ something the create genuinely cannot carry:
 Pass `provenance: false` when flattening a large document set and you do not
 need the origin marker — it halves the store entries.
 
+#### Reclaiming the second entry for a kept id
+
+`assumeUniqueTargetDocId: true` drops that last row back to a single entry. It
+is the copy-side twin of `CreateOptions.assumeUniqueId`: you assert the ids are
+random enough that no other replica can create the same one concurrently, so
+convergence of independent creates is moot and the payload can be baked into
+`doc_create`.
+
+That assertion holds when the ids were minted by MindooDB. A `<prefix>_<base62>`
+id carries ~128 bits of uuidv7 entropy, so a bulk flatten that keeps ids is the
+natural place for the flag:
+
+```typescript
+await monolith.copyDocumentsTo({ idPrefix: "inv2025" }, archive2025, {
+  targetDocId: "same",
+  provenance: false,
+  assumeUniqueTargetDocId: true, // ids are inv2025_<base62> — unique by construction
+});
+```
+
+Two limits are worth knowing before you reach for it:
+
+- **Only letter-leading ids can be kept at all.** Caller-provided ids must match
+  `/^[A-Za-z][A-Za-z0-9_]*$/`, and a *bare* generated id often starts with a
+  digit. `targetDocId: "same"` in flatten mode therefore needs the source ids to
+  carry an `idPrefix` (which must begin with a letter) — another reason to mint
+  shard-friendly ids with one. Use `mode: "history"` to keep a bare generated id.
+- **Never set it for semantic ids** like `"settings"` or a natural key imported
+  from another system. If two replicas create such an id with this flag, their
+  `doc_create` entries share no Automerge ancestry and the document **forks**
+  instead of converging. A single operator running one migration into a fresh
+  target is not exposed to that; concurrent creation on unsynced replicas is.
+
+The flag is ignored outside the case it describes — `mode: "history"` copies the
+source's own `doc_create` rather than synthesizing one, and `targetDocId: "new"`
+uses ids MindooDB already knows to be unique.
+
 ```typescript
 const result = await sourceDb.copyDocumentTo(docId, targetDb, {
   mode: "flatten",       // the default
@@ -207,9 +244,42 @@ intermediate database, and its nested `source.provenance` still names the
 original. Set `provenance: false` to opt out. A graft gets none — the originals
 are right there on the entries.
 
-For a flattened copy, per-change provenance would be meaningless (there is one
-change, corresponding to no single source revision), so the origin is recorded
-once in the payload as a `_provenance` object instead.
+Chaining is not free. Each generation nests the *entire* previous projection,
+including its own nested provenance, and it does so in the metadata of every
+entry. Metadata therefore grows roughly linearly per generation of re-authored
+copying. One or two generations are unremarkable; if documents are expected to
+be copied repeatedly, copy with `provenance: false` at the intermediate hops and
+keep it only where the origin claim is actually needed.
+
+### Where the record is stored
+
+Provenance lives in three places, and the difference between them matters:
+
+| What | Where | Encrypted |
+| ----------------------------- | ------------------------------------------- | --------- |
+| Per-entry record (replay) | `StoreEntryMetadata.provenance` | **No** |
+| Its tamper-binding | Input to `metadataSignature`, block tag `0x02` | n/a |
+| Flatten origin marker | `_provenance` in the document payload | Yes |
+
+The per-entry record is **entry metadata**, next to `contentHash` and
+`createdByPublicKey` — not part of the encrypted payload. It is not stored twice:
+the tagged block is an *input* to the signing bytes, appended only when a record
+is present, which is why entries that are not copies keep the original layout
+byte-for-byte and their existing signatures still verify.
+
+Being metadata makes it **plaintext**, which is the same property that lets an
+operator shard a database without keys. So a replay's provenance discloses the
+source tenant id, source database id, source document id and the original
+author's public key to everyone who can read metadata — the server witness
+included, and any replica holder who cannot decrypt the content. That is usually
+the point (an origin claim nobody can check is worth little), but if the mere
+fact that a document came from a particular tenant or database is itself
+sensitive, use `provenance: false` and record the origin in the payload instead.
+
+A flattened copy inverts this. Per-change provenance would be meaningless there
+(one change, corresponding to no single source revision), so the origin is
+recorded once in the payload as a `_provenance` object — which means it is
+encrypted like any other content, and readable only by someone holding the key.
 
 ## Attachments
 
@@ -340,6 +410,17 @@ turns a big-bang migration into a convergent loop:
    final pass (now small), and point clients at the shard.
 4. **Reclaim** the source, whenever convenient (see below).
 
+Selection re-runs on every pass, so documents **created** after an earlier pass
+are picked up too — a late arrival is not stranded in the source. Deletes
+propagate the same way: a `doc_delete` grafts like any other entry, so a
+document deleted after it was copied ends up deleted on the shard as well.
+
+Watch `copiedEntries` for convergence, not `copiedDocIds`. The latter lists every
+document the pass confirmed present in the target, including ones it found
+already up to date and wrote nothing for — that is deliberate, because it is the
+set that is safe to purge from the source, which must include unchanged
+documents. Per-document deltas are in `documents[].copiedEntries`.
+
 The write freeze in step 3 has a granularity trade-off. A **Tier 1** rule
 (`denyDocChange` on the source database, or a deny rule matching identities)
 is evaluated by the server witness without decrypting anything, so it is cheap
@@ -449,6 +530,7 @@ Every option is documented in TSDoc on `CopyDocumentOptions`; the highlights:
 | `mode` | `"flatten"` | `"history"` carries the whole revision graph |
 | `targetDocId` | `"new"` | `"same"`, `"new"`, or an explicit id |
 | `idPrefix` | — | Prefix for the generated id when `"new"` |
+| `assumeUniqueTargetDocId` | `false` | Flatten only; folds a kept id's payload into `doc_create`. Random ids only — see above |
 | `authorship` | `"reauthor"` | `"preserve"` throws where it cannot be honored |
 | `decryptionKeyId` | source key, else `"default"` | Changing it forces re-encryption |
 | `provenance` | `true` | Verifiable origin record on each entry |

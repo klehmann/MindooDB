@@ -173,9 +173,18 @@ export interface RateLimitConfig {
   max?: number;
 }
 
+/**
+ * Timestamp proxying additionally carries a daily cap, because the constrained
+ * resource is a third party's allowance rather than this server's CPU.
+ */
+export interface TimestampRateLimitConfig extends RateLimitConfig {
+  dailyMax?: number;
+}
+
 export interface ServerRateLimitsConfig {
   auth?: RateLimitConfig;
   sync?: RateLimitConfig;
+  timestamps?: TimestampRateLimitConfig;
 }
 
 /**
@@ -222,4 +231,16 @@ export const ENV_VARS = {
    * non-positive values fall back to {@link DEFAULT_MAX_SYNC_SERVER_DATABASES}.
    */
   MAX_SYNC_SERVER_DATABASES: "MINDOODB_MAX_SYNC_SERVER_DATABASES",
+  /**
+   * Comma-separated RFC 3161 Time-Stamping Authorities the proxy at
+   * `POST /:tenantId/timestamps/rfc3161` may contact. Each entry is a built-in
+   * id (`aimoda`, `opentsa`, `freetsa`, ...) or a custom `id=url` pair; suffix
+   * `!` marks the provider qualified and `+` marks its root publicly trusted.
+   *
+   * Example: `aimoda,opentsa,belgium=http://tsa.belgium.be/connect!+`
+   *
+   * Unset disables the proxy. Clients name a provider by id only — a URL from a
+   * client would turn the endpoint into an SSRF gadget.
+   */
+  TSA_PROVIDERS: "MINDOODB_TSA_PROVIDERS",
 } as const;

@@ -109,6 +109,97 @@ export {
   getEncryptedFieldKeyId,
   type EncryptedFieldDecryptor,
 } from "./crypto/encryptedFields";
+export type {
+  EntryProvenance,
+  EntrySignatureFields,
+} from "./crypto/EntrySignature";
+
+/**
+ * Signature-verification primitives.
+ *
+ * Exported so an *outside* party — an evidence-bundle verifier, an auditor's
+ * own tooling — can check MindooDB's claims with the same code that made them,
+ * without a tenant, a server or a key. `verifyEntrySignatureCrypto` needs the
+ * ciphertext only on the legacy path; given a `metadataSignature` it rebuilds
+ * the signed bytes from metadata alone, so an entry chain is verifiable while
+ * disclosing nothing about what any change contained.
+ */
+export {
+  buildEntrySigningBytes,
+  entrySignatureFieldsFromEntry,
+  importEd25519PublicKeyFromPem,
+  verifyEntrySignatureCrypto,
+  verifyEntrySignatureWithImportedKey,
+  base64ToBytes,
+  bytesToBase64,
+  ENTRY_SIGNATURE_LAYOUT_VERSION,
+} from "./crypto/EntrySignature";
+export {
+  buildWitnessSigningBytes,
+  verifyWitnessReceipt,
+  witnessFieldsFromEntry,
+  WITNESS_RECEIPT_LAYOUT_VERSION,
+  type StampedWitnessFields,
+  type WitnessReceiptFields,
+} from "./crypto/WitnessReceipt";
+export { entryTrustedTime, isProvisional } from "./storeEntryTime";
+
+// Domain-separated statement signing (approval / counter-signature seals).
+export {
+  assertAllowedSigningDomain,
+  buildDomainStatementBytes,
+  isAllowedSigningDomain,
+  InvalidSigningDomainError,
+  MAX_DOMAIN_STATEMENT_BYTES,
+  SIGNING_DOMAINS,
+  type SigningDomain,
+} from "./crypto/DomainStatement";
+
+// RFC 3161 timestamp transport (direct browser call + server proxy fallback).
+export {
+  BROWSER_REACHABLE_TSA,
+  DEFAULT_TIMESTAMP_TIMEOUT_MS,
+  MAX_TIMESTAMP_RESPONSE_BYTES,
+  TIMESTAMP_QUERY_CONTENT_TYPE,
+  TIMESTAMP_REPLY_CONTENT_TYPE,
+  TimestampRequestError,
+  requestTimestampDirect,
+  requestTimestampViaProxy,
+  requestTimestampWithFallback,
+  type ProxyTimestampOptions,
+  type TimestampSource,
+  type TimestampTokenResult,
+  type TimestampWithFallbackOptions,
+} from "./timestamps/timestampClient";
+
+// Document copy across databases (docs/document-copy.md)
+export type {
+  CopyDocumentAuthorship,
+  CopyDocumentFailure,
+  CopyDocumentMode,
+  CopyDocumentOptions,
+  CopyDocumentResult,
+  CopyDocumentSelector,
+  CopyDocumentsOptions,
+  CopyDocumentsResult,
+  CopyFeasibility,
+  CopyFeasibilityReason,
+  CopyFeasibilityReasonCode,
+  CopyProgress,
+  CopyProgressPhase,
+  CopyStrategy,
+} from "./copy/types";
+export {
+  verifyEntryProvenance,
+  type ProvenanceVerification,
+  type ProvenanceVerificationStatus,
+} from "./copy/provenance";
+export { buildDocHistoryPurgeRequest } from "./copy/copyDocuments";
+export type { FlattenedDocumentProvenance } from "./copy/flatten";
+export type {
+  CopyAdmissionCheck,
+  CopyAdmissionPreflight,
+} from "./copy/preflight";
 
 // Keys
 export { KeyBag, type KeyDetail } from "./keys/KeyBag";

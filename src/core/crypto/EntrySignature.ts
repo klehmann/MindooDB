@@ -32,12 +32,20 @@ import type { StoreEntryAttachmentRef, StoreEntryMetadata } from "../types";
  * Exception — backward-compatible trailing extensions: a strictly trailing,
  * optional block whose absence produces ZERO bytes (so the layout is
  * byte-identical to the prior version for entries that do not carry the new
- * data) does NOT bump this value. The `attachmentRefs` block (see
- * {@link buildEntrySigningBytes}) is such an extension: attachment-free entries —
- * including every entry signed before the field existed — are unaffected and
- * keep verifying.
+ * data) does NOT bump this value. The `attachmentRefs` block and the
+ * `provenance` block (see {@link buildEntrySigningBytes}) are such extensions:
+ * entries without attachments and without provenance — including every entry
+ * signed before those fields existed — are unaffected and keep verifying.
  */
 export const ENTRY_SIGNATURE_LAYOUT_VERSION = 0x01;
+
+/**
+ * Tag byte introducing the trailing provenance block. Two independent optional
+ * trailing blocks now exist, so the second one is tagged: a verifier rebuilds
+ * the layout rather than parsing it, but the tag makes an accidental collision
+ * between "an attachmentRefs count" and "a provenance block" impossible.
+ */
+export const ENTRY_PROVENANCE_BLOCK_TAG = 0x02;
 
 /**
  * The exact set of metadata fields bound by an author's `metadataSignature`, in
@@ -62,6 +70,65 @@ export interface EntrySignatureFields {
    * the original v1 signing input and verify unchanged. Treat empty as absent.
    */
   attachmentRefs?: StoreEntryAttachmentRef[];
+  /**
+   * Optional record of the entry this one was copied from (see
+   * {@link EntryProvenance}). Encoded as a tagged, backward-compatible TRAILING
+   * block (see {@link buildEntrySigningBytes}): when absent it contributes ZERO
+   * bytes, so entries that were not produced by a copy keep the original v1
+   * signing input and verify unchanged.
+   *
+   * Binding provenance into the signature is what makes it trustworthy: the
+   * copying user attests to the origin claim, so a relay cannot attach, strip or
+   * rewrite it after the fact.
+   */
+  provenance?: EntryProvenance;
+}
+
+/**
+ * A verifiable record of where a copied entry came from.
+ *
+ * Written by the `replay` copy strategy, which re-signs every entry as the
+ * copying user and would otherwise lose all trace of the original author. The
+ * record is not a bare claim: it embeds the source entry's own signed field
+ * projection together with the original author's signature over it, so a reader
+ * can rebuild those bytes and verify them against the embedded public key. A
+ * successful verification proves the named author really signed an entry with
+ * this exact `contentHash` — i.e. this exact payload.
+ *
+ * What it does NOT establish is that the key belongs to who it claims to: that
+ * is a directory question, answerable in-tenant and out-of-band across tenants.
+ *
+ * Note that copying a copy nests provenance (the source projection carries its
+ * own provenance, because the original signature only verifies over the exact
+ * bytes that were signed). Chains therefore grow one level per generation of
+ * copying.
+ */
+export interface EntryProvenance {
+  /** Tenant the source entry was read from. */
+  sourceTenantId: string;
+  /** Database (store) id the source entry was read from. */
+  sourceDbId: string;
+  /**
+   * The source entry's signed field projection, verbatim. Rebuilding
+   * {@link buildEntrySigningBytes} over this reproduces exactly the bytes the
+   * original author signed.
+   */
+  source: EntrySignatureFields;
+  /**
+   * The original author's `metadataSignature`, base64-encoded.
+   *
+   * Base64 rather than `Uint8Array` so the whole record is plain JSON and
+   * survives every serializer unchanged — the on-disk store, IndexedDB and the
+   * network transport each hand-encode binary metadata fields one by one, and a
+   * dropped or mangled field here would break the enclosing
+   * `metadataSignature`, which binds this block.
+   *
+   * Absent when the source entry is a legacy v1 entry that predates
+   * `metadataSignature`. The provenance record is then still informative but
+   * not cryptographically verifiable; `verifyEntryProvenance` reports that
+   * distinction explicitly rather than failing.
+   */
+  sourceMetadataSignature?: string;
 }
 
 /** Options for the version-aware entry-signature verifiers. */
@@ -76,6 +143,30 @@ export interface VerifyEntrySignatureOptions {
 }
 
 const textEncoder = new TextEncoder();
+
+/**
+ * Decode a standard-base64 string to raw bytes. Kept local so this module stays
+ * free of platform dependencies and usable on both client and server.
+ */
+export function base64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/** Encode raw bytes as a standard-base64 string. Inverse of {@link base64ToBytes}. */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  // Chunked to stay clear of the argument-count limit on large inputs.
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
 
 function pushLengthPrefixed(parts: Uint8Array[], bytes: Uint8Array): void {
   const lengthPrefix = new Uint8Array(4);
@@ -123,18 +214,30 @@ function pushInt64BE(parts: Uint8Array[], value: number): void {
  *  || ( len(attachmentId) || attachmentId
  *       || len(lastChunkId) || lastChunkId
  *       || int64BE(size) ) * (one triple per ref, in array order)
+ *  -- trailing provenance block, PRESENT ONLY IF provenance is set --
+ *  || 0x02                          (ENTRY_PROVENANCE_BLOCK_TAG)
+ *  || len(sourceTenantId)           || sourceTenantId
+ *  || len(sourceDbId)               || sourceDbId
+ *  || len(sourceSigningBytes)       || sourceSigningBytes   (recursive layout)
+ *  || len(sourceMetadataSignature)  || sourceMetadataSignature (raw bytes,
+ *                                      zero-length when absent)
  * ```
  *
- * The attachmentRefs block is a deliberately backward-compatible TRAILING
- * extension: it is appended ONLY when there is at least one ref, so an
- * attachment-free entry (every entry written before this field existed, and
- * every future text-only revision) produces byte-for-byte the same input as the
- * original layout and its existing signature still verifies. This is why the
- * version byte intentionally stays `0x01` and is NOT bumped despite the new
- * field: absence is byte-identical to the prior layout. Callers MUST treat an
- * empty array as absent (the canonicalization in {@link entrySignatureFieldsFromEntry}
- * guarantees this) and emit refs in a stable order (the writer sorts by
- * `attachmentId`) so signing and verification produce identical bytes.
+ * Both trailing blocks are deliberately backward-compatible extensions: each is
+ * appended ONLY when it carries data, so an attachment-free entry that is not a
+ * copy (every entry written before these fields existed, and every ordinary
+ * revision) produces byte-for-byte the same input as the original layout and
+ * its existing signature still verifies. This is why the version byte
+ * intentionally stays `0x01` and is NOT bumped despite the new fields: absence
+ * is byte-identical to the prior layout. Callers MUST treat an empty
+ * `attachmentRefs` array as absent (the canonicalization in
+ * {@link entrySignatureFieldsFromEntry} guarantees this) and emit refs in a
+ * stable order (the writer sorts by `attachmentId`) so signing and verification
+ * produce identical bytes.
+ *
+ * The provenance block embeds the source entry's signing bytes by recursing
+ * into this same function, which is what lets a verifier re-derive the exact
+ * bytes the original author signed.
  */
 export function buildEntrySigningBytes(
   fields: EntrySignatureFields,
@@ -166,6 +269,23 @@ export function buildEntrySigningBytes(
     }
   }
 
+  // Second trailing block, tagged so it can never be confused with the
+  // attachmentRefs count above. Recurses to embed the source entry's own
+  // signing bytes verbatim.
+  const provenance = fields.provenance;
+  if (provenance) {
+    parts.push(new Uint8Array([ENTRY_PROVENANCE_BLOCK_TAG]));
+    pushString(parts, provenance.sourceTenantId);
+    pushString(parts, provenance.sourceDbId);
+    pushLengthPrefixed(parts, buildEntrySigningBytes(provenance.source, version));
+    pushLengthPrefixed(
+      parts,
+      provenance.sourceMetadataSignature
+        ? base64ToBytes(provenance.sourceMetadataSignature)
+        : new Uint8Array(0),
+    );
+  }
+
   const total = parts.reduce((sum, p) => sum + p.length, 0);
   const out = new Uint8Array(total);
   let offset = 0;
@@ -189,7 +309,7 @@ export function entrySignatureFieldsFromEntry(
     | "contentHash"
     | "createdByPublicKey"
     | "attachmentRefs"
-  >,
+  > & { provenance?: EntryProvenance },
 ): EntrySignatureFields {
   return {
     entryType: entry.entryType,
@@ -206,6 +326,7 @@ export function entrySignatureFieldsFromEntry(
       entry.attachmentRefs && entry.attachmentRefs.length > 0
         ? entry.attachmentRefs
         : undefined,
+    provenance: entry.provenance,
   };
 }
 
@@ -215,12 +336,25 @@ function pemToArrayBuffer(pem: string): ArrayBuffer {
     .replace("-----BEGIN PUBLIC KEY-----", "")
     .replace("-----END PUBLIC KEY-----", "")
     .replace(/\s/g, "");
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
+  return base64ToBytes(base64).buffer as ArrayBuffer;
+}
+
+/**
+ * Import a PEM-encoded Ed25519 public key for verification. Exported so
+ * provenance verification can check an embedded author key without duplicating
+ * the PEM handling.
+ */
+export function importEd25519PublicKeyFromPem(
+  publicKeyPem: string,
+  subtle: SubtleCrypto,
+): Promise<CryptoKey> {
+  return subtle.importKey(
+    "spki",
+    pemToArrayBuffer(publicKeyPem),
+    { name: "Ed25519" },
+    false,
+    ["verify"],
+  );
 }
 
 /**
@@ -262,7 +396,7 @@ export async function verifyEntrySignatureWithImportedKey(
     | "createdByPublicKey"
     | "attachmentRefs"
     | "signature"
-  > & { metadataSignature?: Uint8Array },
+  > & { metadataSignature?: Uint8Array; provenance?: EntryProvenance },
   encryptedData: Uint8Array,
   cryptoKey: CryptoKey,
   subtle: SubtleCrypto,
@@ -310,18 +444,12 @@ export async function verifyEntrySignatureCrypto(
     | "createdByPublicKey"
     | "attachmentRefs"
     | "signature"
-  > & { metadataSignature?: Uint8Array },
+  > & { metadataSignature?: Uint8Array; provenance?: EntryProvenance },
   encryptedData: Uint8Array,
   authorPublicKeyPem: string,
   subtle: SubtleCrypto,
   opts?: VerifyEntrySignatureOptions,
 ): Promise<boolean> {
-  const cryptoKey = await subtle.importKey(
-    "spki",
-    pemToArrayBuffer(authorPublicKeyPem),
-    { name: "Ed25519" },
-    false,
-    ["verify"],
-  );
+  const cryptoKey = await importEd25519PublicKeyFromPem(authorPublicKeyPem, subtle);
   return verifyEntrySignatureWithImportedKey(entry, encryptedData, cryptoKey, subtle, opts);
 }
