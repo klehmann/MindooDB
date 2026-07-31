@@ -323,6 +323,94 @@ describe("Document DAG analysis", () => {
     }
   });
 
+  it("materializes one merged before image from a merge entry's parents", async () => {
+    const dbId = "dag-heads-before";
+    const { userDb, userTwoDb } = await createSharedDbPair(dbId);
+
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    const userTwoView = await userTwoDb.getDocument(docId);
+
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().userOnly = "from-user";
+    });
+    await userTwoDb.changeDoc(userTwoView, (draft) => {
+      draft.getData().userTwoOnly = "from-user-two";
+    });
+
+    const mergeDb = await openUserDb(dbId);
+    const mergedDoc = await mergeDb.getDocument(docId);
+    await mergeDb.changeDoc(mergedDoc, (draft) => {
+      draft.getData().merged = true;
+    });
+
+    const analysis = await mergeDb.analyzeDocumentDagAtTimestamp(docId, "now");
+    const mergeEntry = analysis.entries.find((entry) => entry.dependencyIds.length > 1);
+    expect(mergeEntry).toBeTruthy();
+
+    const before = await mergeDb.materializeDocumentAtHeads(docId, mergeEntry!.dependencyIds);
+    expect(before).not.toBeNull();
+    expect(before!.headEntryIds).toHaveLength(2);
+    const beforeData = before!.doc.getData() as Record<string, unknown>;
+    // Both concurrent branches are visible, which is what the merge writer saw.
+    expect(beforeData.userOnly).toBe("from-user");
+    expect(beforeData.userTwoOnly).toBe("from-user-two");
+    expect(beforeData.merged).toBeUndefined();
+
+    const after = await mergeDb.materializeDocumentBranchAtEntry(docId, mergeEntry!.entryId);
+    expect(after).not.toBeNull();
+    expect((after!.doc.getData() as Record<string, unknown>).merged).toBe(true);
+  });
+
+  it("matches branch materialization for a single head and ignores unknown heads", async () => {
+    const dbId = "dag-heads-single";
+    const { userDb } = await createSharedDbPair(dbId);
+
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().step = 1;
+    });
+    const afterFirstChange = await userDb.analyzeDocumentDagAtTimestamp(docId, "now");
+    const firstChangeEntryId = afterFirstChange.activeHeadEntryIds[0]!;
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().step = 2;
+    });
+
+    const atHeads = await userDb.materializeDocumentAtHeads(docId, [firstChangeEntryId]);
+    const atBranch = await userDb.materializeDocumentBranchAtEntry(docId, firstChangeEntryId);
+    expect(atHeads).not.toBeNull();
+    expect(atBranch).not.toBeNull();
+    expect((atHeads!.doc.getData() as Record<string, unknown>).step).toBe(1);
+    expect(atHeads!.branchEntryIds).toEqual(atBranch!.branchEntryIds);
+    expect(atHeads!.headEntryId).toBe(firstChangeEntryId);
+
+    const withUnknownHead = await userDb.materializeDocumentAtHeads(docId, [
+      firstChangeEntryId,
+      `${docId}_d_deadbeef_deadbeef`,
+    ]);
+    expect(withUnknownHead).not.toBeNull();
+    expect(withUnknownHead!.headEntryIds).toEqual([firstChangeEntryId]);
+    expect((withUnknownHead!.doc.getData() as Record<string, unknown>).step).toBe(1);
+  });
+
+  it("reports no document when no head resolves", async () => {
+    const dbId = "dag-heads-empty";
+    const { userDb } = await createSharedDbPair(dbId);
+
+    const doc = await userDb.createDocument();
+    const docId = doc.getId();
+    await userDb.changeDoc(doc, (draft) => {
+      draft.getData().step = 1;
+    });
+
+    // The root create has no parents, so its "before" is the absent document.
+    expect(await userDb.materializeDocumentAtHeads(docId, [])).toBeNull();
+    expect(
+      await userDb.materializeDocumentAtHeads(docId, [`${docId}_d_deadbeef_deadbeef`]),
+    ).toBeNull();
+  });
+
   it("describes and materializes delete heads", async () => {
     const dbId = "dag-delete";
     const { userDb } = await createSharedDbPair(dbId);

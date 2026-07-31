@@ -103,6 +103,7 @@ import {
 import {
   computeBranchMaterializationPlan,
   computeDocumentDagAnalysis,
+  computeHeadsMaterializationPlan,
   isDeletedFromHeads,
   isDagEntry,
   orderDagEntriesCausally,
@@ -5356,6 +5357,7 @@ export class BaseMindooDB implements MindooDB {
           doc: wrappedDoc,
           changeCreatedAt: entryMetadata.createdAt,
           changeCreatedByPublicKey: entryMetadata.createdByPublicKey,
+          changeDependencyIds: [...entryMetadata.dependencyIds],
         };
       }
       
@@ -6095,6 +6097,60 @@ export class BaseMindooDB implements MindooDB {
     return {
       docId,
       headEntryId: plan.headEntryId,
+      headCreatedAt: plan.headCreatedAt,
+      headCreatedByPublicKey: plan.headCreatedByPublicKey,
+      snapshotEntryId: plan.snapshotEntryId,
+      entryIdsApplied: [...plan.entryIdsToApply],
+      branchEntryIds: [...plan.branchEntryIds],
+      doc: this.wrapDocument(internalDoc),
+    };
+  }
+
+  async materializeDocumentAtHeads(
+    docId: string,
+    headEntryIds: string[],
+  ): Promise<DocumentDagBranchMaterializationResult | null> {
+    const startedAt = Date.now();
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    const plan = computeHeadsMaterializationPlan(docId, allEntryMetadata, headEntryIds);
+    if (!plan) {
+      this.performanceCallback?.onHistoryOperation?.({
+        operation: "materializeDocumentAtHeads",
+        docId,
+        time: Date.now() - startedAt,
+        scannedEntries: allEntryMetadata.length,
+        returnedEntries: 0,
+        bounded: true,
+      });
+      return null;
+    }
+    const metadataById = new Map(allEntryMetadata.map((entry) => [entry.id, entry]));
+    const branchEntries = plan.branchEntryIds
+      .map((entryId) => metadataById.get(entryId))
+      .filter((entry): entry is StoreEntryMetadata => entry !== undefined);
+    const internalDoc = await this.materializeDocumentFromPlan(
+      docId,
+      allEntryMetadata,
+      branchEntries,
+      plan.snapshotEntryId,
+      plan.entryIdsToApply,
+      plan.headCreatedAt,
+    );
+    this.performanceCallback?.onHistoryOperation?.({
+      operation: "materializeDocumentAtHeads",
+      docId,
+      time: Date.now() - startedAt,
+      scannedEntries: allEntryMetadata.length,
+      returnedEntries: internalDoc ? 1 : 0,
+      bounded: true,
+    });
+    if (!internalDoc) {
+      return null;
+    }
+    return {
+      docId,
+      headEntryId: plan.headEntryIds[plan.headEntryIds.length - 1]!,
+      headEntryIds: [...plan.headEntryIds],
       headCreatedAt: plan.headCreatedAt,
       headCreatedByPublicKey: plan.headCreatedByPublicKey,
       snapshotEntryId: plan.snapshotEntryId,

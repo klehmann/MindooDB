@@ -682,14 +682,75 @@ export function computeBranchMaterializationPlan(
   allEntriesForDoc: StoreEntryMetadata[],
   headEntryId: string,
 ): DocumentDagBranchPlan | null {
+  const plan = computeHeadsMaterializationPlan(docId, allEntriesForDoc, [headEntryId]);
+  if (!plan) {
+    return null;
+  }
+  return {
+    docId: plan.docId,
+    headEntryId,
+    headCreatedAt: plan.headCreatedAt,
+    headCreatedByPublicKey: plan.headCreatedByPublicKey,
+    snapshotEntryId: plan.snapshotEntryId,
+    entryIdsToApply: plan.entryIdsToApply,
+    branchEntryIds: plan.branchEntryIds,
+  };
+}
+
+/**
+ * Materialization instructions for reconstructing the document state at a set
+ * of concurrent DAG heads.
+ */
+export interface DocumentDagHeadsPlan {
+  docId: string;
+  /** The requested heads that exist as replay entries, ordered by `(createdAt, id)`. */
+  headEntryIds: string[];
+  /** `createdAt` of the latest resolved head — the effective time of this state. */
+  headCreatedAt: number;
+  /** Signing key of the latest resolved head. */
+  headCreatedByPublicKey: string;
+  snapshotEntryId: string | null;
+  entryIdsToApply: string[];
+  branchEntryIds: string[];
+}
+
+/**
+ * Builds the replay plan for the document state at several concurrent heads.
+ *
+ * This is the multi-head generalization of {@link computeBranchMaterializationPlan}:
+ * the plan replays the *union* of the heads' ancestor closures, which is exactly
+ * the Automerge multi-head document a writer holding all of those heads would
+ * have seen. No descendant of the given heads is included, so passing an
+ * entry's `dependencyIds` yields the state right before that entry was applied —
+ * a single "before" image even for a merge with several parents.
+ *
+ * Heads that are not replay entries of this document are ignored, mirroring how
+ * ancestor walking already tolerates unknown dependency ids. When no head
+ * resolves (including an empty `headEntryIds`) there is nothing to replay and
+ * the result is `null`, which callers read as "the document did not exist yet".
+ */
+export function computeHeadsMaterializationPlan(
+  docId: string,
+  allEntriesForDoc: StoreEntryMetadata[],
+  headEntryIds: string[],
+): DocumentDagHeadsPlan | null {
   const dagEntries = allEntriesForDoc.filter(isDagEntry);
   const replayEntries = dagEntries.filter(isReplayEntry);
   const replayById = new Map(replayEntries.map((entry) => [entry.id, entry]));
-  const headEntry = replayById.get(headEntryId);
-  if (!headEntry) {
+  const resolvedHeads = Array.from(new Set(headEntryIds))
+    .map((entryId) => replayById.get(entryId))
+    .filter((entry): entry is StoreEntryMetadata => entry !== undefined)
+    .sort(compareByCreatedAtThenId);
+  const latestHead = resolvedHeads.at(-1);
+  if (!latestHead) {
     return null;
   }
-  const branchAncestors = collectReplayAncestors(replayById, headEntryId);
+  const branchAncestors = new Set<string>();
+  for (const head of resolvedHeads) {
+    for (const ancestorId of collectReplayAncestors(replayById, head.id)) {
+      branchAncestors.add(ancestorId);
+    }
+  }
   const snapshots = dagEntries.filter((entry) => entry.entryType === "doc_snapshot");
   const bestSnapshot = chooseBestBranchSnapshot(snapshots, replayById, branchAncestors);
   const coveredIds = bestSnapshot
@@ -709,9 +770,9 @@ export function computeBranchMaterializationPlan(
     .map((entry) => entry.id);
   return {
     docId,
-    headEntryId,
-    headCreatedAt: headEntry.createdAt,
-    headCreatedByPublicKey: headEntry.createdByPublicKey,
+    headEntryIds: resolvedHeads.map((entry) => entry.id),
+    headCreatedAt: latestHead.createdAt,
+    headCreatedByPublicKey: latestHead.createdByPublicKey,
     snapshotEntryId: bestSnapshot?.id ?? null,
     entryIdsToApply,
     branchEntryIds,

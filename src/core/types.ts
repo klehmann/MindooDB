@@ -3588,6 +3588,17 @@ export interface DocumentHistoryResult {
    * The public signing key of the user who created this change (Ed25519, PEM format).
    */
   changeCreatedByPublicKey: string;
+
+  /**
+   * Parent DAG entry ids of this change — the edges of the signed change graph,
+   * and the heads to pass to {@link MindooDB.materializeDocumentAtHeads} to get
+   * the state this change was written against.
+   *
+   * More than one id means the change merged concurrent branches. Ids may point
+   * at entries this generator never yields, because a change whose payload left
+   * the Automerge heads untouched produces no new state to report.
+   */
+  changeDependencyIds: string[];
 }
 
 /**
@@ -3782,6 +3793,7 @@ export interface PerformanceCallback {
       | 'analyzeDocumentDagAtTimestamp'
       | 'materializeDocumentBranchAtEntry'
       | 'materializeDocumentBranchAtTimestamp'
+      | 'materializeDocumentAtHeads'
       | 'describeDocumentDagEntry'
       | 'analyzeDocumentConflicts'
       | 'getDocumentConflictReport'
@@ -4128,6 +4140,12 @@ export interface DocumentDagBranchMaterializationResult {
   entryIdsApplied: string[];
   branchEntryIds: string[];
   doc: MindooDoc;
+  /**
+   * All heads this state was replayed from, set by
+   * {@link MindooDB.materializeDocumentAtHeads}. Single-head materialization
+   * leaves it undefined; `headEntryId` is then the only head.
+   */
+  headEntryIds?: string[];
 }
 
 /**
@@ -4526,6 +4544,21 @@ export interface MindooDB {
     docId: string,
     timestamp: DocumentDagAnalysisTimestamp,
     headEntryId: string
+  ): Promise<DocumentDagBranchMaterializationResult | null>;
+
+  /**
+   * Reconstruct the document state at a set of concurrent heads: the Automerge
+   * multi-head document formed by replaying the union of those heads' ancestor
+   * closures, with no descendant applied.
+   *
+   * Passing an entry's `dependencyIds` therefore yields the state the writer saw
+   * right before that entry — one "before" image even when the entry merges
+   * several parents. Unknown heads are ignored; when no head resolves (or the
+   * list is empty) the result is `null`, meaning the document did not exist yet.
+   */
+  materializeDocumentAtHeads(
+    docId: string,
+    headEntryIds: string[]
   ): Promise<DocumentDagBranchMaterializationResult | null>;
 
   /**
