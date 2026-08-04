@@ -7,6 +7,7 @@ import type {
 
 const OP_TO_HELPER: Record<MindooDBAppViewExpressionOperation, string> = {
   createdAt: "createdAt",
+  lastModifiedAt: "lastModifiedAt",
   decryptionKeyId: "decryptionKeyId",
   isWitnessed: "isWitnessed",
   isAwaitingWitness: "isAwaitingWitness",

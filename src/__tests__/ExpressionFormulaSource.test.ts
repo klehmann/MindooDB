@@ -110,6 +110,7 @@ describe("formulaSource", () => {
 
   it("parses, formats, and evaluates metadata and attachment helpers", () => {
     const createdAtExpression = parseMindooDBFormulaExpression("v.createdAt()");
+    const lastModifiedAtExpression = parseMindooDBFormulaExpression("v.lastModifiedAt()");
     const decryptionKeyExpression = parseMindooDBFormulaExpression("v.decryptionKeyId()");
     const attachmentNamesExpression = parseMindooDBFormulaExpression("v.attachmentNames()");
     const attachmentLengthsExpression = parseMindooDBFormulaExpression("v.attachmentLengths()");
@@ -124,21 +125,25 @@ describe("formulaSource", () => {
       values: {},
       origin: "remote:replica-1:sales",
       createdAt: "2026-04-01T09:00:00.000Z",
+      lastModifiedAt: "2026-04-03T15:30:00.000Z",
       decryptionKeyId: "default",
       variables: {},
     };
 
     expect(createdAtExpression).toEqual({ kind: "operation", op: "createdAt", args: [] });
+    expect(lastModifiedAtExpression).toEqual({ kind: "operation", op: "lastModifiedAt", args: [] });
     expect(decryptionKeyExpression).toEqual({ kind: "operation", op: "decryptionKeyId", args: [] });
     expect(attachmentNamesExpression).toEqual({ kind: "operation", op: "attachmentNames", args: [] });
     expect(attachmentLengthsExpression).toEqual({ kind: "operation", op: "attachmentLengths", args: [] });
     expect(attachmentCountExpression).toEqual({ kind: "operation", op: "attachmentCount", args: [] });
     expect(formatMindooDBFormulaExpression(createdAtExpression)).toBe("v.createdAt()");
+    expect(formatMindooDBFormulaExpression(lastModifiedAtExpression)).toBe("v.lastModifiedAt()");
     expect(formatMindooDBFormulaExpression(decryptionKeyExpression)).toBe("v.decryptionKeyId()");
     expect(formatMindooDBFormulaExpression(attachmentNamesExpression)).toBe("v.attachmentNames()");
     expect(formatMindooDBFormulaExpression(attachmentLengthsExpression)).toBe("v.attachmentLengths()");
     expect(formatMindooDBFormulaExpression(attachmentCountExpression)).toBe("v.attachmentCount()");
     expect(evaluateExpression(createdAtExpression, context)).toBe("2026-04-01T09:00:00.000Z");
+    expect(evaluateExpression(lastModifiedAtExpression, context)).toBe("2026-04-03T15:30:00.000Z");
     expect(evaluateExpression(decryptionKeyExpression, context)).toBe("default");
     expect(evaluateExpression(attachmentNamesExpression, context)).toEqual(["a.txt", "b.png"]);
     expect(evaluateExpression(attachmentLengthsExpression, context)).toEqual([10, 25]);

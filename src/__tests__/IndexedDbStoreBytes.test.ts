@@ -12,6 +12,8 @@ import {
 import {
   IndexedDBLocalCacheStore,
   readLocalCacheStoreBytes,
+  readLocalCacheStoreBytesForType,
+  readLocalCacheStoreEntriesForType,
 } from "../browser/cache/IndexedDBLocalCacheStore";
 import { StoreKind } from "../core/appendonlystores/types";
 import type { StoreEntry, StoreEntryMetadata } from "../core/types";
@@ -386,6 +388,26 @@ describe("IndexedDB browser store byte counters", () => {
     ]);
 
     expect(await readLocalCacheStoreBytes(dbName)).toBe(5);
+  });
+
+  it("sums payload bytes for one LocalCacheStore type", async () => {
+    const dbName = "cache-bytes-by-type";
+    const store = new IndexedDBLocalCacheStore(dbName);
+
+    await store.put("doc", "entry-1", new Uint8Array([1, 2, 3]));
+    await store.put("fulltext", "acme/main/fulltext/engine", new Uint8Array([4, 5, 6, 7]));
+    await store.put("fulltext", "acme/main/fulltext/meta", new Uint8Array([8, 9]));
+    await store.put("fulltext", "acme/notes/fulltext/engine", new Uint8Array([10]));
+
+    expect(await readLocalCacheStoreBytesForType(dbName, "fulltext")).toBe(7);
+    expect(await readLocalCacheStoreEntriesForType(dbName, "fulltext")).toEqual([
+      { id: "acme/main/fulltext/engine", bytes: 4 },
+      { id: "acme/main/fulltext/meta", bytes: 2 },
+      { id: "acme/notes/fulltext/engine", bytes: 1 },
+    ]);
+    expect(await readLocalCacheStoreBytesForType(dbName, "missing")).toBe(0);
+
+    closeStoreConnection(store);
   });
 
   it("getMany batches reads in a single transaction and preserves ordering", async () => {

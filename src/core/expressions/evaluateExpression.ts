@@ -21,6 +21,8 @@ export type ExpressionEvaluationContext = {
   values: Record<string, unknown>;
   origin: string;
   createdAt?: string | null;
+  /** ISO-8601 last-modified timestamp from the host runtime (`getLastModified()`). */
+  lastModifiedAt?: string | null;
   decryptionKeyId?: string | null;
   witnessed?: boolean;
   awaitingWitness?: boolean;
@@ -151,6 +153,8 @@ function evaluateOperation(
   switch (expression.op) {
     case "createdAt":
       return context.createdAt ?? null;
+    case "lastModifiedAt":
+      return context.lastModifiedAt ?? null;
     case "decryptionKeyId":
       return context.decryptionKeyId ?? null;
     case "isWitnessed":

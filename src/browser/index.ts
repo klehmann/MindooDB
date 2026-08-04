@@ -24,6 +24,9 @@ export { IndexedDBContentAddressedStoreFactory } from "./appendonlystores/Indexe
 export {
   IndexedDBLocalCacheStore,
   readLocalCacheStoreBytes,
+  readLocalCacheStoreBytesForType,
+  readLocalCacheStoreEntriesForType,
+  type LocalCacheStoreTypeEntryBytes,
 } from "./cache/IndexedDBLocalCacheStore";
 
 // Network helpers used by browser sync clients

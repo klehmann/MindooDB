@@ -278,6 +278,7 @@ export async function executeQuery(
       doc: evaluationDoc,
       values: {},
       origin,
+      lastModifiedAt: new Date(entry.lastModified).toISOString(),
       decryptionKeyId: entry.decryptionKeyId,
       variables: {},
     };
@@ -392,6 +393,7 @@ async function executeFullScanQuery(
       values: {},
       origin,
       createdAt: new Date(mindooDoc.getCreatedAt()).toISOString(),
+      lastModifiedAt: new Date(mindooDoc.getLastModified()).toISOString(),
       decryptionKeyId: mindooDoc.getDecryptionKeyId(),
       witnessed: mindooDoc.isWitnessed(),
       awaitingWitness: mindooDoc.isAwaitingWitness(),

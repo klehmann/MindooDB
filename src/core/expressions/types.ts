@@ -9,6 +9,7 @@ export type MindooDBAppViewExpressionDatePart = "year" | "month" | "day" | "quar
 /** Low-level operation identifiers used by AST operation nodes. */
 export type MindooDBAppViewExpressionOperation =
   | "createdAt"
+  | "lastModifiedAt"
   | "decryptionKeyId"
   | "isWitnessed"
   | "isAwaitingWitness"

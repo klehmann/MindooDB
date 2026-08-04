@@ -342,9 +342,7 @@ export class IndexedDBLocalCacheStore implements LocalCacheStore {
  * back to a read-only scan of the `kv` store instead of writing migration
  * metadata. The function returns `null` only when the database does not exist.
  */
-export async function readLocalCacheStoreBytes(
-  idbName: string
-): Promise<number | null> {
+async function openExistingIndexedDb(idbName: string): Promise<IDBDatabase | null> {
   return new Promise((resolve, reject) => {
     let createdDuringProbe = false;
     const request = indexedDB.open(idbName);
@@ -356,33 +354,8 @@ export async function readLocalCacheStoreBytes(
       }
     };
 
-    request.onsuccess = async () => {
-      const db = request.result;
-      try {
-        let totalBytes: number | null = null;
-        if (db.objectStoreNames.contains(SIZE_META_STORE)) {
-          const tx = db.transaction(SIZE_META_STORE, "readonly");
-          totalBytes = await readStoredBytesValue(tx.objectStore(SIZE_META_STORE));
-        }
-
-        if (totalBytes === null) {
-          if (!db.objectStoreNames.contains(STORE_NAME)) {
-            db.close();
-            resolve(null);
-            return;
-          }
-
-          const scanTx = db.transaction(STORE_NAME, "readonly");
-          totalBytes = await computeCacheStoredBytes(scanTx.objectStore(STORE_NAME));
-          await transactionToPromise(scanTx);
-        }
-
-        db.close();
-        resolve(totalBytes);
-      } catch (error) {
-        db.close();
-        reject(error);
-      }
+    request.onsuccess = () => {
+      resolve(request.result);
     };
 
     request.onerror = async () => {
@@ -406,4 +379,107 @@ export async function readLocalCacheStoreBytes(
       );
     };
   });
+}
+
+export async function readLocalCacheStoreBytes(
+  idbName: string
+): Promise<number | null> {
+  const db = await openExistingIndexedDb(idbName);
+  if (!db) {
+    return null;
+  }
+
+  try {
+    let totalBytes: number | null = null;
+    if (db.objectStoreNames.contains(SIZE_META_STORE)) {
+      const tx = db.transaction(SIZE_META_STORE, "readonly");
+      totalBytes = await readStoredBytesValue(tx.objectStore(SIZE_META_STORE));
+    }
+
+    if (totalBytes === null) {
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        return null;
+      }
+
+      const scanTx = db.transaction(STORE_NAME, "readonly");
+      totalBytes = await computeCacheStoredBytes(scanTx.objectStore(STORE_NAME));
+      await transactionToPromise(scanTx);
+    }
+
+    return totalBytes;
+  } finally {
+    db.close();
+  }
+}
+
+export interface LocalCacheStoreTypeEntryBytes {
+  /** LocalCacheStore entry id (the part after `<type>\\0`). */
+  id: string;
+  bytes: number;
+}
+
+/**
+ * Lists approximate payload bytes for every LocalCacheStore entry of `type`.
+ *
+ * Keys are stored as `<type>\\0<id>`; this helper scans that prefix with an
+ * IDB key range. Returns `null` only when the database does not exist.
+ */
+export async function readLocalCacheStoreEntriesForType(
+  idbName: string,
+  type: string
+): Promise<LocalCacheStoreTypeEntryBytes[] | null> {
+  const db = await openExistingIndexedDb(idbName);
+  if (!db) {
+    return null;
+  }
+
+  try {
+    if (!db.objectStoreNames.contains(STORE_NAME)) {
+      return [];
+    }
+
+    const prefix = `${type}\0`;
+    const range = IDBKeyRange.bound(prefix, `${prefix}\uffff`);
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const store = tx.objectStore(STORE_NAME);
+    const entries: LocalCacheStoreTypeEntryBytes[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      const request = store.openCursor(range);
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+        const key = String(cursor.primaryKey);
+        entries.push({
+          id: key.slice(prefix.length),
+          bytes: getPayloadBytes(cursor.value as ArrayBuffer | Uint8Array),
+        });
+        cursor.continue();
+      };
+      request.onerror = () => reject(request.error);
+    });
+
+    await transactionToPromise(tx);
+    return entries;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Sums approximate payload bytes for all LocalCacheStore entries of `type`.
+ * Returns `null` only when the database does not exist.
+ */
+export async function readLocalCacheStoreBytesForType(
+  idbName: string,
+  type: string
+): Promise<number | null> {
+  const entries = await readLocalCacheStoreEntriesForType(idbName, type);
+  if (!entries) {
+    return null;
+  }
+  return entries.reduce((sum, entry) => sum + entry.bytes, 0);
 }

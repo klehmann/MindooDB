@@ -93,6 +93,13 @@ describe("expression evaluation", () => {
       createdAt: documents[0]!.createdAt,
       variables: {},
     })).toBe("2026-04-01T09:00:00.000Z");
+    expect(evaluateExpression(v.lastModifiedAt(), {
+      doc: documents[0]!.data,
+      values: {},
+      origin: "tenant/db",
+      lastModifiedAt: "2026-04-03T15:30:00.000Z",
+      variables: {},
+    })).toBe("2026-04-03T15:30:00.000Z");
     expect(evaluateExpression(v.decryptionKeyId(), {
       doc: documents[0]!.data,
       values: {},
@@ -126,6 +133,12 @@ describe("expression evaluation", () => {
       variables: {},
     })).toBeNull();
     expect(evaluateExpression(v.createdAt(), {
+      doc: documents[2]!.data,
+      values: {},
+      origin: "tenant/db",
+      variables: {},
+    })).toBeNull();
+    expect(evaluateExpression(v.lastModifiedAt(), {
       doc: documents[2]!.data,
       values: {},
       origin: "tenant/db",

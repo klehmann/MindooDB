@@ -1,6 +1,6 @@
 {
   "name": "mindoodb",
-  "version": "0.0.47",
+  "version": "0.0.48",
   "packageManager": "pnpm@11.1.1",
   "engines": {
     "node": ">=22.13.0"
@@ -75,7 +75,7 @@
   "author": "Mindoo GmbH",
   "license": "Apache-2.0",
   "dependencies": {
-    "@automerge/automerge": "^3.2.1",
+    "@automerge/automerge": "^3.3.2",
     "minisearch": "^7.2.0",
     "uuid": "^11.1.1"
   },

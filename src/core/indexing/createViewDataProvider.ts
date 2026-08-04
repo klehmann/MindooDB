@@ -218,6 +218,7 @@ export function filterExpressionToDocumentFilter(
         values: {},
         origin: "",
         createdAt: new Date(doc.getCreatedAt()).toISOString(),
+        lastModifiedAt: new Date(doc.getLastModified()).toISOString(),
         decryptionKeyId: doc.getDecryptionKeyId(),
         variables: {},
       })

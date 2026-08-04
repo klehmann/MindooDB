@@ -209,6 +209,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
         doc: evaluationDoc,
         values: {},
         origin: this.origin,
+        lastModifiedAt: new Date(entry.lastModified).toISOString(),
         decryptionKeyId: entry.decryptionKeyId,
         variables: {},
       };
