@@ -64,6 +64,8 @@ This means the time to "database is open and responsive" is proportional to the 
 
 For most applications, the default lazy behavior is appropriate. Consider switching to eager (pre-fetching all documents at startup) only if your application will immediately access the majority of documents — for example, a full-text search index that must be populated before the UI becomes interactive.
 
+Eager access over a network-backed store is the expensive case: materializing each document individually costs two to three HTTP requests. [Bulk Materialization](./bulk-materialization.md) describes how those are batched, and `OpenDBOptions.autoIndexing: false` turns off the automatic summary and full-text catch-up passes for hosts that cannot afford the walk at all.
+
 ## Dense Sync
 
 When synchronizing a database from a remote server to a local device, transferring the complete change history for every document can be wasteful. Dense sync reduces the transfer to the minimum needed for local usability by wiring the batch materialization planner into the `syncEntriesFromStore` transfer path.

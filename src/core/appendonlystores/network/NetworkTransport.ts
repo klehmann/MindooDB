@@ -408,4 +408,15 @@ export interface NetworkTransportConfig {
    * Store kind for selecting the docs or attachments sync endpoint.
    */
   storeKind?: StoreKind;
+
+  /**
+   * Requests this client may have in flight against one server before further
+   * ones queue (default: 6). The budget is shared by every transport pointing
+   * at that server, so a host opening several databases at once approaches the
+   * server's rate limit as a queue instead of a burst of 429s.
+   *
+   * Applies when the first transport for a server is created; later transports
+   * join the existing gate.
+   */
+  maxConcurrentRequests?: number;
 }

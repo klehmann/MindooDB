@@ -18,7 +18,7 @@ import path from "path";
 import { readFileSync, existsSync } from "fs";
 import helmet from "helmet";
 import cors from "cors";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { jsonCompressionMiddleware } from "./compressionMiddleware";
 import {
   BINARY_ENTRIES_CONTENT_TYPE,
@@ -105,6 +105,7 @@ import {
   TIMESTAMP_REPLY_CONTENT_TYPE,
   type TsaProviderConfig,
 } from "./timestampProxy";
+import { buildSyncRateLimitKey, resolveGlobalRateLimit } from "./rateLimits";
 
 /**
  * Augment Express Request with fields populated by our middleware:
@@ -120,6 +121,8 @@ declare global {
       jsonBodyBytes?: number;
       /** Set by timestampAuthMiddleware; identifies the caller for per-identity throttling. */
       timestampPrincipal?: string;
+      /** Set by syncPrincipalMiddleware; identifies the caller for per-identity throttling. */
+      syncPrincipal?: string;
     }
   }
 }
@@ -177,7 +180,24 @@ interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
 const DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_AUTH_RATE_LIMIT_MAX = 120;
 const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
-const DEFAULT_SYNC_RATE_LIMIT_MAX = 1_000;
+/**
+ * Sync is keyed per authenticated principal, and a client legitimately opens
+ * several databases at once: a host like Teacher's Desk reads six, and a cold
+ * pass over one of them costs a few hundred batched requests. A budget sized
+ * for a single database turns that normal open into a throttled one.
+ */
+const DEFAULT_SYNC_RATE_LIMIT_MAX = 3_000;
+
+/**
+ * The global limiter is a coarse net for unauthenticated floods and unknown
+ * routes; the per-tier limiters are the real budgets. It runs first, so a
+ * global max below a tier max silently replaces that tier — the sync budget
+ * was unreachable while this was a hardcoded 500. The default is therefore
+ * derived from the tiers, and an override that would shadow one is honoured
+ * but flagged at startup rather than quietly applied.
+ */
+const DEFAULT_GLOBAL_RATE_LIMIT_WINDOW_MS = 60_000;
+const GLOBAL_RATE_LIMIT_TIER_HEADROOM = 500;
 
 /**
  * Timestamping gets its own budget rather than sharing the sync one. Sync is
@@ -391,6 +411,7 @@ export class MindooDBServer {
    * 5. request logger
    */
   private setupMiddleware(): void {
+    this.applyTrustProxySetting();
     this.app.use(helmet());
 
     const corsOrigin = this.readCorsOriginsFromEnv();
@@ -400,9 +421,13 @@ export class MindooDBServer {
       allowedHeaders: ["Content-Type", "Authorization"],
     }));
 
+    const globalRateLimitConfig = this.getGlobalRateLimitConfig();
+    console.log(
+      `[MindooDBServer] Global rate limit configured windowMs=${globalRateLimitConfig.windowMs} max=${globalRateLimitConfig.max}`,
+    );
     this.app.use(rateLimit({
-      windowMs: 60_000,
-      max: 500,
+      windowMs: globalRateLimitConfig.windowMs,
+      max: globalRateLimitConfig.max,
       standardHeaders: true,
       legacyHeaders: false,
       message: { error: "Too many requests, please try again later" },
@@ -430,6 +455,44 @@ export class MindooDBServer {
   }
 
   /** Parse MINDOODB_CORS_ORIGIN env var; supports comma-separated multiple origins. */
+  /**
+   * Teach Express which upstream hops to trust for `X-Forwarded-For`, so
+   * `req.ip` is the client rather than the proxy. Every rate limiter keys on
+   * `req.ip`; without this, a deployment behind Cloudflare or nginx puts all
+   * of its users in one bucket and the first busy client locks out the rest.
+   *
+   * `MINDOODB_TRUST_PROXY` takes the Express `trust proxy` values: a hop count
+   * (`1` for Cloudflare only, `2` when nginx also fronts the origin), a
+   * comma-separated list of trusted addresses/CIDRs, or `loopback`. Off by
+   * default, because trusting a header nobody strips lets a client spoof its
+   * own address and mint unlimited budgets. Prefer a hop count or an address
+   * list over `true`, which trusts the whole chain.
+   */
+  private applyTrustProxySetting(): void {
+    const raw = process.env[ENV_VARS.TRUST_PROXY]?.trim();
+    if (!raw || /^(0|false)$/i.test(raw)) {
+      return;
+    }
+
+    const hops = Number(raw);
+    const value: number | boolean | string[] = Number.isInteger(hops) && hops >= 0
+      ? hops
+      : /^true$/i.test(raw)
+        ? true
+        : raw.split(",").map((entry) => entry.trim()).filter(Boolean);
+
+    this.app.set("trust proxy", value);
+    if (value === true) {
+      console.warn(
+        "[MindooDBServer] MINDOODB_TRUST_PROXY=true trusts the entire forwarding chain; " +
+        "a client can then spoof X-Forwarded-For and bypass per-IP rate limits. " +
+        "Set a hop count (e.g. 1 behind Cloudflare) or a trusted address list instead.",
+      );
+    } else {
+      console.log(`[MindooDBServer] trust proxy set to ${JSON.stringify(value)}`);
+    }
+  }
+
   private readCorsOriginsFromEnv(): string | string[] | undefined {
     const raw = process.env.MINDOODB_CORS_ORIGIN?.trim();
     if (!raw) {
@@ -1148,9 +1211,9 @@ export class MindooDBServer {
   // ==================== Tenant Routes ====================
 
   /**
-   * Build the per-tenant router. Rate limiters are scoped: auth endpoints
-   * use a per-user composite key (see createAuthRateLimit) while sync
-   * endpoints use a plain IP-based bucket with a higher ceiling.
+   * Build the per-tenant router. Rate limiters are scoped: auth and sync
+   * endpoints both use a per-user composite key (see createAuthRateLimit and
+   * createSyncRateLimit), sync with a much higher ceiling.
    *
    * Both "docs" and "attachments" store kinds expose the same set of sync
    * operations, mounted at /sync/docs/* and /sync/attachments/*.
@@ -1158,18 +1221,15 @@ export class MindooDBServer {
   private createTenantRouter(): Router {
     const router = Router({ mergeParams: true });
     const authRateLimitConfig = this.getAuthRateLimitConfig();
-    const syncRateLimitConfig = this.getSyncRateLimitConfig();
 
     const challengeRateLimit = this.createAuthRateLimit("tenant", "challenge");
     const authenticateRateLimit = this.createAuthRateLimit("tenant", "authenticate");
 
-    const syncRateLimit = rateLimit({
-      windowMs: syncRateLimitConfig.windowMs,
-      max: syncRateLimitConfig.max,
-      standardHeaders: true,
-      legacyHeaders: false,
-      message: { error: "Too many sync requests, please try again later" },
-    });
+    // Identity resolution precedes the limiter so it can key on the caller.
+    const syncGuards = [
+      this.syncPrincipalMiddleware.bind(this),
+      this.createSyncRateLimit(),
+    ];
 
     console.log(
       `[MindooDBServer] Tenant auth rate limit configured windowMs=${authRateLimitConfig.windowMs} max=${authRateLimitConfig.max}`,
@@ -1192,39 +1252,61 @@ export class MindooDBServer {
 
     for (const storeKind of ["docs", "attachments"] as const) {
       const syncBase = `/sync/${storeKind}`;
-      router.post(`${syncBase}/findNewEntries`, syncRateLimit, this.handleFindNewEntries.bind(this));
-      router.post(`${syncBase}/findNewEntriesForDoc`, syncRateLimit, this.handleFindNewEntriesForDoc.bind(this));
-      router.post(`${syncBase}/findEntries`, syncRateLimit, this.handleFindEntries.bind(this));
-      router.post(`${syncBase}/scanEntriesSince`, syncRateLimit, this.handleScanEntriesSince.bind(this));
-      router.post(`${syncBase}/getStoreHead`, syncRateLimit, this.handleGetStoreHead.bind(this));
-      router.post(`${syncBase}/getIdBloomSummary`, syncRateLimit, this.handleGetIdBloomSummary.bind(this));
-      router.post(`${syncBase}/getCompactionStatus`, syncRateLimit, this.handleGetCompactionStatus.bind(this));
-      router.get(`${syncBase}/capabilities`, syncRateLimit, this.handleGetCapabilities.bind(this));
+      router.post(`${syncBase}/findNewEntries`, syncGuards, this.handleFindNewEntries.bind(this));
+      router.post(`${syncBase}/findNewEntriesForDoc`, syncGuards, this.handleFindNewEntriesForDoc.bind(this));
+      router.post(`${syncBase}/findEntries`, syncGuards, this.handleFindEntries.bind(this));
+      router.post(`${syncBase}/scanEntriesSince`, syncGuards, this.handleScanEntriesSince.bind(this));
+      router.post(`${syncBase}/getStoreHead`, syncGuards, this.handleGetStoreHead.bind(this));
+      router.post(`${syncBase}/getIdBloomSummary`, syncGuards, this.handleGetIdBloomSummary.bind(this));
+      router.post(`${syncBase}/getCompactionStatus`, syncGuards, this.handleGetCompactionStatus.bind(this));
+      router.get(`${syncBase}/capabilities`, syncGuards, this.handleGetCapabilities.bind(this));
       // SSE live change feed (sync-v5, phase 5): one long-lived GET per
       // subscriber; putEntries publishes into the in-process event bus.
-      router.get(`${syncBase}/events`, syncRateLimit, this.handleSyncEvents.bind(this));
-      router.post(`${syncBase}/getEntries`, syncRateLimit, this.handleGetEntries.bind(this));
+      router.get(`${syncBase}/events`, syncGuards, this.handleSyncEvents.bind(this));
+      router.post(`${syncBase}/getEntries`, syncGuards, this.handleGetEntries.bind(this));
       // Binary wire format v2 (sync-v5, phase 3): octet-stream framing for the
       // two payload-heavy endpoints. putEntriesBinary needs its own raw body
       // parser (the global JSON parser only handles application/json).
-      router.post(`${syncBase}/getEntriesBinary`, syncRateLimit, this.handleGetEntriesBinary.bind(this));
+      router.post(`${syncBase}/getEntriesBinary`, syncGuards, this.handleGetEntriesBinary.bind(this));
       router.post(
         `${syncBase}/putEntriesBinary`,
-        syncRateLimit,
+        syncGuards,
         express.raw({ type: BINARY_ENTRIES_CONTENT_TYPE, limit: this.jsonBodyLimit }),
         this.handlePutEntriesBinary.bind(this),
       );
-      router.post(`${syncBase}/getEntryMetadata`, syncRateLimit, this.handleGetEntryMetadata.bind(this));
-      router.post(`${syncBase}/putEntries`, syncRateLimit, this.handlePutEntries.bind(this));
-      router.post(`${syncBase}/hasEntries`, syncRateLimit, this.handleHasEntries.bind(this));
-      router.get(`${syncBase}/getAllIds`, syncRateLimit, this.handleGetAllIds.bind(this));
-      router.post(`${syncBase}/resolveDependencies`, syncRateLimit, this.handleResolveDependencies.bind(this));
-      router.post(`${syncBase}/planDocumentMaterialization`, syncRateLimit, this.handlePlanDocumentMaterialization.bind(this));
-      router.post(`${syncBase}/planDocumentMaterializationBatch`, syncRateLimit, this.handlePlanDocumentMaterializationBatch.bind(this));
-      router.post(`${syncBase}/planAttachmentReadByWalkingMetadata`, syncRateLimit, this.handlePlanAttachmentReadByWalkingMetadata.bind(this));
+      router.post(`${syncBase}/getEntryMetadata`, syncGuards, this.handleGetEntryMetadata.bind(this));
+      router.post(`${syncBase}/putEntries`, syncGuards, this.handlePutEntries.bind(this));
+      router.post(`${syncBase}/hasEntries`, syncGuards, this.handleHasEntries.bind(this));
+      router.get(`${syncBase}/getAllIds`, syncGuards, this.handleGetAllIds.bind(this));
+      router.post(`${syncBase}/resolveDependencies`, syncGuards, this.handleResolveDependencies.bind(this));
+      router.post(`${syncBase}/planDocumentMaterialization`, syncGuards, this.handlePlanDocumentMaterialization.bind(this));
+      router.post(`${syncBase}/planDocumentMaterializationBatch`, syncGuards, this.handlePlanDocumentMaterializationBatch.bind(this));
+      router.post(`${syncBase}/planAttachmentReadByWalkingMetadata`, syncGuards, this.handlePlanAttachmentReadByWalkingMetadata.bind(this));
     }
 
     return router;
+  }
+
+  /**
+   * Resolved global rate-limit config. The default leaves room for the sync
+   * and auth tiers to spend their full budgets inside the global window, so
+   * the net catches only traffic no tier claims.
+   */
+  private getGlobalRateLimitConfig(): { windowMs: number; max: number } {
+    const resolved = resolveGlobalRateLimit(this.serverConfig.rateLimits?.global, {
+      sync: this.getSyncRateLimitConfig(),
+      auth: this.getAuthRateLimitConfig(),
+      defaultWindowMs: DEFAULT_GLOBAL_RATE_LIMIT_WINDOW_MS,
+      headroom: GLOBAL_RATE_LIMIT_TIER_HEADROOM,
+    });
+    if (resolved.shadowsTiers) {
+      console.warn(
+        `[MindooDBServer] rateLimits.global.max=${resolved.max} is below the ${resolved.tierFloor} ` +
+        "requests the sync and auth tiers may spend in the same window; the global limiter " +
+        "will reject requests those tiers still allow.",
+      );
+    }
+    return { windowMs: resolved.windowMs, max: resolved.max };
   }
 
   /** Resolved auth rate-limit config; falls back to defaults when not set in config.json. */
@@ -1277,7 +1359,7 @@ export class MindooDBServer {
       keyGenerator: (req: Request) => {
         const tenantId = req.tenantId ?? "unknown";
         const principal = req.timestampPrincipal ?? "anonymous";
-        return `timestamp:${tier}:${tenantId}:${principal}:${req.ip}`;
+        return `timestamp:${tier}:${tenantId}:${principal}:${this.getClientIpForRateLimit(req)}`;
       },
       handler: (req, res, _next, options) => {
         console.warn(
@@ -1291,6 +1373,67 @@ export class MindooDBServer {
             ? "Too many timestamp requests, please try again shortly"
             : "Daily timestamp quota exhausted for this server",
       },
+    });
+  }
+
+  /**
+   * Resolve the caller of a sync request so {@link createSyncRateLimit} can
+   * bucket per identity instead of per address.
+   *
+   * Unlike {@link timestampAuthMiddleware} this never rejects: the route
+   * handlers do their own token validation and own the 401, and this pass only
+   * needs to know whose budget to spend. An unverifiable token simply falls
+   * back to address-only bucketing — a forged one must not be able to conjure
+   * a fresh budget, which is why the token is verified rather than decoded.
+   */
+  private async syncPrincipalMiddleware(
+    req: Request,
+    _res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const token = this.extractToken(req);
+      const authService = await this.tenantManager.getAuthService(req.tenantId!);
+      const payload = await authService.validateToken(token);
+      if (payload && payload.tenantId === req.tenantId) {
+        req.syncPrincipal = payload.deviceSigningKey ?? payload.sub;
+      }
+    } catch {
+      // No usable token; fall through to address-only bucketing.
+    }
+    next();
+  }
+
+  /**
+   * Sync budget, keyed on tenant + principal + IP like the auth and timestamp
+   * tiers. Address-only keying would put every user behind one NAT or reverse
+   * proxy in a single bucket, so one client opening several databases would
+   * throttle everyone else on that address.
+   */
+  private createSyncRateLimit() {
+    const config = this.getSyncRateLimitConfig();
+    console.log(
+      `[MindooDBServer] Tenant sync rate limit configured windowMs=${config.windowMs} max=${config.max}`,
+    );
+    return rateLimit({
+      windowMs: config.windowMs,
+      max: config.max,
+      standardHeaders: true,
+      legacyHeaders: false,
+      keyGenerator: (req: Request) =>
+        buildSyncRateLimitKey(
+          req.tenantId,
+          req.syncPrincipal,
+          this.getClientIpForRateLimit(req),
+        ),
+      handler: (req, res, _next, options) => {
+        console.warn(
+          `[MindooDBServer] Sync rate limit hit tenant=${req.tenantId} ` +
+          `principal=${req.syncPrincipal ?? "anonymous"} ip=${req.ip} path=${req.path}`,
+        );
+        res.status(options.statusCode).json(options.message);
+      },
+      message: { error: "Too many sync requests, please try again later" },
     });
   }
 
@@ -1461,15 +1604,21 @@ export class MindooDBServer {
   }
 
   /**
-   * Best-effort client IP. Express populates `req.ip` from the trust-proxy
-   * setting; fall back to the raw socket address when it's unavailable.
+   * Best-effort client IP for bucketing. Express populates `req.ip` from the
+   * trust-proxy setting; fall back to the raw socket address when it's
+   * unavailable.
+   *
+   * IPv6 addresses collapse to their /56 prefix. A single IPv6 client is
+   * routinely handed far more than one address, so keying on the full address
+   * would let it mint a fresh budget per request. Non-IPv6 values, including
+   * the "unknown" fallback, pass through unchanged.
    */
   private getClientIpForRateLimit(req: Request): string {
-    return (
+    const raw =
       (typeof req.ip === "string" && req.ip.length > 0
         ? req.ip
-        : req.socket?.remoteAddress) ?? "unknown"
-    );
+        : req.socket?.remoteAddress) ?? "unknown";
+    return ipKeyGenerator(raw);
   }
 
   // ==================== Validation Helpers ====================

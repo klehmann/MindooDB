@@ -732,6 +732,26 @@ describe("full-text open-time auto-activation", () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect((db2 as any).fulltextIndex).toBeNull();
   }, 30000);
+
+  it("stays inactive when the open disabled autoIndexing", async () => {
+    const ctx = await createWitnessingTenant("test-tenant-ftopen-gated");
+    // A host reading through a remote store cannot afford the automatic
+    // catch-up: it materializes every document, i.e. one round trip each.
+    const db = await ctx.tenant.openDB("ftopengated-db", { autoIndexing: false });
+    await db.setFulltextSetup!({ enabled: true });
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (d) => {
+      d.getData().body = "gated searchable content";
+    });
+
+    // Setup enabled plus change events would normally auto-activate.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect((db as any).fulltextIndex).toBeNull();
+
+    // Only the automatic pass is gated — explicit use still indexes.
+    const result = await db.searchText!("gated");
+    expect(result.hits.map((h) => h.docId)).toEqual([doc.getId()]);
+  }, 30000);
 });
 
 describe("query integration (text clause)", () => {

@@ -163,6 +163,7 @@ function validateRateLimits(
   const auth = validateRateLimitConfig(obj.auth, "auth", filePath);
   const sync = validateRateLimitConfig(obj.sync, "sync", filePath);
   const timestamps = validateTimestampRateLimitConfig(obj.timestamps, filePath);
+  const global = validateRateLimitConfig(obj.global, "global", filePath);
 
   const rateLimits: ServerRateLimitsConfig = {};
   if (auth) {
@@ -173,6 +174,9 @@ function validateRateLimits(
   }
   if (timestamps) {
     rateLimits.timestamps = timestamps;
+  }
+  if (global) {
+    rateLimits.global = global;
   }
   return Object.keys(rateLimits).length > 0 ? rateLimits : {};
 }

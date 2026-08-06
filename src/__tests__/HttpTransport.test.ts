@@ -2,6 +2,10 @@ import type { StoreEntry } from "../core/types";
 import { HttpTransport } from "../appendonlystores/network/HttpTransport";
 import { NetworkError, NetworkErrorType } from "../core/appendonlystores/network/types";
 import {
+  getSharedRequestScheduler,
+  resetSharedRequestSchedulers,
+} from "../appendonlystores/network/RequestScheduler";
+import {
   BINARY_ENTRIES_CONTENT_TYPE,
   BINARY_GET_ENTRIES_FORMAT,
   BINARY_PUT_ENTRIES_FORMAT,
@@ -10,6 +14,12 @@ import {
   measureBinaryEntryMessage,
   type BinaryEntryFrame,
 } from "../core/appendonlystores/network/binaryEntryFraming";
+
+// Transports to one origin share a request gate, so a 429 in one test would
+// otherwise pause the next one for as long as its Retry-After asked.
+afterEach(() => {
+  resetSharedRequestSchedulers();
+});
 
 function createEntry(id: string, encryptedBytes: number): StoreEntry {
   return {
@@ -254,6 +264,69 @@ describe("HttpTransport rate limiting", () => {
       type: NetworkErrorType.RATE_LIMITED,
       retryAfterMs: 7000,
     } satisfies Partial<NetworkError>);
+  });
+
+  test("a 429 in one database holds back the others on that server", async () => {
+    global.fetch = jest.fn(async () =>
+      new Response(JSON.stringify({ error: "Too many sync requests" }), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Retry-After": "2" },
+      })) as typeof fetch;
+
+    const first = new HttpTransport({
+      baseUrl: "https://sync.example.com/tenant-a",
+      tenantId: "tenant-a",
+      dbId: "calendar",
+      retryAttempts: 1,
+    });
+    // A second database on the same server: its own transport, same gate.
+    const second = new HttpTransport({
+      baseUrl: "https://sync.example.com/tenant-a",
+      tenantId: "tenant-a",
+      dbId: "lessons",
+      retryAttempts: 1,
+    });
+
+    await expect(first.findNewEntries("token", [])).rejects.toMatchObject({
+      type: NetworkErrorType.RATE_LIMITED,
+    });
+
+    expect(getSharedRequestScheduler("https://sync.example.com").isPaused).toBe(true);
+    // The second database learns to wait from the first one's rejection
+    // instead of discovering the limit for itself.
+    expect(second.getIdentity()).toBe("https://sync.example.com/tenant-a");
+  });
+
+  test("requests to one server queue instead of bursting past the gate", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    global.fetch = jest.fn(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return new Response(JSON.stringify({ entries: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    // A unique origin: the gate for a server is created once, so a shared one
+    // would already carry another test's concurrency setting.
+    const baseUrl = "https://gated.example.com/tenant-a";
+    const transports = ["a", "b", "c", "d"].map((dbId) =>
+      new HttpTransport({
+        baseUrl,
+        tenantId: "tenant-a",
+        dbId,
+        retryAttempts: 1,
+        maxConcurrentRequests: 2,
+      }),
+    );
+
+    await Promise.all(transports.map((transport) => transport.findNewEntries("token", [])));
+
+    expect(peak).toBe(2);
   });
 });
 

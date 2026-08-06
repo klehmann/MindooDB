@@ -43,6 +43,7 @@ import {
 } from "../../core/appendonlystores/network/binaryEntryFraming";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import { isSameOrigin } from "../../core/utils/urlSafety";
+import { getSharedRequestScheduler, type RequestScheduler } from "./RequestScheduler";
 
 /**
  * HTTP implementation of the NetworkTransport interface.
@@ -66,6 +67,8 @@ export class HttpTransport implements NetworkTransport {
   private logger: Logger;
   private remoteJsonBodyLimitBytesPromise: Promise<number | null> | null = null;
   private _syncAbortSignal?: AbortSignal;
+  /** Shared with every other transport talking to the same server. */
+  private scheduler: RequestScheduler;
 
   constructor(config: NetworkTransportConfig, logger?: Logger) {
     this.config = {
@@ -81,6 +84,9 @@ export class HttpTransport implements NetworkTransport {
     
     // Ensure baseUrl doesn't end with /
     this.baseUrl = config.baseUrl.replace(/\/$/, "");
+    this.scheduler = getSharedRequestScheduler(this.baseUrl, {
+      maxConcurrent: this.config.maxConcurrentRequests,
+    });
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), "HttpTransport", true);
@@ -936,6 +942,10 @@ export class HttpTransport implements NetworkTransport {
 
   /**
    * Fetch with retry and exponential backoff.
+   *
+   * Each attempt runs inside the shared per-server gate; the backoff between
+   * attempts deliberately does not, so a sleeping retry does not occupy a slot
+   * another database could be using.
    */
   private async fetchWithRetry(
     url: string,
@@ -951,71 +961,12 @@ export class HttpTransport implements NetworkTransport {
         throw new NetworkError(NetworkErrorType.SERVER_ERROR, "Sync cancelled");
       }
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(
-        () => controller.abort(),
-        this.config.timeout || HttpTransport.DEFAULT_TIMEOUT_MS
-      );
-
-      let onExternalAbort: (() => void) | undefined;
-      if (externalSignal && !externalSignal.aborted) {
-        onExternalAbort = () => controller.abort();
-        externalSignal.addEventListener('abort', onExternalAbort);
-      }
-
       try {
-        const response = await this.safeFetch(url, {
-          ...options,
-          signal: controller.signal,
-        });
-        
-        clearTimeout(timeoutId);
-        
-        // Handle HTTP error responses
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          
-          switch (response.status) {
-            case 401:
-              throw new NetworkError(
-                NetworkErrorType.INVALID_TOKEN,
-                errorData.error || "Unauthorized"
-              );
-            case 403:
-              throw new NetworkError(
-                NetworkErrorType.USER_REVOKED,
-                errorData.error || "Access denied"
-              );
-            case 404:
-              throw new NetworkError(
-                NetworkErrorType.USER_NOT_FOUND,
-                errorData.error || "Not found"
-              );
-            case 413:
-              throw new NetworkError(
-                NetworkErrorType.PAYLOAD_TOO_LARGE,
-                errorData.error || "Request body too large"
-              );
-            case 429: {
-              const retryAfterMs = this.parseRetryAfterMs(response.headers.get("Retry-After"));
-              throw new NetworkError(
-                NetworkErrorType.RATE_LIMITED,
-                errorData.error || "Too many requests",
-                retryAfterMs,
-              );
-            }
-            default:
-              throw new NetworkError(
-                NetworkErrorType.SERVER_ERROR,
-                errorData.error || `HTTP ${response.status}`
-              );
-          }
-        }
-        
-        return response;
+        return await this.scheduler.run(() =>
+          this.attemptFetch(url, options, externalSignal),
+        );
       } catch (error) {
         if (externalSignal?.aborted) {
-          clearTimeout(timeoutId);
           throw new NetworkError(NetworkErrorType.SERVER_ERROR, "Sync cancelled");
         }
 
@@ -1046,11 +997,6 @@ export class HttpTransport implements NetworkTransport {
           const delay = baseDelay * Math.pow(2, attempt);
           await this.sleep(delay);
         }
-      } finally {
-        clearTimeout(timeoutId);
-        if (onExternalAbort) {
-          externalSignal!.removeEventListener('abort', onExternalAbort);
-        }
       }
     }
     
@@ -1058,6 +1004,87 @@ export class HttpTransport implements NetworkTransport {
       NetworkErrorType.NETWORK_ERROR,
       lastError?.message || "Request failed after retries"
     );
+  }
+
+  /**
+   * A single request attempt: timeout wiring, redirect-safe fetch, and status
+   * mapping.
+   *
+   * A 429 also pauses the shared gate, so the other databases on this server
+   * hold back rather than each discovering the limit for themselves.
+   */
+  private async attemptFetch(
+    url: string,
+    options: RequestInit,
+    externalSignal: AbortSignal | undefined,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      this.config.timeout || HttpTransport.DEFAULT_TIMEOUT_MS
+    );
+
+    let onExternalAbort: (() => void) | undefined;
+    if (externalSignal && !externalSignal.aborted) {
+      onExternalAbort = () => controller.abort();
+      externalSignal.addEventListener('abort', onExternalAbort);
+    }
+
+    try {
+      const response = await this.safeFetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+
+      // Handle HTTP error responses
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+
+        switch (response.status) {
+          case 401:
+            throw new NetworkError(
+              NetworkErrorType.INVALID_TOKEN,
+              errorData.error || "Unauthorized"
+            );
+          case 403:
+            throw new NetworkError(
+              NetworkErrorType.USER_REVOKED,
+              errorData.error || "Access denied"
+            );
+          case 404:
+            throw new NetworkError(
+              NetworkErrorType.USER_NOT_FOUND,
+              errorData.error || "Not found"
+            );
+          case 413:
+            throw new NetworkError(
+              NetworkErrorType.PAYLOAD_TOO_LARGE,
+              errorData.error || "Request body too large"
+            );
+          case 429: {
+            const retryAfterMs = this.parseRetryAfterMs(response.headers.get("Retry-After"));
+            this.scheduler.pauseForRateLimit(retryAfterMs);
+            throw new NetworkError(
+              NetworkErrorType.RATE_LIMITED,
+              errorData.error || "Too many requests",
+              retryAfterMs,
+            );
+          }
+          default:
+            throw new NetworkError(
+              NetworkErrorType.SERVER_ERROR,
+              errorData.error || `HTTP ${response.status}`
+            );
+        }
+      }
+
+      return response;
+    } finally {
+      clearTimeout(timeoutId);
+      if (onExternalAbort) {
+        externalSignal!.removeEventListener('abort', onExternalAbort);
+      }
+    }
   }
 
   private static readonly MAX_REDIRECTS = 3;

@@ -1401,8 +1401,13 @@ export interface DocumentCacheConfig {
 
   /**
    * Number of upcoming documents to prefetch during changefeed iteration.
+   * The window's entries are fetched from the store in a few byte-budgeted
+   * calls instead of two or three per document, which is what makes a
+   * changefeed pass over a network-backed store affordable.
+   * Clamped to half of `maxEntries`, because a window that reaches further
+   * ahead than the cache evicts what it just materialized.
    * Set to 0 to disable eager iteration prefetch.
-   * Default: 0
+   * Default: 32
    */
   iteratePrefetchWindowDocs?: number;
 
@@ -3712,6 +3717,20 @@ export interface OpenDBOptions extends OpenStoreOptions {
    */
   persistTimeTravelCache?: boolean;
   
+  /**
+   * Whether the database may activate its automatic index catch-up passes
+   * (summary buffer and full-text index). Defaults to `true`.
+   *
+   * Both passes read every document, which is cheap against a local store
+   * but is one network round trip per document against a
+   * `ClientNetworkContentAddressedStore`. Hosts that open a database
+   * directly against a remote server should pass `false` and let the
+   * indexes be built where the data is local (a replica), or trigger them
+   * explicitly. Explicit `getSummaryStore()` / `getFullTextIndex()` use
+   * and manual `update()` calls are unaffected.
+   */
+  autoIndexing?: boolean;
+
   /**
    * Configuration for attachment handling (chunk size, etc.)
    * If not provided, defaults are used.

@@ -1088,6 +1088,473 @@ describe("dense sync mode", () => {
 });
 
 // ===================================================================
+// 7. COLD SYNC: reuse unfiltered scan metadata (no N× docId scans)
+// ===================================================================
+
+describe("cold sync metadata-first scan batching", () => {
+  test("cold syncStoreChanges does not issue per-doc scanEntriesSince", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("cold-scan-test");
+
+    const createdIds: string[] = [];
+    const docCount = 20;
+    for (let i = 0; i < docCount; i++) {
+      const doc = await db1.createDocument();
+      createdIds.push(doc.getId());
+      await db1.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().index = i;
+      });
+    }
+
+    const store = sharedFactory.getStore("cold-scan-test")!;
+    const originalScan = store.scanEntriesSince!.bind(store);
+    let unfiltered = 0;
+    let contentDocScoped = 0;
+    store.scanEntriesSince = async (cursor, limit, filters) => {
+      if (filters?.docId && createdIds.includes(filters.docId)) {
+        contentDocScoped++;
+      } else if (!filters?.docId) {
+        unfiltered++;
+      }
+      return originalScan(cursor, limit, filters);
+    };
+
+    // Fresh DB instance on the same store — cold sync builds the index from
+    // the unfiltered scan alone (the path that previously N×-scanned by docId).
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("cold-scan-test");
+
+    expect(unfiltered).toBeGreaterThan(0);
+    expect(contentDocScoped).toBe(0);
+    expect((await db2.getAllDocumentIds()).length).toBe(docCount);
+  }, 60000);
+
+  test("materialization after a cold sync reuses the scanned metadata", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("meta-reuse-test");
+
+    const createdIds: string[] = [];
+    const docCount = 10;
+    for (let i = 0; i < docCount; i++) {
+      const doc = await db1.createDocument();
+      createdIds.push(doc.getId());
+      await db1.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().index = i;
+      });
+    }
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("meta-reuse-test");
+
+    // Instrument after the open-time cold sync so only the materializations
+    // below are measured.
+    const store = sharedFactory.getStore("meta-reuse-test")!;
+    const originalScan = store.scanEntriesSince!.bind(store);
+    let docScoped = 0;
+    store.scanEntriesSince = async (cursor, limit, filters) => {
+      if (filters?.docId && createdIds.includes(filters.docId)) {
+        docScoped++;
+      }
+      return originalScan(cursor, limit, filters);
+    };
+
+    for (const [index, docId] of createdIds.entries()) {
+      const doc = await db2.getDocument(docId);
+      // Truncated history would materialize without the change entry.
+      expect(doc?.getData().index).toBe(index);
+    }
+
+    // The sync walk already read this metadata; materializing must not ask
+    // the store for it again (one HTTP request per doc on a remote store).
+    expect(docScoped).toBe(0);
+  }, 60000);
+
+  test("changefeed iteration fetches entries in batches, not per document", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("batch-fetch-test");
+
+    const docCount = 20;
+    for (let i = 0; i < docCount; i++) {
+      const doc = await db1.createDocument();
+      await db1.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().index = i;
+      });
+    }
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("batch-fetch-test");
+
+    // Instrument after the open-time cold sync so only the iteration counts.
+    const store = sharedFactory.getStore("batch-fetch-test")!;
+    const originalGetEntries = store.getEntries.bind(store);
+    let getEntriesCalls = 0;
+    store.getEntries = async (ids: string[]) => {
+      getEntriesCalls++;
+      return originalGetEntries(ids);
+    };
+
+    const seen: string[] = [];
+    for await (const { doc } of db2.iterateChangesSince(null)) {
+      seen.push(doc.getId());
+    }
+
+    expect(seen.length).toBe(docCount);
+    // One batched fetch covers the whole prefetch window; per-document
+    // loading would be at least one call each.
+    expect(getEntriesCalls).toBeLessThan(docCount);
+  }, 60000);
+
+  test("iteration past the prefetch window refills per window, not per document", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("window-refill-test");
+
+    // Comfortably more documents than the prefetch window, so the window has
+    // to refill several times during one pass.
+    const docCount = 80;
+    for (let i = 0; i < docCount; i++) {
+      const doc = await db1.createDocument();
+      await db1.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().index = i;
+      });
+    }
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    // A cache smaller than the database is the real-world shape: a window that
+    // runs ahead of the cursor evicts documents before iteration reaches them,
+    // and they are then fetched a second time.
+    const db2 = await setup2.tenant.openDB("window-refill-test", {
+      documentCacheConfig: { maxEntries: 48, iteratePrefetchWindowDocs: 16 },
+    });
+
+    const store = sharedFactory.getStore("window-refill-test")!;
+    const originalGetEntries = store.getEntries.bind(store);
+    let getEntriesCalls = 0;
+    store.getEntries = async (ids: string[]) => {
+      getEntriesCalls++;
+      return originalGetEntries(ids);
+    };
+
+    const seen: string[] = [];
+    for await (const { doc } of db2.iterateChangesSince(null)) {
+      seen.push(doc.getId());
+    }
+
+    expect(seen.length).toBe(docCount);
+    // A refill per half window is ~10 fetches here. Re-running the window
+    // after every yielded document costs several fetches per document.
+    expect(getEntriesCalls).toBeLessThanOrEqual(16);
+  }, 120000);
+
+  test("a warm open uses one bulk metadata scan, not one per document", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("warm-open-test");
+
+    const createdIds: string[] = [];
+    const docCount = 20;
+    for (let i = 0; i < docCount; i++) {
+      const doc = await db1.createDocument();
+      createdIds.push(doc.getId());
+      await db1.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().index = i;
+      });
+    }
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("warm-open-test");
+
+    // Reproduce a reopen whose index came from the persisted checkpoint: the
+    // changefeed index is there, but this session neither scanned nor
+    // materialized anything, so no metadata is retained.
+    const internals = db2 as unknown as {
+      clearScannedEntryMetadata(): void;
+      docCache: Map<string, unknown>;
+    };
+    internals.clearScannedEntryMetadata();
+    internals.docCache.clear();
+
+    const store = sharedFactory.getStore("warm-open-test")!;
+    const originalScan = store.scanEntriesSince!.bind(store);
+    let docScoped = 0;
+    let unfiltered = 0;
+    store.scanEntriesSince = async (cursor, limit, filters) => {
+      if (filters?.docId && createdIds.includes(filters.docId)) {
+        docScoped++;
+      } else if (!filters?.docId) {
+        unfiltered++;
+      }
+      return originalScan(cursor, limit, filters);
+    };
+
+    const seen: string[] = [];
+    for await (const { doc } of db2.iterateChangesSince(null)) {
+      seen.push(doc.getId());
+    }
+
+    expect(seen.length).toBe(docCount);
+    expect(docScoped).toBe(0);
+    // The whole store fits in one scan page here; the point is that the count
+    // is a function of store size, not of document count.
+    expect(unfiltered).toBeLessThan(docCount);
+  }, 60000);
+
+  test("history and body stay complete after a metadata warm-up", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("warmup-history-test");
+
+    // More documents than the warm-up threshold, each with a create entry plus
+    // three change entries.
+    const createdIds: string[] = [];
+    const docCount = 12;
+    const changesPerDoc = 3;
+    for (let i = 0; i < docCount; i++) {
+      const doc = await db1.createDocument();
+      createdIds.push(doc.getId());
+      for (let change = 0; change < changesPerDoc; change++) {
+        await db1.changeDoc(doc, (d: MindooDoc) => {
+          d.getData()[`field${change}`] = `value-${i}-${change}`;
+        });
+      }
+    }
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("warmup-history-test");
+
+    // Force the warm open shape, so the warm-up scan is what materialization
+    // and history read against.
+    const internals = db2 as unknown as {
+      clearScannedEntryMetadata(): void;
+      docCache: Map<string, unknown>;
+    };
+    internals.clearScannedEntryMetadata();
+    internals.docCache.clear();
+
+    // Drive one changefeed pass so the warm-up scan runs.
+    for await (const _ of db2.iterateChangesSince(null)) {
+      // Materialization happens inside the iteration.
+    }
+
+    for (const [index, docId] of createdIds.entries()) {
+      const revisions: number[] = [];
+      for await (const entry of db2.iterateDocumentHistory(docId)) {
+        revisions.push(entry.changeCreatedAt);
+      }
+      // doc_create plus one entry per change.
+      expect(revisions).toHaveLength(changesPerDoc + 1);
+
+      const doc = await db2.getDocument(docId);
+      for (let change = 0; change < changesPerDoc; change++) {
+        expect(doc?.getData()[`field${change}`]).toBe(`value-${index}-${change}`);
+      }
+    }
+  }, 120000);
+
+  test("metadata without a create or snapshot entry is not retained", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("truncation-guard-test");
+
+    const doc = await db1.createDocument();
+    const docId = doc.getId();
+    await db1.changeDoc(doc, (d: MindooDoc) => {
+      d.getData().value = "one";
+    });
+
+    const store = sharedFactory.getStore("truncation-guard-test")!;
+    const allMetadata = (await store.scanEntriesSince!(null, 10_000, { docId }))
+      .entries;
+    const changeOnly = allMetadata.filter(
+      (entry) => entry.entryType !== "doc_create" && entry.entryType !== "doc_snapshot",
+    );
+    expect(changeOnly.length).toBeGreaterThan(0);
+
+    const internals = db1 as unknown as {
+      rememberScannedEntryMetadata(
+        docId: string,
+        metadata: typeof allMetadata,
+      ): void;
+      peekScannedEntryMetadata(docId: string): typeof allMetadata | null;
+    };
+
+    // A truncated history must be rejected: materializing from it would
+    // produce a wrong document, not just a slow one.
+    internals.rememberScannedEntryMetadata(docId, changeOnly);
+    expect(internals.peekScannedEntryMetadata(docId)).toBeNull();
+
+    internals.rememberScannedEntryMetadata(docId, allMetadata);
+    expect(internals.peekScannedEntryMetadata(docId)).toHaveLength(
+      allMetadata.length,
+    );
+  }, 60000);
+
+  test("a document changed after the sync walk is re-scanned, not reused", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("meta-stale-test");
+
+    const doc = await db1.createDocument();
+    const docId = doc.getId();
+    await db1.changeDoc(doc, (d: MindooDoc) => {
+      d.getData().index = 1;
+    });
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("meta-stale-test");
+
+    // A second writer appends after db2's cold sync retained the metadata.
+    await db1.changeDoc(doc, (d: MindooDoc) => {
+      d.getData().index = 2;
+    });
+    await db2.syncStoreChanges();
+
+    const loaded = await db2.getDocument(docId);
+    expect(loaded?.getData().index).toBe(2);
+  }, 60000);
+
+  test("incremental sync of an uncached doc still uses a doc-scoped scan", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("incr-scan-test");
+
+    for (let i = 0; i < 5; i++) {
+      const doc = await db1.createDocument();
+      await db1.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().index = i;
+      });
+    }
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("incr-scan-test");
+    expect((await db2.getAllDocumentIds()).length).toBe(5);
+
+    const newDoc = await db1.createDocument();
+    await db1.changeDoc(newDoc, (d: MindooDoc) => {
+      d.getData().index = 99;
+    });
+
+    // New doc must not be in db2's cache so metadata-first takes the uncached path.
+    (db2 as unknown as { docCache: Map<string, unknown> }).docCache.delete(newDoc.getId());
+
+    const store = sharedFactory.getStore("incr-scan-test")!;
+    const originalScan = store.scanEntriesSince!.bind(store);
+    let newDocScoped = 0;
+    store.scanEntriesSince = async (cursor, limit, filters) => {
+      if (filters?.docId === newDoc.getId()) {
+        newDocScoped++;
+      }
+      return originalScan(cursor, limit, filters);
+    };
+
+    await db2.syncStoreChanges();
+
+    expect(newDocScoped).toBeGreaterThan(0);
+    expect(await db2.getAllDocumentIds()).toContain(newDoc.getId());
+  }, 60000);
+});
+
+// ===================================================================
+// 8. CONCURRENT SYNC: overlapping callers share one scan
+// ===================================================================
+
+/**
+ * `processedEntryCursor` only advances once a sync run finishes, so every
+ * caller that starts while another run is in flight re-scans the exact
+ * same cursor sequence. On a remote store that shows up as identical
+ * `scanEntriesSince` requests (same `receiptOrder`) repeated back to back.
+ */
+describe("concurrent syncStoreChanges scan deduplication", () => {
+  /** Records the cursor of every unfiltered scan issued against a store. */
+  function instrumentCursorScans(store: InMemoryContentAddressedStore): string[] {
+    const scannedCursors: string[] = [];
+    const originalScan = store.scanEntriesSince!.bind(store);
+    store.scanEntriesSince = async (cursor, limit, filters) => {
+      if (!filters?.docId) {
+        scannedCursors.push(JSON.stringify(cursor ?? null));
+      }
+      return originalScan(cursor, limit, filters);
+    };
+    return scannedCursors;
+  }
+
+  test("overlapping calls collapse into one run plus one follow-up", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("concurrent-idle-test");
+
+    for (let i = 0; i < 10; i++) {
+      const doc = await db1.createDocument();
+      await db1.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().index = i;
+      });
+    }
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("concurrent-idle-test");
+
+    // Instrument after the open-time cold sync so only the concurrent
+    // batch below is measured.
+    const scannedCursors = instrumentCursorScans(
+      sharedFactory.getStore("concurrent-idle-test")!,
+    );
+
+    await Promise.all(
+      Array.from({ length: 6 }, () => db2.syncStoreChanges()),
+    );
+
+    // Two runs, not six: the first caller's run, plus the one follow-up
+    // shared by everybody who arrived while that run was in flight.
+    expect(scannedCursors).toHaveLength(2);
+  }, 60000);
+
+  test("overlapping calls after new entries scan once and still see them", async () => {
+    const sharedFactory = new SharedStoreFactory();
+    const setup1 = await createTenantSetup(sharedFactory);
+    const db1 = await setup1.tenant.openDB("concurrent-delta-test");
+
+    const doc = await db1.createDocument();
+    await db1.changeDoc(doc, (d: MindooDoc) => {
+      d.getData().index = 0;
+    });
+
+    const setup2 = await createTenantSetup(sharedFactory, setup1);
+    const db2 = await setup2.tenant.openDB("concurrent-delta-test");
+    expect((await db2.getAllDocumentIds()).length).toBe(1);
+
+    const newDocIds: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const newDoc = await db1.createDocument();
+      newDocIds.push(newDoc.getId());
+      await db1.changeDoc(newDoc, (d: MindooDoc) => {
+        d.getData().index = i + 1;
+      });
+    }
+
+    const scannedCursors = instrumentCursorScans(
+      sharedFactory.getStore("concurrent-delta-test")!,
+    );
+
+    await Promise.all([
+      db2.syncStoreChanges(),
+      db2.syncStoreChanges(),
+      db2.syncStoreChanges(),
+    ]);
+
+    // The same cursor must not be scanned twice by the overlapping callers.
+    expect(new Set(scannedCursors).size).toBe(scannedCursors.length);
+
+    const visibleIds = await db2.getAllDocumentIds();
+    for (const docId of newDocIds) {
+      expect(visibleIds).toContain(docId);
+    }
+  }, 60000);
+});
+
+// ===================================================================
 // PEM helper (duplicated from NetworkSync.test.ts for self-containment)
 // ===================================================================
 

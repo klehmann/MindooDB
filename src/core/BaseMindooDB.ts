@@ -96,6 +96,7 @@ import type {
   StoreHead,
 } from "./appendonlystores/types";
 import { bloomMightContainId } from "./appendonlystores/bloom";
+import { NetworkErrorType } from "./appendonlystores/network/types";
 import {
   computeDocumentMaterializationPlan,
   topologicalByDependencies,
@@ -188,7 +189,12 @@ const DEFAULT_ATTACHMENT_STREAM_BATCH_SIZE = 4;
 const DEFAULT_SNAPSHOT_MIN_CHANGES = 100;
 const DEFAULT_SNAPSHOT_COOLDOWN_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_CACHED_DOCS = 128;
-const DEFAULT_ITERATE_PREFETCH_WINDOW_DOCS = 0;
+/**
+ * Documents materialized ahead during changefeed iteration. Kept well below
+ * {@link DEFAULT_MAX_CACHED_DOCS} so a window cannot evict itself out of L1
+ * before the iteration reaches it.
+ */
+const DEFAULT_ITERATE_PREFETCH_WINDOW_DOCS = 32;
 const DEFAULT_WARMER_BATCH_SIZE = 50;
 /**
  * Default number of cached documents fetched per `getMany` batch during
@@ -199,6 +205,70 @@ const DEFAULT_WARMER_BATCH_SIZE = 50;
  * Tunable via {@link DocumentCacheConfig.restoreBatchSize}.
  */
 const DEFAULT_RESTORE_BATCH_SIZE = 256;
+/**
+ * Cap for {@link BaseMindooDB.scannedEntryMetadata}, counted in retained
+ * metadata entries (not documents). Metadata is small (~300 bytes), so this
+ * is a few tens of MB at the ceiling; past it, materialization falls back to
+ * the per-document scan it would have done anyway.
+ */
+const MAX_SCANNED_ENTRY_METADATA_ENTRIES = 200_000;
+/**
+ * Encrypted payload bytes per batched entry fetch
+ * ({@link BaseMindooDB.prefetchEntriesForDocuments}). Bounds response size
+ * and peak memory; the count limit below stays far under the server's
+ * per-request id cap, so bytes are the binding constraint in practice.
+ */
+const MATERIALIZATION_PREFETCH_PAGE_BYTES = 8 * 1024 * 1024;
+const MATERIALIZATION_PREFETCH_MAX_IDS = 5_000;
+/**
+ * Documents in a prefetch window without retained metadata that justify one
+ * bulk metadata scan of the whole store
+ * ({@link BaseMindooDB.warmScannedEntryMetadataFromStore}). A store-wide scan
+ * costs one request per 1000 entries, so it repays itself after a handful of
+ * per-document scans.
+ */
+const METADATA_WARMUP_MIN_UNCOVERED_DOCS = 8;
+/**
+ * Backoff before retrying a rate-limited prefetch request when the server
+ * sends no `Retry-After`. The number of entries also caps the retry count.
+ */
+const PREFETCH_RATE_LIMIT_DELAYS_MS = [250, 1_000, 3_000];
+/** Upper bound for an honoured `Retry-After`, so a prefetch cannot hang. */
+const PREFETCH_MAX_RATE_LIMIT_DELAY_MS = 10_000;
+
+/**
+ * Read the type off a transport error by shape rather than `instanceof`:
+ * the error crosses module and bundle boundaries, where prototype identity is
+ * not reliable. Returns null for anything that is not a `NetworkError`.
+ */
+function networkErrorType(error: unknown): NetworkErrorType | null {
+  const candidate = error as { name?: unknown; type?: unknown } | null;
+  if (!candidate || candidate.name !== "NetworkError" || typeof candidate.type !== "string") {
+    return null;
+  }
+  return candidate.type as NetworkErrorType;
+}
+
+/**
+ * How long to wait before retrying a rate-limited request, or null when the
+ * error is not a rate limit or the retries are exhausted. Honours the
+ * server's `Retry-After` when it asks for a longer wait than our backoff.
+ */
+function rateLimitRetryDelayMs(error: unknown, attempt: number): number | null {
+  if (
+    networkErrorType(error) !== NetworkErrorType.RATE_LIMITED ||
+    attempt >= PREFETCH_RATE_LIMIT_DELAYS_MS.length
+  ) {
+    return null;
+  }
+  const retryAfterMs = (error as { retryAfterMs?: unknown }).retryAfterMs;
+  const requested =
+    typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) ? retryAfterMs : 0;
+  return Math.min(
+    Math.max(requested, PREFETCH_RATE_LIMIT_DELAYS_MS[attempt]),
+    PREFETCH_MAX_RATE_LIMIT_DELAY_MS,
+  );
+}
 
 /**
  * Default {@link WarmerScheduler}: a simple `setTimeout(0)` yield that
@@ -514,6 +584,41 @@ export class BaseMindooDB implements MindooDB {
    * below {@link snapshotMinChanges}. Absent key = unknown (scan once).
    */
   private writesSinceSnapshotCheck = new Map<string, number>();
+
+  /**
+   * Full entry metadata per document, kept from the sync walk that already
+   * read it, so the following materialization does not scan the store for
+   * the same document again. On a network-backed store that scan is an HTTP
+   * request per document — the dominant cost of a cold open.
+   *
+   * Only ever holds a document's *complete* history: the sync path fills it
+   * from the unfiltered cold-sync batch or from an explicit per-doc scan,
+   * both of which are complete by construction. A partial history here would
+   * materialize a document from a truncated DAG.
+   *
+   * Invalidated by {@link updateIndex} (every path that writes entries for a
+   * document goes through it) and consumed on first read, since the
+   * materialized document then lives in L1/L2.
+   */
+  private scannedEntryMetadata = new Map<string, StoreEntryMetadata[]>();
+  /** Retained entry count across {@link scannedEntryMetadata}. */
+  private scannedEntryMetadataSize = 0;
+  /**
+   * One bulk metadata scan per instance
+   * ({@link warmScannedEntryMetadataFromStore}); set before the scan runs so
+   * a failed or oversized attempt is not repeated on every window.
+   */
+  private scannedEntryMetadataWarmed = false;
+
+  /**
+   * Entries fetched ahead for a batch of documents about to be materialized
+   * (see {@link prefetchEntriesForDocuments}). Read through
+   * {@link fetchEntries}, which falls back to the store for anything the
+   * buffer does not hold — a partial buffer is always safe.
+   *
+   * Non-null only for the duration of one prefetch batch.
+   */
+  private materializationEntryBuffer: Map<string, StoreEntry> | null = null;
   
   // Track which entry IDs we've already processed
   private processedEntryIds: string[] = [];
@@ -615,6 +720,16 @@ export class BaseMindooDB implements MindooDB {
   // common choke point of all mutation paths, so it only records pending
   // docIds; emission is coalesced per sync batch / event-loop turn.
   // ---------------------------------------------------------------------------
+  /**
+   * Single-flight for {@link syncStoreChanges}. `processedEntryCursor`
+   * only advances once a run finishes, so overlapping callers would
+   * otherwise walk the identical cursor sequence — on a remote store that
+   * is one duplicated `scanEntriesSince` request per caller and page.
+   */
+  private syncStoreChangesInFlight: Promise<void> | null = null;
+  /** Shared follow-up run for callers that arrive mid-sync. */
+  private syncStoreChangesQueued: Promise<void> | null = null;
+
   private changeListeners: Set<DbChangeListener> = new Set();
   private pendingChangeNotifications: Map<string, DbChange> = new Map();
   private changeNotifyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -735,13 +850,27 @@ export class BaseMindooDB implements MindooDB {
       1,
       Math.floor(documentCacheConfig?.maxEntries ?? DEFAULT_MAX_CACHED_DOCS)
     );
-    this.iteratePrefetchWindowDocs = Math.max(
+    const requestedPrefetchWindowDocs = Math.max(
       0,
       Math.floor(
         documentCacheConfig?.iteratePrefetchWindowDocs ??
           DEFAULT_ITERATE_PREFETCH_WINDOW_DOCS
       )
     );
+    // A window refills with up to half a window of runway left, so it can
+    // reach 1.5x its size ahead of the cursor. Keep that under the L1 cache,
+    // or the prefetch evicts the documents it just materialized and iteration
+    // fetches them a second time.
+    this.iteratePrefetchWindowDocs =
+      requestedPrefetchWindowDocs > 0
+        ? Math.max(
+            1,
+            Math.min(
+              requestedPrefetchWindowDocs,
+              Math.floor(this.maxCachedDocs / 2)
+            )
+          )
+        : 0;
     this.cacheRestoreLimit = Math.max(
       1,
       Math.floor(documentCacheConfig?.restoreLimit ?? this.maxCachedDocs)
@@ -2168,6 +2297,9 @@ export class BaseMindooDB implements MindooDB {
     forceChangeSeqBump: boolean = false,
   ): void {
     const startedAt = Date.now();
+    // Every path that writes entries for a document lands here, so this is
+    // where retained metadata for it goes stale (see scannedEntryMetadata).
+    this.forgetScannedEntryMetadata(docId);
     const assignedSeq = this.nextChangeSeq;
     const newEntry: DocumentIndexEntry = {
       docId,
@@ -2672,6 +2804,7 @@ export class BaseMindooDB implements MindooDB {
     this.dirtyDocIds.delete(docId);
     this.lastFlushedDocState.delete(docId);
     this.automergeHashToEntryId.delete(docId);
+    this.forgetScannedEntryMetadata(docId);
     // Plaintext summary values must not outlive the purge either.
     this.summaryStore?.removeDocument(docId);
     // Nor extracted plaintext tokens in the full-text index.
@@ -3047,6 +3180,7 @@ export class BaseMindooDB implements MindooDB {
     this.docCache.clear();
     this.lastFlushedDocState.clear();
     this.automergeHashToEntryId.clear();
+    this.clearScannedEntryMetadata();
     this.processedEntryIds = [];
     this.processedEntryCursor = null;
     this.nextChangeSeq = 1;
@@ -3071,22 +3205,56 @@ export class BaseMindooDB implements MindooDB {
    * sync page) must call {@link startBackgroundWarmer} explicitly so
    * casual sync calls stay cheap and the warmer cost is paid only when
    * the workload is about to benefit from it.
+   *
+   * Overlapping callers are coalesced: at most one run is in flight and
+   * at most one follow-up run is queued behind it (see
+   * {@link syncStoreChangesInFlight}).
    */
   async syncStoreChanges(): Promise<void> {
-    // Hold change-notification emission for the whole batch so listeners
-    // receive one coalesced event per sync run instead of one per document.
-    this.beginChangeNotificationHold();
-    try {
-      await this.syncStoreChangesInternal();
-    } finally {
-      this.endChangeNotificationHold();
+    if (this.syncStoreChangesInFlight) {
+      if (!this.syncStoreChangesQueued) {
+        // The running scan may have started before the entries this caller
+        // is waiting for were written, so it gets a follow-up run rather
+        // than the in-flight one. The follow-up starts regardless of how
+        // the current run ended, so a failed run does not strand it.
+        this.syncStoreChangesQueued = this.syncStoreChangesInFlight
+          .then(
+            () => undefined,
+            () => undefined,
+          )
+          .then(() => {
+            this.syncStoreChangesQueued = null;
+            return this.syncStoreChanges();
+          });
+      }
+      return this.syncStoreChangesQueued;
     }
+
+    const run = (async () => {
+      // Hold change-notification emission for the whole batch so listeners
+      // receive one coalesced event per sync run instead of one per document.
+      this.beginChangeNotificationHold();
+      try {
+        await this.syncStoreChangesInternal();
+      } finally {
+        this.endChangeNotificationHold();
+      }
+    })();
+    this.syncStoreChangesInFlight = run.finally(() => {
+      this.syncStoreChangesInFlight = null;
+    });
+    return this.syncStoreChangesInFlight;
   }
 
   private async syncStoreChangesInternal(): Promise<void> {
     const syncStartedAt = Date.now();
     this.logger.debug(`Syncing store changes for database ${this.store.getId()} in tenant ${this.tenant.getId()}`);
     this.logger.debug(`Already processed ${this.processedEntryIds.length} entry IDs`);
+
+    // Cold sync already fetched every entry via the unfiltered scan; reusing that
+    // per-doc batch avoids N× scanEntriesSince({ docId }) (HTTP storms on remote).
+    const coldSync =
+      this.processedEntryCursor == null && this.processedEntryIds.length === 0;
     
     // Find new entries that we haven't processed yet
     const { entries: newEntryMetadata, nextCursor } = await this.getNewEntryMetadataForSync();
@@ -3184,7 +3352,12 @@ export class BaseMindooDB implements MindooDB {
                 `Skipping metadata-first index for doc ${docId} — decryption key "${representativeEntry.decryptionKeyId}" not available`,
               );
             } else {
-              const allDocMetadata = await this.scanAllMetadata(this.store, { docId });
+              // Cold sync: entryMetadataList is already the full doc history from
+              // the unfiltered scan. Incremental sync of an uncached doc may only
+              // have recent entries, so re-scan that doc for prior lifecycle state.
+              const allDocMetadata = coldSync
+                ? entryMetadataList
+                : await this.scanAllMetadata(this.store, { docId });
               const mutationEntries = allDocMetadata.filter((e) => this.isDocumentReplayEntry(e));
               // Snapshots compact replay history but should not change the user-visible
               // modification time when the original create/change/delete/undelete entries still exist.
@@ -3202,6 +3375,12 @@ export class BaseMindooDB implements MindooDB {
                 this.isDocumentReplayEntry(e),
               );
               this.updateIndex(docId, lastModified, isDeleted, representativeEntry.decryptionKeyId, "visible", awaitingWitness, witnessed, batchHasReplayEntries);
+              // `allDocMetadata` is this document's complete history in both
+              // branches above. Keeping it lets the materialization that
+              // follows (summary, full-text, a UI read) skip its own per-doc
+              // scan — one HTTP request each on a network-backed store.
+              // Must come after updateIndex, which invalidates the entry.
+              this.rememberScannedEntryMetadata(docId, allDocMetadata);
               this.logger.debug(
                 `Metadata-first update for uncached doc ${docId} (lastModified: ${lastModified}, isDeleted: ${isDeleted}, awaitingWitness: ${awaitingWitness})`,
               );
@@ -3327,6 +3506,174 @@ export class BaseMindooDB implements MindooDB {
 
   private supportsCursorScan(store: ContentAddressedStore): boolean {
     return typeof store.scanEntriesSince === "function";
+  }
+
+  /**
+   * Retain a document's complete entry metadata for the materialization that
+   * usually follows. Callers must pass the full history — see
+   * {@link scannedEntryMetadata}.
+   *
+   * Skipped for time-travel instances: their scans are cutoff-scoped, and an
+   * ad-hoc historical open does not repay the extra invariant.
+   */
+  private rememberScannedEntryMetadata(
+    docId: string,
+    metadata: StoreEntryMetadata[],
+  ): void {
+    if (this.timeTravelDate != null || metadata.length === 0) {
+      return;
+    }
+    // A complete history starts at a create entry, or at a snapshot that
+    // compacted one away. Anything else means the scan this came from was
+    // truncated, and materializing a document from a truncated DAG yields a
+    // wrong document rather than a slow one — drop it and let the
+    // per-document scan do the work.
+    const hasHistoryBase = metadata.some(
+      (entry) =>
+        entry.entryType === "doc_create" || entry.entryType === "doc_snapshot",
+    );
+    if (!hasHistoryBase) {
+      this.logger.warn(
+        `Not retaining entry metadata for ${docId}: no doc_create or doc_snapshot among ${metadata.length} entries`,
+      );
+      return;
+    }
+    this.forgetScannedEntryMetadata(docId);
+    if (
+      this.scannedEntryMetadataSize + metadata.length >
+      MAX_SCANNED_ENTRY_METADATA_ENTRIES
+    ) {
+      return;
+    }
+    this.scannedEntryMetadata.set(docId, metadata);
+    this.scannedEntryMetadataSize += metadata.length;
+  }
+
+  /** Read the retained metadata without consuming it (batch planning). */
+  private peekScannedEntryMetadata(docId: string): StoreEntryMetadata[] | null {
+    return this.scannedEntryMetadata.get(docId) ?? null;
+  }
+
+  /** Consume the retained metadata for a document, if any is held. */
+  private takeScannedEntryMetadata(docId: string): StoreEntryMetadata[] | null {
+    const metadata = this.scannedEntryMetadata.get(docId);
+    if (!metadata) {
+      return null;
+    }
+    this.forgetScannedEntryMetadata(docId);
+    return metadata;
+  }
+
+  private forgetScannedEntryMetadata(docId: string): void {
+    const existing = this.scannedEntryMetadata.get(docId);
+    if (!existing) {
+      return;
+    }
+    this.scannedEntryMetadata.delete(docId);
+    this.scannedEntryMetadataSize -= existing.length;
+  }
+
+  private clearScannedEntryMetadata(): void {
+    this.scannedEntryMetadata.clear();
+    this.scannedEntryMetadataSize = 0;
+  }
+
+  /**
+   * Fill {@link scannedEntryMetadata} for the whole database with a single
+   * paged scan.
+   *
+   * The sync walk only retains metadata for the documents it processed, so an
+   * open that restored its index from the cache checkpoint starts with an
+   * empty map — and a pass over the changefeed then scans once per document.
+   * One store-wide scan replaces all of those: it costs a request per 1000
+   * entries instead of a request per document.
+   *
+   * All-or-nothing by necessity. The scan is ordered by receipt order, not by
+   * document, so a run stopped halfway would leave arbitrary documents with a
+   * partial history — and a partial history materializes a wrong document.
+   * If the store holds more entries than the cap allows, nothing is retained
+   * and the per-document path stays in charge.
+   */
+  private async warmScannedEntryMetadataFromStore(): Promise<void> {
+    if (
+      this.scannedEntryMetadataWarmed ||
+      this.timeTravelDate != null ||
+      !this.supportsCursorScan(this.store)
+    ) {
+      return;
+    }
+    this.scannedEntryMetadataWarmed = true;
+
+    const startedAt = Date.now();
+    const byDoc = new Map<string, StoreEntryMetadata[]>();
+    let scannedEntries = 0;
+    let cursor: StoreScanCursor | null = null;
+    const filters = this.mergeTimeTravelScanFilters(undefined);
+    while (true) {
+      const page: StoreScanResult = await this.withRateLimitBackoff(
+        "metadata warm-up scan",
+        () => this.store.scanEntriesSince!(cursor, 1000, filters),
+      );
+      for (const entry of page.entries) {
+        const existing = byDoc.get(entry.docId);
+        if (existing) {
+          existing.push(entry);
+        } else {
+          byDoc.set(entry.docId, [entry]);
+        }
+      }
+      scannedEntries += page.entries.length;
+      if (scannedEntries > MAX_SCANNED_ENTRY_METADATA_ENTRIES) {
+        this.logger.debug(
+          `Metadata warm-up skipped: store holds more than ${MAX_SCANNED_ENTRY_METADATA_ENTRIES} entries`,
+        );
+        return;
+      }
+      if (!page.hasMore || !page.nextCursor) {
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+
+    for (const [docId, metadata] of byDoc) {
+      // Cached documents will not be materialized from this metadata.
+      if (this.docCache.has(docId)) {
+        continue;
+      }
+      this.rememberScannedEntryMetadata(docId, metadata);
+    }
+    // Logged at info: the entries-per-document ratio here is the quickest
+    // answer to "does this database have the history I expect?".
+    this.logger.info(
+      `Metadata warm-up scanned ${scannedEntries} entries and retained ` +
+      `${this.scannedEntryMetadataSize} for ${this.scannedEntryMetadata.size} ` +
+      `document(s) in ${Date.now() - startedAt}ms`,
+    );
+  }
+
+  /**
+   * Run a prefetch request, waiting out a rate limit instead of giving up on
+   * it. Every other failure propagates to the caller, which treats a failed
+   * prefetch as a miss and falls back to the per-document path.
+   */
+  private async withRateLimitBackoff<T>(
+    description: string,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await run();
+      } catch (error) {
+        const delayMs = rateLimitRetryDelayMs(error, attempt);
+        if (delayMs == null) {
+          throw error;
+        }
+        this.logger.debug(
+          `${description} rate limited; retrying in ${delayMs}ms (attempt ${attempt + 1})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
   }
 
   private async scanAllMetadata(
@@ -9945,6 +10292,144 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  /**
+   * Load entries for a materialization, serving whatever
+   * {@link materializationEntryBuffer} already holds and fetching the rest.
+   * Results keep the requested id order.
+   */
+  private async fetchEntries(ids: string[]): Promise<StoreEntry[]> {
+    const buffer = this.materializationEntryBuffer;
+    if (!buffer || buffer.size === 0 || ids.length === 0) {
+      return this.store.getEntries(ids);
+    }
+    const missingIds = ids.filter((id) => !buffer.has(id));
+    const fetched =
+      missingIds.length > 0 ? await this.store.getEntries(missingIds) : [];
+    const fetchedById = new Map(fetched.map((entry) => [entry.id, entry]));
+    const result: StoreEntry[] = [];
+    for (const id of ids) {
+      const entry = buffer.get(id) ?? fetchedById.get(id);
+      if (entry) {
+        result.push(entry);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Fetch one page of a batched prefetch: waits out a rate limit, and splits
+   * the page when the server rejects it as too large. The estimate that built
+   * the page comes from `encryptedSize` metadata, so it can be wrong about
+   * the framing overhead — halving is cheaper than guessing conservatively.
+   */
+  private async fetchEntryPage(ids: string[]): Promise<StoreEntry[]> {
+    try {
+      return await this.withRateLimitBackoff("entry prefetch", () =>
+        this.store.getEntries(ids),
+      );
+    } catch (error) {
+      if (
+        networkErrorType(error) !== NetworkErrorType.PAYLOAD_TOO_LARGE ||
+        ids.length <= 1
+      ) {
+        throw error;
+      }
+      const half = Math.ceil(ids.length / 2);
+      this.logger.debug(
+        `Entry prefetch page of ${ids.length} rejected as too large; splitting`,
+      );
+      return [
+        ...(await this.fetchEntryPage(ids.slice(0, half))),
+        ...(await this.fetchEntryPage(ids.slice(half))),
+      ];
+    }
+  }
+
+  /**
+   * Fetch the entries a window of documents will need in a few large calls
+   * instead of two or three per document. On a network-backed store that is
+   * the difference between tens of requests and tens of thousands for a cold
+   * pass over the changefeed.
+   *
+   * Plans locally from the metadata the sync walk retained
+   * ({@link scannedEntryMetadata}); documents without retained metadata are
+   * left out of the batch and materialize on their own. Pages are bounded by
+   * encrypted payload bytes so peak memory stays predictable.
+   *
+   * Returns the buffer instead of installing it, so the caller controls its
+   * lifetime.
+   */
+  private async prefetchEntriesForDocuments(
+    docIds: string[],
+  ): Promise<Map<string, StoreEntry> | null> {
+    const wantedSizes = new Map<string, number>();
+    for (const docId of docIds) {
+      const metadata = this.peekScannedEntryMetadata(docId);
+      if (!metadata) {
+        continue;
+      }
+      const plan = computeDocumentMaterializationPlan(docId, metadata);
+      const sizeById = new Map(
+        metadata.map((entry) => [entry.id, entry.encryptedSize ?? 0]),
+      );
+      const planned = plan.snapshotEntryId
+        ? [plan.snapshotEntryId, ...plan.entryIdsToApply]
+        : plan.entryIdsToApply;
+      for (const id of planned) {
+        if (!wantedSizes.has(id)) {
+          wantedSizes.set(id, sizeById.get(id) ?? 0);
+        }
+      }
+    }
+    if (wantedSizes.size === 0) {
+      return null;
+    }
+
+    const buffer = new Map<string, StoreEntry>();
+    let page: string[] = [];
+    let pageBytes = 0;
+    const flushPage = async (): Promise<void> => {
+      if (page.length === 0) {
+        return;
+      }
+      for (const entry of await this.fetchEntryPage(page)) {
+        buffer.set(entry.id, entry);
+      }
+      page = [];
+      pageBytes = 0;
+    };
+    for (const [id, size] of wantedSizes) {
+      // A single oversized entry still gets its own page: the budget bounds
+      // a batch, never one document.
+      if (
+        page.length > 0 &&
+        (pageBytes + size > MATERIALIZATION_PREFETCH_PAGE_BYTES ||
+          page.length >= MATERIALIZATION_PREFETCH_MAX_IDS)
+      ) {
+        await flushPage();
+      }
+      page.push(id);
+      pageBytes += size;
+    }
+    await flushPage();
+    return buffer;
+  }
+
+  /**
+   * Materialize a window of upcoming documents so iteration reads them from
+   * the cache instead of the store.
+   *
+   * Called after every yielded document, so it must be cheap when the runway
+   * ahead is still full: `prefetchedThrough` is the index position the
+   * previous window reached, and a call that still has half a window of
+   * runway left returns without touching the store. Without that check the
+   * pass issues a fetch per yielded document, and — because each call would
+   * scan past the cached documents to find a full window of uncached ones —
+   * it also runs unboundedly ahead of the cursor, materializing the whole
+   * changefeed tail and evicting it from L1 before iteration arrives.
+   *
+   * Returns the position prefetched through, which the caller threads back in.
+   */
   private async prefetchIterationWindow(
     indexSnapshot: Array<{
       docId: string;
@@ -9954,21 +10439,32 @@ export class BaseMindooDB implements MindooDB {
       accessState?: DocumentAccessState;
     }>,
     startIndex: number,
+    prefetchedThrough: number,
     idPrefix?: string
-  ): Promise<number> {
-    if (this.iteratePrefetchWindowDocs <= 0) {
-      return 0;
+  ): Promise<{ prefetchedThrough: number; prefetchedDocuments: number }> {
+    const windowSize = this.iteratePrefetchWindowDocs;
+    if (windowSize <= 0) {
+      return { prefetchedThrough: startIndex, prefetchedDocuments: 0 };
+    }
+
+    const from = Math.max(startIndex, prefetchedThrough);
+    if (from - startIndex >= Math.ceil(windowSize / 2)) {
+      // Enough runway left; refilling now would trade one batched fetch per
+      // window for one per document.
+      return { prefetchedThrough, prefetchedDocuments: 0 };
     }
 
     const docIds: string[] = [];
     const seen = new Set<string>();
-    // Only look ahead a bounded number of uncached docs so iteration does not
+    // Look ahead a bounded number of uncached docs so iteration does not
     // materialize the entire remaining changefeed tail up front.
+    let scannedThrough = from;
     for (
-      let i = startIndex;
-      i < indexSnapshot.length && docIds.length < this.iteratePrefetchWindowDocs;
+      let i = from;
+      i < indexSnapshot.length && docIds.length < windowSize;
       i++
     ) {
+      scannedThrough = i + 1;
       const entry = indexSnapshot[i];
       // Skip docs that iterateChangesSince will emit as lightweight
       // tombstones anyway: inaccessible docs are never materialized, and
@@ -9989,21 +10485,48 @@ export class BaseMindooDB implements MindooDB {
     }
 
     if (docIds.length === 0) {
-      return 0;
+      return { prefetchedThrough: scannedThrough, prefetchedDocuments: 0 };
     }
 
     // Prefetch is opportunistic: iteration can still fall back to on-demand
     // loads, so individual prefetch failures are logged and ignored here.
-    await Promise.all(
-      docIds.map((docId) =>
-        this.loadDocumentInternal(docId).catch((err) => {
-          this.logger.warn(`Failed to prefetch document ${docId}:`, err);
-          return null;
-        })
-      )
-    );
+    // The same holds for the batched entry fetch — a failure there just means
+    // the loads below go to the store themselves.
+    try {
+      // Documents the sync walk did not process have no retained metadata, so
+      // they would each scan the store on their own and the batch below would
+      // have nothing to plan from. A window full of them means a bulk pass is
+      // under way (a warm open with a cold document cache); one store-wide
+      // scan covers all of it.
+      const uncoveredDocs = docIds.filter(
+        (docId) => !this.peekScannedEntryMetadata(docId),
+      ).length;
+      if (uncoveredDocs >= METADATA_WARMUP_MIN_UNCOVERED_DOCS) {
+        await this.warmScannedEntryMetadataFromStore();
+      }
+      this.materializationEntryBuffer =
+        await this.prefetchEntriesForDocuments(docIds);
+    } catch (err) {
+      this.logger.warn(`Failed to batch-fetch entries for prefetch window:`, err);
+      this.materializationEntryBuffer = null;
+    }
+    try {
+      await Promise.all(
+        docIds.map((docId) =>
+          this.loadDocumentInternal(docId).catch((err) => {
+            this.logger.warn(`Failed to prefetch document ${docId}:`, err);
+            return null;
+          })
+        )
+      );
+    } finally {
+      this.materializationEntryBuffer = null;
+    }
 
-    return docIds.length;
+    return {
+      prefetchedThrough: scannedThrough,
+      prefetchedDocuments: docIds.length,
+    };
   }
 
   private getStartIndexForCursor(
@@ -10482,11 +11005,21 @@ export class BaseMindooDB implements MindooDB {
     // We want to find the first entry that is greater than the cursor.
     const startIndex = this.getStartIndexForCursor(indexSnapshot, actualCursor);
 
-    let prefetchedDocuments = await this.prefetchIterationWindow(
-      indexSnapshot,
-      startIndex,
-      idPrefix
-    );
+    let prefetchedDocuments = 0;
+    // How far ahead the prefetch windows have reached. Kept per generator run
+    // so concurrent iterations do not share a runway.
+    let prefetchedThrough = startIndex;
+    const prefetchFrom = async (from: number): Promise<void> => {
+      const result = await this.prefetchIterationWindow(
+        indexSnapshot,
+        from,
+        prefetchedThrough,
+        idPrefix
+      );
+      prefetchedThrough = result.prefetchedThrough;
+      prefetchedDocuments += result.prefetchedDocuments;
+    };
+    await prefetchFrom(startIndex);
     let yieldedDocuments = 0;
     let loadedDocuments = 0;
     
@@ -10511,11 +11044,7 @@ export class BaseMindooDB implements MindooDB {
           };
           yieldedDocuments++;
           yield { doc: this.buildInaccessibleDoc(entry), cursor: inaccessibleCursor };
-          prefetchedDocuments += await this.prefetchIterationWindow(
-            indexSnapshot,
-            i + 1,
-            idPrefix
-          );
+          await prefetchFrom(i + 1);
           continue;
         }
 
@@ -10533,11 +11062,7 @@ export class BaseMindooDB implements MindooDB {
           };
           yieldedDocuments++;
           yield { doc: this.buildDeletedDoc(entry), cursor: deletedCursor };
-          prefetchedDocuments += await this.prefetchIterationWindow(
-            indexSnapshot,
-            i + 1,
-            idPrefix
-          );
+          await prefetchFrom(i + 1);
           continue;
         }
 
@@ -10574,11 +11099,7 @@ export class BaseMindooDB implements MindooDB {
           // Deleted documents are included so external indexes can handle deletions
           yieldedDocuments++;
           yield { doc, cursor: currentCursor };
-          prefetchedDocuments += await this.prefetchIterationWindow(
-            indexSnapshot,
-            i + 1,
-            idPrefix
-          );
+          await prefetchFrom(i + 1);
         } catch (error) {
           this.logger.error(`Error processing document ${entry.docId}:`, error);
           // Stop processing on error
@@ -11818,7 +12339,11 @@ export class BaseMindooDB implements MindooDB {
     // TODO: Implement loading from last snapshot if available
     this.logger.debug(`Getting all entry hashes for document ${docId}`);
     const storeQueryStartedAt = Date.now();
-    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    // The sync walk may already have read this document's full metadata; on a
+    // network-backed store that saves one request per document.
+    const allEntryMetadata =
+      this.takeScannedEntryMetadata(docId) ??
+      (await this.scanAllMetadata(this.store, { docId }));
     storeQueryTime += Date.now() - storeQueryStartedAt;
     this.logger.debug(`Found ${allEntryMetadata.length} total entry hashes for document ${docId}`);
     
@@ -11918,7 +12443,7 @@ export class BaseMindooDB implements MindooDB {
     if (startFromSnapshot && snapshotMeta) {
       this.logger.debug(`Loading snapshot for document ${docId}`);
       const snapshotLoadStartedAt = Date.now();
-      const snapshotEntries = await this.store.getEntries([snapshotMeta.id]);
+      const snapshotEntries = await this.fetchEntries([snapshotMeta.id]);
       entryLoadTime += Date.now() - snapshotLoadStartedAt;
       this.logger.debug(`Retrieved ${snapshotEntries.length} snapshot entry(s) from store`);
       if (snapshotEntries.length > 0) {
@@ -11994,7 +12519,7 @@ export class BaseMindooDB implements MindooDB {
     // Load and apply all entries
     this.logger.debug(`Fetching ${entriesToLoad.length} entries from store for document ${docId}`);
     const entryLoadStartedAt = Date.now();
-    const entries = await this.store.getEntries(entriesToLoad.map(em => em.id));
+    const entries = await this.fetchEntries(entriesToLoad.map(em => em.id));
     entryLoadTime += Date.now() - entryLoadStartedAt;
     this.logger.debug(`Retrieved ${entries.length} entries from store for document ${docId}`);
     this.logger.debug(`Loading document ${docId}: found ${entries.length} entries to apply (${startFromSnapshot ? 'starting from snapshot' : 'starting from scratch'})`);

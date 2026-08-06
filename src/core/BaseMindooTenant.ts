@@ -1015,6 +1015,7 @@ export class BaseMindooTenant implements MindooTenant {
       adminOnlyDb,
       timeTravelDate: _timeTravelDate,
       persistTimeTravelCache,
+      autoIndexing,
       attachmentConfig,
       documentCacheConfig,
       snapshotConfig,
@@ -1056,6 +1057,13 @@ export class BaseMindooTenant implements MindooTenant {
       normalizedTimeTravelDate == null || persistTimeTravelCache === true;
     if (this.cacheManager && attachCacheManager) {
       db.setCacheManager(this.cacheManager);
+    }
+    // Must happen before initialize(): the open-time full-text probe and the
+    // summary activation triggered by the first sync ingest event both run
+    // inside it, so setting the flags afterwards would race them.
+    if (autoIndexing === false) {
+      db.setSummaryAutoUpdateEnabled(false);
+      db.setFulltextAutoUpdateEnabled(false);
     }
     await db.initialize();
     

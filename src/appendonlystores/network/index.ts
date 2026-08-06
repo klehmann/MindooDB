@@ -26,3 +26,11 @@ export { AuthenticationService } from "../../core/appendonlystores/network/Authe
 
 // Transport implementations
 export { HttpTransport } from "./HttpTransport";
+
+// Shared per-server request gate used by every transport
+export {
+  RequestScheduler,
+  getSharedRequestScheduler,
+  resetSharedRequestSchedulers,
+  type RequestSchedulerOptions,
+} from "./RequestScheduler";

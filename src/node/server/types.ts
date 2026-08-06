@@ -185,6 +185,12 @@ export interface ServerRateLimitsConfig {
   auth?: RateLimitConfig;
   sync?: RateLimitConfig;
   timestamps?: TimestampRateLimitConfig;
+  /**
+   * Coarse per-IP net applied to every route ahead of the tier limiters.
+   * Defaults to the combined sync and auth budgets plus headroom; setting it
+   * below what a tier allows makes it, not the tier, the effective limit.
+   */
+  global?: RateLimitConfig;
 }
 
 /**
@@ -219,6 +225,15 @@ export const ENV_VARS = {
    * Example: `127.0.0.1,::1,10.0.0.0/8,2001:db8::/32`
    */
   ADMIN_ALLOWED_IPS: "MINDOODB_ADMIN_ALLOWED_IPS",
+  /**
+   * Express `trust proxy` setting: a hop count (`1` behind Cloudflare, `2` when
+   * nginx also fronts the origin), a comma-separated list of trusted
+   * addresses/CIDRs, `loopback`, or `true`. Unset means no proxy is trusted.
+   *
+   * Every rate limiter keys on `req.ip`; behind a proxy without this, all
+   * clients share the proxy's address and therefore one budget.
+   */
+  TRUST_PROXY: "MINDOODB_TRUST_PROXY",
   /**
    * When `true`/`1`, sync-server URLs may use plaintext http and target
    * loopback/private/link-local hosts. Off by default so the server cannot be

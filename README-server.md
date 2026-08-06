@@ -659,7 +659,10 @@ extra field) for human-readable notes. Entries are matched solely by
 | `MINDOODB_SERVER_PASSWORD_FILE` | No | Path to a file whose contents are the server password (trimmed). If set, **used instead of** `MINDOODB_SERVER_PASSWORD`. Prefer for Docker: env only holds the path, not the secret. |
 | `MINDOODB_SYSTEM_ADMIN_PASSWORD` | No | For `server:add-to-network`: password for `--identity` (if not using `--password-file` or interactive prompt). May be visible in `ps` on shared hosts. |
 | `MINDOODB_CORS_ORIGIN` | No | Allowed CORS origin or comma-separated allowlist (e.g., `https://app.example.com` or `http://localhost:4174,https://otherserver.com`). If not set, CORS is disabled. |
-| `MINDOODB_ADMIN_ALLOWED_IPS` | No | Optional comma-separated client IPs/CIDRs allowed to call **`/system/*`** (all system admin routes, including `/system/auth/*`). If unset or `*`, any source IP may reach `/system/*` (JWT + `config.json` capabilities still apply). Example: `127.0.0.1,::1,172.23.248.0/24,2001:db8::/32`. Behind a reverse proxy, configure Express `trust proxy` so `req.ip` is the real client. |
+| `MINDOODB_ADMIN_ALLOWED_IPS` | No | Optional comma-separated client IPs/CIDRs allowed to call **`/system/*`** (all system admin routes, including `/system/auth/*`). If unset or `*`, any source IP may reach `/system/*` (JWT + `config.json` capabilities still apply). Example: `127.0.0.1,::1,172.23.248.0/24,2001:db8::/32`. Behind a reverse proxy, set `MINDOODB_TRUST_PROXY` so `req.ip` is the real client. |
+| `MINDOODB_TRUST_PROXY` | Behind a proxy | Express `trust proxy` setting, so `req.ip` is the client rather than the proxy. Use the number of proxies in front of the server (`1` behind Cloudflare alone, `2` when nginx also fronts the origin), a comma-separated list of trusted addresses/CIDRs, or `loopback`. Unset means no proxy is trusted. Avoid `true`: it trusts the whole `X-Forwarded-For` chain, letting a client spoof its address and bypass per-IP limits. |
+
+> **Set `MINDOODB_TRUST_PROXY` if anything fronts the server.** Rate limits and the `/system/*` allowlist both key on `req.ip`. Without it, every user behind the proxy shares one address, so one busy client can exhaust the address-keyed budgets for everyone and the allowlist matches the proxy instead of the operator network.
 
 > **Note:** The old `MINDOODB_ADMIN_API_KEY` variable has been removed. System admin **authorization** is enforced by `config.json` capabilities and JWTs. **`MINDOODB_ADMIN_ALLOWED_IPS`** is an optional **network** layer for `/system/*` only. See [Server Security](docs/server-security.md).
 
@@ -826,20 +829,51 @@ The **`curl`** examples in this document use **`$SYSTEM_ADMIN_JWT`** as a placeh
 The server includes the following hardening measures:
 
 - **Input validation** -- all identifiers (tenantId, dbId, serverName) are validated to prevent path traversal. Only lowercase alphanumeric characters and hyphens are allowed, max 64 characters. Tenant IDs that collide with server route prefixes (`admin`, `health`, `statics`) are rejected as reserved names.
-- **Rate limiting** -- tiered per-IP rate limits: auth endpoints (20/min), admin endpoints (30/min), sync endpoints (200/min), global fallback (500/min). Returns `429 Too Many Requests` when exceeded.
+- **Rate limiting** -- tiered limits returning `429 Too Many Requests` when exceeded. Auth (120/min) and sync (3000/min) are keyed on tenant + authenticated principal + client address, so users behind one NAT or CDN do not spend each other's budgets; system endpoints (30/min) and the global fallback are keyed on the address alone. See [Rate limits](#rate-limits).
 - **Security headers** -- `helmet` middleware sets X-Content-Type-Options, X-Frame-Options, Content-Security-Policy, Strict-Transport-Security, and others.
 - **CORS** -- disabled by default. Set `MINDOODB_CORS_ORIGIN` to allow one specific origin or a comma-separated allowlist of origins.
 - **Constant-time key comparison** -- tenant creation API keys are compared using `crypto.timingSafeEqual()` where applicable.
 - **Error sanitization** -- internal errors never leak file paths or stack traces to clients. Only known auth/validation errors return specific messages.
 - **Request size limits** -- JSON body limited to 5MB. Array sizes capped (100k IDs, 10k entries for putEntries).
 - **Connection timeouts** -- idle connections are closed after 30 seconds.
-- **Optional `/system/*` IP allowlist** — set `MINDOODB_ADMIN_ALLOWED_IPS` to a comma-separated list of IPs or IPv4/IPv6 CIDRs (e.g., `127.0.0.1,::1,10.0.0.0/8,2001:db8::/32`) to restrict which client addresses may call **any** `/system/*` route (including auth). If unset or `*`, there is no IP restriction at this layer. IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is normalized. Behind a reverse proxy, configure Express `trust proxy` so `req.ip` is accurate.
+- **Optional `/system/*` IP allowlist** — set `MINDOODB_ADMIN_ALLOWED_IPS` to a comma-separated list of IPs or IPv4/IPv6 CIDRs (e.g., `127.0.0.1,::1,10.0.0.0/8,2001:db8::/32`) to restrict which client addresses may call **any** `/system/*` route (including auth). If unset or `*`, there is no IP restriction at this layer. IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is normalized. Behind a reverse proxy, set `MINDOODB_TRUST_PROXY` so `req.ip` is accurate.
 
 For production deployments, also consider:
 
 - Enabling TLS (see below) or running behind a reverse proxy (nginx, Caddy) with TLS termination
+- Setting `MINDOODB_TRUST_PROXY` whenever a proxy, load balancer, or CDN fronts the server
 - Setting `MINDOODB_ADMIN_ALLOWED_IPS` if `/system/*` should only be reachable from operator networks
 - Using a process manager (PM2, systemd) for automatic restarts
+
+### Rate limits
+
+Defaults, all per minute:
+
+| Tier | Limit | Keyed on |
+|------|-------|----------|
+| `auth` | 120 | tenant + principal + address |
+| `sync` | 3000 | tenant + authenticated principal + address |
+| `timestamps` | 10 burst, 500/day | tenant + principal + address |
+| system routes | 30 | address |
+| global fallback | sync + auth + 500 | address |
+
+Override the configurable tiers in `config.json`:
+
+```json
+{
+  "capabilities": { },
+  "rateLimits": {
+    "sync": { "windowMs": 60000, "max": 3000 },
+    "global": { "windowMs": 60000, "max": 5000 }
+  }
+}
+```
+
+Two things are worth knowing before tuning these.
+
+The **global limiter runs first**, so a global `max` below a tier's `max` replaces that tier — the tier's setting then means nothing. Leave `rateLimits.global` unset unless you want a hard cap; the default is derived from the tiers so it only catches traffic no tier claims. A shadowing value is honoured but logged as a warning at startup.
+
+The **sync ceiling is per user, not per request-heavy page**. A host that opens several databases at once (six is normal for an app workspace) spends a few hundred requests per database on a cold open, all against one principal's budget. Clients smooth this themselves — every transport to a server shares one gate that bounds in-flight requests and honours `Retry-After` — but the ceiling still has to fit the burst, which is why the default is 3000 rather than a few hundred.
 
 ## Static File Serving
 
@@ -1020,6 +1054,8 @@ services:
     environment:
       MINDOODB_CORS_ORIGIN: "http://localhost:4174,https://otherserver.com"
       MINDOODB_ADMIN_ALLOWED_IPS: "127.0.0.1,10.0.0.0/8"
+      # One proxy in front (e.g. Cloudflare); use 2 if nginx also fronts the origin.
+      MINDOODB_TRUST_PROXY: "1"
     command: ["--port", "8443", "--auto-sync"]
     ports:
       - "0.0.0.0:8443:8443"
