@@ -11,6 +11,8 @@ import {
   CreateOptions,
   DeleteOptions,
   ListDocumentIdsOptions,
+  ListDocumentCreationDatesOptions,
+  DocumentCreationDate,
   IterateChangesOptions,
   UndeleteOptions,
   ChangeOptions,
@@ -7888,6 +7890,74 @@ export class BaseMindooDB implements MindooDB {
       }
     }
     return docIds;
+  }
+
+  async listDocumentCreationDates(
+    options?: ListDocumentCreationDatesOptions,
+  ): Promise<DocumentCreationDate[]> {
+    const startedAt = Date.now();
+    const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
+    const include = options?.include ?? "existing";
+    const matchesLifecycle = (isDeleted: boolean): boolean =>
+      include === "all" ? true : include === "deleted" ? isDeleted : !isDeleted;
+
+    // The index is the document universe here: it is already access-filtered
+    // and, on a time-travel instance, already reflects existence and deletion
+    // at the cutoff (every scan feeding it is bounded by timeTravelDate). So
+    // the scan below only has to supply dates, never lifecycle state.
+    const candidates = this.index.filter(
+      (entry) =>
+        entry.accessState === "visible"
+        && matchesLifecycle(entry.isDeleted)
+        && (idPrefix === undefined || matchesDocIdPrefix(entry.docId, idPrefix)),
+    );
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    // One metadata-only pass over the whole store. doc_snapshot is included as
+    // the fallback origin for documents whose doc_create was dropped by
+    // compaction; a snapshot is always younger than the create it replaces, so
+    // the oldest of the two is the best creation date available.
+    const originEntries = await this.scanAllMetadata(this.store, {
+      entryTypes: ["doc_create", "doc_snapshot"],
+    });
+    const createdAtByDocId = new Map<string, number>();
+    for (const entry of originEntries) {
+      const known = createdAtByDocId.get(entry.docId);
+      if (known === undefined || entry.createdAt < known) {
+        createdAtByDocId.set(entry.docId, entry.createdAt);
+      }
+    }
+
+    const results: DocumentCreationDate[] = candidates.map((entry) => ({
+      docId: entry.docId,
+      // A document whose entire origin was purged keeps its index entry. Date
+      // it by its last change rather than dropping it from the listing.
+      createdAt: createdAtByDocId.get(entry.docId) ?? entry.lastModified,
+      isDeleted: entry.isDeleted,
+    }));
+    // Plain comparison, NOT localeCompare: ids are base62 in ASCII order and
+    // locale collation would reorder digits against letters, so the tie-break
+    // for same-millisecond documents would no longer follow their ids.
+    results.sort((left, right) =>
+      left.createdAt !== right.createdAt
+        ? left.createdAt - right.createdAt
+        : left.docId < right.docId
+          ? -1
+          : left.docId > right.docId
+            ? 1
+            : 0,
+    );
+    if (options?.order === "desc") {
+      results.reverse();
+    }
+
+    this.logger.debug(
+      `Listed ${results.length} document creation date(s) from ${originEntries.length} ` +
+      `origin entries in ${Date.now() - startedAt}ms`,
+    );
+    return results;
   }
 
   async getAllDocumentIdsAtTimestamp(timestamp: number): Promise<string[]> {

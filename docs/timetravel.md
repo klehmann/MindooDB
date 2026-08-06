@@ -6,12 +6,13 @@ MindooDB provides time travel functionality that allows you to retrieve document
 
 ## Features
 
-MindooDB offers four main time travel capabilities:
+MindooDB offers five main time travel capabilities:
 
 1. **`getDocumentAtTimestamp()`** - Retrieve a document snapshot at a specific point in time
 2. **`getAllDocumentIdsAtTimestamp()`** - Get all document IDs that existed at a specific point in time
-3. **`iterateDocumentHistory()`** - Traverse all changes to a document chronologically
-4. **Time-travel database instances** - Open a whole database read-only as of a cutoff date via `tenant.openDB(id, { timeTravelDate })`
+3. **`listDocumentCreationDates()`** - List documents with their creation date, in chronological order
+4. **`iterateDocumentHistory()`** - Traverse all changes to a document chronologically
+5. **Time-travel database instances** - Open a whole database read-only as of a cutoff date via `tenant.openDB(id, { timeTravelDate })`
 
 All of them work with MindooDB's append-only storage architecture, which maintains a complete history of all document changes.
 
@@ -362,6 +363,52 @@ const createdBetween = idsAtTime2.filter(id => !idsAtTime1.includes(id));
 // Find documents deleted between time1 and time2
 const deletedBetween = idsAtTime1.filter(id => !idsAtTime2.includes(id));
 ```
+
+## listDocumentCreationDates()
+
+Lists documents together with the moment they were created, ordered
+chronologically. Creation dates are not part of the changefeed index — that one
+tracks last modification — so they come from a single metadata-only scan of the
+`doc_create` entries. No payload is fetched and no document is materialized,
+which is what makes this affordable against a network-backed store: the entry
+type filter travels with the scan request and the server applies it.
+
+```typescript
+listDocumentCreationDates(options?: {
+  order?: "asc" | "desc";              // default "asc"
+  include?: "existing" | "deleted" | "all"; // default "existing"
+  idPrefix?: string;
+}): Promise<Array<{ docId: string; createdAt: number; isDeleted: boolean }>>
+```
+
+`createdAt` is author time (the clock of the creating device), so it is stable
+across replicas rather than reflecting local receipt order.
+
+```typescript
+const newest = await db.listDocumentCreationDates({ order: "desc" });
+console.log(newest[0].docId, new Date(newest[0].createdAt));
+
+// Only invoices, oldest first, including the deleted ones
+const invoices = await db.listDocumentCreationDates({
+  idPrefix: "inv",
+  include: "all",
+});
+```
+
+Existence and deletion are evaluated for the instant the database instance
+represents. On a live instance that is now; on a time-travel instance it is the
+cutoff, so a document deleted after the cutoff is still listed as existing, and
+one deleted before it counts as deleted unless an undelete precedes the cutoff:
+
+```typescript
+const snapshot = await tenant.openDB("crm", { timeTravelDate: cutoff });
+// What the database looked like at `cutoff`, in creation order
+const asOfCutoff = await snapshot.listDocumentCreationDates();
+```
+
+Documents the caller holds no decryption key for are never listed. A document
+whose `doc_create` entry was dropped by history compaction is dated by its
+oldest surviving entry rather than omitted.
 
 ## Time-Travel Database Instances
 

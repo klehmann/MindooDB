@@ -1796,6 +1796,47 @@ export interface ListDocumentIdsOptions {
 }
 
 /**
+ * Which lifecycle states a listing returns, mirroring the split between
+ * {@link MindooDB.getAllDocumentIds} (existing) and
+ * {@link MindooDB.getDeletedDocumentIds} (deleted).
+ */
+export type DocumentLifecycleFilter = "existing" | "deleted" | "all";
+
+/**
+ * Options accepted by {@link MindooDB.listDocumentCreationDates}.
+ */
+export interface ListDocumentCreationDatesOptions extends ListDocumentIdsOptions {
+  /** Chronological direction of the result. Default: `"asc"`. */
+  order?: "asc" | "desc";
+
+  /** Lifecycle states to include. Default: `"existing"`. */
+  include?: DocumentLifecycleFilter;
+}
+
+/**
+ * One document's creation date, as returned by
+ * {@link MindooDB.listDocumentCreationDates}.
+ */
+export interface DocumentCreationDate {
+  /** The document's id. */
+  docId: string;
+
+  /**
+   * Author time of the document's `doc_create` entry (milliseconds since the
+   * Unix epoch) — the clock of the device that created it, not local receipt
+   * time, so it is stable across replicas.
+   *
+   * For a document whose `doc_create` entry was dropped by compaction this
+   * falls back to the oldest surviving origin entry, and finally to the
+   * document's last modification.
+   */
+  createdAt: number;
+
+  /** Deletion state at the instant this database instance represents. */
+  isDeleted: boolean;
+}
+
+/**
  * Options accepted by the changefeed iteration methods
  * ({@link MindooDB.iterateChangesSince}, {@link MindooDB.iterateChangeMetadataSince},
  * {@link MindooDB.countChangesSince}).
@@ -4651,6 +4692,30 @@ export interface MindooDB {
    * @return A list of deleted document IDs
    */
   getDeletedDocumentIds(options?: ListDocumentIdsOptions): Promise<string[]>;
+
+  /**
+   * List documents with their creation date, ordered chronologically.
+   *
+   * Creation dates are not part of the changefeed index, which tracks last
+   * modification, so they come from a single metadata-only scan filtered to
+   * the `doc_create` entries — one record per document. No payload is fetched
+   * and no document is materialized, which is what makes this affordable
+   * against a network-backed store: the filter travels with the scan request
+   * and the server applies it.
+   *
+   * Existence and deletion are evaluated for the instant this database
+   * instance represents. On a time-travel instance
+   * ({@link OpenDBOptions.timeTravelDate}) a document deleted after the cutoff
+   * still counts as existing, and one deleted before it counts as deleted
+   * unless an undelete precedes the cutoff. Documents the caller holds no
+   * decryption key for are never listed.
+   *
+   * @param options Ordering, lifecycle filter and `idPrefix` narrowing.
+   * @return The matching documents, ordered by creation date.
+   */
+  listDocumentCreationDates(
+    options?: ListDocumentCreationDatesOptions
+  ): Promise<DocumentCreationDate[]>;
 
   /**
    * Get all document IDs that existed at a specific timestamp.
