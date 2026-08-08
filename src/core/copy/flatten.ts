@@ -104,7 +104,7 @@ export async function flattenDocument(
     // a message that gives no hint about the copy.
     throw new Error(
       `Cannot flatten into document id '${targetDocId}': caller-provided ids must ` +
-        "match /^[A-Za-z][A-Za-z0-9_]*$/. Copy with mode 'history' to keep a " +
+        `match ${CUSTOM_DOC_ID_REGEX.source}. Copy with mode 'history' to keep a ` +
         "MindooDB-generated id, or pass an explicit targetDocId that satisfies the rule.",
     );
   }

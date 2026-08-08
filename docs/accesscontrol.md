@@ -358,10 +358,14 @@ every participant. Several documents use **fixed document IDs** so they can be r
 by direct lookup without building an index/view.
 
 > **ID constraint.** Custom document IDs must match
-> `^[A-Za-z][A-Za-z0-9_]*$` (`CUSTOM_DOC_ID_REGEX` in `types.ts`), because IDs are
-> embedded in store-entry IDs and on-disk filenames. All fixed ACL IDs therefore use
-> underscores, and any embedded `<dbid>`/`<ruleId>`/`<fingerprint>` must itself be
-> made of `[A-Za-z0-9_]`.
+> `^[a-z][a-z0-9_]*$` (`CUSTOM_DOC_ID_REGEX` in `types.ts`), because IDs are
+> embedded in store-entry IDs and on-disk filenames — and those filenames land on
+> case-insensitive file systems, hence lowercase only. All fixed ACL IDs therefore
+> use underscores, and any embedded `<dbid>`/`<ruleId>`/`<fingerprint>` is passed
+> through `encodeAclIdComponent`, which keeps `[a-z0-9]` and escapes every other
+> byte — uppercase included — as `_` plus two hex digits. Escaping rather than
+> lowercasing keeps the mapping injective, so the databases `Sales` and `sales`
+> cannot end up sharing one policy document.
 
 | Purpose | Fixed/Pattern ID | Singleton? |
 |---------|------------------|------------|

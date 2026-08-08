@@ -79,7 +79,7 @@ describe("createDocument with assumeUniqueId", () => {
 
     it("still rejects initialValues with a custom id WITHOUT the flag (single create)", async () => {
       await expect(
-        db.createDocument({ id: "lrn_fixedId1", initialValues: { name: "x" } }),
+        db.createDocument({ id: "lrn_fixedid1", initialValues: { name: "x" } }),
       ).rejects.toThrow(/initialValues is not supported together with a custom id/i);
     });
   });
@@ -143,7 +143,7 @@ describe("createDocument with assumeUniqueId", () => {
   }, 30000);
 
   it("keeps the two-entry convergent behavior on the bulk path WITHOUT the flag", async () => {
-    const id = "cfg_convergentBulkDoc";
+    const id = "cfg_convergentbulkdoc";
     await db.createDocuments([{ id, initialValues: { name: "settings" } }]);
     const entryIds = (await db.getStore().getAllIds()).filter((eid) => eid.startsWith(`${id}_d_`));
     // Deterministic seed doc_create + follow-up doc_change with the values.
@@ -192,7 +192,7 @@ describe("createDocument with assumeUniqueId", () => {
     const dbB = await tenantB.openDB("test-db");
 
     const docA = await dbA.createDocument({
-      id: "lrn_syncMe0011223344556677",
+      id: "lrn_syncme0011223344556677",
       assumeUniqueId: true,
       initialValues: { type: "learner", name: "Kim" },
     });

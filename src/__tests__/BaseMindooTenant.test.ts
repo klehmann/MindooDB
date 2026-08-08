@@ -271,11 +271,11 @@ describe("BaseMindooTenant", () => {
 
     it("opens time travel databases as isolated read-only snapshots", async () => {
       const liveDb = await tenant.openDB("timetravel-test");
-      const first = await liveDb.createDocument({ id: "firstDoc" });
+      const first = await liveDb.createDocument({ id: "first_doc" });
       await new Promise((resolve) => setTimeout(resolve, 5));
       const cutoff = Date.now();
       await new Promise((resolve) => setTimeout(resolve, 5));
-      await liveDb.createDocument({ id: "secondDoc" });
+      await liveDb.createDocument({ id: "second_doc" });
 
       const liveAgain = await tenant.openDB("timetravel-test");
       const snapshotDb = await tenant.openDB("timetravel-test", { timeTravelDate: cutoff });
@@ -285,8 +285,8 @@ describe("BaseMindooTenant", () => {
       expect(snapshotDb.isTimeTravelMode()).toBe(true);
       expect(snapshotDb.isReadOnly()).toBe(true);
       await expect(snapshotDb.getDocument(first.getId())).resolves.toBeDefined();
-      await expect(snapshotDb.getDocument("secondDoc")).rejects.toThrow();
-      await expect(snapshotDb.createDocument({ id: "blockedDoc" })).rejects.toThrow(/read-only mode/);
+      await expect(snapshotDb.getDocument("second_doc")).rejects.toThrow();
+      await expect(snapshotDb.createDocument({ id: "blocked_doc" })).rejects.toThrow(/read-only mode/);
     });
 
     it("should open a database id containing dots", async () => {

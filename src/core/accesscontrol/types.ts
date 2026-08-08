@@ -345,26 +345,30 @@ const ACL_TRUSTED_WITNESS_PREFIX = "acl_trustedwitness_";
 const ACL_RULE_PREFIX = "acl_rule_";
 
 /**
- * Encode an arbitrary string into a component made only of `[A-Za-z0-9_]`, so
- * it can be embedded in a fixed document ID that satisfies
+ * Encode an arbitrary string into a component made only of `[a-z0-9_]`, so it
+ * can be embedded in a fixed document ID that satisfies
  * {@link CUSTOM_DOC_ID_REGEX} (§6).
  *
- * The encoding is injective and reversible: ASCII letters and digits pass
- * through unchanged; every other byte (including a literal `_`) is escaped as
- * `_` followed by two lowercase hex digits. Because every literal underscore is
- * escaped, decoding is unambiguous. Examples:
+ * The encoding is injective and reversible: lowercase ASCII letters and digits
+ * pass through unchanged; every other byte (including uppercase letters and a
+ * literal `_`) is escaped as `_` followed by two lowercase hex digits. Uppercase
+ * has to be escaped rather than lowercased because document IDs are
+ * case-insensitive, so folding `A` to `a` would let two distinct components
+ * (say the database IDs `Sales` and `sales`) collide on one ACL document.
+ * Because every literal underscore is escaped, decoding is unambiguous.
+ * Examples:
  * - `directory` -> `directory`
  * - `test-db`   -> `test_2ddb`
  * - `a_b`       -> `a_5fb`
+ * - `Sales`     -> `_53ales`
  */
 export function encodeAclIdComponent(raw: string): string {
   let out = "";
   const bytes = new TextEncoder().encode(raw);
   for (const byte of bytes) {
-    const isLetter =
-      (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a);
+    const isLowerLetter = byte >= 0x61 && byte <= 0x7a;
     const isDigit = byte >= 0x30 && byte <= 0x39;
-    if (isLetter || isDigit) {
+    if (isLowerLetter || isDigit) {
       out += String.fromCharCode(byte);
     } else {
       out += "_" + byte.toString(16).padStart(2, "0");

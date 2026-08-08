@@ -87,7 +87,7 @@ await monolith.copyDocumentsTo({ idPrefix: "inv2025" }, archive2025, {
 Two limits are worth knowing before you reach for it:
 
 - **Only letter-leading ids can be kept at all.** Caller-provided ids must match
-  `/^[A-Za-z][A-Za-z0-9_]*$/`, and a *bare* generated id often starts with a
+  `/^[a-z][a-z0-9_]*$/`, and a *bare* generated id often starts with a
   digit. `targetDocId: "same"` in flatten mode therefore needs the source ids to
   carry an `idPrefix` (which must begin with a letter) — another reason to mint
   shard-friendly ids with one. Use `mode: "history"` to keep a bare generated id.

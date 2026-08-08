@@ -196,11 +196,11 @@ describe("copyDocumentTo", () => {
       const docId = await seedDocument(sourceDb, { title: "Report" });
 
       const result = await sourceDb.copyDocumentTo(docId, targetDb, {
-        targetDocId: "explicitCopyId",
+        targetDocId: "explicit_copy_id",
       });
 
-      expect(result.targetDocId).toBe("explicitCopyId");
-      const copy = await targetDb.getDocument("explicitCopyId");
+      expect(result.targetDocId).toBe("explicit_copy_id");
+      const copy = await targetDb.getDocument("explicit_copy_id");
       expect(copy.getData().title).toBe("Report");
     }, 30000);
 
@@ -232,7 +232,7 @@ describe("copyDocumentTo", () => {
       // A caller-provided id is seeded from the deterministic convergence
       // change, which cannot carry content either.
       const explicitId = await sourceDb.copyDocumentTo(docId, targetDb, {
-        targetDocId: "explicitFlattenId",
+        targetDocId: "explicit_flatten_id",
         provenance: false,
       });
       expect(await docEntries(targetDb, explicitId.targetDocId)).toHaveLength(2);

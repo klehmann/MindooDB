@@ -46,6 +46,10 @@ describe("access-control schema", () => {
       "0190-uuid-7-style",
       "under_score",
       "ünïcode",
+      // Database ids may contain uppercase (`openDB("TestDatabase")`), as may
+      // fingerprints and app ids, while custom document ids may not.
+      "TestDatabase",
+      "ALLCAPS",
     ])("produces regex-valid, reversible ids for component %j", (component) => {
       const dbId = aclDbPolicyDocId(component);
       const ruleId = aclRuleDocId(component);
@@ -61,6 +65,9 @@ describe("access-control schema", () => {
       // The classic collision risk: "a_b" vs "a-b". Both must encode distinctly.
       expect(aclDbPolicyDocId("a_b")).not.toBe(aclDbPolicyDocId("a-b"));
       expect(aclDbPolicyDocId("a_b")).not.toBe(aclDbPolicyDocId("ab"));
+      // Document ids are case-insensitive, so case may not be folded away:
+      // "Sales" and "sales" are distinct databases and need distinct policies.
+      expect(aclDbPolicyDocId("Sales")).not.toBe(aclDbPolicyDocId("sales"));
     });
   });
 
