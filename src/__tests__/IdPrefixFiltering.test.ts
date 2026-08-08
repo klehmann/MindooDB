@@ -19,12 +19,12 @@ import { matchesDocIdPrefix } from "../core/utils/idGeneration";
  */
 describe("matchesDocIdPrefix", () => {
   it("matches on the `<prefix>_` boundary, not a raw startsWith", () => {
-    expect(matchesDocIdPrefix("cls_0BqXa9yTFn2M4kVzR1sWpq", "cls")).toBe(true);
+    expect(matchesDocIdPrefix("cls_507f1f77bcf86cd799439011", "cls")).toBe(true);
     // Exact equality (no suffix) also matches.
     expect(matchesDocIdPrefix("cls", "cls")).toBe(true);
     // Different prefix that merely shares a leading substring must NOT match.
-    expect(matchesDocIdPrefix("classroom_0BqXa9yTFn2M4kVzR1sWpq", "cls")).toBe(false);
-    expect(matchesDocIdPrefix("clsx_0BqXa9yTFn2M4kVzR1sWpq", "cls")).toBe(false);
+    expect(matchesDocIdPrefix("classroom_507f1f77bcf86cd799439011", "cls")).toBe(false);
+    expect(matchesDocIdPrefix("clsx_507f1f77bcf86cd799439011", "cls")).toBe(false);
     // Empty prefix means "no filter".
     expect(matchesDocIdPrefix("anything", "")).toBe(true);
   });

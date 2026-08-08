@@ -545,7 +545,7 @@ describe("BaseMindooDB cache integration", () => {
     // getAllDocumentIds() returns index (changeSeq/creation) order, not a
     // docId sort — so compare as a set by sorting both sides with the same
     // comparator. (Sorting only the expected side with localeCompare made this
-    // flaky: base62 ids that differ in case at the first divergent char sort
+    // flaky: ObjectId ids that differ in case at the first divergent char sort
     // differently under localeCompare vs the raw index order.)
     expect((await db2.getAllDocumentIds()).sort()).toEqual([doc1Id, doc2Id].sort());
 

@@ -118,14 +118,14 @@ describe("document lifecycle delete and undelete", () => {
   }, 30000);
 
   it("uses createDocument({ id }) to resurrect tombstoned custom-id documents", async () => {
-    const doc = await db.createDocument({ id: "AppSettings" });
+    const doc = await db.createDocument({ id: "appsettings" });
     await db.changeDoc(doc, (mutable) => {
       mutable.getData().theme = "dark";
     });
-    await db.deleteDocument("AppSettings");
+    await db.deleteDocument("appsettings");
 
-    const resurrected = await db.createDocument({ id: "AppSettings" });
-    expect(resurrected.getId()).toBe("AppSettings");
+    const resurrected = await db.createDocument({ id: "appsettings" });
+    expect(resurrected.getId()).toBe("appsettings");
     expect(resurrected.isDeleted()).toBe(false);
     expect(resurrected.getData().theme).toBe("dark");
   }, 30000);
@@ -156,7 +156,7 @@ describe("document lifecycle delete and undelete", () => {
 
     const dbA = db;
     const dbB = await tenantB.openDB("lifecycle-db");
-    const doc = await dbA.createDocument({ id: "SharedLifecycle" });
+    const doc = await dbA.createDocument({ id: "sharedlifecycle" });
     await dbB.pullChangesFrom(dbA.getStore());
 
     await dbA.deleteDocument(doc.getId());

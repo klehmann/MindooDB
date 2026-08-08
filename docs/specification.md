@@ -139,9 +139,9 @@ interface StoreEntry extends StoreEntryMetadata {
 ```
 
 **Document ID formats:**
-- **Default (generated):** 22-char base62-encoded UUIDv7 (e.g. `0BqXa9yTFn2M4kVzR1sWpq`). The base62 alphabet is ASCII-ordered (`0-9A-Za-z`), so generated IDs sort lexicographically by creation time.
-- **Prefixed (generated):** `CreateOptions.idPrefix` (1–10 ASCII-alphanumeric chars, starting with a letter, no `_`) yields `<prefix>_<22-char-base62>` (e.g. `cls_0BqXa9yTFn2M4kVzR1sWpq`) — debug-friendly and time-sortable within the same prefix. Because MindooDB generates the ID, `initialValues` are baked into the single `doc_create` entry.
-- **Custom (caller-provided):** `CreateOptions.id` (matching `^[A-Za-z][A-Za-z0-9_]*$`) for fixed, convergent IDs (e.g. singletons like `dbsetup`). The first change is a deterministic, content-free seed so independent replicas creating the same ID share Automerge ancestry; `initialValues` are not allowed here and data lands in a follow-up `doc_change` (two entries instead of one). Mutually exclusive with `idPrefix`.
+- **Default (generated):** 24-char MongoDB-style ObjectId (e.g. `507f1f77bcf86cd799439011`). Leading timestamp bytes make generated IDs sort lexicographically by creation time (`0-9a-f` only).
+- **Prefixed (generated):** `CreateOptions.idPrefix` (1–10 lowercase ASCII-alphanumeric chars, starting with a letter, no `_`) yields `<prefix>_<24-char-objectid>` (e.g. `cls_507f1f77bcf86cd799439011`) — debug-friendly and time-sortable within the same prefix. Because MindooDB generates the ID, `initialValues` are baked into the single `doc_create` entry.
+- **Custom (caller-provided):** `CreateOptions.id` (matching `^[a-z][a-z0-9_]*$`) for fixed, convergent IDs (e.g. singletons like `dbsetup`). The first change is a deterministic, content-free seed so independent replicas creating the same ID share Automerge ancestry; `initialValues` are not allowed here and data lands in a follow-up `doc_change` (two entries instead of one). Mutually exclusive with `idPrefix`.
 
 **Store entry ID formats:**
 - **Document entries** (`doc_create|doc_change|doc_snapshot|doc_delete`): `<docId>_d_<depsFingerprint>_<automergeHash>`
@@ -149,7 +149,7 @@ interface StoreEntry extends StoreEntryMetadata {
   - **Parent linkage**:
     - `depsFingerprint` commits the *set* of Automerge deps into the ID (hash-of-dep-set)
     - `dependencyIds` carries the actual parent entry IDs
-- **Attachment chunks** (`attachment_chunk`): `<docId>_a_<fileUuid7>_<base62ChunkUuid7>`
+- **Attachment chunks** (`attachment_chunk`): `<docId>_a_<fileUuid7>_<chunkObjectId>`
   - `dependencyIds` is `[prevChunkId]` (or `[]` for the first chunk), forming a chain suitable for `resolveDependencies()`.
 
 **Performance Optimization:**
@@ -551,7 +551,7 @@ The `mdb://` URIs are base64url-encoded JSON payloads with a version field for f
 // Create
 const doc = await db.createDocument();  // Uses "default" key
 // or with a readable, time-sortable prefixed id + initial values
-// (single doc_create entry, e.g. id "cls_0BqXa9yTFn2M4kVzR1sWpq"):
+// (single doc_create entry, e.g. id "cls_507f1f77bcf86cd799439011"):
 const doc = await db.createDocument({ idPrefix: "cls", initialValues: { title: "5b" } });
 // or
 const doc = await db.createEncryptedDocument("confidential-key");

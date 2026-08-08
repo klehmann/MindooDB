@@ -239,7 +239,7 @@ describe("copyDocumentTo", () => {
     }, 30000);
 
     it("folds a kept document id into one entry when the caller asserts uniqueness", async () => {
-      // A prefixed id (`inv2025_<22-char-base62>`) is both MindooDB-generated —
+      // A prefixed id (`inv2025_<24-char-objectid>`) is both MindooDB-generated —
       // so provably unique — and letter-leading, so it is legal as a
       // caller-provided id. That combination is what makes the assertion safe.
       const docId = await seedDocument(sourceDb, { title: "Report" }, 2, {

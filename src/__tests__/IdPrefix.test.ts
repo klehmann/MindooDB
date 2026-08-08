@@ -15,7 +15,7 @@ import { parseDocEntryId } from "../core/utils/idGeneration";
 /**
  * Tests for `CreateOptions.idPrefix`:
  * - prefix validation and mutual exclusivity with `id`
- * - MindooDB-generated `<prefix>_<22-char-base62>` ids
+ * - MindooDB-generated `<prefix>_<24-char-objectid>` ids
  * - a single `doc_create` store entry with `initialValues` baked in
  *   (no deterministic seed + follow-up change like the custom-id path)
  * - replica sync of prefix-created documents
@@ -66,12 +66,14 @@ describe("createDocument with idPrefix", () => {
 
   describe("validation", () => {
     it("accepts prefixes matching DOC_ID_PREFIX_REGEX", () => {
-      for (const good of ["a", "cls", "term", "Z9", "abcdefghij"]) {
+      for (const good of ["a", "cls", "term", "z9", "abcdefghij"]) {
         expect(DOC_ID_PREFIX_REGEX.test(good)).toBe(true);
       }
+      expect(DOC_ID_PREFIX_REGEX.test("Z9")).toBe(false);
+      expect(DOC_ID_PREFIX_REGEX.test("Cls")).toBe(false);
     });
 
-    it.each(["", "1cls", "cls_", "with_underscore", "abcdefghijk", "über", "a-b", "a.b"])(
+    it.each(["", "1cls", "cls_", "with_underscore", "abcdefghijk", "über", "a-b", "a.b", "Z9", "Cls"])(
       "rejects invalid idPrefix %j",
       async (badPrefix) => {
         await expect(db.createDocument({ idPrefix: badPrefix })).rejects.toThrow(
@@ -82,7 +84,7 @@ describe("createDocument with idPrefix", () => {
 
     it("rejects id and idPrefix together", async () => {
       await expect(
-        db.createDocument({ id: "AppSettings", idPrefix: "cls" }),
+        db.createDocument({ id: "appsettings", idPrefix: "cls" }),
       ).rejects.toThrow(/mutually exclusive/i);
     });
 
@@ -91,14 +93,20 @@ describe("createDocument with idPrefix", () => {
         db.createDocuments([{ idPrefix: "ok" }, { idPrefix: "not_ok" }]),
       ).rejects.toThrow(/invalid idPrefix/i);
       await expect(
-        db.createDocuments([{ id: "Fixed", idPrefix: "cls" }]),
+        db.createDocuments([{ id: "fixed", idPrefix: "cls" }]),
       ).rejects.toThrow(/mutually exclusive/i);
+    });
+
+    it("rejects uppercase custom document ids", async () => {
+      await expect(db.createDocument({ id: "AppSettings" })).rejects.toThrow(
+        /Custom document IDs must match/i,
+      );
     });
   });
 
-  it("generates ids of the form <prefix>_<22-char-base62>", async () => {
+  it("generates ids of the form <prefix>_<24-char-objectid>", async () => {
     const doc = await db.createDocument({ idPrefix: "cls" });
-    expect(doc.getId()).toMatch(/^cls_[0-9A-Za-z]{22}$/);
+    expect(doc.getId()).toMatch(/^cls_[0-9a-f]{24}$/);
 
     const reloaded = await db.getDocument(doc.getId());
     expect(reloaded.getId()).toBe(doc.getId());
@@ -136,7 +144,7 @@ describe("createDocument with idPrefix", () => {
     expect(docs).toHaveLength(2);
     const allIds = await db.getStore().getAllIds();
     for (const doc of docs) {
-      expect(doc.getId()).toMatch(/^cls_[0-9A-Za-z]{22}$/);
+      expect(doc.getId()).toMatch(/^cls_[0-9a-f]{24}$/);
       const entryIds = allIds.filter((id) => id.startsWith(`${doc.getId()}_d_`));
       expect(entryIds.length).toBe(1);
     }
@@ -207,11 +215,11 @@ describe("createDocument with idPrefix", () => {
     expect(finalA.getData()).toMatchObject({ name: "5b", fromB: "hello-from-B" });
   }, 60000);
 
-  it("still generates plain (unprefixed) sortable base62 ids by default", async () => {
+  it("still generates plain (unprefixed) sortable ObjectId ids by default", async () => {
     const a = await db.createDocument();
     const b = await db.createDocument();
-    expect(a.getId()).toMatch(/^[0-9A-Za-z]{22}$/);
-    expect(b.getId()).toMatch(/^[0-9A-Za-z]{22}$/);
+    expect(a.getId()).toMatch(/^[0-9a-f]{24}$/);
+    expect(b.getId()).toMatch(/^[0-9a-f]{24}$/);
     expect(a.getId()).not.toBe(b.getId());
   }, 30000);
 });

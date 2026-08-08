@@ -91,16 +91,16 @@ describe("createDocument initialValues", () => {
 
   it("rejects initialValues together with a custom id", async () => {
     await expect(
-      db.createDocument({ id: "AppSettings", initialValues: { theme: "dark" } }),
+      db.createDocument({ id: "appsettings", initialValues: { theme: "dark" } }),
     ).rejects.toThrow(/not supported together with a custom id/i);
   }, 30000);
 
   it("treats initialValues with only reserved keys as no values (custom id allowed)", async () => {
     // Only reserved keys -> effectively empty -> custom id path is fine.
     const doc = await db.createDocument({
-      id: "WithReserved",
+      id: "withreserved",
       initialValues: { _attachments: ["x"] } as Record<string, unknown>,
     });
-    expect(doc.getId()).toBe("WithReserved");
+    expect(doc.getId()).toBe("withreserved");
   }, 30000);
 });

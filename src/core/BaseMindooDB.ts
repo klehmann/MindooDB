@@ -4864,8 +4864,8 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Generate a fresh document id (`<prefix>_<22-char-base62(uuidv7)>`, or the
-   * bare base62 part without a prefix) that does not collide with any document
+   * Generate a fresh document id (`<prefix>_<24-char-objectid>`, or the
+   * bare ObjectId without a prefix) that does not collide with any document
    * already present in the local index. A collision is practically impossible
    * (128-bit UUID7), so this is only a cheap O(1) safety net reusing the
    * existing `indexLookup` map — no extra bookkeeping.
@@ -4883,10 +4883,10 @@ export class BaseMindooDB implements MindooDB {
    * Internal method to create a new document.
    *
    * Handles the creation flavors expressible through `CreateOptions`:
-   * - generated ID (time-sortable base62-encoded UUID7), current user signs,
+   * - generated ID (time-sortable MongoDB-style ObjectId), current user signs,
    *   default tenant key
    * - generated ID with custom signing key (e.g. directory admin operations)
-   * - generated ID with a caller-provided `idPrefix` (`<prefix>_<base62>`)
+   * - generated ID with a caller-provided `idPrefix` (`<prefix>_<objectId>`)
    * - caller-provided ID, current user signs (idempotent on existing IDs)
    * - caller-provided ID with custom signing key
    *
@@ -7937,7 +7937,7 @@ export class BaseMindooDB implements MindooDB {
       createdAt: createdAtByDocId.get(entry.docId) ?? entry.lastModified,
       isDeleted: entry.isDeleted,
     }));
-    // Plain comparison, NOT localeCompare: ids are base62 in ASCII order and
+    // Plain comparison, NOT localeCompare: ids are ObjectIds in ASCII order and
     // locale collation would reorder digits against letters, so the tie-break
     // for same-millisecond documents would no longer follow their ids.
     results.sort((left, right) =>

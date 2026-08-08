@@ -223,7 +223,7 @@ export interface CopyDocumentOptions {
    * takes the generated-id path and the payload folds into a single entry —
    * halving the storage and the write cost of a large flatten migration.
    *
-   * Safe when the ids were minted by MindooDB (`<prefix>_<22-char-base62>` from
+   * Safe when the ids were minted by MindooDB (`<prefix>_<24-char-objectid>` from
    * `createDocument`, ~128 bits of uuidv7 entropy) or by an equivalent random
    * scheme.
    *

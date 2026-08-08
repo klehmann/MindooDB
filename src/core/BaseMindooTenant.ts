@@ -38,9 +38,11 @@ import { buildDomainStatementBytes } from "./crypto/DomainStatement";
 import { entryTrustedTime } from "./storeEntryTime";
 import { computeContentHash } from "./utils/idGeneration";
 import { semanticNow } from "./utils/timeSource";
+import { readTenantSetupLabel } from "./tenantSetup";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
-import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
+import { encodeMindooURI, isMindooURI } from "./uri/MindooURI";
+import { decodeJoinRequestUri } from "./uri/joinRequestUri";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
 import { CacheManager } from "./cache/CacheManager";
@@ -1421,11 +1423,9 @@ export class BaseMindooTenant implements MindooTenant {
       if (!isMindooURI(joinRequest)) {
         throw new Error("Invalid join request: expected a JoinRequest object or a mdb://join-request/... URI string");
       }
-      const decoded = decodeMindooURI<JoinRequest>(joinRequest);
-      if (decoded.type !== "join-request") {
-        throw new Error(`Invalid URI type: expected "join-request", got "${decoded.type}"`);
-      }
-      request = decoded.payload;
+      // Normalizes the compact v3 transport back to PEM-armored keys; older
+      // verbose requests pass through unchanged.
+      request = decodeJoinRequestUri(joinRequest);
     } else {
       request = joinRequest;
     }
@@ -1493,6 +1493,22 @@ export class BaseMindooTenant implements MindooTenant {
     }
     if (options.adminUsername) {
       joinResponse.adminUsername = options.adminUsername;
+    }
+
+    const explicitTenantLabel =
+      typeof options.tenantLabel === "string" ? options.tenantLabel.trim() : "";
+    if (explicitTenantLabel) {
+      joinResponse.tenantLabel = explicitTenantLabel;
+    } else {
+      try {
+        const directoryDb = await this.openDB("directory", { adminOnlyDb: true });
+        const setupLabel = await readTenantSetupLabel(directoryDb);
+        if (setupLabel) {
+          joinResponse.tenantLabel = setupLabel;
+        }
+      } catch {
+        // Best-effort: older tenants or missing setup doc.
+      }
     }
 
     console.log(`[approveJoinRequest] ✓ Join request approved for user "${username}"`);

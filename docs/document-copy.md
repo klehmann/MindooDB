@@ -72,7 +72,7 @@ random enough that no other replica can create the same one concurrently, so
 convergence of independent creates is moot and the payload can be baked into
 `doc_create`.
 
-That assertion holds when the ids were minted by MindooDB. A `<prefix>_<base62>`
+That assertion holds when the ids were minted by MindooDB. A `<prefix>_<objectId>`
 id carries ~128 bits of uuidv7 entropy, so a bulk flatten that keeps ids is the
 natural place for the flag:
 
@@ -80,7 +80,7 @@ natural place for the flag:
 await monolith.copyDocumentsTo({ idPrefix: "inv2025" }, archive2025, {
   targetDocId: "same",
   provenance: false,
-  assumeUniqueTargetDocId: true, // ids are inv2025_<base62> — unique by construction
+  assumeUniqueTargetDocId: true, // ids are inv2025_<objectId> — unique by construction
 });
 ```
 
@@ -350,7 +350,7 @@ content.
 
 ### Partition on the document id prefix
 
-Put the shard key in the document id, using the `<prefix>_<base62>` scheme:
+Put the shard key in the document id, using the `<prefix>_<objectId>` scheme:
 
 ```typescript
 const doc = await db.createDocument({ idPrefix: "inv202506" });

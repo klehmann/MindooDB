@@ -65,19 +65,19 @@ describe("createDocument with CreateOptions", () => {
   });
 
   it("returns a document with the caller-provided id and round-trips through getDocument", async () => {
-    const doc = await db.createDocument({ id: "AppSettings" });
-    expect(doc.getId()).toBe("AppSettings");
+    const doc = await db.createDocument({ id: "appsettings" });
+    expect(doc.getId()).toBe("appsettings");
 
     await db.changeDoc(doc, (d) => {
       d.getData().theme = "dark";
     });
 
-    const reloaded = await db.getDocument("AppSettings");
-    expect(reloaded.getId()).toBe("AppSettings");
+    const reloaded = await db.getDocument("appsettings");
+    expect(reloaded.getId()).toBe("appsettings");
     expect(reloaded.getData().theme).toBe("dark");
   }, 30000);
 
-  it.each(["1bad", "bad-name", "bad.id", "bad|id", ""])(
+  it.each(["1bad", "bad-name", "bad.id", "bad|id", "", "AppSettings", "Bad_Case"])(
     "rejects invalid custom document id %j",
     async (badId) => {
       await expect(db.createDocument({ id: badId })).rejects.toThrow(
@@ -87,41 +87,41 @@ describe("createDocument with CreateOptions", () => {
   );
 
   it("accepts ids that exercise the full allowed character set", async () => {
-    const doc = await db.createDocument({ id: "A_b9_X" });
-    expect(doc.getId()).toBe("A_b9_X");
+    const doc = await db.createDocument({ id: "a_b9_x" });
+    expect(doc.getId()).toBe("a_b9_x");
   }, 30000);
 
   it("is idempotent when the document already exists locally", async () => {
-    const first = await db.createDocument({ id: "AppSettings" });
+    const first = await db.createDocument({ id: "appsettings" });
     await db.changeDoc(first, (d) => {
       d.getData().count = 1;
     });
 
-    const second = await db.createDocument({ id: "AppSettings" });
-    expect(second.getId()).toBe("AppSettings");
+    const second = await db.createDocument({ id: "appsettings" });
+    expect(second.getId()).toBe("appsettings");
     // The second create returns the existing document untouched, including
     // any state we set after the first create.
     expect(second.getData().count).toBe(1);
   }, 30000);
 
   it("undeletes a tombstoned custom-id document instead of creating a replacement", async () => {
-    const first = await db.createDocument({ id: "AppSettings" });
+    const first = await db.createDocument({ id: "appsettings" });
     await db.changeDoc(first, (d) => {
       d.getData().count = 1;
     });
-    await db.deleteDocument("AppSettings");
+    await db.deleteDocument("appsettings");
 
-    const second = await db.createDocument({ id: "AppSettings" });
-    expect(second.getId()).toBe("AppSettings");
+    const second = await db.createDocument({ id: "appsettings" });
+    expect(second.getId()).toBe("appsettings");
     expect(second.isDeleted()).toBe(false);
     expect(second.getData().count).toBe(1);
-    expect(await db.getAllDocumentIds()).toContain("AppSettings");
+    expect(await db.getAllDocumentIds()).toContain("appsettings");
   }, 30000);
 
   it("converges when two independent replicas create the same custom id", async () => {
     // Build a second, independent DB instance against a separate in-memory
     // store factory but using the same tenant identity, so we can validate
-    // that two replicas creating "AppSettings" can sync each other's edits.
+    // that two replicas creating "appsettings" can sync each other's edits.
     const storeFactoryB = new InMemoryContentAddressedStoreFactory();
     const factoryB = new BaseMindooTenantFactory(storeFactoryB, new NodeCryptoAdapter());
 
@@ -156,11 +156,11 @@ describe("createDocument with CreateOptions", () => {
     const dbA = db;
     const dbB = await tenantB.openDB("test-db");
 
-    const docA = await dbA.createDocument({ id: "AppSettings" });
-    const docB = await dbB.createDocument({ id: "AppSettings" });
+    const docA = await dbA.createDocument({ id: "appsettings" });
+    const docB = await dbB.createDocument({ id: "appsettings" });
 
-    expect(docA.getId()).toBe("AppSettings");
-    expect(docB.getId()).toBe("AppSettings");
+    expect(docA.getId()).toBe("appsettings");
+    expect(docB.getId()).toBe("appsettings");
 
     // Each replica makes a different change to the same logical document.
     await dbA.changeDoc(docA, (d) => {
@@ -174,8 +174,8 @@ describe("createDocument with CreateOptions", () => {
     await dbB.pullChangesFrom(dbA.getStore());
     await dbA.pullChangesFrom(dbB.getStore());
 
-    const finalA = await dbA.getDocument("AppSettings");
-    const finalB = await dbB.getDocument("AppSettings");
+    const finalA = await dbA.getDocument("appsettings");
+    const finalB = await dbB.getDocument("appsettings");
     // After convergence, both replicas should observe both edits, proving the
     // initial doc_create entries shared Automerge ancestry.
     expect(finalA.getData()).toMatchObject({ fromA: "hello-from-A", fromB: "hello-from-B" });
@@ -244,11 +244,11 @@ describe("createDocument with CreateOptions", () => {
     const dbA = db;
     const dbB = await tenantB.openDB("test-db");
 
-    await dbA.createDocument({ id: "AppSettings" });
-    await dbB.createDocument({ id: "AppSettings" });
+    await dbA.createDocument({ id: "appsettings" });
+    await dbB.createDocument({ id: "appsettings" });
 
-    const idsA = (await dbA.getStore().getAllIds()).filter((id) => id.startsWith("AppSettings_d_"));
-    const idsB = (await dbB.getStore().getAllIds()).filter((id) => id.startsWith("AppSettings_d_"));
+    const idsA = (await dbA.getStore().getAllIds()).filter((id) => id.startsWith("appsettings_d_"));
+    const idsB = (await dbB.getStore().getAllIds()).filter((id) => id.startsWith("appsettings_d_"));
 
     // Both stores should have produced exactly the same doc_create entry id,
     // proving the underlying Automerge change hash is stable across replicas.
@@ -281,7 +281,7 @@ describe("createDocument with CreateOptions", () => {
       otherKeyBag,
     );
     const directoryDb = await otherTenant.openDB("directory");
-    await expect(directoryDb.createDocument({ id: "DirEntry" })).rejects.toThrow();
+    await expect(directoryDb.createDocument({ id: "direntry" })).rejects.toThrow();
   }, 30000);
 
   it("returns an existing UUID7 document is not affected by id-only existence check", async () => {

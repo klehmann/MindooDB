@@ -7,6 +7,7 @@ import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "../core/uri/MindooURI";
+import { decodeJoinRequestUri } from "../core/uri/joinRequestUri";
 import type {
   MindooTenant,
   JoinRequest,
@@ -112,10 +113,12 @@ describe("Join Flow (convenience API)", () => {
       expect(uri).toMatch(/^mdb:\/\/join-request\//);
       expect(isMindooURI(uri as string)).toBe(true);
 
-      // Should round-trip
-      const decoded = decodeMindooURI<JoinRequest>(uri as string);
-      expect(decoded.type).toBe("join-request");
-      expect(decoded.payload.username).toBe(user2Name);
+      // Round-trips through the codec, which normalizes the compact v3
+      // transport back to the PEM-armored request the SDK works with.
+      const decoded = decodeJoinRequestUri(uri as string);
+      expect(decoded.username).toBe(user2Name);
+      expect(decoded.signingPublicKey).toBe(user2.userSigningKeyPair.publicKey);
+      expect(decoded.encryptionPublicKey).toBe(user2.userEncryptionKeyPair.publicKey);
     });
   });
 
@@ -133,6 +136,7 @@ describe("Join Flow (convenience API)", () => {
       // Step 1: Admin creates tenant
       adminResult = await localFactory.createTenant({
         tenantId: "test-join-obj",
+        tenantLabel: "Join Object Lab",
         adminName: "cn=admin/o=test-join-obj",
         adminPassword,
         userName: "cn=alice/o=test-join-obj",
@@ -161,6 +165,7 @@ describe("Join Flow (convenience API)", () => {
     it("should produce a valid JoinResponse", () => {
       expect(joinResponse.v).toBe(2);
       expect(joinResponse.tenantId).toBe("test-join-obj");
+      expect(joinResponse.tenantLabel).toBe("Join Object Lab");
       expect(joinResponse.adminSigningPublicKey).toBe(
         adminResult.adminUser.userSigningKeyPair.publicKey
       );

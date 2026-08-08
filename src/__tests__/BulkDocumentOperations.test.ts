@@ -89,42 +89,42 @@ describe("bulk document operations", () => {
 
   it("creates custom-id documents WITH initialValues in one batch (bulk-only extension)", async () => {
     const docs = await db.createDocuments([
-      { id: "BulkSettings", initialValues: { theme: "dark" } },
-      { id: "BulkProfile", initialValues: { name: "ACME" } },
+      { id: "bulksettings", initialValues: { theme: "dark" } },
+      { id: "bulkprofile", initialValues: { name: "ACME" } },
     ]);
-    expect(docs[0].getId()).toBe("BulkSettings");
+    expect(docs[0].getId()).toBe("bulksettings");
     expect(docs[0].getData().theme).toBe("dark");
-    expect(docs[1].getId()).toBe("BulkProfile");
+    expect(docs[1].getId()).toBe("bulkprofile");
     expect(docs[1].getData().name).toBe("ACME");
 
     // Persisted state must contain the values (create seed + value change).
-    const reloaded = await db.getDocument("BulkSettings");
+    const reloaded = await db.getDocument("bulksettings");
     expect(reloaded.getData().theme).toBe("dark");
   }, 30000);
 
   it("keeps custom-id documents mergeable with single-create replicas (shared seed ancestry)", async () => {
     const [doc] = await db.createDocuments([
-      { id: "SharedAncestry", initialValues: { origin: "bulk" } },
+      { id: "sharedancestry", initialValues: { origin: "bulk" } },
     ]);
     // The document's first change must be the deterministic seed change, so
     // a doc_create entry id identical to the single-create path is produced.
-    const singleCreated = await db.createDocument({ id: "SharedAncestry" });
+    const singleCreated = await db.createDocument({ id: "sharedancestry" });
     // Idempotent: returns the same document rather than diverging.
     expect(singleCreated.getId()).toBe(doc.getId());
     expect(singleCreated.getData().origin).toBe("bulk");
   }, 30000);
 
   it("is idempotent for existing custom ids and applies initialValues as follow-up change", async () => {
-    const first = await db.createDocument({ id: "ExistingDoc" });
+    const first = await db.createDocument({ id: "existingdoc" });
     await db.changeDoc(first, (d) => {
       (d.getData() as Record<string, unknown>).counter = 1;
     });
 
     const [again] = await db.createDocuments([
-      { id: "ExistingDoc", initialValues: { extra: "value" } },
+      { id: "existingdoc", initialValues: { extra: "value" } },
     ]);
-    expect(again.getId()).toBe("ExistingDoc");
-    const data = (await db.getDocument("ExistingDoc")).getData();
+    expect(again.getId()).toBe("existingdoc");
+    const data = (await db.getDocument("existingdoc")).getData();
     // Existing state is preserved, initialValues applied on top.
     expect(data.counter).toBe(1);
     expect(data.extra).toBe("value");
@@ -142,7 +142,7 @@ describe("bulk document operations", () => {
           skipped: undefined,
         } as Record<string, unknown>,
       },
-      { id: "UndefinedValues", initialValues: { ok: "yes", skipped: undefined } as Record<string, unknown> },
+      { id: "undefinedvalues", initialValues: { ok: "yes", skipped: undefined } as Record<string, unknown> },
     ]);
     const data = doc.getData();
     expect(data.ok).toBe("yes");
@@ -201,7 +201,7 @@ describe("bulk document operations", () => {
 
   it("survives a fresh reload of the database (entries fully persisted)", async () => {
     const docs = await db.createDocuments([
-      { id: "ReloadCheck", initialValues: { v: 42 } },
+      { id: "reloadcheck", initialValues: { v: 42 } },
       { initialValues: { v: 43 } },
     ]);
     const uuidDocId = docs[1].getId();
@@ -209,7 +209,7 @@ describe("bulk document operations", () => {
     // Re-open the database from the same tenant: state must be rebuilt from
     // the store entries alone (no reliance on the L1 cache).
     const db2 = await tenant.openDB("test-db-bulk");
-    const reloadedCustom = await db2.getDocument("ReloadCheck");
+    const reloadedCustom = await db2.getDocument("reloadcheck");
     expect(reloadedCustom.getData().v).toBe(42);
     const reloadedUuid = await db2.getDocument(uuidDocId);
     expect(reloadedUuid.getData().v).toBe(43);

@@ -60,6 +60,12 @@ import type { VirtualViewUpdateOptions } from "./indexing/virtualviews/IVirtualV
 export const PUBLIC_INFOS_KEY_ID = "$publicinfos";
 
 /**
+ * Fixed directory document id for tenant display metadata (`{ label }`).
+ * Encrypted under {@link PUBLIC_INFOS_KEY_ID}.
+ */
+export const TENANT_SETUP_DOC_ID = "tenantsetup";
+
+/**
  * Well-known key ID for the tenant-wide default document encryption key.
  *
  * KeyBag location: type "doc", id DEFAULT_TENANT_KEY_ID.
@@ -248,6 +254,12 @@ interface CreateTenantPasswords {
    * (legacy behavior: v1 entries remain acceptable).
    */
   requireV2Entries?: boolean;
+  /**
+   * Optional human-readable tenant label stored in the directory document
+   * `tenantsetup` (encrypted under `$publicinfos`). When omitted, no setup
+   * document is written at create time.
+   */
+  tenantLabel?: string;
 }
 
 /**
@@ -303,6 +315,12 @@ export interface JoinRequest {
    * Emitting `2` only for nameless requests keeps older readers from silently
    * registering an undefined username — they reject the unknown version
    * instead.
+   *
+   * The `mdb://join-request/...` transport has a third version that is not
+   * visible here: `v: 3` is the compact, PEM-stripped payload written by
+   * `encodeJoinRequestUri`. It carries the same information, and
+   * `decodeJoinRequestUri` normalizes it back to `1` or `2` depending on
+   * whether a username is present.
    */
   v: 1 | 2;
   /**
@@ -369,6 +387,11 @@ export interface ApproveJoinRequestOptions {
    * than trusting the requester's spelling (§6.5).
    */
   username?: string;
+  /**
+   * Optional tenant display label to include in the join response. When omitted,
+   * `approveJoinRequest` tries to read it from the directory `tenantsetup` doc.
+   */
+  tenantLabel?: string;
   /** If "uri", approveJoinRequest returns a mdb://join-response/... URI string instead of an object */
   format?: "object" | "uri";
 }
@@ -407,6 +430,12 @@ export interface JoinResponse {
   serverUrl?: string;
   /** Optional admin username for display purposes */
   adminUsername?: string;
+  /**
+   * Optional human-readable tenant label for display on the joining device.
+   * Snapshotted at approve time from `tenantsetup` (or an explicit override).
+   * After join, clients should prefer the live directory label when synced.
+   */
+  tenantLabel?: string;
   /**
    * The username the joining device was actually registered as.
    *
@@ -641,7 +670,7 @@ export interface MindooTenant {
   getFactory(): MindooTenantFactory;
 
   /**
-   * Get the ID of the tenant (UUID7 format)
+   * Get the ID of the tenant (lowercase MongoDB-style ObjectId when auto-generated)
    *
    * @return The ID of the tenant
    */
@@ -1017,7 +1046,7 @@ export interface StoreEntryMetadata {
   /**
    * Unique identifier for this entry (primary key in the store).
    * - For doc_* entries: "<docId>_d_<depsFingerprint>_<automergeHash>"
-   * - For attachment_chunk: "<docId>_a_<fileUuid7>_<base62ChunkUuid7>"
+   * - For attachment_chunk: "<docId>_a_<fileUuid7>_<chunkObjectId>"
    * 
    * The structured ID format enables:
    * - Guaranteed uniqueness across documents
@@ -1611,20 +1640,20 @@ export interface SnapshotConfig {
 /**
  * Regex used to validate caller-provided MindooDoc IDs.
  *
- * The first character must be an ASCII letter; subsequent characters may be
- * ASCII letters, ASCII digits, or `_`. This keeps caller-provided IDs safe to
- * use unmodified in content-addressed store entry IDs and on disk.
+ * The first character must be an ASCII lowercase letter; subsequent characters
+ * may be ASCII lowercase letters, ASCII digits, or `_`. Lowercase-only keeps
+ * caller-provided IDs safe on case-insensitive filesystems (Windows / APFS).
  */
-export const CUSTOM_DOC_ID_REGEX = /^[A-Za-z][A-Za-z0-9_]*$/;
+export const CUSTOM_DOC_ID_REGEX = /^[a-z][a-z0-9_]*$/;
 
 /**
  * Regex used to validate `CreateOptions.idPrefix`.
  *
- * A prefix is a short (1–10 chars) ASCII-alphanumeric tag starting with a
- * letter, e.g. `"cls"`. It must NOT contain `_` — MindooDB appends the `_`
- * separator itself when building the final id `<prefix>_<22-char-base62>`.
+ * A prefix is a short (1–10 chars) ASCII-alphanumeric lowercase tag starting
+ * with a letter, e.g. `"cls"`. It must NOT contain `_` — MindooDB appends the
+ * `_` separator itself when building the final id `<prefix>_<24-char-objectid>`.
  */
-export const DOC_ID_PREFIX_REGEX = /^[A-Za-z][A-Za-z0-9]{0,9}$/;
+export const DOC_ID_PREFIX_REGEX = /^[a-z][a-z0-9]{0,9}$/;
 
 /**
  * Options accepted by `MindooDB.createDocument()`.
@@ -1632,7 +1661,7 @@ export const DOC_ID_PREFIX_REGEX = /^[A-Za-z][A-Za-z0-9]{0,9}$/;
 export interface CreateOptions {
   /**
    * Caller-provided document ID. When provided it must match
-   * `^[A-Za-z][A-Za-z0-9_]*$` (see `CUSTOM_DOC_ID_REGEX`). When omitted, a fresh
+   * `^[a-z][a-z0-9_]*$` (see `CUSTOM_DOC_ID_REGEX`). When omitted, a fresh
    * time-sortable ID is generated (see `idPrefix` for the format).
    *
    * If a document with this ID already exists locally, `createDocument()`
@@ -1664,10 +1693,10 @@ export interface CreateOptions {
   assumeUniqueId?: boolean;
 
   /**
-   * Optional short prefix (1–10 ASCII-alphanumeric chars, starting with a
-   * letter; see `DOC_ID_PREFIX_REGEX`) for a MindooDB-generated document ID.
-   * The final ID is `<idPrefix>_<22-char-base62(uuidv7)>`, e.g.
-   * `cls_0BqXa9yTFn2M4kVzR1sWpq` — time-sortable within the same prefix.
+   * Optional short lowercase prefix (1–10 ASCII-alphanumeric chars, starting
+   * with a letter; see `DOC_ID_PREFIX_REGEX`) for a MindooDB-generated document
+   * ID. The final ID is `<idPrefix>_<24-char-objectid>`, e.g.
+   * `cls_507f1f77bcf86cd799439011` — time-sortable within the same prefix.
    *
    * Unlike a custom `id`, uniqueness is guaranteed by MindooDB itself, so the
    * create follows the generated-ID code path: a single `doc_create` entry
@@ -1788,7 +1817,7 @@ export interface ListDocumentIdsOptions {
   /**
    * Restrict the result to documents whose id matches this prefix. Matching is
    * boundary-aware: an id matches when it equals `idPrefix` exactly or begins
-   * with `<idPrefix>_`, mirroring the `<prefix>_<base62>` id scheme produced by
+   * with `<idPrefix>_`, mirroring the `<prefix>_<objectId>` id scheme produced by
    * `createDocument({ idPrefix })`. So `"cls"` matches `cls_…` documents but not
    * an unrelated `classroom_…` id. Omit (or pass an empty string) for no filter.
    */
@@ -1896,7 +1925,7 @@ export interface MindooDoc {
   getDatabase(): MindooDB;
 
   /*
-   * Get the ID of the document (UUID7 format)
+   * Get the ID of the document (lowercase MongoDB-style ObjectId when generated)
    *
    * @return The ID of the document
   */

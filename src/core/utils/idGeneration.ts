@@ -1,6 +1,6 @@
 /**
  * ID Generation Utilities for ContentAddressedStore entries.
- * 
+ *
  * Provides structured ID formats that enable:
  * - Guaranteed uniqueness across documents
  * - Efficient prefix-based queries
@@ -10,74 +10,93 @@
 
 import { v7 as uuidv7 } from 'uuid';
 
+/** MongoDB-style ObjectId length: 12 bytes → 24 lowercase hex chars. */
+export const OBJECT_ID_LENGTH = 24;
+
+function randomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes);
+    return bytes;
+  }
+  for (let i = 0; i < length; i++) {
+    bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
 /**
- * Base62 alphabet in ASCII order (digits < uppercase < lowercase). The order
- * matters: fixed-length, left-zero-padded encodings of numerically increasing
- * values (e.g. UUID7 timestamps) then sort chronologically under plain
- * lexicographic string comparison. Do NOT reorder.
+ * Process-unique 5-byte machine/process id (MongoDB ObjectId layout).
+ * Regenerated once per JS realm so concurrent realms don't share the same
+ * random prefix.
  */
-const BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-const UUID_NO_DASH_LENGTH = 32;
-const BASE62_UUID_LENGTH = 22;
+const OBJECT_ID_PROCESS_UNIQUE = randomBytes(5);
 
-function trimLeft(target: string, length: number): string {
-  let trim = 0;
-  while (target[trim] === "0" && target.length - trim > length) {
-    trim++;
-  }
-  return target.slice(trim);
-}
+/** 3-byte counter; seeded randomly then incremented per id (wraps at 2^24). */
+let objectIdCounter = Math.floor(Math.random() * 0xffffff);
 
-function ensureLength(target: string, length: number): string {
-  if (target.length < length) {
-    return target.padStart(length, "0");
-  }
-  if (target.length > length) {
-    return trimLeft(target, length);
-  }
-  return target;
-}
-
-function hexToBase62(uuid: string): string {
-  const normalized = uuid.replace(/-/g, "");
-  if (!/^[0-9a-fA-F]{32}$/.test(normalized)) {
-    throw new TypeError(`Invalid UUID for base62 encoding: ${uuid}`);
-  }
-
-  let value = BigInt(`0x${normalized}`);
-  if (value === 0n) {
-    return "0".repeat(BASE62_UUID_LENGTH);
-  }
-
-  let encoded = "";
-  while (value > 0n) {
-    const digit = Number(value % 62n);
-    encoded = BASE62_ALPHABET[digit] + encoded;
-    value /= 62n;
-  }
-
-  return ensureLength(encoded, BASE62_UUID_LENGTH);
+/**
+ * Generate a MongoDB-style ObjectId: 24 lowercase hex characters.
+ *
+ * Layout (12 bytes):
+ * - 4-byte big-endian Unix timestamp (seconds)
+ * - 5-byte process-unique random value
+ * - 3-byte big-endian incrementing counter
+ *
+ * Leading timestamp bytes make ids lexicographically sortable by creation
+ * time. The alphabet is `0-9a-f` only — safe on case-insensitive filesystems.
+ *
+ * @param timeSeconds Optional Unix timestamp in seconds (for tests). Defaults
+ *   to `Math.floor(Date.now() / 1000)`.
+ */
+export function generateObjectId(timeSeconds?: number): string {
+  const seconds = timeSeconds ?? Math.floor(Date.now() / 1000);
+  const bytes = new Uint8Array(12);
+  bytes[0] = (seconds >>> 24) & 0xff;
+  bytes[1] = (seconds >>> 16) & 0xff;
+  bytes[2] = (seconds >>> 8) & 0xff;
+  bytes[3] = seconds & 0xff;
+  bytes.set(OBJECT_ID_PROCESS_UNIQUE, 4);
+  objectIdCounter = (objectIdCounter + 1) & 0xffffff;
+  bytes[9] = (objectIdCounter >>> 16) & 0xff;
+  bytes[10] = (objectIdCounter >>> 8) & 0xff;
+  bytes[11] = objectIdCounter & 0xff;
+  return bytesToHex(bytes);
 }
 
 /**
- * Generate a fresh, globally unique document id: a UUID7 encoded as a
- * fixed-length (22 char), left-zero-padded base62 string, optionally prefixed
- * with `<prefix>_`.
+ * Generate a fresh, globally unique document id: a MongoDB-style ObjectId
+ * (24-char lowercase hex), optionally prefixed with `<prefix>_`.
  *
- * Because the UUID7 timestamp occupies the most significant bits and the
- * base62 alphabet is in ASCII order, ids generated later sort lexicographically
- * after ids generated earlier (within the same prefix) — same property as raw
- * UUID7 strings, but 14 characters shorter.
+ * Because the ObjectId timestamp occupies the leading bytes, ids generated
+ * later sort lexicographically after earlier ones (within the same prefix).
  *
  * The prefix (if any) is NOT validated here; callers validate it against
  * `DOC_ID_PREFIX_REGEX` before invoking this.
  *
  * @param prefix Optional short application prefix (e.g. "cls"); joined with "_".
- * @returns e.g. "0BqXa9yTFn2M4kVzR1sWpq" or "cls_0BqXa9yTFn2M4kVzR1sWpq"
+ * @returns e.g. "507f1f77bcf86cd799439011" or "cls_507f1f77bcf86cd799439011"
  */
 export function generateDocId(prefix?: string): string {
-  const encoded = hexToBase62(uuidv7());
+  const encoded = generateObjectId();
   return prefix ? `${prefix}_${encoded}` : encoded;
+}
+
+/**
+ * Generate a fresh tenant id: MongoDB-style ObjectId (24-char lowercase hex).
+ * Same format as {@link generateDocId} without a prefix — unique, time-sortable,
+ * and case-insensitive-filesystem safe.
+ */
+export function generateTenantId(): string {
+  return generateObjectId();
 }
 
 /**
@@ -86,7 +105,7 @@ export function generateDocId(prefix?: string): string {
  *
  * A `docId` matches `idPrefix` when it either equals the prefix exactly or
  * begins with `<idPrefix>_`. Matching on the `_` boundary (rather than a raw
- * `startsWith`) mirrors the `<prefix>_<base62>` id scheme, so filtering by
+ * `startsWith`) mirrors the `<prefix>_<objectId>` id scheme, so filtering by
  * `"cls"` returns `cls_…` documents without also catching an unrelated prefix
  * like `classroom_…`.
  *
@@ -151,34 +170,32 @@ export async function generateDepsFingerprint(
 
 /**
  * Generate an attachment chunk ID.
- * Format: <docId>_a_<fileUuid7>_<base62ChunkUuid7>
- * 
+ * Format: <docId>_a_<fileUuid7>_<objectId>
+ *
  * @param docId The document ID this attachment belongs to
  * @param fileUuid7 The UUID7 for the whole file (same for all chunks)
- * @param chunkUuid7 Optional UUID7 for this chunk. If not provided, generates new one.
+ * @param chunkObjectId Optional 24-char ObjectId for this chunk. If omitted, a
+ *   fresh ObjectId is generated.
  * @returns The generated chunk ID
  */
 export function generateAttachmentChunkId(
   docId: string,
   fileUuid7: string,
-  chunkUuid7?: string
+  chunkObjectId?: string
 ): string {
-  const chunkId = chunkUuid7 || uuidv7();
-  const base62Chunk = hexToBase62(chunkId);
-  return `${docId}_a_${fileUuid7}_${base62Chunk}`;
+  const chunkId = chunkObjectId ?? generateObjectId();
+  return `${docId}_a_${fileUuid7}_${chunkId}`;
 }
 
 /**
  * Generate an attachment chunk id that is unique within one write operation
  * even under case-insensitive comparison.
  *
- * Chunk entry ids become on-disk filenames (`entries/<id>.json`) and — unlike
- * document entry ids — contain no lowercase-hex hash component, so two chunk
- * ids differing only in the case of their base62 part would collide on
- * case-insensitive filesystems (APFS/NTFS). The caller passes a set of
- * case-folded ids already used in the current write; on the (astronomically
- * unlikely) fold-collision the id is simply regenerated. The set is expected
- * to be scoped to a single attachment write, so there is no persistent cost.
+ * Chunk entry ids become on-disk filenames (`entries/<id>.json`). New chunk
+ * suffixes are lowercase ObjectIds, but legacy mixed-case suffixes may still
+ * appear; the caller passes a set of case-folded ids already used in the
+ * current write and on a fold-collision the id is regenerated. The set is
+ * expected to be scoped to a single attachment write.
  *
  * @param docId The document ID this attachment belongs to
  * @param fileUuid7 The UUID7 for the whole file (same for all chunks)
@@ -252,15 +269,15 @@ export function parseDocEntryId(id: string): {
 export function parseAttachmentChunkId(id: string): {
   docId: string;
   fileUuid7: string;
-  base62ChunkId: string;
+  chunkObjectId: string;
 } | null {
-  // Match: <docId>_a_<fileUuid7>_<base62ChunkId>
+  // Match: <docId>_a_<fileUuid7>_<chunkObjectId> (legacy suffixes also parse)
   const match = id.match(/^(.+)_a_([^_]+)_(.+)$/);
   if (!match) return null;
   return {
     docId: match[1],
     fileUuid7: match[2],
-    base62ChunkId: match[3],
+    chunkObjectId: match[3],
   };
 }
 

@@ -3,7 +3,10 @@
  */
 
 export {
+  generateObjectId,
+  OBJECT_ID_LENGTH,
   generateDocId,
+  generateTenantId,
   matchesDocIdPrefix,
   generateDocEntryId,
   generateDepsFingerprint,

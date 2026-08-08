@@ -23,9 +23,11 @@ import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbk
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
+import { encodeJoinRequestUri } from "./uri/joinRequestUri";
 import { validateTenantId } from "./tenantIdValidation";
 import { semanticNow } from "./utils/timeSource";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
+import { writeTenantSetupLabel } from "./tenantSetup";
 
 /**
  * BaseTenantFactory is a platform-agnostic implementation of TenantFactory
@@ -475,6 +477,18 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       );
     }
 
+    const tenantLabel =
+      typeof options.tenantLabel === "string" ? options.tenantLabel.trim() : "";
+    if (tenantLabel) {
+      const directoryDb = await tenant.openDB("directory", { adminOnlyDb: true });
+      await writeTenantSetupLabel(
+        directoryDb,
+        tenantLabel,
+        adminUser.userSigningKeyPair,
+        options.adminPassword,
+      );
+    }
+
     console.log(`[createTenant] ✓ Tenant "${tenantId}" created successfully`);
     this.logger.info(`Tenant "${tenantId}" created successfully`);
 
@@ -514,7 +528,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     }
 
     if (options?.format === "uri") {
-      return encodeMindooURI("join-request", joinRequest as unknown as Record<string, unknown>);
+      return encodeJoinRequestUri(joinRequest);
     }
 
     return joinRequest;

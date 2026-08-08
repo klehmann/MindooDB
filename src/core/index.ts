@@ -4,6 +4,8 @@
 export * from "./types";
 export * from "./databaseIdValidation";
 export * from "./tenantIdValidation";
+export { readTenantSetupLabel, writeTenantSetupLabel } from "./tenantSetup";
+export type { TenantSetupData } from "./tenantSetup";
 
 // Access-control directory schema + time-travel state (docs/accesscontrol.md
 // §6/§8). Surfaced so consumers (e.g. the Haven directory-history UI) can read
@@ -220,6 +222,11 @@ export {
   type MindooURIType,
   type DecodedMindooURI,
 } from "./uri/MindooURI";
+export {
+  encodeJoinRequestUri,
+  decodeJoinRequestUri,
+  normalizeJoinRequestPayload,
+} from "./uri/joinRequestUri";
 
 // Errors
 export {
@@ -237,7 +244,10 @@ export { CacheManager, type ICacheable, type CacheManagerOptions } from "./cache
 
 // Utilities
 export {
+  generateObjectId,
+  OBJECT_ID_LENGTH,
   generateDocId,
+  generateTenantId,
   matchesDocIdPrefix,
   generateDocEntryId,
   generateDepsFingerprint,
