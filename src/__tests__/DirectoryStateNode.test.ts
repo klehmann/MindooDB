@@ -122,6 +122,112 @@ describe("DirectoryStateNode chain", () => {
 });
 
 /**
+ * Per-revision grant documents (docs/accesscontrol.md §6.5 / §8.1): several
+ * grantaccess documents may share a `username_hash`; their device keys are
+ * unioned (matching the live trust cache), tracked per document id so a
+ * revision or deletion of one document updates only its contribution.
+ */
+describe("DirectoryStateNode grant-doc merge", () => {
+  it("unions device keys across grant documents sharing a username_hash", () => {
+    const b = new DirectoryStateChainBuilder();
+    b.applyGrantDoc(
+      "gdoc1",
+      {
+        usernameHash: "hashA",
+        signingKeys: ["signA1"],
+        encryptionKeys: ["encA1"],
+        wipeRequestedSigningKeys: [],
+        active: true,
+      },
+      100,
+    );
+    b.applyGrantDoc(
+      "gdoc2",
+      {
+        usernameHash: "hashA",
+        signingKeys: ["signA2"],
+        encryptionKeys: ["encA2"],
+        wipeRequestedSigningKeys: ["signA2"],
+        active: true,
+      },
+      200,
+    );
+
+    // At T=150 only the first document contributed.
+    expect(b.getStateAt(150).usersByHash.get("hashA")?.signingKeys).toEqual(["signA1"]);
+    // At head, both documents' devices are unioned.
+    const head = b.getHead().usersByHash.get("hashA")!;
+    expect(new Set(head.signingKeys)).toEqual(new Set(["signA1", "signA2"]));
+    expect(new Set(head.encryptionKeys)).toEqual(new Set(["encA1", "encA2"]));
+    expect(head.wipeRequestedSigningKeys).toEqual(["signA2"]);
+    expect(b.getHead().bySigningKey.has("signA1")).toBe(true);
+    expect(b.getHead().bySigningKey.has("signA2")).toBe(true);
+  });
+
+  it("removes a document's contribution and recomputes the union", () => {
+    const b = new DirectoryStateChainBuilder();
+    b.applyGrantDoc(
+      "gdoc1",
+      {
+        usernameHash: "hashA",
+        signingKeys: ["signA1"],
+        encryptionKeys: ["encA1"],
+        wipeRequestedSigningKeys: [],
+        active: true,
+      },
+      100,
+    );
+    b.applyGrantDoc(
+      "gdoc2",
+      {
+        usernameHash: "hashA",
+        signingKeys: ["signA2"],
+        encryptionKeys: ["encA2"],
+        wipeRequestedSigningKeys: [],
+        active: true,
+      },
+      200,
+    );
+    b.removeGrantDoc("gdoc2", 300);
+
+    expect(b.getHead().usersByHash.get("hashA")?.signingKeys).toEqual(["signA1"]);
+    expect(b.getHead().bySigningKey.has("signA2")).toBe(false);
+    // History before the removal still sees both devices.
+    expect(new Set(b.getStateAt(250).usersByHash.get("hashA")!.signingKeys)).toEqual(
+      new Set(["signA1", "signA2"]),
+    );
+  });
+
+  it("deactivates the user when every contributing grant has empty keys", () => {
+    const b = new DirectoryStateChainBuilder();
+    b.applyGrantDoc(
+      "gdoc1",
+      {
+        usernameHash: "hashA",
+        signingKeys: ["signA1"],
+        encryptionKeys: ["encA1"],
+        wipeRequestedSigningKeys: [],
+        active: true,
+      },
+      100,
+    );
+    b.applyGrantDoc(
+      "gdoc1",
+      {
+        usernameHash: "hashA",
+        signingKeys: [],
+        encryptionKeys: [],
+        wipeRequestedSigningKeys: [],
+        active: false,
+      },
+      200,
+    );
+    expect(b.getHead().usersByHash.get("hashA")?.active).toBe(false);
+    expect(b.getHead().bySigningKey.has("signA1")).toBe(false);
+  });
+});
+
+/**
  * Per-revision group membership (docs/accesscontrol.md §8.1): group documents
  * sharing a name union their member hashes, tracked per document id so a
  * revision or deletion of one document updates only its contribution.

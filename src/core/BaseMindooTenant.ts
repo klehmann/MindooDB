@@ -619,16 +619,36 @@ export class BaseMindooTenant implements MindooTenant {
     );
 
     // Sign the payload
-    const signature = await subtle.sign(
+    const signatureBuffer = await subtle.sign(
       {
         name: "Ed25519",
       },
       signingKey,
       payload.buffer as ArrayBuffer
     );
+    const signature = new Uint8Array(signatureBuffer);
+
+    // Prove the decrypted private key belongs to the claimed public key.
+    // Directory helpers historically paired `getAdministrationPublicKey()` with
+    // whatever private key the UI passed; admin-only then compared only the
+    // claimed PEM and accepted the write into local memory. Verifying here
+    // closes that gap before any store entry is attributed to that public key.
+    const verifyKey = await this.importVerifyKeyCached(signingKeyPair.publicKey);
+    const matches = await subtle.verify(
+      { name: "Ed25519" },
+      verifyKey,
+      signature.buffer as ArrayBuffer,
+      payload.buffer as ArrayBuffer,
+    );
+    if (!matches) {
+      throw new Error(
+        "Signing key pair mismatch: the decrypted private key does not correspond to the claimed public key. "
+          + "For admin-only databases this usually means a non-admin identity was used as the tenant admin.",
+      );
+    }
 
     this.logger.debug(`Signed payload with provided key (signature: ${signature.byteLength} bytes)`);
-    return new Uint8Array(signature);
+    return signature;
   }
 
   async verifySignature(payload: Uint8Array, signature: Uint8Array, publicKey: string): Promise<boolean> {
@@ -1755,7 +1775,8 @@ export class BaseMindooTenant implements MindooTenant {
       // Get the current user's decrypted RSA encryption private key (for decrypting entries)
       const decryptedEncryptionKey = await this.getDecryptedEncryptionKey();
 
-      // Create the client network store
+      // Create the client network store. Pass the device signing public key so
+      // auth challenges can identify this specific device on multi-device grants.
       const store = new ClientNetworkContentAddressedStore(
         validDbId,
         storeKind,
@@ -1764,7 +1785,8 @@ export class BaseMindooTenant implements MindooTenant {
         this.currentUser.username,
         signingKey,
         decryptedEncryptionKey,
-        this.logger.createChild(`ClientNetworkStore:${validDbId}:${storeKind}`)
+        this.logger.createChild(`ClientNetworkStore:${validDbId}:${storeKind}`),
+        this.currentUser.userSigningKeyPair.publicKey,
       );
 
       console.log(`[connectToServer] ✓ Connected to server for db "${validDbId}"`);

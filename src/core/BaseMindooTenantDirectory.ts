@@ -275,6 +275,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       const newPair: GrantKeyPair = {
         signingPublicKey: userId.userSigningPublicKey,
         encryptionPublicKey: userId.userEncryptionPublicKey,
+        addedAt: semanticNow(),
       };
       if (trimmedLabel.length > 0) newPair.label = trimmedLabel;
       await this.addUserKeys(
@@ -351,6 +352,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         const initialPair: GrantKeyPair = {
           signingPublicKey: userId.userSigningPublicKey,
           encryptionPublicKey: userId.userEncryptionPublicKey,
+          addedAt: semanticNow(),
         };
         if (trimmedLabel.length > 0) initialPair.label = trimmedLabel;
         applyKeyPairFields(data, [initialPair]);
@@ -1540,11 +1542,20 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
+    const now = semanticNow();
     const additions = keyPairs.map((pair) => {
       const trimmedLabel = typeof pair.label === "string" ? pair.label.trim() : "";
-      return trimmedLabel.length > 0
-        ? { ...pair, label: trimmedLabel }
-        : { signingPublicKey: pair.signingPublicKey, encryptionPublicKey: pair.encryptionPublicKey };
+      const next: GrantKeyPair = {
+        signingPublicKey: pair.signingPublicKey,
+        encryptionPublicKey: pair.encryptionPublicKey,
+        addedAt: pair.addedAt ?? now,
+      };
+      if (trimmedLabel.length > 0) next.label = trimmedLabel;
+      if (pair.revoked) {
+        next.revoked = true;
+        if (typeof pair.revokedAt === "number") next.revokedAt = pair.revokedAt;
+      }
+      return next;
     });
     await this.editGrantArrays(
       username,

@@ -133,6 +133,8 @@ export type DirectoryRevisionDelta =
   | { op: "trustedWitness"; t: number; witness: TrustedWitnessDoc }
   | { op: "removeTrustedWitness"; t: number; witnessPublicKey: string }
   | { op: "grant"; t: number; grant: UserGrantSnapshot }
+  | { op: "grantDoc"; t: number; docId: string; grant: UserGrantSnapshot }
+  | { op: "removeGrantDoc"; t: number; docId: string }
   | { op: "revokeBySigningKey"; t: number; signingKey: string }
   | { op: "groupDoc"; t: number; docId: string; name: string; memberHashes: string[] }
   | { op: "removeGroupDoc"; t: number; docId: string }
@@ -164,6 +166,14 @@ export class DirectoryStateChainBuilder {
    */
   private groupContributions = new Map<string, { name: string; memberHashes: string[] }>();
 
+  /**
+   * Per-grant-document contributions, keyed by grant document id. Several
+   * `grantaccess` documents may share a `username_hash` (offline duplicates /
+   * historical re-registers); the live trust cache unions their keys, so the
+   * time-travel node must do the same (§6.5, §8.1).
+   */
+  private grantContributions = new Map<string, UserGrantSnapshot>();
+
   /** The current head node ("now"). */
   getHead(): DirectoryStateNode {
     return this.head;
@@ -179,6 +189,7 @@ export class DirectoryStateChainBuilder {
     this.head = createGenesisNode();
     this.deltaLog = [];
     this.groupContributions.clear();
+    this.grantContributions.clear();
   }
 
   /**
@@ -218,6 +229,12 @@ export class DirectoryStateChainBuilder {
           break;
         case "grant":
           this.applyGrant(d.grant, d.t);
+          break;
+        case "grantDoc":
+          this.applyGrantDoc(d.docId, d.grant, d.t);
+          break;
+        case "removeGrantDoc":
+          this.removeGrantDoc(d.docId, d.t);
           break;
         case "revokeBySigningKey":
           this.revokeBySigningKey(d.signingKey, d.t);
@@ -321,12 +338,80 @@ export class DirectoryStateChainBuilder {
     });
   }
 
-  /** Apply (insert or replace) a user grant, keyed by `username_hash`. */
+  /**
+   * Apply (insert or replace) a user grant for a single logical stream keyed by
+   * `username_hash`. Equivalent to {@link applyGrantDoc} with a synthetic
+   * document id — kept for unit tests and legacy delta logs. Prefer
+   * {@link applyGrantDoc} when projecting real directory revisions so multiple
+   * grant documents for the same user union their device keys.
+   */
   applyGrant(grant: UserGrantSnapshot, trustedTime: number): void {
-    this.deltaLog.push({ op: "grant", t: trustedTime, grant });
+    this.applyGrantDoc(`grant:${grant.usernameHash}`, grant, trustedTime);
+  }
+
+  /**
+   * Apply (insert or replace) one grant document's contribution at trusted time
+   * `T`. Because several documents may share a `username_hash` (offline merge /
+   * duplicate registers), {@link DirectoryStateNode.usersByHash} is the union of
+   * active keys across every contributing document — matching
+   * `trustedKeysCache` / `getUserGrantOverview`.
+   */
+  applyGrantDoc(docId: string, grant: UserGrantSnapshot, trustedTime: number): void {
+    const previous = this.grantContributions.get(docId);
+    this.deltaLog.push({ op: "grantDoc", t: trustedTime, docId, grant });
+    this.grantContributions.set(docId, grant);
+    if (previous && previous.usernameHash !== grant.usernameHash) {
+      this.recomputeUser(previous.usernameHash, trustedTime);
+    }
+    this.recomputeUser(grant.usernameHash, trustedTime);
+  }
+
+  /** Drop a grant document's contribution (e.g. it was deleted), at time `T`. */
+  removeGrantDoc(docId: string, trustedTime: number): void {
+    const existing = this.grantContributions.get(docId);
+    if (!existing) return;
+    this.deltaLog.push({ op: "removeGrantDoc", t: trustedTime, docId });
+    this.grantContributions.delete(docId);
+    this.recomputeUser(existing.usernameHash, trustedTime);
+  }
+
+  /**
+   * Recompute the union-by-hash {@link UserGrantSnapshot} for `usernameHash`
+   * from the current per-document contributions and push a node at trusted
+   * time `T`. Removes the entry when no contributing document remains.
+   */
+  private recomputeUser(usernameHash: string, trustedTime: number): void {
+    // Pair signing → encryption so index alignment survives a cross-doc union
+    // (encryption arrays alone can omit empty keys and are not a reliable zip).
+    const encBySigning = new Map<string, string>();
+    const wipeRequested = new Set<string>();
+    let hasContribution = false;
+    for (const contribution of this.grantContributions.values()) {
+      if (contribution.usernameHash !== usernameHash) continue;
+      hasContribution = true;
+      contribution.signingKeys.forEach((signingKey, index) => {
+        if (!encBySigning.has(signingKey)) {
+          encBySigning.set(signingKey, contribution.encryptionKeys[index] ?? "");
+        }
+      });
+      for (const wipeKey of contribution.wipeRequestedSigningKeys) {
+        wipeRequested.add(wipeKey);
+      }
+    }
     this.push(trustedTime, (next) => {
       next.usersByHash = new Map(this.head.usersByHash);
-      next.usersByHash.set(grant.usernameHash, grant);
+      if (hasContribution) {
+        const signingKeys = [...encBySigning.keys()];
+        next.usersByHash.set(usernameHash, {
+          usernameHash,
+          signingKeys,
+          encryptionKeys: signingKeys.map((key) => encBySigning.get(key) ?? ""),
+          wipeRequestedSigningKeys: [...wipeRequested],
+          active: signingKeys.length > 0,
+        });
+      } else {
+        next.usersByHash.delete(usernameHash);
+      }
       next.bySigningKey = buildBySigningKey(next.usersByHash);
     });
   }

@@ -295,6 +295,55 @@ describe("access-control schema", () => {
         { signingPublicKey: "sign2", encryptionPublicKey: "enc2" },
       ]);
     });
+
+    it("round-trips addedAt on active and revoked key pairs", () => {
+      const data: Record<string, unknown> = {};
+      applyKeyPairFields(data, [
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1", addedAt: 111 },
+        {
+          signingPublicKey: "revoked1",
+          encryptionPublicKey: "enc2",
+          addedAt: 222,
+          revoked: true,
+          revokedAt: 333,
+        },
+      ]);
+      expect(data.userKeyPairs).toEqual([
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1", addedAt: 111 },
+      ]);
+      expect(data.revokedUserKeyPairs).toEqual([
+        {
+          signingPublicKey: "revoked1",
+          encryptionPublicKey: "enc2",
+          addedAt: 222,
+          revokedAt: 333,
+        },
+      ]);
+      expect(extractActiveKeyPairs(data)).toEqual([
+        { signingPublicKey: "active1", encryptionPublicKey: "enc1", addedAt: 111 },
+      ]);
+      expect(extractRevokedKeyPairs(data)).toEqual([
+        {
+          signingPublicKey: "revoked1",
+          encryptionPublicKey: "enc2",
+          addedAt: 222,
+          revoked: true,
+          revokedAt: 333,
+        },
+      ]);
+    });
+
+    it("mergeKeyPairs keeps an existing addedAt when the update omits it", () => {
+      const existing = [
+        { signingPublicKey: "sign1", encryptionPublicKey: "enc1", addedAt: 42 },
+      ];
+      const merged = mergeKeyPairs(existing, [
+        { signingPublicKey: "sign1", encryptionPublicKey: "enc1", label: "Phone" },
+      ]);
+      expect(merged).toEqual([
+        { signingPublicKey: "sign1", encryptionPublicKey: "enc1", label: "Phone", addedAt: 42 },
+      ]);
+    });
   });
 
   describe("two-list active/revoked form (userKeyPairs + revokedUserKeyPairs)", () => {

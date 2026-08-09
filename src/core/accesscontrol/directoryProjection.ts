@@ -1,6 +1,5 @@
 import {
-  extractSigningPublicKeys,
-  extractEncryptionPublicKeys,
+  extractActiveKeyPairs,
   extractWipeRequestedSigningKeys,
 } from "./grantKeys";
 import {
@@ -103,19 +102,28 @@ export function projectDirectoryRevision(
   const { docId, data, deleted, trustedTime } = input;
 
   // Grant documents (`useroperation`/`grantaccess`). Revocation is expressed by
-  // removing keys from the grant in place (§6.5), so applyGrant with an empty
-  // key array deactivates the user.
+  // removing keys from the grant in place (§6.5), so a contribution with an
+  // empty key array deactivates that document's share of the user. Multiple
+  // grant documents for the same `username_hash` union their device keys
+  // (matching `trustedKeysCache` / admin grant overview).
   if (data.form === "useroperation" && data.type === "grantaccess") {
+    if (deleted) {
+      builder.removeGrantDoc(docId, trustedTime);
+      return;
+    }
     if (typeof data.username_hash === "string") {
-      const signingKeys = extractSigningPublicKeys(data);
+      // Build signing/encryption arrays from paired entries so index alignment
+      // survives the cross-document union in the chain builder.
+      const pairs = extractActiveKeyPairs(data);
+      const signingKeys = pairs.map((pair) => pair.signingPublicKey);
       const grant: UserGrantSnapshot = {
         usernameHash: data.username_hash,
         signingKeys,
-        encryptionKeys: extractEncryptionPublicKeys(data),
+        encryptionKeys: pairs.map((pair) => pair.encryptionPublicKey),
         wipeRequestedSigningKeys: extractWipeRequestedSigningKeys(data),
         active: signingKeys.length > 0,
       };
-      builder.applyGrant(grant, trustedTime);
+      builder.applyGrantDoc(docId, grant, trustedTime);
     }
     return;
   }

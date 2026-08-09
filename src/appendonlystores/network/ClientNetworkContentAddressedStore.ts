@@ -65,6 +65,8 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   private privateEncryptionKey: CryptoKey | string;
   private username: string;
   private signingKey: CryptoKey;
+  /** PEM of the device signing public key; sent with challenge for multi-device auth. */
+  private signingPublicKeyPem: string | undefined;
   private cryptoAdapter: CryptoAdapter;
   
   // Cached access token
@@ -91,6 +93,9 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * @param signingKey The user's private signing key (for signing challenges)
    * @param privateEncryptionKey The user's private RSA key (for decrypting received entries)
    * @param logger Optional logger instance
+   * @param signingPublicKeyPem Optional device signing public key (PEM). Sent with
+   *        the auth challenge so the server can detect a second-device key that is
+   *        not yet in its directory copy (instead of a vague "Invalid signature").
    */
   constructor(
     dbId: string,
@@ -100,7 +105,8 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     username: string,
     signingKey: CryptoKey,
     privateEncryptionKey: CryptoKey | string,
-    logger?: Logger
+    logger?: Logger,
+    signingPublicKeyPem?: string,
   ) {
     this.dbId = dbId;
     this.storeKind = storeKind;
@@ -109,6 +115,10 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.username = username;
     this.signingKey = signingKey;
     this.privateEncryptionKey = privateEncryptionKey;
+    this.signingPublicKeyPem =
+      typeof signingPublicKeyPem === "string" && signingPublicKeyPem.trim().length > 0
+        ? signingPublicKeyPem.trim()
+        : undefined;
     this.logger =
       logger ||
       new MindooLogger(getDefaultLogLevel(), `ClientNetworkStore:${dbId}:${storeKind}`, true);
@@ -746,8 +756,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     const authUsername = this.getActiveAuthUsername();
     this.logger.debug(`Authenticating user: ${authUsername}`);
 
-    // Request a challenge
-    const challenge = await this.transport.requestChallenge(authUsername);
+    // Request a challenge. Prefer a non-empty username; always attach this
+    // device's signing public key when known so multi-device grants can be
+    // checked before the client signs (second-device join / directory lag).
+    const challenge = await this.transport.requestChallenge(
+      authUsername.trim() ? authUsername : undefined,
+      this.signingPublicKeyPem ? { signingPublicKey: this.signingPublicKeyPem } : undefined,
+    );
     this.logger.debug(`Received challenge: ${challenge}`);
 
     // Sign the challenge

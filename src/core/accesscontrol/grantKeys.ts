@@ -6,16 +6,18 @@
  * Active devices and revoked devices live in TWO SEPARATE lists:
  *
  *  - `userKeyPairs`: the ACTIVE device key pairs, an array of
- *    `{ signingPublicKey, encryptionPublicKey, label? }` objects. Pairing the
- *    keys per device keeps a device's signing and encryption keys together and
- *    lets each carry an optional human-readable label. This is the canonical
- *    list the server/auth treat as granting access. Because revoked devices are
- *    NOT in this list, any reader (old or new) that treats `userKeyPairs` as
- *    "the keys that have access" is correct without understanding revocation.
+ *    `{ signingPublicKey, encryptionPublicKey, label?, addedAt? }` objects.
+ *    Pairing the keys per device keeps a device's signing and encryption keys
+ *    together and lets each carry an optional human-readable label and the
+ *    trusted-time it was added. This is the canonical list the server/auth
+ *    treat as granting access. Because revoked devices are NOT in this list,
+ *    any reader (old or new) that treats `userKeyPairs` as "the keys that have
+ *    access" is correct without understanding revocation.
  *  - `revokedUserKeyPairs`: the RETAINED revoked device key pairs (§6.5), same
- *    shape plus an optional `revokedAt` timestamp. Membership in this list — not
- *    a per-entry flag — is what marks a device revoked. Retaining them lets
- *    admin UIs list "devices with revoked access" and optionally restore them.
+ *    shape plus an optional `revokedAt` timestamp (and retained `addedAt`).
+ *    Membership in this list — not a per-entry flag — is what marks a device
+ *    revoked. Retaining them lets admin UIs list "devices with revoked access"
+ *    and optionally restore them.
  *
  * For older clients that predate `userKeyPairs`, writers also mirror the ACTIVE
  * keys into the legacy forms, read in this order of authority:
@@ -77,10 +79,11 @@ function legacyEncryptionKeys(data: Record<string, unknown>): string[] {
 }
 
 /**
- * Parse an array of `{ signingPublicKey, encryptionPublicKey, label? }` entries
- * into {@link GrantKeyPair}s, de-duplicated by signing key. When `markRevoked`
- * is set (parsing `revokedUserKeyPairs`), every parsed pair is marked revoked
- * and carries its `revokedAt` timestamp.
+ * Parse an array of
+ * `{ signingPublicKey, encryptionPublicKey, label?, addedAt?, revokedAt? }`
+ * entries into {@link GrantKeyPair}s, de-duplicated by signing key. When
+ * `markRevoked` is set (parsing `revokedUserKeyPairs`), every parsed pair is
+ * marked revoked and carries its `revokedAt` timestamp.
  */
 function parsePairEntries(value: unknown, markRevoked: boolean): GrantKeyPair[] {
   if (!Array.isArray(value)) return [];
@@ -96,6 +99,7 @@ function parsePairEntries(value: unknown, markRevoked: boolean): GrantKeyPair[] 
     const label = asLabel(rec.label);
     const pair: GrantKeyPair = { signingPublicKey, encryptionPublicKey };
     if (label !== undefined) pair.label = label;
+    if (typeof rec.addedAt === "number") pair.addedAt = rec.addedAt;
     if (markRevoked) {
       pair.revoked = true;
       if (typeof rec.revokedAt === "number") pair.revokedAt = rec.revokedAt;
@@ -139,9 +143,9 @@ function legacyKeyPairs(data: Record<string, unknown>): GrantKeyPair[] {
 
 /**
  * All device key pairs on this document — active first, then revoked — in the
- * canonical `{ signingPublicKey, encryptionPublicKey, label?, revoked?,
- * revokedAt? }` shape (§6.5). Used by write paths that need to preserve the
- * full device set (e.g. relabel/merge/revoke) before re-applying.
+ * canonical `{ signingPublicKey, encryptionPublicKey, label?, addedAt?,
+ * revoked?, revokedAt? }` shape (§6.5). Used by write paths that need to
+ * preserve the full device set (e.g. relabel/merge/revoke) before re-applying.
  *
  * For older documents that predate the canonical lists it reconstructs pairs
  * from the parallel signing/encryption arrays (index-aligned) or the legacy
@@ -205,11 +209,14 @@ export function applyKeyPairFields(data: Record<string, unknown>, pairs: GrantKe
     if (pair.label !== undefined && pair.label.length > 0) {
       entry.label = pair.label;
     }
+    if (typeof pair.addedAt === "number") {
+      entry.addedAt = pair.addedAt;
+    }
     return entry;
   });
 
   // Revoked devices: retained in a SEPARATE list (§6.5). Membership here marks
-  // a device revoked; we keep the `revokedAt` timestamp and label for admin UIs.
+  // a device revoked; we keep addedAt/revokedAt and label for admin UIs.
   data.revokedUserKeyPairs = revokedPairs.map((pair) => {
     const entry: Record<string, unknown> = {
       signingPublicKey: pair.signingPublicKey,
@@ -217,6 +224,9 @@ export function applyKeyPairFields(data: Record<string, unknown>, pairs: GrantKe
     };
     if (pair.label !== undefined && pair.label.length > 0) {
       entry.label = pair.label;
+    }
+    if (typeof pair.addedAt === "number") {
+      entry.addedAt = pair.addedAt;
     }
     if (typeof pair.revokedAt === "number") {
       entry.revokedAt = pair.revokedAt;
@@ -241,13 +251,21 @@ export function applyKeyPairFields(data: Record<string, unknown>, pairs: GrantKe
 /**
  * Merge `additional` pairs into `existing`, keyed by signing public key. A new
  * entry with the same signing key replaces the existing one (so its encryption
- * key and/or label are updated). Order is preserved: existing pairs first
- * (updated in place), then brand-new pairs in input order.
+ * key and/or label are updated). An omitted {@link GrantKeyPair.addedAt} on the
+ * incoming pair keeps the existing timestamp. Order is preserved: existing
+ * pairs first (updated in place), then brand-new pairs in input order.
  */
 export function mergeKeyPairs(existing: GrantKeyPair[], additional: GrantKeyPair[]): GrantKeyPair[] {
   const merged = new Map<string, GrantKeyPair>();
   for (const pair of existing) merged.set(pair.signingPublicKey, pair);
-  for (const pair of additional) merged.set(pair.signingPublicKey, pair);
+  for (const pair of additional) {
+    const previous = merged.get(pair.signingPublicKey);
+    if (previous && pair.addedAt === undefined && previous.addedAt !== undefined) {
+      merged.set(pair.signingPublicKey, { ...pair, addedAt: previous.addedAt });
+    } else {
+      merged.set(pair.signingPublicKey, pair);
+    }
+  }
   return Array.from(merged.values());
 }
 

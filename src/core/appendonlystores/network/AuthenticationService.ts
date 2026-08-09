@@ -145,9 +145,47 @@ export class AuthenticationService {
       );
     }
 
+    // Multi-device join: when the client names the device key it will sign with,
+    // refuse the challenge early if that key is not yet on this server's grant.
+    // Otherwise authenticate returns a misleading "Invalid signature" after the
+    // client signs with a key the server only knows older siblings for.
+    if (signingPublicKey) {
+      const known = await this.candidateSigningKeys(username);
+      if (!known.has(this.normalizeSigningPublicKey(signingPublicKey))) {
+        throw new NetworkError(
+          NetworkErrorType.USER_NOT_FOUND,
+          `This device's signing key is not yet in the tenant directory on this server for user "${username}". `
+            + `After the administrator approved the join request, they must sync the directory database `
+            + `to this server before the new device can connect.`,
+        );
+      }
+    }
+
     const challenge = this.storeChallenge({ username, signingPublicKey });
     this.logger.debug(`Generated challenge for user ${username}: ${challenge}`);
     return challenge;
+  }
+
+  /**
+   * Compare PEMs ignoring whitespace / line-ending differences between client
+   * JSON transport and directory storage.
+   */
+  private normalizeSigningPublicKey(pem: string): string {
+    return pem.replace(/\s+/g, "");
+  }
+
+  /** Active + wipe-targeted signing keys for `username` (legacy primary-key fallback). */
+  private async candidateSigningKeys(username: string): Promise<Set<string>> {
+    const universe = await this.getSigningKeyUniverse(username);
+    const keys = new Set<string>();
+    for (const pem of [...universe.active, ...universe.wipeRequested]) {
+      keys.add(this.normalizeSigningPublicKey(pem));
+    }
+    if (keys.size === 0) {
+      const userKeys = await this.directory.getUserPublicKeys(username);
+      if (userKeys) keys.add(this.normalizeSigningPublicKey(userKeys.signingPublicKey));
+    }
+    return keys;
   }
 
   /**
@@ -259,20 +297,13 @@ export class AuthenticationService {
     // user's active (granted) keys plus any keys targeted for remote wipe
     // (§6.5). The wipe set lets a revoked-by-key-removal device authenticate
     // just far enough to receive the directive.
-    const universe = resolvedUsername
-      ? await this.getSigningKeyUniverse(resolvedUsername)
-      : { active: [] as string[], wipeRequested: [] as string[] };
-    const candidateKeys = new Set<string>([...universe.active, ...universe.wipeRequested]);
-    // Legacy fallback: directories without the wipe API expose only the primary
-    // key via getUserPublicKeys.
-    if (candidateKeys.size === 0 && resolvedUsername) {
-      const userKeys = await this.directory.getUserPublicKeys(resolvedUsername);
-      if (userKeys) candidateKeys.add(userKeys.signingPublicKey);
-    }
+    const candidateKeys = resolvedUsername
+      ? await this.candidateSigningKeys(resolvedUsername)
+      : new Set<string>();
     // Key-based challenge with no resolvable grant: the only candidate is the
     // key the client identified with.
     if (candidateKeys.size === 0 && authChallenge.signingPublicKey) {
-      candidateKeys.add(authChallenge.signingPublicKey);
+      candidateKeys.add(this.normalizeSigningPublicKey(authChallenge.signingPublicKey));
     }
     if (candidateKeys.size === 0) {
       this.logger.debug(`User not found or has no active access grant on this server: ${principalLabel}`);
@@ -285,9 +316,41 @@ export class AuthenticationService {
       };
     }
 
+    // Device named a key that is not on this server's grant (second-device join
+    // before the admin synced the directory). Prefer this over "Invalid signature".
+    const challengeKeyNorm = authChallenge.signingPublicKey
+      ? this.normalizeSigningPublicKey(authChallenge.signingPublicKey)
+      : undefined;
+    if (challengeKeyNorm && !candidateKeys.has(challengeKeyNorm)) {
+      this.logger.debug(
+        `Device signing key not in grant on this server for: ${principalLabel}`,
+      );
+      return {
+        success: false,
+        error:
+          `This device's signing key is not yet in the tenant directory on this server for "${principalLabel}". `
+            + `After the administrator approved the join request, they must sync the directory database `
+            + `to this server before the new device can connect.`,
+      };
+    }
+
     // Find which candidate key produced the signature; that is the device's key.
+    // verifySignature strips PEM framing/whitespace, so raw PEMs from the universe
+    // (not only the normalized Set entries) are needed for importKey.
+    const universeForVerify = resolvedUsername
+      ? await this.getSigningKeyUniverse(resolvedUsername)
+      : { active: [] as string[], wipeRequested: [] as string[] };
+    const verifyPems: string[] = [...universeForVerify.active, ...universeForVerify.wipeRequested];
+    if (verifyPems.length === 0 && resolvedUsername) {
+      const userKeys = await this.directory.getUserPublicKeys(resolvedUsername);
+      if (userKeys) verifyPems.push(userKeys.signingPublicKey);
+    }
+    if (verifyPems.length === 0 && authChallenge.signingPublicKey) {
+      verifyPems.push(authChallenge.signingPublicKey);
+    }
+
     let matchedKey: string | null = null;
-    for (const key of candidateKeys) {
+    for (const key of verifyPems) {
       if (await this.verifySignature(challenge, signature, key)) {
         matchedKey = key;
         break;
@@ -302,7 +365,10 @@ export class AuthenticationService {
       };
     }
 
-    const wipe = universe.wipeRequested.includes(matchedKey);
+    const wipeUniverse = resolvedUsername
+      ? await this.getSigningKeyUniverse(resolvedUsername)
+      : { active: [] as string[], wipeRequested: [] as string[] };
+    const wipe = wipeUniverse.wipeRequested.includes(matchedKey);
     // The subject is the cleartext username when one was supplied, otherwise the
     // authenticated device key (an opaque principal id; the read gate resolves
     // identity from deviceSigningKey).

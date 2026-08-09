@@ -180,16 +180,39 @@ export class MindooDocSigner {
     );
     
     // Sign the payload
-    const signature = await subtle.sign(
+    const signatureBuffer = await subtle.sign(
       {
         name: "Ed25519",
       },
       signingKey,
       payloadBytes.buffer as ArrayBuffer
     );
-    
+    const signature = new Uint8Array(signatureBuffer);
+
+    // Same private↔public consistency check as BaseMindooTenant.signPayloadWithKey:
+    // never attribute a signature to a claimed PEM that did not produce it.
+    const publicKeyBuffer = this.tenant.pemToArrayBuffer(this.signKey.publicKey);
+    const verifyKey = await subtle.importKey(
+      "spki",
+      publicKeyBuffer,
+      { name: "Ed25519" },
+      false,
+      ["verify"],
+    );
+    const matches = await subtle.verify(
+      { name: "Ed25519" },
+      verifyKey,
+      signature.buffer as ArrayBuffer,
+      payloadBytes.buffer as ArrayBuffer,
+    );
+    if (!matches) {
+      throw new Error(
+        "Signing key pair mismatch: the decrypted private key does not correspond to the claimed public key.",
+      );
+    }
+
     this.logger.debug(`Signed ${items.length} items (signature: ${signature.byteLength} bytes)`);
-    return new Uint8Array(signature);
+    return signature;
   }
 
   /**

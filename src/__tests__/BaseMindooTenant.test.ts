@@ -232,6 +232,34 @@ describe("BaseMindooTenant", () => {
       expect(isValid).toBe(false);
     });
 
+    it("should reject signPayloadWithKey when claimed public key does not match private key", async () => {
+      // Spoof the admin PEM while signing with the current user's private key —
+      // the historical directory-grant bug that let local admin-only writes
+      // succeed without the admin private key.
+      const payload = new TextEncoder().encode("admin-only spoof");
+      const mismatched: typeof adminUser.userSigningKeyPair = {
+        publicKey: adminUser.userSigningKeyPair.publicKey,
+        privateKey: currentUser.userSigningKeyPair.privateKey,
+      };
+
+      await expect(
+        tenant.signPayloadWithKey(payload, mismatched, currentUserPassword),
+      ).rejects.toThrow(/Signing key pair mismatch/);
+    });
+
+    it("should reject directory registerUser when a non-admin private key is supplied", async () => {
+      const directory = await tenant.openDirectory();
+      const otherUser = await factory.createUserId("CN=joiner/O=testtenant", "joinerpass123");
+
+      await expect(
+        directory.registerUser(
+          factory.toPublicUserId(otherUser),
+          currentUser.userSigningKeyPair.privateKey,
+          currentUserPassword,
+        ),
+      ).rejects.toThrow(/Signing key pair mismatch/);
+    });
+
     it("should create different signatures for same payload (non-deterministic)", async () => {
       const payload = new TextEncoder().encode("Same payload");
 

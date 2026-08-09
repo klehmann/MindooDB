@@ -618,6 +618,7 @@ two refinements.
     signingPublicKey: string,
     encryptionPublicKey: string,
     label?: string,
+    addedAt?: number,                    // trusted-time ms when the device was granted
   }>,
 
   // Retained revoked devices: a revoked device is moved here (not deleted) with
@@ -625,11 +626,13 @@ two refinements.
   // with revoked access" and optionally restore them. Membership in this list —
   // not a per-entry flag — is what marks a device revoked. Revoked pairs are
   // EXCLUDED from `userKeyPairs` and the mirrored active-key arrays below, so the
-  // server/auth never treat them as granting access.
+  // server/auth never treat them as granting access. `addedAt` is retained so
+  // admins can still see when the device was originally granted.
   revokedUserKeyPairs?: Array<{
     signingPublicKey: string,
     encryptionPublicKey: string,
     label?: string,
+    addedAt?: number,
     revokedAt?: number,
   }>,
 
@@ -1035,6 +1038,8 @@ behavior:
 - legacy scalar `userSigningPublicKey` / `userEncryptionPublicKey` fields are still
   read, but only when no key array is present (an empty array means fully revoked);
 - group documents with the same name are merged across offline edits;
+- grantaccess documents that share a `username_hash` union their device keys
+  (matching `trustedKeysCache` / `getUserGrantOverview`);
 - group names are case-insensitive (normalized to lowercase);
 - username wildcard variants (`generateUsernameVariants`, e.g. `*/o=org`) continue to
   participate in group/rule matching.

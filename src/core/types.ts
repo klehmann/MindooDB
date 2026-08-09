@@ -741,11 +741,17 @@ export interface MindooTenant {
    * Sign a payload with a specific signing key pair.
    * This is used for operations that need to sign with a different key than the current user's,
    * such as directory operations that must be signed with the administration key.
-   * 
+   *
+   * After signing, the signature is verified against `signingKeyPair.publicKey`.
+   * A mismatch (claimed admin PEM + unrelated private key) throws — this is what
+   * keeps admin-only directory writes from succeeding locally when the wrong
+   * identity is supplied.
+   *
    * @param payload The payload to sign (binary data)
    * @param signingKeyPair The signing key pair to use (Ed25519)
    * @param password The password to decrypt the signing private key
    * @return The signature (Ed25519 signature as Uint8Array)
+   * @throws when the decrypted private key does not correspond to `publicKey`
    */
   signPayloadWithKey(
     payload: Uint8Array,
@@ -2566,6 +2572,13 @@ export interface GrantKeyPair {
   encryptionPublicKey: string;
   /** Optional human-readable label for this device/key pair. */
   label?: string;
+  /**
+   * Trusted-time (ms since Unix epoch) at which this device was added to the
+   * grant (first registration or later multi-device append). Retained when the
+   * device is revoked so admin UIs can still show when it was granted. Optional
+   * for legacy grants written before this field existed.
+   */
+  addedAt?: number;
   /**
    * When true, this device's access has been revoked but the pair is RETAINED
    * on the grant document (docs/accesscontrol.md §6.5) so admin UIs can list
