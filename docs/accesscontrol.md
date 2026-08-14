@@ -1570,6 +1570,18 @@ guarded again in the client reconcile. The tenant `default` key **may** be distr
 (including `pullfrom`, which strips content access). Manual key sharing (`sharePassword`)
 continues to work unchanged.
 
+**Rotating `default` (and any named key) via the distribution doc.** Because
+`default` is an ordinary distribution `keyId`, a key-holder who already has it can
+mint a new version in their local KeyBag (`createDocKey(tenantId, "default")`), then
+republish `acl_keydistribution_default`. Publish re-reads the bag's version manifest
+and RSA-wraps **every** version to **every** active device of each `pushto` user.
+After the next directory sync, recipients reconcile and merge the new version
+(idempotent); encrypt prefers the newest version while older versions remain for
+history. Minting alone does nothing until the distribution document is republished.
+Join-response URIs are not required for this push — the distribution doc is the live
+channel. Forward secrecy when *removing* a recipient still needs `pullfrom` plus a
+new version for the remaining set (§13.1).
+
 **Managed status is derived, not persisted:** a key id is *managed* iff its distribution
 document exists at the local directory head and lists the user in `pushto`. The KeyBag
 format is unchanged; clients compute the badge and the export/duplicate/rotation
@@ -1846,11 +1858,12 @@ can spin up an ungoverned database" and "only the databases we intended exist".
 | Event | Action | Mechanism |
 |-------|--------|-----------|
 | New user / new device | `addUserKeys` (or the join-request flow) appends a key pair, optionally labeled | section 6.5 |
-| Key rollover | append the new pair, then revoke the old | section 6.5 |
+| User-identity key rollover | append the new signing/encryption pair on the grant, then revoke the old | section 6.5 |
+| Doc-key rotation (`default` or named) | mint a new version in the KeyBag, republish `acl_keydistribution_<keyId>` (re-wrap to all `pushto` devices); clients merge on reconcile | sections 13.1, 13.6 |
 | Revoke a device | `updateUserGrant` moves the pair into `revokedUserKeyPairs` with `revokedAt` | section 6.5 |
 | Fully offboard a user | revoke all pairs; they can rejoin later with fresh keys | section 6.5 |
 | Stolen device | set `wipeRequestedForSigningKeys`; the device drops the whole local tenant on next connect | section 6.5 |
-| Lose read access | move the user to `pullfrom` in `acl_keydistribution_<keyId>` and rotate; clients drop the key and forget its docs on reconcile, the server blacklist withholds them | sections 13.3, 13.4 |
+| Lose read access | move the user to `pullfrom` in `acl_keydistribution_<keyId>` and rotate; clients drop the key and forget its docs on reconcile, the server blacklist withholds them | sections 13.3, 13.4, 13.6 |
 
 Note that **revocation and wipe are independent and both opt-in** (section 6.5): removing
 keys does not wipe a device, and wiping requires explicitly listing its signing key.
