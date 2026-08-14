@@ -257,6 +257,27 @@ export class RSAEncryption {
   }
 
   /**
+   * Wrap a small secret to a base64 RSA-OAEP ciphertext.
+   * Convenience wrapper around {@link wrapKey} for URI/JSON payloads.
+   */
+  async wrapKeyToBase64(
+    rawKey: Uint8Array,
+    publicKey: CryptoKey | string
+  ): Promise<string> {
+    return this.uint8ArrayToBase64(await this.wrapKey(rawKey, publicKey));
+  }
+
+  /**
+   * Unwrap a secret previously wrapped with {@link wrapKeyToBase64}.
+   */
+  async unwrapKeyFromBase64(
+    wrappedKey: string,
+    privateKey: CryptoKey | string
+  ): Promise<Uint8Array> {
+    return this.unwrapKey(this.base64ToUint8Array(wrappedKey), privateKey);
+  }
+
+  /**
    * Unwrap a secret previously wrapped with {@link wrapKey}.
    */
   async unwrapKey(

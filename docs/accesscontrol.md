@@ -1429,10 +1429,11 @@ plaintext document content. There is a single read document type:
 
 The sync server derives, per principal, the set of **revoked decryption key ids** from
 the `pullfrom_users_hashes` lists at the directory head (matched against the
-authenticated user's `usernameHashCandidates`, excluding the protected key ids `default`
-/ `$publicinfos`). This set is the only read-side enforcement the server performs — there
+authenticated user's `usernameHashCandidates`, excluding the protected key id
+`$publicinfos`). This set is the only read-side enforcement the server performs — there
 is no general read-policy evaluator. It is computed from the cached distribution state
-(see §13.6 cache), so it is O(cache size) with no per-request document scans.
+(see §13.6 cache), so it is O(cache size) with no per-request document scans. The tenant
+`default` key may appear on the blacklist when a distribution pulls it from a user.
 
 - **Pull (silent omit).** All read endpoints — `handleFindNewEntries(ForDoc)`,
   `handleFindEntries`, `handleScanEntriesSince`, `handleGetEntries`, `handleGetAllIds`,
@@ -1552,8 +1553,8 @@ A pure, idempotent function of (directory head cache, local bag). Driven from th
 distribution state, matched against the user's `usernameHashCandidates`:
 
 - **Me in `pullfrom`** → remove the whole key id from the bag via
-  `removeNamedDecryptionKey(keyId)` (a no-op when absent; refuses the protected
-  `default` / `$publicinfos` ids). This purges the local scope (plaintext + index
+  `removeNamedDecryptionKey(keyId)` (a no-op when absent; refuses `$publicinfos`).
+  This purges the local scope (plaintext + index
   tombstones) through the existing key-visibility machinery. Pull wins on any list
   overlap. (The revoke pass takes its key-id list straight from
   `getRevokedDecryptionKeyIdsForUser`, so it needs no per-doc scan or fingerprint diff.)
@@ -1564,8 +1565,9 @@ distribution state, matched against the user's `usernameHashCandidates`:
 
 Push is a version merge, never destructive; destruction happens only via explicit
 `pullfrom`. Self-healing: a locally deleted pushed key is re-imported on the next
-reconcile. `default` and `$publicinfos` are rejected as a distribution `keyId` at publish
-time and guarded again in the client reconcile. Manual key sharing (`sharePassword`)
+reconcile. `$publicinfos` is rejected as a distribution `keyId` at publish time and
+guarded again in the client reconcile. The tenant `default` key **may** be distributed
+(including `pullfrom`, which strips content access). Manual key sharing (`sharePassword`)
 continues to work unchanged.
 
 **Managed status is derived, not persisted:** a key id is *managed* iff its distribution

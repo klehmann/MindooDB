@@ -256,8 +256,8 @@ interface CreateTenantPasswords {
   requireV2Entries?: boolean;
   /**
    * Optional human-readable tenant label stored in the directory document
-   * `tenantsetup` (encrypted under `$publicinfos`). When omitted, no setup
-   * document is written at create time.
+   * `tenantsetup` (doc under `$publicinfos`; label field-encrypted under
+   * `default`). When omitted, no setup document is written at create time.
    */
   tenantLabel?: string;
 }
@@ -356,8 +356,12 @@ export interface ApproveJoinRequestOptions {
   adminSigningKey: EncryptedPrivateKey;
   /** The password to decrypt the admin signing key */
   adminPassword: string;
-  /** A shared password for encrypting the exported keys. Must be communicated out-of-band (e.g. phone). */
-  sharePassword: string;
+  /**
+   * @deprecated Join responses are RSA-OAEP-wrapped to the requester's
+   * `encryptionPublicKey` (v3). Ignored when present; kept so older callers
+   * that still pass a share password continue to type-check.
+   */
+  sharePassword?: string;
   /** Optional server URL to include in the response so the joining user knows where to sync */
   serverUrl?: string;
   /** Optional admin username to include in the response so the joining user can display it */
@@ -389,7 +393,8 @@ export interface ApproveJoinRequestOptions {
   username?: string;
   /**
    * Optional tenant display label to include in the join response. When omitted,
-   * `approveJoinRequest` tries to read it from the directory `tenantsetup` doc.
+   * `approveJoinRequest` tries to decrypt it from the directory `tenantsetup`
+   * doc (`label_encrypted` under the tenant `default` key).
    */
   tenantLabel?: string;
   /** If "uri", approveJoinRequest returns a mdb://join-response/... URI string instead of an object */
@@ -399,8 +404,16 @@ export interface ApproveJoinRequestOptions {
 export interface JoinResponseEncryptedDocKeyVersion {
   /** Original KeyBag creation timestamp for this key version, used for rotation ordering. */
   createdAt?: number;
-  /** Symmetric document key version encrypted with the shared password. */
-  encryptedKey: EncryptedPrivateKey;
+  /**
+   * v2: symmetric document key version encrypted with the sharePassword.
+   * Absent on v3 responses.
+   */
+  encryptedKey?: EncryptedPrivateKey;
+  /**
+   * v3: raw AES key RSA-OAEP-wrapped to the join requester's
+   * `encryptionPublicKey` (standard base64). Absent on v2 responses.
+   */
+  wrappedKey?: string;
 }
 
 export interface JoinResponseEncryptedDocKey {
@@ -413,13 +426,16 @@ export interface JoinResponseEncryptedDocKey {
 /**
  * A join response is created by the admin after approving a join request.
  * It contains encrypted symmetric keys and tenant metadata needed to join.
- * 
+ *
  * Can be serialized to a mdb://join-response/... URI for out-of-band exchange.
- * The encrypted keys can only be unlocked with the sharePassword communicated separately.
+ *
+ * v3 wraps each document key to the join requester's RSA encryption public
+ * key, so only that device can unwrap the payload — no share password.
+ * v2 responses (sharePassword) remain readable for backward compatibility.
  */
 export interface JoinResponse {
-  /** Protocol version. v2 carries versioned document-key bundles. */
-  v: 2;
+  /** Protocol version. v2 is password-wrapped; v3 is RSA-OAEP-wrapped to the requester. */
+  v: 2 | 3;
   /** Tenant identifier */
   tenantId: string;
   /** Admin's public signing key (Ed25519, PEM) — needed to open the tenant */
@@ -433,7 +449,8 @@ export interface JoinResponse {
   /**
    * Optional human-readable tenant label for display on the joining device.
    * Snapshotted at approve time from `tenantsetup` (or an explicit override).
-   * After join, clients should prefer the live directory label when synced.
+   * After join, clients should prefer the live directory label (field-encrypted
+   * under `default`) when synced.
    */
   tenantLabel?: string;
   /**
@@ -445,7 +462,7 @@ export interface JoinResponse {
    * requester keeps the name it chose itself.
    */
   username?: string;
-  /** Selected tenant document keys, encrypted with the sharePassword. */
+  /** Selected tenant document keys. v3: RSA-wrapped; v2: sharePassword-encrypted. */
   encryptedDocKeys: JoinResponseEncryptedDocKey[];
 }
 
@@ -467,8 +484,11 @@ export interface JoinTenantOptions {
    * callers may pass an empty string.
    */
   password: string;
-  /** The shared password used to decrypt the keys in the join response */
-  sharePassword: string;
+  /**
+   * The shared password used to decrypt v2 join responses.
+   * Unused for v3 (RSA-wrapped) responses; callers may omit it.
+   */
+  sharePassword?: string;
   /**
    * Optional pre-existing {@link KeyBag} to extend with the joined tenant's
    * keys. When supplied, `joinTenant` will mutate this bag in place (adding
@@ -511,6 +531,48 @@ export interface JoinTenantResult {
    * is the renamed copy (same keys) that the caller should persist locally.
    */
   user: PrivateUserId;
+}
+
+/**
+ * One tenant delivered by `POST /device/discover` after device-key proof.
+ * No cleartext label — the client decrypts `tenantsetup.label_encrypted` after
+ * importing `default` via key distribution.
+ */
+export interface DeviceTenantDelivery {
+  tenantId: string;
+  adminSigningPublicKey: string;
+  adminEncryptionPublicKey: string;
+  /** AES `$publicinfos` RSA-OAEP-wrapped to this device's encryption public key (base64). */
+  wrappedPublicInfosKey: string;
+  username_hash?: string;
+  identity_hashes?: string[];
+}
+
+export interface DiscoverTenantsOnServerOptions {
+  user: PrivateUserId;
+  password: string;
+  /** When set, skip password-decrypt of the signing key. */
+  preDecryptedUserKeys?: PreDecryptedUserKeys;
+}
+
+export interface BootstrapTenantFromDeliveryOptions {
+  user: PrivateUserId;
+  password: string;
+  existingKeyBag?: KeyBag;
+  preDecryptedUserKeys?: PreDecryptedUserKeys;
+  /**
+   * When set, pull the directory from this server URL after open and run
+   * key-distribution reconcile (imports `default`, may adopt username).
+   */
+  serverUrl?: string;
+}
+
+export interface BootstrapTenantFromDeliveryResult {
+  tenant: MindooTenant;
+  keyBag: KeyBag;
+  user: PrivateUserId;
+  /** Display label after `default` import + `tenantsetup` decrypt, if available. */
+  tenantLabel?: string;
 }
 
 /**
@@ -642,14 +704,35 @@ export interface MindooTenantFactory {
    * Join a tenant using a join response from an admin.
    * This orchestrates:
    * 1. Parsing the join response (object or mdb:// URI string)
-   * 2. Creating a new KeyBag and importing the encrypted keys
+   * 2. Creating a new KeyBag and importing the encrypted keys (RSA unwrap for
+   *    v3, sharePassword for legacy v2)
    * 3. Opening the tenant with the admin public keys from the response
    *
    * @param joinResponse A JoinResponse object or a mdb://join-response/... URI string
-   * @param options Options including the user's identity, password, and the shared password
+   * @param options Options including the user's identity and password
    * @return The opened tenant and KeyBag
    */
   joinTenant(joinResponse: JoinResponse | string, options: JoinTenantOptions): Promise<JoinTenantResult>;
+
+  /**
+   * Prove possession of the device signing key against a MindooDB server and
+   * receive every local tenant where that key has an active grant, each with
+   * RSA-wrapped `$publicinfos` plus admin public keys.
+   */
+  discoverTenantsOnServer?(
+    serverUrl: string,
+    options: DiscoverTenantsOnServerOptions,
+  ): Promise<DeviceTenantDelivery[]>;
+
+  /**
+   * Bootstrap a local tenant from a {@link DeviceTenantDelivery}: unwrap
+   * `$publicinfos`, open the tenant, optionally pull the directory and
+   * reconcile key distributions (`default`).
+   */
+  bootstrapTenantFromDelivery?(
+    delivery: DeviceTenantDelivery,
+    options: BootstrapTenantFromDeliveryOptions,
+  ): Promise<BootstrapTenantFromDeliveryResult>;
 }
 
 /**
@@ -902,6 +985,7 @@ export interface MindooTenant {
   reconcileKeyDistributionsForCurrentUser?(): Promise<{
     imported: string[];
     removed: string[];
+    adoptedUsername?: string;
   }>;
 
   /**
@@ -946,11 +1030,11 @@ export interface MindooTenant {
    * This orchestrates:
    * 1. Parsing the join request (object or mdb:// URI string)
    * 2. Registering the user in the tenant directory
-   * 3. Exporting selected document keys, encrypted with the sharePassword
-   * 4. Packaging everything into a JoinResponse
+   * 3. Exporting selected document keys, RSA-OAEP-wrapped to the requester
+   * 4. Packaging everything into a JoinResponse (v3)
    *
    * @param joinRequest A JoinRequest object or a mdb://join-request/... URI string
-   * @param options Options including admin key, share password, and optional server URL
+   * @param options Options including admin key and optional server URL
    * @return A JoinResponse object, or a mdb://join-response/... URI string if format is "uri"
    */
   approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions & { format: "uri" }): Promise<string>;
@@ -2623,6 +2707,7 @@ export interface MindooTenantDirectory {
     administrationPrivateKeyPassword: string,
     userDetails?: DirectoryUserDetails,
     label?: string,
+    options?: { distributeKeyIds?: string[] },
   ): Promise<void>;
 
   /**

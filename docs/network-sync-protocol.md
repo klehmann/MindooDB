@@ -175,6 +175,15 @@ flowchart LR
 
 **MindooTenantDirectory** is the source of truth for user public keys and revocation status. The server consults this directory during authentication and on every sync request to ensure only authorized, non-revoked users can access data.
 
+### Device discovery (server-wide bootstrap)
+
+When a client only knows a server URL (no join-response URI), it can prove possession of its device signing key and ask the server which tenants already granted that device:
+
+1. `POST /device/challenge` `{ signingPublicKey }` → short-lived nonce (rate-limited).
+2. `POST /device/discover` `{ challenge, signature }` → Ed25519 verify, then scan local tenants for an active grant containing that signing key.
+
+Each match returns `tenantId`, admin public keys, and `$publicinfos` RSA-OAEP-wrapped to the grant's device encryption public key. The client unwraps, opens the tenant, pulls the directory, and imports `default` via key distribution. Tenant display labels are **not** returned (they are field-encrypted under `default` in `tenantsetup`). The path `/device` is a reserved tenant id. Join-response URIs remain supported for air-gapped / older servers.
+
 ---
 
 ## 5) Protocol Semantics

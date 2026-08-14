@@ -56,6 +56,10 @@ import { TenantManager } from "./TenantManager";
 import { CapabilityMatcher } from "./CapabilityMatcher";
 import { SystemAdminAuthService } from "./SystemAdminAuth";
 import {
+  DeviceDiscoveryAuthError,
+  DeviceDiscoveryService,
+} from "./DeviceDiscoveryService";
+import {
   validateServerConfig,
   backupConfig,
   writeConfig,
@@ -268,6 +272,7 @@ export class MindooDBServer {
   private tenantManager: TenantManager;
   private capabilityMatcher: CapabilityMatcher;
   private systemAdminAuth: SystemAdminAuthService;
+  private deviceDiscovery: DeviceDiscoveryService;
   private readonly staticDir: string | undefined;
   private serverConfig: ServerConfig;
   private configPath: string;
@@ -324,6 +329,10 @@ export class MindooDBServer {
     this.systemAdminAuth = new SystemAdminAuthService(
       cryptoAdapter,
       this.serverConfig,
+    );
+    this.deviceDiscovery = new DeviceDiscoveryService(
+      this.tenantManager,
+      cryptoAdapter,
     );
 
     const principalCount = Object.values(this.serverConfig.capabilities).reduce(
@@ -529,6 +538,26 @@ export class MindooDBServer {
     this.app.get("/health", (req, res) => {
       res.json({ status: "ok", timestamp: Date.now() });
     });
+
+    // Server-wide device discovery (before /:tenantId so "device" is not a tenant id).
+    // Aggressive rate limit: challenge+discover scans every local tenant.
+    const deviceDiscoveryRateLimit = rateLimit({
+      windowMs: 60_000,
+      max: 10,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many device discovery requests, please try again later" },
+    });
+    this.app.post(
+      "/device/challenge",
+      deviceDiscoveryRateLimit,
+      this.handleDeviceChallenge.bind(this),
+    );
+    this.app.post(
+      "/device/discover",
+      deviceDiscoveryRateLimit,
+      this.handleDeviceDiscover.bind(this),
+    );
 
     // .well-known endpoints are unauthenticated so clients can discover
     // server identity and tenant availability before attempting to authenticate.
@@ -1630,6 +1659,48 @@ export class MindooDBServer {
   private formatTenantNotFoundOnServerError(tenantId: string): string {
     const serverName = this.tenantManager.getServerPublicInfo()?.name ?? "unknown";
     return `Tenant ${tenantId} not found on server ${serverName}`;
+  }
+
+  // ==================== Device Discovery (server-wide) ====================
+
+  private async handleDeviceChallenge(req: Request, res: Response): Promise<void> {
+    try {
+      const { signingPublicKey } = req.body ?? {};
+      if (typeof signingPublicKey !== "string" || !signingPublicKey.trim()) {
+        res.status(400).json({ error: "signingPublicKey is required" });
+        return;
+      }
+      validateStringLength(signingPublicKey, MAX_PEM_KEY_LENGTH, "signingPublicKey");
+      const challenge = this.deviceDiscovery.createChallenge(signingPublicKey);
+      res.json({ challenge });
+    } catch (error) {
+      this.handleRequestError(error, res);
+    }
+  }
+
+  private async handleDeviceDiscover(req: Request, res: Response): Promise<void> {
+    try {
+      const { challenge, signature } = req.body ?? {};
+      if (typeof challenge !== "string" || !challenge.trim()) {
+        res.status(400).json({ error: "challenge is required" });
+        return;
+      }
+      if (typeof signature !== "string" || !signature.trim()) {
+        res.status(400).json({ error: "signature is required" });
+        return;
+      }
+      validateStringLength(challenge, MAX_CHALLENGE_LENGTH, "challenge");
+      validateStringLength(signature, MAX_SIGNATURE_LENGTH, "signature");
+      const signatureBytes = this.base64ToUint8Array(signature);
+      const result = await this.deviceDiscovery.discover(challenge, signatureBytes);
+      res.json(result);
+    } catch (error) {
+      if (error instanceof DeviceDiscoveryAuthError) {
+        res.status(401).json({ error: error.message });
+        return;
+      }
+      this.handleRequestError(error, res);
+    }
   }
 
   // ==================== Tenant Auth Handlers ====================

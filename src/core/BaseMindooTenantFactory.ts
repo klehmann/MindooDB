@@ -14,11 +14,16 @@ import {
   JoinTenantOptions,
   JoinTenantResult,
   OpenTenantOptions,
+  DeviceTenantDelivery,
+  DiscoverTenantsOnServerOptions,
+  BootstrapTenantFromDeliveryOptions,
+  BootstrapTenantFromDeliveryResult,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword, encryptPrivateKey as encryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
+import { RSAEncryption } from "./crypto/RSAEncryption";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbkdf2Iterations";
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
@@ -27,7 +32,8 @@ import { encodeJoinRequestUri } from "./uri/joinRequestUri";
 import { validateTenantId } from "./tenantIdValidation";
 import { semanticNow } from "./utils/timeSource";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
-import { writeTenantSetupLabel } from "./tenantSetup";
+import { readTenantSetupLabel, writeTenantSetupLabel } from "./tenantSetup";
+import { StoreKind } from "./appendonlystores/types";
 
 /**
  * BaseTenantFactory is a platform-agnostic implementation of TenantFactory
@@ -486,6 +492,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         tenantLabel,
         adminUser.userSigningKeyPair,
         options.adminPassword,
+        tenant,
       );
     }
 
@@ -566,8 +573,8 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       this.logger.createChild("KeyBag")
     );
 
-    if (response.v !== 2 || !Array.isArray(response.encryptedDocKeys)) {
-      throw new Error("Invalid join response: expected a v2 encryptedDocKeys payload");
+    if ((response.v !== 2 && response.v !== 3) || !Array.isArray(response.encryptedDocKeys)) {
+      throw new Error("Invalid join response: expected a v2 or v3 encryptedDocKeys payload");
     }
 
     if (!response.encryptedDocKeys.some((entry) => entry.keyId === PUBLIC_INFOS_KEY_ID)) {
@@ -577,23 +584,10 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     // 2. Import all encrypted document key versions from the join response.
     // Preserve the version timestamps so key rotation ordering remains stable
     // in the recipient's KeyBag.
-    for (const entry of response.encryptedDocKeys) {
-      if (!entry.keyId || !Array.isArray(entry.versions) || entry.versions.length === 0) {
-        throw new Error("Invalid join response: encryptedDocKeys entries must include a keyId and versions");
-      }
-
-      for (const version of entry.versions) {
-        await keyBag.decryptAndImportKey(
-          "doc",
-          response.tenantId,
-          entry.keyId,
-          {
-            ...version.encryptedKey,
-            createdAt: version.createdAt ?? version.encryptedKey.createdAt,
-          },
-          options.sharePassword
-        );
-      }
+    if (response.v === 3) {
+      await this.importRsaWrappedJoinKeys(response, options, keyBag);
+    } else {
+      await this.importPasswordWrappedJoinKeys(response, options, keyBag);
     }
 
     // 3. Adopt the username the admin registered. It may differ from the one
@@ -629,6 +623,240 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     this.logger.info(`Joined tenant "${response.tenantId}" successfully`);
 
     return { tenant, keyBag, user: effectiveUser };
+  }
+
+  /**
+   * Prove device signing-key possession and discover tenants on a MindooDB server
+   * (`POST /device/challenge` + `POST /device/discover`).
+   */
+  async discoverTenantsOnServer(
+    serverUrl: string,
+    options: DiscoverTenantsOnServerOptions,
+  ): Promise<DeviceTenantDelivery[]> {
+    const baseUrl = serverUrl.replace(/\/$/, "");
+    const subtle = this.cryptoAdapter.getSubtle();
+
+    const signingKey = options.preDecryptedUserKeys?.signingKey
+      ?? await subtle.importKey(
+        "pkcs8",
+        await decryptPrivateKeyWithPassword(
+          this.cryptoAdapter,
+          options.user.userSigningKeyPair.privateKey,
+          options.password,
+          "signing",
+        ),
+        { name: "Ed25519" },
+        false,
+        ["sign"],
+      );
+
+    const challengeRes = await fetch(`${baseUrl}/device/challenge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        signingPublicKey: options.user.userSigningKeyPair.publicKey,
+      }),
+    });
+    if (!challengeRes.ok) {
+      const errorBody = await challengeRes.text();
+      throw new Error(
+        `Device discovery challenge failed (HTTP ${challengeRes.status}): ${errorBody}`,
+      );
+    }
+    const { challenge } = (await challengeRes.json()) as { challenge: string };
+    if (typeof challenge !== "string" || !challenge) {
+      throw new Error("Device discovery challenge response missing challenge");
+    }
+
+    const messageBytes = new TextEncoder().encode(challenge);
+    const signatureBuffer = await subtle.sign({ name: "Ed25519" }, signingKey, messageBytes);
+    const signature = this.uint8ArrayToBase64(new Uint8Array(signatureBuffer));
+
+    const discoverRes = await fetch(`${baseUrl}/device/discover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challenge, signature }),
+    });
+    if (!discoverRes.ok) {
+      const errorBody = await discoverRes.text();
+      throw new Error(
+        `Device discovery failed (HTTP ${discoverRes.status}): ${errorBody}`,
+      );
+    }
+    const body = (await discoverRes.json()) as { tenants?: DeviceTenantDelivery[] };
+    return Array.isArray(body.tenants) ? body.tenants : [];
+  }
+
+  /**
+   * Bootstrap a tenant from a device-discovery delivery: unwrap `$publicinfos`,
+   * open the tenant, optionally pull the directory and reconcile distributions.
+   */
+  async bootstrapTenantFromDelivery(
+    delivery: DeviceTenantDelivery,
+    options: BootstrapTenantFromDeliveryOptions,
+  ): Promise<BootstrapTenantFromDeliveryResult> {
+    if (!delivery.tenantId || !delivery.wrappedPublicInfosKey) {
+      throw new Error("Invalid device delivery: tenantId and wrappedPublicInfosKey are required");
+    }
+    validateTenantId(delivery.tenantId);
+
+    const keyBag =
+      options.existingKeyBag ??
+      new KeyBag(
+        options.user.userEncryptionKeyPair.privateKey,
+        options.password,
+        this.cryptoAdapter,
+        this.logger.createChild("KeyBag"),
+      );
+
+    const decryptKey = await this.resolveJoinRecipientEncryptionKey({
+      user: options.user,
+      password: options.password,
+      preDecryptedUserKeys: options.preDecryptedUserKeys,
+    });
+    const rsa = new RSAEncryption(this.cryptoAdapter, this.logger.createChild("RSAEncryption"));
+    try {
+      const rawPublicInfos = await rsa.unwrapKeyFromBase64(
+        delivery.wrappedPublicInfosKey,
+        decryptKey,
+      );
+      await keyBag.set("doc", delivery.tenantId, PUBLIC_INFOS_KEY_ID, rawPublicInfos);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Cannot unwrap device discovery delivery: it is bound to a different device's encryption key (${message})`,
+      );
+    }
+
+    let user = options.user;
+    const tenant = await this.openTenant(
+      delivery.tenantId,
+      delivery.adminSigningPublicKey,
+      delivery.adminEncryptionPublicKey,
+      user,
+      options.password,
+      keyBag,
+      options.preDecryptedUserKeys
+        ? { preDecryptedUserKeys: options.preDecryptedUserKeys }
+        : undefined,
+    );
+
+    if (options.serverUrl) {
+      const remoteDirectory = await tenant.connectToServer(
+        options.serverUrl,
+        "directory",
+        StoreKind.docs,
+      );
+      const directoryDb = await tenant.openDB("directory", { adminOnlyDb: true });
+      await directoryDb.pullChangesFrom(remoteDirectory);
+
+      if (typeof tenant.reconcileKeyDistributionsForCurrentUser === "function") {
+        const reconcile = await tenant.reconcileKeyDistributionsForCurrentUser();
+        if (reconcile.adoptedUsername && reconcile.adoptedUsername !== user.username) {
+          user = { ...user, username: reconcile.adoptedUsername };
+        }
+      }
+    }
+
+    let tenantLabel: string | undefined;
+    try {
+      const directoryDb = await tenant.openDB("directory", { adminOnlyDb: true });
+      tenantLabel = await readTenantSetupLabel(directoryDb, tenant);
+    } catch {
+      // Label needs `default`; may still be missing before distribution sync.
+    }
+
+    return {
+      tenant,
+      keyBag,
+      user,
+      ...(tenantLabel ? { tenantLabel } : {}),
+    };
+  }
+
+  private uint8ArrayToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]!);
+    }
+    return btoa(binary);
+  }
+
+  private async importRsaWrappedJoinKeys(
+    response: JoinResponse,
+    options: JoinTenantOptions,
+    keyBag: KeyBag,
+  ): Promise<void> {
+    const decryptKey = await this.resolveJoinRecipientEncryptionKey(options);
+    const rsa = new RSAEncryption(this.cryptoAdapter, this.logger.createChild("RSAEncryption"));
+    for (const entry of response.encryptedDocKeys) {
+      if (!entry.keyId || !Array.isArray(entry.versions) || entry.versions.length === 0) {
+        throw new Error("Invalid join response: encryptedDocKeys entries must include a keyId and versions");
+      }
+      for (const version of entry.versions) {
+        if (!version.wrappedKey) {
+          throw new Error("Invalid join response: v3 versions must include wrappedKey");
+        }
+        try {
+          const rawKey = await rsa.unwrapKeyFromBase64(version.wrappedKey, decryptKey);
+          await keyBag.set("doc", response.tenantId, entry.keyId, rawKey, version.createdAt);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Cannot decrypt join response: it is bound to a different device's encryption key (${message})`,
+          );
+        }
+      }
+    }
+  }
+
+  private async importPasswordWrappedJoinKeys(
+    response: JoinResponse,
+    options: JoinTenantOptions,
+    keyBag: KeyBag,
+  ): Promise<void> {
+    if (!options.sharePassword) {
+      throw new Error("This join response requires a sharePassword (legacy v2)");
+    }
+    for (const entry of response.encryptedDocKeys) {
+      if (!entry.keyId || !Array.isArray(entry.versions) || entry.versions.length === 0) {
+        throw new Error("Invalid join response: encryptedDocKeys entries must include a keyId and versions");
+      }
+      for (const version of entry.versions) {
+        if (!version.encryptedKey) {
+          throw new Error("Invalid join response: v2 versions must include encryptedKey");
+        }
+        await keyBag.decryptAndImportKey(
+          "doc",
+          response.tenantId,
+          entry.keyId,
+          {
+            ...version.encryptedKey,
+            createdAt: version.createdAt ?? version.encryptedKey.createdAt,
+          },
+          options.sharePassword,
+        );
+      }
+    }
+  }
+
+  private async resolveJoinRecipientEncryptionKey(options: JoinTenantOptions): Promise<CryptoKey> {
+    if (options.preDecryptedUserKeys?.encryptionKey) {
+      return options.preDecryptedUserKeys.encryptionKey;
+    }
+    const decryptedKeyBuffer = await decryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      options.user.userEncryptionKeyPair.privateKey,
+      options.password,
+      "encryption",
+    );
+    return this.cryptoAdapter.getSubtle().importKey(
+      "pkcs8",
+      decryptedKeyBuffer,
+      { name: "RSA-OAEP", hash: "SHA-256" },
+      false,
+      ["decrypt"],
+    );
   }
 
   /**

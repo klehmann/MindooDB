@@ -31,7 +31,7 @@ describe("Join Flow (convenience API)", () => {
   const user1Password = "alice-pass-123";
   const user2Name = "cn=bob/o=acme";
   const user2Password = "bob-pass-456";
-  const sharePassword = "shared-secret-789";
+  const legacySharePassword = "shared-secret-789";
 
   function getDocKeyBundle(response: JoinResponse, keyId: string) {
     return response.encryptedDocKeys.find((entry) => entry.keyId === keyId);
@@ -151,19 +151,17 @@ describe("Join Flow (convenience API)", () => {
       joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
       });
 
       // Step 4: User2 joins the tenant
       await localFactory.joinTenant(joinResponse, {
         user: user2,
         password: user2Password,
-        sharePassword,
       });
     }, 120000);
 
     it("should produce a valid JoinResponse", () => {
-      expect(joinResponse.v).toBe(2);
+      expect(joinResponse.v).toBe(3);
       expect(joinResponse.tenantId).toBe("test-join-obj");
       expect(joinResponse.tenantLabel).toBe("Join Object Lab");
       expect(joinResponse.adminSigningPublicKey).toBe(
@@ -174,6 +172,10 @@ describe("Join Flow (convenience API)", () => {
       );
       expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)?.versions).toHaveLength(1);
       expect(getDocKeyBundle(joinResponse, PUBLIC_INFOS_KEY_ID)?.versions).toHaveLength(1);
+      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)?.versions[0]?.wrappedKey).toEqual(
+        expect.any(String),
+      );
+      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)?.versions[0]?.encryptedKey).toBeUndefined();
     });
 
     it("should register user2 in the directory", async () => {
@@ -181,6 +183,21 @@ describe("Join Flow (convenience API)", () => {
       const keys = await directory.getUserPublicKeys("cn=bob/o=test-join-obj");
       expect(keys).not.toBeNull();
       expect(keys!.signingPublicKey).toBe(user2.userSigningKeyPair.publicKey);
+    });
+
+    it("should auto-publish acl_keydistribution_default for the joiner", async () => {
+      const { aclKeyDistributionDocId } = await import("../core/accesscontrol/types");
+      const directoryDb = await adminResult.tenant.openDB("directory", { adminOnlyDb: true });
+      const distDoc = await directoryDb.getDocument(aclKeyDistributionDocId(DEFAULT_TENANT_KEY_ID));
+      const data = distDoc.getData() as {
+        keyId?: string;
+        pushto_users_hashes?: string[];
+        pushto_users_keys?: Record<string, Record<string, string>>;
+      };
+      expect(data.keyId).toBe(DEFAULT_TENANT_KEY_ID);
+      expect(Array.isArray(data.pushto_users_hashes)).toBe(true);
+      expect(data.pushto_users_hashes!.length).toBeGreaterThan(0);
+      expect(Object.keys(data.pushto_users_keys ?? {}).length).toBeGreaterThan(0);
     });
   });
 
@@ -208,7 +225,6 @@ describe("Join Flow (convenience API)", () => {
       const joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
         sharedDocKeyIds: [namedKeyId],
       });
 
@@ -222,7 +238,6 @@ describe("Join Flow (convenience API)", () => {
       const joinResult = await localFactory.joinTenant(joinResponse, {
         user: user2,
         password: user2Password,
-        sharePassword,
       });
       const importedDetails = await joinResult.keyBag.listKeyDetails();
       const importedNamedVersions = importedDetails
@@ -260,7 +275,6 @@ describe("Join Flow (convenience API)", () => {
       const joinResponseURI = await adminResult.tenant.approveJoinRequest(joinRequestURI, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
         format: "uri",
       });
 
@@ -271,7 +285,6 @@ describe("Join Flow (convenience API)", () => {
       const joinResult = await localFactory.joinTenant(joinResponseURI, {
         user: user2,
         password: user2Password,
-        sharePassword,
       });
 
       expect(joinResult.tenant).toBeDefined();
@@ -309,14 +322,12 @@ describe("Join Flow (convenience API)", () => {
       const joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
       });
 
       // User2 joins
       const user2Result = await localFactory.joinTenant(joinResponse, {
         user: user2,
         password: user2Password,
-        sharePassword,
       });
 
       // User1 creates a todo document
@@ -372,7 +383,6 @@ describe("Join Flow (convenience API)", () => {
         factory.joinTenant(requestURI as string, {
           user,
           password: "test-pass",
-          sharePassword: "wrong",
         })
       ).rejects.toThrow(/expected "join-response"/);
     }, 30000);
@@ -384,7 +394,6 @@ describe("Join Flow (convenience API)", () => {
         factory.joinTenant("not-a-valid-uri", {
           user,
           password: "test-pass",
-          sharePassword: "wrong",
         })
       ).rejects.toThrow(/expected a JoinResponse/);
     }, 30000);
@@ -409,7 +418,6 @@ describe("Join Flow (convenience API)", () => {
       const response = await result.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
         adminUsername: "cn=admin/o=test",
       });
 
@@ -434,7 +442,6 @@ describe("Join Flow (convenience API)", () => {
       const response = await result.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
       });
 
       expect(response.adminUsername).toBeUndefined();
@@ -458,7 +465,6 @@ describe("Join Flow (convenience API)", () => {
       const joinResponseURI = await result.tenant.approveJoinRequest(joinRequestURI, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
         adminUsername: "cn=admin/o=test",
         format: "uri",
       });
@@ -490,12 +496,10 @@ describe("Join Flow (convenience API)", () => {
       const joinResponse1 = await result.tenant.approveJoinRequest(joinRequest1, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
       });
       await localFactory.joinTenant(joinResponse1, {
         user: device1,
         password: user2Password,
-        sharePassword,
       });
 
       // Second device with the same username, different keys
@@ -504,12 +508,10 @@ describe("Join Flow (convenience API)", () => {
       const joinResponse2 = await result.tenant.approveJoinRequest(joinRequest2, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
       });
       const { tenant: device2Tenant } = await localFactory.joinTenant(joinResponse2, {
         user: device2,
         password: "device2-pass",
-        sharePassword,
       });
 
       const directory = await result.tenant.openDirectory();
@@ -543,7 +545,6 @@ describe("Join Flow (convenience API)", () => {
       return adminResult.tenant.approveJoinRequest(request, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
-        sharePassword,
         ...(username ? { username } : {}),
       });
     }
@@ -596,7 +597,6 @@ describe("Join Flow (convenience API)", () => {
       const joinResult = await localFactory.joinTenant(response, {
         user: device,
         password: "device-pass",
-        sharePassword,
       });
 
       // The joining device adopts the registered name, keeping its own keys.
@@ -631,7 +631,6 @@ describe("Join Flow (convenience API)", () => {
       const { tenant: deviceTenant, user } = await localFactory.joinTenant(response, {
         user: device,
         password: "typo-pass",
-        sharePassword,
       });
       expect(user.username).toBe(bobName);
 
@@ -641,6 +640,96 @@ describe("Join Flow (convenience API)", () => {
       await deviceDirDB.syncStoreChanges();
 
       await expect(deviceTenant.openDB("shared-db")).resolves.toBeDefined();
+    }, 120000);
+  });
+
+  describe("RSA-wrapped join responses", () => {
+    it("rejects a join response on a device that did not create the request", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+      const localTenantId = "test-join-rsa-bound";
+
+      const adminResult = await localFactory.createTenant({
+        tenantId: localTenantId,
+        adminName: `cn=admin/o=${localTenantId}`,
+        adminPassword,
+        userName: `cn=alice/o=${localTenantId}`,
+        userPassword: user1Password,
+      });
+
+      const bob = await localFactory.createUserId(`cn=bob/o=${localTenantId}`, user2Password);
+      const eve = await localFactory.createUserId(`cn=eve/o=${localTenantId}`, "eve-pass");
+      const joinResponse = await adminResult.tenant.approveJoinRequest(localFactory.createJoinRequest(bob), {
+        adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+      });
+
+      expect(joinResponse.v).toBe(3);
+      await expect(
+        localFactory.joinTenant(joinResponse, {
+          user: eve,
+          password: "eve-pass",
+        }),
+      ).rejects.toThrow(/bound to a different device/);
+    }, 120000);
+
+    it("still accepts a legacy v2 share-password join response", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+      const localTenantId = "test-join-v2-legacy";
+
+      const adminResult = await localFactory.createTenant({
+        tenantId: localTenantId,
+        adminName: `cn=admin/o=${localTenantId}`,
+        adminPassword,
+        userName: `cn=alice/o=${localTenantId}`,
+        userPassword: user1Password,
+      });
+
+      const bob = await localFactory.createUserId(`cn=bob/o=${localTenantId}`, user2Password);
+      await adminResult.tenant.approveJoinRequest(localFactory.createJoinRequest(bob), {
+        adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+      });
+
+      const publicInfosKey = await adminResult.keyBag.encryptAndExportKeyVersion(
+        "doc",
+        localTenantId,
+        PUBLIC_INFOS_KEY_ID,
+        0,
+        legacySharePassword,
+      );
+      const defaultKey = await adminResult.keyBag.encryptAndExportKeyVersion(
+        "doc",
+        localTenantId,
+        DEFAULT_TENANT_KEY_ID,
+        0,
+        legacySharePassword,
+      );
+      expect(publicInfosKey).toBeTruthy();
+      expect(defaultKey).toBeTruthy();
+
+      const v2Response: JoinResponse = {
+        v: 2,
+        tenantId: localTenantId,
+        adminSigningPublicKey: adminResult.adminUser.userSigningKeyPair.publicKey,
+        adminEncryptionPublicKey: adminResult.adminUser.userEncryptionKeyPair.publicKey,
+        encryptedDocKeys: [
+          { keyId: PUBLIC_INFOS_KEY_ID, versions: [{ encryptedKey: publicInfosKey! }] },
+          { keyId: DEFAULT_TENANT_KEY_ID, versions: [{ encryptedKey: defaultKey! }] },
+        ],
+      };
+
+      const joinResult = await localFactory.joinTenant(v2Response, {
+        user: bob,
+        password: user2Password,
+        sharePassword: legacySharePassword,
+      });
+      expect(joinResult.tenant.getId()).toBe(localTenantId);
+      const imported = await joinResult.keyBag.listKeyDetails();
+      expect(imported.some((detail) => detail.scopedKeyId === `doc:${localTenantId}:${PUBLIC_INFOS_KEY_ID}`)).toBe(
+        true,
+      );
     }, 120000);
   });
 });

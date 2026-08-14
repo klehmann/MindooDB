@@ -164,20 +164,21 @@ Alice (the admin) receives Bob's join request and approves it. This registers Bo
 const joinResponse = await tenant.approveJoinRequest(joinRequest, {
   adminSigningKey: adminUser.userSigningKeyPair.privateKey,
   adminPassword: "strong-admin-password",
-  sharePassword: "one-time-secret-42",
   serverUrl: "https://sync.example.com",
   format: "uri",
 });
-// → "mdb://join-response/eyJ2IjoxLCJ0ZW5hbnRJZCI6..."
+// → "mdb://join-response/eyJ2IjozLCJ0ZW5hbnRJZCI6..."
 ```
 
-The join response contains the tenant ID, admin public keys, the server URL, and the tenant's symmetric keys encrypted with the `sharePassword`. Alice sends the `mdb://join-response/...` URI to Bob (same channels as before), and communicates the `sharePassword` separately through a secure channel like a phone call or in-person meeting.
+The join response contains the tenant ID, admin public keys, the server URL, and the tenant's symmetric keys wrapped with RSA-OAEP to Bob's encryption public key from the join request. Alice sends the `mdb://join-response/...` URI to Bob (same channels as before). Confirm the join-request verification code out of band before approving.
 
-> **Security note:** The `sharePassword` never travels alongside the join response. Even if the join response URI is intercepted, the attacker cannot decrypt the symmetric keys without the share password. This is the same principle used by secure key-exchange protocols: split the secret across two channels.
+> **Security note:** A v3 join response is bound to the requesting device. An intercepted URI cannot be imported on another device, because only Bob's encryption private key can unwrap the document keys. Legacy v2 responses that used a separate `sharePassword` remain readable.
+>
+> **URL-only bootstrap:** After Alice approves and syncs the directory to the server, Bob can also connect with only the server URL. `discoverTenantsOnServer` + `bootstrapTenantFromDelivery` prove Bob's device signing key, deliver RSA-wrapped `$publicinfos`, pull the directory, and import `default` from `acl_keydistribution_default` (written automatically at approve time). The join-response URI remains the airgap / older-server fallback.
 
 ### 4c. Bob joins the tenant
 
-Bob receives the join response URI and the share password, and joins the tenant.
+Bob receives the join response URI on the same device that created the request, and joins the tenant.
 
 ```javascript
 // On Bob's machine
@@ -186,12 +187,11 @@ const { tenant: bobTenant, keyBag: bobKeyBag } = await factory.joinTenant(
   {
     user: bob,
     password: "bobs-password",
-    sharePassword: "one-time-secret-42",
   }
 );
 ```
 
-`joinTenant` parses the response, decrypts the symmetric keys using the share password, creates a new KeyBag with the imported keys, and opens the tenant. The imported KeyBag now contains `doc:<tenantId>:default` for regular tenant data and `doc:<tenantId>:$publicinfos` for the directory. Bob now has a fully operational tenant that can read and write encrypted data.
+`joinTenant` parses the response, unwraps the symmetric keys with Bob's encryption private key, creates a new KeyBag with the imported keys, and opens the tenant. The imported KeyBag now contains `doc:<tenantId>:default` for regular tenant data and `doc:<tenantId>:$publicinfos` for the directory. Bob now has a fully operational tenant that can read and write encrypted data.
 
 ---
 

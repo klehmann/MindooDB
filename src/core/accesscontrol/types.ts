@@ -579,7 +579,7 @@ export function effectivePolicy(
 export const KEY_DISTRIBUTION_TYPE = "keydistribution" as const;
 
 /** Key ids that may never be governed by a distribution document. */
-export const PROTECTED_DISTRIBUTION_KEY_IDS: readonly string[] = ["default", "$publicinfos"];
+export const PROTECTED_DISTRIBUTION_KEY_IDS: readonly string[] = ["$publicinfos"];
 
 /**
  * One distributed version of a key in the {@link KeyDistributionDoc.keyVersions}
@@ -724,7 +724,8 @@ export function isKeyDistributionDocId(docId: string): boolean {
  * Validate the structural invariants of a key distribution before publish
  * (docs/accesscontrol.md §13). Throws on the first violation:
  *
- *  - `keyId` is non-empty and not a protected id (`default` / `$publicinfos`);
+ *  - `keyId` is non-empty and not a protected id (`$publicinfos`);
+ *    the tenant `default` key may be distributed (including pullfrom);
  *  - `pushto` and `pullfrom` user-hash sets are disjoint;
  *  - every `pushto` device entry covers EXACTLY the manifest's version
  *    fingerprints (full coverage, no extras), so every recipient can decrypt

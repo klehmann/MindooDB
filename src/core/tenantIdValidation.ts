@@ -7,7 +7,7 @@
  */
 export const TENANT_ID_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
 export const MAX_TENANT_ID_LENGTH = 64;
-export const RESERVED_TENANT_NAMES = new Set(["admin", "system", "health", "statics"]);
+export const RESERVED_TENANT_NAMES = new Set(["admin", "system", "health", "statics", "device"]);
 export const TENANT_ID_REQUIREMENTS =
   "Tenant IDs must be 1-64 characters, start with a letter or digit, and contain only lowercase letters, digits, hyphens, and underscores.";
 

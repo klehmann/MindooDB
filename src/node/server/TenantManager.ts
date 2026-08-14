@@ -669,6 +669,14 @@ export class TenantManager {
     }
   }
 
+  /**
+   * All stored `$publicinfos` AES key versions for a tenant from `server.keybag`.
+   * Empty when the tenant was never published or the server keybag is locked.
+   */
+  async getPublicInfosKeysForTenant(tenantId: string): Promise<Uint8Array[]> {
+    return this.getStoredPublicInfosKeys(tenantId.toLowerCase());
+  }
+
   async listTenantPublicInfosFingerprints(tenantId: string): Promise<string[]> {
     const normalizedId = tenantId.toLowerCase();
     const configPath = this.resolveTenantConfigPath(normalizedId);

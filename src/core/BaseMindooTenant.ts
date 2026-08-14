@@ -1369,36 +1369,19 @@ export class BaseMindooTenant implements MindooTenant {
 
   private async exportJoinResponseDocKeyVersions(
     keyId: string,
-    sharePassword: string
+    recipientEncryptionPublicKey: string
   ): Promise<JoinResponseEncryptedDocKey> {
-    const scopedKeyId = `doc:${this.tenantId}:${keyId}`;
-    const details = (await this.keyBag.listKeyDetails())
-      .filter((detail) => detail.scopedKeyId === scopedKeyId)
-      .sort((a, b) => a.versionIndex - b.versionIndex);
-
-    if (details.length === 0) {
+    const keyVersions = await this.keyBag.getAllKeyVersions("doc", this.tenantId, keyId);
+    if (keyVersions.length === 0) {
       throw new Error(`Failed to export document key "${keyId}" for tenant "${this.tenantId}"`);
     }
 
+    const rsa = new RSAEncryption(this.cryptoAdapter, this.logger.createChild("RSAEncryption"));
     const versions: JoinResponseEncryptedDocKeyVersion[] = [];
-    for (const detail of details) {
-      const encryptedKey = await this.keyBag.encryptAndExportKeyVersion(
-        "doc",
-        this.tenantId,
-        keyId,
-        detail.versionIndex,
-        sharePassword
-      );
-      if (!encryptedKey) {
-        throw new Error(
-          `Failed to export document key "${keyId}" version ${detail.versionIndex} for tenant "${this.tenantId}"`
-        );
-      }
-
-      const { createdAt: encryptedKeyCreatedAt, ...encryptedKeyPayload } = encryptedKey;
+    for (const version of keyVersions) {
       versions.push({
-        createdAt: detail.createdAt ?? encryptedKeyCreatedAt,
-        encryptedKey: encryptedKeyPayload,
+        createdAt: version.createdAt,
+        wrappedKey: await rsa.wrapKeyToBase64(version.key, recipientEncryptionPublicKey),
       });
     }
 
@@ -1485,14 +1468,20 @@ export class BaseMindooTenant implements MindooTenant {
       options.adminPassword,
       undefined,
       deviceLabel,
+      {
+        distributeKeyIds: this.resolveJoinResponseDocKeyIds(options).filter(
+          (keyId) => keyId !== PUBLIC_INFOS_KEY_ID,
+        ),
+      },
     );
 
-    // 2. Export selected document keys encrypted with the share password.
-    // `$publicinfos` is mandatory because the joining user needs it for
-    // directory access; all selected key ids include every rotated version.
+    // 2. Export selected document keys RSA-OAEP-wrapped to the requester's
+    // encryption public key. `$publicinfos` is mandatory because the joining
+    // user needs it for directory access; all selected key ids include every
+    // rotated version.
     const encryptedDocKeys = await Promise.all(
       this.resolveJoinResponseDocKeyIds(options).map((keyId) =>
-        this.exportJoinResponseDocKeyVersions(keyId, options.sharePassword)
+        this.exportJoinResponseDocKeyVersions(keyId, request.encryptionPublicKey)
       )
     );
 
@@ -1500,7 +1489,7 @@ export class BaseMindooTenant implements MindooTenant {
     //    joining device can adopt it instead of keeping a name the directory
     //    does not hold.
     const joinResponse: JoinResponse = {
-      v: 2,
+      v: 3,
       tenantId: this.tenantId,
       adminSigningPublicKey: this.administrationPublicKey,
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
@@ -1522,7 +1511,7 @@ export class BaseMindooTenant implements MindooTenant {
     } else {
       try {
         const directoryDb = await this.openDB("directory", { adminOnlyDb: true });
-        const setupLabel = await readTenantSetupLabel(directoryDb);
+        const setupLabel = await readTenantSetupLabel(directoryDb, this);
         if (setupLabel) {
           joinResponse.tenantLabel = setupLabel;
         }
@@ -2037,14 +2026,14 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   /**
-   * Remove a **named** document key from the local KeyBag. Refuses to delete the
-   * shared tenant default key (`"default"` / {@link DEFAULT_TENANT_KEY_ID}),
-   * which is required for the tenant to function. Returns true if a key was
-   * removed.
+   * Remove a **named** document key from the local KeyBag. Refuses to delete
+   * `$publicinfos` (required for directory access). The tenant `default` key
+   * may be removed when a key-distribution `pullfrom` revokes content access.
+   * Returns true if a key was removed.
    */
   async removeNamedDecryptionKey(decryptionKeyId: string): Promise<boolean> {
-    if (decryptionKeyId === "default" || decryptionKeyId === DEFAULT_TENANT_KEY_ID) {
-      this.logger.debug(`removeNamedDecryptionKey: refusing to delete the tenant default key`);
+    if (decryptionKeyId === PUBLIC_INFOS_KEY_ID) {
+      this.logger.debug(`removeNamedDecryptionKey: refusing to delete the public-infos key`);
       return false;
     }
     try {
@@ -2079,26 +2068,36 @@ export class BaseMindooTenant implements MindooTenant {
   async reconcileKeyDistributionsForCurrentUser(): Promise<{
     imported: string[];
     removed: string[];
+    /** Registered username adopted from grant details after importing `default`. */
+    adoptedUsername?: string;
   }> {
     const username = this.currentUser.username;
     const directory = await this.openDirectory();
     const removed: string[] = [];
     const imported: string[] = [];
 
-    // Revoke pass — no key, no comparison, idempotent.
-    if (typeof directory.getRevokedDecryptionKeyIdsForUser === "function") {
-      let revokedIds: string[] = [];
-      try {
-        revokedIds = await directory.getRevokedDecryptionKeyIdsForUser(username);
-      } catch (error) {
-        this.logger.warn(
-          `reconcileKeyDistributionsForCurrentUser: revoked-id lookup failed: ${error}`,
+    // Revoke pass — no key, no comparison, idempotent. Prefer signing-key
+    // lookup when the local username is empty (nameless device bootstrap).
+    let revokedIds: string[] = [];
+    try {
+      if (
+        !username.trim() &&
+        typeof directory.getRevokedDecryptionKeyIdsForSigningKey === "function"
+      ) {
+        revokedIds = await directory.getRevokedDecryptionKeyIdsForSigningKey(
+          this.currentUser.userSigningKeyPair.publicKey,
         );
+      } else if (typeof directory.getRevokedDecryptionKeyIdsForUser === "function") {
+        revokedIds = await directory.getRevokedDecryptionKeyIdsForUser(username);
       }
-      for (const keyId of revokedIds) {
-        if (await this.removeNamedDecryptionKey(keyId)) {
-          removed.push(keyId);
-        }
+    } catch (error) {
+      this.logger.warn(
+        `reconcileKeyDistributionsForCurrentUser: revoked-id lookup failed: ${error}`,
+      );
+    }
+    for (const keyId of revokedIds) {
+      if (await this.removeNamedDecryptionKey(keyId)) {
+        removed.push(keyId);
       }
     }
 
@@ -2120,7 +2119,49 @@ export class BaseMindooTenant implements MindooTenant {
       }
     }
 
-    return { imported, removed };
+    let adoptedUsername: string | undefined;
+    if (
+      imported.includes(DEFAULT_TENANT_KEY_ID) ||
+      imported.includes("default")
+    ) {
+      adoptedUsername = await this.adoptRegisteredUsernameFromGrant(directory);
+    }
+
+    return { imported, removed, ...(adoptedUsername ? { adoptedUsername } : {}) };
+  }
+
+  /**
+   * After importing the tenant `default` key, decrypt grant `user_details` and
+   * adopt the registered username so local identity matches the directory
+   * (same outcome as join-response `username`).
+   */
+  private async adoptRegisteredUsernameFromGrant(
+    directory: MindooTenantDirectory,
+  ): Promise<string | undefined> {
+    try {
+      if (typeof directory.getUserBySigningPublicKey !== "function") return undefined;
+      const lookup = await directory.getUserBySigningPublicKey(
+        this.currentUser.userSigningKeyPair.publicKey,
+      );
+      const registered =
+        (typeof lookup?.details?.username === "string" && lookup.details.username.trim()) ||
+        (typeof lookup?.username === "string" &&
+        lookup.username.trim() &&
+        // Server-side lookups return username_hash when details are opaque;
+        // only adopt cleartext names (contain '/' for DN form, or non-hex).
+        (lookup.username.includes("/") || !/^[a-f0-9]{64}$/i.test(lookup.username))
+          ? lookup.username.trim()
+          : "");
+      if (!registered || registered === this.currentUser.username) return undefined;
+      this.logger.info(
+        `Adopting registered username "${registered}" (was "${this.currentUser.username}")`,
+      );
+      this.currentUser = { ...this.currentUser, username: registered };
+      return registered;
+    } catch (error) {
+      this.logger.debug(`adoptRegisteredUsernameFromGrant failed: ${error}`);
+      return undefined;
+    }
   }
 
   /**
@@ -2250,16 +2291,17 @@ export class BaseMindooTenant implements MindooTenant {
   /**
    * Remove exactly the key versions of `keyId` whose raw-bytes fingerprint is in
    * `fingerprints` (version-scoped `pullfrom` revocation). Versions obtained
-   * elsewhere — i.e. not in the distribution manifest — survive. Refuses the
-   * protected tenant default / `$publicinfos` keys. The KeyBag change feed
-   * triggers visibility reconciliation (scope purge when nothing remains).
+   * elsewhere — i.e. not in the distribution manifest — survive. Refuses
+   * `$publicinfos` (directory access). The tenant `default` key may be version-
+   * revoked via key distribution. The KeyBag change feed triggers visibility
+   * reconciliation (scope purge when nothing remains).
    * Returns the number of versions removed.
    */
   async removeDecryptionKeyVersionsByFingerprint(
     keyId: string,
     fingerprints: string[],
   ): Promise<number> {
-    if (keyId === "default" || keyId === DEFAULT_TENANT_KEY_ID || keyId === PUBLIC_INFOS_KEY_ID) {
+    if (keyId === PUBLIC_INFOS_KEY_ID) {
       this.logger.debug(`removeDecryptionKeyVersionsByFingerprint: refusing protected key ${keyId}`);
       return 0;
     }

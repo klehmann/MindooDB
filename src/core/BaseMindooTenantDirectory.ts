@@ -238,6 +238,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     administrationPrivateKeyPassword: string,
     userDetails?: DirectoryUserDetails,
     label?: string,
+    options?: { distributeKeyIds?: string[] },
   ): Promise<void> {
     this.logger.info(`Registering user: ${userId.username}`);
 
@@ -262,7 +263,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         extractEncryptionPublicKeys(existingData).includes(userId.userEncryptionPublicKey);
       
       if (keysMatch) {
-        // Same user with same keys - skip re-registration
+        // Same user with same keys - skip re-registration and re-wrap
         this.logger.debug(`User ${userId.username} already registered with same keys, skipping`);
         return;
       }
@@ -283,6 +284,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         [newPair],
         administrationPrivateKey,
         administrationPrivateKeyPassword,
+        options?.distributeKeyIds,
       );
       return;
     }
@@ -366,6 +368,115 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
     
     this.logger.info(`Registered user: ${userId.username}`);
+
+    // Push selected keys (default: tenant default) via key distribution so the
+    // joining device can bootstrap without a join-response URI once the
+    // server delivers `$publicinfos` (docs/accesscontrol.md §13).
+    const distributeKeyIds = options?.distributeKeyIds ?? [DEFAULT_TENANT_KEY_ID];
+    await this.autoDistributeKeysToUser(
+      userId.username,
+      distributeKeyIds,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /**
+   * Merge `username` into `acl_keydistribution_<keyId>` for each distributable
+   * key id (wraps every active device of every pushto user). Skips protected
+   * ids and keys the admin does not hold. Used after grant / device add so
+   * discover-bootstrap can import `default` without a join-response URI.
+   */
+  async autoDistributeKeysToUser(
+    username: string,
+    keyIds: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const filtered = [
+      ...new Set(
+        keyIds
+          .map((id) => (typeof id === "string" ? id.trim() : ""))
+          .filter((id) => id.length > 0 && !PROTECTED_DISTRIBUTION_KEY_IDS.includes(id)),
+      ),
+    ];
+    if (filtered.length === 0) return;
+
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const preparedBy = baseTenant.getAdministrationPublicKey();
+
+    for (const keyId of filtered) {
+      const keyVersions = await this.getKeyVersionManifest(keyId);
+      if (keyVersions.length === 0) {
+        this.logger.debug(
+          `autoDistributeKeysToUser: skipping "${keyId}" — admin KeyBag does not hold it`,
+        );
+        continue;
+      }
+
+      const existing = (await this.listKeyDistributions()).find((v) => v.keyId === keyId);
+      const pushtoNames = new Set<string>(
+        (existing?.pushtoUsernames ?? [])
+          .map((u) => u.trim())
+          .filter((u) => u.length > 0),
+      );
+      pushtoNames.add(username.trim());
+
+      const usernameLower = username.trim().toLowerCase();
+      const pullfromNames = (existing?.pullfromUsernames ?? [])
+        .map((u) => u.trim())
+        .filter((u) => u.length > 0 && u.toLowerCase() !== usernameLower);
+
+      const pushto: KeyDistributionPushRecipient[] = [];
+      for (const pushtoUsername of pushtoNames) {
+        pushto.push(await this.wrapKeyForUserDevices(keyId, pushtoUsername));
+      }
+      const pullfrom: Array<{ username: string; username_hash: string }> = [];
+      for (const pullUsername of pullfromNames) {
+        pullfrom.push({
+          username: pullUsername,
+          username_hash: await this.hashUsernameForWrite(pullUsername),
+        });
+      }
+
+      const title =
+        (typeof existing?.title === "string" && existing.title.trim()) || keyId;
+      const comment =
+        typeof existing?.comment === "string" && existing.comment.trim()
+          ? existing.comment.trim()
+          : undefined;
+
+      await this.publishKeyDistribution(
+        {
+          v: 1,
+          keyId,
+          keyVersions,
+          title,
+          ...(comment ? { comment } : {}),
+          preparedByPublicKey: preparedBy,
+          pushto,
+          pullfrom,
+        },
+        administrationPrivateKey,
+        administrationPrivateKeyPassword,
+      );
+      this.logger.info(`autoDistributeKeysToUser: merged "${username}" into distribution for "${keyId}"`);
+    }
+  }
+
+  /**
+   * Key ids that already list `username` in pushto (plus `default`), so a newly
+   * added device gets re-wrapped material. Protected ids are excluded.
+   */
+  private async keyIdsNeedingDeviceWrap(username: string): Promise<string[]> {
+    const lower = username.trim().toLowerCase();
+    const ids = new Set<string>([DEFAULT_TENANT_KEY_ID]);
+    for (const view of await this.listKeyDistributions()) {
+      if (view.pushtoUsernames?.some((u) => u.trim().toLowerCase() === lower)) {
+        ids.add(view.keyId);
+      }
+    }
+    return [...ids].filter((id) => !PROTECTED_DISTRIBUTION_KEY_IDS.includes(id));
   }
 
   async findGrantAccessDocuments(username: string): Promise<MindooDoc[]> {
@@ -1541,6 +1652,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     keyPairs: GrantKeyPair[],
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
+    distributeKeyIds?: string[],
   ): Promise<void> {
     const now = semanticNow();
     const additions = keyPairs.map((pair) => {
@@ -1564,6 +1676,18 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       (data) => {
         applyKeyPairFields(data, mergeKeyPairs(extractKeyPairs(data), additions));
       },
+    );
+
+    // Re-wrap distributions so the new device gets RSA-wrapped key material.
+    const keyIds =
+      distributeKeyIds !== undefined
+        ? distributeKeyIds
+        : await this.keyIdsNeedingDeviceWrap(username);
+    await this.autoDistributeKeysToUser(
+      username,
+      keyIds,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
     );
   }
 
@@ -2267,6 +2391,22 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     if (this.keyDistributionCache.size === 0) return { imported: [], removed: [] };
 
     const myHashes = new Set(await this.usernameHashCandidates(username));
+    // Nameless / pre-adoption devices: also match via the grant's
+    // identity_hashes / username_hash looked up by signing public key.
+    try {
+      const signingKey = (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+      const lookup = await this.getUserBySigningPublicKey(signingKey);
+      if (lookup) {
+        for (const h of await this.identityHashesForLookup(lookup)) {
+          myHashes.add(h);
+        }
+      }
+    } catch (error) {
+      this.logger.debug(
+        `reconcileKeyDistributionsWithKey: signing-key hash supplement failed: ${error}`,
+      );
+    }
+
     const baseTenant = this.tenant as BaseMindooTenant;
 
     const privateKey = encryptionPrivateCryptoKey;
@@ -2953,13 +3093,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
-   * Hash-space core of the revoked-key blacklist (docs/accesscontrol.md §13):
-   * every `acl_keydistribution_<keyId>` whose `pullfrom_users_hashes` intersects
-   * `myHashes`. Protected ids (the tenant default / public-infos keys) are never
-   * reported. Reads straight from {@link keyDistributionCache} (O(cache size),
-   * no doc scan); the caller must have refreshed it first (both entry points do,
-   * via `updateUnifiedCache` / `getUserBySigningPublicKey`).
-   */
+ * Hash-space core of the revoked-key blacklist (docs/accesscontrol.md §13):
+ * every `acl_keydistribution_<keyId>` whose `pullfrom_users_hashes` intersects
+ * `myHashes`. Protected id `$publicinfos` is never reported. Reads straight from
+ * {@link keyDistributionCache} (O(cache size), no doc scan); the caller must have
+ * refreshed it first (both entry points do, via `updateUnifiedCache` /
+ * `getUserBySigningPublicKey`).
+ */
   private collectRevokedKeyIdsForHashes(myHashes: Set<string>): string[] {
     const revoked: string[] = [];
     for (const [keyId, entry] of this.keyDistributionCache.entries()) {

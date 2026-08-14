@@ -508,7 +508,7 @@ The server uses the `$publicinfos` key to read the directory database and valida
 
 ### Inviting a User (Join Request / Response)
 
-MindooDB uses a three-step handshake to invite new users. The new user generates keys locally (private keys never leave the device), shares a join request containing only public keys, and the admin responds with encrypted symmetric keys protected by a one-time password.
+MindooDB uses a three-step handshake to invite new users. The new user generates keys locally (private keys never leave the device), shares a join request containing only public keys, and the admin responds with the tenant's symmetric keys wrapped to that device's encryption public key (RSA-OAEP). Legacy v2 responses that encrypt keys with a `sharePassword` remain readable.
 
 **Step 1 — New user creates a join request:**
 
@@ -524,14 +524,13 @@ const joinRequest = factory.createJoinRequest(bob, { format: "uri" });
 const joinResponse = await tenant.approveJoinRequest(joinRequest, {
   adminSigningKey: adminUser.userSigningKeyPair.privateKey,
   adminPassword: "admin-pw",
-  sharePassword: "one-time-secret",
   serverUrl: "https://sync.example.com",
   format: "uri",
 });
-// → "mdb://join-response/eyJ2IjoxLCJ0ZW5h..."
+// → "mdb://join-response/eyJ2IjozLCJ0ZW5h..."
 ```
 
-This registers the new user in the directory and encrypts the tenant key and `$publicinfos` key with the `sharePassword`. The admin sends the join response URI through any channel (email, chat, QR code) and communicates the share password separately through a secure channel (phone, in person).
+This registers the new user in the directory and wraps the tenant key and `$publicinfos` key to Bob's `encryptionPublicKey` from the join request. The admin sends the join response URI through any channel (email, chat, QR code). Only the device that created the request can unwrap the keys.
 
 **Step 3 — New user joins the tenant:**
 
@@ -539,11 +538,10 @@ This registers the new user in the directory and encrypts the tenant key and `$p
 const { tenant: bobTenant } = await factory.joinTenant(joinResponse, {
   user: bob,
   password: "bob-pw",
-  sharePassword: "one-time-secret",
 });
 ```
 
-The `mdb://` URIs are base64url-encoded JSON payloads with a version field for forward compatibility. The join request contains `{ v, username, signingPublicKey, encryptionPublicKey }`. The join response contains `{ v, tenantId, adminSigningPublicKey, adminEncryptionPublicKey, serverUrl, encryptedTenantKey, encryptedPublicInfosKey }`.
+The `mdb://` URIs are base64url-encoded JSON payloads with a version field for forward compatibility. The join request contains `{ v, username, signingPublicKey, encryptionPublicKey }`. A v3 join response contains `{ v, tenantId, adminSigningPublicKey, adminEncryptionPublicKey, serverUrl, keys: [{ keyId, versions: [{ wrappedKey }] }] }`. Legacy v2 responses still use `encryptedKey` plus a `sharePassword` on `joinTenant`.
 
 ### Document Lifecycle
 
