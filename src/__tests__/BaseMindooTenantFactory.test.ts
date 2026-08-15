@@ -183,7 +183,8 @@ describe("BaseMindooTenantFactory", () => {
       expect(result.appUser).toBe(appUser);
       expect(await result.keyBag.get("doc", tenantId, "default")).toBeDefined();
       expect(await result.keyBag.get("doc", tenantId, "$publicinfos")).toBeDefined();
-      await expect(result.tenant.openDirectory()).resolves.toBeDefined();
+      const directory = await result.tenant.openDirectory();
+      expect(await directory.listKnownDBIds()).toEqual(["directory"]);
 
       createUserIdSpy.mockRestore();
       console.timeEnd("BaseMindooTenantFactory.reusesExistingIdentities");

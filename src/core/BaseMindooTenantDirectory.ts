@@ -3743,7 +3743,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
     await this.updateUnifiedCache();
 
-    const known = new Set<string>(["directory", "main"]);
+    const known = new Set<string>(["directory"]);
     for (const dbId of this.dbSettingsCache.keys()) {
       known.add(dbId);
     }

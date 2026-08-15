@@ -3516,10 +3516,10 @@ export interface MindooTenantDirectory {
    * Returns the database IDs currently known to the directory.
    *
    * This is intended for admin tooling and overview UIs. The result always includes
-   * `"directory"` and will also include `"main"` as the conventional default app DB.
-   * Additional DBs are discovered from `dbsettings` documents stored in the directory.
+   * `"directory"`. Additional DBs are discovered from `dbsettings` documents stored
+   * in the directory.
    *
-   * @returns The database ids known to the directory (always including `"directory"` and `"main"`).
+   * @returns The database ids known to the directory (always including `"directory"`).
    */
   listKnownDBIds(): Promise<string[]>;
 
