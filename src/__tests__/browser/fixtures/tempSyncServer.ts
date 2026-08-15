@@ -173,6 +173,7 @@ export async function startTempSyncServer(options: StartServerOptions = {}): Pro
   remote.setSyncAuthOverride({
     username: result.adminUser.username,
     signingKey: await decryptUserSigningKey(cryptoAdapter, result.adminUser, "browser-tenant-admin-pass"),
+    signingPublicKey: result.adminUser.userSigningKeyPair.publicKey,
   });
   try {
     await directoryDb.pushChangesTo(remote);

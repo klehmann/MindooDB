@@ -1239,6 +1239,7 @@ describe("System Admin Security", () => {
       remote.setSyncAuthOverride({
         username: result.adminUser.username,
         signingKey: adminSigningKey,
+        signingPublicKey: result.adminUser.userSigningKeyPair.publicKey,
       });
       try {
         await directoryDb.pushChangesTo(remote);

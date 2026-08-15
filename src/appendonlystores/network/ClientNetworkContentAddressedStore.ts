@@ -79,6 +79,8 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   private syncAuthOverride: {
     username: string;
     signingKey: CryptoKey;
+    /** PEM for the override signing key — must match `signingKey` for challenge auth. */
+    signingPublicKey?: string;
     privateEncryptionKey?: CryptoKey | string;
   } | null = null;
   private _syncAbortSignal?: AbortSignal;
@@ -756,12 +758,14 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     const authUsername = this.getActiveAuthUsername();
     this.logger.debug(`Authenticating user: ${authUsername}`);
 
-    // Request a challenge. Prefer a non-empty username; always attach this
-    // device's signing public key when known so multi-device grants can be
-    // checked before the client signs (second-device join / directory lag).
+    // Request a challenge. Prefer a non-empty username; always attach the
+    // signing public key that will actually sign (override PEM when set, else
+    // the store's default device PEM) so multi-device grants can be checked
+    // before the client signs.
+    const challengeSigningPublicKey = this.getActiveSigningPublicKeyPem();
     const challenge = await this.transport.requestChallenge(
       authUsername.trim() ? authUsername : undefined,
-      this.signingPublicKeyPem ? { signingPublicKey: this.signingPublicKeyPem } : undefined,
+      challengeSigningPublicKey ? { signingPublicKey: challengeSigningPublicKey } : undefined,
     );
     this.logger.debug(`Received challenge: ${challenge}`);
 
@@ -1001,16 +1005,29 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   /**
    * Set or clear a temporary per-sync authentication override.
    * Intended for bootstrap scenarios (for example authenticating as admin).
+   *
+   * When overriding, pass `signingPublicKey` (PEM) for the same key material as
+   * `signingKey`. Auth challenges bind username + device key; leaving the
+   * store's default PEM in place while signing with a different key causes the
+   * server to reject the challenge as an unknown device.
    */
   setSyncAuthOverride(
     override: {
       username: string;
       signingKey: CryptoKey;
+      signingPublicKey?: string;
       privateEncryptionKey?: CryptoKey | string;
     } | null
   ): void {
     const previousUsername = this.getActiveAuthUsername();
-    this.syncAuthOverride = override;
+    this.syncAuthOverride = override
+      ? {
+          ...override,
+          ...(typeof override.signingPublicKey === "string" && override.signingPublicKey.trim()
+            ? { signingPublicKey: override.signingPublicKey.trim() }
+            : {}),
+        }
+      : null;
     // Changing auth identity requires token refresh.
     this.clearAuthCache();
     this.clearSharedAuthenticationState(previousUsername);
@@ -1031,6 +1048,14 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
 
   private getActiveSigningKey(): CryptoKey {
     return this.syncAuthOverride?.signingKey ?? this.signingKey;
+  }
+
+  private getActiveSigningPublicKeyPem(): string | undefined {
+    const fromOverride = this.syncAuthOverride?.signingPublicKey;
+    if (typeof fromOverride === "string" && fromOverride.trim().length > 0) {
+      return fromOverride.trim();
+    }
+    return this.signingPublicKeyPem;
   }
 
   private getActivePrivateEncryptionKey(): CryptoKey | string {

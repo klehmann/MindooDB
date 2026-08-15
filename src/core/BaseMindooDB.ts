@@ -13656,6 +13656,7 @@ export class BaseMindooDB implements MindooDB {
       setSyncAuthOverride?: (override: {
         username: string;
         signingKey: CryptoKey;
+        signingPublicKey?: string;
         privateEncryptionKey?: CryptoKey | string;
       } | null) => void;
       clearSyncAuthOverride?: () => void;
@@ -13698,10 +13699,13 @@ export class BaseMindooDB implements MindooDB {
       ["decrypt"]
     );
 
-    // Activate temporary override on the remote store.
+    // Activate temporary override on the remote store. Include the public PEM
+    // so the auth challenge names the same device key that will sign — otherwise
+    // the server rejects bootstrap pushes as an unknown device key.
     overrideCapableStore.setSyncAuthOverride({
       username: override.user.username,
       signingKey,
+      signingPublicKey: override.user.userSigningKeyPair.publicKey,
       privateEncryptionKey: encryptionKey,
     });
 

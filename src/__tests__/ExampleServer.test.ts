@@ -617,8 +617,12 @@ describe("MindooDB Example Server", () => {
     }, 60000);
 
     test("should allow bootstrap directory push with admin networkAuthOverride", async () => {
-      // Purpose: verify bootstrap-deadlock resolution by proving that only a
-      // per-sync admin override can perform the first directory grant push.
+      // Reproduces Haven "Push tenant to server": after publishToServer the
+      // directory is empty on the server, so the first push must authenticate as the
+      // tenant admin (bootstrap identity in config.json). Regression: connectToServer
+      // attaches the *current* (app) user signingPublicKey to challenges; an admin
+      // networkAuthOverride that only swapped the private key left that PEM stale and
+      // the server replied "signing key is not yet in the tenant directory".
       const localStoreFactory = new InMemoryContentAddressedStoreFactory();
       const localFactory = new BaseMindooTenantFactory(localStoreFactory, cryptoAdapter);
 
