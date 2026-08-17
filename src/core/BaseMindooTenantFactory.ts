@@ -36,7 +36,11 @@ import { encodeJoinRequestUri } from "./uri/joinRequestUri";
 import { validateTenantId } from "./tenantIdValidation";
 import { semanticNow } from "./utils/timeSource";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
-import { readTenantSetupLabel, writeTenantSetupLabel } from "./tenantSetup";
+import {
+  readTenantSetupLabel,
+  writeTenantSetupAdministrator,
+  writeTenantSetupLabel,
+} from "./tenantSetup";
 import { StoreKind } from "./appendonlystores/types";
 
 /**
@@ -565,16 +569,33 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
 
     const tenantLabel =
       typeof options.tenantLabel === "string" ? options.tenantLabel.trim() : "";
+    const setupDb = await tenant.openDB("directory", { adminOnlyDb: true });
     if (tenantLabel) {
-      const directoryDb = await tenant.openDB("directory", { adminOnlyDb: true });
       await writeTenantSetupLabel(
-        directoryDb,
+        setupDb,
         tenantLabel,
         adminUser.userSigningKeyPair,
         options.adminPassword,
         tenant,
       );
     }
+    // The admin holds no grantaccess document, so `tenantsetup` is the only
+    // place members can learn who administers the tenant.
+    await writeTenantSetupAdministrator(
+      setupDb,
+      {
+        username: adminUser.username,
+        keyPairs: [
+          {
+            signingPublicKey: adminUser.userSigningKeyPair.publicKey,
+            encryptionPublicKey: adminUser.userEncryptionKeyPair.publicKey,
+          },
+        ],
+      },
+      adminUser.userSigningKeyPair,
+      options.adminPassword,
+      tenant,
+    );
 
     console.log(`[createTenant] ✓ Tenant "${tenantId}" created successfully`);
     this.logger.info(`Tenant "${tenantId}" created successfully`);
@@ -828,6 +849,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
 
     let user = options.user;
     let bootstrapTenantLabel: string | undefined;
+    let bootstrapAdminUsername: string | undefined;
     const wrappedJoinResponse =
       typeof delivery.wrappedJoinResponse === "string" ? delivery.wrappedJoinResponse.trim() : "";
     if (wrappedJoinResponse) {
@@ -841,6 +863,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
           user = { ...user, username: registeredUsername };
         }
         if (bootstrap.tenantLabel) bootstrapTenantLabel = bootstrap.tenantLabel;
+        if (bootstrap.adminUsername) bootstrapAdminUsername = bootstrap.adminUsername;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(
@@ -921,6 +944,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       keyBag,
       user,
       ...(tenantLabel ? { tenantLabel } : {}),
+      ...(bootstrapAdminUsername ? { adminUsername: bootstrapAdminUsername } : {}),
     };
   }
 

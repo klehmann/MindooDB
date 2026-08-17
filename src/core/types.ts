@@ -579,8 +579,8 @@ export interface DeviceTenantDelivery {
   wrappedPublicInfosKeys?: string[];
   /**
    * Per-device join bootstrap from the grant (`userKeyPairs[].joinResponseWrapped`):
-   * username + optional tenantLabel, RSA-hybrid-encrypted to this device.
-   * Opaque to the server; the joining device unwraps it locally.
+   * username + optional tenantLabel/adminUsername, RSA-hybrid-encrypted to this
+   * device. Opaque to the server; the joining device unwraps it locally.
    */
   wrappedJoinResponse?: string;
   username_hash?: string;
@@ -612,6 +612,12 @@ export interface BootstrapTenantFromDeliveryResult {
   user: PrivateUserId;
   /** Display label after `default` import + `tenantsetup` decrypt, if available. */
   tenantLabel?: string;
+  /**
+   * Display name of the approving admin, snapshotted into the per-device join
+   * bootstrap at approve time. Absent for grants written before this field or
+   * when the admin approved without passing a name.
+   */
+  adminUsername?: string;
 }
 
 /**
@@ -2735,10 +2741,11 @@ export interface DirectoryUserLookup {
    */
   identityHashesV?: number;
   /**
-   * RSA-hybrid ciphertext of `{ username, tenantLabel? }` wrapped to this
-   * device's encryption public key. `$publicinfos`-readable (the server
-   * forwards it during discovery) but not decryptable without the device
-   * private key. Absent on grants written before per-device join bootstrap.
+   * RSA-hybrid ciphertext of `{ username, tenantLabel?, adminUsername? }`
+   * wrapped to this device's encryption public key. `$publicinfos`-readable
+   * (the server forwards it during discovery) but not decryptable without the
+   * device private key. Absent on grants written before per-device join
+   * bootstrap.
    */
   joinResponseWrapped?: string;
 }
@@ -2787,9 +2794,10 @@ export interface GrantKeyPair {
    */
   revokedAt?: number;
   /**
-   * RSA-hybrid ciphertext of `{ username, tenantLabel? }` wrapped to this
-   * device's encryption public key. Lives on the `$publicinfos` grant envelope
-   * so discovery can deliver the registered name without `default`.
+   * RSA-hybrid ciphertext of `{ username, tenantLabel?, adminUsername? }`
+   * wrapped to this device's encryption public key. Lives on the `$publicinfos`
+   * grant envelope so discovery can deliver the registered name without
+   * `default`.
    */
   joinResponseWrapped?: string;
 }

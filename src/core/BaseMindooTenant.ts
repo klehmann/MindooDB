@@ -52,7 +52,7 @@ import { buildDomainStatementBytes } from "./crypto/DomainStatement";
 import { entryTrustedTime } from "./storeEntryTime";
 import { computeContentHash } from "./utils/idGeneration";
 import { semanticNow } from "./utils/timeSource";
-import { readTenantSetupLabel } from "./tenantSetup";
+import { ensureTenantSetupAdministrator, readTenantSetupLabel } from "./tenantSetup";
 import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { encodeMindooURI, isMindooURI } from "./uri/MindooURI";
@@ -1783,7 +1783,11 @@ export class BaseMindooTenant implements MindooTenant {
     const rsa = new RSAEncryption(this.cryptoAdapter, this.logger.createChild("RSAEncryption"));
     const wrappedJoinResponse = await wrapDeviceJoinBootstrap(
       rsa,
-      { username, tenantLabel: joinResponse.tenantLabel },
+      {
+        username,
+        tenantLabel: joinResponse.tenantLabel,
+        adminUsername: joinResponse.adminUsername,
+      },
       request.encryptionPublicKey,
     );
     await (directory as BaseMindooTenantDirectory).attachDeviceJoinBootstrap(
@@ -1793,6 +1797,41 @@ export class BaseMindooTenant implements MindooTenant {
       options.adminSigningKey,
       options.adminPassword,
     );
+
+    // Tenants created before `tenantsetup` recorded administrators have no
+    // entry, leaving members with a fingerprint instead of a name. A grant is
+    // where the admin supplies both its name and its keys, so heal it here.
+    if (options.adminUsername) {
+      try {
+        const directoryDb = await this.openDB("directory", { adminOnlyDb: true });
+        const written = await ensureTenantSetupAdministrator(
+          directoryDb,
+          {
+            username: options.adminUsername,
+            keyPairs: [
+              {
+                signingPublicKey: this.administrationPublicKey,
+                encryptionPublicKey: this.administrationEncryptionPublicKey,
+              },
+            ],
+          },
+          { publicKey: this.administrationPublicKey, privateKey: options.adminSigningKey },
+          options.adminPassword,
+          this,
+        );
+        if (written) {
+          this.logger.info(
+            `approveJoinRequest: recorded administrator "${options.adminUsername}" in tenantsetup`,
+          );
+        }
+      } catch (error) {
+        this.logger.warn(
+          `approveJoinRequest: recording the administrator in tenantsetup failed: ${
+            error instanceof Error ? error.message : error
+          }`,
+        );
+      }
+    }
 
     console.log(`[approveJoinRequest] ✓ Join request approved for user "${username}"`);
     this.logger.info(`Join request approved for user: ${username}`);

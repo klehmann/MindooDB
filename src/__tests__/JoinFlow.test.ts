@@ -157,6 +157,7 @@ describe("Join Flow (convenience API)", () => {
       joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
+        adminUsername: "cn=admin/o=test-join-obj",
       });
 
       // Step 4: User2 joins the tenant
@@ -218,6 +219,7 @@ describe("Join Flow (convenience API)", () => {
       );
       expect(bootstrap.username).toBe("cn=bob/o=test-join-obj");
       expect(bootstrap.tenantLabel).toBe("Join Object Lab");
+      expect(bootstrap.adminUsername).toBe("cn=admin/o=test-join-obj");
     });
 
     it("bootstrapTenantFromDelivery adopts username from wrappedJoinResponse", async () => {
@@ -244,6 +246,7 @@ describe("Join Flow (convenience API)", () => {
       );
       expect(boot.user.username).toBe("cn=bob/o=test-join-obj");
       expect(boot.tenantLabel).toBe("Join Object Lab");
+      expect(boot.adminUsername).toBe("cn=admin/o=test-join-obj");
     });
 
     it("should auto-publish acl_keydistribution_default for the joiner", async () => {

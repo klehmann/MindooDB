@@ -15,8 +15,18 @@ export {
 } from "./builtinDbInvariants";
 export * from "./userkeys";
 export * from "./tenantIdValidation";
-export { readTenantSetupLabel, writeTenantSetupLabel } from "./tenantSetup";
-export type { TenantSetupData } from "./tenantSetup";
+export {
+  readTenantSetupLabel,
+  writeTenantSetupLabel,
+  readTenantSetupAdministrators,
+  writeTenantSetupAdministrator,
+  ensureTenantSetupAdministrator,
+} from "./tenantSetup";
+export type {
+  TenantSetupData,
+  TenantAdministrator,
+  TenantAdministratorData,
+} from "./tenantSetup";
 
 // Access-control directory schema + time-travel state (docs/accesscontrol.md
 // §6/§8). Surfaced so consumers (e.g. the Haven directory-history UI) can read

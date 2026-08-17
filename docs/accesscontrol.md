@@ -382,6 +382,25 @@ still apply.
 | Per-database policy | `acl_dbpolicy_<dbid>` | per DB |
 | Trusted witness entry | `acl_trustedwitness_<fingerprint>` | per witness |
 | ACL rule | `acl_rule_<ruleId>` | per rule |
+| Tenant label + administrators | `tenantsetup` | yes |
+
+> **`tenantsetup`.** Written at tenant creation and on every admin rename
+> (`src/core/tenantSetup.ts`). The document itself is `$publicinfos`-encrypted so
+> it reaches every member, but its display strings are field-encrypted under
+> `default`: `label_encrypted` for the tenant label and, per entry in the
+> `administrators` array, `username_encrypted` for the admin's name. Each entry
+> also carries that admin's device keys in the same `userKeyPairs` shape a grant
+> uses (§6.5), so the same extractors read both. An admin has no grant document
+> of its own, so this list is what lets a member name the administration key
+> instead of showing a fingerprint — and it is where additional admins or admin
+> devices will be recorded.
+>
+> **Healing older tenants.** Tenants created before the `administrators` field
+> have no entry. `approveJoinRequest` therefore calls
+> `ensureTenantSetupAdministrator` with the `adminUsername` it was given: a grant
+> is where the admin supplies both its name and its keys anyway. The write only
+> happens when the entry is missing or incomplete, so repeated grants add no
+> no-op revision, and a failure is logged without failing the approval.
 
 > **Encryption choice.** Every field the **server** must evaluate for Tier 1
 > (`users_hashes`, `dbid`, `type`, `action`, group `members_hashes`, witness keys,

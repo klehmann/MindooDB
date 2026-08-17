@@ -174,7 +174,7 @@ The join response contains the tenant ID, admin public keys, the server URL, and
 
 > **Security note:** A v3 join response is bound to the requesting device. An intercepted URI cannot be imported on another device, because only Bob's encryption private key can unwrap the document keys. Legacy v2 responses that used a separate `sharePassword` remain readable.
 >
-> **URL-only bootstrap:** After Alice approves and syncs the directory to the server, Bob can also connect with only the server URL. `discoverTenantsOnServer` + `bootstrapTenantFromDelivery` prove Bob's device signing key, deliver RSA-wrapped `$publicinfos` plus the per-device join bootstrap (username / tenant label), pull the directory, and import `default` from `acl_keydistribution_default` once an existing device has wrapped it to Bob's User-Key. The join-response URI remains the airgap / older-server fallback.
+> **URL-only bootstrap:** After Alice approves and syncs the directory to the server, Bob can also connect with only the server URL. `discoverTenantsOnServer` + `bootstrapTenantFromDelivery` prove Bob's device signing key, deliver RSA-wrapped `$publicinfos` plus the per-device join bootstrap (username / tenant label / admin name), pull the directory, and import `default` from `acl_keydistribution_default` once an existing device has wrapped it to Bob's User-Key. The join-response URI remains the airgap / older-server fallback.
 
 ### 4c. Bob joins the tenant
 

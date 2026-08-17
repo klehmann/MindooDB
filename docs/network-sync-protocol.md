@@ -182,7 +182,7 @@ When a client only knows a server URL (no join-response URI), it can prove posse
 1. `POST /device/challenge` `{ signingPublicKey }` → short-lived nonce (rate-limited).
 2. `POST /device/discover` `{ challenge, signature }` → Ed25519 verify, then scan local tenants for an active grant containing that signing key.
 
-Each match returns `tenantId`, admin public keys, `$publicinfos` RSA-OAEP-wrapped to the grant's device encryption public key, and (when present on the grant) `wrappedJoinResponse` — the registered username and optional tenant label RSA-hybrid-encrypted to that same device. The client unwraps `$publicinfos`, adopts the username from the join bootstrap so the local identity matches the directory, opens the tenant, pulls the directory, and later imports `default` via key distribution. Join-response URIs remain supported for air-gapped / older servers.
+Each match returns `tenantId`, admin public keys, `$publicinfos` RSA-OAEP-wrapped to the grant's device encryption public key, and (when present on the grant) `wrappedJoinResponse` — the registered username plus the optional tenant label and admin display name, RSA-hybrid-encrypted to that same device. The client unwraps `$publicinfos`, adopts the username from the join bootstrap so the local identity matches the directory, opens the tenant, pulls the directory, and later imports `default` via key distribution. Join-response URIs remain supported for air-gapped / older servers.
 
 ---
 

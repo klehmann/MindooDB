@@ -1,8 +1,9 @@
 import type { RSAEncryption } from "../crypto/RSAEncryption";
 
 /**
- * Discovery-usable slice of a join response: the registered username (and
- * optional tenant label) RSA-hybrid-encrypted to one granted device.
+ * Discovery-usable slice of a join response: the registered username (plus the
+ * optional tenant label and admin name) RSA-hybrid-encrypted to one granted
+ * device.
  *
  * Stored on that device's `userKeyPairs[]` entry in the `$publicinfos` grant
  * so the server can forward the ciphertext during device discovery without
@@ -11,6 +12,12 @@ import type { RSAEncryption } from "../crypto/RSAEncryption";
 export interface DeviceJoinBootstrap {
   username: string;
   tenantLabel?: string;
+  /**
+   * Display name of the approving admin. The admin holds no grantaccess
+   * document, so a device that joins through discovery has no other way to
+   * learn the name and would have to show a key fingerprint instead.
+   */
+  adminUsername?: string;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -29,6 +36,9 @@ export async function wrapDeviceJoinBootstrap(
   const body: DeviceJoinBootstrap = { username };
   const tenantLabel = typeof payload.tenantLabel === "string" ? payload.tenantLabel.trim() : "";
   if (tenantLabel) body.tenantLabel = tenantLabel;
+  const adminUsername =
+    typeof payload.adminUsername === "string" ? payload.adminUsername.trim() : "";
+  if (adminUsername) body.adminUsername = adminUsername;
   return rsa.encryptToBase64(new TextEncoder().encode(JSON.stringify(body)), encryptionPublicKey);
 }
 
@@ -44,5 +54,10 @@ export async function unwrapDeviceJoinBootstrap(
     throw new Error("Device join bootstrap is missing username");
   }
   const tenantLabel = isNonEmptyString(parsed.tenantLabel) ? parsed.tenantLabel.trim() : "";
-  return tenantLabel ? { username, tenantLabel } : { username };
+  const adminUsername = isNonEmptyString(parsed.adminUsername) ? parsed.adminUsername.trim() : "";
+  return {
+    username,
+    ...(tenantLabel ? { tenantLabel } : {}),
+    ...(adminUsername ? { adminUsername } : {}),
+  };
 }
