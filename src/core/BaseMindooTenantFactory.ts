@@ -528,12 +528,14 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     if (typeof tenant.reconcileUserKeys === "function") {
       await tenant.reconcileUserKeys({ allowSelfCreate: true });
     }
-    await directory.autoDistributeKeysToUser(
-      this.toPublicUserId(appUser).username,
-      [DEFAULT_TENANT_KEY_ID],
-      adminUser.userSigningKeyPair.privateKey,
-      options.adminPassword,
-    );
+    if (typeof directory.autoDistributeKeysToUser === "function") {
+      await directory.autoDistributeKeysToUser(
+        this.toPublicUserId(appUser).username,
+        [DEFAULT_TENANT_KEY_ID],
+        adminUser.userSigningKeyPair.privateKey,
+        options.adminPassword,
+      );
+    }
 
     // 5. Enforce the v2 storage format from creation (default on). We write an
     //    admin-signed default policy carrying `requireMetadataSignatureSince =
