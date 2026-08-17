@@ -42,6 +42,7 @@ import { openBundle } from "./userkeys/sealedCrypto";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
+import { wrapDeviceJoinBootstrap } from "./join/deviceJoinBootstrap";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import {
   importEd25519PublicKeyFromPem,
@@ -1733,6 +1734,20 @@ export class BaseMindooTenant implements MindooTenant {
         // Best-effort: older tenants or missing setup doc.
       }
     }
+
+    const rsa = new RSAEncryption(this.cryptoAdapter, this.logger.createChild("RSAEncryption"));
+    const wrappedJoinResponse = await wrapDeviceJoinBootstrap(
+      rsa,
+      { username, tenantLabel: joinResponse.tenantLabel },
+      request.encryptionPublicKey,
+    );
+    await (directory as BaseMindooTenantDirectory).attachDeviceJoinBootstrap(
+      username,
+      request.signingPublicKey,
+      wrappedJoinResponse,
+      options.adminSigningKey,
+      options.adminPassword,
+    );
 
     console.log(`[approveJoinRequest] ✓ Join request approved for user "${username}"`);
     this.logger.info(`Join request approved for user: ${username}`);

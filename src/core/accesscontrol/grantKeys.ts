@@ -6,7 +6,7 @@
  * Active devices and revoked devices live in TWO SEPARATE lists:
  *
  *  - `userKeyPairs`: the ACTIVE device key pairs, an array of
- *    `{ signingPublicKey, encryptionPublicKey, label?, addedAt? }` objects.
+ *    `{ signingPublicKey, encryptionPublicKey, label?, addedAt?, joinResponseWrapped? }` objects.
  *    Pairing the keys per device keeps a device's signing and encryption keys
  *    together and lets each carry an optional human-readable label and the
  *    trusted-time it was added. This is the canonical list the server/auth
@@ -100,6 +100,8 @@ function parsePairEntries(value: unknown, markRevoked: boolean): GrantKeyPair[] 
     const pair: GrantKeyPair = { signingPublicKey, encryptionPublicKey };
     if (label !== undefined) pair.label = label;
     if (typeof rec.addedAt === "number") pair.addedAt = rec.addedAt;
+    const joinResponseWrapped = asScalarString(rec.joinResponseWrapped);
+    if (joinResponseWrapped) pair.joinResponseWrapped = joinResponseWrapped;
     if (markRevoked) {
       pair.revoked = true;
       if (typeof rec.revokedAt === "number") pair.revokedAt = rec.revokedAt;
@@ -210,6 +212,9 @@ export function applyKeyPairFields(data: Record<string, unknown>, pairs: GrantKe
       entry.label = pair.label;
     }
     entry.addedAt = typeof pair.addedAt === "number" ? pair.addedAt : Date.now();
+    if (typeof pair.joinResponseWrapped === "string" && pair.joinResponseWrapped.length > 0) {
+      entry.joinResponseWrapped = pair.joinResponseWrapped;
+    }
     return entry;
   });
 
@@ -224,6 +229,9 @@ export function applyKeyPairFields(data: Record<string, unknown>, pairs: GrantKe
       entry.label = pair.label;
     }
     entry.addedAt = typeof pair.addedAt === "number" ? pair.addedAt : Date.now();
+    if (typeof pair.joinResponseWrapped === "string" && pair.joinResponseWrapped.length > 0) {
+      entry.joinResponseWrapped = pair.joinResponseWrapped;
+    }
     if (typeof pair.revokedAt === "number") {
       entry.revokedAt = pair.revokedAt;
     }
@@ -256,11 +264,18 @@ export function mergeKeyPairs(existing: GrantKeyPair[], additional: GrantKeyPair
   for (const pair of existing) merged.set(pair.signingPublicKey, pair);
   for (const pair of additional) {
     const previous = merged.get(pair.signingPublicKey);
-    if (previous && pair.addedAt === undefined && previous.addedAt !== undefined) {
-      merged.set(pair.signingPublicKey, { ...pair, addedAt: previous.addedAt });
-    } else {
+    if (!previous) {
       merged.set(pair.signingPublicKey, pair);
+      continue;
     }
+    const next: GrantKeyPair = { ...pair };
+    if (pair.addedAt === undefined && previous.addedAt !== undefined) {
+      next.addedAt = previous.addedAt;
+    }
+    if (!pair.joinResponseWrapped && previous.joinResponseWrapped) {
+      next.joinResponseWrapped = previous.joinResponseWrapped;
+    }
+    merged.set(pair.signingPublicKey, next);
   }
   return Array.from(merged.values());
 }

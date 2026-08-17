@@ -1,12 +1,14 @@
 /**
  * Server-wide device discovery: prove possession of a device signing key,
  * then scan all tenants for an active grant and deliver RSA-wrapped
- * `$publicinfos` plus admin public keys — no join-response URI required.
+ * `$publicinfos` plus admin public keys and the per-device join bootstrap —
+ * no join-response URI required.
  */
 
 import { v7 as uuidv7 } from "uuid";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
+import type { DeviceTenantDelivery } from "../../core/types";
 import type { TenantManager } from "./TenantManager";
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
@@ -20,19 +22,7 @@ interface DeviceChallenge {
   used: boolean;
 }
 
-/** One tenant the device may bootstrap into. */
-export interface DeviceTenantDelivery {
-  tenantId: string;
-  adminSigningPublicKey: string;
-  adminEncryptionPublicKey: string;
-  /** AES `$publicinfos` wrapped to the grant device encryption public key (base64). */
-  wrappedPublicInfosKey: string;
-  /** All `$publicinfos` versions, oldest first. `wrappedPublicInfosKey` is the newest. */
-  wrappedPublicInfosKeys?: string[];
-  /** Optional `$publicinfos`-readable hashes from the grant (saves a client scan). */
-  username_hash?: string;
-  identity_hashes?: string[];
-}
+export type { DeviceTenantDelivery };
 
 export interface DeviceDiscoverResult {
   tenants: DeviceTenantDelivery[];
@@ -113,6 +103,7 @@ export class DeviceDiscoveryService {
       encryptionPublicKey: string;
       username_hash?: string;
       identity_hashes?: string[];
+      joinResponseWrapped?: string;
     };
     const matches: Match[] = [];
 
@@ -132,6 +123,10 @@ export class DeviceDiscoveryService {
               ? lookup.username
               : undefined,
           identity_hashes: lookup.identityHashes,
+          joinResponseWrapped:
+            typeof lookup.joinResponseWrapped === "string" && lookup.joinResponseWrapped.trim()
+              ? lookup.joinResponseWrapped.trim()
+              : undefined,
         });
       } catch {
         // Tenant missing directory / not loadable — skip.
@@ -163,6 +158,9 @@ export class DeviceDiscoveryService {
             wrappedPublicInfosKey,
             ...(wrappedPublicInfosKeys.length > 1
               ? { wrappedPublicInfosKeys }
+              : {}),
+            ...(match.joinResponseWrapped
+              ? { wrappedJoinResponse: match.joinResponseWrapped }
               : {}),
             ...(match.username_hash ? { username_hash: match.username_hash } : {}),
             ...(match.identity_hashes?.length

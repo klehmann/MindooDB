@@ -26,6 +26,7 @@ import { decryptPrivateKey as decryptPrivateKeyWithPassword, encryptPrivateKey a
 import { generateRsaOaep3072 } from "./crypto/rsaOaep3072";
 import { USERKEY_PRIVATE_SALT } from "./userkeys/types";
 import { RSAEncryption } from "./crypto/RSAEncryption";
+import { unwrapDeviceJoinBootstrap } from "./join/deviceJoinBootstrap";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbkdf2Iterations";
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
@@ -747,7 +748,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
 
   /**
    * Bootstrap a tenant from a device-discovery delivery: unwrap `$publicinfos`,
-   * open the tenant, optionally pull the directory and reconcile distributions.
+   * adopt the registered username from the per-device join bootstrap (when
+   * present), open the tenant, optionally pull the directory and reconcile
+   * distributions.
    */
   async bootstrapTenantFromDelivery(
     delivery: DeviceTenantDelivery,
@@ -800,6 +803,27 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     }
 
     let user = options.user;
+    let bootstrapTenantLabel: string | undefined;
+    const wrappedJoinResponse =
+      typeof delivery.wrappedJoinResponse === "string" ? delivery.wrappedJoinResponse.trim() : "";
+    if (wrappedJoinResponse) {
+      try {
+        const bootstrap = await unwrapDeviceJoinBootstrap(rsa, wrappedJoinResponse, decryptKey);
+        const registeredUsername = bootstrap.username.trim();
+        if (registeredUsername.length > 0 && registeredUsername !== user.username) {
+          this.logger.info(
+            `Adopting registered username "${registeredUsername}" from device join bootstrap (was "${user.username}")`,
+          );
+          user = { ...user, username: registeredUsername };
+        }
+        if (bootstrap.tenantLabel) bootstrapTenantLabel = bootstrap.tenantLabel;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Cannot unwrap device join bootstrap: it is bound to a different device's encryption key (${message})`,
+        );
+      }
+    }
     const tenant = await this.openTenant(
       delivery.tenantId,
       delivery.adminSigningPublicKey,
@@ -837,12 +861,13 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       }
     }
 
-    let tenantLabel: string | undefined;
+    let tenantLabel = bootstrapTenantLabel;
     try {
       const directoryDb = await tenant.openDB("directory", { adminOnlyDb: true });
-      tenantLabel = await readTenantSetupLabel(directoryDb, tenant);
+      const liveLabel = await readTenantSetupLabel(directoryDb, tenant);
+      if (liveLabel) tenantLabel = liveLabel;
     } catch {
-      // Label needs `default`; may still be missing before distribution sync.
+      // Label needs `default`; the join-bootstrap snapshot is the fallback.
     }
 
     return {

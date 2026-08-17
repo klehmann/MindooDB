@@ -398,5 +398,29 @@ describe("access-control schema", () => {
         { signingPublicKey: "revoked1", encryptionPublicKey: "enc2", revoked: true, revokedAt: 5 },
       ]);
     });
+
+    it("round-trips joinResponseWrapped on active pairs and preserves it on merge", () => {
+      const data: Record<string, unknown> = {};
+      applyKeyPairFields(data, [
+        {
+          signingPublicKey: "sign1",
+          encryptionPublicKey: "enc1",
+          joinResponseWrapped: "wrapped-blob",
+        },
+      ]);
+      expect(extractActiveKeyPairs(data)).toEqual([
+        {
+          signingPublicKey: "sign1",
+          encryptionPublicKey: "enc1",
+          addedAt: expect.any(Number),
+          joinResponseWrapped: "wrapped-blob",
+        },
+      ]);
+      const merged = mergeKeyPairs(extractActiveKeyPairs(data), [
+        { signingPublicKey: "sign1", encryptionPublicKey: "enc1", label: "Phone" },
+      ]);
+      expect(merged[0]?.joinResponseWrapped).toBe("wrapped-blob");
+      expect(merged[0]?.label).toBe("Phone");
+    });
   });
 });

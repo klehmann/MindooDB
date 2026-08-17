@@ -8,6 +8,9 @@ import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemo
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "../core/uri/MindooURI";
 import { decodeJoinRequestUri } from "../core/uri/joinRequestUri";
+import { RSAEncryption } from "../core/crypto/RSAEncryption";
+import { decryptPrivateKey } from "../core/crypto/privateKeyEncryption";
+import { unwrapDeviceJoinBootstrap } from "../core/join/deviceJoinBootstrap";
 import type {
   MindooTenant,
   JoinRequest,
@@ -183,6 +186,64 @@ describe("Join Flow (convenience API)", () => {
       const keys = await directory.getUserPublicKeys("cn=bob/o=test-join-obj");
       expect(keys).not.toBeNull();
       expect(keys!.signingPublicKey).toBe(user2.userSigningKeyPair.publicKey);
+    });
+
+    it("stores a device-decryptable join bootstrap on the grant", async () => {
+      const directory = await adminResult.tenant.openDirectory();
+      const lookup = await directory.getUserBySigningPublicKey(user2.userSigningKeyPair.publicKey);
+      expect(lookup?.joinResponseWrapped).toBeTruthy();
+      const pairs = await directory.getUserKeyPairs!("cn=bob/o=test-join-obj");
+      expect(pairs.find((pair) => pair.signingPublicKey === user2.userSigningKeyPair.publicKey)
+        ?.joinResponseWrapped).toBe(lookup!.joinResponseWrapped);
+
+      const cryptoAdapter = new NodeCryptoAdapter();
+      const rsa = new RSAEncryption(cryptoAdapter);
+      const encryptionPrivate = await decryptPrivateKey(
+        cryptoAdapter,
+        user2.userEncryptionKeyPair.privateKey,
+        user2Password,
+        "encryption",
+      );
+      const encryptionKey = await cryptoAdapter.getSubtle().importKey(
+        "pkcs8",
+        encryptionPrivate,
+        { name: "RSA-OAEP", hash: "SHA-256" },
+        false,
+        ["decrypt"],
+      );
+      const bootstrap = await unwrapDeviceJoinBootstrap(
+        rsa,
+        lookup!.joinResponseWrapped!,
+        encryptionKey,
+      );
+      expect(bootstrap.username).toBe("cn=bob/o=test-join-obj");
+      expect(bootstrap.tenantLabel).toBe("Join Object Lab");
+    });
+
+    it("bootstrapTenantFromDelivery adopts username from wrappedJoinResponse", async () => {
+      const directory = await adminResult.tenant.openDirectory();
+      const lookup = await directory.getUserBySigningPublicKey(user2.userSigningKeyPair.publicKey);
+      const publicInfos = await adminResult.keyBag.get("doc", "test-join-obj", PUBLIC_INFOS_KEY_ID);
+      expect(publicInfos).toBeTruthy();
+      const cryptoAdapter = new NodeCryptoAdapter();
+      const rsa = new RSAEncryption(cryptoAdapter);
+      const wrappedPublicInfosKey = await rsa.wrapKeyToBase64(
+        publicInfos!,
+        user2.userEncryptionKeyPair.publicKey,
+      );
+      const nameless = { ...user2, username: "" };
+      const boot = await adminResult.tenant.getFactory().bootstrapTenantFromDelivery!(
+        {
+          tenantId: "test-join-obj",
+          adminSigningPublicKey: adminResult.adminUser.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: adminResult.adminUser.userEncryptionKeyPair.publicKey,
+          wrappedPublicInfosKey,
+          wrappedJoinResponse: lookup!.joinResponseWrapped,
+        },
+        { user: nameless, password: user2Password },
+      );
+      expect(boot.user.username).toBe("cn=bob/o=test-join-obj");
+      expect(boot.tenantLabel).toBe("Join Object Lab");
     });
 
     it("should auto-publish acl_keydistribution_default for the joiner", async () => {

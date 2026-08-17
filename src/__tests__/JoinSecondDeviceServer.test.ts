@@ -200,26 +200,27 @@ describe("second device join over local HTTP server", () => {
       expect(pending).toHaveLength(1);
       expect(pending[0].label).toBe("Edge2");
 
-      await device1Tenant.approveUserKeyDevice!(pending[0].fingerprint);
-      await pushDb(device1Tenant, baseUrl, USER_DIRECTORY_DB_ID);
-
-      const joined = await device2Factory.joinTenant(joinResponse, {
-        user: device2User,
-        password: DEVICE2_PASSWORD,
-      });
-      expect(joined.user.username).toBe(device1User.username);
-      expect(await joined.keyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID)).toBeTruthy();
-      expect(await joined.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(false);
-
       const deliveries = await device2Factory.discoverTenantsOnServer(baseUrl, {
-        user: joined.user,
+        user: device2User,
         password: DEVICE2_PASSWORD,
       });
       expect(deliveries.map((d) => d.tenantId)).toContain(tenantId);
       const delivery = deliveries.find((d) => d.tenantId === tenantId)!;
       expect(delivery.wrappedPublicInfosKey).toBeTruthy();
+      expect(delivery.wrappedJoinResponse).toBeTruthy();
 
-      await pullDb(joined.tenant, baseUrl, "directory");
+      const joined = await device2Factory.bootstrapTenantFromDelivery(delivery, {
+        user: device2User,
+        password: DEVICE2_PASSWORD,
+        serverUrl: baseUrl,
+      });
+      expect(joined.user.username).toBe(device1User.username);
+      expect(await joined.keyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID)).toBeTruthy();
+      expect(await joined.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(false);
+
+      await device1Tenant.approveUserKeyDevice!(pending[0].fingerprint);
+      await pushDb(device1Tenant, baseUrl, USER_DIRECTORY_DB_ID);
+
       await pullDb(joined.tenant, baseUrl, USER_DIRECTORY_DB_ID);
 
       joined.tenant.noteUserDirectoryFetched!();

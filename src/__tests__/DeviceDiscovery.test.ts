@@ -68,6 +68,66 @@ describe("DeviceDiscoveryService", () => {
     );
   }, 60000);
 
+  test("forwards wrappedJoinResponse from the grant lookup", async () => {
+    const cryptoAdapter = new NodeCryptoAdapter();
+    const factory = new BaseMindooTenantFactory(
+      new InMemoryContentAddressedStoreFactory(),
+      cryptoAdapter,
+    );
+    const user = await factory.createUserId("cn=bob/o=discover", "bob-pass-123");
+    const subtle = cryptoAdapter.getSubtle();
+    const signingPrivate = await decryptPrivateKey(
+      cryptoAdapter,
+      user.userSigningKeyPair.privateKey,
+      "bob-pass-123",
+      "signing",
+    );
+    const signingKey = await subtle.importKey(
+      "pkcs8",
+      signingPrivate,
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+    const aesKey = cryptoAdapter.getRandomValues(new Uint8Array(32));
+
+    const service = new DeviceDiscoveryService(
+      {
+        listTenants: () => ["tenant-a"],
+        getTenant: async () => ({
+          directory: {
+            getUserBySigningPublicKey: async () => ({
+              username: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              signingPublicKey: user.userSigningKeyPair.publicKey,
+              encryptionPublicKey: user.userEncryptionKeyPair.publicKey,
+              details: null,
+              joinResponseWrapped: "device-join-blob",
+            }),
+          },
+          context: {
+            config: {
+              adminSigningPublicKey: "admin-sign",
+              adminEncryptionPublicKey: "admin-enc",
+            },
+          },
+        }),
+        getPublicInfosKeysForTenant: async () => [aesKey],
+      } as never,
+      cryptoAdapter,
+    );
+    const challenge = service.createChallenge(user.userSigningKeyPair.publicKey);
+    const sigBuf = await subtle.sign(
+      "Ed25519",
+      signingKey,
+      new TextEncoder().encode(challenge),
+    );
+    const result = await service.discover(challenge, new Uint8Array(sigBuf));
+    expect(result.tenants).toHaveLength(1);
+    expect(result.tenants[0]?.tenantId).toBe("tenant-a");
+    expect(result.tenants[0]?.wrappedJoinResponse).toBe("device-join-blob");
+    expect(result.tenants[0]?.wrappedPublicInfosKey).toBeTruthy();
+  }, 60000);
+
   test("rejects invalid signatures", async () => {
     const cryptoAdapter = new NodeCryptoAdapter();
     const subtle = cryptoAdapter.getSubtle();

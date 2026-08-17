@@ -35,6 +35,7 @@ import {
   DirectoryStateNode,
   grantForSigningKey,
   isSamePerson,
+  signingKeysEqual,
 } from "./accesscontrol/DirectoryStateNode";
 import { DirectoryTimeTravelIndex, ProjectRevisionFn } from "./accesscontrol/DirectoryTimeTravelIndex";
 import { projectDirectoryRevision } from "./accesscontrol/directoryProjection";
@@ -1714,6 +1715,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         next.revoked = true;
         if (typeof pair.revokedAt === "number") next.revokedAt = pair.revokedAt;
       }
+      const wrapped =
+        typeof pair.joinResponseWrapped === "string" ? pair.joinResponseWrapped.trim() : "";
+      if (wrapped) next.joinResponseWrapped = wrapped;
       return next;
     });
     await this.editGrantArrays(
@@ -1733,6 +1737,44 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         distributeKeyIds,
         administrationPrivateKey,
         administrationPrivateKeyPassword,
+      );
+    }
+  }
+
+  /**
+   * Store a per-device RSA-hybrid join bootstrap (`username` + optional
+   * `tenantLabel`) on the matching `userKeyPairs` entry. The blob is
+   * `$publicinfos`-readable so device discovery can forward it; only the
+   * device's encryption private key can unwrap it.
+   */
+  async attachDeviceJoinBootstrap(
+    username: string,
+    signingPublicKey: string,
+    wrappedJoinResponse: string,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const wrapped = wrappedJoinResponse.trim();
+    if (!wrapped) {
+      throw new Error("Cannot attach device join bootstrap: wrappedJoinResponse is empty");
+    }
+    let found = false;
+    await this.editGrantArrays(
+      username,
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      (data) => {
+        const next = extractKeyPairs(data).map((pair) => {
+          if (!signingKeysEqual(pair.signingPublicKey, signingPublicKey)) return pair;
+          found = true;
+          return { ...pair, joinResponseWrapped: wrapped };
+        });
+        applyKeyPairFields(data, next);
+      },
+    );
+    if (!found) {
+      throw new Error(
+        `Cannot attach device join bootstrap: no granted device matches the signing key for "${username}"`,
       );
     }
   }
@@ -4437,6 +4479,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       details,
       identityHashes,
       identityHashesV,
+      ...(pair.joinResponseWrapped
+        ? { joinResponseWrapped: pair.joinResponseWrapped }
+        : {}),
     }));
   }
 

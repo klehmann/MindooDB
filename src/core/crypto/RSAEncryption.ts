@@ -242,6 +242,28 @@ export class RSAEncryption {
   }
 
   /**
+   * Hybrid-encrypt `data` and return standard base64. Used for small JSON
+   * payloads that must stay opaque to anyone without the RSA private key
+   * (e.g. the per-device join bootstrap on a `$publicinfos` grant).
+   */
+  async encryptToBase64(
+    data: Uint8Array,
+    publicKey: CryptoKey | string
+  ): Promise<string> {
+    return this.uint8ArrayToBase64(await this.encrypt(data, publicKey));
+  }
+
+  /**
+   * Decrypt a blob previously produced by {@link encryptToBase64}.
+   */
+  async decryptFromBase64(
+    wrapped: string,
+    privateKey: CryptoKey | string
+  ): Promise<Uint8Array> {
+    return this.decrypt(this.base64ToUint8Array(wrapped), privateKey);
+  }
+
+  /**
    * Wrap a small secret (e.g. a 32-byte AES session key) directly with
    * RSA-OAEP. Unlike {@link encrypt}, no hybrid framing is added — the
    * output is the raw RSA ciphertext. Used by the sync-v5 session-key

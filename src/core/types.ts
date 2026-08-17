@@ -558,8 +558,8 @@ export interface JoinTenantResult {
 
 /**
  * One tenant delivered by `POST /device/discover` after device-key proof.
- * No cleartext label — the client decrypts `tenantsetup.label_encrypted` after
- * importing `default` via key distribution.
+ * No cleartext label or username — those arrive RSA-hybrid-wrapped to this
+ * device (`wrappedJoinResponse`) and/or later via `tenantsetup` under `default`.
  */
 export interface DeviceTenantDelivery {
   tenantId: string;
@@ -569,6 +569,12 @@ export interface DeviceTenantDelivery {
   wrappedPublicInfosKey: string;
   /** All `$publicinfos` versions, oldest first. `wrappedPublicInfosKey` is the newest. */
   wrappedPublicInfosKeys?: string[];
+  /**
+   * Per-device join bootstrap from the grant (`userKeyPairs[].joinResponseWrapped`):
+   * username + optional tenantLabel, RSA-hybrid-encrypted to this device.
+   * Opaque to the server; the joining device unwraps it locally.
+   */
+  wrappedJoinResponse?: string;
   username_hash?: string;
   identity_hashes?: string[];
 }
@@ -748,7 +754,8 @@ export interface MindooTenantFactory {
   /**
    * Prove possession of the device signing key against a MindooDB server and
    * receive every local tenant where that key has an active grant, each with
-   * RSA-wrapped `$publicinfos` plus admin public keys.
+   * RSA-wrapped `$publicinfos`, admin public keys, and the per-device join
+   * bootstrap (username / tenant label) when the grant carries it.
    */
   discoverTenantsOnServer?(
     serverUrl: string,
@@ -757,8 +764,9 @@ export interface MindooTenantFactory {
 
   /**
    * Bootstrap a local tenant from a {@link DeviceTenantDelivery}: unwrap
-   * `$publicinfos`, open the tenant, optionally pull the directory and
-   * reconcile key distributions (`default`).
+   * `$publicinfos`, adopt username from `wrappedJoinResponse` when present,
+   * open the tenant, optionally pull the directory and reconcile key
+   * distributions (`default`).
    */
   bootstrapTenantFromDelivery?(
     delivery: DeviceTenantDelivery,
@@ -2718,6 +2726,13 @@ export interface DirectoryUserLookup {
    * flag the grant for backfill.
    */
   identityHashesV?: number;
+  /**
+   * RSA-hybrid ciphertext of `{ username, tenantLabel? }` wrapped to this
+   * device's encryption public key. `$publicinfos`-readable (the server
+   * forwards it during discovery) but not decryptable without the device
+   * private key. Absent on grants written before per-device join bootstrap.
+   */
+  joinResponseWrapped?: string;
 }
 
 /**
@@ -2763,6 +2778,12 @@ export interface GrantKeyPair {
    * together with {@link revoked}; cleared when the device is restored.
    */
   revokedAt?: number;
+  /**
+   * RSA-hybrid ciphertext of `{ username, tenantLabel? }` wrapped to this
+   * device's encryption public key. Lives on the `$publicinfos` grant envelope
+   * so discovery can deliver the registered name without `default`.
+   */
+  joinResponseWrapped?: string;
 }
 
 /** A {@link GrantKeyPair} enriched with its current remote-wipe status (§6.5). */
