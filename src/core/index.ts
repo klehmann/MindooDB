@@ -91,6 +91,7 @@ export {
   createGenesisNode,
   nodeCovering,
   isSamePerson,
+  grantForSigningKey,
   type DirectoryStateNode,
   type UserGrantSnapshot,
   type GroupSnapshot,

@@ -33,6 +33,7 @@ import { aclTrustedWitnessDocId } from "./accesscontrol/types";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import {
   DirectoryStateNode,
+  grantForSigningKey,
   isSamePerson,
 } from "./accesscontrol/DirectoryStateNode";
 import { DirectoryTimeTravelIndex, ProjectRevisionFn } from "./accesscontrol/DirectoryTimeTravelIndex";
@@ -1243,7 +1244,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     trustedTime: number,
   ): Promise<string | null> {
     const node = await this.getDirectoryStateAt(trustedTime);
-    return node.bySigningKey.get(signingKey)?.usernameHash ?? null;
+    return grantForSigningKey(node, signingKey)?.usernameHash ?? null;
   }
 
   /**
@@ -3336,7 +3337,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // allow-rules until the trust cache refreshed (up to
     // DIRECTORY_SYNC_INTERVAL_MS later). The `node` is the time-`T` snapshot
     // whose `bySigningKey` only contains keys whose grant is active at `T`.
-    const grantedAtT = node.bySigningKey.has(signingKey);
+    const grantedAtT = !!grantForSigningKey(node, signingKey);
 
     // Resolve the author's username from their signing key. Trusted non-user
     // keys (e.g. server-to-server sync identities) have no grant; treat them as

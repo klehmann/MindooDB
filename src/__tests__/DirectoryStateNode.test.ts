@@ -1,6 +1,7 @@
 import {
   DirectoryStateChainBuilder,
   createGenesisNode,
+  grantForSigningKey,
   nodeCovering,
   isSamePerson,
 } from "../core/accesscontrol/DirectoryStateNode";
@@ -92,6 +93,9 @@ describe("DirectoryStateNode chain", () => {
     );
     expect(b.getHead().bySigningKey.get("signA1")?.usernameHash).toBe("hashA");
     expect(b.getHead().bySigningKey.get("signA2")?.usernameHash).toBe("hashA");
+    expect(
+      grantForSigningKey(b.getHead(), "signA1\n")?.usernameHash,
+    ).toBe("hashA");
 
     b.revokeBySigningKey("signA1", 200);
     // Revoking deactivates the grant; reverse index drops inactive grants.

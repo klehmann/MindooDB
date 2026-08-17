@@ -93,20 +93,42 @@ export function evaluateBuiltinWrite(input: BuiltinWriteInput): BuiltinWriteDeci
     if (isAdmin) {
       return { allowed: false, reason: "userdirectory: the admin cannot change userkey documents" };
     }
+    if (!input.documentUsernameHash) {
+      return { allowed: false, reason: "userdirectory: document username_hash could not be resolved" };
+    }
+    if (!input.signerUsernameHash) {
+      return { allowed: false, reason: "userdirectory: signer is not a granted device" };
+    }
     return { allowed: false, reason: "userdirectory: only the owning person can change" };
   }
 
   return { allowed: true, reason: "no builtin invariant" };
 }
 
+function usernameHashFromRecord(doc: Record<string, unknown>): string | null {
+  const value = doc.username_hash;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * `username_hash` from a decrypted `doc_create` payload. Create entries are
+ * usually a single Automerge change; some writers persist a full document
+ * binary instead. The server must accept both — otherwise every later change
+ * is denied as "not the owning person" because the hash looks missing.
+ */
 export function usernameHashFromCreateChangeBytes(changeBytes: Uint8Array): string | null {
   try {
     const [doc] = Automerge.applyChanges(
       Automerge.init<Record<string, unknown>>(),
       [changeBytes],
     );
-    const value = (doc as Record<string, unknown>).username_hash;
-    return typeof value === "string" && value.length > 0 ? value : null;
+    const fromChange = usernameHashFromRecord(doc as Record<string, unknown>);
+    if (fromChange) return fromChange;
+  } catch {
+    // Payload may be a full Automerge document rather than a change.
+  }
+  try {
+    return usernameHashFromRecord(Automerge.load<Record<string, unknown>>(changeBytes));
   } catch {
     return null;
   }

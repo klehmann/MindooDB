@@ -154,6 +154,7 @@ import {
 import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
 import type { RuleType, AccessDecision } from "./accesscontrol/types";
 import { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
+import { grantForSigningKey } from "./accesscontrol/DirectoryStateNode";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { validateDatabaseId } from "./databaseIdValidation";
 import {
@@ -1098,15 +1099,7 @@ export class BaseMindooDB implements MindooDB {
         entry.encryptedData,
         entry.decryptionKeyId,
       );
-      let hash = usernameHashFromCreateChangeBytes(decrypted);
-      if (!hash) {
-        try {
-          const loaded = Automerge.load<Record<string, unknown>>(decrypted);
-          hash = this.usernameHashFromRecord(loaded);
-        } catch {
-          hash = null;
-        }
-      }
+      const hash = usernameHashFromCreateChangeBytes(decrypted);
       if (hash) this.userdirectoryHashByDocId.set(docId, hash);
       return hash;
     } catch {
@@ -2267,7 +2260,7 @@ export class BaseMindooDB implements MindooDB {
     if (trustedTime !== undefined && typeof directory.getDirectoryStateAt === "function") {
       const node = await directory.getDirectoryStateAt(trustedTime);
       isTrusted =
-        node.bySigningKey.has(publicKey) || publicKey === this.getAdminPublicKey();
+        !!grantForSigningKey(node, publicKey) || publicKey === this.getAdminPublicKey();
     } else {
       isTrusted = await directory.validatePublicSigningKey(publicKey);
     }

@@ -126,7 +126,7 @@ export function isSamePerson(
   signerSigningKey: string,
 ): boolean {
   const creatorGrant = grantAtOrBefore(creatorNode, creatorSigningKey);
-  const signerGrant = signerNode.bySigningKey.get(signerSigningKey);
+  const signerGrant = grantForSigningKey(signerNode, signerSigningKey);
   if (creatorGrant && signerGrant) {
     return creatorGrant.usernameHash === signerGrant.usernameHash;
   }
@@ -149,7 +149,7 @@ export function grantAtOrBefore(
 ): UserGrantSnapshot | undefined {
   let current: DirectoryStateNode | null = node;
   while (current) {
-    const grant = current.bySigningKey.get(signingKey);
+    const grant = grantForSigningKey(current, signingKey);
     if (grant) return grant;
     current = current.prev;
   }
@@ -168,6 +168,21 @@ function buildBySigningKey(
     }
   }
   return bySigningKey;
+}
+
+/** Match a signing key in {@link DirectoryStateNode.bySigningKey}, ignoring PEM whitespace. */
+export function grantForSigningKey(
+  node: DirectoryStateNode,
+  signingKey: string,
+): UserGrantSnapshot | undefined {
+  const exact = node.bySigningKey.get(signingKey);
+  if (exact) return exact;
+  const needle = signingKey.replace(/\s+/g, "");
+  if (!needle) return undefined;
+  for (const [key, grant] of node.bySigningKey) {
+    if (key.replace(/\s+/g, "") === needle) return grant;
+  }
+  return undefined;
 }
 
 /**
@@ -477,7 +492,7 @@ export class DirectoryStateChainBuilder {
    * deactivated.
    */
   revokeBySigningKey(signingKey: string, trustedTime: number): void {
-    const grant = this.head.bySigningKey.get(signingKey);
+    const grant = grantForSigningKey(this.head, signingKey);
     if (!grant) return;
     this.deltaLog.push({ op: "revokeBySigningKey", t: trustedTime, signingKey });
     this.push(trustedTime, (next) => {
