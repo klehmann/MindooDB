@@ -3,6 +3,17 @@
 // Types
 export * from "./types";
 export * from "./databaseIdValidation";
+export {
+  evaluateBuiltinWrite,
+  hasBuiltinWriteInvariant,
+  shouldSkipLoadedEntry,
+  entryTypeToBuiltinOp,
+  usernameHashFromCreateChangeBytes,
+  type BuiltinWriteOp,
+  type BuiltinWriteInput,
+  type BuiltinWriteDecision,
+} from "./builtinDbInvariants";
+export * from "./userkeys";
 export * from "./tenantIdValidation";
 export { readTenantSetupLabel, writeTenantSetupLabel } from "./tenantSetup";
 export type { TenantSetupData } from "./tenantSetup";
@@ -79,6 +90,7 @@ export {
 export {
   createGenesisNode,
   nodeCovering,
+  isSamePerson,
   type DirectoryStateNode,
   type UserGrantSnapshot,
   type GroupSnapshot,
@@ -87,6 +99,20 @@ export { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
 
 // User ID types
 export type { PublicUserId, PrivateUserId } from "./userid";
+export {
+  abbreviateCanonicalName,
+  buildCanonicalName,
+  canonicalizeUsername,
+  expandAbbreviatedName,
+  formatCanonicalDisplayName,
+  getCanonicalNameVariants,
+  isCanonicalName,
+  normalizeCanonicalNameForComparison,
+  parseCanonicalName,
+  sanitizeCanonicalNamePart,
+  usernamesEqual,
+} from "./userid";
+export type { CanonicalNameParts } from "./userid";
 
 // Base classes
 export { BaseMindooDB } from "./BaseMindooDB";

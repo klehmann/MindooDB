@@ -17,7 +17,9 @@ import type {
 import {
   DEFAULT_TENANT_KEY_ID,
   PUBLIC_INFOS_KEY_ID,
+  USER_DIRECTORY_DB_ID,
 } from "../core/types";
+import { aclKeyDistributionDocId } from "../core/accesscontrol/types";
 import type { PrivateUserId } from "../core/userid";
 
 describe("Join Flow (convenience API)", () => {
@@ -145,7 +147,8 @@ describe("Join Flow (convenience API)", () => {
 
       // Step 2: User2 creates their identity and join request
       user2 = await localFactory.createUserId("cn=bob/o=test-join-obj", user2Password);
-      joinRequest = localFactory.createJoinRequest(user2);
+      await localFactory.ensureUserKeyPair(user2, user2Password);
+      joinRequest = localFactory.createJoinRequest(user2, { label: "laptop" });
 
       // Step 3: Admin approves the join request
       joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
@@ -170,12 +173,9 @@ describe("Join Flow (convenience API)", () => {
       expect(joinResponse.adminEncryptionPublicKey).toBe(
         adminResult.adminUser.userEncryptionKeyPair.publicKey
       );
-      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)?.versions).toHaveLength(1);
+      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)).toBeUndefined();
       expect(getDocKeyBundle(joinResponse, PUBLIC_INFOS_KEY_ID)?.versions).toHaveLength(1);
-      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)?.versions[0]?.wrappedKey).toEqual(
-        expect.any(String),
-      );
-      expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)?.versions[0]?.encryptedKey).toBeUndefined();
+      expect(joinResponse.encryptedDocKeys.map((entry) => entry.keyId)).toEqual([PUBLIC_INFOS_KEY_ID]);
     });
 
     it("should register user2 in the directory", async () => {
@@ -186,7 +186,6 @@ describe("Join Flow (convenience API)", () => {
     });
 
     it("should auto-publish acl_keydistribution_default for the joiner", async () => {
-      const { aclKeyDistributionDocId } = await import("../core/accesscontrol/types");
       const directoryDb = await adminResult.tenant.openDB("directory", { adminOnlyDb: true });
       const distDoc = await directoryDb.getDocument(aclKeyDistributionDocId(DEFAULT_TENANT_KEY_ID));
       const data = distDoc.getData() as {
@@ -199,6 +198,61 @@ describe("Join Flow (convenience API)", () => {
       expect(data.pushto_users_hashes!.length).toBeGreaterThan(0);
       expect(Object.keys(data.pushto_users_keys ?? {}).length).toBeGreaterThan(0);
     });
+
+    it("rejects a join request that carries no userPublicKey", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+      const admin = await localFactory.createTenant({
+        tenantId: "test-join-no-uk",
+        adminName: "cn=admin/o=test-join-no-uk",
+        adminPassword,
+        userName: "cn=alice/o=test-join-no-uk",
+        userPassword: user1Password,
+      });
+      const stranger = await localFactory.createUserId("cn=eve/o=test-join-no-uk", user2Password);
+      const request = localFactory.createJoinRequest(stranger, { label: "phone" });
+      expect(request.userPublicKey).toBeUndefined();
+      await expect(
+        admin.tenant.approveJoinRequest(request, {
+          adminSigningKey: admin.adminUser.userSigningKeyPair.privateKey,
+          adminPassword,
+        }),
+      ).rejects.toThrow(/userPublicKey/);
+    }, 120000);
+
+    it("first device imports default via the User-Key after writing its wrap", async () => {
+      const localStoreFactory = new InMemoryContentAddressedStoreFactory();
+      const localFactory = new BaseMindooTenantFactory(localStoreFactory, new NodeCryptoAdapter());
+      const admin = await localFactory.createTenant({
+        tenantId: "test-join-uk-import",
+        adminName: "cn=admin/o=test-join-uk-import",
+        adminPassword,
+        userName: "cn=alice/o=test-join-uk-import",
+        userPassword: user1Password,
+      });
+      const joiner = await localFactory.createUserId("cn=carol/o=test-join-uk-import", user2Password);
+      await localFactory.ensureUserKeyPair(joiner, user2Password);
+      const request = localFactory.createJoinRequest(joiner, { label: "laptop" });
+      const response = await admin.tenant.approveJoinRequest(request, {
+        adminSigningKey: admin.adminUser.userSigningKeyPair.privateKey,
+        adminPassword,
+      });
+      const result = await localFactory.joinTenant(response, {
+        user: joiner,
+        password: user2Password,
+      });
+      expect(await result.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(false);
+      const adminDir = await admin.tenant.openDB("directory");
+      const joinerDir = await result.tenant.openDB("directory");
+      await joinerDir.pullChangesFrom(adminDir.getStore());
+      const adminUserDir = await admin.tenant.openDB(USER_DIRECTORY_DB_ID);
+      const joinerUserDir = await result.tenant.openDB(USER_DIRECTORY_DB_ID);
+      await joinerUserDir.pullChangesFrom(adminUserDir.getStore());
+      result.tenant.noteUserDirectoryFetched!();
+      await result.tenant.reconcileUserKeys!();
+      await result.tenant.reconcileKeyDistributionsForCurrentUser!();
+      expect(await result.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
+    }, 180000);
   });
 
   describe("join response shared document keys", () => {
@@ -221,7 +275,8 @@ describe("Join Flow (convenience API)", () => {
       await adminResult.keyBag.createDocKey(localTenantId, namedKeyId, newerCreatedAt);
 
       const user2 = await localFactory.createUserId(`cn=bob/o=${localTenantId}`, user2Password);
-      const joinRequest = localFactory.createJoinRequest(user2);
+      await localFactory.ensureUserKeyPair(user2, user2Password);
+      const joinRequest = localFactory.createJoinRequest(user2, { label: "laptop" });
       const joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
@@ -230,10 +285,7 @@ describe("Join Flow (convenience API)", () => {
 
       expect(getDocKeyBundle(joinResponse, PUBLIC_INFOS_KEY_ID)?.versions).toHaveLength(1);
       expect(getDocKeyBundle(joinResponse, DEFAULT_TENANT_KEY_ID)).toBeUndefined();
-      expect(getDocKeyBundle(joinResponse, namedKeyId)?.versions.map((version) => version.createdAt)).toEqual([
-        newerCreatedAt,
-        olderCreatedAt,
-      ]);
+      expect(getDocKeyBundle(joinResponse, namedKeyId)).toBeUndefined();
 
       const joinResult = await localFactory.joinTenant(joinResponse, {
         user: user2,
@@ -246,7 +298,7 @@ describe("Join Flow (convenience API)", () => {
 
       expect(importedDetails.some((detail) => detail.scopedKeyId === `doc:${localTenantId}:${PUBLIC_INFOS_KEY_ID}`)).toBe(true);
       expect(importedDetails.some((detail) => detail.scopedKeyId === `doc:${localTenantId}:${DEFAULT_TENANT_KEY_ID}`)).toBe(false);
-      expect(importedNamedVersions).toEqual([newerCreatedAt, olderCreatedAt]);
+      expect(importedNamedVersions).toEqual([]);
     }, 120000);
   });
 
@@ -269,7 +321,8 @@ describe("Join Flow (convenience API)", () => {
 
       // Step 2: User2 creates identity + join request URI
       user2 = await localFactory.createUserId("cn=bob/o=test-join-uri", user2Password);
-      const joinRequestURI = localFactory.createJoinRequest(user2, { format: "uri" });
+      await localFactory.ensureUserKeyPair(user2, user2Password);
+      const joinRequestURI = localFactory.createJoinRequest(user2, { format: "uri", label: "laptop" });
 
       // Step 3: Admin approves using the URI string directly, outputs as URI
       const joinResponseURI = await adminResult.tenant.approveJoinRequest(joinRequestURI, {
@@ -316,7 +369,8 @@ describe("Join Flow (convenience API)", () => {
 
       // User2 creates identity + join request
       const user2 = await localFactory.createUserId("cn=bob/o=test-join-sync", user2Password);
-      const joinRequest = localFactory.createJoinRequest(user2);
+      await localFactory.ensureUserKeyPair(user2, user2Password);
+      const joinRequest = localFactory.createJoinRequest(user2, { label: "laptop" });
 
       // Admin approves
       const joinResponse = await adminResult.tenant.approveJoinRequest(joinRequest, {
@@ -344,6 +398,13 @@ describe("Join Flow (convenience API)", () => {
       const user2DirDB = await user2Result.tenant.openDB("directory");
       await user2DirDB.pullChangesFrom(user1DirDB.getStore());
       await user2DirDB.syncStoreChanges();
+
+      const user1UserDir = await adminResult.tenant.openDB(USER_DIRECTORY_DB_ID);
+      const user2UserDir = await user2Result.tenant.openDB(USER_DIRECTORY_DB_ID);
+      await user2UserDir.pullChangesFrom(user1UserDir.getStore());
+      user2Result.tenant.noteUserDirectoryFetched?.();
+      await user2Result.tenant.reconcileUserKeys?.({ allowSelfCreate: false });
+      await user2Result.tenant.reconcileKeyDistributionsForCurrentUser?.();
 
       // User2 pulls todo changes via shared in-memory store
       const user2DB = await user2Result.tenant.openDB("todos");
@@ -413,7 +474,8 @@ describe("Join Flow (convenience API)", () => {
       });
 
       const user = await localFactory.createUserId("cn=bob/o=test", user2Password);
-      const joinRequest = localFactory.createJoinRequest(user);
+      await localFactory.ensureUserKeyPair(user, user2Password);
+      const joinRequest = localFactory.createJoinRequest(user, { label: "laptop" });
 
       const response = await result.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
@@ -437,7 +499,8 @@ describe("Join Flow (convenience API)", () => {
       });
 
       const user = await localFactory.createUserId("cn=bob/o=test", user2Password);
-      const joinRequest = localFactory.createJoinRequest(user);
+      await localFactory.ensureUserKeyPair(user, user2Password);
+      const joinRequest = localFactory.createJoinRequest(user, { label: "laptop" });
 
       const response = await result.tenant.approveJoinRequest(joinRequest, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
@@ -460,7 +523,8 @@ describe("Join Flow (convenience API)", () => {
       });
 
       const user = await localFactory.createUserId("cn=bob/o=test", user2Password);
-      const joinRequestURI = localFactory.createJoinRequest(user, { format: "uri" });
+      await localFactory.ensureUserKeyPair(user, user2Password);
+      const joinRequestURI = localFactory.createJoinRequest(user, { format: "uri", label: "laptop" });
 
       const joinResponseURI = await result.tenant.approveJoinRequest(joinRequestURI, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
@@ -492,6 +556,7 @@ describe("Join Flow (convenience API)", () => {
 
       // First device joins as bob
       const device1 = await localFactory.createUserId("cn=bob/o=test-second-device", user2Password);
+      await localFactory.ensureUserKeyPair(device1, user2Password);
       const joinRequest1 = localFactory.createJoinRequest(device1, { label: "desktop" });
       const joinResponse1 = await result.tenant.approveJoinRequest(joinRequest1, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
@@ -504,6 +569,7 @@ describe("Join Flow (convenience API)", () => {
 
       // Second device with the same username, different keys
       const device2 = await localFactory.createUserId("cn=bob/o=test-second-device", "device2-pass");
+      await localFactory.ensureUserKeyPair(device2, "device2-pass");
       const joinRequest2 = localFactory.createJoinRequest(device2, { label: "ipad" });
       const joinResponse2 = await result.tenant.approveJoinRequest(joinRequest2, {
         adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
@@ -545,6 +611,7 @@ describe("Join Flow (convenience API)", () => {
       return adminResult.tenant.approveJoinRequest(request, {
         adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
         adminPassword,
+        label: "laptop",
         ...(username ? { username } : {}),
       });
     }
@@ -587,8 +654,21 @@ describe("Join Flow (convenience API)", () => {
       await expect(approve(request)).rejects.toThrow(/carries no username/);
     }, 60000);
 
+    it("should refuse to approve a request without a device label", async () => {
+      const device = await localFactory.createUserId(`cn=carol/o=${localTenantId}`, "device-pass");
+      const request = localFactory.createJoinRequest(device);
+
+      await expect(
+        adminResult.tenant.approveJoinRequest(request, {
+          adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
+          adminPassword,
+        }),
+      ).rejects.toThrow(/Device label is required/);
+    }, 60000);
+
     it("should register a nameless request under the supplied name and echo it back", async () => {
       const device = await localFactory.createUserId("", "device-pass");
+      await localFactory.ensureUserKeyPair(device, "device-pass");
       const request = localFactory.createJoinRequest(device);
       const response = await approve(request, bobName);
 
@@ -613,6 +693,7 @@ describe("Join Flow (convenience API)", () => {
       // registered under a typo, which without the override would silently
       // create a second person instead of a second device.
       const device = await localFactory.createUserId(`cn=bobb/o=${localTenantId}`, "typo-pass");
+      await localFactory.ensureUserKeyPair(device, "typo-pass");
       const request = localFactory.createJoinRequest(device);
       expect(request.username).toBe(`cn=bobb/o=${localTenantId}`);
 
@@ -658,13 +739,15 @@ describe("Join Flow (convenience API)", () => {
       });
 
       const bob = await localFactory.createUserId(`cn=bob/o=${localTenantId}`, user2Password);
+      await localFactory.ensureUserKeyPair(bob, user2Password);
       const eve = await localFactory.createUserId(`cn=eve/o=${localTenantId}`, "eve-pass");
-      const joinResponse = await adminResult.tenant.approveJoinRequest(localFactory.createJoinRequest(bob), {
-        adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
-        adminPassword,
-      });
-
-      expect(joinResponse.v).toBe(3);
+      const joinResponse = await adminResult.tenant.approveJoinRequest(
+        localFactory.createJoinRequest(bob, { label: "laptop" }),
+        {
+          adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
+          adminPassword,
+        },
+      );
       await expect(
         localFactory.joinTenant(joinResponse, {
           user: eve,
@@ -687,10 +770,14 @@ describe("Join Flow (convenience API)", () => {
       });
 
       const bob = await localFactory.createUserId(`cn=bob/o=${localTenantId}`, user2Password);
-      await adminResult.tenant.approveJoinRequest(localFactory.createJoinRequest(bob), {
-        adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
-        adminPassword,
-      });
+      await localFactory.ensureUserKeyPair(bob, user2Password);
+      await adminResult.tenant.approveJoinRequest(
+        localFactory.createJoinRequest(bob, { label: "laptop" }),
+        {
+          adminSigningKey: adminResult.adminUser.userSigningKeyPair.privateKey,
+          adminPassword,
+        },
+      );
 
       const publicInfosKey = await adminResult.keyBag.encryptAndExportKeyVersion(
         "doc",

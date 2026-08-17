@@ -18,7 +18,13 @@ module.exports = {
   // norm instead of a rare race. See _helpers/setupSemanticClock.ts.
   setupFiles: ['<rootDir>/src/__tests__/_helpers/setupSemanticClock.ts'],
   transform: {
-    '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json' }],
+    '^.+\\.ts$': ['ts-jest', {
+      tsconfig: 'tsconfig.test.json',
+      // Transpile each file in isolation. Full-program typecheck of
+      // BaseMindooDB (~14k lines) plus RSA-3072 tests OOMs the worker.
+      isolatedModules: true,
+      diagnostics: false,
+    }],
   },
   // Handle .js extensions in imports (for ESM/Node16 resolution)
   // and map mindoodb/* package imports to local source for example server tests

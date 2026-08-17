@@ -835,10 +835,19 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     }
 
     const subtle = this.cryptoAdapter.getSubtle();
-    const sessionKeyBytes = await this.rsaEncryption.unwrapKey(
-      batch.wrappedSessionKey,
-      this.getActivePrivateEncryptionKey()
-    );
+    let sessionKeyBytes: Uint8Array;
+    try {
+      sessionKeyBytes = await this.rsaEncryption.unwrapKey(
+        batch.wrappedSessionKey,
+        this.getActivePrivateEncryptionKey()
+      );
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "Error";
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Cannot unwrap the directory sync session key: it is wrapped to a different device's encryption key (${name}: ${message})`,
+      );
+    }
     const sessionKey = await subtle.importKey(
       "raw",
       sessionKeyBytes.buffer.slice(

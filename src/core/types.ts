@@ -73,6 +73,21 @@ export const TENANT_SETUP_DOC_ID = "tenantsetup";
 export const DEFAULT_TENANT_KEY_ID = "default";
 
 /**
+ * Well-known database id for the per-user encryption-identity directory
+ * (`userkey_*` documents). Protected by a builtin write invariant independent
+ * of the ACL master switch: the admin may create/delete, only the owning
+ * person may change.
+ */
+export const USER_DIRECTORY_DB_ID = "userdirectory";
+
+/**
+ * Well-known database id for the tenant directory (grants, policies, key
+ * distribution). Admin-only writes; hardcoded in several call sites as
+ * `"directory"` for historical reasons.
+ */
+export const DIRECTORY_DB_ID = "directory";
+
+/**
  * JSON payload returned by `GET /.well-known/mindoodb-server-info`.
  */
 export interface MindooDBServerInfo {
@@ -339,13 +354,20 @@ export interface JoinRequest {
   /** RSA-OAEP public encryption key (PEM format) */
   encryptionPublicKey: string;
   /**
-   * Optional human-readable label for this device's signing/encryption key
+   * Human-readable label for this device's signing/encryption key
    * pair (e.g. a date or a note about the device type). Suggested by the
    * joining user; the approving admin may override it (see
-   * {@link ApproveJoinRequestOptions.label}). Stored on the grant document's
-   * key-pair entry and editable later (docs/accesscontrol.md §6.5).
+   * {@link ApproveJoinRequestOptions.label}). Required when granting access.
+   * Stored on the grant document's key-pair entry and editable later
+   * (docs/accesscontrol.md §6.5).
    */
   label?: string;
+  /**
+   * Public half of the joining device's person-bound User-Key (RSA-OAEP 3072
+   * PEM). The admin publishes it as a pending `userkey_*` document on approval
+   * and wraps `default` to it. Required for a new person's first device.
+   */
+  userPublicKey?: string;
 }
 
 /**
@@ -375,10 +397,11 @@ export interface ApproveJoinRequestOptions {
    */
   sharedDocKeyIds?: string[];
   /**
-   * Optional human-readable label for the joining device's key pair. When set,
+   * Human-readable label for the joining device's key pair. When set,
    * it overrides any label the joining user suggested in the join request and
    * is stored on the grant document's key-pair entry (docs/accesscontrol.md
-   * §6.5). Useful for recording a date or a note about the device type.
+   * §6.5). Required: the join request or this field must supply a non-empty
+   * label.
    */
   label?: string;
   /**
@@ -544,6 +567,8 @@ export interface DeviceTenantDelivery {
   adminEncryptionPublicKey: string;
   /** AES `$publicinfos` RSA-OAEP-wrapped to this device's encryption public key (base64). */
   wrappedPublicInfosKey: string;
+  /** All `$publicinfos` versions, oldest first. `wrappedPublicInfosKey` is the newest. */
+  wrappedPublicInfosKeys?: string[];
   username_hash?: string;
   identity_hashes?: string[];
 }
@@ -699,6 +724,12 @@ export interface MindooTenantFactory {
   createJoinRequest(user: PrivateUserId, options?: { format?: "object"; label?: string }): JoinRequest;
   createJoinRequest(user: PrivateUserId, options: { format: "uri"; label?: string }): string;
   createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri"; label?: string }): JoinRequest | string;
+  /**
+   * Generate a person-bound User-Key on `user` if it does not already have one.
+   * The private half is password-encrypted with salt `"userkey"` and stored on
+   * the identity so paper backup includes it.
+   */
+  ensureUserKeyPair?(user: PrivateUserId, password: string): Promise<EncryptionKeyPair>;
 
   /**
    * Join a tenant using a join response from an admin.
@@ -995,6 +1026,16 @@ export interface MindooTenant {
    * result as a guard before attempting decryption.
    */
   hasDecryptionKey?(decryptionKeyId: string): Promise<boolean>;
+  rememberSealedGenerations?(keyId: string, generations: Uint8Array[]): void;
+  getSealedGenerations?(keyId: string): Uint8Array[];
+  ingestSealedRecipients?(
+    keyId: string,
+    recipients: import("./userkeys/sealedTypes").EntryRecipients,
+  ): Promise<void>;
+  ingestSealedFromEntries?(
+    keyId: string,
+    entries: Array<{ recipients?: import("./userkeys/sealedTypes").EntryRecipients; createdAt: number }>,
+  ): Promise<void>;
 
   /**
    * Return a stable, opaque fingerprint of the doc keys this tenant
@@ -1039,6 +1080,24 @@ export interface MindooTenant {
    */
   approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions & { format: "uri" }): Promise<string>;
   approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions): Promise<JoinResponse>;
+
+  /** Devices on this person's grant that still need a User-Key wrap. */
+  listPendingUserKeyDevices?(): Promise<import("./userkeys/types").PendingUserKeyDevice[]>;
+  listUserKeyDevices?(): Promise<import("./userkeys/types").UserKeyDeviceRow[]>;
+  approveUserKeyDevice?(fingerprint: string): Promise<void>;
+  declineUserKeyDevice?(fingerprint: string): Promise<void>;
+  undoDeclineUserKeyDevice?(fingerprint: string): Promise<void>;
+  rotateUserKey?(): Promise<void>;
+  reconcileUserKeys?(options?: { allowSelfCreate?: boolean }): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
+  getUserKeyEnrollmentStatus?(): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
+  noteUserDirectoryFetched?(): void;
+  noteUserDirectoryFetchFailed?(error: unknown): void;
+  ensureLocalUserKeyPair?(): Promise<void>;
+  getUserKeyManager(): import("./userkeys/UserKeyManager").UserKeyManager;
+  isDatabaseOpen?(dbId: string): boolean;
+  isDatabaseReady?(dbId: string): boolean;
+  scheduleUserKeyReconcile?(): void;
+  reconcileUserKeysSafe?(): Promise<void>;
 
   /**
    * Publish (register) this tenant on a MindooDB server.
@@ -1285,6 +1344,13 @@ export interface StoreEntryMetadata {
    * on-disk, IndexedDB and network serializers without per-field binary handling.
    */
   provenance?: EntryProvenance;
+
+  /**
+   * Sealed-document recipient block (docs/recipients.md §3.3). Present only on
+   * entries that change the recipient set. Bound into `metadataSignature` as
+   * tagged trailing block `0x03`.
+   */
+  recipients?: import("./userkeys/sealedTypes").EntryRecipients;
 
   /**
    * Original size of the plaintext data before encryption (in bytes).
@@ -1804,6 +1870,16 @@ export interface CreateOptions {
   decryptionKeyId?: string;
 
   /**
+   * Readers of this document. Mutually exclusive with `decryptionKeyId`.
+   * A fresh document key is generated and sealed to each recipient. User
+   * names are canonicalized (`CN=alice/O=contoso`, case-insensitive) and
+   * must include `O=` — the tenant id is not substituted for the organization.
+   * The author is included unless `recipientOptions.includeSelf` is false.
+   */
+  recipients?: import("./userkeys/sealedTypes").RecipientSpec[];
+  recipientOptions?: import("./userkeys/sealedTypes").RecipientOptions;
+
+  /**
    * Optional signing key pair to sign the initial document entry with. When
    * provided, `signingKeyPassword` must be provided as well. Replaces
    * `createDocumentWithSigningKey(signingKeyPair, signingKeyPassword, ...)`.
@@ -2067,6 +2143,17 @@ export interface MindooDoc {
    *   inaccessible-key tombstone.
    */
   isAccessible(): boolean;
+
+  isSealed(): boolean;
+  getRecipients(): import("./userkeys/sealedTypes").ResolvedRecipient[];
+  getRecipientEpoch(): number;
+  /**
+   * True when this document uses a per-document sealed key (`$sealed:…`) and
+   * every listed user has an active `_encryptFor` entry with a DEK wrap.
+   * Usernames are matched case-insensitively after canonicalization
+   * (`CN=alice/O=contoso`) and must include `O=`.
+   */
+  isEncryptedFor(users: string | string[]): boolean;
 
   /**
    * Whether this document is still "awaiting witness": it has at least one
@@ -2700,7 +2787,8 @@ export interface MindooTenantDirectory {
    * @param administrationPrivateKey The administration private key to sign the registration operation with (signing only)
    * @param administrationPrivateKeyPassword The password to decrypt the administration private key
    * @param userDetails The user details to register (ignored when appending a device to an existing grant)
-   * @param label Optional device label for this key pair (§6.5)
+   * @param label Device label for this key pair (§6.5). Optional for existing
+   *   test/register paths; required when granting access via {@link MindooTenant.approveJoinRequest}.
    * @return A promise that resolves when the user is registered
    */
   registerUser(userId: PublicUserId, administrationPrivateKey: EncryptedPrivateKey,
@@ -3098,6 +3186,29 @@ export interface MindooTenantDirectory {
   }): Promise<AccessDecision>;
 
   /**
+   * Whether two signing keys belong to the same person (same `username_hash`
+   * grant) when resolved at the given trusted times. Used to evaluate `$author`
+   * at grant level rather than device-key equality.
+   *
+   * The creator is resolved at `creatorTrustedTime` (typically the trusted time
+   * of the `doc_create` entry) so authorship survives retirement of the
+   * creating device. The signer is resolved at `signerTrustedTime` so a
+   * revoked device cannot act as `$author`.
+   */
+  isSamePerson?(input: {
+    creatorSigningKey: string;
+    signerSigningKey: string;
+    creatorTrustedTime: number;
+    signerTrustedTime: number;
+  }): Promise<boolean>;
+
+  /**
+   * The `username_hash` of the grant that contained `signingKey` at trusted
+   * time `T`, or `null` when the key was not an active grant member then.
+   */
+  resolveUsernameHashForSigningKey?(signingKey: string, trustedTime: number): Promise<string | null>;
+
+  /**
    * Whether a Tier 2 (`withfields`) content rule exists for `op` on `dbid` at
    * the current head state. Lets callers skip materializing before/after
    * documents when only Tier 1 checks apply (§9.1).
@@ -3136,6 +3247,7 @@ export interface MindooTenantDirectory {
    * @returns The salted, normalized username hash.
    */
   getUsernameHash?(username: string): Promise<string>;
+  getUsernameHashCandidates?(username: string): Promise<string[]>;
 
   /**
    * All ACTIVE (non-revoked) RSA encryption public keys (PEM) for `username` —
@@ -3157,6 +3269,24 @@ export interface MindooTenantDirectory {
    * @returns The recipient's wrapped device material.
    */
   wrapKeyForUserDevices?(keyId: string, username: string): Promise<KeyDistributionPushRecipient>;
+  wrapKeyForUser?(
+    keyId: string,
+    username: string,
+    publicKeyOverride?: string,
+  ): Promise<KeyDistributionPushRecipient | null>;
+
+  /**
+   * Merge `username` into each listed key-distribution document, wrapping to
+   * the person's published User-Key. Users without a published User-Key are
+   * skipped (pending), not wrapped to device keys.
+   */
+  autoDistributeKeysToUser?(
+    username: string,
+    keyIds: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+    publicKeyOverride?: string,
+  ): Promise<void>;
 
   /**
    * The version manifest (`{createdAt, fingerprint}`) of `keyId` from the
@@ -3372,6 +3502,7 @@ export interface MindooTenantDirectory {
     encryptionPublicKey: string;
     details?: DirectoryUserDetails | null;
   } | null>;
+  findGrantAccessDocuments?(username: string): Promise<MindooDoc[]>;
 
   /**
    * Look up a user by their public signing key.
@@ -4967,6 +5098,45 @@ export interface MindooDB {
     doc: MindooDoc,
     candidateAfter: Record<string, unknown>,
     signingKeyPair?: SigningKeyPair
+  ): Promise<AccessDecision>;
+
+  /**
+   * Add readers to a sealed document. Cheap: one RSA wrap per new user, no
+   * rotation. The new readers can decrypt the whole history. Names are
+   * canonicalized (`CN=alice/O=contoso`) and matched case-insensitively;
+   * they must include `O=`.
+   */
+  addRecipients(
+    doc: MindooDoc,
+    recipients: import("./userkeys/sealedTypes").RecipientSpec[],
+    options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
+  ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
+  /**
+   * Drop readers from a sealed document. Rotates the document key: removed
+   * readers keep what they already have, and cannot read later changes.
+   * Names are canonicalized and matched case-insensitively.
+   */
+  removeRecipients(
+    doc: MindooDoc,
+    recipients: import("./userkeys/sealedTypes").RecipientSpec[],
+    options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
+  ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
+  /**
+   * Replace the recipient list. Diffs against the current set: additions wrap,
+   * removals rotate. The author stays on the list unless `includeSelf: false`.
+   */
+  setRecipients(
+    doc: MindooDoc,
+    recipients: import("./userkeys/sealedTypes").RecipientSpec[],
+    options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
+  ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
+  refreshRecipients(
+    doc: MindooDoc,
+    options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
+  ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
+  canChangeRecipients(
+    doc: MindooDoc,
+    next: import("./userkeys/sealedTypes").RecipientSpec[],
   ): Promise<AccessDecision>;
 
   /**

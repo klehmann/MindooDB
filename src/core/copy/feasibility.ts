@@ -16,6 +16,7 @@ import type {
   CopyFeasibilityReasonCode,
   CopyStrategy,
 } from "./types";
+import { isSealedKeyId } from "../userkeys/sealedTypes";
 
 /** The tenant directory database id. Never a valid copy source or target. */
 export const DIRECTORY_DB_ID = "directory";
@@ -64,6 +65,7 @@ export function resolveTargetDecryptionKeyId(
   sameTenant: boolean,
 ): string {
   if (requested) return requested;
+  if (isSealedKeyId(sourceDecryptionKeyId)) return "default";
   return sameTenant ? sourceDecryptionKeyId : "default";
 }
 

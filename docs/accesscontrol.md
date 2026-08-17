@@ -357,6 +357,15 @@ All access-control state lives in the admin-only `directory` database and syncs 
 every participant. Several documents use **fixed document IDs** so they can be read
 by direct lookup without building an index/view.
 
+A second system database, `userdirectory`, holds person-bound User-Key documents
+(`docs/userkeys.md`). It is **not** admin-write-only. Writes are gated by a
+hard-wired invariant (`src/core/builtinDbInvariants.ts`) independent of
+`acl_defaultpolicy` and of the master switch: the admin or the named person may
+create, only the named person may change, only the admin may delete, everyone
+may read. A configured per-database policy may tighten that floor but cannot
+loosen it. Unlike `directory`, ACL materialization stays **on** so extra denies
+still apply.
+
 > **ID constraint.** Custom document IDs must match
 > `^[a-z][a-z0-9_]*$` (`CUSTOM_DOC_ID_REGEX` in `types.ts`), because IDs are
 > embedded in store-entry IDs and on-disk filenames — and those filenames land on

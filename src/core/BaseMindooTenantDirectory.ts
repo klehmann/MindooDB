@@ -13,6 +13,8 @@ import {
   PublicUserId,
   SigningKeyPair,
   PUBLIC_INFOS_KEY_ID,
+  DIRECTORY_DB_ID,
+  USER_DIRECTORY_DB_ID,
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { semanticNow } from "./utils/timeSource";
@@ -31,6 +33,7 @@ import { aclTrustedWitnessDocId } from "./accesscontrol/types";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import {
   DirectoryStateNode,
+  isSamePerson,
 } from "./accesscontrol/DirectoryStateNode";
 import { DirectoryTimeTravelIndex, ProjectRevisionFn } from "./accesscontrol/DirectoryTimeTravelIndex";
 import { projectDirectoryRevision } from "./accesscontrol/directoryProjection";
@@ -392,6 +395,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     keyIds: string[],
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
+    publicKeyOverride?: string,
   ): Promise<void> {
     const filtered = [
       ...new Set(
@@ -429,7 +433,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
       const pushto: KeyDistributionPushRecipient[] = [];
       for (const pushtoUsername of pushtoNames) {
-        pushto.push(await this.wrapKeyForUserDevices(keyId, pushtoUsername));
+        const override = pushtoUsername.trim() === username.trim() ? publicKeyOverride : undefined;
+        const wrapped = await this.wrapKeyForUser(keyId, pushtoUsername, override);
+        if (wrapped) pushto.push(wrapped);
       }
       const pullfrom: Array<{ username: string; username_hash: string }> = [];
       for (const pullUsername of pullfromNames) {
@@ -737,6 +743,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     
     // Track group documents by name for merging (handles offline sync scenarios)
     const groupDocsByName: Map<string, MindooDoc[]> = new Map();
+    let sawGrantAccessChange = false;
     
     // Process changes (documents are returned in order by lastModified, oldest to newest)
     for await (const { doc, cursor } of directoryDB.iterateChangesSince(startCursor)) {
@@ -759,6 +766,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
           }
         }
         if (data.type === "grantaccess") {
+              sawGrantAccessChange = true;
               // Record this grant document's CURRENT signing keys. Because grant
               // documents are Automerge-merged in place, removing keys (the only
               // revocation mechanism, §6.5) is reflected by a smaller array here.
@@ -915,6 +923,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
     if (newlyTrustedKeys.size > 0) {
       void this.tenant.reconcileAuthorTrustChangesSafe(newlyTrustedKeys);
+    }
+    if (sawGrantAccessChange) {
+      this.tenant.scheduleUserKeyReconcile?.();
     }
 
     // Merge group documents with the same name
@@ -1201,6 +1212,41 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * Grant-level `$author` resolver: creator at `creatorTrustedTime`, signer at
+   * `signerTrustedTime`. See {@link isSamePerson}.
+   */
+  async isSamePerson(input: {
+    creatorSigningKey: string;
+    signerSigningKey: string;
+    creatorTrustedTime: number;
+    signerTrustedTime: number;
+  }): Promise<boolean> {
+    const creatorNode = await this.getDirectoryStateAt(input.creatorTrustedTime);
+    const signerNode =
+      input.signerTrustedTime === input.creatorTrustedTime
+        ? creatorNode
+        : await this.getDirectoryStateAt(input.signerTrustedTime);
+    return isSamePerson(
+      creatorNode,
+      signerNode,
+      input.creatorSigningKey,
+      input.signerSigningKey,
+    );
+  }
+
+  /**
+   * The `username_hash` of the active grant that contained `signingKey` at
+   * trusted time `T`, or `null` when the key was not a granted device then.
+   */
+  async resolveUsernameHashForSigningKey(
+    signingKey: string,
+    trustedTime: number,
+  ): Promise<string | null> {
+    const node = await this.getDirectoryStateAt(trustedTime);
+    return node.bySigningKey.get(signingKey)?.usernameHash ?? null;
+  }
+
+  /**
    * Whether the active policy has any Tier 2 (`withfields`) content rule for
    * operation `op` in database `dbid` at the current head state. Lets the
    * client write prechecks skip the (potentially costly) Automerge -> JS
@@ -1315,7 +1361,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     dbid: string,
     opts?: { signingKey?: string },
   ): Promise<boolean> {
-    if (dbid === "directory") return true;
+    if (dbid === DIRECTORY_DB_ID || dbid === USER_DIRECTORY_DB_ID) return true;
     const { mode, allowedDbIds } = await this.getDatabaseCreationPolicy();
     if (mode === "open") return true;
     if (allowedDbIds.includes(dbid)) return true;
@@ -1342,7 +1388,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
     // The directory database is never read-gated (it must always sync so the
     // policy that defines the read gate can be read at all).
-    if (input.dbid === "directory") return true;
+    if (input.dbid === DIRECTORY_DB_ID || input.dbid === USER_DIRECTORY_DB_ID) return true;
     // The tenant admin is exempt from the read gate.
     const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
     if (input.signingKey === adminKey) return true;
@@ -1371,7 +1417,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * ({@link isDatabaseAllowed}); callers enforce both gates.
    */
   async canReadDatabase(dbid: string): Promise<boolean> {
-    if (dbid === "directory") return true;
+    if (dbid === DIRECTORY_DB_ID || dbid === USER_DIRECTORY_DB_ID) return true;
     const currentUser = await this.tenant.getCurrentUserId();
     const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
     if (currentUser.userSigningPublicKey === adminKey) return true;
@@ -1677,18 +1723,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         applyKeyPairFields(data, mergeKeyPairs(extractKeyPairs(data), additions));
       },
     );
-
-    // Re-wrap distributions so the new device gets RSA-wrapped key material.
-    const keyIds =
-      distributeKeyIds !== undefined
-        ? distributeKeyIds
-        : await this.keyIdsNeedingDeviceWrap(username);
-    await this.autoDistributeKeysToUser(
-      username,
-      keyIds,
-      administrationPrivateKey,
-      administrationPrivateKeyPassword,
-    );
+    // Device enrollment no longer re-wraps named keys: wraps target User-Keys,
+    // which do not change when a device is added. An existing approved device
+    // wraps the User-Key for the new device instead.
+    if (distributeKeyIds !== undefined && distributeKeyIds.length > 0) {
+      await this.autoDistributeKeysToUser(
+        username,
+        distributeKeyIds,
+        administrationPrivateKey,
+        administrationPrivateKeyPassword,
+      );
+    }
   }
 
   /**
@@ -2086,6 +2131,50 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * Wrap every stored version of `keyId` to the recipient's published User-Key
+   * (one wrap per person, not per device). Throws if the caller does not hold
+   * the key. Returns `null` when the recipient has no published (non-pending)
+   * User-Key — callers treat that as a pending state, not an error.
+   *
+   * `publicKeyOverride` is the join-bootstrap exception: the admin wraps
+   * `default` to the User-Key from the join request before the person has
+   * written a device wrap.
+   */
+  async wrapKeyForUser(
+    keyId: string,
+    username: string,
+    publicKeyOverride?: string,
+  ): Promise<KeyDistributionPushRecipient | null> {
+    const baseTenant = this.tenant as BaseMindooTenant;
+    const versions = await baseTenant.fingerprintKeyVersions(keyId);
+    if (versions.length === 0) {
+      throw new Error(`Cannot wrap key: key "${keyId}" is not in your KeyBag`);
+    }
+    let publicKey = publicKeyOverride;
+    let fingerprint: string | undefined;
+    if (!publicKey) {
+      const published = await baseTenant.getUserKeyManager().publishedUserKeyFor(username);
+      if (!published || published.pending) return null;
+      publicKey = published.publicKey;
+      fingerprint = published.fingerprint;
+    }
+    if (!fingerprint) {
+      fingerprint = await this.encryptionKeyFingerprint(publicKey);
+    }
+    const rsa = new RSAEncryption(this.tenant.getCryptoAdapter(), this.logger.createChild("RSAEncryption"));
+    const wrappedByVersion: DeviceWrappedVersions = {};
+    for (const version of versions) {
+      const wrapped = await rsa.encrypt(version.bytes, publicKey);
+      wrappedByVersion[version.fingerprint] = this.bytesToBase64(wrapped);
+    }
+    return {
+      username,
+      username_hash: await this.hashUsernameForWrite(username),
+      devices: { [fingerprint]: wrappedByVersion },
+    };
+  }
+
+  /**
    * The canonical write-time hash for `username` (the value stored in
    * `pushto_users_hashes` / `pullfrom_users_hashes`). Exposed so callers (the
    * Haven dialog/session) can build `pullfrom` entries for users they are
@@ -2093,6 +2182,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    */
   async getUsernameHash(username: string): Promise<string> {
     return this.hashUsernameForWrite(username);
+  }
+
+  /**
+   * All hash forms a given username could be stored as (v1/v2/v3). Public so
+   * User-Key lookup can scan `userdirectory` the same way grants are found.
+   */
+  async getUsernameHashCandidates(username: string): Promise<string[]> {
+    return this.usernameHashCandidates(username);
   }
 
   /**
@@ -2144,14 +2241,34 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       pushto_users_keys: pushtoUsersKeys,
     });
 
-    // Directory-level validation: every pushto user must have an active grant,
-    // and every active encryption device must have wrapped material (otherwise a
-    // newly-added device could not decrypt — re-wrap is required).
+    // Directory-level validation: every pushto user must have an active grant.
+    // Coverage is per published User-Key epoch (or per device for service
+    // accounts that have no User-Key).
     const manifestFps = new Set(request.keyVersions.map((v) => v.fingerprint));
     for (const p of request.pushto) {
       const userKeys = await this.getUserPublicKeys(p.username);
       if (!userKeys) {
         throw new Error(`Cannot publish: pushto user "${p.username}" has no active grant`);
+      }
+      const baseTenant = this.tenant as BaseMindooTenant;
+      const published = await baseTenant.getUserKeyManager().publishedUserKeyFor(p.username);
+      if (published) {
+        // Pending documents are the join-bootstrap case: the admin wraps
+        // `default` to the join-request User-Key before the person has written
+        // a device wrap. Coverage is still per User-Key fingerprint.
+        const wrapped = p.devices[published.fingerprint];
+        if (!wrapped) {
+          throw new Error(
+            `Cannot publish: pushto user "${p.username}" has no wrap for their User-Key`,
+          );
+        }
+        const covered = Object.keys(wrapped);
+        if (covered.length !== manifestFps.size || covered.some((fp) => !manifestFps.has(fp))) {
+          throw new Error(
+            `Cannot publish: User-Key coverage for "${p.username}" does not match the version manifest`,
+          );
+        }
+        continue;
       }
       const activePems = await this.getUserEncryptionPublicKeys(p.username);
       for (const pem of activePems) {
@@ -2348,15 +2465,26 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     username: string,
   ): Promise<{ imported: string[]; removed: string[] }> {
     const baseTenant = this.tenant as BaseMindooTenant;
-    const key = await baseTenant.getEncryptionPrivateKeyForReconcile();
-    if (!key) {
+    const keys: CryptoKey[] = [];
+    const userKeys = await baseTenant.getUserKeyManager().getUserKeyCryptoKeysForReconcile();
+    keys.push(...userKeys);
+    const deviceKey = await baseTenant.getEncryptionPrivateKeyForReconcile();
+    if (deviceKey) keys.push(deviceKey);
+    if (keys.length === 0) {
       this.logger.debug(
         "reconcileImportedKeysForCurrentUser: no encryption key available; " +
           "skipping import pass (revoke pass still ran)",
       );
       return { imported: [], removed: [] };
     }
-    return this.reconcileKeyDistributionsWithKey(username, key);
+    let imported: string[] = [];
+    let removed: string[] = [];
+    for (const key of keys) {
+      const result = await this.reconcileKeyDistributionsWithKey(username, key);
+      imported = Array.from(new Set([...imported, ...result.imported]));
+      removed = Array.from(new Set([...removed, ...result.removed]));
+    }
+    return { imported, removed };
   }
 
   /**
@@ -3462,7 +3590,16 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     await this.updateUnifiedCache();
-    return this.userLookupCache.get(publicKey) ?? null;
+    const exact = this.userLookupCache.get(publicKey);
+    if (exact) return exact;
+    // Auth/JWT/client transport may re-wrap PEM line endings; match the grant
+    // entry whose signing key is the same key material.
+    const needle = publicKey.replace(/\s+/g, "");
+    if (!needle) return null;
+    for (const [key, lookup] of this.userLookupCache) {
+      if (key.replace(/\s+/g, "") === needle) return lookup;
+    }
+    return null;
   }
 
   /**
@@ -3743,7 +3880,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
     await this.updateUnifiedCache();
 
-    const known = new Set<string>(["directory"]);
+    const known = new Set<string>([DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID]);
     for (const dbId of this.dbSettingsCache.keys()) {
       known.add(dbId);
     }

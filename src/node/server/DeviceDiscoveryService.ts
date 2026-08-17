@@ -27,6 +27,8 @@ export interface DeviceTenantDelivery {
   adminEncryptionPublicKey: string;
   /** AES `$publicinfos` wrapped to the grant device encryption public key (base64). */
   wrappedPublicInfosKey: string;
+  /** All `$publicinfos` versions, oldest first. `wrappedPublicInfosKey` is the newest. */
+  wrappedPublicInfosKeys?: string[];
   /** Optional `$publicinfos`-readable hashes from the grant (saves a client scan). */
   username_hash?: string;
   identity_hashes?: string[];
@@ -146,16 +148,22 @@ export class DeviceDiscoveryService {
         try {
           const keys = await this.tenantManager.getPublicInfosKeysForTenant(match.tenantId);
           if (!keys.length) return null;
-          const rawKey = keys[keys.length - 1]!;
-          const wrappedPublicInfosKey = await rsa.wrapKeyToBase64(
-            rawKey,
-            match.encryptionPublicKey,
+          const wrappedPublicInfosKeys = await Promise.all(
+            keys.map((rawKey) => rsa.wrapKeyToBase64(rawKey, match.encryptionPublicKey)),
+          );
+          // getAllKeys is newest-first; keep wrappedPublicInfosKey as the current generation.
+          const wrappedPublicInfosKey = wrappedPublicInfosKeys[0]!;
+          console.log(
+            `[DeviceDiscovery] Wrapped ${wrappedPublicInfosKeys.length} $publicinfos version(s) for tenant ${match.tenantId}`,
           );
           return {
             tenantId: match.tenantId,
             adminSigningPublicKey: match.adminSigningPublicKey,
             adminEncryptionPublicKey: match.adminEncryptionPublicKey,
             wrappedPublicInfosKey,
+            ...(wrappedPublicInfosKeys.length > 1
+              ? { wrappedPublicInfosKeys }
+              : {}),
             ...(match.username_hash ? { username_hash: match.username_hash } : {}),
             ...(match.identity_hashes?.length
               ? { identity_hashes: match.identity_hashes }

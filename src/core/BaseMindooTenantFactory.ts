@@ -23,6 +23,8 @@ import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword, encryptPrivateKey as encryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
+import { generateRsaOaep3072 } from "./crypto/rsaOaep3072";
+import { USERKEY_PRIVATE_SALT } from "./userkeys/types";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbkdf2Iterations";
 import { KeyBag } from "./keys/KeyBag";
@@ -273,6 +275,22 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     return privateUserId;
   }
 
+  async ensureUserKeyPair(user: PrivateUserId, password: string): Promise<EncryptionKeyPair> {
+    if (user.userKeyPair) return user.userKeyPair;
+    const generated = await generateRsaOaep3072(this.cryptoAdapter);
+    const encrypted = await encryptPrivateKeyWithPassword(
+      this.cryptoAdapter,
+      generated.privateKeyBytes,
+      password,
+      USERKEY_PRIVATE_SALT,
+    );
+    user.userKeyPair = {
+      publicKey: generated.publicKeyPem,
+      privateKey: encrypted,
+    };
+    return user.userKeyPair;
+  }
+
   /**
    * Removes the private information from a private user ID and returns a public user ID.
    */
@@ -317,6 +335,40 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       "encryption",
     );
 
+    let userKeyPair: EncryptionKeyPair | undefined;
+    if (identity.userKeyPair) {
+      try {
+        userKeyPair = {
+          publicKey: identity.userKeyPair.publicKey,
+          privateKey: await encryptPrivateKeyWithPassword(
+            this.cryptoAdapter,
+            new Uint8Array(
+              await decryptPrivateKeyWithPassword(
+                this.cryptoAdapter,
+                identity.userKeyPair.privateKey,
+                oldPassword,
+                USERKEY_PRIVATE_SALT,
+              ),
+            ),
+            newPassword,
+            USERKEY_PRIVATE_SALT,
+          ),
+        };
+      } catch (error) {
+        // Haven verifies the password by calling this with old === new.
+        // A stored User-Key that cannot be opened (wrong salt, truncated JSON)
+        // must not block unlocking the signing/encryption keys.
+        try {
+          this.logger.warn(
+            `Skipping User-Key re-encrypt for ${identity.username}; signing/encryption keys still opened`,
+            error,
+          );
+        } catch {
+          // Logging a DOMException must never fail password change / unlock.
+        }
+      }
+    }
+
     return {
       username: identity.username,
       userSigningKeyPair: {
@@ -327,6 +379,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         publicKey: identity.userEncryptionKeyPair.publicKey,
         privateKey: encryptedEncryptionKey,
       },
+      ...(userKeyPair ? { userKeyPair } : {}),
     };
   }
 
@@ -461,7 +514,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     await directory.registerUser(
       this.toPublicUserId(appUser),
       adminUser.userSigningKeyPair.privateKey,
-      options.adminPassword
+      options.adminPassword,
+      undefined,
+      "First device",
     );
 
     // 5. Enforce the v2 storage format from creation (default on). We write an
@@ -532,6 +587,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     const trimmedLabel = typeof options?.label === "string" ? options.label.trim() : "";
     if (trimmedLabel.length > 0) {
       joinRequest.label = trimmedLabel;
+    }
+    if (user.userKeyPair?.publicKey) {
+      joinRequest.userPublicKey = user.userKeyPair.publicKey;
     }
 
     if (options?.format === "uri") {
@@ -715,12 +773,25 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       preDecryptedUserKeys: options.preDecryptedUserKeys,
     });
     const rsa = new RSAEncryption(this.cryptoAdapter, this.logger.createChild("RSAEncryption"));
+    const wrappedList =
+      delivery.wrappedPublicInfosKeys && delivery.wrappedPublicInfosKeys.length > 0
+        ? delivery.wrappedPublicInfosKeys
+        : [delivery.wrappedPublicInfosKey];
     try {
-      const rawPublicInfos = await rsa.unwrapKeyFromBase64(
-        delivery.wrappedPublicInfosKey,
-        decryptKey,
+      for (let index = 0; index < wrappedList.length; index++) {
+        const rawPublicInfos = await rsa.unwrapKeyFromBase64(wrappedList[index]!, decryptKey);
+        // wrappedList is newest-first (server getAllKeys order). Higher createdAt = newer.
+        await keyBag.set(
+          "doc",
+          delivery.tenantId,
+          PUBLIC_INFOS_KEY_ID,
+          rawPublicInfos,
+          wrappedList.length - index,
+        );
+      }
+      this.logger.info(
+        `Unwrapped ${wrappedList.length} $publicinfos version(s) from device discovery for tenant ${delivery.tenantId}`,
       );
-      await keyBag.set("doc", delivery.tenantId, PUBLIC_INFOS_KEY_ID, rawPublicInfos);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -748,7 +819,15 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         StoreKind.docs,
       );
       const directoryDb = await tenant.openDB("directory", { adminOnlyDb: true });
-      await directoryDb.pullChangesFrom(remoteDirectory);
+      try {
+        await directoryDb.pullChangesFrom(remoteDirectory);
+      } catch (error) {
+        const name = error instanceof Error ? error.name : "Error";
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Cannot pull directory after device discovery (${name}: ${message})`,
+        );
+      }
 
       if (typeof tenant.reconcileKeyDistributionsForCurrentUser === "function") {
         const reconcile = await tenant.reconcileKeyDistributionsForCurrentUser();

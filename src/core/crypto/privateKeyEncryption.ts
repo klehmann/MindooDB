@@ -79,7 +79,7 @@ export async function encryptPrivateKey(
       tagLength: 128,
     },
     derivedKey,
-    privateKeyBytes.buffer as ArrayBuffer,
+    privateKeyBytes.slice(),
   );
 
   const encryptedArray = new Uint8Array(encrypted);

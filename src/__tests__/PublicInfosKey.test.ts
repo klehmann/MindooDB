@@ -282,6 +282,10 @@ describe("$publicinfos Key System", () => {
       );
       const labels = keyPairs.map((p) => p.label).sort();
       expect(labels).toEqual(["desktop", "ipad"]);
+      const compactPem = upperUser.userSigningKeyPair.publicKey.replace(/\s+/g, "");
+      const lookup = await directory.getUserBySigningPublicKey!(compactPem);
+      expect(lookup?.encryptionPublicKey).toBe(upperUser.userEncryptionKeyPair.publicKey);
+      expect(lookup?.encryptionPublicKey).not.toBe(lowerUser.userEncryptionKeyPair.publicKey);
     }, 60000);
     
     it("should skip re-registration of same user with same keys", async () => {

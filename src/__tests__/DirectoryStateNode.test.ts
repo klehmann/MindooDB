@@ -2,6 +2,7 @@ import {
   DirectoryStateChainBuilder,
   createGenesisNode,
   nodeCovering,
+  isSamePerson,
 } from "../core/accesscontrol/DirectoryStateNode";
 import { AclRuleDoc, DefaultAccessPolicyDoc, TrustedWitnessDoc } from "../core/accesscontrol/types";
 
@@ -322,5 +323,65 @@ describe("DirectoryStateNode delta-log round-trip", () => {
     const restored = new DirectoryStateChainBuilder();
     restored.importDeltaLog(original.exportDeltaLog());
     expect(restored.exportDeltaLog()).toEqual(original.exportDeltaLog());
+  });
+});
+
+describe("isSamePerson (grant-level $author)", () => {
+  function grant(
+    usernameHash: string,
+    signingKeys: string[],
+    active = true,
+  ) {
+    return {
+      usernameHash,
+      signingKeys,
+      encryptionKeys: [],
+      wipeRequestedSigningKeys: [],
+      active,
+    };
+  }
+
+  it("matches two devices of the same person", () => {
+    const b = new DirectoryStateChainBuilder();
+    b.applyGrant(grant("alice", ["dev1", "dev2"]), 100);
+    const node = b.getHead();
+    expect(isSamePerson(node, node, "dev1", "dev2")).toBe(true);
+  });
+
+  it("does not match devices of different people", () => {
+    const b = new DirectoryStateChainBuilder();
+    b.applyGrant(grant("alice", ["a1"]), 100);
+    b.applyGrant(grant("bob", ["b1"]), 110);
+    const node = b.getHead();
+    expect(isSamePerson(node, node, "a1", "b1")).toBe(false);
+  });
+
+  it("resolves the creator at creation time so retiring the creating device keeps authorship", () => {
+    const b = new DirectoryStateChainBuilder();
+    b.applyGrant(grant("alice", ["dev1", "dev2"]), 100);
+    // Later: creating device retired, only dest2 remains.
+    b.applyGrant(grant("alice", ["dev2"]), 200);
+    const atCreate = b.getStateAt(150);
+    const atChange = b.getHead();
+    expect(isSamePerson(atCreate, atChange, "dev1", "dev2")).toBe(true);
+    // Even when both lookups are asked at HEAD (clock skew: creator time sits
+    // past every directory bound), look-back still names Alice.
+    expect(isSamePerson(atChange, atChange, "dev1", "dev2")).toBe(true);
+  });
+
+  it("rejects a signer whose device was revoked at change time", () => {
+    const b = new DirectoryStateChainBuilder();
+    b.applyGrant(grant("alice", ["dev1", "dev2"]), 100);
+    b.applyGrant(grant("alice", ["dev1"]), 200);
+    const atCreate = b.getStateAt(150);
+    const atChange = b.getHead();
+    expect(isSamePerson(atCreate, atChange, "dev1", "dev2")).toBe(false);
+  });
+
+  it("falls back to device-key equality for keys that never appear in a grant", () => {
+    const b = new DirectoryStateChainBuilder();
+    const node = b.getHead();
+    expect(isSamePerson(node, node, "admin-key", "admin-key")).toBe(true);
+    expect(isSamePerson(node, node, "admin-key", "other-key")).toBe(false);
   });
 });

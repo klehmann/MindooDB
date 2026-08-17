@@ -89,15 +89,28 @@ export async function preflightCopyAdmission(
     }
   }
 
+  const createEntry = entries.find((e) => e.entryType === "doc_create");
+  const creatorTrustedTime = createEntry
+    ? (createEntry.receivedAt ?? createEntry.createdAt)
+    : Number.MAX_SAFE_INTEGER;
+
   const checked: CopyAdmissionCheck[] = [];
   const denied: CopyAdmissionCheck[] = [];
   const undecidableOps = new Set<RuleType>();
 
   for (const pair of pairs.values()) {
+    const isAuthor =
+      documentCreatorKey !== null &&
+      (await target.isSamePerson(
+        documentCreatorKey,
+        pair.signerPublicKey,
+        creatorTrustedTime,
+        Number.MAX_SAFE_INTEGER,
+      ));
     const decision = await target.evaluateWriteAccess(
       pair.op,
       pair.signerPublicKey,
-      documentCreatorKey !== null && pair.signerPublicKey === documentCreatorKey,
+      isAuthor,
     );
     const check: CopyAdmissionCheck = { ...pair, decision };
     checked.push(check);

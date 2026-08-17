@@ -110,8 +110,9 @@ function readOptionalText(value: unknown, max: number): string | undefined {
 export function encodeJoinRequestUri(request: JoinRequest): string {
   const signing = toCompactKey(request.signingPublicKey);
   const encryption = toCompactKey(request.encryptionPublicKey);
+  const userKey = request.userPublicKey ? toCompactKey(request.userPublicKey) : true;
 
-  if (!signing || !encryption) {
+  if (!signing || !encryption || userKey === null) {
     return encodeMindooURI("join-request", request as unknown as Record<string, unknown>);
   }
 
@@ -124,6 +125,9 @@ export function encodeJoinRequestUri(request: JoinRequest): string {
   const label = readOptionalText(request.label, MAX_LABEL_CHARS);
   if (label) {
     payload.l = label;
+  }
+  if (typeof userKey === "string") {
+    payload.k = userKey;
   }
 
   return encodeMindooURI("join-request", payload);
@@ -157,8 +161,6 @@ export function normalizeJoinRequestPayload(
     const username = readOptionalText(payload.u, MAX_USERNAME_CHARS);
     const label = readOptionalText(payload.l, MAX_LABEL_CHARS);
     const request: JoinRequest = {
-      // The compact form is a transport detail; the semantic version is still
-      // "named" (1) vs. "the admin names it" (2), derived from the payload.
       v: username ? 1 : 2,
       signingPublicKey: readCompactKey(payload.s, "s"),
       encryptionPublicKey: readCompactKey(payload.e, "e"),
@@ -168,6 +170,9 @@ export function normalizeJoinRequestPayload(
     }
     if (label) {
       request.label = label;
+    }
+    if (typeof payload.k === "string" && payload.k) {
+      request.userPublicKey = readCompactKey(payload.k, "k");
     }
     return request;
   }
@@ -185,6 +190,10 @@ export function normalizeJoinRequestPayload(
     }
     if (label) {
       request.label = label;
+    }
+    const userPublicKey = readOptionalText(payload.userPublicKey, MAX_KEY_BASE64_CHARS * 2);
+    if (userPublicKey) {
+      request.userPublicKey = userPublicKey;
     }
     return request;
   }

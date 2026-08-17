@@ -125,10 +125,17 @@ export class RSAEncryption {
     // Generate a random 96-bit IV for AES-GCM
     const iv = this.cryptoAdapter.getRandomValues(new Uint8Array(12));
     
+    // Copy views so WebCrypto never encrypts a shared backing store
+    // (Automerge/WASM heaps, Node Buffer pools). Pass the Uint8Array itself
+    // — `.buffer` can be a pooled/shared ArrayBuffer larger than the view.
+    const aesKeyBytes = aesKey.slice();
+    const ivBytes = iv.slice();
+    const plaintext = data.slice();
+
     // Import the AES key
     const aesKeyObj = await subtle.importKey(
       "raw",
-      aesKey.buffer as ArrayBuffer,
+      aesKeyBytes,
       { name: "AES-GCM", length: 256 },
       false,
       ["encrypt"]
@@ -136,16 +143,16 @@ export class RSAEncryption {
     
     // Encrypt the data with AES-GCM
     const encryptedData = await subtle.encrypt(
-      { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
+      { name: "AES-GCM", iv: ivBytes },
       aesKeyObj,
-      data.buffer as ArrayBuffer
+      plaintext
     );
     
     // Encrypt the AES key with RSA-OAEP
     const encryptedKey = await subtle.encrypt(
       { name: "RSA-OAEP" },
       cryptoKey,
-      aesKey.buffer as ArrayBuffer
+      aesKeyBytes
     );
     
     // Pack the result: [encryptedKeyLength (2 bytes)][encryptedKey][iv][encryptedData]

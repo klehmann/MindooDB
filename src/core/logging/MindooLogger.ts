@@ -123,39 +123,44 @@ export class MindooLogger implements Logger {
   }
 
   private sanitizeArgs(args: any[]): any[] {
-    return args.map((arg) => {
-      // Handle strings
-      if (typeof arg === "string") {
-        return this.sanitizeString(arg);
-      }
-
-      // Handle Error objects (preserve structure, sanitize message and stack)
-      if (arg instanceof Error) {
-        return this.sanitizeError(arg);
-      }
-
-      // Handle objects (shallow sanitization of string values)
-      if (arg && typeof arg === "object" && !Array.isArray(arg)) {
-        const sanitized: any = {};
-        for (const [key, value] of Object.entries(arg)) {
-          if (typeof value === "string") {
-            sanitized[key] = this.sanitizeString(value);
-          } else {
-            sanitized[key] = value; // Preserve non-string values
-          }
+    try {
+      return args.map((arg) => {
+        // Handle strings
+        if (typeof arg === "string") {
+          return this.sanitizeString(arg);
         }
-        return sanitized;
-      }
 
-      // Handle arrays (sanitize string elements)
-      if (Array.isArray(arg)) {
-        return arg.map((item) =>
-          typeof item === "string" ? this.sanitizeString(item) : item
-        );
-      }
+        // Handle Error objects (preserve structure, sanitize message and stack).
+        // jsdom's DOMException is not always `instanceof Error`.
+        if (isErrorLike(arg)) {
+          return this.sanitizeError(arg);
+        }
 
-      return arg;
-    });
+        // Handle objects (shallow sanitization of string values)
+        if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+          const sanitized: any = {};
+          for (const [key, value] of Object.entries(arg)) {
+            if (typeof value === "string") {
+              sanitized[key] = this.sanitizeString(value);
+            } else {
+              sanitized[key] = value; // Preserve non-string values
+            }
+          }
+          return sanitized;
+        }
+
+        // Handle arrays (sanitize string elements)
+        if (Array.isArray(arg)) {
+          return arg.map((item) =>
+            typeof item === "string" ? this.sanitizeString(item) : item
+          );
+        }
+
+        return arg;
+      });
+    } catch {
+      return args.map((arg) => (isErrorLike(arg) ? arg.message : arg));
+    }
   }
 
   private sanitizeString(str: string): string {
@@ -223,26 +228,44 @@ export class MindooLogger implements Logger {
       sanitizedError.stack = sanitizedStackLines.join("\n");
     }
 
-    // Preserve any additional properties that might be on custom Error types
-    // (e.g., SymmetricKeyNotFoundError.keyId, NetworkError.type, etc.)
-    // but sanitize their values if they're strings
-    if (error.constructor !== Error) {
-      // This is a custom error type - preserve its type
-      Object.setPrototypeOf(sanitizedError, error.constructor.prototype);
+    // Preserve extra fields on app Error subclasses (keyId, type, …).
+    // Host errors such as DOMException have getter-only `code`; cloning their
+    // prototype onto a plain Error and assigning those fields throws
+    // TypeError ("setting getter-only property 'code'") and would abort
+    // callers that only meant to log a failed decrypt.
+    if (error.constructor !== Error && !isHostError(error)) {
+      try {
+        Object.setPrototypeOf(sanitizedError, error.constructor.prototype);
+      } catch {
+        // keep a plain Error if the prototype cannot be adopted
+      }
 
-      // Copy over additional properties, sanitizing string values
       for (const key in error) {
-        if (key !== "name" && key !== "message" && key !== "stack") {
+        if (key === "name" || key === "message" || key === "stack") continue;
+        try {
           const value = (error as any)[key];
-          if (typeof value === "string") {
-            (sanitizedError as any)[key] = this.sanitizeString(value);
-          } else {
-            (sanitizedError as any)[key] = value;
-          }
+          const sanitizedValue = typeof value === "string" ? this.sanitizeString(value) : value;
+          Object.defineProperty(sanitizedError, key, {
+            value: sanitizedValue,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+        } catch {
+          // skip getter-only / non-configurable host fields
         }
       }
     }
 
     return sanitizedError;
   }
+}
+
+function isErrorLike(arg: unknown): arg is Error {
+  if (arg instanceof Error) return true;
+  return typeof DOMException !== "undefined" && arg instanceof DOMException;
+}
+
+function isHostError(error: Error): boolean {
+  return typeof DOMException !== "undefined" && error instanceof DOMException;
 }

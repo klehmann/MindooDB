@@ -209,9 +209,7 @@ export function applyKeyPairFields(data: Record<string, unknown>, pairs: GrantKe
     if (pair.label !== undefined && pair.label.length > 0) {
       entry.label = pair.label;
     }
-    if (typeof pair.addedAt === "number") {
-      entry.addedAt = pair.addedAt;
-    }
+    entry.addedAt = typeof pair.addedAt === "number" ? pair.addedAt : Date.now();
     return entry;
   });
 
@@ -225,9 +223,7 @@ export function applyKeyPairFields(data: Record<string, unknown>, pairs: GrantKe
     if (pair.label !== undefined && pair.label.length > 0) {
       entry.label = pair.label;
     }
-    if (typeof pair.addedAt === "number") {
-      entry.addedAt = pair.addedAt;
-    }
+    entry.addedAt = typeof pair.addedAt === "number" ? pair.addedAt : Date.now();
     if (typeof pair.revokedAt === "number") {
       entry.revokedAt = pair.revokedAt;
     }

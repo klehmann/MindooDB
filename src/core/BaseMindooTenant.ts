@@ -19,6 +19,8 @@ import {
   DEFAULT_TENANT_KEY_ID,
   PublishToServerOptions,
   PUBLIC_INFOS_KEY_ID,
+  DIRECTORY_DB_ID,
+  USER_DIRECTORY_DB_ID,
 } from "./types";
 import { PrivateUserId, PublicUserId } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
@@ -26,6 +28,17 @@ import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
+import { UserKeyManager } from "./userkeys/UserKeyManager";
+import type {
+  PendingUserKeyDevice,
+  UserKeyEnrollmentStatus,
+} from "./userkeys/types";
+import { currentUserKeyEpoch } from "./userkeys/types";
+import { asUserKeyPayload } from "./userkeys/validateUserKeyDocument";
+import { isSealedKeyId } from "./userkeys/sealedTypes";
+import type { EntryRecipients } from "./userkeys/sealedTypes";
+import { newestRecipientBlock } from "./userkeys/recipients";
+import { openBundle } from "./userkeys/sealedCrypto";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
@@ -73,6 +86,7 @@ export class BaseMindooTenant implements MindooTenant {
   private keyBag: KeyBag;
   private storeFactory: ContentAddressedStoreFactory;
   private databaseCache: Map<string, MindooDB> = new Map();
+  private databaseOpenInFlight: Map<string, Promise<MindooDB>> = new Map();
   private directoryCache: MindooTenantDirectory | null = null;
   private remoteStoreCache: Map<string, Promise<ContentAddressedStore>> = new Map();
   /**
@@ -122,6 +136,9 @@ export class BaseMindooTenant implements MindooTenant {
   // recursing or overlapping. Reconcile is idempotent, so a skipped overlap is
   // harmless — the next trigger re-runs it.
   private reconcileInFlight = false;
+  private userKeyReconcileScheduled = false;
+  private readonly userKeys = new UserKeyManager(this);
+  private readonly sealedGenerations = new Map<string, Uint8Array[]>();
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -285,6 +302,140 @@ export class BaseMindooTenant implements MindooTenant {
     return timestamp;
   }
 
+  getCurrentPrivateUser(): PrivateUserId {
+    return this.currentUser;
+  }
+
+  getCurrentUserPassword(): string {
+    return this.currentUserPassword;
+  }
+
+  getUserKeyManager(): UserKeyManager {
+    return this.userKeys;
+  }
+
+  isDatabaseOpen(dbId: string): boolean {
+    return this.databaseCache.has(dbId) || this.databaseOpenInFlight.has(dbId);
+  }
+
+  /** Fully initialized (not merely in-flight). See UserKeyManager.canReconcileAgainstUserDirectory. */
+  isDatabaseReady(dbId: string): boolean {
+    return this.databaseCache.has(dbId);
+  }
+
+  /**
+   * Coalesce grant-driven user-key compares onto one run after the current
+   * `updateUnifiedCache` stack unwinds. Calling reconcile synchronously from
+   * the cache pass re-enters the cache via `findGrantAccessDocuments` and
+   * unbounded-allocates.
+   */
+  scheduleUserKeyReconcile(): void {
+    if (this.userKeys.isReconciling() || this.userKeyReconcileScheduled) return;
+    this.userKeyReconcileScheduled = true;
+    queueMicrotask(() => {
+      this.userKeyReconcileScheduled = false;
+      if (this.userKeys.isReconciling()) return;
+      void this.reconcileUserKeysSafe();
+    });
+  }
+
+  noteUserDirectoryFetched(): void {
+    this.userKeys.noteUserDirectoryFetched();
+  }
+
+  noteUserDirectoryFetchFailed(error: unknown): void {
+    this.userKeys.noteUserDirectoryFetchFailed(error);
+  }
+
+  async listPendingUserKeyDevices(): Promise<PendingUserKeyDevice[]> {
+    return this.userKeys.listPendingUserKeyDevices();
+  }
+
+  async listUserKeyDevices(): Promise<import("./userkeys/types").UserKeyDeviceRow[]> {
+    return this.userKeys.listUserKeyDevices();
+  }
+
+  async approveUserKeyDevice(fingerprint: string): Promise<void> {
+    return this.userKeys.approveUserKeyDevice(fingerprint);
+  }
+
+  async declineUserKeyDevice(fingerprint: string): Promise<void> {
+    return this.userKeys.declineUserKeyDevice(fingerprint);
+  }
+
+  async undoDeclineUserKeyDevice(fingerprint: string): Promise<void> {
+    return this.userKeys.undoDeclineUserKeyDevice(fingerprint);
+  }
+
+  async rotateUserKey(): Promise<void> {
+    return this.userKeys.rotateUserKey();
+  }
+
+  async reconcileUserKeys(options?: { allowSelfCreate?: boolean }): Promise<UserKeyEnrollmentStatus> {
+    return this.userKeys.reconcile(options);
+  }
+
+  async reconcileUserKeysSafe(): Promise<void> {
+    try {
+      await this.userKeys.reconcile();
+    } catch (error) {
+      this.logger.warn(`reconcileUserKeysSafe: ${error}`);
+    }
+  }
+
+  async getUserKeyEnrollmentStatus(): Promise<UserKeyEnrollmentStatus> {
+    return this.userKeys.getEnrollmentStatus();
+  }
+
+  async ensureLocalUserKeyPair(): Promise<void> {
+    await this.userKeys.ensureLocalUserKeyPair(this.currentUser, this.currentUserPassword);
+  }
+
+  rememberSealedGenerations(keyId: string, generations: Uint8Array[]): void {
+    this.sealedGenerations.set(keyId, generations);
+  }
+
+  getSealedGenerations(keyId: string): Uint8Array[] {
+    return this.sealedGenerations.get(keyId) ?? [];
+  }
+
+  async ingestSealedRecipients(keyId: string, recipients: EntryRecipients): Promise<void> {
+    const cached = this.sealedGenerations.get(keyId);
+    if (cached && cached.length >= recipients.epoch) return;
+    const keys = [
+      ...(await this.userKeys.getUserKeyCryptoKeysForReconcile()),
+      await this.getEncryptionPrivateKeyForReconcile(),
+    ].filter((k): k is CryptoKey => !!k);
+    if (keys.length === 0) return;
+    for (const key of keys) {
+      try {
+        const gens = await openBundle({
+          crypto: this.cryptoAdapter,
+          recipients,
+          privateKey: key,
+        });
+        this.sealedGenerations.set(keyId, gens);
+        return;
+      } catch {
+        // try next key
+      }
+    }
+    // Newest wrap list is not for us (removed, or never added). Drop any
+    // older session cache so hasDecryptionKey / visibility reconcile hide
+    // the document instead of decrypting new entries with a stale DEK.
+    this.sealedGenerations.delete(keyId);
+  }
+
+  async ingestSealedFromEntries(
+    keyId: string,
+    entries: Array<{ recipients?: EntryRecipients; createdAt: number }>,
+  ): Promise<void> {
+    if (!isSealedKeyId(keyId)) return;
+    const newest = newestRecipientBlock(entries);
+    if (!newest) return;
+    await this.ingestSealedRecipients(keyId, newest);
+  }
+
   getFactory(): MindooTenantFactory {
     return this.factory;
   }
@@ -324,6 +475,9 @@ export class BaseMindooTenant implements MindooTenant {
     usage: "encrypt" | "decrypt",
   ): Promise<CryptoKey> {
     let cacheKey = usage + ":";
+    if (symmetricKey.length !== 32) {
+      throw new Error(`AES-256 key must be 32 bytes, got ${symmetricKey.length}`);
+    }
     for (let i = 0; i < symmetricKey.length; i++) {
       cacheKey += symmetricKey[i].toString(16).padStart(2, "0");
     }
@@ -332,11 +486,10 @@ export class BaseMindooTenant implements MindooTenant {
       return cached;
     }
     const subtle = this.cryptoAdapter.getSubtle();
-    // Create a new Uint8Array to ensure we have a proper ArrayBuffer
-    const keyArray = new Uint8Array(symmetricKey);
+    const keyArray = symmetricKey.slice();
     const cryptoKey = await subtle.importKey(
       "raw",
-      keyArray.buffer,
+      keyArray,
       { name: "AES-GCM" },
       false, // not extractable
       [usage]
@@ -360,7 +513,13 @@ export class BaseMindooTenant implements MindooTenant {
     // Get the symmetric key for this key ID
     let symmetricKey: Uint8Array;
     try {
-      if (decryptionKeyId === "default") {
+      if (isSealedKeyId(decryptionKeyId)) {
+        const generations = this.sealedGenerations.get(decryptionKeyId);
+        if (!generations?.length) {
+          throw new SymmetricKeyNotFoundError(decryptionKeyId);
+        }
+        symmetricKey = generations[0];
+      } else if (decryptionKeyId === "default") {
         // Use cached tenant encryption key if available
         if (this.decryptedTenantKeyCache) {
           symmetricKey = this.decryptedTenantKeyCache;
@@ -501,7 +660,9 @@ export class BaseMindooTenant implements MindooTenant {
       }
     }
     this.logger.debug(`Decrypt failed against all ${candidates.length} version(s) of key "${decryptionKeyId}"`);
-    throw lastError ?? new SymmetricKeyNotFoundError(decryptionKeyId);
+    throw lastError instanceof Error
+      ? new SymmetricKeyNotFoundError(decryptionKeyId)
+      : new SymmetricKeyNotFoundError(decryptionKeyId);
   }
 
   /**
@@ -514,6 +675,9 @@ export class BaseMindooTenant implements MindooTenant {
    * tenant-default version so encryption keeps using the latest key.
    */
   private async getDecryptionKeyCandidates(decryptionKeyId: string): Promise<Uint8Array[]> {
+    if (isSealedKeyId(decryptionKeyId)) {
+      return this.sealedGenerations.get(decryptionKeyId) ?? [];
+    }
     const id = decryptionKeyId === "default" ? DEFAULT_TENANT_KEY_ID : decryptionKeyId;
     const versions = await this.keyBag.getAllKeys("doc", this.tenantId, id);
     if (decryptionKeyId === "default" && versions.length > 0) {
@@ -536,7 +700,7 @@ export class BaseMindooTenant implements MindooTenant {
         name: "Ed25519",
       },
       signingKey,
-      payload.buffer as ArrayBuffer
+      payload.slice(),
     );
 
     this.logger.debug(`Signed payload (signature: ${signature.byteLength} bytes)`);
@@ -869,7 +1033,8 @@ export class BaseMindooTenant implements MindooTenant {
     // Every local database belonging to this tenant: the directory plus any
     // opened/known data databases. Wipe is a whole-tenant operation.
     const dbIds = new Set<string>([
-      "directory",
+      DIRECTORY_DB_ID,
+      USER_DIRECTORY_DB_ID,
       ...this.databaseCache.keys(),
       ...(additionalDbIds ?? []),
     ]);
@@ -928,7 +1093,7 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   private async assertCurrentUserCanOpenDB(id: string): Promise<void> {
-    if (id === "directory") {
+    if (id === DIRECTORY_DB_ID || id === USER_DIRECTORY_DB_ID) {
       return;
     }
 
@@ -1005,7 +1170,7 @@ export class BaseMindooTenant implements MindooTenant {
 
     // Enforce admin-only mode for directory database - this is a security invariant
     // The directory database must only accept entries signed by the admin key
-    const effectiveOptions: OpenDBOptions = validDbId === "directory"
+    const effectiveOptions: OpenDBOptions = validDbId === DIRECTORY_DB_ID
       ? { ...options, adminOnlyDb: true }
       : options ?? {};
     const normalizedTimeTravelDate = this.normalizeTimeTravelDate(effectiveOptions.timeTravelDate);
@@ -1014,23 +1179,53 @@ export class BaseMindooTenant implements MindooTenant {
       : `${validDbId}::tt:${normalizedTimeTravelDate}`;
 
     await this.assertCurrentUserCanOpenDB(validDbId);
-    
-    // Return cached database if it exists
+
     const cached = this.databaseCache.get(databaseCacheKey);
     if (cached) {
-      // For directory DB, verify admin-only flag matches (defensive check)
-      if (validDbId === "directory" && !cached.isAdminOnlyDb()) {
+      if (validDbId === DIRECTORY_DB_ID && !cached.isAdminOnlyDb()) {
         throw new Error("Directory database was cached without adminOnlyDb - this should never happen");
       }
-      // Live databases must reflect the current KeyBag state before they
-      // are handed back to callers. Time-travel snapshots are immutable
-      // historical views and intentionally do not participate in
-      // visibility reconciliation, so we skip the call for them.
       if (normalizedTimeTravelDate == null) {
         await this.reconcileKeyBagChanges();
       }
       return cached;
     }
+
+    const inFlight = this.databaseOpenInFlight.get(databaseCacheKey);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    let resolveOpen: (db: MindooDB) => void;
+    let rejectOpen: (error: unknown) => void;
+    const opening = new Promise<MindooDB>((resolve, reject) => {
+      resolveOpen = resolve;
+      rejectOpen = reject;
+    });
+    this.databaseOpenInFlight.set(databaseCacheKey, opening);
+    try {
+      const db = await this.openDBUncached(
+        validDbId,
+        databaseCacheKey,
+        effectiveOptions,
+        normalizedTimeTravelDate,
+      );
+      resolveOpen!(db);
+      return db;
+    } catch (error) {
+      rejectOpen!(error);
+      throw error;
+    } finally {
+      this.databaseOpenInFlight.delete(databaseCacheKey);
+    }
+  }
+
+  private async openDBUncached(
+    validDbId: string,
+    databaseCacheKey: string,
+    effectiveOptions: OpenDBOptions,
+    normalizedTimeTravelDate: number | null,
+  ): Promise<MindooDB> {
 
     // Extract store options and DB-specific options
     const {
@@ -1388,28 +1583,8 @@ export class BaseMindooTenant implements MindooTenant {
     return { keyId, versions };
   }
 
-  private resolveJoinResponseDocKeyIds(options: ApproveJoinRequestOptions): string[] {
-    const requestedKeyIds = options.sharedDocKeyIds ?? [PUBLIC_INFOS_KEY_ID, DEFAULT_TENANT_KEY_ID];
-    const keyIds = new Set<string>();
-    keyIds.add(PUBLIC_INFOS_KEY_ID);
-
-    for (const keyId of requestedKeyIds) {
-      const normalizedKeyId = keyId.trim();
-      if (normalizedKeyId) {
-        keyIds.add(normalizedKeyId);
-      }
-    }
-
-    return [
-      PUBLIC_INFOS_KEY_ID,
-      ...Array.from(keyIds)
-        .filter((keyId) => keyId !== PUBLIC_INFOS_KEY_ID)
-        .sort((a, b) => {
-          if (a === DEFAULT_TENANT_KEY_ID) return -1;
-          if (b === DEFAULT_TENANT_KEY_ID) return 1;
-          return a.localeCompare(b);
-        }),
-    ];
+  private resolveJoinResponseDocKeyIds(_options: ApproveJoinRequestOptions): string[] {
+    return [PUBLIC_INFOS_KEY_ID];
   }
 
   // ==================== Convenience Methods ====================
@@ -1461,7 +1636,12 @@ export class BaseMindooTenant implements MindooTenant {
     const deviceLabel =
       typeof options.label === "string" && options.label.trim().length > 0
         ? options.label.trim()
-        : request.label;
+        : typeof request.label === "string"
+          ? request.label.trim()
+          : "";
+    if (!deviceLabel) {
+      throw new Error("Device label is required when granting access");
+    }
     await directory.registerUser(
       publicUserId,
       options.adminSigningKey,
@@ -1469,11 +1649,45 @@ export class BaseMindooTenant implements MindooTenant {
       undefined,
       deviceLabel,
       {
-        distributeKeyIds: this.resolveJoinResponseDocKeyIds(options).filter(
-          (keyId) => keyId !== PUBLIC_INFOS_KEY_ID,
-        ),
+        distributeKeyIds: [],
       },
     );
+
+    const userPublicKey =
+      typeof request.userPublicKey === "string" ? request.userPublicKey.trim() : "";
+    if (userPublicKey) {
+      const userKeyDoc = await this.userKeys.createPendingFromJoin({
+        username,
+        userPublicKey,
+        signingKeyPair: {
+          publicKey: this.administrationPublicKey,
+          privateKey: options.adminSigningKey,
+        },
+        signingKeyPassword: options.adminPassword,
+      });
+      const payload = asUserKeyPayload(userKeyDoc.getData());
+      const epoch = payload ? currentUserKeyEpoch(payload) : null;
+      const publishedPublicKey = epoch ? payload?.userKeys[epoch]?.publicKey : undefined;
+      // First device: wrap `default` to the join-request User-Key (pending is
+      // OK). Additional device: the published key already exists and must not
+      // be rewritten to this device's freshly generated pair.
+      if (publishedPublicKey === userPublicKey) {
+        await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
+          username,
+          [DEFAULT_TENANT_KEY_ID],
+          options.adminSigningKey,
+          options.adminPassword,
+          userPublicKey,
+        );
+      }
+    } else {
+      const existingUserKey = await this.userKeys.publishedUserKeyFor(username);
+      if (!existingUserKey) {
+        throw new Error(
+          "Cannot approve join request: it carries no userPublicKey and the person has no published User-Key. Generate a User-Key on the joining device first.",
+        );
+      }
+    }
 
     // 2. Export selected document keys RSA-OAEP-wrapped to the requester's
     // encryption public key. `$publicinfos` is mandatory because the joining
@@ -2003,6 +2217,9 @@ export class BaseMindooTenant implements MindooTenant {
    * @returns true if the key can be resolved, false otherwise
    */
   async hasDecryptionKey(decryptionKeyId: string): Promise<boolean> {
+    if (isSealedKeyId(decryptionKeyId)) {
+      return (this.sealedGenerations.get(decryptionKeyId)?.length ?? 0) > 0;
+    }
     try {
       await this.getSymmetricKey(decryptionKeyId);
       return true;

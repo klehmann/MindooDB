@@ -18,6 +18,8 @@ import {
   ChangeOptions,
   CUSTOM_DOC_ID_REGEX,
   DOC_ID_PREFIX_REGEX,
+  DIRECTORY_DB_ID,
+  USER_DIRECTORY_DB_ID,
   DocumentDagAnalysisTimestamp,
   DocumentDagAnalysisResult,
   DocumentDagBranchMaterializationResult,
@@ -154,6 +156,34 @@ import type { RuleType, AccessDecision } from "./accesscontrol/types";
 import { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { validateDatabaseId } from "./databaseIdValidation";
+import {
+  evaluateBuiltinWrite,
+  hasBuiltinWriteInvariant,
+  shouldSkipLoadedEntry,
+  usernameHashFromCreateChangeBytes,
+  type BuiltinWriteOp,
+} from "./builtinDbInvariants";
+import {
+  applyEncryptForAdds,
+  applyEncryptForCreate,
+  applyEncryptForRemoves,
+  newestRecipientBlock,
+  readEncryptFor,
+  resolveRecipientSpecs,
+  resolveRecipientsFromPayload,
+  isPayloadEncryptedFor,
+  sealToTargets,
+  type ResolvedWrapTarget,
+} from "./userkeys/recipients";
+import {
+  ENCRYPT_FOR_FIELD,
+  isSealedKeyId,
+  sealedKeyId,
+  type EntryRecipients,
+  type RecipientChangeOptions,
+  type RecipientChangeResult,
+  type RecipientSpec,
+} from "./userkeys/sealedTypes";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import type { ICacheable } from "./cache/CacheManager";
 import type { CacheManager } from "./cache/CacheManager";
@@ -362,6 +392,8 @@ interface InternalDoc {
   jsCache?: MindooDocPayload;
   /** Automerge heads (joined) that {@link jsCache} was computed from. */
   jsCacheHeads?: string;
+  /** Latest recipient block for a sealed document, used by `getRecipients()`. */
+  sealedRecipients?: EntryRecipients;
 }
 
 /**
@@ -532,12 +564,13 @@ export class BaseMindooDB implements MindooDB {
    */
   private aclActiveCache: { value: boolean; at: number } | null = null;
   /**
-   * Per-document cache of the original creator's signing public key (the
-   * `doc_create` entry's `createdByPublicKey`). Used by the client write
-   * prechecks to resolve `$author` (`isAuthor`) without re-scanning metadata on
-   * every change/delete. Populated on create and lazily on first lookup.
+   * Per-document cache of the original creator's signing public key and the
+   * trusted time of the `doc_create` entry. Used by the client write prechecks
+   * to resolve `$author` (`isAuthor`) at grant level without re-scanning
+   * metadata on every change/delete. Populated on create and lazily on first
+   * lookup.
    */
-  private creatorKeyCache = new Map<string, string>();
+  private creatorInfoCache = new Map<string, { signingKey: string; trustedTime: number }>();
   private chunkSizeBytes: number;
   
   // Admin-only mode: only entries signed by the admin key are loaded
@@ -812,6 +845,10 @@ export class BaseMindooDB implements MindooDB {
    * the warmer settled can still display its outcome.
    */
   private warmerProgress: BackgroundWarmerProgress | null = null;
+  /** `username_hash` per userdirectory document, filled from creates. */
+  private userdirectoryHashByDocId = new Map<string, string>();
+  /** Grant `username_hash` for a signing public key at "now". */
+  private signerUsernameHashByKey = new Map<string, string | null>();
 
   constructor(
     tenant: BaseMindooTenant, 
@@ -932,6 +969,149 @@ export class BaseMindooDB implements MindooDB {
    */
   private getAdminPublicKey(): string {
     return this.tenant.getAdministrationPublicKey();
+  }
+
+  /**
+   * Database id used by the builtin-write registry. Admin-only databases that
+   * are not `userdirectory` are treated like `directory` (admin-only writes).
+   */
+  private effectiveBuiltinDbId(): string {
+    const dbId = this.store.getId();
+    if (this._isAdminOnlyDb && dbId !== USER_DIRECTORY_DB_ID) {
+      return DIRECTORY_DB_ID;
+    }
+    return dbId;
+  }
+
+  private usernameHashFromRecord(payload: unknown): string | null {
+    if (!payload || typeof payload !== "object") return null;
+    const value = (payload as Record<string, unknown>).username_hash;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  private usernameHashFromInternalDoc(internalDoc: InternalDoc): string | null {
+    return this.usernameHashFromRecord(
+      this.convertAutomergeToJS(internalDoc.doc) as unknown as Record<string, unknown>,
+    );
+  }
+
+  private async resolveSignerUsernameHash(signerKey: string): Promise<string | null> {
+    try {
+      const directory = await this.tenant.openDirectory();
+      if (typeof directory.resolveUsernameHashForSigningKey !== "function") {
+        return null;
+      }
+      return directory.resolveUsernameHashForSigningKey(signerKey, Number.MAX_SAFE_INTEGER);
+    } catch {
+      return null;
+    }
+  }
+
+  private async resolveSignerPublicKey(signingKeyPair?: SigningKeyPair): Promise<string> {
+    if (signingKeyPair) return signingKeyPair.publicKey;
+    return (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+  }
+
+  /**
+   * Hard-wired write gate for `directory` / `userdirectory` (and other
+   * admin-only databases). Independent of the ACL master switch.
+   */
+  private async assertBuiltinWriteAllowed(
+    op: BuiltinWriteOp,
+    signerPublicKey: string,
+    documentUsernameHash?: string | null,
+  ): Promise<void> {
+    const dbId = this.effectiveBuiltinDbId();
+    if (!hasBuiltinWriteInvariant(dbId) && !this._isAdminOnlyDb) {
+      return;
+    }
+    let signerUsernameHash: string | null = null;
+    if (dbId === USER_DIRECTORY_DB_ID) {
+      signerUsernameHash = await this.resolveSignerUsernameHash(signerPublicKey);
+      this.signerUsernameHashByKey.set(signerPublicKey, signerUsernameHash);
+    }
+    const decision = evaluateBuiltinWrite({
+      dbId,
+      op,
+      signerKey: signerPublicKey,
+      adminPublicKey: this.getAdminPublicKey(),
+      documentUsernameHash,
+      signerUsernameHash,
+    });
+    if (!decision.allowed) {
+      throw new Error(decision.reason);
+    }
+  }
+
+  /**
+   * Load-path counterpart: drop entries that the builtin invariant forbids.
+   * Username-hash matching for userdirectory creates is enforced on write and
+   * on the server. Admin-signed changes load only when the signer is also the
+   * person named by the document (the tenant founder wrapping their own key).
+   */
+  private async shouldSkipLoadedEntryForBuiltin(entry: {
+    entryType?: string;
+    createdByPublicKey: string;
+    docId?: string;
+  }): Promise<boolean> {
+    const dbId = this.effectiveBuiltinDbId();
+    const entryType = entry.entryType ?? "doc_change";
+    let documentUsernameHash: string | null = null;
+    let signerUsernameHash: string | null = null;
+    if (
+      dbId === USER_DIRECTORY_DB_ID &&
+      (entryType === "doc_change" || entryType === "doc_snapshot") &&
+      entry.docId
+    ) {
+      documentUsernameHash = await this.ensureUserdirectoryDocHash(entry.docId);
+      signerUsernameHash = await this.ensureSignerUsernameHash(entry.createdByPublicKey);
+    }
+    return shouldSkipLoadedEntry({
+      dbId,
+      entryType,
+      signerKey: entry.createdByPublicKey,
+      adminPublicKey: this.getAdminPublicKey(),
+      documentUsernameHash,
+      signerUsernameHash,
+    });
+  }
+
+  private async ensureSignerUsernameHash(signerKey: string): Promise<string | null> {
+    if (this.signerUsernameHashByKey.has(signerKey)) {
+      return this.signerUsernameHashByKey.get(signerKey) ?? null;
+    }
+    const hash = await this.resolveSignerUsernameHash(signerKey);
+    this.signerUsernameHashByKey.set(signerKey, hash);
+    return hash;
+  }
+
+  private async ensureUserdirectoryDocHash(docId: string): Promise<string | null> {
+    const cached = this.userdirectoryHashByDocId.get(docId);
+    if (cached) return cached;
+    try {
+      const metas = await this.scanAllMetadata(this.store, { docId });
+      const create = metas.find((meta) => meta.entryType === "doc_create");
+      if (!create) return null;
+      const [entry] = await this.store.getEntries([create.id]);
+      if (!entry) return null;
+      const decrypted = await this.tenant.decryptPayload(
+        entry.encryptedData,
+        entry.decryptionKeyId,
+      );
+      let hash = usernameHashFromCreateChangeBytes(decrypted);
+      if (!hash) {
+        try {
+          const loaded = Automerge.load<Record<string, unknown>>(decrypted);
+          hash = this.usernameHashFromRecord(loaded);
+        } catch {
+          hash = null;
+        }
+      }
+      if (hash) this.userdirectoryHashByDocId.set(docId, hash);
+      return hash;
+    } catch {
+      return null;
+    }
   }
   
   isAdminOnlyDb(): boolean {
@@ -1134,7 +1314,7 @@ export class BaseMindooDB implements MindooDB {
     // indexing (DirectoryTimeTravelIndex) and its change events interleave
     // with access-control evaluation; admin-only databases hold no user
     // data worth summarizing. Explicit getSummaryStore() calls still work.
-    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+    if (this._isAdminOnlyDb || this.store.getId() === DIRECTORY_DB_ID || this.store.getId() === USER_DIRECTORY_DB_ID) {
       return;
     }
     const hasSetupChange = changes.some((change) => change.docId === DB_SETUP_DOC_ID);
@@ -1373,7 +1553,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
     // Same system-database exclusion as the summary auto-activation.
-    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+    if (this._isAdminOnlyDb || this.store.getId() === DIRECTORY_DB_ID || this.store.getId() === USER_DIRECTORY_DB_ID) {
       return;
     }
     const hasSetupChange = changes.some((change) => change.docId === DB_SETUP_DOC_ID);
@@ -2073,36 +2253,45 @@ export class BaseMindooDB implements MindooDB {
   /**
    * Get or import a CryptoKey for signature verification, with caching.
    * This avoids re-importing the same public key multiple times.
+   *
+   * Trust is evaluated at `trustedTime` when provided (grant membership in the
+   * directory node covering that time, or the tenant admin key). Callers that
+   * omit it keep the historical HEAD check via `validatePublicSigningKey`.
    */
-  private async getOrImportPublicKey(publicKey: string): Promise<CryptoKey | null> {
-    // Check cache first
-    if (this.publicKeyCache.has(publicKey)) {
-      return this.publicKeyCache.get(publicKey)!;
-    }
-
-    // Validate the public key is trusted
+  private async getOrImportPublicKey(
+    publicKey: string,
+    trustedTime?: number,
+  ): Promise<CryptoKey | null> {
     const directory = await this.tenant.openDirectory();
-    const isTrusted = await directory.validatePublicSigningKey(publicKey);
+    let isTrusted = false;
+    if (trustedTime !== undefined && typeof directory.getDirectoryStateAt === "function") {
+      const node = await directory.getDirectoryStateAt(trustedTime);
+      isTrusted =
+        node.bySigningKey.has(publicKey) || publicKey === this.getAdminPublicKey();
+    } else {
+      isTrusted = await directory.validatePublicSigningKey(publicKey);
+    }
     if (!isTrusted) {
       this.logger.warn(`Public key not trusted: ${publicKey}`);
       return null;
     }
 
-    // Import the key
+    const cached = this.publicKeyCache.get(publicKey);
+    if (cached) return cached;
+
     const subtle = this.tenant.getCryptoAdapter().getSubtle();
     const publicKeyBuffer = this.tenant.pemToArrayBuffer(publicKey);
-    
+
     const cryptoKey = await subtle.importKey(
       "spki",
       publicKeyBuffer,
       {
         name: "Ed25519",
       },
-      false, // not extractable
-      ["verify"]
+      false,
+      ["verify"],
     );
 
-    // Cache the imported key
     this.publicKeyCache.set(publicKey, cryptoKey);
     return cryptoKey;
   }
@@ -2152,6 +2341,7 @@ export class BaseMindooDB implements MindooDB {
       | "contentHash"
       | "createdByPublicKey"
       | "attachmentRefs"
+      | "recipients"
     > & { provenance?: EntryProvenance },
     signing?: { signingKeyPair?: SigningKeyPair; signingKeyPassword?: string },
   ): Promise<Uint8Array> {
@@ -2667,7 +2857,7 @@ export class BaseMindooDB implements MindooDB {
     if (!this.summaryAutoUpdateEnabled || this.summarySetupProbed || this.summaryStore) {
       return;
     }
-    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+    if (this._isAdminOnlyDb || this.store.getId() === DIRECTORY_DB_ID || this.store.getId() === USER_DIRECTORY_DB_ID) {
       return;
     }
     this.summarySetupProbed = true;
@@ -2701,7 +2891,7 @@ export class BaseMindooDB implements MindooDB {
     if (!this.fulltextAutoUpdateEnabled || this.fulltextSetupProbed || this.fulltextIndex) {
       return;
     }
-    if (this._isAdminOnlyDb || this.store.getId() === "directory") {
+    if (this._isAdminOnlyDb || this.store.getId() === DIRECTORY_DB_ID || this.store.getId() === USER_DIRECTORY_DB_ID) {
       return;
     }
     if (this.isTimeTravelMode()) {
@@ -2886,10 +3076,7 @@ export class BaseMindooDB implements MindooDB {
 
       const existingIndex = this.getDocIndexPosition(docId);
       const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
-      // Visibility is governed by key possession alone: documents whose
-      // decryption key is in the bag are visible; the rest are hidden. Which
-      // keys a user holds is governed by the key distribution model
-      // (docs/accesscontrol.md §13), not by a server/client read gate.
+      await this.tenant.ingestSealedFromEntries?.(visibility.decryptionKeyId, metadataByDoc.get(docId)!);
       const canRead = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
 
       if (canRead) {
@@ -3076,7 +3263,7 @@ export class BaseMindooDB implements MindooDB {
    *     directory was synced in a session that never opened this DB).
    */
   private async reconcileAuthorTrustAtOpen(): Promise<void> {
-    if (this.isTimeTravelMode() || this._isAdminOnlyDb || this.store.getId() === "directory") {
+    if (this.isTimeTravelMode() || this._isAdminOnlyDb || this.store.getId() === DIRECTORY_DB_ID || this.store.getId() === USER_DIRECTORY_DB_ID) {
       return;
     }
     if (this.legacyCheckpointNeedsAuthorTrustScan) {
@@ -3348,6 +3535,7 @@ export class BaseMindooDB implements MindooDB {
             // Before indexing, verify the user has the decryption key so that
             // documents the user cannot access do not appear in getAllDocumentIds.
             const representativeEntry = docLifecycleEntries[0];
+            await this.tenant.ingestSealedFromEntries?.(representativeEntry.decryptionKeyId, docLifecycleEntries);
             const keyAvailable = await this.tenant.hasDecryptionKey(representativeEntry.decryptionKeyId);
             if (!keyAvailable) {
               this.logger.debug(
@@ -4905,7 +5093,6 @@ export class BaseMindooDB implements MindooDB {
       );
     }
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
-    const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
     this.validateIdPrefixOption("createDocument", options);
     this.validateAssumeUniqueIdOption("createDocument", options);
@@ -4945,18 +5132,21 @@ export class BaseMindooDB implements MindooDB {
           "create the document, then apply values with changeDoc()."
         );
       }
-    }
-
-    // Admin-only validation: only admin key can modify data in admin-only databases
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const signerPublicKey = useCustomSigningKey 
-        ? signingKeyPair!.publicKey 
-        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-      if (signerPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
+      if (useDeterministicSeed && options.recipients !== undefined) {
+        throw new Error(
+          "createDocument: recipients is not supported together with a convergent custom id; " +
+          "pass assumeUniqueId for random ids."
+        );
       }
     }
+
+    const signerPublicKey = await this.resolveSignerPublicKey(
+      useCustomSigningKey ? signingKeyPair : undefined,
+    );
+    const createUsernameHash = this.usernameHashFromRecord(
+      Object.fromEntries(initialValueEntries),
+    );
+    await this.assertBuiltinWriteAllowed("doc_create", signerPublicKey, createUsernameHash);
 
     const docId = useCustomDocId ? options.id! : this.generateUnusedDocId(options.idPrefix);
 
@@ -4979,6 +5169,7 @@ export class BaseMindooDB implements MindooDB {
       }
     }
 
+    const keyId = await this.resolveCreateKeyId(options, docId);
     this.logger.debug(`Creating document ${docId} with key ${keyId}${useCustomSigningKey ? ' using custom signing key' : ''}${useCustomDocId ? ' with caller-provided id' : ''}`);
     
     // Build the initial Automerge document and its first change bytes.
@@ -4989,6 +5180,7 @@ export class BaseMindooDB implements MindooDB {
     // replicas using the same id produce the same Automerge hash and
     // `doc_create` entry id, allowing later changes to merge.
     const now = semanticNow();
+    const sealedCreate = await this.prepareSealedCreate(options, docId, keyId, now, signerPublicKey);
     let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
     let changeBytes: Uint8Array;
     if (useDeterministicSeed) {
@@ -5011,6 +5203,9 @@ export class BaseMindooDB implements MindooDB {
           // Store metadata in the document payload
           // We need to modify the document to ensure a change is created
           doc._attachments = [];
+          if (sealedCreate) {
+            applyEncryptForCreate(doc, sealedCreate.encryptFor);
+          }
           // Seed caller-provided initial values within the same doc_create
           // change so a doc_create Tier 2 rule can evaluate them in the
           // "after" state (docs/accesscontrol.md §6.3, §9).
@@ -5095,9 +5290,12 @@ export class BaseMindooDB implements MindooDB {
       createdByPublicKey = currentUser.userSigningPublicKey;
     }
     this.logger.debug(`Signed payload, signature length: ${signature.length} bytes`);
-    // Remember the creator's signing key so $author prechecks on subsequent
-    // change/delete operations don't need a metadata scan.
-    this.creatorKeyCache.set(docId, createdByPublicKey);
+    // Remember the creator so $author prechecks on subsequent change/delete
+    // operations don't need a metadata scan. `now` is the local createdAt;
+    // a later witness may stamp receivedAt, which resolveCreatorInfo picks up
+    // on a cache miss. For the local writer, createdAt is sufficient: the
+    // creating device is still granted.
+    this.creatorInfoCache.set(docId, { signingKey: createdByPublicKey, trustedTime: now });
 
     // Snapshot of attachments referenced by the freshly created doc (normally
     // empty; the public create API does not add attachments inline).
@@ -5117,6 +5315,7 @@ export class BaseMindooDB implements MindooDB {
       originalSize: changeBytes.length,
       encryptedSize: encryptedPayload.length,
       attachmentRefs: createAttachmentRefs.length > 0 ? createAttachmentRefs : undefined,
+      recipients: sealedCreate?.recipients,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     // Bind the metadata with the author signature (audit finding #5).
@@ -5154,6 +5353,7 @@ export class BaseMindooDB implements MindooDB {
       isDeleted: false,
       awaitingWitness,
       witnessed,
+      sealedRecipients: sealedCreate?.recipients,
     };
     
     // Update cache and index
@@ -5189,7 +5389,6 @@ export class BaseMindooDB implements MindooDB {
       );
     }
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
-    const keyId = await this.resolveCreateKeyId(options);
     const useCustomDocId = options.id !== undefined;
     this.validateIdPrefixOption("createDocuments", options);
     this.validateAssumeUniqueIdOption("createDocuments", options);
@@ -5197,6 +5396,11 @@ export class BaseMindooDB implements MindooDB {
     // out of the deterministic seed, so initialValues fold into doc_create
     // and the document costs a single store entry.
     const useDeterministicSeed = useCustomDocId && !options.assumeUniqueId;
+    if (useDeterministicSeed && options.recipients !== undefined) {
+      throw new Error(
+        "createDocuments: recipients is not supported together with a convergent custom id; pass assumeUniqueId",
+      );
+    }
 
     // Sanitize caller-provided initial values: internal/reserved fields are
     // managed by MindooDB and must not be seeded by callers. `undefined`
@@ -5207,19 +5411,18 @@ export class BaseMindooDB implements MindooDB {
         )
       : [];
 
-    // Admin-only validation: only admin key can modify data in admin-only databases
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const signerPublicKey = useCustomSigningKey
-        ? signingKeyPair!.publicKey
-        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-      if (signerPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
+    const signerPublicKey = await this.resolveSignerPublicKey(
+      useCustomSigningKey ? signingKeyPair : undefined,
+    );
+    const createUsernameHash = this.usernameHashFromRecord(
+      Object.fromEntries(initialValueEntries),
+    );
+    await this.assertBuiltinWriteAllowed("doc_create", signerPublicKey, createUsernameHash);
 
     const docId = useCustomDocId ? options.id! : this.generateUnusedDocId(options.idPrefix);
     const now = semanticNow();
+    const keyId = await this.resolveCreateKeyId(options, docId);
+    const sealedCreate = await this.prepareSealedCreate(options, docId, keyId, now, signerPublicKey);
 
     // Build the initial Automerge document and its first change bytes,
     // following the same seeding rules as the single-create path.
@@ -5234,6 +5437,9 @@ export class BaseMindooDB implements MindooDB {
       const initialDoc = Automerge.init<MindooDocPayload>();
       seedDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
         doc._attachments = [];
+        if (sealedCreate) {
+          applyEncryptForCreate(doc, sealedCreate.encryptFor);
+        }
         // Seed caller-provided initial values within the same doc_create change
         // so a doc_create Tier 2 rule can evaluate them in the "after" state.
         for (const [key, value] of initialValueEntries) {
@@ -5303,9 +5509,12 @@ export class BaseMindooDB implements MindooDB {
       signature = await this.tenant.signPayload(encryptedPayload);
       createdByPublicKey = currentUser.userSigningPublicKey;
     }
-    // Remember the creator's signing key so $author prechecks on subsequent
-    // change/delete operations don't need a metadata scan.
-    this.creatorKeyCache.set(docId, createdByPublicKey);
+    // Remember the creator so $author prechecks on subsequent change/delete
+    // operations don't need a metadata scan. `now` is the local createdAt;
+    // a later witness may stamp receivedAt, which resolveCreatorInfo picks up
+    // on a cache miss. For the local writer, createdAt is sufficient: the
+    // creating device is still granted.
+    this.creatorInfoCache.set(docId, { signingKey: createdByPublicKey, trustedTime: now });
 
     const createAttachmentRefs = this.collectAttachmentRefs(finalDoc);
     const entryMetadata: StoreEntryMetadata = {
@@ -5321,6 +5530,7 @@ export class BaseMindooDB implements MindooDB {
       originalSize: createChangeBytes.length,
       encryptedSize: encryptedPayload.length,
       attachmentRefs: createAttachmentRefs.length > 0 ? createAttachmentRefs : undefined,
+      recipients: sealedCreate?.recipients,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     // Bind the metadata with the author signature (audit finding #5).
@@ -5374,6 +5584,7 @@ export class BaseMindooDB implements MindooDB {
       isDeleted: false,
       awaitingWitness,
       witnessed,
+      sealedRecipients: sealedCreate?.recipients,
     };
 
     return { internalDoc, entries };
@@ -5457,7 +5668,7 @@ export class BaseMindooDB implements MindooDB {
         const snapshotData = snapshotEntries[0];
 
         let isValid = false;
-        if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+        if (await this.shouldSkipLoadedEntryForBuiltin(snapshotData)) {
           this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
           isValid = await this.tenant.verifyEntrySignature(
@@ -5515,7 +5726,7 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(entryData)) {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
@@ -5615,7 +5826,7 @@ export class BaseMindooDB implements MindooDB {
       }
       
       // Admin-only mode: only accept entries signed by the admin key
-      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(entryData)) {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
@@ -5816,14 +6027,14 @@ export class BaseMindooDB implements MindooDB {
     let stableCursor: RevisionCursor | null = cursor;
     let sawProvisional = false;
 
-    const consider = (em: StoreEntryMetadata): void => {
+    const consider = async (em: StoreEntryMetadata): Promise<void> => {
       if (!this.isDocumentReplayEntry(em)) {
         return;
       }
       // Admin-only mode: only accept entries signed by the admin key (mirrors
       // materialization / iterateDocumentHistory). Non-admin entries are
       // permanently ignored and do not gate the stable cursor.
-      if (this._isAdminOnlyDb && em.createdByPublicKey !== this.getAdminPublicKey()) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(em)) {
         return;
       }
       newEntries.push(em);
@@ -5855,7 +6066,7 @@ export class BaseMindooDB implements MindooDB {
       while (true) {
         const page = await this.store.scanEntriesSince!(scanCursor, 1000, scanFilters);
         for (const em of page.entries) {
-          consider(em);
+          await consider(em);
         }
         scanCursor = page.nextCursor;
         if (!page.hasMore) {
@@ -5875,7 +6086,7 @@ export class BaseMindooDB implements MindooDB {
         if (cursor && !this.isAfterReceiptCursor(em, cursor)) {
           continue;
         }
-        consider(em);
+        await consider(em);
       }
     }
 
@@ -5913,10 +6124,12 @@ export class BaseMindooDB implements MindooDB {
     // All metadata for this doc (metadata only, cheap). Includes snapshots, used
     // for cache-miss seed reconstruction.
     const docAllMeta = await this.scanAllMetadata(this.store, { docId });
-    let replayMeta = docAllMeta.filter((em) => this.isDocumentReplayEntry(em));
-    if (this._isAdminOnlyDb) {
-      const adminKey = this.getAdminPublicKey();
-      replayMeta = replayMeta.filter((em) => em.createdByPublicKey === adminKey);
+    const replayCandidates = docAllMeta.filter((em) => this.isDocumentReplayEntry(em));
+    const replayMeta: typeof replayCandidates = [];
+    for (const em of replayCandidates) {
+      if (!(await this.shouldSkipLoadedEntryForBuiltin(em))) {
+        replayMeta.push(em);
+      }
     }
     if (replayMeta.length === 0) {
       return;
@@ -6165,7 +6378,7 @@ export class BaseMindooDB implements MindooDB {
       return null;
     }
     const snapshotData = entries[0];
-    if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+    if (await this.shouldSkipLoadedEntryForBuiltin(snapshotData)) {
       this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
       return null;
     }
@@ -6377,7 +6590,7 @@ export class BaseMindooDB implements MindooDB {
         result.set(metadata.id, null);
         continue;
       }
-      if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(entry)) {
         result.set(metadata.id, null);
         continue;
       }
@@ -6590,7 +6803,7 @@ export class BaseMindooDB implements MindooDB {
       const entry = entries[0];
       if (entry) {
         let isValid = false;
-        if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
+        if (await this.shouldSkipLoadedEntryForBuiltin(entry)) {
           this.logger.warn(`Admin-only DB: skipping DAG details for ${entry.id} not signed by admin key`);
         } else {
           isValid = await this.tenant.verifyEntrySignature(
@@ -7395,7 +7608,7 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Conflict analysis: entry ${metadata.id} not found in store, skipping`);
         continue;
       }
-      if (this._isAdminOnlyDb && entry.createdByPublicKey !== this.getAdminPublicKey()) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(entry)) {
         this.logger.warn(`Admin-only DB: skipping conflict analysis entry ${entry.id} not signed by admin key`);
         continue;
       }
@@ -8070,7 +8283,7 @@ export class BaseMindooDB implements MindooDB {
     if (docIds.length === 0) {
       return;
     }
-    await this.assertLifecycleMutationAllowed(options.signingKeyPair, options.signingKeyPassword);
+    await this.assertLifecycleMutationAllowed("doc_delete", options.signingKeyPair, options.signingKeyPassword);
     this.logger.info(`Bulk-deleting ${docIds.length} documents`);
 
     // Unlike creation, a delete must first materialize the CURRENT document
@@ -8145,23 +8358,20 @@ export class BaseMindooDB implements MindooDB {
   }
 
   private async assertLifecycleMutationAllowed(
+    op: "doc_delete" | "doc_undelete",
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
+    documentUsernameHash?: string | null,
   ): Promise<void> {
     this.assertWritable("document lifecycle mutation");
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     if ((signingKeyPair !== undefined) !== (signingKeyPassword !== undefined)) {
       throw new Error("Lifecycle mutation requires both signingKeyPair and signingKeyPassword");
     }
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const signerPublicKey = useCustomSigningKey
-        ? signingKeyPair!.publicKey
-        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-      if (signerPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
+    const signerPublicKey = await this.resolveSignerPublicKey(
+      useCustomSigningKey ? signingKeyPair : undefined,
+    );
+    await this.assertBuiltinWriteAllowed(op, signerPublicKey, documentUsernameHash);
   }
 
   /**
@@ -8312,12 +8522,11 @@ export class BaseMindooDB implements MindooDB {
     // default to the "before" state; both states are supplied so either `when`
     // resolves. Throws AccessDeniedError if denied.
     {
-      const creatorKey = await this.resolveCreatorSigningKey(docId);
       const beforeState = internalDoc.doc;
       await this.assertWriteAllowed({
         op: entryType,
         signerKey: createdByPublicKey,
-        isAuthor: creatorKey !== null && createdByPublicKey === creatorKey,
+        isAuthor: await this.resolveIsAuthor(docId, createdByPublicKey, Number.MAX_SAFE_INTEGER),
         bypass: bypassPrecheck,
         getBeforeDoc: () =>
           this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
@@ -8402,7 +8611,7 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`Deleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
-    await this.assertLifecycleMutationAllowed(signingKeyPair, signingKeyPassword);
+    await this.assertLifecycleMutationAllowed("doc_delete", signingKeyPair, signingKeyPassword);
     
     // Get current document
     const internalDoc = await this.loadDocumentInternal(docId);
@@ -8421,12 +8630,16 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`Undeleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
-    await this.assertLifecycleMutationAllowed(signingKeyPair, signingKeyPassword);
-
     const internalDoc = await this.loadDocumentInternal(docId);
     if (!internalDoc) {
       throw new DocumentNotFoundError(docId);
     }
+    await this.assertLifecycleMutationAllowed(
+      "doc_undelete",
+      signingKeyPair,
+      signingKeyPassword,
+      this.usernameHashFromInternalDoc(internalDoc),
+    );
     if (!internalDoc.isDeleted) {
       this.logger.debug(`Document ${docId} is already alive; undelete is a no-op`);
       return;
@@ -8463,14 +8676,6 @@ export class BaseMindooDB implements MindooDB {
     this.assertWritable("applyTextPatch");
     const docId = doc.getId();
     this.logger.debug(`===== applyTextPatch called for document ${docId} =====`);
-
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const currentUser = await this.tenant.getCurrentUserId();
-      if (currentUser.userSigningPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
 
     let internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
@@ -8543,14 +8748,6 @@ export class BaseMindooDB implements MindooDB {
     this.assertWritable("applyRichTextPatch");
     const docId = doc.getId();
     this.logger.debug(`===== applyRichTextPatch called for document ${docId} =====`);
-
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const currentUser = await this.tenant.getCurrentUserId();
-      if (currentUser.userSigningPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
 
     let internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
@@ -8640,14 +8837,6 @@ export class BaseMindooDB implements MindooDB {
     this.assertWritable("applyRichTextStepsPatch");
     const docId = doc.getId();
     this.logger.debug(`===== applyRichTextStepsPatch called for document ${docId} =====`);
-
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const currentUser = await this.tenant.getCurrentUserId();
-      if (currentUser.userSigningPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
 
     let internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
@@ -8790,14 +8979,6 @@ export class BaseMindooDB implements MindooDB {
     const docId = doc.getId();
     this.logger.debug(`===== applyAutomergeChanges called for document ${docId} =====`);
 
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const currentUser = await this.tenant.getCurrentUserId();
-      if (currentUser.userSigningPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
-
     if (!Array.isArray(patch.changes) || patch.changes.length === 0) {
       throw new Error("Automerge changes patch must include at least one change byte sequence");
     }
@@ -8923,14 +9104,6 @@ export class BaseMindooDB implements MindooDB {
     const docId = doc.getId();
     this.logger.debug(`===== applyJsonPatch called for document ${docId} =====`);
 
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const currentUser = await this.tenant.getCurrentUserId();
-      if (currentUser.userSigningPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
-
     let internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
       const loadedDoc = await this.loadDocumentInternal(docId);
@@ -9003,17 +9176,6 @@ export class BaseMindooDB implements MindooDB {
     const useCustomKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`===== ${useCustomKey ? 'changeDocWithSigningKey' : 'changeDoc'} called for document ${docId} =====`);
     
-    // Admin-only validation: only admin key can modify data in admin-only databases
-    if (this._isAdminOnlyDb) {
-      const adminPublicKey = this.getAdminPublicKey();
-      const signerPublicKey = useCustomKey 
-        ? signingKeyPair!.publicKey 
-        : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-      if (signerPublicKey !== adminPublicKey) {
-        throw new Error("Admin-only database: only the admin key can modify data");
-      }
-    }
-    
     // Get internal document from cache or load it
     let internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
@@ -9084,6 +9246,20 @@ export class BaseMindooDB implements MindooDB {
       isAccessible: () => true,
       isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
       isWitnessed: () => internalDoc.witnessed ?? false,
+      isSealed: () => isSealedKeyId(internalDoc.decryptionKeyId),
+      getRecipients: () =>
+        resolveRecipientsFromPayload(
+          internalDoc.doc as unknown as MindooDocPayload,
+          internalDoc.sealedRecipients,
+        ),
+      getRecipientEpoch: () => internalDoc.sealedRecipients?.epoch ?? 0,
+      isEncryptedFor: (users: string | string[]) =>
+        isSealedKeyId(internalDoc.decryptionKeyId)
+        && isPayloadEncryptedFor(
+          internalDoc.doc as unknown as MindooDocPayload,
+          internalDoc.sealedRecipients,
+          Array.isArray(users) ? users : [users],
+        ),
       getHeads: () => Automerge.getHeads(internalDoc.doc),
       getData: () => {
         // Return a proxy that collects property assignments and deletions
@@ -9448,6 +9624,7 @@ export class BaseMindooDB implements MindooDB {
         successMessage: useCustomKey ? "changed with custom signing key" : "changed",
         attachmentIds: pendingAttachmentAdditions.map((ref) => ref.attachmentId),
         bypassPrecheck,
+        recipients: internalDoc.sealedRecipients,
       });
     } catch (error) {
       await Promise.all(
@@ -10047,8 +10224,9 @@ export class BaseMindooDB implements MindooDB {
     successMessage: string;
     attachmentIds?: string[];
     bypassPrecheck?: boolean;
+    recipients?: EntryRecipients;
   }): Promise<void> {
-    const { internalDoc, newDoc, now, headsBeforeChange, useCustomKey, signingKeyPair, signingKeyPassword, successMessage, attachmentIds, bypassPrecheck } = options;
+    const { internalDoc, newDoc, now, headsBeforeChange, useCustomKey, signingKeyPair, signingKeyPassword, successMessage, attachmentIds, bypassPrecheck, recipients } = options;
     const docId = internalDoc.id;
     this.logger.debug(`Getting change bytes from document ${docId}`);
     const changesSincePreviousHeads = headsBeforeChange
@@ -10073,6 +10251,7 @@ export class BaseMindooDB implements MindooDB {
       successMessage,
       attachmentIds,
       bypassPrecheck,
+      recipients: options.recipients,
     });
   }
 
@@ -10088,6 +10267,7 @@ export class BaseMindooDB implements MindooDB {
     successMessage: string;
     attachmentIds?: string[];
     bypassPrecheck?: boolean;
+    recipients?: EntryRecipients;
   }): Promise<void> {
     const {
       internalDoc,
@@ -10101,6 +10281,7 @@ export class BaseMindooDB implements MindooDB {
       successMessage,
       attachmentIds,
       bypassPrecheck,
+      recipients,
     } = options;
     const docId = internalDoc.id;
     const resolvedChangeBytesList = changeBytesList ?? (
@@ -10111,6 +10292,15 @@ export class BaseMindooDB implements MindooDB {
     if (resolvedChangeBytesList.length === 0) {
       throw new Error("No Automerge changes to persist");
     }
+
+    const signerPublicKey = await this.resolveSignerPublicKey(
+      useCustomKey ? signingKeyPair : undefined,
+    );
+    await this.assertBuiltinWriteAllowed(
+      "doc_change",
+      signerPublicKey,
+      this.usernameHashFromInternalDoc(internalDoc),
+    );
 
     // Signed snapshot of the document's attachments after this change, computed
     // once from the resulting document state so EVERY change path (changeDoc,
@@ -10131,6 +10321,7 @@ export class BaseMindooDB implements MindooDB {
         // The full attachment snapshot describes the document's resulting state,
         // so it goes on every produced entry (unlike the add-only attachmentIds).
         attachmentRefs,
+        recipients: index === 0 ? recipients : undefined,
       });
       entries.push(entry);
       const decodedChange = Automerge.decodeChange(changeBytes);
@@ -10145,12 +10336,11 @@ export class BaseMindooDB implements MindooDB {
       const signerKey = useCustomKey
         ? signingKeyPair!.publicKey
         : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-      const creatorKey = await this.resolveCreatorSigningKey(docId);
       const beforeState = internalDoc.doc;
       await this.assertWriteAllowed({
         op: "doc_change",
         signerKey,
-        isAuthor: creatorKey !== null && signerKey === creatorKey,
+        isAuthor: await this.resolveIsAuthor(docId, signerKey, Number.MAX_SAFE_INTEGER),
         bypass: bypassPrecheck,
         getBeforeDoc: () =>
           this.convertAutomergeToJS(beforeState) as unknown as Record<string, unknown>,
@@ -10177,6 +10367,9 @@ export class BaseMindooDB implements MindooDB {
     // changefeed must re-emit the doc even when `lastModified` collides with
     // the previous change in the same millisecond.
     this.updateIndex(docId, internalDoc.lastModified, internalDoc.isDeleted, internalDoc.decryptionKeyId, "visible", internalDoc.awaitingWitness, internalDoc.witnessed, true);
+    if (recipients) {
+      internalDoc.sealedRecipients = recipients;
+    }
     this.markDocDirty(docId);
 
     this.logger.info(`Document ${docId} ${successMessage} successfully`);
@@ -10200,8 +10393,9 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string;
     attachmentIds?: string[];
     attachmentRefs?: StoreEntryAttachmentRef[];
+    recipients?: EntryRecipients;
   }): Promise<StoreEntry> {
-    const { internalDoc, changeBytes, now, useCustomKey, signingKeyPair, signingKeyPassword, attachmentIds, attachmentRefs } = options;
+    const { internalDoc, changeBytes, now, useCustomKey, signingKeyPair, signingKeyPassword, attachmentIds, attachmentRefs, recipients } = options;
     const docId = internalDoc.id;
     this.logger.debug(`Got change bytes: ${changeBytes.length} bytes`);
 
@@ -10242,6 +10436,7 @@ export class BaseMindooDB implements MindooDB {
       encryptedSize: encryptedPayload.length,
       attachmentIds: attachmentIds && attachmentIds.length > 0 ? attachmentIds : undefined,
       attachmentRefs: attachmentRefs && attachmentRefs.length > 0 ? attachmentRefs : undefined,
+      recipients,
       entryVersion: CURRENT_STORE_ENTRY_VERSION,
     };
     // Bind the metadata with the author signature (audit finding #5).
@@ -10879,7 +11074,7 @@ export class BaseMindooDB implements MindooDB {
       if (snapshotEntries.length > 0) {
         const snapshotData = snapshotEntries[0];
         let isValid = false;
-        if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+        if (await this.shouldSkipLoadedEntryForBuiltin(snapshotData)) {
           this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
           isValid = await this.tenant.verifyEntrySignature(
@@ -10931,7 +11126,7 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(`Entry ${entryMeta.id} not found in store, skipping`);
         continue;
       }
-      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(entryData)) {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
         continue;
       }
@@ -11231,13 +11426,14 @@ export class BaseMindooDB implements MindooDB {
     const entries = await this.store.getEntries(orderedEntryIds);
     
     // Filter entries for admin-only mode first
-    const validEntries = entries.filter(entryData => {
-      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+    const validEntries: StoreEntry[] = [];
+    for (const entryData of entries) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(entryData)) {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
-        return false;
+        continue;
       }
-      return true;
-    });
+      validEntries.push(entryData);
+    }
     
     if (validEntries.length === 0) {
       this.logger.debug(`No valid entries to process for cached document ${docId}`);
@@ -11861,7 +12057,13 @@ export class BaseMindooDB implements MindooDB {
    * server. Directory ACL writes always pass an explicit key, so this never
    * re-enters the directory for them.
    */
-  private async resolveCreateKeyId(options: CreateOptions): Promise<string> {
+  private async resolveCreateKeyId(options: CreateOptions, docId?: string): Promise<string> {
+    if (options.recipients !== undefined && options.decryptionKeyId !== undefined) {
+      throw new Error("createDocument: recipients and decryptionKeyId are mutually exclusive");
+    }
+    if (options.recipients !== undefined) {
+      return sealedKeyId(docId ?? options.id ?? "pending");
+    }
     if (options.decryptionKeyId !== undefined) return options.decryptionKeyId;
     try {
       const directory = await this.tenant.openDirectory();
@@ -11874,6 +12076,33 @@ export class BaseMindooDB implements MindooDB {
       this.logger.debug(`[ACL] default create-key lookup skipped (directory error): ${error}`);
     }
     return "default";
+  }
+
+  private async prepareSealedCreate(
+    options: CreateOptions,
+    docId: string,
+    keyId: string,
+    now: number,
+    signerPublicKey: string,
+  ): Promise<{ encryptFor: Record<string, import("./userkeys/sealedTypes").EncryptForEntry>; recipients: EntryRecipients } | undefined> {
+    if (options.recipients === undefined) return undefined;
+    const tenant = this.tenant as BaseMindooTenant;
+    const resolved = await resolveRecipientSpecs({
+      tenant,
+      specs: options.recipients,
+      options: options.recipientOptions,
+      addedBy: signerPublicKey,
+      now,
+    });
+    const dek = tenant.getCryptoAdapter().getRandomValues(new Uint8Array(32));
+    const recipients = await sealToTargets({
+      tenant,
+      generations: [dek],
+      targets: resolved.targets,
+      epoch: 1,
+    });
+    tenant.rememberSealedGenerations(keyId, [dek]);
+    return { encryptFor: resolved.encryptFor, recipients };
   }
 
   /**
@@ -11985,16 +12214,236 @@ export class BaseMindooDB implements MindooDB {
     const signerKey = signingKeyPair
       ? signingKeyPair.publicKey
       : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-    const creatorKey = await this.resolveCreatorSigningKey(docId);
     const before = doc.getData() as unknown as Record<string, unknown>;
     const decision = await this.evaluateClientWriteAccess({
       op: "doc_change",
       signerKey,
-      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      isAuthor: await this.resolveIsAuthor(docId, signerKey, Number.MAX_SAFE_INTEGER),
       getBeforeDoc: () => before,
       getAfterDoc: () => candidateAfter,
     });
     return decision ?? BaseMindooDB.ACL_NOT_ENFORCED_DECISION;
+  }
+
+  async addRecipients(
+    doc: MindooDoc,
+    recipients: RecipientSpec[],
+    options?: RecipientChangeOptions,
+  ): Promise<RecipientChangeResult> {
+    return this.mutateRecipients(doc, "add", recipients, options);
+  }
+
+  async removeRecipients(
+    doc: MindooDoc,
+    recipients: RecipientSpec[],
+    options?: RecipientChangeOptions,
+  ): Promise<RecipientChangeResult> {
+    return this.mutateRecipients(doc, "remove", recipients, options);
+  }
+
+  async setRecipients(
+    doc: MindooDoc,
+    recipients: RecipientSpec[],
+    options?: RecipientChangeOptions,
+  ): Promise<RecipientChangeResult> {
+    return this.mutateRecipients(doc, "set", recipients, options);
+  }
+
+  async refreshRecipients(
+    doc: MindooDoc,
+    options?: RecipientChangeOptions,
+  ): Promise<RecipientChangeResult> {
+    const current = doc.getRecipients().filter((r) => r.kind === "user").map((r) => r.id);
+    const groups = [...new Set(doc.getRecipients().map((r) => r.viaGroup).filter((g): g is string => !!g))];
+    return this.mutateRecipients(doc, "set", [...current, ...groups.map((g) => ({ group: g }))], options);
+  }
+
+  async canChangeRecipients(doc: MindooDoc, next: RecipientSpec[]): Promise<AccessDecision> {
+    const after = { ...(doc.getData() as unknown as Record<string, unknown>) };
+    after[ENCRYPT_FOR_FIELD] = { ...(readEncryptFor(after) as Record<string, unknown>) };
+    return this.canChange(doc, after);
+  }
+
+  private async mutateRecipients(
+    doc: MindooDoc,
+    mode: "add" | "remove" | "set",
+    specs: RecipientSpec[],
+    options?: RecipientChangeOptions,
+  ): Promise<RecipientChangeResult> {
+    this.assertWritable("changeDoc");
+    if (!isSealedKeyId(doc.getDecryptionKeyId())) {
+      throw new Error("Recipient mutators require a document created with `recipients`");
+    }
+    const tenant = this.tenant as BaseMindooTenant;
+    const docId = doc.getId();
+    let internalDoc = this.getCachedDocument(docId) ?? (await this.loadDocumentInternal(docId));
+    if (!internalDoc || internalDoc.isDeleted) {
+      throw new DocumentNotFoundError(docId);
+    }
+    const now = semanticNow();
+    const signer = options?.signingKeyPair?.publicKey
+      ?? (await this.tenant.getCurrentUserId()).userSigningPublicKey;
+    const resolved = await resolveRecipientSpecs({
+      tenant,
+      specs,
+      options: {
+        includeSelf: mode === "set" ? options?.includeSelf !== false : false,
+        strict: options?.strict,
+      },
+      addedBy: signer,
+      now,
+    });
+    const currentMap = readEncryptFor(internalDoc.doc as unknown as MindooDocPayload);
+    const activeIds = new Set(
+      Object.entries(currentMap).filter(([, e]) => !e.removedAt).map(([id]) => id.split("#")[0]),
+    );
+    const addedTargets: ResolvedWrapTarget[] = [];
+    const removedStableIds: string[] = [];
+    const matchesTarget = (id: string, entry: { label?: string; keyFingerprint?: string }, target: ResolvedWrapTarget): boolean => {
+      const base = id.split("#")[0];
+      return (
+        target.stableId === base
+        || target.id === base
+        || (!!entry.label && target.id === entry.label)
+        || (!!entry.keyFingerprint && target.keyFingerprint === entry.keyFingerprint)
+      );
+    };
+    if (mode === "add" || mode === "set") {
+      for (const target of resolved.targets) {
+        if (!activeIds.has(target.stableId) && !activeIds.has(target.id)) addedTargets.push(target);
+      }
+    }
+    if (mode === "remove") {
+      for (const [id, entry] of Object.entries(currentMap)) {
+        if (entry.removedAt) continue;
+        if (resolved.targets.some((target) => matchesTarget(id, entry, target))) {
+          removedStableIds.push(id.split("#")[0]);
+        }
+      }
+    } else if (mode === "set") {
+      const nextIds = new Set(resolved.targets.flatMap((t) => [t.stableId, t.id]));
+      for (const [id, entry] of Object.entries(currentMap)) {
+        if (entry.removedAt) continue;
+        const base = id.split("#")[0];
+        const keep = resolved.targets.some((target) => matchesTarget(id, entry, target));
+        if (!keep && !nextIds.has(base)) removedStableIds.push(base);
+      }
+    }
+    const rotate = removedStableIds.length > 0;
+    const currentGens = tenant.getSealedGenerations(internalDoc.decryptionKeyId);
+    if (currentGens.length === 0) {
+      throw new Error("Cannot change recipients: the current document key is not in this session");
+    }
+    let generations = currentGens;
+    let epoch = internalDoc.sealedRecipients?.epoch ?? currentGens.length;
+    if (rotate) {
+      const nextDek = tenant.getCryptoAdapter().getRandomValues(new Uint8Array(32));
+      generations = [nextDek, ...currentGens];
+      epoch += 1;
+    }
+
+    const remainingByStable = new Map<string, ResolvedWrapTarget>();
+    const existingSpecs = Object.entries(currentMap)
+      .filter(([, e]) => !e.removedAt)
+      .map(([id, e]) =>
+        e.kind === "device"
+          ? { device: e.keyFingerprint ?? id, label: e.label }
+          : (e.label ?? id),
+      );
+    if (existingSpecs.length > 0) {
+      const existingResolved = await resolveRecipientSpecs({
+        tenant,
+        specs: existingSpecs,
+        options: { includeSelf: false, strict: false },
+        addedBy: signer,
+        now,
+      });
+      for (const target of existingResolved.targets) remainingByStable.set(target.stableId, target);
+    }
+    for (const target of addedTargets) remainingByStable.set(target.stableId, target);
+    for (const id of removedStableIds) {
+      remainingByStable.delete(id);
+      for (const [stableId, target] of [...remainingByStable.entries()]) {
+        if (target.id === id || target.stableId === id || target.keyFingerprint === id) {
+          remainingByStable.delete(stableId);
+        }
+      }
+    }
+    const remaining = [...remainingByStable.values()];
+    if (remaining.length === 0) {
+      throw new Error("Refusing to leave a sealed document with no recipients");
+    }
+    const recipientsBlock = await sealToTargets({
+      tenant,
+      generations,
+      targets: remaining,
+      epoch,
+    });
+    tenant.rememberSealedGenerations(internalDoc.decryptionKeyId, generations);
+
+    const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
+    const newDoc = Automerge.change(internalDoc.doc, (draft: MindooDocPayload) => {
+      if (addedTargets.length > 0) {
+        const addMap: Record<string, import("./userkeys/sealedTypes").EncryptForEntry> = {};
+        for (const target of addedTargets) {
+          addMap[target.stableId] = {
+            kind: target.kind,
+            addedAt: now,
+            addedBy: signer,
+            keyFingerprint: target.keyFingerprint,
+            ...(target.label ? { label: target.label } : {}),
+            ...(target.viaGroup ? { viaGroup: target.viaGroup } : {}),
+          };
+        }
+        applyEncryptForAdds(draft, addMap, epoch);
+      }
+      if (removedStableIds.length > 0) {
+        applyEncryptForRemoves(draft, removedStableIds, now, signer);
+      }
+      if (options?.change) {
+        // Content edits from the caller happen in a follow-up changeDoc; the
+        // recipient field itself is the carrier entry.
+      }
+      draft._lastModified = now;
+    });
+    await this.persistDocumentChange({
+      internalDoc,
+      newDoc,
+      now,
+      headsBeforeChange,
+      useCustomKey: !!(options?.signingKeyPair && options.signingKeyPassword),
+      signingKeyPair: options?.signingKeyPair,
+      signingKeyPassword: options?.signingKeyPassword,
+      successMessage: "recipients updated",
+      bypassPrecheck: options?.bypassAccessControlPrecheck,
+      recipients: recipientsBlock,
+    });
+    if (options?.change) {
+      await this.changeDoc(this.wrapDocument(internalDoc), options.change, {
+        signingKeyPair: options.signingKeyPair,
+        signingKeyPassword: options.signingKeyPassword,
+        bypassAccessControlPrecheck: options.bypassAccessControlPrecheck,
+      });
+    }
+    const wrapped = this.wrapDocument(internalDoc);
+    return {
+      epoch,
+      rotated: rotate,
+      added: wrapped.getRecipients().filter((r) => addedTargets.some((t) => t.keyFingerprint === r.keyFingerprint)),
+      removed: Object.entries(readEncryptFor(internalDoc.doc as unknown as MindooDocPayload))
+        .filter(([id, e]) => e.removedAt && removedStableIds.includes(id.split("#")[0]))
+        .map(([id, e]) => ({
+          kind: e.kind === "device" ? "device" as const : "user" as const,
+          id: e.kind === "device" ? (e.keyFingerprint ?? id) : id,
+          keyFingerprint: e.keyFingerprint ?? "",
+          label: e.label,
+          addedInEpoch: epoch,
+          viaGroup: e.viaGroup,
+          sealed: false,
+        })),
+      skipped: resolved.skipped,
+      entryId: "",
+    };
   }
 
   /**
@@ -12009,12 +12458,11 @@ export class BaseMindooDB implements MindooDB {
     const signerKey = signingKeyPair
       ? signingKeyPair.publicKey
       : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-    const creatorKey = await this.resolveCreatorSigningKey(docId);
     const current = doc.getData() as unknown as Record<string, unknown>;
     const decision = await this.evaluateClientWriteAccess({
       op: "doc_delete",
       signerKey,
-      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      isAuthor: await this.resolveIsAuthor(docId, signerKey, Number.MAX_SAFE_INTEGER),
       getBeforeDoc: () => current,
       getAfterDoc: () => current,
     });
@@ -12033,12 +12481,11 @@ export class BaseMindooDB implements MindooDB {
     const signerKey = signingKeyPair
       ? signingKeyPair.publicKey
       : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-    const creatorKey = await this.resolveCreatorSigningKey(docId);
     const current = doc.getData() as unknown as Record<string, unknown>;
     const decision = await this.evaluateClientWriteAccess({
       op: "doc_undelete",
       signerKey,
-      isAuthor: creatorKey !== null && signerKey === creatorKey,
+      isAuthor: await this.resolveIsAuthor(docId, signerKey, Number.MAX_SAFE_INTEGER),
       getBeforeDoc: () => current,
       getAfterDoc: () => current,
     });
@@ -12046,25 +12493,62 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
-   * Resolve the signing public key of the document's original creator (the
-   * `doc_create` entry's `createdByPublicKey`), used to set `$author`
-   * (`isAuthor`) for the client write prechecks on change/delete/undelete.
-   * Cached per document; returns `null` if the create entry isn't present yet
-   * (in which case `isAuthor` is treated as false, matching materialization).
+   * Resolve the signing public key of the document's original creator and the
+   * trusted time of the `doc_create` entry, used to set `$author` (`isAuthor`)
+   * at grant level. Cached per document; returns `null` if the create entry
+   * isn't present yet (in which case `isAuthor` is treated as false).
    */
-  private async resolveCreatorSigningKey(docId: string): Promise<string | null> {
-    const cached = this.creatorKeyCache.get(docId);
+  private async resolveCreatorInfo(
+    docId: string,
+  ): Promise<{ signingKey: string; trustedTime: number } | null> {
+    const cached = this.creatorInfoCache.get(docId);
     if (cached) return cached;
     try {
       const metas = await this.scanAllMetadata(this.store, { docId });
-      const createKey =
-        metas.find((m) => m.entryType === "doc_create")?.createdByPublicKey ?? null;
-      if (createKey) this.creatorKeyCache.set(docId, createKey);
-      return createKey;
+      const createMeta = metas.find((m) => m.entryType === "doc_create");
+      const createKey = createMeta?.createdByPublicKey ?? null;
+      if (!createMeta || !createKey) return null;
+      const trustedTime = createMeta.receivedAt ?? createMeta.createdAt;
+      const info = { signingKey: createKey, trustedTime };
+      this.creatorInfoCache.set(docId, info);
+      return info;
     } catch (error) {
       this.logger.debug(`[ACL] creator-key resolution failed for ${docId}: ${error}`);
       return null;
     }
+  }
+
+  /**
+   * Whether `signerKey` is the document author at grant level: the creator is
+   * resolved at the `doc_create` trusted time, the signer at `signerTrustedTime`.
+   */
+  private async resolveIsAuthor(
+    docId: string,
+    signerKey: string,
+    signerTrustedTime: number,
+  ): Promise<boolean> {
+    const creator = await this.resolveCreatorInfo(docId);
+    if (!creator) return false;
+    try {
+      const directory = await this.tenant.openDirectory();
+      if (typeof directory.isSamePerson === "function") {
+        return directory.isSamePerson({
+          creatorSigningKey: creator.signingKey,
+          signerSigningKey: signerKey,
+          creatorTrustedTime: creator.trustedTime,
+          signerTrustedTime,
+        });
+      }
+    } catch (error) {
+      this.logger.debug(`[ACL] grant-level $author resolution failed for ${docId}: ${error}`);
+    }
+    return creator.signingKey === signerKey;
+  }
+
+  /** @deprecated kept as a thin wrapper for any remaining device-key callers. */
+  private async resolveCreatorSigningKey(docId: string): Promise<string | null> {
+    const info = await this.resolveCreatorInfo(docId);
+    return info?.signingKey ?? null;
   }
 
   /** Append a record to the quarantine/audit log (and log it). */
@@ -12137,8 +12621,12 @@ export class BaseMindooDB implements MindooDB {
       );
     if (dataEntries.length === 0) return { doc: null, cacheable };
 
-    const creatorKey =
-      dataEntries.find((m) => m.entryType === "doc_create")?.createdByPublicKey ?? null;
+    const createMeta = dataEntries.find((m) => m.entryType === "doc_create");
+    const creatorKey = createMeta?.createdByPublicKey ?? null;
+    const creatorTrustedTime = createMeta
+      ? (createMeta.receivedAt ?? createMeta.createdAt)
+      : 0;
+    const isSamePersonFn = directory.isSamePerson?.bind(directory);
 
     const fetched = await this.store.getEntries(dataEntries.map((m) => m.id));
     const entryById = new Map(fetched.map((e) => [e.id, e]));
@@ -12178,8 +12666,13 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      // Verify the author signature over the encrypted payload.
-      const cryptoKey = await this.getOrImportPublicKey(entry.createdByPublicKey);
+      // Verify the author signature over the encrypted payload. Trust the
+      // signing key at the entry's trusted time (not HEAD) so a later revoke
+      // does not rewrite history.
+      const trustedTimeForTrust = isProvisional(meta)
+        ? Number.MAX_SAFE_INTEGER
+        : (meta.receivedAt ?? meta.createdAt);
+      const cryptoKey = await this.getOrImportPublicKey(entry.createdByPublicKey, trustedTimeForTrust);
       if (!cryptoKey) {
         // Author key not (yet) trusted by the directory. Remember it so a
         // later grantaccess sync can re-materialize the doc (reconcileAuthorTrust).
@@ -12246,20 +12739,28 @@ export class BaseMindooDB implements MindooDB {
         : null;
       const afterJS = this.convertAutomergeToJS(afterDoc) as unknown as Record<string, unknown>;
 
-      const isAuthor = creatorKey !== null && entry.createdByPublicKey === creatorKey;
-      // Trusted-time rule (docs/accesscontrol.md §8, version-aware): a witnessed
-      // entry is judged against the directory as it provably was at its
-      // `receivedAt`. A versioned un-witnessed entry (provisional) has no
-      // provable position, so it is judged against the current directory HEAD —
-      // `MAX_SAFE_INTEGER` selects the head node deterministically regardless of
-      // where the directory's own provisional (un-witnessed) entries currently
-      // float, which a wall-clock `now` would not (those entries can sit at a
-      // later `now`). A legacy un-witnessed entry predates witnessing and is
-      // stable at its `createdAt`, so it is judged against the historical
-      // directory state in effect then. See {@link isProvisional}.
       const trustedTime = isProvisional(meta)
         ? Number.MAX_SAFE_INTEGER
         : (meta.receivedAt ?? meta.createdAt);
+
+      let isAuthor = false;
+      if (creatorKey !== null) {
+        if (isSamePersonFn) {
+          try {
+            isAuthor = await isSamePersonFn({
+              creatorSigningKey: creatorKey,
+              signerSigningKey: entry.createdByPublicKey,
+              creatorTrustedTime,
+              signerTrustedTime: trustedTime,
+            });
+          } catch (error) {
+            this.logger.debug(`[ACL] grant-level $author resolution failed during materialization: ${error}`);
+            isAuthor = entry.createdByPublicKey === creatorKey;
+          }
+        } else {
+          isAuthor = entry.createdByPublicKey === creatorKey;
+        }
+      }
 
       let decision: AccessDecision;
       try {
@@ -12440,6 +12941,12 @@ export class BaseMindooDB implements MindooDB {
     const entryTypes = allEntryMetadata.map(em => `${em.entryType}@${em.createdAt}`).join(', ');
     this.logger.debug(`Entry types for ${docId}: ${entryTypes}`);
 
+    await this.tenant.ingestSealedFromEntries?.(
+      allEntryMetadata.find((em) => em.entryType === "doc_create")?.decryptionKeyId
+        ?? allEntryMetadata[0].decryptionKeyId,
+      allEntryMetadata,
+    );
+
     // Access-control materialization (docs/accesscontrol.md §10): when the
     // tenant has access control active, materialize through the Tier 2
     // quarantine path (deterministic per-entry evaluation + cascade) instead of
@@ -12521,7 +13028,7 @@ export class BaseMindooDB implements MindooDB {
         
         // Admin-only mode: only accept snapshots signed by admin
         let isValid = false;
-        if (this._isAdminOnlyDb && snapshotData.createdByPublicKey !== this.getAdminPublicKey()) {
+        if (await this.shouldSkipLoadedEntryForBuiltin(snapshotData)) {
           this.logger.warn(`Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`);
         } else {
           // Verify signature against the encrypted snapshot (no decryption needed)
@@ -12598,13 +13105,14 @@ export class BaseMindooDB implements MindooDB {
     if (this.isDebugEnabled()) this.logger.debug(`Document state before applying entries: heads=${JSON.stringify(Automerge.getHeads(doc!))}`);
     
     // Filter entries for admin-only mode first
-    const validEntries = entries.filter(entryData => {
-      if (this._isAdminOnlyDb && entryData.createdByPublicKey !== this.getAdminPublicKey()) {
+    const validEntries: StoreEntry[] = [];
+    for (const entryData of entries) {
+      if (await this.shouldSkipLoadedEntryForBuiltin(entryData)) {
         this.logger.warn(`Admin-only DB: skipping entry ${entryData.id} not signed by admin key`);
-        return false;
+        continue;
       }
-      return true;
-    });
+      validEntries.push(entryData);
+    }
     
     if (validEntries.length === 0) {
       this.logger.debug(`No valid entries to process for document ${docId}`);
@@ -12751,6 +13259,7 @@ export class BaseMindooDB implements MindooDB {
       isDeleted,
       awaitingWitness: witnessState.awaitingWitness,
       witnessed: witnessState.witnessed,
+      sealedRecipients: newestRecipientBlock(allEntryMetadata),
     };
     
     // Update cache
@@ -12860,6 +13369,20 @@ export class BaseMindooDB implements MindooDB {
       isAccessible: () => internalDoc.accessible ?? true,
       isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
       isWitnessed: () => internalDoc.witnessed ?? false,
+      isSealed: () => isSealedKeyId(internalDoc.decryptionKeyId),
+      getRecipients: () =>
+        resolveRecipientsFromPayload(
+          internalDoc.doc as unknown as MindooDocPayload,
+          internalDoc.sealedRecipients,
+        ),
+      getRecipientEpoch: () => internalDoc.sealedRecipients?.epoch ?? 0,
+      isEncryptedFor: (users: string | string[]) =>
+        isSealedKeyId(internalDoc.decryptionKeyId)
+        && isPayloadEncryptedFor(
+          internalDoc.doc as unknown as MindooDocPayload,
+          internalDoc.sealedRecipients,
+          Array.isArray(users) ? users : [users],
+        ),
       getHeads: () => Automerge.getHeads(internalDoc.doc),
       getData: () => {
         // Convert Automerge document to plain JS object, converting Text
@@ -13032,7 +13555,7 @@ export class BaseMindooDB implements MindooDB {
   }
 
   private async decryptAttachmentChunk(chunk: StoreEntry): Promise<Uint8Array> {
-    if (this._isAdminOnlyDb && chunk.createdByPublicKey !== this.getAdminPublicKey()) {
+    if (await this.shouldSkipLoadedEntryForBuiltin(chunk)) {
       throw new Error(`Admin-only DB: chunk ${chunk.id} not signed by admin key`);
     }
 
@@ -13750,6 +14273,18 @@ export class BaseMindooDB implements MindooDB {
       syncStoreChanges: () => this.syncStoreChanges(),
       evaluateWriteAccess: (op, signerKey, isAuthor) =>
         this.evaluateClientWriteAccess({ op, signerKey, isAuthor }),
+      isSamePerson: async (creatorSigningKey, signerSigningKey, creatorTrustedTime, signerTrustedTime) => {
+        const directory = await this.tenant.openDirectory();
+        if (typeof directory.isSamePerson === "function") {
+          return directory.isSamePerson({
+            creatorSigningKey,
+            signerSigningKey,
+            creatorTrustedTime,
+            signerTrustedTime,
+          });
+        }
+        return creatorSigningKey === signerSigningKey;
+      },
       hasWriteContentRules: async (op) => {
         const directory = await this.tenant.openDirectory();
         return (await directory.hasWriteContentRules?.(op, this.store.getId())) ?? false;
@@ -13973,6 +14508,10 @@ export class BaseMindooDB implements MindooDB {
 
       if (syncResult.transferred === 0) {
         this.logger.debug(`No new entries to pull`);
+        if (storeKind === StoreKind.docs && this.store.getId() === USER_DIRECTORY_DB_ID) {
+          this.tenant.noteUserDirectoryFetched?.();
+          await this.tenant.reconcileUserKeysSafe?.();
+        }
         return { transferredEntries: 0, transferredBytes, scannedEntries: syncResult.scanned, cancelled: false };
       }
       
@@ -14006,13 +14545,12 @@ export class BaseMindooDB implements MindooDB {
         // single-flight; never blocks or fails the sync.
         if (this.store.getId() === "directory") {
           await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
-          // Author-trust reconcile: refresh the directory trust caches NOW
-          // (instead of waiting up to DIRECTORY_SYNC_INTERVAL_MS for the next
-          // cache-miss validation) so grantaccess documents that just arrived
-          // immediately unblock entries other open databases skipped while
-          // the author was still unknown. Awaited so a subsequent content-DB
-          // sync in the same flow observes the healed state.
           await this.tenant.reconcileAuthorTrustAfterDirectorySyncSafe();
+          await this.tenant.reconcileUserKeysSafe?.();
+        }
+        if (this.store.getId() === USER_DIRECTORY_DB_ID) {
+          this.tenant.noteUserDirectoryFetched?.();
+          await this.tenant.reconcileUserKeysSafe?.();
         }
       }
       if (options?.signal?.aborted) {

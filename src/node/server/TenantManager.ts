@@ -23,7 +23,7 @@ import { join, resolve, sep } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
-import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver, ServerPurgedDocResolver } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver, ServerPurgedDocResolver, BuiltinWriteContext } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import { PurgedDocRegistry } from "./PurgedDocRegistry";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
@@ -44,8 +44,10 @@ import type {
   EncryptedPrivateKey,
   DirectoryUserLookup,
   GrantKeyPairInfo,
+  StoreEntry,
 } from "../../core/types";
-import { PUBLIC_INFOS_KEY_ID, StoreKind } from "../../core/types";
+import { PUBLIC_INFOS_KEY_ID, StoreKind, USER_DIRECTORY_DB_ID } from "../../core/types";
+import { usernameHashFromCreateChangeBytes } from "../../core/builtinDbInvariants";
 import type { PrivateUserId } from "../../core/userid";
 
 import { StoreFactory } from "./StoreFactory";
@@ -144,10 +146,21 @@ export class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
   }
 
   async getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null> {
-    const user = this.usersByKey.get(publicKey);
-    if (!user) {
-      return null;
+    const exact = this.usersByKey.get(publicKey);
+    if (exact) {
+      return this.toLookup(exact);
     }
+    const needle = publicKey.replace(/\s+/g, "");
+    if (!needle) return null;
+    for (const [key, user] of this.usersByKey) {
+      if (key.replace(/\s+/g, "") === needle) {
+        return this.toLookup(user);
+      }
+    }
+    return null;
+  }
+
+  private toLookup(user: UserConfig): DirectoryUserLookup | null {
     if (
       typeof user.username === "string" &&
       this.revokedUsers.has(user.username.toLowerCase())
@@ -945,6 +958,11 @@ export class TenantManager {
         ? undefined
         : () => this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
 
+    const builtinWriteContext: BuiltinWriteContext | undefined =
+      dbId === USER_DIRECTORY_DB_ID
+        ? this.buildUserdirectoryWriteContext(tenant, localStore)
+        : undefined;
+
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
       directory,
@@ -959,6 +977,7 @@ export class TenantManager {
         dbAccessEvaluator,
         revokedKeyResolver,
         purgedDocResolver,
+        builtinWriteContext,
       },
     );
 
@@ -991,15 +1010,26 @@ export class TenantManager {
       // it will stamp into the receipt (docs/accesscontrol.md §5.3, §7).
       const trustedTime = Date.now();
 
-      // Resolve `$author`: for doc_create the author is the creator; otherwise
-      // compare the change signer to the document's original doc_create author.
+      // Resolve `$author` at grant level: creator at the doc_create trusted
+      // time, signer at the witness's acceptance time. Falls back to device-key
+      // equality when the directory cannot answer.
       let isAuthor = entry.entryType === "doc_create";
       if (!isAuthor) {
         try {
           const docEntries = await localStore.findNewEntriesForDoc([], entry.docId);
           const createEntry = docEntries.find((m) => m.entryType === "doc_create");
           if (createEntry) {
-            isAuthor = createEntry.createdByPublicKey === entry.createdByPublicKey;
+            const samePerson = directory.isSamePerson;
+            if (typeof samePerson === "function") {
+              isAuthor = await samePerson({
+                creatorSigningKey: createEntry.createdByPublicKey,
+                signerSigningKey: entry.createdByPublicKey,
+                creatorTrustedTime: createEntry.receivedAt ?? createEntry.createdAt,
+                signerTrustedTime: trustedTime,
+              });
+            } else {
+              isAuthor = createEntry.createdByPublicKey === entry.createdByPublicKey;
+            }
           }
         } catch {
           // If we cannot resolve the creator, leave isAuthor false; a rule that
@@ -1015,6 +1045,55 @@ export class TenantManager {
         isAuthor,
       });
     };
+  }
+
+  /**
+   * Builtin `userdirectory` write invariant: admin may create/delete, only the
+   * owning person may change. `username_hash` is read from the decrypted
+   * `doc_create` payload (`$publicinfos`).
+   */
+  private buildUserdirectoryWriteContext(
+    tenant: LoadedTenant,
+    localStore: ContentAddressedStore,
+  ): BuiltinWriteContext {
+    const adminPublicKey = tenant.context.config.adminSigningPublicKey;
+    const mindooTenant = tenant.mindooTenant;
+    return {
+      adminPublicKey,
+      resolveDocumentUsernameHash: mindooTenant
+        ? async (entry: StoreEntry) => {
+            const createEntry = await this.findCreateEntry(localStore, entry);
+            if (!createEntry) return null;
+            try {
+              const plaintext = await mindooTenant.decryptPayload(
+                createEntry.encryptedData,
+                createEntry.decryptionKeyId,
+              );
+              return usernameHashFromCreateChangeBytes(plaintext);
+            } catch {
+              return null;
+            }
+          }
+        : undefined,
+    };
+  }
+
+  private async findCreateEntry(
+    localStore: ContentAddressedStore,
+    entry: StoreEntry,
+  ): Promise<StoreEntry | null> {
+    if (entry.entryType === "doc_create") {
+      return entry;
+    }
+    try {
+      const metas = await localStore.findNewEntriesForDoc([], entry.docId);
+      const createMeta = metas.find((m) => m.entryType === "doc_create");
+      if (!createMeta) return null;
+      const loaded = await localStore.getEntries([createMeta.id]);
+      return loaded[0] ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

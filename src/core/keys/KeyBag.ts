@@ -830,7 +830,7 @@ export class KeyBag {
         tagLength: 128,
       },
       wrappingKey,
-      plaintext.buffer as ArrayBuffer
+      plaintext
     );
 
     // AES-GCM appends the 16-byte authentication tag at the end of the ciphertext
@@ -888,7 +888,7 @@ export class KeyBag {
         tagLength: 128,
       },
       wrappingKey,
-      encryptedDataWithTag.buffer as ArrayBuffer
+      encryptedDataWithTag
     );
 
     const decryptedArray = new Uint8Array(decrypted);
@@ -1046,7 +1046,7 @@ export class KeyBag {
         tagLength: 128,
       },
       derivedKey,
-      encryptedData.buffer as ArrayBuffer
+      encryptedData
     );
 
     return decrypted;
@@ -1194,7 +1194,7 @@ export class KeyBag {
         tagLength: 128,
       },
       derivedKey,
-      privateKeyBytes.buffer as ArrayBuffer
+      privateKeyBytes
     );
 
     // Extract ciphertext and tag from encrypted data

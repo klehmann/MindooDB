@@ -74,6 +74,26 @@ describe("IdentityTools", () => {
         factory.changeIdentityPassword(identity, "wrong-password", "new-password"),
       ).rejects.toThrow();
     });
+
+    it("still opens signing keys when a stored User-Key cannot be decrypted", async () => {
+      const poisoned: PrivateUserId = {
+        ...identity,
+        userKeyPair: {
+          publicKey: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----",
+          privateKey: {
+            ciphertext: "not-valid",
+            iv: "AAAA",
+            tag: "AAAA",
+            salt: "AAAA",
+            iterations: 100000,
+          },
+        },
+      };
+      const updated = await factory.changeIdentityPassword(poisoned, "old-password", "old-password");
+      expect(updated.username).toBe(identity.username);
+      expect(updated.userSigningKeyPair.publicKey).toBe(identity.userSigningKeyPair.publicKey);
+      expect(updated.userKeyPair).toBeUndefined();
+    });
   });
 
   describe("CLI commands", () => {

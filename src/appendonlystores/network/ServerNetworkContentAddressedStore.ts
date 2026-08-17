@@ -10,6 +10,8 @@ import type {
   StoreIdBloomSummary,
   StoreCompactionStatus,
 } from "../../core/types";
+import { USER_DIRECTORY_DB_ID } from "../../core/types";
+import { evaluateBuiltinWrite, entryTypeToBuiltinOp } from "../../core/builtinDbInvariants";
 import type { PutEntriesAck, RejectedPutEntry, StoreHead } from "../../core/appendonlystores/types";
 import type {
   AttachmentReadPlan,
@@ -128,6 +130,22 @@ export interface ServerAccessControlOptions {
    * `"directory"` store.
    */
   purgedDocResolver?: ServerPurgedDocResolver;
+  /**
+   * Builtin write-invariant context for `userdirectory` (docs/userkeys.md §6.5).
+   * When present, `handlePutEntries` rejects illegal creates/changes/deletes
+   * before they are witnessed. Independent of the ACL master switch.
+   */
+  builtinWriteContext?: BuiltinWriteContext;
+}
+
+/**
+ * Server-side context for the hard-wired `userdirectory` write invariant.
+ * `resolveDocumentUsernameHash` supplies the `username_hash` stored on the
+ * document (from a decrypted create payload, or a test stub).
+ */
+export interface BuiltinWriteContext {
+  adminPublicKey: string;
+  resolveDocumentUsernameHash?: (entry: StoreEntry) => Promise<string | null>;
 }
 
 /**
@@ -163,6 +181,10 @@ export class ServerNetworkContentAddressedStore {
   private revokedKeyResolver?: ServerRevokedKeyResolver;
   /** Optional purged-document denylist resolver; undefined disables it. */
   private purgedDocResolver?: ServerPurgedDocResolver;
+  /** Optional builtin write-invariant context for `userdirectory`. */
+  private builtinWriteContext?: BuiltinWriteContext;
+  /** Cached `username_hash` per userdirectory docId, filled as creates are seen. */
+  private userdirectoryHashByDocId = new Map<string, string>();
   /** The directory database id, where grant documents live (§6.5). */
   private static readonly DIRECTORY_DB_ID = "directory";
   /**
@@ -206,6 +228,7 @@ export class ServerNetworkContentAddressedStore {
     this.dbAccessEvaluator = accessControl?.dbAccessEvaluator;
     this.revokedKeyResolver = accessControl?.revokedKeyResolver;
     this.purgedDocResolver = accessControl?.purgedDocResolver;
+    this.builtinWriteContext = accessControl?.builtinWriteContext;
   }
 
   /**
@@ -221,10 +244,25 @@ export class ServerNetworkContentAddressedStore {
     if (payload.deviceSigningKey && typeof this.directory.getUserBySigningPublicKey === "function") {
       const lookup = await this.directory.getUserBySigningPublicKey(payload.deviceSigningKey);
       if (lookup?.encryptionPublicKey) {
+        this.logger.info(
+          `[transport-wrap] Using encryption key for device signing key (sub=${payload.sub.slice(0, 12)}…)`,
+        );
         return lookup.encryptionPublicKey;
       }
+      // Do not fall back to getUserPublicKeys: that returns keys[0] of the
+      // grant — the first device. Wrapping the session key to that RSA key
+      // makes the authenticating second device fail unwrap with OperationError.
+      this.logger.warn(
+        `[transport-wrap] No encryption key for authenticated device signing key (sub=${payload.sub.slice(0, 12)}…); refusing first-device fallback`,
+      );
+      return null;
     }
     const userKeys = await this.directory.getUserPublicKeys(payload.sub);
+    if (userKeys?.encryptionPublicKey) {
+      this.logger.info(
+        `[transport-wrap] Using encryption key from username lookup (legacy token, sub=${payload.sub.slice(0, 12)}…)`,
+      );
+    }
     return userKeys?.encryptionPublicKey ?? null;
   }
 
@@ -968,6 +1006,16 @@ export class ServerNetworkContentAddressedStore {
         continue;
       }
 
+      // Builtin `userdirectory` write invariant (docs/userkeys.md §6.5). Runs
+      // before Tier 1 so it holds even when the ACL master switch is on.
+      const dbId = this.witnessDbid ?? this.localStore.getId();
+      if (dbId === USER_DIRECTORY_DB_ID && this.builtinWriteContext) {
+        const denied = await this.evaluateUserdirectoryInvariant(entry, receivedAt);
+        if (denied) {
+          throw new NetworkError(NetworkErrorType.ACCESS_DENIED, denied);
+        }
+      }
+
       // Rule-based Tier 1 enforcement (docs/accesscontrol.md §7). The server can
       // only decide the identity tier; content-tier (Tier 2) gates are deferred
       // to clients and treated as allowed here.
@@ -1016,6 +1064,51 @@ export class ServerNetworkContentAddressedStore {
         (rejected.length > 0 ? ` (${rejected.length} rejected)` : ""),
     );
     return { receipts: stampedMetadata, rejected };
+  }
+
+  /**
+   * Enforce the hard-wired `userdirectory` write invariant. Returns a denial
+   * message, or `null` when the entry is allowed.
+   */
+  private async evaluateUserdirectoryInvariant(
+    entry: StoreEntry,
+    trustedTime: number,
+  ): Promise<string | null> {
+    const op = entryTypeToBuiltinOp(entry.entryType);
+    if (!op || !this.builtinWriteContext) {
+      return null;
+    }
+    let documentUsernameHash: string | null =
+      this.userdirectoryHashByDocId.get(entry.docId) ?? null;
+    if (!documentUsernameHash && this.builtinWriteContext.resolveDocumentUsernameHash) {
+      try {
+        documentUsernameHash = await this.builtinWriteContext.resolveDocumentUsernameHash(entry);
+      } catch {
+        documentUsernameHash = null;
+      }
+    }
+    if (documentUsernameHash) {
+      this.userdirectoryHashByDocId.set(entry.docId, documentUsernameHash);
+    }
+    let signerUsernameHash: string | null = null;
+    if (typeof this.directory.resolveUsernameHashForSigningKey === "function") {
+      signerUsernameHash = await this.directory.resolveUsernameHashForSigningKey(
+        entry.createdByPublicKey,
+        trustedTime,
+      );
+    }
+    const decision = evaluateBuiltinWrite({
+      dbId: USER_DIRECTORY_DB_ID,
+      op,
+      signerKey: entry.createdByPublicKey,
+      adminPublicKey: this.builtinWriteContext.adminPublicKey,
+      documentUsernameHash,
+      signerUsernameHash,
+    });
+    if (!decision.allowed) {
+      return `Entry ${entry.id} denied by userdirectory invariant: ${decision.reason}`;
+    }
+    return null;
   }
 
   /** Record a per-entry rejection (signature-class failure) and log it. */

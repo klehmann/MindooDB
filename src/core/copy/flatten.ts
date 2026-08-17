@@ -28,6 +28,7 @@ import type { CopyEngineHost } from "./host";
 import type { CopyContext } from "./feasibility";
 import type { CopyProgressReporter } from "./copyDocument";
 import type { CopyDocumentOptions, CopyDocumentResult } from "./types";
+import { isSealedKeyId } from "../userkeys/sealedTypes";
 
 /**
  * Document-level provenance for a flattened copy.
@@ -151,12 +152,16 @@ export async function flattenDocument(
   );
 
   reporter.emit("transferring", `Writing flattened copy as ${targetDocId}`);
+  const sealedCopy = options.recipients !== undefined
+    || (isSealedKeyId(context.sourceDecryptionKeyId) && options.decryptionKeyId === undefined);
   const targetDoc = await target.db.createDocument({
     ...(usesGeneratedId
       ? { idPrefix: options.idPrefix }
       : { id: targetDocId, assumeUniqueId }),
     ...(seedPayloadIntoCreate ? { initialValues: payload } : {}),
-    decryptionKeyId: context.targetDecryptionKeyId,
+    ...(sealedCopy
+      ? { recipients: options.recipients ?? [], recipientOptions: options.recipientOptions }
+      : { decryptionKeyId: context.targetDecryptionKeyId }),
     signingKeyPair: options.signingKeyPair,
     signingKeyPassword: options.signingKeyPassword,
     bypassAccessControlPrecheck: options.bypassAccessControlPrecheck,

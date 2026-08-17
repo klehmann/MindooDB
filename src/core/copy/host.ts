@@ -105,6 +105,17 @@ export interface CopyEngineHost {
   ): Promise<AccessDecision | null>;
 
   /**
+   * Grant-level `$author` resolver used by the copy preflight. Creator is
+   * resolved at `creatorTrustedTime`, signer at `signerTrustedTime`.
+   */
+  isSamePerson(
+    creatorSigningKey: string,
+    signerSigningKey: string,
+    creatorTrustedTime: number,
+    signerTrustedTime: number,
+  ): Promise<boolean>;
+
+  /**
    * Whether a Tier 2 (content) rule governs `op` on this database. A copy
    * cannot evaluate one — grafting never decrypts anything — so the preflight
    * reports such cases as undecidable instead of guessing.

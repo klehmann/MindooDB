@@ -1,5 +1,20 @@
 import { SigningKeyPair, EncryptionKeyPair } from "../types";
 
+export {
+  abbreviateCanonicalName,
+  buildCanonicalName,
+  canonicalizeUsername,
+  expandAbbreviatedName,
+  formatCanonicalDisplayName,
+  getCanonicalNameVariants,
+  isCanonicalName,
+  normalizeCanonicalNameForComparison,
+  parseCanonicalName,
+  sanitizeCanonicalNamePart,
+  usernamesEqual,
+} from "./canonicalUsername";
+export type { CanonicalNameParts } from "./canonicalUsername";
+
 /**
  * Public info for a user of the platform
  */
@@ -45,4 +60,12 @@ export interface PrivateUserId {
    * Used ONLY for encrypting/decrypting the named symmetric keys map stored on disk, not for signing.
    */
   userEncryptionKeyPair: EncryptionKeyPair;
+
+  /**
+   * Person-bound RSA-OAEP User-Key (docs/userkeys.md). Password-encrypted with
+   * salt `"userkey"`, same wrapping as the device encryption key. Optional on
+   * identities created before User-Keys existed; generated before a join
+   * request and included in paper backups of this object.
+   */
+  userKeyPair?: EncryptionKeyPair;
 }

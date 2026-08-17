@@ -271,6 +271,14 @@ export interface CopyDocumentOptions {
   decryptionKeyId?: string;
 
   /**
+   * Readers of the copy. Mutually exclusive with {@link decryptionKeyId}.
+   * A sealed source is never copied under `$sealed:<sourceDocId>`; pass
+   * `recipients` (or omit both to seal the copy to the copier only).
+   */
+  recipients?: import("../userkeys/sealedTypes").RecipientSpec[];
+  recipientOptions?: import("../userkeys/sealedTypes").RecipientOptions;
+
+  /**
    * Record a verifiable {@link EntryProvenance} on each copied entry (history
    * modes), or a document-level `_provenance` object in the payload (flatten
    * mode), capturing where the copy came from and who originally authored it.

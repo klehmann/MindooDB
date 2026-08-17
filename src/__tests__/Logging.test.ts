@@ -414,6 +414,31 @@ describe("Logging System", () => {
       expect(sanitizedError.code).toBe(404);
       expect(sanitizedError.keyId).toBe("[REDACTED: Key]");
     });
+
+    it("does not throw when sanitizing an error with getter-only code", () => {
+      class HostishError extends Error {
+        get code() {
+          return 0;
+        }
+      }
+      const logger = new MindooLogger(LogLevel.WARN, "", true);
+      const error = new HostishError("The operation failed for an operation-specific reason");
+      expect(() => logger.warn("Skipping User-Key re-encrypt", error)).not.toThrow();
+      expect(consoleOutput.length).toBeGreaterThan(0);
+      const sanitizedError = consoleOutput[0].args[2];
+      expect(sanitizedError).toBeInstanceOf(Error);
+      expect(sanitizedError.message).toContain("operation-specific reason");
+    });
+
+    it("does not throw when sanitizing a DOMException", () => {
+      if (typeof DOMException === "undefined") {
+        return;
+      }
+      const logger = new MindooLogger(LogLevel.WARN, "", true);
+      const error = new DOMException("The operation failed for an operation-specific reason", "OperationError");
+      expect(() => logger.warn("Skipping User-Key re-encrypt", error)).not.toThrow();
+      expect(consoleOutput.length).toBeGreaterThan(0);
+    });
   });
 
   describe("MindooLogger - isLevelEnabled", () => {

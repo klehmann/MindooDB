@@ -101,6 +101,61 @@ export function nodeCovering(head: DirectoryStateNode, T: number): DirectoryStat
   return node ?? createGenesisNode();
 }
 
+/**
+ * Whether `creatorSigningKey` and `signerSigningKey` belong to the same person.
+ *
+ * The creator is resolved against {@link creatorNode} (typically the directory
+ * at the trusted time of the `doc_create` entry) so authorship survives
+ * retirement of the creating device. If that node no longer indexes the
+ * creating key — because the device was later retired, or because the
+ * creator's trusted time sits past every directory bound — we walk `prev`
+ * until we find a node that still had the key. Signing keys are not reused
+ * across people, so that look-back still names the original person.
+ *
+ * The signer is resolved against {@link signerNode} only (no look-back) so a
+ * revoked device cannot act as `$author`.
+ *
+ * Keys that never appear in a grant (admin, trusted non-user keys) fall back
+ * to device-key equality, matching the historical `$author` behaviour for
+ * those identities.
+ */
+export function isSamePerson(
+  creatorNode: DirectoryStateNode,
+  signerNode: DirectoryStateNode,
+  creatorSigningKey: string,
+  signerSigningKey: string,
+): boolean {
+  const creatorGrant = grantAtOrBefore(creatorNode, creatorSigningKey);
+  const signerGrant = signerNode.bySigningKey.get(signerSigningKey);
+  if (creatorGrant && signerGrant) {
+    return creatorGrant.usernameHash === signerGrant.usernameHash;
+  }
+  // Signer is (or never was) a granted user-device. A revoked grant key is
+  // absent from `bySigningKey` at signer time and must not pass, even if it
+  // still matches the creator key byte-for-byte.
+  if (signerGrant) return false;
+  if (creatorGrant) return false;
+  return creatorSigningKey === signerSigningKey;
+}
+
+/**
+ * The grant that contained `signingKey` at `node`, or at the most recent
+ * predecessor that still indexed it. Used for creator resolution so a retired
+ * creating device can still be attributed to its person.
+ */
+export function grantAtOrBefore(
+  node: DirectoryStateNode,
+  signingKey: string,
+): UserGrantSnapshot | undefined {
+  let current: DirectoryStateNode | null = node;
+  while (current) {
+    const grant = current.bySigningKey.get(signingKey);
+    if (grant) return grant;
+    current = current.prev;
+  }
+  return undefined;
+}
+
 /** Rebuild a reverse signing-key index from a `usersByHash` map. */
 function buildBySigningKey(
   usersByHash: Map<string, UserGrantSnapshot>

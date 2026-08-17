@@ -46,6 +46,7 @@ export const ENTRY_SIGNATURE_LAYOUT_VERSION = 0x01;
  * between "an attachmentRefs count" and "a provenance block" impossible.
  */
 export const ENTRY_PROVENANCE_BLOCK_TAG = 0x02;
+export const ENTRY_RECIPIENTS_BLOCK_TAG = 0x03;
 
 /**
  * The exact set of metadata fields bound by an author's `metadataSignature`, in
@@ -82,6 +83,7 @@ export interface EntrySignatureFields {
    * rewrite it after the fact.
    */
   provenance?: EntryProvenance;
+  recipients?: import("../userkeys/sealedTypes").EntryRecipients;
 }
 
 /**
@@ -286,6 +288,12 @@ export function buildEntrySigningBytes(
     );
   }
 
+  const recipients = fields.recipients;
+  if (recipients && recipients.wraps.length > 0) {
+    parts.push(new Uint8Array([ENTRY_RECIPIENTS_BLOCK_TAG]));
+    pushString(parts, JSON.stringify(recipients));
+  }
+
   const total = parts.reduce((sum, p) => sum + p.length, 0);
   const out = new Uint8Array(total);
   let offset = 0;
@@ -309,6 +317,7 @@ export function entrySignatureFieldsFromEntry(
     | "contentHash"
     | "createdByPublicKey"
     | "attachmentRefs"
+    | "recipients"
   > & { provenance?: EntryProvenance },
 ): EntrySignatureFields {
   return {
@@ -320,13 +329,12 @@ export function entrySignatureFieldsFromEntry(
     dependencyIds: entry.dependencyIds,
     contentHash: entry.contentHash,
     createdByPublicKey: entry.createdByPublicKey,
-    // Canonicalize empty -> undefined so "no attachments" has a single byte
-    // representation (zero trailing bytes); see buildEntrySigningBytes.
     attachmentRefs:
       entry.attachmentRefs && entry.attachmentRefs.length > 0
         ? entry.attachmentRefs
         : undefined,
     provenance: entry.provenance,
+    recipients: entry.recipients,
   };
 }
 
@@ -368,7 +376,7 @@ export async function signEntryMetadata(
   version: number = ENTRY_SIGNATURE_LAYOUT_VERSION,
 ): Promise<Uint8Array> {
   const bytes = buildEntrySigningBytes(fields, version);
-  const signature = await subtle.sign({ name: "Ed25519" }, signingPrivateKey, bytes.buffer as ArrayBuffer);
+  const signature = await subtle.sign({ name: "Ed25519" }, signingPrivateKey, bytes.slice());
   return new Uint8Array(signature);
 }
 
