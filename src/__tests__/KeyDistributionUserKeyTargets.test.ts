@@ -13,6 +13,19 @@ async function stripDefaultKey(device: DeviceHandle, tenantId: string): Promise<
   await device.keyBag.deleteKey("doc", tenantId, DEFAULT_TENANT_KEY_ID);
 }
 
+/** Logger.warn goes through console.warn, so this observes what a user would see. */
+async function captureWarnings(run: () => Promise<void>): Promise<string[]> {
+  const spy = jest.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    await run();
+    return spy.mock.calls.map((call) => call.map((arg) => String(arg)).join(" "));
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+const NOT_UNWRAPPED = "not unwrapped by any";
+
 describe("key distribution targets user keys", () => {
   jest.setTimeout(240000);
 
@@ -77,8 +90,14 @@ describe("key distribution targets user keys", () => {
     alice2.tenant.noteUserDirectoryFetched!();
     const waiting = await alice2.tenant.reconcileUserKeys!();
     expect(waiting.state).toBe("waiting");
-    await alice2.tenant.reconcileKeyDistributionsForCurrentUser!();
+    const warnings = await captureWarnings(async () => {
+      await alice2.tenant.reconcileKeyDistributionsForCurrentUser!();
+    });
     expect(await alice2.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(false);
+    // A key nobody could open must still be reported — this is the counterpart
+    // that keeps the "no false alarm" test below from passing by simply
+    // deleting the warning.
+    expect(warnings.filter((line) => line.includes(NOT_UNWRAPPED))).not.toEqual([]);
   });
 
   it("an approved additional device imports default via the user key", async () => {
@@ -97,6 +116,33 @@ describe("key distribution targets user keys", () => {
     await alice2.tenant.reconcileUserKeys!();
     await alice2.tenant.reconcileKeyDistributionsForCurrentUser!();
     expect(await alice2.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
+  });
+
+  it("stays silent when the user key opens default and the device key cannot", async () => {
+    const alice2 = await addDevice(fixture, alice1, "kiosk");
+    await stripDefaultKey(alice2, fixture.tenantId);
+    await alice2.factory.ensureUserKeyPair!(alice2.user, alice2.password);
+    await syncAll(fixture, "directory");
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+    alice1.tenant.noteUserDirectoryFetched!();
+    await alice1.tenant.reconcileUserKeys!();
+    const pending = (await alice1.tenant.listPendingUserKeyDevices!()).find(
+      (p) => p.label === "kiosk",
+    );
+    expect(pending).toBeDefined();
+    await alice1.tenant.approveUserKeyDevice!(pending!.fingerprint);
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+    alice2.tenant.noteUserDirectoryFetched!();
+    await alice2.tenant.reconcileUserKeys!();
+
+    // The reconcile pass tries every candidate key in turn, and the default wrap
+    // is addressed to the User-Key — so the device key fails on it by
+    // construction. That lost race is not a fault and must not warn.
+    const warnings = await captureWarnings(async () => {
+      await alice2.tenant.reconcileKeyDistributionsForCurrentUser!();
+    });
+    expect(await alice2.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
+    expect(warnings.filter((line) => line.includes(NOT_UNWRAPPED))).toEqual([]);
   });
 
   it("does not mint a second User-Key when default is already wrapped", async () => {

@@ -2548,10 +2548,26 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
     let imported: string[] = [];
     let removed: string[] = [];
+    // A wrap is addressed to exactly one of these keys, so every other candidate
+    // fails on it by construction. Collect the misses and judge them only once
+    // the whole pass is done, otherwise the losing candidates cry wolf on a key
+    // that was delivered fine.
+    const unopened = new Map<string, string[]>();
     for (const key of keys) {
       const result = await this.reconcileKeyDistributionsWithKey(username, key);
       imported = Array.from(new Set([...imported, ...result.imported]));
       removed = Array.from(new Set([...removed, ...result.removed]));
+      for (const [keyId, reason] of result.unopened ?? []) {
+        unopened.set(keyId, [...(unopened.get(keyId) ?? []), reason]);
+      }
+    }
+    for (const [keyId, reasons] of unopened) {
+      if (imported.includes(keyId)) continue;
+      if (await baseTenant.hasDecryptionKey(keyId)) continue;
+      this.logger.warn(
+        `reconcileKeyDistributions: ${keyId} not unwrapped by any of the ${keys.length} ` +
+          `available encryption key(s) (wrong User-Key or corrupt wrap): ${reasons.join(" || ")}`,
+      );
     }
     return { imported, removed };
   }
@@ -2580,7 +2596,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   private async reconcileKeyDistributionsWithKey(
     username: string,
     encryptionPrivateCryptoKey: CryptoKey,
-  ): Promise<{ imported: string[]; removed: string[] }> {
+  ): Promise<{ imported: string[]; removed: string[]; unopened?: Map<string, string> }> {
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
     await this.updateUnifiedCache();
@@ -2621,6 +2637,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
     const imported: string[] = [];
     const removed: string[] = [];
+    // keyId -> why this candidate key could not open any of its wraps.
+    const unopened = new Map<string, string>();
 
     for (const [keyId, entry] of this.keyDistributionCache.entries()) {
       if (PROTECTED_DISTRIBUTION_KEY_IDS.includes(keyId)) continue;
@@ -2705,50 +2723,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }
 
       if (collected.size === 0) {
+        // Not an error yet: the caller runs this pass once per candidate key
+        // (every User-Key epoch, then the device key), so a wrap addressed to
+        // the User-Key can never open with the device key. Only the caller knows
+        // whether some other candidate succeeded, so report instead of warning.
         const addressedTo = myEntries.map(([entryKey]) => entryKey.split("|")[1] ?? "?");
-        // "Wrong User-Key or corrupt wrap" lumps two very different faults
-        // together. Separate them: wrap a probe to the published User-Key PEM
-        // right now and open it with the very key that just failed. If that
-        // round-trip works, the key is right and the stored ciphertext is bad.
-        const userKeyManager = baseTenant.getUserKeyManager();
-        const openable = async (pem: string): Promise<boolean> => {
-          try {
-            const sample = new Uint8Array(32).fill(7);
-            const reopened = await rsa.decrypt(await rsa.encrypt(sample, pem), privateKey);
-            return reopened.length === 32 && reopened.every((b) => b === 7);
-          } catch {
-            return false;
-          }
-        };
-        let probe: string;
-        try {
-          const published = await userKeyManager.publishedUserKeyFor(username);
-          const localPem = await userKeyManager.getLocalUserPublicKey();
-          if (!published) {
-            probe = "probe skipped — no published User-Key for this user";
-          } else {
-            // `publishedUserKeyFor` picks its epoch via currentUserKeyEpoch, the
-            // reconcile keys via epochsNewestFirst. If those disagree we wrap to
-            // one generation and decrypt with another, which looks exactly like a
-            // corrupt wrap. Name the divergence instead of guessing.
-            const publishedFp = await this.encryptionKeyFingerprint(published.publicKey);
-            const publishedOpens = await openable(published.publicKey);
-            const localFp = localPem ? await this.encryptionKeyFingerprint(localPem) : "none";
-            const localOpens = localPem ? await openable(localPem) : false;
-            probe =
-              `probe published[fp=${publishedFp} docField=${published.fingerprint} ` +
-              `pending=${published.pending} len=${published.publicKey.length} opens=${publishedOpens}] ` +
-              `local[fp=${localFp} len=${localPem?.length ?? 0} opens=${localOpens}] ` +
-              `samePem=${!!localPem && localPem === published.publicKey}`;
-          }
-        } catch (error) {
-          probe = `probe threw (${error instanceof Error ? error.message || error.name : error})`;
-        }
-        this.logger.warn(
-          `reconcileKeyDistributions: ${keyId} has ${myEntries.length} wrap(s) for this user but none unwrapped ` +
-            `(wrong User-Key or corrupt wrap); wraps addressed to [${addressedTo.join(", ")}], ` +
+        unopened.set(
+          keyId,
+          `${myEntries.length} wrap(s) for this user, none unwrapped; ` +
+            `wraps addressed to [${addressedTo.join(", ")}], ` +
             `manifest versions [${manifest.map((ref) => ref.fingerprint).join(", ")}]; ` +
-            `attempts: ${attempts.join(" | ")}; ${probe}`,
+            `attempts: ${attempts.join(" | ")}`,
         );
         continue;
       }
@@ -2759,7 +2744,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       if (count > 0) imported.push(keyId);
     }
 
-    return { imported, removed };
+    return { imported, removed, unopened };
   }
 
   /**
