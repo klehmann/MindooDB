@@ -92,6 +92,7 @@ export {
   nodeCovering,
   isSamePerson,
   grantForSigningKey,
+  signingKeysEqual,
   type DirectoryStateNode,
   type UserGrantSnapshot,
   type GroupSnapshot,

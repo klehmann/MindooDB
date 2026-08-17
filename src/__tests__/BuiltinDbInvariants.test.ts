@@ -189,6 +189,27 @@ describe("evaluateBuiltinWrite", () => {
     ).toMatch(/only the owning person can change/);
   });
 
+  it("treats admin PEMs that differ only by whitespace as the same key", () => {
+    const adminPem = "-----BEGIN PUBLIC KEY-----\nMCow\n-----END PUBLIC KEY-----";
+    const adminPemSpaced = "-----BEGIN PUBLIC KEY-----\nMCow\n\n-----END PUBLIC KEY-----\n";
+    expect(
+      evaluateBuiltinWrite({
+        dbId: "directory",
+        op: "doc_create",
+        signerKey: adminPem,
+        adminPublicKey: adminPemSpaced,
+      }).allowed,
+    ).toBe(true);
+    expect(
+      evaluateBuiltinWrite({
+        dbId: "userdirectory",
+        op: "doc_create",
+        signerKey: adminPem,
+        adminPublicKey: adminPemSpaced,
+      }).reason,
+    ).toBe("userdirectory admin create");
+  });
+
   it("reads username_hash from a full Automerge document as well as a change", () => {
     const doc = Automerge.from({ username_hash: "hash-from-save" });
     expect(usernameHashFromCreateChangeBytes(Automerge.save(doc))).toBe("hash-from-save");

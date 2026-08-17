@@ -1,4 +1,5 @@
 import { Automerge } from "./automerge-adapter";
+import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
 import { DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID } from "./types";
 
 /**
@@ -39,14 +40,14 @@ export function hasBuiltinWriteInvariant(dbId: string): boolean {
 
 export function evaluateBuiltinWrite(input: BuiltinWriteInput): BuiltinWriteDecision {
   if (input.dbId === DIRECTORY_DB_ID) {
-    if (input.signerKey !== input.adminPublicKey) {
+    if (!signingKeysEqual(input.signerKey, input.adminPublicKey)) {
       return { allowed: false, reason: "Admin-only database: only the admin key can modify data" };
     }
     return { allowed: true, reason: "directory admin write" };
   }
 
   if (input.dbId === USER_DIRECTORY_DB_ID) {
-    const isAdmin = input.signerKey === input.adminPublicKey;
+    const isAdmin = signingKeysEqual(input.signerKey, input.adminPublicKey);
     if (input.op === "doc_delete") {
       return isAdmin
         ? { allowed: true, reason: "userdirectory admin delete" }
@@ -165,10 +166,10 @@ export function shouldSkipLoadedEntry(input: {
   signerUsernameHash?: string | null;
 }): boolean {
   if (input.dbId === DIRECTORY_DB_ID) {
-    return input.signerKey !== input.adminPublicKey;
+    return !signingKeysEqual(input.signerKey, input.adminPublicKey);
   }
   if (input.dbId === USER_DIRECTORY_DB_ID) {
-    const isAdmin = input.signerKey === input.adminPublicKey;
+    const isAdmin = signingKeysEqual(input.signerKey, input.adminPublicKey);
     if (input.entryType === "doc_delete") {
       return !isAdmin;
     }

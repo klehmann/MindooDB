@@ -1,7 +1,7 @@
 /**
  * Device discovery: challenge / discover without a tenant id in the path.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "@jest/globals";
 import { DeviceDiscoveryAuthError, DeviceDiscoveryService } from "../node/server/DeviceDiscoveryService";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";

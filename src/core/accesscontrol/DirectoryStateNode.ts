@@ -170,6 +170,14 @@ function buildBySigningKey(
   return bySigningKey;
 }
 
+/** True when two Ed25519 PEM signing keys are the same device, ignoring whitespace. */
+export function signingKeysEqual(a: string, b: string): boolean {
+  if (a === b) return true;
+  const left = a.replace(/\s+/g, "");
+  const right = b.replace(/\s+/g, "");
+  return left.length > 0 && left === right;
+}
+
 /** Match a signing key in {@link DirectoryStateNode.bySigningKey}, ignoring PEM whitespace. */
 export function grantForSigningKey(
   node: DirectoryStateNode,
@@ -177,10 +185,8 @@ export function grantForSigningKey(
 ): UserGrantSnapshot | undefined {
   const exact = node.bySigningKey.get(signingKey);
   if (exact) return exact;
-  const needle = signingKey.replace(/\s+/g, "");
-  if (!needle) return undefined;
   for (const [key, grant] of node.bySigningKey) {
-    if (key.replace(/\s+/g, "") === needle) return grant;
+    if (signingKeysEqual(key, signingKey)) return grant;
   }
   return undefined;
 }

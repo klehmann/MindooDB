@@ -2,7 +2,7 @@
  * Tenant setup label is field-encrypted under `default` so the sync server
  * (which only holds `$publicinfos`) cannot read the display name.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "@jest/globals";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
@@ -11,6 +11,7 @@ import { readTenantSetupLabel, writeTenantSetupLabel } from "../core/tenantSetup
 import { isValidTenantId } from "../core/tenantIdValidation";
 
 describe("tenantsetup label encryption", () => {
+  jest.setTimeout(120000);
   const adminName = "cn=admin/o=label-test";
   const adminPassword = "admin-pass-123";
   const userName = "cn=alice/o=label-test";

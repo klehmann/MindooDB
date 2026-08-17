@@ -48,6 +48,7 @@ import type {
 } from "../../core/types";
 import { PUBLIC_INFOS_KEY_ID, StoreKind, USER_DIRECTORY_DB_ID } from "../../core/types";
 import { usernameHashFromCreateChangeBytes } from "../../core/builtinDbInvariants";
+import { signingKeysEqual } from "../../core/accesscontrol/DirectoryStateNode";
 import type { PrivateUserId } from "../../core/userid";
 
 import { StoreFactory } from "./StoreFactory";
@@ -222,7 +223,8 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
         | "getUserSigningKeyUniverse"
         | "getUserKeyPairs"
         | "getWipeGrantDocId"
-        | "getRevokedDecryptionKeyIdsForSigningKey">>
+        | "getRevokedDecryptionKeyIdsForSigningKey"
+        | "resolveUsernameHashForSigningKey">>
       & Partial<Pick<BaseMindooTenantDirectory, "evaluateDbAccessForSigningKey">>,
     private trustedServers: TrustedServer[],
     private adminBootstrapIdentity?: {
@@ -286,7 +288,10 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     publicKey: string,
     opts?: { forceRefresh?: boolean },
   ): Promise<boolean> {
-    if (this.adminBootstrapIdentity && this.adminBootstrapIdentity.signingPublicKey === publicKey) {
+    if (
+      this.adminBootstrapIdentity &&
+      signingKeysEqual(this.adminBootstrapIdentity.signingPublicKey, publicKey)
+    ) {
       return true;
     }
 
@@ -321,7 +326,10 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     // server, mirroring getUserPublicKeys. Without this, key-based identity
     // resolution (and the validateToken active-key check below) would treat the
     // admin's own key as unknown the moment the directory has no admin grant.
-    if (this.adminBootstrapIdentity && this.adminBootstrapIdentity.signingPublicKey === publicKey) {
+    if (
+      this.adminBootstrapIdentity &&
+      signingKeysEqual(this.adminBootstrapIdentity.signingPublicKey, publicKey)
+    ) {
       return {
         username: this.adminBootstrapIdentity.username,
         signingPublicKey: this.adminBootstrapIdentity.signingPublicKey,
@@ -393,6 +401,23 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     }
     // Config-based directories carry no database-open policy -> unrestricted.
     return true;
+  }
+
+  /**
+   * Forwarded so server-side `userdirectory` writes can resolve the signer's
+   * grant. Without this, `evaluateUserdirectoryInvariant` sees a missing
+   * method, leaves `signerUsernameHash` null, and denies every non-admin
+   * change as "signer is not a granted device" — including the founder
+   * wrapping a second device of their own User-Key.
+   */
+  async resolveUsernameHashForSigningKey(
+    signingKey: string,
+    trustedTime: number,
+  ): Promise<string | null> {
+    if (typeof this.inner.resolveUsernameHashForSigningKey === "function") {
+      return this.inner.resolveUsernameHashForSigningKey(signingKey, trustedTime);
+    }
+    return null;
   }
 }
 

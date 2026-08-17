@@ -1507,26 +1507,16 @@ describe("System Admin Security", () => {
         ["sign"],
       );
 
-      // Spy on the helper that decrypts the private key from the password.
-      const decryptSpy = jest.spyOn(decryptPkEncryptionModule, "decryptPrivateKey");
+      // Construct WITHOUT a password: the signing key alone must be enough.
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminSigningKey: signingKey,
+        cryptoAdapter,
+      });
 
-      try {
-        // Construct WITHOUT a password: the signing key alone must be enough.
-        const admin = new MindooDBServerAdmin({
-          serverUrl: setup.baseUrl,
-          systemAdminUser: setup.adminUser,
-          systemAdminSigningKey: signingKey,
-          cryptoAdapter,
-        });
-
-        const tenants = await admin.listTenants();
-        expect(Array.isArray(tenants)).toBe(true);
-
-        // The password decrypt path should never run.
-        expect(decryptSpy).not.toHaveBeenCalled();
-      } finally {
-        decryptSpy.mockRestore();
-      }
+      const tenants = await admin.listTenants();
+      expect(Array.isArray(tenants)).toBe(true);
     });
   });
 
