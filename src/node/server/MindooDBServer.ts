@@ -53,7 +53,10 @@ import type { NetworkSyncCapabilities } from "../../core/appendonlystores/networ
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 
 import { TenantManager } from "./TenantManager";
-import { CapabilityMatcher } from "./CapabilityMatcher";
+import {
+  CapabilityMatcher,
+  parseSystemTenantItemPath,
+} from "./CapabilityMatcher";
 import { SystemAdminAuthService } from "./SystemAdminAuth";
 import {
   DeviceDiscoveryAuthError,
@@ -329,6 +332,10 @@ export class MindooDBServer {
     this.systemAdminAuth = new SystemAdminAuthService(
       cryptoAdapter,
       this.serverConfig,
+      {
+        isTenantAdminSigningKey: (publicsignkey) =>
+          this.tenantManager.isRegisteredTenantAdminSigningKey(publicsignkey),
+      },
     );
     this.deviceDiscovery = new DeviceDiscoveryService(
       this.tenantManager,
@@ -662,6 +669,10 @@ export class MindooDBServer {
    * JWT-based middleware for /system/* routes (excluding /system/auth/*).
    * Extracts and validates the bearer token, then checks capabilities
    * for the current (method, path, username, publicsignkey).
+   *
+   * `DELETE /system/tenants/:tenantId` is also allowed when the JWT signing
+   * key is that tenant's registered `adminSigningPublicKey` (own-tenant
+   * delete). Sub-resources and other tenants stay capability-gated.
    */
   private async systemAdminMiddleware(
     req: Request,
@@ -686,14 +697,17 @@ export class MindooDBServer {
     const fullPath = `/system${req.path}`;
     const method = req.method.toUpperCase();
 
-    if (
-      !this.capabilityMatcher.isAuthorized(
-        method,
-        fullPath,
-        payload.sub,
-        payload.publicsignkey,
-      )
-    ) {
+    const capabilityAuthorized = this.capabilityMatcher.isAuthorized(
+      method,
+      fullPath,
+      payload.sub,
+      payload.publicsignkey,
+    );
+    const ownerDeleteAuthorized =
+      !capabilityAuthorized &&
+      this.isOwnTenantDeleteAuthorized(method, fullPath, payload.publicsignkey);
+
+    if (!capabilityAuthorized && !ownerDeleteAuthorized) {
       res.status(403).json({ error: "Forbidden: insufficient capabilities" });
       return;
     }
@@ -703,6 +717,31 @@ export class MindooDBServer {
       publicsignkey: payload.publicsignkey,
     };
     next();
+  }
+
+  /**
+   * Owner bypass for deleting the caller's own tenant. Matches only
+   * `DELETE /system/tenants/:tenantId` (no sub-resource) and requires the
+   * JWT public key to equal that tenant's stored admin signing key.
+   */
+  private isOwnTenantDeleteAuthorized(
+    method: string,
+    fullPath: string,
+    publicsignkey: string,
+  ): boolean {
+    if (method !== "DELETE") {
+      return false;
+    }
+    const tenantId = parseSystemTenantItemPath(fullPath);
+    if (!tenantId) {
+      return false;
+    }
+    try {
+      validateTenantIdFormat(tenantId);
+    } catch {
+      return false;
+    }
+    return this.tenantManager.isTenantAdminSigningKeyFor(tenantId, publicsignkey);
   }
 
   // ==================== Tenant Middleware ====================

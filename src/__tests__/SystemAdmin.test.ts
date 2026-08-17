@@ -790,6 +790,85 @@ describe("System Admin Security", () => {
       );
       expect(status).toBe(403);
     });
+
+    test("wildcard principal can delete the tenant they registered as admin", async () => {
+      const owner = await factory.createUserId("cn=demo-owner/o=test", "owner-pass");
+      const token = await getSystemAdminToken(
+        setup.baseUrl,
+        owner,
+        "owner-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const create = await httpRequest(
+        `${setup.baseUrl}/system/tenants/owner-delete-me`,
+        "POST",
+        {
+          adminSigningPublicKey: owner.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: owner.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(7),
+        },
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(create.status).toBe(201);
+
+      const { status, body } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/owner-delete-me`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ success: true });
+    });
+
+    test("wildcard principal cannot delete a tenant they do not administer", async () => {
+      const owner = await factory.createUserId("cn=demo-keep/o=test", "keep-pass");
+      const stranger = await factory.createUserId("cn=demo-stranger/o=test", "stranger-pass");
+      const ownerToken = await getSystemAdminToken(
+        setup.baseUrl,
+        owner,
+        "keep-pass",
+        cryptoAdapter,
+        factory,
+      );
+      const strangerToken = await getSystemAdminToken(
+        setup.baseUrl,
+        stranger,
+        "stranger-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const create = await httpRequest(
+        `${setup.baseUrl}/system/tenants/keep-this-tenant`,
+        "POST",
+        {
+          adminSigningPublicKey: owner.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: owner.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(8),
+        },
+        { Authorization: `Bearer ${ownerToken}` },
+      );
+      expect(create.status).toBe(201);
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/keep-this-tenant`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${strangerToken}` },
+      );
+      expect(status).toBe(403);
+
+      const ownerDelete = await httpRequest(
+        `${setup.baseUrl}/system/tenants/keep-this-tenant`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${ownerToken}` },
+      );
+      expect(ownerDelete.status).toBe(200);
+    });
   });
 
   describe("Wildcard Tenant Prefix Authorization", () => {
@@ -856,6 +935,129 @@ describe("System Admin Security", () => {
           adminEncryptionPublicKey: wildcardUser.userEncryptionKeyPair.publicKey,
         },
         { Authorization: `Bearer ${token}` },
+      );
+      expect(status).toBe(403);
+    });
+  });
+
+  describe("Own-tenant delete authorization", () => {
+    let setup: TestSetup;
+    const port = 4014;
+
+    beforeAll(async () => {
+      setup = await createTestSetup(port, cryptoAdapter, factory);
+    });
+
+    afterAll(async () => {
+      await teardownTestSetup(setup);
+    });
+
+    test("tenant admin can delete own tenant without a DELETE capability", async () => {
+      const tenantAdmin = await factory.createUserId(
+        "cn=tenant-admin/o=test",
+        "tenant-admin-pass",
+      );
+      const sysToken = await getSystemAdminToken(
+        setup.baseUrl,
+        setup.adminUser,
+        "admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const create = await httpRequest(
+        `${setup.baseUrl}/system/tenants/owned-by-tenant-admin`,
+        "POST",
+        {
+          adminSigningPublicKey: tenantAdmin.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: tenantAdmin.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(9),
+        },
+        { Authorization: `Bearer ${sysToken}` },
+      );
+      expect(create.status).toBe(201);
+
+      const ownerToken = await getSystemAdminToken(
+        setup.baseUrl,
+        tenantAdmin,
+        "tenant-admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const listDenied = await httpRequest(
+        `${setup.baseUrl}/system/tenants`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${ownerToken}` },
+      );
+      expect(listDenied.status).toBe(403);
+
+      const subresourceDenied = await httpRequest(
+        `${setup.baseUrl}/system/tenants/owned-by-tenant-admin/sync-servers/other`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${ownerToken}` },
+      );
+      expect(subresourceDenied.status).toBe(403);
+
+      const { status, body } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/owned-by-tenant-admin`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${ownerToken}` },
+      );
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ success: true });
+    });
+
+    test("tenant admin cannot delete a different tenant", async () => {
+      const ownerA = await factory.createUserId("cn=owner-a/o=test", "owner-a-pass");
+      const ownerB = await factory.createUserId("cn=owner-b/o=test", "owner-b-pass");
+      const sysToken = await getSystemAdminToken(
+        setup.baseUrl,
+        setup.adminUser,
+        "admin-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const createA = await httpRequest(
+        `${setup.baseUrl}/system/tenants/tenant-a-own`,
+        "POST",
+        {
+          adminSigningPublicKey: ownerA.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: ownerA.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(10),
+        },
+        { Authorization: `Bearer ${sysToken}` },
+      );
+      const createB = await httpRequest(
+        `${setup.baseUrl}/system/tenants/tenant-b-own`,
+        "POST",
+        {
+          adminSigningPublicKey: ownerB.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: ownerB.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(11),
+        },
+        { Authorization: `Bearer ${sysToken}` },
+      );
+      expect(createA.status).toBe(201);
+      expect(createB.status).toBe(201);
+
+      const tokenA = await getSystemAdminToken(
+        setup.baseUrl,
+        ownerA,
+        "owner-a-pass",
+        cryptoAdapter,
+        factory,
+      );
+
+      const { status } = await httpRequest(
+        `${setup.baseUrl}/system/tenants/tenant-b-own`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${tokenA}` },
       );
       expect(status).toBe(403);
     });

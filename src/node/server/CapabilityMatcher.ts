@@ -160,7 +160,7 @@ export class CapabilityMatcher {
    * but no further path segment.
    */
   private static isTenantCreationPath(path: string): boolean {
-    return /^\/system\/tenants\/[^/]+\/?$/.test(path);
+    return parseSystemTenantItemPath(path) !== null;
   }
 
   /**
@@ -187,4 +187,13 @@ export class CapabilityMatcher {
 
     return requestPath.endsWith(suffix);
   }
+}
+
+/**
+ * Parse `/system/tenants/:tenantId` (optional trailing slash, no sub-resource).
+ * Returns the tenant id segment or `null`.
+ */
+export function parseSystemTenantItemPath(path: string): string | null {
+  const match = /^\/system\/tenants\/([^/]+)\/?$/.exec(path);
+  return match ? match[1] : null;
 }

@@ -802,6 +802,54 @@ export class TenantManager {
     return existsSync(configPath);
   }
 
+  /**
+   * Read the tenant's registered admin signing key without fully loading the
+   * tenant. Returns `null` if the tenant is missing or the config is unreadable.
+   */
+  getTenantAdminSigningPublicKey(tenantId: string): string | null {
+    try {
+      const normalizedId = tenantId.toLowerCase();
+      const cached = this.loadedTenants.get(normalizedId);
+      if (cached?.context.config.adminSigningPublicKey) {
+        return cached.context.config.adminSigningPublicKey;
+      }
+      const configPath = this.resolveTenantConfigPath(normalizedId);
+      if (!existsSync(configPath)) {
+        return null;
+      }
+      const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+      return typeof config.adminSigningPublicKey === "string" &&
+        config.adminSigningPublicKey.length > 0
+        ? config.adminSigningPublicKey
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * True when `publicsignkey` is the registered tenant-admin signing key for
+   * `tenantId` (PEM whitespace-insensitive).
+   */
+  isTenantAdminSigningKeyFor(tenantId: string, publicsignkey: string): boolean {
+    const adminKey = this.getTenantAdminSigningPublicKey(tenantId);
+    return adminKey !== null && signingKeysEqual(adminKey, publicsignkey);
+  }
+
+  /**
+   * True when `publicsignkey` is the registered admin signing key of any
+   * tenant on this server. Used to issue a system JWT so that admin can
+   * DELETE their own tenant; other `/system/*` routes stay capability-gated.
+   */
+  isRegisteredTenantAdminSigningKey(publicsignkey: string): boolean {
+    for (const tenantId of this.listTenants()) {
+      if (this.isTenantAdminSigningKeyFor(tenantId, publicsignkey)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   listTenants(): string[] {
     if (!existsSync(this.dataDir)) {
       return [];

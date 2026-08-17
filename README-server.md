@@ -261,7 +261,7 @@ Each rule in `config.json` is a key-value pair where:
 | `POST:/system/tenants/acme` | Can only create the specific tenant `acme` |
 | `PUT:/system/tenants/company-*` | Can update any tenant whose ID starts with `company-` |
 | `GET:/system/tenants` | Read-only: can list tenants but not modify anything |
-| `DELETE:/system/tenants/*` | Can delete any tenant |
+| `DELETE:/system/tenants/*` | Can delete any tenant. Tenant admins can also delete **their own** tenant without this rule (see [Own-tenant delete](#own-tenant-delete)). |
 
 ### Multiple admins with different roles
 
@@ -304,6 +304,7 @@ On each `/system/*` request the server:
 3. Finds all capability rules whose method and path pattern match
 4. Unions all principal entries from matching rules
 5. **Allows** the request if any entry has **both** a matching `username` AND `publicsignkey`
+6. If that fails, **also allows** `DELETE /system/tenants/:tenantId` when the JWT signing key is that tenant's registered admin signing key (see [Own-tenant delete](#own-tenant-delete))
 
 A principal is identified by the combination of username + public key. Two admins may share a username but have different keys -- they are treated as distinct identities.
 

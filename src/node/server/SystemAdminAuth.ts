@@ -53,6 +53,12 @@ export class SystemAdminAuthService {
   private principals: SystemAdminPrincipal[];
   private allowTenantCreationWildcardPrincipal: boolean;
   private cryptoAdapter: CryptoAdapter;
+  /**
+   * Optional live lookup: a signing key that is a registered tenant's
+   * `adminSigningPublicKey` may obtain a system JWT so it can DELETE that
+   * tenant. Capability checks still deny every other `/system/*` route.
+   */
+  private isTenantAdminSigningKey?: (publicsignkey: string) => boolean;
 
   constructor(
     cryptoAdapter: CryptoAdapter,
@@ -61,12 +67,14 @@ export class SystemAdminAuthService {
       jwtSecret?: Uint8Array;
       challengeExpirationMs?: number;
       tokenExpirationMs?: number;
+      isTenantAdminSigningKey?: (publicsignkey: string) => boolean;
     },
   ) {
     this.cryptoAdapter = cryptoAdapter;
     this.principals = extractAllPrincipals(config);
     this.allowTenantCreationWildcardPrincipal =
       hasTenantCreationWildcardPrincipal(config);
+    this.isTenantAdminSigningKey = options?.isTenantAdminSigningKey;
     this.jwtSecret =
       options?.jwtSecret ?? cryptoAdapter.getRandomValues(new Uint8Array(32));
     this.challengeExpirationMs = options?.challengeExpirationMs ?? 5 * 60 * 1000;
@@ -100,7 +108,11 @@ export class SystemAdminAuthService {
         p.username.toLowerCase() === normalizedUsername &&
         p.publicsignkey === publicsignkey,
     );
-    if (!found && !this.allowTenantCreationWildcardPrincipal) {
+    if (
+      !found &&
+      !this.allowTenantCreationWildcardPrincipal &&
+      !this.isTenantAdminSigningKey?.(publicsignkey)
+    ) {
       throw new Error("Unknown system admin principal");
     }
 
