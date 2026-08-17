@@ -1194,7 +1194,7 @@ export class KeyBag {
         tagLength: 128,
       },
       derivedKey,
-      privateKeyBytes
+      new Uint8Array(privateKeyBytes),
     );
 
     // Extract ciphertext and tag from encrypted data
