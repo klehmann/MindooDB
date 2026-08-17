@@ -99,6 +99,16 @@ describe("key distribution targets user keys", () => {
     expect(await alice2.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
   });
 
+  it("does not mint a second User-Key when default is already wrapped", async () => {
+    const alice2 = await addDevice(fixture, alice1, "nomint");
+    await alice2.factory.ensureUserKeyPair!(alice2.user, alice2.password);
+    await syncAll(fixture, "directory");
+    alice2.tenant.noteUserDirectoryFetched!();
+    await alice2.tenant.reconcileUserKeys!({ allowSelfCreate: false });
+    const ids = await (await alice2.tenant.openDB(USER_DIRECTORY_DB_ID)).getAllDocumentIds();
+    expect(ids.filter((id) => id.startsWith("userkey_"))).toEqual([]);
+  });
+
   it("wrapKeyForUser after rotation targets the new fingerprint", async () => {
     const before = await alice1.tenant.getUserKeyManager().publishedUserKeyFor(alice1.username);
     await alice1.tenant.rotateUserKey!();

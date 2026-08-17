@@ -1489,8 +1489,12 @@ contains revoked keys*, which happens with no directory change — and `KeyBag.l
 replaces keys silently (no `onChanges`, no cursor bump). So reconcile runs:
 
 - on directory **bring-up / open** (first `getDirectoryDB` use), and
-- after each directory **`pullChangesFrom`** (right after `syncStoreChanges()` when
-  `store.getId() === "directory"`).
+- after each directory **`pullChangesFrom`** (including a no-op pull that transfers
+  0 new entries — Device 2 often already has the distribution document from
+  bootstrap, then imports the User-Key later from `userdirectory`), and
+- after each **`userdirectory` `pullChangesFrom`**, once the User-Key is in the
+  session, so `default` can be unwrapped from `acl_keydistribution_default`
+  without requiring a second directory transfer.
 
 `reconcileKeyDistributionsForCurrentUserSafe()` wraps it with a single-flight in-flight
 flag (the only guard) so reconcile's own `getDirectoryDB` / `updateUnifiedCache` /

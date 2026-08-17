@@ -22,7 +22,7 @@ import {
   DIRECTORY_DB_ID,
   USER_DIRECTORY_DB_ID,
 } from "./types";
-import { PrivateUserId, PublicUserId } from "./userid";
+import { PrivateUserId, PublicUserId, usernamesEqual } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
@@ -182,6 +182,7 @@ export class BaseMindooTenant implements MindooTenant {
       signingKey?: CryptoKey;
       encryptionKey?: CryptoKey;
       cacheEncryptionKey?: CryptoKey;
+      userKeyPrivateBytes?: Uint8Array;
     },
   ) {
     this.factory = factory;
@@ -227,6 +228,9 @@ export class BaseMindooTenant implements MindooTenant {
     }
     if (preDecryptedMaterial?.encryptionKey) {
       this.decryptedUserEncryptionKeyCache = preDecryptedMaterial.encryptionKey;
+    }
+    if (preDecryptedMaterial?.userKeyPrivateBytes) {
+      this.userKeys.seedDecryptedUserKeyBytes(preDecryptedMaterial.userKeyPrivateBytes);
     }
 
     // Set up cache if a local cache store is provided. When a pre-derived
@@ -1700,6 +1704,34 @@ export class BaseMindooTenant implements MindooTenant {
         [DEFAULT_TENANT_KEY_ID],
         options.adminSigningKey,
         options.adminPassword,
+      );
+    }
+
+    // Same person: wrap the published User-Key to this device's encryption
+    // key (from the grant). A different existing person stays pending until
+    // one of *their* devices writes the wrap — this replica cannot.
+    const current = await this.getCurrentUserId();
+    const samePerson = usernamesEqual(current.username, username);
+    console.log("[approveJoinRequest] User-Key wrap decision", {
+      joiningUsername: username,
+      currentUsername: current.username,
+      samePerson,
+      hasEncryptionPublicKey: !!request.encryptionPublicKey,
+    });
+    if (samePerson) {
+      try {
+        await this.userKeys.wrapUserKeyForGrantDevice(request.encryptionPublicKey, deviceLabel);
+        console.log(`[approveJoinRequest] ✓ wrapped User-Key for joining device of "${username}"`);
+        this.logger.info(`approveJoinRequest: wrapped User-Key for joining device of "${username}"`);
+      } catch (error) {
+        console.error("[approveJoinRequest] User-Key wrap for joining device failed", error);
+        this.logger.error(
+          `approveJoinRequest: User-Key wrap for joining device failed (${error instanceof Error ? error.message : error})`,
+        );
+      }
+    } else {
+      this.logger.info(
+        `approveJoinRequest: User-Key wrap deferred; joining "${username}" is not the current user "${current.username}"`,
       );
     }
 

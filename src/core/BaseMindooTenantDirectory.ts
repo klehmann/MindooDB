@@ -440,8 +440,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         if (wrapped) pushto.push(wrapped);
       }
       if (pushto.length === 0) {
-        this.logger.debug(
-          `autoDistributeKeysToUser: skipping "${keyId}" — no published User-Key wrap yet`,
+        this.logger.warn(
+          `autoDistributeKeysToUser: skipping "${keyId}" — no published User-Key wrap yet for "${username}"`,
         );
         continue;
       }
@@ -2203,9 +2203,29 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     let fingerprint: string | undefined;
     if (!publicKey) {
       const published = await baseTenant.getUserKeyManager().publishedUserKeyFor(username);
-      if (!published || published.pending) return null;
+      // Wrap even while the User-Key document is still pending (no device
+      // wraps yet). The public key is already the person's; later devices
+      // unwrap `default` from this document after they import the User-Key.
+      if (!published) {
+        this.logger.warn(
+          `wrapKeyForUser: no published User-Key for "${username}" — cannot wrap "${keyId}"`,
+        );
+        return null;
+      }
       publicKey = published.publicKey;
-      fingerprint = published.fingerprint;
+      // Derive the map key from the PEM we actually encrypt to, never from the
+      // document's fingerprint field. If the two ever disagree, the recipient
+      // finds a wrap under its own fingerprint that its private key cannot
+      // open — an undebuggable "wrong User-Key or corrupt wrap".
+      const derived = await this.encryptionKeyFingerprint(publicKey);
+      if (published.fingerprint && published.fingerprint !== derived) {
+        this.logger.warn(
+          `wrapKeyForUser: User-Key document for "${username}" is inconsistent — ` +
+            `fingerprint field says ${published.fingerprint} but its publicKey hashes to ${derived}; ` +
+            `wrapping "${keyId}" under ${derived}`,
+        );
+      }
+      fingerprint = derived;
     }
     if (!fingerprint) {
       fingerprint = await this.encryptionKeyFingerprint(publicKey);
@@ -2565,7 +2585,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     await directoryDB.syncStoreChanges();
     await this.updateUnifiedCache();
 
-    if (this.keyDistributionCache.size === 0) return { imported: [], removed: [] };
+    if (this.keyDistributionCache.size === 0) {
+      this.logger.warn(
+        "reconcileKeyDistributionsWithKey: directory has no key-distribution documents in cache",
+      );
+      return { imported: [], removed: [] };
+    }
+    if (!this.keyDistributionCache.has(DEFAULT_TENANT_KEY_ID)) {
+      this.logger.warn(
+        "reconcileKeyDistributionsWithKey: no acl_keydistribution_default in directory cache",
+      );
+    }
 
     const myHashes = new Set(await this.usernameHashCandidates(username));
     // Nameless / pre-adoption devices: also match via the grant's
@@ -2608,7 +2638,15 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         continue;
       }
 
-      if (!meInPush) continue;
+      if (!meInPush) {
+        if (keyId === DEFAULT_TENANT_KEY_ID) {
+          this.logger.warn(
+            `reconcileKeyDistributions: "${keyId}" exists but current user is not in pushto ` +
+              `(hashes=${entry.pushto_users_hashes.length})`,
+          );
+        }
+        continue;
+      }
 
       const wrappedMap = entry.pushto_users_keys;
 
@@ -2619,14 +2657,27 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         const hash = entryKey.split("|")[0];
         return myHashes.has(hash);
       });
-      if (myEntries.length === 0) continue;
+      if (myEntries.length === 0) {
+        this.logger.warn(
+          `reconcileKeyDistributions: "${keyId}" lists this user in pushto but has no wrap entries for their hashes`,
+        );
+        continue;
+      }
 
       const collected = new Map<string, { bytes: Uint8Array; keyVersionCreatedAt: number }>();
-      for (const [, wrappedByVersion] of myEntries) {
+      // Why each candidate failed, so a "none unwrapped" warning can name the
+      // cause instead of lumping a missing version in with a decrypt failure.
+      const attempts: string[] = [];
+      for (const [entryKey, wrappedByVersion] of myEntries) {
         for (const ref of manifest) {
           if (collected.has(ref.fingerprint)) continue;
           const wrappedB64 = wrappedByVersion[ref.fingerprint];
-          if (typeof wrappedB64 !== "string") continue;
+          if (typeof wrappedB64 !== "string") {
+            attempts.push(
+              `${entryKey}: no wrap for version ${ref.fingerprint}; entry carries [${Object.keys(wrappedByVersion).join(", ")}]`,
+            );
+            continue;
+          }
           try {
             const bytes = await rsa.decrypt(this.base64ToBytes(wrappedB64), privateKey);
             const actualFp = await baseTenant.fingerprintKeyBytes(bytes);
@@ -2634,17 +2685,73 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
               this.logger.warn(
                 `reconcileKeyDistributions: fingerprint mismatch for ${keyId}@${ref.fingerprint} (got ${actualFp}); rejecting`,
               );
+              attempts.push(`${entryKey}: unwrapped ${ref.fingerprint} but got key ${actualFp}`);
               continue;
             }
             collected.set(ref.fingerprint, { bytes, keyVersionCreatedAt: ref.createdAt });
-          } catch {
-            // Not our device entry (or corrupt); try the next one.
+          } catch (error) {
+            // Byte length separates a truncated/corrupt wrap from a genuine
+            // key mismatch: hybrid format is 2 + 384 (RSA-3072) + 12 + AES.
+            const wrappedBytes = this.base64ToBytes(wrappedB64);
+            const rsaBlockLength = (wrappedBytes[0] << 8) | wrappedBytes[1];
+            attempts.push(
+              `${entryKey}: RSA decrypt of version ${ref.fingerprint} failed ` +
+                `(${error instanceof Error ? error.message || error.name : error}); ` +
+                `wrap b64=${wrappedB64.length} bytes=${wrappedBytes.length} rsaBlock=${rsaBlockLength}`,
+            );
           }
         }
         if (collected.size === manifest.length) break;
       }
 
-      if (collected.size === 0) continue;
+      if (collected.size === 0) {
+        const addressedTo = myEntries.map(([entryKey]) => entryKey.split("|")[1] ?? "?");
+        // "Wrong User-Key or corrupt wrap" lumps two very different faults
+        // together. Separate them: wrap a probe to the published User-Key PEM
+        // right now and open it with the very key that just failed. If that
+        // round-trip works, the key is right and the stored ciphertext is bad.
+        const userKeyManager = baseTenant.getUserKeyManager();
+        const openable = async (pem: string): Promise<boolean> => {
+          try {
+            const sample = new Uint8Array(32).fill(7);
+            const reopened = await rsa.decrypt(await rsa.encrypt(sample, pem), privateKey);
+            return reopened.length === 32 && reopened.every((b) => b === 7);
+          } catch {
+            return false;
+          }
+        };
+        let probe: string;
+        try {
+          const published = await userKeyManager.publishedUserKeyFor(username);
+          const localPem = await userKeyManager.getLocalUserPublicKey();
+          if (!published) {
+            probe = "probe skipped — no published User-Key for this user";
+          } else {
+            // `publishedUserKeyFor` picks its epoch via currentUserKeyEpoch, the
+            // reconcile keys via epochsNewestFirst. If those disagree we wrap to
+            // one generation and decrypt with another, which looks exactly like a
+            // corrupt wrap. Name the divergence instead of guessing.
+            const publishedFp = await this.encryptionKeyFingerprint(published.publicKey);
+            const publishedOpens = await openable(published.publicKey);
+            const localFp = localPem ? await this.encryptionKeyFingerprint(localPem) : "none";
+            const localOpens = localPem ? await openable(localPem) : false;
+            probe =
+              `probe published[fp=${publishedFp} docField=${published.fingerprint} ` +
+              `pending=${published.pending} len=${published.publicKey.length} opens=${publishedOpens}] ` +
+              `local[fp=${localFp} len=${localPem?.length ?? 0} opens=${localOpens}] ` +
+              `samePem=${!!localPem && localPem === published.publicKey}`;
+          }
+        } catch (error) {
+          probe = `probe threw (${error instanceof Error ? error.message || error.name : error})`;
+        }
+        this.logger.warn(
+          `reconcileKeyDistributions: ${keyId} has ${myEntries.length} wrap(s) for this user but none unwrapped ` +
+            `(wrong User-Key or corrupt wrap); wraps addressed to [${addressedTo.join(", ")}], ` +
+            `manifest versions [${manifest.map((ref) => ref.fingerprint).join(", ")}]; ` +
+            `attempts: ${attempts.join(" | ")}; ${probe}`,
+        );
+        continue;
+      }
       const count = await baseTenant.importDeliveredDecryptionKeyVersions(
         keyId,
         Array.from(collected.values()),

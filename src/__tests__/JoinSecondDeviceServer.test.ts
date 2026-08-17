@@ -1,8 +1,8 @@
 /**
  * HTTP end-to-end: Device 1 founds a tenant, Device 2 joins as a second
- * device of the same person, Device 1 approves the User-Key wrap and pushes
- * `userdirectory` to a local MindooDBServer, Device 2 discovers the tenant
- * and imports `default` wrapped to the published User-Key.
+ * device of the same person. Join approval wraps the User-Key to Device 2's
+ * device encryption key and pushes `userdirectory`; Device 2 discovers the
+ * tenant and imports `default` wrapped to the published User-Key.
  *
  * Regression: the server wraps the real directory in CompositeMindooDirectory
  * and used to skip `resolveUsernameHashForSigningKey`, so the wrap push was
@@ -185,12 +185,11 @@ describe("second device join over local HTTP server", () => {
       );
 
       await pushDb(device1Tenant, baseUrl, "directory", adminAuth);
+      await pushDb(device1Tenant, baseUrl, USER_DIRECTORY_DB_ID);
 
       device1Tenant.noteUserDirectoryFetched!();
       await device1Tenant.reconcileUserKeys!();
-      const pending = await device1Tenant.listPendingUserKeyDevices!();
-      expect(pending).toHaveLength(1);
-      expect(pending[0].label).toBe("Edge2");
+      expect(await device1Tenant.listPendingUserKeyDevices!()).toEqual([]);
 
       const deliveries = await device2Factory.discoverTenantsOnServer(baseUrl, {
         user: device2User,
@@ -208,21 +207,14 @@ describe("second device join over local HTTP server", () => {
       });
       expect(joined.user.username).toBe(device1User.username);
       expect(await joined.keyBag.get("doc", tenantId, PUBLIC_INFOS_KEY_ID)).toBeTruthy();
-      expect(await joined.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(false);
-
-      await device1Tenant.approveUserKeyDevice!(pending[0].fingerprint);
-      await pushDb(device1Tenant, baseUrl, USER_DIRECTORY_DB_ID);
-
-      await pullDb(joined.tenant, baseUrl, USER_DIRECTORY_DB_ID);
-
-      joined.tenant.noteUserDirectoryFetched!();
-      const enrollment = await joined.tenant.reconcileUserKeys!();
-      expect(enrollment.state).toBe("approved");
+      expect(await joined.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
 
       await pullDb(joined.tenant, baseUrl, "directory");
       const imported = await joined.tenant.reconcileKeyDistributionsForCurrentUser!();
-      expect(imported.imported).toContain(DEFAULT_TENANT_KEY_ID);
-      expect(await joined.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
+      expect(
+        imported.imported.includes(DEFAULT_TENANT_KEY_ID) ||
+          (await joined.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)),
+      ).toBe(true);
 
       await pullDb(joined.tenant, baseUrl, "main");
       const device2Main = await joined.tenant.openDB("main");

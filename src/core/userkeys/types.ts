@@ -94,3 +94,13 @@ export class UserKeyMismatchError extends Error {
     super(message);
   }
 }
+
+/** Identity already has a User-Key that this session cannot open. */
+export class UserKeyDecryptError extends Error {
+  readonly name = "UserKeyDecryptError";
+  constructor(
+    message = "Local User-Key exists but cannot be decrypted with the current password. Refusing to generate a second pair (that would desync acl_keydistribution_default).",
+  ) {
+    super(message);
+  }
+}

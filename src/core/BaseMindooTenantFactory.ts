@@ -7,6 +7,7 @@ import {
   EncryptionKeyPair,
   PUBLIC_INFOS_KEY_ID,
   DEFAULT_TENANT_KEY_ID,
+  USER_DIRECTORY_DB_ID,
   CreateTenantOptions,
   CreateTenantResult,
   JoinRequest,
@@ -155,6 +156,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
             signingKey: options.preDecryptedUserKeys.signingKey,
             encryptionKey: options.preDecryptedUserKeys.encryptionKey,
             cacheEncryptionKey: options.preDecryptedUserKeys.cacheEncryptionKey,
+            userKeyPrivateBytes: options.preDecryptedUserKeys.userKeyPrivateBytes,
           }
         : undefined,
     );
@@ -525,6 +527,11 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     // device). Later devices import `default` from that document after they
     // receive the User-Key.
     tenant.noteUserDirectoryFetched?.();
+    // Open (or mint) the identity User-Key *before* reconcile so a live-bag
+    // empty password cannot generate a throwaway pair and wrap `default` to it.
+    if (typeof tenant.ensureLocalUserKeyPair === "function") {
+      await tenant.ensureLocalUserKeyPair();
+    }
     if (typeof tenant.reconcileUserKeys === "function") {
       await tenant.reconcileUserKeys({ allowSelfCreate: true });
     }
@@ -875,6 +882,28 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         if (reconcile.adoptedUsername && reconcile.adoptedUsername !== user.username) {
           user = { ...user, username: reconcile.adoptedUsername };
         }
+      }
+
+      // User-Key lives in `userdirectory` (encrypted with `$publicinfos`).
+      // Dist unwrap needs that private key; pulling directory alone leaves
+      // Device 2 trying its locally generated pair against the published wrap.
+      try {
+        const remoteUserDirectory = await tenant.connectToServer(
+          options.serverUrl,
+          USER_DIRECTORY_DB_ID,
+          StoreKind.docs,
+        );
+        const userDirectoryDb = await tenant.openDB(USER_DIRECTORY_DB_ID);
+        await userDirectoryDb.pullChangesFrom(remoteUserDirectory);
+        tenant.noteUserDirectoryFetched?.();
+        await tenant.reconcileUserKeys?.({ allowSelfCreate: false });
+        if (typeof tenant.reconcileKeyDistributionsForCurrentUser === "function") {
+          await tenant.reconcileKeyDistributionsForCurrentUser();
+        }
+      } catch (error) {
+        this.logger.warn(
+          `bootstrapTenantFromDelivery: userdirectory pull/reconcile failed: ${error}`,
+        );
       }
     }
 

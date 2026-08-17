@@ -22,6 +22,7 @@ export {
   currentUserKeyEpoch,
   isPendingUserKeyDocument,
   UserKeyMismatchError,
+  UserKeyDecryptError,
   USERKEY_USERNAME_HASH_VERSION,
   type UserKeyDeviceWrap,
   type UserKeyGeneration,

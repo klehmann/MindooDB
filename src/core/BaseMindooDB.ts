@@ -14501,9 +14501,8 @@ export class BaseMindooDB implements MindooDB {
 
       if (syncResult.transferred === 0) {
         this.logger.debug(`No new entries to pull`);
-        if (storeKind === StoreKind.docs && this.store.getId() === USER_DIRECTORY_DB_ID) {
-          this.tenant.noteUserDirectoryFetched?.();
-          await this.tenant.reconcileUserKeysSafe?.();
+        if (storeKind === StoreKind.docs) {
+          await this.reconcileAfterDocsPull();
         }
         return { transferredEntries: 0, transferredBytes, scannedEntries: syncResult.scanned, cancelled: false };
       }
@@ -14529,22 +14528,7 @@ export class BaseMindooDB implements MindooDB {
       }
       if (storeKind === StoreKind.docs) {
         await this.syncStoreChanges();
-        // SDK-driven key-distribution reconcile (docs/accesscontrol.md §13).
-        // After the directory pulls and processes new entries, reconcile the
-        // local KeyBag against the directory head: bulk-remove revoked keys
-        // (forgetting now-inaccessible docs) and import keys newly pushed to
-        // this user (revealing their docs on the next content-DB pull). Runs in
-        // the SDK so standalone apps get it too, not just Haven. Best-effort and
-        // single-flight; never blocks or fails the sync.
-        if (this.store.getId() === "directory") {
-          await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
-          await this.tenant.reconcileAuthorTrustAfterDirectorySyncSafe();
-          await this.tenant.reconcileUserKeysSafe?.();
-        }
-        if (this.store.getId() === USER_DIRECTORY_DB_ID) {
-          this.tenant.noteUserDirectoryFetched?.();
-          await this.tenant.reconcileUserKeysSafe?.();
-        }
+        await this.reconcileAfterDocsPull();
       }
       if (options?.signal?.aborted) {
         this.logger.info(`Pull cancelled after local processing for ${storeKind} entries`);
@@ -14574,6 +14558,27 @@ export class BaseMindooDB implements MindooDB {
       };
     } finally {
       restoreAuthOverride();
+    }
+  }
+
+  /**
+   * After a directory / userdirectory docs pull — including a no-op pull
+   * (`transferred === 0`). Device 2 typically already has
+   * `acl_keydistribution_default` from bootstrap, then later imports the
+   * User-Key from `userdirectory`. A subsequent directory pull transfers
+   * nothing and used to skip reconcile, so `default` never landed in the bag.
+   * Re-run both passes whenever either database is fetched.
+   */
+  private async reconcileAfterDocsPull(): Promise<void> {
+    if (this.store.getId() === "directory") {
+      await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
+      await this.tenant.reconcileAuthorTrustAfterDirectorySyncSafe();
+      await this.tenant.reconcileUserKeysSafe?.();
+    }
+    if (this.store.getId() === USER_DIRECTORY_DB_ID) {
+      this.tenant.noteUserDirectoryFetched?.();
+      await this.tenant.reconcileUserKeysSafe?.();
+      await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
     }
   }
 

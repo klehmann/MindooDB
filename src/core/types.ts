@@ -220,6 +220,14 @@ export interface PreDecryptedUserKeys {
    * `EncryptedLocalCacheStore` performs internally.
    */
   cacheEncryptionKey?: CryptoKey;
+  /**
+   * PKCS8 bytes of the identity User-Key. Live-bag hosts (Haven) decrypt this
+   * once at unlock and pass it here so `createTenant` / reconcile can mint and
+   * wrap `default` to the **identity** User-Key when `currentUserPassword` is
+   * empty. Without this, a failed password decrypt used to generate a second
+   * throwaway pair and desync `acl_keydistribution_default`.
+   */
+  userKeyPrivateBytes?: Uint8Array;
 }
 
 // ==================== Join Flow Types ====================
@@ -231,10 +239,10 @@ interface CreateTenantPasswords {
    * Password for the regular (app) user's private keys.
    *
    * When {@link existingKeyBag} **and** {@link preDecryptedAppUserKeys}
-   * are both supplied the password is no longer needed by `createTenant`
-   * (the bag has already been wrapped, and `openTenant` consumes the
-   * pre-imported `CryptoKey`s directly). Callers in that live-bag mode
-   * may pass an empty string.
+   * are both supplied, signing/encryption private keys skip password
+   * decrypt. The identity User-Key still needs either `userPassword` or
+   * {@link PreDecryptedUserKeys.userKeyPrivateBytes} — otherwise mint
+   * cannot wrap `default` to the existing pair.
    */
   userPassword: string;
   /**

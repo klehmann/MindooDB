@@ -2,9 +2,10 @@ import type { BaseMindooTenant } from "../BaseMindooTenant";
 import type { BaseMindooTenantDirectory } from "../BaseMindooTenantDirectory";
 import { extractRevokedKeyPairs } from "../accesscontrol/grantKeys";
 import { encryptPrivateKey } from "../crypto/privateKeyEncryption";
+import { RSAEncryption } from "../crypto/RSAEncryption";
 import { generateRsaOaep3072, importRsaOaepPrivateKey } from "../crypto/rsaOaep3072";
 import type { EncryptionKeyPair, MindooDB, MindooDoc, PrivateUserId } from "../types";
-import { USER_DIRECTORY_DB_ID } from "../types";
+import { DEFAULT_TENANT_KEY_ID, USER_DIRECTORY_DB_ID } from "../types";
 import { fingerprintEncryptionPublicKey } from "./fingerprint";
 import { resolveUserKeyDocument } from "./resolveUserKeyDocument";
 import { asUserKeyPayload } from "./validateUserKeyDocument";
@@ -22,6 +23,7 @@ import {
 import {
   USERKEY_PRIVATE_SALT,
   USERKEY_USERNAME_HASH_VERSION,
+  UserKeyDecryptError,
   UserKeyMismatchError,
   currentUserKeyEpoch,
   isPendingUserKeyDocument,
@@ -38,6 +40,9 @@ export class UserKeyManager {
   private lastUserDirectoryFetchError: unknown = null;
   private decryptedUserKeyCache: CryptoKey | null = null;
   private decryptedUserKeyBytes: Uint8Array | null = null;
+  private seededBytesMatchLocalPublic: boolean | null = null;
+  private seededBytesVerifiedForPublicKey: string | null = null;
+  private resolvingOwnDeviceWrap = false;
   private reconcileInFlight: Promise<UserKeyEnrollmentStatus> | null = null;
 
   constructor(private readonly tenant: BaseMindooTenant) {}
@@ -51,17 +56,101 @@ export class UserKeyManager {
     this.lastUserDirectoryFetchError = error;
   }
 
+  /**
+   * Inject User-Key PKCS8 bytes already decrypted by the host (Haven unlock).
+   * Used when `currentUserPassword` is empty so mint/wrap does not generate a
+   * second pair.
+   */
+  seedDecryptedUserKeyBytes(bytes: Uint8Array): void {
+    this.decryptedUserKeyBytes = bytes.slice();
+    this.decryptedUserKeyCache = null;
+    this.seededBytesMatchLocalPublic = null;
+    this.seededBytesVerifiedForPublicKey = null;
+  }
+
+  /**
+   * RSA round-trip against `publicKeyPem`: seal a probe with the public key and
+   * open it with the seeded private bytes. Cheaper than deriving the public key
+   * from PKCS8 and works on every crypto adapter.
+   */
+  private async seededBytesBelongToLocalPublicKey(publicKeyPem: string): Promise<boolean> {
+    if (
+      this.seededBytesMatchLocalPublic !== null &&
+      this.seededBytesVerifiedForPublicKey === publicKeyPem
+    ) {
+      return this.seededBytesMatchLocalPublic;
+    }
+    const bytes = this.decryptedUserKeyBytes;
+    if (!bytes) return false;
+    let matches = false;
+    try {
+      const crypto = this.tenant.getCryptoAdapter();
+      const rsa = new RSAEncryption(crypto);
+      const probe = crypto.getRandomValues(new Uint8Array(16));
+      const sealed = await rsa.encrypt(probe, publicKeyPem);
+      const privateKey = await importRsaOaepPrivateKey(crypto, bytes.slice(), false);
+      const opened = await rsa.decrypt(sealed, privateKey);
+      matches = opened.length === probe.length && opened.every((b, i) => b === probe[i]);
+    } catch (error) {
+      console.warn("[userkeys] User-Key round-trip check failed", error);
+      matches = false;
+    }
+    const fingerprint = await fingerprintEncryptionPublicKey(
+      publicKeyPem,
+      this.tenant.getCryptoAdapter().getSubtle(),
+    ).catch(() => "?");
+    console.log(
+      matches
+        ? "[userkeys] seeded User-Key private bytes match the local public key"
+        : "[userkeys] seeded User-Key private bytes do NOT match the local public key",
+      { publicKeyFingerprint: fingerprint },
+    );
+    this.seededBytesMatchLocalPublic = matches;
+    this.seededBytesVerifiedForPublicKey = publicKeyPem;
+    return matches;
+  }
+
   hasFetchedUserDirectory(): boolean {
     return this.userDirectoryFetched;
   }
 
   async ensureLocalUserKeyPair(user: PrivateUserId, password: string): Promise<EncryptionKeyPair> {
     if (user.userKeyPair) {
-      const usable = await this.decryptUserKeyPairBytes(user.userKeyPair, password);
-      if (usable) {
-        this.decryptedUserKeyBytes = usable;
+      // Host-seeded bytes come first: Haven opens with an empty password, so
+      // trying PBKDF2 would only log a decrypt failure per call. They must
+      // belong to `userKeyPair.publicKey` — a foreign pair would publish a
+      // document whose wraps nobody, not even this device, can open.
+      if (
+        this.decryptedUserKeyBytes &&
+        (await this.seededBytesBelongToLocalPublicKey(user.userKeyPair.publicKey))
+      ) {
         return user.userKeyPair;
       }
+      const usable = password
+        ? await this.decryptUserKeyPairBytes(user.userKeyPair, password)
+        : null;
+      if (usable) {
+        this.decryptedUserKeyBytes = usable;
+        this.seededBytesMatchLocalPublic = true;
+        this.seededBytesVerifiedForPublicKey = user.userKeyPair.publicKey;
+        return user.userKeyPair;
+      }
+      // Joined device: the key lives as a wrap to this device's key, and the
+      // host may have seeded different bytes for the same identity.
+      const fromWrap = await this.ownDeviceWrapPrivateKeyBytes(user.userKeyPair.publicKey);
+      if (fromWrap) {
+        this.decryptedUserKeyBytes = fromWrap;
+        this.decryptedUserKeyCache = null;
+        this.seededBytesMatchLocalPublic = true;
+        this.seededBytesVerifiedForPublicKey = user.userKeyPair.publicKey;
+        return user.userKeyPair;
+      }
+      if (this.decryptedUserKeyBytes) {
+        console.error(
+          "[userkeys] seeded User-Key private bytes do not match the identity's User-Key public key",
+        );
+      }
+      throw new UserKeyDecryptError();
     }
     const crypto = this.tenant.getCryptoAdapter();
     const generated = await generateRsaOaep3072(crypto);
@@ -78,6 +167,8 @@ export class UserKeyManager {
     user.userKeyPair = pair;
     this.decryptedUserKeyBytes = generated.privateKeyBytes;
     this.decryptedUserKeyCache = null;
+    this.seededBytesMatchLocalPublic = true;
+    this.seededBytesVerifiedForPublicKey = pair.publicKey;
     return pair;
   }
 
@@ -101,14 +192,83 @@ export class UserKeyManager {
   }
 
   async getDecryptedUserKeyBytes(): Promise<Uint8Array | null> {
-    if (this.decryptedUserKeyBytes) return this.decryptedUserKeyBytes;
     const user = this.tenant.getCurrentPrivateUser();
     const pair = user.userKeyPair;
+    if (this.decryptedUserKeyBytes) {
+      if (!pair) return this.decryptedUserKeyBytes;
+      // Host-seeded bytes are only usable if they open the published pair;
+      // wrapping with a foreign key produces wraps nobody can unwrap. On a
+      // mismatch fall through to the password path rather than giving up.
+      if (await this.seededBytesBelongToLocalPublicKey(pair.publicKey)) {
+        return this.decryptedUserKeyBytes;
+      }
+    }
     if (!pair) return null;
-    const bytes = await this.decryptUserKeyPairBytes(pair, this.tenant.getCurrentUserPassword());
-    if (!bytes) return null;
-    this.decryptedUserKeyBytes = bytes;
-    return bytes;
+    const password = this.tenant.getCurrentUserPassword();
+    // Haven live-bag opens with "". PBKDF2 then fails loudly, so skip it and
+    // let the device wrap supply the key.
+    const bytes = password ? await this.decryptUserKeyPairBytes(pair, password) : null;
+    if (bytes) {
+      this.decryptedUserKeyBytes = bytes;
+      this.seededBytesMatchLocalPublic = true;
+      this.seededBytesVerifiedForPublicKey = pair.publicKey;
+      return bytes;
+    }
+    // A joined device holds the User-Key only as a wrap to its device key, and
+    // the host may have seeded this identity's own (different) bytes over it.
+    // Recover from the wrap so wrapping/reconcile is not lost for the session.
+    const fromWrap = await this.ownDeviceWrapPrivateKeyBytes(pair.publicKey);
+    if (!fromWrap) return null;
+    this.decryptedUserKeyBytes = fromWrap;
+    this.decryptedUserKeyCache = null;
+    this.seededBytesMatchLocalPublic = true;
+    this.seededBytesVerifiedForPublicKey = pair.publicKey;
+    return fromWrap;
+  }
+
+  /**
+   * The User-Key private bytes taken from THIS device's wrap in the own
+   * User-Key document, verified against `publicKeyPem`. Returns null when no
+   * wrap for this device exists or it does not open the pair. Kept free of
+   * {@link getDecryptedUserKeyBytes} so the two cannot recurse.
+   */
+  private async ownDeviceWrapPrivateKeyBytes(publicKeyPem: string): Promise<Uint8Array | null> {
+    if (this.resolvingOwnDeviceWrap) return null;
+    this.resolvingOwnDeviceWrap = true;
+    try {
+      const deviceKey = await this.tenant.getEncryptionPrivateKeyForReconcile();
+      if (!deviceKey) return null;
+      const resolved = await this.resolveOwnUserKeyDocument();
+      if (!resolved) return null;
+      const user = this.tenant.getCurrentPrivateUser();
+      const deviceFp = await fingerprintEncryptionPublicKey(
+        user.userEncryptionKeyPair.publicKey,
+        this.tenant.getCryptoAdapter().getSubtle(),
+      );
+      for (const epoch of this.epochsNewestFirst(resolved.payload)) {
+        const gen = resolved.payload.userKeys[epoch];
+        if (gen?.publicKey !== publicKeyPem) continue;
+        const wrappedKeyB64 = gen.deviceWraps?.[deviceFp]?.wrappedKey;
+        if (!wrappedKeyB64) continue;
+        try {
+          const bytes = await unwrapPrivateKeyFromDevice({
+            cryptoAdapter: this.tenant.getCryptoAdapter(),
+            wrappedKeyB64,
+            deviceEncryptionPrivateKey: deviceKey,
+          });
+          console.log("[userkeys] recovered User-Key private bytes from own device wrap", {
+            epoch,
+            ownDeviceFingerprint: deviceFp,
+          });
+          return bytes;
+        } catch (error) {
+          console.warn("[userkeys] own device wrap unwrap failed", { epoch }, error);
+        }
+      }
+      return null;
+    } finally {
+      this.resolvingOwnDeviceWrap = false;
+    }
   }
 
   async getDecryptedUserKey(): Promise<CryptoKey | null> {
@@ -127,13 +287,19 @@ export class UserKeyManager {
   async getUserKeyCryptoKeysForReconcile(): Promise<CryptoKey[]> {
     const keys: CryptoKey[] = [];
     const seen = new Set<string>();
-    // Opening userdirectory during directory bring-up races a second Automerge
-    // WASM heap and OOMs Jest. Other epochs are only needed after a rotation,
-    // once the session has already fetched userdirectory.
-    if (this.userDirectoryFetched) {
+    let usedPublishedDocument = false;
+    // Prefer the published User-Key (possibly a different pair than this
+    // device generated). Opening userdirectory during directory bring-up
+    // races a second Automerge WASM heap — only do it when that DB is
+    // already fetched or already open on this tenant instance.
+    const canUseUserDirectory = this.canReconcileAgainstUserDirectory();
+    let resolvedDocId: string | undefined;
+    if (canUseUserDirectory) {
       try {
         const resolved = await this.resolveOwnUserKeyDocument();
         if (resolved) {
+          usedPublishedDocument = true;
+          resolvedDocId = resolved.doc.getId();
           for (const epoch of this.epochsNewestFirst(resolved.payload)) {
             const bytes = await this.privateKeyBytesForEpoch(resolved.payload, epoch);
             if (!bytes) continue;
@@ -145,14 +311,21 @@ export class UserKeyManager {
             );
           }
         }
-      } catch {
-        // Fall through to the session key.
+      } catch (error) {
+        console.warn("[userkeys] getUserKeyCryptoKeysForReconcile: published lookup failed", error);
       }
     }
-    if (keys.length === 0) {
+    if (keys.length === 0 && !usedPublishedDocument) {
       const current = await this.getDecryptedUserKey();
       if (current) keys.push(current);
     }
+    console.log("[userkeys] getUserKeyCryptoKeysForReconcile", {
+      canUseUserDirectory,
+      usedPublishedDocument,
+      resolvedDocId,
+      userKeyFingerprints: [...seen],
+      keyCount: keys.length,
+    });
     return keys;
   }
 
@@ -236,8 +409,22 @@ export class UserKeyManager {
       options?.allowSelfCreate === true || this.userDirectoryFetched;
     if (!allow) return null;
 
+    // Additional device: `acl_keydistribution_default` is already wrapped to
+    // the published User-Key. Minting a second pair (this device's locally
+    // generated key) desyncs dist — Device 2 would publish a key that cannot
+    // unwrap `default`. Wait for the userkey document and import from wrap.
+    if (await this.defaultAlreadyWrappedForCurrentUser()) {
+      return null;
+    }
+
     const user = this.tenant.getCurrentPrivateUser();
-    const pair = await this.ensureLocalUserKeyPair(user, this.tenant.getCurrentUserPassword());
+    let pair: EncryptionKeyPair;
+    try {
+      pair = await this.ensureLocalUserKeyPair(user, this.tenant.getCurrentUserPassword());
+    } catch (error) {
+      if (error instanceof UserKeyDecryptError) return null;
+      throw error;
+    }
     const userId = await this.tenant.getCurrentUserId();
     const binding = await this.mintBindingForUsername(userId.username, userId.userSigningPublicKey);
     if (!binding) return null;
@@ -407,6 +594,8 @@ export class UserKeyManager {
         };
         this.decryptedUserKeyBytes = bytes;
         this.decryptedUserKeyCache = null;
+        this.seededBytesMatchLocalPublic = true;
+        this.seededBytesVerifiedForPublicKey = gen.publicKey;
         return true;
       } catch {
         // wrap is not for this device or is corrupt; try next generation
@@ -662,7 +851,7 @@ export class UserKeyManager {
       await this.dropRevokedDeviceWraps(resolved.doc, resolved.payload);
       return this.enrollmentStatus(resolved.payload, this.waitState());
     } catch (error) {
-      if (error instanceof UserKeyMismatchError) throw error;
+      if (error instanceof UserKeyMismatchError || error instanceof UserKeyDecryptError) throw error;
       this.lastUserDirectoryFetchError = error;
       console.warn("[userkeys] reconcile failed", error);
       return this.enrollmentStatus(null, "unknown");
@@ -744,6 +933,63 @@ export class UserKeyManager {
       rows.push({ fingerprint: fp, status: "declined" });
     }
     return rows;
+  }
+
+  /**
+   * Wrap every User-Key epoch to `encryptionPublicKey` (the joining device).
+   * Does not look up the grant overview — join approval just registered the
+   * device, and the directory cache can still miss it.
+   */
+  async wrapUserKeyForGrantDevice(encryptionPublicKey: string, label?: string): Promise<void> {
+    const fingerprint = await fingerprintEncryptionPublicKey(
+      encryptionPublicKey,
+      this.tenant.getCryptoAdapter().getSubtle(),
+    );
+    const resolved = await this.resolveOwnUserKeyDocument();
+    console.log("[userkeys] wrapUserKeyForGrantDevice: start", {
+      joiningDeviceFingerprint: fingerprint,
+      hasUserKeyDocument: !!resolved,
+      docId: resolved?.doc.getId(),
+      epochs: resolved ? this.epochsNewestFirst(resolved.payload) : [],
+    });
+    if (!resolved) {
+      throw new Error("Cannot wrap User-Key for joining device: no user-key document");
+    }
+    const signer = await this.tenant.getCurrentUserId();
+    const db = resolved.doc.getDatabase();
+    let wroteWrap = false;
+    for (const epoch of this.epochsNewestFirst(resolved.payload).reverse()) {
+      const bytes = await this.privateKeyBytesForEpoch(resolved.payload, epoch);
+      console.log("[userkeys] wrapUserKeyForGrantDevice: epoch", {
+        epoch,
+        hasPrivateKeyBytes: !!bytes,
+      });
+      if (!bytes) continue;
+      const wrapped = await wrapPrivateKeyForDevice({
+        cryptoAdapter: this.tenant.getCryptoAdapter(),
+        privateKeyBytes: bytes,
+        deviceEncryptionPublicKey: encryptionPublicKey,
+      });
+      await writeDeviceWrap({
+        db,
+        doc: resolved.doc,
+        epoch,
+        deviceFingerprint: fingerprint,
+        wrap: {
+          wrappedKey: wrapped,
+          ...(label ? { label } : {}),
+          approvedAt: Date.now(),
+          approvedBySigningPublicKey: signer.userSigningPublicKey,
+        },
+      });
+      wroteWrap = true;
+    }
+    if (!wroteWrap) {
+      throw new Error("Cannot wrap User-Key for joining device: local User-Key is locked");
+    }
+    console.log("[userkeys] wrapUserKeyForGrantDevice: wrote wrap", {
+      joiningDeviceFingerprint: fingerprint,
+    });
   }
 
   async approveUserKeyDevice(fingerprint: string): Promise<void> {
@@ -888,9 +1134,10 @@ export class UserKeyManager {
     fingerprint: string;
     pending: boolean;
   } | null> {
-    if (!this.canReconcileAgainstUserDirectory()) {
-      return null;
-    }
+    // Lookup only — Trap 1 (no mint from local emptiness) does not apply.
+    // Haven reopens a fresh tenant per action; blocking on
+    // `userDirectoryFetched` made wrapKeyForUser return null so
+    // `acl_keydistribution_default` never gained a User-Key wrap.
     const directory = await this.directory();
     const db = await this.openUserDirectory();
     const hashes = await directory.getUsernameHashCandidates(username);
@@ -972,17 +1219,31 @@ export class UserKeyManager {
     const gen = payload.userKeys[epoch];
     if (!gen) return null;
     const localPublic = await this.getLocalUserPublicKey();
-    if (localPublic && gen.publicKey === localPublic) {
-      return this.getDecryptedUserKeyBytes();
+    const publicKeyMatchesLocal = !!localPublic && gen.publicKey === localPublic;
+    if (publicKeyMatchesLocal) {
+      const localBytes = await this.getDecryptedUserKeyBytes();
+      if (localBytes) return localBytes;
+      // Haven restoreTenantWithLiveBag opens with an empty password, so the
+      // identity's password-encrypted User-Key may not unwrap even when the
+      // public key matches. Fall through to the device wrap.
     }
     const deviceKey = await this.tenant.getEncryptionPrivateKeyForReconcile();
-    if (!deviceKey) return null;
     const user = this.tenant.getCurrentPrivateUser();
     const deviceFp = await fingerprintEncryptionPublicKey(
       user.userEncryptionKeyPair.publicKey,
       this.tenant.getCryptoAdapter().getSubtle(),
     );
     const wrap = gen.deviceWraps?.[deviceFp];
+    console.log("[userkeys] privateKeyBytesForEpoch", {
+      epoch,
+      publicKeyMatchesLocal,
+      seededUserKeyBytes: !!this.decryptedUserKeyBytes,
+      ownDeviceFingerprint: deviceFp,
+      wrappedDeviceFingerprints: Object.keys(gen.deviceWraps ?? {}),
+      hasOwnDeviceWrap: !!wrap?.wrappedKey,
+      hasDeviceEncryptionKey: !!deviceKey,
+    });
+    if (!deviceKey) return null;
     if (!wrap?.wrappedKey) return null;
     try {
       return unwrapPrivateKeyFromDevice({
@@ -990,7 +1251,8 @@ export class UserKeyManager {
         wrappedKeyB64: wrap.wrappedKey,
         deviceEncryptionPrivateKey: deviceKey,
       });
-    } catch {
+    } catch (error) {
+      console.warn("[userkeys] privateKeyBytesForEpoch: device wrap unwrap failed", epoch, error);
       return null;
     }
   }
@@ -1107,6 +1369,17 @@ export class UserKeyManager {
       )?.label;
     } catch {
       return undefined;
+    }
+  }
+
+  private async defaultAlreadyWrappedForCurrentUser(): Promise<boolean> {
+    try {
+      const directory = await this.directory();
+      const username = (await this.tenant.getCurrentUserId()).username;
+      const managed = await directory.getManagedKeyIds(username);
+      return managed.includes(DEFAULT_TENANT_KEY_ID);
+    } catch {
+      return false;
     }
   }
 
