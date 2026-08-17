@@ -385,6 +385,14 @@ Prefix-restricted demo server (allow only tenant names starting with `demo_`):
 
 These examples are useful for public demos or temporary onboarding servers, but they are intentionally less strict than normal production setups. For regular servers, prefer explicit principals with real public keys.
 
+### Own-tenant delete
+
+Independently of `config.json`, `DELETE /system/tenants/:tenantId` is also allowed when the caller's JWT signing key equals that tenant's registered `adminSigningPublicKey`. The tenant admin can remove **their own** tenant from the server. They cannot list tenants, change server config, touch sync-server sub-resources, or delete anyone else's tenant.
+
+This is not a wildcard capability. `{ "username": "*", "publicsignkey": "*" }` remains valid only on `POST:/system/tenants/...`. A demo server that already allows open tenant creation therefore needs no extra `DELETE` rule — the creator's tenant-admin key is enough to unpublish that same tenant.
+
+A system admin with `DELETE:/system/tenants/*` or `ALL:/system/*` can still delete any tenant.
+
 For key rotation, adding/removing admins, and the full authentication flow (challenge/response, JWT lifecycle), see [Server Security](docs/server-security.md).
 
 ## Walkthrough: Multi-Server Setup
@@ -766,7 +774,7 @@ The **`curl`** examples in this document use **`$SYSTEM_ADMIN_JWT`** as a placeh
 | `POST` | `/system/tenants/:tenantId` | JWT | Create a tenant |
 | `GET` | `/system/tenants` | JWT | List all registered tenants |
 | `PUT` | `/system/tenants/:tenantId` | JWT | Update tenant config |
-| `DELETE` | `/system/tenants/:tenantId` | JWT | Remove a tenant |
+| `DELETE` | `/system/tenants/:tenantId` | JWT | Remove a tenant (capability **or** that tenant's admin signing key) |
 
 #### Trusted Server Management
 

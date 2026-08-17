@@ -370,15 +370,20 @@ the server. Two triggers:
 
 - **Join.** The joining device generates the User-Key **before** the Join-Request
   and puts `userPublicKey` on the request. The admin creates a *pending*
-  `userkey_*` document (public key only) and wraps `default` to that public key.
-  The Join-Response is only `$publicinfos`. The first device writes its own wrap
-  after it can read `userdirectory`.
+  `userkey_*` document (public key only) and wraps `default` to that public key
+  in `acl_keydistribution_default`. An additional device of an existing person
+  is wrapped to the **already published** User-Key, not to the joining device's
+  freshly generated pair. The Join-Response is only `$publicinfos`. The first
+  device writes its own wrap after it can read `userdirectory`.
 - **Existing tenant members** (Haven, first launch of a User-Key-aware client).
   After a successful **server pull** of `directory` then `userdirectory`, if no
   valid document exists for this person, the client mints a keypair, wraps the
   private half to **every active device on the current grant**, and **pushes**
   `userdirectory`. Local emptiness alone never mints (Trap 1). Devices added to
   the grant *after* that document exists still need explicit approval (§6.2).
+  Founding `createTenant` mints immediately and admin-signs the `default` wrap
+  into `acl_keydistribution_default`, so later devices of that person import
+  `default` from key distribution once they hold the User-Key.
 
 Steps for the missing-document mint:
 

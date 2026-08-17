@@ -2,7 +2,7 @@
  * HTTP end-to-end: Device 1 founds a tenant, Device 2 joins as a second
  * device of the same person, Device 1 approves the User-Key wrap and pushes
  * `userdirectory` to a local MindooDBServer, Device 2 discovers the tenant
- * and imports `default` from the ACL key-distribution document.
+ * and imports `default` wrapped to the published User-Key.
  *
  * Regression: the server wraps the real directory in CompositeMindooDirectory
  * and used to skip `resolveUsernameHashForSigningKey`, so the wrap push was
@@ -144,14 +144,6 @@ describe("second device join over local HTTP server", () => {
       const minted = await device1Tenant.reconcileUserKeys!({ allowSelfCreate: true });
       expect(minted.state).toBe("approved");
 
-      const directory = await device1Tenant.openDirectory();
-      await directory.autoDistributeKeysToUser!(
-        device1User.username,
-        [DEFAULT_TENANT_KEY_ID],
-        adminUser.userSigningKeyPair.privateKey,
-        DEVICE1_PASSWORD,
-      );
-
       const mainDb = await device1Tenant.openDB("main");
       const seedDoc = await mainDb.createDocument();
       const seedDocId = seedDoc.getId();
@@ -227,6 +219,7 @@ describe("second device join over local HTTP server", () => {
       const enrollment = await joined.tenant.reconcileUserKeys!();
       expect(enrollment.state).toBe("approved");
 
+      await pullDb(joined.tenant, baseUrl, "directory");
       const imported = await joined.tenant.reconcileKeyDistributionsForCurrentUser!();
       expect(imported.imported).toContain(DEFAULT_TENANT_KEY_ID);
       expect(await joined.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);

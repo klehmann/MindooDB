@@ -1670,8 +1670,8 @@ export class BaseMindooTenant implements MindooTenant {
       const epoch = payload ? currentUserKeyEpoch(payload) : null;
       const publishedPublicKey = epoch ? payload?.userKeys[epoch]?.publicKey : undefined;
       // First device: wrap `default` to the join-request User-Key (pending is
-      // OK). Additional device: the published key already exists and must not
-      // be rewritten to this device's freshly generated pair.
+      // OK). Additional device: wrap to the already-published User-Key — never
+      // to this device's freshly generated pair.
       if (publishedPublicKey === userPublicKey) {
         await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
           username,
@@ -1679,6 +1679,13 @@ export class BaseMindooTenant implements MindooTenant {
           options.adminSigningKey,
           options.adminPassword,
           userPublicKey,
+        );
+      } else if (publishedPublicKey) {
+        await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
+          username,
+          [DEFAULT_TENANT_KEY_ID],
+          options.adminSigningKey,
+          options.adminPassword,
         );
       }
     } else {
@@ -1688,6 +1695,12 @@ export class BaseMindooTenant implements MindooTenant {
           "Cannot approve join request: it carries no userPublicKey and the person has no published User-Key. Generate a User-Key on the joining device first.",
         );
       }
+      await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
+        username,
+        [DEFAULT_TENANT_KEY_ID],
+        options.adminSigningKey,
+        options.adminPassword,
+      );
     }
 
     // 2. Export selected document keys RSA-OAEP-wrapped to the requester's

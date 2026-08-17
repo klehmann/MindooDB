@@ -388,8 +388,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
   /**
    * Merge `username` into `acl_keydistribution_<keyId>` for each distributable
-   * key id (wraps every active device of every pushto user). Skips protected
-   * ids and keys the admin does not hold. Used after grant / device add so
+   * key id (wraps to the person's published User-Key). Skips protected ids and
+   * keys the caller's KeyBag does not hold. Used after grant so
    * discover-bootstrap can import `default` without a join-response URI.
    */
   async autoDistributeKeysToUser(
@@ -415,7 +415,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       const keyVersions = await this.getKeyVersionManifest(keyId);
       if (keyVersions.length === 0) {
         this.logger.debug(
-          `autoDistributeKeysToUser: skipping "${keyId}" — admin KeyBag does not hold it`,
+          `autoDistributeKeysToUser: skipping "${keyId}" — caller KeyBag does not hold it`,
         );
         continue;
       }
@@ -438,6 +438,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         const override = pushtoUsername.trim() === username.trim() ? publicKeyOverride : undefined;
         const wrapped = await this.wrapKeyForUser(keyId, pushtoUsername, override);
         if (wrapped) pushto.push(wrapped);
+      }
+      if (pushto.length === 0) {
+        this.logger.debug(
+          `autoDistributeKeysToUser: skipping "${keyId}" — no published User-Key wrap yet`,
+        );
+        continue;
       }
       const pullfrom: Array<{ username: string; username_hash: string }> = [];
       for (const pullUsername of pullfromNames) {

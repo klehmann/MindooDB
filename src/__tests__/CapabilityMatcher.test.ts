@@ -2,7 +2,7 @@
  * Unit tests for the capability matching engine.
  */
 
-import { CapabilityMatcher } from "../node/server/CapabilityMatcher";
+import { CapabilityMatcher, parseSystemTenantItemPath } from "../node/server/CapabilityMatcher";
 import type { ServerConfig } from "../node/server/types";
 
 describe("CapabilityMatcher", () => {
@@ -289,6 +289,19 @@ describe("CapabilityMatcher", () => {
       expect(
         matcher.isAuthorized("POST", "/system/tenants/x", "other", key2),
       ).toBe(false);
+    });
+  });
+
+  describe("parseSystemTenantItemPath", () => {
+    test("parses a tenant id and optional trailing slash", () => {
+      expect(parseSystemTenantItemPath("/system/tenants/acme")).toBe("acme");
+      expect(parseSystemTenantItemPath("/system/tenants/acme/")).toBe("acme");
+    });
+
+    test("rejects collection, sub-resources, and unrelated paths", () => {
+      expect(parseSystemTenantItemPath("/system/tenants")).toBeNull();
+      expect(parseSystemTenantItemPath("/system/tenants/acme/sync-servers")).toBeNull();
+      expect(parseSystemTenantItemPath("/system/config")).toBeNull();
     });
   });
 

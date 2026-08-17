@@ -169,6 +169,8 @@ Capability checks use the new rules **immediately** after a successful update. I
 
 For demo-only environments, `config.json` may also contain the special wildcard principal `{ "username": "*", "publicsignkey": "*" }`, but only on `POST:/system/tenants/...` capability rules. That wildcard intentionally means "any username + any signing key may create tenants matching this rule." It is rejected for broader routes such as `GET /system/tenants`, `PUT /system/config`, or `ALL:/system/*`, so it cannot be used as a general-purpose admin bypass.
 
+Separately from capabilities, `DELETE /system/tenants/:tenantId` succeeds when the JWT's `publicsignkey` matches that tenant's stored `adminSigningPublicKey`. That lets a tenant admin unpublish their own tenant (including on an open demo server) without a `DELETE:/system/tenants/*` rule. The bypass is path-exact: it does not grant list, config, or sub-resource access, and it does not authorize deleting a different tenant.
+
 For the full API endpoint reference (all `/system/*` routes, sync endpoints, health checks), see the [API Reference](../README-server.md#api-reference) in README-server.md.
 
 ## Key rotation

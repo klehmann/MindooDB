@@ -520,6 +520,21 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       "First device",
     );
 
+    // Mint the founder's User-Key while admin can still sign the `default`
+    // wrap into `acl_keydistribution_default` (User-Key target, not per
+    // device). Later devices import `default` from that document after they
+    // receive the User-Key.
+    tenant.noteUserDirectoryFetched?.();
+    if (typeof tenant.reconcileUserKeys === "function") {
+      await tenant.reconcileUserKeys({ allowSelfCreate: true });
+    }
+    await directory.autoDistributeKeysToUser(
+      this.toPublicUserId(appUser).username,
+      [DEFAULT_TENANT_KEY_ID],
+      adminUser.userSigningKeyPair.privateKey,
+      options.adminPassword,
+    );
+
     // 5. Enforce the v2 storage format from creation (default on). We write an
     //    admin-signed default policy carrying `requireMetadataSignatureSince =
     //    now`, but with `disableAllAccessChecksAndPolicies: true` so this turns
