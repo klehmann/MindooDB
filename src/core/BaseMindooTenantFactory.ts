@@ -502,8 +502,12 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       this.cryptoAdapter,
       this.logger.createChild("KeyBag")
     );
-    await keyBag.createDocKey(tenantId, DEFAULT_TENANT_KEY_ID);
-    await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID);
+    // Stamp the founding keys: `createdAt` is the version identity travelling
+    // with every delivery and join response, so leaving it unset would make all
+    // versions of a key indistinguishable to delivery dedupe.
+    const keyCreatedAt = Date.now();
+    await keyBag.createDocKey(tenantId, DEFAULT_TENANT_KEY_ID, keyCreatedAt);
+    await keyBag.createDocKey(tenantId, PUBLIC_INFOS_KEY_ID, keyCreatedAt);
 
     // 3. Open tenant
     const tenant = await this.openTenant(
@@ -828,14 +832,12 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     try {
       for (let index = 0; index < wrappedList.length; index++) {
         const rawPublicInfos = await rsa.unwrapKeyFromBase64(wrappedList[index]!, decryptKey);
-        // wrappedList is newest-first (server getAllKeys order). Higher createdAt = newer.
-        await keyBag.set(
-          "doc",
-          delivery.tenantId,
-          PUBLIC_INFOS_KEY_ID,
-          rawPublicInfos,
-          wrappedList.length - index,
-        );
+        // wrappedList is newest-first (server getAllKeys order) and the KeyBag
+        // sorts stably, so inserting in that order already yields newest-first
+        // without a `createdAt`. The delivery does not carry the real rotation
+        // stamps; a synthetic rank would masquerade as both a creation date
+        // (epoch 0 + n ms) and a version identity in delivery dedupe.
+        await keyBag.set("doc", delivery.tenantId, PUBLIC_INFOS_KEY_ID, rawPublicInfos);
       }
       this.logger.info(
         `Unwrapped ${wrappedList.length} $publicinfos version(s) from device discovery for tenant ${delivery.tenantId}`,

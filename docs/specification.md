@@ -389,10 +389,37 @@ Documents encrypted with named symmetric keys for restricted access:
 
 Canonical local storage for tenant and document symmetric keys:
 - Encrypted on disk using user's encryption key password (PBKDF2)
-- Typed API: `get(type, id)`, `set(type, id, key, createdAt)`, `decryptAndImportKey(type, id, encryptedKey, password)`, `encryptAndExportKey(type, id, password)`
+- Typed API: `get(type, id)`, `set(type, id, key, createdAt?, addedAt?)`, `decryptAndImportKey(type, id, encryptedKey, password)`, `encryptAndExportKey(type, id, password)`
 - Type/id pairs:
   - tenant default key: `("tenant", tenantId)`
   - named document key: `("doc", keyId)`
+- One key id can hold several **versions** (key rotation); `listKeyDetails()` reports
+  them with both timestamps described below.
+
+#### Two timestamps per key version
+
+A stored version carries `createdAt` and `addedAt`, and they answer different
+questions. Mixing them up produces wrong displays and wrong dedupe decisions:
+
+| | `createdAt` | `addedAt` |
+| --- | --- | --- |
+| Means | when this key **version** was minted | when **this bag** stored it |
+| Scope | the same value on every device that holds the version | local to one bag; differs per device |
+| Distributed | yes — it is the version identity in `acl_keydistribution_*` manifests and in delivery dedupe | never leaves the bag |
+| Present | often absent (versions minted before it was stamped, or delivered without it) | always stamped on write; only bags written before the field existed lack it |
+
+So: compare `createdAt` to decide *which version* something is, and read `addedAt`
+to tell a user *since when they have it*. A UI that shows a creation date should
+render `addedAt ?? createdAt` — `createdAt` alone renders "unknown" for keys that
+never got a stamp.
+
+`save()` / `load()` and `clone()` preserve both stamps, so persisting or copying
+a bag does not reset when the user got a key. `decryptAndImportKey` deliberately
+stamps a **fresh** `addedAt` (this bag received the key just now) while keeping
+whatever `createdAt` the material carries. When duplicate versions with identical
+key material are collapsed, the **newest** `createdAt` wins (it identifies the
+version) and the **earliest** `addedAt` is kept (the bag has held that material
+since then).
 
 ### Server Access Control ($publicinfos Key)
 

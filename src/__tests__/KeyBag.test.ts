@@ -597,6 +597,78 @@ describe("KeyBag", () => {
       expect(versions[1]).toEqual({ key: sharedBytes, createdAt: 2000 });
     });
 
+    it("should preserve addedAt across save and load", async () => {
+      await keyBag.set("doc", docTenantId, "persisted", new Uint8Array([7]), 2000, 1234);
+
+      const saved = await keyBag.save();
+      const loadedKeyBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter()
+      );
+      await loadedKeyBag.load(saved);
+
+      const details = await loadedKeyBag.listKeyDetails();
+      expect(details).toEqual([
+        {
+          scopedKeyId: `doc:${docTenantId}:persisted`,
+          createdAt: 2000,
+          addedAt: 1234,
+          keyLengthBits: 8,
+          versionIndex: 0,
+        },
+      ]);
+    });
+
+    it("should leave versions stored before addedAt existed without a stamp", async () => {
+      // A bag written by an older build: entries carry `createdAt` only.
+      (keyBag as unknown as {
+        keys: Map<string, Array<{ key: Uint8Array; createdAt?: number }>>;
+      }).keys = new Map([
+        [`doc:${docTenantId}:legacy`, [{ key: new Uint8Array([4]), createdAt: 1000 }]],
+      ]);
+
+      const saved = await keyBag.save();
+      const loadedKeyBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter()
+      );
+      await loadedKeyBag.load(saved);
+
+      const detail = (await loadedKeyBag.listKeyDetails())[0];
+      expect(detail?.createdAt).toBe(1000);
+      expect(detail?.addedAt).toBeUndefined();
+    });
+
+    it("should keep the oldest addedAt when collapsing duplicate versions on load", async () => {
+      const sharedBytes = new Uint8Array([9, 9, 9, 9]);
+      (keyBag as unknown as {
+        keys: Map<string, Array<{ key: Uint8Array; createdAt?: number; addedAt?: number }>>;
+      }).keys = new Map([
+        [
+          `doc:${docTenantId}:dupes`,
+          [
+            { key: sharedBytes, createdAt: 1000, addedAt: 5000 },
+            { key: new Uint8Array(sharedBytes), createdAt: 2000, addedAt: 1000 },
+          ],
+        ],
+      ]);
+
+      const saved = await keyBag.save();
+      const loadedKeyBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter()
+      );
+      await loadedKeyBag.load(saved);
+
+      const details = await loadedKeyBag.listKeyDetails();
+      expect(details).toHaveLength(1);
+      expect(details[0]?.createdAt).toBe(2000);
+      expect(details[0]?.addedAt).toBe(1000);
+    });
+
     it("should throw error when loading data that is too short", async () => {
       const invalidData = new Uint8Array(10); // Too short (needs at least 28 bytes)
 
@@ -658,22 +730,61 @@ describe("KeyBag", () => {
         {
           scopedKeyId: `doc:tenant-1:${DEFAULT_TENANT_KEY_ID}`,
           createdAt: 2000,
+          addedAt: expect.any(Number),
           keyLengthBits: 256,
           versionIndex: 0,
         },
         {
           scopedKeyId: `doc:${docTenantId}:alpha`,
           createdAt: 3000,
+          addedAt: expect.any(Number),
           keyLengthBits: 192,
           versionIndex: 0,
         },
         {
           scopedKeyId: `doc:${docTenantId}:alpha`,
           createdAt: 1000,
+          addedAt: expect.any(Number),
           keyLengthBits: 128,
           versionIndex: 1,
         },
       ]));
+    });
+
+    it("should stamp addedAt when a version is written and keep a supplied stamp", async () => {
+      const before = Date.now();
+      await keyBag.set("doc", docTenantId, "stamped", new Uint8Array([1]));
+      // A copy into another bag (bag merge, re-wrap for another identity) passes
+      // the previous stamp so the date the user sees survives the copy.
+      await keyBag.set("doc", docTenantId, "copied", new Uint8Array([2]), 3000, 1234);
+      const after = Date.now();
+
+      const details = await keyBag.listKeyDetails();
+      const stamped = details.find((detail) => detail.scopedKeyId === `doc:${docTenantId}:stamped`);
+      const copied = details.find((detail) => detail.scopedKeyId === `doc:${docTenantId}:copied`);
+
+      expect(stamped?.createdAt).toBeUndefined();
+      expect(stamped?.addedAt).toBeGreaterThanOrEqual(before);
+      expect(stamped?.addedAt).toBeLessThanOrEqual(after);
+      expect(copied?.addedAt).toBe(1234);
+    });
+
+    it("should stamp addedAt when importing a password-wrapped key", async () => {
+      const keyPassword = "keypassword123";
+      await keyBag.set("doc", docTenantId, "exported", new Uint8Array([1, 2, 3, 4]), 5000);
+      const exported = await keyBag.encryptAndExportKey("doc", docTenantId, "exported", keyPassword);
+
+      const importingBag = new KeyBag(
+        currentUser.userEncryptionKeyPair.privateKey,
+        currentUserPassword,
+        factory.getCryptoAdapter()
+      );
+      const before = Date.now();
+      await importingBag.decryptAndImportKey("doc", docTenantId, "exported", exported!, keyPassword);
+
+      const detail = (await importingBag.listKeyDetails())[0];
+      expect(detail?.createdAt).toBe(5000);
+      expect(detail?.addedAt).toBeGreaterThanOrEqual(before);
     });
 
     it("should export a specific key version", async () => {

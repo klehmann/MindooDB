@@ -20,6 +20,29 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 interface KeyEntry {
   key: Uint8Array;
   createdAt?: number; // milliseconds since Unix epoch
+  /**
+   * When this bag stored the version, in milliseconds since Unix epoch.
+   *
+   * Unlike {@link createdAt} - which identifies the key *version* across
+   * devices (key distribution manifests and delivery dedupe compare it) and is
+   * frequently absent - this stamp is local to the bag and always written, so
+   * it is the reliable value to show a user. Only entries persisted before this
+   * field existed lack it.
+   */
+  addedAt?: number;
+}
+
+/**
+ * On-disk shape of a {@link KeyEntry} inside the encrypted KeyBag blob.
+ *
+ * There is no schema version inside the blob: optional fields are the
+ * compatibility mechanism, so older bags simply deserialize with the newer
+ * fields left `undefined`.
+ */
+interface PersistedKeyEntry {
+  key: string;
+  createdAt?: number;
+  addedAt?: number;
 }
 
 /**
@@ -83,7 +106,19 @@ export type KeyBagChangeListener = (event: KeyBagChangeEvent) => void;
 
 export interface KeyDetail {
   scopedKeyId: string;
+  /**
+   * When the key *version* was minted (milliseconds since Unix epoch). Same
+   * value on every device that holds the version, which is why key-distribution
+   * manifests and delivery dedupe compare it — and why it is frequently absent.
+   */
   createdAt?: number;
+  /**
+   * When this bag stored the version (milliseconds since Unix epoch), stamped
+   * on every write. Absent only for entries persisted before the field
+   * existed. Prefer it over {@link createdAt} for display: `createdAt` carries
+   * the cross-device version identity and is often missing.
+   */
+  addedAt?: number;
   keyLengthBits: number;
   versionIndex: number;
 }
@@ -459,15 +494,19 @@ export class KeyBag {
    * @param keyId The ID of the key
    * @param key The key bytes
    * @param createdAt Optional creation timestamp (milliseconds since Unix epoch)
+   * @param addedAt Optional override for the local "stored in this bag" stamp,
+   *   defaulting to now. Pass the previous stamp when copying an entry into
+   *   another bag (re-wrapping for a different identity, merging bags) so the
+   *   date the user sees survives the copy.
    */
-  async set(type: KeyType, tenantId: string, id: string, key: Uint8Array, createdAt?: number): Promise<void>;
-  async set(type: KeyType, tenantId: string, id: string, key: Uint8Array, createdAt?: number): Promise<void> {
+  async set(type: KeyType, tenantId: string, id: string, key: Uint8Array, createdAt?: number, addedAt?: number): Promise<void>;
+  async set(type: KeyType, tenantId: string, id: string, key: Uint8Array, createdAt?: number, addedAt?: number): Promise<void> {
     const scopedKeyId = buildScopedKeyId(type, tenantId, id);
     const keyEntries = this.keys.get(scopedKeyId) || [];
     if (keyEntries.some((entry) => bytesEqual(entry.key, key))) {
       return;
     }
-    keyEntries.push({ key, createdAt });
+    keyEntries.push({ key, createdAt, addedAt: addedAt ?? Date.now() });
     this.keys.set(scopedKeyId, keyEntries);
     this.recordKeyChange(type, tenantId, id, "add", keyEntries.length);
   }
@@ -519,6 +558,7 @@ export class KeyBag {
     keyEntries.push({
       key: decryptedKeyBytes,
       createdAt: key.createdAt,
+      addedAt: Date.now(),
     });
     this.keys.set(scopedKeyId, keyEntries);
     this.recordKeyChange(type, tenantId, id, "add", keyEntries.length);
@@ -741,6 +781,7 @@ export class KeyBag {
         details.push({
           scopedKeyId,
           createdAt: entry.createdAt,
+          addedAt: entry.addedAt,
           keyLengthBits: entry.key.length * 8,
           versionIndex,
         });
@@ -787,6 +828,7 @@ export class KeyBag {
         entries.map((entry) => ({
           key: new Uint8Array(entry.key),
           createdAt: entry.createdAt,
+          addedAt: entry.addedAt,
         })),
       ])
     );
@@ -804,11 +846,12 @@ export class KeyBag {
   async save(): Promise<Uint8Array> {
     this.logger.debug(`Saving key bag with ${this.keys.size} keys`);
 
-    const mapArray: Array<[string, Array<{key: string, createdAt?: number}>]> = Array.from(this.keys.entries()).map(([keyId, keyEntries]) => [
+    const mapArray: Array<[string, Array<PersistedKeyEntry>]> = Array.from(this.keys.entries()).map(([keyId, keyEntries]) => [
       keyId,
       keyEntries.map(entry => ({
         key: this.uint8ArrayToBase64(entry.key),
-        createdAt: entry.createdAt
+        createdAt: entry.createdAt,
+        addedAt: entry.addedAt
       }))
     ]);
     const jsonString = JSON.stringify(mapArray);
@@ -893,15 +936,18 @@ export class KeyBag {
 
     const decryptedArray = new Uint8Array(decrypted);
     const jsonString = new TextDecoder().decode(decryptedArray);
-    const mapArray: Array<[string, Array<{key: string, createdAt?: number}>]> = JSON.parse(jsonString);
+    const mapArray: Array<[string, Array<PersistedKeyEntry>]> = JSON.parse(jsonString);
 
     const loadedKeys = new Map<string, KeyEntry[]>();
     let collapsedDuplicates = 0;
     for (const [scopedKeyId, keyEntries] of mapArray) {
       const normalizedScopedKeyId = this.normalizeLoadedScopedKeyId(scopedKeyId);
+      // Bags written before `addedAt` existed have no stamp; leaving it
+      // undefined keeps them honest instead of backdating them to load time.
       const normalizedEntries = keyEntries.map(entry => ({
         key: this.base64ToUint8Array(entry.key),
-        createdAt: entry.createdAt
+        createdAt: entry.createdAt,
+        addedAt: entry.addedAt
       }));
       const existingEntries = loadedKeys.get(normalizedScopedKeyId) || [];
       const merged = existingEntries.concat(normalizedEntries);
@@ -1090,20 +1136,25 @@ export class KeyBag {
 
   /**
    * Collapse identical key-material versions under one id.
-   * When duplicates differ only by `createdAt`, keep the newest timestamp.
+   * When duplicates differ only by `createdAt`, keep the newest timestamp;
+   * for `addedAt` keep the oldest, because that is when the bag first held
+   * the key material.
    */
   private dedupeKeyEntries(entries: KeyEntry[]): KeyEntry[] {
     const unique: KeyEntry[] = [];
     for (const entry of entries) {
       const existing = unique.find((candidate) => bytesEqual(candidate.key, entry.key));
       if (!existing) {
-        unique.push({ key: entry.key, createdAt: entry.createdAt });
+        unique.push({ key: entry.key, createdAt: entry.createdAt, addedAt: entry.addedAt });
         continue;
       }
       const existingTime = existing.createdAt ?? 0;
       const entryTime = entry.createdAt ?? 0;
       if (entryTime > existingTime) {
         existing.createdAt = entry.createdAt;
+      }
+      if (entry.addedAt !== undefined && (existing.addedAt === undefined || entry.addedAt < existing.addedAt)) {
+        existing.addedAt = entry.addedAt;
       }
     }
     return unique;

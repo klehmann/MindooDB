@@ -1437,6 +1437,9 @@ plaintext document content. There is a single read document type:
     the authoritative list of what this distribution delivers on **push**: imports
     verify unwrapped bytes against the fingerprint. (On **pull**, revocation is
     whole-key — see §13.6 — so the manifest is not consulted for removal.)
+    `createdAt` is the version's cross-device identity and may be absent; the
+    KeyBag's `addedAt` stamp is per-device local state and is never distributed
+    (both timestamps: `specification.md` → KeyBag).
   - `title_encrypted` / `comment_encrypted` (+ `_key: "default"`) — display
     metadata encrypted with the **tenant default key**, opaque to the sync server.
   - `pushto_users_hashes: string[]` — users whose KeyBags receive the key.
