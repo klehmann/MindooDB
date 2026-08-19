@@ -110,7 +110,7 @@ interface StoreEntry extends StoreEntryMetadata {
   dependencyIds: string[];            // Entry ID of previous chunk (for append-only files)
   createdAt: number;
   createdByPublicKey: string;         // Author's public signing key
-  decryptionKeyId: string;            // "default" or named key ID
+  decryptionKeyId: string;            // "default", a named key ID, or "$sealed:<docId>"
   signature: Uint8Array;              // Signature over encrypted data
   encryptedData: Uint8Array;          // Encrypted chunk data
   originalSize?: number;              // Plaintext chunk size before encryption
@@ -128,7 +128,7 @@ interface AttachmentReference {
   mimeType: string;               // MIME type
   size: number;                   // Total file size in bytes
   lastChunkId: string;            // Entry ID of the last chunk (enables append-only growth)
-  decryptionKeyId: string;        // Same key as document ("default" or named)
+  decryptionKeyId: string;        // Same key as document ("default", named, or sealed)
   createdAt: number;              // When attachment was added
   createdBy: string;              // User public key
 }
@@ -232,10 +232,12 @@ Each chunk is encrypted independently using AES-256-GCM with two modes:
 [mode byte (1)] [IV (12 bytes)] [ciphertext + GCM tag]
 ```
 
-- **Key**: Same as document (tenant key or named key from `decryptionKeyId`)
+- **Key**: Same as document — the tenant key, a named key, or a sealed per-document key, whichever the owning document's `decryptionKeyId` names
 - **Mode byte**: 0x00 = random IV, 0x01 = deterministic IV
 - **IV**: 12 bytes (random or derived from content)
 - **contentHash**: SHA-256 of complete encrypted payload (mode + IV + ciphertext)
+
+**Sealed documents.** When the owning document was created with a recipient list, its `decryptionKeyId` is `$sealed:<docId>` and attachment chunks are encrypted under that per-document key, so attachment bytes are readable exactly by the document's recipients. Only the document entries carry the per-recipient key wraps; chunks carry none, and a reader acquires the key by opening the document first. Because a recipient removal mints a new key generation without rewriting stored chunks, decryption tries every generation the reader holds: attachments written before a rotation stay readable for remaining recipients, a recipient added later can read attachments written before they were added, and a removed recipient loses the series and can no longer decrypt any of it. See [userkeys.md](userkeys.md) section 6 for the recipient model.
 
 **Why encrypt before hashing?**
 - Security: Content hash doesn't reveal plaintext information

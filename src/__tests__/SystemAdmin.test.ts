@@ -1916,12 +1916,65 @@ describe("System Admin Security", () => {
 
       await admin.revokeSystemAdminAccess(principal);
 
-      const { status } = await httpRequest(
+      // Creating the tenant above registered this principal as that tenant's
+      // admin signing key, which keeps it eligible for challenge issuance so
+      // it can still DELETE its own tenant. Authentication therefore survives
+      // the revoke; authorization must not.
+      const { status: challengeStatus } = await httpRequest(
         `${setup.baseUrl}/system/auth/challenge`,
         "POST",
         principal,
       );
-      expect(status).toBe(404);
+      expect(challengeStatus).toBe(200);
+
+      const revokedToken = await getSystemAdminToken(
+        setup.baseUrl,
+        delegatedAdmin,
+        "delegated-pass",
+        cryptoAdapter,
+        factory,
+      );
+      const secondCreateResponse = await httpRequest(
+        `${setup.baseUrl}/system/tenants/delegated-auth-test-2`,
+        "POST",
+        {
+          adminSigningPublicKey: delegatedAdmin.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: delegatedAdmin.userEncryptionKeyPair.publicKey,
+          publicInfosKey: createPublicInfosKeyBase64(9),
+        },
+        { Authorization: `Bearer ${revokedToken}` },
+      );
+      expect(secondCreateResponse.status).toBe(403);
+    });
+
+    test("revoke stops challenge issuance for a principal that owns no tenant", async () => {
+      const admin = new MindooDBServerAdmin({
+        serverUrl: setup.baseUrl,
+        systemAdminUser: setup.adminUser,
+        systemAdminPassword: "admin-pass",
+        cryptoAdapter,
+      });
+      const delegatedAdmin = await factory.createUserId("cn=no-tenant/o=test", "no-tenant-pass");
+      const principal = {
+        username: delegatedAdmin.username,
+        publicsignkey: delegatedAdmin.userSigningKeyPair.publicKey as string,
+      };
+
+      await admin.grantSystemAdminAccess(principal, ["POST:/system/tenants/*"]);
+      const granted = await httpRequest(
+        `${setup.baseUrl}/system/auth/challenge`,
+        "POST",
+        principal,
+      );
+      expect(granted.status).toBe(200);
+
+      await admin.revokeSystemAdminAccess(principal);
+      const revoked = await httpRequest(
+        `${setup.baseUrl}/system/auth/challenge`,
+        "POST",
+        principal,
+      );
+      expect(revoked.status).toBe(404);
     });
   });
 
