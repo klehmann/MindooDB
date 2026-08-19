@@ -11,7 +11,12 @@ export {
   type EntryRecipients,
   type RecipientChangeResult,
 } from "./sealedTypes";
-export { resolveRecipientSpecs, newestRecipientBlock, resolveRecipientsFromPayload, isPayloadEncryptedFor } from "./recipients";
+export {
+  resolveRecipientSpecs,
+  newestRecipientBlock,
+  resolveRecipientsFromPayload,
+  isPayloadEncryptedFor,
+} from "./recipients";
 export {
   USERKEY_FORM,
   USERKEY_TYPE,

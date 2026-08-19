@@ -315,7 +315,7 @@ export class UserKeyManager {
         console.warn("[userkeys] getUserKeyCryptoKeysForReconcile: published lookup failed", error);
       }
     }
-    if (keys.length === 0 && !usedPublishedDocument) {
+    if (keys.length === 0) {
       const current = await this.getDecryptedUserKey();
       if (current) keys.push(current);
     }

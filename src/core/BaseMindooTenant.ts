@@ -406,12 +406,33 @@ export class BaseMindooTenant implements MindooTenant {
 
   async ingestSealedRecipients(keyId: string, recipients: EntryRecipients): Promise<void> {
     const cached = this.sealedGenerations.get(keyId);
-    if (cached && cached.length >= recipients.epoch) return;
+    const epoch = typeof recipients.epoch === "number" ? recipients.epoch : 0;
+    if (cached && cached.length >= epoch && epoch > 0) {
+      console.log("[sealed] ingest: cache already has generations", {
+        keyId,
+        cached: cached.length,
+        epoch,
+      });
+      return;
+    }
     const keys = [
       ...(await this.userKeys.getUserKeyCryptoKeysForReconcile()),
       await this.getEncryptionPrivateKeyForReconcile(),
     ].filter((k): k is CryptoKey => !!k);
-    if (keys.length === 0) return;
+    console.log("[sealed] ingest: trying unwrap", {
+      keyId,
+      wrapCount: recipients.wraps?.length ?? 0,
+      wrapKinds: (recipients.wraps ?? []).map((wrap) => wrap.kind),
+      epoch,
+      keyCount: keys.length,
+      cached: cached?.length ?? 0,
+    });
+    if (keys.length === 0) {
+      // Keep a create-time session DEK. Without unwrap keys we cannot prove
+      // the wrap list excludes us, and deleting would make the author unable
+      // to read a document they just sealed.
+      return;
+    }
     for (const key of keys) {
       try {
         const gens = await openBundle({
@@ -420,14 +441,20 @@ export class BaseMindooTenant implements MindooTenant {
           privateKey: key,
         });
         this.sealedGenerations.set(keyId, gens);
+        console.log("[sealed] ingest: unwrapped", { keyId, generations: gens.length });
         return;
       } catch {
         // try next key
       }
     }
     // Newest wrap list is not for us (removed, or never added). Drop any
-    // older session cache so hasDecryptionKey / visibility reconcile hide
-    // the document instead of decrypting new entries with a stale DEK.
+    // session DEK so hasDecryptionKey / visibility reconcile hide the
+    // document instead of leaving the last readable plaintext editable.
+    console.log("[sealed] ingest: unwrap failed, dropping session DEK", {
+      keyId,
+      cached: cached?.length ?? 0,
+      epoch,
+    });
     this.sealedGenerations.delete(keyId);
   }
 
@@ -2662,6 +2689,13 @@ export class BaseMindooTenant implements MindooTenant {
    * @returns The decrypted symmetric key bytes
    */
   protected async getSymmetricKey(decryptionKeyId: string): Promise<Uint8Array> {
+    if (isSealedKeyId(decryptionKeyId)) {
+      const generations = this.sealedGenerations.get(decryptionKeyId);
+      if (!generations?.length) {
+        throw new SymmetricKeyNotFoundError(decryptionKeyId);
+      }
+      return generations[0];
+    }
     if (decryptionKeyId === "default") {
       // Use cached tenant encryption key if available
       if (this.decryptedTenantKeyCache) {

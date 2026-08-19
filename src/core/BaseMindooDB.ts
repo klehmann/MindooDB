@@ -3534,6 +3534,20 @@ export class BaseMindooDB implements MindooDB {
               this.logger.debug(
                 `Skipping metadata-first index for doc ${docId} — decryption key "${representativeEntry.decryptionKeyId}" not available`,
               );
+              const existingIndex = this.getDocIndexPosition(docId);
+              const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
+              if (existing?.accessState === "visible") {
+                await this.purgeMaterializedDocument(docId);
+                this.updateIndex(
+                  docId,
+                  existing.lastModified,
+                  true,
+                  representativeEntry.decryptionKeyId,
+                  "inaccessible",
+                );
+                this.cacheMetaDirty = true;
+                this.cacheManager?.markDirty();
+              }
             } else {
               // Cold sync: entryMetadataList is already the full doc history from
               // the unfiltered scan. Incremental sync of an uncached doc may only
@@ -5603,6 +5617,9 @@ export class BaseMindooDB implements MindooDB {
     
     // Get all entry metadata for this document
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    if (allEntryMetadata.length > 0) {
+      await this.ingestSealedKeyFromEntries(allEntryMetadata);
+    }
     
     // Filter to document replay metadata plus snapshots up to the timestamp.
     // Attachment chunks are not part of the Automerge replay DAG and must not
@@ -5779,11 +5796,30 @@ export class BaseMindooDB implements MindooDB {
     return this.wrapDocument(internalDoc);
   }
 
+  /**
+   * Unwrap a `$sealed:` DEK from entry recipient wraps into the tenant session
+   * cache. `loadDocumentInternal` already does this; history / timestamp reads
+   * must as well — otherwise Haven's revision list throws SymmetricKeyNotFoundError
+   * on a cold tenant even when this device is in the wrap list.
+   */
+  private async ingestSealedKeyFromEntries(
+    entries: Array<{ decryptionKeyId: string; recipients?: EntryRecipients; createdAt: number; entryType?: string }>,
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    const keyId =
+      entries.find((entry) => entry.entryType === "doc_create")?.decryptionKeyId
+      ?? entries[0].decryptionKeyId;
+    await this.tenant.ingestSealedFromEntries?.(keyId, entries);
+  }
+
   async *iterateDocumentHistory(docId: string): AsyncGenerator<DocumentHistoryResult, void, unknown> {
     this.logger.debug(`Iterating document history for ${docId}`);
     
     // Get all entry metadata for this document
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    if (allEntryMetadata.length > 0) {
+      await this.ingestSealedKeyFromEntries(allEntryMetadata);
+    }
     
     // Filter to document replay entries (exclude snapshots) and order them
     // causally: a plain chronological sort can place an effect before its
@@ -5801,6 +5837,7 @@ export class BaseMindooDB implements MindooDB {
     
     // Load all entries
     const entries = await this.store.getEntries(relevantEntries.map(em => em.id));
+    await this.ingestSealedKeyFromEntries(entries.length > 0 ? entries : relevantEntries);
     
     // Build a map for quick lookup
     const entryMap = new Map(entries.map(e => [e.id, e]));
@@ -9186,6 +9223,15 @@ export class BaseMindooDB implements MindooDB {
     if (internalDoc.isDeleted) {
       throw new DocumentDeletedError(docId);
     }
+
+    if (isSealedKeyId(internalDoc.decryptionKeyId)) {
+      const metas = await this.scanAllMetadata(this.store, { docId });
+      await this.ingestSealedKeyFromEntries(metas);
+    }
+    if (!(await this.tenant.hasDecryptionKey(internalDoc.decryptionKeyId))) {
+      await this.purgeMaterializedDocument(docId);
+      throw new DocumentNotFoundError(docId);
+    }
     
     // Apply the change function
     const now = semanticNow();
@@ -12088,6 +12134,13 @@ export class BaseMindooDB implements MindooDB {
       now,
     });
     const dek = tenant.getCryptoAdapter().getRandomValues(new Uint8Array(32));
+    console.log("[sealed] prepareSealedCreate", {
+      docId,
+      keyId,
+      includeSelf: options.recipientOptions?.includeSelf !== false,
+      userTargets: resolved.targets.map((target) => ({ kind: target.kind, id: target.id })),
+      skipped: resolved.skipped,
+    });
     const recipients = await sealToTargets({
       tenant,
       generations: [dek],
@@ -12242,15 +12295,6 @@ export class BaseMindooDB implements MindooDB {
     return this.mutateRecipients(doc, "set", recipients, options);
   }
 
-  async refreshRecipients(
-    doc: MindooDoc,
-    options?: RecipientChangeOptions,
-  ): Promise<RecipientChangeResult> {
-    const current = doc.getRecipients().filter((r) => r.kind === "user").map((r) => r.id);
-    const groups = [...new Set(doc.getRecipients().map((r) => r.viaGroup).filter((g): g is string => !!g))];
-    return this.mutateRecipients(doc, "set", [...current, ...groups.map((g) => ({ group: g }))], options);
-  }
-
   async canChangeRecipients(doc: MindooDoc, next: RecipientSpec[]): Promise<AccessDecision> {
     const after = { ...(doc.getData() as unknown as Record<string, unknown>) };
     after[ENCRYPT_FOR_FIELD] = { ...(readEncryptFor(after) as Record<string, unknown>) };
@@ -12385,7 +12429,6 @@ export class BaseMindooDB implements MindooDB {
             addedBy: signer,
             keyFingerprint: target.keyFingerprint,
             ...(target.label ? { label: target.label } : {}),
-            ...(target.viaGroup ? { viaGroup: target.viaGroup } : {}),
           };
         }
         applyEncryptForAdds(draft, addMap, epoch);
@@ -12431,7 +12474,6 @@ export class BaseMindooDB implements MindooDB {
           keyFingerprint: e.keyFingerprint ?? "",
           label: e.label,
           addedInEpoch: epoch,
-          viaGroup: e.viaGroup,
           sealed: false,
         })),
       skipped: resolved.skipped,
@@ -12939,6 +12981,21 @@ export class BaseMindooDB implements MindooDB {
         ?? allEntryMetadata[0].decryptionKeyId,
       allEntryMetadata,
     );
+    const loadKeyId =
+      allEntryMetadata.find((em) => em.entryType === "doc_create")?.decryptionKeyId
+      ?? allEntryMetadata[0].decryptionKeyId;
+    if (isSealedKeyId(loadKeyId) && !(await this.tenant.hasDecryptionKey(loadKeyId))) {
+      this.logger.debug(`Document ${docId} is sealed and not unwrapable; treating as missing`);
+      const existingIndex = this.getDocIndexPosition(docId);
+      const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
+      if (existing?.accessState === "visible") {
+        await this.purgeMaterializedDocument(docId);
+        this.updateIndex(docId, existing.lastModified, true, loadKeyId, "inaccessible");
+        this.cacheMetaDirty = true;
+        this.cacheManager?.markDirty();
+      }
+      return null;
+    }
 
     // Access-control materialization (docs/accesscontrol.md §10): when the
     // tenant has access control active, materialize through the Tier 2

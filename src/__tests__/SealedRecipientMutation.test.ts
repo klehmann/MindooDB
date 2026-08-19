@@ -97,4 +97,31 @@ describe("sealed recipient mutation", () => {
     expect(doc.isEncryptedFor(bob.username)).toBe(false);
     expect(doc.isEncryptedFor(carol.username)).toBe(true);
   });
+
+  it("remaining recipients can still change after someone is removed", async () => {
+    const db = await alice.tenant.openDB("after-remove");
+    const doc = await db.createDocument({
+      recipients: [bob.username, carol.username],
+      initialValues: { n: 1 },
+    });
+    await db.removeRecipients!(doc, [bob.username]);
+    await db.changeDoc(doc, (target) => {
+      target.getData().n = 4;
+    });
+    await syncAll(fixture, "after-remove");
+
+    const carolDb = await carol.tenant.openDB("after-remove");
+    const carolDoc = await carolDb.getDocument(doc.getId());
+    expect(carolDoc.getData().n).toBe(4);
+    await carolDb.changeDoc(carolDoc, (target) => {
+      target.getData().n = 5;
+    });
+    await syncAll(fixture, "after-remove");
+    expect((await db.getDocument(doc.getId())).getData().n).toBe(5);
+
+    const bobDb = await bob.tenant.openDB("after-remove");
+    await bobDb.syncStoreChanges();
+    await bobDb.reconcileKeyVisibility();
+    expect(await bobDb.getAllDocumentIds()).not.toContain(doc.getId());
+  });
 });

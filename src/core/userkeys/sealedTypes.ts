@@ -13,8 +13,7 @@ export type RecipientSpec =
   | string
   | { user: string }
   | { device: string; label?: string }
-  | { devicePem: string; label: string }
-  | { group: string };
+  | { devicePem: string; label: string };
 
 export interface RecipientOptions {
   includeSelf?: boolean;
@@ -22,12 +21,16 @@ export interface RecipientOptions {
 }
 
 export interface EncryptForEntry {
-  kind: "user" | "device" | "group";
+  kind: "user" | "device";
   label?: string;
   addedAt: number;
   addedBy: string;
   /** Fingerprint of the public key wrapped to; used for `sealed` on the handle. */
   keyFingerprint?: string;
+  /**
+   * Legacy field from when recipients could be expanded from a directory group.
+   * No longer written. Still read so older documents keep their payload shape.
+   */
   viaGroup?: string;
   removedAt?: number;
   removedBy?: string;
@@ -49,7 +52,6 @@ export interface ResolvedRecipient {
   keyFingerprint: string;
   label?: string;
   addedInEpoch: number;
-  viaGroup?: string;
   sealed: boolean;
 }
 

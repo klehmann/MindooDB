@@ -23,7 +23,6 @@ export interface ResolvedWrapTarget {
   keyFingerprint: string;
   publicKeyPem: string;
   label?: string;
-  viaGroup?: string;
 }
 
 export function newestRecipientBlock(
@@ -67,7 +66,6 @@ export function resolveRecipientsFromPayload(
     keyFingerprint: entry.keyFingerprint ?? "",
     label: entry.label,
     addedInEpoch: epoch,
-    viaGroup: entry.viaGroup,
     sealed: !!(entry.keyFingerprint && wraps.has(entry.keyFingerprint)),
   }));
 }
@@ -77,8 +75,21 @@ function specKey(spec: RecipientSpec): string {
   if ("user" in spec) return `user:${spec.user}`;
   if ("device" in spec) return `device:${spec.device}`;
   if ("devicePem" in spec) return `devicePem:${spec.devicePem}`;
-  if ("group" in spec) return `group:${spec.group}`;
   return JSON.stringify(spec);
+}
+
+function userNameFromSpec(spec: RecipientSpec): string | null {
+  if (typeof spec === "string") return spec;
+  if ("user" in spec) return spec.user;
+  return null;
+}
+
+function assertCanonicalizableUsernames(specs: RecipientSpec[]): void {
+  for (const spec of specs) {
+    const name = userNameFromSpec(spec);
+    if (name == null) continue;
+    canonicalizeUsername(name);
+  }
 }
 
 export async function resolveRecipientSpecs(input: {
@@ -92,6 +103,7 @@ export async function resolveRecipientSpecs(input: {
   encryptFor: Record<string, EncryptForEntry>;
   skipped: Array<{ spec: RecipientSpec; reason: string }>;
 }> {
+  assertCanonicalizableUsernames(input.specs);
   const includeSelf = input.options?.includeSelf !== false;
   const strict = input.options?.strict === true;
   const specs = [...input.specs];
@@ -155,7 +167,6 @@ export async function resolveRecipientSpecs(input: {
       addedBy: input.addedBy,
       keyFingerprint: target.keyFingerprint,
       ...(target.label ? { label: target.label } : {}),
-      ...(target.viaGroup ? { viaGroup: target.viaGroup } : {}),
     };
   }
   return { targets, encryptFor, skipped };
@@ -170,17 +181,6 @@ async function resolveOneSpec(
     const target = await resolveUserTarget(tenant, username);
     if (!target) return { targets: [], skipped: "no published user key" };
     return { targets: [target] };
-  }
-  if ("group" in spec) {
-    const directory = await tenant.openDirectory();
-    const members = (await directory.getGroupMembers?.(spec.group)) ?? [];
-    const targets: ResolvedWrapTarget[] = [];
-    for (const member of members) {
-      const target = await resolveUserTarget(tenant, member);
-      if (target) targets.push({ ...target, viaGroup: spec.group });
-    }
-    if (targets.length === 0) return { targets: [], skipped: `group "${spec.group}" has no published members` };
-    return { targets };
   }
   if ("devicePem" in spec) {
     const subtle = tenant.getCryptoAdapter().getSubtle();

@@ -1368,7 +1368,7 @@ export interface StoreEntryMetadata {
   provenance?: EntryProvenance;
 
   /**
-   * Sealed-document recipient block (docs/recipients.md §3.3). Present only on
+   * Sealed-document recipient block (docs/userkeys.md §9.7). Present only on
    * entries that change the recipient set. Bound into `metadataSignature` as
    * tagged trailing block `0x03`.
    */
@@ -1896,6 +1896,8 @@ export interface CreateOptions {
    * A fresh document key is generated and sealed to each recipient. User
    * names are canonicalized (`CN=alice/O=contoso`, case-insensitive) and
    * must include `O=` — the tenant id is not substituted for the organization.
+   * Directory groups are not a recipient target: list the people who should
+   * read the document so `_encryptFor` stays an explicit, queryable set.
    * The author is included unless `recipientOptions.includeSelf` is false.
    */
   recipients?: import("./userkeys/sealedTypes").RecipientSpec[];
@@ -5165,10 +5167,6 @@ export interface MindooDB {
   setRecipients(
     doc: MindooDoc,
     recipients: import("./userkeys/sealedTypes").RecipientSpec[],
-    options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
-  ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
-  refreshRecipients(
-    doc: MindooDoc,
     options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
   ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
   canChangeRecipients(

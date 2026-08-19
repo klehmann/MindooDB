@@ -62,6 +62,42 @@ describe("sealed document recipients", () => {
     expect(await carolDb.getAllDocumentIds()).not.toContain(doc.getId());
   });
 
+  it("iterateDocumentHistory decrypts after the session DEK is dropped", async () => {
+    const db = await alice.tenant.openDB("history-sealed");
+    const doc = await db.createDocument({
+      recipients: [],
+      initialValues: { n: 7 },
+    });
+    alice.tenant.rememberSealedGenerations!(doc.getDecryptionKeyId(), []);
+    const history: Array<{ n: unknown }> = [];
+    for await (const entry of db.iterateDocumentHistory(doc.getId())) {
+      history.push({ n: entry.doc.getData().n });
+    }
+    expect(history).toEqual([{ n: 7 }]);
+  });
+
+  it("named recipients can iterate history without a session DEK", async () => {
+    const bob = await addPerson(fixture, "bob-history", "desk");
+    await bob.factory.ensureUserKeyPair!(bob.user, bob.password);
+    await syncAll(fixture, "directory");
+    bob.tenant.noteUserDirectoryFetched!();
+    await bob.tenant.reconcileUserKeys!({ allowSelfCreate: true });
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+
+    const db = await alice.tenant.openDB("shared-history");
+    const doc = await db.createDocument({
+      recipients: [bob.username],
+      initialValues: { n: 2 },
+    });
+    await syncAll(fixture, "shared-history");
+    const bobDb = await bob.tenant.openDB("shared-history");
+    const history: Array<{ n: unknown }> = [];
+    for await (const entry of bobDb.iterateDocumentHistory(doc.getId())) {
+      history.push({ n: entry.doc.getData().n });
+    }
+    expect(history).toEqual([{ n: 2 }]);
+  });
+
   it("rejects an empty list with includeSelf: false", async () => {
     const db = await alice.tenant.openDB("dropbox");
     await expect(
@@ -70,5 +106,14 @@ describe("sealed document recipients", () => {
         recipientOptions: { includeSelf: false },
       }),
     ).rejects.toThrow(/nobody can read/);
+  });
+
+  it("rejects a username that cannot be canonicalized", async () => {
+    const db = await alice.tenant.openDB("bare-names");
+    await expect(
+      db.createDocument({
+        recipients: ["hr"],
+      }),
+    ).rejects.toThrow(/organization/i);
   });
 });
