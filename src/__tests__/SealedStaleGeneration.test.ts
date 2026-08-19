@@ -50,4 +50,26 @@ describe("sealed stale generation", () => {
     const ids = await bobDb.getAllDocumentIds();
     expect(ids).not.toContain(doc.getId());
   });
+
+  it("removal alone hides the document: no follow-up content change required", async () => {
+    const db = await alice.tenant.openDB("carrier");
+    const doc = await db.createDocument({
+      recipients: [bob.username],
+      initialValues: { v: 1 },
+    });
+    await syncAll(fixture, "carrier");
+    const bobDb = await bob.tenant.openDB("carrier");
+    expect(await bobDb.getAllDocumentIds()).toContain(doc.getId());
+
+    // The recipient mutation is itself the carrier entry: it persists as a
+    // doc_change encrypted under the freshly rotated generation, so the
+    // removed reader has something undecryptable to sync straight away.
+    await db.removeRecipients!(doc, [bob.username]);
+    await syncAll(fixture, "carrier");
+
+    // No changeDoc and no explicit reconcileKeyVisibility(): the plain sync
+    // that syncAll already performed must be enough to hide the document.
+    expect(await bobDb.getAllDocumentIds()).not.toContain(doc.getId());
+    await expect(bobDb.getDocument(doc.getId())).rejects.toThrow();
+  });
 });

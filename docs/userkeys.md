@@ -495,6 +495,8 @@ _encryptFor["CN=alice/O=contoso"] != null
 
 Visibility needs no special handling. Sealed documents participate in the ordinary key-visibility machinery, so a person added to a document sees it appear, and a person removed from one sees it disappear along with any cached plaintext. Callers who cannot decrypt a document cannot see its recipient list at all — views only index plaintext the current user can already read.
 
+Removal takes effect on the removed reader's very next sync; no follow-up edit is needed to push them out. The recipient change is itself carried by a document change, encrypted under the freshly rotated key, so there is always something the removed reader cannot decrypt waiting for them. When they sync, that failure is treated as a lost key rather than an error: cached plaintext is purged, the document drops out of `getAllDocumentIds()`, `getDocument()` reports it as missing, views drop it, and the change feed emits a single tombstone so incremental consumers can evict it. A decryption exception never reaches the caller, even though the reader still holds the older generations of that document's key.
+
 ---
 
 ## 7) Architecture
@@ -816,6 +818,9 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 | Creating over a tombstone restores rather than duplicates | 7.4 | `UserKeyDocumentLifecycle` |
 | Owner-only change, admin-only delete, everyone reads | 7.2 | `UserDirectoryInvariant` |
 | Sealed documents, recipient changes, stale generations, visibility | 6 | `SealedDocumentRecipients`, `SealedRecipientMutation`, `SealedRecipientVisibility`, `SealedStaleGeneration`, `SealedRecipientConcurrency` |
+| Removal hides the document on the next sync, with no follow-up edit | 6.5 | `SealedStaleGeneration` |
+| A removed reader gets a tombstone, never a decryption exception | 6.5 | `SealedStaleGeneration`, `SealedRecipientVisibility` |
+| Re-adding a reader restores the document with its full history | 6.5 | `SealedRecipientVisibility` |
 
 ---
 
