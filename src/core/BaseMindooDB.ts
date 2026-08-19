@@ -3482,6 +3482,12 @@ export class BaseMindooDB implements MindooDB {
         let updatedDoc: InternalDoc | null = null;
         
         if (cachedDoc) {
+          if (await this.dropSealedAccessIfUnwrapFailed(cachedDoc)) {
+            this.logger.debug(
+              `Dropping cached sealed document ${docId} — newest wrap is not for this user`,
+            );
+            return;
+          }
           // Document is cached - try incremental update
           this.logger.debug(`Document ${docId} found in cache, attempting incremental update`);
           try {
@@ -5810,6 +5816,50 @@ export class BaseMindooDB implements MindooDB {
       entries.find((entry) => entry.entryType === "doc_create")?.decryptionKeyId
       ?? entries[0].decryptionKeyId;
     await this.tenant.ingestSealedFromEntries?.(keyId, entries);
+  }
+
+  /**
+   * Re-ingest the newest sealed wrap list. When this replica can no longer
+   * unwrap it (recipient removal), drop the leftover session DEK and any
+   * materialized plaintext so later honest-client writes cannot reuse it.
+   *
+   * @returns true when access was revoked
+   */
+  private async dropSealedAccessIfUnwrapFailed(internalDoc: InternalDoc): Promise<boolean> {
+    if (!isSealedKeyId(internalDoc.decryptionKeyId)) {
+      return false;
+    }
+    const metas = await this.scanAllMetadata(this.store, { docId: internalDoc.id });
+    await this.ingestSealedKeyFromEntries(metas);
+    if (await this.tenant.hasDecryptionKey(internalDoc.decryptionKeyId)) {
+      return false;
+    }
+    await this.purgeMaterializedDocument(internalDoc.id);
+    const existingIndex = this.getDocIndexPosition(internalDoc.id);
+    const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
+    if (existing?.accessState === "visible") {
+      this.updateIndex(
+        internalDoc.id,
+        existing.lastModified,
+        true,
+        internalDoc.decryptionKeyId,
+        "inaccessible",
+      );
+      this.cacheMetaDirty = true;
+      this.cacheManager?.markDirty();
+    }
+    return true;
+  }
+
+  /**
+   * Patch paths (`applyTextPatch`, rich-text, Automerge) used to persist with
+   * a leftover session DEK after the newest wrap excluded this user.
+   * `changeDoc` already refused those writes; this is the shared chokepoint.
+   */
+  private async assertCurrentSealedAccess(internalDoc: InternalDoc): Promise<void> {
+    if (await this.dropSealedAccessIfUnwrapFailed(internalDoc)) {
+      throw new DocumentNotFoundError(internalDoc.id);
+    }
   }
 
   async *iterateDocumentHistory(docId: string): AsyncGenerator<DocumentHistoryResult, void, unknown> {
@@ -9224,14 +9274,7 @@ export class BaseMindooDB implements MindooDB {
       throw new DocumentDeletedError(docId);
     }
 
-    if (isSealedKeyId(internalDoc.decryptionKeyId)) {
-      const metas = await this.scanAllMetadata(this.store, { docId });
-      await this.ingestSealedKeyFromEntries(metas);
-    }
-    if (!(await this.tenant.hasDecryptionKey(internalDoc.decryptionKeyId))) {
-      await this.purgeMaterializedDocument(docId);
-      throw new DocumentNotFoundError(docId);
-    }
+    await this.assertCurrentSealedAccess(internalDoc);
     
     // Apply the change function
     const now = semanticNow();
@@ -10323,6 +10366,7 @@ export class BaseMindooDB implements MindooDB {
       recipients,
     } = options;
     const docId = internalDoc.id;
+    await this.assertCurrentSealedAccess(internalDoc);
     const resolvedChangeBytesList = changeBytesList ?? (
       headsBeforeChange
         ? Automerge.getChangesSince(newDoc, headsBeforeChange as AutomergeTypes.Heads)

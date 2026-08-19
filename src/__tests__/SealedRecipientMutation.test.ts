@@ -6,6 +6,7 @@ import {
   type MultiDeviceFixture,
 } from "./_helpers/multiDevice";
 import { USER_DIRECTORY_DB_ID } from "../core/types";
+import { DocumentNotFoundError } from "../core/errors";
 
 async function publishUserKey(device: DeviceHandle): Promise<void> {
   await device.factory.ensureUserKeyPair!(device.user, device.password);
@@ -123,5 +124,49 @@ describe("sealed recipient mutation", () => {
     await bobDb.syncStoreChanges();
     await bobDb.reconcileKeyVisibility();
     expect(await bobDb.getAllDocumentIds()).not.toContain(doc.getId());
+  });
+
+  it("removed reader cannot persist cached writes after the newest wrap excludes them", async () => {
+    const db = await alice.tenant.openDB("cached-write");
+    const doc = await db.createDocument({
+      recipients: [bob.username],
+      initialValues: { n: 1 },
+    });
+    await db.changeDoc(doc, (target) => {
+      target.getData().body = "hello";
+    });
+    await syncAll(fixture, "cached-write");
+
+    const bobDb = await bob.tenant.openDB("cached-write");
+    const bobDoc = await bobDb.getDocument(doc.getId());
+    expect(bobDoc.getData().n).toBe(1);
+    expect(bobDoc.getData().body).toBe("hello");
+
+    await db.removeRecipients!(doc, [bob.username]);
+    await db.changeDoc(doc, (target) => {
+      target.getData().n = 2;
+    });
+    await syncAll(fixture, "cached-write");
+
+    // Pull the rotation without an extra reconcile: the cached sync path used
+    // to keep the leftover session DEK and let patch/changeDoc persist.
+    await bobDb.syncStoreChanges();
+
+    await expect(
+      bobDb.applyTextPatch(bobDoc, {
+        path: ["body"],
+        edits: [{ index: 5, deleteCount: 0, insert: "x" }],
+      }),
+    ).rejects.toThrow(DocumentNotFoundError);
+    await expect(
+      bobDb.changeDoc(bobDoc, (target) => {
+        target.getData().n = 99;
+      }),
+    ).rejects.toThrow(DocumentNotFoundError);
+
+    await syncAll(fixture, "cached-write");
+    const aliceDoc = await db.getDocument(doc.getId());
+    expect(aliceDoc.getData().n).toBe(2);
+    expect(aliceDoc.getData().body).toBe("hello");
   });
 });
