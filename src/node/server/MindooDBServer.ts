@@ -27,13 +27,17 @@ import {
   decodeBinaryEntryMessage,
   encodeBinaryEntryMessage,
 } from "../../core/appendonlystores/network/binaryEntryFraming";
-import type { EntryProvenance } from "../../core/crypto/EntrySignature";
+import {
+  deserializeEntryMetadata as decodeEntryMetadata,
+  deserializeStoreEntry,
+  serializeEntryMetadata as encodeEntryMetadata,
+  type SerializedEntry,
+  type SerializedEntryMetadata,
+} from "../../core/appendonlystores/network/entryWireCodec";
 import { SyncEventBus } from "./SyncEventBus";
 import type {
   StoreEntry,
   StoreEntryMetadata,
-  StoreEntryAttachmentRef,
-  StoreEntryType,
   StoreScanCursor,
   StoreScanFilters,
   StoreIdBloomSummary,
@@ -135,47 +139,12 @@ declare global {
 }
 
 /**
- * Wire-format types for the sync HTTP API.
- *
- * Binary fields (signature, encryptedData, rsaEncryptedPayload) are base64-
- * encoded strings in transit and converted to Uint8Array on deserialization.
+ * Wire-format types for the sync HTTP API live in
+ * {@link ../../core/appendonlystores/network/entryWireCodec}: binary fields
+ * (signature, encryptedData, rsaEncryptedPayload) are base64 strings in
+ * transit. Client and server share that codec so signed trailing blocks
+ * cannot drift off the wire.
  */
-interface SerializedEntryMetadata {
-  entryType: StoreEntryType;
-  id: string;
-  contentHash: string;
-  docId: string;
-  dependencyIds: string[];
-  createdAt: number;
-  receiptOrder?: number;
-  createdByPublicKey: string;
-  decryptionKeyId: string;
-  signature: string;
-  metadataSignature?: string; // base64 (author metadata-binding signature)
-  originalSize: number;
-  encryptedSize: number;
-  // Access-control witness receipt (docs/accesscontrol.md §5). The Ed25519
-  // signature is base64 on the wire; the other two fields are plain JSON.
-  receivedAt?: number;
-  receivedByPublicKey?: string;
-  receivedDateSignature?: string; // base64
-  // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
-  // Must round-trip so metadataSignature verification succeeds on ingest.
-  attachmentRefs?: StoreEntryAttachmentRef[];
-  // Copy provenance (plain JSON; see StoreEntryMetadata.provenance). Also bound
-  // into metadataSignature, so it must round-trip.
-  provenance?: EntryProvenance;
-  // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
-  entryVersion?: number;
-}
-
-interface SerializedEntry extends SerializedEntryMetadata {
-  encryptedData: string;
-}
-
-interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {
-  rsaEncryptedPayload: string;
-}
 
 /**
  * Rate-limit defaults. Auth and sync have separate tiers because a single
@@ -2602,73 +2571,19 @@ export class MindooDBServer {
 
   // ==================== Serialization ====================
   // Entries are stored with binary fields (Uint8Array) internally but
-  // transmitted as base64 strings over JSON. These methods handle the
-  // conversion in both directions.
+  // transmitted as base64 strings over JSON. Shared with the client
+  // (entryWireCodec) so signed trailing blocks cannot drift off the wire.
 
   private serializeEntryMetadata(metadata: StoreEntryMetadata): SerializedEntryMetadata {
-    return {
-      entryType: metadata.entryType,
-      id: metadata.id,
-      contentHash: metadata.contentHash,
-      docId: metadata.docId,
-      dependencyIds: metadata.dependencyIds,
-      createdAt: metadata.createdAt,
-      receiptOrder: metadata.receiptOrder,
-      createdByPublicKey: metadata.createdByPublicKey,
-      decryptionKeyId: metadata.decryptionKeyId,
-      signature: this.uint8ArrayToBase64(metadata.signature),
-      metadataSignature: metadata.metadataSignature
-        ? this.uint8ArrayToBase64(metadata.metadataSignature)
-        : undefined,
-      originalSize: metadata.originalSize,
-      encryptedSize: metadata.encryptedSize,
-      receivedAt: metadata.receivedAt,
-      receivedByPublicKey: metadata.receivedByPublicKey,
-      receivedDateSignature: metadata.receivedDateSignature
-        ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
-        : undefined,
-      attachmentRefs: metadata.attachmentRefs,
-      // Bound into metadataSignature, so it must survive the round-trip.
-      provenance: metadata.provenance,
-      entryVersion: metadata.entryVersion,
-    };
+    return encodeEntryMetadata(metadata);
   }
 
   private deserializeEntryMetadata(serialized: SerializedEntryMetadata): StoreEntryMetadata {
-    return {
-      entryType: serialized.entryType,
-      id: serialized.id,
-      contentHash: serialized.contentHash,
-      docId: serialized.docId,
-      dependencyIds: serialized.dependencyIds,
-      createdAt: serialized.createdAt,
-      receiptOrder: serialized.receiptOrder,
-      createdByPublicKey: serialized.createdByPublicKey,
-      decryptionKeyId: serialized.decryptionKeyId,
-      signature: this.base64ToUint8Array(serialized.signature),
-      metadataSignature: serialized.metadataSignature
-        ? this.base64ToUint8Array(serialized.metadataSignature)
-        : undefined,
-      originalSize: serialized.originalSize,
-      encryptedSize: serialized.encryptedSize,
-      // Preserve any pre-existing witness receipt (e.g. on re-sync or
-      // server-to-server forwarding); a fresh local push has none.
-      receivedAt: serialized.receivedAt,
-      receivedByPublicKey: serialized.receivedByPublicKey,
-      receivedDateSignature: serialized.receivedDateSignature
-        ? this.base64ToUint8Array(serialized.receivedDateSignature)
-        : undefined,
-      attachmentRefs: serialized.attachmentRefs,
-      provenance: serialized.provenance,
-      entryVersion: serialized.entryVersion,
-    };
+    return decodeEntryMetadata(serialized);
   }
 
   private deserializeEntry(serialized: SerializedEntry): StoreEntry {
-    return {
-      ...this.deserializeEntryMetadata(serialized),
-      encryptedData: this.base64ToUint8Array(serialized.encryptedData),
-    };
+    return deserializeStoreEntry(serialized);
   }
 
   private uint8ArrayToBase64(bytes: Uint8Array): string {

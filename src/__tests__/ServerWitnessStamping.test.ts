@@ -11,6 +11,10 @@ import { NetworkError } from "../core/appendonlystores/network/types";
 import type { AccessDecision } from "../core/accesscontrol/types";
 import { computeContentHash } from "../core/utils/idGeneration";
 import { buildEntrySigningBytes, entrySignatureFieldsFromEntry } from "../core/crypto/EntrySignature";
+import {
+  deserializeStoreEntry,
+  serializeStoreEntry,
+} from "../core/appendonlystores/network/entryWireCodec";
 
 /**
  * Server-store integration tests for the witness protocol and Tier 1
@@ -487,6 +491,50 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
         attachmentRefs: [{ attachmentId: "att-1", lastChunkId: "doc7_a_f_evil", size: 100 }],
       } as StoreEntry;
       const ack = await server.handlePutEntries("token", [tampered]);
+      expect(ack.receipts).toHaveLength(0);
+      expect(ack.rejected).toEqual([
+        { id: e.id, reason: expect.stringContaining("invalid author signature") },
+      ]);
+      expect(await localStore.getAllIds()).toHaveLength(0);
+    });
+
+    it("accepts a sealed-recipient entry after a JSON wire round-trip", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      const e = await makeEntry({
+        decryptionKeyId: "$sealed:doc7",
+        recipients: {
+          epoch: 1,
+          bundle: "bundle-b64",
+          wraps: [{ kind: "user", keyFingerprint: "fp-alice", wrapped: "wrap-alice" }],
+        },
+      });
+      const roundTripped = deserializeStoreEntry(
+        JSON.parse(JSON.stringify(serializeStoreEntry(e))),
+      );
+      await expect(server.handlePutEntries("token", [roundTripped])).resolves.toMatchObject({
+        receipts: [expect.objectContaining({ id: e.id })],
+        rejected: [],
+      });
+      const [stored] = await localStore.getEntries([e.id]);
+      expect(stored.recipients).toEqual(e.recipients);
+    });
+
+    it("rejects a sealed-recipient entry whose recipients were dropped on the wire", async () => {
+      const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const server = plainServer(localStore);
+      const e = await makeEntry({
+        decryptionKeyId: "$sealed:doc7",
+        recipients: {
+          epoch: 1,
+          bundle: "bundle-b64",
+          wraps: [{ kind: "user", keyFingerprint: "fp-alice", wrapped: "wrap-alice" }],
+        },
+      });
+      const serialized = serializeStoreEntry(e);
+      delete serialized.recipients;
+      const dropped = deserializeStoreEntry(serialized);
+      const ack = await server.handlePutEntries("token", [dropped]);
       expect(ack.receipts).toHaveLength(0);
       expect(ack.rejected).toEqual([
         { id: e.id, reason: expect.stringContaining("invalid author signature") },

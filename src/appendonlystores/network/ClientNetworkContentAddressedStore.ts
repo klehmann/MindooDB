@@ -898,26 +898,13 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         enc.rsaEncryptedPayload,
         this.getActivePrivateEncryptionKey()
       );
-      
-      // Create the full StoreEntry using metadata from the network entry
+
+      const { rsaEncryptedPayload: _payload, ...metadata } = enc;
       const entry: StoreEntry = {
-        entryType: enc.entryType,
-        id: enc.id,
-        contentHash: enc.contentHash,
-        docId: enc.docId,
-        dependencyIds: enc.dependencyIds,
-        createdAt: enc.createdAt,
-        createdByPublicKey: enc.createdByPublicKey,
-        decryptionKeyId: enc.decryptionKeyId,
-        snapshotHeadHashes: enc.snapshotHeadHashes,
-        snapshotHeadEntryIds: enc.snapshotHeadEntryIds,
-        signature: enc.signature,
-        originalSize: enc.originalSize,
-        encryptedSize: enc.encryptedSize,
-        attachmentRefs: enc.attachmentRefs,
+        ...(metadata as StoreEntryMetadata),
         encryptedData,
       };
-      
+
       results.push(entry);
     }
     

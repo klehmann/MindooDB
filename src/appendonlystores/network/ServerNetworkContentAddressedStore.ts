@@ -1298,22 +1298,12 @@ export class ServerNetworkContentAddressedStore {
         publicKey
       );
       
-      // Create NetworkEncryptedEntry with all metadata plus RSA-encrypted payload
+      // Create NetworkEncryptedEntry with all metadata plus RSA-encrypted payload.
+      // Spread toMetadata so signed trailing blocks (recipients, provenance,
+      // attachmentRefs) and metadataSignature survive getEntries the same way
+      // they survive putEntries.
       const encryptedEntry: NetworkEncryptedEntry = {
-        entryType: entry.entryType,
-        id: entry.id,
-        contentHash: entry.contentHash,
-        docId: entry.docId,
-        dependencyIds: entry.dependencyIds,
-        createdAt: entry.createdAt,
-        createdByPublicKey: entry.createdByPublicKey,
-        decryptionKeyId: entry.decryptionKeyId,
-        snapshotHeadHashes: entry.snapshotHeadHashes,
-        snapshotHeadEntryIds: entry.snapshotHeadEntryIds,
-        signature: entry.signature,
-        originalSize: entry.originalSize,
-        encryptedSize: entry.encryptedSize,
-        attachmentRefs: entry.attachmentRefs,
+        ...this.toMetadata(entry),
         rsaEncryptedPayload,
       };
       

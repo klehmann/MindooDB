@@ -2,7 +2,6 @@ import type {
   MindooDBServerInfo,
   StoreEntry,
   StoreEntryMetadata,
-  StoreEntryAttachmentRef,
   StoreEntryType,
   StoreScanCursor,
   StoreScanFilters,
@@ -20,7 +19,6 @@ import type {
   RejectedPutEntry,
   StoreHead,
 } from "../../core/appendonlystores/types";
-import type { EntryProvenance } from "../../core/crypto/EntrySignature";
 import { StoreKind } from "../../core/appendonlystores/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
@@ -41,6 +39,13 @@ import {
   measureBinaryEntryMessage,
   type BinaryEntryFrame,
 } from "../../core/appendonlystores/network/binaryEntryFraming";
+import {
+  deserializeEntryMetadata as decodeEntryMetadata,
+  serializeEntryMetadata as encodeEntryMetadata,
+  serializeStoreEntry,
+  type SerializedEntry,
+  type SerializedEntryMetadata,
+} from "../../core/appendonlystores/network/entryWireCodec";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import { isSameOrigin } from "../../core/utils/urlSafety";
 import { getSharedRequestScheduler, type RequestScheduler } from "./RequestScheduler";
@@ -1539,116 +1544,26 @@ export class HttpTransport implements NetworkTransport {
 
   /**
    * Serialize StoreEntryMetadata for network transmission.
+   * Shared with the server so signed trailing blocks (attachmentRefs,
+   * provenance, recipients) cannot drift off the wire.
    */
   private serializeEntryMetadata(metadata: StoreEntryMetadata): SerializedEntryMetadata {
-    return {
-      entryType: metadata.entryType,
-      id: metadata.id,
-      contentHash: metadata.contentHash,
-      docId: metadata.docId,
-      dependencyIds: metadata.dependencyIds,
-      createdAt: metadata.createdAt,
-      receiptOrder: metadata.receiptOrder,
-      createdByPublicKey: metadata.createdByPublicKey,
-      decryptionKeyId: metadata.decryptionKeyId,
-      snapshotHeadHashes: metadata.snapshotHeadHashes,
-      snapshotHeadEntryIds: metadata.snapshotHeadEntryIds,
-      signature: this.uint8ArrayToBase64(metadata.signature),
-      metadataSignature: metadata.metadataSignature
-        ? this.uint8ArrayToBase64(metadata.metadataSignature)
-        : undefined,
-      originalSize: metadata.originalSize,
-      encryptedSize: metadata.encryptedSize,
-      receivedAt: metadata.receivedAt,
-      receivedByPublicKey: metadata.receivedByPublicKey,
-      receivedDateSignature: metadata.receivedDateSignature
-        ? this.uint8ArrayToBase64(metadata.receivedDateSignature)
-        : undefined,
-      // Signed attachment snapshot (plain JSON, no binary). Must survive the
-      // round-trip or metadataSignature verification fails on the receiver.
-      attachmentRefs: metadata.attachmentRefs,
-      // Copy provenance (plain JSON, base64 signature inside). Also bound into
-      // metadataSignature, so the same round-trip requirement applies.
-      provenance: metadata.provenance,
-      entryVersion: metadata.entryVersion,
-    };
+    return encodeEntryMetadata(metadata);
   }
 
   /**
    * Deserialize StoreEntryMetadata from network format.
    */
   private deserializeEntryMetadata(serialized: SerializedEntryMetadata): StoreEntryMetadata {
-    return {
-      entryType: serialized.entryType,
-      id: serialized.id,
-      contentHash: serialized.contentHash,
-      docId: serialized.docId,
-      dependencyIds: serialized.dependencyIds,
-      createdAt: serialized.createdAt,
-      receiptOrder: serialized.receiptOrder,
-      createdByPublicKey: serialized.createdByPublicKey,
-      decryptionKeyId: serialized.decryptionKeyId,
-      snapshotHeadHashes: serialized.snapshotHeadHashes,
-      snapshotHeadEntryIds: serialized.snapshotHeadEntryIds,
-      signature: this.base64ToUint8Array(serialized.signature),
-      metadataSignature: serialized.metadataSignature
-        ? this.base64ToUint8Array(serialized.metadataSignature)
-        : undefined,
-      originalSize: serialized.originalSize,
-      encryptedSize: serialized.encryptedSize,
-      receivedAt: serialized.receivedAt,
-      receivedByPublicKey: serialized.receivedByPublicKey,
-      receivedDateSignature: serialized.receivedDateSignature
-        ? this.base64ToUint8Array(serialized.receivedDateSignature)
-        : undefined,
-      attachmentRefs: serialized.attachmentRefs,
-      provenance: serialized.provenance,
-      entryVersion: serialized.entryVersion,
-    };
+    return decodeEntryMetadata(serialized);
   }
 
   /**
    * Serialize StoreEntry for network transmission.
    */
   private serializeEntry(entry: StoreEntry): SerializedEntry {
-    return {
-      ...this.serializeEntryMetadata(entry),
-      encryptedData: this.uint8ArrayToBase64(entry.encryptedData),
-    };
+    return serializeStoreEntry(entry);
   }
-}
-
-// Types for serialized network data (Uint8Array converted to base64)
-interface SerializedEntryMetadata {
-  entryType: StoreEntryType;
-  id: string;
-  contentHash: string;
-  docId: string;
-  dependencyIds: string[];
-  createdAt: number;
-  receiptOrder?: number;
-  createdByPublicKey: string;
-  decryptionKeyId: string;
-  snapshotHeadHashes?: string[];
-  snapshotHeadEntryIds?: string[];
-  signature: string; // base64
-  metadataSignature?: string; // base64 (author metadata-binding signature)
-  originalSize: number;
-  encryptedSize: number;
-  // Access-control witness receipt (docs/accesscontrol.md §5).
-  receivedAt?: number;
-  receivedByPublicKey?: string;
-  receivedDateSignature?: string; // base64
-  // Signed attachment snapshot (plain JSON; see StoreEntryMetadata.attachmentRefs).
-  attachmentRefs?: StoreEntryAttachmentRef[];
-  // Copy provenance (plain JSON; see StoreEntryMetadata.provenance).
-  provenance?: EntryProvenance;
-  // Writer-era version discriminator (see StoreEntryMetadata.entryVersion).
-  entryVersion?: number;
-}
-
-interface SerializedEntry extends SerializedEntryMetadata {
-  encryptedData: string; // base64
 }
 
 interface SerializedNetworkEncryptedEntry extends SerializedEntryMetadata {

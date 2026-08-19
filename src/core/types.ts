@@ -1371,6 +1371,12 @@ export interface StoreEntryMetadata {
    * Sealed-document recipient block (docs/userkeys.md §9.7). Present only on
    * entries that change the recipient set. Bound into `metadataSignature` as
    * tagged trailing block `0x03`.
+   *
+   * Plain JSON (wraps carry base64 ciphertext) so it survives the on-disk,
+   * IndexedDB and network serializers without per-field binary handling. The
+   * HTTP codec MUST include this field: dropping it on the wire makes the
+   * server rebuild signing bytes without the recipients block and reject the
+   * entry as an invalid author signature.
    */
   recipients?: import("./userkeys/sealedTypes").EntryRecipients;
 

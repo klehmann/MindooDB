@@ -33,7 +33,8 @@ import type { StoreEntryAttachmentRef, StoreEntryMetadata } from "../types";
  * optional block whose absence produces ZERO bytes (so the layout is
  * byte-identical to the prior version for entries that do not carry the new
  * data) does NOT bump this value. The `attachmentRefs` block and the
- * `provenance` block (see {@link buildEntrySigningBytes}) are such extensions:
+ * `provenance` block and the `recipients` block (see {@link buildEntrySigningBytes})
+ * are such extensions:
  * entries without attachments and without provenance — including every entry
  * signed before those fields existed — are unaffected and keep verifying.
  */
@@ -223,6 +224,9 @@ function pushInt64BE(parts: Uint8Array[], value: number): void {
  *  || len(sourceSigningBytes)       || sourceSigningBytes   (recursive layout)
  *  || len(sourceMetadataSignature)  || sourceMetadataSignature (raw bytes,
  *                                      zero-length when absent)
+ *  -- trailing recipients block, PRESENT ONLY IF recipients.wraps.length > 0 --
+ *  || 0x03                          (ENTRY_RECIPIENTS_BLOCK_TAG)
+ *  || len(JSON.stringify(recipients)) || JSON.stringify(recipients)
  * ```
  *
  * Both trailing blocks are deliberately backward-compatible extensions: each is

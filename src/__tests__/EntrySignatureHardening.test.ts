@@ -283,6 +283,86 @@ describe("attachmentRefs signed trailing block (backward-compatible extension)",
   });
 });
 
+describe("recipients signed trailing block (backward-compatible extension)", () => {
+  const encryptedData = new Uint8Array([7, 7, 7]);
+  const toHex = (u: Uint8Array) =>
+    Array.from(u).map((x) => x.toString(16).padStart(2, "0")).join("");
+
+  const sampleRecipients = {
+    epoch: 1,
+    bundle: "bundle-b64",
+    wraps: [
+      { kind: "user" as const, keyFingerprint: "fp-alice", wrapped: "wrap-alice" },
+    ],
+  };
+
+  async function baseFields() {
+    return {
+      entryType: "doc_create" as const,
+      id: "entry-1",
+      docId: "doc-1",
+      decryptionKeyId: "$sealed:doc-1",
+      createdAt: 1_700_000_000_000,
+      dependencyIds: [] as string[],
+      contentHash: await sha256Hex(encryptedData),
+      createdByPublicKey: "k",
+    };
+  }
+
+  test("empty wraps, undefined, and absent recipients all produce identical (legacy) bytes", async () => {
+    const fields = await baseFields();
+    const absent = toHex(buildEntrySigningBytes(entrySignatureFieldsFromEntry({ ...fields })));
+    const emptyWraps = toHex(
+      buildEntrySigningBytes(
+        entrySignatureFieldsFromEntry({ ...fields, recipients: { epoch: 1, bundle: "", wraps: [] } }),
+      ),
+    );
+    const undef = toHex(
+      buildEntrySigningBytes(
+        entrySignatureFieldsFromEntry({ ...fields, recipients: undefined }),
+      ),
+    );
+    expect(emptyWraps).toEqual(absent);
+    expect(undef).toEqual(absent);
+  });
+
+  test("non-empty recipients change the signed bytes (the block is bound)", async () => {
+    const fields = await baseFields();
+    const without = toHex(buildEntrySigningBytes(entrySignatureFieldsFromEntry({ ...fields })));
+    const withRecipients = toHex(
+      buildEntrySigningBytes(
+        entrySignatureFieldsFromEntry({ ...fields, recipients: sampleRecipients }),
+      ),
+    );
+    expect(withRecipients).not.toEqual(without);
+  });
+
+  test("a signed recipient-bearing entry verifies; stripping recipients fails", async () => {
+    const { privateKey, publicKeyPem } = await generateEd25519();
+    const fields = await baseFields();
+    const meta = {
+      ...fields,
+      createdByPublicKey: publicKeyPem,
+      signature: new Uint8Array(),
+      originalSize: 3,
+      encryptedSize: encryptedData.length,
+      recipients: sampleRecipients,
+    } as unknown as StoreEntryMetadata;
+    meta.metadataSignature = await signEntryMetadata(
+      entrySignatureFieldsFromEntry(meta),
+      privateKey,
+      subtle,
+    );
+
+    expect(await verifyEntrySignatureCrypto(meta, encryptedData, publicKeyPem, subtle)).toBe(true);
+
+    const stripped = { ...meta, recipients: undefined } as StoreEntryMetadata;
+    expect(
+      await verifyEntrySignatureCrypto(stripped, encryptedData, publicKeyPem, subtle),
+    ).toBe(false);
+  });
+});
+
 describe("PBKDF2 stored-iteration floor (audit #3)", () => {
   test("floors an attacker-lowered iteration count to the minimum", () => {
     expect(resolveStoredIterations(1)).toBe(MIN_PBKDF2_ITERATIONS);
