@@ -1060,6 +1060,26 @@ describe("System Admin Security", () => {
         { Authorization: `Bearer ${tokenA}` },
       );
       expect(status).toBe(403);
+
+      // A 403 alone would also be reported by a handler that deleted first and
+      // rejected afterwards, so confirm B survived.
+      const { body: listBody } = await httpRequest(
+        `${setup.baseUrl}/system/tenants`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${sysToken}` },
+      );
+      expect((listBody as { tenants: string[] }).tenants).toContain("tenant-b-own");
+
+      // The same token still deletes A's own tenant, so the denial above was
+      // about scope rather than a bad token.
+      const ownDelete = await httpRequest(
+        `${setup.baseUrl}/system/tenants/tenant-a-own`,
+        "DELETE",
+        undefined,
+        { Authorization: `Bearer ${tokenA}` },
+      );
+      expect(ownDelete.status).toBe(200);
     });
   });
 
