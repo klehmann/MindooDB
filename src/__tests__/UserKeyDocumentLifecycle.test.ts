@@ -138,6 +138,26 @@ describe("userkey document lifecycle", () => {
     expect(restored!.doc.isDeleted()).toBe(false);
   });
 
+  it("lets the admin delete a published user-key document by username", async () => {
+    const iris = await addPerson(fixture, "iris", "one");
+    await iris.factory.ensureUserKeyPair!(iris.user, iris.password);
+    await syncAll(fixture, "directory");
+    iris.tenant.noteUserDirectoryFetched!();
+    await iris.tenant.reconcileUserKeys!({ allowSelfCreate: true });
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+    const before = await iris.tenant.getUserKeyManager().publishedUserKeyFor(iris.username);
+    expect(before).not.toBeNull();
+
+    await fixture.host.tenant.getUserKeyManager().deletePublishedUserKeyFor({
+      username: iris.username,
+      signingKeyPair: fixture.adminUser.userSigningKeyPair,
+      signingKeyPassword: fixture.adminPassword,
+    });
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+    const after = await iris.tenant.getUserKeyManager().publishedUserKeyFor(iris.username);
+    expect(after).toBeNull();
+  });
+
   it("validate rejects a forged document signed by a stranger", async () => {
     const directory = await alice1.tenant.openDirectory();
     const hashes = await directory.getUsernameHashCandidates!(alice1.username);

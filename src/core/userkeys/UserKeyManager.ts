@@ -4,7 +4,7 @@ import { extractRevokedKeyPairs } from "../accesscontrol/grantKeys";
 import { encryptPrivateKey } from "../crypto/privateKeyEncryption";
 import { RSAEncryption } from "../crypto/RSAEncryption";
 import { generateRsaOaep3072, importRsaOaepPrivateKey } from "../crypto/rsaOaep3072";
-import type { EncryptionKeyPair, MindooDB, MindooDoc, PrivateUserId } from "../types";
+import type { EncryptionKeyPair, MindooDB, MindooDoc, PrivateUserId, SigningKeyPair } from "../types";
 import { DEFAULT_TENANT_KEY_ID, USER_DIRECTORY_DB_ID } from "../types";
 import { fingerprintEncryptionPublicKey } from "./fingerprint";
 import { resolveUserKeyDocument } from "./resolveUserKeyDocument";
@@ -1129,27 +1129,35 @@ export class UserKeyManager {
     });
   }
 
+  /**
+   * Admin-only delete of the published user-key document for `username`.
+   * Lookup uses the same grant-binding path as {@link publishedUserKeyFor}.
+   * Recovery path when every device that held the private key is gone.
+   * A remaining enrolled device keeps local access; it does not republish
+   * the tombstone on unlock while `default` is already wrapped to that user.
+   */
+  async deletePublishedUserKeyFor(input: {
+    username: string;
+    signingKeyPair: SigningKeyPair;
+    signingKeyPassword: string;
+  }): Promise<void> {
+    const resolved = await this.resolvePublishedUserKeyDocument(input.username);
+    if (!resolved) {
+      throw new Error(`No published personal key document for "${input.username}".`);
+    }
+    const db = await this.openUserDirectory();
+    await db.deleteDocument(resolved.doc.getId(), {
+      signingKeyPair: input.signingKeyPair,
+      signingKeyPassword: input.signingKeyPassword,
+    });
+  }
+
   async publishedUserKeyFor(username: string): Promise<{
     publicKey: string;
     fingerprint: string;
     pending: boolean;
   } | null> {
-    // Lookup only — Trap 1 (no mint from local emptiness) does not apply.
-    // Haven reopens a fresh tenant per action; blocking on
-    // `userDirectoryFetched` made wrapKeyForUser return null so
-    // `acl_keydistribution_default` never gained a User-Key wrap.
-    const directory = await this.directory();
-    const db = await this.openUserDirectory();
-    const hashes = await directory.getUsernameHashCandidates(username);
-    const grants = await directory.findGrantAccessDocuments(username);
-    const resolved = await resolveUserKeyDocument({
-      db,
-      directory,
-      username,
-      usernameHashCandidates: hashes,
-      grantDocIds: grants.map((g) => g.getId()),
-      adminPublicKey: this.tenant.getAdministrationPublicKey(),
-    });
+    const resolved = await this.resolvePublishedUserKeyDocument(username);
     if (!resolved) return null;
     const epoch = currentUserKeyEpoch(resolved.payload);
     if (!epoch) return null;
@@ -1159,6 +1167,27 @@ export class UserKeyManager {
       fingerprint: gen.fingerprint,
       pending: isPendingUserKeyDocument(resolved.payload),
     };
+  }
+
+  /**
+   * Lookup only — Trap 1 (no mint from local emptiness) does not apply.
+   * Haven reopens a fresh tenant per action; blocking on
+   * `userDirectoryFetched` made wrapKeyForUser return null so
+   * `acl_keydistribution_default` never gained a User-Key wrap.
+   */
+  private async resolvePublishedUserKeyDocument(username: string) {
+    const directory = await this.directory();
+    const db = await this.openUserDirectory();
+    const hashes = await directory.getUsernameHashCandidates(username);
+    const grants = await directory.findGrantAccessDocuments(username);
+    return resolveUserKeyDocument({
+      db,
+      directory,
+      username,
+      usernameHashCandidates: hashes,
+      grantDocIds: grants.map((g) => g.getId()),
+      adminPublicKey: this.tenant.getAdministrationPublicKey(),
+    });
   }
 
   async getEnrollmentStatus(): Promise<UserKeyEnrollmentStatus> {

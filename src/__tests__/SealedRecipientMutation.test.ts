@@ -7,6 +7,7 @@ import {
 } from "./_helpers/multiDevice";
 import { USER_DIRECTORY_DB_ID } from "../core/types";
 import { DocumentNotFoundError } from "../core/errors";
+import { formatCanonicalUsernameLabel } from "../core/userid/canonicalUsername";
 
 async function publishUserKey(device: DeviceHandle): Promise<void> {
   await device.factory.ensureUserKeyPair!(device.user, device.password);
@@ -74,8 +75,14 @@ describe("sealed recipient mutation", () => {
     const result = await db.setRecipients!(doc, [carol.username]);
     expect(result.rotated).toBe(true);
     const labels = doc.getRecipients().map((r) => r.label);
-    expect(labels).toEqual(expect.arrayContaining([alice.username, carol.username]));
+    expect(labels).toEqual(
+      expect.arrayContaining([
+        formatCanonicalUsernameLabel(alice.username),
+        formatCanonicalUsernameLabel(carol.username),
+      ]),
+    );
     expect(labels).not.toContain(bob.username);
+    expect(labels).not.toContain(formatCanonicalUsernameLabel(bob.username));
   });
 
   it("canonicalizes mixed-case usernames in _encryptFor and isEncryptedFor", async () => {
@@ -84,8 +91,16 @@ describe("sealed recipient mutation", () => {
       recipients: [`cn=${bob.username.split("/")[0].slice(3)}/o=${fixture.tenantId.toUpperCase()}`],
     });
     const canonicalBob = `CN=bob/O=${fixture.tenantId.toLowerCase()}`;
-    const encryptFor = (doc.getData() as { _encryptFor: Record<string, unknown> })._encryptFor;
+    const encryptFor = (doc.getData() as {
+      _encryptFor: Record<string, { label?: string }>;
+    })._encryptFor;
     expect(encryptFor[canonicalBob]).toBeDefined();
+    expect(encryptFor[canonicalBob].label).toBe(
+      `cn=bob/o=${fixture.tenantId.toUpperCase()}`,
+    );
+    expect(encryptFor[`CN=alice/O=${fixture.tenantId.toLowerCase()}`]?.label).toBe(
+      formatCanonicalUsernameLabel(alice.username),
+    );
     expect(doc.isEncryptedFor(bob.username)).toBe(true);
     expect(doc.isEncryptedFor([`cn=bob/o=${fixture.tenantId}`, alice.username])).toBe(true);
     expect(doc.isEncryptedFor(carol.username)).toBe(false);

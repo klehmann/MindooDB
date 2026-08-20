@@ -2,7 +2,11 @@ import type { BaseMindooTenant } from "../BaseMindooTenant";
 import { extractActiveKeyPairs } from "../accesscontrol/grantKeys";
 import { DIRECTORY_DB_ID } from "../types";
 import type { MindooDocPayload } from "../types";
-import { canonicalizeUsername, usernamesEqual } from "../userid/canonicalUsername";
+import {
+  canonicalizeUsername,
+  formatCanonicalUsernameLabel,
+  usernamesEqual,
+} from "../userid/canonicalUsername";
 import { fingerprintEncryptionPublicKey } from "./fingerprint";
 import { sealBundle } from "./sealedCrypto";
 import {
@@ -108,7 +112,7 @@ export async function resolveRecipientSpecs(input: {
   const strict = input.options?.strict === true;
   const specs = [...input.specs];
   if (includeSelf) {
-    const me = canonicalizeUsername((await input.tenant.getCurrentUserId()).username);
+    const me = (await input.tenant.getCurrentUserId()).username;
     const already = specs.some((spec) => {
       const name = typeof spec === "string" ? spec : "user" in spec ? spec.user : null;
       if (name == null) return false;
@@ -216,7 +220,7 @@ async function resolveUserTarget(
     stableId: canonical,
     keyFingerprint: published.fingerprint,
     publicKeyPem: published.publicKey,
-    label: canonical,
+    label: formatCanonicalUsernameLabel(username),
   };
 }
 

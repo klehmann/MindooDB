@@ -11,6 +11,10 @@
  * way Haven does (`cn=` first, `ou=` middle, `o=` last), then uppercase types
  * and lowercase NFKC-normalized values. The result must include `O=`; the
  * tenant id is a random string and must not be substituted for the organization.
+ *
+ * Display / `_encryptFor.label` ({@link formatCanonicalUsernameLabel}) uses the
+ * same expand, but lowercase types and the original value case so UI chips can
+ * abbreviate to `Maya Chen/Acme` instead of the persist key `maya chen/acme`.
  */
 
 const CANONICAL_PART_PATTERN = /^\s*([^=]+)\s*=\s*(.*?)\s*$/;
@@ -190,11 +194,11 @@ export function getCanonicalNameVariants(value: string | undefined | null) {
   return Array.from(new Set([normalized, abbreviated, commonName].filter(Boolean)));
 }
 
-/**
- * Stable `_encryptFor` map key: Haven expand, then uppercase types and
- * lowercase NFKC values. Throws if the name has no organization after expand.
- */
-export function canonicalizeUsername(username: string): string {
+function parseExpandedRdns(
+  username: string,
+  typeCase: "upper" | "lower",
+  valueCase: "lower" | "preserve",
+): Array<{ type: string; value: string }> {
   const trimmed = username.trim().normalize("NFKC");
   if (!trimmed) {
     throw new Error("Username must not be empty");
@@ -208,18 +212,41 @@ export function canonicalizeUsername(username: string): string {
         `Username must include an organization (O=...): got "${username.trim()}"`,
       );
     }
+    const type = match[1].trim();
+    const value = match[2].trim();
     rdns.push({
-      type: match[1].trim().toUpperCase(),
-      value: match[2].trim().toLowerCase(),
+      type: typeCase === "upper" ? type.toUpperCase() : type.toLowerCase(),
+      value: valueCase === "lower" ? value.toLowerCase() : value,
     });
   }
-  const org = rdns.find((rdn) => rdn.type === "O")?.value;
-  if (!org) {
+  const orgType = typeCase === "upper" ? "O" : "o";
+  if (!rdns.some((rdn) => rdn.type === orgType && rdn.value)) {
     throw new Error(
       `Username must include an organization (O=...): got "${username.trim()}"`,
     );
   }
-  return rdns.map((rdn) => `${rdn.type}=${rdn.value}`).join("/");
+  return rdns;
+}
+
+/**
+ * Stable `_encryptFor` map key: Haven expand, then uppercase types and
+ * lowercase NFKC values. Throws if the name has no organization after expand.
+ */
+export function canonicalizeUsername(username: string): string {
+  return parseExpandedRdns(username, "upper", "lower")
+    .map((rdn) => `${rdn.type}=${rdn.value}`)
+    .join("/");
+}
+
+/**
+ * Display spelling for `_encryptFor.label` and similar UI fields: Haven expand,
+ * lowercase attribute types, keep value case. Persist map keys stay on
+ * {@link canonicalizeUsername}.
+ */
+export function formatCanonicalUsernameLabel(username: string): string {
+  return parseExpandedRdns(username, "lower", "preserve")
+    .map((rdn) => `${rdn.type}=${rdn.value}`)
+    .join("/");
 }
 
 export function usernamesEqual(a: string, b: string): boolean {

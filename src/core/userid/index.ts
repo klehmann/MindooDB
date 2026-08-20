@@ -6,6 +6,7 @@ export {
   canonicalizeUsername,
   expandAbbreviatedName,
   formatCanonicalDisplayName,
+  formatCanonicalUsernameLabel,
   getCanonicalNameVariants,
   isCanonicalName,
   normalizeCanonicalNameForComparison,

@@ -4,6 +4,7 @@ import {
   canonicalizeUsername,
   expandAbbreviatedName,
   formatCanonicalDisplayName,
+  formatCanonicalUsernameLabel,
   getCanonicalNameVariants,
   isCanonicalName,
   normalizeCanonicalNameForComparison,
@@ -121,5 +122,30 @@ describe("canonicalizeUsername", () => {
   it("throws when no organization can be derived from the value", () => {
     expect(() => canonicalizeUsername("alice")).toThrow(/organization/i);
     expect(() => canonicalizeUsername("CN=alice")).toThrow(/organization/i);
+  });
+});
+
+describe("formatCanonicalUsernameLabel", () => {
+  it("lowercases attribute types and keeps value case", () => {
+    expect(formatCanonicalUsernameLabel("CN=Maya Chen/O=Acme")).toBe("cn=Maya Chen/o=Acme");
+    expect(formatCanonicalUsernameLabel("cn=Ada Lovelace/ou=HR/o=Acme")).toBe(
+      "cn=Ada Lovelace/ou=HR/o=Acme",
+    );
+  });
+
+  it("expands abbreviated names without lowercasing values", () => {
+    expect(formatCanonicalUsernameLabel("Maya Chen/Acme")).toBe("cn=Maya Chen/o=Acme");
+    expect(formatCanonicalUsernameLabel("Ada Lovelace/HR/Acme")).toBe(
+      "cn=Ada Lovelace/ou=HR/o=Acme",
+    );
+  });
+
+  it("does not recover case from a persist key", () => {
+    expect(formatCanonicalUsernameLabel("CN=maya chen/O=acme")).toBe("cn=maya chen/o=acme");
+  });
+
+  it("throws when no organization can be derived from the value", () => {
+    expect(() => formatCanonicalUsernameLabel("alice")).toThrow(/organization/i);
+    expect(() => formatCanonicalUsernameLabel("")).toThrow(/empty/i);
   });
 });

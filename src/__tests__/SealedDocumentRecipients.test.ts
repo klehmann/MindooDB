@@ -6,6 +6,7 @@ import {
   type MultiDeviceFixture,
 } from "./_helpers/multiDevice";
 import { USER_DIRECTORY_DB_ID } from "../core/types";
+import { formatCanonicalUsernameLabel } from "../core/userid/canonicalUsername";
 import { isSealedKeyId } from "../core/userkeys/sealedTypes";
 
 describe("sealed document recipients", () => {
@@ -30,7 +31,7 @@ describe("sealed document recipients", () => {
     expect(doc.isSealed()).toBe(true);
     expect(isSealedKeyId(doc.getDecryptionKeyId())).toBe(true);
     expect(doc.getRecipients()).toHaveLength(1);
-    expect(doc.getRecipients()[0].label).toBe(alice.username);
+    expect(doc.getRecipients()[0].label).toBe(formatCanonicalUsernameLabel(alice.username));
   });
 
   it("named recipients can read; others cannot", async () => {

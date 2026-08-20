@@ -6,6 +6,7 @@ import {
   type MultiDeviceFixture,
 } from "./_helpers/multiDevice";
 import { USER_DIRECTORY_DB_ID } from "../core/types";
+import { formatCanonicalUsernameLabel } from "../core/userid/canonicalUsername";
 
 async function publishUserKey(device: DeviceHandle): Promise<void> {
   await device.factory.ensureUserKeyPair!(device.user, device.password);
@@ -53,10 +54,16 @@ describe("sealed recipient concurrency", () => {
     const after = await db.getDocument("shared_note");
     const recipients = after!.getRecipients();
     const labels = recipients.map((r) => r.label);
-    expect(labels).toEqual(expect.arrayContaining([alice.username, carol.username]));
+    expect(labels).toEqual(
+      expect.arrayContaining([
+        formatCanonicalUsernameLabel(alice.username),
+        formatCanonicalUsernameLabel(carol.username),
+      ]),
+    );
+    const bobLabel = formatCanonicalUsernameLabel(bob.username);
     const bobEntry = Object.values(
       (after!.getData() as { _encryptFor?: Record<string, { removedAt?: number; label?: string }> })._encryptFor ?? {},
-    ).find((e) => e.label === bob.username);
+    ).find((e) => e.label === bobLabel);
     expect(bobEntry?.removedAt).toBeDefined();
   });
 });
