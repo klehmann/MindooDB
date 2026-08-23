@@ -154,8 +154,8 @@ export class CapabilityMatcher {
    * Tenant creation targets exactly one path segment under `/system/tenants/`
    * (the new tenant id) — e.g. `/system/tenants/acme`. A prefix (`startsWith`)
    * test over-grants the wildcard tenant-creation principal to sub-resources of
-   * an *existing* tenant such as `/system/tenants/acme/sync-servers` or
-   * `/system/tenants/acme/trigger-sync` (audit #6). Require a segment-exact
+   * an *existing* tenant, e.g. any future `/system/tenants/acme/<sub>` route
+   * (audit #6). Require a segment-exact
    * match so the wildcard authorizes creation only. A trailing slash is allowed
    * but no further path segment.
    */

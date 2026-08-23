@@ -13,6 +13,7 @@ import { MindooDBServerAdmin } from "../../core/MindooDBServerAdmin";
 import type { MindooDBServerInfo } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
+import { isPeerRole } from "./peer/types";
 
 const ENV_PASSWORD = "MINDOODB_SYSTEM_ADMIN_PASSWORD";
 
@@ -204,27 +205,43 @@ function createAdmin(
   });
 }
 
+/**
+ * Register `serverInfo` as a trusted peer on `targetUrl`.
+ *
+ * `peerUrl` and the peer's role travel with the keys: an entry without a url is
+ * a trust relationship only, and the target would accept the peer's inbound
+ * connections but never dial it back. Handing over both ends here is what makes
+ * the link bidirectional without a second manual configuration step on each
+ * node. The role is read from the peer's own `.well-known` info rather than
+ * asked for on the command line, so a node's role is stated once — in its own
+ * config — and propagates from there.
+ */
 async function addTrustedServer(
   targetUrl: string,
-  serverInfo: MindooDBServerInfo,
+  serverInfo: MindooDBServerInfo & { clusterRole?: string },
+  peerUrl: string,
   identity: PrivateUserId,
   password: string,
 ): Promise<void> {
   const admin = createAdmin(targetUrl, identity, password);
+  const peer = {
+    name: serverInfo.name,
+    signingPublicKey: serverInfo.signingPublicKey,
+    encryptionPublicKey: serverInfo.encryptionPublicKey,
+    url: peerUrl,
+    role: isPeerRole(serverInfo.clusterRole) ? serverInfo.clusterRole : undefined,
+  };
   try {
-    await admin.addTrustedServer({
-      name: serverInfo.name,
-      signingPublicKey: serverInfo.signingPublicKey,
-      encryptionPublicKey: serverInfo.encryptionPublicKey,
-    });
-    console.log(`  Added "${serverInfo.name}" to ${targetUrl}`);
+    await admin.addTrustedServer(peer);
+    console.log(`  Added "${serverInfo.name}" (${peerUrl}) to ${targetUrl}`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("409") || /already exists/i.test(msg)) {
-      console.log(`  "${serverInfo.name}" already trusted on ${targetUrl} (skipped)`);
-      return;
-    }
-    throw e;
+    if (!msg.includes("409") && !/already exists/i.test(msg)) throw e;
+    // Already trusted, but possibly from before the url mattered — an entry
+    // without one is never dialled. Update it rather than skipping, so
+    // re-running the CLI repairs a half-configured link.
+    await admin.saveClusterPeer(peer.name, peer);
+    console.log(`  Updated "${serverInfo.name}" (${peerUrl}) on ${targetUrl}`);
   }
 }
 
@@ -280,8 +297,8 @@ async function main(): Promise<void> {
       const existingInfo = await fetchServerInfo(existingUrl);
       console.log(`  Server name: ${existingInfo.name}`);
 
-      await addTrustedServer(existingUrl, newServerInfo, identity, password);
-      await addTrustedServer(options.newServer, existingInfo, identity, password);
+      await addTrustedServer(existingUrl, newServerInfo, options.newServer, identity, password);
+      await addTrustedServer(options.newServer, existingInfo, existingUrl, identity, password);
 
       successCount++;
     } catch (error) {
@@ -306,7 +323,8 @@ async function main(): Promise<void> {
 
   console.log(`\n${newServerInfo.name} is now part of the network.`);
   console.log(
-    "Next step: configure per-tenant sync via POST /system/tenants/:tenantId/sync-servers (see README-server.md).",
+    "Next step: start each node with --auto-sync to begin replication, then watch " +
+      "GET /system/cluster/status (see README-server.md, Clustering).",
   );
 }
 

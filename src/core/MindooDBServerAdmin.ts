@@ -47,17 +47,25 @@ export interface MindooDBServerAdminOptions {
   cryptoAdapter: CryptoAdapter;
 }
 
+/**
+ * One entry of `trusted-servers.json`.
+ *
+ * The keys establish trust; the optional fields turn that trust into an active
+ * replication link. Without a `url` this server accepts the peer's inbound
+ * connections but never dials out to it.
+ */
 interface TrustedServer {
   name: string;
   signingPublicKey: string;
   encryptionPublicKey: string;
-}
-
-interface SyncServerConfig {
-  name: string;
-  url: string;
-  syncIntervalMs?: number;
-  databases: string[];
+  /** Base URL of the peer. Omit for a trust-only entry. */
+  url?: string;
+  /** Which way entries flow. Defaults to `bidirectional`. */
+  direction?: "bidirectional" | "push" | "pull" | "disabled";
+  /** Mesh shape. Defaults to `peer`; two spokes never dial each other. */
+  role?: "peer" | "hub" | "spoke";
+  /** How eagerly attachment blobs follow their documents. Defaults to `eager`. */
+  attachments?: "eager" | "lazy" | "never";
 }
 
 /**
@@ -291,61 +299,93 @@ export class MindooDBServerAdmin {
   }
 
   // =========================================================================
-  // Per-tenant sync server management
+  // Cluster administration
+  //
+  // Every method here answers for the node this client points at. A console
+  // that wants a cluster-wide view creates one client per node and merges the
+  // results — no node reports on behalf of another, because peers trust each
+  // other with data, not with each other's administration.
   // =========================================================================
 
-  /**
-   * List sync server targets configured for one tenant.
-   */
-  async listTenantSyncServers(tenantId: string): Promise<SyncServerConfig[]> {
-    const res = await this.authenticatedRequest(
+  /** This node's peers, their roles and whether a session is live. */
+  async getClusterTopology(): Promise<unknown> {
+    return await this.authenticatedRequest("GET", "/system/cluster/topology");
+  }
+
+  /** Health, lag, retry depth and last error per peer. */
+  async getClusterStatus(): Promise<unknown> {
+    return await this.authenticatedRequest("GET", "/system/cluster/status");
+  }
+
+  /** Per-peer replication state for one tenant. */
+  async getClusterTenantStatus(tenantId: string): Promise<unknown> {
+    return await this.authenticatedRequest(
       "GET",
-      `/system/tenants/${encodeURIComponent(tenantId)}/sync-servers`,
+      `/system/cluster/status/tenants/${encodeURIComponent(tenantId)}`,
     );
-    return (res as { servers: SyncServerConfig[] }).servers;
   }
 
   /**
-   * Add one sync target for a tenant.
+   * Dispatch a cluster action. Returns a `jobId` immediately; poll
+   * {@link getClusterJob} for progress and the result.
+   *
+   * Omit `scope.peer` to act on every peer.
    */
-  async addTenantSyncServer(
-    tenantId: string,
-    config: SyncServerConfig,
-  ): Promise<{ success: boolean; message?: string }> {
-    return await this.authenticatedRequest(
+  async runClusterAction(
+    action: "sync" | "retry-rejected" | "refresh-intersection" | "pause" | "resume",
+    scope: { peer?: string; tenantId?: string; dbId?: string } = {},
+  ): Promise<{ jobId: string; job: unknown }> {
+    return (await this.authenticatedRequest(
       "POST",
-      `/system/tenants/${encodeURIComponent(tenantId)}/sync-servers`,
-      config,
+      `/system/cluster/actions/${action}`,
+      scope,
+    )) as { jobId: string; job: unknown };
+  }
+
+  async getClusterJob(jobId: string): Promise<unknown> {
+    return await this.authenticatedRequest(
+      "GET",
+      `/system/cluster/jobs/${encodeURIComponent(jobId)}`,
     );
   }
 
+  async listClusterJobs(limit = 50): Promise<unknown> {
+    return await this.authenticatedRequest("GET", `/system/cluster/jobs?limit=${limit}`);
+  }
+
   /**
-   * Remove one tenant-specific sync target.
+   * Read the administrative audit log, newest first. `before` is the
+   * `nextCursor` of the previous page.
    */
-  async removeTenantSyncServer(
-    tenantId: string,
-    serverName: string,
-  ): Promise<{ success: boolean; message?: string }> {
+  async getClusterAudit(options: { limit?: number; before?: string } = {}): Promise<unknown> {
+    const params = new URLSearchParams();
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.before) params.set("before", options.before);
+    const query = params.toString();
     return await this.authenticatedRequest(
+      "GET",
+      `/system/cluster/audit${query ? `?${query}` : ""}`,
+    );
+  }
+
+  /** Create or replace a peer's replication settings (url, role, direction). */
+  async saveClusterPeer(
+    name: string,
+    peer: Partial<TrustedServer>,
+    mode: "create" | "update" = "update",
+  ): Promise<{ success: boolean; peer: TrustedServer }> {
+    return (await this.authenticatedRequest(
+      mode === "create" ? "POST" : "PATCH",
+      `/system/cluster/peers/${encodeURIComponent(name)}`,
+      peer,
+    )) as { success: boolean; peer: TrustedServer };
+  }
+
+  async deleteClusterPeer(name: string): Promise<{ success: boolean }> {
+    return (await this.authenticatedRequest(
       "DELETE",
-      `/system/tenants/${encodeURIComponent(tenantId)}/sync-servers/${encodeURIComponent(serverName)}`,
-    );
-  }
-
-  // =========================================================================
-  // Trigger sync
-  // =========================================================================
-
-  /**
-   * Trigger an on-demand sync for one tenant.
-   */
-  async triggerTenantSync(
-    tenantId: string,
-  ): Promise<{ success: boolean; message?: string }> {
-    return await this.authenticatedRequest(
-      "POST",
-      `/system/tenants/${encodeURIComponent(tenantId)}/trigger-sync`,
-    );
+      `/system/cluster/peers/${encodeURIComponent(name)}`,
+    )) as { success: boolean };
   }
 
   // =========================================================================

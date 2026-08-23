@@ -412,6 +412,39 @@ This design means server resources cannot accumulate per client: no cursor table
 
 One honest boundary: there is currently no per-tenant storage quota. A *legitimate*, non-revoked user with a trusted key can push an unbounded volume of validly signed entries into an append-only store. The mitigations today are key revocation (stops further pushes immediately) and remote wipe.
 
+### 5.10 Server-to-server replication
+
+Two MindooDB servers can mirror the tenants they both host. The data path is the protocol described above, unchanged: a peer authenticates once at the cluster level, then speaks the ordinary `/:tenantId/sync/*` routes with that token. There is no second replication format. What is peer-specific is the negotiation around it, under `/system/peer/*`, and three invariants that make repeated runs converge.
+
+#### Session establishment
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /system/peer/challenge` | `{ publicsignkey }` → nonce. Answered only for a key in `trusted-servers.json`; an unknown key gets 401 and learns nothing. |
+| `POST /system/peer/authenticate` | `{ challenge, signature }` → peer token, after Ed25519 verification against the trusted key. |
+| `POST /system/peer/tenant-bloom` | Exchange Bloom summaries of tenant ids (5.4) to compute the shared set. |
+| `GET /system/peer/databases` | Database ids held for one shared tenant. |
+| `GET /system/peer/events` | SSE change feed, filtered to the shared tenants. |
+| `POST /system/peer/sync` | Ask the peer to run a pass towards us. |
+
+A peer token and a system-admin JWT are distinct and not interchangeable in either direction: a peer token is refused by `/system/cluster/*`, and an admin token is refused by `/system/peer/*`.
+
+**Tenant intersection.** Neither side sends a tenant list. Each sends a Bloom summary of its tenant ids and intersects the candidate answer against its own authoritative list, so a false positive costs a wasted candidate and nothing more, and a tenant only one side hosts is never named to the other.
+
+**Access control for a peer.** On the tenant sync routes, a peer token bypasses the per-user gates — grant checks, per-user key resolution, the revoked-key blacklist. Those answer "which subset may this person see", which has no meaning for a replica that mirrors the tenant completely and can decrypt none of it. Withholding entries there would not protect anything; it would produce a silently incomplete mirror. The peer is still bound by trust: unknown keys are refused at the door, and every entry is validated exactly as a client's would be.
+
+#### Convergence invariants
+
+Client sync and server replication differ in one respect that changes the correct behavior on failure: a client is *allowed* to be a partial replica, and two mirrors are not.
+
+**1. Directory first.** Within a tenant, `directory` and `userdirectory` replicate before application databases, in a deterministic order both sides agree on. Application entries are signed by keys the peer only learns from the directory, so any other order rejects entries that are in fact valid.
+
+**2. The cursor holds on rejection.** When the target rejects an entry, a client may skip it and advance its cursor. A peer may not: the cursor stays clamped until the entry is accepted, so the next run retries it. Advancing past a rejected entry would make the divergence permanent and, worse, invisible — both sides would report a clean sync. The same applies to a batch-wide `ACCESS_DENIED` (a purged document, a revoked key): the pair is held and retried, the remaining databases still replicate, and the condition is reported as a backoff rather than an outage. These conditions are usually transient — they resolve once the directory change that caused them has itself replicated.
+
+**3. Receipts are preserved.** An entry arriving from a trusted peer normally carries the witness receipt (§5.2 of the witness layout) of the server that first accepted it. The receiving server verifies that receipt — the witness key must be one it trusts, and the signature must verify over the fields including `dbid`, so a receipt cannot be transplanted between databases — and keeps it. Only an unwitnessed entry is stamped fresh; a receipt that fails verification is a rejection, never a silent overwrite.
+
+Re-stamping would be the easy implementation and it is wrong: `receivedAt` would become the replication time, so every mirrored document would look like it appeared the moment the mirror was set up, and "trusted time" would degrade to "time it reached the last server in the chain". The receipt is safe to carry across servers precisely because it holds no local ordering value — only `receivedAt`, the witness key, and the signature binding them to that entry and database. `receiptOrder`, which *is* local, is not part of it.
+
 ---
 
 ## 6) Security Model
@@ -597,6 +630,17 @@ All `/sync/*` endpoints require `Authorization: Bearer <jwt>`.
 | `POST` | `/sync/getEntriesBinary` | `getEntries` over binary wire format v2 with session-key encryption (sync-v5) |
 | `POST` | `/sync/putEntriesBinary` | `putEntries` over binary wire format v2 (sync-v5) |
 | `GET` | `/sync/:storeKind/events` | SSE live change feed; emits a `change` event after each accepted write (sync-v5) |
+
+Server-to-server only, authenticated with a peer token rather than a user JWT (section 5.10):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/system/peer/challenge` | Request a challenge for a trusted server signing key |
+| `POST` | `/system/peer/authenticate` | Submit signed challenge to receive a peer token |
+| `POST` | `/system/peer/tenant-bloom` | Exchange Bloom summaries of tenant ids to find the shared set |
+| `GET` | `/system/peer/databases` | List database ids held for a shared tenant |
+| `GET` | `/system/peer/events` | SSE change feed across the shared tenants |
+| `POST` | `/system/peer/sync` | Ask the peer to run a sync pass towards the caller |
 
 ### 7.3 Request/response examples
 

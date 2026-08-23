@@ -18,6 +18,16 @@ export interface SyncChangeEvent {
   /** Store head after the write, when the store supports getStoreHead. */
   epoch?: string;
   maxReceiptOrder?: number;
+  /**
+   * Name of the trusted peer whose push produced this write, when it came from
+   * server-to-server replication rather than a client.
+   *
+   * The peer replicator uses it to suppress the obvious loop: entries that
+   * arrived from peer X must not immediately be pushed back to peer X. They
+   * still fan out to every *other* peer, which is how a spoke's write reaches
+   * the rest of the mesh through its hub.
+   */
+  originPeer?: string;
 }
 
 export type SyncChangeListener = (event: SyncChangeEvent) => void;

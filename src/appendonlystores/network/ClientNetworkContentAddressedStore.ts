@@ -84,6 +84,18 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     privateEncryptionKey?: CryptoKey | string;
   } | null = null;
   private _syncAbortSignal?: AbortSignal;
+  /**
+   * Supplies a ready-made bearer token instead of running the tenant
+   * challenge-response handshake.
+   *
+   * Used by server-to-server replication: a peer authenticates once at the
+   * cluster level (`/system/peer/authenticate`) against `trusted-servers.json`
+   * and holds no tenant grant, so the per-tenant handshake would always fail.
+   * Everything else — the entire sync protocol — is identical, which is the
+   * point: the mesh reuses the client protocol rather than inventing a second
+   * replication format.
+   */
+  private externalTokenProvider: (() => Promise<string>) | null = null;
 
   /**
    * Create a new ClientNetworkContentAddressedStore.
@@ -700,7 +712,18 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   /**
    * Ensure we have a valid access token, authenticating if necessary.
    */
+  /**
+   * Route every authenticated call through `provider` instead of the tenant
+   * handshake. See {@link externalTokenProvider}.
+   */
+  setExternalTokenProvider(provider: (() => Promise<string>) | null): void {
+    this.externalTokenProvider = provider;
+  }
+
   private async ensureAuthenticated(): Promise<string> {
+    if (this.externalTokenProvider) {
+      return this.externalTokenProvider();
+    }
     const now = Date.now();
     const sharedState = this.getSharedAuthenticationState();
     const sharedKey = this.getSharedAuthenticationKey();

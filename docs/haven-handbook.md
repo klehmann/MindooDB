@@ -24,7 +24,7 @@ Underneath all of this is the same promise MindooDB makes everywhere else: keys 
 
 If you understand these handful of words, the rest of the handbook reads naturally.
 
-A user identity is your account inside Haven. It is a password-protected file that holds your public details and your encrypted private keys. Identities are created locally in your browser and never leave it unless you choose to export them. Haven can keep several identities side by side and switch between them from the top bar. Losing the password to an identity is permanent — there is no reset link, because nobody outside your device has the key.
+A user identity is your account inside Haven. It is a locally encrypted file that holds your public details and your encrypted private keys, unlocked either by a passkey on your device or by a password you chose. Identities are created locally in your browser and never leave it unless you choose to export them. Haven can keep several identities side by side and switch between them from the top bar. Losing every secret that unlocks an identity is permanent — there is no reset link, because nobody outside your device has the key.
 
 A tenant is your team's private workspace inside MindooDB. Everyone who can see a particular set of databases is a member of the same tenant. Tenants contain a directory database (where user registrations and tenant-wide settings live), one or more application databases, and a set of encryption keys. Tenants are created entirely client-side and can be published to a server when you are ready to collaborate.
 
@@ -34,7 +34,7 @@ A database is a collection of related documents inside a tenant — contacts, in
 
 Every change to a document is signed with the author's private key and appended to the document's history. Each change is also cryptographically linked to the change that came before it, a bit like a blockchain, so the chain of edits forms a tamper-evident sequence rather than a bag of loose revisions. That history is what Haven shows in the Database Browser and the Document History view. Because changes are signed and chained, nobody can quietly rewrite the past: altering or dropping an earlier change would break every link that follows.
 
-A KeyBag is a local, password-protected store of the encryption keys a tenant needs. Each user keeps their own KeyBag in their browser. A default key is shared with every member of a tenant; named keys are extra keys that can be given to a smaller group for sensitive documents.
+A KeyBag is a local, encrypted store of the encryption keys a tenant needs, opened by the identity that owns it. Each user keeps their own KeyBag in their browser. A default key is shared with every member of a tenant; named keys are extra keys that can be given to a smaller group for sensitive documents.
 
 A virtual view is a spreadsheet-like tree that filters, categorizes, sorts, and totals documents. A view can pull from one database, several databases, or even several tenants, which is how you answer questions across data rather than just inside one database.
 
@@ -66,9 +66,11 @@ The Welcome page opens with a short pitch (end-to-end encrypted, local-first, ze
 
 If you are starting fresh, press Create a tenant. The wizard walks you through four steps on a single page.
 
-Step one, create your personal user identity. This is your account inside Haven — a small, password-protected file that holds your public details and your encrypted private keys. You can either reuse the identity that is already unlocked in the top bar, or create a brand-new one by entering a username (for example `cn=user/o=acme`) and a strong password. The password encrypts your private keys; Haven will ask for it every time you use this identity later, and there is no recovery flow, so save it in a password manager before you continue.
+Step one, create your personal user identity. This is your account inside Haven — a small, locally encrypted file that holds your public details and your encrypted private keys. You can either reuse the identity that is already unlocked in the top bar, or create a brand-new one by entering a username (for example `cn=user/o=acme`).
 
-Step two, set up a separate admin identity. MindooDB deliberately keeps the tenant admin and the everyday app user apart, so that a single compromised password cannot take over both directory management and day-to-day document work. The wizard creates the admin identity for you with its own username and password.
+Then pick how you want to unlock that identity from day to day. Haven pre-selects Passkey when your browser supports it, because it is both the easier and the stronger option: your device asks for Face ID, Touch ID, Windows Hello, or a security key, and derives the key that opens your private keys locally. Password is the alternative, and it is the right choice on a shared device where someone else knows the unlock code, or when you want the same identity to work in the console. Either way the secret stays on this device — there is no recovery flow and no server that can unlock your identity for you, so save whichever secret you chose before you continue. You can add the other method later from Preferences → User ids.
+
+Step two, set up a separate admin identity. MindooDB deliberately keeps the tenant admin and the everyday app user apart, so that a single compromised secret cannot take over both directory management and day-to-day document work. Haven generates a six-word passphrase for the admin identity and shows it once, with buttons to copy it or download it as a text file, and a confirmation field so you cannot skip past it by accident. It is deliberately a passphrase and not a passkey: an admin you can only unlock with this device's Face ID is an admin you lose together with the device, and admin work is exactly what you need after replacing a laptop. Keep it where you keep your other emergency credentials.
 
 Step three, create the tenant itself. Haven generates the encryption keys for the new tenant, stores them in your local KeyBag, and wires up both identities. Everything stays locally in your browser at this stage — nothing has been pushed to a server yet.
 
@@ -107,6 +109,30 @@ A common setup is to run three or four tenants in parallel: one for work, one fo
 Haven is genuinely multi-tenant, not single-tenant-with-switching. You can have several tenants unlocked and active at the same time, mix their data inside a single workspace page, and map databases from different tenants behind separate logical handles to the same application so it can work across organisational boundaries without ever seeing more than it should. Virtual views take this one step further: a single view can pull from several databases across several tenants and categorize, sort, and total their documents as if they were one data set. For example, a personal planning view can combine your private to-do list with the work tasks assigned to you in the company tenant, even though the two data sets are encrypted with completely different keys and synced to completely different servers.
 
 Add tenants whenever a new context appears. Leaving them side by side is cheap, and the cryptographic separation means you never have to worry about data leaking from one into another.
+
+## Using Haven on more than one device
+
+Haven keeps your data in the browser it runs in. That is what makes it fast and what keeps your keys off other people's servers, but it also means a second browser — Safari on your iPhone, a work laptop, another installed copy of Haven on the same phone — starts out as a stranger. It has its own storage, its own device keys, and no way to read anything until a device you already trust lets it in. This section is about that moment.
+
+Two different permissions are involved, and keeping them apart is what makes the model safe. The first is permission to sync: a tenant admin grants your username access, and from then on the server is willing to hand your devices encrypted data. The second is permission to read: the keys that turn that ciphertext back into documents. A server can grant the first, because it is only moving bytes around, but it can never grant the second, since it has never held a key. So a brand-new device can finish a sync, hold every byte of a database locally, and still have nothing in it that it can read. Haven never lists a document it cannot decrypt, so the symptom is not a row that refuses to open: it is a database that looks empty, or a view that is much shorter than you expected, on a device that just reported a successful sync. That is not a bug and not a half-finished join; it is the design, and the banner described below is what tells the two apart. The Database Browser also puts a number on it: its heading counts the documents you can read and, when this device holds documents your keys cannot open, says how many are hidden — "Documents (3) · 7 hidden" is a device that has ten and can read three. The number counts what has arrived here, not what the tenant holds, so it grows as a sync brings more in.
+
+What bridges the gap is your user key. Every person in a tenant has exactly one — an encryption keypair that belongs to you rather than to a device or to the tenant itself. Its public half is published inside the tenant so teammates and admins can encrypt for you, which is how the tenant's default key reaches you in the first place. Its private half exists only on the devices you have approved. Approving a device means writing one more copy of that private half into the tenant's user directory, wrapped so that only the new device's own key can open it. The server stores and relays that copy like everything else, without ever being able to read it.
+
+On the new device you will see a banner along the bottom of the screen: This device is waiting for approval. It names which access is stuck — for example "Tenant acme · on Server1/ACME", where the second half is the server's own canonical name, the same one the Servers tab shows, falling back to its address if it never reported one — because the same tenant can be synced through more than one server at once, and a bare "waiting" tells you nothing in that situation. Underneath, it names the keys you are missing, so you know what will come back when the wait is over: documents that need the default key stay hidden until then. If you joined several tenants from this device, a line tells you how many more are queued behind this one. The banner deliberately sits on every page rather than only in the workspace, because a device without keys is locked out everywhere and the way out has to stay in reach. Check again re-reads the directory on the spot; Open restore leads to the last resort described at the end of this section.
+
+On a device that is already approved, the other half of the handshake arrives as a dialog shortly after you unlock: Approve a new device. It shows the device's label, the same tenant-and-server line so you can see what you are about to hand out, and when the device was added. Approve this device writes the wrapped copy of your user key and pushes it out. Not now postpones the question until the next time Haven starts, which is the right answer when you are mid-task and the device is genuinely yours. Don't ask again is the firm answer: the device is recorded as declined, every approved device stops asking about it, and it appears as Hidden in your device list. Declining does not throw the device off the tenant — it can still sync — it simply never receives keys, so everything it syncs stays invisible to it. When several devices are waiting, Haven asks about them one at a time.
+
+Approval travels through the tenant's user directory, which makes it a sync rather than a live handshake. The two devices never talk to each other directly and the approving device does not have to stay open: the approval is written, pushed to the server, and picked up by the waiting device the next time it pulls — on the next directory sync, when you press Check again, or when Haven next starts. If neither device can reach the server, nothing moves until one of them can.
+
+Preferences → User ids has the full picture under Your devices, and that is where you go when a dialog was dismissed or a decline needs undoing. Each row is one device with its label, when it was added, which tenant it belongs to, and its status: Approved, Waiting for approval, or Hidden. Waiting devices get an Approve button, hidden ones an Allow anyway button that puts the device back into the waiting state so it can be approved normally. One rule surprises people the first time: approval has to come from a device that is already approved. A device still waiting for its own approval sees that sentence instead of a button and cannot let itself in — if it could, the whole mechanism would be decoration. It also means the second device on a published tenant has to be approved from the first one, so approve it while you still have both.
+
+If a tenant was never published, none of this appears. There is no user directory on a server to consult and no other device to ask, so the first device seals its own user key and gets on with it. The flow starts mattering the moment a tenant lives on a server and a second device shows up.
+
+There is one more case where Haven asks nothing at all. If you grant the join request for your new device yourself, from a device that already holds your user key, the copy is written as part of granting access and the newcomer arrives able to read straight away. Silence is the good outcome there, not a missing step. It is when somebody else approves the join — a tenant admin registering you, typically — that the new device lands in the waiting state and needs one of your own devices to finish the job.
+
+Sometimes Haven cannot tell. An amber banner saying Haven could not yet tell whether this device is approved means the user directory could not be read at all — usually because the server is unreachable — rather than that somebody declined you. Check the network and press Check again. Where re-checking could never change the answer, Haven stays quiet instead of leaving a banner up forever.
+
+The one situation this flow cannot repair is losing every approved device at once, because then nobody is left to approve the replacement. That is what the tenant recovery printout on the Backup tab is for, and why the waiting banner links straight to the Restore tab. Print one per tenant while things are calm; the section on Backup and Restore explains what it holds.
 
 ## Workspace
 
@@ -198,7 +224,7 @@ Nothing in the Document History view can be edited. It is a faithful, read-only 
 
 ## Preferences
 
-Preferences is the one screen that is organized as a tab bar instead of a single page. It has five tabs: General, User ids, Tenants, Backup, and Stats. Everything on these tabs lives in this browser and, with a few exceptions in Tenants, does not touch the server.
+Preferences is the one screen that is organized as a tab bar instead of a single page. It has six tabs: General, User ids, Tenants, Backup, Restore, and Stats. Everything on these tabs lives in this browser and, with a few exceptions in Tenants, does not touch the server.
 
 ### General
 
@@ -214,11 +240,21 @@ An Optimize for iOS multitasking toggle near the bottom of the tab tells Haven t
 
 ### User ids
 
-A user identity is your account inside Haven, and this tab is where you manage your stored identities. Each row is one identity with its username and creation date. The Switch action makes that identity the active one for this Haven session. Only one identity is unlocked at a time — if something on another screen complains that it cannot read a tenant, the wrong identity is usually unlocked.
+A user identity is your account inside Haven, and this tab is where you manage your stored identities. Each row is one identity with its username, what it unlocks with, and its creation date; admin identities are marked with an Administrator tag so they are easy to tell apart from everyday users. The Switch action makes that identity the active one for this Haven session — for a passkey identity that is a single button and a Face ID prompt instead of a typed password. Only one identity is unlocked at a time; if something on another screen complains that it cannot read a tenant, the wrong identity is usually unlocked.
 
-Create generates a brand-new identity directly in the browser. Haven asks for a username and a password; the password encrypts the new private keys before they are stored. Import brings in a .json file that was previously exported from Haven (for example on another device or by a teammate) and asks for the password that was used when the file was exported.
+Create generates a brand-new identity directly in the browser and offers the same passkey-or-password choice as the Welcome wizard. Import brings in a .json file that was previously exported from Haven or created by the MindooDB console (for example on another device or by a teammate) and asks for the password that was used when the file was exported.
 
-Change password re-encrypts an identity's private keys and the tenant KeyBags that depend on it. Haven does this in one step so the new password works everywhere immediately. Pick a strong password and store it somewhere you can find again, because there is no reset link: if you forget the new password, every tenant tied to this identity becomes unreadable, even on devices that already had the data. Save the password to a password manager before pressing Save.
+The Unlocks with column tells you which secrets currently open an identity, and one button changes that: Sign-in options. It repeats what opens the selected identity today and then offers only the changes that fit it: an identity that already has a password is not offered a second one, and an identity without a passkey has none to remove, so the list is two or three entries rather than a wall of greyed-out buttons. The exception is an action that does fit the identity but that a rule forbids — that one stays in the list with the reason written in place of its description, because the reason is usually the way forward. An administrator identity says why it stays password-only, and Remove password on an identity that has no passkey yet says to add one first instead of simply refusing.
+
+Add a passkey registers this device's authenticator for an identity that only had a password; your password keeps working exactly as before, so this is a safe thing to do on every device you use. Remove passkeys drops the registered authenticators again. Add a password does the reverse, and matters mainly for exports: the console and the SDK run in Node, where there is no authenticator to ask, so a passkey-only identity cannot be opened outside this browser. If you ask for a full export of a passkey-only identity, Haven does not grey the menu item out — it asks for a password first, adds it alongside the passkey, and then writes the file. Nothing is re-encrypted in the process; the identity simply gains a second way in.
+
+Remove password is the option to think about twice. It leaves an identity that only its passkey opens, which is the stronger setup — there is no typed secret left to phish, reuse, or forget — but it also narrows the ways back in down to one. Haven refuses outright unless a passkey is registered, because an identity with no unlock method left is unrecoverable: the key that opens the private keys exists only inside those wrappers. Even with a passkey in place, keep an encrypted backup: a passkey that does not sync lives in this one authenticator, and the backup file is what turns a lost laptop into "restore and type the backup password" instead of a lost identity. Full identity export stays blocked while no password exists, for the Node reason above, and adding one back is a two-field dialog away.
+
+Change password sits in the same list. For an identity whose unlock methods are wrappers around an internal key — anything created recently, and anything that has ever had a passkey — Haven replaces only the password wrapper, so every registered passkey stays valid and no KeyBag has to be rebuilt. For an older identity whose password encrypts the private keys directly, Haven re-encrypts those and the tenant KeyBags that depend on them in one step, so the new password works everywhere immediately. Either way, pick a strong password and store it somewhere you can find again, because there is no reset link: if you forget the new password, every tenant tied to this identity becomes unreadable, even on devices that already had the data. Save it to a password manager before pressing Save.
+
+If an identity was created with a password before passkeys existed, Haven offers to add one the next time you unlock it. Accepting takes one Face ID prompt and leaves the password in place as a fallback. Choosing Keep using the password is a permanent answer for this device: Haven remembers it and never asks again for that identity, and Sign-in options on this tab stays available if you change your mind later. Closing the dialog with the X or Escape only postpones the question, so you can decide at the next unlock. Removing a passkey again also counts as an answer — Haven will not start offering one on every unlock afterwards.
+
+Below the identity table, once an identity is unlocked, Your devices lists every device that holds — or is waiting to hold — that person's user key, one row per device and tenant, with an Approve or Allow anyway action where you are allowed to use it. This is the panel behind the approval flow described under Using Haven on more than one device, and the place to go when you dismissed the approval dialog too quickly.
 
 ### Tenants
 
@@ -226,19 +262,33 @@ A tenant is your team's private workspace, and this tab lists every tenant Haven
 
 Opening a tenant shows its key fingerprints and where it is currently published. The fingerprints come from the local KeyBag for the active user, so they only appear once that user is unlocked. Treat fingerprints as proof of identity for the tenant's encryption keys: if two team members compare them in person and they match, you can be confident nobody swapped a key in between.
 
+Actions that touch the tenant directory — publishing a tenant, or granting a teammate access from a join request — are signed by the admin identity, so Haven asks for its passphrase. Because those tasks usually come in batches, the prompt offers to unlock the admin for this session: tick it once and the following steps stop asking. Unlocking an admin this way does not switch your active identity, so your everyday user stays the one doing document work, and a Lock administrator action ends it early when you are done.
+
 New tenants always start in this browser for the active user. Publishing pushes the tenant to a MindooDB server so other team members can join. Deleting from a server removes the tenant location from that server only — the local copy stays put. Publishing and deleting on a server require a system admin password, because they touch shared infrastructure; if you are not the platform admin, ask them to run the action with you.
 
 Be careful with delete-on-server. It wipes that server's view of the tenant for every user, not just yours, and other clients may suddenly fail to sync. Confirm it with the platform admin and any other team admins first, and make sure a current encrypted backup exists before pressing the button.
 
 ### Backup
 
-Haven keeps almost everything in this browser. The Backup tab is the safety net: you can back that up to an encrypted file, restore a backup later, or wipe Haven entirely.
+Haven keeps almost everything in this browser. The Backup tab is the safety net, and it offers two very different nets: an encrypted file that holds everything, and a paper printout that can bring a single tenant back from nothing. Putting either one back — and wiping Haven — happens on the Restore tab next door.
 
-An encrypted backup is a single file that contains everything Haven keeps in this browser: saved users, tenants, applications, hosted app files, workspace layout, virtual views, and the local IndexedDB content. You choose a backup password, and Haven uses it to encrypt the file before it is downloaded. The password itself is never stored anywhere — Haven cannot show it to you later and cannot help you recover the backup if you lose it. Downloads use the .mdbhaven-backup extension so they are easy to spot in a downloads folder.
+An encrypted backup is a single file that contains everything Haven keeps in this browser: saved users, tenants, applications, hosted app files, workspace layout, virtual views, and the local IndexedDB content. You choose a backup password, and Haven uses it to encrypt the file before it is downloaded. There is exactly one backup password for the whole file, no matter how many identities are inside it. The password itself is never stored anywhere — Haven cannot show it to you later and cannot help you recover the backup if you lose it. Downloads use the .mdbhaven-backup extension so they are easy to spot in a downloads folder.
 
-Restore happens in two steps, both deliberate. The first step, Preview, decrypts the file just enough to show you a summary of what is inside: counts of identities, tenants, applications, IndexedDB databases, and any restore warnings. Nothing local is touched yet. Some backups contain databases that cannot be moved across browsers as-is; the preview shows a warning per affected database with whether it will be rebuilt empty or skipped. Rebuild means the database will be created empty and refilled from sync. Skip means it will not be restored at all and you will need to reconnect that source manually.
+Identities that unlock with a passkey need one extra consideration, because a passkey cannot leave the device that holds it — that is the whole point of a passkey, and it is also why restoring on a new laptop would otherwise hand you an identity nobody can open. Haven solves this inside the file rather than by weakening your device: for each passkey-only identity it adds a copy of the unlock key that opens with your backup password. Your local identity is untouched and keeps its passkey. If any of those identities are currently locked, Haven asks for the passkey once while the download is being prepared. The practical consequence is that the backup password is as valuable as the identities in the file: treat it like a master key and store it accordingly.
+
+The second card on the tab is the tenant recovery printout, and it answers a different question: what survives when no browser does. It covers one tenant at a time and holds only what cannot be downloaded again — the user and admin identities you select, their KeyBag keys, the server URL, and the sync setup — so that a later sync can fetch the actual documents from the server. It deliberately contains no document data, which also means it is of no use for a tenant that was never published. You choose a secret question, which is printed on the sheet, and an answer, which is not; the answer is what decrypts the sheet later. Haven then spreads the encrypted payload across eight QR codes with enough redundancy that any six of them suffice, so a coffee stain or a torn corner does not cost you the tenant. Store it where you keep passports, not where you keep printouts.
+
+### Restore
+
+The Restore tab is where a backup comes back, and where Haven can be wiped when nothing else helps.
+
+Restoring an encrypted backup file happens in two steps, both deliberate. The first step, Preview, decrypts the file just enough to show you a summary of what is inside: counts of identities, tenants, applications, IndexedDB databases, and any restore warnings. Nothing local is touched yet. Some backups contain databases that cannot be moved across browsers as-is; the preview shows a warning per affected database with whether it will be rebuilt empty or skipped. Rebuild means the database will be created empty and refilled from sync. Skip means it will not be restored at all and you will need to reconnect that source manually.
 
 The second step, Restore and reload, wipes the current Haven state in this browser and writes the backup back. Haven reloads automatically and you end up signed in to the restored data. Because restore deletes the current state first, anything that was not exported and not synced will be gone. Export a fresh encrypted backup of the current state before pressing Restore, just in case.
+
+After a restore on a different device or browser, identities that used to unlock with a passkey will ask for the backup password instead, and the unlock dialog says so. The passkey stayed on the old device, so this is expected rather than a sign that something went wrong. Unlock the identity once with the backup password and then use Add a passkey to register the new device's authenticator; from that point on the identity behaves exactly as it did before.
+
+Restoring from a tenant recovery printout uses the second card and the same two-step caution. Scan the QR codes with the device's camera or paste their contents, answer the secret question, and Haven puts the identities, KeyBag material, server URL, and sync setup back. Nothing else travels on paper, so run a sync afterwards to pull the tenant's documents down again. This is also the way back when every approved device for a tenant is gone and there is nobody left to approve a new one.
 
 Factory reset is at the bottom of the tab. It wipes everything Haven knows in this browser — identities, tenants, applications, hosted app files, virtual views, workspace layout, and all synced MindooDB data — and returns Haven to its brand-new state. Because it is irreversible, Haven asks you to type a confirmation phrase before the button becomes active, and then asks the browser for one more confirmation. Treat factory reset as a last resort and only after a known-good backup exists.
 
@@ -272,9 +322,11 @@ After install, always launch Haven from the home screen icon when you are on a p
 
 If you want to explain Haven to someone in one minute, this is the summary.
 
-Every user has a cryptographic identity made of an Ed25519 signing key and an RSA-OAEP encryption key. Both private keys are encrypted with a password you choose, stored locally in the browser, and never transmitted. That identity is what unlocks tenants and signs your changes.
+Every user has a cryptographic identity made of an Ed25519 signing key and an RSA-OAEP encryption key. Both private keys are encrypted with a secret only you hold, stored locally in the browser, and never transmitted. That identity is what unlocks tenants and signs your changes.
 
-Each tenant has a KeyBag — a password-protected store of encryption keys. The default key is shared with every member of the tenant and encrypts documents unless a more specific key is chosen. Named keys give fine-grained access to a smaller group for especially sensitive documents. All of this lives on your device; the server never sees keys.
+The secret can be a password or a passkey, and both end up in the same place. Haven gives each identity one internal random key that encrypts the private keys, then wraps that key once per unlock method: a password wrap derived with PBKDF2, and a passkey wrap derived from the WebAuthn PRF extension. Adding or removing an unlock method only adds or removes a wrapper, which is why you can have both at once and why neither one ever learns the other's secret. The same mechanism is what makes a YubiKey work: to WebAuthn a security key and a built-in Face ID sensor are the same kind of authenticator, so Haven does not exclude roaming keys — pick a YubiKey if you want the unlock secret to live on something you can put in a drawer rather than on the laptop itself. What does not exist is a cloud copy: nothing is escrowed to MindooDB, to Apple, or to your browser vendor, and a passkey is not synced into an iCloud or Google device backup in a form Haven could recover. That is the deliberate trade — no server can be compelled to unlock your data, and no server can help you if you lose every secret you had. Your encrypted backup file is the recovery story, which is why the Backup tab is not optional.
+
+Each tenant has a KeyBag — an encrypted store of encryption keys, opened by the identity that owns it. The default key is shared with every member of the tenant and encrypts documents unless a more specific key is chosen. Named keys give fine-grained access to a smaller group for especially sensitive documents. All of this lives on your device; the server never sees keys.
 
 Every document is an Automerge CRDT stored in a content-addressed store. Every change is signed with your Ed25519 key and encrypted with AES-256-GCM before it ever leaves the browser. The server stores and relays ciphertext and can never read your data, even if it is fully compromised. Transport adds a second layer of per-user RSA-OAEP encryption, and TLS wraps the whole thing as a third layer. Access control is enforced through encryption, which means if you do not have the key, the document is just ciphertext — there is no trusted server to ask for permission and be tricked into giving it.
 
@@ -288,7 +340,11 @@ That, in a minute, is why Haven is private by design rather than by policy.
 
 These are the terms Haven uses across its screens and its help drawer. They are listed roughly in the order you are likely to meet them, not strictly alphabetically, because most of them build on the ones before.
 
-User identity — your account inside Haven. Created locally, protected by a password, and is what unlocks tenants and signs your changes. The Preferences tab calls it User ids.
+User identity — your account inside Haven. Created locally, protected by a passkey or a password, and is what unlocks tenants and signs your changes. The Preferences tab calls it User ids.
+
+Passkey — an unlock method backed by your device's authenticator: Face ID, Touch ID, Windows Hello, or a security key such as a YubiKey. Haven derives the key that opens your private keys from it locally, so the secret never leaves the device and is never sent to a server.
+
+Passphrase — several random words used instead of a password. Haven generates a six-word passphrase for admin identities because it is both stronger than a typical typed password and easy to write down.
 
 Tenant — your team's private workspace inside MindooDB. Groups users, encryption keys, and databases together so a team can share data securely.
 
@@ -298,11 +354,17 @@ App user — a regular user identity inside a tenant. Does everyday document wor
 
 System admin — a server-level identity used to manage a MindooDB server itself: connecting Haven to it, trusting other servers, and bootstrapping new tenants.
 
-KeyBag — a local, password-protected key store that holds the encryption keys a tenant needs. Each user keeps their own in this browser.
+KeyBag — a local, encrypted key store that holds the encryption keys a tenant needs, opened by the identity that owns it. Each user keeps their own in this browser.
 
 Default key — the encryption key shared with every member of a tenant. If a document does not specify a named key, it is encrypted with the default key.
 
 Named key — an extra encryption key shared only with selected users. Useful for sensitive documents that should not be visible to the whole tenant.
+
+User key — an encryption keypair that belongs to a person rather than to a device or a tenant. Its public half is published in the tenant so others can encrypt for you (this is how the default key reaches you); its private half lives only on the devices you approved. One user key per person, one wrapped copy per approved device.
+
+Device approval — the step that lets a new browser or phone read a tenant's documents. An already-approved device writes a copy of your user key for the newcomer; until that happens the new device can sync ciphertext but not open it. Approval always has to come from a device that is already approved.
+
+Tenant recovery printout — a printable sheet of redundant QR codes for one tenant, holding identities, KeyBag keys, and the server and sync setup, but no documents. Created on the Backup tab, restored on the Restore tab, and the only way back when every approved device is gone.
 
 Signed change — every edit to a document is signed with the author's private key. This proves who made the change and prevents anyone from forging history later.
 
@@ -374,7 +436,7 @@ Install prompt — the browser-native sheet that confirms adding a progressive w
 
 Encrypted backup — a single file containing everything Haven keeps in this browser, scrambled with a password you choose. Without that password the file is unreadable.
 
-Backup password — the password used to encrypt and later decrypt a backup file. Haven never stores it; if you lose it the backup cannot be restored.
+Backup password — the single password used to encrypt and later decrypt a backup file, whatever the identities inside it unlock with. It also opens any passkey-only identity restored from that file on a new device. Haven never stores it; if you lose it the backup cannot be restored.
 
 Preview restore — a safe step that decrypts a backup file just enough to show you what it contains, before any local data is touched.
 

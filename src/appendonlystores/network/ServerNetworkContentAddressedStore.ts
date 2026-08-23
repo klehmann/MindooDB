@@ -33,6 +33,10 @@ import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/netw
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import { verifyEntrySignatureCrypto } from "../../core/crypto/EntrySignature";
 import { computeContentHash } from "../../core/utils/idGeneration";
+import {
+  verifyWitnessReceipt,
+  witnessFieldsFromEntry,
+} from "../../core/crypto/WitnessReceipt";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
@@ -96,6 +100,34 @@ export type ServerRevokedKeyResolver = (
  */
 export type ServerPurgedDocResolver = () => Promise<Set<string>> | Set<string>;
 
+/**
+ * A trusted peer server, resolved from a `/system/peer/*` JWT.
+ *
+ * A peer is not a tenant user: it holds no grant in the tenant directory and
+ * cannot decrypt anything it relays. It authenticates against
+ * `trusted-servers.json` at the cluster level and then mirrors the tenant's
+ * encrypted stores wholesale.
+ */
+export interface ServerPeerPrincipal {
+  name: string;
+  signingPublicKey: string;
+  encryptionPublicKey: string;
+}
+
+/** Resolve a bearer token to a trusted peer, or null when it is not a peer token. */
+export type ServerPeerTokenResolver = (
+  token: string,
+) => Promise<ServerPeerPrincipal | null>;
+
+/** Is this witness key one we trust to have stamped a receipt? */
+export type ServerTrustedWitnessResolver = (receivedByPublicKey: string) => boolean;
+
+/**
+ * A validated token payload, plus the peer identity when the caller
+ * authenticated as a trusted server rather than as a tenant user.
+ */
+type ResolvedTokenPayload = NetworkAuthTokenPayload & { peer?: ServerPeerPrincipal };
+
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
 export interface ServerAccessControlOptions {
   /** The trusted-time provider used to stamp receipts on accepted entries (§5, §13). */
@@ -136,6 +168,17 @@ export interface ServerAccessControlOptions {
    * before they are witnessed. Independent of the ACL master switch.
    */
   builtinWriteContext?: BuiltinWriteContext;
+  /**
+   * Resolves a bearer token to a trusted peer server (server-to-server
+   * replication). Tried only after the tenant `AuthenticationService` has
+   * rejected the token, so client behavior is untouched.
+   */
+  peerTokenResolver?: ServerPeerTokenResolver;
+  /**
+   * Decides whether a witness key on an incoming entry is trusted
+   * (convergence invariant 2). Only consulted for peer pushes.
+   */
+  trustedWitnessResolver?: ServerTrustedWitnessResolver;
 }
 
 /**
@@ -183,6 +226,10 @@ export class ServerNetworkContentAddressedStore {
   private purgedDocResolver?: ServerPurgedDocResolver;
   /** Optional builtin write-invariant context for `userdirectory`. */
   private builtinWriteContext?: BuiltinWriteContext;
+  /** Optional peer-token resolver enabling server-to-server replication. */
+  private peerTokenResolver?: ServerPeerTokenResolver;
+  /** Optional trusted-witness check used to preserve replicated receipts. */
+  private trustedWitnessResolver?: ServerTrustedWitnessResolver;
   /** Cached `username_hash` per userdirectory docId, filled as creates are seen. */
   private userdirectoryHashByDocId = new Map<string, string>();
   /** The directory database id, where grant documents live (§6.5). */
@@ -229,6 +276,8 @@ export class ServerNetworkContentAddressedStore {
     this.revokedKeyResolver = accessControl?.revokedKeyResolver;
     this.purgedDocResolver = accessControl?.purgedDocResolver;
     this.builtinWriteContext = accessControl?.builtinWriteContext;
+    this.peerTokenResolver = accessControl?.peerTokenResolver;
+    this.trustedWitnessResolver = accessControl?.trustedWitnessResolver;
   }
 
   /**
@@ -239,8 +288,13 @@ export class ServerNetworkContentAddressedStore {
    * is found.
    */
   private async resolveReaderEncryptionKey(
-    payload: NetworkAuthTokenPayload,
+    payload: ResolvedTokenPayload,
   ): Promise<string | null> {
+    // A peer has no directory grant; its transport key comes from the
+    // trusted-servers entry that authenticated it.
+    if (payload.peer) {
+      return payload.peer.encryptionPublicKey;
+    }
     if (payload.deviceSigningKey && typeof this.directory.getUserBySigningPublicKey === "function") {
       const lookup = await this.directory.getUserBySigningPublicKey(payload.deviceSigningKey);
       if (lookup?.encryptionPublicKey) {
@@ -307,8 +361,11 @@ export class ServerNetworkContentAddressedStore {
    * per request and reused across the per-entry filter.
    */
   private async resolveRevokedKeyIds(
-    payload: NetworkAuthTokenPayload,
+    payload: ResolvedTokenPayload,
   ): Promise<Set<string> | null> {
+    // Per-user blacklist; a peer replica has no user principal to resolve it
+    // for and must mirror the store completely.
+    if (payload.peer) return null;
     if (!this.revokedKeyResolver) return null;
     if (this.localStore.getId() === ServerNetworkContentAddressedStore.DIRECTORY_DB_ID) {
       return null;
@@ -853,6 +910,9 @@ export class ServerNetworkContentAddressedStore {
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
 
+    // Server-to-server push: enables witness-receipt preservation below.
+    const peerIngest = tokenPayload.peer !== undefined;
+
     // A wipe-targeted device may not push anything (§6.5): it exists only to
     // receive the wipe directive and then delete its local copy.
     if (tokenPayload.wipe && this.wipeGrantDocIdResolver) {
@@ -1039,7 +1099,31 @@ export class ServerNetworkContentAddressedStore {
       // server would collapse every old doc onto "today" and re-introduce the
       // "access since: today" bug. Only witness-era writers (`entryVersion`
       // present) are eligible for a receipt.
-      if (
+      //
+      // Convergence invariant 2 (peer replication): an entry arriving from a
+      // trusted peer usually already carries the receipt of the server that
+      // first accepted it. Re-stamping it would set `receivedAt = now` on
+      // documents that are years old — exactly the "access since: today" bug
+      // the legacy-entry rule above guards against, but for every replicated
+      // document. The receipt is safe to carry across servers because
+      // `StampedWitnessFields` holds no local ordering value: only
+      // `receivedAt`, the witness key, and the signature binding them to this
+      // entry and database. So verify the signature against a witness we trust
+      // and keep it. A receipt that fails verification is a rejection, never a
+      // silent overwrite.
+      if (peerIngest && this.hasWitnessReceipt(entry)) {
+        const preserved = await this.verifyReplicatedReceipt(entry, dbId);
+        if (!preserved) {
+          this.rejectEntry(
+            rejected,
+            entry.id,
+            `Entry ${entry.id} carries a witness receipt that is not verifiable against a trusted server`,
+          );
+          continue;
+        }
+        toStore.push(entry);
+        stampedMetadata.push(this.toMetadata(entry));
+      } else if (
         this.timestampProvider
         && entry.entryVersion !== undefined
         && entry.createdByPublicKey !== this.timestampProvider.issuerPublicKey
@@ -1109,6 +1193,64 @@ export class ServerNetworkContentAddressedStore {
       return `Entry ${entry.id} denied by userdirectory invariant: ${decision.reason}`;
     }
     return null;
+  }
+
+  /** Does this entry already carry a complete witness receipt? */
+  private hasWitnessReceipt(
+    entry: StoreEntry,
+  ): entry is StoreEntry & {
+    receivedAt: number;
+    receivedByPublicKey: string;
+    receivedDateSignature: Uint8Array;
+  } {
+    return (
+      typeof entry.receivedAt === "number" &&
+      typeof entry.receivedByPublicKey === "string" &&
+      entry.receivedByPublicKey.length > 0 &&
+      entry.receivedDateSignature !== undefined &&
+      entry.receivedDateSignature !== null
+    );
+  }
+
+  /**
+   * Verify a receipt that travelled with an entry from another server
+   * (convergence invariant 2).
+   *
+   * Two conditions, both required: the witness key must be one this node
+   * trusts (its own, or an entry in `trusted-servers.json`), and the signature
+   * must verify over the §5.2 layout — including `dbid`, so a receipt cannot be
+   * transplanted from one database onto another.
+   */
+  private async verifyReplicatedReceipt(
+    entry: StoreEntry & {
+      receivedAt: number;
+      receivedByPublicKey: string;
+      receivedDateSignature: Uint8Array;
+    },
+    dbid: string,
+  ): Promise<boolean> {
+    const witnessKey = entry.receivedByPublicKey;
+    const isOwnWitnessKey = this.timestampProvider?.issuerPublicKey === witnessKey;
+    if (!isOwnWitnessKey && !this.trustedWitnessResolver?.(witnessKey)) {
+      return false;
+    }
+
+    try {
+      const fields = witnessFieldsFromEntry(entry, {
+        dbid,
+        receivedAt: entry.receivedAt,
+        receivedByPublicKey: witnessKey,
+      });
+      return await verifyWitnessReceipt(
+        fields,
+        entry.receivedDateSignature,
+        witnessKey,
+        this.cryptoAdapter.getSubtle(),
+      );
+    } catch (error) {
+      this.logger.warn(`Failed to verify replicated witness receipt for ${entry.id}`, error);
+      return false;
+    }
   }
 
   /** Record a per-entry rejection (signature-class failure) and log it. */
@@ -1247,10 +1389,31 @@ export class ServerNetworkContentAddressedStore {
    * @returns The token payload
    * @throws NetworkError if token is invalid
    */
-  private async validateToken(token: string): Promise<NetworkAuthTokenPayload> {
+  private async validateToken(token: string): Promise<ResolvedTokenPayload> {
     const payload = await this.authService.validateToken(token);
-    
+
     if (!payload) {
+      // Server-to-server replication: a trusted peer authenticates once at the
+      // cluster level (`/system/peer/authenticate`) and then speaks the ordinary
+      // client sync protocol with that token. It holds no tenant grant, so the
+      // tenant AuthenticationService is expected to reject it.
+      //
+      // Per-user gates below are deliberately not applied to a peer. They
+      // answer "which subset may this person see", which has no meaning for a
+      // replica whose job is to mirror the tenant completely and which cannot
+      // decrypt any of it. Withholding entries here would not protect anything
+      // — it would just produce a silently incomplete mirror.
+      const peer = await this.peerTokenResolver?.(token);
+      if (peer) {
+        const now = Math.floor(Date.now() / 1000);
+        return {
+          sub: peer.name,
+          iat: now,
+          exp: now,
+          tenantId: this.witnessDbid ?? this.localStore.getId(),
+          peer,
+        };
+      }
       throw new NetworkError(
         NetworkErrorType.INVALID_TOKEN,
         "Invalid or expired token"

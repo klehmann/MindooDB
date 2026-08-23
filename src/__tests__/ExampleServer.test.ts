@@ -1056,87 +1056,176 @@ describe("Server Network Management", () => {
     });
   });
 
-  describe("Per-tenant sync server API", () => {
-    const tenantId = "network-test-tenant";
-
-    test("GET should return empty array for tenant with no sync servers", async () => {
+  describe("Cluster peer API", () => {
+    test("GET /system/cluster/topology reports this node and its peers", async () => {
       const { status, body } = await httpRequest(
-        `${baseUrl}/system/tenants/${tenantId}/sync-servers`,
+        `${baseUrl}/system/cluster/topology`,
         "GET",
         undefined,
         { Authorization: `Bearer ${systemAdminToken}` },
       );
       expect(status).toBe(200);
-      expect((body as { servers: unknown[] }).servers).toEqual([]);
+      expect((body as { server: { name: string; role: string } }).server).toMatchObject({
+        name: "CN=test-network-server",
+        role: "peer",
+      });
+      expect((body as { peers: unknown[] }).peers).toEqual([]);
     });
 
-    test("POST should add a sync server", async () => {
+    test("GET /system/cluster/status is healthy with no peers configured", async () => {
       const { status, body } = await httpRequest(
-        `${baseUrl}/system/tenants/${tenantId}/sync-servers`,
+        `${baseUrl}/system/cluster/status`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ health: "ok", peers: [] });
+    });
+
+    test("PATCH /system/cluster/peers rejects an unknown peer", async () => {
+      const { status } = await httpRequest(
+        `${baseUrl}/system/cluster/peers/${encodeURIComponent("CN=nope")}`,
+        "PATCH",
+        { url: "https://nope.example.com" },
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      expect(status).toBe(404);
+    });
+
+    test("POST /system/cluster/peers stores url and role, and shows up in topology", async () => {
+      const create = await httpRequest(
+        `${baseUrl}/system/cluster/peers/${encodeURIComponent("CN=peer-1")}`,
         "POST",
         {
-          name: "CN=remote-server-1",
-          url: "https://s1.example.com",
-          syncIntervalMs: 60000,
-          databases: ["directory", "main"],
+          signingPublicKey: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----",
+          encryptionPublicKey: "-----BEGIN PUBLIC KEY-----\nBBBB\n-----END PUBLIC KEY-----",
+          url: "https://peer1.example.com",
+          role: "hub",
+          attachments: "lazy",
         },
         { Authorization: `Bearer ${systemAdminToken}` },
       );
-      expect(status).toBe(201);
-      expect(body).toMatchObject({ success: true });
-    });
+      expect(create.status).toBe(201);
 
-    test("GET should return the added sync server", async () => {
-      const { status, body } = await httpRequest(
-        `${baseUrl}/system/tenants/${tenantId}/sync-servers`,
+      const { body } = await httpRequest(
+        `${baseUrl}/system/cluster/topology`,
         "GET",
         undefined,
         { Authorization: `Bearer ${systemAdminToken}` },
       );
-      expect(status).toBe(200);
-      const servers = (body as { servers: any[] }).servers;
-      expect(servers).toHaveLength(1);
-      expect(servers[0]).toMatchObject({
-        name: "CN=remote-server-1",
-        url: "https://s1.example.com",
-        syncIntervalMs: 60000,
-        databases: ["directory", "main"],
-      });
+      expect((body as { peers: any[] }).peers).toContainEqual(
+        expect.objectContaining({
+          name: "CN=peer-1",
+          url: "https://peer1.example.com",
+          role: "hub",
+          attachments: "lazy",
+        }),
+      );
     });
 
-    test("POST should reject request without databases", async () => {
+    test("POST /system/cluster/peers rejects an invalid role", async () => {
       const { status, body } = await httpRequest(
-        `${baseUrl}/system/tenants/${tenantId}/sync-servers`,
+        `${baseUrl}/system/cluster/peers/${encodeURIComponent("CN=peer-2")}`,
         "POST",
-        { name: "CN=no-dbs", url: "https://s2.example.com" },
+        {
+          signingPublicKey: "-----BEGIN PUBLIC KEY-----\nCCCC\n-----END PUBLIC KEY-----",
+          encryptionPublicKey: "-----BEGIN PUBLIC KEY-----\nDDDD\n-----END PUBLIC KEY-----",
+          role: "overlord",
+        },
         { Authorization: `Bearer ${systemAdminToken}` },
       );
       expect(status).toBe(400);
-      expect(body).toMatchObject({
-        error: expect.stringContaining("databases"),
+      expect(body).toMatchObject({ error: expect.stringContaining("role") });
+    });
+
+    test("a cluster action returns a job id and is written to the audit log", async () => {
+      const action = await httpRequest(
+        `${baseUrl}/system/cluster/actions/refresh-intersection`,
+        "POST",
+        { peer: "CN=peer-1" },
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      expect(action.status).toBe(202);
+      const jobId = (action.body as { jobId: string }).jobId;
+      expect(jobId).toBeTruthy();
+
+      const audit = await httpRequest(
+        `${baseUrl}/system/cluster/audit`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      expect(audit.status).toBe(200);
+      const records = (audit.body as { records: any[] }).records;
+      expect(records[0]).toMatchObject({
+        action: "refresh-intersection",
+        jobId,
+        outcome: "accepted",
+        scope: { peer: "CN=peer-1" },
+      });
+      // Admin-blindness: an audit record names the scope, never a document.
+      expect(JSON.stringify(records)).not.toContain("docId");
+    });
+
+    test("an action against an unknown peer is rejected and audited as such", async () => {
+      const { status } = await httpRequest(
+        `${baseUrl}/system/cluster/actions/sync`,
+        "POST",
+        { peer: "CN=ghost" },
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      expect(status).toBe(400);
+
+      const audit = await httpRequest(
+        `${baseUrl}/system/cluster/audit`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      expect((audit.body as { records: any[] }).records[0]).toMatchObject({
+        action: "sync",
+        outcome: "rejected",
       });
     });
 
-    test("DELETE should remove a sync server", async () => {
-      await httpRequest(
-        `${baseUrl}/system/tenants/${tenantId}/sync-servers`,
-        "POST",
-        {
-          name: "CN=to-delete",
-          url: "https://delete-me.example.com",
-          databases: ["main"],
-        },
-        { Authorization: `Bearer ${systemAdminToken}` },
-      );
-
-      const { status, body } = await httpRequest(
-        `${baseUrl}/system/tenants/${tenantId}/sync-servers/${encodeURIComponent("CN=to-delete")}`,
+    test("DELETE /system/cluster/peers removes the peer", async () => {
+      const { status } = await httpRequest(
+        `${baseUrl}/system/cluster/peers/${encodeURIComponent("CN=peer-1")}`,
         "DELETE",
         undefined,
         { Authorization: `Bearer ${systemAdminToken}` },
       );
       expect(status).toBe(200);
-      expect(body).toMatchObject({ success: true });
+
+      const { body } = await httpRequest(
+        `${baseUrl}/system/cluster/topology`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      expect((body as { peers: unknown[] }).peers).toEqual([]);
+    });
+  });
+
+  describe("Peer protocol endpoints", () => {
+    test("an unknown signing key gets no challenge", async () => {
+      const { status } = await httpRequest(`${baseUrl}/system/peer/challenge`, "POST", {
+        publicsignkey: "-----BEGIN PUBLIC KEY-----\nZZZZ\n-----END PUBLIC KEY-----",
+      });
+      expect(status).toBe(401);
+    });
+
+    test("peer routes reject a system-admin token", async () => {
+      const { status } = await httpRequest(
+        `${baseUrl}/system/peer/databases?tenantId=network-test-tenant`,
+        "GET",
+        undefined,
+        { Authorization: `Bearer ${systemAdminToken}` },
+      );
+      // Two token classes, deliberately non-interchangeable: an admin JWT must
+      // not let a human write entries as a server identity.
+      expect(status).toBe(401);
     });
   });
 });

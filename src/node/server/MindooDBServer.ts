@@ -35,6 +35,9 @@ import {
   type SerializedEntryMetadata,
 } from "../../core/appendonlystores/network/entryWireCodec";
 import { SyncEventBus } from "./SyncEventBus";
+import { ClusterManager } from "./peer/ClusterManager";
+import { createClusterRouter, createPeerRouter } from "./peer/routes";
+import { isPeerAttachmentMode, isPeerRole, isPeerSyncDirection } from "./peer/types";
 import type {
   StoreEntry,
   StoreEntryMetadata,
@@ -86,7 +89,6 @@ import type {
   ListTenantsResponse,
   TenantPublicInfosFingerprintsResponse,
   TrustedServer,
-  NamedRemoteServerConfig,
 } from "./types";
 import {
   validateIdentifier,
@@ -102,7 +104,6 @@ import {
   MAX_PEM_KEY_LENGTH,
   MAX_SIGNATURE_LENGTH,
   MAX_CHALLENGE_LENGTH,
-  DEFAULT_MAX_SYNC_SERVER_DATABASES,
 } from "./validation";
 import { assertSafeSyncUrl, UnsafeUrlError } from "../../core/utils/urlSafety";
 import { ENV_VARS } from "./types";
@@ -192,26 +193,6 @@ const TIMESTAMP_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
 
-/**
- * The effective max number of database ids per sync-server registration. Reads
- * the `MINDOODB_MAX_SYNC_SERVER_DATABASES` env override and falls back to
- * {@link DEFAULT_MAX_SYNC_SERVER_DATABASES} when unset or invalid (non-integer
- * or non-positive), so a typo can never silently disable the bound.
- */
-function resolveMaxSyncServerDatabases(): number {
-  const raw = process.env[ENV_VARS.MAX_SYNC_SERVER_DATABASES]?.trim();
-  if (!raw) return DEFAULT_MAX_SYNC_SERVER_DATABASES;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    console.warn(
-      `[MindooDBServer] Ignoring invalid ${ENV_VARS.MAX_SYNC_SERVER_DATABASES}="${raw}" ` +
-        `(expected a positive integer); using default ${DEFAULT_MAX_SYNC_SERVER_DATABASES}`,
-    );
-    return DEFAULT_MAX_SYNC_SERVER_DATABASES;
-  }
-  return parsed;
-}
-
 /** Parse a human-readable size string ("5mb", "1024", "100kb") into bytes. */
 function parseBodySizeLimitToBytes(limit: string): number | null {
   const normalized = limit.trim().toLowerCase();
@@ -245,6 +226,8 @@ export class MindooDBServer {
   private capabilityMatcher: CapabilityMatcher;
   private systemAdminAuth: SystemAdminAuthService;
   private deviceDiscovery: DeviceDiscoveryService;
+  /** Peer sessions, replicators, cluster jobs and the audit log. */
+  private cluster: ClusterManager;
   private readonly staticDir: string | undefined;
   private serverConfig: ServerConfig;
   private configPath: string;
@@ -310,6 +293,40 @@ export class MindooDBServer {
       this.tenantManager,
       cryptoAdapter,
     );
+    this.cluster = new ClusterManager({
+      cryptoAdapter,
+      dataDir,
+      eventBus: this.syncEventBus,
+      listTrustedServers: () => this.tenantManager.listTrustedServers(),
+      localServerName: () => this.tenantManager.getServerPublicInfo()?.name ?? null,
+      localSigningPublicKey: () =>
+        this.tenantManager.getServerPublicInfo()?.signingPublicKey ?? null,
+      getSigningKey: async () => (await this.tenantManager.getWitnessSigner())?.signingPrivateKey,
+      getEncryptionKey: () => this.tenantManager.getServerEncryptionPrivateKey(),
+      listTenants: () => this.tenantManager.listTenants(),
+      listDatabases: (tenantId) => this.tenantManager.listDatabases(tenantId),
+      getLocalStore: (tenantId, dbId, storeKind) =>
+        this.tenantManager.getStore(tenantId, dbId, storeKind),
+      localRole: this.serverConfig.cluster?.role,
+    });
+    // Peer tokens are accepted by the tenant sync routes so a peer can mirror
+    // the encrypted stores through the ordinary protocol; the store bypasses
+    // per-user access control for them (see ServerNetworkContentAddressedStore).
+    this.tenantManager.setPeerAccessControl({
+      peerTokenResolver: async (token) => {
+        const payload = await this.cluster.auth.validateToken(token);
+        if (!payload) return null;
+        const trusted = this.cluster.auth.findTrustedServerByKey(payload.publicsignkey);
+        if (!trusted) return null;
+        return {
+          name: trusted.name,
+          signingPublicKey: trusted.signingPublicKey,
+          encryptionPublicKey: trusted.encryptionPublicKey,
+        };
+      },
+      trustedWitnessResolver: (receivedByPublicKey) =>
+        this.cluster.auth.findTrustedServerByKey(receivedByPublicKey) !== null,
+    });
 
     const principalCount = Object.values(this.serverConfig.capabilities).reduce(
       (sum, arr) => sum + arr.length,
@@ -335,6 +352,26 @@ export class MindooDBServer {
 
   getSystemAdminAuth(): SystemAdminAuthService {
     return this.systemAdminAuth;
+  }
+
+  getClusterManager(): ClusterManager {
+    return this.cluster;
+  }
+
+  /**
+   * Begin replicating with every trusted server that has a `url`.
+   *
+   * Separate from the constructor so a server can serve the peer and cluster
+   * endpoints — answering handshakes, status and admin actions — without
+   * dialling out itself. That is what `--auto-sync` toggles, and it is what
+   * makes a passive mirror or a test harness possible.
+   */
+  startCluster(): void {
+    this.cluster.start();
+  }
+
+  async stopCluster(): Promise<void> {
+    await this.cluster.stop();
   }
 
   getServerConfig(): ServerConfig {
@@ -545,6 +582,10 @@ export class MindooDBServer {
       }
       res.json({
         ...info,
+        // Its own mesh role, so `add-to-network` can propagate it into the
+        // other side's trusted-servers entry instead of asking the operator to
+        // repeat it on every node.
+        clusterRole: this.serverConfig.cluster?.role ?? "peer",
         maxJsonRequestBodyLimit: this.jsonBodyLimit,
         maxJsonRequestBodyBytes: this.jsonBodyLimitBytes ?? undefined,
         // Lets a client decide between calling a browser-reachable TSA directly
@@ -555,6 +596,33 @@ export class MindooDBServer {
         },
       });
     });
+    /**
+     * Mirrors of one tenant, for client failover.
+     *
+     * Scoped to the tenant in the query on purpose: a client asking about
+     * tenant A must not learn which other tenants this server replicates, or
+     * to whom. Unauthenticated like the other discovery endpoints — a client
+     * needs it precisely when it cannot reach a server to authenticate with.
+     */
+    this.app.get("/.well-known/mindoodb-cluster", (req, res) => {
+      const tenantId = typeof req.query.tenantId === "string" ? req.query.tenantId.toLowerCase() : "";
+      if (!tenantId) {
+        res.status(400).json({ error: "tenantId query parameter is required" });
+        return;
+      }
+      try {
+        validateTenantId(tenantId);
+      } catch {
+        res.status(400).json({ error: "Invalid tenantId format" });
+        return;
+      }
+      if (!this.tenantManager.tenantExists(tenantId)) {
+        res.status(404).json({ error: "Tenant not found on server" });
+        return;
+      }
+      res.json({ tenantId, mirrors: this.cluster.mirrorsForTenant(tenantId) });
+    });
+
     this.app.get("/.well-known/mindoodb-tenants/:tenantId/publicinfos-fingerprints", async (req, res) => {
       const tenantId = req.params.tenantId.toLowerCase();
       try {
@@ -608,12 +676,34 @@ export class MindooDBServer {
     }
 
     const systemRateLimit = rateLimit({
-      windowMs: 60_000,
-      max: 30,
+      windowMs: this.serverConfig.rateLimits?.system?.windowMs ?? 60_000,
+      max: this.serverConfig.rateLimits?.system?.max ?? 30,
       standardHeaders: true,
       legacyHeaders: false,
       message: { error: "Too many system requests, please try again later" },
     });
+
+    // Peer routes are mounted before the /system chain on purpose. They are
+    // server-to-server traffic, not administration: the admin IP allowlist
+    // would lock out the operator's own cluster, and 30 req/min would throttle
+    // replication to a crawl. They are protected by the peer JWT, which is only
+    // issued to a key in trusted-servers.json.
+    this.app.use(
+      "/system/peer",
+      rateLimit({
+        windowMs: 60_000,
+        max: 600,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: "Too many peer requests, please try again later" },
+      }),
+      createPeerRouter({
+        cluster: this.cluster,
+        eventBus: this.syncEventBus,
+        listTenants: () => this.tenantManager.listTenants(),
+        listDatabases: (tenantId) => this.tenantManager.listDatabases(tenantId),
+      }),
+    );
 
     const systemRouter = Router();
     this.setupSystemRoutes(systemRouter);
@@ -755,6 +845,20 @@ export class MindooDBServer {
     router.post("/auth/authenticate", authenticateRateLimit, this.handleSystemAuthenticate.bind(this));
 
     const authMiddleware = this.systemAdminMiddleware.bind(this);
+
+    // Cluster administration. Behind the same JWT + capability middleware as
+    // the rest of /system, so config.json can grant an auditor principal the
+    // GET routes without granting the POST/PATCH/DELETE ones.
+    router.use(
+      "/cluster",
+      authMiddleware,
+      createClusterRouter({
+        cluster: this.cluster,
+        listTrustedServers: () => this.tenantManager.listTrustedServers(),
+        saveTrustedServer: (peer) => this.tenantManager.saveTrustedServer(peer),
+        removeTrustedServer: (name) => this.tenantManager.removeTrustedServer(name),
+      }),
+    );
 
     // Tenant CRUD
     router.get("/tenants", authMiddleware, (req: Request, res: Response) => {
@@ -904,7 +1008,8 @@ export class MindooDBServer {
 
     router.post("/trusted-servers", authMiddleware, (req: Request, res: Response) => {
       try {
-        const { name, signingPublicKey, encryptionPublicKey } = req.body;
+        const { name, signingPublicKey, encryptionPublicKey, url, direction, role, attachments } =
+          req.body;
 
         if (!name || !signingPublicKey || !encryptionPublicKey) {
           res.status(400).json({ error: "name, signingPublicKey, and encryptionPublicKey are required" });
@@ -916,7 +1021,43 @@ export class MindooDBServer {
         validateStringLength(encryptionPublicKey, MAX_PEM_KEY_LENGTH, "encryptionPublicKey");
 
         const server: TrustedServer = { name, signingPublicKey, encryptionPublicKey };
+
+        // Replication settings are optional: an entry without a url is a trust
+        // relationship only (inbound peers may authenticate, we never dial).
+        if (url !== undefined) {
+          validateStringLength(url, 2048, "url");
+          const allowInsecure = /^(1|true)$/i.test(
+            process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
+          );
+          try {
+            assertSafeSyncUrl(url, {
+              requireHttps: !allowInsecure,
+              allowPrivate: allowInsecure,
+            });
+          } catch (e) {
+            if (e instanceof UnsafeUrlError) {
+              res.status(400).json({ error: e.message });
+              return;
+            }
+            throw e;
+          }
+          server.url = url;
+        }
+        for (const [field, value, guard] of [
+          ["direction", direction, isPeerSyncDirection],
+          ["role", role, isPeerRole],
+          ["attachments", attachments, isPeerAttachmentMode],
+        ] as const) {
+          if (value === undefined) continue;
+          if (!guard(value)) {
+            res.status(400).json({ error: `Invalid ${field}: ${String(value)}` });
+            return;
+          }
+          Object.assign(server, { [field]: value });
+        }
+
         this.tenantManager.addTrustedServer(server);
+        this.cluster.syncReplicators();
 
         res.status(201).json({ success: true, message: `Trusted server "${name}" added` });
       } catch (error) {
@@ -943,6 +1084,8 @@ export class MindooDBServer {
           res.status(404).json({ error: "Trusted server not found" });
           return;
         }
+        // Revoking trust must also stop replicating with that server.
+        this.cluster.syncReplicators();
 
         res.json({ success: true, message: `Trusted server "${serverName}" removed` });
       } catch (error) {
@@ -954,128 +1097,6 @@ export class MindooDBServer {
         res.status(500).json({ error: "Failed to remove trusted server" });
       }
     });
-
-    // Per-tenant sync server management
-    router.get("/tenants/:tenantId/sync-servers", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const tenantId = req.params.tenantId.toLowerCase();
-        try { validateTenantId(tenantId); } catch {
-          res.status(400).json({ error: "Invalid tenantId format" });
-          return;
-        }
-        if (!this.tenantManager.tenantExists(tenantId)) {
-          res.status(404).json({ error: "Tenant not found" });
-          return;
-        }
-        const servers = this.tenantManager.getTenantSyncServers(tenantId);
-        res.json({ servers });
-      } catch (error) {
-        console.error("[MindooDBServer] Error listing sync servers:", error);
-        res.status(500).json({ error: "Failed to list sync servers" });
-      }
-    });
-
-    router.post("/tenants/:tenantId/sync-servers", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const tenantId = req.params.tenantId.toLowerCase();
-        try { validateTenantId(tenantId); } catch {
-          res.status(400).json({ error: "Invalid tenantId format" });
-          return;
-        }
-        if (!this.tenantManager.tenantExists(tenantId)) {
-          res.status(404).json({ error: "Tenant not found" });
-          return;
-        }
-
-        const { name, url, syncIntervalMs, databases } = req.body;
-        if (!name || !url) {
-          res.status(400).json({ error: "name and url are required" });
-          return;
-        }
-        if (!databases || !Array.isArray(databases) || databases.length === 0) {
-          res.status(400).json({ error: "databases array is required and must not be empty" });
-          return;
-        }
-        // Bound and format-validate each database id (audit, Low): these are
-        // used to scope sync and must be safe identifiers, not arbitrary input.
-        // The bound is overridable per deployment via
-        // MINDOODB_MAX_SYNC_SERVER_DATABASES.
-        validateArraySize(databases, resolveMaxSyncServerDatabases(), "databases");
-        for (const db of databases) {
-          validateIdentifier(db, "databases[]");
-        }
-
-        validateStringLength(name, 256, "name");
-        validateStringLength(url, 2048, "url");
-
-        // SSRF guard: an admin-supplied sync URL is fetched server-side, so
-        // reject plaintext/internal targets unless explicitly allowed for dev.
-        const allowInsecure = /^(1|true)$/i.test(
-          process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
-        );
-        try {
-          assertSafeSyncUrl(url, {
-            requireHttps: !allowInsecure,
-            allowPrivate: allowInsecure,
-          });
-        } catch (e) {
-          if (e instanceof UnsafeUrlError) {
-            res.status(400).json({ error: e.message });
-            return;
-          }
-          throw e;
-        }
-
-        const config: NamedRemoteServerConfig = { name, url, databases };
-        if (syncIntervalMs !== undefined) {
-          config.syncIntervalMs = syncIntervalMs;
-        }
-
-        this.tenantManager.addTenantSyncServer(tenantId, config);
-        res.status(201).json({ success: true, message: `Sync server "${name}" configured for tenant ${tenantId}` });
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          res.status(400).json({ error: error.message });
-          return;
-        }
-        console.error("[MindooDBServer] Error adding sync server:", error);
-        res.status(500).json({ error: "Failed to add sync server" });
-      }
-    });
-
-    router.delete("/tenants/:tenantId/sync-servers/:serverName", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const tenantId = req.params.tenantId.toLowerCase();
-        try { validateTenantId(tenantId); } catch {
-          res.status(400).json({ error: "Invalid tenantId format" });
-          return;
-        }
-        if (!this.tenantManager.tenantExists(tenantId)) {
-          res.status(404).json({ error: "Tenant not found" });
-          return;
-        }
-
-        const serverName = decodeURIComponent(req.params.serverName);
-        validateStringLength(serverName, 256, "serverName");
-
-        const removed = this.tenantManager.removeTenantSyncServer(tenantId, serverName);
-        if (!removed) {
-          res.status(404).json({ error: "Sync server not found" });
-          return;
-        }
-        res.json({ success: true, message: `Sync server "${serverName}" removed from tenant ${tenantId}` });
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          res.status(400).json({ error: error.message });
-          return;
-        }
-        console.error("[MindooDBServer] Error removing sync server:", error);
-        res.status(500).json({ error: "Failed to remove sync server" });
-      }
-    });
-
-    // Per-tenant trigger-sync (moved from /:tenantId/admin/trigger-sync)
-    router.post("/tenants/:tenantId/trigger-sync", authMiddleware, this.handleTriggerSync.bind(this));
 
     // Runtime config management
     router.get("/config/backups", authMiddleware, (req: Request, res: Response) => {
@@ -2010,18 +2031,25 @@ export class MindooDBServer {
     if (this.syncEventBus.listenerCount === 0) {
       return;
     }
-    void serverStore
-      .handleGetStoreHead(token)
-      .catch(() => null)
-      .then((head) => {
+    // Peer replicators subscribe to this bus, so a write that arrived from a
+    // peer has to be labelled: without the label it would be pushed straight
+    // back to its origin, and two bidirectional peers would ping-pong.
+    const originPeer = this.cluster?.auth
+      ? this.cluster.auth.validateToken(token).then((payload) => payload?.sub)
+      : Promise.resolve(undefined);
+
+    void Promise.all([serverStore.handleGetStoreHead(token).catch(() => null), originPeer]).then(
+      ([head, peerName]) => {
         this.syncEventBus.publish({
           tenantId,
           dbId,
           storeKind,
           epoch: head?.epoch,
           maxReceiptOrder: head?.maxReceiptOrder,
+          originPeer: peerName,
         });
-      });
+      },
+    );
   }
 
   private async handleGetCompactionStatus(req: Request, res: Response): Promise<void> {
@@ -2454,10 +2482,6 @@ export class MindooDBServer {
   }
 
   // ==================== Management Handlers ====================
-
-  private async handleTriggerSync(req: Request, res: Response): Promise<void> {
-    res.json({ success: true, message: "Sync triggered (not yet implemented)" });
-  }
 
   // ==================== Helper Methods ====================
 

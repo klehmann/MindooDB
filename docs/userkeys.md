@@ -313,6 +313,8 @@ A device that is on the grant but holds no wrap can detect this itself at startu
 
 Derive the message from the keys the device actually holds rather than hard-coding it. Without `default`, almost nothing opens and the message should be prominent. With `default` but without the user key, only personal and per-recipient content is waiting, and the message belongs on those views.
 
+Per database, `db.getInaccessibleDocumentCount()` says how much is actually being withheld, which turns a vague warning into a fact — "3 documents, 7 hidden" rather than a list that looks like the database is nearly empty. The number cannot be derived from the listing APIs: a document that was never readable on this device gets no index entry at all, so `getAllDocumentIds()` and the change feed have nothing to report about it. It is a synchronous read of a tally maintained while syncing and reconciling and persisted with the metadata checkpoint, so it costs nothing to poll after a sync. It counts what has arrived on this device, not what the tenant holds, and includes deleted documents — the presence of a document we cannot decrypt is knowable, its lifecycle state is not.
+
 ### 4.7 Why approval is never automatic
 
 A device is never wrapped on the strength of an admin signature, a join response, or a matching username alone. The attack this prevents is specific: an administrator generates a keypair, appends it to Alice's grant, and waits for one of Alice's honest clients to wrap the key for it. A single client that wraps without asking would hand over everything Alice owns.

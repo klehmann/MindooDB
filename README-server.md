@@ -398,7 +398,9 @@ For key rotation, adding/removing admins, and the full authentication flow (chal
 
 ## Walkthrough: Multi-Server Setup
 
-MindooDB servers can mirror encrypted data between each other. This section covers the full workflow: initializing servers, establishing trust, and configuring per-tenant sync.
+MindooDB servers can mirror encrypted data between each other. This section covers the full workflow: initializing servers, establishing trust, seeding a tenant onto a second server, and running the mesh.
+
+**The model in one paragraph.** Replication is configured per *peer*, not per tenant. Each trusted server with a `url` becomes one replication session, and over that session the two servers mirror **every tenant they both host** — all databases, documents and attachments. Which tenants those are is negotiated, not configured: the peers exchange a Bloom summary of their tenant ids and intersect it, so a tenant only one side hosts is never replicated and the other side never learns it exists. Servers relay encrypted entries and never see plaintext; a mirror is a full replica that cannot read what it stores.
 
 ### 1. Initialize servers
 
@@ -432,15 +434,16 @@ curl https://server1.example.com/.well-known/mindoodb-server-info
 {
   "name": "CN=server1",
   "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-  "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+  "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+  "clusterRole": "peer"
 }
 ```
 
-This eliminates the need to manually copy public keys between servers.
+This eliminates the need to manually copy public keys between servers. `clusterRole` is the role this server announces for itself (`peer`, `hub` or `spoke`), which `add-to-network` records on the other side.
 
 ### 3. Establish trust
 
-The `add-to-network` CLI automates mutual trust exchange. It fetches each server's public keys from `/.well-known/mindoodb-server-info` and calls `POST /system/trusted-servers` on each side using your system admin identity.
+The `add-to-network` CLI automates mutual trust exchange. It fetches each server's public keys, url and cluster role from `/.well-known/mindoodb-server-info` and calls `POST /system/trusted-servers` on each side using your system admin identity. Because it records the peer's url, trust and replication are established in the same step — there is no separate "now configure sync" pass.
 
 ```bash
 printf '%s' 'admin-pass' > ./.admin-password && chmod 600 ./.admin-password
@@ -464,69 +467,46 @@ curl -X POST http://server1:1661/system/trusted-servers \
   -d '{
     "name": "CN=server2",
     "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
-    "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+    "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+    "url": "http://server2:3001",
+    "direction": "bidirectional",
+    "role": "peer",
+    "attachments": "eager"
   }'
 ```
 
-Trust changes take effect immediately -- no restart required.
+Only `name` and the two public keys are required. The rest describe the replication session and all have defaults:
 
-### 4. Publish tenant to servers
+| Field | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `url` | base url | *(none)* | Where to reach the peer. **Without it the server is trusted but never dialled** — it can push to us, we never pull from it. |
+| `direction` | `bidirectional`, `push`, `pull`, `disabled` | `bidirectional` | Which legs are allowed. `pull` makes a read-only mirror; `disabled` keeps the trust but stops replicating. |
+| `role` | `peer`, `hub`, `spoke` | `peer` | Mesh shape. Two `spoke`s do not open a session with each other — they exchange data through their hub. |
+| `attachments` | `eager`, `lazy`, `never` | `eager` | `eager` completes each database before the next. `lazy` replicates every document store first and attachments afterwards, so an interrupted or slow run has spent its bandwidth on the text. `never` mirrors metadata only. |
 
-Reuse the same system admin identity that is authorized in each server's `config.json`:
+Trust and configuration changes take effect immediately -- no restart required.
+
+### 4. Seed the tenant onto both servers
+
+**A tenant is defined by its administration keypair, so "create the same tenant id on both servers" produces two different tenants that happen to share a name.** The second server would refuse every replicated entry as *not signed by a trusted user* — correctly, because for it the signer really is a stranger. Create the tenant once and publish it to each server that should host it:
 
 ```typescript
-await result.tenant.publishToServer("http://server1:1661", {
-  systemAdminUser: systemAdminIdentity,
-  systemAdminPassword: "sysadmin-pass",
-  adminUsername: result.adminUser.username,
-});
-
-await result.tenant.publishToServer("http://server2:3001", {
-  systemAdminUser: systemAdminIdentity,
-  systemAdminPassword: "sysadmin-pass",
-  adminUsername: result.adminUser.username,
-});
+for (const url of ["http://server1:1661", "http://server2:3001"]) {
+  await result.tenant.publishToServer(url, {
+    systemAdminUser: systemAdminIdentity,
+    systemAdminPassword: "sysadmin-pass",
+    adminUsername: result.adminUser.username,
+  });
+}
 ```
 
-### 5. Configure per-tenant sync
+Publishing registers the tenant and its admin keys. The data itself arrives through replication; you do not have to push it to both servers by hand.
 
-After trust is established, configure which tenants each server syncs. This gives full control over sync topology -- not every server needs to sync every tenant.
+To add a mirror for a tenant that already exists, publish that same tenant object to the new server and let the mesh fill it.
 
-**Add a sync server for a tenant:**
+### 5. Enable replication
 
-```bash
-curl -X POST http://server1:1661/system/tenants/acme/sync-servers \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
-  -d '{
-    "name": "CN=server2",
-    "url": "http://server2:3001",
-    "syncIntervalMs": 60000,
-    "databases": ["directory", "main"]
-  }'
-```
-
-The `databases` field is required and controls which databases are synced with the remote server. The `name` field identifies the remote server (must match the trusted server name). If a server with the same name already exists for the tenant, it is updated.
-
-**List sync servers for a tenant:**
-
-```bash
-curl http://server1:1661/system/tenants/acme/sync-servers \
-  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT"
-```
-
-**Remove a sync server from a tenant:**
-
-```bash
-curl -X DELETE http://server1:1661/system/tenants/acme/sync-servers/CN%3Dserver2 \
-  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT"
-```
-
-Note: the server name in the URL must be percent-encoded (e.g., `CN%3Dserver2` for `CN=server2`).
-
-### 6. Enable auto-sync
-
-Add `--auto-sync` via the `command` key in each server's `docker-compose.override.yml`:
+Add `--auto-sync` via the `command` key in each server's `docker-compose.override.yml`, or set `"cluster": { "autoSync": true }` in `config.json`:
 
 ```yaml
 services:
@@ -540,7 +520,59 @@ Then restart:
 docker compose up -d
 ```
 
-The servers will periodically sync all configured tenant databases, relaying encrypted entries without decrypting them. Sync config changes take effect on the next server restart or when auto-sync timers are restarted.
+Each peer with a `url` gets one session. A session catches up on start, then follows the peer's change feed over SSE and pushes local writes as they happen, with a periodic full pass as a safety net. Nothing is per-tenant: adding a tenant to both servers is enough for it to start replicating.
+
+### 6. Watch the mesh
+
+`/system/cluster/*` is the administrative view, behind the same system-admin JWT and capability rules as the rest of `/system`:
+
+```bash
+curl http://server1:1661/system/cluster/status \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT"
+```
+
+The status reports, per peer: session state, health with classified reasons, shared tenant count, lag, retry depth, rejected entries and the last error. Counts and classifications only — never a document id, so the console does not become a way around admin-blindness.
+
+Two health reasons are worth recognizing:
+
+- **`access-denied-backoff`** — the peer refused a batch (a purged document, a revoked key). The replicator holds its cursor and retries; it does not skip past the entries. This usually clears itself once the directory change that caused it has replicated.
+- **`entries-awaiting-directory-trust`** — entries are waiting for a grant that has not arrived yet. Also self-clearing.
+
+Mutating actions are jobs, so a long resync does not block the request:
+
+```bash
+curl -X POST http://server1:1661/system/cluster/actions/sync-now \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT" \
+  -d '{"peer": "CN=server2", "tenantId": "acme"}'
+# → { "jobId": "...", "job": { "state": "running", ... } }
+
+curl http://server1:1661/system/cluster/jobs/$JOB_ID \
+  -H "Authorization: Bearer $SYSTEM_ADMIN_JWT"
+```
+
+Every action is recorded in an append-only audit log (`GET /system/cluster/audit`, paged) with who, what, where and when.
+
+Because each server is administered independently, there is no cluster-wide aggregate endpoint: a console shows the whole mesh by asking each server for its own view. That keeps one server's admin credentials from becoming credentials for the others.
+
+### Client failover
+
+A client can discover where else a tenant lives, without authenticating:
+
+```bash
+curl "http://server1:1661/.well-known/mindoodb-cluster?tenantId=acme"
+# → { "mirrors": [ { "name": "CN=server2", "url": "http://server2:3001", "role": "peer" } ] }
+```
+
+Only mirrors of the tenant that was asked for are listed, so the answer says nothing about peers that exist for other tenants.
+
+### What the mesh guarantees
+
+Three invariants make repeated replication converge rather than drift:
+
+1. **Directory first.** Within each tenant, `directory` and `userdirectory` replicate before application databases. Application entries are signed by keys the peer only learns from the directory, so any other order rejects entries that are in fact valid.
+2. **The cursor holds on rejection.** A client may skip an entry the server refuses and move on. Two servers that are meant to be identical may not: the cursor stays clamped until the entry is accepted, or the divergence would be permanent and silent.
+3. **Receipts are preserved.** A replicated entry keeps the witness receipt of the server that first accepted it, verified against `trusted-servers.json` on arrival. Re-stamping would make "trusted time" mean "the time it reached the last server in the chain", and would show every mirrored document as having appeared today.
 
 ## Data Directory Layout
 
@@ -620,10 +652,16 @@ Generated by `pnpm server:init`. Contains a `PrivateUserId` with encrypted priva
   {
     "name": "CN=server2",
     "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
-    "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n..."
+    "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
+    "url": "https://server2.example.com",
+    "direction": "bidirectional",
+    "role": "peer",
+    "attachments": "eager"
   }
 ]
 ```
+
+This file is the whole replication topology. An entry with a `url` becomes one replication session covering every tenant both servers host; an entry without one is trusted (it may push to us) but never dialled. See [Server-to-Server Sync](#server-to-server-sync) for the field meanings.
 
 ### `<tenantId>/config.json`
 
@@ -640,17 +678,11 @@ Generated by `pnpm server:init`. Contains a `PrivateUserId` with encrypted priva
       "signingPublicKey": "-----BEGIN PUBLIC KEY-----\n...",
       "encryptionPublicKey": "-----BEGIN PUBLIC KEY-----\n..."
     }
-  ],
-  "remoteServers": [
-    {
-      "name": "CN=server2",
-      "url": "https://server2.example.com",
-      "syncIntervalMs": 60000,
-      "databases": ["directory", "main"]
-    }
   ]
 }
 ```
+
+Replication is not configured here. It is a property of the peer (`trusted-servers.json`), and a tenant is mirrored simply by existing on both servers.
 
 The `users` array is a **public-key allowlist**: each entry's identity is its
 `signingPublicKey` (with the paired `encryptionPublicKey`). The cleartext
@@ -673,8 +705,6 @@ extra field) for human-readable notes. Entries are matched solely by
 
 > **Set `MINDOODB_TRUST_PROXY` if anything fronts the server.** Rate limits and the `/system/*` allowlist both key on `req.ip`. Without it, every user behind the proxy shares one address, so one busy client can exhaust the address-keyed budgets for everyone and the allowlist matches the proxy instead of the operator network.
 
-> **Note:** The old `MINDOODB_ADMIN_API_KEY` variable has been removed. System admin **authorization** is enforced by `config.json` capabilities and JWTs. **`MINDOODB_ADMIN_ALLOWED_IPS`** is an optional **network** layer for `/system/*` only. See [Server Security](docs/server-security.md).
-
 ## CLI Reference
 
 ### `pnpm server:dev` / `pnpm server:start` — Start the server
@@ -685,7 +715,7 @@ Launches the MindooDB server process. `server:dev` runs via `ts-node` for develo
 |--------|-------|-------------|---------|
 | `--data-dir` | `-d` | Data directory path | `./data` |
 | `--port` | `-p` | Server port | `1661` |
-| `--auto-sync` | `-s` | Enable automatic sync with remote servers | disabled |
+| `--auto-sync` | `-s` | Start peer replication: one session per trusted server with a `url`, mirroring every tenant both sides host. Equivalent to `"cluster": { "autoSync": true }` in `config.json` | disabled |
 | `--static-dir` | `-w` | Serve static files at `/statics/` (e.g. bootstrap UI) | — |
 | `--tls-cert` | — | Path to TLS certificate file (PEM) | — |
 | `--tls-key` | — | Path to TLS private key file (PEM) | — |
@@ -695,16 +725,18 @@ Launches the MindooDB server process. `server:dev` runs via `ts-node` for develo
 
 One-time setup that generates the server's Ed25519/RSA keypair (`server.identity.json`) and an empty `trusted-servers.json`. It also interactively offers to create a first system admin keypair and writes the initial `config.json` with that admin's public key in the `capabilities` section.
 
+Both names — the server's and the system admin's — are stored in canonical form (`cn=…/o=…`). An abbreviated name is expanded, a canonical one is taken as it is, and a name without an organization is rejected: the system admin is matched against `config.json` as a string, so a client sending `cn=sysadmin/o=acme` would never match a stored `sysadmin/acme`, and an identity without an organization fails later in every path that resolves recipients.
+
 | Option | Alias | Description | Default |
 |--------|-------|-------------|---------|
-| `--name` | `-n` | Server name (e.g., "server1") | **required** |
+| `--name` | `-n` | Server name. Canonical (`cn=server1/o=acme`) or abbreviated (`server1/acme`); a common name and an organization are both required, and the value is stored in canonical form | **required** |
 | `--data-dir` | `-d` | Data directory path | `./data` |
 | `--force` | `-f` | Overwrite existing identity | — |
 | `--help` | `-h` | Show help message | — |
 
 ### `pnpm server:add-to-network` — Add a server to the network
 
-Automates mutual trust exchange when adding a new server to an existing network. For each existing server it fetches public keys from `/.well-known/mindoodb-server-info` and calls `POST /system/trusted-servers` in both directions so that the new server and every existing server trust each other.
+Automates mutual trust exchange when adding a new server to an existing network. For each existing server it fetches public keys, url and cluster role from `/.well-known/mindoodb-server-info` and calls `POST /system/trusted-servers` in both directions, so the new server and every existing server both trust *and* can dial each other.
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -782,17 +814,41 @@ The **`curl`** examples in this document use **`$SYSTEM_ADMIN_JWT`** as a placeh
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | `GET` | `/system/trusted-servers` | JWT | List trusted servers |
-| `POST` | `/system/trusted-servers` | JWT | Add a trusted server |
+| `POST` | `/system/trusted-servers` | JWT | Add or update a trusted server (keys, `url`, `direction`, `role`, `attachments`) |
 | `DELETE` | `/system/trusted-servers/:serverName` | JWT | Remove a trusted server |
 
-#### Per-Tenant Sync Server Management
+#### Cluster Administration
+
+The console surface for peer replication. Reads and writes are separate capabilities, so an auditor role can be granted `GET:/system/cluster/*` without the ability to change anything.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/system/tenants/:tenantId/sync-servers` | JWT | List sync servers for a tenant |
-| `POST` | `/system/tenants/:tenantId/sync-servers` | JWT | Add or update a sync server |
-| `DELETE` | `/system/tenants/:tenantId/sync-servers/:serverName` | JWT | Remove a sync server |
-| `POST` | `/system/tenants/:tenantId/trigger-sync` | JWT | Trigger sync for a tenant |
+| `GET` | `/system/cluster/topology` | JWT | Configured peers and their roles |
+| `GET` | `/system/cluster/status` | JWT | Live per-peer state: health, lag, retry depth, last error |
+| `GET` | `/system/cluster/tenants/:tenantId` | JWT | The same, narrowed to one tenant |
+| `POST` | `/system/cluster/actions/:action` | JWT | Start a job: `sync-now`, `retry-rejected`, `refresh-intersection`, `pause`, `resume` |
+| `GET` | `/system/cluster/jobs` | JWT | Recent jobs |
+| `GET` | `/system/cluster/jobs/:jobId` | JWT | One job's state and result |
+| `GET` | `/system/cluster/audit` | JWT | Append-only record of administrative actions (paged) |
+| `PUT`/`POST` | `/system/cluster/peers/:name` | JWT | Create or reconfigure a peer |
+| `DELETE` | `/system/cluster/peers/:name` | JWT | Remove a peer |
+
+Status, job and audit responses carry counts and classified reasons only — never document ids or author keys.
+
+#### Peer Protocol
+
+Server-to-server only, authenticated with a peer token from `trusted-servers.json` (a system-admin JWT is refused, and vice versa). Listed for completeness; operators do not call these.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/system/peer/challenge` | Request a challenge (only for a trusted signing key) |
+| `POST` | `/system/peer/authenticate` | Exchange a signed challenge for a peer token |
+| `POST` | `/system/peer/tenant-bloom` | Exchange Bloom summaries of tenant ids to find the intersection |
+| `GET` | `/system/peer/databases` | Database ids held for a shared tenant |
+| `GET` | `/system/peer/events` | SSE change feed for shared tenants |
+| `POST` | `/system/peer/sync` | Ask the peer to run a sync pass towards us |
+
+The data itself moves over the ordinary `/:tenantId/sync/*` routes: a peer speaks the client protocol with a peer token, rather than a second replication format existing alongside it.
 
 #### Server Config Management
 
@@ -1013,7 +1069,7 @@ docker run --rm -it \
   -v "$(pwd)/../mindoodb-data/.server_unlock:/run/secrets/server_unlock:ro" \
   -e MINDOODB_SERVER_PASSWORD_FILE=/run/secrets/server_unlock \
   --entrypoint node \
-  mindoodb-server dist/node/server/serverinit.js --data-dir /data --name server1
+  mindoodb-server dist/node/server/serverinit.js --data-dir /data --name server1/acme
 
 # Start the server
 docker compose up -d

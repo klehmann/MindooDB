@@ -100,6 +100,13 @@ import type {
   StoreHead,
 } from "./appendonlystores/types";
 import { bloomMightContainId } from "./appendonlystores/bloom";
+import {
+  syncEntriesBetweenStores,
+  setSyncAbortSignalOnStore,
+  getStoreBloomSummary,
+  filterMissingIds,
+} from "./appendonlystores/syncStores";
+import type { SyncScanCursorStore } from "./appendonlystores/syncStores";
 import { NetworkErrorType } from "./appendonlystores/network/types";
 import {
   computeDocumentMaterializationPlan,
@@ -728,6 +735,35 @@ export class BaseMindooDB implements MindooDB {
    * from the cached materialization and seeds the pending map from them.
    */
   private legacyCheckpointNeedsAuthorTrustScan = false;
+  /**
+   * Ids of documents that exist in the local store but cannot be read with
+   * the current KeyBag, so they are absent from the index and from every
+   * document listing.
+   *
+   * The index alone cannot answer "how much is hidden from me": a document
+   * that was never readable on this device gets no index entry at all (see
+   * {@link reconcileKeyVisibility}), and one that lost its key becomes an
+   * `"inaccessible"` tombstone that listings filter out. This set is the
+   * only place that remembers both cases, which is what
+   * {@link getInaccessibleDocumentCount} reports so a UI can tell an empty
+   * database apart from one whose keys have not arrived yet.
+   *
+   * Counts documents regardless of their deletion state - the question it
+   * answers is "is it here and unreadable", which is knowable without the
+   * key, unlike a reliable lifecycle state for a doc we cannot decrypt.
+   *
+   * Persisted in the metadata checkpoint: a warm start with an unchanged
+   * KeyBag skips the visibility scan, so an in-memory-only tally would
+   * silently reset to zero on every restart.
+   */
+  private readonly inaccessibleDocIds = new Set<string>();
+  /**
+   * Set while restoring a metadata checkpoint that predates
+   * {@link inaccessibleDocIds}. Forces one visibility scan at open so the
+   * tally starts out complete instead of counting only what happens to
+   * arrive in this session.
+   */
+  private legacyCheckpointNeedsVisibilityTally = false;
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -2006,6 +2042,12 @@ export class BaseMindooDB implements MindooDB {
     }
     checkpoint.pendingUntrustedAuthors = pendingUntrusted;
 
+    // Persist the unreadable-document tally (additive field). Written even
+    // when empty, for the same reason as above: the field's PRESENCE marks
+    // the checkpoint as tally-aware, so restore can tell "nothing hidden"
+    // apart from "written before this existed, count unknown".
+    checkpoint.inaccessibleDocIds = Array.from(this.inaccessibleDocIds);
+
     return new TextEncoder().encode(JSON.stringify(checkpoint));
   }
 
@@ -2055,6 +2097,21 @@ export class BaseMindooDB implements MindooDB {
         }
       } else {
         this.legacyCheckpointNeedsAuthorTrustScan = true;
+      }
+      // Unreadable-document tally. Missing field means the checkpoint predates
+      // it: the count would otherwise stay at zero for as long as the KeyBag
+      // is unchanged, because that is exactly when the visibility scan is
+      // skipped. Force one scan instead.
+      this.inaccessibleDocIds.clear();
+      if (Array.isArray(checkpoint.inaccessibleDocIds)) {
+        this.legacyCheckpointNeedsVisibilityTally = false;
+        for (const docId of checkpoint.inaccessibleDocIds) {
+          if (typeof docId === "string") {
+            this.inaccessibleDocIds.add(docId);
+          }
+        }
+      } else {
+        this.legacyCheckpointNeedsVisibilityTally = true;
       }
       this.syncScanCursors.clear();
       if (checkpoint.syncScanCursors && typeof checkpoint.syncScanCursors === "object") {
@@ -2485,6 +2542,16 @@ export class BaseMindooDB implements MindooDB {
     // Every path that writes entries for a document lands here, so this is
     // where retained metadata for it goes stale (see scannedEntryMetadata).
     this.forgetScannedEntryMetadata(docId);
+    // Same reasoning for the unreadable-document tally: every reveal and every
+    // inaccessibility tombstone passes through here, so keeping it in step
+    // needs no bookkeeping at the individual call sites. The one case this
+    // misses is a document that was never readable, which produces no index
+    // entry at all - those call `noteInaccessibleDocument` directly.
+    if (accessState === "visible") {
+      this.forgetInaccessibleDocument(docId);
+    } else {
+      this.noteInaccessibleDocument(docId);
+    }
     const assignedSeq = this.nextChangeSeq;
     const newEntry: DocumentIndexEntry = {
       docId,
@@ -2793,7 +2860,8 @@ export class BaseMindooDB implements MindooDB {
         const currentFingerprint = await this.computeCurrentKeyBagFingerprint();
         const fingerprintMatches =
           currentFingerprint !== null && currentFingerprint === this.lastReconciledKeyBagFingerprint;
-        if (!fingerprintMatches) {
+        if (!fingerprintMatches || this.legacyCheckpointNeedsVisibilityTally) {
+          this.legacyCheckpointNeedsVisibilityTally = false;
           await this.reconcileKeyVisibility();
         }
         this.markKeyBagFingerprintReconciled(currentFingerprint);
@@ -2918,6 +2986,42 @@ export class BaseMindooDB implements MindooDB {
     this.lastReconciledKeyBagFingerprint = fingerprint;
     this.cacheMetaDirty = true;
     this.cacheManager?.markDirty();
+  }
+
+  /**
+   * Remember that `docId` is present in the store but unreadable. Idempotent:
+   * the same document is re-observed on every sync batch that carries another
+   * entry for it.
+   */
+  private noteInaccessibleDocument(docId: string): void {
+    if (this.inaccessibleDocIds.has(docId)) {
+      return;
+    }
+    this.inaccessibleDocIds.add(docId);
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
+  /** Counterpart of {@link noteInaccessibleDocument} for a doc that became readable. */
+  private forgetInaccessibleDocument(docId: string): void {
+    if (!this.inaccessibleDocIds.delete(docId)) {
+      return;
+    }
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
+  /**
+   * How many documents this database holds locally that the current KeyBag
+   * cannot open. They appear in no listing and in no view, so this count is
+   * the only signal that a database looks emptier than it is - typically on a
+   * device whose user key is still waiting for approval.
+   *
+   * Includes deleted documents, and counts what has arrived on this device -
+   * not what the tenant holds.
+   */
+  public getInaccessibleDocumentCount(): number {
+    return this.inaccessibleDocIds.size;
   }
 
   /**
@@ -3073,6 +3177,9 @@ export class BaseMindooDB implements MindooDB {
       const canRead = await this.tenant.hasDecryptionKey(visibility.decryptionKeyId);
 
       if (canRead) {
+        // This scan is the authority on visibility, so it also heals a tally
+        // that a visible->visible short-circuit below would leave untouched.
+        this.forgetInaccessibleDocument(docId);
         // Reveal-on-add only triggers when the previous state was
         // missing or inaccessible; visible->visible transitions stay
         // idempotent via the existing `updateIndex` short-circuit.
@@ -3092,8 +3199,11 @@ export class BaseMindooDB implements MindooDB {
         this.updateIndex(docId, visibility.lastModified, true, visibility.decryptionKeyId, "inaccessible");
         changed = true;
       } else {
-        // Already inaccessible (or never seen). Scrub defensively in
-        // case a previous session left an L2 record behind.
+        // Already inaccessible (or never seen, which is the common case on a
+        // device whose keys have not arrived). No index entry is written for
+        // it, so the tally is the only record that it is here at all.
+        this.noteInaccessibleDocument(docId);
+        // Scrub defensively in case a previous session left an L2 record behind.
         await this.purgeMaterializedDocument(docId);
       }
     }
@@ -3540,6 +3650,10 @@ export class BaseMindooDB implements MindooDB {
               this.logger.debug(
                 `Skipping metadata-first index for doc ${docId} — decryption key "${representativeEntry.decryptionKeyId}" not available`,
               );
+              // This is where a device that is still waiting for its keys meets
+              // most of the tenant: the doc is skipped before it ever reaches
+              // the index, so record it for `getInaccessibleDocumentCount`.
+              this.noteInaccessibleDocument(docId);
               const existingIndex = this.getDocIndexPosition(docId);
               const existing = existingIndex === undefined ? undefined : this.index[existingIndex];
               if (existing?.accessState === "visible") {
@@ -3605,6 +3719,7 @@ export class BaseMindooDB implements MindooDB {
         // doc.
         if (error instanceof SymmetricKeyNotFoundError) {
           this.logger.debug(`Skipping document ${docId} - missing key: ${error.keyId}`);
+          this.noteInaccessibleDocument(docId);
           // Avoid a per-doc scanAllMetadata round-trip here: everything
           // we need is already in this batch's entryMetadataList plus the
           // existing index entry (if any). We do NOT need a second pass
@@ -3968,61 +4083,10 @@ export class BaseMindooDB implements MindooDB {
     };
   }
 
-  /**
-   * Fetch a store's bloom filter summary, returning null if unsupported or on
-   * error. Used on the target for missing-id pre-screening (callers fall back
-   * to exact checks) and on the source for the total-entry-count progress
-   * denominator.
-   */
-  private async getStoreBloomSummary(
+  private getStoreBloomSummary(
     store: ContentAddressedStore,
   ): Promise<StoreIdBloomSummary | null> {
-    if (typeof store.getIdBloomSummary !== "function") {
-      return null;
-    }
-    try {
-      return await store.getIdBloomSummary();
-    } catch (error) {
-      this.logger.warn("Failed to get bloom summary from store, falling back to exact checks", error);
-      return null;
-    }
-  }
-
-  private static setSyncAbortSignalOnStore(store: ContentAddressedStore, signal?: AbortSignal): void {
-    if ('setSyncAbortSignal' in store && typeof (store as any).setSyncAbortSignal === 'function') {
-      (store as any).setSyncAbortSignal(signal);
-    }
-  }
-
-  /**
-   * Fetch a store's head descriptor (`{ epoch, maxReceiptOrder }`), returning
-   * null when the store (or the remote server behind it) does not support it
-   * or the request fails. A null head simply disables the persisted-cursor
-   * fast path for this sync.
-   */
-  private async getStoreHeadSafe(store: ContentAddressedStore): Promise<StoreHead | null> {
-    if (typeof store.getStoreHead !== "function") {
-      return null;
-    }
-    try {
-      return await store.getStoreHead();
-    } catch (error) {
-      this.logger.debug("Store head unavailable, falling back to full scan", error);
-      return null;
-    }
-  }
-
-  /** Stable identity for a store in the persisted sync-cursor map. */
-  private static syncStoreIdentity(store: ContentAddressedStore): string {
-    return store.getCacheIdentity?.() ?? `${store.getId()}/${store.getStoreKind()}`;
-  }
-
-  /** Key for {@link syncScanCursors}: one record per (source, target) pair. */
-  private syncScanCursorKey(
-    sourceStore: ContentAddressedStore,
-    targetStore: ContentAddressedStore,
-  ): string {
-    return `${BaseMindooDB.syncStoreIdentity(sourceStore)}->${BaseMindooDB.syncStoreIdentity(targetStore)}`;
+    return getStoreBloomSummary(store, this.logger);
   }
 
   /** Persist a sync scan cursor and schedule a checkpoint flush. */
@@ -4045,234 +4109,12 @@ export class BaseMindooDB implements MindooDB {
     this.cacheManager?.markDirty();
   }
 
-  /**
-   * From a list of candidate IDs, return only those the target store is
-   * missing.  Uses bloom-filter pre-screening when available, then falls
-   * back to exact `hasEntries` for the uncertain set.
-   */
-  private async filterMissingIds(
+  private filterMissingIds(
     targetStore: ContentAddressedStore,
     candidateIds: string[],
     bloom: StoreIdBloomSummary | null,
   ): Promise<string[]> {
-    let definitelyMissing: string[] = [];
-    let maybeExisting: string[] = candidateIds;
-
-    if (bloom) {
-      definitelyMissing = [];
-      maybeExisting = [];
-      for (const id of candidateIds) {
-        if (bloomMightContainId(bloom, id)) {
-          maybeExisting.push(id);
-        } else {
-          definitelyMissing.push(id);
-        }
-      }
-    }
-
-    let missingIds = definitelyMissing;
-    if (maybeExisting.length > 0) {
-      const existing = await targetStore.hasEntries(maybeExisting);
-      const existingSet = new Set(existing);
-      missingIds = missingIds.concat(maybeExisting.filter((id) => !existingSet.has(id)));
-    }
-    return missingIds;
-  }
-
-  /**
-   * Determine how many entry IDs to fetch per `getEntries` call during sync.
-   *
-   * This is intentionally separate from the metadata scan `pageSize` so that
-   * scanning can page through large ID lists quickly while the heavier
-   * payload downloads use a smaller batch to keep progress responsive and
-   * cancellation timely.
-   *
-   * Priority: explicit option > attachment default (100) > docs default (250,
-   * capped by pageSize).
-   *
-   * The docs default is intentionally smaller than the metadata scan pageSize
-   * (1000): a full scan page transferred as one `putEntries` call serializes
-   * to a multi-megabyte JSON body whose upload cannot report progress, risks
-   * the HTTP timeout on slow uplinks (each retry restarts the whole body),
-   * and can exceed the remote JSON body limit. Smaller batches keep progress
-   * events frequent and make each POST cheap to retry.
-   */
-  private static readonly DEFAULT_DOCS_TRANSFER_BATCH_SIZE = 250;
-
-  /**
-   * Default window of transfer batches running in parallel (sync-v5,
-   * phase 4). Kept small: each in-flight batch holds one decrypted page of
-   * entries in memory, and HTTP/2 multiplexes the requests over a single
-   * connection anyway. Overridable via `SyncOptions.maxConcurrentBatches`.
-   */
-  private static readonly DEFAULT_MAX_CONCURRENT_TRANSFER_BATCHES = 3;
-
-  private resolveTransferBatchSize(options?: SyncOptions): number {
-    if (options?.transferBatchSize && options.transferBatchSize > 0) {
-      return options.transferBatchSize;
-    }
-    if (options?.storeKind === StoreKind.attachments) {
-      return 100;
-    }
-    return Math.min(
-      options?.pageSize ?? 1000,
-      BaseMindooDB.DEFAULT_DOCS_TRANSFER_BATCH_SIZE,
-    );
-  }
-
-  /**
-   * Transfer a set of entry IDs from source to target in fixed-size batches,
-   * emitting progress and checking for cancellation between each batch.
-   *
-   * Callers (cursor-scan path and legacy path) collect the IDs that need
-   * transferring, then delegate to this method instead of issuing one
-   * monolithic `getEntries`.  This gives three benefits:
-   *
-   * 1. The UI receives frequent progress updates with batch metadata so long
-   *    transfers no longer look frozen.
-   * 2. Cancellation can interrupt work between batches rather than waiting
-   *    for one large HTTP response to complete.
-   * 3. Each server-side `getEntries` + RSA encryption unit is smaller,
-   *    reducing the risk of socket timeouts on large payloads.
-   *
-   * Returns partial progress on cancellation so callers can report how much
-   * was actually transferred before the abort.
-   */
-  private async transferEntriesInBatches(
-    sourceStore: ContentAddressedStore,
-    targetStore: ContentAddressedStore,
-    entryIds: string[],
-    options: SyncOptions | undefined,
-    state: {
-      transferred: number;
-      transferredBytes: number;
-      scanned: number;
-      totalSourceEntries?: number;
-      currentPage?: number;
-    },
-  ): Promise<{ transferred: number; transferredBytes: number; cancelled: boolean; rejected: RejectedPutEntry[] }> {
-    if (entryIds.length === 0) {
-      return { transferred: state.transferred, transferredBytes: state.transferredBytes, cancelled: false, rejected: [] };
-    }
-
-    const onProgress = options?.onProgress;
-    const signal = options?.signal;
-    const transferBatchSize = this.resolveTransferBatchSize(options);
-    const totalTransferBatches = Math.max(1, Math.ceil(entryIds.length / transferBatchSize));
-    // Parallel transfer window (sync-v5, phase 4): each batch is one
-    // getEntries + putEntries round trip; a small window of concurrent
-    // batches overlaps network latency and server-side crypto. Witness
-    // receipts are applied per batch and are order-independent.
-    const maxConcurrent = Math.min(
-      Math.max(1, Math.floor(options?.maxConcurrentBatches ?? BaseMindooDB.DEFAULT_MAX_CONCURRENT_TRANSFER_BATCHES)),
-      totalTransferBatches,
-    );
-    let transferred = state.transferred;
-    let transferredBytes = state.transferredBytes;
-    let cancelled = false;
-    let firstError: unknown = null;
-    let nextBatchIndex = 0;
-    // Per-entry rejections reported by a witnessing target (sync-v5): the
-    // push continues, the rejected entries are surfaced to the caller.
-    const rejected: RejectedPutEntry[] = [];
-
-    const runWorker = async (): Promise<void> => {
-      while (true) {
-        if (firstError || cancelled || signal?.aborted) {
-          if (signal?.aborted) cancelled = true;
-          return;
-        }
-        const batchIndex = nextBatchIndex++;
-        const offset = batchIndex * transferBatchSize;
-        if (offset >= entryIds.length) {
-          return;
-        }
-
-        const currentTransferBatch = batchIndex + 1;
-        const batchIds = entryIds.slice(offset, offset + transferBatchSize);
-        const pageSummary = state.currentPage ? `page ${state.currentPage}, ` : "";
-        onProgress?.({
-          phase: "transferring",
-          message: `Transferring batch ${currentTransferBatch}/${totalTransferBatches} (${batchIds.length} entries, ${pageSummary}scanned ${state.scanned})...`,
-          transferredEntries: transferred,
-          transferredBytes,
-          scannedEntries: state.scanned,
-          totalSourceEntries: state.totalSourceEntries,
-          currentPage: state.currentPage,
-          currentTransferBatch,
-          totalTransferBatches,
-          transferBatchSize,
-        });
-
-        try {
-          const batchEntries = await sourceStore.getEntries(batchIds);
-          if (signal?.aborted) {
-            cancelled = true;
-            return;
-          }
-          const putResult = await targetStore.putEntries(batchEntries);
-          // On push, the remote (witnessing) target returns receipts for accepted
-          // entries; persist them back onto the local source so the revision feed
-          // re-anchors them from the provisional head to their committed
-          // `receivedAt` (docs/accesscontrol.md §5.3). Pull targets return void.
-          // sync-v5 targets return a structured ack that additionally carries
-          // per-entry rejections (signature-class failures the remote skipped).
-          const { receipts, batchRejected } = BaseMindooDB.normalizePutResult(putResult);
-          if (receipts.length > 0 && sourceStore.applyWitnessReceipts) {
-            await sourceStore.applyWitnessReceipts(receipts);
-          }
-          const rejectedIds =
-            batchRejected.length > 0 ? new Set(batchRejected.map((entry) => entry.id)) : null;
-          if (rejectedIds) {
-            rejected.push(...batchRejected);
-            this.logger.warn(
-              `Target rejected ${batchRejected.length} of ${batchEntries.length} entries in transfer batch ${currentTransferBatch}/${totalTransferBatches}`,
-            );
-          }
-          for (const entry of batchEntries) {
-            if (rejectedIds?.has(entry.id)) {
-              continue;
-            }
-            transferredBytes += entry.encryptedSize ?? entry.encryptedData.length;
-          }
-          transferred += batchEntries.length - batchRejected.length;
-        } catch (error) {
-          if (signal?.aborted) {
-            cancelled = true;
-            return;
-          }
-          if (!firstError) {
-            firstError = error;
-          }
-          return;
-        }
-
-        onProgress?.({
-          phase: "transferring",
-          message: `Transferred ${transferred} entries after batch ${currentTransferBatch}/${totalTransferBatches}`,
-          transferredEntries: transferred,
-          transferredBytes,
-          scannedEntries: state.scanned,
-          totalSourceEntries: state.totalSourceEntries,
-          currentPage: state.currentPage,
-          currentTransferBatch,
-          totalTransferBatches,
-          transferBatchSize,
-        });
-      }
-    };
-
-    await Promise.all(
-      Array.from({ length: maxConcurrent }, () => runWorker()),
-    );
-
-    if (signal?.aborted || cancelled) {
-      return { transferred, transferredBytes, cancelled: true, rejected };
-    }
-    if (firstError) {
-      throw firstError;
-    }
-    return { transferred, transferredBytes, cancelled: false, rejected };
+    return filterMissingIds(targetStore, candidateIds, bloom);
   }
 
   /**
@@ -4294,19 +4136,44 @@ export class BaseMindooDB implements MindooDB {
     return { receipts: [], batchRejected: [] };
   }
 
+  /**
+   * Expose this database's persisted {@link syncScanCursors} map to the shared
+   * store-transfer helper. The map lives in the metadata checkpoint, so saving
+   * a cursor also marks the cache dirty.
+   */
+  private syncCursorStore(): SyncScanCursorStore {
+    return {
+      get: (key) => this.syncScanCursors.get(key) ?? null,
+      save: (key, record) => this.saveSyncScanCursor(key, record),
+      delete: (key) => {
+        this.syncScanCursors.delete(key);
+      },
+    };
+  }
+
   private async syncEntriesFromStore(
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions
   ): Promise<{ transferred: number; transferredBytes?: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
     const signal = options?.signal;
-    BaseMindooDB.setSyncAbortSignalOnStore(sourceStore, signal);
-    BaseMindooDB.setSyncAbortSignalOnStore(targetStore, signal);
+    setSyncAbortSignalOnStore(sourceStore, signal);
+    setSyncAbortSignalOnStore(targetStore, signal);
     try {
       if (options?.mode === "dense") {
         return await this.syncEntriesFromStoreDense(sourceStore, targetStore, options);
       }
-      return await this.syncEntriesFromStoreImpl(sourceStore, targetStore, options);
+      // Client rejection semantics: the scan cursor advances past a rejected
+      // entry so a single corrupt or forged entry cannot block this database's
+      // push sync forever (docs/network-sync-protocol.md §5.7.6). The
+      // server-to-server replicator passes `"hold"` instead, because there a
+      // rejection usually means "the peer has not replicated the directory
+      // yet" and skipping would drop the entry permanently.
+      return await syncEntriesBetweenStores(sourceStore, targetStore, options, {
+        logger: this.logger,
+        cursors: this.syncCursorStore(),
+        rejectionPolicy: "advance",
+      });
     } catch (error) {
       if (signal?.aborted) {
         this.logger.info("Sync cancelled by abort signal");
@@ -4314,309 +4181,9 @@ export class BaseMindooDB implements MindooDB {
       }
       throw error;
     } finally {
-      BaseMindooDB.setSyncAbortSignalOnStore(sourceStore, undefined);
-      BaseMindooDB.setSyncAbortSignalOnStore(targetStore, undefined);
+      setSyncAbortSignalOnStore(sourceStore, undefined);
+      setSyncAbortSignalOnStore(targetStore, undefined);
     }
-  }
-
-  private async syncEntriesFromStoreImpl(
-    sourceStore: ContentAddressedStore,
-    targetStore: ContentAddressedStore,
-    options?: SyncOptions
-  ): Promise<{ transferred: number; transferredBytes?: number; scanned: number; cancelled: boolean; rejected?: RejectedPutEntry[] }> {
-    let transferred = 0;
-    let transferredBytes = 0;
-    let scanned = 0;
-    // Per-entry rejections reported by a witnessing target (sync-v5): the
-    // sync completes; rejected entries are surfaced to the caller as warnings.
-    const rejected: RejectedPutEntry[] = [];
-    const onProgress = options?.onProgress;
-    const pageSize = options?.pageSize ?? 1000;
-    const signal = options?.signal;
-
-    if (this.supportsCursorScan(sourceStore)) {
-      // Persisted-cursor fast path (sync-v5, phase 1): resume the metadata
-      // scan where the previous sync between this (source, target) pair left
-      // off — or skip the sync entirely when the source head shows nothing
-      // new. The heads are fetched up front (cheap; one request per side for
-      // network stores) and also anchor the epochs persisted with the cursor.
-      const cursorKey = this.syncScanCursorKey(sourceStore, targetStore);
-      const persisted = options?.forceFullScan
-        ? null
-        : this.syncScanCursors.get(cursorKey) ?? null;
-      const [sourceHead, targetHead] = await Promise.all([
-        this.getStoreHeadSafe(sourceStore),
-        this.getStoreHeadSafe(targetStore),
-      ]);
-
-      let cursor: StoreScanCursor | null = null;
-      if (persisted && sourceHead && targetHead) {
-        if (
-          persisted.sourceEpoch === sourceHead.epoch &&
-          persisted.targetEpoch === targetHead.epoch
-        ) {
-          if (sourceHead.maxReceiptOrder <= persisted.cursor.receiptOrder) {
-            this.logger.debug(
-              `Sync skip: source head ${sourceHead.maxReceiptOrder} already covered by persisted cursor (${cursorKey})`,
-            );
-            onProgress?.({
-              phase: 'preparing',
-              message: 'Source unchanged since last sync, nothing to scan',
-              transferredEntries: 0,
-              scannedEntries: 0,
-            });
-            return { transferred: 0, scanned: 0, cancelled: false };
-          }
-          cursor = persisted.cursor;
-          this.logger.debug(
-            `Resuming sync scan from persisted cursor receiptOrder=${cursor.receiptOrder} (${cursorKey})`,
-          );
-        } else {
-          // Epoch change on either side: the cursor lineage is broken
-          // (store reset / receipt-order migration) — full rescan.
-          this.logger.info(
-            `Sync cursor epoch changed for ${cursorKey}, discarding persisted cursor and re-scanning`,
-          );
-          this.syncScanCursors.delete(cursorKey);
-        }
-      }
-
-      const persistScanCursor = (finalCursor: StoreScanCursor | null): void => {
-        if (finalCursor && sourceHead && targetHead) {
-          this.saveSyncScanCursor(cursorKey, {
-            sourceEpoch: sourceHead.epoch,
-            targetEpoch: targetHead.epoch,
-            cursor: finalCursor,
-          });
-        }
-      };
-
-      const targetBloom = await this.getStoreBloomSummary(targetStore);
-      // Fixed progress denominator: the SOURCE's total entry count. The cursor
-      // scan below examines every source entry, so `scannedEntries/totalSourceEntries`
-      // is a real completion ratio. (Local stores serve this from a cached bloom
-      // summary; network stores answer with one extra request.) The target bloom
-      // stays dedicated to missing-id pre-screening.
-      const sourceBloom = await this.getStoreBloomSummary(sourceStore);
-      const totalSourceEstimate = sourceBloom?.totalIds;
-
-      onProgress?.({
-        phase: 'preparing',
-        message: 'Preparing to sync entries...',
-        transferredEntries: 0,
-        scannedEntries: 0,
-        totalSourceEntries: totalSourceEstimate,
-      });
-
-      // Upper scan bound: the source head captured BEFORE the scan started.
-      // Pushing to a witnessing target re-anchors the just-transferred
-      // entries to a fresh receiptOrder on the source (applyWitnessReceipts),
-      // i.e. past the running cursor — without this bound the scan would
-      // re-discover its own transfers and never terminate (first-sync loop).
-      // Entries beyond the bound (re-anchored or written concurrently) are
-      // picked up by the next sync.
-      const scanUpperBound = sourceHead?.maxReceiptOrder;
-      // IDs already transferred in this sync session. Guards against
-      // re-pushing entries the scan re-discovers when the target bloom
-      // snapshot is stale (fetched once up front; empty on a first sync, so
-      // it would classify every re-discovered id as "definitely missing"
-      // and skip the exact hasEntries check).
-      const transferredThisSync = new Set<string>();
-
-      let currentPage = 0;
-      // Scan-page pipelining (sync-v5, phase 4): while page N is being
-      // filtered and transferred, page N+1 is already being fetched.
-      let nextPagePromise: Promise<StoreScanResult> | null = null;
-      const discardPrefetch = (): void => {
-        // Swallow errors of an in-flight prefetch we will never consume
-        // (abort/cancel paths) to avoid unhandled rejections.
-        nextPagePromise?.catch(() => {});
-        nextPagePromise = null;
-      };
-      while (true) {
-        if (signal?.aborted) {
-          discardPrefetch();
-          persistScanCursor(cursor);
-          return { transferred, transferredBytes, scanned, cancelled: true, rejected };
-        }
-
-        const page: StoreScanResult = nextPagePromise
-          ? await nextPagePromise
-          : await sourceStore.scanEntriesSince!(cursor, pageSize);
-        nextPagePromise = page.hasMore
-          ? sourceStore.scanEntriesSince!(page.nextCursor, pageSize)
-          : null;
-        currentPage++;
-
-        // Clamp the page to the scan bound. Pages are ordered by
-        // (receiptOrder, id), so everything past the first out-of-bound
-        // entry is out of bound as well.
-        let pageEntries = page.entries;
-        let reachedScanBound = false;
-        if (scanUpperBound !== undefined && pageEntries.length > 0) {
-          const inBound = pageEntries.filter(
-            (m) => (m.receiptOrder ?? 0) <= scanUpperBound,
-          );
-          if (inBound.length < pageEntries.length) {
-            reachedScanBound = true;
-            pageEntries = inBound;
-          }
-        }
-        scanned += pageEntries.length;
-
-        if (signal?.aborted) {
-          discardPrefetch();
-          persistScanCursor(cursor);
-          return { transferred, transferredBytes, scanned, cancelled: true, rejected };
-        }
-
-        if (pageEntries.length > 0) {
-          onProgress?.({
-            phase: 'transferring',
-            message: `Scanned ${scanned} entries, checking for changes (page ${currentPage})...`,
-            transferredEntries: transferred,
-            scannedEntries: scanned,
-            totalSourceEntries: totalSourceEstimate,
-            currentPage,
-          });
-
-          const ids = pageEntries
-            .map((m) => m.id)
-            .filter((id) => !transferredThisSync.has(id));
-          const missingIds =
-            ids.length > 0
-              ? await this.filterMissingIds(targetStore, ids, targetBloom)
-              : [];
-
-          if (signal?.aborted) {
-            discardPrefetch();
-            persistScanCursor(cursor);
-            return { transferred, transferredBytes, scanned, cancelled: true, rejected };
-          }
-
-          if (missingIds.length > 0) {
-            const transferResult = await this.transferEntriesInBatches(
-              sourceStore,
-              targetStore,
-              missingIds,
-              options,
-              {
-                transferred,
-                transferredBytes,
-                scanned,
-                totalSourceEntries: totalSourceEstimate,
-                currentPage,
-              },
-            );
-            transferred = transferResult.transferred;
-            transferredBytes = transferResult.transferredBytes;
-            rejected.push(...transferResult.rejected);
-            if (transferResult.cancelled) {
-              // The current page's transfer did not complete: persist the
-              // boundary of the last fully transferred page instead.
-              discardPrefetch();
-              persistScanCursor(cursor);
-              return { transferred, transferredBytes, scanned, cancelled: true, rejected };
-            }
-            for (const id of missingIds) {
-              transferredThisSync.add(id);
-            }
-          }
-        }
-
-        onProgress?.({
-          phase: 'transferring',
-          message: `Transferred ${transferred} entries (page ${currentPage}, scanned ${scanned})`,
-          transferredEntries: transferred,
-          transferredBytes,
-          scannedEntries: scanned,
-          totalSourceEntries: totalSourceEstimate,
-          currentPage,
-        });
-
-        if (reachedScanBound) {
-          // Persist the last in-bound position (NOT page.nextCursor, which
-          // already points into the out-of-bound tail): a concurrent write
-          // that landed between the bound and the re-anchored tail must be
-          // scanned by the next sync.
-          const lastInBound =
-            pageEntries.length > 0 ? pageEntries[pageEntries.length - 1] : null;
-          if (lastInBound) {
-            cursor = { receiptOrder: lastInBound.receiptOrder ?? 0, id: lastInBound.id };
-          }
-          discardPrefetch();
-          break;
-        }
-
-        cursor = page.nextCursor;
-        if (!page.hasMore) {
-          break;
-        }
-      }
-      persistScanCursor(cursor);
-      return { transferred, transferredBytes, scanned, cancelled: false, rejected };
-    }
-
-    onProgress?.({
-      phase: 'preparing',
-      message: 'Finding new entries...',
-      transferredEntries: 0,
-      scannedEntries: 0,
-    });
-
-    const targetIds = await targetStore.getAllIds();
-    const sourceNewMetadata = await sourceStore.findNewEntries(targetIds);
-    if (sourceNewMetadata.length === 0) {
-      return { transferred: 0, scanned: 0, cancelled: false };
-    }
-
-    if (options?.signal?.aborted) {
-      return { transferred: 0, scanned: 0, cancelled: true };
-    }
-
-    onProgress?.({
-      phase: 'transferring',
-      message: `Transferring ${sourceNewMetadata.length} entries...`,
-      transferredEntries: transferred,
-      scannedEntries: sourceNewMetadata.length,
-      totalSourceEntries: sourceNewMetadata.length,
-    });
-
-    const transferResult = await this.transferEntriesInBatches(
-      sourceStore,
-      targetStore,
-      sourceNewMetadata.map((m) => m.id),
-      options,
-      {
-        transferred,
-        transferredBytes,
-        scanned: sourceNewMetadata.length,
-        totalSourceEntries: sourceNewMetadata.length,
-      },
-    );
-    transferred = transferResult.transferred;
-    transferredBytes = transferResult.transferredBytes;
-    rejected.push(...transferResult.rejected);
-    if (transferResult.cancelled) {
-      return { transferred, transferredBytes, scanned: sourceNewMetadata.length, cancelled: true, rejected };
-    }
-
-    onProgress?.({
-      phase: 'transferring',
-      message: `Transferred ${transferred} entries`,
-      transferredEntries: transferred,
-      transferredBytes,
-      scannedEntries: sourceNewMetadata.length,
-      totalSourceEntries: sourceNewMetadata.length,
-    });
-
-    return {
-      transferred,
-      transferredBytes,
-      scanned: sourceNewMetadata.length,
-      cancelled: false,
-      rejected,
-    };
   }
 
   /**

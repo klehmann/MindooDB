@@ -23,7 +23,7 @@ import { join, resolve, sep } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
-import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver, ServerPurgedDocResolver, BuiltinWriteContext } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver, ServerPurgedDocResolver, BuiltinWriteContext, ServerPeerTokenResolver, ServerTrustedWitnessResolver } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import { PurgedDocRegistry } from "./PurgedDocRegistry";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
@@ -58,10 +58,7 @@ import type {
   RegisterTenantRequest,
   UserConfig,
   TrustedServer,
-  NamedRemoteServerConfig,
 } from "./types";
-import { ENV_VARS } from "./types";
-import { assertSafeSyncUrl } from "../../core/utils/urlSafety";
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -445,6 +442,13 @@ export class TenantManager {
   private trustedServers: TrustedServer[] = [];
   /** Lazily-built, cached witness signer (server's Ed25519 signing identity). */
   private witnessSigner: WitnessSigner | undefined;
+  /** Lazily-imported RSA private key for peer replication (see getServerEncryptionPrivateKey). */
+  private serverEncryptionPrivateKey: CryptoKey | undefined;
+  /** Peer wiring handed down to every server store; see setPeerAccessControl. */
+  private peerAccessControl: {
+    peerTokenResolver?: ServerPeerTokenResolver;
+    trustedWitnessResolver?: ServerTrustedWitnessResolver;
+  } = {};
   /** Per-tenant persistent registry of executed purges (docs/accesscontrol.md §13). */
   private purgedDocRegistries: Map<string, PurgedDocRegistry> = new Map();
   /** In-flight purge executions, keyed by normalized tenant id (serializes runs). */
@@ -492,6 +496,84 @@ export class TenantManager {
       signingPublicKey: this.serverIdentity.userSigningKeyPair.publicKey as string,
       encryptionPublicKey: this.serverIdentity.userEncryptionKeyPair.publicKey as string,
     };
+  }
+
+  getDataDir(): string {
+    return this.dataDir;
+  }
+
+  /**
+   * Teach every server store how to recognise a trusted peer.
+   *
+   * `MindooDBServer` calls this once at startup. Two hooks, both required for
+   * peer replication to be correct:
+   *
+   * - `peerTokenResolver` lets a peer's cluster-level JWT through the tenant
+   *   sync routes. A peer holds no per-tenant grant, so without it the mirror
+   *   would need a second replication protocol; with it the peer reuses the
+   *   client one and the store skips the per-user gates that do not apply to a
+   *   full replica.
+   * - `trustedWitnessResolver` decides whose witness receipts may be preserved
+   *   instead of re-stamped (convergence invariant 3). Without it a replicated
+   *   entry would get a fresh `receivedAt` on every hop and "trusted time"
+   *   would mean "time it reached the last server".
+   *
+   * Must be called before the first {@link getServerStore}, since stores are
+   * cached per tenant and database.
+   */
+  setPeerAccessControl(options: {
+    peerTokenResolver?: ServerPeerTokenResolver;
+    trustedWitnessResolver?: ServerTrustedWitnessResolver;
+  }): void {
+    this.peerAccessControl = options;
+  }
+
+  /**
+   * Database ids this server holds for a tenant, read from
+   * `{dataDir}/{tenantId}/stores`. Used by peer replication to mirror every
+   * database rather than a configured subset.
+   */
+  listDatabases(tenantId: string): string[] {
+    const storesDir = join(this.resolveTenantDir(tenantId.toLowerCase()), "stores");
+    if (!existsSync(storesDir)) {
+      return [];
+    }
+    try {
+      return readdirSync(storesDir).filter((entry) =>
+        statSync(join(storesDir, entry)).isDirectory(),
+      );
+    } catch (error) {
+      console.warn(`[TenantManager] Could not list databases for ${tenantId}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * The server's own RSA private key, imported for decryption.
+   *
+   * Peer replication needs it because the remote wraps transported entries to
+   * this server's `encryptionPublicKey` (the one in its `trusted-servers.json`),
+   * exactly as it would wrap them for a client.
+   */
+  async getServerEncryptionPrivateKey(): Promise<CryptoKey | undefined> {
+    if (this.serverEncryptionPrivateKey) return this.serverEncryptionPrivateKey;
+    if (!this.serverIdentity || !this.serverPassword) return undefined;
+
+    const subtle = this.cryptoAdapter.getSubtle();
+    const keyBuffer = await decryptPrivateKey(
+      this.cryptoAdapter,
+      this.serverIdentity.userEncryptionKeyPair.privateKey as EncryptedPrivateKey,
+      this.serverPassword,
+      "encryption",
+    );
+    this.serverEncryptionPrivateKey = await subtle.importKey(
+      "pkcs8",
+      keyBuffer,
+      { name: "RSA-OAEP", hash: "SHA-256" },
+      false,
+      ["decrypt"],
+    );
+    return this.serverEncryptionPrivateKey;
   }
 
   /**
@@ -556,6 +638,27 @@ export class TenantManager {
     this.trustedServers.push(server);
     this.persistTrustedServers();
     console.log(`[TenantManager] Added trusted server: ${server.name}`);
+  }
+
+  /**
+   * Add or replace a trusted server by name.
+   *
+   * Peer CRUD needs an upsert: `addTrustedServer` throws on an existing name,
+   * which is right for `add-to-network` (a silent overwrite of a peer's keys
+   * would be a trust change disguised as a config edit) but wrong for the admin
+   * API, where changing a peer's url or role is the common case.
+   */
+  saveTrustedServer(server: TrustedServer): void {
+    const idx = this.trustedServers.findIndex(
+      (s) => s.name.toLowerCase() === server.name.toLowerCase(),
+    );
+    if (idx === -1) {
+      this.trustedServers.push(server);
+    } else {
+      this.trustedServers[idx] = server;
+    }
+    this.persistTrustedServers();
+    console.log(`[TenantManager] Saved trusted server: ${server.name}`);
   }
 
   removeTrustedServer(name: string): boolean {
@@ -876,7 +979,7 @@ export class TenantManager {
    */
   updateTenantConfig(
     tenantId: string,
-    updates: Partial<Pick<TenantConfig, "defaultStoreType" | "remoteServers">>,
+    updates: Partial<Pick<TenantConfig, "defaultStoreType">>,
   ): void {
     const normalizedId = tenantId.toLowerCase();
     const configPath = this.resolveTenantConfigPath(normalizedId);
@@ -887,9 +990,6 @@ export class TenantManager {
 
     if (updates.defaultStoreType !== undefined) {
       config.defaultStoreType = updates.defaultStoreType;
-    }
-    if (updates.remoteServers !== undefined) {
-      config.remoteServers = updates.remoteServers;
     }
 
     writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
@@ -914,78 +1014,6 @@ export class TenantManager {
     rmSync(tenantDir, { recursive: true, force: true });
 
     console.log(`[TenantManager] Removed tenant: ${normalizedId}`);
-  }
-
-  // =======================================================================
-  // Per-tenant sync server management
-  // =======================================================================
-
-  getTenantSyncServers(tenantId: string): NamedRemoteServerConfig[] {
-    const normalizedId = tenantId.toLowerCase();
-    const configPath = this.resolveTenantConfigPath(normalizedId);
-    if (!existsSync(configPath)) {
-      throw new Error(`Tenant ${normalizedId} not found`);
-    }
-    const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
-    return (config.remoteServers || []) as NamedRemoteServerConfig[];
-  }
-
-  addTenantSyncServer(tenantId: string, server: NamedRemoteServerConfig): void {
-    const normalizedId = tenantId.toLowerCase();
-    // SSRF guard (defense in depth alongside the HTTP route): a configured sync
-    // URL is fetched server-side, so reject plaintext/internal targets unless
-    // explicitly allowed for local development.
-    const allowInsecure = /^(1|true)$/i.test(
-      process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
-    );
-    assertSafeSyncUrl(server.url, {
-      requireHttps: !allowInsecure,
-      allowPrivate: allowInsecure,
-    });
-    const configPath = this.resolveTenantConfigPath(normalizedId);
-    if (!existsSync(configPath)) {
-      throw new Error(`Tenant ${normalizedId} not found`);
-    }
-    const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
-    const servers = (config.remoteServers || []) as NamedRemoteServerConfig[];
-
-    const idx = servers.findIndex(
-      (s) => s.name?.toLowerCase() === server.name.toLowerCase(),
-    );
-    if (idx >= 0) {
-      servers[idx] = server;
-      console.log(`[TenantManager] Updated sync server "${server.name}" for tenant ${normalizedId}`);
-    } else {
-      servers.push(server);
-      console.log(`[TenantManager] Added sync server "${server.name}" for tenant ${normalizedId}`);
-    }
-    config.remoteServers = servers;
-    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
-
-    this.loadedTenants.delete(normalizedId);
-  }
-
-  removeTenantSyncServer(tenantId: string, serverName: string): boolean {
-    const normalizedId = tenantId.toLowerCase();
-    const configPath = this.resolveTenantConfigPath(normalizedId);
-    if (!existsSync(configPath)) {
-      throw new Error(`Tenant ${normalizedId} not found`);
-    }
-    const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
-    const servers = (config.remoteServers || []) as NamedRemoteServerConfig[];
-
-    const idx = servers.findIndex(
-      (s) => s.name?.toLowerCase() === serverName.toLowerCase(),
-    );
-    if (idx === -1) return false;
-
-    servers.splice(idx, 1);
-    config.remoteServers = servers;
-    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
-
-    this.loadedTenants.delete(normalizedId);
-    console.log(`[TenantManager] Removed sync server "${serverName}" from tenant ${normalizedId}`);
-    return true;
   }
 
   // =======================================================================
@@ -1051,6 +1079,7 @@ export class TenantManager {
         revokedKeyResolver,
         purgedDocResolver,
         builtinWriteContext,
+        ...this.peerAccessControl,
       },
     );
 

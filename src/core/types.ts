@@ -4997,6 +4997,25 @@ export interface MindooDB {
   getDeletedDocumentIds(options?: ListDocumentIdsOptions): Promise<string[]>;
 
   /**
+   * How many documents this database holds locally that the current KeyBag
+   * cannot open.
+   *
+   * Such documents are returned by no listing method and appear in no view, by
+   * design — but that makes an under-provisioned device indistinguishable from
+   * an empty database. This count is the difference: a UI can say "3 documents,
+   * 7 hidden" instead of showing an empty list to a device whose user key is
+   * still waiting for approval.
+   *
+   * Reflects what has arrived on this device, not what the tenant holds, and
+   * includes deleted documents: the deletion state of a document we cannot
+   * decrypt is not reliably knowable, its presence is.
+   *
+   * Synchronous and free — the tally is maintained while syncing and
+   * reconciling, and persisted with the metadata checkpoint.
+   */
+  getInaccessibleDocumentCount?(): number;
+
+  /**
    * List documents with their creation date, ordered chronologically.
    *
    * Creation dates are not part of the changefeed index, which tracks last

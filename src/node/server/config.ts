@@ -16,11 +16,13 @@ import { join, dirname, basename } from "path";
 
 import type {
   RateLimitConfig,
+  ServerClusterConfig,
   ServerConfig,
   ServerRateLimitsConfig,
   SystemAdminPrincipal,
   TimestampRateLimitConfig,
 } from "./types";
+import { isPeerRole } from "./peer/types";
 
 export interface ConfigBackupInfo {
   file: string;
@@ -42,7 +44,7 @@ export function isTenantCreationCapabilityRule(ruleKey: string): boolean {
   // Segment-exact: tenant creation targets exactly one segment under
   // `/system/tenants/` (the tenant id, which may itself be a `*` pattern). A
   // prefix test would let a wildcard `*` principal be configured on an existing
-  // tenant's sub-resource (e.g. `.../sync-servers`), an over-grant (audit #6).
+  // tenant's sub-resource, an over-grant (audit #6).
   return method === "POST" && /^\/system\/tenants\/[^/]+\/?$/.test(pathPattern);
 }
 
@@ -137,6 +139,11 @@ export function validateServerConfig(raw: unknown, filePath: string): ServerConf
   const rateLimits = validateRateLimits(obj.rateLimits, filePath);
   const config: ServerConfig = rateLimits ? { capabilities, rateLimits } : { capabilities };
 
+  const cluster = validateCluster(obj.cluster, filePath);
+  if (cluster) {
+    config.cluster = cluster;
+  }
+
   const principalCount = Object.values(capabilities).reduce(
     (sum, arr) => sum + arr.length,
     0,
@@ -146,6 +153,34 @@ export function validateServerConfig(raw: unknown, filePath: string): ServerConf
   );
 
   return config;
+}
+
+function validateCluster(raw: unknown, filePath: string): ServerClusterConfig | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config.json at ${filePath}: "cluster" must be an object`);
+  }
+
+  const obj = raw as Record<string, unknown>;
+  const cluster: ServerClusterConfig = {};
+
+  if (obj.autoSync !== undefined) {
+    if (typeof obj.autoSync !== "boolean") {
+      throw new Error(`config.json at ${filePath}: "cluster.autoSync" must be a boolean`);
+    }
+    cluster.autoSync = obj.autoSync;
+  }
+  if (obj.role !== undefined) {
+    if (!isPeerRole(obj.role)) {
+      throw new Error(
+        `config.json at ${filePath}: "cluster.role" must be "peer", "hub" or "spoke"`,
+      );
+    }
+    cluster.role = obj.role;
+  }
+  return Object.keys(cluster).length > 0 ? cluster : undefined;
 }
 
 function validateRateLimits(
@@ -164,8 +199,12 @@ function validateRateLimits(
   const sync = validateRateLimitConfig(obj.sync, "sync", filePath);
   const timestamps = validateTimestampRateLimitConfig(obj.timestamps, filePath);
   const global = validateRateLimitConfig(obj.global, "global", filePath);
+  const system = validateRateLimitConfig(obj.system, "system", filePath);
 
   const rateLimits: ServerRateLimitsConfig = {};
+  if (system) {
+    rateLimits.system = system;
+  }
   if (auth) {
     rateLimits.auth = auth;
   }

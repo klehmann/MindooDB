@@ -9,7 +9,7 @@
  * Options:
  *   -d, --data-dir <path>   Data directory path (default: ./data)
  *   -p, --port <port>       Server port (default: 1661)
- *   -s, --auto-sync         Enable automatic sync with remote servers
+ *   -s, --auto-sync         Replicate with the peers in trusted-servers.json
  *   -w, --static-dir <path> Serve static files from this directory at /statics/
  *   --tls-cert <path>       Path to TLS certificate file (PEM)
  *   --tls-key <path>        Path to TLS private key file (PEM)
@@ -20,8 +20,6 @@
  */
 
 import { MindooDBServer } from "./MindooDBServer";
-import { StoreKind } from "../../core/types";
-import { ServerSync, startPeriodicSync } from "./ServerSync";
 import { loadServerConfig, resolveConfigPath } from "./config";
 import { resolveServerPassword } from "./resolveServerPassword";
 import { ENV_VARS } from "./types";
@@ -133,7 +131,8 @@ Usage:
 Options:
   -d, --data-dir <path>   Data directory path (default: ./data)
   -p, --port <port>       Server port (default: 1661)
-  -s, --auto-sync         Enable automatic sync with remote servers
+  -s, --auto-sync         Replicate with every peer in trusted-servers.json
+                          that has a "url" (see README-server.md, Clustering)
   -w, --static-dir <path> Serve static files at /statics/ (e.g. bootstrap UI)
   --config <path>         Path to config.json (default: <dataDir>/config.json)
   --tls-cert <path>       Path to TLS certificate file (PEM format)
@@ -151,7 +150,7 @@ Examples:
   # Start server with custom data directory and port
   npm run server:dev -- -d /var/lib/mindoodb -p 8080
 
-  # Start server with auto-sync enabled
+  # Start server as a cluster node, replicating with its trusted peers
   MINDOODB_SERVER_PASSWORD_FILE=./.server-password npm run server:dev -- -s
 
   # Start server with explicit config file
@@ -201,12 +200,12 @@ async function main(): Promise<void> {
   // Create and start the server
   const server = new MindooDBServer(options.dataDir, serverPassword, options.staticDir, serverConfig, configPath);
 
-  // If auto-sync is enabled and we have server identity, start periodic sync
-  if (options.autoSync) {
+  // Peer replication is cluster-wide, not per tenant: one session per trusted
+  // server with a `url`, and every tenant both sides hold is mirrored over it.
+  if (options.autoSync || serverConfig.cluster?.autoSync) {
     const tenantManager = server.getTenantManager();
-    const serverIdentity = tenantManager.getServerIdentity();
 
-    if (!serverIdentity) {
+    if (!tenantManager.getServerIdentity()) {
       console.warn(
         "[Main] Auto-sync enabled but no server.identity.json found. " +
         "Run 'npm run init' to create a server identity.",
@@ -215,45 +214,17 @@ async function main(): Promise<void> {
       console.warn(
         "[Main] Auto-sync enabled but no server password (set " +
         `${ENV_VARS.SERVER_PASSWORD} or ${ENV_VARS.SERVER_PASSWORD_FILE}). ` +
-        "Server-to-server sync will not work.",
+        "Peer replication needs it to sign challenges and unwrap peer entries.",
       );
     } else {
-      const tenants = tenantManager.listTenants();
+      server.startCluster();
 
-      for (const tenantId of tenants) {
-        try {
-          const tenant = await tenantManager.getTenant(tenantId);
-          const config = tenant.context.config;
-
-          if (config.remoteServers && config.remoteServers.length > 0) {
-            const serverSync = new ServerSync(
-              tenantManager.getCryptoAdapter(),
-              tenantId,
-              serverIdentity,
-              serverPassword,
-              async (dbId) => tenantManager.getStore(tenantId, dbId, StoreKind.docs),
-            );
-
-            const stopSync = startPeriodicSync(serverSync, config.remoteServers);
-
-            process.on("SIGINT", () => {
-              console.log("\n[Main] Shutting down...");
-              stopSync();
-              process.exit(0);
-            });
-
-            process.on("SIGTERM", () => {
-              console.log("\n[Main] Shutting down...");
-              stopSync();
-              process.exit(0);
-            });
-
-            console.log(`[Main] Started auto-sync for tenant ${tenantId}`);
-          }
-        } catch (error) {
-          console.error(`[Main] Error setting up auto-sync for tenant ${tenantId}:`, error);
-        }
-      }
+      const shutdown = () => {
+        console.log("\n[Main] Shutting down...");
+        void server.stopCluster().finally(() => process.exit(0));
+      };
+      process.on("SIGINT", shutdown);
+      process.on("SIGTERM", shutdown);
     }
   }
 

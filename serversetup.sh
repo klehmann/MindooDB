@@ -17,7 +17,6 @@ set -euo pipefail
 
 DOCKER_IMAGE="mindoodb-server"
 DOCKERFILE="src/node/server/Dockerfile"
-DEFAULT_SERVER_NAME="server1"
 DEFAULT_DATA_DIR="../mindoodb-data"
 DEFAULT_BIND_ADDR="0.0.0.0"
 DEFAULT_CONTAINER_PORT="1661"
@@ -104,6 +103,36 @@ prompt_default() {
   printf "  %s [%s]: " "$prompt" "$default"
   read -r value
   eval "$var_name=\"\${value:-$default}\""
+}
+
+# Pre-flight check for the shape serverinit.ts insists on: a common name and an
+# organization, canonical ("cn=server1/o=acme") or abbreviated ("server1/acme").
+# serverinit is authoritative and does the actual expansion; catching it here
+# only spares the operator a Docker build that ends in a rejected name.
+names_common_name_and_org() {
+  local name="$1" first last
+  [[ "$name" == */* ]] || return 1
+  first="${name%%/*}"
+  last="${name##*/}"
+  [[ -n "$first" && -n "$last" ]] || return 1
+  # A segment that carries its own key is kept as it is, so only "cn" fits first
+  # and only "o" fits last; a keyless segment gets the right one added.
+  [[ "$first" != *=* || "$(to_lower "${first%%=*}")" == "cn" ]] || return 1
+  [[ "$last" != *=* || "$(to_lower "${last%%=*}")" == "o" ]] || return 1
+  return 0
+}
+
+prompt_server_name() {
+  local var_name="$1" value
+  while true; do
+    printf "  Server name (e.g. server1/acme or cn=server1/o=acme): "
+    read -r value
+    if names_common_name_and_org "$value"; then
+      eval "$var_name=\"\$value\""
+      return
+    fi
+    error "Please give a common name and an organization, e.g. server1/acme."
+  done
 }
 
 prompt_port() {
@@ -451,7 +480,7 @@ elif [[ -f "$IDENTITY_FILE" ]]; then
 fi
 
 if [[ "$MODE" != "update" ]]; then
-  prompt_default "Server name" "$DEFAULT_SERVER_NAME" SERVER_NAME
+  prompt_server_name SERVER_NAME
 fi
 
 prompt_default "Bind address (0.0.0.0 = all interfaces)" "$DEFAULT_BIND_ADDR" BIND_ADDR

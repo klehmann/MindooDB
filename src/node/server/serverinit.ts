@@ -7,7 +7,8 @@
  *   npx ts-node src/serverinit.ts --name <serverName> [options]
  *
  * Options:
- *   -n, --name <name>       Server name (e.g., "server1") -- required
+ *   -n, --name <name>       Server name, canonical or abbreviated
+ *                           (e.g. "cn=server1/o=acme" or "server1/acme") -- required
  *   -d, --data-dir <path>   Data directory path (default: ./data)
  *   -f, --force             Overwrite existing server.identity.json
  *   --skip-admin            Skip system admin keypair generation
@@ -27,6 +28,7 @@ import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../../appendonlystores/InMemoryContentAddressedStoreFactory";
 
+import { CANONICAL_NAME_HINT, toCanonicalSetupName } from "./canonicalSetupName";
 import { resolveServerPassword } from "./resolveServerPassword";
 import { ENV_VARS } from "./types";
 import type { ServerConfig } from "./types";
@@ -102,7 +104,9 @@ Usage:
   npx ts-node src/serverinit.ts --name <serverName> [options]
 
 Options:
-  -n, --name <name>       Server name (e.g., "server1") -- required
+  -n, --name <name>       Server name -- required. Canonical or abbreviated;
+                          both a common name and an organization are needed
+                          ("cn=server1/o=acme" or "server1/acme").
   -d, --data-dir <path>   Data directory path (default: ./data)
   -f, --force             Overwrite existing server.identity.json
   --skip-admin            Skip interactive system admin keypair generation
@@ -114,10 +118,10 @@ Environment variables:
 
 Examples:
   # Interactive (prompts for password and system admin setup):
-  npx ts-node src/serverinit.ts --name server1
+  npx ts-node src/serverinit.ts --name server1/acme
 
   # Non-interactive (password from file, skip admin):
-  MINDOODB_SERVER_PASSWORD_FILE=./.server-password npx ts-node src/serverinit.ts --name server1 --skip-admin
+  MINDOODB_SERVER_PASSWORD_FILE=./.server-password npx ts-node src/serverinit.ts --name cn=server1/o=acme --skip-admin
 `);
 }
 
@@ -192,6 +196,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const serverUsername = toCanonicalSetupName(options.name);
+  if (!serverUsername) {
+    console.error(`Error: --name ${CANONICAL_NAME_HINT} (got "${options.name}").`);
+    process.exit(1);
+  }
+
   const identityPath = join(options.dataDir, "server.identity.json");
   const trustedServersPath = join(options.dataDir, "trusted-servers.json");
   const configPath = join(options.dataDir, "config.json");
@@ -219,7 +229,7 @@ async function main(): Promise<void> {
   console.log("=".repeat(60));
   console.log("MindooDB Server Init");
   console.log("=".repeat(60));
-  console.log(`Server name: ${options.name}`);
+  console.log(`Server name: ${serverUsername}`);
   console.log(`Data directory: ${options.dataDir}`);
   console.log("=".repeat(60));
 
@@ -229,7 +239,6 @@ async function main(): Promise<void> {
     cryptoAdapter,
   );
 
-  const serverUsername = `CN=${options.name}`;
   console.log(`\nGenerating server identity for "${serverUsername}"...`);
   console.log("(This may take a few seconds for RSA key generation)\n");
 
@@ -292,12 +301,26 @@ async function generateSystemAdmin(
     return;
   }
 
-  const adminUsername = await promptLine(rl, "System admin username (e.g. cn=sysadmin/o=myorg): ");
-  if (!adminUsername.trim()) {
-    rl.close();
-    console.error("Error: username cannot be empty.");
-    writeDefaultConfig(configPath);
-    return;
+  // Ask again rather than abort: a rejected name here would otherwise cost the
+  // operator the whole init run, and the mistake is a spelling, not a decision.
+  let adminUsername = "";
+  while (!adminUsername) {
+    const typed = await promptLine(rl, "System admin username (e.g. cn=sysadmin/o=myorg): ");
+    if (!typed.trim()) {
+      rl.close();
+      console.error("Error: username cannot be empty.");
+      writeDefaultConfig(configPath);
+      return;
+    }
+    const canonical = toCanonicalSetupName(typed);
+    if (!canonical) {
+      console.error(`  The username ${CANONICAL_NAME_HINT}.`);
+      continue;
+    }
+    if (canonical !== typed.trim()) {
+      console.log(`  Using canonical name: ${canonical}`);
+    }
+    adminUsername = canonical;
   }
 
   const adminPassword = await promptHiddenLine("Password to protect the system admin private key: ");

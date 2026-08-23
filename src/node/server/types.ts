@@ -1,4 +1,5 @@
 import type { MindooDBServerInfo } from "../../core/types";
+import type { PeerSyncDirection, PeerRole, PeerAttachmentMode } from "./peer/types";
 
 /**
  * Types for the MindooDB Example Server
@@ -39,30 +40,24 @@ export interface UserConfig {
 /**
  * A remote server trusted for server-to-server sync.
  * Stored globally in <dataDir>/trusted-servers.json.
+ *
+ * Trust and reachability are one entry: the keys authenticate the peer in both
+ * directions, and `url` says where to reach it. An entry without `url` stays
+ * auth-only — the peer may call us, we never dial it.
  */
-export interface TrustedServer extends MindooDBServerInfo {}
-
-/**
- * Configuration for a remote server to sync with (per-tenant).
- * The server authenticates using its global identity (from server.identity.json).
- * The remote server's public keys are looked up from trusted-servers.json.
- */
-export interface RemoteServerConfig {
-  /** Base URL of the remote server (e.g., "https://eu-west.example.com") */
-  url: string;
-  /** Optional: automatic sync interval in milliseconds */
-  syncIntervalMs?: number;
-  /** Optional: specific databases to sync (default: all) */
-  databases?: string[];
-}
-
-/**
- * RemoteServerConfig with a required name, used when managing sync servers
- * via the admin API. The name identifies the server for updates and deletes.
- */
-export interface NamedRemoteServerConfig extends RemoteServerConfig {
-  /** Server name matching the trusted-servers identity (e.g., "CN=server2") */
-  name: string;
+export interface TrustedServer extends MindooDBServerInfo {
+  /**
+   * Base origin of the peer, without a tenant path (e.g.
+   * `https://eu-west.example.com`). The replicator appends `/{tenantId}` itself,
+   * matching what clients do in `BaseMindooTenant.connectToServer`.
+   */
+  url?: string;
+  /** Which way entries flow. Defaults to `"bidirectional"`. */
+  direction?: PeerSyncDirection;
+  /** Mesh shape. Defaults to `"peer"`. */
+  role?: PeerRole;
+  /** How eagerly attachment blobs follow. Defaults to `"eager"`. */
+  attachments?: PeerAttachmentMode;
 }
 
 /**
@@ -92,9 +87,6 @@ export interface TenantConfig {
 
   /** Registered users (clients and other servers) kept for bootstrap metadata only */
   users?: UserConfig[];
-
-  /** Remote servers to sync with (for server-to-server sync) */
-  remoteServers?: RemoteServerConfig[];
 }
 
 /**
@@ -186,6 +178,16 @@ export interface ServerRateLimitsConfig {
   sync?: RateLimitConfig;
   timestamps?: TimestampRateLimitConfig;
   /**
+   * Per-IP limit for `/system/*`. Defaults to 30/min, which suits occasional
+   * CRUD but is tight for a cluster console: `GET /system/cluster/status`
+   * polled every few seconds across several nodes will hit it. Raise it on
+   * nodes that a monitoring dashboard watches.
+   *
+   * Does not cover `/system/peer/*`, which is server-to-server traffic with its
+   * own, much higher limit.
+   */
+  system?: RateLimitConfig;
+  /**
    * Coarse per-IP net applied to every route ahead of the tier limiters.
    * Defaults to the combined sync and auth budgets plus headroom; setting it
    * below what a tier allows makes it, not the tier, the effective limit.
@@ -204,6 +206,21 @@ export interface ServerRateLimitsConfig {
 export interface ServerConfig {
   capabilities: Record<string, SystemAdminPrincipal[]>;
   rateLimits?: ServerRateLimitsConfig;
+  cluster?: ServerClusterConfig;
+}
+
+/** Node-level cluster settings; per-peer settings live in `trusted-servers.json`. */
+export interface ServerClusterConfig {
+  /**
+   * Start peer replication on boot. Equivalent to the `--auto-sync` CLI flag,
+   * which is the more common way to set it.
+   */
+  autoSync?: boolean;
+  /**
+   * This node's mesh role. `spoke` means it does not dial other spokes (the hub
+   * carries that traffic); `hub` and the default `peer` dial everyone.
+   */
+  role?: PeerRole;
 }
 
 /**
@@ -235,17 +252,11 @@ export const ENV_VARS = {
    */
   TRUST_PROXY: "MINDOODB_TRUST_PROXY",
   /**
-   * When `true`/`1`, sync-server URLs may use plaintext http and target
+   * When `true`/`1`, peer URLs may use plaintext http and target
    * loopback/private/link-local hosts. Off by default so the server cannot be
    * pointed at internal services (SSRF). Enable only for local development.
    */
   ALLOW_INSECURE_SYNC_URLS: "MINDOODB_ALLOW_INSECURE_SYNC_URLS",
-  /**
-   * Maximum number of database ids accepted in a single sync-server registration
-   * (`POST /tenants/:tenantId/sync-servers`). A positive integer; invalid or
-   * non-positive values fall back to {@link DEFAULT_MAX_SYNC_SERVER_DATABASES}.
-   */
-  MAX_SYNC_SERVER_DATABASES: "MINDOODB_MAX_SYNC_SERVER_DATABASES",
   /**
    * Comma-separated RFC 3161 Time-Stamping Authorities the proxy at
    * `POST /:tenantId/timestamps/rfc3161` may contact. Each entry is a built-in

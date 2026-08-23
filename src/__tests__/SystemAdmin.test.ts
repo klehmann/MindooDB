@@ -163,6 +163,10 @@ async function createTestSetup(
       ],
       ...(configOverride?.capabilities ?? {}),
     },
+    // The 30/min default is a production-shaped limit for occasional CRUD; a
+    // test suite issues hundreds of admin calls in seconds and would otherwise
+    // start failing with 429 as tests are added.
+    rateLimits: { system: { windowMs: 60_000, max: 10_000 }, ...configOverride?.rateLimits },
   };
 
   const server = new MindooDBServer(dataDir, "test-password", undefined, config);
@@ -993,13 +997,15 @@ describe("System Admin Security", () => {
       );
       expect(listDenied.status).toBe(403);
 
-      const subresourceDenied = await httpRequest(
-        `${setup.baseUrl}/system/tenants/owned-by-tenant-admin/sync-servers/other`,
-        "DELETE",
-        undefined,
+      // The owner bypass is DELETE-of-own-tenant and nothing else: the same
+      // token must not be able to reconfigure the tenant it owns.
+      const updateDenied = await httpRequest(
+        `${setup.baseUrl}/system/tenants/owned-by-tenant-admin`,
+        "PUT",
+        { defaultStoreType: "inmemory" },
         { Authorization: `Bearer ${ownerToken}` },
       );
-      expect(subresourceDenied.status).toBe(403);
+      expect(updateDenied.status).toBe(403);
 
       const { status, body } = await httpRequest(
         `${setup.baseUrl}/system/tenants/owned-by-tenant-admin`,
@@ -1609,7 +1615,7 @@ describe("System Admin Security", () => {
       expect(removeResult.success).toBe(true);
     });
 
-    test("should manage tenant sync servers", async () => {
+    test("should manage cluster peers and dispatch actions as jobs", async () => {
       const admin = new MindooDBServerAdmin({
         serverUrl: setup.baseUrl,
         systemAdminUser: setup.adminUser,
@@ -1617,34 +1623,38 @@ describe("System Admin Security", () => {
         cryptoAdapter,
       });
 
-      // Create a tenant first
-      const adminSigningKey = await factory.createSigningKeyPair("pw");
-      const adminEncryptionKey = await factory.createEncryptionKeyPair("pw");
-      await admin.registerTenant("sync-test", {
-        adminSigningPublicKey: adminSigningKey.publicKey,
-        adminEncryptionPublicKey: adminEncryptionKey.publicKey,
-        publicInfosKey: createPublicInfosKeyBase64(3),
-      });
-
-      const addResult = await admin.addTenantSyncServer("sync-test", {
-        name: "CN=sync-server",
-        url: "https://sync.example.com",
-        databases: ["directory", "main"],
-      });
-      expect(addResult.success).toBe(true);
-
-      const servers = await admin.listTenantSyncServers("sync-test");
-      expect(servers).toHaveLength(1);
-      expect(servers[0].name).toBe("CN=sync-server");
-
-      const removeResult = await admin.removeTenantSyncServer(
-        "sync-test",
-        "CN=sync-server",
+      const created = await admin.saveClusterPeer(
+        "CN=cluster-peer",
+        {
+          signingPublicKey: "-----BEGIN PUBLIC KEY-----\nFAKE1\n-----END PUBLIC KEY-----",
+          encryptionPublicKey: "-----BEGIN PUBLIC KEY-----\nFAKE2\n-----END PUBLIC KEY-----",
+          url: "https://peer.example.com",
+          direction: "pull",
+        },
+        "create",
       );
-      expect(removeResult.success).toBe(true);
+      expect(created.success).toBe(true);
+      expect(created.peer.direction).toBe("pull");
+
+      const topology = (await admin.getClusterTopology()) as {
+        peers: Array<{ name: string; direction: string }>;
+      };
+      expect(topology.peers).toContainEqual(
+        expect.objectContaining({ name: "CN=cluster-peer", direction: "pull" }),
+      );
+
+      // A mutating action answers with a job id, not a finished result: a full
+      // mirror can outlive any sensible request timeout.
+      const dispatched = await admin.runClusterAction("pause", { peer: "CN=cluster-peer" });
+      expect(dispatched.jobId).toBeTruthy();
+      const job = (await admin.getClusterJob(dispatched.jobId)) as { kind: string };
+      expect(job.kind).toBe("pause");
+
+      const removed = await admin.deleteClusterPeer("CN=cluster-peer");
+      expect(removed.success).toBe(true);
     });
 
-    test("should trigger tenant sync", async () => {
+    test("cluster status and audit stay admin-blind", async () => {
       const admin = new MindooDBServerAdmin({
         serverUrl: setup.baseUrl,
         systemAdminUser: setup.adminUser,
@@ -1652,8 +1662,16 @@ describe("System Admin Security", () => {
         cryptoAdapter,
       });
 
-      const result = await admin.triggerTenantSync("sync-test");
-      expect(result.success).toBe(true);
+      const status = (await admin.getClusterStatus()) as { health: string; peers: unknown[] };
+      expect(status.health).toBe("ok");
+
+      const audit = (await admin.getClusterAudit({ limit: 10 })) as {
+        records: Array<{ action: string; actor: string }>;
+      };
+      // Every action taken above is on record, with the principal that took it
+      // and nothing that identifies a document.
+      expect(audit.records.some((record) => record.action === "pause")).toBe(true);
+      expect(JSON.stringify(audit.records)).not.toContain("docId");
     });
 
     test("should update tenant config through the wrapper", async () => {

@@ -51,7 +51,7 @@ describe("CapabilityMatcher", () => {
 
       expect(matcher.isAuthorized("GET", "/system/tenants", "admin", key1)).toBe(true);
       expect(matcher.isAuthorized("POST", "/system/tenants/my-tenant", "admin", key1)).toBe(true);
-      expect(matcher.isAuthorized("DELETE", "/system/tenants/my-tenant/sync-servers/foo", "admin", key1)).toBe(true);
+      expect(matcher.isAuthorized("DELETE", "/system/tenants/my-tenant/subresource/foo", "admin", key1)).toBe(true);
     });
 
     test("should match prefix wildcard for tenant creation", () => {
@@ -232,8 +232,8 @@ describe("CapabilityMatcher", () => {
 
   describe("tenant-creation wildcard principal (audit #6)", () => {
     // The "*"/"*" wildcard principal may ONLY authorize tenant creation, which
-    // targets exactly one segment under /system/tenants/. It must not be able to
-    // act on an existing tenant's sub-resources (sync-servers, trigger-sync).
+    // targets exactly one segment under /system/tenants/. It must not reach any
+    // sub-resource of an existing tenant, now or when one is added later.
     const wildcardConfig: ServerConfig = {
       capabilities: {
         "POST:/system/tenants/*": [{ username: "*", publicsignkey: "*" }],
@@ -252,7 +252,7 @@ describe("CapabilityMatcher", () => {
       expect(
         matcher.isAuthorized(
           "POST",
-          "/system/tenants/acme/sync-servers",
+          "/system/tenants/acme/subresource",
           "anyone",
           key3,
         ),
@@ -260,7 +260,7 @@ describe("CapabilityMatcher", () => {
       expect(
         matcher.isAuthorized(
           "POST",
-          "/system/tenants/acme/trigger-sync",
+          "/system/tenants/acme/subresource/item",
           "anyone",
           key3,
         ),
@@ -283,11 +283,69 @@ describe("CapabilityMatcher", () => {
       const matcher = new CapabilityMatcher(config);
       // Explicit principal still matched only by the path pattern, not over-granted.
       expect(
-        matcher.isAuthorized("POST", "/system/tenants/x/sync-servers", "creator", key1),
+        matcher.isAuthorized("POST", "/system/tenants/x/subresource", "creator", key1),
       ).toBe(true);
       // ...but a DIFFERENT principal cannot ride the wildcard creation path.
       expect(
         matcher.isAuthorized("POST", "/system/tenants/x", "other", key2),
+      ).toBe(false);
+    });
+  });
+
+  describe("cluster administration roles", () => {
+    // The read/act split for /system/cluster/* is not a separate mechanism: it
+    // falls out of method-scoped capability rules. An auditor gets the GET
+    // routes and nothing else, so it can watch convergence without being able
+    // to pause replication or repoint a peer.
+    const config: ServerConfig = {
+      capabilities: {
+        "GET:/system/cluster/*": [
+          { username: "auditor", publicsignkey: key1 },
+          { username: "clusteradmin", publicsignkey: key2 },
+        ],
+        "POST:/system/cluster/*": [{ username: "clusteradmin", publicsignkey: key2 }],
+        "DELETE:/system/cluster/*": [{ username: "clusteradmin", publicsignkey: key2 }],
+      },
+    };
+
+    test("an auditor may read status, topology, jobs and audit", () => {
+      const matcher = new CapabilityMatcher(config);
+      for (const path of [
+        "/system/cluster/status",
+        "/system/cluster/status/tenants/acme",
+        "/system/cluster/topology",
+        "/system/cluster/jobs",
+        "/system/cluster/audit",
+      ]) {
+        expect(matcher.isAuthorized("GET", path, "auditor", key1)).toBe(true);
+      }
+    });
+
+    test("an auditor may not act", () => {
+      const matcher = new CapabilityMatcher(config);
+      expect(
+        matcher.isAuthorized("POST", "/system/cluster/actions/pause", "auditor", key1),
+      ).toBe(false);
+      expect(
+        matcher.isAuthorized("DELETE", "/system/cluster/peers/CN=p1", "auditor", key1),
+      ).toBe(false);
+    });
+
+    test("a cluster admin may both read and act", () => {
+      const matcher = new CapabilityMatcher(config);
+      expect(matcher.isAuthorized("GET", "/system/cluster/status", "clusteradmin", key2)).toBe(
+        true,
+      );
+      expect(
+        matcher.isAuthorized("POST", "/system/cluster/actions/sync", "clusteradmin", key2),
+      ).toBe(true);
+    });
+
+    test("cluster capabilities do not leak into other /system routes", () => {
+      const matcher = new CapabilityMatcher(config);
+      expect(matcher.isAuthorized("GET", "/system/tenants", "clusteradmin", key2)).toBe(false);
+      expect(
+        matcher.isAuthorized("POST", "/system/trusted-servers", "clusteradmin", key2),
       ).toBe(false);
     });
   });
@@ -300,7 +358,7 @@ describe("CapabilityMatcher", () => {
 
     test("rejects collection, sub-resources, and unrelated paths", () => {
       expect(parseSystemTenantItemPath("/system/tenants")).toBeNull();
-      expect(parseSystemTenantItemPath("/system/tenants/acme/sync-servers")).toBeNull();
+      expect(parseSystemTenantItemPath("/system/tenants/acme/subresource")).toBeNull();
       expect(parseSystemTenantItemPath("/system/config")).toBeNull();
     });
   });

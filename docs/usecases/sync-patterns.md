@@ -334,6 +334,14 @@ class OfflineFirstSync {
 
 ## Server-Server Sync
 
+> The MindooDB server does this for you. Give a trusted server a `url` in
+> `trusted-servers.json` and start the server with `--auto-sync`: the two nodes
+> negotiate which tenants they both host and mirror all of them, live, with
+> convergence guarantees you would otherwise have to get right yourself. See
+> [Server-to-Server Sync](../../README-server.md#server-to-server-sync). The
+> code below shows the underlying store-level pattern, which is what you would
+> build on for a topology the server does not cover.
+
 ### Multi-Server Replication
 
 **Pattern**: Multiple servers replicate data

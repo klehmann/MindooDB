@@ -866,8 +866,14 @@ omits these fields, behave exactly as before (`"open"`). Local "play" tenants
 created by users carry no restrictive policy, so they remain the intended escape
 hatch for ad-hoc data.
 
-**Out of scope.** Server-to-server `ServerSync` uses `getStore` and bypasses the
-network-store layer, so it is not gated by this policy (noted as a follow-up).
+**Out of scope: peer replication.** A trusted peer syncing on a peer token is
+not gated by this policy, and that is deliberate rather than a gap. The policy
+answers "which databases may this *person* open"; a mirror is not a person and
+holds no key to any of it. Gating it would not withhold anything from a reader,
+it would only produce a silently incomplete replica. What bounds a peer is trust
+itself: it must be in `trusted-servers.json`, and every entry it pushes is
+validated exactly as a client's would be. See
+[network-sync-protocol.md §5.10](network-sync-protocol.md).
 
 ### 6.8 Database read/sync access (`denyDocRead` + `doc_read` rules)
 
