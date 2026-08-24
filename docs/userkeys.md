@@ -531,6 +531,8 @@ The change rule is the load-bearing one, and it is worth being precise about how
 
 The same check runs on the server before its own access control evaluation, so a modified client cannot plant entries. Clients that nonetheless receive a hostile change drop it on load and keep the last valid state.
 
+The table above describes key documents. `userdirectory` also holds each person's **personal documents**, which follow a different ownership rule for a reason that section 7.6 explains.
+
 ### 7.3 The user key document
 
 Each person has one document holding every generation of their key. Generations are a map keyed by epoch, never an array, because two devices that rotate while partitioned write different generations and a map merges per key.
@@ -574,6 +576,28 @@ Keeping the list in the document is what makes concurrent edits safe. As a per-e
 Crucially, **intent is not access**. Nothing in the list grants anything; access comes from a wrap. A hostile writer who adds themselves gains nothing until a client that can actually read the document re-seals it — and to edit the field at all they must already be able to read it.
 
 The key material itself is stored efficiently. Only entries that *change* the recipient set carry a recipient block, so ordinary writes pay nothing. Within a block, the key generations are bundled under a single symmetric key and only that key is wrapped per recipient, which makes the cost `generations + recipients` rather than `generations × recipients`. Each block carries the full bundle for its generation plus only the new wraps, so a recipient needs exactly one entry — the newest one addressing them — to reconstruct every generation. Sealed keys are cached in memory per session rather than in the KeyBag, which is persisted as a single blob and would otherwise grow with the document count and be rewritten on every share.
+
+### 7.6 Personal documents
+
+Once documents can be sealed to a person, `userdirectory` becomes the natural home for a person's own settings — the data that should follow them between devices without any administrator provisioning a database for it. The roamed workspace and application list are the first such payload, stored as one document per save id under the id prefix `wks_`.
+
+These documents need the opposite of what a key document needs. A key document is published: everybody must read it, and its owner is named inside it by `username_hash`. A personal document is private: it is sealed to its owner, so nobody else — the server included — can read a single field of it. Ownership therefore cannot be read out of the payload, which is exactly what the rule in section 7.2 does.
+
+**Ownership is the person who signed the create.** That is available to everyone without decrypting anything: the create entry names its signing key, and grants map that key to a person's `username_hash`, the same resolution the change rule already uses. Every device of that person resolves to the same hash, so roaming across your own devices works, while another member's devices never match.
+
+| Operation | Who may perform it |
+|---|---|
+| Create | any granted device (the creator becomes the owner) |
+| Change | **only** the owning person |
+| Delete | the owning person, or the administrator |
+| Undelete | the owning person, or the administrator |
+| Read | only the recipients the document is sealed to |
+
+Two entries in that table differ from key documents, both deliberately. **The owner may delete**, because a person who stops roaming a workspace must be able to remove it — for a key document deletion is an administrative repair, here it is ordinary use. **The administrator may delete but not change**, so a departed member's data can be cleaned up while editing a document nobody but its owner can read stays impossible; the write would only ever produce garbage or a downgrade attempt.
+
+The prefix is what marks a document as personal, and that is a deliberate choice over a payload field: the server must apply the rule to a document it cannot decrypt, so the discriminator has to live in plain metadata. Ids are generated (`wks_` plus an object id) rather than derived from the save id, which keeps two devices from racing for the same id and lets the document carry `recipients` — a caller-chosen convergent id and recipient sealing are mutually exclusive, because a convergent id needs a derived document key while sealing generates one.
+
+Because ids are generated, two devices enabling roaming for the same save id while partitioned create two documents. They converge by rule rather than by merge: the lexicographically smallest id wins (object ids are time-sortable, so this is the older one), the loser is absorbed once and then deleted by its owner. This costs one extra document in a race that heals on the first sync, which is cheaper than the alternative of a convergent id without sealing.
 
 ---
 

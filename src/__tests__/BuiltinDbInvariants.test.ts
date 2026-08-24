@@ -210,6 +210,108 @@ describe("evaluateBuiltinWrite", () => {
     ).toBe("userdirectory admin create");
   });
 
+  describe("personal userdirectory documents", () => {
+    const personal = { dbId: "userdirectory", docId: "wks_0123456789abcdef01234567" } as const;
+
+    it("lets any granted device create one and refuses an ungranted signing key", () => {
+      expect(
+        evaluateBuiltinWrite({
+          ...personal,
+          op: "doc_create",
+          signerKey: alice,
+          adminPublicKey: admin,
+          signerUsernameHash: aliceHash,
+        }).allowed,
+      ).toBe(true);
+      expect(
+        evaluateBuiltinWrite({
+          ...personal,
+          op: "doc_create",
+          signerKey: "stranger-key",
+          adminPublicKey: admin,
+          signerUsernameHash: null,
+        }).reason,
+      ).toMatch(/require a granted device/);
+    });
+
+    it("lets the creating person change and delete, and nobody else", () => {
+      for (const op of ["doc_change", "doc_snapshot", "doc_delete", "doc_undelete"] as const) {
+        expect(
+          evaluateBuiltinWrite({
+            ...personal,
+            op,
+            signerKey: alice,
+            adminPublicKey: admin,
+            creatorUsernameHash: aliceHash,
+            signerUsernameHash: aliceHash,
+          }).allowed,
+        ).toBe(true);
+        expect(
+          evaluateBuiltinWrite({
+            ...personal,
+            op,
+            signerKey: bob,
+            adminPublicKey: admin,
+            creatorUsernameHash: aliceHash,
+            signerUsernameHash: bobHash,
+          }).allowed,
+        ).toBe(false);
+      }
+    });
+
+    it("lets the admin delete but not change a document they cannot even read", () => {
+      expect(
+        evaluateBuiltinWrite({
+          ...personal,
+          op: "doc_delete",
+          signerKey: admin,
+          adminPublicKey: admin,
+          creatorUsernameHash: aliceHash,
+          signerUsernameHash: null,
+        }).allowed,
+      ).toBe(true);
+      expect(
+        evaluateBuiltinWrite({
+          ...personal,
+          op: "doc_change",
+          signerKey: admin,
+          adminPublicKey: admin,
+          creatorUsernameHash: aliceHash,
+          signerUsernameHash: null,
+        }).reason,
+      ).toMatch(/the admin cannot change a personal document/);
+    });
+
+    it("denies a change when the owner cannot be resolved", () => {
+      expect(
+        evaluateBuiltinWrite({
+          ...personal,
+          op: "doc_change",
+          signerKey: alice,
+          adminPublicKey: admin,
+          creatorUsernameHash: null,
+          signerUsernameHash: aliceHash,
+        }).reason,
+      ).toMatch(/owner could not be resolved/);
+    });
+
+    it("does not apply to userkey documents in the same database", () => {
+      // Same signer, same hashes, only the id differs: the userkey rule keys off
+      // `username_hash`, so a missing document hash must still deny.
+      expect(
+        evaluateBuiltinWrite({
+          dbId: "userdirectory",
+          docId: "userkey_0123456789abcdef01234567",
+          op: "doc_change",
+          signerKey: alice,
+          adminPublicKey: admin,
+          creatorUsernameHash: aliceHash,
+          signerUsernameHash: aliceHash,
+        }).allowed,
+      ).toBe(false);
+    });
+  });
+
   it("reads username_hash from a full Automerge document as well as a change", () => {
     const doc = Automerge.from({ username_hash: "hash-from-save" });
     expect(usernameHashFromCreateChangeBytes(Automerge.save(doc))).toBe("hash-from-save");

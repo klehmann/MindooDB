@@ -11,7 +11,12 @@ import type {
   StoreCompactionStatus,
 } from "../../core/types";
 import { USER_DIRECTORY_DB_ID } from "../../core/types";
-import { evaluateBuiltinWrite, entryTypeToBuiltinOp } from "../../core/builtinDbInvariants";
+import {
+  evaluateBuiltinWrite,
+  entryTypeToBuiltinOp,
+  isPersonalUserdirectoryDocId,
+  type BuiltinWriteOp,
+} from "../../core/builtinDbInvariants";
 import type { PutEntriesAck, RejectedPutEntry, StoreHead } from "../../core/appendonlystores/types";
 import type {
   AttachmentReadPlan,
@@ -185,10 +190,14 @@ export interface ServerAccessControlOptions {
  * Server-side context for the hard-wired `userdirectory` write invariant.
  * `resolveDocumentUsernameHash` supplies the `username_hash` stored on the
  * document (from a decrypted create payload, or a test stub).
+ * `resolveCreatorSigningKey` supplies the signing key of a document's
+ * `doc_create` — the ownership signal for personal documents, whose payload the
+ * server cannot read because it is sealed to its owner.
  */
 export interface BuiltinWriteContext {
   adminPublicKey: string;
   resolveDocumentUsernameHash?: (entry: StoreEntry) => Promise<string | null>;
+  resolveCreatorSigningKey?: (entry: StoreEntry) => Promise<string | null>;
 }
 
 /**
@@ -232,6 +241,8 @@ export class ServerNetworkContentAddressedStore {
   private trustedWitnessResolver?: ServerTrustedWitnessResolver;
   /** Cached `username_hash` per userdirectory docId, filled as creates are seen. */
   private userdirectoryHashByDocId = new Map<string, string>();
+  /** Cached create signing key per personal userdirectory docId (its owner). */
+  private personalDocCreatorKeyByDocId = new Map<string, string>();
   /** The directory database id, where grant documents live (§6.5). */
   private static readonly DIRECTORY_DB_ID = "directory";
   /**
@@ -1070,7 +1081,7 @@ export class ServerNetworkContentAddressedStore {
       // before Tier 1 so it holds even when the ACL master switch is on.
       const dbId = this.witnessDbid ?? this.localStore.getId();
       if (dbId === USER_DIRECTORY_DB_ID && this.builtinWriteContext) {
-        const denied = await this.evaluateUserdirectoryInvariant(entry, receivedAt);
+        const denied = await this.evaluateUserdirectoryInvariant(entry, receivedAt, entries);
         if (denied) {
           throw new NetworkError(NetworkErrorType.ACCESS_DENIED, denied);
         }
@@ -1157,10 +1168,14 @@ export class ServerNetworkContentAddressedStore {
   private async evaluateUserdirectoryInvariant(
     entry: StoreEntry,
     trustedTime: number,
+    batch: StoreEntry[] = [],
   ): Promise<string | null> {
     const op = entryTypeToBuiltinOp(entry.entryType);
     if (!op || !this.builtinWriteContext) {
       return null;
+    }
+    if (isPersonalUserdirectoryDocId(entry.docId)) {
+      return this.evaluatePersonalUserdirectoryEntry(entry, op, trustedTime, batch);
     }
     let documentUsernameHash: string | null =
       this.userdirectoryHashByDocId.get(entry.docId) ?? null;
@@ -1188,6 +1203,67 @@ export class ServerNetworkContentAddressedStore {
       adminPublicKey: this.builtinWriteContext.adminPublicKey,
       documentUsernameHash,
       signerUsernameHash,
+    });
+    if (!decision.allowed) {
+      return `Entry ${entry.id} denied by userdirectory invariant: ${decision.reason}`;
+    }
+    return null;
+  }
+
+  /**
+   * Personal `userdirectory` document (docs/userkeys.md §7.6): sealed to its
+   * owner, so the server cannot read `username_hash` out of it. Ownership is
+   * the person who signed `doc_create`, which grants answer without any
+   * decryption. Both hashes are resolved at the same trusted time so a device
+   * that was re-granted since the create still maps to the same person.
+   */
+  private async evaluatePersonalUserdirectoryEntry(
+    entry: StoreEntry,
+    op: BuiltinWriteOp,
+    trustedTime: number,
+    batch: StoreEntry[],
+  ): Promise<string | null> {
+    const resolveHash = async (signingKey: string | null): Promise<string | null> => {
+      if (!signingKey) return null;
+      if (typeof this.directory.resolveUsernameHashForSigningKey !== "function") return null;
+      return this.directory.resolveUsernameHashForSigningKey(signingKey, trustedTime);
+    };
+    const signerUsernameHash = await resolveHash(entry.createdByPublicKey);
+    let creatorUsernameHash: string | null = null;
+    if (op === "doc_create") {
+      creatorUsernameHash = signerUsernameHash;
+    } else {
+      let creatorKey = this.personalDocCreatorKeyByDocId.get(entry.docId) ?? null;
+      if (!creatorKey) {
+        // A new document arrives as create + first change in one push, and
+        // nothing is stored until the whole batch passed. Without this the very
+        // first change of every roamed workspace would be rejected.
+        creatorKey =
+          batch.find(
+            (candidate) =>
+              candidate.entryType === "doc_create" && candidate.docId === entry.docId,
+          )?.createdByPublicKey ?? null;
+      }
+      if (!creatorKey && this.builtinWriteContext?.resolveCreatorSigningKey) {
+        try {
+          creatorKey = await this.builtinWriteContext.resolveCreatorSigningKey(entry);
+        } catch {
+          creatorKey = null;
+        }
+        if (creatorKey) {
+          this.personalDocCreatorKeyByDocId.set(entry.docId, creatorKey);
+        }
+      }
+      creatorUsernameHash = await resolveHash(creatorKey);
+    }
+    const decision = evaluateBuiltinWrite({
+      dbId: USER_DIRECTORY_DB_ID,
+      op,
+      signerKey: entry.createdByPublicKey,
+      adminPublicKey: this.builtinWriteContext!.adminPublicKey,
+      docId: entry.docId,
+      signerUsernameHash,
+      creatorUsernameHash,
     });
     if (!decision.allowed) {
       return `Entry ${entry.id} denied by userdirectory invariant: ${decision.reason}`;

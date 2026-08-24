@@ -6,6 +6,8 @@ export * from "./databaseIdValidation";
 export {
   evaluateBuiltinWrite,
   hasBuiltinWriteInvariant,
+  isPersonalUserdirectoryDocId,
+  PERSONAL_DOC_ID_PREFIXES,
   shouldSkipLoadedEntry,
   entryTypeToBuiltinOp,
   usernameHashFromCreateChangeBytes,

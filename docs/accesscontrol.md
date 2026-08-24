@@ -366,6 +366,16 @@ may read. A configured per-database policy may tighten that floor but cannot
 loosen it. Unlike `directory`, ACL materialization stays **on** so extra denies
 still apply.
 
+The same database also holds each person's **personal documents** — private data
+that roams between their devices, currently the workspace and application list
+under the id prefix `wks_`. Those are sealed to their owner, so no rule that
+reads the payload could be enforced on the server; ownership is instead the
+person who signed `doc_create`, resolved through grants. Any granted device may
+create one, only the owning person may change it, and the owning person **or**
+the admin may delete it (`docs/userkeys.md` §7.6). The prefix is the
+discriminator, so `PERSONAL_DOC_ID_PREFIXES` in `builtinDbInvariants.ts` is the
+one place that decides which id space this applies to.
+
 > **ID constraint.** Custom document IDs must match
 > `^[a-z][a-z0-9_]*$` (`CUSTOM_DOC_ID_REGEX` in `types.ts`), because IDs are
 > embedded in store-entry IDs and on-disk filenames — and those filenames land on

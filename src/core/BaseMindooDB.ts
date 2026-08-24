@@ -167,6 +167,7 @@ import { validateDatabaseId } from "./databaseIdValidation";
 import {
   evaluateBuiltinWrite,
   hasBuiltinWriteInvariant,
+  isPersonalUserdirectoryDocId,
   shouldSkipLoadedEntry,
   usernameHashFromCreateChangeBytes,
   type BuiltinWriteOp,
@@ -886,6 +887,8 @@ export class BaseMindooDB implements MindooDB {
   private userdirectoryHashByDocId = new Map<string, string>();
   /** Grant `username_hash` for a signing public key at "now". */
   private signerUsernameHashByKey = new Map<string, string | null>();
+  /** Owning person per personal userdirectory document (its create signer). */
+  private personalDocCreatorHashByDocId = new Map<string, string>();
 
   constructor(
     tenant: BaseMindooTenant, 
@@ -1057,15 +1060,23 @@ export class BaseMindooDB implements MindooDB {
     op: BuiltinWriteOp,
     signerPublicKey: string,
     documentUsernameHash?: string | null,
+    docId?: string,
   ): Promise<void> {
     const dbId = this.effectiveBuiltinDbId();
     if (!hasBuiltinWriteInvariant(dbId) && !this._isAdminOnlyDb) {
       return;
     }
     let signerUsernameHash: string | null = null;
+    let creatorUsernameHash: string | null = null;
     if (dbId === USER_DIRECTORY_DB_ID) {
       signerUsernameHash = await this.resolveSignerUsernameHash(signerPublicKey);
       this.signerUsernameHashByKey.set(signerPublicKey, signerUsernameHash);
+      if (isPersonalUserdirectoryDocId(docId)) {
+        creatorUsernameHash =
+          op === "doc_create"
+            ? signerUsernameHash
+            : await this.ensurePersonalDocCreatorHash(docId!);
+      }
     }
     const decision = evaluateBuiltinWrite({
       dbId,
@@ -1074,6 +1085,8 @@ export class BaseMindooDB implements MindooDB {
       adminPublicKey: this.getAdminPublicKey(),
       documentUsernameHash,
       signerUsernameHash,
+      docId,
+      creatorUsernameHash,
     });
     if (!decision.allowed) {
       throw new Error(decision.reason);
@@ -1095,7 +1108,13 @@ export class BaseMindooDB implements MindooDB {
     const entryType = entry.entryType ?? "doc_change";
     let documentUsernameHash: string | null = null;
     let signerUsernameHash: string | null = null;
-    if (
+    let creatorUsernameHash: string | null = null;
+    if (dbId === USER_DIRECTORY_DB_ID && isPersonalUserdirectoryDocId(entry.docId)) {
+      if (entryType !== "doc_create") {
+        creatorUsernameHash = await this.ensurePersonalDocCreatorHash(entry.docId!);
+        signerUsernameHash = await this.ensureSignerUsernameHash(entry.createdByPublicKey);
+      }
+    } else if (
       dbId === USER_DIRECTORY_DB_ID &&
       (entryType === "doc_change" || entryType === "doc_snapshot") &&
       entry.docId
@@ -1110,6 +1129,8 @@ export class BaseMindooDB implements MindooDB {
       adminPublicKey: this.getAdminPublicKey(),
       documentUsernameHash,
       signerUsernameHash,
+      docId: entry.docId,
+      creatorUsernameHash,
     });
   }
 
@@ -1119,6 +1140,32 @@ export class BaseMindooDB implements MindooDB {
     }
     const hash = await this.resolveSignerUsernameHash(signerKey);
     this.signerUsernameHashByKey.set(signerKey, hash);
+    return hash;
+  }
+
+  /**
+   * Owner of a personal `userdirectory` document: the person who signed its
+   * `doc_create`, resolved through grants rather than the payload. A sealed
+   * document is opaque to everyone but its owner, so the payload is not an
+   * option — and grants map every device of a person to one hash, which is
+   * exactly the granularity ownership needs.
+   */
+  private async ensurePersonalDocCreatorHash(docId: string): Promise<string | null> {
+    const cached = this.personalDocCreatorHashByDocId.get(docId);
+    if (cached !== undefined) return cached;
+    let hash: string | null = null;
+    try {
+      const metas = await this.scanAllMetadata(this.store, { docId });
+      const create = metas.find((meta) => meta.entryType === "doc_create");
+      if (create) {
+        hash = await this.ensureSignerUsernameHash(create.createdByPublicKey);
+      }
+    } catch {
+      hash = null;
+    }
+    // Only a resolved owner is worth caching: a miss usually means the create
+    // entry has not arrived yet, and the next write must ask again.
+    if (hash) this.personalDocCreatorHashByDocId.set(docId, hash);
     return hash;
   }
 
@@ -4726,9 +4773,10 @@ export class BaseMindooDB implements MindooDB {
     const createUsernameHash = this.usernameHashFromRecord(
       Object.fromEntries(initialValueEntries),
     );
-    await this.assertBuiltinWriteAllowed("doc_create", signerPublicKey, createUsernameHash);
-
+    // The id is settled before the write gate because it decides which rule
+    // applies in `userdirectory`: a personal document is recognized by its id.
     const docId = useCustomDocId ? options.id! : this.generateUnusedDocId(options.idPrefix);
+    await this.assertBuiltinWriteAllowed("doc_create", signerPublicKey, createUsernameHash, docId);
 
     // Idempotent create: when a caller-provided id already exists locally,
     // return the existing document instead of producing a duplicate doc_create.
@@ -4997,9 +5045,9 @@ export class BaseMindooDB implements MindooDB {
     const createUsernameHash = this.usernameHashFromRecord(
       Object.fromEntries(initialValueEntries),
     );
-    await this.assertBuiltinWriteAllowed("doc_create", signerPublicKey, createUsernameHash);
-
     const docId = useCustomDocId ? options.id! : this.generateUnusedDocId(options.idPrefix);
+    await this.assertBuiltinWriteAllowed("doc_create", signerPublicKey, createUsernameHash, docId);
+
     const now = semanticNow();
     const keyId = await this.resolveCreateKeyId(options, docId);
     const sealedCreate = await this.prepareSealedCreate(options, docId, keyId, now, signerPublicKey);
@@ -7930,7 +7978,22 @@ export class BaseMindooDB implements MindooDB {
     if (docIds.length === 0) {
       return;
     }
-    await this.assertLifecycleMutationAllowed("doc_delete", options.signingKeyPair, options.signingKeyPassword);
+    // One gate call per document id: inside `userdirectory` the applicable rule
+    // depends on the id (personal documents are owned by their creator), so a
+    // single batch-wide check would deny an owner deleting their own data.
+    if (hasBuiltinWriteInvariant(this.effectiveBuiltinDbId()) || this._isAdminOnlyDb) {
+      for (const docId of docIds) {
+        await this.assertLifecycleMutationAllowed(
+          "doc_delete",
+          options.signingKeyPair,
+          options.signingKeyPassword,
+          undefined,
+          docId,
+        );
+      }
+    } else {
+      await this.assertLifecycleMutationAllowed("doc_delete", options.signingKeyPair, options.signingKeyPassword);
+    }
     this.logger.info(`Bulk-deleting ${docIds.length} documents`);
 
     // Unlike creation, a delete must first materialize the CURRENT document
@@ -8009,6 +8072,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
     documentUsernameHash?: string | null,
+    docId?: string,
   ): Promise<void> {
     this.assertWritable("document lifecycle mutation");
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
@@ -8018,7 +8082,7 @@ export class BaseMindooDB implements MindooDB {
     const signerPublicKey = await this.resolveSignerPublicKey(
       useCustomSigningKey ? signingKeyPair : undefined,
     );
-    await this.assertBuiltinWriteAllowed(op, signerPublicKey, documentUsernameHash);
+    await this.assertBuiltinWriteAllowed(op, signerPublicKey, documentUsernameHash, docId);
   }
 
   /**
@@ -8258,8 +8322,14 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<void> {
     const useCustomSigningKey = signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(`Deleting document ${docId}${useCustomSigningKey ? ' using custom signing key' : ''}`);
-    await this.assertLifecycleMutationAllowed("doc_delete", signingKeyPair, signingKeyPassword);
-    
+    await this.assertLifecycleMutationAllowed(
+      "doc_delete",
+      signingKeyPair,
+      signingKeyPassword,
+      undefined,
+      docId,
+    );
+
     // Get current document
     const internalDoc = await this.loadDocumentInternal(docId);
     if (!internalDoc || internalDoc.isDeleted) {
@@ -8286,6 +8356,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPair,
       signingKeyPassword,
       this.usernameHashFromInternalDoc(internalDoc),
+      docId,
     );
     if (!internalDoc.isDeleted) {
       this.logger.debug(`Document ${docId} is already alive; undelete is a no-op`);
@@ -9950,6 +10021,7 @@ export class BaseMindooDB implements MindooDB {
       "doc_change",
       signerPublicKey,
       this.usernameHashFromInternalDoc(internalDoc),
+      docId,
     );
 
     // Signed snapshot of the document's attachments after this change, computed

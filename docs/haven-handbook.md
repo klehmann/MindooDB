@@ -136,7 +136,7 @@ The one situation this flow cannot repair is losing every approved device at onc
 
 ## Workspace
 
-The Workspace is your daily home. You arrange databases, applications, notes, web pages, videos, and diagrams as draggable tiles across multiple pages, like home screens on a phone. The layout is personal: it is stored only in this browser, so it loads instantly and works offline.
+The Workspace is your daily home. You arrange databases, applications, notes, web pages, videos, and diagrams as draggable tiles across multiple pages, like home screens on a phone. The layout is personal: by default it is stored only in this browser, so it loads instantly and works offline. If you want the same arrangement on your other devices, the Roamed workspace setting under Preferences → General saves it into your tenant, encrypted for you alone.
 
 Pages are the tabs across the top of the Workspace. Each page has its own grid of tiles, and you can have as many pages as you like — one per project, one per role, one for daily dashboards, one for personal links. Right-click a page tab to rename, reorder, or delete it. A special page called All shows every tile from every page in one read-only overview, which is handy when your Workspace has grown past a few pages.
 
@@ -224,7 +224,7 @@ Nothing in the Document History view can be edited. It is a faithful, read-only 
 
 ## Preferences
 
-Preferences is the one screen that is organized as a tab bar instead of a single page. It has six tabs: General, User ids, Tenants, Backup, Restore, and Stats. Everything on these tabs lives in this browser and, with a few exceptions in Tenants, does not touch the server.
+Preferences is the one screen that is organized as a tab bar instead of a single page. It has six tabs: General, User ids, Tenants, Backup, Restore, and Stats. Everything on these tabs lives in this browser and, apart from a few exceptions in Tenants and the opt-in Roamed workspace setting in General, does not touch the server.
 
 ### General
 
@@ -237,6 +237,12 @@ Current theme lets you pick a color preset (for example Mindoo or Aura) and swit
 Add Haven to your home screen is a one-tap card that offers a shortcut to the install guide for your platform. On iPhone it links to Safari's Add to Home Screen flow; on Android it triggers the browser's Install prompt or points you at the Install app action in the browser menu. If Haven is already running from its installed icon, the card simply confirms that and shows a Review install steps button in case you want to add another copy.
 
 An Optimize for iOS multitasking toggle near the bottom of the tab tells Haven that it is used in iPad split-screen or slide-over mode, where the system adds window controls that overlap Haven's mobile menu button. Turning the toggle on shifts Haven's navigation button to the right so it stops colliding with the system chrome.
+
+Roamed workspace is the one setting on this tab that leaves the browser, and it is off until you turn it on. It makes the workspace pages, tiles, groups and the application list of the active user id follow you to your other devices. Pick the tenant that should hold the saved copy, give it a name — the name is how devices find each other, so "office" on your laptop and "office" on your phone share one workspace — and switch the toggle on. If that name is already in use, Haven asks the one question it cannot answer for you before writing anything: Use the saved workspace takes what is stored and replaces this device's layout, Replace it with this device does the opposite. From then on the two run without further questions.
+
+What travels is only the arrangement: pages and their order, every tile with its position and size, groups, the grid and sorting settings, and your application registrations. What stays local is deliberately left out — which page you are looking at right now, so a second device cannot yank your view around. Apps your tenant admin distributes by policy are also left out, because every device already gets those from the tenant directory.
+
+The saved workspace is an ordinary MindooDB document in the tenant's user directory, encrypted for you alone — teammates and admins sync its bytes like everything else and cannot read a word of it, and only your own devices can change or delete it. Because it is a document, it travels exactly like your data does: a change is written locally and reaches the other device on the next sync, so both devices need to be able to reach the server, not each other, and neither has to be open at the same time. Two devices editing at once merge rather than overwrite — moving a tile here while renaming a page there keeps both edits, and the same tile dragged on both devices settles on one position. You can keep several saved workspaces per user id, follow one of them per device, and delete one for good from the same card; devices that were following it simply stop roaming and keep the layout they have.
 
 ### User ids
 

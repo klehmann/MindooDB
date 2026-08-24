@@ -1152,7 +1152,10 @@ export class TenantManager {
   /**
    * Builtin `userdirectory` write invariant: admin may create/delete, only the
    * owning person may change. `username_hash` is read from the decrypted
-   * `doc_create` payload (`$publicinfos`).
+   * `doc_create` payload (`$publicinfos`). Personal documents are sealed to
+   * their owner and therefore undecryptable here, so they are owned by whoever
+   * signed their `doc_create` — `resolveCreatorSigningKey` answers that from
+   * the entry chain alone.
    */
   private buildUserdirectoryWriteContext(
     tenant: LoadedTenant,
@@ -1162,6 +1165,10 @@ export class TenantManager {
     const mindooTenant = tenant.mindooTenant;
     return {
       adminPublicKey,
+      resolveCreatorSigningKey: async (entry: StoreEntry) => {
+        const createEntry = await this.findCreateEntry(localStore, entry);
+        return createEntry?.createdByPublicKey ?? null;
+      },
       resolveDocumentUsernameHash: mindooTenant
         ? async (entry: StoreEntry) => {
             const createEntry = await this.findCreateEntry(localStore, entry);
