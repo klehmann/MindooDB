@@ -77,6 +77,26 @@ describe("sealed document recipients", () => {
     expect(history).toEqual([{ n: 7 }]);
   });
 
+  it("DAG analysis decrypts after the session DEK is dropped", async () => {
+    const db = await alice.tenant.openDB("dag-sealed");
+    const doc = await db.createDocument({
+      recipients: [],
+      initialValues: { n: 9 },
+    });
+    const docId = doc.getId();
+    alice.tenant.rememberSealedGenerations!(doc.getDecryptionKeyId(), []);
+
+    const analysis = await db.analyzeDocumentDagAtTimestamp(docId, "now");
+    const createEntryId = analysis.entries.find((entry) => entry.entryType === "doc_create")?.entryId;
+    expect(createEntryId).toBeTruthy();
+
+    const details = await db.describeDocumentDagEntry(docId, createEntryId!);
+    expect(details?.entryType).toBe("doc_create");
+
+    const branch = await db.materializeDocumentBranchAtEntry(docId, createEntryId!);
+    expect(branch?.doc.getData().n).toBe(9);
+  });
+
   it("named recipients can iterate history without a session DEK", async () => {
     const bob = await addPerson(fixture, "bob-history", "desk");
     await bob.factory.ensureUserKeyPair!(bob.user, bob.password);

@@ -5419,9 +5419,10 @@ export class BaseMindooDB implements MindooDB {
 
   /**
    * Unwrap a `$sealed:` DEK from entry recipient wraps into the tenant session
-   * cache. `loadDocumentInternal` already does this; history / timestamp reads
-   * must as well — otherwise Haven's revision list throws SymmetricKeyNotFoundError
-   * on a cold tenant even when this device is in the wrap list.
+   * cache. `loadDocumentInternal` already does this; history, timestamp, and
+   * DAG reads must as well — otherwise Haven's revision list and DAG explorer
+   * throw SymmetricKeyNotFoundError on a cold tenant even when this device is
+   * in the wrap list.
    */
   private async ingestSealedKeyFromEntries(
     entries: Array<{ decryptionKeyId: string; recipients?: EntryRecipients; createdAt: number; entryType?: string }>,
@@ -6246,6 +6247,9 @@ export class BaseMindooDB implements MindooDB {
     const startedAt = Date.now();
     const resolvedTimestamp = this.resolveDagTimestamp(timestamp);
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    if (allEntryMetadata.length > 0) {
+      await this.ingestSealedKeyFromEntries(allEntryMetadata);
+    }
     const relevantEntries = allEntryMetadata
       .filter((entry) => entry.createdAt <= resolvedTimestamp && isDagEntry(entry));
     const result = computeDocumentDagAnalysis(docId, relevantEntries, resolvedTimestamp);
@@ -6494,6 +6498,9 @@ export class BaseMindooDB implements MindooDB {
     let decodedChange: DocumentDagDecodedChangeSummary | null = null;
     if (metadata.entryType !== "doc_snapshot") {
       const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+      if (allEntryMetadata.length > 0) {
+        await this.ingestSealedKeyFromEntries(allEntryMetadata);
+      }
       const entries = await this.store.getEntries([entryId]);
       const entry = entries[0];
       if (entry) {
@@ -7291,6 +7298,9 @@ export class BaseMindooDB implements MindooDB {
   private async loadVerifiedReplayChanges(
     replayEntries: StoreEntryMetadata[],
   ): Promise<Map<string, VerifiedReplayChange>> {
+    if (replayEntries.length > 0) {
+      await this.ingestSealedKeyFromEntries(replayEntries);
+    }
     const loadedEntries = replayEntries.length > 0
       ? await this.store.getEntries(replayEntries.map((entry) => entry.id))
       : [];
@@ -10779,6 +10789,9 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<InternalDoc | null> {
     if (replayEntriesForState.length === 0 && !snapshotEntryId) {
       return null;
+    }
+    if (allEntryMetadata.length > 0) {
+      await this.ingestSealedKeyFromEntries(allEntryMetadata);
     }
     const metadataById = new Map(allEntryMetadata.map((entry) => [entry.id, entry]));
     let startFromSnapshot = snapshotEntryId !== null;
