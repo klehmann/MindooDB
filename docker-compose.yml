@@ -15,8 +15,6 @@
 #   docker compose logs -f       # follow logs
 #   docker compose up -d --build # rebuild image and restart
 
-version: "3.8"
-
 services:
   mindoodb:
     image: mindoodb-server
