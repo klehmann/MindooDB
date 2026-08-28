@@ -373,9 +373,28 @@ export interface JoinRequest {
   /**
    * Public half of the joining device's person-bound User-Key (RSA-OAEP 3072
    * PEM). The admin publishes it as a pending `userkey_*` document on approval
-   * and wraps `default` to it. Required for a new person's first device.
+   * and wraps the keys they actually grant to it. Required for a new person's
+   * first device.
    */
   userPublicKey?: string;
+  /**
+   * Hint for the approving admin: which document keys this device is asking
+   * for. Not a grant — the admin remains the authority. `$publicinfos` is
+   * always implied. Omitting `default` is how a service (for example the mail
+   * bridge) asks not to receive the tenant key, so an admin UI can leave that
+   * box unchecked.
+   */
+  requestedDocKeyIds?: string[];
+}
+
+/**
+ * Options for {@link MindooTenantFactory.createJoinRequest}.
+ */
+export interface CreateJoinRequestOptions {
+  format?: "object" | "uri";
+  label?: string;
+  /** See {@link JoinRequest.requestedDocKeyIds}. */
+  requestedDocKeyIds?: string[];
 }
 
 /**
@@ -401,7 +420,9 @@ export interface ApproveJoinRequestOptions {
    *
    * `$publicinfos` is always included because it is required for directory
    * access. When this option is omitted, the response includes the historical
-   * default set: `$publicinfos` and `default`.
+   * default set: `$publicinfos` and `default`, and `default` is also wrapped
+   * to the joining user's User-Key. Passing a list that omits `default` skips
+   * that wrap so a directory-only member cannot later import the tenant key.
    */
   sharedDocKeyIds?: string[];
   /**
@@ -604,6 +625,13 @@ export interface BootstrapTenantFromDeliveryOptions {
    * key-distribution reconcile (imports `default`, may adopt username).
    */
   serverUrl?: string;
+  /**
+   * When `serverUrl` is set, pull directory + `userdirectory` and then run
+   * {@link MindooTenant.reconcileKeyDistributionsForCurrentUser} (hop 2 —
+   * imports `default`). Pass `false` for a service member that must not
+   * receive the tenant key. Defaults to `true`.
+   */
+  reconcileKeyDistributions?: boolean;
 }
 
 export interface BootstrapTenantFromDeliveryResult {
@@ -741,9 +769,9 @@ export interface MindooTenantFactory {
    * @param options Optional. Set format to "uri" to get a mdb://join-request/... URI string.
    * @return A JoinRequest object or a mdb://join-request/... URI string
    */
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object"; label?: string }): JoinRequest;
-  createJoinRequest(user: PrivateUserId, options: { format: "uri"; label?: string }): string;
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri"; label?: string }): JoinRequest | string;
+  createJoinRequest(user: PrivateUserId, options?: CreateJoinRequestOptions & { format?: "object" }): JoinRequest;
+  createJoinRequest(user: PrivateUserId, options: CreateJoinRequestOptions & { format: "uri" }): string;
+  createJoinRequest(user: PrivateUserId, options?: CreateJoinRequestOptions): JoinRequest | string;
   /**
    * Generate a person-bound User-Key on `user` if it does not already have one.
    * The private half is password-encrypted with salt `"userkey"` and stored on

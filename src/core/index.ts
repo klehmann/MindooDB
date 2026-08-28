@@ -267,6 +267,7 @@ export {
   encodeJoinRequestUri,
   decodeJoinRequestUri,
   normalizeJoinRequestPayload,
+  normalizeRequestedDocKeyIds,
 } from "./uri/joinRequestUri";
 
 // Errors

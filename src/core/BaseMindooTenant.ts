@@ -1700,10 +1700,16 @@ export class BaseMindooTenant implements MindooTenant {
       const payload = asUserKeyPayload(userKeyDoc.getData());
       const epoch = payload ? currentUserKeyEpoch(payload) : null;
       const publishedPublicKey = epoch ? payload?.userKeys[epoch]?.publicKey : undefined;
-      // First device: wrap `default` to the join-request User-Key (pending is
-      // OK). Additional device: wrap to the already-published User-Key — never
-      // to this device's freshly generated pair.
-      if (publishedPublicKey === userPublicKey) {
+      // First device: wrap the granted keys to the join-request User-Key
+      // (pending is OK). Additional device: wrap to the already-published
+      // User-Key — never to this device's freshly generated pair.
+      // `default` is only wrapped when the admin omitted sharedDocKeyIds
+      // (historical) or explicitly included it. A directory-only grant
+      // (`[$publicinfos]`) must not quietly hand out the tenant key.
+      const wrapDefault =
+        options.sharedDocKeyIds === undefined ||
+        options.sharedDocKeyIds.includes(DEFAULT_TENANT_KEY_ID);
+      if (wrapDefault && publishedPublicKey === userPublicKey) {
         await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
           username,
           [DEFAULT_TENANT_KEY_ID],
@@ -1711,7 +1717,7 @@ export class BaseMindooTenant implements MindooTenant {
           options.adminPassword,
           userPublicKey,
         );
-      } else if (publishedPublicKey) {
+      } else if (wrapDefault && publishedPublicKey) {
         await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
           username,
           [DEFAULT_TENANT_KEY_ID],
@@ -1726,12 +1732,17 @@ export class BaseMindooTenant implements MindooTenant {
           "Cannot approve join request: it carries no userPublicKey and the person has no published User-Key. Generate a User-Key on the joining device first.",
         );
       }
-      await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
-        username,
-        [DEFAULT_TENANT_KEY_ID],
-        options.adminSigningKey,
-        options.adminPassword,
-      );
+      const wrapDefault =
+        options.sharedDocKeyIds === undefined ||
+        options.sharedDocKeyIds.includes(DEFAULT_TENANT_KEY_ID);
+      if (wrapDefault) {
+        await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
+          username,
+          [DEFAULT_TENANT_KEY_ID],
+          options.adminSigningKey,
+          options.adminPassword,
+        );
+      }
     }
 
     // Same person: wrap the published User-Key to this device's encryption

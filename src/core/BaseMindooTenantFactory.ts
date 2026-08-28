@@ -11,6 +11,7 @@ import {
   CreateTenantOptions,
   CreateTenantResult,
   JoinRequest,
+  CreateJoinRequestOptions,
   JoinResponse,
   JoinTenantOptions,
   JoinTenantResult,
@@ -32,7 +33,7 @@ import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbk
 import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
-import { encodeJoinRequestUri } from "./uri/joinRequestUri";
+import { encodeJoinRequestUri, normalizeRequestedDocKeyIds } from "./uri/joinRequestUri";
 import { validateTenantId } from "./tenantIdValidation";
 import { semanticNow } from "./utils/timeSource";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
@@ -610,9 +611,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
   /**
    * Create a join request from a user's private identity.
    */
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object"; label?: string }): JoinRequest;
-  createJoinRequest(user: PrivateUserId, options: { format: "uri"; label?: string }): string;
-  createJoinRequest(user: PrivateUserId, options?: { format?: "object" | "uri"; label?: string }): JoinRequest | string {
+  createJoinRequest(user: PrivateUserId, options?: CreateJoinRequestOptions & { format?: "object" }): JoinRequest;
+  createJoinRequest(user: PrivateUserId, options: CreateJoinRequestOptions & { format: "uri" }): string;
+  createJoinRequest(user: PrivateUserId, options?: CreateJoinRequestOptions): JoinRequest | string {
     const publicUser = this.toPublicUserId(user);
 
     // An identity without a username produces a nameless v2 request: the
@@ -640,6 +641,10 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     }
     if (user.userKeyPair?.publicKey) {
       joinRequest.userPublicKey = user.userKeyPair.publicKey;
+    }
+    const requestedDocKeyIds = normalizeRequestedDocKeyIds(options?.requestedDocKeyIds);
+    if (requestedDocKeyIds) {
+      joinRequest.requestedDocKeyIds = requestedDocKeyIds;
     }
 
     if (options?.format === "uri") {
@@ -902,7 +907,11 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         );
       }
 
-      if (typeof tenant.reconcileKeyDistributionsForCurrentUser === "function") {
+      const shouldReconcileDistributions = options.reconcileKeyDistributions !== false;
+      if (
+        shouldReconcileDistributions &&
+        typeof tenant.reconcileKeyDistributionsForCurrentUser === "function"
+      ) {
         const reconcile = await tenant.reconcileKeyDistributionsForCurrentUser();
         if (reconcile.adoptedUsername && reconcile.adoptedUsername !== user.username) {
           user = { ...user, username: reconcile.adoptedUsername };
@@ -922,7 +931,10 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         await userDirectoryDb.pullChangesFrom(remoteUserDirectory);
         tenant.noteUserDirectoryFetched?.();
         await tenant.reconcileUserKeys?.({ allowSelfCreate: false });
-        if (typeof tenant.reconcileKeyDistributionsForCurrentUser === "function") {
+        if (
+          shouldReconcileDistributions &&
+          typeof tenant.reconcileKeyDistributionsForCurrentUser === "function"
+        ) {
           await tenant.reconcileKeyDistributionsForCurrentUser();
         }
       } catch (error) {

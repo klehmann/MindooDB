@@ -60,6 +60,23 @@ describe("joinRequestUri", () => {
       expect(decoded.label).toBe("iPad");
     });
 
+    it("round-trips a directory-only key hint and implies $publicinfos", () => {
+      const decoded = decodeJoinRequestUri(
+        encodeJoinRequestUri(makeRequest({ requestedDocKeyIds: ["$publicinfos"] })),
+      );
+      expect(decoded.requestedDocKeyIds).toEqual(["$publicinfos"]);
+
+      const implied = decodeJoinRequestUri(
+        encodeJoinRequestUri(makeRequest({ requestedDocKeyIds: ["notes"] })),
+      );
+      expect(implied.requestedDocKeyIds).toEqual(["$publicinfos", "notes"]);
+    });
+
+    it("omits the key hint when the requester did not name any keys", () => {
+      const decoded = decodeJoinRequestUri(encodeJoinRequestUri(makeRequest()));
+      expect(decoded.requestedDocKeyIds).toBeUndefined();
+    });
+
     it("emits the compact v3 transport version", () => {
       const uri = encodeJoinRequestUri(makeRequest());
       expect(decodeMindooURI(uri).version).toBe(3);

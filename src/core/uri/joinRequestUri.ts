@@ -11,7 +11,7 @@
  * `v: 1` / `v: 2` requests (verbose, PEM-armored) stay decodable so URIs already
  * in flight — in someone's mailbox, on a printout — keep working.
  */
-import type { JoinRequest } from "../types";
+import { PUBLIC_INFOS_KEY_ID, type JoinRequest } from "../types";
 
 import { decodeMindooURI, encodeMindooURI } from "./MindooURI";
 
@@ -37,6 +37,11 @@ const MAX_USERNAME_CHARS = 512;
 
 /** Device labels are a short human note (§6.5), not free-form storage. */
 const MAX_LABEL_CHARS = 256;
+
+/** Key-id hint list: a convenience for the admin UI, not a payload channel. */
+const MAX_REQUESTED_KEY_IDS = 32;
+const MAX_REQUESTED_KEY_ID_CHARS = 128;
+const REQUESTED_KEY_ID_PATTERN = /^[A-Za-z0-9_$.-]+$/;
 
 const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -101,6 +106,45 @@ function readOptionalText(value: unknown, max: number): string | undefined {
 }
 
 /**
+ * Normalize a requester-supplied key-id hint. Always includes `$publicinfos`
+ * when the caller named any keys. Unknown / oversized ids are dropped rather
+ * than rejected so an older admin client can still decode the rest.
+ */
+export function normalizeRequestedDocKeyIds(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== "string") {
+      continue;
+    }
+    const id = raw.trim();
+    if (
+      !id ||
+      id.length > MAX_REQUESTED_KEY_ID_CHARS ||
+      !REQUESTED_KEY_ID_PATTERN.test(id) ||
+      seen.has(id)
+    ) {
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= MAX_REQUESTED_KEY_IDS) {
+      break;
+    }
+  }
+  if (ids.length === 0) {
+    return undefined;
+  }
+  if (!ids.includes(PUBLIC_INFOS_KEY_ID)) {
+    ids.unshift(PUBLIC_INFOS_KEY_ID);
+  }
+  return ids;
+}
+
+/**
  * Encode a join request, preferring the compact `v: 3` payload.
  *
  * Falls back to the verbose form when either key is not canonically formatted
@@ -128,6 +172,10 @@ export function encodeJoinRequestUri(request: JoinRequest): string {
   }
   if (typeof userKey === "string") {
     payload.k = userKey;
+  }
+  const requestedDocKeyIds = normalizeRequestedDocKeyIds(request.requestedDocKeyIds);
+  if (requestedDocKeyIds) {
+    payload.d = requestedDocKeyIds;
   }
 
   return encodeMindooURI("join-request", payload);
@@ -174,6 +222,10 @@ export function normalizeJoinRequestPayload(
     if (typeof payload.k === "string" && payload.k) {
       request.userPublicKey = readCompactKey(payload.k, "k");
     }
+    const requestedDocKeyIds = normalizeRequestedDocKeyIds(payload.d);
+    if (requestedDocKeyIds) {
+      request.requestedDocKeyIds = requestedDocKeyIds;
+    }
     return request;
   }
 
@@ -194,6 +246,10 @@ export function normalizeJoinRequestPayload(
     const userPublicKey = readOptionalText(payload.userPublicKey, MAX_KEY_BASE64_CHARS * 2);
     if (userPublicKey) {
       request.userPublicKey = userPublicKey;
+    }
+    const requestedDocKeyIds = normalizeRequestedDocKeyIds(payload.requestedDocKeyIds);
+    if (requestedDocKeyIds) {
+      request.requestedDocKeyIds = requestedDocKeyIds;
     }
     return request;
   }
