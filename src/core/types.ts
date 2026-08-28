@@ -2009,6 +2009,19 @@ export interface UndeleteOptions {
  * Options accepted by the document-id listing methods
  * ({@link MindooDB.getAllDocumentIds}, {@link MindooDB.getDeletedDocumentIds}).
  */
+/**
+ * One document the current KeyBag cannot open, described from store
+ * metadata only (no payload, no materialization).
+ */
+export interface InaccessibleDocumentInfo {
+  docId: string;
+  /** Origin `createdAt` from `doc_create` (or the oldest `doc_snapshot`). */
+  createdAt: number;
+  decryptionKeyId: string;
+  /** Device signing public key of the origin entry's author (PEM). */
+  createdByPublicKey: string;
+}
+
 export interface ListDocumentIdsOptions {
   /**
    * Restrict the result to documents whose id matches this prefix. Matching is
@@ -5014,6 +5027,21 @@ export interface MindooDB {
    * reconciling, and persisted with the metadata checkpoint.
    */
   getInaccessibleDocumentCount?(): number;
+
+  /**
+   * Documents present in the local store that the current KeyBag cannot open.
+   *
+   * Unlike {@link getAllDocumentIds}, this returns ids that listings hide.
+   * Each row is built from unsigned store metadata (`doc_create`, falling
+   * back to `doc_snapshot`) — no payload is decrypted and no document is
+   * materialized. Use it to tell an empty database apart from one whose
+   * documents are sealed to someone else, and to show who authored them.
+   *
+   * Reflects what has arrived on this device, not what the tenant holds.
+   */
+  listInaccessibleDocuments?(
+    options?: ListDocumentIdsOptions,
+  ): Promise<InaccessibleDocumentInfo[]>;
 
   /**
    * List documents with their creation date, ordered chronologically.

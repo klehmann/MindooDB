@@ -11,6 +11,7 @@ import {
   CreateOptions,
   DeleteOptions,
   ListDocumentIdsOptions,
+  InaccessibleDocumentInfo,
   ListDocumentCreationDatesOptions,
   DocumentCreationDate,
   IterateChangesOptions,
@@ -3069,6 +3070,46 @@ export class BaseMindooDB implements MindooDB {
    */
   public getInaccessibleDocumentCount(): number {
     return this.inaccessibleDocIds.size;
+  }
+
+  /**
+   * Documents in the local store that this KeyBag cannot open, described
+   * from unsigned origin metadata. See {@link MindooDB.listInaccessibleDocuments}.
+   */
+  public async listInaccessibleDocuments(
+    options?: ListDocumentIdsOptions,
+  ): Promise<InaccessibleDocumentInfo[]> {
+    const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
+    const docIds = [...this.inaccessibleDocIds].filter(
+      (docId) => !idPrefix || matchesDocIdPrefix(docId, idPrefix),
+    );
+    if (docIds.length === 0) {
+      return [];
+    }
+
+    const results: InaccessibleDocumentInfo[] = [];
+    for (const docId of docIds) {
+      const originEntries = await this.scanAllMetadata(this.store, {
+        docId,
+        entryTypes: ["doc_create", "doc_snapshot"],
+      });
+      let origin: StoreEntryMetadata | undefined;
+      for (const entry of originEntries) {
+        if (!origin || entry.createdAt < origin.createdAt) {
+          origin = entry;
+        }
+      }
+      const indexPos = this.getDocIndexPosition(docId);
+      const indexEntry = indexPos === undefined ? undefined : this.index[indexPos];
+      results.push({
+        docId,
+        createdAt: origin?.createdAt ?? indexEntry?.lastModified ?? 0,
+        decryptionKeyId: origin?.decryptionKeyId ?? indexEntry?.decryptionKeyId ?? "",
+        createdByPublicKey: origin?.createdByPublicKey ?? "",
+      });
+    }
+    results.sort((left, right) => left.docId.localeCompare(right.docId));
+    return results;
   }
 
   /**

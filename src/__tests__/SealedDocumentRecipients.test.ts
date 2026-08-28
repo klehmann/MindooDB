@@ -61,6 +61,18 @@ describe("sealed document recipients", () => {
     await syncAll(fixture, "shared");
     const carolDb = await carol.tenant.openDB("shared");
     expect(await carolDb.getAllDocumentIds()).not.toContain(doc.getId());
+    expect(carolDb.getInaccessibleDocumentCount?.()).toBe(1);
+    const hidden = await carolDb.listInaccessibleDocuments?.();
+    expect(hidden).toEqual([
+      expect.objectContaining({
+        docId: doc.getId(),
+        decryptionKeyId: doc.getDecryptionKeyId(),
+        createdByPublicKey: alice.user.userSigningKeyPair.publicKey,
+      }),
+    ]);
+    expect(hidden?.[0]?.createdAt).toBeGreaterThan(0);
+    const byPrefix = await carolDb.listInaccessibleDocuments?.({ idPrefix: "shared" });
+    expect(byPrefix ?? []).toHaveLength(0);
   });
 
   it("iterateDocumentHistory decrypts after the session DEK is dropped", async () => {
