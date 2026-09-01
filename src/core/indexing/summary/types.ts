@@ -64,6 +64,19 @@ export interface SummaryConfig {
    * are deliberately not copied.
    */
   includeAttachments?: boolean;
+
+  /**
+   * When `true` (default), a slim projection of the document's `_encryptFor`
+   * map (`kind`, `label`, `addedAt`, `removedAt` per recipient) is stored in
+   * the summary, so documents created with per-document sealed keys can be
+   * filtered and categorized by recipient without materializing them. The
+   * adding/removing users' full signing keys (`addedBy`, `removedBy`) and the
+   * internal `keyFingerprint` are deliberately not copied.
+   *
+   * Only sealed documents carry the field, so enabling this costs nothing for
+   * databases that do not use per-document recipients.
+   */
+  includeRecipients?: boolean;
 }
 
 /** {@link SummaryConfig} with all defaults applied. */
@@ -73,6 +86,7 @@ export interface ResolvedSummaryConfig {
   include: string[];
   exclude: string[];
   includeAttachments: boolean;
+  includeRecipients: boolean;
 }
 
 export const DEFAULT_SUMMARY_MAX_VALUE_BYTES = 1024;
@@ -84,6 +98,7 @@ export function resolveSummaryConfig(config?: SummaryConfig): ResolvedSummaryCon
     include: [...(config?.include ?? [])],
     exclude: [...(config?.exclude ?? [])],
     includeAttachments: config?.includeAttachments ?? true,
+    includeRecipients: config?.includeRecipients ?? true,
   };
 }
 
@@ -122,6 +137,9 @@ export function sanitizeSummaryConfig(value: unknown): SummaryConfig | undefined
   if (typeof raw.includeAttachments === "boolean") {
     config.includeAttachments = raw.includeAttachments;
   }
+  if (typeof raw.includeRecipients === "boolean") {
+    config.includeRecipients = raw.includeRecipients;
+  }
   return config;
 }
 
@@ -129,6 +147,11 @@ export function sanitizeSummaryConfig(value: unknown): SummaryConfig | undefined
  * Deterministic fingerprint of a summary configuration. Persisted alongside
  * the summary cache; a mismatch on restore (or a config change at runtime)
  * marks the summary as `"rebuilding"` and triggers a backfill.
+ *
+ * Every field the extraction depends on must appear here. Adding one
+ * invalidates persisted caches written by older versions — which is the
+ * point: entries extracted before the field existed do not carry it, so
+ * serving them while reporting the field as covered would be a coverage lie.
  */
 export function computeSummaryConfigFingerprint(config: ResolvedSummaryConfig): string {
   return JSON.stringify({
@@ -137,6 +160,7 @@ export function computeSummaryConfigFingerprint(config: ResolvedSummaryConfig): 
     include: [...config.include].sort(),
     exclude: [...config.exclude].sort(),
     includeAttachments: config.includeAttachments,
+    includeRecipients: config.includeRecipients,
   });
 }
 

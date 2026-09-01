@@ -7,7 +7,10 @@ import {
 } from "./_helpers/multiDevice";
 import { USER_DIRECTORY_DB_ID } from "../core/types";
 import { DocumentNotFoundError } from "../core/errors";
-import { formatCanonicalUsernameLabel } from "../core/userid/canonicalUsername";
+import {
+  canonicalizeUsername,
+  formatCanonicalUsernameLabel,
+} from "../core/userid/canonicalUsername";
 
 async function publishUserKey(device: DeviceHandle): Promise<void> {
   await device.factory.ensureUserKeyPair!(device.user, device.password);
@@ -65,6 +68,51 @@ describe("sealed recipient mutation", () => {
     await bobDb.reconcileKeyVisibility();
     await expect(bobDb.getDocument(doc.getId())).rejects.toThrow();
     expect(await bobDb.getAllDocumentIds()).not.toContain(doc.getId());
+  });
+
+  it("projects real _encryptFor entries into the summary buffer without signing keys", async () => {
+    const db = await alice.tenant.openDB("summaryrecipients");
+    const doc = await db.createDocument({
+      recipients: [bob.username],
+      initialValues: { subject: "Quarterly review" },
+    });
+
+    const summary = db.getSummaryStore!();
+    await summary.update();
+
+    const canonicalAlice = canonicalizeUsername(alice.username);
+    const canonicalBob = canonicalizeUsername(bob.username);
+    const projected = summary.getEntry(doc.getId())?.fields._encryptFor as Record<
+      string,
+      Record<string, unknown>
+    >;
+
+    // Both the author and the named recipient are projected, keyed exactly as
+    // in the document payload, so a summary query matches a document query.
+    expect(Object.keys(projected).sort()).toEqual([canonicalAlice, canonicalBob].sort());
+    expect(projected[canonicalBob].kind).toBe("user");
+    expect(typeof projected[canonicalBob].addedAt).toBe("number");
+    expect(projected[canonicalBob].removedAt).toBeUndefined();
+    // The adding user's full PEM signing key and the wrap plumbing stay out.
+    expect(projected[canonicalBob].addedBy).toBeUndefined();
+    expect(projected[canonicalBob].keyFingerprint).toBeUndefined();
+    // Guard against the projection silently widening to the raw entry.
+    expect(Object.keys(projected[canonicalBob]).sort()).toEqual(["addedAt", "kind", "label"]);
+
+    // Withdrawal is visible as removedAt rather than as a vanished key, so a
+    // "currently shared with" query gets the same answer from either path.
+    await db.removeRecipients!(doc, [bob.username]);
+    await summary.update();
+
+    const afterRemoval = summary.getEntry(doc.getId())?.fields._encryptFor as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(typeof afterRemoval[canonicalBob].removedAt).toBe("number");
+    expect(afterRemoval[canonicalBob].removedBy).toBeUndefined();
+    expect(afterRemoval[canonicalAlice].removedAt).toBeUndefined();
+
+    expect(db.getSummaryStore!().isFieldCovered("_encryptFor")).toBe(true);
   });
 
   it("setRecipients diffs adds and removes", async () => {

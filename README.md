@@ -339,6 +339,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 
 - [Haven Handbook](./docs/haven-handbook.md) — Complete guide to Haven, the graphical MindooDB collaboration client
 - [Getting Started](./docs/getting-started.md) — Fast setup for Node.js, Web, and React Native
+- [Best Practices](./docs/best-practices.md) — What append-only storage, local-first replicas, client-side-only querying, and encryption-based read access mean for application design: summary-first querying, patch-sized writes, growth planning, collaboration expectations, and Haven app mappings
 - [Example Snippets](./docs/examples/README.md) — Copy-paste Todo starters for all runtimes
 - [Architecture Specification](./docs/specification.md) — Full technical details
 - [React Native Guide](./docs/reactnative.md) — Native Automerge setup and troubleshooting

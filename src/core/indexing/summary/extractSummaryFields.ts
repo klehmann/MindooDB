@@ -1,3 +1,5 @@
+import { ENCRYPT_FOR_FIELD } from "../../userkeys/sealedTypes";
+import type { EncryptForEntry } from "../../userkeys/sealedTypes";
 import type { ResolvedSummaryConfig } from "./types";
 
 /**
@@ -128,6 +130,55 @@ function projectAttachments(value: unknown): SummaryAttachmentInfo[] | undefined
 }
 
 /**
+ * Slim projection of one `_encryptFor` entry: enough to answer "who is this
+ * document shared with, and is that entry still active" from the summary.
+ * Deliberately omits `addedBy`/`removedBy` (each a full PEM signing key,
+ * ~800 chars per recipient — the same reason `_attachments` drops
+ * `createdBy`), `keyFingerprint` (internal plumbing for matching DEK wraps,
+ * not a useful query key) and the legacy `viaGroup`.
+ *
+ * `removedAt` is kept rather than filtering withdrawn recipients out, so the
+ * summary and the materialized document answer a recipient query the same
+ * way — a caller filtering for current recipients checks `removedAt` in both
+ * places.
+ */
+export interface SummaryRecipientInfo {
+  kind: "user" | "device";
+  label?: string;
+  addedAt?: number;
+  removedAt?: number;
+}
+
+function projectRecipients(
+  value: unknown
+): Record<string, SummaryRecipientInfo> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const projected: Record<string, SummaryRecipientInfo> = {};
+  let count = 0;
+  for (const [stableId, item] of Object.entries(value as Record<string, unknown>)) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const raw = item as Partial<EncryptForEntry>;
+    const info: SummaryRecipientInfo = {
+      kind: raw.kind === "device" ? "device" : "user",
+    };
+    if (typeof raw.label === "string") info.label = raw.label;
+    if (typeof raw.addedAt === "number" && Number.isFinite(raw.addedAt)) {
+      info.addedAt = raw.addedAt;
+    }
+    if (typeof raw.removedAt === "number" && Number.isFinite(raw.removedAt)) {
+      info.removedAt = raw.removedAt;
+    }
+    projected[stableId] = info;
+    count += 1;
+  }
+  return count > 0 ? projected : undefined;
+}
+
+/**
  * Extract the summary field map for one document payload according to the
  * resolved configuration:
  *
@@ -182,6 +233,17 @@ export function extractSummaryFields(
     const attachments = projectAttachments(data[ATTACHMENTS_FIELD]);
     if (attachments !== undefined) {
       fields[ATTACHMENTS_FIELD] = attachments;
+    }
+  }
+
+  // Managed recipient metadata for documents created with per-document
+  // sealed keys, so "shared with whom" is queryable without materializing.
+  // Slim for the same reason as attachments: the raw entries carry the
+  // adding/removing users' full signing keys.
+  if (config.includeRecipients && !isExcluded(ENCRYPT_FOR_FIELD, config.exclude)) {
+    const recipients = projectRecipients(data[ENCRYPT_FOR_FIELD]);
+    if (recipients !== undefined) {
+      fields[ENCRYPT_FOR_FIELD] = recipients;
     }
   }
 
@@ -278,10 +340,13 @@ export function isFieldPathCovered(path: string, config: ResolvedSummaryConfig):
     }
   }
   const topLevel = path.includes(".") ? path.slice(0, path.indexOf(".")) : path;
-  // Managed fields with special handling: the slim attachment projection
-  // (when enabled) and the always-mirrored modification timestamp.
+  // Managed fields with special handling: the slim attachment and recipient
+  // projections (when enabled) and the always-mirrored modification timestamp.
   if (topLevel === ATTACHMENTS_FIELD) {
     return config.includeAttachments;
+  }
+  if (topLevel === ENCRYPT_FOR_FIELD) {
+    return config.includeRecipients;
   }
   if (path === "_lastModified") {
     return true;

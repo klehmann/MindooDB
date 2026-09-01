@@ -423,6 +423,7 @@ export {
   SUMMARY_SETUP_FIELD,
   ATTACHMENTS_FIELD,
   type SummaryAttachmentInfo,
+  type SummaryRecipientInfo,
   type SummaryConfig,
   type ResolvedSummaryConfig,
   type DocumentSummaryEntry,

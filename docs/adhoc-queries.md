@@ -64,6 +64,7 @@ const summary = db.getSummaryStore({
   include: ["meta.owner"],    // nested/large paths, stored under the dot-path key
   exclude: ["draftBody"],     // wins over everything, covers nested paths
   includeAttachments: true,   // default: slim _attachments projection
+  includeRecipients: true,    // default: slim _encryptFor projection
 });
 ```
 
@@ -83,8 +84,9 @@ Extraction rules:
    values, and bypass the size cap. Stored under the full dot-path as key.
 3. **`exclude` paths**: win over both and also cover all nested paths below them.
 
-Two managed underscore fields get special treatment so summary-backed
-expressions behave like their document-backed counterparts:
+Auto-include skips every `_`-prefixed key, so the underscore namespace is
+reserved for fields MindooDB manages itself. Three of them get special treatment
+so summary-backed expressions behave like their document-backed counterparts:
 
 - **`_attachments`** (default on via `includeAttachments`): a slim projection of
   each attachment — `attachmentId`, `fileName`, `size`, `mimeType`, `createdAt` —
@@ -95,6 +97,19 @@ expressions behave like their document-backed counterparts:
   are deliberately dropped. With `includeAttachments: false`, attachment
   expressions are rejected by the coverage guardrails instead of silently
   returning zero/empty.
+- **`_encryptFor`** (default on via `includeRecipients`): for documents created
+  with per-document sealed keys (`createDocument({ recipients: [...] })`), a slim
+  projection of the recipient map is stored under the same keys as the document
+  payload uses (canonical username for users, key fingerprint for devices), each
+  entry keeping `kind`, `label`, `addedAt`, and `removedAt`. That makes "which
+  documents are currently shared with X" a summary query — filter or categorize on
+  `_encryptFor`, checking `removedAt` to skip withdrawn recipients exactly as you
+  would on the document path. The adding/removing users' full PEM signing keys
+  (`addedBy`, `removedBy`) and the internal `keyFingerprint` are dropped for the
+  same reason as `_attachments.createdBy`. Documents without per-document
+  recipients have no such field, so the projection costs nothing for databases
+  that do not use them. For a single-document check prefer
+  `doc.isEncryptedFor(user)`.
 - **`_lastModified`**: always available — the summary entry's `lastModified`
   metadata is mirrored into the evaluation document, so
   `v.field("_lastModified")` filters and sort keys work without configuration.

@@ -24,4 +24,5 @@ export {
   buildSummaryEvaluationDoc,
   ATTACHMENTS_FIELD,
   type SummaryAttachmentInfo,
+  type SummaryRecipientInfo,
 } from "./extractSummaryFields";

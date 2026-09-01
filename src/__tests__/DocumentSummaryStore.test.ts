@@ -7,6 +7,7 @@ import {
   isFieldPathCovered,
 } from "../core/indexing/summary/extractSummaryFields";
 import {
+  computeSummaryConfigFingerprint,
   resolveSummaryConfig,
   sanitizeSummaryConfig,
   DB_SETUP_DOC_ID,
@@ -166,6 +167,96 @@ describe("summary field extraction", () => {
     ).toBeUndefined();
   });
 
+  it("stores a slim _encryptFor projection (no addedBy/removedBy/keyFingerprint)", () => {
+    const fields = extractSummaryFields(
+      {
+        name: "Alice",
+        _encryptFor: {
+          "CN=alice/O=acme": {
+            kind: "user",
+            label: "cn=Alice/o=Acme",
+            addedAt: 111,
+            addedBy: "-----BEGIN PUBLIC KEY-----\n...",
+            keyFingerprint: "fp-alice",
+          },
+          "CN=bob/O=acme": {
+            kind: "user",
+            label: "cn=Bob/o=Acme",
+            addedAt: 112,
+            addedBy: "-----BEGIN PUBLIC KEY-----\n...",
+            keyFingerprint: "fp-bob",
+            removedAt: 222,
+            removedBy: "-----BEGIN PUBLIC KEY-----\n...",
+          },
+        },
+      },
+      resolveSummaryConfig()
+    );
+
+    expect(fields._encryptFor).toEqual({
+      "CN=alice/O=acme": { kind: "user", label: "cn=Alice/o=Acme", addedAt: 111 },
+      "CN=bob/O=acme": {
+        kind: "user",
+        label: "cn=Bob/o=Acme",
+        addedAt: 112,
+        removedAt: 222,
+      },
+    });
+  });
+
+  it("keeps the device recipient kind and defaults an unknown kind to user", () => {
+    const fields = extractSummaryFields(
+      {
+        _encryptFor: {
+          "fp-laptop": { kind: "device", label: "Alice's laptop", addedAt: 1 },
+          "CN=carol/O=acme": { kind: "bogus", addedAt: 2 },
+        },
+      },
+      resolveSummaryConfig()
+    );
+
+    expect(fields._encryptFor).toEqual({
+      "fp-laptop": { kind: "device", label: "Alice's laptop", addedAt: 1 },
+      "CN=carol/O=acme": { kind: "user", addedAt: 2 },
+    });
+  });
+
+  it("omits the recipient projection when disabled, excluded, absent, or malformed", () => {
+    const doc = { _encryptFor: { "CN=alice/O=acme": { kind: "user", addedAt: 1 } } };
+
+    expect(
+      extractSummaryFields(doc, resolveSummaryConfig({ includeRecipients: false }))._encryptFor
+    ).toBeUndefined();
+    expect(
+      extractSummaryFields(doc, resolveSummaryConfig({ exclude: ["_encryptFor"] }))._encryptFor
+    ).toBeUndefined();
+    // Unsealed documents simply have no such field.
+    expect(
+      extractSummaryFields({ name: "Alice" }, resolveSummaryConfig())._encryptFor
+    ).toBeUndefined();
+    expect(
+      extractSummaryFields({ _encryptFor: {} }, resolveSummaryConfig())._encryptFor
+    ).toBeUndefined();
+    expect(
+      extractSummaryFields({ _encryptFor: ["nope"] }, resolveSummaryConfig())._encryptFor
+    ).toBeUndefined();
+  });
+
+  it("resolves recipient paths and lookups on the summary field map", () => {
+    const fields = extractSummaryFields(
+      { _encryptFor: { "CN=alice/O=acme": { kind: "user", addedAt: 1 } } },
+      resolveSummaryConfig()
+    );
+
+    expect(getSummaryFieldValue(fields, "_encryptFor")).toEqual({
+      "CN=alice/O=acme": { kind: "user", addedAt: 1 },
+    });
+    expect(getSummaryFieldValue(fields, "_encryptFor.CN=alice/O=acme")).toEqual({
+      kind: "user",
+      addedAt: 1,
+    });
+  });
+
   it("covers managed fields and uncovers ciphertext fields", () => {
     const config = resolveSummaryConfig();
     expect(isFieldPathCovered("_attachments", config)).toBe(true);
@@ -178,6 +269,22 @@ describe("summary field extraction", () => {
 
     const noAttachments = resolveSummaryConfig({ includeAttachments: false });
     expect(isFieldPathCovered("_attachments", noAttachments)).toBe(false);
+
+    expect(isFieldPathCovered("_encryptFor", config)).toBe(true);
+    expect(isFieldPathCovered("_encryptFor.CN=alice/O=acme", config)).toBe(true);
+    const noRecipients = resolveSummaryConfig({ includeRecipients: false });
+    expect(isFieldPathCovered("_encryptFor", noRecipients)).toBe(false);
+    // An explicit include still wins over the disabled managed projection,
+    // and then stores the raw (unprojected) value.
+    expect(
+      isFieldPathCovered(
+        "_encryptFor",
+        resolveSummaryConfig({ includeRecipients: false, include: ["_encryptFor"] })
+      )
+    ).toBe(true);
+    expect(isFieldPathCovered("_encryptFor", resolveSummaryConfig({ exclude: ["_encryptFor"] }))).toBe(
+      false
+    );
   });
 
   it("mirrors lastModified as _lastModified in the evaluation doc", () => {
@@ -223,6 +330,7 @@ describe("summary field extraction", () => {
         include: ["meta.owner", 42, "tags"],
         exclude: "not-an-array",
         includeAttachments: false,
+        includeRecipients: false,
         unknownProp: true,
       })
     ).toEqual({
@@ -230,7 +338,16 @@ describe("summary field extraction", () => {
       maxValueBytes: 512,
       include: ["meta.owner", "tags"],
       includeAttachments: false,
+      includeRecipients: false,
     });
+  });
+
+  it("changes the config fingerprint when the recipient projection is toggled", () => {
+    const on = computeSummaryConfigFingerprint(resolveSummaryConfig());
+    const off = computeSummaryConfigFingerprint(
+      resolveSummaryConfig({ includeRecipients: false })
+    );
+    expect(on).not.toBe(off);
   });
 });
 
