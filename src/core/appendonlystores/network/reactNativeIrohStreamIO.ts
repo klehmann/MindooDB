@@ -5,7 +5,11 @@ import { MINDOODB_IROH_ALPN, type IrohByteStream, type IrohStreamIO } from "./Ir
  * does not hard-depend on that package.
  */
 export async function createReactNativeIrohStreamIO(): Promise<IrohStreamIO> {
-  const mod = await import("react-native-iroh").catch(() => null) as
+  // The specifier is kept in a variable so web bundlers cannot see it: with a
+  // literal, Rollup resolves the import while bundling and fails the build of
+  // every consumer that has no React-Native dependency, guard or not.
+  const specifier = "react-native-iroh";
+  const mod = await import(/* @vite-ignore */ specifier).catch(() => null) as
     | {
         Endpoint?: {
           create: (options: { alpns?: string[]; preset?: string }) => Promise<{
