@@ -30,7 +30,7 @@ import { InMemoryContentAddressedStoreFactory } from "../../appendonlystores/InM
 
 import { CANONICAL_NAME_HINT, toCanonicalSetupName } from "./canonicalSetupName";
 import { resolveServerPassword } from "./resolveServerPassword";
-import { ENV_VARS } from "./types";
+import { DEFAULT_SERVER_IROH_CONFIG, ENV_VARS } from "./types";
 import type { ServerConfig } from "./types";
 
 interface InitOptions {
@@ -364,6 +364,7 @@ async function generateSystemAdmin(
         },
       ],
     },
+    iroh: { ...DEFAULT_SERVER_IROH_CONFIG },
   };
   writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
   console.log(`Config written to: ${configPath}`);
@@ -392,6 +393,7 @@ function writeDefaultConfig(configPath: string): void {
         },
       ],
     },
+    iroh: { ...DEFAULT_SERVER_IROH_CONFIG },
   };
   writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
   console.log(`Default config.json (with placeholder) written to: ${configPath}`);

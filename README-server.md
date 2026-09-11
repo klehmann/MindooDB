@@ -48,7 +48,7 @@ bash serversetup.sh --update
 docker compose up -d --build
 ```
 
-`bash serversetup.sh --update` preserves the existing `server.identity.json`, `server.keybag`, `config.json`, tenant data, `trusted-servers.json`, and `.server_unlock`, while still rebuilding the Docker image and regenerating `docker-compose.override.yml`. Before the override is rewritten, the script now saves the previous file as `docker-compose.override.<timestamp>.yml`.
+`bash serversetup.sh --update` preserves the existing `server.identity.json`, `server.keybag`, `config.json`, tenant data, `trusted-servers.json`, and `.server_unlock`, while still rebuilding the Docker image (including `@number0/iroh`) and regenerating `docker-compose.override.yml`. Before the override is rewritten, the script now saves the previous file as `docker-compose.override.<timestamp>.yml`. Existing `config.json` files are not patched — add `"iroh": { "enabled": true, "secretKeyPath": "iroh-secret.key" }` yourself if you want the rebuilt image to join the Iroh network.
 
 The setup and update flows now prompt for a separate `Host port`. This lets you keep MindooDB listening on its internal container port `1661` while publishing a different host port such as `80`.
 
@@ -104,6 +104,10 @@ The most important file for day-to-day operations is **`config.json`**. After a 
         "publicsignkey": "-----BEGIN PUBLIC KEY-----\nMCow...base64...\n-----END PUBLIC KEY-----"
       }
     ]
+  },
+  "iroh": {
+    "enabled": false,
+    "secretKeyPath": "iroh-secret.key"
   }
 }
 ```
@@ -611,6 +615,26 @@ Controls which system admins can call which `/system/*` endpoints. See [How `con
         "publicsignkey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
       }
     ]
+  }
+}
+```
+
+Optional Iroh listen (off by default). The Docker image already contains
+`@number0/iroh`; you do not install it on the host. New servers get the block
+below with `"enabled": false` in `config.json`. `--update` never rewrites an
+existing `config.json` — add or flip the block yourself, then restart.
+
+When `"enabled": true` the process joins the Iroh network with ALPN
+`mindoodb/sync-v5` and logs a ticket. The secret key is created at
+`iroh-secret.key` in the data directory on first start. Haven pastes
+`iroh:<ticket>` into the server URL field.
+
+```json
+{
+  "capabilities": {},
+  "iroh": {
+    "enabled": true,
+    "secretKeyPath": "iroh-secret.key"
   }
 }
 ```

@@ -18,6 +18,7 @@ import type {
   RateLimitConfig,
   ServerClusterConfig,
   ServerConfig,
+  ServerIrohConfig,
   ServerRateLimitsConfig,
   SystemAdminPrincipal,
   TimestampRateLimitConfig,
@@ -144,6 +145,11 @@ export function validateServerConfig(raw: unknown, filePath: string): ServerConf
     config.cluster = cluster;
   }
 
+  const iroh = validateIroh(obj.iroh, filePath);
+  if (iroh) {
+    config.iroh = iroh;
+  }
+
   const principalCount = Object.values(capabilities).reduce(
     (sum, arr) => sum + arr.length,
     0,
@@ -181,6 +187,31 @@ function validateCluster(raw: unknown, filePath: string): ServerClusterConfig | 
     cluster.role = obj.role;
   }
   return Object.keys(cluster).length > 0 ? cluster : undefined;
+}
+
+function validateIroh(raw: unknown, filePath: string): ServerIrohConfig | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config.json at ${filePath}: "iroh" must be an object`);
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.enabled !== undefined && typeof obj.enabled !== "boolean") {
+    throw new Error(`config.json at ${filePath}: "iroh.enabled" must be a boolean`);
+  }
+  if (obj.secretKeyPath !== undefined) {
+    if (typeof obj.secretKeyPath !== "string" || !obj.secretKeyPath.trim()) {
+      throw new Error(`config.json at ${filePath}: "iroh.secretKeyPath" must be a non-empty string`);
+    }
+  }
+  const iroh: ServerIrohConfig = {
+    enabled: obj.enabled === true,
+  };
+  if (typeof obj.secretKeyPath === "string") {
+    iroh.secretKeyPath = obj.secretKeyPath.trim();
+  }
+  return iroh;
 }
 
 function validateRateLimits(

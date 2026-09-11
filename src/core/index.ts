@@ -341,6 +341,7 @@ export {
   NetworkError,
 } from "./appendonlystores/network/types";
 export { ClientNetworkContentAddressedStore } from "../appendonlystores/network/ClientNetworkContentAddressedStore";
+export { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 export { HttpTransport } from "../appendonlystores/network/HttpTransport";
 
 // Indexing - Virtual Views

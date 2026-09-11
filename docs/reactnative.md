@@ -293,7 +293,7 @@ Your App (JavaScript)
        │
 react-native-automerge-generated (JSI bridge)
        │
-Native Rust Automerge v0.7.3 (compiled into your app)
+Native Rust Automerge v0.11.0 (compiled into your app)
 ```
 
 **Benefits:**
@@ -337,48 +337,25 @@ const storeFactory = new InMemoryContentAddressedStoreFactory();
 **Use for:** Quick prototypes, testing, demos
 **Limitation:** Data lost when app closes
 
-### File-Based (Production)
+### SQLite (Production)
 
-For production apps, implement a file-backed store using:
-- **expo-file-system** for Expo apps
-- **react-native-fs** for bare React Native
-- **SQLite** for structured storage with indices
-
-Example with expo-file-system:
+Use the additive `mindoodb/sqlite` export — not imported by `mindoodb/browser`.
 
 ```typescript
-import * as FileSystem from 'expo-file-system';
-import { ContentAddressedStore } from 'mindoodb';
+import { SqliteContentAddressedStoreFactory, createExpoSqliteBackend } from "mindoodb/sqlite";
+import * as SQLite from "expo-sqlite";
 
-class FileBackedStore extends ContentAddressedStore {
-  constructor(tenantId: string, databaseId: string) {
-    super();
-    this.basePath = `${FileSystem.documentDirectory}${tenantId}/${databaseId}/`;
-  }
-
-  async put(hash: string, content: Uint8Array): Promise<void> {
-    const path = `${this.basePath}${hash}`;
-    await FileSystem.writeAsStringAsync(
-      path,
-      Buffer.from(content).toString('base64'),
-      { encoding: FileSystem.EncodingType.Base64 }
-    );
-  }
-
-  async get(hash: string): Promise<Uint8Array | null> {
-    const path = `${this.basePath}${hash}`;
-    const exists = await FileSystem.getInfoAsync(path);
-    if (!exists.exists) return null;
-
-    const base64 = await FileSystem.readAsStringAsync(path, {
-      encoding: FileSystem.EncodingType.Base64
-    });
-    return new Uint8Array(Buffer.from(base64, 'base64'));
-  }
-
-  // Implement other methods: has, delete, getAllHashes, estimateSize, clear
-}
+const factory = new SqliteContentAddressedStoreFactory((dbId, kind) => {
+  const db = SQLite.openDatabaseSync(`mindoodb-${dbId}-${kind}.db`);
+  return createExpoSqliteBackend(db);
+});
 ```
+
+Tables: `entries`, `content` (ref-counted blobs), `store_meta`. Sync surface includes `scanEntriesSince`, `getStoreHead`, `getIdBloomSummary`, and `applyWitnessReceipts`.
+
+### Iroh P2P
+
+`mindoodb/iroh` implements `IrohNetworkTransport` (`NetworkTransport` over ALPN `mindoodb/sync-v5`) and `IrohPeerStore` (store-to-store sync of already-encrypted entries). Wire `IrohStreamIO` to `react-native-iroh` `endpoint.streams`, or use `createLoopbackIrohPair()` in tests.
 
 ### Server-Backed (Sync)
 

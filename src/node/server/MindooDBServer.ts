@@ -83,6 +83,8 @@ import {
   systemIpAllowlistMiddleware,
 } from "./SystemIpAllowlist";
 import type { ServerConfig } from "./types";
+import { createMindooDBServerIrohHandler } from "./IrohServerRpc";
+import { IrohServerEndpoint } from "./IrohServerEndpoint";
 import type {
   RegisterTenantRequest,
   RegisterTenantResponse,
@@ -239,6 +241,7 @@ export class MindooDBServer {
    * SSRF boundary for {@link handleTimestampRequest}.
    */
   private readonly tsaProviders: TsaProviderConfig[];
+  private readonly irohEndpoint = new IrohServerEndpoint();
 
   /**
    * @param dataDir      Root directory for on-disk tenant data and server identity
@@ -399,6 +402,7 @@ export class MindooDBServer {
     });
 
     server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
+    void this.startIrohIfEnabled();
   }
 
   /**
@@ -421,6 +425,39 @@ export class MindooDBServer {
     });
 
     server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
+    void this.startIrohIfEnabled();
+  }
+
+  getIrohStatus() {
+    return this.irohEndpoint.getStatus();
+  }
+
+  async startIrohIfEnabled(): Promise<void> {
+    const irohConfig = this.serverConfig.iroh;
+    if (!irohConfig?.enabled) {
+      return;
+    }
+    try {
+      await this.irohEndpoint.start({
+        dataDir: this.tenantManager.getDataDir(),
+        config: irohConfig,
+        handler: createMindooDBServerIrohHandler({
+          getServerPublicInfo: () => this.tenantManager.getServerPublicInfo(),
+          getJsonBodyLimit: () => ({
+            limit: this.jsonBodyLimit,
+            bytes: this.jsonBodyLimitBytes,
+          }),
+          getClusterRole: () => this.serverConfig.cluster?.role ?? "peer",
+          listTenantPublicInfosFingerprints: (tenantId) =>
+            this.tenantManager.listTenantPublicInfosFingerprints(tenantId),
+          getAuthService: (tenantId) => this.tenantManager.getAuthService(tenantId),
+          getServerStore: (tenantId, dbId, storeKind) =>
+            this.tenantManager.getServerStore(tenantId, dbId, storeKind),
+        }),
+      });
+    } catch (error) {
+      console.error("[MindooDBServer] Failed to start Iroh listener:", error);
+    }
   }
 
   /**

@@ -18,8 +18,10 @@ COPY src/ ./src/
 RUN pnpm exec tsc
 
 # Production node_modules only. Two things happen here:
-#  1. The HTTP stack lives in devDependencies (it is optional for library
-#     consumers), so it is promoted to a regular dependency for the server.
+#  1. The HTTP stack and the optional Iroh N-API binding live in
+#     peer/devDependencies (they are optional for library consumers), so they
+#     are promoted to regular dependencies for the server image. `--update`
+#     rebuilds this image; operators do not `pnpm add` on the host.
 #  2. auto-install-peers is disabled so the optional React Native / Expo peer
 #     packages recorded in the lockfile stay out of the server image.
 RUN rm -rf node_modules \
@@ -28,6 +30,7 @@ RUN rm -rf node_modules \
     cors@^2.8.6 \
     helmet@^8.1.0 \
     express-rate-limit@^8.2.1 \
+    @number0/iroh@^1.0.0 \
   && pnpm install --prod --no-frozen-lockfile --ignore-scripts --config.auto-install-peers=false
 
 FROM node:22-alpine

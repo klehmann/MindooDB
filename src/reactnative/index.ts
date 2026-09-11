@@ -16,3 +16,26 @@ export { QuickCryptoAdapter, isQuickCryptoAvailable } from "./crypto/QuickCrypto
 
 // React Native-specific cache store
 export { MMKVLocalCacheStore, type MMKVInterface, type AsyncStorageInterface } from "./cache/MMKVLocalCacheStore";
+
+// Additive native persistence + P2P (not imported by mindoodb/browser)
+export {
+  SqliteContentAddressedStore,
+  SqliteContentAddressedStoreFactory,
+  createMemorySqliteBackend,
+  createSqlBackend,
+  createExpoSqliteBackend,
+  createExpoSqliteExecutor,
+} from "../sqlite/index";
+export type { SqliteExecutor, SqliteStoreBackend, SqliteValue, ExpoSqliteLike } from "../sqlite/index";
+export {
+  MINDOODB_IROH_ALPN,
+  IrohNetworkTransport,
+  IrohPeerStore,
+  createLoopbackIrohPair,
+  createReactNativeIrohStreamIO,
+  createStoreIrohHandler,
+  listenForIrohPeers,
+  serveIrohRpc,
+} from "../iroh/index";
+export type { IrohByteStream, IrohStreamIO, IrohRpcHandler, IrohRpcContext } from "../iroh/index";
+export { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";

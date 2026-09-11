@@ -1,5 +1,7 @@
 # Distributed Web Applications with MindooDB: MindooDB Apps
 
+> Haven can also serve a built zip from Cache Storage (hosted mode). That is a different design: the app is not stored in a MindooDB database, and isolation including the network allowlist is documented in [hosted-app-isolation.md](hosted-app-isolation.md). This page is the older “application assets live in the database and sync with the data” model.
+
 ## 1) The idea: applications that travel with their data
 
 In 2008, CouchDB introduced a radical concept called [CouchApps](https://couchapp.readthedocs.io/en/latest/intro/what-is-couchapp.html): web applications served directly from the database, replicated alongside their data to any CouchDB instance. The insight was powerful -- if the application code lives in the same database as the application data, replication distributes both at once. A user could install CouchDB on a laptop, replicate a CouchApp from a remote server, and run the full application locally with zero additional infrastructure. The traditional three-tier architecture (browser, application server, database) collapsed into two tiers, and the application became as portable as the data itself.

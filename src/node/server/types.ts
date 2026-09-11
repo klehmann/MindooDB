@@ -207,7 +207,28 @@ export interface ServerConfig {
   capabilities: Record<string, SystemAdminPrincipal[]>;
   rateLimits?: ServerRateLimitsConfig;
   cluster?: ServerClusterConfig;
+  /**
+   * Join the Iroh network and accept MindooDB sync on ALPN `mindoodb/sync-v5`.
+   * Off when omitted. HTTP listen stays unchanged.
+   */
+  iroh?: ServerIrohConfig;
 }
+
+/** Optional Iroh listen settings in config.json. Default is disabled. */
+export interface ServerIrohConfig {
+  enabled: boolean;
+  /**
+   * Path to the 32-byte secret key (hex). Relative paths are resolved against
+   * the server data directory. Created on first start when missing.
+   */
+  secretKeyPath?: string;
+}
+
+/** Written into new `config.json` files. `--update` does not rewrite existing files. */
+export const DEFAULT_SERVER_IROH_CONFIG: ServerIrohConfig = {
+  enabled: false,
+  secretKeyPath: "iroh-secret.key",
+};
 
 /** Node-level cluster settings; per-peer settings live in `trusted-servers.json`. */
 export interface ServerClusterConfig {
