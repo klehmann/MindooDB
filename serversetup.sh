@@ -306,7 +306,17 @@ write_password_file() {
 
 build_docker_image() {
   banner "Building Docker image"
-  docker build -f "$DOCKERFILE" -t "$DOCKER_IMAGE" .
+  local -a build_cmd=(docker build -f "$DOCKERFILE" -t "$DOCKER_IMAGE")
+  local mode="${MINDOODB_DOCKER_BUILD_NETWORK:-}"
+  # Docker's default bridge DNS often fails on OpenWrt and similar router/NAS
+  # hosts (getaddrinfo EAI_AGAIN registry.npmjs.org). Host networking during RUN
+  # steps uses the host resolver; the running server still uses Compose's bridge.
+  # Set MINDOODB_DOCKER_BUILD_NETWORK=default to keep the isolated default network.
+  if [[ "$mode" != "default" && ( "$mode" == "host" || "$(uname -s)" == "Linux" ) ]]; then
+    info "Using Docker host network for the image build (avoids bridge DNS failures on OpenWrt and similar hosts)."
+    build_cmd+=(--network host)
+  fi
+  "${build_cmd[@]}" .
   info "Image $DOCKER_IMAGE built successfully."
 }
 

@@ -1072,13 +1072,15 @@ The generated override also contains the published port bindings. This supports 
 
 If you only changed application code and do not need to adjust ports or bind addresses, `docker compose up -d --build` is usually enough.
 
+On Linux, `serversetup.sh` and `docker-compose.yml` use Docker **host networking for the image build only**. That lets `pnpm` resolve `registry.npmjs.org` on hosts where the default `docker0` bridge has no working DNS — a common OpenWrt / GL.iNet setup. The running server still uses Compose's default bridge and the published ports from `docker-compose.override.yml`. To force the isolated default build network: `MINDOODB_DOCKER_BUILD_NETWORK=default bash serversetup.sh`.
+
 ### Manual Docker commands (without serversetup.sh)
 
 If you prefer not to use the setup script, here are the individual steps:
 
 ```bash
-# Build the image
-docker build -f src/node/server/Dockerfile -t mindoodb-server .
+# Build the image (--network host: needed on OpenWrt when docker0 cannot resolve DNS)
+docker build --network host -f src/node/server/Dockerfile -t mindoodb-server .
 
 # Create data directory and password file
 mkdir -p ../mindoodb-data/server

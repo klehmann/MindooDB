@@ -21,6 +21,10 @@ services:
     build:
       context: .
       dockerfile: src/node/server/Dockerfile
+      # Host network during the image build only. Docker's default bridge DNS
+      # often fails on OpenWrt/router hosts; the running container still uses
+      # Compose's default bridge (see ports in docker-compose.override.yml).
+      network: host
     restart: unless-stopped
     environment:
       MINDOODB_SERVER_PASSWORD_FILE: /run/secrets/server_unlock
