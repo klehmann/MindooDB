@@ -7,7 +7,8 @@
 # Run `bash serversetup.sh` first to build the image, create the data directory,
 # and initialise the server identity. serversetup.sh writes a
 # `docker-compose.override.yml` with the current host uid/gid, bind mounts,
-# selected bind address, and SELinux relabeling suffixes when needed.
+# runtime network (bridge ports or host), and SELinux relabeling suffixes
+# when needed.
 #
 # Usage:
 #   docker compose up -d        # start
@@ -21,9 +22,9 @@ services:
     build:
       context: .
       dockerfile: src/node/server/Dockerfile
-      # Host network during the image build only. Docker's default bridge DNS
-      # often fails on OpenWrt/router hosts; the running container still uses
-      # Compose's default bridge (see ports in docker-compose.override.yml).
+      # Host network during the image build. Docker's default bridge DNS
+      # often fails on OpenWrt/router hosts. Runtime networking is chosen in
+      # docker-compose.override.yml (bridge ports or network_mode: host).
       network: host
     restart: unless-stopped
     environment:

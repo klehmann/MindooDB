@@ -396,9 +396,9 @@ export class MindooDBServer {
     this.systemAdminAuth.reloadPrincipals(newConfig);
   }
 
-  listen(port: number): void {
-    const server = this.app.listen(port, () => {
-      console.log(`[MindooDBServer] Listening on port ${port}`);
+  listen(port: number, host = "0.0.0.0"): void {
+    const server = this.app.listen(port, host, () => {
+      console.log(`[MindooDBServer] Listening on ${host}:${port}`);
     });
 
     server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);
@@ -420,8 +420,8 @@ export class MindooDBServer {
     const server = http2.createSecureServer(tlsOptions, (req, res) => {
       this.app(req as unknown as express.Request, res as unknown as express.Response);
     });
-    server.listen(port, () => {
-      console.log(`[MindooDBServer] Listening on HTTPS port ${port} with HTTP/2 enabled (HTTP/1 fallback active)`);
+    server.listen(port, "0.0.0.0", () => {
+      console.log(`[MindooDBServer] Listening on HTTPS 0.0.0.0:${port} with HTTP/2 enabled (HTTP/1 fallback active)`);
     });
 
     server.setTimeout(DEFAULT_SERVER_SOCKET_TIMEOUT_MS);

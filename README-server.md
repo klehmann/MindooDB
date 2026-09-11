@@ -1065,14 +1065,14 @@ The server ships with a multi-stage `Dockerfile` under `src/node/server/` that p
 
 The repository includes a `docker-compose.yml` that uses the default data paths (`../mindoodb-data`). `serversetup.sh` writes a `docker-compose.override.yml` that docker compose merges automatically. It pins the container to your current host uid/gid so the non-root container can read the password file and write to the mounted data directory. On SELinux hosts it also adds the required mount suffixes.
 
-The generated override also contains the published port bindings. This supports all three common setups:
-- bind all interfaces (`0.0.0.0`)
-- bind a single specific IP (for example a VPN address)
-- bind both `127.0.0.1` and one specific extra IP
+The generated override contains either published port bindings or `network_mode: host`, depending on the Docker network prompt in `serversetup.sh`:
+
+- **bridge** (default on a VPS or laptop) — published ports. Supports binding all interfaces (`0.0.0.0`), a single IP (for example a VPN address), or both `127.0.0.1` and one extra IP.
+- **host** (default on OpenWrt / GL.iNet, and when the existing override already uses it) — the process listens on the host stack. Needed when Docker's published bridge ports appear in `docker ps` but `curl http://localhost:1661/health` gets `Connection reset by peer` (fw4/nftables cannot hairpin DNAT). Portainer on these routers is usually started with `--net=host` for the same reason.
 
 If you only changed application code and do not need to adjust ports or bind addresses, `docker compose up -d --build` is usually enough.
 
-On Linux, `serversetup.sh` and `docker-compose.yml` use Docker **host networking for the image build only**. That lets `pnpm` resolve `registry.npmjs.org` on hosts where the default `docker0` bridge has no working DNS — a common OpenWrt / GL.iNet setup. The running server still uses Compose's default bridge and the published ports from `docker-compose.override.yml`. To force the isolated default build network: `MINDOODB_DOCKER_BUILD_NETWORK=default bash serversetup.sh`.
+Linux **image builds** always use Docker host networking so `pnpm` can resolve `registry.npmjs.org`. That is independent of the runtime choice. To force the isolated default build network: `MINDOODB_DOCKER_BUILD_NETWORK=default bash serversetup.sh`. Skip the runtime prompt with `MINDOODB_DOCKER_NETWORK=host` or `bridge`. Health checks use `/health` — `GET /` is 404 unless a static UI is configured.
 
 ### Manual Docker commands (without serversetup.sh)
 
@@ -1108,30 +1108,34 @@ On SELinux hosts, append `:Z` to the `/data` bind mount and `,Z` to the read-onl
 
 ### Bind to a specific IP
 
-To restrict the server to a specific network interface (e.g. a VPN), rerun `bash serversetup.sh --update` and provide the bind address when prompted. Update mode preserves the existing server identity, keybag, config, tenant data, and password file while regenerating `docker-compose.override.yml`.
+Choose **bridge** at the Docker network prompt, then restrict the published mapping to a specific interface (e.g. a VPN) via the bind-address prompt. Update mode preserves the existing server identity, keybag, config, tenant data, and password file while regenerating `docker-compose.override.yml`.
 
-If you also want local checks from the same host, answer `y` when asked whether to also bind `127.0.0.1`. The generated `docker-compose.override.yml` will then contain both mappings.
+If you also want local checks from the same host, answer `y` when asked whether to also bind `127.0.0.1`. The generated override will then contain both mappings.
+
+Host networking always listens on `0.0.0.0` (the process shares the host stack). Use bridge when you need a single-IP publish.
 
 ### Publish on a different host port
 
-`serversetup.sh` now distinguishes between:
+On **bridge**, `serversetup.sh` distinguishes between:
 
 - the container port, which stays at `1661`
 - the published host port, which you choose via the `Host port` prompt
 
+On **host**, there is no port mapping: the listen-port prompt is passed as `--port` so the process binds that port on the host.
+
 This is useful when an upstream proxy only supports standard web ports. Examples:
 
-- default local/demo setup: `1661:1661`
-- Cloudflare proxy or direct HTTP on port 80: `80:1661`
-- alternate public port: `8080:1661`
+- default local/demo setup: `1661`
+- Cloudflare proxy or direct HTTP on port 80: `80`
+- alternate public port: `8080`
 
-To change only the published host port for an existing deployment, rerun:
+To change only the published or listen port for an existing deployment, rerun:
 
 ```bash
 bash serversetup.sh --update
 ```
 
-Then enter the existing data directory, keep your preferred bind address, and choose the new `Host port`.
+Then enter the existing data directory and choose the network mode and port.
 
 Avoid the overwrite path unless you intentionally want to replace `server.identity.json`. Replacing the server identity breaks the relationship to server-owned encrypted state such as `server.keybag`, so it should be treated as a destructive reinitialization step, not a normal upgrade.
 

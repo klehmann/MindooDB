@@ -40,6 +40,7 @@ HEALTHCHECK_URL=""
 FORCE_FLAG=""
 ALSO_BIND_LOCALHOST=false
 HOST_PORT="$DEFAULT_HOST_PORT"
+USE_HOST_NETWORK=false
 
 show_help() {
   cat <<'EOF'
@@ -57,6 +58,14 @@ Modes:
               image and rewrites docker-compose.override.yml without touching
               server.identity.json, server.keybag, config.json, tenant data,
               or .server_unlock.
+
+Linux image builds always use Docker host networking so pnpm can resolve
+the npm registry (override with MINDOODB_DOCKER_BUILD_NETWORK=default).
+
+The running container is a separate choice, prompted as [b]ridge
+(published ports) or [h]ost. Default is host on OpenWrt/GL.iNet and
+when the existing override already uses network_mode: host; otherwise
+bridge. Set MINDOODB_DOCKER_NETWORK=host|bridge to skip the prompt.
 EOF
 }
 
@@ -240,10 +249,79 @@ prepare_mounts() {
   fi
 }
 
+is_openwrt() {
+  [[ -f /etc/openwrt_release ]] || grep -qi '^ID=openwrt' /etc/os-release 2>/dev/null
+}
+
+override_uses_host_network() {
+  [[ -f docker-compose.override.yml ]] \
+    && grep -qE '^[[:space:]]*network_mode:[[:space:]]*['\''"]?host['\''"]?' docker-compose.override.yml
+}
+
+# Bridge (published ports) is the usual VPS/laptop setup. Host networking is
+# required on OpenWrt/GL.iNet, where fw4/nftables cannot hairpin Docker DNAT
+# (curl localhost gets Connection reset; Portainer on these boxes uses --net=host).
+default_runtime_network() {
+  local mode="${MINDOODB_DOCKER_NETWORK:-}"
+  case "$mode" in
+    host) printf '%s\n' host; return ;;
+    bridge) printf '%s\n' bridge; return ;;
+  esac
+  if override_uses_host_network || is_openwrt; then
+    printf '%s\n' host
+  else
+    printf '%s\n' bridge
+  fi
+}
+
+prompt_runtime_network() {
+  local default_mode reply hint default_reply
+  default_mode="$(default_runtime_network)"
+  if [[ -n "${MINDOODB_DOCKER_NETWORK:-}" ]]; then
+    if [[ "$default_mode" == "host" ]]; then
+      USE_HOST_NETWORK=true
+    else
+      USE_HOST_NETWORK=false
+    fi
+    info "Docker runtime network from MINDOODB_DOCKER_NETWORK: $default_mode"
+    return
+  fi
+
+  if [[ "$default_mode" == "host" ]]; then
+    hint="b/H"
+    default_reply="h"
+  else
+    hint="B/h"
+    default_reply="b"
+  fi
+
+  echo ""
+  info "Bridge publishes host:container ports (typical VPS or laptop)."
+  info "Host shares the host network stack (needed on OpenWrt when published ports reset)."
+  while true; do
+    printf "  Docker network [b]ridge / [h]ost [%s]: " "$hint"
+    read -r reply
+    reply="$(to_lower "${reply:-$default_reply}")"
+    case "$reply" in
+      b|bridge)
+        USE_HOST_NETWORK=false
+        return
+        ;;
+      h|host)
+        USE_HOST_NETWORK=true
+        return
+        ;;
+      *)
+        error "Please answer b or h."
+        ;;
+    esac
+  done
+}
+
 prepare_ports() {
   PORT_LINES=("      - \"${BIND_ADDR}:${HOST_PORT}:${DEFAULT_CONTAINER_PORT}\"")
   HEALTHCHECK_URL="http://${BIND_ADDR}:${HOST_PORT}/health"
-  if [[ "$BIND_ADDR" == "0.0.0.0" ]]; then
+  if [[ "$BIND_ADDR" == "0.0.0.0" || "$USE_HOST_NETWORK" == "true" ]]; then
     HEALTHCHECK_URL="http://localhost:${HOST_PORT}/health"
   fi
   if $ALSO_BIND_LOCALHOST; then
@@ -282,11 +360,21 @@ write_override_file() {
     echo "    volumes:"
     echo "      - \"${DATA_MOUNT}\""
     echo "      - \"${PASSWORD_MOUNT}\""
-    echo "    ports:"
-    printf '%s\n' "${PORT_LINES[@]}"
+    if $USE_HOST_NETWORK; then
+      echo "    # Host network: the process binds HOST_PORT on the host stack."
+      echo "    # Compose ignores `ports:` in this mode (OpenWrt cannot hairpin DNAT)."
+      echo "    command: [\"--port\", \"${HOST_PORT}\"]"
+      echo "    network_mode: host"
+    else
+      echo "    ports:"
+      printf '%s\n' "${PORT_LINES[@]}"
+    fi
   } > docker-compose.override.yml
 
   info "Override written to docker-compose.override.yml"
+  if $USE_HOST_NETWORK; then
+    info "Runtime network is host (same pattern as Portainer on OpenWrt). Published bridge ports are not used."
+  fi
   if [[ -n "$backup_file" ]]; then
     info "The previous docker-compose.override.yml was overwritten."
     info "Review $backup_file and merge any custom changes (for example environment variables or command flags) back into docker-compose.override.yml if needed."
@@ -310,7 +398,7 @@ build_docker_image() {
   local mode="${MINDOODB_DOCKER_BUILD_NETWORK:-}"
   # Docker's default bridge DNS often fails on OpenWrt and similar router/NAS
   # hosts (getaddrinfo EAI_AGAIN registry.npmjs.org). Host networking during RUN
-  # steps uses the host resolver; the running server still uses Compose's bridge.
+  # steps uses the host resolver. Runtime networking is a separate prompt.
   # Set MINDOODB_DOCKER_BUILD_NETWORK=default to keep the isolated default network.
   if [[ "$mode" != "default" && ( "$mode" == "host" || "$(uname -s)" == "Linux" ) ]]; then
     info "Using Docker host network for the image build (avoids bridge DNS failures on OpenWrt and similar hosts)."
@@ -350,7 +438,9 @@ print_summary() {
   else
     info "Password file:     $PASSWORD_FILE (preserved)"
   fi
-  if $ALSO_BIND_LOCALHOST; then
+  if $USE_HOST_NETWORK; then
+    info "Docker network:    host (process binds 0.0.0.0:$HOST_PORT on the host)"
+  elif $ALSO_BIND_LOCALHOST; then
     info "Bind addresses:    127.0.0.1:$HOST_PORT, $BIND_ADDR:$HOST_PORT"
   else
     info "Bind address:      $BIND_ADDR:$HOST_PORT"
@@ -383,7 +473,9 @@ run_setup_mode() {
   echo ""
   info "Server name:    $SERVER_NAME"
   info "Data directory: $DATA_DIR"
-  if $ALSO_BIND_LOCALHOST; then
+  if $USE_HOST_NETWORK; then
+    info "Docker network: host (listen 0.0.0.0:$HOST_PORT)"
+  elif $ALSO_BIND_LOCALHOST; then
     info "Bind addresses: 127.0.0.1:$HOST_PORT, $BIND_ADDR:$HOST_PORT"
   else
     info "Bind address:   $BIND_ADDR:$HOST_PORT"
@@ -422,7 +514,9 @@ run_update_mode() {
   info "Safe update mode selected."
   info "Existing identity, keybag, config, tenant data, and password file will be preserved."
   info "Data directory: $DATA_DIR"
-  if $ALSO_BIND_LOCALHOST; then
+  if $USE_HOST_NETWORK; then
+    info "Docker network: host (listen 0.0.0.0:$HOST_PORT)"
+  elif $ALSO_BIND_LOCALHOST; then
     info "Bind addresses: 127.0.0.1:$HOST_PORT, $BIND_ADDR:$HOST_PORT"
   else
     info "Bind address:   $BIND_ADDR:$HOST_PORT"
@@ -492,10 +586,17 @@ if [[ "$MODE" != "update" ]]; then
   prompt_server_name SERVER_NAME
 fi
 
-prompt_default "Bind address (0.0.0.0 = all interfaces)" "$DEFAULT_BIND_ADDR" BIND_ADDR
-prompt_port "Host port" "$DEFAULT_HOST_PORT" HOST_PORT
-if [[ "$BIND_ADDR" != "0.0.0.0" && "$BIND_ADDR" != "127.0.0.1" ]]; then
-  prompt_yes_no "Also bind localhost (127.0.0.1) for local health checks?" "n" ALSO_BIND_LOCALHOST
+prompt_runtime_network
+if $USE_HOST_NETWORK; then
+  prompt_port "Listen port" "$DEFAULT_HOST_PORT" HOST_PORT
+  BIND_ADDR="0.0.0.0"
+  ALSO_BIND_LOCALHOST=false
+else
+  prompt_default "Bind address (0.0.0.0 = all interfaces)" "$DEFAULT_BIND_ADDR" BIND_ADDR
+  prompt_port "Host port" "$DEFAULT_HOST_PORT" HOST_PORT
+  if [[ "$BIND_ADDR" != "0.0.0.0" && "$BIND_ADDR" != "127.0.0.1" ]]; then
+    prompt_yes_no "Also bind localhost (127.0.0.1) for local health checks?" "n" ALSO_BIND_LOCALHOST
+  fi
 fi
 
 if [[ "$MODE" == "update" ]]; then
