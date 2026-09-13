@@ -13095,27 +13095,42 @@ export class BaseMindooDB implements MindooDB {
       }
     }
 
-    // Fallback: direct access (for WASM or if native fails)
-    const result: Record<string, any> = {};
-    const keys = Object.keys(doc);
+    // Fallback: walk the document. Automerge Text must become a string — treating
+    // it as a nested object recurses into character indexes / internals and can
+    // yield `{}` for bodySketch (blank page after saving text).
+    return this.convertAutomergeValueToJS(doc, 0) as MindooDocPayload;
+  }
 
-    for (const key of keys) {
-      const value = (doc as any)[key];
-      if (value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array)) {
-        result[key] = this.convertAutomergeToJS(value as AutomergeTypes.Doc<MindooDocPayload>);
-      } else if (Array.isArray(value)) {
-        result[key] = value.map(item => {
-          if (item !== null && typeof item === 'object' && !Array.isArray(item) && !(item instanceof Uint8Array)) {
-            return this.convertAutomergeToJS(item as AutomergeTypes.Doc<MindooDocPayload>);
-          }
-          return item;
-        });
-      } else {
-        result[key] = value;
-      }
+  private convertAutomergeValueToJS(value: unknown, depth: number): unknown {
+    if (value === null || value === undefined) return value;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+    if (value instanceof Uint8Array) return value;
+    if (depth > 40) return null;
+    const automerge = Automerge as {
+      isText?: (candidate: unknown) => boolean;
+      isRawString?: (candidate: unknown) => boolean;
+    };
+    if (automerge.isText?.(value) || automerge.isRawString?.(value)) return String(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => this.convertAutomergeValueToJS(item, depth + 1));
     }
-
-    return result as MindooDocPayload;
+    if (typeof value !== "object") return value;
+    const record = value as Record<string, unknown>;
+    if (
+      typeof (record as { length?: unknown }).length === "number"
+      && typeof (value as { concat?: unknown }).concat === "function"
+      && record.kind === undefined
+      && typeof (value as { toString?: () => string }).toString === "function"
+    ) {
+      const asString = String(value);
+      if (asString && asString !== "[object Object]") return asString;
+    }
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+      if (key.startsWith("_")) continue;
+      result[key] = this.convertAutomergeValueToJS(record[key], depth + 1);
+    }
+    return result;
   }
 
   /**
