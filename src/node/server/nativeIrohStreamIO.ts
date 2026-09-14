@@ -161,8 +161,15 @@ async function* acceptIncomingStreams(
   setWake: (wake: (() => void) | null) => void,
 ): AsyncGenerator<IrohByteStream> {
   const pending: IrohByteStream[] = [];
-  let spaceWake: (() => void) | null = null;
-  let notify: (() => void) | null = null;
+  const wake = {
+    space: null as (() => void) | null,
+    notify: null as (() => void) | null,
+  };
+  const flushWake = (key: "space" | "notify") => {
+    const fn = wake[key];
+    wake[key] = null;
+    fn?.();
+  };
   const producers = new Set<Promise<void>>();
   // Keep JS refs so N-API Drop does not close the QUIC connection mid-accept.
   const inboundConnections = new Set<IrohConnection>();
@@ -170,7 +177,7 @@ async function* acceptIncomingStreams(
   const pushStream = async (stream: IrohByteStream): Promise<void> => {
     while (pending.length >= MAX_PENDING_INBOUND_STREAMS && !isClosed()) {
       await new Promise<void>((resolve) => {
-        spaceWake = resolve;
+        wake.space = () => resolve();
       });
     }
     if (isClosed()) {
@@ -178,8 +185,7 @@ async function* acceptIncomingStreams(
       return;
     }
     pending.push(stream);
-    notify?.();
-    notify = null;
+    flushWake("notify");
   };
 
   const runProducer = async (conn: IrohConnection): Promise<void> => {
@@ -226,33 +232,30 @@ async function* acceptIncomingStreams(
   })();
 
   void acceptLoop.finally(() => {
-    notify?.();
-    notify = null;
-    spaceWake?.();
-    spaceWake = null;
+    flushWake("notify");
+    flushWake("space");
   });
 
   try {
     while (!isClosed()) {
       if (pending.length === 0) {
         await new Promise<void>((resolve) => {
-          notify = resolve;
-          setWake(resolve);
+          wake.notify = () => resolve();
+          setWake(() => resolve());
         });
         if (isClosed() && pending.length === 0) {
           break;
         }
       }
       const next = pending.shift();
-      spaceWake?.();
-      spaceWake = null;
+      flushWake("space");
       if (next) {
         yield next;
       }
     }
   } finally {
-    notify?.();
-    spaceWake?.();
+    flushWake("notify");
+    flushWake("space");
     await acceptLoop.catch(() => undefined);
     await Promise.allSettled(producers);
   }
