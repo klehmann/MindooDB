@@ -351,6 +351,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Document Copy & Sharding](./docs/document-copy.md) — Copying documents between databases with or without history, verifiable provenance, and splitting a growing database into shards as a keyless operation
 - [Access Control & Governance](./docs/accesscontrol.md) — Encryption-key read access, admin-signed write policies, the two-tier model, witness receipts and trusted-time enforcement
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization
+- [Iroh transport](./docs/iroh.md) — QUIC sync without a public HTTPS URL (server, Node CLI, Haven, React Native)
 - [Attachments](./docs/attachments.md) — File storage and streaming
 - [Data Import Example](https://github.com/klehmann/mindoodb-data-import) — CLI tool that imports external data into MindooDB with historical `createdAt` timestamps for Time Travel
 

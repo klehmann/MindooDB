@@ -36,6 +36,8 @@ export interface IrohLiveServer {
   server: MindooDBServer;
   tenant: MindooTenant;
   adminUser: PrivateUserId;
+  systemAdmin: PrivateUserId;
+  systemAdminPassword: string;
   crypto: NodeCryptoAdapter;
   stop: () => Promise<void>;
 }
@@ -53,7 +55,9 @@ export function skipIrohLiveUnlessEnabled(): boolean {
   return process.env[IROH_LIVE_ENV] !== "1";
 }
 
-export async function startIrohLiveServer(): Promise<IrohLiveServer> {
+export async function startIrohLiveServer(options?: {
+  serverName?: string;
+}): Promise<IrohLiveServer> {
   if (!(await canUseNativeIroh())) {
     throw new Error(
       "@number0/iroh is not installed. From mindoodb: pnpm add -D @number0/iroh",
@@ -66,7 +70,10 @@ export async function startIrohLiveServer(): Promise<IrohLiveServer> {
   writeFileSync(path.join(dataDir, "trusted-servers.json"), "[]", "utf-8");
 
   const bootstrap = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
-  const serverIdentity = await bootstrap.createUserId("CN=iroh-live-server", SERVER_PASSWORD);
+  const serverIdentity = await bootstrap.createUserId(
+    options?.serverName ?? "CN=iroh-live-server",
+    SERVER_PASSWORD,
+  );
   writeFileSync(path.join(dataDir, "server.identity.json"), JSON.stringify(serverIdentity, null, 2), "utf-8");
 
   const systemAdmin = await bootstrap.createUserId("cn=sysadmin/o=iroh-live", SYSTEM_ADMIN_PASSWORD);
@@ -143,6 +150,8 @@ export async function startIrohLiveServer(): Promise<IrohLiveServer> {
     server,
     tenant: created.tenant,
     adminUser: created.adminUser,
+    systemAdmin,
+    systemAdminPassword: SYSTEM_ADMIN_PASSWORD,
     crypto,
     stop: async () => {
       await server.stopIroh();

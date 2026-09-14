@@ -12,6 +12,7 @@
 import { StoreKind, type ContentAddressedStore } from "../../../core/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../../core/logging";
 import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
+import type { IrohStreamIO } from "../../../core/appendonlystores/network/IrohStreamIO";
 import type { TrustedServer } from "../types";
 import type { SyncEventBus } from "../SyncEventBus";
 import { PeerAuthService } from "./PeerAuthService";
@@ -55,6 +56,11 @@ export interface ClusterManagerDeps {
   ): Promise<ContentAddressedStore>;
   /** This node's mesh role; `peer` unless config says hub or spoke. */
   localRole?: PeerRole;
+  /**
+   * Bound Iroh endpoint for outbound peer dials. `null` until Iroh is online
+   * (or when `iroh.enabled` is off). Replicators treat that as a reconnect.
+   */
+  getIrohStreamIO?: () => IrohStreamIO | null;
   logger?: Logger;
 }
 
@@ -132,6 +138,7 @@ export class ClusterManager {
         getLocalStore: (tenantId, dbId, storeKind) =>
           this.deps.getLocalStore(tenantId, dbId, storeKind),
         eventBus: this.deps.eventBus,
+        getIrohStreamIO: this.deps.getIrohStreamIO,
         logger: this.logger,
       });
       this.replicators.set(name, replicator);

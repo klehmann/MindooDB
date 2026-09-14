@@ -26,6 +26,8 @@ MindooDB runs on three platforms. The API is identical across all of them — on
 
 For this guide, we use Node.js imports. Replace them with the browser or React Native imports if you are targeting those platforms — every other line of code stays the same.
 
+To sync over [Iroh](./iroh.md) instead of HTTP (no public server URL), a Node CLI uses `createNodeIrohStreamIO` from `mindoodb/iroh/node` plus the same `ClientNetworkContentAddressedStore` as HTTPS. The browser needs the separate Haven WASM build; that is not required for CLI tools.
+
 ---
 
 ## Step 1: Create a Tenant

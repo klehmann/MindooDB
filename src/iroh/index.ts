@@ -1,5 +1,9 @@
 /**
  * Additive Iroh transport. Not imported by `mindoodb/browser`.
+ *
+ * Protocol types and `IrohNetworkTransport` live here. The Node QUIC adapter
+ * (`createNodeIrohStreamIO`) is `mindoodb/iroh/node` so web bundlers do not
+ * pull in `fs` / `@number0/iroh`.
  */
 export {
   MINDOODB_IROH_ALPN,
@@ -8,6 +12,7 @@ export {
   encodeIrohFrame,
   wrapLengthPrefixedByteStream,
   type IrohByteStream,
+  type IrohConnectionHandle,
   type IrohRpcContext,
   type IrohRpcRequest,
   type IrohRpcResponse,

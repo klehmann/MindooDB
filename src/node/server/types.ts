@@ -47,9 +47,11 @@ export interface UserConfig {
  */
 export interface TrustedServer extends MindooDBServerInfo {
   /**
-   * Base origin of the peer, without a tenant path (e.g.
-   * `https://eu-west.example.com`). The replicator appends `/{tenantId}` itself,
-   * matching what clients do in `BaseMindooTenant.connectToServer`.
+   * Where to reach the peer: an HTTPS origin without a tenant path
+   * (`https://eu-west.example.com`) or an Iroh locator (`iroh:<ticket>` /
+   * raw `endpoint…` ticket). HTTP appends `/{tenantId}`; Iroh uses the
+   * same peer RPC over QUIC. An endpoint-id-only locator (`iroh:<64-hex>`)
+   * is a stable label but cannot be dialled — store a full ticket to pair.
    */
   url?: string;
   /** Which way entries flow. Defaults to `"bidirectional"`. */

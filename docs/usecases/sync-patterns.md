@@ -2,7 +2,7 @@
 
 ## Overview
 
-MindooDB supports multiple synchronization patterns: peer-to-peer (P2P), client-server, and server-server. This document explores these patterns, how to implement them, and when to use each approach. It also covers sync without decryption, incremental sync, and local-first workflows.
+MindooDB supports multiple synchronization patterns: peer-to-peer (P2P), client-server, and server-server. This document explores these patterns, how to implement them, and when to use each approach. It also covers sync without decryption, incremental sync, and local-first workflows. For QUIC sync without a public HTTPS URL, see [Iroh transport](../iroh.md).
 
 ## Key Concepts
 

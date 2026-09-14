@@ -32,8 +32,12 @@
 
 import { HttpTransport } from "../../../appendonlystores/network/HttpTransport";
 import { ClientNetworkContentAddressedStore } from "../../../appendonlystores/network/ClientNetworkContentAddressedStore";
+import { IrohNetworkTransport } from "../../../core/appendonlystores/network/IrohNetworkTransport";
+import { isIrohLocator, parseIrohLocator } from "../../../core/appendonlystores/network/irohLocator";
+import type { IrohStreamIO } from "../../../core/appendonlystores/network/IrohStreamIO";
 import { StoreKind, type ContentAddressedStore } from "../../../core/types";
 import { NetworkError } from "../../../core/appendonlystores/network/types";
+import { IrohPeerLink } from "./IrohPeerLink";
 import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../../core/logging";
 import { createIdBloomSummary } from "../../../core/appendonlystores/bloom";
@@ -89,6 +93,8 @@ export interface PeerReplicatorHost {
     storeKind: StoreKind,
   ): Promise<ContentAddressedStore>;
   eventBus: SyncEventBus;
+  /** Bound Iroh endpoint for `iroh:` peer urls. Missing / null → reconnect. */
+  getIrohStreamIO?: () => IrohStreamIO | null;
   logger?: Logger;
 }
 
@@ -161,6 +167,7 @@ export class PeerReplicator {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempt = 0;
   private sseAbort: AbortController | null = null;
+  private irohLink: IrohPeerLink | null = null;
   private unsubscribeBus: (() => void) | null = null;
 
   private lastError: string | null = null;
@@ -208,6 +215,8 @@ export class PeerReplicator {
     // Identity or endpoint may have changed; force a fresh session.
     this.token = null;
     this.tokenIssuedAt = 0;
+    void this.irohLink?.close();
+    this.irohLink = null;
   }
 
   /** Roles and endpoint, for `GET /system/cluster/topology`. */
@@ -268,6 +277,8 @@ export class PeerReplicator {
     this.sseAbort?.abort();
     this.sseAbort = null;
     this.eventsConnected = false;
+    void this.irohLink?.close();
+    this.irohLink = null;
     this.sessionState = "disabled";
     try {
       await this.syncInFlight;
@@ -377,6 +388,30 @@ export class PeerReplicator {
     return this.token;
   }
 
+  private isIrohPeer(): boolean {
+    return typeof this.peer.url === "string" && isIrohLocator(this.peer.url);
+  }
+
+  private async getIrohLink(): Promise<IrohPeerLink> {
+    if (this.irohLink) {
+      return this.irohLink;
+    }
+    const io = this.host.getIrohStreamIO?.() ?? null;
+    if (!io) {
+      throw new Error(
+        `Iroh peer ${this.peer.name} requires iroh.enabled and a ready Iroh endpoint`,
+      );
+    }
+    const parsed = parseIrohLocator(this.peer.url as string);
+    if (!parsed.ticket) {
+      throw new Error(
+        `Iroh peer ${this.peer.name} url is an endpoint id only; store a full ticket to dial`,
+      );
+    }
+    this.irohLink = new IrohPeerLink(io, parsed.ticket);
+    return this.irohLink;
+  }
+
   private async peerFetch(
     path: string,
     init: {
@@ -388,6 +423,9 @@ export class PeerReplicator {
   ): Promise<unknown> {
     const base = this.peer.url;
     if (!base) throw new Error(`Peer ${this.peer.name} has no url`);
+    if (this.isIrohPeer()) {
+      return this.irohPeerFetch(path, init);
+    }
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (init.authenticated !== false) {
@@ -411,6 +449,49 @@ export class PeerReplicator {
       throw new Error(`Peer ${this.peer.name} ${path} failed (${response.status}): ${text}`);
     }
     return response.json();
+  }
+
+  private async irohPeerFetch(
+    path: string,
+    init: {
+      method?: string;
+      body?: unknown;
+      authenticated?: boolean;
+    },
+  ): Promise<unknown> {
+    const link = await this.getIrohLink();
+    const body = (init.body ?? {}) as Record<string, unknown>;
+    try {
+      if (path === "/system/peer/challenge") {
+        return await link.rpc("peer.challenge", [body.publicsignkey]);
+      }
+      if (path === "/system/peer/authenticate") {
+        const signature = body.signature;
+        const bytes =
+          signature instanceof Uint8Array
+            ? signature
+            : new Uint8Array(Buffer.from(String(signature ?? ""), "base64"));
+        return await link.rpc("peer.authenticate", [body.challenge, bytes]);
+      }
+      const token = init.authenticated !== false ? await this.ensureToken() : "";
+      if (path === "/system/peer/tenant-bloom") {
+        return await link.rpc("peer.tenantBloom", [token, body.bloom]);
+      }
+      if (path.startsWith("/system/peer/databases")) {
+        const tenantId = new URL(`http://peer${path}`).searchParams.get("tenantId") ?? "";
+        return await link.rpc("peer.listDatabases", [token, tenantId]);
+      }
+      if (path === "/system/peer/sync") {
+        return await link.rpc("peer.sync", [token, body]);
+      }
+      throw new Error(`No Iroh mapping for ${path}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/Invalid or expired peer token|Unknown peer|Authentication failed/i.test(message)) {
+        this.token = null;
+      }
+      throw new Error(`Peer ${this.peer.name} ${path} failed: ${message}`);
+    }
   }
 
   // ----------------------------------------------------------- intersection
@@ -753,12 +834,18 @@ export class PeerReplicator {
     // sync under `/:tenantId/sync/*`. Passing the bare server url — as the old
     // per-tenant ServerSync did — makes every request land on `/sync/...`,
     // where Express reads "sync" as the tenant id and answers 404.
-    const transport = new HttpTransport({
-      baseUrl: `${(this.peer.url as string).replace(/\/$/, "")}/${encodeURIComponent(tenantId)}`,
-      tenantId,
-      dbId,
-      storeKind,
-    });
+    const transport = this.isIrohPeer()
+      ? new IrohNetworkTransport((await this.getIrohLink()).asStreamIO(), parseIrohLocator(this.peer.url as string).ticket, {
+          tenantId,
+          dbId,
+          storeKind,
+        })
+      : new HttpTransport({
+          baseUrl: `${(this.peer.url as string).replace(/\/$/, "")}/${encodeURIComponent(tenantId)}`,
+          tenantId,
+          dbId,
+          storeKind,
+        });
 
     const store = new ClientNetworkContentAddressedStore(
       dbId,
@@ -846,6 +933,10 @@ export class PeerReplicator {
   }
 
   private async consumeEventStream(controller: AbortController): Promise<void> {
+    if (this.isIrohPeer()) {
+      await this.consumeIrohEventStream(controller);
+      return;
+    }
     const base = this.peer.url as string;
     const token = await this.ensureToken();
     const response = await fetch(`${base.replace(/\/$/, "")}/system/peer/events`, {
@@ -889,6 +980,26 @@ export class PeerReplicator {
     }
   }
 
+  private async consumeIrohEventStream(controller: AbortController): Promise<void> {
+    const link = await this.getIrohLink();
+    const token = await this.ensureToken();
+    this.sessionState = "connected";
+    this.eventsConnected = true;
+    this.reconnectAttempt = 0;
+    try {
+      await link.subscribeEvents(token, (event) => this.handleChangeEvent(event), controller.signal);
+    } finally {
+      if (this.sseAbort === controller) {
+        this.sseAbort = null;
+        this.eventsConnected = false;
+        if (this.running && !this.paused && !controller.signal.aborted) {
+          void this.syncNow().catch(() => undefined);
+          this.scheduleReconnect();
+        }
+      }
+    }
+  }
+
   private handleEventFrame(frame: string): void {
     const dataLine = frame
       .split("\n")
@@ -901,6 +1012,10 @@ export class PeerReplicator {
     } catch {
       return;
     }
+    this.handleChangeEvent(event);
+  }
+
+  private handleChangeEvent(event: SyncChangeEvent): void {
     if (!event.tenantId || !event.dbId) return;
     if (!this.intersection.includes(event.tenantId)) return;
     if (this.attachments === "never" && event.storeKind === StoreKind.attachments) return;

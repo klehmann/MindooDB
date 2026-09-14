@@ -355,7 +355,7 @@ Tables: `entries`, `content` (ref-counted blobs), `store_meta`. Sync surface inc
 
 ### Iroh P2P
 
-`mindoodb/iroh` implements `IrohNetworkTransport` (`NetworkTransport` over ALPN `mindoodb/sync-v5`) and `IrohPeerStore` (store-to-store sync of already-encrypted entries). Wire `IrohStreamIO` to `react-native-iroh` `endpoint.streams`, or use `createLoopbackIrohPair()` in tests.
+See **[iroh.md](iroh.md)** for the full Iroh model. `mindoodb/iroh` implements `IrohNetworkTransport` (`NetworkTransport` over ALPN `mindoodb/sync-v5`) and `IrohPeerStore`. On device, call `createReactNativeIrohStreamIO()` (wraps `react-native-iroh`). Tests can use `createLoopbackIrohPair()`.
 
 ### Server-Backed (Sync)
 

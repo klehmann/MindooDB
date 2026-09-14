@@ -18,10 +18,16 @@ export interface IrohServerEndpointStatus {
  */
 export class IrohServerEndpoint {
   private stop: (() => Promise<void>) | null = null;
+  private io: NativeIrohStreamIO | null = null;
   private status: IrohServerEndpointStatus = { enabled: false };
 
   getStatus(): IrohServerEndpointStatus {
     return this.status;
+  }
+
+  /** The bound native endpoint, or `null` until listen succeeds. */
+  getStreamIO(): NativeIrohStreamIO | null {
+    return this.io;
   }
 
   async start(options: {
@@ -36,6 +42,7 @@ export class IrohServerEndpoint {
     }
 
     const io = await createNativeIrohStreamIO(options.dataDir, options.config);
+    this.io = io;
     const abort = new AbortController();
     const listenDone = listenForIrohPeers(io, options.handler, { signal: abort.signal }).catch(
       (error) => {
@@ -44,6 +51,7 @@ export class IrohServerEndpoint {
     );
     this.stop = async () => {
       abort.abort();
+      this.io = null;
       await io.close?.();
       await listenDone;
     };
@@ -67,6 +75,7 @@ export class IrohServerEndpoint {
         console.error("[Iroh] stop failed:", error);
       });
     }
+    this.io = null;
     this.status = { enabled: false };
   }
 }

@@ -167,7 +167,7 @@ flowchart LR
 
 **ClientNetworkContentAddressedStore** is the client-side entry point. It implements the same `ContentAddressedStore` interface as a local store, so application code can treat it as a transparent remote proxy. Internally, it handles authentication, capability negotiation, request orchestration, and RSA payload decryption.
 
-**NetworkTransport / HttpTransport** handles the actual wire communication. The `HttpTransport` implementation provides REST-based communication with automatic retry and exponential backoff for transient failures. Other transport implementations (WebSocket, WebRTC) can be plugged in by implementing the `NetworkTransport` interface.
+**NetworkTransport / HttpTransport** handles the actual wire communication. The `HttpTransport` implementation provides REST-based communication with automatic retry and exponential backoff for transient failures. **`IrohNetworkTransport`** is the same interface over QUIC (ALPN `mindoodb/sync-v5`) when the server should not expose a public HTTPS URL — see [iroh.md](iroh.md). Other transports can be plugged in by implementing `NetworkTransport`.
 
 **ServerNetworkContentAddressedStore** is the server-side handler. It validates JWT tokens, checks user revocation status, maps incoming requests to operations on the local store, and encrypts response payloads with the requesting user's RSA public key.
 

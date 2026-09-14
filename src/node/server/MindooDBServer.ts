@@ -311,6 +311,7 @@ export class MindooDBServer {
       getLocalStore: (tenantId, dbId, storeKind) =>
         this.tenantManager.getStore(tenantId, dbId, storeKind),
       localRole: this.serverConfig.cluster?.role,
+      getIrohStreamIO: () => this.irohEndpoint.getStreamIO(),
     });
     // Peer tokens are accepted by the tenant sync routes so a peer can mirror
     // the encrypted stores through the ordinary protocol; the store bypasses
@@ -432,6 +433,10 @@ export class MindooDBServer {
     return this.irohEndpoint.getStatus();
   }
 
+  getIrohStreamIO() {
+    return this.irohEndpoint.getStreamIO();
+  }
+
   async stopIroh(): Promise<void> {
     await this.irohEndpoint.stopListening();
   }
@@ -462,6 +467,27 @@ export class MindooDBServer {
           getServerStore: (tenantId, dbId, storeKind) =>
             this.tenantManager.getServerStore(tenantId, dbId, storeKind),
           syncEventBus: this.syncEventBus,
+          peerAuth: {
+            generateChallenge: (publicsignkey) => this.cluster.auth.generateChallenge(publicsignkey),
+            authenticate: (challenge, signature) => this.cluster.auth.authenticate(challenge, signature),
+            validateToken: (token) => this.cluster.auth.validateToken(token),
+          },
+          peerCluster: {
+            recordPeerIntersection: (peerName, tenantIds) =>
+              this.cluster.recordPeerIntersection(peerName, tenantIds),
+            peerMaySeeTenant: (peerName, tenantId) => this.cluster.peerMaySeeTenant(peerName, tenantId),
+            listTenants: () => this.tenantManager.listTenants(),
+            listDatabases: (tenantId) => this.tenantManager.listDatabases(tenantId),
+            requestSync: (peerName, scope) => {
+              const replicator = this.cluster.getReplicator(peerName);
+              if (!replicator) {
+                throw new Error(
+                  `No outbound session configured for peer ${peerName} (missing url in trusted-servers.json)`,
+                );
+              }
+              void replicator.syncNow(scope).catch(() => undefined);
+            },
+          },
         }),
       });
     } catch (error) {

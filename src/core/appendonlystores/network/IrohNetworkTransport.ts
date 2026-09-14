@@ -33,6 +33,7 @@ import {
   isBenignIrohClose,
   MINDOODB_IROH_ALPN,
   type IrohByteStream,
+  type IrohConnectionHandle,
   type IrohRpcRequest,
   type IrohRpcResponse,
   type IrohStreamIO,
@@ -41,7 +42,8 @@ import {
 
 export type { IrohRpcContext };
 
-async function rpcCall(
+/** One request / one response on a single stream. Exported so tests can force an id mismatch. */
+export async function rpcCall(
   stream: IrohByteStream,
   method: string,
   args: unknown[],
@@ -55,6 +57,12 @@ async function rpcCall(
     throw new NetworkError(NetworkErrorType.NETWORK_ERROR, "Iroh stream closed");
   }
   const response = decodeIrohFrame(bytes) as IrohRpcResponse;
+  if (response.id !== id) {
+    throw new NetworkError(
+      NetworkErrorType.NETWORK_ERROR,
+      `Iroh response id mismatch: expected ${id}, got ${response.id}`,
+    );
+  }
   if (!response.ok) {
     throw new NetworkError(NetworkErrorType.NETWORK_ERROR, response.error ?? "Iroh RPC failed");
   }
@@ -68,6 +76,8 @@ async function rpcCall(
 export class IrohNetworkTransport implements NetworkTransport {
   private nextId = 1;
   private stream: IrohByteStream | null = null;
+  private connection: Promise<IrohConnectionHandle> | null = null;
+  private sessionTail: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly io: IrohStreamIO,
@@ -87,6 +97,16 @@ export class IrohNetworkTransport implements NetworkTransport {
     };
   }
 
+  private async sharedConnection(): Promise<IrohConnectionHandle | null> {
+    if (!this.io.openConnection) {
+      return null;
+    }
+    if (!this.connection) {
+      this.connection = this.io.openConnection(this.peerTicket, MINDOODB_IROH_ALPN);
+    }
+    return this.connection;
+  }
+
   private async session(): Promise<IrohByteStream> {
     if (!this.stream) {
       this.stream = await this.io.connect(this.peerTicket, MINDOODB_IROH_ALPN);
@@ -94,8 +114,28 @@ export class IrohNetworkTransport implements NetworkTransport {
     return this.stream;
   }
 
+  private enqueueSession<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.sessionTail.then(work, work);
+    this.sessionTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   private async call(method: string, args: unknown[]): Promise<unknown> {
-    return rpcCall(await this.session(), method, args, this.nextId++, this.rpcContext());
+    const connection = await this.sharedConnection();
+    if (connection) {
+      const stream = await connection.openStream();
+      try {
+        return await rpcCall(stream, method, args, this.nextId++, this.rpcContext());
+      } finally {
+        await stream.close();
+      }
+    }
+    return this.enqueueSession(async () =>
+      rpcCall(await this.session(), method, args, this.nextId++, this.rpcContext()),
+    );
   }
 
   getServerInfo(): Promise<unknown> {
@@ -221,7 +261,13 @@ export class IrohNetworkTransport implements NetworkTransport {
     onEvent: (event: StoreChangeEvent) => void,
     options?: { signal?: AbortSignal },
   ): Promise<void> {
-    const stream = await this.io.connect(this.peerTicket, MINDOODB_IROH_ALPN);
+    // Dedicated stream so the RPC session stays usable. When openConnection
+    // exists this is a second bi-stream on the shared QUIC connection;
+    // otherwise it is a second connect() (WASM / RN adapters).
+    const connection = await this.sharedConnection();
+    const stream = connection
+      ? await connection.openStream()
+      : await this.io.connect(this.peerTicket, MINDOODB_IROH_ALPN);
     const onAbort = () => {
       void stream.close();
     };
@@ -273,6 +319,8 @@ export class IrohNetworkTransport implements NetworkTransport {
 export class IrohPeerStore implements ContentAddressedStore {
   private nextId = 1;
   private stream: IrohByteStream | null = null;
+  private connection: Promise<IrohConnectionHandle> | null = null;
+  private sessionTail: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly io: IrohStreamIO,
@@ -293,6 +341,16 @@ export class IrohPeerStore implements ContentAddressedStore {
     return `iroh:${this.peerTicket}:${this.dbId}:${this.storeKind}`;
   }
 
+  private async sharedConnection(): Promise<IrohConnectionHandle | null> {
+    if (!this.io.openConnection) {
+      return null;
+    }
+    if (!this.connection) {
+      this.connection = this.io.openConnection(this.peerTicket, MINDOODB_IROH_ALPN);
+    }
+    return this.connection;
+  }
+
   private async session(): Promise<IrohByteStream> {
     if (!this.stream) {
       this.stream = await this.io.connect(this.peerTicket, MINDOODB_IROH_ALPN);
@@ -300,8 +358,26 @@ export class IrohPeerStore implements ContentAddressedStore {
     return this.stream;
   }
 
+  private enqueueSession<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.sessionTail.then(work, work);
+    this.sessionTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   private async call(method: string, args: unknown[]): Promise<unknown> {
-    return rpcCall(await this.session(), method, args, this.nextId++);
+    const connection = await this.sharedConnection();
+    if (connection) {
+      const stream = await connection.openStream();
+      try {
+        return await rpcCall(stream, method, args, this.nextId++);
+      } finally {
+        await stream.close();
+      }
+    }
+    return this.enqueueSession(async () => rpcCall(await this.session(), method, args, this.nextId++));
   }
 
   putEntries(entries: StoreEntry[]) {

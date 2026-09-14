@@ -1,5 +1,5 @@
 import { randomBytes } from "crypto";
-import { IrohNetworkTransport, serveIrohRpc } from "../core/appendonlystores/network/IrohNetworkTransport";
+import { IrohNetworkTransport, listenForIrohPeers } from "../core/appendonlystores/network/IrohNetworkTransport";
 import { createLoopbackIrohPair } from "../core/appendonlystores/network/IrohStreamIO";
 import { isIrohLocator, parseIrohLocator } from "../core/appendonlystores/network/irohLocator";
 import { createMindooDBServerIrohHandler } from "../node/server/IrohServerRpc";
@@ -42,7 +42,6 @@ describe("Iroh server locator and config", () => {
 describe("Iroh server RPC", () => {
   test("getServerInfo and challenge reach the host over loopback", async () => {
     const { a, b } = createLoopbackIrohPair();
-    const incoming = b.listen!()[Symbol.asyncIterator]().next();
     const handler = createMindooDBServerIrohHandler({
       getServerPublicInfo: () => ({
         name: "cn=home/o=mindoo",
@@ -65,10 +64,8 @@ describe("Iroh server RPC", () => {
       dbId: "db1",
       storeKind: StoreKind.docs,
     });
-    const pendingInfo = transport.getServerInfo();
-    const { value: stream } = await incoming;
-    void serveIrohRpc(stream!, handler);
-    await expect(pendingInfo).resolves.toMatchObject({
+    void listenForIrohPeers(b, handler);
+    await expect(transport.getServerInfo()).resolves.toMatchObject({
       name: "cn=home/o=mindoo",
       signingPublicKey: "sign-pem",
       clusterRole: "peer",

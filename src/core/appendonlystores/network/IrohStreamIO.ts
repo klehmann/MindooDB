@@ -31,6 +31,18 @@ export interface IrohByteStream {
 }
 
 /**
+ * One QUIC connection that can open many bidirectional streams.
+ * Native adapters implement this; WASM / React Native may omit it and keep
+ * using {@link IrohStreamIO.connect} (one stream per handshake).
+ */
+export interface IrohConnectionHandle {
+  /** Open another bi-stream on this connection. */
+  openStream(): Promise<IrohByteStream>;
+  /** Close the connection and every stream on it. */
+  close(): Promise<void>;
+}
+
+/**
  * Local Iroh endpoint: publish a ticket, dial a peer, and optionally accept
  * inbound streams on {@link MINDOODB_IROH_ALPN}.
  */
@@ -44,18 +56,29 @@ export interface IrohStreamIO {
   /**
    * Open an outbound stream to `peerTicket`.
    *
-   * Native and WASM adapters must open a **new QUIC connection** per call.
-   * The server listen loop accepts exactly one `acceptBi()` per incoming
-   * connection, so reusing a connection would silently drop a second stream
-   * (the change-feed subscribe path depends on this).
+   * Convenience for one stream. Adapters that implement
+   * {@link IrohStreamIO.openConnection} should treat this as
+   * `openConnection().openStream()` and close the connection when the
+   * stream closes. WASM / RN adapters that omit `openConnection` open a
+   * new QUIC connection per call.
    *
    * @param peerTicket Remote Iroh ticket or loopback id
    * @param alpn Protocol, defaults to {@link MINDOODB_IROH_ALPN}
    */
   connect(peerTicket: string, alpn?: string): Promise<IrohByteStream>;
   /**
+   * Open a QUIC connection that can carry many bi-streams (RPC + change
+   * feed, or several in-flight RPCs). Optional — {@link IrohNetworkTransport}
+   * falls back to {@link IrohStreamIO.connect} when this is missing.
+   *
+   * @param peerTicket Remote Iroh ticket or loopback id
+   * @param alpn Protocol, defaults to {@link MINDOODB_IROH_ALPN}
+   */
+  openConnection?(peerTicket: string, alpn?: string): Promise<IrohConnectionHandle>;
+  /**
    * Yield inbound streams. Required on the server / listener side; a
-   * client-only IO may omit it.
+   * client-only IO may omit it. Native adapters yield every `acceptBi()`
+   * on each incoming connection (one connection, many streams).
    *
    * @param alpn Protocol, defaults to {@link MINDOODB_IROH_ALPN}
    */
@@ -284,18 +307,37 @@ export function createLoopbackIrohPair(): { a: IrohStreamIO; b: IrohStreamIO } {
     async getLocalTicket() {
       return ticket;
     },
-    async connect(target) {
+    async openConnection(target) {
       if (target !== peerTicket) {
         throw new Error(`Unknown loopback peer ${target}`);
       }
-      const local = new LoopbackStream();
-      const remote = new LoopbackStream();
-      local.peer = remote;
-      remote.peer = local;
-      for (const listener of remoteListeners) {
-        listener(remote);
-      }
-      return local;
+      return {
+        async openStream() {
+          const local = new LoopbackStream();
+          const remote = new LoopbackStream();
+          local.peer = remote;
+          remote.peer = local;
+          for (const listener of remoteListeners) {
+            listener(remote);
+          }
+          return local;
+        },
+        async close() {
+          // Streams close independently; loopback has no shared socket.
+        },
+      };
+    },
+    async connect(target) {
+      const connection = await this.openConnection!(target);
+      const stream = await connection.openStream();
+      return {
+        send: (bytes) => stream.send(bytes),
+        recv: () => stream.recv(),
+        close: async () => {
+          await stream.close();
+          await connection.close();
+        },
+      };
     },
     async *listen() {
       const pending: IrohByteStream[] = [];

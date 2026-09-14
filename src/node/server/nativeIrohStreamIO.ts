@@ -7,6 +7,7 @@ import {
   MINDOODB_IROH_ALPN,
   wrapLengthPrefixedByteStream,
   type IrohByteStream,
+  type IrohConnectionHandle,
   type IrohStreamIO,
 } from "../../core/appendonlystores/network/IrohStreamIO";
 import type { ServerIrohConfig } from "./types";
@@ -30,6 +31,7 @@ interface IrohIncoming {
 interface IrohConnection {
   openBi(): Promise<IrohBiStream>;
   acceptBi(): Promise<IrohBiStream>;
+  close(errorCode: bigint, reason: number[]): void;
 }
 
 interface IrohBiStream {
@@ -59,8 +61,8 @@ export async function createNativeIrohStreamIO(
   const iroh = await tryImportNumber0Iroh();
   if (!iroh) {
     throw new Error(
-      "Iroh is enabled in config.json but @number0/iroh is missing from the server image. " +
-        "Rebuild with ./serversetup.sh --update.",
+      "@number0/iroh is not installed. Add it with `pnpm add @number0/iroh` " +
+        "(or rebuild the server image with ./serversetup.sh --update).",
     );
   }
 
@@ -74,53 +76,186 @@ export async function createNativeIrohStreamIO(
   await waitUntilOnline(endpoint);
 
   const endpointId = endpoint.id().toString();
+  const connectEndpoint = (
+    endpoint as unknown as { connect(addr: unknown, alpn: number[]): Promise<IrohConnection> }
+  ).connect.bind(endpoint);
+  const acceptNext = (
+    endpoint as unknown as { acceptNext(): Promise<IrohIncoming | null> }
+  ).acceptNext.bind(endpoint);
+
+  let listenClosed = false;
+  let listenWake: (() => void) | null = null;
+
+  const openConnection = async (
+    peerTicket: string,
+    protocolAlpn?: string,
+  ): Promise<IrohConnectionHandle> => {
+    const raw = peerTicket.trim().replace(/^iroh:/, "");
+    const addr = iroh.EndpointTicket.fromString(raw).endpointAddr();
+    const conn = await connectEndpoint(
+      addr,
+      protocolAlpn ? Array.from(Buffer.from(protocolAlpn)) : alpn,
+    );
+    return wrapNativeConnection(conn);
+  };
 
   return {
     endpointId,
     async getLocalTicket() {
       return iroh.EndpointTicket.fromAddr(endpoint.addr()).toString();
     },
+    openConnection,
     async connect(peerTicket, protocolAlpn) {
-      const raw = peerTicket.trim().replace(/^iroh:/, "");
-      const addr = iroh.EndpointTicket.fromString(raw).endpointAddr();
-      const conn = await (endpoint as unknown as {
-        connect(addr: unknown, alpn: number[]): Promise<IrohConnection>;
-      }).connect(addr, protocolAlpn ? Array.from(Buffer.from(protocolAlpn)) : alpn);
-      const bi = await conn.openBi();
-      return wrapNativeBiStream(bi);
+      const connection = await openConnection(peerTicket, protocolAlpn);
+      const stream = await connection.openStream();
+      return {
+        send: (bytes) => stream.send(bytes),
+        recv: () => stream.recv(),
+        close: async () => {
+          await stream.close();
+          await connection.close();
+        },
+      };
     },
-    async *listen() {
-      const acceptNext = (
-        endpoint as unknown as { acceptNext(): Promise<IrohIncoming | null> }
-      ).acceptNext.bind(endpoint);
-      while (true) {
-        let incoming: IrohIncoming | null;
-        try {
-          incoming = await acceptNext();
-        } catch (error) {
-          console.error("[Iroh] acceptNext failed:", error);
-          return;
-        }
-        if (!incoming) {
-          return;
-        }
-        try {
-          const connecting = await incoming.accept();
-          const conn = await connecting.connect();
-          // One bi-stream per incoming connection. A second openBi() on the
-          // same connection is never accepted — clients must connect() again
-          // for the change-feed stream.
-          const bi = await conn.acceptBi();
-          yield wrapNativeBiStream(bi);
-        } catch (error) {
-          console.error("[Iroh] incoming connection failed:", error);
-        }
-      }
-    },
+    listen: () =>
+      acceptIncomingStreams(acceptNext, () => listenClosed, (wake) => {
+        listenWake = wake;
+      }),
     async close() {
+      listenClosed = true;
+      listenWake?.();
+      listenWake = null;
       await endpoint.close();
     },
   };
+}
+
+const MAX_PENDING_INBOUND_STREAMS = 16;
+
+function wrapNativeConnection(conn: IrohConnection): IrohConnectionHandle {
+  let closed = false;
+  return {
+    async openStream() {
+      if (closed) {
+        throw new Error("ConnectionLost");
+      }
+      return wrapNativeBiStream(await conn.openBi());
+    },
+    async close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      try {
+        conn.close(0n, []);
+      } catch {
+        // already closed
+      }
+    },
+  };
+}
+
+async function* acceptIncomingStreams(
+  acceptNext: () => Promise<IrohIncoming | null>,
+  isClosed: () => boolean,
+  setWake: (wake: (() => void) | null) => void,
+): AsyncGenerator<IrohByteStream> {
+  const pending: IrohByteStream[] = [];
+  let spaceWake: (() => void) | null = null;
+  let notify: (() => void) | null = null;
+  const producers = new Set<Promise<void>>();
+  // Keep JS refs so N-API Drop does not close the QUIC connection mid-accept.
+  const inboundConnections = new Set<IrohConnection>();
+
+  const pushStream = async (stream: IrohByteStream): Promise<void> => {
+    while (pending.length >= MAX_PENDING_INBOUND_STREAMS && !isClosed()) {
+      await new Promise<void>((resolve) => {
+        spaceWake = resolve;
+      });
+    }
+    if (isClosed()) {
+      await stream.close();
+      return;
+    }
+    pending.push(stream);
+    notify?.();
+    notify = null;
+  };
+
+  const runProducer = async (conn: IrohConnection): Promise<void> => {
+    try {
+      while (!isClosed()) {
+        const bi = await conn.acceptBi();
+        await pushStream(wrapNativeBiStream(bi));
+      }
+    } catch (error) {
+      if (!isClosed() && !isBenignIrohClose(error)) {
+        console.error("[Iroh] acceptBi loop ended:", error);
+      }
+    }
+  };
+
+  const acceptLoop = (async () => {
+    while (!isClosed()) {
+      let incoming: IrohIncoming | null;
+      try {
+        incoming = await acceptNext();
+      } catch (error) {
+        if (!isClosed()) {
+          console.error("[Iroh] acceptNext failed:", error);
+        }
+        return;
+      }
+      if (!incoming) {
+        return;
+      }
+      try {
+        const connecting = await incoming.accept();
+        const conn = await connecting.connect();
+        inboundConnections.add(conn);
+        const producer = runProducer(conn);
+        producers.add(producer);
+        void producer.finally(() => {
+          producers.delete(producer);
+          inboundConnections.delete(conn);
+        });
+      } catch (error) {
+        console.error("[Iroh] incoming connection failed:", error);
+      }
+    }
+  })();
+
+  void acceptLoop.finally(() => {
+    notify?.();
+    notify = null;
+    spaceWake?.();
+    spaceWake = null;
+  });
+
+  try {
+    while (!isClosed()) {
+      if (pending.length === 0) {
+        await new Promise<void>((resolve) => {
+          notify = resolve;
+          setWake(resolve);
+        });
+        if (isClosed() && pending.length === 0) {
+          break;
+        }
+      }
+      const next = pending.shift();
+      spaceWake?.();
+      spaceWake = null;
+      if (next) {
+        yield next;
+      }
+    }
+  } finally {
+    notify?.();
+    spaceWake?.();
+    await acceptLoop.catch(() => undefined);
+    await Promise.allSettled(producers);
+  }
 }
 
 async function waitUntilOnline(endpoint: BoundIrohEndpoint, timeoutMs = 30_000): Promise<void> {

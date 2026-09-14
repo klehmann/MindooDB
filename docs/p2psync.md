@@ -48,7 +48,7 @@ In the simplest deployment, a client has a local store (on disk or in memory) an
 
 The server's `ServerNetworkContentAddressedStore` validates the client's JWT token, looks up entries in its local store, RSA-encrypts the payloads for the requesting client, and returns them. The client decrypts the RSA layer and stores the entries locally.
 
-This is covered in detail in [network-sync-protocol.md](network-sync-protocol.md). The rest of this document builds on this foundation.
+This is covered in detail in [network-sync-protocol.md](network-sync-protocol.md). When the server has no public HTTPS URL, the same `ClientNetworkContentAddressedStore` can sit on [Iroh](iroh.md) instead of `HttpTransport`. The rest of this document builds on this foundation.
 
 ---
 

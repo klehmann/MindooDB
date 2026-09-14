@@ -126,6 +126,26 @@ describeLive("Iroh live network (MindooDBServer)", () => {
     }
   });
 
+  test("parallel transfer batches share one QUIC connection", async () => {
+    const remote = await connectIrohStore(live, IROH_LIVE_FEED_DB_ID);
+    try {
+      const notes = await live.tenant.openDB(IROH_LIVE_FEED_DB_ID);
+      for (let i = 0; i < 6; i += 1) {
+        await notes.createDocument();
+      }
+      await notes.syncStoreChanges();
+      const pushed = await notes.pushChangesTo(remote.store, {
+        transferBatchSize: 1,
+        maxConcurrentBatches: 3,
+      });
+      expect(pushed.cancelled).toBe(false);
+      expect(pushed.transferredEntries).toBeGreaterThan(1);
+      expect((await remote.store.getStoreHead()).maxReceiptOrder).toBeGreaterThan(0);
+    } finally {
+      await remote.io.close?.();
+    }
+  });
+
   test("a second native client sees the same directory entries and can push over Iroh", async () => {
     const first = await connectIrohStore(live, "directory");
     const second = await connectIrohStore(live, "directory");

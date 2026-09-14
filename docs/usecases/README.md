@@ -30,7 +30,7 @@ These documents cover fundamental patterns and strategies:
 4. **[Cross-Tenant Collaboration](cross-tenant-collaboration.md)** - Controlled data sharing between organizations using incremental sync
 5. **[Virtual Views Patterns](virtual-views-patterns.md)** - Creating views across databases and tenants for reporting and analytics
 6. **[Backups and Recovery](backups-and-recovery.md)** - Leveraging append-only nature for simple backups and disaster recovery
-7. **[Sync Patterns](sync-patterns.md)** - P2P, client-server, and server-server synchronization strategies
+7. **[Sync Patterns](sync-patterns.md)** - P2P, client-server, and server-server synchronization strategies. QUIC without a public URL: [Iroh transport](../iroh.md).
 
 ### Industry-Specific Documents
 
