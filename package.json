@@ -1,6 +1,6 @@
 {
   "name": "mindoodb",
-  "version": "0.0.60",
+  "version": "0.0.61",
   "packageManager": "pnpm@11.1.1",
   "engines": {
     "node": ">=22.13.0"
@@ -70,6 +70,8 @@
     "test:browser:install": "playwright install chromium",
     "test:browser": "npm run build && playwright test",
     "test:browser:watch": "npm run build && playwright test --ui",
+    "test:iroh": "MINDOODB_IROH_LIVE=1 node --experimental-vm-modules ./node_modules/jest/bin/jest.js --runInBand --forceExit IrohLiveNetwork",
+    "iroh:live-server": "node scripts/iroh-live-test-server.mjs",
     "test:all": "npm test && npm run test:browser",
     "prepublishOnly": "npm run build && npm run test",
     "identity:info": "node dist/node/cli/identity-info.js",
