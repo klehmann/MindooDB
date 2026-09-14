@@ -3,6 +3,12 @@ import type { IrohRpcHandler } from "../../core/appendonlystores/network/IrohNet
 import type { IrohRpcContext } from "../../core/appendonlystores/network/IrohStreamIO";
 import type { MindooDBServerInfo } from "../../core/types";
 import { validateTenantId, ValidationError } from "./validation";
+import type { SyncEventBus } from "./SyncEventBus";
+
+/** QUIC idle timeout is ~30s; keep the feed alive below that. */
+export const IROH_CHANGE_FEED_HEARTBEAT_MS = 20_000;
+
+export const IROH_CHANGE_FEED_HEARTBEAT = { type: "heartbeat" } as const;
 
 export interface IrohServerAuthService {
   generateChallenge(
@@ -70,6 +76,7 @@ export interface IrohServerRpcHost {
   listTenantPublicInfosFingerprints(tenantId: string): Promise<string[]>;
   getAuthService(tenantId: string): Promise<IrohServerAuthService>;
   getServerStore(tenantId: string, dbId: string, storeKind: StoreKind): Promise<IrohServerStore>;
+  syncEventBus?: SyncEventBus;
 }
 
 function requireTenant(ctx?: IrohRpcContext): string {
@@ -156,8 +163,10 @@ async function dispatchStoreMethod(
   const token = String(args[0] ?? "");
 
   switch (method) {
-    case "getCapabilities":
-      return store.handleGetCapabilities(token);
+    case "getCapabilities": {
+      const capabilities = (await store.handleGetCapabilities(token)) as Record<string, unknown>;
+      return { ...capabilities, supportsChangeEvents: true };
+    }
     case "findNewEntries":
       return store.handleFindNewEntries(token, (args[1] as string[]) ?? []);
     case "findNewEntriesForDoc":
@@ -194,8 +203,25 @@ async function dispatchStoreMethod(
       return store.handleGetEntriesSessionWrapped(token, (args[1] as string[]) ?? []);
     case "getEntryMetadata":
       return store.handleGetEntryMetadata(token, String(args[1] ?? ""));
-    case "putEntries":
-      return store.handlePutEntries(token, (args[1] as unknown[]) ?? []);
+    case "putEntries": {
+      const ack = (await store.handlePutEntries(token, (args[1] as unknown[]) ?? [])) as {
+        receipts?: unknown[];
+      };
+      if ((ack.receipts?.length ?? 0) > 0 && host.syncEventBus) {
+        const head = (await store.handleGetStoreHead(token).catch(() => null)) as {
+          epoch?: string;
+          maxReceiptOrder?: number;
+        } | null;
+        host.syncEventBus.publish({
+          tenantId: scope.tenantId,
+          dbId: scope.dbId,
+          storeKind: scope.storeKind,
+          epoch: head?.epoch,
+          maxReceiptOrder: head?.maxReceiptOrder,
+        });
+      }
+      return ack;
+    }
     case "hasEntries":
       return store.handleHasEntries(token, (args[1] as string[]) ?? []);
     case "getAllIds":
@@ -207,7 +233,11 @@ async function dispatchStoreMethod(
         args[2] as Record<string, unknown> | undefined,
       );
     case "subscribeToChanges":
-      throw new Error("subscribeToChanges is not implemented on the Iroh server path yet");
+      await store.handleGetCapabilities(token);
+      if (!host.syncEventBus) {
+        throw new Error("Iroh change feed is not configured");
+      }
+      return createIrohChangeFeed(host.syncEventBus, scope);
     default:
       throw new Error(`Unknown Iroh RPC method ${method}`);
   }
@@ -215,4 +245,67 @@ async function dispatchStoreMethod(
 
 export function isIrohValidationError(error: unknown): error is ValidationError {
   return error instanceof ValidationError;
+}
+
+function createIrohChangeFeed(
+  bus: SyncEventBus,
+  scope: { tenantId: string; storeKind: StoreKind },
+): AsyncIterable<unknown> {
+  return {
+    [Symbol.asyncIterator]() {
+      const queue: unknown[] = [];
+      let notify: (() => void) | null = null;
+      let closed = false;
+
+      const unsubscribe = bus.subscribe((event) => {
+        if (event.tenantId !== scope.tenantId || event.storeKind !== scope.storeKind) {
+          return;
+        }
+        queue.push({
+          dbId: event.dbId,
+          storeKind: event.storeKind,
+          epoch: event.epoch,
+          maxReceiptOrder: event.maxReceiptOrder,
+        });
+        notify?.();
+      });
+
+      const heartbeat = setInterval(() => {
+        if (closed) {
+          return;
+        }
+        queue.push(IROH_CHANGE_FEED_HEARTBEAT);
+        notify?.();
+      }, IROH_CHANGE_FEED_HEARTBEAT_MS);
+      heartbeat.unref?.();
+
+      const close = () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        clearInterval(heartbeat);
+        unsubscribe();
+        notify?.();
+      };
+
+      return {
+        async next() {
+          while (queue.length === 0 && !closed) {
+            await new Promise<void>((resolve) => {
+              notify = resolve;
+            });
+          }
+          if (queue.length === 0) {
+            return { done: true, value: undefined };
+          }
+          return { done: false, value: queue.shift() };
+        },
+        async return() {
+          close();
+          return { done: true, value: undefined };
+        },
+      };
+    },
+  };
 }

@@ -30,6 +30,7 @@ import { NetworkError, NetworkErrorType } from "./types";
 import {
   decodeIrohFrame,
   encodeIrohFrame,
+  isBenignIrohClose,
   MINDOODB_IROH_ALPN,
   type IrohByteStream,
   type IrohRpcRequest,
@@ -220,17 +221,47 @@ export class IrohNetworkTransport implements NetworkTransport {
     onEvent: (event: StoreChangeEvent) => void,
     options?: { signal?: AbortSignal },
   ): Promise<void> {
-    const stream = await this.session();
-    await stream.send(encodeIrohFrame({ id: this.nextId++, method: "subscribeToChanges", args: [token] }));
-    while (!options?.signal?.aborted) {
-      const bytes = await stream.recv();
-      if (!bytes) {
+    const stream = await this.io.connect(this.peerTicket, MINDOODB_IROH_ALPN);
+    const onAbort = () => {
+      void stream.close();
+    };
+    if (options?.signal) {
+      if (options.signal.aborted) {
+        await stream.close();
         return;
       }
-      const frame = decodeIrohFrame(bytes) as IrohRpcResponse | StoreChangeEvent;
-      if ("dbId" in frame && "storeKind" in frame) {
-        onEvent(frame as StoreChangeEvent);
+      options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      await stream.send(
+        encodeIrohFrame({
+          id: this.nextId++,
+          method: "subscribeToChanges",
+          args: [token],
+          ctx: this.rpcContext(),
+        }),
+      );
+      const ackBytes = await stream.recv();
+      if (!ackBytes) {
+        throw new NetworkError(NetworkErrorType.NETWORK_ERROR, "Iroh stream closed");
       }
+      const ack = decodeIrohFrame(ackBytes) as IrohRpcResponse;
+      if (!ack.ok) {
+        throw new NetworkError(NetworkErrorType.NETWORK_ERROR, ack.error ?? "Iroh RPC failed");
+      }
+      while (!options?.signal?.aborted) {
+        const bytes = await stream.recv();
+        if (!bytes) {
+          return;
+        }
+        const frame = decodeIrohFrame(bytes);
+        if (isStoreChangeEvent(frame)) {
+          onEvent(frame);
+        }
+      }
+    } finally {
+      options?.signal?.removeEventListener("abort", onAbort);
+      await stream.close();
     }
   }
 }
@@ -355,25 +386,93 @@ export function createStoreIrohHandler(store: ContentAddressedStore): IrohRpcHan
   };
 }
 
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return Boolean(value && typeof value === "object" && Symbol.asyncIterator in (value as object));
+}
+
+function isStoreChangeEvent(value: unknown): value is StoreChangeEvent {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const event = value as StoreChangeEvent;
+  return typeof event.dbId === "string" && typeof event.storeKind === "string";
+}
+
 export async function serveIrohRpc(stream: IrohByteStream, handler: IrohRpcHandler): Promise<void> {
-  while (true) {
-    const bytes = await stream.recv();
-    if (!bytes) {
+  try {
+    while (true) {
+      const bytes = await stream.recv();
+      if (!bytes) {
+        return;
+      }
+      const request = decodeIrohFrame(bytes) as IrohRpcRequest;
+      try {
+        const result = await handler(request.method, request.args, request.ctx);
+        if (isAsyncIterable(result)) {
+          await streamHandlerIterable(stream, request, result);
+          return;
+        }
+        const response: IrohRpcResponse = { id: request.id, ok: true, result };
+        await stream.send(encodeIrohFrame(response));
+      } catch (error) {
+        const response: IrohRpcResponse = {
+          id: request.id,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+        await stream.send(encodeIrohFrame(response));
+      }
+    }
+  } catch (error) {
+    if (isBenignIrohClose(error)) {
       return;
     }
-    const request = decodeIrohFrame(bytes) as IrohRpcRequest;
-    try {
-      const result = await handler(request.method, request.args, request.ctx);
-      const response: IrohRpcResponse = { id: request.id, ok: true, result };
-      await stream.send(encodeIrohFrame(response));
-    } catch (error) {
-      const response: IrohRpcResponse = {
-        id: request.id,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-      await stream.send(encodeIrohFrame(response));
+    throw error;
+  }
+}
+
+async function streamHandlerIterable(
+  stream: IrohByteStream,
+  request: IrohRpcRequest,
+  result: AsyncIterable<unknown>,
+): Promise<void> {
+  await stream.send(encodeIrohFrame({ id: request.id, ok: true, result: { subscribed: true } }));
+  const iterator = result[Symbol.asyncIterator]();
+  let stopped = false;
+  const stop = async () => {
+    if (stopped) {
+      return;
     }
+    stopped = true;
+    await iterator.return?.();
+  };
+  const watchClose = (async () => {
+    try {
+      while (true) {
+        const next = await stream.recv();
+        if (!next) {
+          break;
+        }
+      }
+    } finally {
+      await stop();
+    }
+  })();
+  try {
+    while (!stopped) {
+      const next = await iterator.next();
+      if (next.done) {
+        break;
+      }
+      await stream.send(encodeIrohFrame(next.value));
+    }
+  } catch (error) {
+    if (!isBenignIrohClose(error)) {
+      throw error;
+    }
+  } finally {
+    await stop();
+    await watchClose.catch(() => undefined);
   }
 }
 
@@ -390,6 +489,10 @@ export async function listenForIrohPeers(
       await stream.close();
       return;
     }
-    void serveIrohRpc(stream, handler);
+    void serveIrohRpc(stream, handler).catch((error) => {
+      if (!isBenignIrohClose(error)) {
+        console.error("[Iroh] RPC session failed:", error);
+      }
+    });
   }
 }

@@ -1,6 +1,6 @@
 declare module "@number0/iroh" {
   export class SecretKey {
-    static fromBytes(bytes: Uint8Array): SecretKey;
+    static fromBytes(bytes: Uint8Array | number[]): SecretKey;
     static fromString(value: string): SecretKey;
     static generate(): SecretKey;
   }
@@ -15,12 +15,13 @@ declare module "@number0/iroh" {
   export class Endpoint {
     static bind(options?: {
       alpns?: number[][];
-      secretKey?: unknown;
+      secretKey?: Uint8Array | number[];
     }): Promise<Endpoint>;
     id(): { toString(): string };
     addr(): unknown;
+    online(): Promise<void>;
     close(): Promise<void>;
     connect(addr: unknown, alpn: number[]): Promise<unknown>;
-    acceptNext(): Promise<unknown>;
+    acceptNext(): Promise<unknown | null>;
   }
 }

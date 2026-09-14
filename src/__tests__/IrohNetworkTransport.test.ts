@@ -6,7 +6,7 @@ import {
   createStoreIrohHandler,
   serveIrohRpc,
 } from "../core/appendonlystores/network/IrohNetworkTransport";
-import { createLoopbackIrohPair } from "../core/appendonlystores/network/IrohStreamIO";
+import { createLoopbackIrohPair, isBenignIrohClose } from "../core/appendonlystores/network/IrohStreamIO";
 import type { StoreEntry } from "../core/types";
 
 function createTestEntry(id: string): StoreEntry {
@@ -57,5 +57,14 @@ describe("Iroh P2P framing", () => {
       throw new Error(`unexpected ${method}`);
     });
     await expect(pending).resolves.toBe("challenge-for-alice");
+  });
+
+  test("isBenignIrohClose treats peer disconnects as clean", () => {
+    expect(
+      isBenignIrohClose(
+        new Error('ConnectionLost(ApplicationClosed(ApplicationClose { error_code: 0, reason: b"" }))'),
+      ),
+    ).toBe(true);
+    expect(isBenignIrohClose(new Error("Unknown Iroh RPC method foo"))).toBe(false);
   });
 });

@@ -16,6 +16,7 @@ README-dev.md
 *.js.map
 .cursor/
 dist/
+.tmp/
 build/
 lib/
 out/

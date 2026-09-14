@@ -625,9 +625,13 @@ below with `"enabled": false` in `config.json`. `--update` never rewrites an
 existing `config.json` — add or flip the block yourself, then restart.
 
 When `"enabled": true` the process joins the Iroh network with ALPN
-`mindoodb/sync-v5` and logs a ticket. The secret key is created at
+`mindoodb/sync-v5`, waits until the endpoint is online (home relay), and
+logs a ticket. The secret key is created at
 `iroh-secret.key` in the data directory on first start. Haven pastes
 `iroh:<ticket>` into the server URL field.
+
+Live tests (real relays): `MINDOODB_IROH_LIVE=1 pnpm test:iroh` in this
+repo, and `pnpm test:e2e:iroh` in Haven.
 
 ```json
 {

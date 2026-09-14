@@ -44,6 +44,11 @@ export interface IrohStreamIO {
   /**
    * Open an outbound stream to `peerTicket`.
    *
+   * Native and WASM adapters must open a **new QUIC connection** per call.
+   * The server listen loop accepts exactly one `acceptBi()` per incoming
+   * connection, so reusing a connection would silently drop a second stream
+   * (the change-feed subscribe path depends on this).
+   *
    * @param peerTicket Remote Iroh ticket or loopback id
    * @param alpn Protocol, defaults to {@link MINDOODB_IROH_ALPN}
    */
@@ -95,6 +100,12 @@ const textDecoder = new TextDecoder();
  */
 export function encodeIrohFrame(payload: unknown): Uint8Array {
   return textEncoder.encode(JSON.stringify(payload, replacer));
+}
+
+/** Peer closed the QUIC stream or endpoint. Not an application error. */
+export function isBenignIrohClose(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /ApplicationClosed|ConnectionLost|ConnectionReset/.test(message);
 }
 
 /**
@@ -207,8 +218,8 @@ class LoopbackStream implements IrohByteStream {
   peer: LoopbackStream | null = null;
 
   async send(bytes: Uint8Array): Promise<void> {
-    if (!this.peer) {
-      throw new Error("Loopback stream has no peer");
+    if (!this.peer || this.peer.closed) {
+      throw new Error('ConnectionLost(ApplicationClosed)');
     }
     this.peer.push(bytes);
   }
@@ -236,11 +247,18 @@ class LoopbackStream implements IrohByteStream {
   }
 
   async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
     this.closed = true;
     if (this.waiter) {
       const resolve = this.waiter;
       this.waiter = null;
       resolve(null);
+    }
+    const peer = this.peer;
+    if (peer && !peer.closed) {
+      await peer.close();
     }
   }
 }

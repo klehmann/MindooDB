@@ -432,6 +432,14 @@ export class MindooDBServer {
     return this.irohEndpoint.getStatus();
   }
 
+  async stopIroh(): Promise<void> {
+    await this.irohEndpoint.stopListening();
+  }
+
+  getSyncEventListenerCount(): number {
+    return this.syncEventBus.listenerCount;
+  }
+
   async startIrohIfEnabled(): Promise<void> {
     const irohConfig = this.serverConfig.iroh;
     if (!irohConfig?.enabled) {
@@ -453,6 +461,7 @@ export class MindooDBServer {
           getAuthService: (tenantId) => this.tenantManager.getAuthService(tenantId),
           getServerStore: (tenantId, dbId, storeKind) =>
             this.tenantManager.getServerStore(tenantId, dbId, storeKind),
+          syncEventBus: this.syncEventBus,
         }),
       });
     } catch (error) {
