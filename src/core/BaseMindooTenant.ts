@@ -16,6 +16,7 @@ import {
   JoinResponseEncryptedDocKey,
   JoinResponseEncryptedDocKeyVersion,
   ApproveJoinRequestOptions,
+  ConnectToServerOptions,
   DEFAULT_TENANT_KEY_ID,
   PublishToServerOptions,
   PUBLIC_INFOS_KEY_ID,
@@ -44,6 +45,7 @@ import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { wrapDeviceJoinBootstrap } from "./join/deviceJoinBootstrap";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
+import { isIrohLocator, parseIrohLocator } from "./appendonlystores/network/irohLocator";
 import {
   importEd25519PublicKeyFromPem,
   verifyEntrySignatureWithImportedKey,
@@ -1888,10 +1890,20 @@ export class BaseMindooTenant implements MindooTenant {
    * When `systemAdminUser` + `systemAdminPassword` are provided the method
    * performs a challenge/response handshake against `/system/auth/*` to
    * obtain a JWT, then calls `POST /system/tenants/:tenantId`.
+   *
+   * Iroh locators (`iroh:<ticket>` / `iroh:<64-hex>`) cannot use browser
+   * `fetch` (CORS only allows http/https). Pass {@link PublishToServerOptions.irohStreamIO}
+   * and the full ticket so the same handshake runs over Iroh RPC.
    */
   async publishToServer(serverUrl: string, options?: PublishToServerOptions): Promise<void> {
     console.log(`[publishToServer] Publishing tenant "${this.tenantId}" to server: ${serverUrl}`);
     this.logger.info(`Publishing tenant "${this.tenantId}" to server: ${serverUrl}`);
+
+    const irohTarget = this.resolveIrohDial(serverUrl, options);
+    if (irohTarget) {
+      await this.publishToIrohServer(irohTarget, options);
+      return;
+    }
 
     const baseUrl = serverUrl.replace(/\/$/, "");
 
@@ -1989,6 +2001,132 @@ export class BaseMindooTenant implements MindooTenant {
     this.logger.info(`Tenant "${this.tenantId}" published to server successfully`);
   }
 
+  private resolveIrohDial(
+    serverUrl: string,
+    options?: { irohTicket?: string; irohStreamIO?: PublishToServerOptions["irohStreamIO"] },
+  ): { ticket: string; io: NonNullable<PublishToServerOptions["irohStreamIO"]> } | null {
+    if (!isIrohLocator(serverUrl) && !options?.irohTicket) {
+      return null;
+    }
+    const ticket = options?.irohTicket?.trim() || parseIrohLocator(serverUrl).ticket;
+    if (!ticket) {
+      throw new Error("This Iroh connection has no ticket. Paste the full iroh:<ticket> again.");
+    }
+    if (!options?.irohStreamIO) {
+      throw new Error(
+        "Publishing or syncing over Iroh requires an Iroh stream IO. Browsers cannot fetch iroh: URLs.",
+      );
+    }
+    return { ticket, io: options.irohStreamIO };
+  }
+
+  private async publishToIrohServer(
+    target: { ticket: string; io: NonNullable<PublishToServerOptions["irohStreamIO"]> },
+    options?: PublishToServerOptions,
+  ): Promise<void> {
+    const { IrohNetworkTransport } = await import("./appendonlystores/network/IrohNetworkTransport.js");
+    const transport = new IrohNetworkTransport(target.io, target.ticket, {
+      tenantId: this.tenantId,
+    });
+
+    const publicInfosKeyBytes = await this.keyBag.get("doc", this.tenantId, PUBLIC_INFOS_KEY_ID);
+    if (!publicInfosKeyBytes) {
+      throw new Error(`Cannot publish to server: $publicinfos key not found in KeyBag`);
+    }
+    const requestBody: Record<string, unknown> = {
+      adminSigningPublicKey: this.administrationPublicKey,
+      adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
+    };
+    let supportsSystemAdmin = false;
+    try {
+      const serverInfo = await transport.getServerInfo();
+      if (
+        !serverInfo
+        || typeof serverInfo !== "object"
+        || Array.isArray(serverInfo)
+        || typeof (serverInfo as { encryptionPublicKey?: unknown }).encryptionPublicKey !== "string"
+      ) {
+        throw new Error("The server returned an invalid Iroh server-info payload.");
+      }
+      supportsSystemAdmin = (serverInfo as { supportsSystemAdmin?: unknown }).supportsSystemAdmin === true;
+      const rsaEncryption = new RSAEncryption(this.cryptoAdapter);
+      requestBody.encryptedPublicInfosKey = this.uint8ArrayToBase64(
+        await rsaEncryption.encrypt(
+          publicInfosKeyBytes,
+          (serverInfo as { encryptionPublicKey: string }).encryptionPublicKey,
+        ),
+      );
+    } catch (error) {
+      console.warn("[publishToServer] Falling back to raw publicInfosKey transport:", error);
+      requestBody.publicInfosKey = this.uint8ArrayToBase64(publicInfosKeyBytes);
+    }
+    if (!supportsSystemAdmin) {
+      throw new Error(
+        "This MindooDB server does not support publishing tenants over Iroh yet. Rebuild and restart the server from the current mindoodb source (docker compose up -d --build), then try again.",
+      );
+    }
+    if (options?.adminUsername) {
+      requestBody.adminUsername = options.adminUsername;
+    }
+    if (options?.registerUsers && options.registerUsers.length > 0) {
+      requestBody.users = options.registerUsers.map((u) => ({
+        username: u.username,
+        signingPublicKey: u.userSigningPublicKey,
+        encryptionPublicKey: u.userEncryptionPublicKey,
+      }));
+    }
+
+    if (!options?.systemAdminUser || !options?.systemAdminPassword) {
+      throw new Error("Publishing over Iroh requires systemAdminUser and systemAdminPassword.");
+    }
+    const token = await this.authenticateAsSystemAdminOverIroh(
+      transport,
+      options.systemAdminUser,
+      options.systemAdminPassword,
+    );
+    await transport.registerTenant(token, this.tenantId, requestBody);
+    console.log(`[publishToServer] ✓ Tenant "${this.tenantId}" published to server successfully`);
+    this.logger.info(`Tenant "${this.tenantId}" published to server successfully`);
+  }
+
+  private async authenticateAsSystemAdminOverIroh(
+    transport: {
+      requestSystemChallenge(username: string, publicsignkey: string): Promise<{ challenge: string }>;
+      authenticateSystem(challenge: string, signature: Uint8Array): Promise<{
+        success: boolean;
+        token?: string;
+        error?: string;
+      }>;
+    },
+    adminUser: PrivateUserId,
+    adminPassword: string,
+  ): Promise<string> {
+    const subtle = this.cryptoAdapter.getSubtle();
+    const signingKeyBuffer = await this.decryptPrivateKey(
+      adminUser.userSigningKeyPair.privateKey as EncryptedPrivateKey,
+      adminPassword,
+      "signing",
+    );
+    const signingKey = await subtle.importKey(
+      "pkcs8",
+      signingKeyBuffer,
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+    const { challenge } = await transport.requestSystemChallenge(
+      adminUser.username,
+      adminUser.userSigningKeyPair.publicKey,
+    );
+    const messageBytes = new TextEncoder().encode(challenge);
+    const signatureBuffer = await subtle.sign({ name: "Ed25519" }, signingKey, messageBytes);
+    const result = await transport.authenticateSystem(challenge, new Uint8Array(signatureBuffer));
+    if (!result.success || !result.token) {
+      throw new Error(`System admin authentication failed: ${result.error || "unknown error"}`);
+    }
+    return result.token;
+  }
+
   /**
    * Perform system admin challenge/response auth and return a JWT token.
    */
@@ -2076,6 +2214,7 @@ export class BaseMindooTenant implements MindooTenant {
     serverUrl: string,
     dbId: string,
     storeKind: StoreKind = StoreKind.docs,
+    options?: ConnectToServerOptions,
   ): Promise<ContentAddressedStore> {
     const validDbId = validateDatabaseId(dbId, "dbId");
 
@@ -2083,7 +2222,8 @@ export class BaseMindooTenant implements MindooTenant {
     this.logger.info(`Connecting to server: ${serverUrl}, db: ${validDbId}, storeKind: ${storeKind}`);
 
     const normalizedServerUrl = serverUrl.replace(/\/$/, "");
-    const cacheKey = `${normalizedServerUrl}::${validDbId}::${storeKind}`;
+    const irohTarget = this.resolveIrohDial(serverUrl, options);
+    const cacheKey = `${normalizedServerUrl}::${validDbId}::${storeKind}${irohTarget ? `::iroh:${irohTarget.ticket}` : ""}`;
     const cachedStore = this.remoteStoreCache.get(cacheKey);
     if (cachedStore) {
       this.logger.debug(`Reusing cached remote store for ${normalizedServerUrl}, db: ${validDbId}`);
@@ -2092,22 +2232,29 @@ export class BaseMindooTenant implements MindooTenant {
 
     const remoteStorePromise = (async () => {
       // Lazy-import network modules to avoid circular dependencies and keep core lightweight
-      const { HttpTransport } = await import("../appendonlystores/network/HttpTransport.js");
       const { ClientNetworkContentAddressedStore } = await import(
         "../appendonlystores/network/ClientNetworkContentAddressedStore.js"
       );
 
-      // Create the HTTP transport
-      const baseUrl = `${normalizedServerUrl}/${this.tenantId}`;
-      const transport = new HttpTransport(
-        {
-          baseUrl,
-          tenantId: this.tenantId,
-          dbId: validDbId,
-          storeKind,
-        },
-        this.logger.createChild("HttpTransport")
-      );
+      const transport = irohTarget
+        ? new (await import("./appendonlystores/network/IrohNetworkTransport.js")).IrohNetworkTransport(
+            irohTarget.io,
+            irohTarget.ticket,
+            {
+              tenantId: this.tenantId,
+              dbId: validDbId,
+              storeKind,
+            },
+          )
+        : new (await import("../appendonlystores/network/HttpTransport.js")).HttpTransport(
+            {
+              baseUrl: `${normalizedServerUrl}/${this.tenantId}`,
+              tenantId: this.tenantId,
+              dbId: validDbId,
+              storeKind,
+            },
+            this.logger.createChild("HttpTransport"),
+          );
 
       // Get the current user's decrypted signing key
       const signingKey = await this.getDecryptedSigningKey();

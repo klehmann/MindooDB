@@ -81,6 +81,8 @@ That is the same peer control plane as HTTP (`challenge` → `authenticate` → 
 
 Both sides need `iroh.enabled` and a shared tenant (create once, `publishToServer` to each). `--auto-sync` / `startCluster()` starts the replicators; Iroh listen is async, so a first dial may retry until the endpoint is online.
 
+`publishToServer` and Haven's "Push tenant" dialog use the same Iroh RPC as discovery — not browser `fetch`. An `iroh:` locator is not an HTTP origin (Firefox reports "CORS request was not http"). The client must pass the full endpoint ticket plus an `IrohStreamIO`; the server answers `system.requestChallenge`, `system.authenticate`, and `system.registerTenant` with the same JWT + capability checks as `/system/auth/*` and `POST /system/tenants/:tenantId`. Cluster admin (`/system/cluster/*`, `add-to-network`) stays on HTTP.
+
 ## Node CLI
 
 A CLI does **not** need the Haven WASM build. Node talks to the same server through the native N-API package `@number0/iroh`.

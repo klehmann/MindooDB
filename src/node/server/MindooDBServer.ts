@@ -466,6 +466,16 @@ export class MindooDBServer {
           getAuthService: (tenantId) => this.tenantManager.getAuthService(tenantId),
           getServerStore: (tenantId, dbId, storeKind) =>
             this.tenantManager.getServerStore(tenantId, dbId, storeKind),
+          systemAdmin: {
+            generateChallenge: (username, publicsignkey) =>
+              this.systemAdminAuth.generateChallenge(username, publicsignkey),
+            authenticate: (challenge, signature) =>
+              this.systemAdminAuth.authenticate(challenge, signature),
+            validateToken: (token) => this.systemAdminAuth.validateToken(token),
+            isAuthorized: (method, path, username, publicsignkey) =>
+              this.capabilityMatcher.isAuthorized(method, path, username, publicsignkey),
+            registerTenant: (request) => this.tenantManager.registerTenant(request),
+          },
           syncEventBus: this.syncEventBus,
           peerAuth: {
             generateChallenge: (publicsignkey) => this.cluster.auth.generateChallenge(publicsignkey),

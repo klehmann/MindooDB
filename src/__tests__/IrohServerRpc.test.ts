@@ -69,12 +69,116 @@ describe("Iroh server RPC", () => {
       name: "cn=home/o=mindoo",
       signingPublicKey: "sign-pem",
       clusterRole: "peer",
+      supportsSystemAdmin: false,
     });
+    await expect(handler("notAStoreMethod", [], { tenantId: "acme" })).rejects.toThrow(
+      /Unknown Iroh RPC method notAStoreMethod/,
+    );
     await expect(transport.requestChallenge("alice")).resolves.toBe("challenge-for-alice");
     await expect(transport.getTenantPublicInfosFingerprints("acme")).resolves.toEqual({
       tenantId: "acme",
       fingerprints: ["fp-1"],
     });
+  });
+
+  test("system admin challenge, authenticate, and registerTenant over loopback", async () => {
+    const { a, b } = createLoopbackIrohPair();
+    const registered: Array<{ tenantId: string; adminSigningPublicKey: string }> = [];
+    const handler = createMindooDBServerIrohHandler({
+      getServerPublicInfo: () => ({
+        name: "cn=home/o=mindoo",
+        signingPublicKey: "sign-pem",
+        encryptionPublicKey: "enc-pem",
+      }),
+      getAuthService: async () => {
+        throw new Error("tenant auth should not run");
+      },
+      getServerStore: async () => {
+        throw new Error("store should not be opened for system admin");
+      },
+      listTenantPublicInfosFingerprints: async () => [],
+      systemAdmin: {
+        generateChallenge: async (username, publicsignkey) => `sys-${username}-${publicsignkey.length}`,
+        authenticate: async () => ({ success: true, token: "system-jwt" }),
+        validateToken: async (token) =>
+          token === "system-jwt"
+            ? { sub: "cn=admin/o=mindoo", publicsignkey: "admin-pem", iat: 1, exp: 2 }
+            : null,
+        isAuthorized: (method, path) => method === "POST" && path.startsWith("/system/tenants/"),
+        registerTenant: async (request) => {
+          registered.push({
+            tenantId: request.tenantId,
+            adminSigningPublicKey: request.adminSigningPublicKey,
+          });
+          return { created: true, context: { tenantId: request.tenantId } };
+        },
+      },
+    });
+
+    const transport = new IrohNetworkTransport(a, "loopback:b", { tenantId: "discovery" });
+    void listenForIrohPeers(b, handler);
+
+    await expect(transport.getServerInfo()).resolves.toMatchObject({ supportsSystemAdmin: true });
+    await expect(transport.requestSystemChallenge("cn=admin/o=mindoo", "admin-pem")).resolves.toEqual({
+      challenge: "sys-cn=admin/o=mindoo-9",
+    });
+    await expect(transport.authenticateSystem("challenge-1", new Uint8Array([1, 2, 3]))).resolves.toEqual({
+      success: true,
+      token: "system-jwt",
+    });
+    await expect(
+      transport.registerTenant("system-jwt", "acme", {
+        adminSigningPublicKey: "tenant-sign",
+        adminEncryptionPublicKey: "tenant-enc",
+        encryptedPublicInfosKey: "wrapped",
+      }),
+    ).resolves.toMatchObject({
+      success: true,
+      tenantId: "acme",
+      created: true,
+    });
+    expect(registered).toEqual([{ tenantId: "acme", adminSigningPublicKey: "tenant-sign" }]);
+  });
+
+  test("system.registerTenant rejects a capability-denied principal", async () => {
+    const { a, b } = createLoopbackIrohPair();
+    const handler = createMindooDBServerIrohHandler({
+      getServerPublicInfo: () => ({
+        name: "cn=home/o=mindoo",
+        signingPublicKey: "sign-pem",
+        encryptionPublicKey: "enc-pem",
+      }),
+      getAuthService: async () => {
+        throw new Error("unused");
+      },
+      getServerStore: async () => {
+        throw new Error("unused");
+      },
+      listTenantPublicInfosFingerprints: async () => [],
+      systemAdmin: {
+        generateChallenge: async () => "unused",
+        authenticate: async () => ({ success: true, token: "jwt" }),
+        validateToken: async () => ({
+          sub: "cn=auditor/o=mindoo",
+          publicsignkey: "auditor-pem",
+          iat: 1,
+          exp: 2,
+        }),
+        isAuthorized: () => false,
+        registerTenant: async () => {
+          throw new Error("must not register");
+        },
+      },
+    });
+    const transport = new IrohNetworkTransport(a, "loopback:b", { tenantId: "discovery" });
+    void listenForIrohPeers(b, handler);
+    await expect(
+      transport.registerTenant("jwt", "acme", {
+        adminSigningPublicKey: "tenant-sign",
+        adminEncryptionPublicKey: "tenant-enc",
+        encryptedPublicInfosKey: "wrapped",
+      }),
+    ).rejects.toThrow(/Forbidden/);
   });
 });
 

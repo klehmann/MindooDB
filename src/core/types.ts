@@ -660,6 +660,27 @@ export interface PublishToServerOptions {
   adminUsername?: string;
   /** Optional users to register on the server at the same time */
   registerUsers?: PublicUserId[];
+  /**
+   * Full Iroh endpoint ticket when `serverUrl` is a stored `iroh:<64-hex>`
+   * locator (not dialable by itself). Required together with {@link irohStreamIO}.
+   */
+  irohTicket?: string;
+  /**
+   * Byte-stream adapter used instead of `fetch` when the target is an Iroh
+   * locator. Browsers cannot CORS-fetch `iroh:` URLs.
+   */
+  irohStreamIO?: import("./appendonlystores/network/IrohStreamIO").IrohStreamIO;
+}
+
+/**
+ * Extra options for {@link MindooTenant.connectToServer} when the remote is
+ * an Iroh locator rather than an HTTPS origin.
+ */
+export interface ConnectToServerOptions {
+  /** Full Iroh endpoint ticket when `serverUrl` is `iroh:<64-hex>`. */
+  irohTicket?: string;
+  /** Byte-stream adapter used instead of HTTP. */
+  irohStreamIO?: import("./appendonlystores/network/IrohStreamIO").IrohStreamIO;
 }
 
 /**
@@ -1171,7 +1192,12 @@ export interface MindooTenant {
    * @param storeKind The store kind to connect to (e.g. StoreKind.docs or StoreKind.attachments)
    * @return A ContentAddressedStore connected to the remote server
    */
-  connectToServer(serverUrl: string, dbId: string, storeKind?: StoreKind): Promise<ContentAddressedStore>;
+  connectToServer(
+    serverUrl: string,
+    dbId: string,
+    storeKind?: StoreKind,
+    options?: ConnectToServerOptions,
+  ): Promise<ContentAddressedStore>;
 }
 
 // Re-export ContentAddressedStore and ContentAddressedStoreFactory from appendonlystores

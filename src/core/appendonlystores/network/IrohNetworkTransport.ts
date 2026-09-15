@@ -157,6 +157,38 @@ export class IrohNetworkTransport implements NetworkTransport {
     return this.call("authenticate", [challenge, signature]) as Promise<AuthResult>;
   }
 
+  /**
+   * System-admin challenge (`POST /system/auth/challenge`). No tenant scope.
+   */
+  requestSystemChallenge(username: string, publicsignkey: string): Promise<{ challenge: string }> {
+    return this.call("system.requestChallenge", [username, publicsignkey]) as Promise<{
+      challenge: string;
+    }>;
+  }
+
+  /**
+   * System-admin authenticate (`POST /system/auth/authenticate`).
+   */
+  authenticateSystem(challenge: string, signature: Uint8Array): Promise<AuthResult> {
+    return this.call("system.authenticate", [challenge, signature]) as Promise<AuthResult>;
+  }
+
+  /**
+   * Register a tenant (`POST /system/tenants/:tenantId`) with a system JWT.
+   */
+  registerTenant(
+    token: string,
+    tenantId: string,
+    body: Record<string, unknown>,
+  ): Promise<{ success: boolean; tenantId: string; created?: boolean; message?: string }> {
+    return this.call("system.registerTenant", [token, tenantId, body]) as Promise<{
+      success: boolean;
+      tenantId: string;
+      created?: boolean;
+      message?: string;
+    }>;
+  }
+
   getCapabilities(token: string): Promise<NetworkSyncCapabilities> {
     return this.call("getCapabilities", [token]) as Promise<NetworkSyncCapabilities>;
   }

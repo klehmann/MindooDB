@@ -3,9 +3,18 @@ import { bloomMightContainId } from "../../core/appendonlystores/bloom";
 import type { IrohRpcHandler } from "../../core/appendonlystores/network/IrohNetworkTransport";
 import type { IrohRpcContext } from "../../core/appendonlystores/network/IrohStreamIO";
 import type { MindooDBServerInfo } from "../../core/types";
-import { validateTenantId, ValidationError } from "./validation";
+import {
+  MAX_CHALLENGE_LENGTH,
+  MAX_PEM_KEY_LENGTH,
+  validateStringLength,
+  validateTenantId,
+  validateUsername,
+  ValidationError,
+} from "./validation";
+import type { RegisterTenantRequest } from "./types";
 import type { SyncEventBus } from "./SyncEventBus";
 import type { PeerTokenPayload } from "./peer/PeerAuthService";
+import type { SystemAdminTokenPayload } from "./SystemAdminAuth";
 
 /** QUIC idle timeout is ~30s; keep the feed alive below that. */
 export const IROH_CHANGE_FEED_HEARTBEAT_MS = 20_000;
@@ -94,6 +103,20 @@ export interface IrohPeerClusterHost {
   requestSync(peerName: string, scope?: { tenantId?: string; dbId?: string }): void;
 }
 
+export interface IrohSystemAdminHost {
+  generateChallenge(username: string, publicsignkey: string): Promise<string>;
+  authenticate(
+    challenge: string,
+    signature: Uint8Array,
+  ): Promise<{ success: boolean; token?: string; error?: string }>;
+  validateToken(token: string): Promise<SystemAdminTokenPayload | null>;
+  isAuthorized(method: string, path: string, username: string, publicsignkey: string): boolean;
+  registerTenant(request: RegisterTenantRequest): Promise<{
+    created: boolean;
+    context: { tenantId: string };
+  }>;
+}
+
 export interface IrohServerRpcHost {
   getServerPublicInfo(): MindooDBServerInfo | null;
   getJsonBodyLimit?: () => { limit: string; bytes: number | null };
@@ -104,6 +127,7 @@ export interface IrohServerRpcHost {
   syncEventBus?: SyncEventBus;
   peerAuth?: IrohPeerAuthHost;
   peerCluster?: IrohPeerClusterHost;
+  systemAdmin?: IrohSystemAdminHost;
   getPeerUnauthRateLimit?: () => { windowMs: number; max: number };
 }
 
@@ -148,6 +172,7 @@ export function createMindooDBServerIrohHandler(host: IrohServerRpcHost): IrohRp
           clusterRole: host.getClusterRole?.() ?? "peer",
           maxJsonRequestBodyLimit: limit?.limit,
           maxJsonRequestBodyBytes: limit?.bytes ?? undefined,
+          supportsSystemAdmin: Boolean(host.systemAdmin),
         };
       }
       case "getTenantPublicInfosFingerprints": {
@@ -181,6 +206,10 @@ export function createMindooDBServerIrohHandler(host: IrohServerRpcHost): IrohRp
       case "peer.subscribeEvents":
       case "peer.sync":
         return dispatchPeerMethod(host, method, args);
+      case "system.requestChallenge":
+      case "system.authenticate":
+      case "system.registerTenant":
+        return dispatchSystemMethod(host, method, args);
       default:
         return dispatchStoreMethod(host, method, args, ctx);
     }
@@ -311,12 +340,177 @@ async function dispatchPeerMethod(
   }
 }
 
+function asUint8Array(value: unknown): Uint8Array | null {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return null;
+}
+
+async function requireSystemAdminPayload(
+  host: IrohServerRpcHost,
+  token: string,
+): Promise<SystemAdminTokenPayload> {
+  if (!host.systemAdmin) {
+    throw new Error("Iroh system admin is not configured");
+  }
+  const payload = await host.systemAdmin.validateToken(token);
+  if (!payload) {
+    throw new Error("Invalid or expired system admin token");
+  }
+  return payload;
+}
+
+async function dispatchSystemMethod(
+  host: IrohServerRpcHost,
+  method: string,
+  args: unknown[],
+): Promise<unknown> {
+  if (!host.systemAdmin) {
+    throw new Error("Iroh system admin is not configured");
+  }
+
+  if (method === "system.requestChallenge" || method === "system.authenticate") {
+    const limit = host.getPeerUnauthRateLimit?.() ?? {
+      windowMs: IROH_PEER_UNAUTH_WINDOW_MS,
+      max: IROH_PEER_UNAUTH_MAX,
+    };
+    const key =
+      method === "system.requestChallenge"
+        ? `system-challenge:${String(args[0] ?? "")}`
+        : `system-auth:${String(args[0] ?? "")}`;
+    if (!allowUnauthPeerCall(key, limit)) {
+      throw new Error("Too many system admin requests, please try again later");
+    }
+  }
+
+  switch (method) {
+    case "system.requestChallenge": {
+      const username = String(args[0] ?? "");
+      const publicsignkey = String(args[1] ?? "");
+      if (!username) {
+        throw new Error("username is required");
+      }
+      if (!publicsignkey) {
+        throw new Error("publicsignkey is required");
+      }
+      validateUsername(username);
+      validateStringLength(publicsignkey, MAX_PEM_KEY_LENGTH, "publicsignkey");
+      try {
+        return { challenge: await host.systemAdmin.generateChallenge(username, publicsignkey) };
+      } catch (error) {
+        if (error instanceof Error && error.message === "Unknown system admin principal") {
+          throw new Error("System admin principal not found");
+        }
+        throw error;
+      }
+    }
+    case "system.authenticate": {
+      const challenge = String(args[0] ?? "");
+      const signature = asUint8Array(args[1]);
+      if (!challenge || !signature) {
+        throw new Error("challenge and signature (Uint8Array) are required");
+      }
+      validateStringLength(challenge, MAX_CHALLENGE_LENGTH, "challenge");
+      const result = await host.systemAdmin.authenticate(challenge, signature);
+      if (!result.success || !result.token) {
+        throw new Error(result.error ?? "Authentication failed");
+      }
+      return { success: true, token: result.token };
+    }
+    case "system.registerTenant": {
+      const payload = await requireSystemAdminPayload(host, String(args[0] ?? ""));
+      const tenantId = String(args[1] ?? "").trim().toLowerCase();
+      validateTenantId(tenantId);
+      const path = `/system/tenants/${tenantId}`;
+      if (!host.systemAdmin.isAuthorized("POST", path, payload.sub, payload.publicsignkey)) {
+        throw new Error("Forbidden: insufficient capabilities");
+      }
+      const body = (args[2] ?? {}) as Record<string, unknown>;
+      const adminSigningPublicKey = String(body.adminSigningPublicKey ?? "");
+      const adminEncryptionPublicKey = String(body.adminEncryptionPublicKey ?? "");
+      if (!adminSigningPublicKey) {
+        throw new Error("adminSigningPublicKey is required");
+      }
+      if (!adminEncryptionPublicKey) {
+        throw new Error("adminEncryptionPublicKey is required");
+      }
+      if (body.adminUsername !== undefined) {
+        validateUsername(body.adminUsername);
+      }
+      validateStringLength(adminSigningPublicKey, MAX_PEM_KEY_LENGTH, "adminSigningPublicKey");
+      validateStringLength(adminEncryptionPublicKey, MAX_PEM_KEY_LENGTH, "adminEncryptionPublicKey");
+      if (!body.encryptedPublicInfosKey && !body.publicInfosKey) {
+        throw new Error("encryptedPublicInfosKey or publicInfosKey is required");
+      }
+      if (body.publicInfosKey !== undefined) {
+        validateStringLength(body.publicInfosKey, MAX_PEM_KEY_LENGTH, "publicInfosKey");
+      }
+      if (body.encryptedPublicInfosKey !== undefined) {
+        validateStringLength(body.encryptedPublicInfosKey, MAX_PEM_KEY_LENGTH, "encryptedPublicInfosKey");
+      }
+      const request: RegisterTenantRequest = {
+        tenantId,
+        adminSigningPublicKey,
+        adminEncryptionPublicKey,
+        adminUsername: typeof body.adminUsername === "string" ? body.adminUsername : undefined,
+        publicInfosKey: typeof body.publicInfosKey === "string" ? body.publicInfosKey : undefined,
+        encryptedPublicInfosKey:
+          typeof body.encryptedPublicInfosKey === "string" ? body.encryptedPublicInfosKey : undefined,
+        users: Array.isArray(body.users) ? (body.users as RegisterTenantRequest["users"]) : undefined,
+      };
+      const result = await host.systemAdmin.registerTenant(request);
+      return {
+        success: true,
+        tenantId: result.context.tenantId,
+        created: result.created,
+        message: result.created
+          ? `Tenant ${result.context.tenantId} registered successfully`
+          : `Tenant ${result.context.tenantId} already exists with matching $publicinfos key`,
+      };
+    }
+    default:
+      throw new Error(`Unknown Iroh RPC method ${method}`);
+  }
+}
+
+const IROH_STORE_METHODS = new Set([
+  "getCapabilities",
+  "findNewEntries",
+  "findNewEntriesForDoc",
+  "findEntries",
+  "scanEntriesSince",
+  "getIdBloomSummary",
+  "getStoreHead",
+  "getCompactionStatus",
+  "planDocumentMaterialization",
+  "planDocumentMaterializationBatch",
+  "planAttachmentReadByWalkingMetadata",
+  "getEntries",
+  "getEntriesSessionWrapped",
+  "getEntryMetadata",
+  "putEntries",
+  "hasEntries",
+  "getAllIds",
+  "resolveDependencies",
+  "subscribeToChanges",
+]);
+
 async function dispatchStoreMethod(
   host: IrohServerRpcHost,
   method: string,
   args: unknown[],
   ctx?: IrohRpcContext,
 ): Promise<unknown> {
+  if (!IROH_STORE_METHODS.has(method)) {
+    throw new Error(`Unknown Iroh RPC method ${method}`);
+  }
   const scope = requireStoreScope(ctx);
   const store = await host.getServerStore(scope.tenantId, scope.dbId, scope.storeKind);
   const token = String(args[0] ?? "");
