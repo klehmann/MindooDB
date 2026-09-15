@@ -48,13 +48,24 @@ type MindooDBGlobalAuthState = typeof globalThis & {
  * Promise, which stringified as `[object Promise]` and split both the
  * auth-share cache and the persisted sync-cursor key.
  */
+const UNKNOWN_TRANSPORT_IDENTITY = "unknown";
+
 function resolveTransportIdentity(transport: NetworkTransport): string {
   const identity = transport.getIdentity?.();
-  return typeof identity === "string" && identity.length > 0 ? identity : "unknown";
+  return typeof identity === "string" && identity.length > 0 ? identity : UNKNOWN_TRANSPORT_IDENTITY;
 }
 
-/** Capabilities are per server+db+store, not per ClientNetworkStore instance. */
+/**
+ * Capabilities are per server+db+store, not per ClientNetworkStore instance.
+ * Only share when the transport has a real identity: mocks that omit
+ * `getIdentity()` all collapse to {@link UNKNOWN_TRANSPORT_IDENTITY} and would
+ * otherwise leak one server's caps onto the next (see Materialization tests).
+ */
 const sharedCapabilitiesByIdentity = new Map<string, NetworkSyncCapabilities>();
+
+function canShareCapabilities(transport: NetworkTransport): boolean {
+  return resolveTransportIdentity(transport) !== UNKNOWN_TRANSPORT_IDENTITY;
+}
 
 /**
  * Client-side network ContentAddressedStore that forwards all operations to a remote server.
@@ -507,10 +518,12 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       return this.capabilitiesCache;
     }
     const sharedIdentity = this.getCacheIdentity();
-    const shared = sharedCapabilitiesByIdentity.get(sharedIdentity);
-    if (shared) {
-      this.capabilitiesCache = shared;
-      return shared;
+    if (canShareCapabilities(this.transport)) {
+      const shared = sharedCapabilitiesByIdentity.get(sharedIdentity);
+      if (shared) {
+        this.capabilitiesCache = shared;
+        return shared;
+      }
     }
     if (this.capabilitiesPromise) {
       return this.capabilitiesPromise;
@@ -535,7 +548,9 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
           );
         }
         this.capabilitiesCache = capabilities;
-        sharedCapabilitiesByIdentity.set(sharedIdentity, capabilities);
+        if (canShareCapabilities(this.transport)) {
+          sharedCapabilitiesByIdentity.set(sharedIdentity, capabilities);
+        }
         return this.capabilitiesCache;
       }
       this.capabilitiesCache = {
@@ -547,7 +562,9 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         supportsBatchMaterializationPlanning: false,
         supportsAttachmentReadPlanning: false,
       };
-      sharedCapabilitiesByIdentity.set(sharedIdentity, this.capabilitiesCache);
+      if (canShareCapabilities(this.transport)) {
+        sharedCapabilitiesByIdentity.set(sharedIdentity, this.capabilitiesCache);
+      }
       return this.capabilitiesCache;
     });
     try {
@@ -1011,7 +1028,9 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.tokenExpiry = 0;
     this.capabilitiesCache = null;
     this.capabilitiesPromise = null;
-    sharedCapabilitiesByIdentity.delete(this.getCacheIdentity());
+    if (canShareCapabilities(this.transport)) {
+      sharedCapabilitiesByIdentity.delete(this.getCacheIdentity());
+    }
     sharedState.accessToken = null;
     sharedState.tokenExpiry = 0;
   }

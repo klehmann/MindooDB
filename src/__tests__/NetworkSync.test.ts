@@ -950,6 +950,37 @@ describe("Network Sync", () => {
       expect(getCapabilitiesSpy).toHaveBeenCalledTimes(1);
     });
 
+    test("shares capabilities across store instances only when the transport identity is known", async () => {
+      const sharedIdentity = "shared-caps-scope";
+      const transportA = new MockNetworkTransport(serverHandler, sharedIdentity);
+      const transportB = new MockNetworkTransport(serverHandler, sharedIdentity);
+      const firstStore = new ClientNetworkContentAddressedStore(
+        "test-db",
+        StoreKind.docs,
+        transportA,
+        cryptoAdapter,
+        "testuser",
+        userSigningKeyPair.privateKey,
+        userEncryptionPrivateKeyPem,
+      );
+      const secondStore = new ClientNetworkContentAddressedStore(
+        "test-db",
+        StoreKind.docs,
+        transportB,
+        cryptoAdapter,
+        "testuser",
+        userSigningKeyPair.privateKey,
+        userEncryptionPrivateKeyPem,
+      );
+      const spyA = jest.spyOn(transportA, "getCapabilities");
+      const spyB = jest.spyOn(transportB, "getCapabilities");
+
+      await firstStore.getCapabilities();
+      await secondStore.getCapabilities();
+
+      expect(spyA.mock.calls.length + spyB.mock.calls.length).toBe(1);
+    });
+
     // --- Per-user revoked-key blacklist (docs/accesscontrol.md §13.3) ---
 
     /**
