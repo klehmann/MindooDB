@@ -465,15 +465,21 @@ export async function syncEntriesBetweenStores(
     ]);
 
     let cursor: StoreScanCursor | null = null;
+    let cursorDecision: "skip" | "resume" | "full-scan" = "full-scan";
+    let cursorReason = options?.forceFullScan
+      ? "forceFullScan"
+      : persisted
+        ? "persisted cursor unusable"
+        : "no persisted cursor";
     if (persisted && sourceHead && targetHead) {
       if (
         persisted.sourceEpoch === sourceHead.epoch &&
         persisted.targetEpoch === targetHead.epoch
       ) {
         if (sourceHead.maxReceiptOrder <= persisted.cursor.receiptOrder) {
-          logger.debug(
-            `Sync skip: source head ${sourceHead.maxReceiptOrder} already covered by persisted cursor (${cursorKey})`,
-          );
+          cursorDecision = "skip";
+          cursorReason = `source head ${sourceHead.maxReceiptOrder} already covered by cursor ${persisted.cursor.receiptOrder}`;
+          logger.info(`Sync ${cursorDecision}: ${cursorReason} (${cursorKey})`);
           onProgress?.({
             phase: "preparing",
             message: "Source unchanged since last sync, nothing to scan",
@@ -483,17 +489,23 @@ export async function syncEntriesBetweenStores(
           return { transferred: 0, scanned: 0, cancelled: false };
         }
         cursor = persisted.cursor;
-        logger.debug(
-          `Resuming sync scan from persisted cursor receiptOrder=${cursor.receiptOrder} (${cursorKey})`,
-        );
+        cursorDecision = "resume";
+        cursorReason = `from receiptOrder=${cursor.receiptOrder} (source head ${sourceHead.maxReceiptOrder})`;
+        logger.info(`Sync ${cursorDecision}: ${cursorReason} (${cursorKey})`);
       } else {
         // Epoch change on either side: the cursor lineage is broken (store
         // reset / receipt-order migration) — full rescan.
+        cursorReason = `epoch changed (persisted ${persisted.sourceEpoch}/${persisted.targetEpoch} vs live ${sourceHead.epoch}/${targetHead.epoch})`;
         logger.info(
-          `Sync cursor epoch changed for ${cursorKey}, discarding persisted cursor and re-scanning`,
+          `Sync ${cursorDecision}: ${cursorReason}, discarding persisted cursor (${cursorKey})`,
         );
         cursors.delete(cursorKey);
       }
+    } else {
+      if (persisted && (!sourceHead || !targetHead)) {
+        cursorReason = `persisted cursor but missing head (source=${sourceHead ? "ok" : "none"}, target=${targetHead ? "ok" : "none"})`;
+      }
+      logger.info(`Sync ${cursorDecision}: ${cursorReason} (${cursorKey})`);
     }
 
     // Under the "hold" rejection policy this pins the cursor to the position

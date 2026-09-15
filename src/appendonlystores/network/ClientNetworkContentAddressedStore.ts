@@ -44,6 +44,19 @@ type MindooDBGlobalAuthState = typeof globalThis & {
 };
 
 /**
+ * `getIdentity()` must be a string. A lazy Iroh Proxy used to return a
+ * Promise, which stringified as `[object Promise]` and split both the
+ * auth-share cache and the persisted sync-cursor key.
+ */
+function resolveTransportIdentity(transport: NetworkTransport): string {
+  const identity = transport.getIdentity?.();
+  return typeof identity === "string" && identity.length > 0 ? identity : "unknown";
+}
+
+/** Capabilities are per server+db+store, not per ClientNetworkStore instance. */
+const sharedCapabilitiesByIdentity = new Map<string, NetworkSyncCapabilities>();
+
+/**
  * Client-side network ContentAddressedStore that forwards all operations to a remote server.
  * 
  * This store acts as a pure remote proxy:
@@ -149,7 +162,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   }
 
   getCacheIdentity(): string {
-    const transportId = this.transport.getIdentity?.() ?? "unknown";
+    const transportId = resolveTransportIdentity(this.transport);
     return `net:${transportId}/${this.dbId}/${this.storeKind}`;
   }
 
@@ -493,6 +506,12 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     if (this.capabilitiesCache) {
       return this.capabilitiesCache;
     }
+    const sharedIdentity = this.getCacheIdentity();
+    const shared = sharedCapabilitiesByIdentity.get(sharedIdentity);
+    if (shared) {
+      this.capabilitiesCache = shared;
+      return shared;
+    }
     if (this.capabilitiesPromise) {
       return this.capabilitiesPromise;
     }
@@ -516,6 +535,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
           );
         }
         this.capabilitiesCache = capabilities;
+        sharedCapabilitiesByIdentity.set(sharedIdentity, capabilities);
         return this.capabilitiesCache;
       }
       this.capabilitiesCache = {
@@ -527,6 +547,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         supportsBatchMaterializationPlanning: false,
         supportsAttachmentReadPlanning: false,
       };
+      sharedCapabilitiesByIdentity.set(sharedIdentity, this.capabilitiesCache);
       return this.capabilitiesCache;
     });
     try {
@@ -730,14 +751,14 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
 
     // Check if we have a valid token
     if (this.accessToken && this.tokenExpiry > now + 60000) { // 1 minute buffer
-      this.logger.info(`[auth-share] Reusing local cached token for ${sharedKey}`);
+      this.logger.debug(`[auth-share] Reusing local cached token for ${sharedKey}`);
       return this.accessToken;
     }
 
     if (sharedState.accessToken && sharedState.tokenExpiry > now + 60000) {
       this.accessToken = sharedState.accessToken;
       this.tokenExpiry = sharedState.tokenExpiry;
-      this.logger.info(`[auth-share] Adopting shared cached token for ${sharedKey}`);
+      this.logger.debug(`[auth-share] Adopting shared cached token for ${sharedKey}`);
       return this.accessToken;
     }
 
@@ -935,8 +956,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
   }
 
   private buildSharedAuthenticationKey(username: string): string {
-    const transportIdentity = this.transport.getIdentity?.() ?? "unknown";
-    return `${transportIdentity}::${username}`;
+    return `${resolveTransportIdentity(this.transport)}::${username}`;
   }
 
   private getSharedAuthenticationKey(): string {
@@ -991,6 +1011,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     this.tokenExpiry = 0;
     this.capabilitiesCache = null;
     this.capabilitiesPromise = null;
+    sharedCapabilitiesByIdentity.delete(this.getCacheIdentity());
     sharedState.accessToken = null;
     sharedState.tokenExpiry = 0;
   }
