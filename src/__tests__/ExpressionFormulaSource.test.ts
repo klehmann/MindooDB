@@ -108,6 +108,58 @@ describe("formulaSource", () => {
     })).toBe("remote:replica-1:sales");
   });
 
+  it("parses, formats, and evaluates v.parent()", () => {
+    const expression = parseMindooDBFormulaExpression('v.parent("customerId")');
+
+    expect(expression).toEqual({ kind: "parent", path: "customerId" });
+    expect(formatMindooDBFormulaExpression(expression)).toBe('v.parent("customerId")');
+    expect(evaluateExpression(expression, {
+      doc: {},
+      values: {},
+      origin: "remote:replica-1:sales",
+      variables: {},
+      parent: { docId: "inv_1", doc: { customerId: "c_9" } },
+    })).toBe("c_9");
+  });
+
+  it("round-trips an include join filter through formula source", () => {
+    // The whole point of parsing include filters: a query object written
+    // as text must produce the same AST the builder does.
+    const source = 'v.eq(v.field("invoiceId"), v.parentDocId())';
+    const expression = parseMindooDBFormulaExpression(source);
+
+    expect(expression).toEqual({
+      kind: "operation",
+      op: "eq",
+      args: [
+        { kind: "field", path: "invoiceId" },
+        { kind: "operation", op: "parentDocId", args: [] },
+      ],
+    });
+    expect(formatMindooDBFormulaExpression(expression)).toBe(source);
+  });
+
+  it("parses, formats, and evaluates the document id helpers", () => {
+    const own = parseMindooDBFormulaExpression("v.docId()");
+    const parent = parseMindooDBFormulaExpression("v.parentDocId()");
+
+    expect(own).toEqual({ kind: "operation", op: "docId", args: [] });
+    expect(parent).toEqual({ kind: "operation", op: "parentDocId", args: [] });
+    expect(formatMindooDBFormulaExpression(own)).toBe("v.docId()");
+    expect(formatMindooDBFormulaExpression(parent)).toBe("v.parentDocId()");
+
+    const context = {
+      doc: { customerId: "c_9" },
+      values: {},
+      origin: "remote:replica-1:sales",
+      docId: "line_a",
+      variables: {},
+      parent: { docId: "inv_1", doc: {} },
+    };
+    expect(evaluateExpression(own, context)).toBe("line_a");
+    expect(evaluateExpression(parent, context)).toBe("inv_1");
+  });
+
   it("parses, formats, and evaluates metadata and attachment helpers", () => {
     const createdAtExpression = parseMindooDBFormulaExpression("v.createdAt()");
     const lastModifiedAtExpression = parseMindooDBFormulaExpression("v.lastModifiedAt()");

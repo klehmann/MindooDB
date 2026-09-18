@@ -4,6 +4,7 @@ import {
   createViewLanguage,
   evaluateExpression,
   getReferencedFields,
+  getReferencedParentFields,
 } from "../core/expressions";
 
 describe("expression evaluation", () => {
@@ -286,6 +287,7 @@ describe("expression analysis helpers", () => {
       needsDecryption: false,
       needsViewContext: false,
       viewContextOperations: [],
+      needsParentContext: false,
     });
 
     const withDecrypt = v.exists(v.decryptField("secret_encrypted"));
@@ -295,5 +297,86 @@ describe("expression analysis helpers", () => {
     const analysis = analyzeExpressionRequirements(withCounts);
     expect(analysis.needsViewContext).toBe(true);
     expect(analysis.viewContextOperations).toEqual(["childCount"]);
+  });
+
+  it("detects the parent-context requirement of include filters", () => {
+    expect(analyzeExpressionRequirements(v.eq(v.field("status"), "open")).needsParentContext).toBe(false);
+    expect(
+      analyzeExpressionRequirements(v.eq(v.field("status"), v.parent("status"))).needsParentContext
+    ).toBe(true);
+    // parentDocId() reaches the parent row just as parent() does, so it has
+    // to raise the same flag — otherwise the guardrails would let it through
+    // in a root filter, where there is no parent at all.
+    expect(
+      analyzeExpressionRequirements(v.eq(v.field("invoiceId"), v.parentDocId())).needsParentContext
+    ).toBe(true);
+    expect(analyzeExpressionRequirements(v.docId()).needsParentContext).toBe(false);
+  });
+
+  it("separates parent field paths from document field paths", () => {
+    const expression = v.and(
+      v.eq(v.field("invoiceId"), v.parentDocId()),
+      v.eq(v.field("status"), v.parent("meta.owner")),
+    );
+    // `field` paths are checked against the child summary, `parent` paths
+    // against the parent's — so they must never end up in the same bucket.
+    expect(getReferencedFields(expression).sort()).toEqual(["invoiceId", "status"]);
+    // An id is not a summary field, so neither helper is a coverage subject.
+    expect(getReferencedParentFields(expression)).toEqual(["meta.owner"]);
+    expect(getReferencedFields(v.docId())).toEqual([]);
+  });
+});
+
+describe("parent expressions", () => {
+  const v = createViewLanguage<{ invoiceId: string; amount: number }>();
+
+  const base = {
+    doc: { invoiceId: "inv_1", amount: 80 },
+    values: {},
+    origin: "tenant/db",
+    variables: {},
+  };
+
+  it("reads the parent row id and parent fields", () => {
+    const context = {
+      ...base,
+      parent: {
+        docId: "inv_1",
+        doc: { customerId: "c_9", meta: { owner: "ada" }, _lastModified: 1710000000000 },
+      },
+    };
+
+    expect(evaluateExpression(v.parentDocId(), context)).toBe("inv_1");
+    // The id is metadata, so the "docId" PATH is an ordinary field lookup
+    // that finds nothing — the two must not be confused.
+    expect(evaluateExpression(v.parent("docId"), context)).toBeUndefined();
+    expect(evaluateExpression(v.parent("customerId"), context)).toBe("c_9");
+    expect(evaluateExpression(v.parent("meta.owner"), context)).toBe("ada");
+    // No special case needed for the timestamp: the evaluation doc mirrors it.
+    expect(evaluateExpression(v.parent("_lastModified"), context)).toBe(1710000000000);
+    expect(evaluateExpression(v.parent("missing"), context)).toBeUndefined();
+  });
+
+  it("evaluates to undefined without a parent context", () => {
+    expect(evaluateExpression(v.parentDocId(), base)).toBeNull();
+    expect(evaluateExpression(v.parent("customerId"), base)).toBeUndefined();
+  });
+
+  it("reads the current document id only through docId()", () => {
+    // The evaluation doc holds summary FIELDS; the id travels beside it.
+    const context = { ...base, docId: "line_a" };
+    expect(evaluateExpression(v.docId(), context)).toBe("line_a");
+    expect(evaluateExpression(v.field("docId" as never), context)).toBeUndefined();
+    // Hosts that never populate the id yield null rather than a stale value.
+    expect(evaluateExpression(v.docId(), base)).toBeNull();
+  });
+
+  it("does not read the current document", () => {
+    // `invoiceId` exists on the evaluated document, but parent() must not
+    // fall back to it — silently joining a document to itself would be the
+    // worst possible failure mode.
+    const context = { ...base, parent: { docId: "inv_2", doc: {} } };
+    expect(evaluateExpression(v.parent("invoiceId"), context)).toBeUndefined();
+    expect(evaluateExpression(v.field("invoiceId"), context)).toBe("inv_1");
   });
 });

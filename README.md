@@ -236,6 +236,19 @@ const { rows, total, coverage } = await db.query({
 ```
 
 ```typescript
+// Nested lookups: join related documents (same or another database) onto
+// every returned row — one extra scan per slot, never a query per row.
+const invoices = await invoicesDb.query({
+  filter: v.eq(v.field("type"), "invoice"),
+  include: {
+    customer: { db: customersDb, cardinality: "one", localKey: "customerId", fields: ["name"] },
+    lines: { cardinality: "many", filter: v.eq(v.field("invoiceId"), v.parentDocId()) },
+  },
+});
+// invoices.rows[0].includes.customer / .includes.lines
+```
+
+```typescript
 // Incremental indexing: process only what's new (foundation for the above)
 let cursor = null;
 while (true) {
@@ -344,7 +357,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Architecture Specification](./docs/specification.md) — Full technical details
 - [React Native Guide](./docs/reactnative.md) — Native Automerge setup and troubleshooting
 - [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
-- [Ad-hoc Queries & Reactive Updates](./docs/adhoc-queries.md) — Summary buffer, `db.query()`, ephemeral views, live queries and change listeners
+- [Ad-hoc Queries & Reactive Updates](./docs/adhoc-queries.md) — Summary buffer, `db.query()`, nested `include` lookups, ephemeral views, live queries and change listeners
 - [Full-Text Search](./docs/fulltext-search.md) — Client-side encrypted full-text index, `db.searchText()`, the query `text` clause, attachment text extraction
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal

@@ -1,7 +1,13 @@
 import type { MindooDB } from "../types";
 import type { DocumentSummaryStore } from "../indexing/summary/DocumentSummaryStore";
 import { executeQuery } from "./executeQuery";
-import type { MindooQuery, MindooQueryOptions, MindooQueryResult } from "./types";
+import type {
+  MindooQuery,
+  MindooQueryInclude,
+  MindooQueryOptions,
+  MindooQueryResult,
+  MindooQueryRow,
+} from "./types";
 
 /** Handle returned by `db.queryLive()`. */
 export interface MindooQuerySubscription {
@@ -24,17 +30,72 @@ export interface MindooQuerySubscription {
  * or removing documents shifts BM25 statistics slightly for every other
  * match, and re-pushing an unchanged result list over marginal score
  * drift would spam subscribers.
+ *
+ * Included rows participate recursively. Without that, editing a line
+ * item would leave the invoice's own `lastModified` untouched and the
+ * subscriber would never hear about a change to data it was handed.
  */
 function fingerprintResult(result: MindooQueryResult): string {
   const parts: string[] = [String(result.total)];
   for (const row of result.rows) {
-    parts.push(
-      row.textScore === undefined
-        ? `${row.docId}:${row.lastModified}`
-        : `${row.docId}:${row.lastModified}:${row.textScore.toFixed(2)}`
-    );
+    appendRowFingerprint(parts, row);
   }
   return parts.join("|");
+}
+
+function appendRowFingerprint(parts: string[], row: MindooQueryRow): void {
+  parts.push(
+    row.textScore === undefined
+      ? `${row.docId}:${row.lastModified}`
+      : `${row.docId}:${row.lastModified}:${row.textScore.toFixed(2)}`
+  );
+  if (!row.includes) {
+    return;
+  }
+  for (const [slot, slotValue] of Object.entries(row.includes)) {
+    if (slotValue === null) {
+      parts.push(`${slot}:-`);
+      continue;
+    }
+    if (Array.isArray(slotValue)) {
+      parts.push(`${slot}:${slotValue.length}`);
+      for (const child of slotValue) {
+        appendRowFingerprint(parts, child);
+      }
+      continue;
+    }
+    parts.push(`${slot}:1`);
+    appendRowFingerprint(parts, slotValue);
+  }
+}
+
+/**
+ * Every database a query reads from: the root plus each `include.db`
+ * (recursively; an include without one stays on its parent's database).
+ * Deduplicated by instance, so two slots on the same database do not
+ * install two listeners.
+ */
+function collectQueryDatabases(db: MindooDB, query: MindooQuery): MindooDB[] {
+  const databases: MindooDB[] = [db];
+  const seen = new Set<MindooDB>([db]);
+
+  const walk = (includes: Record<string, MindooQueryInclude>, parentDb: MindooDB): void => {
+    for (const include of Object.values(includes)) {
+      const target = include.db ?? parentDb;
+      if (!seen.has(target)) {
+        seen.add(target);
+        databases.push(target);
+      }
+      if (include.include) {
+        walk(include.include, target);
+      }
+    }
+  };
+
+  if (query.include) {
+    walk(query.include, db);
+  }
+  return databases;
 }
 
 /**
@@ -54,8 +115,14 @@ export function executeQueryLive(
   onResult: (result: MindooQueryResult) => void,
   options?: MindooQueryOptions & { onError?: (error: unknown) => void }
 ): MindooQuerySubscription {
-  if (!db.addChangeListener) {
-    throw new Error("This MindooDB instance does not support change listeners.");
+  // A live query with includes is only live if it watches every database
+  // it reads from — a changed customer must push just like a changed
+  // invoice does.
+  const databases = collectQueryDatabases(db, query);
+  for (const database of databases) {
+    if (!database.addChangeListener) {
+      throw new Error("This MindooDB instance does not support change listeners.");
+    }
   }
 
   let lastFingerprint: string | null = null;
@@ -104,11 +171,13 @@ export function executeQueryLive(
     }
   };
 
-  const removeListener = db.addChangeListener(() => {
-    if (!unsubscribed) {
-      void run(false);
-    }
-  });
+  const removeListeners = databases.map((database) =>
+    database.addChangeListener!(() => {
+      if (!unsubscribed) {
+        void run(false);
+      }
+    })
+  );
 
   // Deliver the initial result asynchronously.
   void run(true);
@@ -116,7 +185,9 @@ export function executeQueryLive(
   return {
     unsubscribe(): void {
       unsubscribed = true;
-      removeListener();
+      for (const removeListener of removeListeners) {
+        removeListener();
+      }
     },
     async refresh(): Promise<void> {
       if (unsubscribed) {

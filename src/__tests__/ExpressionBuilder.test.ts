@@ -310,4 +310,29 @@ describe("createViewLanguage", () => {
       path: "address.city",
     });
   });
+
+  it("builds parent references for nested query lookups", () => {
+    const v = createViewLanguage<{ invoiceId: string }>();
+
+    expect(v.parent("customerId")).toEqual({ kind: "parent", path: "customerId" });
+    expect(v.parent("meta.owner")).toEqual({ kind: "parent", path: "meta.owner" });
+
+    // The join condition an include filter is built from.
+    expect(v.eq(v.field("invoiceId"), v.parentDocId())).toEqual({
+      kind: "operation",
+      op: "eq",
+      args: [
+        { kind: "field", path: "invoiceId" },
+        { kind: "operation", op: "parentDocId", args: [] },
+      ],
+    });
+  });
+
+  it("builds document id references", () => {
+    const v = createViewLanguage<{ invoiceId: string }>();
+
+    // Ids are metadata, so they are operations rather than field paths.
+    expect(v.docId()).toEqual({ kind: "operation", op: "docId", args: [] });
+    expect(v.parentDocId()).toEqual({ kind: "operation", op: "parentDocId", args: [] });
+  });
 });

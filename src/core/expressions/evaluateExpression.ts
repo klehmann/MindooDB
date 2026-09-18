@@ -20,6 +20,12 @@ export type ExpressionEvaluationContext = {
   doc: Record<string, unknown>;
   values: Record<string, unknown>;
   origin: string;
+  /**
+   * The document's id, which is metadata rather than one of its fields and
+   * therefore not part of `doc`. Hosts populate it so `docId()` resolves;
+   * where it is missing the operation yields `null`.
+   */
+  docId?: string | null;
   createdAt?: string | null;
   /** ISO-8601 last-modified timestamp from the host runtime (`getLastModified()`). */
   lastModifiedAt?: string | null;
@@ -30,6 +36,23 @@ export type ExpressionEvaluationContext = {
   variables: Record<string, unknown>;
   /** Pre-resolved plaintext for `decrypt` nodes, keyed by field name. */
   decrypted?: Record<string, unknown>;
+  /**
+   * Second evaluation context for `parent` nodes: the parent row of a
+   * nested query lookup (`MindooQuery.include`). Only populated while an
+   * include filter is evaluated; `parent` nodes yield `undefined` without
+   * it.
+   */
+  parent?: ExpressionParentContext;
+};
+
+/** The parent row a `parent` node reads from inside an include filter. */
+export type ExpressionParentContext = {
+  docId: string;
+  /**
+   * The parent's field values in evaluation form (`buildSummaryEvaluationDoc`),
+   * i.e. unprojected and with `_lastModified` mirrored in.
+   */
+  doc: Record<string, unknown>;
 };
 
 /** A field whose ciphertext a view/query definition needs decrypted before evaluation. */
@@ -151,6 +174,10 @@ function evaluateOperation(
 ): unknown {
   const args = expression.args.map((arg) => evaluateExpression(arg, context));
   switch (expression.op) {
+    case "docId":
+      return context.docId ?? null;
+    case "parentDocId":
+      return context.parent?.docId ?? null;
     case "createdAt":
       return context.createdAt ?? null;
     case "lastModifiedAt":
@@ -313,6 +340,10 @@ export function evaluateExpression(expression: MindooDBAppExpression, context: E
       return getFieldValue(context.values, expression.path);
     case "origin":
       return context.origin;
+    case "parent": {
+      const parent = context.parent;
+      return parent ? getFieldValue(parent.doc, expression.path) : undefined;
+    }
     case "variable":
       return context.variables[expression.name];
     case "if":
@@ -375,10 +406,67 @@ function walkExpression(expression: MindooDBAppExpression, visit: (node: MindooD
     case "field":
     case "value":
     case "origin":
+    case "parent":
     case "variable":
     case "json":
       break;
   }
+}
+
+/**
+ * Every node kind {@link evaluateExpression} understands — the runtime
+ * mirror of the `MindooDBAppExpression` union, and the one list both the
+ * builder (telling nodes from literals) and the query engine (rejecting a
+ * node the evaluator cannot run) work from. A new node kind belongs here.
+ */
+export const EXPRESSION_KINDS: ReadonlySet<MindooDBAppExpression["kind"]> = new Set([
+  "literal",
+  "field",
+  "value",
+  "origin",
+  "parent",
+  "variable",
+  "operation",
+  "if",
+  "let",
+  "decrypt",
+  "json",
+]);
+
+/**
+ * Describes the first node of an expression tree that the evaluator would
+ * not recognize, or `null` when every node is a known kind.
+ *
+ * The evaluator's switch is exhaustive over the node union and deliberately
+ * has no `default`, so anything else — formula *source text* passed where a
+ * node was expected, a hand-built node with a typo'd `kind`, a value that
+ * survived a JSON round trip badly — evaluates to `undefined` rather than
+ * failing. As a filter that means "matches nothing", with no error and full
+ * coverage reported: the worst way to be wrong. Entry points that accept an
+ * expression from a caller check it with this first.
+ */
+export function findUnknownExpressionNode(expression: MindooDBAppExpression): string | null {
+  let unknown: string | null = null;
+  walkExpression(expression, (node) => {
+    if (unknown !== null) {
+      return;
+    }
+    if (typeof node === "string") {
+      unknown = "formula source text (parse it first)";
+      return;
+    }
+    if (node === null || typeof node !== "object") {
+      unknown = `a ${node === null ? "null" : typeof node} value`;
+      return;
+    }
+    const kind = (node as { kind?: unknown }).kind;
+    if (typeof kind !== "string") {
+      unknown = "an object without a `kind`";
+    } else if (!EXPRESSION_KINDS.has(kind as MindooDBAppExpression["kind"])) {
+      unknown = `kind "${kind}"`;
+    }
+  });
+  return unknown;
 }
 
 /**
@@ -425,20 +513,45 @@ export function getReferencedFields(expression: MindooDBAppExpression): string[]
 }
 
 /**
+ * Collects every PARENT field path (`parent` nodes) an expression
+ * references. The counterpart of {@link getReferencedFields} for nested
+ * query lookups: both sets are coverage-checked, but against different
+ * summaries — `field` paths against the child database's, these against
+ * the parent's. `parentDocId()` contributes nothing here: an id is not a
+ * summary field and so has nothing to cover.
+ */
+export function getReferencedParentFields(expression: MindooDBAppExpression): string[] {
+  const paths = new Set<string>();
+  walkExpression(expression, (node) => {
+    if (node.kind === "parent") {
+      paths.add(node.path);
+    }
+  });
+  return Array.from(paths);
+}
+
+/**
  * Collects expression capabilities relevant for the query engine's
- * guardrails: whether the expression needs decryption or a view-tree
- * context (neither can be answered from the summary buffer).
+ * guardrails: whether the expression needs decryption, a view-tree
+ * context (neither can be answered from the summary buffer), or a parent
+ * row (only exists inside a nested query lookup).
  */
 export function analyzeExpressionRequirements(expression: MindooDBAppExpression): {
   needsDecryption: boolean;
   needsViewContext: boolean;
   viewContextOperations: string[];
+  needsParentContext: boolean;
 } {
   let needsDecryption = false;
+  let needsParentContext = false;
   const viewContextOperations = new Set<string>();
   walkExpression(expression, (node) => {
     if (node.kind === "decrypt") {
       needsDecryption = true;
+    } else if (node.kind === "parent") {
+      needsParentContext = true;
+    } else if (node.kind === "operation" && node.op === "parentDocId") {
+      needsParentContext = true;
     } else if (node.kind === "operation" && VIEW_CONTEXT_OPERATIONS.has(node.op)) {
       viewContextOperations.add(node.op);
     }
@@ -447,5 +560,6 @@ export function analyzeExpressionRequirements(expression: MindooDBAppExpression)
     needsDecryption,
     needsViewContext: viewContextOperations.size > 0,
     viewContextOperations: Array.from(viewContextOperations),
+    needsParentContext,
   };
 }

@@ -362,6 +362,21 @@ providers (see below) only evaluate `expression` — JS functions are rejected t
 because no materialized document exists to pass them. Expression columns make a whole
 view definition serializable, the basis for view designs stored/synchronized as data.
 
+#### Showing the document id
+
+A document's id is metadata rather than a stored field, so `v.field("docId")`
+does not find it — it reads a field of that name, which normally does not
+exist. Use `v.docId()`, which works in column expressions, filters, and sort
+keys alike:
+
+```typescript
+new VirtualViewColumn({ name: "id", expression: v.docId() });
+```
+
+Every view row also carries its id as row metadata (`VirtualViewEntryData.docId`,
+and `docId` on the SDK's view entries), so a UI that only wants to *display* the
+id can read it there without defining a column at all.
+
 ### Ephemeral Summary-Backed Views
 
 For ad-hoc UI grids with dynamic re-sorting, `db.queryView()` builds an ephemeral

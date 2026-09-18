@@ -5,27 +5,41 @@ import {
   collectDecryptRequests,
   evaluateExpression,
   expressionToBoolean,
+  findUnknownExpressionNode,
   getReferencedFields,
+  parseMindooDBFormulaBooleanExpression,
   type DecryptRequest,
   type ExpressionEvaluationContext,
 } from "../expressions";
 import { decryptEncryptedField } from "../crypto/encryptedFields";
 import type { DocumentSummaryStore } from "../indexing/summary/DocumentSummaryStore";
-import { buildSummaryEvaluationDoc, getSummaryFieldValue } from "../indexing/summary/extractSummaryFields";
+import { buildSummaryEvaluationDoc } from "../indexing/summary/extractSummaryFields";
 import type { DocumentFullTextIndex } from "../indexing/fulltext/DocumentFullTextIndex";
-import { compareValues } from "../indexing/virtualviews/types";
 import {
   MindooQueryError,
   type MindooQuery,
+  type MindooQueryInclude,
+  type ParsedMindooQuery,
+  type ParsedMindooQueryInclude,
   type MindooQueryOptions,
   type MindooQueryResult,
   type MindooQueryRow,
   type MindooQuerySortKey,
 } from "./types";
-
-type CandidateRow = MindooQueryRow & {
-  sortValues: unknown[];
-};
+import {
+  compareCandidates,
+  computeSortValues,
+  effectiveSortKeys,
+  mergeCoverage,
+  projectFields,
+  queryOrigin,
+  type CandidateRow,
+} from "./queryInternals";
+import {
+  hydrateQueryIncludes,
+  validateQueryIncludes,
+  type IncludeParentBinding,
+} from "./executeQueryInclude";
 
 /**
  * Resolve and prepare the full-text index for a query with a `text`
@@ -37,7 +51,7 @@ type CandidateRow = MindooQueryRow & {
  */
 async function resolveTextClauseScores(
   db: MindooDB,
-  query: MindooQuery,
+  query: ParsedMindooQuery,
   options?: MindooQueryOptions
 ): Promise<{ scores: Map<string, number>; index: DocumentFullTextIndex } | null> {
   const text = query.text;
@@ -73,21 +87,58 @@ async function resolveTextClauseScores(
 }
 
 /**
- * Effective sort keys of a query: an explicit `sortBy` wins; a `text`
- * clause without one defaults to relevance ranking (best score first).
+ * Turn a caller's query into one the evaluator can run: formula source text
+ * becomes an expression, and anything that is neither is rejected here.
+ *
+ * Both matter for the same reason. The evaluator returns `undefined` for a
+ * node it does not recognize, and `undefined` as a filter means "no match" —
+ * so a filter handed over as source text, or built by hand with a typo,
+ * used to come back as an empty result set with `coverage: "full"`, which
+ * reads exactly like a correct query over data that isn't there.
  */
-function effectiveSortKeys(query: MindooQuery): MindooQuerySortKey[] {
-  if (query.sortBy && query.sortBy.length > 0) {
-    return query.sortBy;
+function parseQuery(query: MindooQuery): ParsedMindooQuery {
+  return {
+    ...query,
+    filter: parseFilter(query.filter, "Query filter"),
+    include: query.include ? parseIncludes(query.include, "") : undefined,
+  } as ParsedMindooQuery;
+}
+
+function parseFilter(
+  filter: MindooQuery["filter"],
+  label: string
+): ParsedMindooQuery["filter"] {
+  if (typeof filter !== "string") {
+    return filter;
   }
-  if (query.text) {
-    return [{ special: "textScore", direction: "descending" }];
+  try {
+    return parseMindooDBFormulaBooleanExpression(filter);
+  } catch (error) {
+    throw new MindooQueryError(
+      `${label} is not valid formula source: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
-  return [];
+}
+
+/** Formula-source filters are supported at every include level, not just the root. */
+function parseIncludes(
+  includes: Record<string, MindooQueryInclude>,
+  slotPath: string
+): Record<string, ParsedMindooQueryInclude> {
+  const parsed: Record<string, ParsedMindooQueryInclude> = {};
+  for (const [slot, include] of Object.entries(includes)) {
+    const label = slotPath ? `${slotPath}.${slot}` : slot;
+    parsed[slot] = {
+      ...include,
+      filter: parseFilter(include.filter, `Filter of include "${label}"`),
+      include: include.include ? parseIncludes(include.include, label) : undefined,
+    };
+  }
+  return parsed;
 }
 
 /** All expressions a query references (filter + expression sort keys). */
-function collectQueryExpressions(query: MindooQuery): MindooDBAppExpression[] {
+function collectQueryExpressions(query: ParsedMindooQuery): MindooDBAppExpression[] {
   const expressions: MindooDBAppExpression[] = [];
   if (query.filter) {
     expressions.push(query.filter);
@@ -106,6 +157,13 @@ function collectQueryExpressions(query: MindooQuery): MindooDBAppExpression[] {
  */
 function validateQueryExpressions(expressions: MindooDBAppExpression[], allowFullScan: boolean): void {
   for (const expression of expressions) {
+    const unknown = findUnknownExpressionNode(expression);
+    if (unknown !== null) {
+      throw new MindooQueryError(
+        `Query expression contains ${unknown}, which the expression language does not define. ` +
+        `Build expressions with createViewLanguage() (or pass the filter as formula source text).`
+      );
+    }
     const requirements = analyzeExpressionRequirements(expression);
     if (requirements.needsViewContext) {
       throw new MindooQueryError(
@@ -119,50 +177,27 @@ function validateQueryExpressions(expressions: MindooDBAppExpression[], allowFul
         `Re-run with allowFullScan: true to evaluate them against materialized documents (expensive).`
       );
     }
+    if (requirements.needsParentContext) {
+      throw new MindooQueryError(
+        `Query expressions cannot use v.parent(); there is no parent document at the top level of a query. ` +
+        `It only resolves inside the filter of an include lookup.`
+      );
+    }
   }
 }
 
-function sortDirectionDescending(sortKey: MindooQuerySortKey): boolean {
-  return sortKey.direction === "descending";
-}
-
-function computeSortValues(
-  sortKeys: MindooQuerySortKey[],
-  context: ExpressionEvaluationContext,
-  textScore?: number
-): unknown[] {
-  return sortKeys.map((sortKey) => {
-    if (sortKey.special === "textScore") {
-      return textScore ?? 0;
-    }
-    if (sortKey.expression) {
-      return evaluateExpression(sortKey.expression, context);
-    }
-    // Plain field sort keys resolve against the evaluation doc, which also
-    // carries the mirrored managed fields (`_lastModified`, `_attachments`).
-    return getSummaryFieldValue(context.doc, sortKey.field ?? "");
-  });
-}
-
+/**
+ * Sorts, pages, and turns candidates into result rows. The paged
+ * candidates are returned alongside so include hydration can reach their
+ * unprojected values without scanning again.
+ */
 function sortAndPage(
   candidates: CandidateRow[],
-  query: MindooQuery,
+  query: ParsedMindooQuery,
   sortKeys: MindooQuerySortKey[]
-): { rows: MindooQueryRow[]; total: number } {
+): { rows: MindooQueryRow[]; total: number; paged: CandidateRow[] } {
   if (sortKeys.length > 0) {
-    candidates.sort((left, right) => {
-      for (let i = 0; i < sortKeys.length; i++) {
-        const result = compareValues(
-          left.sortValues[i],
-          right.sortValues[i],
-          sortDirectionDescending(sortKeys[i])
-        );
-        if (result !== 0) {
-          return result;
-        }
-      }
-      return left.docId.localeCompare(right.docId);
-    });
+    candidates.sort((left, right) => compareCandidates(left, right, sortKeys));
   }
 
   const total = candidates.length;
@@ -179,25 +214,8 @@ function sortAndPage(
         : { docId, fields, lastModified, textScore }
     ),
     total,
+    paged,
   };
-}
-
-function projectFields(fields: Record<string, unknown>, projection?: string[]): Record<string, unknown> {
-  if (!projection) {
-    return fields;
-  }
-  const projected: Record<string, unknown> = {};
-  for (const path of projection) {
-    const value = getSummaryFieldValue(fields, path);
-    if (value !== undefined) {
-      projected[path] = value;
-    }
-  }
-  return projected;
-}
-
-function queryOrigin(db: MindooDB): string {
-  return `${db.getTenant().getId()}/${db.getStore().getId()}`;
 }
 
 /**
@@ -216,17 +234,27 @@ function queryOrigin(db: MindooDB): string {
 export async function executeQuery(
   db: MindooDB,
   summary: DocumentSummaryStore,
-  query: MindooQuery,
+  input: MindooQuery,
   options?: MindooQueryOptions
 ): Promise<MindooQueryResult> {
+  const query = parseQuery(input);
   const expressions = collectQueryExpressions(query);
 
   if (options?.allowFullScan) {
+    if (query.include) {
+      throw new MindooQueryError(
+        `Queries cannot combine allowFullScan with include lookups: includes are answered from the ` +
+        `summary buffer of every involved database, which is exactly what allowFullScan bypasses.`
+      );
+    }
     validateQueryExpressions(expressions, true);
     return executeFullScanQuery(db, query, expressions, options);
   }
 
   validateQueryExpressions(expressions, false);
+  if (query.include) {
+    validateQueryIncludes(query.include);
+  }
 
   // Coverage check: every field referenced by filter/sort expressions and
   // plain-field sort keys must be answerable from the summary.
@@ -278,6 +306,7 @@ export async function executeQuery(
       doc: evaluationDoc,
       values: {},
       origin,
+      docId: entry.docId,
       lastModifiedAt: new Date(entry.lastModified).toISOString(),
       decryptionKeyId: entry.decryptionKeyId,
       variables: {},
@@ -293,16 +322,38 @@ export async function executeQuery(
       lastModified: entry.lastModified,
       textScore,
       sortValues: computeSortValues(sortKeys, context, textScore),
+      evaluationDoc,
     });
   }
 
-  const { rows, total } = sortAndPage(candidates, query, sortKeys);
+  const { rows, total, paged } = sortAndPage(candidates, query, sortKeys);
   // Coverage is the minimum of the summary and full-text coverage: while
   // either side is still backfilling, results may be incomplete.
-  const coverage =
+  let coverage: MindooQueryResult["coverage"] =
     textMatch && textMatch.index.getCoverage() === "rebuilding"
       ? "rebuilding"
       : summary.getCoverage();
+
+  // Includes are hydrated AFTER paging: only the rows actually returned
+  // get related documents, so a `limit: 20` page costs 20 rows' worth of
+  // joins regardless of how many documents matched.
+  if (query.include) {
+    const parents: IncludeParentBinding[] = rows.map((row, index) => ({
+      row,
+      docId: row.docId,
+      doc: paged[index]!.evaluationDoc,
+    }));
+    const includeCoverage = await hydrateQueryIncludes({
+      parentDb: db,
+      parentSummary: summary,
+      includes: query.include,
+      parents,
+      depth: 1,
+      options,
+    });
+    coverage = mergeCoverage(coverage, includeCoverage);
+  }
+
   return { rows, total, coverage };
 }
 
@@ -342,7 +393,7 @@ async function resolveDecryptedFields(
  */
 async function executeFullScanQuery(
   db: MindooDB,
-  query: MindooQuery,
+  query: ParsedMindooQuery,
   expressions: MindooDBAppExpression[],
   options?: MindooQueryOptions
 ): Promise<MindooQueryResult> {
@@ -392,6 +443,7 @@ async function executeFullScanQuery(
       doc: data,
       values: {},
       origin,
+      docId: mindooDoc.getId(),
       createdAt: new Date(mindooDoc.getCreatedAt()).toISOString(),
       lastModifiedAt: new Date(mindooDoc.getLastModified()).toISOString(),
       decryptionKeyId: mindooDoc.getDecryptionKeyId(),
@@ -412,6 +464,7 @@ async function executeFullScanQuery(
       lastModified: mindooDoc.getLastModified(),
       textScore,
       sortValues: computeSortValues(sortKeys, context, textScore),
+      evaluationDoc: data,
     });
   }
 

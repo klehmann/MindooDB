@@ -1,7 +1,11 @@
 import type { MindooDB } from "../types";
-import type { MindooDBAppBooleanExpression } from "../expressions/types";
+import type { MindooDBAppBooleanExpression, MindooDBAppExpression } from "../expressions/types";
 import type { DocumentFullTextIndex } from "../indexing/fulltext/DocumentFullTextIndex";
-import { analyzeExpressionRequirements, getReferencedFields } from "../expressions";
+import {
+  analyzeExpressionRequirements,
+  findUnknownExpressionNode,
+  getReferencedFields,
+} from "../expressions";
 import type { DocumentSummaryStore } from "../indexing/summary/DocumentSummaryStore";
 import { SummaryVirtualViewDataProvider } from "../indexing/summary/SummaryVirtualViewDataProvider";
 import { VirtualView } from "../indexing/virtualviews/VirtualView";
@@ -270,6 +274,26 @@ export class EphemeralSummaryView {
 const TEXT_SCORE_FIELDS = new Set(["_textScore", "_textScoreRaw"]);
 
 /**
+ * Reject an expression the evaluator does not define.
+ *
+ * Same trap as in `db.query()`: an unrecognized node evaluates to
+ * `undefined`, which silently drops every row (in a filter) or blanks a
+ * column instead of reporting the mistake. View definitions take expressions
+ * only — formula source text has to be parsed by the caller, and saying so
+ * is more useful than an empty view.
+ */
+function assertKnownExpression(expression: MindooDBAppExpression, role: string): void {
+  const unknown = findUnknownExpressionNode(expression);
+  if (unknown !== null) {
+    throw new MindooQueryError(
+      `View ${role} contains ${unknown}, which the expression language does not define ` +
+      `(build it with createViewLanguage(), or parse formula text with ` +
+      `parseMindooDBFormulaBooleanExpression()).`
+    );
+  }
+}
+
+/**
  * Guardrails mirroring `db.query()`: expressions must be answerable from
  * the summary buffers (no decrypt, no view-tree operations in filters,
  * referenced fields covered by EACH source's summary configuration).
@@ -284,6 +308,7 @@ function validateViewDefinition(sources: ResolvedViewSource[], definition: Mindo
     if (!expression) {
       continue;
     }
+    assertKnownExpression(expression, "column");
     const requirements = analyzeExpressionRequirements(expression);
     if (requirements.needsDecryption) {
       throw new MindooQueryError(
@@ -300,6 +325,7 @@ function validateViewDefinition(sources: ResolvedViewSource[], definition: Mindo
 
     const filter = source.filter ?? definition.filter;
     if (filter) {
+      assertKnownExpression(filter, "filter");
       const requirements = analyzeExpressionRequirements(filter);
       if (requirements.needsViewContext) {
         throw new MindooQueryError(

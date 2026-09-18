@@ -3,23 +3,12 @@ import type {
   MindooDBAppExpression,
   MindooDBAppViewExpressionDatePart,
 } from "./types";
+import { EXPRESSION_KINDS } from "./evaluateExpression";
 
 type Primitive = string | number | boolean | bigint | symbol | null | undefined | Date;
 type NonTraversable = Primitive | Array<unknown>;
 type StringKey<T> = Extract<keyof T, string>;
 type ExpressionKind = MindooDBAppExpression["kind"];
-const EXPRESSION_KINDS: ReadonlySet<ExpressionKind> = new Set([
-  "literal",
-  "field",
-  "value",
-  "origin",
-  "variable",
-  "operation",
-  "if",
-  "let",
-  "decrypt",
-  "json",
-]);
 
 /** Dot-separated field paths available on a source document type. */
 export type MindooDBAppFieldPath<T> = T extends NonTraversable
@@ -112,6 +101,37 @@ export function createViewLanguage<
     },
     origin(): MindooDBAppExpression<string> {
       return { kind: "origin" };
+    },
+    /**
+     * Read a FIELD of the parent document of a nested query lookup
+     * (`MindooQuery.include`). Only valid inside an include filter; the
+     * query engine rejects it everywhere else. For the parent's id use
+     * {@link parentDocId} — `parent("docId")` is an ordinary field path
+     * and yields a value only if the parent really stores such a field.
+     *
+     * Untyped by design: the parent belongs to a different document type
+     * (often a different database) than the `TDocument` this builder was
+     * created for.
+     */
+    parent<T = unknown>(path: string): MindooDBAppExpression<T> {
+      return { kind: "parent", path };
+    },
+    /**
+     * The current document's id. A document's id is metadata rather than
+     * one of its fields, so it is reachable only through this helper —
+     * `field("docId")` reads a field of that name, which normally does
+     * not exist.
+     */
+    docId(): MindooDBAppExpression<string> {
+      return { kind: "operation", op: "docId", args: [] };
+    },
+    /**
+     * The id of the parent row inside a nested query lookup — the
+     * {@link docId} counterpart of {@link parent}. `eq(docId(),
+     * parentDocId())` is the usual "child points at parent" join.
+     */
+    parentDocId(): MindooDBAppExpression<string> {
+      return { kind: "operation", op: "parentDocId", args: [] };
     },
     createdAt(): MindooDBAppExpression<string | null> {
       return { kind: "operation", op: "createdAt", args: [] };

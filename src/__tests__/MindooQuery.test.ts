@@ -1,5 +1,6 @@
 import type { MindooDB } from "../core/types";
 import { createViewLanguage } from "../core/expressions";
+import type { MindooDBAppBooleanExpression } from "../core/expressions/types";
 import { MindooQueryError } from "../core/query/types";
 import { createWitnessingTenant } from "./_helpers/witnessingTenant";
 
@@ -116,6 +117,39 @@ describe("MindooQuery (db.query)", () => {
     await expect(
       db.query!({ filter: v.eq(v.field("secret"), "x") })
     ).rejects.toThrow(/secret/);
+  }, 30000);
+
+  it("accepts a filter as formula source text", async () => {
+    // The app SDK lets callers write the filter as formula text, so a query
+    // object built for it has to work here too — and a string used to
+    // evaluate to undefined, i.e. match nothing, without any complaint.
+    const result = await db.query!({ filter: 'v.eq(v.field("type"), "task")' });
+
+    expect(result.total).toBe(3);
+  }, 30000);
+
+  it("rejects formula source text that does not parse", async () => {
+    await expect(db.query!({ filter: 'v.eq(v.field("type")' })).rejects.toThrow(MindooQueryError);
+    await expect(db.query!({ filter: "not a formula" })).rejects.toThrow(/formula source/);
+  }, 30000);
+
+  it("rejects an expression node the language does not define", async () => {
+    // The evaluator has no default case, so a typo'd `kind` yields undefined
+    // and the query silently returns nothing. That is how a JSON filter from
+    // another process arrives — the builder would have wrapped the typo as a
+    // literal, so only the hand-built path can carry it this far.
+    const typo = { kind: "feild", path: "type" } as unknown as MindooDBAppBooleanExpression;
+    const nested = {
+      kind: "operation",
+      op: "eq",
+      args: [typo, { kind: "literal", value: "task" }],
+    } as unknown as MindooDBAppBooleanExpression;
+
+    await expect(db.query!({ filter: typo })).rejects.toThrow(/feild/);
+    await expect(db.query!({ filter: nested })).rejects.toThrow(MindooQueryError);
+    await expect(
+      db.query!({ sortBy: [{ expression: typo, direction: "ascending" }] })
+    ).rejects.toThrow(MindooQueryError);
   }, 30000);
 
   it("rejects decrypt expressions without allowFullScan", async () => {

@@ -8,6 +8,8 @@ export type MindooDBAppViewTotalMode = "sum" | "average" | "none";
 export type MindooDBAppViewExpressionDatePart = "year" | "month" | "day" | "quarter";
 /** Low-level operation identifiers used by AST operation nodes. */
 export type MindooDBAppViewExpressionOperation =
+  | "docId"
+  | "parentDocId"
   | "createdAt"
   | "lastModifiedAt"
   | "decryptionKeyId"
@@ -88,6 +90,22 @@ export interface MindooDBAppViewOriginExpression extends MindooDBAppViewExpressi
   kind: "origin";
 }
 
+/**
+ * Reads a value from the PARENT document of a nested query lookup
+ * (`MindooQuery.include`), not from the document being evaluated.
+ *
+ * Only meaningful where a parent evaluation context exists — inside an
+ * include filter. The path `"docId"` yields the parent row's id; every
+ * other path is resolved against the parent's field values exactly like
+ * `field` does for the current document (including the mirrored
+ * `_lastModified`). Without a parent context the node evaluates to
+ * `undefined`; the query engine rejects such placements up front.
+ */
+export interface MindooDBAppViewParentExpression<T = unknown> extends MindooDBAppViewExpressionBase {
+  kind: "parent";
+  path: string;
+}
+
 /** References a variable introduced by a surrounding `let()` binding. */
 export interface MindooDBAppViewVariableExpression<T = unknown> extends MindooDBAppViewExpressionBase {
   kind: "variable";
@@ -153,6 +171,7 @@ export type MindooDBAppExpression<T = unknown> =
   | MindooDBAppViewFieldExpression<T>
   | MindooDBAppViewValueExpressionRef<T>
   | MindooDBAppViewOriginExpression
+  | MindooDBAppViewParentExpression<T>
   | MindooDBAppViewVariableExpression<T>
   | MindooDBAppViewOperationExpression<T>
   | MindooDBAppViewIfExpression<T>

@@ -97,6 +97,28 @@ describe("Ephemeral summary views (db.queryView)", () => {
     view.dispose();
   }, 30000);
 
+  it("shows the document id in a column via docId()", async () => {
+    const doc = await db.createDocument({ id: "person_dora" });
+    await db.changeDoc(doc, (d) => {
+      Object.assign(d.getData(), { department: "Sales", name: "Dora", salary: 70 });
+    });
+
+    const view = await db.queryView!({
+      // A document id is metadata rather than a summary field, so docId()
+      // is the only way a view definition can reach it.
+      filter: v.eq(v.docId(), "person_dora"),
+      columns: [
+        VirtualViewColumn.sorted("name", ColumnSorting.ASCENDING),
+        new VirtualViewColumn({ name: "id", expression: v.docId() }),
+      ],
+    });
+
+    const rows = await collectRows(view);
+    expect(rows.map((r) => r.name)).toEqual(["Dora"]);
+    expect(rows.map((r) => r.id)).toEqual(["person_dora"]);
+    view.dispose();
+  }, 30000);
+
   it("re-sorts dynamically over the same summary via resort()", async () => {
     const view = await db.queryView!({
       columns: [VirtualViewColumn.sorted("name", ColumnSorting.ASCENDING)],

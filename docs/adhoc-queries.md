@@ -269,12 +269,170 @@ const result = await db.query({
 ```
 
 The filter IS an expression of the **MindooDB expression language** (the same
-language used for declarative view columns) — built with `createViewLanguage()`
-or parsed from formula text with `parseMindooDBFormulaBooleanExpression()`. Query
-definitions are plain JSON and can be stored or transmitted safely.
+language used for declarative view columns) — built with `createViewLanguage()`.
+Query definitions are plain JSON and can be stored or transmitted safely.
+
+`filter` also accepts the **formula source text** of an expression, which
+`query()` parses for you (the same convenience the app SDK offers, so a query
+object written for one works with the other):
+
+```typescript
+await db.query({ filter: 'v.eq(v.field("type"), "task")' });
+```
+
+Anything else in a filter or sort expression — source text that does not parse,
+a hand-built node with a typo'd `kind` — is rejected with a `MindooQueryError`.
+The evaluator has no default case, so such a node evaluates to `undefined`,
+which as a filter means "matches nothing": without the check, a mistake looks
+exactly like a correct query over data that isn't there.
 
 Sort keys are either summary field paths or expressions
 (`{ expression: v.mul(v.field("amount"), -1) }`).
+
+### Nested lookups: the `include` clause
+
+A query can join related documents onto every row it returns — the invoice's
+customer, its line items, the product each line points at — without a second
+round of queries in application code:
+
+```typescript
+const result = await invoicesDb.query({
+  filter: v.eq(v.field("type"), "invoice"),
+  fields: ["total", "customerId"],
+  include: {
+    customer: {
+      db: customersDb,              // omit for the same database
+      cardinality: "one",
+      localKey: "customerId",       // parent field holding the child's docId
+      fields: ["name"],
+    },
+    lines: {
+      cardinality: "many",
+      filter: v.eq(v.field("invoiceId"), v.parentDocId()),
+      sortBy: [{ field: "amount", direction: "descending" }],
+      fields: ["amount"],
+    },
+  },
+});
+```
+
+The related rows land in **one** new key on the row, `includes`:
+
+```jsonc
+{
+  "docId": "inv_1",
+  "lastModified": 1710000000000,
+  "fields": { "total": 120, "customerId": "c_9" },
+  "includes": {
+    "customer": { "docId": "c_9", "lastModified": 1709000000000, "fields": { "name": "Acme" } },
+    "lines": [
+      { "docId": "line_a", "lastModified": 1710000000000, "fields": { "amount": 80 } }
+    ]
+  }
+}
+```
+
+- `cardinality` is always explicit: `"one"` yields a row or `null` (more than
+  one match is a `MindooQueryError`, never a silently picked first hit),
+  `"many"` yields an array — empty, never `null`.
+- `includes` is **absent** when a query carried no `include`, so existing
+  results keep exactly the shape they always had.
+- Included rows are ordinary rows, so a nested lookup reads as
+  `row.includes.customer.includes.address` — the same rule at every level, up
+  to a nesting depth of 3.
+- Slot names are free-form. They live in their own object, so a relation may be
+  called `fields` or `docId` without colliding with the row's own properties,
+  and the row's top level stays available for future engine data.
+
+TypeScript callers who want precise slot types pass them explicitly; they are
+not inferred from the `include` object:
+
+```typescript
+const result = await db.query<{ customer: MindooQueryRow | null; lines: MindooQueryRow[] }>({ /* … */ });
+result.rows[0].includes?.lines[0].fields.amount;
+```
+
+#### Document ids: `v.docId()` and `v.parentDocId()`
+
+A document's id is **metadata, not a field**. The summary buffer stores the
+fields a document carries, and the id travels beside them, so `v.field("docId")`
+is an ordinary field path that yields `undefined` unless a document really has a
+field of that name. Two helpers reach the ids instead:
+
+- `v.docId()` — the id of the document being evaluated. Valid everywhere:
+  filters, sort keys, and view columns alike.
+- `v.parentDocId()` — the id of the **parent** row of a nested lookup. Valid
+  only inside an include filter.
+
+```typescript
+filter: v.eq(v.docId(), "inv_1")                       // matches that document
+filter: v.eq(v.field("docId"), "inv_1")                // matches nothing
+```
+
+#### `v.parent()` — reaching the parent row
+
+`v.parent(path)` is a second evaluation context, not an operation on the current
+document: inside an include filter it resolves against the **parent** row's
+summary fields — including the mirrored `v.parent("_lastModified")`. It reads
+fields only; `v.parentDocId()` is the id. Outside an include filter there is no
+parent row, so `db.query()` rejects both in a root filter or sort key rather
+than evaluating them to nothing (which as a filter would mean "matches
+nothing").
+
+Inside one include filter, the two contexts combine into the join condition:
+
+```typescript
+filter: v.eq(v.field("invoiceId"), v.parentDocId())    // child points at parent
+filter: v.eq(v.docId(), v.parent("customerId"))        // parent points at child
+```
+
+The second form is exactly what `localKey: "customerId"` desugars to, so
+`localKey` names a **parent field holding the child's id**. An id-to-id self
+join (`v.eq(v.docId(), v.parentDocId())`) has no `localKey` spelling.
+
+When the parent value is an **array**, every element joins, which is how "this
+document references several others" is expressed. `localKey` and `filter` can be
+combined — the filter then narrows the children further
+(`v.eq(v.field("active"), true)`).
+
+#### Cost model of a lookup
+
+A slot costs **one additional summary scan**, never one query per parent row —
+the reason `include` exists in the engine rather than in application code. Three
+consequences follow:
+
+- Hydration runs **after** `sortBy`/`limit`/`offset`, so only the rows actually
+  returned are joined, and `total` stays the unpaged match count of the root
+  query. A `limit: 20` page costs twenty rows' worth of joins no matter how many
+  documents matched.
+- Join keys are read from the parent's **summary entry**, not from the row that
+  is handed back: projecting `fields: ["total"]` does not break a join on
+  `customerId`.
+- An include filter must reduce to exactly one join equality —
+  `v.eq(v.field(childPath), v.parent(parentPath))` in either operand order,
+  optionally ANDed with conditions that do not mention the parent. Anything else
+  that references the parent (a range comparison against a parent value, an `or`
+  spanning parent terms, a second parent equality) is rejected with a
+  `MindooQueryError`: evaluating it would mean a nested loop over
+  parents × children, which is exactly the cost `include` is meant to avoid.
+
+Each `"many"` slot is additionally capped per parent (`limit`, default 200), so
+one pathological parent cannot dominate a result.
+
+#### Coverage and guardrails
+
+`coverage` is the **minimum** over every involved summary: a child database
+still backfilling makes the whole result `"rebuilding"`. Both sides of a join
+are coverage-checked against their own summary — `v.field(…)` paths against the
+database being looked up, `v.parent(…)` paths against the parent's.
+
+`include` cannot be combined with `allowFullScan`: lookups are answered from the
+summary buffer of every involved database, which is what `allowFullScan`
+bypasses. Include-level `text` clauses and sorting root rows by an included
+field are not supported.
+
+Note that `include.db` is a runtime handle — the one part of a query object that
+is not plain JSON. Query ASTs otherwise stay serializable.
 
 ### Full-text search: the `text` clause
 
@@ -504,6 +662,11 @@ subscription.unsubscribe();
 - **Result fingerprinting**: `onResult` only fires when the result actually changed
   (docIds + `lastModified` of the matches, in order). Changes to non-matching
   documents cost only the in-memory scan — no UI cycle.
+- **With `include` lookups**, the fingerprint covers the nested rows too, and the
+  subscription listens on every joined database (deduplicated per instance).
+  Both are needed for the same reason: editing a line item leaves the invoice's
+  own `lastModified` untouched, and a changed customer on another database would
+  otherwise never reach the subscriber that was handed it.
 - Re-evaluations are single-flight with a pending flag (no evaluation backlog);
   evaluation errors go to the optional `onError` callback.
 - React/Vue hooks (`useQuery`, `useView`) are intentionally left to the app SDK;
@@ -538,6 +701,10 @@ documentation.
 
 - **No per-field secondary indexes** (B-tree/inverted): the linear in-memory scan
   is sufficient for the target scale and keeps write paths cheap.
+- **No general join predicates** in `include`: only equality joins are accepted,
+  so a lookup stays one scan. Range or containment joins, sorting root rows by an
+  included field, and sideloading shared documents instead of embedding them are
+  all out.
 - The `dbsetup` design document intentionally stays **minimal**: one document with
   a `summarySetup` and a `fulltextSetup` field, last-writer-wins per Automerge
   merge semantics. There is no per-user or per-device configuration layering in

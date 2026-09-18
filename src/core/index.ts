@@ -399,6 +399,9 @@ export {
   type MindooQuerySubscription,
   type MindooQueryViewDefinition,
   type MindooQuery,
+  type MindooQueryInclude,
+  type MindooQueryIncludeCardinality,
+  type MindooQueryIncludeSlots,
   type MindooQuerySortKey,
   type MindooQueryTextClause,
   type MindooQueryErrorCode,
@@ -406,6 +409,8 @@ export {
   type MindooQueryRow,
   type MindooQueryCoverage,
   type MindooQueryResult,
+  DEFAULT_INCLUDE_LIMIT,
+  MAX_INCLUDE_DEPTH,
 } from "./query";
 
 // Indexing - Document summary buffer (ad-hoc query substrate)

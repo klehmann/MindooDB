@@ -6,6 +6,8 @@ import type {
 } from "./types";
 
 const OP_TO_HELPER: Record<MindooDBAppViewExpressionOperation, string> = {
+  docId: "docId",
+  parentDocId: "parentDocId",
   createdAt: "createdAt",
   lastModifiedAt: "lastModifiedAt",
   decryptionKeyId: "decryptionKeyId",
@@ -145,6 +147,8 @@ function formatExpression(expression: MindooDBAppExpression, level: number, inde
       return `v.value(${JSON.stringify(expression.path)})`;
     case "origin":
       return "v.origin()";
+    case "parent":
+      return `v.parent(${JSON.stringify(expression.path)})`;
     case "variable":
       return expression.name;
     case "if": {
@@ -220,10 +224,18 @@ function formatExpression(expression: MindooDBAppExpression, level: number, inde
   }
 }
 
-/** Expands multi-argument wrappers once nested expressions become hard to read inline. */
+/**
+ * Expands multi-argument wrappers once nested expressions become hard to
+ * read inline. A zero-argument operation (`docId()`, `createdAt()`, the
+ * count helpers) is not one of those: it reads exactly like `origin()`,
+ * so it stays on the line with its siblings.
+ */
 function shouldFormatOperationMultiline(expression: Extract<MindooDBAppExpression, { kind: "operation" }>): boolean {
   return expression.args.length > 1 && expression.args.some((arg) =>
-    arg.kind === "operation" || arg.kind === "if" || arg.kind === "let" || !isInlineExpression(arg));
+    (arg.kind === "operation" && arg.args.length > 0) ||
+    arg.kind === "if" ||
+    arg.kind === "let" ||
+    !isInlineExpression(arg));
 }
 
 /** Identifies expressions that stay readable on a single line. */
@@ -233,6 +245,7 @@ function isInlineExpression(expression: MindooDBAppExpression): boolean {
     case "field":
     case "value":
     case "origin":
+    case "parent":
     case "variable":
     case "json":
       return true;
@@ -376,6 +389,12 @@ class FormulaParser {
       case "origin": {
         this.expectChar(")");
         return { kind: "origin" };
+      }
+      case "parent": {
+        const path = this.parseStringLiteral();
+        this.consumeOptionalComma();
+        this.expectChar(")");
+        return { kind: "parent", path };
       }
       case "ifElse": {
         // Domino-@If-style variadic form: cond1, val1, [cond2, val2, ...], default.

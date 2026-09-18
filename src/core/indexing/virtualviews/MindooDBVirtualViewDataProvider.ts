@@ -191,6 +191,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
           doc: docData as Record<string, unknown>,
           values,
           origin: this.origin,
+          docId: doc.getId(),
           createdAt: new Date(doc.getCreatedAt()).toISOString(),
           lastModifiedAt: new Date(doc.getLastModified()).toISOString(),
           decryptionKeyId: doc.getDecryptionKeyId(),
