@@ -176,6 +176,74 @@ materializes everything. It is the correct choice for one-off administrative or
 migration queries, and for queries that must read `decrypt` expressions. It is
 documented as expensive by design — never put it behind an interactive control.
 
+**Fetch related documents with `include`, not with a query per row.** The second
+shape of the same anti-pattern is running one query per result row to pick up the
+related records — an invoice list that queries its line items per invoice turns
+one cheap scan into N of them. An `include` clause joins them in the same call,
+and the engine answers each slot with ONE additional summary scan regardless of
+how many rows it decorates:
+
+```typescript
+const result = await invoicesDb.query({
+  filter: v.eq(v.field("type"), v.string("invoice")),
+  fields: ["total"],             // `customerId` is joined on but not projected
+  limit: 50,
+  include: {
+    customer: {
+      db: customersDb,           // another database — needs a handle
+      cardinality: "one",        // → a row or null
+      localKey: "customerId",    // this invoice's field holds the customer's id
+      fields: ["name"],
+    },
+    lines: {
+      // No `db`: the slot is scanned in the database this query runs against,
+      // which is where the line items of an invoice live.
+      cardinality: "many",       // → an array, possibly empty, never null
+      filter: v.eq(v.field("invoiceId"), v.parentDocId()),
+      sortBy: [{ field: "position", direction: "ascending" }],
+    },
+    contracts: {
+      // Joined on a shared field rather than on an id: inside an include
+      // filter, `v.field(...)` reads the contract, `v.parent(...)` the invoice.
+      db: contractsDb,
+      cardinality: "many",
+      filter: v.eq(v.field("customerId"), v.parent("customerId")),
+      fields: ["title", "validUntil"],
+    },
+  },
+});
+result.rows[0].includes?.customer?.fields.name;
+result.rows[0].includes?.lines.length;
+```
+
+What the shape of that API is protecting:
+
+- **The join key is what keeps a slot linear.** Exactly one equality may relate
+  the related document to the parent row — `v.parentDocId()` for the parent's id,
+  `v.parent("<path>")` for one of its fields, with `localKey` as shorthand for
+  "this row's field holds the related document's id". Further conditions are
+  allowed but must not mention the parent; anything else is rejected rather than
+  silently evaluated once per (parent × child) pair.
+- **Both sides still have to be summary-covered** ([§4.2](#42-keep-filter-and-sort-fields-summary-coverable)),
+  the related document's fields against the joined database's configuration and
+  the parent's against this one's. Covered is all they need to be: a join key is
+  read from the parent's summary entry, not from `row.fields`, so `localKey` and
+  `v.parent(...)` work on fields the query does not project.
+- **Cardinality is explicit.** A `"one"` slot that matches several documents
+  raises `MindooQueryError` instead of quietly picking the first — that mismatch
+  is a data-model bug, and hiding it would make it permanent.
+- **Hydration runs after `sortBy` / `limit` / `offset`**, so only the rows you
+  actually return are joined and `total` stays the unpaged match count. Slots
+  nest up to three levels, and a `"many"` slot returns at most 200 related rows
+  per parent unless you set `limit`.
+- **`queryLive` watches every database in the tree**, so a change to a joined
+  document delivers a new result too.
+
+In a Haven app the same clause travels over the bridge, with one substitution: a
+related database is named by its logical `databaseId` instead of a handle, and
+the host resolves it under the app's own mapping and `read` capability at every
+level ([§8.1](#81-address-databases-by-logical-id-never-by-physical-name)).
+
 See [Ad-hoc Queries, Ephemeral Views and Reactive Updates](adhoc-queries.md).
 
 ### 4.2 Keep filter and sort fields summary-coverable
@@ -813,6 +881,8 @@ Protocol](network-sync-protocol.md).
 - [ ] Lists, filters, sorts, and counts go through `db.query()` / `db.queryView()`,
       not through a document scan.
 - [ ] `db.getDocument()` is called only for documents the user actually opens.
+- [ ] Related records come from an `include` clause, not from a query per result
+      row.
 - [ ] Every field used in a filter or sort is summary-covered (top-level scalar,
       or an explicit `include` path).
 - [ ] `coverage: "rebuilding"` renders as a hint, not an error.
