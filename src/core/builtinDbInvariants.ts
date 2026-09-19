@@ -16,11 +16,11 @@ import { DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID } from "./types";
  * public key cannot be swapped in after the fact. Anyone may read.
  *
  * Personal documents (see {@link PERSONAL_DOC_ID_PREFIXES}) are the exception
- * inside `userdirectory`: they carry their owner's private data and are
- * therefore usually sealed to recipients, which means neither the server nor
- * another member can read `username_hash` out of them. Ownership for those is
- * the person who signed `doc_create`, resolved from grants — no decryption
- * involved. That person may change and delete their own document.
+ * inside `userdirectory`: they carry their owner's own data and are not
+ * readable by the server, which means it cannot read `username_hash` out of
+ * them. Ownership for those is the person who signed `doc_create`, resolved
+ * from grants — no decryption involved. That person may change and delete
+ * their own document.
  */
 
 export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_undelete" | "doc_snapshot";
@@ -32,8 +32,14 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * server, so any rule reading the payload could not be enforced there.
  *
  * `wks_` — roamed workspace and application list (one document per save id).
+ * `dev_` — one device's peer-sync record (Iroh endpoint id and label).
+ *
+ * The two differ in who may *read* them, which this rule does not care about:
+ * `wks_` documents are sealed to their owner, while `dev_` documents are
+ * encrypted with the tenant `default` key so every member can discover peers
+ * while the hoster still sees ciphertext. Ownership is the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {

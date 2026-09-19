@@ -1,255 +1,231 @@
-# Peer-to-Peer Sync and Advanced Network Topologies
+# Peer-to-Peer Sync
 
-## Why This Document Exists
+Two devices syncing their replicas straight to each other over [Iroh](iroh.md), with no `MindooDBServer` in between.
 
-The network synchronization protocol (see [network-sync-protocol.md](network-sync-protocol.md)) describes how a client synchronizes encrypted entries with a server. But MindooDB's architecture was not designed for client-server alone. The same protocol, the same entry format, and the same `ContentAddressedStore` interface that power server sync also enable peer-to-peer communication, multi-hop relay chains, and network topologies where data flows through nodes that cannot read it.
+This is the practical guide: what to build, in what order, to get sync running in both directions using nothing but the SDK. [network-sync-protocol.md](network-sync-protocol.md) covers the client-server path, and [iroh.md](iroh.md) is the transport reference — this document assumes neither and links out where the detail lives.
 
-This document explains the design decisions that make these advanced topologies possible, walks through the most useful patterns, and discusses when each one is the right choice.
-
----
-
-## 1) The Design Insight That Makes This Work
-
-MindooDB's sync protocol operates on encrypted entries. Every entry payload is encrypted with a symmetric key (AES-256-GCM) before it enters the store. The sync layer never needs to decrypt that payload — it only reads metadata (entry ID, content hash, timestamps, signatures) to figure out what is missing and where to send it.
-
-This means that any node in the network can participate in sync without being able to read the data it is transferring. A server, a relay, or another client can store and forward entries faithfully even if it has no access to the decryption keys. The entry's cryptographic signature ensures integrity regardless of how many hops it takes.
-
-This is not an accidental side effect. It is a deliberate architectural choice: by separating the sync concern (moving encrypted bytes) from the application concern (decrypting and interpreting those bytes), MindooDB enables topologies that would be impossible in systems where the transport layer needs access to plaintext.
+> **Scope.** Everything here is SDK surface, so it works the same in a CLI, a service, a mobile app, or a browser. What the SDK deliberately does *not* prescribe is how two devices learn each other's addresses; that belongs to the application. §7 explains the constraint and how Haven solves it.
 
 ---
 
-## 2) The Interface That Enables Composition
+## 1) Why the same protocol works without a server
 
-At the center of MindooDB's flexibility is the `ContentAddressedStore` interface. Every store — whether backed by local disk, in-memory data, or a remote network connection — implements this same interface. The sync methods `pullChangesFrom()` and `pushChangesTo()` accept any `ContentAddressedStore` or `MindooDB` instance (in which case the store is resolved automatically via `getStore()`). This means they work identically regardless of whether the other side is a local store, a remote server, another client connected over WebRTC, or another `MindooDB` database instance directly.
+Entry payloads are encrypted (AES-256-GCM) before they ever reach a store. The sync layer reads only metadata — entry id, content hash, timestamps, signatures — to work out what the other side is missing. It never needs the plaintext.
 
-Two components make network composition possible:
+Two consequences matter here. First, a peer is not a reduced form of a server: it answers the same comparison-and-transfer protocol, so Bloom summaries, cursor scanning, and deduplication all behave as they do against a server. Second, because `pullChangesFrom()` and `pushChangesTo()` accept any `ContentAddressedStore`, pointing a database at a peer instead of a server is a change of argument, not a change of code path.
 
-**`ClientNetworkContentAddressedStore`** implements `ContentAddressedStore` and acts as a remote proxy. From the caller's perspective, it looks and behaves like a local store, but internally it forwards every operation over a network transport to a remote endpoint. It handles authentication, capability negotiation, and RSA payload decryption transparently.
-
-**`ServerNetworkContentAddressedStore`** accepts incoming sync requests and delegates them to a local `ContentAddressedStore`. The critical detail is in that constructor parameter: the "local store" it delegates to can be any `ContentAddressedStore` implementation — including another `ClientNetworkContentAddressedStore` that points somewhere else.
-
-This composability is what unlocks every topology described in this document.
+There is one real difference from server sync, and it is a simplification: the server path wraps payloads in an extra RSA layer per recipient. Peer sync does not. Entries travel in the encryption they already carry.
 
 ---
 
-## 3) Standard Client-Server Sync
+## 2) The two halves
 
-Before exploring advanced topologies, it helps to understand the baseline that everything builds on.
+Peer sync is deliberately asymmetric in implementation even though it is symmetric in effect. Each device needs both halves to sync in both directions.
 
-In the simplest deployment, a client has a local store (on disk or in memory) and syncs with a server that also has a local store. The client creates a `ClientNetworkContentAddressedStore` pointing at the server, and calls `pullChangesFrom()` to fetch missing entries or `pushChangesTo()` to upload local entries.
+| Half | You use | What it is |
+| --- | --- | --- |
+| Outgoing (dialing) | `IrohPeerStore` | A `ContentAddressedStore` that proxies every call to the peer. Hand it to `pullChangesFrom` / `pushChangesTo`. |
+| Incoming (listening) | `listenForIrohPeers` + `createStoreIrohHandler` | Accepts streams and answers store RPCs against a local store. |
 
-```
-┌──────────┐         HTTPS/TLS         ┌──────────┐
-│  Client   │ ◄──────────────────────► │  Server   │
-│           │                           │           │
-│ LocalStore│                           │ LocalStore│
-└──────────┘                           └──────────┘
-```
-
-The server's `ServerNetworkContentAddressedStore` validates the client's JWT token, looks up entries in its local store, RSA-encrypts the payloads for the requesting client, and returns them. The client decrypts the RSA layer and stores the entries locally.
-
-This is covered in detail in [network-sync-protocol.md](network-sync-protocol.md). When the server has no public HTTPS URL, the same `ClientNetworkContentAddressedStore` can sit on [Iroh](iroh.md) instead of `HttpTransport`. The rest of this document builds on this foundation.
+Both come from `mindoodb/iroh`. The transport underneath is an `IrohStreamIO`, which differs per platform (§6).
 
 ---
 
-## 4) Direct Peer-to-Peer Sync
+## 3) Outgoing: dialing a peer
 
-In a peer-to-peer scenario, two clients sync directly without a central server. This works because both sides of the sync use the same `ContentAddressedStore` interface.
+`IrohPeerStore` takes the transport, the peer's address, the database id, and which store kind you mean:
 
-### How it works
+```ts
+import { IrohPeerStore, StoreKind } from "mindoodb/iroh";
 
-Each peer runs a lightweight server component that wraps its local store with a `ServerNetworkContentAddressedStore`. The other peer connects to it via a `ClientNetworkContentAddressedStore`. The transport can be HTTP over a local network, WebRTC for NAT traversal, or any other mechanism that implements the `NetworkTransport` interface.
+const peer = new IrohPeerStore(io, `iroh:${peerEndpointId}`, "mydb", StoreKind.docs, {
+  tenantId: "tenant-1",
+  peerEndpointId,
+});
 
-```
-┌──────────┐       WebRTC / LAN        ┌──────────┐
-│  Peer A   │ ◄──────────────────────► │  Peer B   │
-│           │                           │           │
-│ LocalStore│                           │ LocalStore│
-│ + Server  │                           │ + Server  │
-└──────────┘                           └──────────┘
+await db.pullChangesFrom(peer, { storeKind: StoreKind.docs });
+await db.pushChangesTo(peer, { storeKind: StoreKind.docs });
 ```
 
-Both peers can act as client and server simultaneously. Peer A pulls from Peer B, then Peer B pulls from Peer A. After both operations complete, both peers have the same set of entries.
+Three details are easy to get wrong:
 
-### Why this design was chosen
+**Pass `tenantId`.** It travels as `ctx` with every call and is how the listener knows which of its replicas you mean. Without it a listener holding several tenants has to guess.
 
-Many P2P sync systems require a custom protocol that is fundamentally different from their client-server protocol. MindooDB avoids this by making the same `ContentAddressedStore` interface serve both roles. A peer does not need a different sync implementation for P2P — it reuses the same `pullChangesFrom()` and `pushChangesTo()` methods, the same capability negotiation, and the same reconciliation logic. The only thing that changes is the transport layer underneath.
+**Pass `peerEndpointId` when you dial by ticket.** The store's cache identity keys the sync scan cursor. A ticket embeds the peer's current relay and addresses, so keying on it would reset the cursor every time the peer changes network and force a full metadata rescan. The endpoint id never changes. Dialing by bare id (as above) already gives a stable key, so the option only matters for tickets.
 
-### When to use this
-
-Direct P2P sync is ideal when two devices are on the same network (or can establish a direct WebRTC connection) and you want to sync without depending on a central server. Common scenarios include field teams syncing tablets at a job site, or two users exchanging updates in a meeting room.
+**Attachments are a separate store.** `storeKind` defaults to `StoreKind.docs`. A database with attachments needs a second `IrohPeerStore` built with `StoreKind.attachments` and a second pair of calls; syncing only docs leaves attachment bytes behind.
 
 ---
 
-## 5) Relay and Passthrough Nodes
+## 4) Incoming: answering a peer
 
-This is where MindooDB's architecture enables something unusual: a node that participates in sync without being able to read the data it handles.
+Listening is where the security lives. A caller reaching this path is addressing your storage directly, so three separate questions have to be answered before you serve anything.
 
-### The relay pattern
+```ts
+import {
+  createStoreIrohHandler,
+  listenForIrohPeers,
+  type IrohRpcHandler,
+} from "mindoodb/iroh";
 
-Consider three users: Alice, Bob, and Carol. Alice and Carol share encrypted documents that Bob cannot decrypt. But Bob's server is the only one with reliable uptime and connectivity. Can Alice sync her data through Bob's server to reach Carol?
+const handler: IrohRpcHandler = async (method, args, ctx, peerEndpointId) => {
+  // 1. Which replica? Route on ctx, and never reveal what you do not hold.
+  const store = resolveLocalStore(ctx?.tenantId, ctx?.dbId, ctx?.storeKind);
+  if (!store) {
+    throw new Error("Not available");
+  }
+  // 2. Which peer? Re-check per request, not just per connection.
+  if (!peerEndpointId || !isAllowed(peerEndpointId, ctx?.tenantId)) {
+    throw new Error("Not available");
+  }
+  // 3. Which methods? The default allowlist, never the raw store.
+  return createStoreIrohHandler(store)(method, args, ctx, peerEndpointId);
+};
 
-Yes. Because sync operates on encrypted entries, Bob's server can store and forward Alice's entries without ever accessing their plaintext content. When Carol connects to Bob's server and syncs, she receives Alice's entries — still encrypted with keys that only Alice and Carol share. Bob's server fulfilled its role as a relay without needing (or having) access to the decryption keys.
-
-```
-┌──────────┐                ┌──────────┐                ┌──────────┐
-│  Alice    │ ──── sync ──► │   Bob    │ ◄── sync ──── │  Carol    │
-│           │                │  (relay)  │                │           │
-│ can read  │                │ cannot    │                │ can read  │
-│ the data  │                │ read data │                │ the data  │
-└──────────┘                └──────────┘                └──────────┘
-```
-
-This works because:
-
-1. Entry payloads are encrypted at the application layer before they enter any store.
-2. The sync protocol only needs metadata (IDs, hashes, timestamps) to reconcile — it never inspects payload contents.
-3. Entry signatures guarantee integrity regardless of how many intermediaries handle the entry.
-4. Bob's server stores the encrypted bytes faithfully and serves them to Carol when she syncs.
-
-### Why this matters
-
-In many real-world deployments, not every node should be able to read every piece of data. A shared infrastructure server might host data for multiple teams with different access levels. A regional office server might relay data between field workers who share encrypted project data that the office administrator does not need to see. The relay pattern makes these topologies safe by default — there is no configuration step to "disable decryption" on the relay, because the relay never had the keys in the first place.
-
----
-
-## 6) Store Chaining: The Passthrough Architecture
-
-The relay pattern described above works naturally when a server stores entries locally and other clients sync from that local store. But MindooDB's composability enables an even more powerful pattern: a node that does not store data locally at all, but instead forwards sync requests to another remote store in real time.
-
-### How store chaining works
-
-`ServerNetworkContentAddressedStore` accepts any `ContentAddressedStore` as its backing store. A `ClientNetworkContentAddressedStore` implements `ContentAddressedStore`. This means you can construct a server whose backing store is actually a client connection to another server:
-
-```
-┌──────────┐         ┌──────────────────────┐         ┌──────────┐
-│  Client   │ ──────►│  Passthrough Node     │────────►│  Origin   │
-│           │        │                       │         │  Server   │
-│           │        │ ServerNetwork...Store  │         │           │
-│           │        │   └─► ClientNetwork..  │         │ LocalStore│
-│           │        │         Store (proxy)  │         │           │
-└──────────┘        └──────────────────────┘         └──────────┘
+await listenForIrohPeers(io, handler, {
+  authorize: (peerEndpointId) => Boolean(peerEndpointId) && isKnownDevice(peerEndpointId!),
+  maxConcurrentSessions: 32,
+  signal: abortController.signal,
+});
 ```
 
-When the client sends a `findNewEntries` request to the passthrough node, the passthrough's `ServerNetworkContentAddressedStore` receives it, validates the token, and delegates to its backing store — which is a `ClientNetworkContentAddressedStore` pointing at the origin server. The request flows through to the origin, the response flows back, and the client receives its answer as if it were talking to the origin directly.
+**Which replica.** Route on `ctx` (`tenantId`, `dbId`, `storeKind`). Serve only replicas that exist locally, and answer everything else with the *same* opaque error — a distinguishable "unknown tenant" lets a caller enumerate which tenants your device holds.
 
-### When to use store chaining
+**Which peer.** The QUIC handshake proves the caller holds the secret behind its endpoint id, and you receive it as `peerEndpointId`. That is authentication, not authorization: it tells you *who* is calling, not whether they may. The `authorize` callback gates the connection once; the handler should still check per request, because one connection can carry calls for several tenants. Treat an undefined `peerEndpointId` as an unknown peer and refuse — it means the adapter could not report the caller. Without this check, any endpoint on the internet that learns your id is served.
 
-**Edge caching.** Place a passthrough node close to a group of clients (e.g., in the same data center or office). The passthrough can optionally cache entries in a local store alongside the forwarding connection, serving as both a relay and a local cache that reduces latency for repeated requests.
+**Which methods.** `createStoreIrohHandler` resolves methods by name off the store object, so it is gated by `IROH_SYNC_STORE_METHODS` by default. Keep that default. The store also exposes `purgeDocHistory`, which would let a peer destroy history on your device. Pass a narrower `allowedMethods` for a read-only mirror (drop `putEntries` and `applyWitnessReceipts`).
 
-**Access control boundaries.** A passthrough node can enforce its own authentication and authorization layer before forwarding requests. This is useful when the origin server is internal and should not be exposed directly to external clients.
+`maxConcurrentSessions` (default 32) caps how much one caller can tie up by opening streams in a loop.
 
-**Multi-hop data distribution.** In geographically distributed deployments, data can flow through a chain of nodes — origin server to regional relay to local office server to field devices — with each hop using the same protocol and the same entry format. No node in the chain needs to decrypt the payload to forward it correctly.
+### Materializing what arrives
 
-### What makes this different from a traditional proxy
+Entries land as bytes. They become documents only when something drives that:
 
-A traditional HTTP reverse proxy forwards opaque bytes without understanding the protocol. MindooDB's store chaining is protocol-aware: the passthrough node participates in capability negotiation, can serve Bloom filter summaries from its own cache, and can merge metadata from multiple upstream sources. It is a first-class participant in the sync protocol, not a transparent byte forwarder.
+```ts
+await db.syncStoreChanges();
+```
 
----
-
-## 7) Multi-Party Sync Without Shared Keys
-
-The patterns above lead to a topology that is rare in encrypted database systems: multi-party sync where not all participants share decryption keys.
-
-### The scenario
-
-Consider a healthcare application. A doctor creates encrypted patient records. A hospital server stores and distributes those records. A specialist at another clinic needs to review specific records. The hospital IT administrator manages the server but should not have access to patient data.
-
-With MindooDB:
-
-1. The doctor encrypts entries with keys shared only with authorized medical staff.
-2. The hospital server stores the encrypted entries and syncs them to all connected clients.
-3. The specialist syncs from the hospital server and decrypts the entries using their shared key.
-4. The IT administrator can manage, monitor, and maintain the server (including compaction telemetry) without ever being able to decrypt patient records.
-
-No special configuration is required to achieve this. It is simply how the system works when encryption keys are distributed to authorized users and the sync layer operates on encrypted entries.
-
-### Trust model
-
-The trust boundary in MindooDB is at the encryption key level, not at the network topology level. Any node can participate in sync — the question is which nodes hold keys that can decrypt which entries. This separation means you can add relay nodes, regional caches, or partner-organization servers to the sync topology without expanding the set of entities that can read sensitive data.
-
-Entry signatures (Ed25519) provide an additional layer: even if a relay or intermediary were malicious, it cannot forge or tamper with entries without detection, because every entry carries a cryptographic signature from its creator.
+Call it after an inbound `putEntries`. Skipping it is the single most common reason a peer sync "did nothing" — the data is there, it just has not been processed.
 
 ---
 
-## 8) Transport Options for P2P
+## 5) A complete pair
 
-MindooDB's sync protocol is transport-agnostic. The `NetworkTransport` interface abstracts the wire communication, and any transport that can carry request/response messages can be used. Here are the most common choices for P2P scenarios:
+A CLI that both listens and dials, with persistent identity, on Node:
 
-### WebRTC
+```ts
+import { createNodeIrohStreamIO } from "mindoodb/iroh/node";
+import {
+  IrohPeerStore,
+  StoreKind,
+  createStoreIrohHandler,
+  listenForIrohPeers,
+} from "mindoodb/iroh";
 
-WebRTC is the recommended transport for P2P sync across the internet. It handles NAT traversal automatically, provides encrypted channels by default, and works across platforms (browsers, React Native, Node.js). A signaling mechanism (a lightweight server, mDNS, or manual exchange) is needed for the initial connection setup, but once established, communication is direct between peers.
+// One secret per install; the endpoint id derived from it is what peers dial.
+// A fresh secret on every start would make every published id worthless.
+const io = await createNodeIrohStreamIO({ dataDir: "./data" });
+console.log("this device:", io.endpointId);
 
-### Local network (HTTP/mDNS)
+// --- incoming -------------------------------------------------------------
+const dbId = db.getStore().getId();
+const allowed = new Set([partnerEndpointId]);
+void listenForIrohPeers(
+  io,
+  async (method, args, ctx, peer) => {
+    if (ctx?.dbId !== dbId || !peer || !allowed.has(peer)) {
+      throw new Error("Not available");
+    }
+    const store = ctx.storeKind === StoreKind.attachments ? db.getAttachmentStore() : db.getStore();
+    const result = await createStoreIrohHandler(store)(method, args, ctx, peer);
+    if (method.endsWith("putEntries")) {
+      await db.syncStoreChanges();
+    }
+    return result;
+  },
+  { authorize: (peer) => Boolean(peer) && allowed.has(peer!) },
+);
 
-For devices on the same WiFi or LAN, running a lightweight HTTP server and discovering peers via mDNS/Bonjour is the simplest approach. Each peer advertises its sync endpoint, and other peers connect using standard HTTP. This avoids the complexity of WebRTC signaling when NAT traversal is not needed.
+// --- outgoing -------------------------------------------------------------
+for (const storeKind of [StoreKind.docs, StoreKind.attachments]) {
+  const peer = new IrohPeerStore(io, `iroh:${partnerEndpointId}`, dbId, storeKind, {
+    tenantId,
+  });
+  await db.pullChangesFrom(peer, { storeKind });
+  await db.pushChangesTo(peer, { storeKind });
+}
+```
 
-### Bluetooth Low Energy
-
-For close-proximity sync without any network connectivity (e.g., two tablets in a field with no WiFi), BLE can serve as the transport layer. Bandwidth is limited, so this works best for small-to-medium datasets or incremental sync of recent changes.
-
-### Choosing a transport
-
-The choice depends on your connectivity environment. WebRTC is the most versatile option and works in the widest range of scenarios. Local network HTTP is simpler to implement when all devices are on the same network. BLE is a last resort for truly offline environments. In practice, many applications implement multiple transports and select the best available one at runtime.
-
----
-
-## 9) Peer Discovery
-
-Before two peers can sync, they need to find each other. MindooDB does not prescribe a discovery mechanism — the sync protocol starts after a transport connection is established — but here are proven approaches:
-
-**mDNS / Bonjour** works well for automatic discovery on local networks. Each peer broadcasts a service advertisement, and other peers discover it without manual configuration. This is the most seamless user experience for same-network scenarios.
-
-**QR code / manual pairing** is useful for initial connection setup across different networks. One device displays a QR code containing its connection endpoint (IP address, signaling server URL, or WebRTC offer), and the other device scans it. This is secure because it requires physical proximity for the initial exchange.
-
-**Signaling server** is the standard approach for WebRTC. A lightweight server brokers the initial connection handshake between two peers, after which communication is direct. The signaling server does not handle sync data — it only facilitates the WebRTC connection setup.
-
-**Hybrid discovery** combines multiple methods: mDNS for same-network peers, a signaling server for remote WebRTC connections, and QR codes as a fallback. This provides automatic discovery when possible and manual options when needed.
-
----
-
-## 10) Practical Considerations
-
-### Local-first behavior
-
-Every peer should maintain a local store that works independently of network connectivity. When a connection is available, sync transfers missing entries. When the connection drops, the peer continues working with its local data. This is the same local-first model used in client-server sync — P2P simply adds more sync targets.
-
-### Conflict resolution
-
-MindooDB uses CRDTs (Conflict-free Replicated Data Types) for document state. This means that entries synced from multiple peers in any order will converge to the same document state. There is no need for conflict resolution logic in the sync layer — the data model handles it.
-
-### Entry deduplication
-
-Entries are identified by `id` and deduplicated by `contentHash`. If the same entry arrives from multiple peers (which is common in mesh topologies), it is stored once. The sync protocol's `hasEntries` check prevents redundant transfers.
-
-### Security in P2P
-
-In a P2P scenario, peers authenticate each other using the same challenge-response mechanism used in client-server sync. Each peer's `ServerNetworkContentAddressedStore` validates tokens using the tenant directory, which contains the authorized users and their public keys. A peer that is not in the tenant directory cannot authenticate and cannot participate in sync.
-
-### Performance at scale
-
-The optimized sync features (cursor scanning and Bloom filters) work identically in P2P scenarios. For peers with large local stores, cursor-based scanning avoids transmitting large ID lists, and Bloom filter summaries reduce the number of existence checks. These optimizations are negotiated per-connection through capability discovery, so a peer that supports them will use them automatically when connecting to another peer that also supports them.
+Run this on both devices with each other's endpoint id and they converge. Order does not matter: document state is CRDT-based, so entries arriving from either side in any order settle on the same result.
 
 ---
 
-## 11) Summary of Topologies
+## 6) Platforms, relays, and what "direct" means
 
-| Topology | Description | Key benefit |
-|---|---|---|
-| Client-Server | Standard sync with a central server | Simplest deployment |
-| Peer-to-Peer | Two clients sync directly | No server dependency |
-| Relay | Data flows through a node that cannot decrypt it | Secure data distribution |
-| Store chain | A node forwards sync requests to another remote store | Edge caching, access boundaries |
-| Multi-hop | Data traverses multiple nodes to reach its destination | Geographic distribution |
-| Mesh | Multiple peers sync with each other | Resilience, convergence |
+`IrohStreamIO` is the seam. Everything above is identical across platforms; only the adapter and the connectivity it can achieve change.
 
-All of these topologies use the same sync protocol, the same entry format, and the same `ContentAddressedStore` interface. The choice of topology is a deployment decision, not a code change.
+| Platform | Adapter | Connectivity |
+| --- | --- | --- |
+| Node / CLI / service | `createNodeIrohStreamIO` (`mindoodb/iroh/node`) | Hole punching, falls back to relay |
+| React Native | `createReactNativeIrohStreamIO` | Hole punching, falls back to relay |
+| Browser / PWA | Haven's WASM build (`ensureHavenIrohStreamIO`) | Relay only |
+
+The browser limitation is structural, not a missing feature: a page cannot open raw UDP sockets, so there is no hole punching to do. Every byte between two browser tabs goes through a relay. That costs latency and relay bandwidth, and the n0 public relays are shared, rate-limited, and carry no SLA — fine for syncing a handful of devices, not a transport to build a product on without reading [iroh.computer/pricing](https://www.iroh.computer/pricing) first.
+
+Native adapters attempt a direct path first and fall back to a relay when NAT traversal fails. A future CLI or native mobile client therefore gets materially better peer sync than the PWA does, with no change to the code in §3–§5.
+
+Relays never see plaintext. They forward QUIC packets; the entries inside are already encrypted, and the relay has no key.
+
+### Addressing: id or ticket
+
+A bare 64-hex endpoint id is dialable on its own, because Iroh publishes the changing address information to `dns.iroh.link` via pkarr and resolves it back on dial. That is what makes the `iroh:<endpointId>` form in the examples work, and it is why an endpoint id is the only thing worth persisting. A ticket additionally embeds current relay and socket addresses — useful for an offline LAN exchange (QR, see [sqlite-and-iroh.md](sqlite-and-iroh.md)), but it goes stale.
 
 ---
 
-## 12) Related Documents
+## 7) Discovery is the application's job
 
-- Network sync protocol: [network-sync-protocol.md](network-sync-protocol.md)
-- On-disk store: [on-disk-content-addressed-store.md](on-disk-content-addressed-store.md)
-- DB open, dense sync, and materialization planner: [db-open-and-sync-optimization.md](db-open-and-sync-optimization.md)
+The SDK starts at "I have the peer's endpoint id." Getting that id from one device to the other is deliberately out of scope, because the right channel depends entirely on the product: a QR code, a pairing server, a shared directory, or a user pasting a string.
+
+The constraint to design around: **the id must be stable, and the channel must be one the peer can read before the connection exists.** An id that rotates is worthless, since a peer that has not synced recently would hold a dead address.
+
+Haven is the reference implementation. Each device persists one Iroh secret and publishes the derived endpoint id as a `dev_<fingerprint>` document in the tenant's `userdirectory`, encrypted with the tenant `default` key. That gets the properties you want: every member of the tenant can resolve a device label to an endpoint, while the hoster — who has `$publicinfos` but not `default` — cannot read it at all. The allowlist for `authorize` is built from exactly those documents. See [userkeys.md](userkeys.md) §7.6.1 for the document format and the anti-spoofing rules.
+
+Note what this buys and what it costs. It is server-assisted discovery for a serverless sync: the directory has to have travelled at least once before two devices can find each other, which is why Haven only offers peer sync for tenants that already live on a server. A product with a different pairing story (QR at setup, for instance) has no such dependency.
+
+---
+
+## 8) Testing without a network
+
+`createLoopbackIrohPair()` returns two `IrohStreamIO` instances wired to each other in-process. Everything in §3 and §4 runs against it unchanged, so the routing, allowlist, and method-gating logic can be tested without relays, NAT, or timing:
+
+```ts
+import { createLoopbackIrohPair } from "mindoodb/iroh";
+
+const { a, b } = createLoopbackIrohPair();
+```
+
+See `src/__tests__/IrohPeerSyncGuards.test.ts` for the three guards tested this way.
+
+---
+
+## 9) What peer sync does not give you
+
+Worth knowing before designing around it:
+
+- **No JWT, no tenant publication, no cluster membership.** A peer is not a server. It does not issue tokens, host tenants for others, or join a mesh.
+- **No live change feed.** `subscribeToChanges` over a peer link is not part of this path; sync is something you trigger.
+- **No witness receipts** from the peer.
+- **No availability.** A peer answers only while its process is running and listening. For a browser tab that means only while the tab is open.
+
+If you need any of these, you need a server — see [iroh.md](iroh.md) §Server for running one reachable over Iroh rather than HTTPS.
+
+---
+
+## 10) Related documents
+
+- Iroh transport, adapters, relays: [iroh.md](iroh.md)
+- Client-server sync protocol: [network-sync-protocol.md](network-sync-protocol.md)
+- Peer-device records and key visibility: [userkeys.md](userkeys.md)
+- Ticket exchange over QR on a LAN: [sqlite-and-iroh.md](sqlite-and-iroh.md)
+- React Native adapter: [reactnative.md](reactnative.md)
 - Main system spec: [specification.md](specification.md)

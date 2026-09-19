@@ -282,6 +282,47 @@ describe("evaluateBuiltinWrite", () => {
       ).toMatch(/the admin cannot change a personal document/);
     });
 
+    it("covers peer-device records, which are tenant-readable rather than sealed", () => {
+      // `dev_` documents carry an Iroh endpoint id encrypted with the tenant
+      // `default` key, so every member can read them. The invariant does not
+      // look at encryption at all — it keys off the id prefix and the creator —
+      // so the same ownership rule has to hold for a readable document too.
+      const device = {
+        dbId: "userdirectory",
+        docId: "dev_0123456789abcdef0123456789abcdef",
+      } as const;
+      expect(
+        evaluateBuiltinWrite({
+          ...device,
+          op: "doc_create",
+          signerKey: alice,
+          adminPublicKey: admin,
+          signerUsernameHash: aliceHash,
+        }).allowed,
+      ).toBe(true);
+      expect(
+        evaluateBuiltinWrite({
+          ...device,
+          op: "doc_change",
+          signerKey: alice,
+          adminPublicKey: admin,
+          creatorUsernameHash: aliceHash,
+          signerUsernameHash: aliceHash,
+        }).allowed,
+      ).toBe(true);
+      // Nobody may repoint someone else's device record at their own endpoint.
+      expect(
+        evaluateBuiltinWrite({
+          ...device,
+          op: "doc_change",
+          signerKey: bob,
+          adminPublicKey: admin,
+          creatorUsernameHash: aliceHash,
+          signerUsernameHash: bobHash,
+        }).allowed,
+      ).toBe(false);
+    });
+
     it("denies a change when the owner cannot be resolved", () => {
       expect(
         evaluateBuiltinWrite({

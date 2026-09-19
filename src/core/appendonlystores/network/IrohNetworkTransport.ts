@@ -39,6 +39,7 @@ import {
   type IrohStreamIO,
   type IrohRpcContext,
 } from "./IrohStreamIO";
+import { resolveIrohEndpointId } from "./irohLocator";
 
 export type { IrohRpcContext };
 
@@ -353,13 +354,34 @@ export class IrohPeerStore implements ContentAddressedStore {
   private stream: IrohByteStream | null = null;
   private connection: Promise<IrohConnectionHandle> | null = null;
   private sessionTail: Promise<unknown> = Promise.resolve();
+  private readonly tenantId?: string;
+  private readonly peerKey: string;
 
   constructor(
     private readonly io: IrohStreamIO,
     private readonly peerTicket: string,
     private readonly dbId: string,
     private readonly storeKind: ReturnType<ContentAddressedStore["getStoreKind"]>,
-  ) {}
+    options?: {
+      /** Sent as `ctx.tenantId` so a listener can route to the right replica. */
+      tenantId?: string;
+      /**
+       * Stable endpoint id of the peer. Only needed when dialing by ticket —
+       * dialing by id already yields a stable key.
+       */
+      peerEndpointId?: string;
+    },
+  ) {
+    this.tenantId = options?.tenantId;
+    // The scan cursor is keyed by this string (see `syncScanCursorKey`). A
+    // ticket embeds the peer's current relay and addresses, so keying on it
+    // would invalidate the cursor whenever the peer's network changes and
+    // force a full metadata rescan. The endpoint id never changes.
+    this.peerKey =
+      resolveIrohEndpointId(options?.peerEndpointId) ??
+      resolveIrohEndpointId(peerTicket) ??
+      peerTicket;
+  }
 
   getId(): string {
     return this.dbId;
@@ -370,7 +392,15 @@ export class IrohPeerStore implements ContentAddressedStore {
   }
 
   getCacheIdentity(): string {
-    return `iroh:${this.peerTicket}:${this.dbId}:${this.storeKind}`;
+    return `iroh:${this.peerKey}:${this.dbId}:${this.storeKind}`;
+  }
+
+  private rpcContext(): IrohRpcContext {
+    return {
+      tenantId: this.tenantId,
+      dbId: this.dbId,
+      storeKind: this.storeKind,
+    };
   }
 
   private async sharedConnection(): Promise<IrohConnectionHandle | null> {
@@ -404,12 +434,14 @@ export class IrohPeerStore implements ContentAddressedStore {
     if (connection) {
       const stream = await connection.openStream();
       try {
-        return await rpcCall(stream, method, args, this.nextId++);
+        return await rpcCall(stream, method, args, this.nextId++, this.rpcContext());
       } finally {
         await stream.close();
       }
     }
-    return this.enqueueSession(async () => rpcCall(await this.session(), method, args, this.nextId++));
+    return this.enqueueSession(async () =>
+      rpcCall(await this.session(), method, args, this.nextId++, this.rpcContext()),
+    );
   }
 
   putEntries(entries: StoreEntry[]) {
@@ -481,11 +513,57 @@ export type IrohRpcHandler = (
   method: string,
   args: unknown[],
   ctx?: IrohRpcContext,
+  /**
+   * Endpoint id of the caller, proven by the QUIC handshake. Undefined when
+   * the adapter cannot report it — treat that as an unknown peer.
+   */
+  peerEndpointId?: string,
 ) => Promise<unknown>;
 
-export function createStoreIrohHandler(store: ContentAddressedStore): IrohRpcHandler {
+/**
+ * Store methods a sync peer legitimately needs: compare (Bloom + head), scan,
+ * fetch, and hand over entries.
+ *
+ * Everything else a {@link ContentAddressedStore} happens to expose stays out,
+ * because {@link createStoreIrohHandler} resolves methods by name off the store
+ * object. Without this list a peer could call `purgeDocHistory` and destroy
+ * history on the listening device.
+ */
+export const IROH_SYNC_STORE_METHODS: readonly string[] = [
+  "getIdBloomSummary",
+  "getStoreHead",
+  "scanEntriesSince",
+  "hasEntries",
+  "findNewEntries",
+  "findNewEntriesForDoc",
+  "findEntries",
+  "getEntries",
+  "getEntryMetadata",
+  "getAllIds",
+  "putEntries",
+  "applyWitnessReceipts",
+  "resolveDependencies",
+  "planDocumentMaterialization",
+  "planDocumentMaterializationBatch",
+];
+
+export function createStoreIrohHandler(
+  store: ContentAddressedStore,
+  options?: {
+    /**
+     * Methods this handler will dispatch. Defaults to
+     * {@link IROH_SYNC_STORE_METHODS}; pass an explicit list to narrow further
+     * (for example read-only mirrors that must reject `putEntries`).
+     */
+    allowedMethods?: readonly string[];
+  },
+): IrohRpcHandler {
+  const allowed = new Set(options?.allowedMethods ?? IROH_SYNC_STORE_METHODS);
   return async (method, args) => {
     const name = method.startsWith("store.") ? method.slice(6) : method;
+    if (!allowed.has(name)) {
+      throw new Error(`Iroh store method ${method} is not allowed`);
+    }
     const fn = (store as unknown as Record<string, (...inner: unknown[]) => Promise<unknown>>)[name];
     if (typeof fn !== "function") {
       throw new Error(`Unknown Iroh store method ${method}`);
@@ -515,7 +593,12 @@ export async function serveIrohRpc(stream: IrohByteStream, handler: IrohRpcHandl
       }
       const request = decodeIrohFrame(bytes) as IrohRpcRequest;
       try {
-        const result = await handler(request.method, request.args, request.ctx);
+        const result = await handler(
+          request.method,
+          request.args,
+          request.ctx,
+          stream.remoteEndpointId,
+        );
         if (isAsyncIterable(result)) {
           await streamHandlerIterable(stream, request, result);
           return;
@@ -584,23 +667,68 @@ async function streamHandlerIterable(
   }
 }
 
+export interface IrohListenOptions {
+  signal?: AbortSignal;
+  /**
+   * Connection-level gate, run once per inbound stream before any RPC is
+   * served. Return false to drop the stream immediately.
+   *
+   * `peerEndpointId` is authenticated (QUIC proved key possession) but not
+   * authorized — that is what this callback decides, typically by looking the
+   * id up in the tenant directory. It is undefined when the adapter cannot
+   * report the peer, which an authorizing listener should reject.
+   *
+   * Per-request scope (`ctx.tenantId` / `ctx.dbId`) still has to be checked in
+   * the handler; this gate only sees the connection.
+   */
+  authorize?(peerEndpointId: string | undefined): boolean | Promise<boolean>;
+  /**
+   * Maximum RPC sessions served at once. Further inbound streams are closed
+   * without being served, so an unauthorized peer cannot pin resources by
+   * opening streams in a loop. Defaults to 32.
+   */
+  maxConcurrentSessions?: number;
+}
+
+const DEFAULT_MAX_CONCURRENT_IROH_SESSIONS = 32;
+
 export async function listenForIrohPeers(
   io: IrohStreamIO,
   handler: IrohRpcHandler,
-  options?: { signal?: AbortSignal },
+  options?: IrohListenOptions,
 ): Promise<void> {
   if (!io.listen) {
     throw new Error("IrohStreamIO.listen is required to accept peers");
   }
+  const maxSessions = options?.maxConcurrentSessions ?? DEFAULT_MAX_CONCURRENT_IROH_SESSIONS;
+  const sessions = new Set<Promise<void>>();
   for await (const stream of io.listen(MINDOODB_IROH_ALPN)) {
     if (options?.signal?.aborted) {
       await stream.close();
       return;
     }
-    void serveIrohRpc(stream, handler).catch((error) => {
+    if (sessions.size >= maxSessions) {
+      await stream.close();
+      continue;
+    }
+    if (options?.authorize) {
+      let allowed = false;
+      try {
+        allowed = await options.authorize(stream.remoteEndpointId);
+      } catch (error) {
+        console.error("[Iroh] peer authorization failed:", error);
+      }
+      if (!allowed) {
+        await stream.close();
+        continue;
+      }
+    }
+    const session = serveIrohRpc(stream, handler).catch((error) => {
       if (!isBenignIrohClose(error)) {
         console.error("[Iroh] RPC session failed:", error);
       }
     });
+    sessions.add(session);
+    void session.finally(() => sessions.delete(session));
   }
 }

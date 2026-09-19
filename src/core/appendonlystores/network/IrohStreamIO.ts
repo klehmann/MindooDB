@@ -5,6 +5,8 @@
  * `mindoodb/sync-v5`). The Node server uses `@number0/iroh`. Tests use
  * {@link createLoopbackIrohPair}.
  */
+import { normalizeIrohEndpointId } from "./irohLocator";
+
 export const MINDOODB_IROH_ALPN = "mindoodb/sync-v5";
 
 /**
@@ -28,6 +30,18 @@ export interface IrohByteStream {
   recv(): Promise<Uint8Array | null>;
   /** Finish the send side and release the stream. */
   close(): Promise<void>;
+  /**
+   * Endpoint id of the peer on the other end, when the adapter can report it.
+   *
+   * On an inbound stream this is proof of identity: QUIC only completes the
+   * handshake if the peer holds the secret key behind that id. Authorization
+   * (is this peer a member of the tenant?) still has to be looked up
+   * separately — see {@link IrohListenOptions.authorize}.
+   *
+   * Loopback and older adapters leave this undefined, which must be treated as
+   * "unknown peer", never as "trusted".
+   */
+  readonly remoteEndpointId?: string;
 }
 
 /**
@@ -47,6 +61,13 @@ export interface IrohConnectionHandle {
  * inbound streams on {@link MINDOODB_IROH_ALPN}.
  */
 export interface IrohStreamIO {
+  /**
+   * Stable 64-char lowercase hex id of the local endpoint, derived from its
+   * secret key. Unlike a ticket this never goes stale: peers dial it and the
+   * pkarr/DNS address lookup resolves the current relay. Adapters that cannot
+   * report it (loopback) leave it undefined.
+   */
+  readonly endpointId?: string;
   /**
    * Return the stable local ticket (or endpoint id) other peers can dial.
    * Native bindings usually return an `endpoint…` ticket; loopback uses
@@ -139,12 +160,17 @@ export function isBenignIrohClose(error: unknown): boolean {
  * message-oriented and do not use this.
  *
  * @param raw Unframed write/read/close used by `@number0/iroh` (and similar)
+ * @param remoteEndpointId Peer id from the QUIC handshake, forwarded onto the
+ *   wrapped stream so listeners can authorize it
  */
-export function wrapLengthPrefixedByteStream(raw: {
-  write(bytes: Uint8Array): Promise<void>;
-  read(max: number): Promise<Uint8Array | null>;
-  close(): Promise<void>;
-}): IrohByteStream {
+export function wrapLengthPrefixedByteStream(
+  raw: {
+    write(bytes: Uint8Array): Promise<void>;
+    read(max: number): Promise<Uint8Array | null>;
+    close(): Promise<void>;
+  },
+  remoteEndpointId?: string,
+): IrohByteStream {
   let pending = new Uint8Array(0);
 
   const readExact = async (need: number): Promise<Uint8Array | null> => {
@@ -164,6 +190,7 @@ export function wrapLengthPrefixedByteStream(raw: {
   };
 
   return {
+    remoteEndpointId,
     async send(bytes: Uint8Array) {
       const header = new Uint8Array(4);
       new DataView(header.buffer).setUint32(0, bytes.length);
@@ -240,6 +267,8 @@ class LoopbackStream implements IrohByteStream {
   private closed = false;
   peer: LoopbackStream | null = null;
 
+  constructor(readonly remoteEndpointId?: string) {}
+
   async send(bytes: Uint8Array): Promise<void> {
     if (!this.peer || this.peer.closed) {
       throw new Error('ConnectionLost(ApplicationClosed)');
@@ -292,29 +321,44 @@ class LoopbackStream implements IrohByteStream {
  * spike without native Iroh. Streams are already message-oriented; do not
  * wrap them with {@link wrapLengthPrefixedByteStream}.
  *
- * @returns Pair whose `connect` only accepts the other side's ticket
+ * Each side also reports a synthetic {@link IrohStreamIO.endpointId} and stamps
+ * inbound streams with the dialer's id, so listener authorization can be tested
+ * without native Iroh. `connect` accepts either the peer's loopback ticket or
+ * its endpoint id, mirroring the real adapters.
+ *
+ * @returns Pair whose `connect` only accepts the other side's locator
  */
-export function createLoopbackIrohPair(): { a: IrohStreamIO; b: IrohStreamIO } {
+export function createLoopbackIrohPair(options?: {
+  endpointIdA?: string;
+  endpointIdB?: string;
+}): { a: IrohStreamIO; b: IrohStreamIO } {
   const listenersA: Array<(stream: IrohByteStream) => void> = [];
   const listenersB: Array<(stream: IrohByteStream) => void> = [];
+  const endpointIdA = options?.endpointIdA ?? "a".repeat(64);
+  const endpointIdB = options?.endpointIdB ?? "b".repeat(64);
 
   const makeIo = (
     ticket: string,
     peerTicket: string,
+    endpointId: string,
+    peerEndpointId: string,
     localListeners: Array<(stream: IrohByteStream) => void>,
     remoteListeners: Array<(stream: IrohByteStream) => void>,
   ): IrohStreamIO => ({
+    endpointId,
     async getLocalTicket() {
       return ticket;
     },
     async openConnection(target) {
-      if (target !== peerTicket) {
+      const normalized = normalizeIrohEndpointId(target);
+      if (target !== peerTicket && normalized !== peerEndpointId) {
         throw new Error(`Unknown loopback peer ${target}`);
       }
       return {
         async openStream() {
-          const local = new LoopbackStream();
-          const remote = new LoopbackStream();
+          // The dialer sees the listener's id and vice versa.
+          const local = new LoopbackStream(peerEndpointId);
+          const remote = new LoopbackStream(endpointId);
           local.peer = remote;
           remote.peer = local;
           for (const listener of remoteListeners) {
@@ -331,6 +375,7 @@ export function createLoopbackIrohPair(): { a: IrohStreamIO; b: IrohStreamIO } {
       const connection = await this.openConnection!(target);
       const stream = await connection.openStream();
       return {
+        remoteEndpointId: stream.remoteEndpointId,
         send: (bytes) => stream.send(bytes),
         recv: () => stream.recv(),
         close: async () => {
@@ -361,7 +406,7 @@ export function createLoopbackIrohPair(): { a: IrohStreamIO; b: IrohStreamIO } {
   });
 
   return {
-    a: makeIo("loopback:a", "loopback:b", listenersA, listenersB),
-    b: makeIo("loopback:b", "loopback:a", listenersB, listenersA),
+    a: makeIo("loopback:a", "loopback:b", endpointIdA, endpointIdB, listenersA, listenersB),
+    b: makeIo("loopback:b", "loopback:a", endpointIdB, endpointIdA, listenersB, listenersA),
   };
 }

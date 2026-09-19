@@ -32,6 +32,8 @@ interface IrohConnection {
   openBi(): Promise<IrohBiStream>;
   acceptBi(): Promise<IrohBiStream>;
   close(errorCode: bigint, reason: number[]): void;
+  /** Peer endpoint id, proven by the QUIC handshake. */
+  remoteId?(): { toString(): string };
 }
 
 interface IrohBiStream {
@@ -109,6 +111,7 @@ export async function createNativeIrohStreamIO(
       const connection = await openConnection(peerTicket, protocolAlpn);
       const stream = await connection.openStream();
       return {
+        remoteEndpointId: stream.remoteEndpointId,
         send: (bytes) => stream.send(bytes),
         recv: () => stream.recv(),
         close: async () => {
@@ -132,14 +135,25 @@ export async function createNativeIrohStreamIO(
 
 const MAX_PENDING_INBOUND_STREAMS = 16;
 
+function remoteEndpointIdOf(conn: IrohConnection): string | undefined {
+  try {
+    return conn.remoteId?.()?.toString();
+  } catch {
+    // Older bindings do not expose it; the listener then treats the peer as
+    // unknown rather than trusted.
+    return undefined;
+  }
+}
+
 function wrapNativeConnection(conn: IrohConnection): IrohConnectionHandle {
   let closed = false;
+  const remoteEndpointId = remoteEndpointIdOf(conn);
   return {
     async openStream() {
       if (closed) {
         throw new Error("ConnectionLost");
       }
-      return wrapNativeBiStream(await conn.openBi());
+      return wrapNativeBiStream(await conn.openBi(), remoteEndpointId);
     },
     async close() {
       if (closed) {
@@ -189,10 +203,11 @@ async function* acceptIncomingStreams(
   };
 
   const runProducer = async (conn: IrohConnection): Promise<void> => {
+    const remoteEndpointId = remoteEndpointIdOf(conn);
     try {
       while (!isClosed()) {
         const bi = await conn.acceptBi();
-        await pushStream(wrapNativeBiStream(bi));
+        await pushStream(wrapNativeBiStream(bi, remoteEndpointId));
       }
     } catch (error) {
       if (!isClosed() && !isBenignIrohClose(error)) {
@@ -273,7 +288,7 @@ async function waitUntilOnline(endpoint: BoundIrohEndpoint, timeoutMs = 30_000):
   ]);
 }
 
-function wrapNativeBiStream(bi: IrohBiStream): IrohByteStream {
+function wrapNativeBiStream(bi: IrohBiStream, remoteEndpointId?: string): IrohByteStream {
   return wrapLengthPrefixedByteStream({
     async write(bytes) {
       // @number0/iroh N-API rejects Uint8Array (`Failed to get Array length`).
@@ -297,7 +312,7 @@ function wrapNativeBiStream(bi: IrohBiStream): IrohByteStream {
     async close() {
       await bi.send.finish().catch(() => undefined);
     },
-  });
+  }, remoteEndpointId);
 }
 
 function toUint8Array(value: number[] | Uint8Array): Uint8Array {

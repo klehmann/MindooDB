@@ -7,13 +7,14 @@ export function normalizePublicKeyPem(pem: string): string {
 }
 
 /**
- * SHA-256 fingerprint of an RSA encryption public key (PEM).
+ * SHA-256 fingerprint of a public key (PEM), for encryption and signing keys
+ * alike — the digest is taken over the decoded SPKI body, which carries the
+ * key type, so the two never collide.
  *
  * Matches {@link BaseMindooTenantDirectory}'s device-map keys and Haven's
- * `getPublicKeyFingerprint`: SHA-256 over the decoded SPKI body, first 8
- * bytes as colon-separated hex.
+ * `getPublicKeyFingerprint`: first 8 bytes as colon-separated hex.
  */
-export async function fingerprintEncryptionPublicKey(
+export async function fingerprintPublicKeyPem(
   pem: string,
   subtle: SubtleCrypto,
 ): Promise<string> {
@@ -32,6 +33,14 @@ export async function fingerprintEncryptionPublicKey(
     .map((b) => b.toString(16).padStart(2, "0"))
     .join(":");
 }
+
+/**
+ * Fingerprint of an RSA encryption public key.
+ *
+ * @deprecated Prefer {@link fingerprintPublicKeyPem}; the algorithm is not
+ * specific to encryption keys. Kept so existing call sites keep reading well.
+ */
+export const fingerprintEncryptionPublicKey = fingerprintPublicKeyPem;
 
 export function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";

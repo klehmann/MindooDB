@@ -10,11 +10,18 @@ import { InMemoryContentAddressedStore } from "../core/appendonlystores/InMemory
 import { ServerNetworkContentAddressedStore } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 import {
   CURRENT_STORE_ENTRY_VERSION,
+  DEFAULT_TENANT_KEY_ID,
   PUBLIC_INFOS_KEY_ID,
   StoreKind,
   USER_DIRECTORY_DB_ID,
   type StoreEntry,
 } from "../core/types";
+import {
+  listPeerDeviceRecords,
+  peerDeviceDocumentId,
+  publishPeerDeviceRecord,
+} from "../core/peerdevices/PeerDeviceDocument";
+import { fingerprintPublicKeyPem } from "../core/userkeys/fingerprint";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { NetworkErrorType } from "../core/appendonlystores/network/types";
 import type { AuthenticationService } from "../core/appendonlystores/network/AuthenticationService";
@@ -172,6 +179,107 @@ describe("personal userdirectory documents", () => {
     const phoneDb = await alice2.tenant.openDB(USER_DIRECTORY_DB_ID);
     const ids = await phoneDb.getAllDocumentIds();
     expect(ids).not.toContain(doc.getId());
+  });
+
+  /**
+   * Peer-device records are the one personal document that is deliberately
+   * *not* sealed: it names an Iroh endpoint, which every member needs in order
+   * to dial the device, while the hoster has no business knowing who talks to
+   * whom. Encrypting with the tenant `default` key gives exactly that split —
+   * and because the invariant keys off the id prefix rather than the
+   * encryption, the ownership rule is unchanged.
+   */
+  describe("peer-device records under the tenant default key", () => {
+    const endpointId = "c".repeat(64);
+
+    it("is readable by another member but still only writable by its owner", async () => {
+      const aliceDb = await alice1.tenant.openDB(USER_DIRECTORY_DB_ID);
+      await publishPeerDeviceRecord({
+        db: aliceDb,
+        signingPublicKey: alice1.user.userSigningKeyPair.publicKey,
+        irohEndpointId: endpointId,
+        label: "desktop",
+        subtle: fixture.crypto.getSubtle(),
+      });
+      await syncAll(fixture, USER_DIRECTORY_DB_ID);
+
+      // Bob is a different person, not another device of Alice. He could not
+      // read her sealed `wks_` document above; this one he can.
+      const bobDb = await bob.tenant.openDB(USER_DIRECTORY_DB_ID);
+      const docId = peerDeviceDocumentId(
+        await fingerprintPublicKeyPem(
+          alice1.user.userSigningKeyPair.publicKey,
+          fixture.crypto.getSubtle(),
+        ),
+      );
+      const onBob = await bobDb.getDocument(docId);
+      expect(onBob.getData().irohEndpointId).toBe(endpointId);
+
+      // Readable is not writable: the personal-document invariant still binds
+      // the record to the device that created it.
+      await expect(
+        bobDb.changeDoc(onBob, (d) => {
+          d.getData().irohEndpointId = "d".repeat(64);
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("travels under the tenant key, which the hoster never holds", async () => {
+      // What keeps who-dials-whom away from the hoster is the key the entries
+      // are sealed with. A server only ever holds `$publicinfos`; `default` is
+      // distributed to members and never leaves the tenant. Asserting on the
+      // wire format rather than on a read, because every party in this fixture
+      // is a tenant member and therefore legitimately holds `default`.
+      const aliceDb = await alice1.tenant.openDB(USER_DIRECTORY_DB_ID);
+      const docId = peerDeviceDocumentId(
+        await fingerprintPublicKeyPem(
+          alice1.user.userSigningKeyPair.publicKey,
+          fixture.crypto.getSubtle(),
+        ),
+      );
+      const ids = await aliceDb.getStore().getAllIds();
+      const entries = await aliceDb.getStore().getEntries(ids);
+      const deviceEntries = entries.filter((entry) => entry.docId === docId);
+      expect(deviceEntries.length).toBeGreaterThan(0);
+      for (const entry of deviceEntries) {
+        expect(entry.decryptionKeyId).toBe(DEFAULT_TENANT_KEY_ID);
+        expect(entry.decryptionKeyId).not.toBe(PUBLIC_INFOS_KEY_ID);
+      }
+    });
+
+    it("only counts when the creator owns the key it names", async () => {
+      // Bob publishes a record under his own id but naming Alice's key — the
+      // shape of an attempt to claim her device. Verification has to drop it.
+      const bobDb = await bob.tenant.openDB(USER_DIRECTORY_DB_ID);
+      const spoofId = peerDeviceDocumentId(
+        await fingerprintPublicKeyPem(
+          bob.user.userSigningKeyPair.publicKey,
+          fixture.crypto.getSubtle(),
+        ),
+      );
+      const spoof = await bobDb.createDocument({
+        id: spoofId,
+        decryptionKeyId: DEFAULT_TENANT_KEY_ID,
+      });
+      await bobDb.changeDoc(spoof, (d) => {
+        const data = d.getData() as unknown as Record<string, unknown>;
+        data.type = "peerdevice";
+        data.irohEndpointId = "e".repeat(64);
+        data.signingPublicKey = alice1.user.userSigningKeyPair.publicKey;
+        data.updatedAt = Date.now();
+      });
+      await syncAll(fixture, USER_DIRECTORY_DB_ID);
+
+      const aliceDb = await alice1.tenant.openDB(USER_DIRECTORY_DB_ID);
+      const records = await listPeerDeviceRecords({
+        db: aliceDb,
+        directory: await alice1.tenant.openDirectory(),
+        subtle: fixture.crypto.getSubtle(),
+      });
+      expect(records.map((record) => record.docId)).not.toContain(spoofId);
+      // Alice's own record is untouched by the attempt.
+      expect(records.map((record) => record.irohEndpointId)).toContain(endpointId);
+    });
   });
 
   it("passes server ingest even though the server cannot decrypt it", async () => {

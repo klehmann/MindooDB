@@ -581,7 +581,9 @@ The key material itself is stored efficiently. Only entries that *change* the re
 
 Once documents can be sealed to a person, `userdirectory` becomes the natural home for a person's own settings — the data that should follow them between devices without any administrator provisioning a database for it. The roamed workspace and application list are the first such payload, stored as one document per save id under the id prefix `wks_`.
 
-These documents need the opposite of what a key document needs. A key document is published: everybody must read it, and its owner is named inside it by `username_hash`. A personal document is private: it is sealed to its owner, so nobody else — the server included — can read a single field of it. Ownership therefore cannot be read out of the payload, which is exactly what the rule in section 7.2 does.
+These documents need the opposite of what a key document needs. A key document is published: everybody must read it, and its owner is named inside it by `username_hash`. A personal document is not: it is encrypted so that the hoster cannot read it, which means ownership cannot be read out of the payload — exactly what the rule in section 7.2 does.
+
+The ownership rule is about *who may write*, and it is deliberately independent of *who may read*. A personal document may be sealed to its owner alone, or encrypted with the tenant `default` key so that every member can read it; either way only the person who signed the create may change it. Both variants exist, and section 7.6.1 covers the readable one.
 
 **Ownership is the person who signed the create.** That is available to everyone without decrypting anything: the create entry names its signing key, and grants map that key to a person's `username_hash`, the same resolution the change rule already uses. Every device of that person resolves to the same hash, so roaming across your own devices works, while another member's devices never match.
 
@@ -591,13 +593,33 @@ These documents need the opposite of what a key document needs. A key document i
 | Change | **only** the owning person |
 | Delete | the owning person, or the administrator |
 | Undelete | the owning person, or the administrator |
-| Read | only the recipients the document is sealed to |
+| Read | whoever the document was encrypted for — its sealed recipients, or every member when it uses the tenant `default` key |
 
 Two entries in that table differ from key documents, both deliberately. **The owner may delete**, because a person who stops roaming a workspace must be able to remove it — for a key document deletion is an administrative repair, here it is ordinary use. **The administrator may delete but not change**, so a departed member's data can be cleaned up while editing a document nobody but its owner can read stays impossible; the write would only ever produce garbage or a downgrade attempt.
 
 The prefix is what marks a document as personal, and that is a deliberate choice over a payload field: the server must apply the rule to a document it cannot decrypt, so the discriminator has to live in plain metadata. Ids are generated (`wks_` plus an object id) rather than derived from the save id, which keeps two devices from racing for the same id and lets the document carry `recipients` — a caller-chosen convergent id and recipient sealing are mutually exclusive, because a convergent id needs a derived document key while sealing generates one.
 
 Because ids are generated, two devices enabling roaming for the same save id while partitioned create two documents. They converge by rule rather than by merge: the lexicographically smallest id wins (object ids are time-sortable, so this is the older one), the loser is absorbed once and then deleted by its owner. This costs one extra document in a race that heals on the first sync, which is cheaper than the alternative of a convergent id without sealing.
+
+#### 7.6.1 Peer-device records (`dev_`)
+
+A device that wants to sync directly with another device of the same tenant has to publish where it can be reached: its Iroh endpoint id. That is a personal document under the prefix `dev_`, and it is the case where "personal" and "sealed" come apart.
+
+**It uses the tenant `default` key, not recipient sealing.** Sealing it to its owner would defeat the purpose — the whole point is that *other* members can find the device and dial it. `$publicinfos` is not an option either, because the hoster holds that key, and who syncs with whom is not the hoster's business. `default` is distributed to members and never leaves the tenant, which lands exactly between the two: every member reads it, the server stores bytes it cannot open.
+
+**The id is derived, not generated.** `dev_<fingerprint of the device signing key>`, with the colons stripped so it satisfies `^[a-z][a-z0-9_]*$`. Deriving it means a device republishing after a reload updates one record rather than accumulating one per session — the opposite trade-off from `wks_`, and available here precisely because the document is not sealed.
+
+**A record is a claim until it is verified.** Any member can write a `dev_` document naming any endpoint id, so a reader must accept one only when all three hold:
+
+1. the id is the fingerprint of the `signingPublicKey` in the payload,
+2. the `doc_create` entry was signed by exactly that key, and
+3. that key is an active, non-revoked grant.
+
+Together these mean only the device that owns a signing key can publish a record under it. `listPeerDeviceRecords` applies all three and silently drops what fails — an unverifiable record is the expected shape of an attack, not an error worth surfacing.
+
+**Known limit — id squatting.** A member can create `dev_<another device's fingerprint>` before that device does. The squatted record fails check 2 and so can never impersonate anyone, but the real device then cannot claim its own id and stays invisible to peer pickers. The symptom is a record that is present yet unverifiable.
+
+Publishing a record is not the same as accepting connections. A device advertises so others can dial it; whether it answers is a separate, off-by-default choice, and the endpoint only exists while the app is running. See [iroh.md](iroh.md) for the listener-side checks.
 
 ---
 
@@ -635,8 +657,8 @@ Encryption hides content, but it does not hide the shape of who is talking to wh
 
 | Party | Can see | Cannot see |
 |---|---|---|
-| Sync server | Published public keys; which device fingerprints hold a wrap; which key fingerprints a document is sealed to, and when that changed | Any plaintext; recipient display names; any private key |
-| Tenant member (not a recipient) | Published public keys; the existence of sealed documents and their recipient fingerprints | The document contents or its recipient list |
+| Sync server | Published public keys; which device fingerprints hold a wrap; which key fingerprints a document is sealed to, and when that changed; that `dev_` records exist and who created them | Any plaintext; recipient display names; any private key; the endpoint ids inside `dev_` records, so not which devices sync with each other |
+| Tenant member (not a recipient) | Published public keys; the existence of sealed documents and their recipient fingerprints; every `dev_` record, including endpoint ids and device labels | The contents of a sealed document or its recipient list |
 | Recipient | The document contents and its full recipient list with names | Other people's private keys |
 | Administrator | Everything a member sees, plus the grant | Content addressed to a user key they were not approved for |
 

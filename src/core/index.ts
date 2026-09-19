@@ -16,6 +16,21 @@ export {
   type BuiltinWriteDecision,
 } from "./builtinDbInvariants";
 export * from "./userkeys";
+export {
+  PEER_DEVICE_DOC_ID_PREFIX,
+  PEER_DEVICE_FORM,
+  PEER_DEVICE_SCHEMA_VERSION,
+  PEER_DEVICE_TYPE,
+  isPeerDeviceDocId,
+  listPeerDeviceRecords,
+  peerDeviceDocumentId,
+  publishPeerDeviceRecord,
+  removePeerDeviceRecord,
+  verifyPeerDeviceRecord,
+  type PeerDeviceDirectory,
+  type PeerDeviceDocumentPayload,
+  type PeerDeviceRecord,
+} from "./peerdevices/PeerDeviceDocument";
 export * from "./tenantIdValidation";
 export {
   readTenantSetupLabel,
@@ -309,6 +324,7 @@ export {
 } from "./utils";
 
 // Content-addressed stores
+export { StoreKind } from "./appendonlystores/types";
 export {
   type ContentAddressedStore,
   type ContentAddressedStoreFactory,

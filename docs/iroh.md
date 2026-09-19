@@ -77,7 +77,9 @@ Two MindooDB servers can mirror each other over Iroh instead of HTTPS. Put the p
 
 That is the same peer control plane as HTTP (`challenge` → `authenticate` → tenant Bloom → store sync → live events), on the same Iroh endpoint the server already uses for clients. Cluster admin (`/system/cluster/*`, `add-to-network`) stays on HTTP.
 
-**Ticket vs Node-ID.** A full `endpoint…` ticket includes the current addresses and relay. Store that for the first pairing so the peer can dial. The stable label is the 64-hex Node-ID (`iroh:<64-hex>`); a frozen ticket can go stale after an IP or relay change, in which case paste a fresh ticket from the peer's log. An endpoint-id-only locator is not dialable.
+**Ticket vs Node-ID.** A full `endpoint…` ticket includes the current addresses and relay. The stable label is the 64-hex Node-ID (`iroh:<64-hex>`).
+
+A bare Node-ID **is** dialable whenever both sides run an endpoint with n0 address discovery — which `presets::N0` wires up by default, and which both the Haven WASM build and the native `@number0/iroh` adapter use. The binding endpoint publishes its current relay and addresses to pkarr under its Node-ID, and the dialing endpoint resolves them back. That makes the Node-ID the value worth persisting: it survives IP and relay changes, whereas a stored ticket goes stale. Store a ticket only for a first pairing between endpoints that have discovery switched off, and paste a fresh one from the peer's log when it goes stale.
 
 Both sides need `iroh.enabled` and a shared tenant (create once, `publishToServer` to each). `--auto-sync` / `startCluster()` starts the replicators; Iroh listen is async, so a first dial may retry until the endpoint is online.
 
@@ -147,7 +149,19 @@ On React Native, `createReactNativeIrohStreamIO()` wraps `react-native-iroh`. Se
 
 ## Device-to-device (no MindooDBServer)
 
-`IrohPeerStore` plus `listenForIrohPeers(io, createStoreIrohHandler(localStore))` syncs already-encrypted entries between two devices after they exchange tickets (QR). There is no extra RSA wrap on that path. This is the pairing model described in [sqlite-and-iroh.md](sqlite-and-iroh.md).
+`IrohPeerStore` plus `listenForIrohPeers` syncs already-encrypted entries between two devices — Bloom compare, `scanEntriesSince`, `getEntries`, `putEntries`, the same protocol a server answers. There is no extra RSA wrap on that path. Devices can exchange tickets (QR) as in [sqlite-and-iroh.md](sqlite-and-iroh.md), or address each other by bare Node-ID once each has published it somewhere both can read.
+
+Three things must be got right before a device answers this protocol, because the caller is addressing storage directly:
+
+- **Which replica.** `IrohPeerStore` sends `ctx` (`tenantId`, `dbId`, `storeKind`) with every call, and the listener routes on it. Serve only replicas that exist locally; answer anything else with the same opaque error, so a caller cannot probe for which tenants a device holds.
+- **Which peer.** The QUIC handshake proves the caller holds the secret behind its Node-ID, and the listener sees it as `peerEndpointId` on the handler (and as `IrohByteStream.remoteEndpointId`). Pass `authorize` to `listenForIrohPeers` to check it against a list of known devices; without that check any endpoint on the internet that learns the Node-ID is served. Use `maxConcurrentSessions` to cap what one caller can tie up.
+- **Which methods.** `createStoreIrohHandler` resolves methods by name off the store, so pass it through its `IROH_SYNC_STORE_METHODS` allowlist (the default) rather than exposing everything — `purgeDocHistory` is on the store too.
+
+After an incoming `putEntries`, call `db.syncStoreChanges()`: entries land as bytes and only materialize into documents once something drives that.
+
+Haven builds on exactly this. Each device persists one Iroh secret, publishes the derived Node-ID as a `dev_<fingerprint>` document in `userdirectory` encrypted with the tenant `default` key (readable by every member, opaque to the hoster), and accepts incoming sync only from the devices it finds there. See [userkeys.md](userkeys.md) §7.6.
+
+[p2psync.md](p2psync.md) is the step-by-step version of this section: both halves with runnable code, the platform/relay matrix, and what peer sync does not give you.
 
 ## Relays and cost
 
