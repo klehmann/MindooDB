@@ -15,6 +15,11 @@ export {
   type BuiltinWriteInput,
   type BuiltinWriteDecision,
 } from "./builtinDbInvariants";
+export {
+  buildTier1Evaluator,
+  type Tier1Evaluator,
+  type Tier1Directory,
+} from "./accesscontrol/tier1Evaluator";
 export * from "./userkeys";
 export {
   PEER_DEVICE_DOC_ID_PREFIX,
@@ -297,7 +302,11 @@ export {
 export type { LocalCacheStore } from "./cache/LocalCacheStore";
 export { InMemoryLocalCacheStore } from "./cache/LocalCacheStore";
 export { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
-export { CacheManager, type ICacheable, type CacheManagerOptions } from "./cache/CacheManager";
+export {
+  CacheManager,
+  type ICacheable,
+  type CacheManagerOptions,
+} from "./cache/CacheManager";
 
 // Utilities
 export {
@@ -340,11 +349,17 @@ export {
   type DocumentMaterializationPlan,
   type DocumentMaterializationBatchPlan,
 } from "./appendonlystores/types";
-export { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory } from "./appendonlystores/InMemoryContentAddressedStore";
+export {
+  InMemoryContentAddressedStore,
+  InMemoryContentAddressedStoreFactory,
+} from "./appendonlystores/InMemoryContentAddressedStore";
 
 // Network
 export { AuthenticationService } from "./appendonlystores/network/AuthenticationService";
-export type { NetworkTransport, NetworkTransportConfig } from "./appendonlystores/network/NetworkTransport";
+export type {
+  NetworkTransport,
+  NetworkTransportConfig,
+} from "./appendonlystores/network/NetworkTransport";
 export {
   type NetworkEncryptedEntry,
   type UserPublicKeys,

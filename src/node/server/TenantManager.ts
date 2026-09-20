@@ -17,13 +17,29 @@
  * auth without servers being in each tenant's user directory.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from "fs";
 import { join, resolve, sep } from "path";
 
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { AuthenticationService } from "../../core/appendonlystores/network/AuthenticationService";
 import { ServerNetworkContentAddressedStore } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
-import type { ServerTier1Evaluator, ServerDbAccessEvaluator, ServerRevokedKeyResolver, ServerPurgedDocResolver, BuiltinWriteContext, ServerPeerTokenResolver, ServerTrustedWitnessResolver } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
+import type {
+  ServerTier1Evaluator,
+  ServerDbAccessEvaluator,
+  ServerRevokedKeyResolver,
+  ServerPurgedDocResolver,
+  BuiltinWriteContext,
+  ServerPeerTokenResolver,
+  ServerTrustedWitnessResolver,
+} from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import { PurgedDocRegistry } from "./PurgedDocRegistry";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
@@ -46,9 +62,17 @@ import type {
   GrantKeyPairInfo,
   StoreEntry,
 } from "../../core/types";
-import { PUBLIC_INFOS_KEY_ID, StoreKind, USER_DIRECTORY_DB_ID } from "../../core/types";
+import {
+  PUBLIC_INFOS_KEY_ID,
+  StoreKind,
+  USER_DIRECTORY_DB_ID,
+} from "../../core/types";
 import { usernameHashFromCreateChangeBytes } from "../../core/builtinDbInvariants";
 import { signingKeysEqual } from "../../core/accesscontrol/DirectoryStateNode";
+import {
+  buildTier1Evaluator,
+  type Tier1Directory,
+} from "../../core/accesscontrol/tier1Evaluator";
 import type { PrivateUserId } from "../../core/userid";
 
 import { StoreFactory } from "./StoreFactory";
@@ -87,7 +111,10 @@ class StoreFactoryAdapter implements ContentAddressedStoreFactory {
   createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
     return {
       docStore: this.storeFactory.getStore(dbId, "docs" as StoreKind),
-      attachmentStore: this.storeFactory.getStore(dbId, "attachments" as StoreKind),
+      attachmentStore: this.storeFactory.getStore(
+        dbId,
+        "attachments" as StoreKind,
+      ),
     };
   }
 }
@@ -96,8 +123,12 @@ class StoreFactoryAdapter implements ContentAddressedStoreFactory {
 // SimpleMindooDirectory — config-based fallback
 // ---------------------------------------------------------------------------
 
-export class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
-  "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey" | "getUserBySigningPublicKey"
+export class SimpleMindooDirectory implements Pick<
+  MindooTenantDirectory,
+  | "getUserPublicKeys"
+  | "isUserRevoked"
+  | "validatePublicSigningKey"
+  | "getUserBySigningPublicKey"
 > {
   /** Canonical index: entries are identified by their signing public key. */
   private usersByKey: Map<string, UserConfig> = new Map();
@@ -143,7 +174,9 @@ export class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
     };
   }
 
-  async getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null> {
+  async getUserBySigningPublicKey(
+    publicKey: string,
+  ): Promise<DirectoryUserLookup | null> {
     const exact = this.usersByKey.get(publicKey);
     if (exact) {
       return this.toLookup(exact);
@@ -207,22 +240,29 @@ export class SimpleMindooDirectory implements Pick<MindooTenantDirectory,
  * the global trusted-servers list. Holds a reference to the array so
  * runtime changes via the admin API are immediately visible.
  */
-class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
+class CompositeMindooDirectory implements Pick<
+  MindooTenantDirectory,
   "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey"
 > {
   private readonly adminUsernameNormalized: string | null;
 
   constructor(
-    private inner: Pick<MindooTenantDirectory,
-      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">
-      & Partial<Pick<MindooTenantDirectory,
-        "getUserBySigningPublicKey"
-        | "getUserSigningKeyUniverse"
-        | "getUserKeyPairs"
-        | "getWipeGrantDocId"
-        | "getRevokedDecryptionKeyIdsForSigningKey"
-        | "resolveUsernameHashForSigningKey">>
-      & Partial<Pick<BaseMindooTenantDirectory, "evaluateDbAccessForSigningKey">>,
+    private inner: Pick<
+      MindooTenantDirectory,
+      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey"
+    > &
+      Partial<
+        Pick<
+          MindooTenantDirectory,
+          | "getUserBySigningPublicKey"
+          | "getUserSigningKeyUniverse"
+          | "getUserKeyPairs"
+          | "getWipeGrantDocId"
+          | "getRevokedDecryptionKeyIdsForSigningKey"
+          | "resolveUsernameHashForSigningKey"
+        >
+      > &
+      Partial<Pick<BaseMindooTenantDirectory, "evaluateDbAccessForSigningKey">>,
     private trustedServers: TrustedServer[],
     private adminBootstrapIdentity?: {
       username: string;
@@ -230,7 +270,8 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
       encryptionPublicKey: string;
     },
   ) {
-    this.adminUsernameNormalized = adminBootstrapIdentity?.username.toLowerCase() ?? null;
+    this.adminUsernameNormalized =
+      adminBootstrapIdentity?.username.toLowerCase() ?? null;
   }
 
   async getUserPublicKeys(username: string): Promise<{
@@ -269,7 +310,10 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
   async isUserRevoked(username: string): Promise<boolean> {
     const normalizedUsername = username.toLowerCase();
 
-    if (this.adminUsernameNormalized && normalizedUsername === this.adminUsernameNormalized) {
+    if (
+      this.adminUsernameNormalized &&
+      normalizedUsername === this.adminUsernameNormalized
+    ) {
       return false;
     }
 
@@ -292,7 +336,10 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
       return true;
     }
 
-    const innerResult = await this.inner.validatePublicSigningKey(publicKey, opts);
+    const innerResult = await this.inner.validatePublicSigningKey(
+      publicKey,
+      opts,
+    );
     if (innerResult) return true;
 
     for (const server of this.trustedServers) {
@@ -312,7 +359,9 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
   // remote-wipe paths (docs/accesscontrol.md §6.5).
   // -----------------------------------------------------------------------
 
-  async getUserBySigningPublicKey(publicKey: string): Promise<DirectoryUserLookup | null> {
+  async getUserBySigningPublicKey(
+    publicKey: string,
+  ): Promise<DirectoryUserLookup | null> {
     if (typeof this.inner.getUserBySigningPublicKey === "function") {
       const innerLookup = await this.inner.getUserBySigningPublicKey(publicKey);
       if (innerLookup) return innerLookup;
@@ -382,8 +431,12 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     return null;
   }
 
-  async getRevokedDecryptionKeyIdsForSigningKey(signingKey: string): Promise<string[]> {
-    if (typeof this.inner.getRevokedDecryptionKeyIdsForSigningKey === "function") {
+  async getRevokedDecryptionKeyIdsForSigningKey(
+    signingKey: string,
+  ): Promise<string[]> {
+    if (
+      typeof this.inner.getRevokedDecryptionKeyIdsForSigningKey === "function"
+    ) {
       return this.inner.getRevokedDecryptionKeyIdsForSigningKey(signingKey);
     }
     return [];
@@ -412,7 +465,10 @@ class CompositeMindooDirectory implements Pick<MindooTenantDirectory,
     trustedTime: number,
   ): Promise<string | null> {
     if (typeof this.inner.resolveUsernameHashForSigningKey === "function") {
-      return this.inner.resolveUsernameHashForSigningKey(signingKey, trustedTime);
+      return this.inner.resolveUsernameHashForSigningKey(
+        signingKey,
+        trustedTime,
+      );
     }
     return null;
   }
@@ -468,16 +524,22 @@ export class TenantManager {
     const identityPath = join(dataDir, "server.identity.json");
     if (existsSync(identityPath)) {
       this.serverIdentity = JSON.parse(readFileSync(identityPath, "utf-8"));
-      console.log(`[TenantManager] Loaded server identity: ${this.serverIdentity!.username}`);
+      console.log(
+        `[TenantManager] Loaded server identity: ${this.serverIdentity!.username}`,
+      );
     } else {
-      console.log(`[TenantManager] No server.identity.json found (run "npm run init" to create one)`);
+      console.log(
+        `[TenantManager] No server.identity.json found (run "npm run init" to create one)`,
+      );
     }
 
     // Load trusted servers
     const trustedPath = join(dataDir, "trusted-servers.json");
     if (existsSync(trustedPath)) {
       this.trustedServers = JSON.parse(readFileSync(trustedPath, "utf-8"));
-      console.log(`[TenantManager] Loaded ${this.trustedServers.length} trusted server(s)`);
+      console.log(
+        `[TenantManager] Loaded ${this.trustedServers.length} trusted server(s)`,
+      );
     }
   }
 
@@ -493,8 +555,10 @@ export class TenantManager {
     if (!this.serverIdentity) return null;
     return {
       name: this.serverIdentity.username,
-      signingPublicKey: this.serverIdentity.userSigningKeyPair.publicKey as string,
-      encryptionPublicKey: this.serverIdentity.userEncryptionKeyPair.publicKey as string,
+      signingPublicKey: this.serverIdentity.userSigningKeyPair
+        .publicKey as string,
+      encryptionPublicKey: this.serverIdentity.userEncryptionKeyPair
+        .publicKey as string,
     };
   }
 
@@ -534,7 +598,10 @@ export class TenantManager {
    * database rather than a configured subset.
    */
   listDatabases(tenantId: string): string[] {
-    const storesDir = join(this.resolveTenantDir(tenantId.toLowerCase()), "stores");
+    const storesDir = join(
+      this.resolveTenantDir(tenantId.toLowerCase()),
+      "stores",
+    );
     if (!existsSync(storesDir)) {
       return [];
     }
@@ -543,7 +610,10 @@ export class TenantManager {
         statSync(join(storesDir, entry)).isDirectory(),
       );
     } catch (error) {
-      console.warn(`[TenantManager] Could not list databases for ${tenantId}:`, error);
+      console.warn(
+        `[TenantManager] Could not list databases for ${tenantId}:`,
+        error,
+      );
       return [];
     }
   }
@@ -562,7 +632,8 @@ export class TenantManager {
     const subtle = this.cryptoAdapter.getSubtle();
     const keyBuffer = await decryptPrivateKey(
       this.cryptoAdapter,
-      this.serverIdentity.userEncryptionKeyPair.privateKey as EncryptedPrivateKey,
+      this.serverIdentity.userEncryptionKeyPair
+        .privateKey as EncryptedPrivateKey,
       this.serverPassword,
       "encryption",
     );
@@ -674,7 +745,11 @@ export class TenantManager {
 
   private persistTrustedServers(): void {
     const filePath = join(this.dataDir, "trusted-servers.json");
-    writeFileSync(filePath, JSON.stringify(this.trustedServers, null, 2), "utf-8");
+    writeFileSync(
+      filePath,
+      JSON.stringify(this.trustedServers, null, 2),
+      "utf-8",
+    );
   }
 
   private getServerKeyBagPath(): string {
@@ -683,9 +758,14 @@ export class TenantManager {
 
   private async loadServerKeyBag(): Promise<KeyBag> {
     if (!this.serverIdentity || !this.serverPassword) {
-      throw new Error("Server identity and server password are required to manage tenant $publicinfos keys");
+      throw new Error(
+        "Server identity and server password are required to manage tenant $publicinfos keys",
+      );
     }
-    const keyBag = await this.createServerKeyBag(this.serverIdentity, this.serverPassword);
+    const keyBag = await this.createServerKeyBag(
+      this.serverIdentity,
+      this.serverPassword,
+    );
     const keyBagPath = this.getServerKeyBagPath();
     if (existsSync(keyBagPath)) {
       const data = readFileSync(keyBagPath);
@@ -694,7 +774,10 @@ export class TenantManager {
     return keyBag;
   }
 
-  private async createServerKeyBag(serverUser: PrivateUserId, serverPassword: string): Promise<KeyBag> {
+  private async createServerKeyBag(
+    serverUser: PrivateUserId,
+    serverPassword: string,
+  ): Promise<KeyBag> {
     const wrappingKey = await KeyBag.deriveWrappingKey(
       serverUser.userEncryptionKeyPair.privateKey,
       serverPassword,
@@ -709,7 +792,10 @@ export class TenantManager {
 
   private async saveServerKeyBag(keyBag: KeyBag): Promise<void> {
     const data = await keyBag.save();
-    writeFileSync(this.getServerKeyBagPath(), new DataView(data.buffer, data.byteOffset, data.byteLength));
+    writeFileSync(
+      this.getServerKeyBagPath(),
+      new DataView(data.buffer, data.byteOffset, data.byteLength),
+    );
   }
 
   private bytesToBase64(bytes: Uint8Array): string {
@@ -730,8 +816,12 @@ export class TenantManager {
     return unique;
   }
 
-  private async computePublicInfosFingerprint(key: Uint8Array): Promise<string> {
-    const digest = await this.cryptoAdapter.getSubtle().digest("SHA-256", key as BufferSource);
+  private async computePublicInfosFingerprint(
+    key: Uint8Array,
+  ): Promise<string> {
+    const digest = await this.cryptoAdapter
+      .getSubtle()
+      .digest("SHA-256", key as BufferSource);
     return Array.from(new Uint8Array(digest).slice(0, 8))
       .map((byte) => byte.toString(16).padStart(2, "0"))
       .join(":");
@@ -741,7 +831,9 @@ export class TenantManager {
     const baseDir = resolve(this.dataDir);
     const tenantDir = resolve(baseDir, tenantId);
     if (tenantDir !== baseDir && !tenantDir.startsWith(`${baseDir}${sep}`)) {
-      throw new Error(`Resolved tenant path escapes data directory for tenantId "${tenantId}"`);
+      throw new Error(
+        `Resolved tenant path escapes data directory for tenantId "${tenantId}"`,
+      );
     }
     return tenantDir;
   }
@@ -750,16 +842,23 @@ export class TenantManager {
     return join(this.resolveTenantDir(tenantId), "config.json");
   }
 
-  private async decryptEncryptedPublicInfosKey(base64Payload: string): Promise<Uint8Array> {
+  private async decryptEncryptedPublicInfosKey(
+    base64Payload: string,
+  ): Promise<Uint8Array> {
     if (!this.serverIdentity) {
-      throw new Error("Server identity not initialized; cannot decrypt encrypted $publicinfos payload");
+      throw new Error(
+        "Server identity not initialized; cannot decrypt encrypted $publicinfos payload",
+      );
     }
     if (!this.serverPassword) {
-      throw new Error("Server password not configured; cannot decrypt encrypted $publicinfos payload");
+      throw new Error(
+        "Server password not configured; cannot decrypt encrypted $publicinfos payload",
+      );
     }
     const privateKeyBuffer = await decryptPrivateKey(
       this.cryptoAdapter,
-      this.serverIdentity.userEncryptionKeyPair.privateKey as EncryptedPrivateKey,
+      this.serverIdentity.userEncryptionKeyPair
+        .privateKey as EncryptedPrivateKey,
       this.serverPassword,
       "encryption",
     );
@@ -780,30 +879,53 @@ export class TenantManager {
     return new Uint8Array(decrypted);
   }
 
-  private async resolveIncomingPublicInfosKey(request: RegisterTenantRequest): Promise<Uint8Array> {
+  private async resolveIncomingPublicInfosKey(
+    request: RegisterTenantRequest,
+  ): Promise<Uint8Array> {
     if (request.encryptedPublicInfosKey) {
-      return this.decryptEncryptedPublicInfosKey(request.encryptedPublicInfosKey);
+      return this.decryptEncryptedPublicInfosKey(
+        request.encryptedPublicInfosKey,
+      );
     }
     if (request.publicInfosKey) {
       return new Uint8Array(Buffer.from(request.publicInfosKey, "base64"));
     }
-    throw new Error("Tenant registration requires encryptedPublicInfosKey or publicInfosKey");
+    throw new Error(
+      "Tenant registration requires encryptedPublicInfosKey or publicInfosKey",
+    );
   }
 
-  private async getStoredPublicInfosKeys(tenantId: string): Promise<Uint8Array[]> {
+  private async getStoredPublicInfosKeys(
+    tenantId: string,
+  ): Promise<Uint8Array[]> {
     const keys: Uint8Array[] = [];
-    if (this.serverIdentity && this.serverPassword && existsSync(this.getServerKeyBagPath())) {
+    if (
+      this.serverIdentity &&
+      this.serverPassword &&
+      existsSync(this.getServerKeyBagPath())
+    ) {
       const keyBag = await this.loadServerKeyBag();
-      keys.push(...await keyBag.getAllKeys("doc", tenantId, PUBLIC_INFOS_KEY_ID));
+      keys.push(
+        ...(await keyBag.getAllKeys("doc", tenantId, PUBLIC_INFOS_KEY_ID)),
+      );
     }
     return this.mergeUniqueKeys(keys);
   }
 
-  private async persistTenantPublicInfosKey(tenantId: string, key: Uint8Array): Promise<void> {
+  private async persistTenantPublicInfosKey(
+    tenantId: string,
+    key: Uint8Array,
+  ): Promise<void> {
     const keyBag = await this.loadServerKeyBag();
-    const existingKeys = await keyBag.getAllKeys("doc", tenantId, PUBLIC_INFOS_KEY_ID);
+    const existingKeys = await keyBag.getAllKeys(
+      "doc",
+      tenantId,
+      PUBLIC_INFOS_KEY_ID,
+    );
     const incomingSignature = this.bytesToBase64(key);
-    const alreadyStored = existingKeys.some((entry) => this.bytesToBase64(entry) === incomingSignature);
+    const alreadyStored = existingKeys.some(
+      (entry) => this.bytesToBase64(entry) === incomingSignature,
+    );
     if (!alreadyStored) {
       await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, key, Date.now());
       await this.saveServerKeyBag(keyBag);
@@ -825,7 +947,9 @@ export class TenantManager {
       throw new Error(`Tenant ${normalizedId} not found`);
     }
     const fingerprints = await Promise.all(
-      (await this.getStoredPublicInfosKeys(normalizedId)).map((key) => this.computePublicInfosFingerprint(key)),
+      (await this.getStoredPublicInfosKeys(normalizedId)).map((key) =>
+        this.computePublicInfosFingerprint(key),
+      ),
     );
     return [...new Set(fingerprints)].sort();
   }
@@ -834,28 +958,40 @@ export class TenantManager {
   // Tenant management
   // =======================================================================
 
-  async registerTenant(request: RegisterTenantRequest): Promise<RegisterTenantResult> {
+  async registerTenant(
+    request: RegisterTenantRequest,
+  ): Promise<RegisterTenantResult> {
     const tenantId = request.tenantId.toLowerCase();
     const tenantDir = this.resolveTenantDir(tenantId);
     const configPath = this.resolveTenantConfigPath(tenantId);
     if (!this.serverIdentity || !this.serverPassword) {
-      throw new Error("Tenant registration requires an unlocked server identity to store $publicinfos keys");
+      throw new Error(
+        "Tenant registration requires an unlocked server identity to store $publicinfos keys",
+      );
     }
     const publicInfosKey = await this.resolveIncomingPublicInfosKey(request);
 
     if (existsSync(configPath)) {
-      const existingConfig: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+      const existingConfig: TenantConfig = JSON.parse(
+        readFileSync(configPath, "utf-8"),
+      );
       const incomingSignature = this.bytesToBase64(publicInfosKey);
       const existingKeys = await this.getStoredPublicInfosKeys(tenantId);
-      const hasMatch = existingKeys.some((key) => this.bytesToBase64(key) === incomingSignature);
+      const hasMatch = existingKeys.some(
+        (key) => this.bytesToBase64(key) === incomingSignature,
+      );
       if (hasMatch) {
-        console.log(`[TenantManager] Tenant ${tenantId} already registered with matching $publicinfos key`);
+        console.log(
+          `[TenantManager] Tenant ${tenantId} already registered with matching $publicinfos key`,
+        );
         return {
           context: { tenantId, config: existingConfig },
           created: false,
         };
       }
-      throw new Error(`Tenant ${tenantId} already exists with different $publicinfos key`);
+      throw new Error(
+        `Tenant ${tenantId} already exists with different $publicinfos key`,
+      );
     }
 
     mkdirSync(tenantDir, { recursive: true });
@@ -920,7 +1056,9 @@ export class TenantManager {
       if (!existsSync(configPath)) {
         return null;
       }
-      const config: TenantConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+      const config: TenantConfig = JSON.parse(
+        readFileSync(configPath, "utf-8"),
+      );
       return typeof config.adminSigningPublicKey === "string" &&
         config.adminSigningPublicKey.length > 0
         ? config.adminSigningPublicKey
@@ -1006,7 +1144,11 @@ export class TenantManager {
     }
 
     this.loadedTenants.delete(normalizedId);
-    if (this.serverIdentity && this.serverPassword && existsSync(this.getServerKeyBagPath())) {
+    if (
+      this.serverIdentity &&
+      this.serverPassword &&
+      existsSync(this.getServerKeyBagPath())
+    ) {
       const keyBag = await this.loadServerKeyBag();
       await keyBag.deleteKey("doc", normalizedId, PUBLIC_INFOS_KEY_ID);
       await this.saveServerKeyBag(keyBag);
@@ -1051,7 +1193,9 @@ export class TenantManager {
     // Per-user revoked-key blacklist (§13). Never applied to the directory store
     // itself (its policy, which defines the blacklist, must always sync).
     const revokedKeyResolver =
-      dbId === "directory" ? undefined : this.buildRevokedKeyResolver(directory);
+      dbId === "directory"
+        ? undefined
+        : this.buildRevokedKeyResolver(directory);
     // Purged-document denylist (§13). Never applied to the directory store (purge
     // requests themselves live there and must always sync).
     const purgedDocResolver: ServerPurgedDocResolver | undefined =
@@ -1084,7 +1228,9 @@ export class TenantManager {
     );
 
     tenant.serverStores.set(cacheKey, serverStore);
-    console.log(`[TenantManager] Created server store for ${tenantId}/${dbId}/${storeKind}`);
+    console.log(
+      `[TenantManager] Created server store for ${tenantId}/${dbId}/${storeKind}`,
+    );
 
     return serverStore;
   }
@@ -1096,57 +1242,19 @@ export class TenantManager {
    * ops by reading the document's `doc_create` entry creator key from the local
    * store (metadata only, no decryption) and comparing it to the change author.
    */
+  /**
+   * The witness's Tier 1 gate. The evaluation itself is shared with the peer
+   * listener, which has to run it for entries that never reach a witness at
+   * all — see `core/accesscontrol/tier1Evaluator.ts`.
+   */
   private buildTier1Evaluator(
     directory: MindooTenantDirectory,
     localStore: ContentAddressedStore,
   ): ServerTier1Evaluator | undefined {
-    const evaluable = directory as unknown as {
-      evaluateAccessForSigningKey?: BaseMindooTenantDirectory["evaluateAccessForSigningKey"];
-    };
-    if (typeof evaluable.evaluateAccessForSigningKey !== "function") {
-      return undefined;
-    }
-
-    return async (entry, dbid) => {
-      // The witness evaluates Tier 1 at its acceptance time (now), the same time
-      // it will stamp into the receipt (docs/accesscontrol.md §5.3, §7).
-      const trustedTime = Date.now();
-
-      // Resolve `$author` at grant level: creator at the doc_create trusted
-      // time, signer at the witness's acceptance time. Falls back to device-key
-      // equality when the directory cannot answer.
-      let isAuthor = entry.entryType === "doc_create";
-      if (!isAuthor) {
-        try {
-          const docEntries = await localStore.findNewEntriesForDoc([], entry.docId);
-          const createEntry = docEntries.find((m) => m.entryType === "doc_create");
-          if (createEntry) {
-            const samePerson = directory.isSamePerson;
-            if (typeof samePerson === "function") {
-              isAuthor = await samePerson({
-                creatorSigningKey: createEntry.createdByPublicKey,
-                signerSigningKey: entry.createdByPublicKey,
-                creatorTrustedTime: createEntry.receivedAt ?? createEntry.createdAt,
-                signerTrustedTime: trustedTime,
-              });
-            } else {
-              isAuthor = createEntry.createdByPublicKey === entry.createdByPublicKey;
-            }
-          }
-        } catch {
-          // If we cannot resolve the creator, leave isAuthor false; a rule that
-          // requires $author will deny, which is the safe (fail-closed) choice.
-        }
-      }
-
-      return evaluable.evaluateAccessForSigningKey!({
-        op: entry.entryType as Parameters<BaseMindooTenantDirectory["evaluateAccessForSigningKey"]>[0]["op"],
-        dbid,
-        signingKey: entry.createdByPublicKey,
-        trustedTime,
-        isAuthor,
-      });
-    };
+    return buildTier1Evaluator(
+      directory as unknown as Tier1Directory,
+      localStore,
+    );
   }
 
   /**
@@ -1256,7 +1364,9 @@ export class TenantManager {
   private buildRevokedKeyResolver(
     directory: MindooTenantDirectory,
   ): ServerRevokedKeyResolver | undefined {
-    if (typeof directory.getRevokedDecryptionKeyIdsForSigningKey !== "function") {
+    if (
+      typeof directory.getRevokedDecryptionKeyIdsForSigningKey !== "function"
+    ) {
       return undefined;
     }
     return async (principal) => {
@@ -1267,7 +1377,11 @@ export class TenantManager {
     };
   }
 
-  async getStore(tenantId: string, dbId: string, storeKind: StoreKind): Promise<ContentAddressedStore> {
+  async getStore(
+    tenantId: string,
+    dbId: string,
+    storeKind: StoreKind,
+  ): Promise<ContentAddressedStore> {
     const tenant = await this.getTenant(tenantId);
     return tenant.storeFactory.getStore(dbId, storeKind);
   }
@@ -1309,7 +1423,9 @@ export class TenantManager {
     return run;
   }
 
-  private async executePendingPurgesInternal(normalizedId: string): Promise<void> {
+  private async executePendingPurgesInternal(
+    normalizedId: string,
+  ): Promise<void> {
     const tenant = await this.getTenant(normalizedId);
     if (!tenant.mindooTenant) {
       // Config-based fallback: the server holds no $publicinfos directory and
@@ -1321,7 +1437,10 @@ export class TenantManager {
     try {
       directory = await tenant.mindooTenant.openDirectory();
     } catch (error) {
-      console.error(`[TenantManager] executePendingPurges: cannot open directory for ${normalizedId}:`, error);
+      console.error(
+        `[TenantManager] executePendingPurges: cannot open directory for ${normalizedId}:`,
+        error,
+      );
       return;
     }
 
@@ -1329,11 +1448,18 @@ export class TenantManager {
       return;
     }
 
-    let requests: Awaited<ReturnType<NonNullable<MindooTenantDirectory["getRequestedDocHistoryPurges"]>>>;
+    let requests: Awaited<
+      ReturnType<
+        NonNullable<MindooTenantDirectory["getRequestedDocHistoryPurges"]>
+      >
+    >;
     try {
       requests = await directory.getRequestedDocHistoryPurges();
     } catch (error) {
-      console.error(`[TenantManager] executePendingPurges: cannot read purge requests for ${normalizedId}:`, error);
+      console.error(
+        `[TenantManager] executePendingPurges: cannot read purge requests for ${normalizedId}:`,
+        error,
+      );
       return;
     }
     if (requests.length === 0) return;
@@ -1358,7 +1484,11 @@ export class TenantManager {
         registry.recordPurgedDoc(request.dbId, docId);
         for (const storeKind of [StoreKind.docs, StoreKind.attachments]) {
           try {
-            const store = await this.getStore(normalizedId, request.dbId, storeKind);
+            const store = await this.getStore(
+              normalizedId,
+              request.dbId,
+              storeKind,
+            );
             await store.purgeDocHistory(docId);
           } catch (error) {
             console.error(
@@ -1413,26 +1543,46 @@ export class TenantManager {
     const storeFactory = new StoreFactory(tenantId, config, this.dataDir);
 
     // Build the inner directory (real or config-based fallback)
-    let innerDirectory: Pick<MindooTenantDirectory,
-      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey">;
+    let innerDirectory: Pick<
+      MindooTenantDirectory,
+      "getUserPublicKeys" | "isUserRevoked" | "validatePublicSigningKey"
+    >;
     let mindooTenant: MindooTenant | undefined;
 
     const publicInfosKeys = await this.getStoredPublicInfosKeys(tenantId);
-    if (publicInfosKeys.length > 0 && this.serverIdentity && this.serverPassword) {
+    if (
+      publicInfosKeys.length > 0 &&
+      this.serverIdentity &&
+      this.serverPassword
+    ) {
       try {
-        const result = await this.createDirectoryTenant(tenantId, config, storeFactory, publicInfosKeys);
+        const result = await this.createDirectoryTenant(
+          tenantId,
+          config,
+          storeFactory,
+          publicInfosKeys,
+        );
         mindooTenant = result.tenant;
         innerDirectory = await mindooTenant.openDirectory();
-        console.log(`[TenantManager] Loaded tenant ${tenantId} with real directory`);
+        console.log(
+          `[TenantManager] Loaded tenant ${tenantId} with real directory`,
+        );
       } catch (error) {
-        console.error(`[TenantManager] Failed to create real directory for ${tenantId}, falling back to config:`, error);
+        console.error(
+          `[TenantManager] Failed to create real directory for ${tenantId}, falling back to config:`,
+          error,
+        );
         innerDirectory = new SimpleMindooDirectory(config);
       }
     } else {
       if (publicInfosKeys.length > 0 && !this.serverIdentity) {
-        console.log(`[TenantManager] Tenant ${tenantId} has $publicinfos keys but no server identity; using config-based directory`);
+        console.log(
+          `[TenantManager] Tenant ${tenantId} has $publicinfos keys but no server identity; using config-based directory`,
+        );
       } else {
-        console.log(`[TenantManager] No $publicinfos keys for ${tenantId}, using config-based directory`);
+        console.log(
+          `[TenantManager] No $publicinfos keys for ${tenantId}, using config-based directory`,
+        );
       }
       innerDirectory = new SimpleMindooDirectory(config);
     }
@@ -1479,12 +1629,18 @@ export class TenantManager {
     publicInfosKeys: Uint8Array[],
   ): Promise<{ tenant: MindooTenant }> {
     const storeFactoryAdapter = new StoreFactoryAdapter(storeFactory);
-    const factory = new BaseMindooTenantFactory(storeFactoryAdapter, this.cryptoAdapter);
+    const factory = new BaseMindooTenantFactory(
+      storeFactoryAdapter,
+      this.cryptoAdapter,
+    );
 
     const serverUser = this.serverIdentity!;
 
     // Create a KeyBag using the server user's encryption key
-    const keyBag = await this.createServerKeyBag(serverUser, this.serverPassword!);
+    const keyBag = await this.createServerKeyBag(
+      serverUser,
+      this.serverPassword!,
+    );
     for (const publicInfosKey of this.mergeUniqueKeys(publicInfosKeys)) {
       await keyBag.set("doc", tenantId, PUBLIC_INFOS_KEY_ID, publicInfosKey);
     }

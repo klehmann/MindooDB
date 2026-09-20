@@ -59,7 +59,7 @@ Three details are easy to get wrong:
 
 ## 4) Incoming: answering a peer
 
-Listening is where the security lives. A caller reaching this path is addressing your storage directly, so three separate questions have to be answered before you serve anything.
+Listening is where the security lives. A caller reaching this path is addressing your storage directly, so four separate questions have to be answered before you serve anything — the three below, plus access control on writes (§4.1), which nobody else will do for you.
 
 ```ts
 import {
@@ -96,6 +96,80 @@ await listenForIrohPeers(io, handler, {
 **Which methods.** `createStoreIrohHandler` resolves methods by name off the store object, so it is gated by `IROH_SYNC_STORE_METHODS` by default. Keep that default. The store also exposes `purgeDocHistory`, which would let a peer destroy history on your device. Pass a narrower `allowedMethods` for a read-only mirror (drop `putEntries` and `applyWitnessReceipts`).
 
 `maxConcurrentSessions` (default 32) caps how much one caller can tie up by opening streams in a loop.
+
+### 4.1) Verifying and authorizing what arrives
+
+These are the duties with no counterpart in the server path, and they are easy to miss because the code that would normally do them runs somewhere else.
+
+**Verify every entry before storing it.** `putEntries` takes bytes; the store does not check them. A server accepting a push verifies four things first, and a listener has to do the same. One tenant call covers all four:
+
+```ts
+const authentic = await tenant.verifyEntrySignature(entry, entry.encryptedData);
+```
+
+That checks the author key is trusted by the directory, the payload hashes to the declared `contentHash`, the tenant's v2-signature floor is met, and the author signature verifies. It caches the imported verify key per PEM, so a batch from one author does not re-import it per entry.
+
+Skipping this does not let forged entries become documents — materialization verifies signatures again and drops them. But they do occupy your store, and the next sync pushes them on to the server, which rejects them and fails that run. Refusing at the door keeps the damage there.
+
+**Apply the builtin invariant.** For `directory` and `userdirectory`, the admin/owner rules decide who may write what. Ask the database itself, so ingest and materialization agree by construction:
+
+```ts
+if (await db.violatesBuiltinWriteInvariant(entry)) {
+  throw new Error(`Entry ${entry.id} denied by the ${ctx.dbId} invariant`);
+}
+```
+
+This is the load-path rule, which is deliberately more forgiving than the server's: where a username hash cannot be resolved it fails open, rather than discarding an owner's own change. That makes it the right guard for this purpose — nothing is stored that would later be dropped unread — but it is not a promise that a server will accept everything you admitted. For any database without a builtin invariant it returns false, so it can be asked unconditionally.
+
+**Then evaluate Tier 1**, which is the subtlest of the three.
+
+Tier 1 — the identity tier of [accesscontrol.md](accesscontrol.md) §7: who signed, which database, which operation — is evaluated by a **witness** when it accepts an entry, and stamped into the receipt. Receivers then trust that receipt rather than deciding again (§ Scenario C). That is what keeps the system convergent, and it works because every entry reaches a replica *through* a witness.
+
+A peer sync has no witness. The entries carry no receipt, and an entry without one is read as a purely local write with nothing to check:
+
+```ts
+// core/accesscontrol/receiptValidation.ts
+if (receivedAt === undefined || !receivedByPublicKey || !receivedDateSignature) {
+  return { ok: true, noReceipt: true };
+}
+```
+
+So unless the listener evaluates Tier 1 itself, **nobody ever does**. A member whose write right on a database was withdrawn is still a member — still on your allowlist, still able to sign — and their changes would land on your replica by going around the server. Signature verification at materialization does not catch this: the signature is perfectly valid, it is the *permission* that is missing.
+
+Build the gate from your tenant directory and run both checks per entry, before the bytes are stored:
+
+```ts
+import { buildTier1Evaluator } from "mindoodb";
+
+const directory = await tenant.openDirectory();
+const evaluate = buildTier1Evaluator(directory, db.getStore());
+
+// In the handler, for putEntries only:
+if (!evaluate) {
+  throw new Error("Access rules cannot be evaluated"); // no verdict is not a yes
+}
+for (const entry of incomingEntries) {
+  if (!(await tenant.verifyEntrySignature(entry, entry.encryptedData))) {
+    throw new Error(`Entry ${entry.id} failed verification`);
+  }
+  if (await db.violatesBuiltinWriteInvariant(entry)) {
+    throw new Error(`Entry ${entry.id} denied by the ${ctx.dbId} invariant`);
+  }
+  const decision = await evaluate(entry, ctx.dbId);
+  if (!decision.allowed) {
+    throw new Error(`Entry ${entry.id} denied by Tier 1 policy: ${decision.reason}`);
+  }
+}
+```
+
+Four details worth keeping:
+
+- **Verify before evaluating.** Tier 1 is keyed on `createdByPublicKey`. On an unverified entry that field is a claim, so a caller could borrow a permitted colleague's key to pass the rules. Verification is what turns it into an identity.
+- **Builtin invariant before Tier 1**, the order a server uses: it must hold even where the ACL master switch turns Tier 1 into a blanket allow.
+- **Gate on ingest, not at materialization.** An entry that is merely skipped when documents are built still sits in your store, and the next sync pushes it on to the server — which rejects it and fails that run. Refusing before `putEntries` keeps the damage at the door.
+- **Fail closed.** `buildTier1Evaluator` returns `undefined` when the directory cannot decide. That is a missing verdict, not an approval.
+
+For tenants that never enabled access control this costs nothing: with no policy document, `evaluateAccess` allows everything by definition.
 
 ### Materializing what arrives
 
@@ -214,7 +288,9 @@ Worth knowing before designing around it:
 
 - **No JWT, no tenant publication, no cluster membership.** A peer is not a server. It does not issue tokens, host tenants for others, or join a mesh.
 - **No live change feed.** `subscribeToChanges` over a peer link is not part of this path; sync is something you trigger.
-- **No witness receipts** from the peer.
+- **No witness receipts** from the peer — which is why the acceptance checks become the listener's job (§4.1) instead of something a receipt can vouch for.
+- **No ingest checks by default.** `putEntries` writes bytes and asks nothing. §4.1 is not optional advice; a listener that skips it has none of the acceptance checks a server applies to a push.
+- **No guarantee a server will agree.** §4.1 admits what this replica would itself materialize. A server may still refuse some of it later — it evaluates the builtin invariants more strictly, and it may be running a different SDK version than the peer that sent the entry.
 - **No availability.** A peer answers only while its process is running and listening. For a browser tab that means only while the tab is open.
 
 If you need any of these, you need a server — see [iroh.md](iroh.md) §Server for running one reachable over Iroh rather than HTTPS.

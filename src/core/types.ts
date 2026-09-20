@@ -5649,6 +5649,22 @@ export interface MindooDB {
   syncStoreChanges(): Promise<void>;
 
   /**
+   * Would the builtin `directory` / `userdirectory` invariant forbid this
+   * entry? For callers that accept entries from somewhere other than a server
+   * — a peer sync — and therefore have to apply the admin/owner rules
+   * themselves before storing anything.
+   *
+   * Deliberately the same check the load path uses, so an entry admitted on
+   * this answer is one that will also materialize. Returns false for databases
+   * without a builtin invariant, so it can be asked unconditionally.
+   */
+  violatesBuiltinWriteInvariant(entry: {
+    entryType?: string;
+    createdByPublicKey: string;
+    docId?: string;
+  }): Promise<boolean>;
+
+  /**
    * Reconcile local document visibility with the current tenant KeyBag.
    *
    * Reveals documents whose decryption keys are now available, hides
