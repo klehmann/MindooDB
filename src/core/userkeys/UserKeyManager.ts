@@ -797,7 +797,14 @@ export class UserKeyManager {
         resolved = await this.ensureOwnUserKeyDocument(options);
       }
       if (!resolved) {
-        return this.enrollmentStatus(null, "unknown");
+        // First device of a newly granted user: `default` already arrived via
+        // key distribution, so minting a User-Key is refused. That is not
+        // "unknown" and not "waiting for another device" — this device can
+        // already unwrap tenant content.
+        if (await this.defaultAlreadyWrappedForCurrentUser()) {
+          return { state: "approved", pending: false, missingKeys: [] };
+        }
+        return this.enrollmentStatus(null, this.userDirectoryFetched ? "waiting" : "unknown");
       }
 
       if (isPendingUserKeyDocument(resolved.payload)) {
@@ -1196,6 +1203,9 @@ export class UserKeyManager {
     }
     const resolved = await this.resolveOwnUserKeyDocument();
     if (!resolved) {
+      if (await this.defaultAlreadyWrappedForCurrentUser()) {
+        return { state: "approved", pending: false, missingKeys: [] };
+      }
       return this.enrollmentStatus(null, this.userDirectoryFetched ? "waiting" : "unknown");
     }
     return this.enrollmentStatus(resolved.payload, this.waitState());

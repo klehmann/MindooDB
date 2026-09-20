@@ -243,6 +243,7 @@ Most problems in this area are ordering or timing issues rather than genuine fai
 | `hasDecryptionKey("default")` is false after enrollment | Hop 2 did not run, or ran before hop 1 | Call `reconcileUserKeys()` first, then `reconcileKeyDistributionsForCurrentUser()`. |
 | `approveJoinRequest` throws about a missing `userPublicKey` | `ensureUserKeyPair` was not called before `createJoinRequest`, and the person has no published key | Create the user key on the joining device and build a new request. |
 | `reconcileUserKeys` returns `state: "unknown"` | `userdirectory` has not been fetched, or the fetch failed | Sync `userdirectory`, call `noteUserDirectoryFetched()`, and retry. |
+| `reconcileUserKeys` returns `state: "approved"` with no user-key document | This person already holds `default` from key distribution (a newly granted first device). Minting a user-key document is refused so a second pair cannot desync `acl_keydistribution_default`. | Do not show a waiting banner. Shared tenant data already works; personal-data enrollment is not missing another device's approval. |
 | A second key document appears for one person | A device published before it had synced | Do not call `reconcileUserKeys({ allowSelfCreate: true })` on a device that has not fetched `userdirectory`. Lookup tolerates the fork, but avoid creating it. |
 | Adding a recipient reports them as skipped | That person has no published user key yet | Wait until they enroll a device, or pass `strict: true` to fail loudly instead of skipping. |
 | A recipient is listed but cannot read the document | Intent was recorded but no wrap exists yet | Expected and self-healing: `getRecipients()` reports `sealed: false` until a client that can read the document re-seals it. |
@@ -812,6 +813,7 @@ Wording matters here more than in most features, because the concepts are unfami
 | Situation | What to show |
 |---|---|
 | First device joins | Nothing. The key is created silently. |
+| Newly granted user already holds `default` | Nothing. Key distribution delivered shared tenant access; there is no other device of this person that could approve a user key. |
 | Existing user, first launch with user keys | Nothing. The key is published and every existing device is wrapped. |
 | Your own additional device, approved by yourself | Nothing to confirm. It is ready once it has synced. |
 | A new device is waiting for access | "**Your laptop 'Alice's laptop' wants access to your personal data.** Your private notes, backups and settings are locked so that only your own devices can open them. If you just set this device up, allow it. If not, someone else is trying to reach your data." Show the device label and a short fingerprint to compare. Offer *Yes, that's my device*, *Not now*, and *Don't ask about this device again*. |
