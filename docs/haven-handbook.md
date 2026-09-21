@@ -46,21 +46,27 @@ Those are the pieces. Everything else in Haven is a screen for working with them
 
 ## Getting around Haven
 
-Haven has a steady layout. A sidebar on the left, a slim top bar across the top, and your content in the middle.
+Haven puts everything on one surface. A slim top bar runs across the top, and below it sits the Workspace — the page you start on, come back to, and navigate from. There is no sidebar and no separate menu tree to learn.
 
-The left sidebar is the main navigation. It has five destinations: Workspace, Applications, Sync, Virtual Views, and Preferences. A small button at the bottom of the rail collapses the sidebar to icons when you need more room on screen, and a separate mobile menu opens the rail on phones and narrow viewports.
+The top bar is the same on every screen. On the left, the MindooDB Haven wordmark is a link back to the Workspace from wherever you happen to be. On the right sit two things: an identity chip showing the currently active user, and a Help button. Press the chip to open the identity switcher; right-click or long-press it for a quick menu that flips between light and dark mode or locks the session. The Help button opens a contextual help drawer for whatever screen you are on. Every screen has its own article, written in the same friendly style as this handbook, plus a short spotlight walkthrough that highlights the controls worth knowing — if you ever feel lost, that button is the first thing to try. On a phone or tablet, Haven will occasionally nudge you from the top bar to add it to your home screen.
 
-The top bar is the same on every screen. On the right you will find three things: an identity chip that shows the currently active user (press it to open the identity switcher, right-click it to flip between light and dark mode), and a Help button that opens a contextual help drawer for whatever screen you are on. Every screen in Haven has its own help article written in the same friendly style as this handbook, and if you ever feel lost the Help button is the first thing to try. On a phone or tablet, Haven will occasionally nudge you from the top bar to add it to your home screen for a better mobile experience.
+The Workspace opens on a tab called Start, and Start is Haven's front door. Across the top of it runs a row of six shortcut tiles, one for each of Haven's own screens: Setup wizard for a new environment, Haven App Store, Sync with server, Quick Scan, Virtual Views, and Preferences. Each gets its own section later in this handbook. Below the shortcuts, Start lists one tile for every application you have installed, so it doubles as the catalog of what is available to you. Double-click any tile to open it, or use the ⋮ button in its corner for the actions belonging to it.
 
-There is one more piece of the top chrome that is easy to miss the first time: the Running Apps panel. When you launch a MindooDB app "inside Haven" — more on that under Applications — the app keeps running in the background while you navigate elsewhere. A small arrow handle appears at the top of the content area, and clicking it slides down a drawer that lists every app you have running. From the drawer you can jump back into any running app, use the "Back to Workspace" shortcut to return to where you were, sync that app's local databases against the server, reload the app, open an info dialog about it, or close it. The drawer is available from any route, not just from the app runner page, so you never have to hunt for a running app.
+Start is deliberately fixed. The six shortcuts are always in the same place and cannot be moved, removed, or rearranged, and Start is not where your own tiles go — it is the one page you can rely on looking the same tomorrow. Everything you arrange yourself lives on the pages you create next to Start, described under Workspace below.
+
+The App Drawer is how you move between the things you have open. Whenever an application is running or a Haven screen is open, a small arrow handle appears at the top of the content area; clicking it slides down a drawer in two parts. Views lists the Haven screens you have open — Sync, Preferences, Virtual Views, the setup wizard — and Apps lists the MindooDB applications currently running. Above both sits a Back to Workspace entry. From an application's tile in the drawer you can also sync that app's local databases against the server, reload it, open an info dialog, or close it.
+
+Two shortcuts make the drawer worth learning properly. Cmd+Shift+Enter returns you to the Workspace from anywhere, including from inside a running application, and Cmd+Shift+Space opens and closes the drawer. On Windows and Linux, press Ctrl instead of Cmd. Haven forwards both to embedded applications, so they keep working even when an app has the keyboard focus.
+
+What you open stays open. Launch an application or open the Sync page, wander off somewhere else, and it is still sitting in the drawer when you come back, with its scroll position, unsaved edits, and open tabs untouched.
 
 When you install Haven on a phone and launch it from the home screen, it opens in standalone mode, which removes the browser's address bar and tab strip. Certain screens inside Haven — mostly immersive ones like a full-screen running app — also hide the top bar for the same reason.
 
 ## Your first 10 minutes
 
-The first time you open Haven, it greets you with a Welcome page that turns the whole setup — identity, admin, tenant, or joining an existing team — into a short guided flow. You can do all of this by hand later through Preferences → User ids and Preferences → Tenants, but the Welcome page is by far the easiest path, so use it whenever you can.
+The first time you open Haven there is nothing to find and nothing to configure: it takes you straight into the setup wizard, which turns the whole beginning — identity, admin, tenant, or joining an existing team — into a short guided flow. Haven decides this by looking at the device. Once it finds both a named user identity and a tenant, opening Haven lands you on the Workspace; until then it lands you in the wizard. You can return to it whenever you like from the Setup wizard for a new environment tile on Start, which is also how you add a second tenant later on. Everything the wizard does can be done by hand through Preferences → User ids and Preferences → Tenants, but the wizard is by far the easiest path, so use it whenever you can.
 
-The Welcome page opens with a short pitch (end-to-end encrypted, local-first, zero-trust servers) and three big buttons: Create a tenant, Join a team, and Open tenants. Below those, two cards explain what each path actually does. If Haven already has an unlocked identity, a small banner tells you so — the wizard will happily reuse it and skip the identity step if you want.
+The wizard opens with a short pitch (end-to-end encrypted, local-first, zero-trust servers) and three big buttons: Create a tenant, Join a team, and Open tenants. Below those, two cards explain what each path actually does. If Haven already has an unlocked identity, a small banner tells you so — the wizard will happily reuse it and skip the identity step if you want.
 
 ### Path one: starting your own tenant
 
@@ -72,9 +78,9 @@ Then pick how you want to unlock that identity from day to day. Haven pre-select
 
 Step two, set up a separate admin identity. MindooDB deliberately keeps the tenant admin and the everyday app user apart, so that a single compromised secret cannot take over both directory management and day-to-day document work. You choose here how the admin identity is protected: have Haven generate a six-word passphrase, or type a password of your own with the usual repeat field. The generated one is shown once, with buttons to copy it or download it as a text file, and a checkbox confirming you have saved it so you cannot skip past it by accident. Either way it is deliberately not a passkey: an admin you can only unlock with this device's Face ID is an admin you lose together with the device, and admin work is exactly what you need after replacing a laptop. Keep it where you keep your other emergency credentials.
 
-Step three, create the tenant itself. Haven generates the encryption keys for the new tenant, stores them in your local KeyBag, and wires up both identities. Everything stays locally in your browser at this stage — nothing has been pushed to a server yet.
+Step three, create the tenant itself. Haven generates the tenant id for you, and it cannot be changed afterwards. That is deliberate: once several teams share a MindooDB server, tenant ids have to be unique, and an id somebody typed by hand is an id that eventually collides with somebody else's. What you do choose is the tenant label — a short, memorable name so you can recognise this tenant later — and any admin can rename it at any time, because the label is only there for humans. Haven then generates the tenant's encryption keys, a default key for your content and a second one for the access directory, stores them in your local KeyBag, and wires up both identities. Everything stays locally in your browser at this stage; nothing has been pushed to a server yet.
 
-Step four, you are all set. Haven drops you into your empty Workspace, already unlocked, already inside the new tenant. When you are ready to collaborate, publish the tenant to a MindooDB server from Preferences → Tenants.
+Step four, you are all set. Haven drops you into your empty Workspace, already unlocked, already inside the new tenant. When you are ready to collaborate, publish the tenant to a MindooDB server: the Sync page offers a Push to server button for any tenant that is still local-only, and the same thing lives in Preferences → Tenants.
 
 ### Path two: joining an existing team
 
@@ -92,13 +98,15 @@ Step four, you are in. Haven drops you into the freshly joined tenant and the Wo
 
 Once the Welcome wizard is done, the day-to-day path is the same whichever route you took.
 
-Open the Workspace. The first time there will be no tiles on it. Use the Add button in the top right of the Workspace page to create a new database tile pointing at one of the databases in your tenant. Double-click the tile to open the Database Browser and see its documents.
+Open the Workspace. Start already has its six shortcut tiles; what it does not have yet is anything of yours. Add a page next to Start from the Add menu, then use the same menu to put a database tile on it pointing at one of the databases in your tenant. Double-click the tile to open the Database Browser and see its documents.
 
-Run a sync. Go to the Sync screen and press Sync All, or use the per-row Sync if you only want to refresh a single database. Once the status column shows a green check, your local replica is up to date with the server.
+Install an app. Open Haven App Store from Start, pick something that looks useful, and install it. It appears as a tile on Start straight away, and you can place it on one of your own pages from there.
+
+Run a sync. Open Sync with server from Start and press Sync All, or use the per-row Sync if you only want to refresh a single database. Once the status column shows a green check, your local replica is up to date with the server.
 
 Come back to the Workspace and keep adding tiles — applications, notes, web pages, dashboards, anything that makes your workspace feel like home.
 
-If any step feels abstract, open the Help button on that screen. The in-app help has a "spotlight" walkthrough that highlights exactly what to click. And you can always revisit the Welcome page later — it is happy to reuse an existing identity or help you create additional ones.
+If any step feels abstract, open the Help button on that screen. The in-app help has a "spotlight" walkthrough that highlights exactly what to click. And you can always reopen the setup wizard from its tile on Start — it is happy to reuse an existing identity or help you create additional ones.
 
 ### Haven is multi-tenant by design
 
@@ -138,7 +146,9 @@ The one situation this flow cannot repair is losing every approved device at onc
 
 The Workspace is your daily home. You arrange databases, applications, notes, web pages, videos, and diagrams as draggable tiles across multiple pages, like home screens on a phone. The layout is personal: by default it is stored only in this browser, so it loads instantly and works offline. If you want the same arrangement on your other devices, the Roamed workspace setting under Preferences → General saves it into your tenant, encrypted for you alone.
 
-Pages are the tabs across the top of the Workspace. Each page has its own grid of tiles, and you can have as many pages as you like — one per project, one per role, one for daily dashboards, one for personal links. Right-click a page tab to rename, reorder, or delete it. A special page called All shows every tile from every page in one read-only overview, which is handy when your Workspace has grown past a few pages.
+Pages are the tabs across the top of the Workspace. The first one is always Start, described under Getting around Haven: Haven's own six shortcuts plus a tile for every installed application. Start is read-only, so you cannot drop your own tiles on it or rearrange what is there, and it is the one page that always looks the same.
+
+Everything else is yours. Add as many pages next to Start as you like — one per project, one per role, one for daily dashboards, one for personal links — each with its own grid of tiles. Right-click a page tab to rename, reorder, or delete it.
 
 Tiles are the cards on the grid. Drag a tile by its header to move it, drag the corner to resize it, or right-click for the full context menu. Drop a tile onto another page tab to move it there. Drop a tile onto another tile to start a group.
 
@@ -148,29 +158,53 @@ Several kinds of tile live on the same grid.
 
 A database tile points at one MindooDB database. Double-click it to open the Database Browser. Use the context menu to switch which copy of the database the tile is showing — a local replica for speed and offline, or a live server target for the freshest state. Database tiles remember the tenant, the database, and the source you last used, so they are also a handy bookmark back into the rest of MindooDB.
 
-An application tile launches a MindooDB app. There are three runtime modes and you pick the one that fits the app. Embedded in the tile runs the app right inside its workspace card, which is perfect for small glanceable tools like a capture form or a mini dashboard. Inside Haven opens the app full-width inside the Haven window and uses the Running Apps drawer for switching; apps opened this way keep running in the background while you navigate elsewhere, so their scroll position, unsaved edits, and open tabs are still there when you switch back. In a separate browser tab opens the app as a standalone page, useful for a second monitor or for browsing Haven and the app at the same time.
+An application tile launches a MindooDB app, and two separate settings decide how it behaves. The tile's own Display mode is either Launcher, a card you double-click, or Embedded, which runs the app right inside the workspace card and is perfect for small glanceable tools like a capture form or a mini dashboard. The registration's Runtime mode then decides what a launch actually does: Embed in Haven opens the app full-width inside the Haven window, where the App Drawer handles switching, while Open in new window gives it a standalone browser tab — useful for a second monitor, or for reading Haven and the app side by side. Apps opened inside Haven keep running in the background while you navigate elsewhere, so their scroll position, unsaved edits, and open tabs are still there when you switch back.
 
 Text tiles hold formatted notes. Web tiles embed any URL as a mini browser, which is how you keep a partner system or another team's dashboard next to the MindooDB data it documents. Video tiles play YouTube content for tutorials and walkthroughs. Mermaid tiles render live architecture diagrams and flowcharts right on the grid. These content tiles are personal — they live in this browser only — so they are ideal for cheat sheets, daily links, and live reference material.
 
-A search bar across the top of the Workspace filters tiles across pages by name, database, tenant, tag, or server. On the All page you can also sort tiles by last used, tenant, alphabet, or connection, which becomes the fastest way to find something when the workspace has grown.
+A search bar across the top of the Workspace filters tiles across pages by name, database, tenant, tag, or server. On Start you can also sort what is listed there by last used, by tenant, or alphabetically, which becomes the fastest way to find something once you have installed more than a handful of applications.
 
-## Applications
+## Applications and the Haven App Store
 
-Applications is the screen where team admins register MindooDB apps so Haven can launch them securely. Regular users never need to visit this screen; they just use the apps their admin set up from their workspace.
+MindooDB apps are small web tools that run inside Haven with a scoped view of your data. Getting one is a single click in the Haven App Store; everything afterwards — launching, configuring, updating, removing — happens from the app's own tile on Start.
 
-Each row in the catalog is one application registration. A registration is a contract between Haven and the app: Haven promises to launch the app in the way the registration describes and to expose only the data the mappings allow, and the app agrees to go through Haven's SDK connector for every read and write. Changing a mapping takes effect the next time the app starts; no code changes are required in the app itself.
+The Haven App Store is the catalog of ready-made MindooDB applications, and it opens as a dialog on top of the Workspace rather than taking you somewhere else. Browse the catalog, open an entry to read its description, screenshots, and version, then press Install. Haven asks which tenant the app should work in and what to call it, and Install now finishes the job. There is no registration form to fill in: Haven writes one for you from the catalog entry, grants the app the databases it declares, and the app appears as a tile on Start ready to launch. If a hosted app has a newer build waiting, the App Store tile carries a small badge with the number of available updates.
 
-The catalog lets you create a new registration with the New button (it is a dropdown, so you can pick between adding a new external URL and importing a hosted bundle), or bring in a pre-packaged registration with the Import button. Each row has four actions: Launch to start the app with the active user, Edit to change its settings or mappings, Info to view its metadata (like its app id and current version), and Remove to unregister it. A small RUNNING badge next to the name tells you that an instance of this app is already alive inside Haven; in that case Launch takes you into the existing session instead of starting a second one.
+A registration is the saved contract between Haven and an app: Haven promises to launch it the way the registration describes and to expose only the data its mappings allow, and the app agrees to go through Haven's SDK connector for every read and write. Installing from the App Store produces one automatically, which is why most people never have to think about the concept at all. It starts mattering the day you want to change what an app is allowed to see.
 
-Two things define how Haven serves an app. First, where the code lives. An external URL points at a dev server or a deployed web app running somewhere else; you will use this while developing or when another team hosts the app. A hosted bundle is a packaged set of web assets imported into Haven itself. Once stored locally, Haven can deliver the bundle through its own service worker, which means the app launches from local storage even when there is no network — this is the route to truly offline-capable apps. Hosted mode also applies a network allowlist you control; empty means no external network. See [hosted-app isolation](hosted-app-isolation.md) for the sandbox, the Vite plugin, and why local `vite dev` stays on an external entry URL. Second, how it runs. Embedded mode sits inside a workspace tile. Window mode opens the app in its own browser tab or popup.
+Everything you can do with an installed app hangs off the ⋮ menu on its Start tile. Launch application starts it with the active user, or takes you into the existing session if it is already running rather than starting a second one. Configure application opens the registration for editing, which is where the hosting, runtime, and data mappings described below live; changes take effect the next time the app starts, and no code changes are needed in the app itself. About this application shows its metadata, such as the app id and current version. Check for updates appears on apps served from a hosted bundle and pulls a newer build if the publisher shipped one. Remove application uninstalls it again. The App Store tile carries one extra entry of its own, Import application, for bringing in a pre-packaged registration that did not come from the catalog.
+
+Two things define how Haven serves an app. First, where the code lives. An external URL points at a dev server or a deployed web app running somewhere else; you will use this while developing or when another team hosts the app. A hosted bundle is a packaged set of web assets imported into Haven itself. Once stored locally, Haven can deliver the bundle through its own service worker, which means the app launches from local storage even when there is no network — this is the route to truly offline-capable apps. Hosted mode also applies a network allowlist you control; empty means no external network. See [hosted-app isolation](hosted-app-isolation.md) for the sandbox, the Vite plugin, and why local `vite dev` stays on an external entry URL. Second, how it runs. Embed in Haven runs the app in an iframe inside the Haven window, where the App Drawer handles switching. Open in new window launches it as a standalone browser tab instead, which is useful for a second monitor.
 
 The part of the registration that actually protects you is the data mapping. For every database you want the app to see, you choose the logical name the app will address it by and the capabilities you are granting: read-only or read/write, whether to allow deletion, attachments, revision history, and the creation of app-defined virtual views. You can also map databases from different tenants or different servers behind separate logical handles, which lets a single app work across boundaries without ever seeing more than it should.
 
 When an app launches, it does not talk to MindooDB storage directly. It calls the SDK connector, which opens a session with Haven, and every read, write, query, attachment operation, or history call flows through that connector. Haven validates each request against the mapping and permissions you configured, so even if the app tried to misbehave, the bridge would refuse.
 
-Registrations can be exported as JSON packages and imported again in another browser, for a teammate, or in a different environment. Exports can optionally include the hosted bundle files, which makes it practical to promote an app from local development to a reusable Haven package without rebuilding the registration by hand.
+Registrations travel as JSON packages. Export application, inside the Configure application dialog, writes one; Import application on the App Store tile reads it back. A package can carry the hosted bundle files along with the definition, so an app developed in one browser can be handed to a teammate or moved into another environment without anyone rebuilding the registration by hand.
 
-A good rule of thumb when registering a new app: start with read-only access and a single database, get the app running, and only then widen the capabilities. It is much easier to add write access later than to take it away in a hurry.
+Not every app comes from the catalog, and the store's New app menu covers the rest. From URL registers an app that lives at an address you paste — a fork, a preview deployment, or a builder running on your own machine; Haven reads the app's `haven-app.json` from that address and shows you what it asks for before writing anything. New blank app opens an empty registration when you want to fill in the hosting and mappings by hand. Custom, built by AI leads to the App Builder, which the next section is about.
+
+A good rule of thumb when you widen an app's access: start with read-only on a single database, get the app running, and only then grant more. It is much easier to add write access later than to take it away in a hurry.
+
+## Building an app with the App Builder
+
+One app in the store exists to produce other apps. The App Builder takes a description of the tool your team is missing — a task board, a booking list, a shift plan — and turns it into a working Haven application: an AI agent writes the code, it is published to the web at its own address, and Haven offers it for installation. Nothing on your side involves programming, and what comes out is a real application rather than a demo.
+
+You install it from the Haven App Store like anything else. The first run asks you to connect three accounts, and that is the only technical part of the whole business. GitHub keeps the app's source code, Cloudflare publishes it, and Cursor supplies the AI that writes it. GitHub and Cloudflare connect through their own consent screens in a click each, with no account id or owner name to look up anywhere. Cursor has no consent flow, so you paste an API key from its dashboard — and the cloud agents the builder starts are not included in Cursor's free plan. That is also the one you can postpone: without a Cursor key the project is still created and published, it simply arrives empty.
+
+From then on, building an app is a name, one sentence about its purpose, and a brief describing what it should do, written in ordinary language rather than technical wording. Pressing the button sets four things in motion. The project is created from the official starter template, which already carries the App SDK documentation and a best-practices guide, so the agent works from the interfaces that actually exist instead of guessing at them. The app gets its own web address, wired to Cloudflare's build pipeline so every later push redeploys it by itself. A cloud agent picks up the brief and starts writing, generating a matching app icon as it goes. And when it finishes, the builder hands the app to Haven.
+
+You can watch all of it. Each step reports what it did, and the agent's work is visible while it runs, so you follow along and give feedback rather than waiting on a black box. That channel stays open afterwards: asking for the next feature is another brief against the same project, and the agent picks up where it left off.
+
+Haven installs the result the way it installs anything else. It reads the finished app's own description and asks you first, listing the databases, permissions, and network access the new app wants. Once you approve, it is a tile on your Workspace like any other, ready to run full-screen or embedded in the card.
+
+What you own at the end is worth being explicit about. The code is an ordinary Git repository in your own GitHub account, built on the same App SDK the first-party apps use, with the whole platform open to it: databases, virtual views, offline operation, real-time sync, Haven's theme. The AI is replaceable — point Claude Code, Codex, or your own hands at the repository instead, and Cloudflare republishes whatever arrives, whoever wrote it. And because the app lives at a public address, a colleague you send the link to can add the same app to their own Haven.
+
+The credentials get careful treatment, because there are three of them and they are powerful. They live in a single document in your own App Builder database, encrypted for you personally, so a shared database does not expose them and the next app does not ask for them again. The GitHub token never leaves the browser tab at all. The Cloudflare token and the Cursor key do reach the builder's server, for the calls a browser is not permitted to make, and nothing is kept afterwards. No credential is ever handed to the coding agent: publishing runs through Cloudflare's own Git integration, which needs no token hand-off, precisely so that a cloud machine is never given something that can deploy.
+
+The App Builder asks Haven for one unusual permission, propose applications, which is what lets it offer the app it just built instead of making you copy a URL by hand. It also needs to open pop-up windows, because GitHub's and Cloudflare's consent screens arrive in one. Haven still asks you before installing anything, every time.
+
+The builder is itself open source, and the hosted copy is a convenience rather than a requirement. If you would rather the Cursor key never passed through a server you do not run, clone [`mindoodb-app-builder`](https://github.com/klehmann/mindoodb-app-builder) and run it yourself; it serves on a loopback address, which counts as a secure origin, so an HTTPS Haven can still embed it. Point Haven at your own copy with New app → From URL in the App Store, using the loopback address it prints on start, instead of installing the catalog entry. It is the same application, and the Cursor key then never leaves your machine.
 
 ## Sync
 
@@ -178,7 +212,15 @@ Sync is how the data in your local replicas stays in step with the server. Every
 
 The screen lists every tracked database in every local replica the active user can see. Rows are grouped by tenant. For each row you see which server, tenant, replica, and database it belongs to, the direction of sync (push only, pull only, or bidirectional), and the last sync result. A small "synced before" badge appears on rows that have previously completed at least once, which makes it easy to spot the databases that have never been pulled yet.
 
+A tenant that exists only on this device has no rows to list, because there is no server to sync against yet. Rather than leave it out, Sync gives it a card of its own with a Push to server button, which opens the same publish dialog as Preferences → Tenants. This is the usual way to take a tenant from the setup wizard to a shared one: the card sits where you would go looking for sync anyway, and it disappears once the tenant is on a server and its databases show up as ordinary rows.
+
 There are three ways to trigger sync. The per-row Sync button refreshes just that database. The Sync tenant button (on each tenant's header) refreshes every database in that tenant. The Sync All button at the top of the page refreshes everything in one go. While a sync is running, the status column shows live progress, including how many batches have been transferred. A green check means the row finished without errors. A red badge means something went wrong; when that happens, Haven leaves the row as it was before the sync started, so you never end up with half-applied changes.
+
+Sync All is a split button, and its dropdown holds one option worth finding: Auto-push changes to servers. With it on, Haven sends your changes up as you make them instead of waiting for the next manual sync, which takes most of the "did I remember to sync?" out of a working day. It covers the outbound half only, and it is remembered per user identity rather than per device.
+
+The inbound half needs no setting, because it is always on. For every server and tenant holding at least one row set to pull or bidirectional, Haven keeps a live change feed open and listens. When the server announces a change to a database you track, Haven pulls it a couple of seconds later through the ordinary sync runner, so the row shows the same progress and the same green check as a sync you started yourself. An announcement does not force a transfer: Haven compares heads first, so news about something you already have costs one cheap request. A dropped feed reconnects on its own. What the feed does depend on is what sync always depends on — the Haven tab open and the active identity unlocked — and rows set to push only or switched off are left out, since nothing about them is waiting to come down. Over an ordinary server connection the feed arrives as server-sent events; over an Iroh connection it uses an Iroh stream instead. A server too old to offer a change feed simply does not get one, and its rows stay on manual sync.
+
+With both halves in place, a server connection keeps itself current in both directions, and the manual Sync buttons become what you reach for when you want certainty at a particular moment rather than what moves your data.
 
 A Stop button appears while a sync is running. It sends a cooperative stop signal to the current run. The current row is allowed to finish or roll back cleanly, so you do not end up with half-written data. There is one caveat worth knowing: if you press Stop while a specific row is mid-transfer, that row may end up with only some of the new data, so the next read could mix recent and old values. After a stop, re-run that row before trusting any numbers from it.
 
@@ -186,9 +228,39 @@ When should you sync? The short answer is: before you trust a number you are abo
 
 One small gotcha: if you expected a database to appear in the queue and it is missing, the usual reason is that the user identity holding the replica is not unlocked yet. Sync needs the keys from the local KeyBag, and the KeyBag only opens once the active identity is unlocked from the top bar.
 
+### Peer-to-peer sync without a server
+
+Sync does not have to go through a server at all. Two Haven devices in the same tenant can exchange data directly, and that turns out to matter in two quite different situations. The obvious one is a server outage: the team keeps working and the data keeps moving, because nothing in the path depends on the server being up. The subtler one is ordinary drafting. Two people working through the same document can sync straight to each other while they iterate and push the finished result to the server once, instead of routing every intermediate state through it.
+
+You start it from the ⋮ menu on a tenant's header on the Sync page, under Peer-to-peer sync without a server. The dialog that opens is called Sync with another device and lists the devices of that tenant — yours under Your devices, everyone else's grouped by the member they belong to. Each row gives the device label, its Endpoint, its Signing key, and whether it is currently Reachable. Pick one and press Add device.
+
+The device on the other end has to be expecting you. In Preferences → General there is a card called Device-to-device sync holding a checkbox: Accept incoming device sync. Turning it on lets other devices of this tenant sync directly with this one — including devices belonging to other members, not only your own. Two conditions come with that. The listener exists only while the Haven tab is open, and the session has to be unlocked; a tab sitting at the unlock dialog answers but refuses to sync, which is exactly what Haven reports back to the other side when it happens.
+
+What makes devices findable is an endpoint id. Haven generates one per device the first time it starts and publishes it in the tenant's user directory database, which is also where the Sync with another device dialog reads its list from — that is why it can show you a legible user name and device label instead of a bare identifier. Publishing happens whether or not you accept incoming sync, deliberately so: the whole point is that devices can still find each other when the server is down and nothing new can be published. The flip side is that a device only knows about peers whose directory entry it has already pulled, so a tenant that has never been synced on this device has nobody to offer yet.
+
+Underneath, this runs on the Iroh network. In the browser Haven reaches the other device through an Iroh relay — a consequence of what a web page is permitted to do with the network, not a design preference — while a native Haven build can connect directly when both devices sit on the same network. The same transport is available between client and server, if the MindooDB server has been configured to join Iroh; [`README-server.md`](https://github.com/klehmann/MindooDB/blob/main/README-server.md) covers that side of the setup.
+
+That client-server case is worth a second look, because it changes what a server has to be. Reached over HTTP, a server has to be reachable: a hostname, a certificate, and a port that something on the internet is allowed to open. Over Iroh none of that applies. The server can sit inside a network nothing can dial into — a machine at home behind a NAT router, with no forwarded port — and Haven still gets to it, because neither side has to accept an incoming connection: they find each other through a relay, which either helps them open a direct path or carries the traffic itself when the router will not allow one. In place of an `https://` address you enter the `iroh:` locator the server prints when it starts, and sync runs as it always does, live change feed included. A relay in the path sees no more than the server does: what passes through is ciphertext, and the relay learns only that two endpoints are talking.
+
+While other devices are syncing with yours, the Sync page grows a panel headed Incoming peer-to-peer sync with a count of the sessions, listing which device transferred what and in which direction. It is cleared on reload, and it is the place to look when you want to confirm a direct sync really happened.
+
+## Quick Scan
+
+Quick Scan is a document scanner built into Haven, and it turns a sheet of paper into a clean file without anything leaving the browser tab. Open it from Start and it appears as an overlay on the workspace rather than a screen you have to navigate back out of.
+
+Point the camera at a page, or pick an image you already have. Haven finds the edges of the sheet, corrects the perspective so the result looks like a scan rather than a photograph taken at an angle, and lets you straighten, crop, and rotate afterwards. If the automatic edge detection picks the wrong rectangle — a patterned tablecloth will do it — drag the corners yourself or press Re-detect edges to try again. Page presets such as A4 and Letter keep the output at a sensible aspect ratio.
+
+A scan does not have to be a single sheet. Press Add page and capture the next one, and keep going until the stack is done. A filmstrip along the edge shows the pages you have so far and numbers them; select one to rotate it, or drop it and capture that page again. A multi-page scan comes out as a single PDF, while one page can also be a PNG or a JPEG. There is also an Extract text action that runs OCR over the page when you want the words rather than the picture.
+
+All of it happens in the browser tab. Quick Scan works offline, nothing is uploaded to a service for processing, and the image never leaves the device except through the download or share you choose yourself.
+
+What Quick Scan does not do is file the result for you. It has two ways out — a download button and the system share sheet — and both hand you a file; nothing is written into a database. When you want the scan to land inside a document instead, start it from whatever owns that document. The Database Browser scans directly onto the document you have open, and an application can open the same scanner through the App SDK and attach the result to one of its own documents. It is the same scanner and the same perspective correction in all three places; only the last step differs.
+
 ## Virtual Views
 
 Virtual views are the analytical surface of Haven. They give you a spreadsheet-like tree that filters, categorizes, sorts, and totals documents across one database, several databases, or even several tenants. They are how you answer questions across your data rather than just inside one database.
+
+They have a second job that is easy to overlook: a view makes a good data source for an application. Granting an app a whole database is sometimes more than it needs and more than you want to hand over. Build a view that exposes exactly the documents and columns the app should work with, map the app to the view instead of the database, and the app gets what it needs while the rest stays out of reach.
 
 The Virtual Views screen has two parts: the catalog of saved views at the top and the builder canvas that opens below it when you select or create one. The catalog offers New view, Open view, Edit view, Duplicate view, and Remove view, plus Import and Export buttons for moving view definitions between environments. Each row shows the view name and its data sources.
 
@@ -224,19 +296,21 @@ Nothing in the Document History view can be edited. It is a faithful, read-only 
 
 ## Preferences
 
-Preferences is the one screen that is organized as a tab bar instead of a single page. It has six tabs: General, User ids, Tenants, Backup, Restore, and Stats. Everything on these tabs lives in this browser and, apart from a few exceptions in Tenants and the opt-in Roamed workspace setting in General, does not touch the server.
+Preferences is the one screen that is organized as a tab bar instead of a single page. It has six tabs: General, User ids, Tenants, Backup, Restore, and Stats. Everything on these tabs lives in this browser, with a few deliberate exceptions: the actions in Tenants, the opt-in Roamed workspace setting, and the endpoint that Device-to-device sync publishes so other devices can find this one.
 
 ### General
 
 General is where you adjust how Haven looks and how it launches on your device. All of it is personal and applies immediately — there is no Save button.
 
-At the top, a Start page setting lets you pick which page Haven opens when you visit the root URL. If you always land on the same screen first thing in the morning, point Start page at it and skip the extra click.
+At the top, Display language sets the language Haven itself speaks — its navigation, preferences, dialogs, and help. It does not touch your documents, and applications running inside Haven bring their own translations.
 
 Current theme lets you pick a color preset (for example Mindoo or Aura) and switch between light and dark mode. The preset changes accent colors throughout the app; the light/dark toggle controls the background and text contrast. The same theme choice is reflected in the identity chip's right-click menu and is propagated live to any embedded MindooDB app so they match Haven's look without reloading.
 
 Add Haven to your home screen is a one-tap card that offers a shortcut to the install guide for your platform. On iPhone it links to Safari's Add to Home Screen flow; on Android it triggers the browser's Install prompt or points you at the Install app action in the browser menu. If Haven is already running from its installed icon, the card simply confirms that and shows a Review install steps button in case you want to add another copy.
 
-An Optimize for iOS multitasking toggle near the bottom of the tab tells Haven that it is used in iPad split-screen or slide-over mode, where the system adds window controls that overlap Haven's mobile menu button. Turning the toggle on shifts Haven's navigation button to the right so it stops colliding with the system chrome.
+An Optimize for iOS multitasking toggle tells Haven that it is used in iPad split-screen or slide-over mode, where the system adds window controls that overlap Haven's own chrome. Turning it on shifts Haven's controls clear of them. Under Motion, Reduce animations strips out Haven's transitions for anyone who finds them distracting or whose system already asks for less movement.
+
+Device-to-device sync is where the receiving half of peer-to-peer sync lives. The checkbox is Accept incoming device sync, and the card also shows this device's endpoint — the identifier other devices dial to reach it — along with whether anyone can currently see it. The section on peer-to-peer sync under Sync explains what the two sides do; this is the switch that makes this device one of them.
 
 Roamed workspace is the one setting on this tab that leaves the browser, and it is off until you turn it on. It makes the workspace pages, tiles, groups and the application list of the active user id follow you to your other devices, and it lets you keep several environments and switch between them — office and home, or desktop and mobile. It is a Haven Enterprise feature: without an active license the toggle stays off, this device neither saves its workspace nor takes one over, and environments you set up earlier are left exactly as they are until a license is imported again. Switching the toggle on reveals two fields: the tenant the workspace is synced through, and the name of the saved workspace. The name is how devices find each other, so "office" on your laptop and "office" on your phone share one workspace; the field opens a drop-down of the names already saved for this user id, and typing a name that is not in that list starts a new one. Neither field takes effect while you edit it — Apply commits both, Cancel puts back what is in force. What Apply does follows from the name: a new one is created from this device's workspace, an existing one is taken over, and the tabs and tiles arranged here are replaced by it. That replacement only costs you something when roaming was off, so that is the single case Haven asks about first; once roaming is on, this device's state is already in its saved workspace and moving to another name is free. Switching the toggle off stops roaming right away and leaves every saved workspace untouched.
 
@@ -270,7 +344,7 @@ Opening a tenant shows its key fingerprints and where it is currently published.
 
 Actions that touch the tenant directory — publishing a tenant, or granting a teammate access from a join request — are signed by the admin identity, so Haven asks for its passphrase. Because those tasks usually come in batches, the prompt offers to unlock the admin for this session: tick it once and the following steps stop asking. Unlocking an admin this way does not switch your active identity, so your everyday user stays the one doing document work, and a Lock administrator action ends it early when you are done.
 
-New tenants always start in this browser for the active user. Publishing pushes the tenant to a MindooDB server so other team members can join. Deleting from a server removes the tenant location from that server only — the local copy stays put. Publishing and deleting on a server require a system admin password, because they touch shared infrastructure; if you are not the platform admin, ask them to run the action with you.
+New tenants always start in this browser for the active user. Publishing pushes the tenant to a MindooDB server so other team members can join; the Sync page offers the same step as a Push to server button while a tenant is still local-only, so most people meet it there first. Deleting from a server removes the tenant location from that server only — the local copy stays put. Publishing and deleting on a server require a system admin password, because they touch shared infrastructure; if you are not the platform admin, ask them to run the action with you.
 
 Be careful with delete-on-server. It wipes that server's view of the tenant for every user, not just yours, and other clients may suddenly fail to sync. Confirm it with the platform admin and any other team admins first, and make sure a current encrypted backup exists before pressing the button.
 
@@ -354,6 +428,8 @@ Passphrase — several random words used instead of a password. Haven offers a g
 
 Tenant — your team's private workspace inside MindooDB. Groups users, encryption keys, and databases together so a team can share data securely.
 
+Tenant label — the human-readable name of a tenant. Haven generates the tenant id itself and it never changes; the label is the part you pick, and an admin can rename it whenever it stops fitting.
+
 Tenant admin — a privileged identity inside a tenant. Can register or revoke other users and change tenant-wide settings.
 
 App user — a regular user identity inside a tenant. Does everyday document work but cannot register or revoke other users.
@@ -378,6 +454,16 @@ Local replica — a browser-local synced copy of a tenant's databases. Fast, wor
 
 Live source — a source mode that pulls fresh data from a MindooDB server before using it. Slower than the local replica but useful when you need the very latest state.
 
+Change feed — the stream a server uses to announce new writes to the clients listening on it. Haven keeps one open per server and tenant it pulls from, which is what makes incoming work arrive on its own. Always on; no setting of its own.
+
+Peer-to-peer sync — a direct sync between two devices of the same tenant with no server in the path. Runs over the Iroh network. The receiving device needs Accept incoming device sync switched on, and its tab open and unlocked.
+
+Endpoint — the address a device is dialled at for peer-to-peer sync. Haven generates one per device and publishes it in the tenant's user directory, so devices can still find each other while the server is unreachable.
+
+Iroh — the network Haven uses when there is no reachable address to connect to. It carries peer-to-peer sync between two devices, and it can also carry ordinary client-server sync to a MindooDB server that has joined it — one behind a NAT router, say, with no forwarded port and no certificate. Both ends meet through a relay, which sees that they are talking but not what they say.
+
+Quick Scan — Haven's built-in document scanner. Finds the edges of a page, corrects the perspective, and takes as many pages as you need into one scan. Runs entirely in the browser tab, offline included. It hands the result out as a file — a multi-page PDF, or a PNG or JPEG for one page — through a download or the system share sheet; attaching a scan to a document is done from the Database Browser or by an app through the App SDK.
+
 IndexedDB — the browser's built-in database. Haven stores almost everything inside IndexedDB so it can work offline.
 
 Payload bytes — an approximate measurement of how much real content Haven keeps in this browser. It excludes the overhead the browser itself adds.
@@ -390,11 +476,15 @@ Virtual view cache — stores a virtual view's materialized results plus its res
 
 Protected database — a database that Haven needs in order to operate (for example, the tenant directory). It cannot be deleted from the storage panel.
 
+Start — the fixed first tab of the Workspace. Carries Haven's six shortcut tiles and one tile per installed application. It cannot be rearranged; your own tiles go on the pages next to it.
+
 Tile — a draggable, resizable card on the workspace grid. Each tile holds a database, an application, a note, an embedded web page, a video, or a diagram. Also called a chicklet.
 
 Page — a workspace tab that contains its own grid of tiles. Use multiple pages like home screens on a smartphone.
 
 Group — a visual container that clusters related tiles under a shared, color-coded header. Drag one tile onto another to create a group.
+
+App Drawer — the panel behind the arrow handle at the top of the content area. Lists the Haven screens you have open and the applications currently running, with a way back to the Workspace above both. Cmd+Shift+Space opens it and Cmd+Shift+Enter returns to the Workspace; press Ctrl instead of Cmd on Windows and Linux.
 
 Database — a collection of related documents inside a tenant. A tenant can have many databases (for example contacts, invoices, notes).
 
@@ -416,6 +506,10 @@ Origin — an identifier that marks which database (or tenant) a row in a virtua
 
 Materialized index — the pre-computed view results stored in this browser so a virtual view can be reopened instantly.
 
+Haven App Store — the catalog of ready-made MindooDB applications, opened from Start. Installing an entry writes its registration for you and puts the app on Start.
+
+App Builder — the app in the store that builds other apps. You describe what you need; it creates the repository, publishes the app, has an AI agent write it, and hands it to Haven for installation. The result is an ordinary MindooDB app with source code in your own GitHub account.
+
 Application registration — the saved Haven-side definition of a MindooDB app: where to launch it from, how to run it, and which databases or views it is allowed to see.
 
 Hosted bundle — a packaged set of web assets imported into Haven so it can serve the app locally, even when offline.
@@ -426,7 +520,7 @@ App connector (bridge) — the secure channel between a MindooDB app and Haven. 
 
 Launch context — the initial information an app receives from Haven when it starts: theme, viewport, current user, launch parameters, and the databases it has been granted.
 
-Runtime mode — how an app is presented: embedded inside a Haven tile, or opened in its own browser window or tab.
+Runtime mode — how a registered app is launched: embedded in the Haven window, or opened in its own browser tab. Distinct from a tile's display mode, which decides whether the tile is a launcher you double-click or runs the app inside the card itself.
 
 Sandbox — the browser-enforced isolation that wraps every app. The app cannot reach Haven's storage, cookies, or other apps unless you explicitly share data with it.
 
@@ -458,7 +552,7 @@ Haven Community is the free edition of Haven, in beta, available today at [haven
 
 Haven Community works in three deployment topologies. Local-only, where everything lives in your browser and there is no server at all — perfect for personal notes and offline demos; in this mode the Preferences → Backup tab doubles as your transfer mechanism, because an encrypted `.mdbhaven-backup` file contains your user identities, settings, and MindooDB databases, so you can move a complete local-only Haven from one browser to another by exporting and restoring. Connected to the hosted Mindoo demo server, which lets you publish a local tenant and test real multi-user collaboration; demo-server data is wiped periodically, so it is for evaluation rather than production. And self-hosted, where you point Haven at a MindooDB server you run yourself, with full setup instructions in [`README-server.md`](https://github.com/klehmann/MindooDB/blob/main/README-server.md) in the MindooDB repository. The choice is yours and you can move between topologies at any time.
 
-Haven Community is also a complete platform for custom app development. You can build MindooDB apps by hand using the App SDK, or let an AI agent generate them from the structured `llms-full.txt` on mindoodb.com plus the public reference app repositories. Two free productivity apps ship pre-configured in the Applications page's New dropdown so you can install them in one click and see what a polished MindooDB app looks like. Mindoo Vega renders the same tree of nodes as either a Mindmap or a Kanban board, with task fields, attachments, and full-text search — handy for project planning where the same data needs both a big-picture and a lane-by-lane view. Mindoo TodoManager turns Covey's four-quadrant method (important/not important, urgent/not urgent) into a visual task workflow for staying focused on what matters most. A third ready-to-use app, [Mindoo Weather](https://github.com/klehmann/mindoodb-app-weather), is a beautiful iOS-Weather-style tile that shows a 10-day forecast plus air quality for one or more locations configured through a launch parameter — it adapts live to the tile size Haven reports (narrow: one swipeable card with dots; wider: two to four at a time) and pulls all data from keyless Open-Meteo APIs, so it doubles as a reference for the UX side of the SDK. All three are free to use; the same dropdown also carries the SDK Example App for developers who want a living reference of every SDK feature.
+Haven Community is also a complete platform for custom app development. You can build MindooDB apps by hand using the App SDK, or let an AI agent generate them from the structured `llms-full.txt` on mindoodb.com plus the public reference app repositories. The Haven App Store ships with a catalog of finished apps you can install in one click, both to use and to see what a polished MindooDB app looks like. Mindoo Vega renders the same tree of nodes as a mindmap, a Kanban board, a Gantt chart, or a spreadsheet, with task fields, attachments, time travel through the document history, and full-text search — handy for project planning where the same data needs a big-picture view one minute and a lane-by-lane or date-by-date one the next. Mindoo TodoManager turns Covey's four-quadrant method (important/not important, urgent/not urgent) into a visual task workflow for staying focused on what matters most. [Mindoo Weather](https://github.com/klehmann/mindoodb-app-weather) is an iOS-Weather-style tile that shows a 10-day forecast plus air quality for one or more locations configured through a launch parameter — it adapts live to the tile size Haven reports (narrow: one swipeable card with dots; wider: two to four at a time) and pulls all data from keyless Open-Meteo APIs, so it doubles as a reference for the UX side of the SDK. The catalog also carries the App Builder, which writes, publishes, and installs a new app from a description you type, and the SDK Example App for developers who want a living reference of every SDK feature. All of them are free to use.
 
 The underlying MindooDB platform is open source under the Apache 2.0 license. That matters beyond the price tag: there is no data lock-in. The data model, the content-addressed store, and the sync protocol are all documented and reimplementable, which means a team can take their encrypted data with them at any time — and it is even possible to build entirely alternative clients on top of the same platform if Haven is not the right fit for a particular use case. Haven is the official client; it is not the only possible one.
 
