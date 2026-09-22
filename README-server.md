@@ -48,7 +48,7 @@ bash serversetup.sh --update
 docker compose up -d --build
 ```
 
-`bash serversetup.sh --update` preserves the existing `server.identity.json`, `server.keybag`, `config.json`, tenant data, `trusted-servers.json`, and `.server_unlock`, while still rebuilding the Docker image (including `@number0/iroh`) and regenerating `docker-compose.override.yml`. Before the override is rewritten, the script now saves the previous file as `docker-compose.override.<timestamp>.yml`. Existing `config.json` files are not patched — add `"iroh": { "enabled": true, "secretKeyPath": "iroh-secret.key" }` yourself if you want the rebuilt image to join the Iroh network.
+`bash serversetup.sh --update` preserves the existing `server.identity.json`, `server.keybag`, `config.json`, tenant data, `trusted-servers.json`, and `.server_unlock`, while still rebuilding the Docker image (including `@number0/iroh`) and regenerating `docker-compose.override.yml`. Before the override is rewritten, the script now saves the previous file as `docker-compose.override.<timestamp>.yml`. Existing `config.json` files are not patched — add `"iroh": { "enabled": true, "secretKeyPath": "iroh-secret.key" }` yourself if you want the rebuilt image to join the Iroh network, as described in [Reaching the server over Iroh](#reaching-the-server-over-iroh).
 
 The setup and update flows now prompt for a separate `Host port`. This lets you keep MindooDB listening on its internal container port `1661` while publishing a different host port such as `80`.
 
@@ -400,6 +400,78 @@ A system admin with `DELETE:/system/tenants/*` or `ALL:/system/*` can still dele
 
 For key rotation, adding/removing admins, and the full authentication flow (challenge/response, JWT lifecycle), see [Server Security](docs/server-security.md).
 
+## Reaching the server over Iroh
+
+Most of the machines people actually want to run this on are not in a data centre. They sit in a practice, an office, or a cupboard at home — behind a router that does NAT, on a connection whose public address changes every few days. Publishing such a server the usual way means DynDNS, a port forward, and a TLS certificate for a hostname you only half control.
+
+[Iroh](https://www.iroh.computer/) is the alternative. It is a QUIC-based peer protocol in which endpoints identify each other by public key rather than by DNS name. Two endpoints hole-punch a direct path when the networks allow it and fall back through public relays when they do not. Payloads stay end-to-end encrypted either way — a relay forwards packets and holds no key.
+
+For MindooDB, Iroh is an alternative `NetworkTransport`, not a second protocol: the same sync RPCs, the same challenge/response and JWT, the same encrypted entries, the same access rules. HTTP remains the default and is still what you want whenever the server *does* have a public URL. Transport reference: [docs/iroh.md](docs/iroh.md).
+
+### It is off by default
+
+A fresh `serversetup.sh` writes the block into `config.json` with `"enabled": false`. The Docker image already contains the native `@number0/iroh` package, so nothing has to be installed on the host — but the server does not join the Iroh network until you turn it on, and `serversetup.sh --update` never rewrites an existing `config.json`.
+
+### Enabling it
+
+Edit `config.json` in the server data directory, then restart:
+
+```json
+{
+  "capabilities": {
+    "ALL:/system/*": [
+      {
+        "username": "cn=sysadmin/o=myorg",
+        "publicsignkey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+      }
+    ]
+  },
+  "iroh": {
+    "enabled": true,
+    "secretKeyPath": "iroh-secret.key"
+  }
+}
+```
+
+```bash
+docker compose restart
+```
+
+`secretKeyPath` is relative to the data directory and the file is created on first start. It holds the server's long-term Iroh identity, so back it up with the rest of the data directory: replacing it changes the endpoint id, and every client that stored the old one has to be repointed.
+
+On start the server joins the network, waits until it has a home relay, and logs its endpoint id and a ticket. Listen is asynchronous, so these lines appear shortly after `Listening on 0.0.0.0:1661`:
+
+```
+[Iroh] Listening on ALPN mindoodb/sync-v5
+[Iroh] Endpoint id: 1b5fb57653d25ae7b0ef8a30fe8b3f4bf9b60283cc3afe1d38f0ff9a8412dc0b
+[Iroh] Ticket: endpointaanv7nlwkpjfvz5q56fdb7ulh5f7tnqcqpgdv7q5hdyp7guecloawayaenuhi5dqom5c6l3fovrtcljrfzzgk3dbpexg4mbonfzg62bonruw42zof4aqalxbs5x6thicaeakyeqaaluz2aq
+```
+
+### What to enter in the Haven client
+
+Take the **`Ticket:` line and prefix it with `iroh:`**. That string goes into the **Base URL** field of Haven's **Push to server** dialog — and equally into **Add existing location** and **Join tenant**:
+
+```
+iroh:endpointaanv7nlwkpjfvz5q56fdb7ulh5f7tnqcqpgdv7q5hdyp7gue...
+```
+
+The raw `endpoint...` ticket without the `iroh:` prefix is accepted too. What does **not** work as a pairing value is the bare `Endpoint id:` line — `iroh:<64-hex>` is the stable label Haven keeps internally, but a first dial needs the full ticket, which is what carries the current relay and socket addresses.
+
+A ticket can go stale after the server changes its IP or its home relay. If an existing connection stops working, copy a fresh ticket out of the log and paste it again.
+
+A Node CLI or service uses the same ticket through `createNodeIrohStreamIO` from `mindoodb/iroh/node` — see [docs/iroh.md](docs/iroh.md#node-cli).
+
+### Notes before you rely on it
+
+- **Iroh replaces the address, not the security.** Clients still sign a challenge, the server still stores ciphertext, and the capability rules in `config.json` apply exactly as they do over HTTP. A ticket is neither a secret nor a credential.
+- **Cluster admin stays on HTTP.** Tenant publication and the auth handshake are answered over Iroh; `/system/cluster/*` and `add-to-network` are HTTP only.
+- **Server-to-server mirroring works over Iroh too.** Put `iroh:<ticket>` in `trusted-servers.json` as the peer's `url` — see [Walkthrough: Multi-Server Setup](#walkthrough-multi-server-setup).
+- **Relays are shared by default.** Endpoints use the free public n0 relays: rate-limited, no SLA, fine for development. Production deployments should use dedicated or self-hosted relays ([iroh.computer/pricing](https://www.iroh.computer/pricing)).
+- **Browsers are relay-only.** A page cannot open raw UDP sockets, so Haven never hole-punches; every byte travels through a relay. Native clients try a direct path first.
+- **Health checks stay on HTTP.** `curl http://localhost:1661/health` is still how you verify the process, from the LAN or on the box itself.
+
+Live tests against real relays: `MINDOODB_IROH_LIVE=1 pnpm test:iroh` in this repo, and `pnpm test:e2e:iroh` in Haven.
+
 ## Walkthrough: Multi-Server Setup
 
 MindooDB servers can mirror encrypted data between each other. This section covers the full workflow: initializing servers, establishing trust, seeding a tenant onto a second server, and running the mesh.
@@ -621,21 +693,10 @@ Controls which system admins can call which `/system/*` endpoints. See [How `con
 }
 ```
 
-Optional Iroh listen (off by default). The Docker image already contains
-`@number0/iroh`; you do not install it on the host. New servers get the block
-below with `"enabled": false` in `config.json`. `--update` never rewrites an
-existing `config.json` — add or flip the block yourself, then restart.
-
-When `"enabled": true` the process joins the Iroh network with ALPN
-`mindoodb/sync-v5`, waits until the endpoint is online (home relay), and
-logs a ticket. The secret key is created at
-`iroh-secret.key` in the data directory on first start. Haven pastes
-`iroh:<ticket>` into the server URL field. A Node CLI uses the same ticket
-via `createNodeIrohStreamIO` from `mindoodb/iroh/node` — see
-[docs/iroh.md](docs/iroh.md).
-
-Live tests (real relays): `MINDOODB_IROH_LIVE=1 pnpm test:iroh` in this
-repo, and `pnpm test:e2e:iroh` in Haven.
+The same file carries the optional `iroh` block, which lets clients reach this
+server without a public URL. It is off by default; how to enable it and what to
+paste into a Haven client is in
+[Reaching the server over Iroh](#reaching-the-server-over-iroh).
 
 ```json
 {
