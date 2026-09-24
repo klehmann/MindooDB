@@ -333,3 +333,38 @@ export class NetworkError extends Error {
     this.name = "NetworkError";
   }
 }
+
+/**
+ * True when `error` is a {@link NetworkError}.
+ *
+ * Checks the `name` rather than the prototype: an error crossing a realm
+ * boundary (worker, bundled copy of the library) fails `instanceof` while still
+ * carrying its type.
+ */
+export function isNetworkError(error: unknown): error is NetworkError {
+  return (
+    error instanceof Error &&
+    error.name === "NetworkError" &&
+    typeof (error as NetworkError).type === "string"
+  );
+}
+
+/**
+ * Validate a remote-supplied error type against {@link NetworkErrorType}.
+ *
+ * Both transports carry the far side's classification now (an HTTP error body's
+ * `type`, an Iroh response's `errorType`), which means the value arrives from
+ * the other end of the wire and must be checked before it is trusted. Returns
+ * `undefined` for anything unrecognised so the caller keeps whatever default it
+ * derived locally — the field is advisory, and neither an old peer nor a
+ * hostile one should be able to steer a client into a type it has no handling
+ * for.
+ */
+export function parseNetworkErrorType(value: unknown): NetworkErrorType | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  return (Object.values(NetworkErrorType) as string[]).includes(value)
+    ? (value as NetworkErrorType)
+    : undefined;
+}

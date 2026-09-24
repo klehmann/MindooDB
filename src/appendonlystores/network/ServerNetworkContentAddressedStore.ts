@@ -17,7 +17,12 @@ import {
   isPersonalUserdirectoryDocId,
   type BuiltinWriteOp,
 } from "../../core/builtinDbInvariants";
-import type { PutEntriesAck, RejectedPutEntry, StoreHead } from "../../core/appendonlystores/types";
+import type {
+  PutEntriesAck,
+  PutRejectionClass,
+  RejectedPutEntry,
+  StoreHead,
+} from "../../core/appendonlystores/types";
 import type {
   AttachmentReadPlan,
   AttachmentReadPlanOptions,
@@ -902,13 +907,16 @@ export class ServerNetworkContentAddressedStore {
   /**
    * Handle a putEntries request from a client.
    *
-   * Signature-class validation failures (untrusted key, content-hash
-   * mismatch, missing v2 metadata signature, invalid author signature) are
-   * rejected PER ENTRY and reported in the returned ack instead of failing
-   * the whole batch: one poisoned entry must not permanently block a
-   * database's push sync. Access-denied conditions (remote wipe, revoked
-   * decryptionKeyId, purged document, Tier 1 policy denial) still fail the
-   * whole request — those are deliberate blocks, not data corruption.
+   * Refused entries are rejected PER ENTRY and reported in the returned ack,
+   * each carrying a {@link PutRejectionClass} that says why: one refused entry
+   * must not permanently block a database's push sync, and the pushing side
+   * needs to tell a corrupt entry (final) from a legitimate write whose right
+   * was withdrawn (keepable, and offerable again once the right returns).
+   *
+   * Two conditions still fail the whole request, because they are about the
+   * session rather than about an entry: a device targeted for remote wipe (here)
+   * and a database outside the tenant's allowed list (in
+   * {@link validateToken}).
    *
    * @param token The JWT access token
    * @param entries The entries to store
@@ -1001,20 +1009,26 @@ export class ServerNetworkContentAddressedStore {
         entry.decryptionKeyId &&
         revokedKeyIds.has(entry.decryptionKeyId)
       ) {
-        throw new NetworkError(
-          NetworkErrorType.ACCESS_DENIED,
+        this.rejectEntry(
+          rejected,
+          entry.id,
           `Entry ${entry.id} carries a revoked decryptionKeyId and may not be pushed`,
+          "revoked-key",
         );
+        continue;
       }
 
       // Reject a push for a purged document (§13). The document's history was
       // physically purged on the server; re-ingesting these entries would
       // resurrect data that must stay deleted.
       if (purgedDocIds && entry.docId && purgedDocIds.has(entry.docId)) {
-        throw new NetworkError(
-          NetworkErrorType.ACCESS_DENIED,
+        this.rejectEntry(
+          rejected,
+          entry.id,
           `Entry ${entry.id} belongs to a purged document and may not be pushed`,
+          "purged",
         );
+        continue;
       }
 
       // Duplicate push: acknowledge with the stored metadata (including the
@@ -1038,7 +1052,12 @@ export class ServerNetworkContentAddressedStore {
       );
       forceTrustRefresh = false;
       if (!isValidKey) {
-        this.rejectEntry(rejected, entry.id, `Entry ${entry.id} was not signed by a trusted user`);
+        this.rejectEntry(
+          rejected,
+          entry.id,
+          `Entry ${entry.id} was not signed by a trusted user`,
+          "untrusted-key",
+        );
         continue;
       }
 
@@ -1083,7 +1102,8 @@ export class ServerNetworkContentAddressedStore {
       if (dbId === USER_DIRECTORY_DB_ID && this.builtinWriteContext) {
         const denied = await this.evaluateUserdirectoryInvariant(entry, receivedAt, entries);
         if (denied) {
-          throw new NetworkError(NetworkErrorType.ACCESS_DENIED, denied);
+          this.rejectEntry(rejected, entry.id, denied, "policy");
+          continue;
         }
       }
 
@@ -1093,10 +1113,13 @@ export class ServerNetworkContentAddressedStore {
       if (this.tier1Evaluator) {
         const decision = await this.tier1Evaluator(entry, this.witnessDbid ?? this.localStore.getId());
         if (!decision.allowed) {
-          throw new NetworkError(
-            NetworkErrorType.ACCESS_DENIED,
-            `Entry ${entry.id} denied by Tier 1 policy: ${decision.reason}`
+          this.rejectEntry(
+            rejected,
+            entry.id,
+            `Entry ${entry.id} denied by Tier 1 policy: ${decision.reason}`,
+            "policy",
           );
+          continue;
         }
       }
 
@@ -1329,10 +1352,22 @@ export class ServerNetworkContentAddressedStore {
     }
   }
 
-  /** Record a per-entry rejection (signature-class failure) and log it. */
-  private rejectEntry(rejected: RejectedPutEntry[], id: string, reason: string): void {
-    this.logger.warn(`putEntries rejected entry: ${reason}`);
-    rejected.push({ id, reason });
+  /**
+   * Record a per-entry rejection and log it.
+   *
+   * The class travels with the rejection because it decides what the pushing
+   * side may do with the entry: a `"signature"` failure is final, while a
+   * `"policy"` denial is a legitimate write that lost its right and can regain
+   * it (see {@link PutRejectionClass}).
+   */
+  private rejectEntry(
+    rejected: RejectedPutEntry[],
+    id: string,
+    reason: string,
+    rejectionClass: PutRejectionClass = "signature",
+  ): void {
+    this.logger.warn(`putEntries rejected entry (${rejectionClass}): ${reason}`);
+    rejected.push({ id, reason, rejectionClass });
   }
 
   /** Project a store entry to its metadata (including any witness fields). */

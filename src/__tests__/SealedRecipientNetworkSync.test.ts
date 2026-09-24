@@ -154,6 +154,7 @@ describe("sealed recipient entries over the HTTP wire", () => {
       {
         id: sealedCreate.id,
         reason: expect.stringContaining("invalid author signature"),
+        rejectionClass: "signature",
       },
     ]);
   });

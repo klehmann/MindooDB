@@ -16,10 +16,11 @@ import type {
   DocumentMaterializationPlan,
   MaterializationPlanOptions,
   PutEntriesAck,
+  PutRejectionClass,
   RejectedPutEntry,
   StoreHead,
 } from "../../core/appendonlystores/types";
-import { StoreKind } from "../../core/appendonlystores/types";
+import { PUT_REJECTION_CLASSES, StoreKind } from "../../core/appendonlystores/types";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
@@ -29,7 +30,11 @@ import type {
   AuthResult,
   NetworkSyncCapabilities,
 } from "../../core/appendonlystores/network/types";
-import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
+import {
+  NetworkError,
+  NetworkErrorType,
+  parseNetworkErrorType,
+} from "../../core/appendonlystores/network/types";
 import {
   BINARY_ENTRIES_CONTENT_TYPE,
   BINARY_GET_ENTRIES_FORMAT,
@@ -977,11 +982,16 @@ export class HttpTransport implements NetworkTransport {
 
         lastError = error as Error;
         
-        // Don't retry for certain error types
+        // Don't retry a decision the server will reach again. Repeating it
+        // costs the caller the retry delay and, worse, loses the type: after
+        // the last attempt this method throws a generic NETWORK_ERROR, so an
+        // answer as specific as "this write is not allowed" would arrive
+        // looking like a broken connection.
         if (error instanceof NetworkError) {
           if (
             error.type === NetworkErrorType.INVALID_TOKEN ||
             error.type === NetworkErrorType.USER_REVOKED ||
+            error.type === NetworkErrorType.ACCESS_DENIED ||
             error.type === NetworkErrorType.INVALID_SIGNATURE ||
             error.type === NetworkErrorType.PAYLOAD_TOO_LARGE ||
             error.type === NetworkErrorType.RATE_LIMITED
@@ -1052,8 +1062,13 @@ export class HttpTransport implements NetworkTransport {
               errorData.error || "Unauthorized"
             );
           case 403:
+            // 403 covers both "this user is gone" and "this particular write
+            // is not allowed", and the two want different handling. Trust the
+            // server's own type when it sends one; a server predating the
+            // field could only have meant USER_REVOKED from this client's
+            // point of view, so that stays the fallback.
             throw new NetworkError(
-              NetworkErrorType.USER_REVOKED,
+              parseNetworkErrorType(errorData.type) ?? NetworkErrorType.USER_REVOKED,
               errorData.error || "Access denied"
             );
           case 404:
@@ -1479,14 +1494,30 @@ export class HttpTransport implements NetworkTransport {
     };
     const receipts = (body.receipts ?? []).map((e) => this.deserializeEntryMetadata(e));
     const rejected: RejectedPutEntry[] = Array.isArray(body.rejected)
-      ? (body.rejected as Array<{ id?: unknown; reason?: unknown }>)
+      ? (body.rejected as Array<{ id?: unknown; reason?: unknown; rejectionClass?: unknown }>)
           .filter((r) => typeof r?.id === "string")
-          .map((r) => ({
-            id: r.id as string,
-            reason: typeof r.reason === "string" ? r.reason : "rejected by remote",
-          }))
+          .map((r) => {
+            // Omitted by servers predating the field; `rejectionClassOf` then
+            // applies the "signature" default. An unknown string is dropped
+            // rather than passed through, so a newer server cannot smuggle a
+            // class this client has no handling for.
+            const rejectionClass = this.parseRejectionClass(r.rejectionClass);
+            return {
+              id: r.id as string,
+              reason: typeof r.reason === "string" ? r.reason : "rejected by remote",
+              ...(rejectionClass ? { rejectionClass } : {}),
+            };
+          })
       : [];
     return { receipts, rejected };
+  }
+
+  /** Validate a server-supplied rejection class against the known set. */
+  private parseRejectionClass(value: unknown): PutRejectionClass | undefined {
+    return typeof value === "string" &&
+      (PUT_REJECTION_CLASSES as readonly string[]).includes(value)
+      ? (value as PutRejectionClass)
+      : undefined;
   }
 
   private async postSerializedEntries(

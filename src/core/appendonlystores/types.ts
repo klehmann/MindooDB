@@ -124,19 +124,123 @@ export interface StoreHead {
 }
 
 /**
+ * Why a store refused one entry. The pushing side needs this to decide what
+ * to do with the entry, because the two ends of the scale want opposite
+ * things:
+ *
+ * - `"signature"` — the entry is corrupt or forged (invalid author signature,
+ *   content-hash mismatch, missing v2 metadata signature, unverifiable
+ *   replicated receipt). It can never become valid, so there is nothing to keep
+ *   and nothing to retry.
+ * - `"untrusted-key"` — the author's signing key is not trusted *here yet*.
+ *   Kept apart from `"signature"` because it is the one rejection that resolves
+ *   without anybody doing anything: the key is usually a live grant that this
+ *   target has not replicated from `directory` yet. This is the case the
+ *   `"hold"` cursor policy exists for.
+ * - `"policy"` — the entry is intact and was legitimate when it was written,
+ *   but the rules changed: the author's write right was withdrawn, or the
+ *   `userdirectory` invariant no longer admits it. It may become valid again,
+ *   so it must be *kept* and offerable later (see
+ *   {@link ../quarantine/QuarantineDocument}).
+ * - `"purged"` — the document's history was physically purged on the target.
+ *   Re-ingesting would resurrect data that must stay deleted, and no later
+ *   directory change reverses that.
+ * - `"revoked-key"` — the entry carries a revoked `decryptionKeyId`. Only a
+ *   re-encryption under a live key can make it acceptable, so the entry as it
+ *   stands is final.
+ *
+ * Absent on acks from servers older than this field; treat a missing value as
+ * `"signature"`, which is what those servers could only ever have meant.
+ */
+export type PutRejectionClass =
+  | "signature"
+  | "untrusted-key"
+  | "policy"
+  | "purged"
+  | "revoked-key";
+
+/** Every value {@link PutRejectionClass} admits, for validating untrusted input. */
+export const PUT_REJECTION_CLASSES: readonly PutRejectionClass[] = [
+  "signature",
+  "untrusted-key",
+  "policy",
+  "purged",
+  "revoked-key",
+] as const;
+
+/**
+ * Whether re-offering the entry unchanged could succeed on its own.
+ *
+ * Only `"untrusted-key"` can: the target is expected to learn the key from
+ * `directory` shortly. Everything else needs something outside the sync to
+ * happen first — an administrator restoring a right (`"policy"`), a
+ * re-encryption (`"revoked-key"`), or nothing at all, because the entry is
+ * corrupt (`"signature"`) or was deliberately erased (`"purged"`).
+ *
+ * This is what a cursor may be held for. Holding on any other class pins the
+ * cursor to an entry that will be refused for exactly the same reason on every
+ * future run: the pair re-scans from that position and re-offers it forever,
+ * the scan cost never falls back to the cheap resume path, and the run never
+ * reports clean — so a permanent condition presents as a permanent backoff.
+ */
+export function isSelfResolvingRejection(rejectionClass: PutRejectionClass): boolean {
+  return rejectionClass === "untrusted-key";
+}
+
+/**
+ * Whether offering the entry again is worth trying once the world has changed —
+ * a right restored, a key registered — rather than on the same run.
+ *
+ * Wider than {@link isSelfResolvingRejection} because a deliberate re-submit is
+ * allowed to bet on something the sync cannot bring about by itself, but
+ * narrower than "everything that was refused", and the two exclusions are not
+ * about saving a round trip:
+ *
+ * - **`"purged"` must never be re-offered.** The document's history was erased
+ *   on purpose. Pushing the entry again is an attempt to undo an erasure, so a
+ *   re-submit here works against the person who asked for it.
+ * - **`"signature"` cannot pass.** The entry does not verify, and nothing
+ *   outside the entry can change that.
+ *
+ * `"revoked-key"` is excluded for the same reason as `"signature"`: the payload
+ * is sealed to a key the tenant retired, so it takes a re-encryption — a new
+ * entry — not another attempt at this one.
+ */
+export function isResubmittableRejection(rejectionClass: PutRejectionClass): boolean {
+  return rejectionClass === "policy" || rejectionClass === "untrusted-key";
+}
+
+/**
  * One entry a store refused to ingest during a putEntries batch
  * (sync-v5, per-entry rejection).
  *
- * Signature-class failures (invalid author signature, content-hash mismatch,
- * untrusted signing key, missing v2 metadata signature) are reported per
- * entry instead of failing the whole batch, so one poisoned entry cannot
- * permanently block a database's push sync. Access-denied conditions
- * (remote wipe, revoked key, purged document, Tier 1 policy) still fail the
- * whole request — those are deliberate blocks, not data corruption.
+ * Rejections are reported per entry rather than by failing the whole batch, so
+ * one refused entry cannot permanently block a database's push sync. What the
+ * pushing side then does with it depends on {@link rejectionClass}.
+ *
+ * A few conditions still fail the whole request, because they are about the
+ * session rather than about an entry: a device targeted for remote wipe, and a
+ * database that is not in the tenant's allowed list.
  */
 export interface RejectedPutEntry {
   id: string;
   reason: string;
+  /**
+   * Why the entry was refused. Optional for wire compatibility with servers
+   * predating the field — read it through `rejectionClassOf`, never directly,
+   * so the fallback stays in one place.
+   */
+  rejectionClass?: PutRejectionClass;
+}
+
+/**
+ * {@link RejectedPutEntry.rejectionClass} with the pre-field default applied.
+ *
+ * An older server reported only signature-class failures per entry, so a
+ * missing value means exactly that.
+ */
+export function rejectionClassOf(rejected: RejectedPutEntry): PutRejectionClass {
+  return rejected.rejectionClass ?? "signature";
 }
 
 /**

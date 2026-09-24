@@ -26,7 +26,12 @@ import type {
   SessionEncryptedEntriesBatch,
   StoreChangeEvent,
 } from "./types";
-import { NetworkError, NetworkErrorType } from "./types";
+import {
+  NetworkError,
+  NetworkErrorType,
+  isNetworkError,
+  parseNetworkErrorType,
+} from "./types";
 import {
   decodeIrohFrame,
   encodeIrohFrame,
@@ -65,7 +70,13 @@ export async function rpcCall(
     );
   }
   if (!response.ok) {
-    throw new NetworkError(NetworkErrorType.NETWORK_ERROR, response.error ?? "Iroh RPC failed");
+    // Keep the far side's own classification when it sent one: over Iroh every
+    // failure used to arrive as NETWORK_ERROR, which made a refused write look
+    // like a broken link and left callers matching on message text.
+    throw new NetworkError(
+      parseNetworkErrorType(response.errorType) ?? NetworkErrorType.NETWORK_ERROR,
+      response.error ?? "Iroh RPC failed",
+    );
   }
   return response.result;
 }
@@ -610,6 +621,7 @@ export async function serveIrohRpc(stream: IrohByteStream, handler: IrohRpcHandl
           id: request.id,
           ok: false,
           error: error instanceof Error ? error.message : String(error),
+          ...(isNetworkError(error) ? { errorType: error.type } : {}),
         };
         await stream.send(encodeIrohFrame(response));
       }

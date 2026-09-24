@@ -41,6 +41,7 @@ import { IrohPeerLink } from "./IrohPeerLink";
 import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../../core/logging";
 import { createIdBloomSummary } from "../../../core/appendonlystores/bloom";
+import { rejectionClassOf } from "../../../core/appendonlystores/types";
 import {
   syncEntriesBetweenStores,
   syncScanCursorKey,
@@ -796,6 +797,27 @@ export class PeerReplicator {
         cursors: this.cursorStore(),
         rejectionPolicy: "hold",
       });
+      // Entries the cursor moved past will not be offered again — either
+      // because the refusal can never pass, or because it was supposed to and
+      // did not within the retry budget. This log line is the only place they
+      // are announced: the counters below make them visible in the status
+      // read-model, but not why.
+      const final = result.abandoned ?? [];
+      if (final.length > 0) {
+        const byClass = new Map<string, number>();
+        for (const entry of final) {
+          const key = rejectionClassOf(entry);
+          byClass.set(key, (byClass.get(key) ?? 0) + 1);
+        }
+        const breakdown = [...byClass]
+          .map(([cls, count]) => `${count} ${cls}`)
+          .join(", ");
+        this.logger.warn(
+          `Peer refused ${final.length} entr${final.length === 1 ? "y" : "ies"} for good ` +
+            `(${breakdown}); moving the cursor past them. First reason: ` +
+            redactEntryIds(final[0].reason),
+        );
+      }
       return {
         transferred: result.transferred,
         bytes: result.transferredBytes ?? 0,

@@ -580,11 +580,17 @@ The key material itself is stored efficiently. Only entries that *change* the re
 
 ### 7.6 Personal documents
 
-Once documents can be sealed to a person, `userdirectory` becomes the natural home for a person's own settings — the data that should follow them between devices without any administrator provisioning a database for it. The roamed workspace and application list are the first such payload, stored as one document per save id under the id prefix `wks_`.
+Once documents can be sealed to a person, `userdirectory` becomes the natural home for a person's own data — the kind that should follow them between devices without any administrator provisioning a database for it. Three prefixes exist so far, and the shared property that makes `userdirectory` the right home is not privacy but **writability**: it is the one database where every member can create their own documents without anybody granting them anything.
+
+| Prefix | What it is | Who may read it | Id |
+|---|---|---|---|
+| `wks_` | The roamed workspace and application list, one document per save id | sealed to its owner | generated |
+| `dev_` | Where a device can be dialled over Iroh (§7.6.1) | every member, via the tenant `default` key | derived from the device key fingerprint |
+| `qtn_` | A write the server turned away, kept so it can be found and offered again (§7.6.2) | every member, via the tenant `default` key | derived from author, database, document and rejection class |
 
 These documents need the opposite of what a key document needs. A key document is published: everybody must read it, and its owner is named inside it by `username_hash`. A personal document is not: it is encrypted so that the hoster cannot read it, which means ownership cannot be read out of the payload — exactly what the rule in section 7.2 does.
 
-The ownership rule is about *who may write*, and it is deliberately independent of *who may read*. A personal document may be sealed to its owner alone, or encrypted with the tenant `default` key so that every member can read it; either way only the person who signed the create may change it. Both variants exist, and section 7.6.1 covers the readable one.
+The ownership rule is about *who may write*, and it is deliberately independent of *who may read*. A personal document may be sealed to its owner alone, or encrypted with the tenant `default` key so that every member can read it; either way only the person who signed the create may change it. Both variants exist, as the table shows.
 
 **Ownership is the person who signed the create.** That is available to everyone without decrypting anything: the create entry names its signing key, and grants map that key to a person's `username_hash`, the same resolution the change rule already uses. Every device of that person resolves to the same hash, so roaming across your own devices works, while another member's devices never match.
 
@@ -622,6 +628,20 @@ Together these mean only the device that owns a signing key can publish a record
 
 Publishing a record is not the same as accepting connections. A device advertises so others can dial it; whether it answers is a separate, off-by-default choice, and the endpoint only exists while the app is running. See [iroh.md](iroh.md) for the listener-side checks.
 
+#### 7.6.2 Quarantine records (`qtn_`)
+
+When a device pushes a change and the server refuses it — the author's write right was withdrawn in the meantime, most often on a change that arrived over peer-to-peer sync from somebody else — the push moves on rather than blocking the database, and leaves a record behind. See [accesscontrol.md](accesscontrol.md) §10.1 for what the record is for and how re-submitting works; this section is about why it lives here.
+
+**It cannot live in the database it is about.** That is the whole reason for the prefix. The record documents the loss of a write right on some database, so writing it *there* would earn exactly the same refusal as the entry it documents — a log that cannot be written precisely when there is something to log. `userdirectory` is the one database where a member can create their own documents unconditionally.
+
+**It uses the tenant `default` key.** Same reasoning as `dev_`, arrived at from the other end: `$publicinfos` is out because the hoster holds that key, and which of a tenant's writes were refused is none of the hoster's business. `default` makes the record readable to every member, which is what turns it into an audit trail rather than one device's private note, while the server stores bytes it cannot open.
+
+**The id is derived, and the author's key fingerprint is part of the derivation.** Deriving it from (author fingerprint, database, document, rejection class) makes recording idempotent: a retry that fails the same way updates one record instead of adding another, and a cascade of refused entries on one document collapses into a single record carrying a capped list of entry ids. Folding in the *author* is load-bearing rather than decorative. Without it, two members refused on the same document for the same reason would derive the same id — and since the rule in §7.2 only lets the creator write a personal document, the second member's record would be refused by the very invariant that is supposed to protect it. Including the fingerprint keeps id and ownership in agreement.
+
+**A record is a claim until it is verified**, and here the stakes are higher than for `dev_`: the record says *this person tried to write something they were not allowed to write*. An unverified one is a way to put words in someone else's mouth. `verifyQuarantineRecord` applies the same three checks as `dev_` — the id derives from the payload's own fields including the fingerprint of the `signingPublicKey` it names, the `doc_create` was signed by exactly that key, and that key is an active non-revoked grant.
+
+**Known limit — silence proves nothing.** Nothing compels a device to write a record, so the absence of one is not evidence that nothing was refused. Like `dev_`, this is a tool for auditing cooperating devices, not for catching an uncooperative one.
+
 ---
 
 ## 8) Security Model
@@ -658,8 +678,8 @@ Encryption hides content, but it does not hide the shape of who is talking to wh
 
 | Party | Can see | Cannot see |
 |---|---|---|
-| Sync server | Published public keys; which device fingerprints hold a wrap; which key fingerprints a document is sealed to, and when that changed; that `dev_` records exist and who created them | Any plaintext; recipient display names; any private key; the endpoint ids inside `dev_` records, so not which devices sync with each other |
-| Tenant member (not a recipient) | Published public keys; the existence of sealed documents and their recipient fingerprints; every `dev_` record, including endpoint ids and device labels | The contents of a sealed document or its recipient list |
+| Sync server | Published public keys; which device fingerprints hold a wrap; which key fingerprints a document is sealed to, and when that changed; that `dev_` and `qtn_` records exist and who created them | Any plaintext; recipient display names; any private key; the endpoint ids inside `dev_` records, so not which devices sync with each other; the contents of `qtn_` records, so not which of its own refusals a tenant is tracking |
+| Tenant member (not a recipient) | Published public keys; the existence of sealed documents and their recipient fingerprints; every `dev_` record, including endpoint ids and device labels; every `qtn_` record, so which member was refused on which document and why | The contents of a sealed document or its recipient list |
 | Recipient | The document contents and its full recipient list with names | Other people's private keys |
 | Administrator | Everything a member sees, plus the grant | Content addressed to a user key they were not approved for |
 

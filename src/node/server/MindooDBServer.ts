@@ -2601,7 +2601,12 @@ export class MindooDBServer {
     if (error instanceof Error && error.name === "NetworkError") {
       const networkError = error as NetworkError;
       const status = this.getStatusForErrorType(networkError.type);
-      res.status(status).json({ error: networkError.message });
+      // The status alone loses the distinction the client needs: several
+      // NetworkErrorTypes map onto the same code (USER_REVOKED and
+      // ACCESS_DENIED both become 403), and a client that has to guess falls
+      // back to matching on the message text. Carry the type so it does not
+      // have to.
+      res.status(status).json({ error: networkError.message, type: networkError.type });
       return;
     }
 

@@ -368,6 +368,25 @@ const DEFAULT_WARMER_SCHEDULER: WarmerScheduler = {
 const DOC_CACHE_HEADER_VERSION = 2;
 
 /**
+ * How many quarantine records one document keeps in the audit log.
+ *
+ * One refused entry usually taints its causal dependents too (the
+ * `cascade_dependent` reason), so a single bad entry near the start of a long
+ * history can quarantine everything after it. The log exists to say which
+ * document is affected and why; a bounded sample of entry ids answers that as
+ * well as an unbounded one, and keeps one broken document from crowding every
+ * other out of the log — and out of the checkpoint it is written to.
+ */
+const MAX_QUARANTINE_RECORDS_PER_DOC = 200;
+
+/**
+ * How many documents the audit log covers at once. Oldest-first eviction: a
+ * document that started failing long ago has had its chance to be noticed,
+ * whereas dropping the newest would hide the problem the user is looking at.
+ */
+const MAX_QUARANTINE_DOCS = 500;
+
+/**
  * Result of deserializing a persisted L2 document cache record.
  *
  * `internal` is the materialized {@link InternalDoc}. `persistedChangeSeq`
@@ -592,10 +611,19 @@ export class BaseMindooDB implements MindooDB {
   private attachmentStore: ContentAddressedStore;
   /**
    * Per-tenant quarantine/audit log of entries rejected during materialization
-   * (docs/accesscontrol.md §10). In-memory; surfaced via {@link getQuarantineLog}
-   * for Haven's audit view.
+   * (docs/accesscontrol.md §10), grouped by document and persisted in the
+   * metadata checkpoint. Surfaced via {@link getQuarantineLog} for Haven's
+   * audit view.
+   *
+   * Grouped by document because that is the unit a verdict is recomputed in: a
+   * materialization pass re-evaluates every entry of one document and knows the
+   * complete set of quarantined ones when it ends. Replacing that document's
+   * group with the pass result is what makes recording idempotent — the log
+   * would otherwise gain a duplicate of every record on every re-materialization
+   * — and what lets it heal once trust is restored, since an entry that is
+   * accepted this time is simply absent from the new group.
    */
-  private quarantineLog: QuarantineRecord[] = [];
+  private quarantineLog: Map<string, QuarantineRecord[]> = new Map();
   /**
    * Short-TTL cache of "is access control active for this tenant?" so the
    * materialization fast-path does not re-query the directory on every load.
@@ -2276,6 +2304,15 @@ export class BaseMindooDB implements MindooDB {
     // apart from "written before this existed, count unknown".
     checkpoint.inaccessibleDocIds = Array.from(this.inaccessibleDocIds);
 
+    // Persist the materialization quarantine log (additive field, no version
+    // bump: a missing log restores as empty, which is exactly what the log was
+    // before it was persisted at all — and bumping the version would force a
+    // full metadata rebuild on every existing installation to gain nothing but
+    // an audit trail).
+    if (this.quarantineLog.size > 0) {
+      checkpoint.quarantineLog = Object.fromEntries(this.quarantineLog);
+    }
+
     return new TextEncoder().encode(JSON.stringify(checkpoint));
   }
 
@@ -2349,6 +2386,36 @@ export class BaseMindooDB implements MindooDB {
         }
       } else {
         this.legacyCheckpointNeedsVisibilityTally = true;
+      }
+      // Materialization quarantine log. Absent in checkpoints written before it
+      // was persisted, and absent whenever nothing is quarantined — both mean
+      // an empty log, and no heal flag is needed: the next materialization of
+      // an affected document re-derives its verdict anyway.
+      this.quarantineLog.clear();
+      if (
+        checkpoint.quarantineLog &&
+        typeof checkpoint.quarantineLog === "object"
+      ) {
+        for (const [docId, records] of Object.entries(
+          checkpoint.quarantineLog as Record<string, unknown>,
+        )) {
+          if (!Array.isArray(records)) continue;
+          const valid = records
+            .filter((rec): rec is QuarantineRecord =>
+              Boolean(
+                rec &&
+                  typeof rec === "object" &&
+                  typeof (rec as QuarantineRecord).entryId === "string" &&
+                  typeof (rec as QuarantineRecord).reason === "string",
+              ),
+            )
+            // Re-apply the caps on read: this file is on disk and may have been
+            // written by a build with different limits.
+            .slice(0, MAX_QUARANTINE_RECORDS_PER_DOC);
+          if (valid.length === 0) continue;
+          if (this.quarantineLog.size >= MAX_QUARANTINE_DOCS) break;
+          this.quarantineLog.set(docId, valid);
+        }
       }
       this.syncScanCursors.clear();
       if (
@@ -13421,7 +13488,11 @@ export class BaseMindooDB implements MindooDB {
    * store but are excluded from materialized state and queries.
    */
   getQuarantineLog(): readonly QuarantineRecord[] {
-    return this.quarantineLog;
+    const flat: QuarantineRecord[] = [];
+    for (const records of this.quarantineLog.values()) {
+      flat.push(...records);
+    }
+    return flat;
   }
 
   /**
@@ -14098,12 +14169,62 @@ export class BaseMindooDB implements MindooDB {
     return info?.signingKey ?? null;
   }
 
-  /** Append a record to the quarantine/audit log (and log it). */
-  private recordQuarantine(rec: QuarantineRecord): void {
-    this.quarantineLog.push(rec);
-    console.log(
-      `[MindooDB][ACL] Quarantined entry ${rec.entryId} (doc ${rec.docId}): ${rec.reason} — ${rec.detail}`,
-    );
+  /**
+   * Replace one document's quarantine records with the verdict of the pass that
+   * just ended.
+   *
+   * Whole-group replacement rather than appending, because a pass re-derives the
+   * complete verdict for the document: appending would duplicate every record
+   * on every re-materialization, and would never drop the record of an entry
+   * that has since become acceptable.
+   *
+   * Writes nothing when the verdict is unchanged. That is not just thrift — the
+   * checkpoint is rewritten whenever this marks it dirty, and a document is
+   * re-materialized often, so marking dirty on an unchanged verdict would turn
+   * every read of a quarantined document into a checkpoint write.
+   */
+  private commitQuarantineForDoc(
+    docId: string,
+    records: QuarantineRecord[],
+  ): void {
+    const previous = this.quarantineLog.get(docId);
+    if (records.length === 0) {
+      if (previous) {
+        this.quarantineLog.delete(docId);
+        this.cacheMetaDirty = true;
+      }
+      return;
+    }
+
+    const kept =
+      records.length > MAX_QUARANTINE_RECORDS_PER_DOC
+        ? records.slice(0, MAX_QUARANTINE_RECORDS_PER_DOC)
+        : records;
+
+    // Compare the verdict, not the record objects: `recordedAt` is a wall-clock
+    // stamp that differs on every pass and would make every verdict look new.
+    const verdictOf = (list: readonly QuarantineRecord[]): string =>
+      list.map((rec) => `${rec.entryId}\u0000${rec.reason}`).join("\u0001");
+    if (previous && verdictOf(previous) === verdictOf(kept)) {
+      return;
+    }
+
+    this.quarantineLog.set(docId, kept);
+    if (!previous) {
+      while (this.quarantineLog.size > MAX_QUARANTINE_DOCS) {
+        // Map iteration is insertion-ordered, so this is the oldest document.
+        const oldest = this.quarantineLog.keys().next();
+        if (oldest.done || oldest.value === docId) break;
+        this.quarantineLog.delete(oldest.value);
+      }
+    }
+    this.cacheMetaDirty = true;
+
+    for (const rec of kept) {
+      console.log(
+        `[MindooDB][ACL] Quarantined entry ${rec.entryId} (doc ${rec.docId}): ${rec.reason} — ${rec.detail}`,
+      );
+    }
   }
 
   /**
@@ -14170,7 +14291,12 @@ export class BaseMindooDB implements MindooDB {
           ? a.id.localeCompare(b.id)
           : (a.receivedAt ?? a.createdAt) - (b.receivedAt ?? b.createdAt),
       );
-    if (dataEntries.length === 0) return { doc: null, cacheable };
+    if (dataEntries.length === 0) {
+      // Nothing left to judge (e.g. the history was purged), so no verdict can
+      // stand either.
+      this.commitQuarantineForDoc(docId, []);
+      return { doc: null, cacheable };
+    }
 
     const createMeta = dataEntries.find((m) => m.entryType === "doc_create");
     const creatorKey = createMeta?.createdByPublicKey ?? null;
@@ -14187,6 +14313,10 @@ export class BaseMindooDB implements MindooDB {
     let decryptionKeyId = "default";
     const acceptedMeta: StoreEntryMetadata[] = [];
     const quarantined = new Set<string>();
+    // Collected for the whole pass and committed once at the end, so the log
+    // holds this document's current verdict rather than the union of every
+    // verdict ever reached for it. See commitQuarantineForDoc.
+    const quarantineRecords: QuarantineRecord[] = [];
 
     const quarantine = (
       meta: StoreEntryMetadata,
@@ -14194,7 +14324,7 @@ export class BaseMindooDB implements MindooDB {
       detail: string,
     ): void => {
       quarantined.add(meta.id);
-      this.recordQuarantine({
+      quarantineRecords.push({
         entryId: meta.id,
         docId,
         dbid,
@@ -14419,6 +14549,10 @@ export class BaseMindooDB implements MindooDB {
         );
       }
     }
+
+    // The pass is over and `quarantineRecords` is this document's full verdict,
+    // including the empty verdict that retires an earlier one.
+    this.commitQuarantineForDoc(docId, quarantineRecords);
 
     if (currentDoc === null) {
       // The create was quarantined or absent: the document is logically absent.

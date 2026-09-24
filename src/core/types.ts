@@ -35,6 +35,7 @@ import type {
   AccessDecision,
 } from "./accesscontrol/types";
 import type { DirectoryStateNode } from "./accesscontrol/DirectoryStateNode";
+import type { QuarantineRecord } from "./accesscontrol/materializationGuard";
 import type { SummaryConfig } from "./indexing/summary/types";
 import type { DocumentSummaryStore } from "./indexing/summary/DocumentSummaryStore";
 import type {
@@ -4773,6 +4774,21 @@ export interface MindooDB {
    * @return The content-addressed store for attachments
    */
   getAttachmentStore(): ContentAddressedStore;
+
+  /**
+   * Entries this device refused to materialize, grouped per document and
+   * persisted in the metadata checkpoint (docs/accesscontrol.md §10).
+   *
+   * These entries are present in the append-only store but excluded from
+   * materialized state and queries, so a document can be missing a change with
+   * nothing in the document itself to show it. This is where an audit view finds
+   * out why. Pair it with the outbound half — the `qtn_` records a refused push
+   * leaves in `userdirectory` — through `inboundQuarantineView` /
+   * `outboundQuarantineView`.
+   *
+   * Optional so a host can run against an SDK build that predates it.
+   */
+  getQuarantineLog?(): readonly QuarantineRecord[];
 
   reclaimIncompleteAttachmentUploads?(
     options?: { minAgeMs?: number }

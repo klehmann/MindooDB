@@ -109,7 +109,7 @@ const authentic = await tenant.verifyEntrySignature(entry, entry.encryptedData);
 
 That checks the author key is trusted by the directory, the payload hashes to the declared `contentHash`, the tenant's v2-signature floor is met, and the author signature verifies. It caches the imported verify key per PEM, so a batch from one author does not re-import it per entry.
 
-Skipping this does not let forged entries become documents — materialization verifies signatures again and drops them. But they do occupy your store, and the next sync pushes them on to the server, which rejects them and fails that run. Refusing at the door keeps the damage there.
+Skipping this does not let forged entries become documents — materialization verifies signatures again and drops them. But they do occupy your store, and the next sync pushes them on to the server, which refuses them. That refusal no longer fails the run (network-sync-protocol.md §5.7.6), so the cost is quieter than it used to be and not smaller: you have taken ownership of somebody else's junk, you will carry it in your store and in your quarantine log, and every full scan will walk over it. Refusing at the door keeps the damage there.
 
 **Apply the builtin invariant.** For `directory` and `userdirectory`, the admin/owner rules decide who may write what. Ask the database itself, so ingest and materialization agree by construction:
 
@@ -166,10 +166,21 @@ Four details worth keeping:
 
 - **Verify before evaluating.** Tier 1 is keyed on `createdByPublicKey`. On an unverified entry that field is a claim, so a caller could borrow a permitted colleague's key to pass the rules. Verification is what turns it into an identity.
 - **Builtin invariant before Tier 1**, the order a server uses: it must hold even where the ACL master switch turns Tier 1 into a blanket allow.
-- **Gate on ingest, not at materialization.** An entry that is merely skipped when documents are built still sits in your store, and the next sync pushes it on to the server — which rejects it and fails that run. Refusing before `putEntries` keeps the damage at the door.
+- **Gate on ingest, not at materialization.** An entry that is merely skipped when documents are built still sits in your store, and the next sync pushes it on to the server — which refuses it and hands you back a quarantine record to carry (see below). Refusing before `putEntries` keeps the damage at the door.
 - **Fail closed.** `buildTier1Evaluator` returns `undefined` when the directory cannot decide. That is a missing verdict, not an approval.
 
 For tenants that never enabled access control this costs nothing: with no policy document, `evaluateAccess` allows everything by definition.
+
+### 4.2) When the server later refuses what a peer gave you
+
+The gate above is the right place to stop what should never have been admitted, but it cannot stop everything, and the reason is a timing one rather than a bug. Your listener evaluated Tier 1 against the directory state *it* had. The server evaluates against the directory state *it* has, possibly days later, and by then the author's write right may be gone. So a peer-received entry can be admitted honestly and refused honestly.
+
+This is the case the quarantine log exists for. Two facts about it matter when you write a peer:
+
+- **The refusal does not block the database.** It comes back as a per-entry `"policy"` rejection, the push completes, and the scan cursor advances (network-sync-protocol.md §5.7.6). Before that, a single such entry stopped every later change from reaching the server, indefinitely.
+- **Advancing means the sync will not offer it again.** That makes recording it the caller's job, not an optional nicety. `recordPushRejections()` writes a signed record into `userdirectory` (accesscontrol.md §10.1) so the entry stays findable and can be offered again later — automatically once a new directory version arrives, or on demand.
+
+If your peer pushes to a server at all, call it after the push. Nothing else will, and without it a refused change becomes a line in a log that vanishes on reload.
 
 ### Materializing what arrives
 
@@ -290,7 +301,7 @@ Worth knowing before designing around it:
 - **No live change feed.** `subscribeToChanges` over a peer link is not part of this path; sync is something you trigger.
 - **No witness receipts** from the peer — which is why the acceptance checks become the listener's job (§4.1) instead of something a receipt can vouch for.
 - **No ingest checks by default.** `putEntries` writes bytes and asks nothing. §4.1 is not optional advice; a listener that skips it has none of the acceptance checks a server applies to a push.
-- **No guarantee a server will agree.** §4.1 admits what this replica would itself materialize. A server may still refuse some of it later — it evaluates the builtin invariants more strictly, and it may be running a different SDK version than the peer that sent the entry.
+- **No guarantee a server will agree.** §4.1 admits what this replica would itself materialize. A server may still refuse some of it later — it evaluates the builtin invariants more strictly, it may be running a different SDK version than the peer that sent the entry, and it decides against a directory state that has moved on since your listener decided. §4.2 is what you do about it.
 - **No availability.** A peer answers only while its process is running and listening. For a browser tab that means only while the tab is open.
 
 If you need any of these, you need a server — see [iroh.md](iroh.md) §Server for running one reachable over Iroh rather than HTTPS.

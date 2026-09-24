@@ -1049,10 +1049,18 @@ describe("Network Sync", () => {
       const revokedEntry = createMockEntry(
         "doc1", "h1", 1000, [], userSigningPublicKeyPem, signature, "revoked-key",
       );
-      await expect(client.putEntries([revokedEntry])).rejects.toMatchObject({
-        name: "NetworkError",
-        type: NetworkErrorType.ACCESS_DENIED,
-      });
+      // Reported per entry, not as a failed batch: the revoked key is a
+      // property of this entry, so refusing it must not stop everything behind
+      // it from syncing.
+      const ack = await client.putEntries([revokedEntry]);
+      expect(ack.receipts).toEqual([]);
+      expect(ack.rejected).toEqual([
+        {
+          id: "h1",
+          reason: expect.stringContaining("revoked decryptionKeyId"),
+          rejectionClass: "revoked-key",
+        },
+      ]);
       expect(await docStore.getAllIds()).toEqual([]);
 
       // A push under a non-revoked key still succeeds.
@@ -1078,7 +1086,11 @@ describe("Network Sync", () => {
       const ack = await client.putEntries([good, bad]);
       expect(ack.receipts.map((r) => r.id)).toEqual(["good"]);
       expect(ack.rejected).toEqual([
-        { id: "bad", reason: expect.stringContaining("invalid author signature") },
+        {
+          id: "bad",
+          reason: expect.stringContaining("invalid author signature"),
+          rejectionClass: "signature",
+        },
       ]);
       expect(await docStore.getAllIds()).toEqual(["good"]);
     });

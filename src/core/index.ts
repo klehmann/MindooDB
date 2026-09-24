@@ -36,6 +36,42 @@ export {
   type PeerDeviceDocumentPayload,
   type PeerDeviceRecord,
 } from "./peerdevices/PeerDeviceDocument";
+export {
+  MAX_QUARANTINED_ENTRY_IDS,
+  QUARANTINE_DOC_ID_PREFIX,
+  QUARANTINE_FORM,
+  QUARANTINE_SCHEMA_VERSION,
+  QUARANTINE_TYPE,
+  QuarantineRecursionError,
+  clearQuarantineRecord,
+  isQuarantineDocId,
+  listQuarantineRecords,
+  quarantineDocumentId,
+  recordPushQuarantine,
+  verifyQuarantineRecord,
+  type QuarantineDirectory,
+  type QuarantineDocumentPayload,
+  type QuarantineRecordDoc,
+  type QuarantineRecordKey,
+} from "./quarantine/QuarantineDocument";
+export {
+  DEFAULT_MAX_RESUBMIT_RECORDS,
+  resubmitQuarantinedEntries,
+  type ResubmitOutcome,
+  type ResubmitResult,
+} from "./quarantine/resubmitQuarantined";
+export {
+  UNKNOWN_QUARANTINED_DOC_ID,
+  recordPushRejections,
+  type PushQuarantineResult,
+} from "./quarantine/recordPushRejections";
+export {
+  inboundQuarantineView,
+  mergeQuarantineViews,
+  outboundQuarantineView,
+  type QuarantineDirection,
+  type QuarantineViewRecord,
+} from "./quarantine/QuarantineView";
 export * from "./tenantIdValidation";
 export {
   readTenantSetupLabel,
@@ -130,6 +166,13 @@ export {
   type GroupSnapshot,
 } from "./accesscontrol/DirectoryStateNode";
 export { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
+// The inbound half of the quarantine view (docs/accesscontrol.md §10): entries
+// this device refused at materialization, read via MindooDB.getQuarantineLog.
+export type {
+  QuarantineReason,
+  QuarantineRecord,
+} from "./accesscontrol/materializationGuard";
+export { fingerprintPublicKeyPem, normalizePublicKeyPem } from "./userkeys/fingerprint";
 
 // User ID types
 export type { PublicUserId, PrivateUserId } from "./userid";
@@ -348,6 +391,17 @@ export {
   type MaterializationPlanDiagnostics,
   type DocumentMaterializationPlan,
   type DocumentMaterializationBatchPlan,
+} from "./appendonlystores/types";
+// Per-entry push rejection (sync-v5). A host that surfaces or re-submits refused
+// entries needs the class and its predicates, not just the reason string.
+export {
+  PUT_REJECTION_CLASSES,
+  isResubmittableRejection,
+  isSelfResolvingRejection,
+  rejectionClassOf,
+  type PutEntriesAck,
+  type PutRejectionClass,
+  type RejectedPutEntry,
 } from "./appendonlystores/types";
 export {
   InMemoryContentAddressedStore,

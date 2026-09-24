@@ -304,9 +304,17 @@ describe("userdirectory builtin write invariant", () => {
       await subtle.sign({ name: "Ed25519" }, privateKey, metaBytes.buffer as ArrayBuffer),
     );
 
-    await expect(server.handlePutEntries("token", [base])).rejects.toMatchObject({
-      type: NetworkErrorType.ACCESS_DENIED,
-    });
+    // Refused per entry, with the class that says this was a rule decision
+    // rather than a corrupt payload — the signatures here are all valid.
+    const ack = await server.handlePutEntries("token", [base]);
+    expect(ack.receipts).toHaveLength(0);
+    expect(ack.rejected).toEqual([
+      {
+        id: base.id,
+        reason: expect.stringContaining("userdirectory"),
+        rejectionClass: "policy",
+      },
+    ]);
   }, 120000);
 
   it("silently drops an injected admin-signed change on load", async () => {

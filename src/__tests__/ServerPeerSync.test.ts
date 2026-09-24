@@ -457,12 +457,17 @@ describe("two servers replicating a shared tenant", () => {
     trust(alpha, beta);
   });
 
-  test("a purged document makes the peer back off instead of skipping past it", async () => {
-    // The one rejection a peer must not treat as "move on": the target refuses
-    // the whole batch with ACCESS_DENIED because the document's history was
-    // purged there. A client may shrug and advance; two servers that are meant
-    // to be identical may not, or the cursor walks past entries that were never
-    // accepted and the divergence is permanent and silent.
+  test("a purged document is reported and passed, not retried forever", async () => {
+    // Beta refuses these entries because it purged the document's history, and
+    // it will refuse them again every time: a purge is final. The refusal is
+    // therefore reported per entry and the cursor moves on.
+    //
+    // Holding it — which is right for an author key beta has not learned yet —
+    // would be wrong here: the entries can never be accepted, so the cursor
+    // would stay pinned to them and this pair would re-scan and re-offer the
+    // same batch on every run, never reporting a clean one. And the divergence
+    // a hold is meant to prevent is the *point* of a purge: beta is not
+    // supposed to hold this document.
     const fs = await import("fs");
     const path = await import("path");
 
@@ -495,20 +500,32 @@ describe("two servers replicating a shared tenant", () => {
     await replicator.refreshIntersection();
 
     const first = await replicator.syncNow({ tenantId: "purge-tenant" });
-    expect(first.held).toBeGreaterThan(0);
-    // A backoff, not a crash: the directory still replicated in the same run.
+    expect(first.rejected).toBeGreaterThan(0);
+    expect(first.held).toBe(0);
+    // Not a crash: the directory still replicated in the same run.
     expect(first.errors).toEqual([]);
 
-    // The cursor stayed put, so the next run retries the same entries rather
-    // than reporting a clean, and false, "nothing left to do".
+    // The second run is clean. This is the assertion that would fail if the
+    // cursor were held: it would report the same rejections again, and keep
+    // doing so for as long as both servers exist.
     const second = await replicator.syncNow({ tenantId: "purge-tenant" });
-    expect(second.held).toBeGreaterThan(0);
+    expect(second.rejected).toBe(0);
+    expect(second.held).toBe(0);
 
+    // And the database behind the refusal still replicates.
+    const later = await notes.createDocument();
+    await notes.changeDoc(later, (d: any) => {
+      d.getData().title = "written-after-the-purge";
+    });
+    await pushDb(purgeTenant, alpha, "notes");
+    const third = await replicator.syncNow({ tenantId: "purge-tenant" });
+    expect(third.pushed).toBeGreaterThan(0);
+    expect(third.rejected).toBe(0);
+
+    // Whatever is reported, it never names the document that caused it.
     const status = alpha.server.getClusterManager().status();
-    const peer = status.peers.find((entry) => entry.name === beta.name)!;
-    expect(peer.lastErrorClass).toBe("access-denied");
-    // The reason is classified, never the document that caused it.
     expect(JSON.stringify(status)).not.toContain(doc.getId());
+    expect(status.peers.find((entry) => entry.name === beta.name)).toBeDefined();
   });
 
   test("cluster status reports the peer, its role and its health", async () => {

@@ -131,6 +131,16 @@ export interface IrohRpcResponse {
   ok: boolean;
   result?: unknown;
   error?: string;
+  /**
+   * {@link NetworkErrorType} of a `NetworkError` the handler threw, so the
+   * caller can tell a refused write from a broken link instead of seeing every
+   * failure as a generic network problem.
+   *
+   * Absent when the handler threw something that is not a `NetworkError`, and
+   * absent from peers predating the field — the caller then keeps its
+   * `NETWORK_ERROR` default.
+   */
+  errorType?: string;
 }
 
 const textEncoder = new TextEncoder();

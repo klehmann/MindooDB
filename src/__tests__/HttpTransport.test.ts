@@ -1,6 +1,8 @@
 import type { StoreEntry } from "../core/types";
 import { HttpTransport } from "../appendonlystores/network/HttpTransport";
 import { NetworkError, NetworkErrorType } from "../core/appendonlystores/network/types";
+import type { PutEntriesAck } from "../core/appendonlystores/types";
+import { rejectionClassOf } from "../core/appendonlystores/types";
 import {
   getSharedRequestScheduler,
   resetSharedRequestSchedulers,
@@ -537,6 +539,158 @@ describe("HttpTransport binary wire format v2 (sync-v5 phase 3)", () => {
     for (const count of putCalls) {
       expect(count).toBeLessThanOrEqual(2);
     }
+  });
+});
+
+/**
+ * A 403 answers two different questions — "is this user still allowed here?"
+ * and "is this particular write allowed?" — and the client acts differently on
+ * each. The status code alone cannot tell them apart, so the server sends its
+ * own error type and the client uses it when it recognises it.
+ */
+describe("HttpTransport error-type fidelity", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  function transportAgainst(body: unknown, status: number): HttpTransport {
+    global.fetch = (jest.fn(async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/.well-known/mindoodb-server-info")) {
+        return new Response(
+          JSON.stringify({
+            name: "CN=sync.example.com",
+            signingPublicKey: "signing",
+            encryptionPublicKey: "encryption",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown) as typeof fetch;
+
+    return new HttpTransport({
+      baseUrl: "https://sync.example.com/tenant-a",
+      tenantId: "tenant-a",
+      dbId: "main",
+      retryAttempts: 1,
+    });
+  }
+
+  async function typeOfThrownError(transport: HttpTransport): Promise<NetworkErrorType> {
+    try {
+      await transport.getEntries("token", ["entry-1"]);
+    } catch (error) {
+      expect(error).toBeInstanceOf(NetworkError);
+      return (error as NetworkError).type;
+    }
+    throw new Error("expected the request to fail");
+  }
+
+  test("keeps the server's own error type on a 403", async () => {
+    const transport = transportAgainst(
+      { error: "Database \"main\" is not in the tenant's allowed database list", type: "ACCESS_DENIED" },
+      403,
+    );
+    expect(await typeOfThrownError(transport)).toBe(NetworkErrorType.ACCESS_DENIED);
+  });
+
+  test("falls back to USER_REVOKED on a 403 from a server that sends no type", async () => {
+    const transport = transportAgainst({ error: "Access denied" }, 403);
+    expect(await typeOfThrownError(transport)).toBe(NetworkErrorType.USER_REVOKED);
+  });
+
+  test("ignores an error type it does not know", async () => {
+    // The field arrives from the far end of the wire, so an unrecognised value
+    // must not steer the client into handling it has no branch for.
+    const transport = transportAgainst(
+      { error: "Access denied", type: "TOTALLY_MADE_UP" },
+      403,
+    );
+    expect(await typeOfThrownError(transport)).toBe(NetworkErrorType.USER_REVOKED);
+  });
+
+  test("still maps a 401 to INVALID_TOKEN regardless of the type field", async () => {
+    const transport = transportAgainst({ error: "Unauthorized" }, 401);
+    expect(await typeOfThrownError(transport)).toBe(NetworkErrorType.INVALID_TOKEN);
+  });
+});
+
+/**
+ * The rejection class rides in the ack, which means it too arrives from the
+ * wire and has to survive both an older server that omits it and a newer or
+ * hostile one that sends something unexpected.
+ */
+describe("HttpTransport putEntries ack parsing", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  async function ackFor(rejected: unknown): Promise<PutEntriesAck> {
+    global.fetch = (jest.fn(async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/.well-known/mindoodb-server-info")) {
+        return new Response(
+          JSON.stringify({
+            name: "CN=sync.example.com",
+            signingPublicKey: "signing",
+            encryptionPublicKey: "encryption",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ success: true, receipts: [], rejected }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown) as typeof fetch;
+
+    const transport = new HttpTransport({
+      baseUrl: "https://sync.example.com/tenant-a",
+      tenantId: "tenant-a",
+      dbId: "main",
+      retryAttempts: 1,
+    });
+    return transport.putEntries("token", [createEntry("entry-1", 32)]);
+  }
+
+  test("carries a known rejection class through", async () => {
+    const ack = await ackFor([
+      { id: "entry-1", reason: "denied by Tier 1 policy: no rule", rejectionClass: "policy" },
+    ]);
+    expect(ack.rejected).toEqual([
+      {
+        id: "entry-1",
+        reason: "denied by Tier 1 policy: no rule",
+        rejectionClass: "policy",
+      },
+    ]);
+    expect(rejectionClassOf(ack.rejected[0])).toBe("policy");
+  });
+
+  test("reads an omitted class as signature, which is all an older server could mean", async () => {
+    const ack = await ackFor([{ id: "entry-1", reason: "invalid author signature" }]);
+    expect(ack.rejected[0].rejectionClass).toBeUndefined();
+    expect(rejectionClassOf(ack.rejected[0])).toBe("signature");
+  });
+
+  test("drops an unknown class rather than passing it on", async () => {
+    const ack = await ackFor([
+      { id: "entry-1", reason: "something new", rejectionClass: "from-the-future" },
+    ]);
+    expect(ack.rejected[0].rejectionClass).toBeUndefined();
+    expect(rejectionClassOf(ack.rejected[0])).toBe("signature");
   });
 });
 

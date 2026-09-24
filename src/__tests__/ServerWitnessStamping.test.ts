@@ -226,7 +226,7 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
     expect(stored.receivedDateSignature).toBeUndefined();
   });
 
-  it("rejects a push denied by the Tier 1 evaluator with ACCESS_DENIED", async () => {
+  it("rejects a push denied by the Tier 1 evaluator as a policy rejection", async () => {
     const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
     const signer = await generateSigner();
     const denyEvaluator: ServerTier1Evaluator = async (): Promise<AccessDecision> => ({
@@ -243,9 +243,50 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       { timestampProvider: new Ed25519WitnessProvider({ signer, subtle: signer.subtle }), witnessDbid: dbid, tier1Evaluator: denyEvaluator },
     );
 
-    await expect(server.handlePutEntries("token", [await makeEntry()])).rejects.toBeInstanceOf(NetworkError);
+    // A Tier 1 denial is reported per entry rather than by failing the batch:
+    // the entry is intact and was legitimate when written, so the pushing side
+    // has to be able to keep it and offer it again if the right returns —
+    // and one such entry must not stall the database's whole push sync.
+    const entry = await makeEntry();
+    const ack = await server.handlePutEntries("token", [entry]);
+    expect(ack.receipts).toHaveLength(0);
+    expect(ack.rejected).toEqual([
+      {
+        id: entry.id,
+        reason: expect.stringContaining("denied by Tier 1 policy"),
+        rejectionClass: "policy",
+      },
+    ]);
     // Nothing should have been persisted.
     expect(await localStore.getAllIds()).toHaveLength(0);
+  });
+
+  it("keeps pushing the rest of a batch when Tier 1 denies one entry", async () => {
+    const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+    const signer = await generateSigner();
+    const denied = await makeEntry();
+    const allowed = await makeEntry();
+    const denyOne: ServerTier1Evaluator = async (entry): Promise<AccessDecision> =>
+      entry.id === denied.id
+        ? { allowed: false, reason: "no doc_change rule grants this user", tier: "tier1" }
+        : { allowed: true, tier: "tier1" };
+    const server = new ServerNetworkContentAddressedStore(
+      localStore,
+      fakeDirectory(),
+      fakeAuth(),
+      cryptoAdapter,
+      undefined,
+      {
+        timestampProvider: new Ed25519WitnessProvider({ signer, subtle: signer.subtle }),
+        witnessDbid: dbid,
+        tier1Evaluator: denyOne,
+      },
+    );
+
+    const ack = await server.handlePutEntries("token", [denied, allowed]);
+    expect(ack.rejected.map((r) => r.id)).toEqual([denied.id]);
+    expect(ack.receipts.map((r) => r.id)).toEqual([allowed.id]);
+    expect(await localStore.getAllIds()).toEqual([allowed.id]);
   });
 
   it("advertises serverTime and supportsAccessControlV1 when a witness signer is present", async () => {
@@ -379,10 +420,11 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
 
   // Server-side cryptographic verification on push (audit findings #1 / #5):
   // the server must refuse forged/tampered entries before stamping them, even
-  // when the author key is "trusted" by the directory. Since sync-v5 these
-  // signature-class failures are rejected PER ENTRY (reported in the ack)
-  // instead of failing the whole batch, so one poisoned entry cannot block
-  // a database's push sync.
+  // when the author key is "trusted" by the directory. These failures are
+  // rejected PER ENTRY (reported in the ack) instead of failing the whole
+  // batch, so one poisoned entry cannot block a database's push sync. Each
+  // rejection carries the class that decides what the pushing side may do with
+  // it — see PutRejectionClass.
   describe("push-time signature + contentHash verification", () => {
     function plainServer(localStore: InMemoryContentAddressedStore, trusted = true) {
       return new ServerNetworkContentAddressedStore(
@@ -401,7 +443,11 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       const ack = await server.handlePutEntries("token", [e]);
       expect(ack.receipts).toHaveLength(0);
       expect(ack.rejected).toEqual([
-        { id: e.id, reason: expect.stringContaining("content hash") },
+        {
+          id: e.id,
+          reason: expect.stringContaining("content hash"),
+          rejectionClass: "signature",
+        },
       ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
@@ -416,19 +462,31 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       const ack = await server.handlePutEntries("token", [tampered]);
       expect(ack.receipts).toHaveLength(0);
       expect(ack.rejected).toEqual([
-        { id: e.id, reason: expect.stringContaining("invalid author signature") },
+        {
+          id: e.id,
+          reason: expect.stringContaining("invalid author signature"),
+          rejectionClass: "signature",
+        },
       ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
 
-    it("rejects an entry signed by an untrusted key", async () => {
+    // An untrusted key is the one rejection that is expected to fix itself: the
+    // key is usually a live grant the target has not replicated yet. It is
+    // therefore classified apart from the corruption cases, because it is the
+    // only class a cursor may be held for.
+    it("rejects an entry signed by an untrusted key as self-resolving", async () => {
       const localStore = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
       const server = plainServer(localStore, /* trusted */ false);
       const e = await makeEntry();
       const ack = await server.handlePutEntries("token", [e]);
       expect(ack.receipts).toHaveLength(0);
       expect(ack.rejected).toEqual([
-        { id: e.id, reason: expect.stringContaining("not signed by a trusted user") },
+        {
+          id: e.id,
+          reason: expect.stringContaining("not signed by a trusted user"),
+          rejectionClass: "untrusted-key",
+        },
       ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
@@ -442,7 +500,11 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       const ack = await server.handlePutEntries("token", [good, bad, good2]);
       expect(ack.receipts.map((r) => r.id).sort()).toEqual([good.id, good2.id].sort());
       expect(ack.rejected).toEqual([
-        { id: bad.id, reason: expect.stringContaining("content hash") },
+        {
+          id: bad.id,
+          reason: expect.stringContaining("content hash"),
+          rejectionClass: "signature",
+        },
       ]);
       const storedIds = await localStore.getAllIds();
       expect(storedIds).toContain(good.id);
@@ -493,7 +555,11 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       const ack = await server.handlePutEntries("token", [tampered]);
       expect(ack.receipts).toHaveLength(0);
       expect(ack.rejected).toEqual([
-        { id: e.id, reason: expect.stringContaining("invalid author signature") },
+        {
+          id: e.id,
+          reason: expect.stringContaining("invalid author signature"),
+          rejectionClass: "signature",
+        },
       ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
@@ -537,7 +603,11 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       const ack = await server.handlePutEntries("token", [dropped]);
       expect(ack.receipts).toHaveLength(0);
       expect(ack.rejected).toEqual([
-        { id: e.id, reason: expect.stringContaining("invalid author signature") },
+        {
+          id: e.id,
+          reason: expect.stringContaining("invalid author signature"),
+          rejectionClass: "signature",
+        },
       ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });

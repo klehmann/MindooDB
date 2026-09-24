@@ -186,10 +186,26 @@ describe("server-side document-history purge (HTTP)", () => {
     const purged = await waitFor(async () => (await entriesForDoc(remoteMain, docId!)).length === 0);
     expect(purged).toBe(true);
 
-    // A re-push of the now-purged document is rejected by the purged-doc
-    // registry (the local client still holds the entries).
-    await expect(mainDb.pushChangesTo(remoteMain)).rejects.toThrow(
-      /purged document|access[_ ]denied/i,
-    );
+    // A re-push of the now-purged document is refused by the purged-doc
+    // registry (the local client still holds the entries). The refusal is
+    // per-entry: the push itself completes, and reports which entries were
+    // turned away and why.
+    const rePush = await mainDb.pushChangesTo(remoteMain);
+    expect(rePush.cancelled).toBe(false);
+    expect(rePush.rejectedEntries?.length).toBeGreaterThan(0);
+    for (const rejection of rePush.rejectedEntries ?? []) {
+      expect(rejection.rejectionClass).toBe("purged");
+      expect(rejection.reason).toMatch(/purged document/i);
+    }
+    // And the document's entries are still not on the server.
+    expect(await entriesForDoc(remoteMain, docId!)).toHaveLength(0);
+
+    // The refusal must not turn into a sync that never finishes. A purged
+    // document can never be accepted again, so pinning the cursor to it would
+    // make every later push re-scan and re-offer the same entries. The cursor
+    // moves on instead, and the next push is clean.
+    const thirdPush = await mainDb.pushChangesTo(remoteMain);
+    expect(thirdPush.cancelled).toBe(false);
+    expect(thirdPush.rejectedEntries ?? []).toHaveLength(0);
   }, 120000);
 });

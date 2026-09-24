@@ -1198,12 +1198,16 @@ also throws synchronously).
   locally in the first place. This is a UX/early-feedback layer only — it fails open
   on infra errors and can be bypassed — so the server and materialization checks
   below remain the authoritative enforcers against tampered or offline clients.
-- **Push violation (Tier 1, server):** rejected with a structured `AccessDenied`
-  (HTTP 4xx). The entry remains local and is retried only if access is regained.
+- **Push violation (Tier 1, server):** the entry is refused **per entry**, classified
+  as `"policy"`, and reported in the `putEntries` response
+  (`RejectedPutEntry.rejectionClass`, see network-sync-protocol.md §5.7.6). The push
+  itself completes and the scan cursor advances, so one withdrawn right cannot block
+  a database's sync. Advancing has a price the caller must pay: the sync will not
+  offer the entry again, so it is written to the quarantine log (§10.1) instead.
 - **Materialization violation (Tier 2, client):** the entry is **not materialized**;
   its bytes remain in the append-only store but are excluded from queries and from
   re-sync, and the event is added to a per-tenant quarantine/audit log that Haven can
-  display.
+  display (§10.1).
 - **Tier 2 is a pure, deterministic function** — this is what keeps "quarantine on
   receipt" compatible with eventual consistency. The verdict for an entry is computed
   purely from:
@@ -1250,7 +1254,68 @@ also throws synchronously).
   effective. Use `listDocHistoryPurges()` to enumerate pending requests and
   `deleteDocHistoryPurge(requestId, ...)` to withdraw one before it is acted on.
 
-## 11. Worked example: a CRM with per-record editors
+### 10.1 The quarantine log
+
+Both refusals above leave a device holding a change that exists nowhere else. The
+same situation from two directions:
+
+- **Outbound** — the device wrote it (or received it over peer-to-peer sync and
+  merged it), tried to push it, and the server said no. The push advanced past it,
+  so nothing will offer it again.
+- **Inbound** — it arrived from another device and Tier 2 refused to materialize it,
+  so it sits in the local store without appearing in any query.
+
+From the user's side those are one complaint — *a change that exists but has not
+arrived* — so they are read through one view, `QuarantineViewRecord`, discriminated
+by a `direction` field. They are *stored* differently, because they are different
+kinds of fact.
+
+**Inbound records are local.** A materialization verdict is a local computation over
+local inputs (§10), so every replica recomputes it independently and there is nothing
+to distribute. The log lives in memory and rides along in the metadata checkpoint, so
+it survives a restart without a rebuild. Recording it is **group replacement per
+document**: a re-materialization pass replaces that document's records wholesale
+rather than appending, which makes it idempotent by construction and self-healing
+when the verdict changes. Bounded at 200 records per document and 500 documents,
+oldest document evicted first.
+
+**Outbound records are documents.** A refusal by the server is a fact about the
+tenant that belongs in the tenant's history, not in one device's cache — and the
+whole point is to be able to act on it later, possibly from Haven on another device.
+Each one is a `qtn_`-prefixed document in `userdirectory`; see the module
+documentation of `core/quarantine/QuarantineDocument.ts` for why that database,
+why the `default` key rather than `$publicinfos`, why the doc id folds in the
+author's key fingerprint, and why a record **must be verified on read** before it is
+believed. In short: the record must not live in the database whose write right was
+just withdrawn, every tenant member may audit it, the hoster may not read it, and
+since any member can write a `qtn_` document saying anything, an unverified record is
+a way to put words in someone else's mouth.
+
+Caps on both sides exist because a refused write normally drags its causal dependents
+along (§10), so one refusal can mean a long list. One record per (author, database,
+document, class) carries up to `MAX_QUARANTINED_ENTRY_IDS` = 200 entry ids plus an
+`omittedEntryCount`; the list is there to find the entries again, and a bounded one
+does that just as well.
+
+**Re-submitting.** `resubmitQuarantinedEntries()` offers the recorded entries to the
+target store directly rather than rewinding a cursor, and only for the classes where
+trying again can succeed (`isResubmittableRejection`: `"policy"` and
+`"untrusted-key"`). Two exclusions are worth stating explicitly because they are not
+about saving a round trip:
+
+- **`"purged"` is never re-offered.** The history was erased on purpose, so pushing
+  the entry again is an attempt to undo an erasure — a re-submit here works against
+  the person who asked for it. This is enforced in the taxonomy, in the core
+  re-submit, and again in Haven's UI, so no single missing check re-opens it.
+- **`"revoked-key"` and `"signature"` cannot pass.** A retired key needs a
+  re-encryption, which is a new entry, and a payload that does not verify never will.
+
+A record is withdrawn only when *nothing* it names is refused again, or when its
+entries are gone locally. A partial acceptance deliberately leaves the record
+standing: rewriting it would itself be a write, and a write is one more thing to
+push. Haven re-submits automatically after a new directory version arrives — that
+being the event that can have restored the right — and offers a manual button for the
+impatient case.
 
 This walks one realistic policy end-to-end so the moving parts line up. The tenant
 has a `crm` database. The rules we want:

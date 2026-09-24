@@ -332,8 +332,14 @@ describe("personal userdirectory documents", () => {
       id: `${doc.getId()}_x_forged_bob`,
       docId: doc.getId(),
     });
-    await expect(server.handlePutEntries("token", [forged])).rejects.toMatchObject({
-      type: NetworkErrorType.ACCESS_DENIED,
-    });
+    const ack = await server.handlePutEntries("token", [forged]);
+    expect(ack.receipts).toHaveLength(0);
+    expect(ack.rejected).toEqual([
+      {
+        id: forged.id,
+        reason: expect.stringContaining("only the owning person or the admin can delete"),
+        rejectionClass: "policy",
+      },
+    ]);
   });
 });

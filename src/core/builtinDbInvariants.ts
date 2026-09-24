@@ -33,13 +33,16 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  *
  * `wks_` — roamed workspace and application list (one document per save id).
  * `dev_` — one device's peer-sync record (Iroh endpoint id and label).
+ * `qtn_` — one device's record of entries a server refused (one document per
+ *   author, database, document and rejection class).
  *
- * The two differ in who may *read* them, which this rule does not care about:
- * `wks_` documents are sealed to their owner, while `dev_` documents are
- * encrypted with the tenant `default` key so every member can discover peers
- * while the hoster still sees ciphertext. Ownership is the creator either way.
+ * They differ in who may *read* them, which this rule does not care about:
+ * `wks_` documents are sealed to their owner, while `dev_` and `qtn_` are
+ * encrypted with the tenant `default` key — so every member can discover peers
+ * and audit refused writes while the hoster still sees ciphertext. Ownership is
+ * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {

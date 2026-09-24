@@ -33,7 +33,7 @@ import type {
   RejectedPutEntry,
   PutEntriesAck,
 } from "./types";
-import { StoreKind } from "./types";
+import { StoreKind, isSelfResolvingRejection, rejectionClassOf } from "./types";
 import type { StoreEntryMetadata } from "../types";
 import type { SyncOptions } from "../types";
 import { bloomMightContainId } from "./bloom";
@@ -48,6 +48,24 @@ export interface SyncScanCursorRecord {
   sourceEpoch: string;
   targetEpoch: string;
   cursor: StoreScanCursor;
+  /**
+   * How long the cursor has been waiting on the same rejected entry, under the
+   * `"hold"` policy.
+   *
+   * A hold assumes the refusal will pass — see
+   * {@link isSelfResolvingRejection}. That assumption can be wrong: a key the
+   * target never comes to trust (a grant that was never replicated, a device
+   * removed mid-flight, a forged key) leaves the pair re-scanning from this
+   * position on every run for good. Counting the attempts gives the wait an
+   * end, after which the entry is given up on and reported instead.
+   *
+   * Absent until the first hold, and cleared as soon as the cursor moves.
+   */
+  hold?: {
+    /** Entry the cursor is waiting on. A different id restarts the count. */
+    id: string;
+    attempts: number;
+  };
 }
 
 /**
@@ -67,7 +85,7 @@ export interface SyncScanCursorStore {
 
 /**
  * What a caller does with entries the target refused per-entry
- * (signature-class rejections, sync-v5 §5.7.6).
+ * (sync-v5 §5.7.6).
  *
  * - `"advance"` — the persisted cursor moves past the rejected entry, so it is
  *   never offered again. Correct for **clients**: one locally corrupted or
@@ -79,6 +97,17 @@ export interface SyncScanCursorStore {
  *   replicated the `directory` database. Advancing the cursor past those
  *   entries would drop them permanently and silently, leaving two servers
  *   divergent with no error anywhere.
+ *
+ * `"hold"` applies only to rejections that can resolve by themselves — see
+ * {@link isSelfResolvingRejection}. A refusal the next attempt would earn just
+ * as certainly (purged document, withdrawn right, corrupt payload) is reported
+ * and passed, because a cursor pinned to it would re-scan from that position on
+ * every future run and never report a clean one.
+ *
+ * And even a self-resolving refusal is only waited on for
+ * {@link DEFAULT_MAX_CURSOR_HOLD_ATTEMPTS} runs. The bet that it will pass can
+ * be wrong, and nothing else would ever end the wait. Whatever the cursor moves
+ * past either way is reported in {@link SyncStoresResult.abandoned}.
  */
 export type SyncRejectionPolicy = "advance" | "hold";
 
@@ -88,7 +117,22 @@ export interface SyncStoresContext {
   cursors: SyncScanCursorStore;
   /** Defaults to `"advance"` (client semantics). */
   rejectionPolicy?: SyncRejectionPolicy;
+  /**
+   * How many consecutive runs may wait on the same rejected entry before it is
+   * given up on. Defaults to {@link DEFAULT_MAX_CURSOR_HOLD_ATTEMPTS}.
+   */
+  maxHoldAttempts?: number;
 }
+
+/**
+ * Default retry budget for a held cursor.
+ *
+ * Generous on purpose: the condition a hold waits for is a `directory`
+ * replication, which normally resolves within a run or two, so reaching twenty
+ * means it is not going to resolve at all. Spending a few extra runs costs a
+ * re-scan; giving up too early costs an entry that would have been accepted.
+ */
+export const DEFAULT_MAX_CURSOR_HOLD_ATTEMPTS = 20;
 
 export interface SyncStoresResult {
   transferred: number;
@@ -103,6 +147,15 @@ export interface SyncStoresResult {
    * precursor of divergence.
    */
   cursorHeldForRetry?: boolean;
+  /**
+   * Rejections the cursor has moved past, so they will not be offered again.
+   *
+   * Under `"advance"` that is every rejection. Under `"hold"` it is the ones no
+   * hold could help — plus any whose retry budget ran out. This is the set a
+   * caller has to record somewhere if it wants to keep them findable, because
+   * after this run the sync itself has forgotten them.
+   */
+  abandoned?: RejectedPutEntry[];
 }
 
 /**
@@ -225,7 +278,15 @@ export async function filterMissingIds(
  * Normalize the polymorphic putEntries result (`void`, receipts array, or
  * structured {@link PutEntriesAck}) into receipts + per-entry rejections.
  */
-function normalizePutResult(
+/**
+ * Read a `putEntries` result whatever shape the store returned.
+ *
+ * The signature admits three: nothing (a plain local store), bare receipts (a
+ * witnessing store predating per-entry rejection), and a full ack. Exported so
+ * every caller that pushes entries reads them the same way, rather than each
+ * re-deriving which of the three it got.
+ */
+export function normalizePutResult(
   putResult: void | StoreEntryMetadata[] | PutEntriesAck,
 ): { receipts: StoreEntryMetadata[]; batchRejected: RejectedPutEntry[] } {
   if (Array.isArray(putResult)) {
@@ -441,6 +502,7 @@ export async function syncEntriesBetweenStores(
 ): Promise<SyncStoresResult> {
   const { logger, cursors } = ctx;
   const holdCursorOnRejection = ctx.rejectionPolicy === "hold";
+  const maxHoldAttempts = ctx.maxHoldAttempts ?? DEFAULT_MAX_CURSOR_HOLD_ATTEMPTS;
   let transferred = 0;
   let transferredBytes = 0;
   let scanned = 0;
@@ -513,6 +575,12 @@ export async function syncEntriesBetweenStores(
     // it instead of skipping it forever. Null means "nothing rejected yet".
     let heldCursor: StoreScanCursor | null = null;
     let cursorIsHeld = false;
+    // The entry this run decided to wait on, and how many runs in a row have
+    // now waited on it (see SyncScanCursorRecord.hold).
+    let holdState: { id: string; attempts: number } | null = null;
+    // Rejections the cursor moved past, including any whose retry budget ran
+    // out. Reported so the caller can keep them findable.
+    const abandoned: RejectedPutEntry[] = [];
 
     const persistScanCursor = (finalCursor: StoreScanCursor | null): void => {
       const effective = cursorIsHeld ? heldCursor : finalCursor;
@@ -521,6 +589,9 @@ export async function syncEntriesBetweenStores(
           sourceEpoch: sourceHead.epoch,
           targetEpoch: targetHead.epoch,
           cursor: effective,
+          // Only carried while the cursor is actually waiting. Once it moves,
+          // dropping it restarts the budget for whatever comes next.
+          ...(cursorIsHeld && holdState ? { hold: holdState } : {}),
         });
       }
     };
@@ -577,6 +648,7 @@ export async function syncEntriesBetweenStores(
           cancelled: true,
           rejected,
           cursorHeldForRetry: cursorIsHeld,
+          abandoned,
         };
       }
 
@@ -613,6 +685,7 @@ export async function syncEntriesBetweenStores(
           cancelled: true,
           rejected,
           cursorHeldForRetry: cursorIsHeld,
+          abandoned,
         };
       }
 
@@ -640,6 +713,7 @@ export async function syncEntriesBetweenStores(
             cancelled: true,
             rejected,
             cursorHeldForRetry: cursorIsHeld,
+            abandoned,
           };
         }
 
@@ -665,20 +739,58 @@ export async function syncEntriesBetweenStores(
           // Clamp the cursor at the first rejection so the retry actually
           // re-offers the entry. Only the earliest one matters: everything
           // after it is re-scanned anyway.
-          if (holdCursorOnRejection && transferResult.rejected.length > 0 && !cursorIsHeld) {
-            const rejectedIds = new Set(transferResult.rejected.map((entry) => entry.id));
+          //
+          // Only self-resolving rejections are worth holding for. Holding for a
+          // purged document or a withdrawn right pins the cursor to an entry
+          // that earns the same refusal every time: the pair re-scans from
+          // there and re-offers it on every run, and never reports clean.
+          // Those are reported through `rejected` instead, which is where the
+          // caller can record them.
+          const holdable = holdCursorOnRejection
+            ? transferResult.rejected.filter((entry) =>
+                isSelfResolvingRejection(rejectionClassOf(entry)),
+              )
+            : [];
+          // Everything the cursor will not wait for is gone after this run.
+          abandoned.push(
+            ...transferResult.rejected.filter((entry) => !holdable.includes(entry)),
+          );
+
+          if (holdable.length > 0 && !cursorIsHeld) {
+            const rejectedIds = new Set(holdable.map((entry) => entry.id));
             const firstRejectedIndex = pageEntries.findIndex((m) => rejectedIds.has(m.id));
             if (firstRejectedIndex >= 0) {
-              cursorIsHeld = true;
-              const previous =
-                firstRejectedIndex > 0 ? pageEntries[firstRejectedIndex - 1] : null;
-              heldCursor = previous
-                ? { receiptOrder: previous.receiptOrder ?? 0, id: previous.id }
-                : cursorAtPageStart;
-              logger.warn(
-                `Holding sync cursor at receiptOrder=${heldCursor?.receiptOrder ?? "start"} for ${cursorKey}: ` +
-                  `${transferResult.rejected.length} entr${transferResult.rejected.length === 1 ? "y was" : "ies were"} rejected and must be retried`,
-              );
+              const waitingOn = pageEntries[firstRejectedIndex].id;
+              // Continue the count only while it is the same entry; a different
+              // one means the previous wait ended, one way or another.
+              const attempts =
+                persisted?.hold?.id === waitingOn ? persisted.hold.attempts + 1 : 1;
+
+              if (attempts > maxHoldAttempts) {
+                // The refusal was classified as one that passes on its own, and
+                // it has not. Waiting further would only re-scan from here on
+                // every future run, so give up on these and let the cursor run.
+                logger.warn(
+                  `Giving up on ${holdable.length} entr${holdable.length === 1 ? "y" : "ies"} for ` +
+                    `${cursorKey} after ${attempts - 1} attempts: rejected as ` +
+                    `${rejectionClassOf(holdable[0])} but never accepted. ` +
+                    `First reason: ${holdable[0].reason}`,
+                );
+                abandoned.push(...holdable);
+              } else {
+                cursorIsHeld = true;
+                holdState = { id: waitingOn, attempts };
+                const previous =
+                  firstRejectedIndex > 0 ? pageEntries[firstRejectedIndex - 1] : null;
+                heldCursor = previous
+                  ? { receiptOrder: previous.receiptOrder ?? 0, id: previous.id }
+                  : cursorAtPageStart;
+                logger.warn(
+                  `Holding sync cursor at receiptOrder=${heldCursor?.receiptOrder ?? "start"} for ${cursorKey}: ` +
+                    `${holdable.length} entr${holdable.length === 1 ? "y was" : "ies were"} rejected and must be retried ` +
+                    `(attempt ${attempts} of ${maxHoldAttempts})`,
+                );
+              }
             }
           }
 
@@ -694,6 +806,7 @@ export async function syncEntriesBetweenStores(
               cancelled: true,
               rejected,
               cursorHeldForRetry: cursorIsHeld,
+              abandoned,
             };
           }
           for (const id of missingIds) {
@@ -738,6 +851,7 @@ export async function syncEntriesBetweenStores(
       cancelled: false,
       rejected,
       cursorHeldForRetry: cursorIsHeld,
+      abandoned,
     };
   }
 

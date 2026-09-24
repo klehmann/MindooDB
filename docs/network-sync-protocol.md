@@ -130,7 +130,7 @@ When the server advertises `supportsSessionKeyWrap`, the client can add `"sessio
 
 If the client has entries that the server is missing (bidirectional sync), use `POST /sync/putEntries` to push them upstream. The same reconciliation logic applies in reverse.
 
-The response carries witness receipts for the accepted entries plus a `rejected` list for entries the server refused on signature-class validation grounds (see section 5.7.6). A rejection does not fail the push: the client skips the entry, reports it as a warning, and keeps syncing.
+The response carries witness receipts for the accepted entries plus a `rejected` list for the entries the server refused, each with a `rejectionClass` (see section 5.7.6). A rejection does not fail the push: the client skips the entry, reports it as a warning, and keeps syncing. Skipping means the sync will not offer the entry again, so a client that cares about the entry has to record it — section 5.7.6.
 
 ### 3.7 Handling errors
 
@@ -140,7 +140,7 @@ The protocol defines structured error types that map to standard HTTP status cod
 |---|---|---|
 | `INVALID_TOKEN` | 401 | Re-authenticate and retry the request |
 | `USER_REVOKED` | 403 | Stop sync; the user's access has been removed |
-| `INVALID_SIGNATURE` | 401 | Check client key configuration. On `putEntries`, signature-class failures of individual entries are reported per entry in the response (`rejected`, section 5.7.6) instead of raising this error; the batch-level error remains for authentication-level signature problems and pre-sync-v5 servers |
+| `INVALID_SIGNATURE` | 401 | Check client key configuration. On `putEntries`, a failure attributable to one entry is reported per entry in the response (`rejected`, section 5.7.6) instead of raising this error; the batch-level error remains for authentication-level signature problems and pre-sync-v5 servers |
 | `CHALLENGE_EXPIRED` | 401 | Request a new challenge and re-authenticate |
 | `USER_NOT_FOUND` | 404 | Verify the username is correct |
 | `NETWORK_ERROR` | varies | Retry with exponential backoff |
@@ -339,26 +339,48 @@ The SDK's `ClientNetworkContentAddressedStore.subscribeToChanges(onChange)` wrap
 
 The server validates every pushed entry cryptographically before storing it (section 6): the author key must be trusted by the directory, the `contentHash` must match the payload, and the author signature (including the v2 metadata-signature floor) must verify. Originally, any one failing entry aborted the whole `putEntries` batch with `INVALID_SIGNATURE` — which meant a single locally corrupted or forged entry could permanently block a database's push sync: every retry re-sent the same batch and hit the same error.
 
-Since sync-v5, these **signature-class failures are rejected per entry** instead. The server skips the offending entry (it is never stored, witnessed, or propagated), stores the rest of the batch, and reports the skipped entries in the response next to the witness receipts:
+Since sync-v5, a refused entry is **reported per entry** instead. The server skips the offending entry (it is never stored, witnessed, or propagated), stores the rest of the batch, and reports the skipped entries in the response next to the witness receipts. Each rejection carries a `rejectionClass` saying what kind of refusal it was, because the pushing side's correct reaction differs sharply between them:
 
 ```json
 {
   "success": true,
   "receipts": [ ... ],
   "rejected": [
-    { "id": "id-125", "reason": "Entry id-125 has an invalid author signature" }
+    {
+      "id": "id-125",
+      "reason": "Entry id-125 has an invalid author signature",
+      "rejectionClass": "signature"
+    },
+    {
+      "id": "id-133",
+      "reason": "Entry id-133 denied by Tier 1 policy: not an editor of proj_alpha",
+      "rejectionClass": "policy"
+    }
   ]
 }
 ```
 
-The client surfaces the rejections as warnings on the sync result (`SyncResult.rejectedEntries`) while the push completes normally — the persisted scan cursor (5.7.1) advances past the poisoned entry, so it does not block future syncs either. The same contract applies to `putEntriesBinary`.
+| `rejectionClass` | Condition | Can re-offering it unchanged ever succeed? |
+| --- | --- | --- |
+| `signature` | Content hash mismatch, bad or missing author signature, unverifiable replicated witness receipt | No — nothing outside the entry can fix it |
+| `untrusted-key` | The author key is not (yet) trusted by the directory | Yes, by itself — the directory replication that registers it is usually a run or two away |
+| `policy` | Tier 1 rule denial, or the builtin `userdirectory` write invariant | Only after an administrator restores the right |
+| `purged` | The document's history was purged on the server (accesscontrol.md §10, *Purge*) | No, and it must not be tried — see below |
+| `revoked-key` | The entry's `decryptionKeyId` is on the pushing user's revoked-key blacklist | No — the payload is sealed to a retired key, so it takes a re-encryption, which is a new entry |
+
+The class exists because the field's absence used to be silently ambiguous. A client reads it through `rejectionClassOf`, never directly: a server predating the field could only ever have reported signature-class failures per entry, so a missing value means exactly `"signature"`.
+
+The pushing side then chooses between two policies, and the choice is not cosmetic:
+
+- **Clients advance** (`SyncRejectionPolicy: "advance"`). The persisted scan cursor (5.7.1) moves past the refused entry, so the push completes normally and the database is never blocked. The unavoidable consequence is that **the sync will not offer the entry again** — it is now the caller's job to keep it findable. MindooDB writes a signed quarantine record for it (accesscontrol.md §10.1), which is also what makes a later deliberate re-submit possible.
+- **Servers replicating to each other hold** (`"hold"`). The cursor stays clamped just before the earliest refusal so the next run retries it; see 5.10, convergence invariant 2.
 
 Two boundaries are deliberately unchanged:
 
-- **Access-denied conditions still fail the whole request** (`ACCESS_DENIED`): remote wipe, a revoked `decryptionKeyId`, a purged document, or a Tier 1 policy denial are intentional blocks, not data corruption, and must stop the push loudly.
-- **The security model is unchanged.** A rejected entry is treated exactly as strictly as before — it never enters the store. Only the blast radius of the failure shrank from "whole batch, forever" to "that entry".
+- **Session-wide conditions still fail the whole request** (`ACCESS_DENIED`), because they are not about any one entry: a device targeted for remote wipe may push nothing at all, and a database outside the tenant's allowed list is refused for reads and writes alike. Everything that *is* a statement about a single entry — including the access-denied conditions that used to abort the batch — is now per-entry.
+- **The security model is unchanged.** A refused entry is treated exactly as strictly as before: it never enters the store, is never witnessed, and is never propagated. Only the blast radius of the failure shrank from "whole batch, forever" to "that entry".
 
-Older servers that predate this behavior still fail the batch; clients handle both by treating a missing `rejected` field as an empty list.
+The same contract applies to `putEntriesBinary`. Older servers that predate the behavior still fail the batch; clients handle both by treating a missing `rejected` field as an empty list.
 
 ### 5.8 Anatomy of a sync run: request sequences
 
@@ -439,7 +461,16 @@ Client sync and server replication differ in one respect that changes the correc
 
 **1. Directory first.** Within a tenant, `directory` and `userdirectory` replicate before application databases, in a deterministic order both sides agree on. Application entries are signed by keys the peer only learns from the directory, so any other order rejects entries that are in fact valid.
 
-**2. The cursor holds on rejection.** When the target rejects an entry, a client may skip it and advance its cursor. A peer may not: the cursor stays clamped until the entry is accepted, so the next run retries it. Advancing past a rejected entry would make the divergence permanent and, worse, invisible — both sides would report a clean sync. The same applies to a batch-wide `ACCESS_DENIED` (a purged document, a revoked key): the pair is held and retried, the remaining databases still replicate, and the condition is reported as a backoff rather than an outage. These conditions are usually transient — they resolve once the directory change that caused them has itself replicated.
+**2. The cursor holds on rejection — but only where holding can help, and not forever.** When the target rejects an entry, a client may skip it and advance its cursor. A peer may not by default: the cursor stays clamped just before the earliest refusal, so the next run retries it. Advancing past a rejected entry would make the divergence permanent and, worse, invisible — both sides would report a clean sync.
+
+Two bounds keep that from turning into its own kind of outage:
+
+- **Only a self-resolving refusal is worth waiting on.** `untrusted-key` is the one class the sync itself can clear, because the `directory` replication that registers the key is normally a run or two away. Holding on any other class pins the cursor to an entry that will be refused for exactly the same reason on every future run: the pair re-scans from that position forever, the scan never falls back to the cheap resume path of 5.7.1, and a permanent condition presents as a permanent backoff. So `policy`, `purged`, `revoked-key` and `signature` are reported and passed.
+- **Even a self-resolving refusal is only waited on for a bounded number of runs** (`DEFAULT_MAX_CURSOR_HOLD_ATTEMPTS`, currently 20). The bet that the key will show up can simply be wrong, and nothing else would ever end the wait. The budget is generous on purpose: overspending costs a re-scan, giving up too early costs an entry that would have been accepted.
+
+Whatever the cursor moves past — immediately or after the budget ran out — is reported in `SyncStoresResult.abandoned`, which is the set a caller must record if it wants the entries to stay findable. `PeerReplicator` logs exactly that set; it deliberately does not re-derive it by filtering `rejected` by class, which would miss the entries the budget just gave up on.
+
+The session-wide `ACCESS_DENIED` conditions (remote wipe, a database outside the allowed list) still fail the request: the pair is held and retried, the remaining databases still replicate, and the condition is reported as a backoff rather than an outage.
 
 **3. Receipts are preserved.** An entry arriving from a trusted peer normally carries the witness receipt (§5.2 of the witness layout) of the server that first accepted it. The receiving server verifies that receipt — the witness key must be one it trusts, and the signature must verify over the fields including `dbid`, so a receipt cannot be transplanted between databases — and keeps it. Only an unwitnessed entry is stamped fresh; a receipt that fails verification is a rejection, never a silent overwrite.
 
@@ -548,12 +579,25 @@ interface StoreHead {
 }
 ```
 
-**RejectedPutEntry / PutEntriesAck** — the response of `putEntries`/`putEntriesBinary`: witness receipts for accepted entries plus per-entry rejections for signature-class validation failures (see section 5.7.6).
+**RejectedPutEntry / PutEntriesAck** — the response of `putEntries`/`putEntriesBinary`: witness receipts for accepted entries plus the per-entry rejections (see section 5.7.6).
 
 ```typescript
+type PutRejectionClass =
+  | "signature"      // corrupt or unverifiable — no retry can help
+  | "untrusted-key"  // the directory does not know the author key yet
+  | "policy"         // Tier 1 rule or userdirectory invariant said no
+  | "purged"         // the document's history was erased on purpose
+  | "revoked-key";   // sealed to a key the tenant retired
+
 interface RejectedPutEntry {
   id: string;
   reason: string; // human-readable, e.g. "Entry ... has an invalid author signature"
+  /**
+   * Absent from servers predating the field, which could only ever have meant
+   * `"signature"`. Read it through `rejectionClassOf` so that default lives in
+   * one place.
+   */
+  rejectionClass?: PutRejectionClass;
 }
 
 interface PutEntriesAck {
@@ -809,7 +853,7 @@ Request (`POST /sync/putEntries`; payloads travel as the stored ciphertext, base
 }
 ```
 
-Response — witness receipts for accepted entries, per-entry rejections for signature-class failures (section 5.7.6):
+Response — witness receipts for accepted entries, classified per-entry rejections for the rest (section 5.7.6):
 ```json
 {
   "success": true,
@@ -823,7 +867,11 @@ Response — witness receipts for accepted entries, per-entry rejections for sig
     }
   ],
   "rejected": [
-    { "id": "id-125", "reason": "Entry id-125 has an invalid author signature" }
+    {
+      "id": "id-125",
+      "reason": "Entry id-125 has an invalid author signature",
+      "rejectionClass": "signature"
+    }
   ]
 }
 ```
