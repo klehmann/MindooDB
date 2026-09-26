@@ -3,11 +3,9 @@
 **Sleep well, even if your hosting service gets hacked.** 🔒
 
 MindooDB is an **end-to-end encrypted, local-first sync database**.
-It lets apps collaborate and sync data without giving servers access to the contents.
+Apps collaborate and sync data without ever giving a server access to the contents.
 
-Even if someone has full access to your infrastructure — database dumps, backups, logs — all they get is ciphertext.
-
-Your data is encrypted on the client before it ever touches a server. No plaintext. No server-side keys. No trust required.
+Data is encrypted on the client before it leaves the device. Even someone with full access to your infrastructure — database dumps, backups, logs — gets nothing but ciphertext. No plaintext on the server, no server-side keys, no trust required.
 
 > ⚠️ **Beta software**: This project is in early development and not yet recommended for production use. APIs may change without notice.
 
@@ -17,7 +15,7 @@ Use AI to explore this repository:
 
 ## The Problem
 
-Traditional databases trust the server. If your hosting provider is compromised, your data is exposed. Even "encrypted at rest" solutions decrypt data server-side for queries. **MindooDB takes a different approach**: encryption keys never leave your clients.
+Traditional databases trust the server. If your hosting provider is compromised, your data is exposed. Even "encrypted at rest" solutions decrypt data on the server to answer queries. **MindooDB takes a different approach**: encryption keys never leave your clients, and all querying happens on the client.
 
 ## How It Works
 
@@ -25,21 +23,25 @@ Traditional databases trust the server. If your hosting provider is compromised,
 flowchart TB
     subgraph clients["Your Clients: keys stay on devices"]
         direction LR
-        A["Alice's Device<br/>🔑 private keys"]
-        B["Bob's Device<br/>🔑 private keys"]
-        C["Charlie's Device<br/>🔑 private keys"]
+        A["Alice's Device<br/>🔑 private keys<br/>🔒 local encrypted store"]
+        B["Bob's Device<br/>🔑 private keys<br/>🔒 local encrypted store"]
+        C["Charlie's Device<br/>🔑 private keys<br/>🔒 local encrypted store"]
     end
 
     subgraph server["Server (or P2P Peers): can sync & store data, but CANNOT read it"]
-        S[("🔒 Encrypted Blobs<br/>(unreadable)")]
+        S[("🔒 Encrypted Blobs<br/>(same entries, unreadable)")]
+        D[("📇 Directory DB<br/>public keys, admin-signed grants")]
     end
 
-    A -- encrypted --> S
-    B -- encrypted --> S
-    C -- encrypted --> S
+    A <-- "sync missing entries" --> S
+    B <-- "sync missing entries" --> S
+    C <-- "sync missing entries" --> S
+    clients <-. "public keys synced like any other data" .-> D
 ```
 
-**Sync happens through content-addressed stores**: clients exchange only the encrypted entries they're missing. Works peer-to-peer, client-server, or any combination - for documents and attached files.
+Every device keeps its own local, encrypted copy of the data it syncs, so reading, writing, and querying work offline. **Sync happens through content-addressed stores**: two sides compare what they have and exchange only the encrypted entries they're missing. This works peer-to-peer, client-server, or any mix of the two, for documents and attachments alike.
+
+Public keys are not secret and travel the same way: users and their devices are registered in the tenant's **directory database** through admin-signed grant documents, which every member syncs like any other database. That is how any client can check who signed a change, and how keys are handed to new members without a central key server.
 
 ## Key Features
 
@@ -48,9 +50,9 @@ flowchart TB
 | 🛡️ **End-to-End Encrypted** | Data encrypted on client before sync. Servers can't decrypt. |
 | 📴 **Local-First** | Create and edit documents without network. Sync when online. |
 | ✍️ **Signed Changes** | Every change is digitally signed. Proves authorship, prevents tampering. |
-| 🔗 **Tamperproof History** | Append-only, cryptographically chained. Like a blockchain for your docs. |
-| 🤝 **Real-time Collaboration** | Built on [Automerge](https://automerge.org/) CRDTs. Conflicts resolve automatically. |
-| 🔑 **Fine-grained Access** | Named encryption keys for sensitive documents. Share with specific users. |
+| 🔗 **Tamperproof History** | Append-only and hash-chained, so any tampering is detectable. |
+| 🤝 **Collaboration** | Built on [Automerge](https://automerge.org/) CRDTs. Concurrent edits merge automatically. |
+| 🔑 **Fine-grained Access** | Named encryption keys for sensitive documents, shared only with the users you choose. |
 | 🔎 **Full-Text Search & OCR** | Built-in encrypted full-text index. The Haven client extracts text from PDF/Office files and OCRs images. |
 
 ## MindooDB Haven — the graphical client
@@ -159,16 +161,16 @@ await aliceDB.pullChangesFrom(bobDB.getStore());
 ## Core Concepts
 
 ### Tenants
-An organization or team that shares access. Created client-side—no server registration needed.
-- Has a **default encryption key** (a regular KeyBag key shared with all members)
-- Has an **admin key** (for registering/revoking users)
-- Contains multiple databases
+An organization or team that shares access. Created on the client, with no server registration needed.
+- Has a **default encryption key** shared with all members
+- Has an **admin key** for registering and revoking users
+- Contains any number of databases
 
 ### Users
-Identified by cryptographic key pairs, registered by an admin:
-- **Signing key** (Ed25519): Proves authorship of changes
-- **Encryption key** (RSA-OAEP): Protects local key storage
-- Keys generated locally; only public keys shared with admin
+Identified by cryptographic key pairs and registered by an admin:
+- **Signing key** (Ed25519): proves authorship of every change
+- **Encryption key** (RSA-OAEP): lets other members wrap symmetric keys for this user's devices
+- Keys are generated on the device; only the public halves are handed to the admin, who records them in the directory. See [User Keys](./docs/userkeys.md).
 
 ### Databases
 Each tenant can have multiple databases, created on-demand:
@@ -176,7 +178,7 @@ Each tenant can have multiple databases, created on-demand:
 const contacts = await tenant.openDB("contacts");
 const invoices = await tenant.openDB("invoices");
 ```
-A special **directory** database stores user registrations (admin-only).
+A special **directory** database holds user registrations, public keys, key distributions, and access policies. Only admins can write to it; every member syncs it.
 
 Databases that outgrow their store can be split. `copyDocumentsTo()` moves whole
 document histories into a new database with every original signature still
@@ -270,17 +272,6 @@ A built-in, **client-side full-text index** (`DocumentFullTextIndex`, powered by
 
 See: [Full-Text Search](./docs/fulltext-search.md)
 
-### Encryption Model
-
-All encryption keys are stored in the **KeyBag**—a local, password-protected key store.
-
-| Key Type | Purpose | Who Has It |
-|----------|---------|------------|
-| **`default` key** | Used when no other key is specified | All tenant members |
-| **Named keys** | Fine-grained access for sensitive docs | Only users you share it with |
-
-Keys are distributed offline (e.g. password protected via email or a shared drive). The `default` key is typically shared during onboarding; named keys are shared as needed for specific documents.
-
 ## Security
 
 ### Cryptographic Guarantees
@@ -290,15 +281,15 @@ Keys are distributed offline (e.g. password protected via email or a shared driv
 - **Trusted time**: when a sync server accepts an entry it signs a **witness receipt** attesting *when* it was accepted - a clock no client can rewind
 
 ### Encryption-based Access Control
-Read access is governed by **key possession**, not server-side permissions. If you hold the key you can decrypt; if you don't, the document stays ciphertext wherever it travels (server, peer, or relay):
+Read access is governed by **key possession**, not server-side permissions. If you hold the key you can decrypt; if you don't, the document stays ciphertext wherever it travels (server, peer, or relay). Each device keeps its keys in the **KeyBag**, a local, password-protected key store.
 
 | Key | Scope |
 |-----|-------|
-| **`default` key** | Tenant-wide data; shared with every member during onboarding |
+| **`default` key** | Tenant-wide data; every member receives it during onboarding |
 | **Named keys** | Need-to-know documents; shared only with the users you choose |
 | **`$publicinfos` key** | Encrypts directory access-control metadata so servers can validate signing keys without seeing usernames or business data |
 
-Rotating a named key is the cryptographic cutoff for read access: re-encrypt under a new key and withhold it from anyone who should no longer see the data.
+Keys are distributed through the directory: an admin publishes a signed key distribution that wraps the key to each recipient's public encryption key, and the recipient's devices import it on their next sync. Rotating a named key is the cryptographic cutoff for read access: new data is encrypted under the new key, which is withheld from anyone who should no longer see it.
 
 ### Write Governance (opt-in)
 On top of the encryption model, MindooDB adds fine-grained, **admin-signed** control over write operations (`doc_create`, `doc_change`, `doc_delete`, `doc_undelete`, `doc_snapshot`). Policies, rules, groups, and grants are append-only documents in the directory database that every participant already syncs:
@@ -396,14 +387,14 @@ pnpm test:all
 ### Current parity status
 
 - The package exports and core API shape are aligned across Node.js, browser, and React Native entrypoints.
-- Node and browser now have executable CLI lanes with runtime validation.
+- Node and browser tests both run from the command line against real runtimes.
 - React Native coverage is currently adapter-focused in Jest and does not yet validate full app-level behavior inside a real React Native runtime.
 - For high confidence in three-environment parity, add a React Native integration lane (Expo/Detox or RN test app) that exercises document lifecycle, sync, and virtual view updates on device/simulator.
 - For Expo Go / JS fallback scenarios, PBKDF2 iterations can be tuned at runtime; native RN builds should keep strong defaults.
 
 ## Support
 
-Need commercial support, have questions, or want to request a feature? We're here to help! :-)
+Need commercial support, have a question, or want to request a feature? We're happy to help.
 
 - 🐛 **Bug Reports**: [Open an issue on GitHub](https://github.com/klehmann/mindoodb/issues)
 - 💬 **Questions & Discussions**: [GitHub Discussions](https://github.com/klehmann/mindoodb/discussions)
