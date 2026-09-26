@@ -162,8 +162,14 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
       // Signature-class failure: rejected per entry (sync-v5), not stored.
       const ack = await server.handlePutEntries("token", [v1]);
       expect(ack.receipts).toHaveLength(0);
+      // The class matters as much as the refusal: "signature" is not resubmittable,
+      // so a client that quarantines this entry never offers it again.
       expect(ack.rejected).toEqual([
-        { id: v1.id, reason: expect.stringContaining("v2 metadata signature") },
+        {
+          id: v1.id,
+          reason: expect.stringContaining("v2 metadata signature"),
+          rejectionClass: "signature",
+        },
       ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
@@ -205,7 +211,11 @@ describe("v2 storage-format floor (requireMetadataSignatureSince)", () => {
       const ack = await server.handlePutEntries("token", [backdated]);
       expect(ack.receipts).toHaveLength(0);
       expect(ack.rejected).toEqual([
-        { id: backdated.id, reason: expect.stringContaining("v2 metadata signature") },
+        {
+          id: backdated.id,
+          reason: expect.stringContaining("v2 metadata signature"),
+          rejectionClass: "signature",
+        },
       ]);
       expect(await localStore.getAllIds()).toHaveLength(0);
     });

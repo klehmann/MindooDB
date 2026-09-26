@@ -39,7 +39,7 @@ Empty allowlist still lets the app start. Haven serves the zip. The bridge still
 
 What you list is every other host the UI may call with `fetch`, XHR, images, fonts, media, `sendBeacon`, or WebSockets. HTTP methods are not part of the policy: a secret on a query string is still a GET, and CSP cannot tell GET from POST. One URL pattern list is enough.
 
-Catalog apps can ship a starting list. The SDK example’s manifest carries `https://api.open-meteo.com/*`, and Haven keeps those patterns on the registration even though the catalog entry installs as **external** — so the Network tab’s weather preset still works once you switch that app to hosted, instead of starting from an empty list. httpbin is not listed, so that probe fails in hosted mode even though CORS would allow it.
+Catalog apps can ship a starting list. The SDK example’s manifest carries `https://api.open-meteo.com/*`, and catalog entries install as **hosted**, so the Network tab’s weather preset works out of the box instead of starting from an empty list. The App Builder is the exception and still installs as external, because it calls its own Worker backend with relative `/api/*` requests. httpbin is not listed, so that probe fails in hosted mode even though CORS would allow it.
 
 Popups, camera, microphone, and geolocation are off unless you tick them on the registration. Window-mode apps are a normal browser tab; those iframe flags do not apply there.
 
