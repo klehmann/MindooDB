@@ -21,30 +21,22 @@ Traditional databases trust the server. If your hosting provider is compromised,
 
 ## How It Works
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         Your Clients                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │
-│  │   Alice's   │  │    Bob's    │  │  Charlie's  │               │
-│  │   Device    │  │   Device    │  │   Device    │               │
-│  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │               │
-│  │ │  Keys   │ │  │ │  Keys   │ │  │ │  Keys   │ │ ← Keys stay   │
-│  │ │(private)│ │  │ │(private)│ │  │ │(private)│ │   on devices  │
-│  │ └─────────┘ │  │ └─────────┘ │  │ └─────────┘ │               │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │
-└─────────┼────────────────┼────────────────┼──────────────────────┘
-          │ encrypted      │ encrypted      │ encrypted
-          ▼                ▼                ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                     Server (or P2P Peers)                        │
-│                                                                  │
-│   ┌─────────────────────────────────────────────────────────┐    │
-│   │           Encrypted Blobs (unreadable)                  │    │
-│   │     🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒 🔒             │    │
-│   └─────────────────────────────────────────────────────────┘    │
-│                                                                  │
-│   Server can sync & store data, but CANNOT read it               │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph clients["Your Clients: keys stay on devices"]
+        direction LR
+        A["Alice's Device<br/>🔑 private keys"]
+        B["Bob's Device<br/>🔑 private keys"]
+        C["Charlie's Device<br/>🔑 private keys"]
+    end
+
+    subgraph server["Server (or P2P Peers): can sync & store data, but CANNOT read it"]
+        S[("🔒 Encrypted Blobs<br/>(unreadable)")]
+    end
+
+    A -- encrypted --> S
+    B -- encrypted --> S
+    C -- encrypted --> S
 ```
 
 **Sync happens through content-addressed stores**: clients exchange only the encrypted entries they're missing. Works peer-to-peer, client-server, or any combination - for documents and attached files.
