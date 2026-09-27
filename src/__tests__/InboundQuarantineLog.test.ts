@@ -208,13 +208,21 @@ describe("materialization quarantine log", () => {
       },
       { signingKeyPair: aliceSigning, signingKeyPassword: alicePassword },
     );
+    // Editing the archived contact is exactly what the rule denies, so the local
+    // client precheck refuses it. Bypass the precheck to stand in for a peer that
+    // produced the entry anyway: the point of this fixture is a validly signed,
+    // rule-violating entry IN the store, which materialization must quarantine.
     const archived = await crm.getDocument(docId);
     await crm.changeDoc(
       archived!,
       async (d) => {
         d.getData().v = 2;
       },
-      { signingKeyPair: aliceSigning, signingKeyPassword: alicePassword },
+      {
+        signingKeyPair: aliceSigning,
+        signingKeyPassword: alicePassword,
+        bypassAccessControlPrecheck: true,
+      },
     );
     return docId;
   }

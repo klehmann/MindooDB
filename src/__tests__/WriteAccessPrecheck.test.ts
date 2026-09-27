@@ -1,3 +1,4 @@
+import * as Automerge from "@automerge/automerge";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStore } from "../core/appendonlystores/InMemoryContentAddressedStore";
 import {
@@ -208,6 +209,79 @@ describe("client write-policy prechecks (§9)", () => {
     );
     const after = await crm.getDocument(docId);
     expect(after!.getData().rev).toBe(3);
+  }, 90000);
+
+  it("takes the Tier 2 before-state from the change, not from the mutable document cache", async () => {
+    const crm = await writerTenant.openDB("crm");
+    const doc = await crm.createDocument({
+      signingKeyPair: aliceSigning,
+      signingKeyPassword: alicePassword,
+      initialValues: { form: "CRMContact", myeditors: [aliceUsername], rev: 1 },
+    });
+    const docId = doc.getId();
+
+    // `crm_change_if_editor` allows the change only when the BEFORE state lists
+    // the writer in `myeditors`; the baseline denies `doc_change` otherwise. The
+    // cache slot is shared mutable state and can be advanced out of band between
+    // the moment Automerge produces the change and the moment the precheck runs
+    // (clone recovery, a concurrent op on the same document). Move it here, at
+    // exactly that point, to a state that would flip the verdict.
+    const internals = crm as unknown as {
+      docCache: Map<string, { doc: unknown }>;
+      buildDocChangeStoreEntry: (args: unknown) => Promise<unknown>;
+    };
+    const cached = internals.docCache.get(docId)!;
+    const buildEntry = internals.buildDocChangeStoreEntry.bind(crm);
+    let poisoned = false;
+    internals.buildDocChangeStoreEntry = async (args: unknown) => {
+      const entry = await buildEntry(args);
+      if (!poisoned) {
+        poisoned = true;
+        cached.doc = Automerge.change(
+          Automerge.clone(cached.doc as Automerge.Doc<{ myeditors: string[] }>),
+          (d) => {
+            d.myeditors = [];
+          },
+        );
+      }
+      return entry;
+    };
+
+    const forAlice = await crm.getDocument(docId);
+    await crm.changeDoc(
+      forAlice!,
+      (d) => {
+        d.getData().rev = 2;
+      },
+      { signingKeyPair: aliceSigning, signingKeyPassword: alicePassword },
+    );
+    expect(poisoned).toBe(true);
+    const after = await crm.getDocument(docId);
+    expect(after!.getData().rev).toBe(2);
+  }, 90000);
+
+  it("judges the before-state before the change, so an editor may drop themselves from myeditors", async () => {
+    const crm = await writerTenant.openDB("crm");
+    const doc = await crm.createDocument({
+      signingKeyPair: aliceSigning,
+      signingKeyPassword: alicePassword,
+      initialValues: { form: "CRMContact", myeditors: [aliceUsername], rev: 1 },
+    });
+
+    // `crm_change_if_editor` reads `myeditors` in the BEFORE state, where Alice is
+    // still an editor, so removing herself is allowed. The change is refused only
+    // if the "before" the precheck sees is really the "after" — which is what a
+    // snapshot taken without its own Automerge handle silently produces.
+    const forAlice = await crm.getDocument(doc.getId());
+    await crm.changeDoc(
+      forAlice!,
+      (d) => {
+        d.getData().myeditors = [];
+      },
+      { signingKeyPair: aliceSigning, signingKeyPassword: alicePassword },
+    );
+    const after = await crm.getDocument(doc.getId());
+    expect(after!.getData().myeditors).toEqual([]);
   }, 90000);
 
   it("deleteDocument is allowed for the creator ($author) and denied for others", async () => {

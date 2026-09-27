@@ -262,13 +262,20 @@ describe("Tier 2 content-rule quarantine (materialization)", () => {
     );
 
     // Alice tries to edit the now-archived contact: before=archived -> Tier 2 deny.
+    // The local precheck refuses this, so bypass it to stand in for a peer that
+    // produced the entry anyway; materialization on a fresh replica is what this
+    // test measures.
     const archived = await crm.getDocument(docId);
     await crm.changeDoc(
       archived,
       async (d) => {
         d.getData().v = 2;
       },
-      { signingKeyPair: aliceSigning, signingKeyPassword: alicePassword },
+      {
+        signingKeyPair: aliceSigning,
+        signingKeyPassword: alicePassword,
+        bypassAccessControlPrecheck: true,
+      },
     );
 
     const readerTenant = await openTenantAs(
