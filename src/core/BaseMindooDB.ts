@@ -2625,13 +2625,22 @@ export class BaseMindooDB implements MindooDB {
    * fall back to the normal materialization path when they encounter
    * one. Throws on truly malformed records (caught by callers).
    */
-  private deserializeDoc(value: Uint8Array): DeserializedCachedDoc | null {
+  /** Split an L2 record into its JSON header and the Automerge binary. */
+  private parseDocCacheRecord(value: Uint8Array): {
+    header: Record<string, any>;
+    amBinary: Uint8Array;
+  } {
     const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
     const headerLen = view.getUint32(0, false);
     const headerBytes = value.slice(4, 4 + headerLen);
-    const amBinary = value.slice(4 + headerLen);
+    return {
+      header: JSON.parse(new TextDecoder().decode(headerBytes)),
+      amBinary: value.slice(4 + headerLen),
+    };
+  }
 
-    const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  private deserializeDoc(value: Uint8Array): DeserializedCachedDoc | null {
+    const { header, amBinary } = this.parseDocCacheRecord(value);
 
     if (header.version !== DOC_CACHE_HEADER_VERSION) {
       // v1 records (no `version`) and unknown future versions: skip
@@ -13631,8 +13640,12 @@ export class BaseMindooDB implements MindooDB {
     });
 
     if (missingMetadata.length === 0) {
-      // No real deltas (changeSeq pointer drift only). Promote and return.
+      // No real deltas (changeSeq pointer drift only). Promote and return,
+      // marked dirty so the record is rewritten under the current changeSeq:
+      // otherwise every later read (and every warmer pass) would repeat
+      // this metadata scan + hash comparison for a record that is current.
       await this.storeCachedDocument(internal);
+      this.markDocDirty(docId);
       return internal;
     }
 
@@ -13651,8 +13664,9 @@ export class BaseMindooDB implements MindooDB {
       // applyNewEntriesToCachedDocument returns null when no signed entries
       // produced a head change. Treat the persisted doc as authoritative
       // and put it in L1 ourselves (the helper only caches when it
-      // actually applied work).
+      // actually applied work). Dirty for the same reason as above.
       await this.storeCachedDocument(internal);
+      this.markDocDirty(docId);
       return internal;
     }
 
@@ -13676,9 +13690,13 @@ export class BaseMindooDB implements MindooDB {
   /**
    * Start the L2 background warmer.
    *
-   * Walks a snapshot of the in-memory document index and, for every
-   * doc not already in L1, calls {@link tryLoadFromL2}. That path
-   * either:
+   * First waits until the changefeed consumers (summary buffer, an
+   * enabled full-text index) have caught up: they materialize every
+   * changed document anyway, so running next to them would do the same
+   * work twice. Then walks a snapshot of the in-memory document index and
+   * skips every doc that is in L1 or whose L2 record is already at the
+   * current changeSeq (checked from the record header, no deserialization).
+   * For the rest it calls {@link tryLoadFromL2}. That path either:
    *
    *  - hits L2 fresh and just promotes the doc to L1, or
    *  - hits L2 stale and applies missing deltas (re-flushed via the
@@ -13791,6 +13809,34 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
 
+    // Changefeed consumers (summary buffer, full-text index) materialize
+    // every changed document anyway, and those loads persist to L2 through
+    // flush-before-evict / the periodic flush. Running the warmer next to
+    // them (it is typically started right after a sync, while their
+    // catch-up is still going) materialized the same documents twice. Let
+    // them finish first; the pass below then only has to pick up what they
+    // did not cover.
+    const emitProgress = (progress: BackgroundWarmerProgress) => {
+      this.warmerProgress = progress;
+      if (!onProgress) return;
+      try {
+        onProgress(progress);
+      } catch (e) {
+        // A buggy progress consumer must not break the warmer.
+        this.logger.warn(`Warmer onProgress callback threw: ${e}`);
+      }
+    };
+    this.warmerProgress = {
+      processed: 0,
+      total: this.index.length,
+      phase: "warming",
+    };
+    await this.awaitChangefeedConsumersForWarmer(signal);
+    if (signal.aborted) {
+      emitProgress({ processed: 0, total: this.index.length, phase: "cancelled" });
+      return;
+    }
+
     // Snapshot the docId list so concurrent index updates don't shift
     // our iteration mid-pass. Iterating the index directly would also
     // work but a snapshot makes the loop's behavior easier to reason
@@ -13802,16 +13848,6 @@ export class BaseMindooDB implements MindooDB {
     // readers see consistent values. We initialize even when total=0
     // so the UI can display a "done" terminal state.
     this.warmerProgress = { processed: 0, total, phase: "warming" };
-    const emitProgress = (progress: BackgroundWarmerProgress) => {
-      this.warmerProgress = progress;
-      if (!onProgress) return;
-      try {
-        onProgress(progress);
-      } catch (e) {
-        // A buggy progress consumer must not break the warmer.
-        this.logger.warn(`Warmer onProgress callback threw: ${e}`);
-      }
-    };
 
     if (total === 0) {
       this.logger.debug("Warmer: nothing to warm, index is empty.");
@@ -13823,6 +13859,7 @@ export class BaseMindooDB implements MindooDB {
     let processed = 0;
     let warmed = 0;
     let skippedAlreadyHot = 0;
+    let skippedFreshInL2 = 0;
     let errored = 0;
 
     try {
@@ -13839,6 +13876,10 @@ export class BaseMindooDB implements MindooDB {
 
         if (this.docCache.has(docId)) {
           skippedAlreadyHot++;
+        } else if (await this.isL2RecordCurrent(docId)) {
+          // Nothing to do: loading it would only deserialize the doc into
+          // L1 and evict it again (L1 is far smaller than a large DB).
+          skippedFreshInL2++;
         } else {
           try {
             const fromL2 = await this.tryLoadFromL2(docId);
@@ -13866,7 +13907,7 @@ export class BaseMindooDB implements MindooDB {
 
       this.logger.info(
         `Warmer finished in ${Date.now() - startedAt}ms: processed=${processed}, ` +
-          `warmed=${warmed}, alreadyHot=${skippedAlreadyHot}, errored=${errored}`,
+          `warmed=${warmed}, alreadyHot=${skippedAlreadyHot}, freshInL2=${skippedFreshInL2}, errored=${errored}`,
       );
       emitProgress({ processed, total, phase: "done" });
     } catch (e) {
@@ -13875,6 +13916,88 @@ export class BaseMindooDB implements MindooDB {
       // as `cancelled` since the pass did not complete normally.
       this.logger.warn(`Warmer crashed: ${e}`);
       emitProgress({ processed, total, phase: "cancelled" });
+    }
+  }
+
+  /**
+   * Wait until the summary buffer and an enabled full-text index have
+   * consumed the changefeed (joining a running auto-follow run or starting
+   * a catch-up). Failures are logged: the warmer then simply does the
+   * remaining work itself.
+   */
+  private async awaitChangefeedConsumersForWarmer(
+    signal: AbortSignal,
+  ): Promise<void> {
+    const startedAt = Date.now();
+    const catchUp = (async () => {
+      await this.summaryStore?.update({ signal });
+      if (!signal.aborted && this.fulltextIndex?.isEnabled()) {
+        await this.fulltextIndex.update({ signal });
+      }
+    })();
+    // Joining an already running auto-follow run does not honor our signal,
+    // so a stop must not wait for it: the run just continues on its own.
+    let onAbort: () => void = () => {};
+    const aborted = new Promise<void>((resolve) => {
+      onAbort = () => resolve();
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([catchUp, aborted]);
+    } catch (e) {
+      this.logger.warn(`Warmer: changefeed consumer catch-up failed: ${e}`);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+    catchUp.catch(() => {});
+    this.logger.debug(
+      `Warmer: changefeed consumers caught up in ${Date.now() - startedAt}ms`,
+    );
+  }
+
+  /**
+   * Whether L2 already holds this document at its current changeSeq, so
+   * the warmer can skip it without deserializing. Answered from
+   * {@link lastFlushedDocState} for records written in this session,
+   * otherwise from the record header (no Automerge load).
+   */
+  private async isL2RecordCurrent(docId: string): Promise<boolean> {
+    const indexEntryIdx = this.getDocIndexPosition(docId);
+    const store = this.cacheManager?.getStore() ?? null;
+    if (indexEntryIdx === undefined || !store) {
+      return false;
+    }
+    const entry = this.index[indexEntryIdx];
+    if (entry.accessState !== "visible") {
+      return false;
+    }
+    const currentChangeSeq = entry.changeSeq;
+    const flushed = this.lastFlushedDocState.get(docId);
+    if (flushed !== undefined) {
+      return flushed.startsWith(`${currentChangeSeq}:`);
+    }
+    try {
+      const bytes = await store.get("doc", `${this.getCachePrefix()}/${docId}`);
+      if (!bytes) {
+        return false;
+      }
+      const { header } = this.parseDocCacheRecord(bytes);
+      if (
+        header.version !== DOC_CACHE_HEADER_VERSION ||
+        header.changeSeq !== currentChangeSeq ||
+        !Array.isArray(header.automergeHeads)
+      ) {
+        return false;
+      }
+      this.lastFlushedDocState.set(
+        docId,
+        `${currentChangeSeq}:${header.automergeHeads.join(",")}`,
+      );
+      return true;
+    } catch {
+      // Unreadable record: let the regular L2 path evict/rebuild it.
+      return false;
     }
   }
 
