@@ -604,4 +604,88 @@ describe("BaseMindooDB background L2 warmer", () => {
     expect(snapshot!.processed).toBe(snapshot!.total);
     expect(snapshot!.total).toBe(5);
   }, 30000);
+
+  // ---------------------------------------------------------------------------
+  // Test: no double work with fresh L2 records / a running summary catch-up
+  // ---------------------------------------------------------------------------
+
+  async function createFlushedDocsAndRestart(dbName: string, count: number): Promise<string[]> {
+    const db = await tenant.openDB(dbName, { documentCacheConfig: { maxEntries: 4 } });
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const d = await db.createDocument();
+      ids.push(d.getId());
+      await db.changeDoc(d, (doc: MindooDoc) => {
+        doc.getData().idx = i;
+      });
+    }
+    // As after a sync: the processed-entry cursor covers every entry, so the
+    // restart does not re-index (and re-sequence) the documents. A first
+    // warmer pass then brings every L2 record to the current changeSeq.
+    await db.syncStoreChanges();
+    await db.startBackgroundWarmer!();
+    await ((tenant as any).cacheManager as CacheManager).flush();
+    simulateRestartWithoutFlush();
+    return ids;
+  }
+
+  it("skips docs whose L2 record is already current without loading them", async () => {
+    const ids = await createFlushedDocsAndRestart("warmfresh", 12);
+    const db2 = await tenant.openDB("warmfresh", { documentCacheConfig: { maxEntries: 4 } });
+    const tryLoadFromL2 = jest.spyOn(db2 as any, "tryLoadFromL2");
+    const loadDocumentInternal = jest.spyOn(db2 as any, "loadDocumentInternal");
+    await db2.startBackgroundWarmer!();
+
+    expect(tryLoadFromL2).not.toHaveBeenCalled();
+    expect(loadDocumentInternal).not.toHaveBeenCalled();
+    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 12, total: 12 });
+
+    for (const id of ids) {
+      expect((await db2.getDocument(id)).getData().idx).toBe(ids.indexOf(id));
+    }
+  }, 60000);
+
+  it("still loads docs whose L2 record is stale", async () => {
+    const ids = await createFlushedDocsAndRestart("warmstale", 6);
+    const db2 = await tenant.openDB("warmstale", { documentCacheConfig: { maxEntries: 4 } });
+    // Change one doc, then push it out of L1 without letting it reach L2
+    // at the new changeSeq: its L2 record is now outdated.
+    const changed = await db2.getDocument(ids[0]);
+    await db2.changeDoc(changed, (doc: MindooDoc) => {
+      doc.getData().idx = 100;
+    });
+    (db2 as any).docCache.delete(ids[0]);
+    (db2 as any).dirtyDocIds.delete(ids[0]);
+
+    const tryLoadFromL2 = jest.spyOn(db2 as any, "tryLoadFromL2");
+    await db2.startBackgroundWarmer!();
+
+    const visited = tryLoadFromL2.mock.calls.map((call) => call[0]);
+    expect(visited).toContain(ids[0]);
+    expect((await db2.getDocument(ids[0])).getData().idx).toBe(100);
+  }, 60000);
+
+  it("lets the summary catch up first and does not load its docs a second time", async () => {
+    await createFlushedDocsAndRestart("warmsummary", 12);
+    const db2 = await tenant.openDB("warmsummary", { documentCacheConfig: { maxEntries: 4 } });
+    const summary = db2.getSummaryStore!();
+    // Pretend the L2 records are missing, as after an initial replication:
+    // every document has to be materialized once.
+    for (const id of await db2.getAllDocumentIds()) {
+      await (db2 as any).cacheManager.getStore().delete("doc", `${(db2 as any).getCachePrefix()}/${id}`);
+    }
+
+    const loadDocumentInternal = jest.spyOn(db2 as any, "loadDocumentInternal");
+    await db2.startBackgroundWarmer!();
+
+    expect(summary.getSize()).toBe(12);
+    // Summary materializes each doc once; the warmer adds no second load.
+    const docIds = new Set(await db2.getAllDocumentIds());
+    const loadedDocIds = loadDocumentInternal.mock.calls
+      .map((call) => call[0] as string)
+      .filter((id) => docIds.has(id));
+    expect(loadedDocIds).toHaveLength(12);
+    expect(new Set(loadedDocIds).size).toBe(12);
+    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 12, total: 12 });
+  }, 60000);
 });
