@@ -176,6 +176,12 @@ grouped into hash buckets; only dirty buckets are rewritten on flush. The change
 cursor, configuration fingerprint and backfill cursor are persisted alongside, so an
 app restart restores the summary and continues incrementally instead of rebuilding.
 
+While a catch-up run is in progress (initial replication, a large sync), nearly
+every bucket is dirty after each batch, so every periodic flush would serialize
+the whole buffer. Periodic flushes are therefore throttled to one per 30 s while
+a run is active (constructor option `minFlushIntervalDuringUpdateMs`); the final
+state is flushed right after the run, and shutdown flushes are never deferred.
+
 The store registers with the tenant's `CacheManager` like other caches and is
 restored lazily on first use. Purge paths (`purgeDocument`, key revocation) also
 remove summary entries immediately, so plaintext values never outlive access.
@@ -192,6 +198,17 @@ changes arrive:
   Runs are single-flight; further events during a run coalesce into one
   follow-up. Compared to the network I/O of a sync, the incremental extraction
   is cheap — and the first query afterwards finds the summary already current.
+  A `summary.update()` (and therefore `db.query()`) that finds a run in flight
+  waits for it and runs once more if the changefeed moved on meanwhile, so it
+  never resolves on an older state than the one at the call.
+- A docs pull (`pullChangesFrom`) processes each transferred **scan page**
+  (`pageSize`, default 1000 entries) locally before the next one: the index
+  advances page by page and each page emits its own change event. Materializing
+  and extracting documents thus overlaps with waiting for the network, instead
+  of starting only after the complete transfer. Documents whose history spans
+  several pages converge: a materialization that started before a later page
+  was indexed is not cached, and the re-emitted change is picked up by the next
+  run.
 - A database that has no summary store yet **auto-activates** one when its
   `dbsetup` document carries a `summarySetup` configuration — whether the
   configuration was just written locally, arrived via sync, or synced long ago
@@ -226,8 +243,9 @@ db.getSummaryStore();   // activate before / when starting the initial sync
 
 once when opening an app database (or right before kicking off the initial
 replication). That single call is cheap, writes nothing into the database, and
-turns on the auto-follow — the summary is then extracted batch by batch **while
-documents stream in**, and it is already warm when the sync completes.
+turns on the auto-follow — the summary is then extracted page by page **while
+documents stream in** (see "Auto-follow" above), and it is (nearly) warm when
+the sync completes.
 
 Why this is always safe:
 

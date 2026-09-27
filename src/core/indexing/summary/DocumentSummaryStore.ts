@@ -20,6 +20,14 @@ import {
 import { extractSummaryFields, isFieldPathCovered } from "./extractSummaryFields";
 
 const DEFAULT_BUCKET_COUNT = 64;
+/**
+ * Minimum time between periodic flushes while an update run is in progress.
+ * A catch-up (initial replication, chunked sync ingest) dirties nearly every
+ * bucket in every batch, so each flush would re-serialize the whole buffer;
+ * the default CacheManager interval (5 s) would make that quadratic over a
+ * long catch-up. Idle flushes and forced (shutdown) flushes are not deferred.
+ */
+const DEFAULT_MIN_FLUSH_INTERVAL_DURING_UPDATE_MS = 30000;
 
 /** Simple deterministic string hash (djb2) used for bucket assignment. */
 function hashDocId(docId: string): number {
@@ -64,6 +72,15 @@ export class DocumentSummaryStore implements ICacheable {
   private readonly bucketCount: number = DEFAULT_BUCKET_COUNT;
   private dirtyBuckets: Set<number> = new Set();
   private metaDirty: boolean = false;
+  /** Timestamp of the last completed (non-deferred) flush. */
+  private lastFlushAt: number = 0;
+  /**
+   * Set by `flushToCache` once it has taken over the dirty state (or
+   * deliberately deferred it), so the CacheManager's follow-up `clearDirty`
+   * does not wipe state that became dirty while the flush was awaiting I/O.
+   */
+  private flushHandledDirty: boolean = false;
+  private readonly minFlushIntervalDuringUpdateMs: number;
   private restorePromise: Promise<void> | null = null;
   private restored: boolean = false;
 
@@ -74,8 +91,16 @@ export class DocumentSummaryStore implements ICacheable {
   // --- single-flight update ---
   private updatePromise: Promise<void> | null = null;
 
-  constructor(db: MindooDB, config?: SummaryConfig) {
+  constructor(
+    db: MindooDB,
+    config?: SummaryConfig,
+    options?: { minFlushIntervalDuringUpdateMs?: number },
+  ) {
     this.db = db;
+    this.minFlushIntervalDuringUpdateMs = Math.max(
+      0,
+      options?.minFlushIntervalDuringUpdateMs ?? DEFAULT_MIN_FLUSH_INTERVAL_DURING_UPDATE_MS,
+    );
     this.hasExplicitConfig = config !== undefined;
     this.config = resolveSummaryConfig(config);
     this.configFingerprint = computeSummaryConfigFingerprint(this.config);
@@ -216,16 +241,38 @@ export class DocumentSummaryStore implements ICacheable {
    *
    * Accepts the same batching/progress/cancellation options as VirtualView
    * updates; an interrupted run resumes from the saved cursors.
-   * Calls are single-flight: concurrent callers share one run.
+   * Calls are single-flight: concurrent callers share one run. A caller that
+   * finds a run in flight waits for it and then starts a follow-up run when
+   * the changefeed moved on meanwhile (the in-flight run iterates a snapshot
+   * taken when it started, e.g. before the latest sync page was ingested), so
+   * the promise never resolves on a state older than the call.
    */
   async update(options?: VirtualViewUpdateOptions): Promise<void> {
     if (this.updatePromise) {
-      return this.updatePromise;
+      while (this.updatePromise) {
+        try {
+          await this.updatePromise;
+        } catch {
+          // The follow-up run below reports its own errors.
+        }
+      }
+      if (this.isCaughtUp()) {
+        return;
+      }
     }
     this.updatePromise = this.runUpdate(options).finally(() => {
       this.updatePromise = null;
     });
     return this.updatePromise;
+  }
+
+  /** Whether the last run consumed the whole changefeed and no backfill is pending. */
+  private isCaughtUp(): boolean {
+    if (!this.restored || this.needsBackfill) {
+      return false;
+    }
+    const remaining = this.db.countChangesSince?.(this.cursor);
+    return remaining !== undefined && remaining === 0;
   }
 
   private async runUpdate(options?: VirtualViewUpdateOptions): Promise<void> {
@@ -393,8 +440,24 @@ export class DocumentSummaryStore implements ICacheable {
   }
 
   clearDirty(): void {
+    if (this.flushHandledDirty) {
+      // Follow-up of a flush that already took (or deferred) its snapshot:
+      // anything dirty now changed during the flush and must stay dirty.
+      this.flushHandledDirty = false;
+      return;
+    }
+    this.discardDirtyState();
+  }
+
+  /**
+   * Unconditionally drop all dirty markers (unlike {@link clearDirty}, which
+   * after a flush only acknowledges that flush). Used when the persisted
+   * records are about to be deleted and must not be rewritten.
+   */
+  discardDirtyState(): void {
     this.dirtyBuckets.clear();
     this.metaDirty = false;
+    this.flushHandledDirty = false;
   }
 
   private bucketIndexFor(docId: string): number {
@@ -406,16 +469,36 @@ export class DocumentSummaryStore implements ICacheable {
     this.metaDirty = true;
   }
 
-  async flushToCache(store: LocalCacheStore, _options?: { force?: boolean }): Promise<number> {
-    const prefix = this.getCachePrefix();
-    let written = 0;
+  async flushToCache(store: LocalCacheStore, options?: { force?: boolean }): Promise<number> {
+    if (
+      !options?.force &&
+      this.updatePromise !== null &&
+      Date.now() - this.lastFlushAt < this.minFlushIntervalDuringUpdateMs
+    ) {
+      // Mid catch-up: defer, keep the dirty state, and re-arm the cache
+      // manager so the state lands on a later cycle (or right after the run,
+      // which marks dirty when it finishes).
+      this.flushHandledDirty = true;
+      this.cacheManager?.markDirty();
+      return 0;
+    }
 
-    if (this.dirtyBuckets.size > 0) {
+    // Snapshot everything synchronously before the first await: bucket
+    // payloads and the meta cursor must describe the same state, and entries
+    // an update run changes while the writes are in flight must stay dirty
+    // for the next flush instead of being cleared with this one.
+    const prefix = this.getCachePrefix();
+    const bucketsToWrite = this.dirtyBuckets;
+    this.dirtyBuckets = new Set();
+    this.metaDirty = false;
+    this.flushHandledDirty = true;
+
+    const byBucket = new Map<number, DocumentSummaryEntry[]>();
+    if (bucketsToWrite.size > 0) {
       // Group entries by bucket once, then rewrite only dirty buckets.
-      const byBucket = new Map<number, DocumentSummaryEntry[]>();
       for (const entry of this.entries.values()) {
         const bucket = this.bucketIndexFor(entry.docId);
-        if (!this.dirtyBuckets.has(bucket)) {
+        if (!bucketsToWrite.has(bucket)) {
           continue;
         }
         let list = byBucket.get(bucket);
@@ -425,8 +508,18 @@ export class DocumentSummaryStore implements ICacheable {
         }
         list.push(entry);
       }
+    }
+    const meta: SummaryMetaPayload = {
+      cursor: this.cursor,
+      configFingerprint: this.configFingerprint,
+      bucketCount: this.bucketCount,
+      needsBackfill: this.needsBackfill,
+      backfillCursor: this.backfillCursor,
+    };
 
-      for (const bucket of this.dirtyBuckets) {
+    let written = 0;
+    try {
+      for (const bucket of bucketsToWrite) {
         const payload: SummaryBucketPayload = { entries: byBucket.get(bucket) ?? [] };
         await store.put(
           "summary",
@@ -435,18 +528,20 @@ export class DocumentSummaryStore implements ICacheable {
         );
         written++;
       }
+      await store.put("summary", `${prefix}/meta`, new TextEncoder().encode(JSON.stringify(meta)));
+      written++;
+    } catch (error) {
+      // Nothing is lost: re-dirty the snapshot for the next attempt. The
+      // CacheManager skips clearDirty on errors, so reset the handoff flag.
+      for (const bucket of bucketsToWrite) {
+        this.dirtyBuckets.add(bucket);
+      }
+      this.metaDirty = true;
+      this.flushHandledDirty = false;
+      throw error;
     }
 
-    const meta: SummaryMetaPayload = {
-      cursor: this.cursor,
-      configFingerprint: this.configFingerprint,
-      bucketCount: this.bucketCount,
-      needsBackfill: this.needsBackfill,
-      backfillCursor: this.backfillCursor,
-    };
-    await store.put("summary", `${prefix}/meta`, new TextEncoder().encode(JSON.stringify(meta)));
-    written++;
-
+    this.lastFlushAt = Date.now();
     return written;
   }
 
