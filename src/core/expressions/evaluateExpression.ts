@@ -92,12 +92,18 @@ export function getFieldValue(source: Record<string, unknown>, path: string): un
   if (!path) {
     return undefined;
   }
-  return path.split(".").reduce<unknown>((current, part) => {
+  const value = path.split(".").reduce<unknown>((current, part) => {
     if (current && typeof current === "object" && part in current) {
       return (current as Record<string, unknown>)[part];
     }
     return undefined;
   }, source);
+  // Timestamps read as ISO 8601 strings, exactly as the summary buffer stores
+  // them, so a query answers the same on the summary and full-document paths.
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  return value;
 }
 
 export function expressionToNumber(value: unknown): number | null {

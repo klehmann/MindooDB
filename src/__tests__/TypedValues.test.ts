@@ -130,6 +130,22 @@ describe("Typed values (atomic strings, timestamps) and text cursors", () => {
     expect(JSON.parse(JSON.stringify(result.data)).createdAt).toBe("2023-11-14T22:13:20.000Z");
   }, 30000);
 
+  it("filters and sorts by timestamps through the summary buffer", async () => {
+    await db.createDocument({ initialValues: { name: "late", dueAt: MindooValue.timestamp("2026-12-01T00:00:00Z") } });
+    await db.createDocument({ initialValues: { name: "early", dueAt: MindooValue.timestamp("2026-02-01T00:00:00Z") } });
+    await db.createDocument({ initialValues: { name: "mid", dueAt: MindooValue.timestamp(Date.UTC(2026, 5, 1)) } });
+    const v = createViewLanguage<{ name: string; dueAt: string }>();
+
+    const result = await db.query!({
+      filter: v.gte(v.field("dueAt"), "2026-03-01T00:00:00.000Z"),
+      sortBy: [{ field: "dueAt", direction: "ascending" }],
+    });
+
+    expect(result.coverage).toBe("full");
+    expect(result.rows.map((row) => row.fields.name)).toEqual(["mid", "late"]);
+    expect(result.rows[0].fields.dueAt).toBe("2026-06-01T00:00:00.000Z");
+  }, 30000);
+
   it("returns Dates from getData whose methods work", async () => {
     const doc = await db.createDocument({ initialValues: { at: MindooValue.timestamp(0) } });
     const at = doc.getData().at as Date;

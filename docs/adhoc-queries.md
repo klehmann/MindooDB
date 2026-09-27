@@ -74,8 +74,14 @@ Passing a config in code is optional — without one, the store follows the sync
 Extraction rules:
 
 1. **Auto-include** (default on): every non-underscore top-level field whose value is
-   a scalar (string/number/boolean/null) or an array of scalars, as long as its
-   JSON-serialized size stays within `maxValueBytes`. Fields following the
+   a scalar (string/number/boolean/null, or a timestamp) or an array of scalars, as
+   long as its JSON-serialized size stays within `maxValueBytes`. Timestamps
+   (`MindooValue.timestamp()`, i.e. `Date` values) are stored as ISO 8601 UTC
+   strings, also inside `include`d values, and field reads on the full-document
+   path return the same strings, so filters and sorts behave identically on both
+   paths. Upgrading from a build without timestamp support rebuilds persisted
+   summary buffers once (the configuration fingerprint carries an extraction
+   version). Fields following the
    encrypted-field convention (`*_encrypted`, `*_encrypted_key`) are skipped —
    their values are ciphertext, useless for querying, and would waste bucket
    space. (An explicit `include` still wins for the rare case that wants the

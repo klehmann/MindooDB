@@ -30,13 +30,40 @@ function isScalar(value: unknown): boolean {
   );
 }
 
-/** Scalars and flat arrays of scalars qualify for auto-include. */
+/**
+ * Timestamps (`Date`, written with `MindooValue.timestamp()`) are stored in
+ * the summary as ISO 8601 strings: JSON-safe for persistence, ordered like the
+ * dates they encode, and accepted by the expression language's date
+ * functions. `getFieldValue()` returns the same representation on the
+ * full-document path, so both paths compare alike. Invalid dates become null.
+ */
+export function toSummaryValue(value: unknown): unknown {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => item instanceof Date || (item !== null && typeof item === "object"))
+      ? value.map((item) => toSummaryValue(item))
+      : value;
+  }
+  if (value !== null && typeof value === "object" && !(value instanceof Uint8Array)) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+        key,
+        toSummaryValue(entry),
+      ]),
+    );
+  }
+  return value;
+}
+
+/** Scalars (timestamps included) and flat arrays of them qualify for auto-include. */
 function isAutoIncludableValue(value: unknown): boolean {
-  if (isScalar(value)) {
+  if (isScalar(value) || value instanceof Date) {
     return true;
   }
   if (Array.isArray(value)) {
-    return value.every((item) => isScalar(item));
+    return value.every((item) => isScalar(item) || item instanceof Date);
   }
   return false;
 }
@@ -184,7 +211,8 @@ function projectRecipients(
  *
  * 1. auto-include (when enabled): every non-underscore top-level field with
  *    a scalar (or scalar-array) value whose serialized size stays within
- *    `maxValueBytes`
+ *    `maxValueBytes`; timestamps count as scalars and are stored as ISO
+ *    8601 strings
  * 2. explicit `include` paths: any value type, no size cap, keyed by the
  *    full dot-path
  * 3. `exclude` wins over both (and covers nested paths)
@@ -209,10 +237,11 @@ export function extractSummaryFields(
       if (!isAutoIncludableValue(value)) {
         continue;
       }
-      if (estimateValueSize(value) > config.maxValueBytes) {
+      const summaryValue = toSummaryValue(value);
+      if (estimateValueSize(summaryValue) > config.maxValueBytes) {
         continue;
       }
-      fields[key] = value;
+      fields[key] = summaryValue;
     }
   }
 
@@ -222,7 +251,7 @@ export function extractSummaryFields(
     }
     const value = resolveFieldPath(data, path);
     if (value !== undefined) {
-      fields[path] = value;
+      fields[path] = toSummaryValue(value);
     }
   }
 

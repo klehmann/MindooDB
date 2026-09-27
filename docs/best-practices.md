@@ -252,7 +252,8 @@ A query is only fast if every field it references is in the summary buffer.
 Coverage is governed by the extraction rules, and the defaults are generous:
 every **non-underscore** top-level field holding a scalar (or array of scalars)
 is auto-included, as long as its JSON-serialized size stays within
-`DEFAULT_SUMMARY_MAX_VALUE_BYTES` (1024 bytes).
+`DEFAULT_SUMMARY_MAX_VALUE_BYTES` (1024 bytes). Timestamps count as scalars and
+are stored as ISO 8601 UTC strings.
 
 Design consequences:
 
@@ -496,6 +497,11 @@ the same guarantees through its patch flavors (field set/unset, granular JSON
 patches, text patches, rich-text patches), each carrying the `baseHeads` the app
 composed against.
 
+Field-level writes only merge well if each field also has the right *type*: a
+status written as a plain string merges like prose, and a tally written as a
+plain number loses concurrent updates. See
+[§7.6](#76-pick-the-value-type-that-merges-the-way-you-mean).
+
 ### 6.3 Plan for growth before you need to
 
 Data accumulates and cannot be removed from the primary store by ordinary
@@ -686,6 +692,102 @@ silently winning. Design the collaborative story around *convergence*, not aroun
 latency, and the architecture is working with you.
 
 ---
+
+### 7.6 Pick the value type that merges the way you mean
+
+Every value you write has merge semantics, whether you chose them or not. JSON
+gives you one kind of string and one kind of number, and their defaults are
+right for some fields and wrong for others:
+
+- A **plain string** is collaborative text. Concurrent edits are merged
+  character by character. That is right for titles, notes and bodies. For a
+  `status` that one user changes from `"open"` to `"closed"` while another
+  changes it to `"blocked"`, it can produce a mix of both words.
+- A **plain number** is last-writer-wins. Two users who both read `votes: 4`
+  and save `5` lose a vote.
+- An **ISO date written as a string** is text, not a date.
+
+For the other cases, write a **typed value**. `MindooValue` (from `mindoodb`)
+and `MindooDBAppValue` (from `mindoodb-app-sdk`) produce the same tagged JSON,
+for example `{ "$mindoo": "atomic", "value": "open" }`, and it works wherever a
+value is written: `createDocument({ initialValues })` / `documents.create({ set
+})`, assignments inside `changeDoc`, `documents.update({ set })`, and JSON patch
+`set` and `listInsert` values, also nested inside objects and arrays.
+
+| Field holds | Write it as | Merges | Reads back as |
+|---|---|---|---|
+| Prose: titles, notes, bodies | plain string | character by character | string |
+| Ids, status and enum values, URLs, hashes, stored cursors | `MindooValue.atomic("open")` | whole value, one concurrent write wins | string |
+| Tallies several people change: votes, likes, stock, seats | `MindooValue.counter(0)`, then `counterIncrement` | concurrent increments are summed | number |
+| Dates and times | `MindooValue.timestamp(date)` | whole value | `Date` from `getData()`, ISO 8601 string through the App SDK |
+| Settings, flags, other numbers | plain value | last writer wins | as written |
+
+```typescript
+import { MindooValue } from "mindoodb";
+
+const task = await db.createDocument({
+  initialValues: {
+    title: "Release notes",                        // collaborative text
+    status: MindooValue.atomic("open"),
+    votes: MindooValue.counter(0),
+    dueAt: MindooValue.timestamp("2026-10-01T12:00:00Z"),
+  },
+});
+
+await db.changeDoc(task, (d) => {
+  d.getData().status = MindooValue.atomic("in-progress");
+  d.incrementCounter("votes", 1);
+});
+
+// Outside changeDoc, e.g. from buffered UI actions:
+await db.applyJsonPatch(task, { counterIncrement: [{ path: ["votes"], delta: 1 }] });
+```
+
+Rules that keep typed fields typed:
+
+- **Reads are plain, writes must be typed again.** `getData()` returns an atomic
+  string as a string, so writing `status: "done"` back stores text. Write
+  `MindooValue.atomic("done")`.
+- **Create counters with the document, change them only by increment.** Writing
+  a counter (or a number) over an existing counter resets it without merging.
+  `counterIncrement` on a missing field creates the counter, but two devices
+  doing that at the same time keep only one creation. Incrementing a plain
+  number is rejected.
+- **Typed values are ordinary scalars to queries.** Atomic strings and counters
+  filter, sort and land in the summary buffer as strings and numbers.
+  Timestamps are stored in the summary as ISO 8601 strings in UTC and read the
+  same way on the full-document path, so they sort chronologically and compare
+  against ISO literals: `v.gte(v.field("dueAt"), "2026-03-01T00:00:00.000Z")`.
+  The expression language's date functions accept them too.
+- The key `$mindoo` is reserved. An object carrying it must be a valid typed
+  value, otherwise the write is rejected.
+- Haven's database browser keeps these types when a user edits the JSON view:
+  a changed counter is saved as an increment, atomic strings and timestamps are
+  written back as typed values.
+
+**Anchor positions in text with cursors, not indexes.** An index such as
+"character 120" breaks as soon as another user types before it. For comment and
+review anchors, highlights, bookmarks or reading positions, create stable
+cursors and store them as atomic strings:
+
+```typescript
+// Range 120..134 inclusive: anchor its first and its LAST character
+const { cursors } = await db.getTextCursors(doc, ["body"], [120, 134], {
+  heads, // the version the user selected in
+});
+// ...later, after concurrent edits:
+const [start, last] = (await db.resolveTextCursors(doc, ["body"], cursors)).positions;
+const range = { start, end: last + 1 };
+```
+
+A cursor names the character at its index, and text inserted exactly there
+lands in front of that character. Anchoring a range's end on the character
+*after* the range would therefore grow the range whenever someone types at its
+end. A cursor whose character was deleted resolves to where it stood (`move:
+"before"` resolves towards the start instead). Cursors work only on
+collaborative text (plain strings and rich text). App SDK apps use
+`db.documents.getTextCursors()` / `resolveTextCursors()` with the `read`
+capability.
 
 ## 8. Building Apps for Haven
 
@@ -888,6 +990,13 @@ Protocol](network-sync-protocol.md).
 - [ ] `coverage: "rebuilding"` renders as a hint, not an error.
 - [ ] `"fulltext-not-enabled"` is caught and hides the search UI.
 - [ ] Writes mutate individual fields inside `changeDoc`, not whole payloads.
+- [ ] Ids, status/enum values and URLs are written as `MindooValue.atomic()`,
+      tallies as counters changed only by `counterIncrement`, dates as
+      `MindooValue.timestamp()` — and rewritten with the same helper
+      ([§7.6](#76-pick-the-value-type-that-merges-the-way-you-mean)).
+- [ ] Query filters on timestamp fields compare against ISO 8601 UTC strings.
+- [ ] Positions in collaborative text (comments, highlights) are stored as text
+      cursors, not indexes, with ranges anchored on their last character.
 - [ ] Derived indexes observe tombstones and persist their cursor.
 - [ ] Deleted documents can be restored where that makes product sense.
 - [ ] No UI path blocks on sync completion.
@@ -916,6 +1025,8 @@ Protocol](network-sync-protocol.md).
       bridge accepts nothing but logical ids.)
 - [ ] Capabilities are checked and the UI degrades accordingly.
 - [ ] The app tolerates a time-travel (read-only) launch.
+- [ ] Typed fields use `MindooDBAppValue` on every write, and timestamps are
+      read as ISO 8601 strings.
 - [ ] The registration grants the narrowest capability set that works.
 - [ ] Views that must not expose documents use view-only mappings (created
       automatically on view import). `documents.get` on those logical ids must

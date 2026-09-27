@@ -153,8 +153,16 @@ export function sanitizeSummaryConfig(value: unknown): SummaryConfig | undefined
  * point: entries extracted before the field existed do not carry it, so
  * serving them while reporting the field as covered would be a coverage lie.
  */
+/**
+ * Bumped when extraction changes what an unchanged configuration stores, so
+ * persisted buffers from older builds are rebuilt instead of silently lacking
+ * fields. 2: timestamps are auto-included as ISO 8601 strings.
+ */
+export const SUMMARY_EXTRACTION_VERSION = 2;
+
 export function computeSummaryConfigFingerprint(config: ResolvedSummaryConfig): string {
   return JSON.stringify({
+    extractionVersion: SUMMARY_EXTRACTION_VERSION,
     autoInclude: config.autoInclude,
     maxValueBytes: config.maxValueBytes,
     include: [...config.include].sort(),
