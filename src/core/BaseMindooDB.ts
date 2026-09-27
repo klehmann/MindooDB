@@ -902,6 +902,16 @@ export class BaseMindooDB implements MindooDB {
   /** Whether the setup document was already probed for FTS auto-activation. */
   private fulltextSetupProbed: boolean = false;
   private dirtyDocIds: Set<string> = new Set();
+  /**
+   * Per-document counter bumped by {@link updateIndex}, i.e. whenever new
+   * entries of a document are indexed. A materialization compares it before
+   * caching its result: if entries arrived while it was reading (a sync
+   * ingested the next page while a changefeed consumer was materializing),
+   * the result reflects an older entry set and must not land in L1 — the
+   * index already points past it, so a cached copy would be served (and
+   * flushed to L2 under the new changeSeq) as if it were current.
+   */
+  private docEntryGeneration: Map<string, number> = new Map();
   private cacheMetaDirty: boolean = false;
   /**
    * Per-document fingerprint (`changeSeq:automergeHeads`) of the state last
@@ -1424,7 +1434,7 @@ export class BaseMindooDB implements MindooDB {
     // flush-before-remove step.
     this.dirtyDocIds.clear();
     this.cacheMetaDirty = false;
-    this.summaryStore?.clearDirty();
+    this.summaryStore?.discardDirtyState();
     this.fulltextIndex?.clearDirty();
     void cacheManager.deregister(this as unknown as ICacheable);
     if (this.summaryStore) {
@@ -2922,6 +2932,10 @@ export class BaseMindooDB implements MindooDB {
     // Every path that writes entries for a document lands here, so this is
     // where retained metadata for it goes stale (see scannedEntryMetadata).
     this.forgetScannedEntryMetadata(docId);
+    this.docEntryGeneration.set(
+      docId,
+      (this.docEntryGeneration.get(docId) ?? 0) + 1,
+    );
     // Same reasoning for the unreadable-document tally: every reveal and every
     // inaccessibility tombstone passes through here, so keeping it in step
     // needs no bookkeeping at the individual call sites. The one case this
@@ -4808,6 +4822,7 @@ export class BaseMindooDB implements MindooDB {
     sourceStore: ContentAddressedStore,
     targetStore: ContentAddressedStore,
     options?: SyncOptions,
+    onPageTransferred?: () => Promise<void>,
   ): Promise<{
     transferred: number;
     transferredBytes?: number;
@@ -4836,6 +4851,7 @@ export class BaseMindooDB implements MindooDB {
         logger: this.logger,
         cursors: this.syncCursorStore(),
         rejectionPolicy: "advance",
+        onPageTransferred,
       });
     } catch (error) {
       if (signal?.aborted) {
@@ -14968,6 +14984,30 @@ export class BaseMindooDB implements MindooDB {
   /**
    * Internal method to load a document from the content-addressed store
    */
+  /** Whether no new entries of `docId` were indexed since `generation` was read. */
+  private isEntryGenerationCurrent(docId: string, generation: number): boolean {
+    return (this.docEntryGeneration.get(docId) ?? 0) === generation;
+  }
+
+  /**
+   * The L2 path caches inside {@link tryLoadFromL2}; when entries were
+   * indexed while it ran, take the (outdated) result back out of L1.
+   */
+  private dropCachedLoadIfSuperseded(
+    docId: string,
+    generation: number,
+    loaded: InternalDoc,
+  ): void {
+    if (
+      this.isEntryGenerationCurrent(docId, generation) ||
+      this.docCache.get(docId) !== loaded
+    ) {
+      return;
+    }
+    this.docCache.delete(docId);
+    this.dirtyDocIds.delete(docId);
+  }
+
   private async loadDocumentInternal(
     docId: string,
   ): Promise<InternalDoc | null> {
@@ -15018,8 +15058,10 @@ export class BaseMindooDB implements MindooDB {
     // the full signature-verify + decrypt + Automerge-replay pipeline.
     // The L2 path either returns a ready-to-use InternalDoc (already
     // promoted into L1) or null - in which case we proceed below.
+    const entryGeneration = this.docEntryGeneration.get(docId) ?? 0;
     const l2Doc = await this.tryLoadFromL2(docId);
     if (l2Doc !== null) {
+      this.dropCachedLoadIfSuperseded(docId, entryGeneration, l2Doc);
       this.performanceCallback?.onDocumentLoad?.({
         docId,
         cacheHit: true,
@@ -15134,7 +15176,11 @@ export class BaseMindooDB implements MindooDB {
       const aclDoc = aclResult.doc;
       // Only cache a fully-validated result. A transient validation failure
       // (audit finding #2) leaves `cacheable` false so the next load retries.
-      if (aclDoc && aclResult.cacheable) {
+      if (
+        aclDoc &&
+        aclResult.cacheable &&
+        this.isEntryGenerationCurrent(docId, entryGeneration)
+      ) {
         await this.storeCachedDocument(aclDoc);
         this.markDocDirty(docId);
       }
@@ -15516,12 +15562,19 @@ export class BaseMindooDB implements MindooDB {
       sealedRecipients: newestRecipientBlock(allEntryMetadata),
     };
 
-    // Update cache
-    await this.storeCachedDocument(internalDoc);
-    this.markDocDirty(docId);
-    this.logger.debug(
-      `===== Successfully loaded document ${docId} and cached it =====`,
-    );
+    // Update cache (unless newer entries were indexed meanwhile: then this
+    // result is already outdated and the next read materializes again)
+    if (this.isEntryGenerationCurrent(docId, entryGeneration)) {
+      await this.storeCachedDocument(internalDoc);
+      this.markDocDirty(docId);
+      this.logger.debug(
+        `===== Successfully loaded document ${docId} and cached it =====`,
+      );
+    } else {
+      this.logger.debug(
+        `===== Loaded document ${docId}; not cached, newer entries were indexed during the load =====`,
+      );
+    }
     this.performanceCallback?.onDocumentLoad?.({
       docId,
       cacheHit: false,
@@ -17023,10 +17076,18 @@ export class BaseMindooDB implements MindooDB {
       options,
     );
     try {
+      // Docs pulls process each transferred scan page right away: the local
+      // index advances chunk by chunk, and the change event it emits lets the
+      // summary buffer / full-text index materialize and extract documents
+      // while the next page is still on the wire, instead of all at once
+      // after the transfer (see docs/adhoc-queries.md, "Cold start").
       const syncResult = await this.syncEntriesFromStore(
         remoteStore,
         localStore,
         options,
+        storeKind === StoreKind.docs
+          ? () => this.syncStoreChanges()
+          : undefined,
       );
       const transferredBytes = syncResult.transferredBytes ?? 0;
       this.logger.debug(

@@ -122,6 +122,15 @@ export interface SyncStoresContext {
    * given up on. Defaults to {@link DEFAULT_MAX_CURSOR_HOLD_ATTEMPTS}.
    */
   maxHoldAttempts?: number;
+  /**
+   * Called after each scan page whose missing entries were all transferred to
+   * the target (cursor-scan path only). A pull uses it to process the new
+   * entries locally while the next page is still in flight, so changefeed
+   * consumers (summary buffer, full-text index, live views) catch up chunk by
+   * chunk instead of in one burst after the whole transfer. Awaited before
+   * the next page is processed; errors abort the sync like transfer errors.
+   */
+  onPageTransferred?: () => Promise<void>;
 }
 
 /**
@@ -811,6 +820,14 @@ export async function syncEntriesBetweenStores(
           }
           for (const id of missingIds) {
             transferredThisSync.add(id);
+          }
+          if (ctx.onPageTransferred && !signal?.aborted) {
+            try {
+              await ctx.onPageTransferred();
+            } catch (error) {
+              discardPrefetch();
+              throw error;
+            }
           }
         }
       }
