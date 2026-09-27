@@ -3,6 +3,12 @@
 // Browser/Node.js: WASM (@automerge/automerge/slim)
 import { Automerge } from "./automerge-adapter";
 import {
+  MINDOO_VALUE_TAG,
+  assertCounterAmount,
+  parseTypedValue,
+  toTimestampDate,
+} from "./values";
+import {
   entryTrustedTime,
   isProvisional,
   isVersioned,
@@ -73,6 +79,10 @@ import {
   DocumentHistoryPageResult,
   MindooTextEdit,
   MindooJsonPatch,
+  MindooTextCursorOptions,
+  MindooTextCursorPosition,
+  MindooTextCursorPositionsResult,
+  MindooTextCursorsResult,
   MindooJsonPatchResult,
   MindooRichTextPatch,
   MindooRichTextPatchResult,
@@ -1090,7 +1100,9 @@ export class BaseMindooDB implements MindooDB {
 
   private usernameHashFromRecord(payload: unknown): string | null {
     if (!payload || typeof payload !== "object") return null;
-    const value = (payload as Record<string, unknown>).username_hash;
+    const value = this.readAutomergeScalar(
+      (payload as Record<string, unknown>).username_hash,
+    );
     return typeof value === "string" && value.length > 0 ? value : null;
   }
 
@@ -5413,10 +5425,12 @@ export class BaseMindooDB implements MindooDB {
     // starting with "_", e.g. "_attachments") are managed by MindooDB and must
     // not be seeded by callers. `undefined` values are treated as "not set"
     // (Automerge cannot represent undefined).
+    // `MindooValue` typed values become CRDT values here (this also validates
+    // them before anything is written).
     const initialValueEntries = options.initialValues
-      ? Object.entries(options.initialValues).filter(
-          ([k, v]) => !k.startsWith("_") && v !== undefined,
-        )
+      ? Object.entries(options.initialValues)
+          .filter(([k, v]) => !k.startsWith("_") && v !== undefined)
+          .map(([k, v]): [string, unknown] => [k, this.hydrateTypedValues(v)])
       : [];
     const hasInitialValues = initialValueEntries.length > 0;
 
@@ -5798,10 +5812,12 @@ export class BaseMindooDB implements MindooDB {
     // Sanitize caller-provided initial values: internal/reserved fields are
     // managed by MindooDB and must not be seeded by callers. `undefined`
     // values are treated as "not set" (Automerge cannot represent undefined).
+    // `MindooValue` typed values become CRDT values here (this also validates
+    // them before anything is written).
     const initialValueEntries = options.initialValues
-      ? Object.entries(options.initialValues).filter(
-          ([k, v]) => !k.startsWith("_") && v !== undefined,
-        )
+      ? Object.entries(options.initialValues)
+          .filter(([k, v]) => !k.startsWith("_") && v !== undefined)
+          .map(([k, v]): [string, unknown] => [k, this.hydrateTypedValues(v)])
       : [];
 
     const signerPublicKey = await this.resolveSignerPublicKey(
@@ -9448,13 +9464,15 @@ export class BaseMindooDB implements MindooDB {
       encryptedData: encryptedPayload,
     };
 
-    // Client-side write-policy precheck (docs/accesscontrol.md §9). `internalDoc.doc`
-    // is still the pre-change state here (reassigned in
-    // applyLifecycleEntryLocally, after the store write). For deletes the rules
-    // default to the "before" state; both states are supplied so either `when`
-    // resolves. Throws AccessDeniedError if denied.
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). For deletes
+    // the rules default to the "before" state; both states are supplied so either
+    // `when` resolves. Throws AccessDeniedError if denied.
     {
-      const beforeState = internalDoc.doc;
+      const beforeState = this.docAtHeads(
+        internalDoc,
+        newDoc,
+        automergeDepHashes as AutomergeTypes.Heads,
+      );
       await this.assertWriteAllowed({
         op: entryType,
         signerKey: createdByPublicKey,
@@ -10000,6 +10018,142 @@ export class BaseMindooDB implements MindooDB {
     };
   }
 
+  async getTextCursors(
+    doc: MindooDoc,
+    path: Array<string | number>,
+    positions: MindooTextCursorPosition[],
+    options?: MindooTextCursorOptions,
+  ): Promise<MindooTextCursorsResult> {
+    this.validateJsonPath(path, "Text cursor");
+    if (!Array.isArray(positions)) {
+      throw new Error("Text cursor positions must be an array");
+    }
+    const { automergeDoc, heads } = await this.resolveTextCursorTarget(
+      doc,
+      options,
+    );
+    if (
+      options?.move !== undefined &&
+      options.move !== "before" &&
+      options.move !== "after"
+    ) {
+      throw new Error('Text cursor move must be "before" or "after"');
+    }
+    const source = this.textCursorSource(automergeDoc, heads);
+    const text = this.readTextForCursor(source, path);
+    const cursors = positions.map((position) => {
+      let target: number | "start" | "end";
+      if (position === "start" || position === "end") {
+        target = position;
+      } else if (typeof position === "number" && Number.isFinite(position)) {
+        target = this.clampIndex(position, text.length);
+      } else {
+        throw new Error(
+          "Text cursor positions must be numbers, \"start\" or \"end\"",
+        );
+      }
+      return (Automerge as any).getCursor(
+        source,
+        path as AutomergeTypes.Prop[],
+        target,
+        options?.move,
+      ) as string;
+    });
+    return {
+      path: [...path],
+      heads: heads ?? Automerge.getHeads(automergeDoc),
+      cursors,
+    };
+  }
+
+  async resolveTextCursors(
+    doc: MindooDoc,
+    path: Array<string | number>,
+    cursors: string[],
+    options?: MindooTextCursorOptions,
+  ): Promise<MindooTextCursorPositionsResult> {
+    this.validateJsonPath(path, "Text cursor");
+    if (
+      !Array.isArray(cursors) ||
+      cursors.some((cursor) => typeof cursor !== "string" || cursor === "")
+    ) {
+      throw new Error("Text cursors must be non-empty strings");
+    }
+    const { automergeDoc, heads } = await this.resolveTextCursorTarget(
+      doc,
+      options,
+    );
+    const source = this.textCursorSource(automergeDoc, heads);
+    this.readTextForCursor(source, path);
+    const positions = cursors.map(
+      (cursor) =>
+        (Automerge as any).getCursorPosition(
+          source,
+          path as AutomergeTypes.Prop[],
+          cursor,
+        ) as number,
+    );
+    return {
+      path: [...path],
+      heads: heads ?? Automerge.getHeads(automergeDoc),
+      positions,
+    };
+  }
+
+  private async resolveTextCursorTarget(
+    doc: MindooDoc,
+    options?: MindooTextCursorOptions,
+  ): Promise<{
+    automergeDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    heads: AutomergeTypes.Heads | undefined;
+  }> {
+    const docId = doc.getId();
+    let internalDoc = this.wrappedInternalDocs.get(doc) ?? null;
+    if (!internalDoc) {
+      internalDoc = this.getCachedDocument(docId);
+    }
+    if (!internalDoc) {
+      const loadedDoc = await this.loadDocumentInternal(docId);
+      if (!loadedDoc) {
+        throw new DocumentNotFoundError(docId);
+      }
+      internalDoc = loadedDoc;
+    }
+    if (internalDoc.isDeleted) {
+      throw new DocumentDeletedError(docId);
+    }
+    const heads =
+      options?.heads && options.heads.length > 0
+        ? (options.heads as AutomergeTypes.Heads)
+        : undefined;
+    return { automergeDoc: internalDoc.doc, heads };
+  }
+
+  /** The document itself, or a read-only view of it at `heads`. */
+  private textCursorSource(
+    automergeDoc: AutomergeTypes.Doc<MindooDocPayload>,
+    heads: AutomergeTypes.Heads | undefined,
+  ): AutomergeTypes.Doc<MindooDocPayload> {
+    return heads ? Automerge.view(automergeDoc, heads) : automergeDoc;
+  }
+
+  /** Reads the text a cursor operates on, rejecting non-text fields early. */
+  private readTextForCursor(
+    source: AutomergeTypes.Doc<MindooDocPayload>,
+    path: Array<string | number>,
+  ): string {
+    const value = this.readValueAtPath(
+      source as unknown as MindooDocPayload,
+      path,
+    );
+    if (typeof value !== "string") {
+      throw new Error(
+        `Text cursors require an Automerge text field at '${path.map(String).join(".")}'`,
+      );
+    }
+    return value;
+  }
+
   async exportAutomergeSnapshot(
     doc: MindooDoc,
   ): Promise<MindooAutomergeSnapshot> {
@@ -10305,6 +10459,13 @@ export class BaseMindooDB implements MindooDB {
       }
     >();
 
+    // incrementCounter() calls, applied in call order after the field
+    // assignments so they can target counters assigned in the same callback.
+    const pendingCounterIncrements: Array<{
+      path: Array<string | number>;
+      delta: number;
+    }> = [];
+
     // Reference to db for closures
     const db = this;
 
@@ -10383,7 +10544,9 @@ export class BaseMindooDB implements MindooDB {
             if (typeof prop === "string" && pendingChanges.has(prop)) {
               return pendingChanges.get(prop);
             }
-            return (target as any)[prop];
+            // Counters read as numbers and immutable strings as strings here
+            // too; change counters with incrementCounter().
+            return db.readAutomergeScalar((target as any)[prop]);
           },
           has: (target, prop) => {
             // If marked for deletion, it doesn't exist
@@ -10597,6 +10760,20 @@ export class BaseMindooDB implements MindooDB {
         }
       },
 
+      // ========== Counter Write Methods ==========
+
+      incrementCounter: (
+        path: string | Array<string | number>,
+        delta: number,
+      ) => {
+        throwIfCallbackInactive("incrementCounter");
+        const segments = typeof path === "string" ? [path] : [...path];
+        db.validateJsonPath(segments, "incrementCounter");
+        assertCounterAmount(delta, "incrementCounter delta");
+        pendingCounterIncrements.push({ path: segments, delta });
+      },
+
+
       // ========== Attachment Read Methods (also work in changeDoc context) ==========
 
       getAttachments: (): AttachmentReference[] => {
@@ -10657,13 +10834,18 @@ export class BaseMindooDB implements MindooDB {
         Automerge.change(doc, (automergeDoc: MindooDocPayload) => {
           // Apply all pending changes (sets/updates)
           for (const [key, value] of pendingChanges) {
-            (automergeDoc as any)[key] = value;
+            (automergeDoc as any)[key] = this.hydrateTypedValues(value);
           }
 
           // Apply all pending deletions
           for (const key of pendingDeletions) {
             delete (automergeDoc as any)[key];
           }
+
+          for (const { path, delta } of pendingCounterIncrements) {
+            this.incrementCounterAtPath(automergeDoc, path, delta);
+          }
+
 
           // Apply pending attachment changes
           if (
@@ -10830,12 +11012,14 @@ export class BaseMindooDB implements MindooDB {
       (patch.listInsert?.length ?? 0) +
       (patch.textSplice?.length ?? 0) +
       (patch.textMark?.length ?? 0) +
-      (patch.textUnmark?.length ?? 0);
+      (patch.textUnmark?.length ?? 0) +
+      (patch.counterIncrement?.length ?? 0);
     if (operationCount === 0) {
       throw new Error("JSON patch must include at least one operation");
     }
     for (const operation of patch.set ?? []) {
       this.validateJsonPath(operation.path, "JSON set");
+      this.hydrateTypedValues(operation.value);
     }
     for (const operation of patch.unset ?? []) {
       this.validateJsonPath(operation.path, "JSON unset");
@@ -10862,6 +11046,7 @@ export class BaseMindooDB implements MindooDB {
       if (!Array.isArray(operation.values)) {
         throw new Error("JSON listInsert values must be an array");
       }
+      this.hydrateTypedValues(operation.values);
     }
     for (const operation of patch.textSplice ?? []) {
       this.validateJsonPath(operation.path, "JSON textSplice");
@@ -10914,6 +11099,150 @@ export class BaseMindooDB implements MindooDB {
         throw new Error("JSON textUnmark names must be non-empty strings");
       }
     }
+    for (const operation of patch.counterIncrement ?? []) {
+      this.validateJsonPath(operation.path, "JSON counterIncrement");
+      assertCounterAmount(operation.delta, "JSON counterIncrement delta");
+    }
+  }
+
+  private isAutomergeCounter(value: unknown): value is AutomergeTypes.Counter {
+    if (value === null || typeof value !== "object") return false;
+    const automerge = Automerge as {
+      isCounter?: (candidate: unknown) => boolean;
+      Counter?: new (value?: number) => unknown;
+    };
+    if (typeof automerge.isCounter === "function") {
+      return automerge.isCounter(value);
+    }
+    return (
+      typeof automerge.Counter === "function" &&
+      value instanceof automerge.Counter
+    );
+  }
+
+  private isAutomergeImmutableString(value: unknown): boolean {
+    if (value === null || typeof value !== "object") return false;
+    const check = (Automerge as { isImmutableString?: (candidate: unknown) => boolean })
+      .isImmutableString;
+    return typeof check === "function" && check(value);
+  }
+
+  /**
+   * Plain-JS read view of an Automerge scalar wrapper: counters become numbers
+   * and immutable strings become strings. Everything else is returned as is.
+   */
+  private readAutomergeScalar(value: unknown): unknown {
+    if (this.isAutomergeCounter(value)) return value.value;
+    if (this.isAutomergeImmutableString(value)) return String(value);
+    return value;
+  }
+
+  /**
+   * Turns `MindooValue` typed values (tagged plain objects, see values.ts)
+   * anywhere inside `value` into their CRDT representation, and copies plain
+   * objects and arrays into fresh literals on the way. Values that already are
+   * CRDT scalars, dates or bytes pass through. Throws for malformed tags, so
+   * it doubles as validation.
+   */
+  private hydrateTypedValues(value: unknown, depth = 0): unknown {
+    if (value === null || typeof value !== "object") return value;
+    if (depth > 100) {
+      throw new Error("Document value is nested too deeply");
+    }
+    if (
+      value instanceof Uint8Array ||
+      value instanceof Date ||
+      this.isAutomergeCounter(value) ||
+      this.isAutomergeImmutableString(value)
+    ) {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.hydrateTypedValues(entry, depth + 1));
+    }
+    const record = value as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(record, MINDOO_VALUE_TAG)) {
+      const typed = parseTypedValue(record);
+      switch (typed.$mindoo) {
+        case "atomic":
+          return new ((Automerge as any).ImmutableString as new (
+            value: string,
+          ) => unknown)(typed.value);
+        case "counter":
+          return new Automerge.Counter(typed.value);
+        case "timestamp":
+          return toTimestampDate(typed.value, 'Typed value "timestamp"');
+      }
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(record)) {
+      if (entry !== undefined) {
+        result[key] = this.hydrateTypedValues(entry, depth + 1);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * The plain read view of a value that may contain `MindooValue` tags, as
+   * `getData()` would return it once written (used where a precheck needs the
+   * "after" state before the value is in a document).
+   */
+  private readTypedValues(value: unknown): unknown {
+    return this.normalizeAutomergeScalars(this.hydrateTypedValues(value));
+  }
+
+  /**
+   * Replaces counters and atomic strings inside a materialized value with
+   * plain numbers and strings, in place where possible. Reads (getData, the
+   * query and summary indexes, write prechecks) then compare them like any
+   * other JSON value.
+   */
+  private normalizeAutomergeScalars(value: unknown, depth = 0): unknown {
+    if (value === null || typeof value !== "object") return value;
+    if (this.isAutomergeCounter(value) || this.isAutomergeImmutableString(value)) {
+      return this.readAutomergeScalar(value);
+    }
+    if (value instanceof Uint8Array || value instanceof Date || depth > 100) {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        value[index] = this.normalizeAutomergeScalars(value[index], depth + 1);
+      }
+      return value;
+    }
+    const record = value as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      record[key] = this.normalizeAutomergeScalars(record[key], depth + 1);
+    }
+    return record;
+  }
+
+  /**
+   * Must run inside an Automerge change callback. Initializes a missing field
+   * as a counter holding `delta`; rejects existing non-counter values rather
+   * than silently converting them (a plain number would lose its history and
+   * any concurrent plain-number write would still win).
+   */
+  private incrementCounterAtPath(
+    automergeDoc: MindooDocPayload,
+    path: Array<string | number>,
+    delta: number,
+  ): void {
+    const parent = this.ensureJsonParentAtPath(automergeDoc, path);
+    const leaf = path[path.length - 1];
+    const existing = parent[leaf];
+    if (existing === undefined || existing === null) {
+      parent[leaf] = new Automerge.Counter(delta);
+      return;
+    }
+    if (!this.isAutomergeCounter(existing)) {
+      throw new Error(
+        `Cannot increment non-counter value at '${path.map(String).join(".")}'; create it with MindooValue.counter() first`,
+      );
+    }
+    existing.increment(delta);
   }
 
   private validateRichTextPatch(patch: MindooRichTextPatch): void {
@@ -11119,7 +11448,7 @@ export class BaseMindooDB implements MindooDB {
       this.setJsonValueAtPath(
         automergeDoc,
         operation.path,
-        structuredClone(operation.value),
+        this.hydrateTypedValues(structuredClone(operation.value)),
       );
     }
     for (const operation of patch.unset ?? []) {
@@ -11131,7 +11460,11 @@ export class BaseMindooDB implements MindooDB {
     }
     for (const operation of patch.listInsert ?? []) {
       const list = this.ensureJsonListAtPath(automergeDoc, operation.path);
-      list.splice(operation.index, 0, ...structuredClone(operation.values));
+      list.splice(
+        operation.index,
+        0,
+        ...(this.hydrateTypedValues(structuredClone(operation.values)) as unknown[]),
+      );
     }
     for (const operation of patch.textSplice ?? []) {
       this.spliceJsonTextAtPath(
@@ -11167,6 +11500,13 @@ export class BaseMindooDB implements MindooDB {
           name,
         );
       }
+    }
+    for (const operation of patch.counterIncrement ?? []) {
+      this.incrementCounterAtPath(
+        automergeDoc,
+        operation.path,
+        operation.delta,
+      );
     }
   }
 
@@ -11438,6 +11778,45 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  /**
+   * The document as it stood at `heads`, for the "before" side of a Tier 2
+   * (`withfields`) write precheck.
+   *
+   * `internalDoc.doc` is normally the pre-change document (it is reassigned to
+   * the new document after the store write), but it is shared mutable state and
+   * is not guaranteed to still sit on the heads a change was computed from: an
+   * out-of-band Automerge operation, the clone recovery in
+   * {@link runChangeWithOutdatedDocRecovery}, or a concurrent op on the same
+   * cached document can move it. A "before" that is really the "after" silently
+   * flips every `when: "before"` verdict, so the caller passes the change's own
+   * dependency hashes, which are fixed at the moment the change was produced,
+   * and only falls back to the cache slot when it has none.
+   *
+   * `Automerge.clone` is load-bearing: a bare `Automerge.view` shares the source
+   * document's WASM handle, and {@link convertAutomergeToJS} materializes through
+   * that handle at ITS heads, not the view's — so materializing a view returns
+   * the post-change state. Cloning gives the snapshot its own handle.
+   */
+  private docAtHeads(
+    internalDoc: InternalDoc,
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    heads: AutomergeTypes.Heads | undefined,
+  ): AutomergeTypes.Doc<MindooDocPayload> {
+    if (!heads || heads.length === 0) return internalDoc.doc;
+    try {
+      return Automerge.clone(
+        Automerge.view(doc, heads),
+      ) as AutomergeTypes.Doc<MindooDocPayload>;
+    } catch (error) {
+      // A snapshot we cannot build must not fail the write outright; the cache
+      // slot is the same value this code used before the snapshot existed.
+      this.logger.warn(
+        `Could not snapshot document ${internalDoc.id} at its pre-change heads, using the cached state: ${error}`,
+      );
+      return internalDoc.doc;
+    }
+  }
+
   private isOutdatedDocumentError(error: unknown): boolean {
     if (!(error instanceof Error)) return false;
     return /outdated document/i.test(error.message);
@@ -11598,6 +11977,9 @@ export class BaseMindooDB implements MindooDB {
     const attachmentRefs = this.collectAttachmentRefs(newDoc);
 
     const entries: StoreEntry[] = [];
+    // The dependencies of the first change ARE the heads the change was computed
+    // from, i.e. the document's "before" state for the write precheck below.
+    let headsBeforeFirstChange: AutomergeTypes.Heads | undefined;
     for (let index = 0; index < resolvedChangeBytesList.length; index += 1) {
       const changeBytes = resolvedChangeBytesList[index];
       const entry = await this.buildDocChangeStoreEntry({
@@ -11615,18 +11997,18 @@ export class BaseMindooDB implements MindooDB {
       });
       entries.push(entry);
       const decodedChange = Automerge.decodeChange(changeBytes);
+      if (index === 0) {
+        headsBeforeFirstChange = decodedChange.deps as AutomergeTypes.Heads;
+      }
       this.registerAutomergeHashMapping(docId, decodedChange.hash, entry.id);
     }
 
-    // Client-side write-policy precheck (docs/accesscontrol.md §9). `internalDoc.doc`
-    // is still the pre-change state here (it is reassigned to `newDoc` below,
-    // after the store write), so before/after are both available for Tier 2
-    // (`withfields`) evaluation. Throws AccessDeniedError when denied.
+    // Client-side write-policy precheck (docs/accesscontrol.md §9). Throws
+    // AccessDeniedError when denied.
     {
       const signerKey = useCustomKey
         ? signingKeyPair!.publicKey
         : (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-      const beforeState = internalDoc.doc;
       await this.assertWriteAllowed({
         op: "doc_change",
         signerKey,
@@ -11637,10 +12019,9 @@ export class BaseMindooDB implements MindooDB {
         ),
         bypass: bypassPrecheck,
         getBeforeDoc: () =>
-          this.convertAutomergeToJS(beforeState) as unknown as Record<
-            string,
-            unknown
-          >,
+          this.convertAutomergeToJS(
+            this.docAtHeads(internalDoc, newDoc, headsBeforeFirstChange),
+          ) as unknown as Record<string, unknown>,
         getAfterDoc: () =>
           this.convertAutomergeToJS(newDoc) as unknown as Record<
             string,
@@ -13746,7 +14127,9 @@ export class BaseMindooDB implements MindooDB {
     const afterValues: Record<string, unknown> = { _attachments: [] };
     if (options.initialValues) {
       for (const [k, v] of Object.entries(options.initialValues)) {
-        if (!k.startsWith("_")) afterValues[k] = v;
+        if (!k.startsWith("_") && v !== undefined) {
+          afterValues[k] = this.readTypedValues(v);
+        }
       }
     }
     const decision = await this.evaluateClientWriteAccess({
@@ -15174,8 +15557,12 @@ export class BaseMindooDB implements MindooDB {
     if (meta && meta.handle && typeof meta.handle.materialize === "function") {
       // Use native materialize() which properly converts Text objects to strings
       try {
+        // materialize() returns fresh objects, so the scalar wrappers can be
+        // replaced in place.
         const materialized = meta.handle.materialize("/");
-        return materialized as MindooDocPayload;
+        return this.normalizeAutomergeScalars(
+          materialized,
+        ) as MindooDocPayload;
       } catch (error) {
         console.error("[MindooDB] Failed to materialize document:", error);
         // Fall through to direct access
@@ -15197,6 +15584,10 @@ export class BaseMindooDB implements MindooDB {
     )
       return value;
     if (value instanceof Uint8Array) return value;
+    if (value instanceof Date) return new Date(value.getTime());
+    if (this.isAutomergeCounter(value) || this.isAutomergeImmutableString(value)) {
+      return this.readAutomergeScalar(value);
+    }
     if (depth > 40) return null;
     const automerge = Automerge as {
       isText?: (candidate: unknown) => boolean;
@@ -15253,6 +15644,20 @@ export class BaseMindooDB implements MindooDB {
         },
         get: (target, prop) => {
           const value = (target as Record<string | symbol, unknown>)[prop];
+          // Counters read as plain numbers and immutable strings as strings;
+          // their wrappers would otherwise surface as `{ value }` / `{ val }`
+          // after structured cloning.
+          if (
+            db.isAutomergeCounter(value) ||
+            db.isAutomergeImmutableString(value)
+          ) {
+            return db.readAutomergeScalar(value);
+          }
+          // Hand out a copy: a Proxy around a Date breaks every Date method
+          // ("this is not a Date object").
+          if (value instanceof Date) {
+            return new Date(value.getTime());
+          }
           // Recursively wrap nested objects (but not arrays or special types)
           if (
             value !== null &&
@@ -15338,6 +15743,12 @@ export class BaseMindooDB implements MindooDB {
       setAttachmentExtractedText: () => {
         throw new Error(
           "setAttachmentExtractedText() can only be called within changeDoc() callback",
+        );
+      },
+
+      incrementCounter: () => {
+        throw new Error(
+          "incrementCounter() can only be called within changeDoc() callback; use applyJsonPatch() with counterIncrement outside of it",
         );
       },
 

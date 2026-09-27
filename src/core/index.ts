@@ -3,6 +3,7 @@
 // Types
 export * from "./types";
 export * from "./databaseIdValidation";
+export * from "./values";
 export {
   evaluateBuiltinWrite,
   hasBuiltinWriteInvariant,

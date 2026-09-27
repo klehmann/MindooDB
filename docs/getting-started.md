@@ -135,6 +135,16 @@ Every document change is automatically signed with the user's Ed25519 key and en
 
 > **Change granularity:** Inside a `changeDoc()` callback, assigning a top-level field (e.g. `d.getData().title = "..."` or replacing a whole array/object) records the replacement of that entire value in the change history. For small values this is fine, but repeatedly rewriting large fields (long strings, big arrays) produces large change entries and grows the document history quickly. For fine-grained edits, use the dedicated patch APIs instead: `db.applyTextPatch()` for character-level text edits and `db.applyJsonPatch()` for granular object/list operations at specific paths. These record only the actual delta and merge cleanly with concurrent edits.
 
+> **Typed values:** Strings you write are collaborative text (concurrent edits merge character by character) and numbers are last-writer-wins. For values that need other semantics, write a typed value from `MindooValue` (exported by `mindoodb`) wherever you write a value: in `createDocument({ initialValues })`, in `changeDoc()` assignments, and in `applyJsonPatch()` `set` / `listInsert` values, also nested inside objects.
+>
+> - `MindooValue.atomic("open")` for ids, status values, URLs and hashes: replaced as a whole, never mixed. Reads back as a string.
+> - `MindooValue.counter(0)` for votes, likes or stock levels: concurrent increments are summed. Change it with `d.incrementCounter(["stats", "views"], 1)` inside `changeDoc()` or `applyJsonPatch(doc, { counterIncrement: [{ path: ["stats", "views"], delta: 1 }] })`. Reads back as a number.
+> - `MindooValue.timestamp(new Date())` for dates. Reads back as a `Date`.
+>
+> Reads return plain values, so write the typed value again when you change such a field.
+>
+> **Text cursors:** To anchor comments or highlights in a text field, create stable cursors with `db.getTextCursors(doc, ["body"], [120, 134])` (a cursor names the character at its index, so anchor a range on its first and last character and add 1 to the resolved end), store them as `MindooValue.atomic(cursor)`, and turn them back into positions with `db.resolveTextCursors(doc, ["body"], cursors)`. Cursors keep pointing at the same characters while others edit the text.
+
 `connectToServer` creates a remote store backed by an HTTP transport. It handles authentication (challenge-response using your signing key), encryption of the sync payload, and capability negotiation with the server. You can use the returned store with `pushChangesTo` and `pullChangesFrom` just like any local store.
 
 ---

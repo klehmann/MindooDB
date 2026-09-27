@@ -2290,6 +2290,12 @@ export interface MindooDoc {
   /*
    * Get the payload of the document
    *
+   * Collaborative text and atomic strings are returned as strings, counters
+   * as plain numbers and timestamps as `Date` objects. Inside changeDoc()
+   * top-level fields can be assigned and deleted on the returned object
+   * (assign `MindooValue` typed values for atomic strings, counters and
+   * timestamps); use {@link incrementCounter} to change counters.
+   *
    * @return The payload of the document
    */
   getData(): MindooDocPayload;
@@ -2400,6 +2406,28 @@ export interface MindooDoc {
       extractedAt?: number;
     }
   ): void;
+
+
+  // ========== Counter Write Method ==========
+
+  /**
+   * Add `delta` (negative to decrement) to the counter at `path`. Only works
+   * within the changeDoc() callback; outside of it use
+   * `MindooDB.applyJsonPatch()` with `counterIncrement`.
+   *
+   * Concurrent increments from different replicas are summed on merge instead
+   * of overwriting each other, which is what makes counters safe for shared
+   * tallies (votes, views, stock levels). Create counters with
+   * `MindooValue.counter()`; a missing field is initialized as a counter
+   * holding `delta`. Repeated calls within one changeDoc() add up and are
+   * applied after the callback's field assignments.
+   *
+   * @param path Field name or path segments (e.g. `["stats", "views"]`)
+   * @param delta Amount to add, a safe integer
+   * @throws Error if called outside of changeDoc() callback, or (when the
+   *   change is applied) if the value at `path` exists but is not a counter
+   */
+  incrementCounter(path: string | Array<string | number>, delta: number): void;
 
   // ========== Attachment Read Methods ==========
   // These methods work both inside and outside of changeDoc().
@@ -2717,7 +2745,13 @@ export interface MindooAutomergePatchResult {
   changesSince?: MindooAutomergeChangesSince;
 }
 
-/** Sets a value at `path`, creating or replacing that payload field. */
+/**
+ * Sets a value at `path`, creating or replacing that payload field.
+ *
+ * Strings become collaborative text. Use `MindooValue` (`atomic`, `counter`,
+ * `timestamp`) for values that need another type; typed values may also be
+ * nested inside objects and arrays.
+ */
 export interface MindooJsonSetPatch {
   path: Array<string | number>;
   value: unknown;
@@ -2767,11 +2801,31 @@ export interface MindooJsonTextUnmarkPatch {
 }
 
 /**
+ * Adds `delta` (negative to decrement) to the counter at `path`.
+ *
+ * Unlike a `set` of a plain number, concurrent increments from different
+ * replicas are summed when they merge instead of one overwriting the other.
+ * A missing (or `null`) field is initialized as a counter with value `delta`;
+ * because that initialization is an assignment, two replicas that both create
+ * the same counter concurrently keep only one of the two creations, so create
+ * shared counters up front with `MindooValue.counter()`. Incrementing a value
+ * that is not a counter (e.g. a plain number) is rejected. `delta` must be a
+ * safe integer.
+ */
+export interface MindooJsonCounterIncrementPatch {
+  path: Array<string | number>;
+  delta: number;
+}
+
+/**
  * Granular JSON mutation batch for a MindooDoc payload.
  *
- * Operations are applied in patch order by operation group. `baseHeads` has the
- * same role as in text patches: it records the document heads the caller saw
- * before constructing operations whose order matters, such as list inserts.
+ * Operations are applied in patch order by operation group (`set`, `unset`,
+ * `listDelete`, `listInsert`, `textSplice`, `textMark`, `textUnmark`,
+ * `counterIncrement`). Values in `set` and `listInsert` may contain
+ * `MindooValue` typed values. `baseHeads` has the same role as in text
+ * patches: it records the document heads the caller saw before constructing
+ * operations whose order matters, such as list inserts.
  */
 export interface MindooJsonPatch {
   baseHeads?: string[];
@@ -2782,6 +2836,48 @@ export interface MindooJsonPatch {
   textSplice?: MindooJsonTextSplicePatch[];
   textMark?: MindooJsonTextMarkPatch[];
   textUnmark?: MindooJsonTextUnmarkPatch[];
+  counterIncrement?: MindooJsonCounterIncrementPatch[];
+}
+
+/**
+ * Where a text cursor should be created: a character index in the text
+ * (clamped to its length), or the start/end of the text. An `"end"` cursor
+ * keeps pointing past the last character when text is appended.
+ */
+export type MindooTextCursorPosition = number | "start" | "end";
+
+/** Options for {@link MindooDB.getTextCursors} and {@link MindooDB.resolveTextCursors}. */
+export interface MindooTextCursorOptions {
+  /**
+   * Read the text as it was at these Automerge heads instead of the current
+   * version, e.g. the `baseHeads` an editor rendered from, or the heads of a
+   * historical revision.
+   */
+  heads?: string[];
+  /**
+   * Only for {@link MindooDB.getTextCursors}: where a cursor goes when the
+   * character it points at is deleted. `"after"` (default) resolves towards
+   * the end of the text, `"before"` towards its start.
+   */
+  move?: "before" | "after";
+}
+
+/** Stable cursors created by {@link MindooDB.getTextCursors}. */
+export interface MindooTextCursorsResult {
+  path: Array<string | number>;
+  /** Heads of the document version the positions were read against. */
+  heads: string[];
+  /** One opaque cursor string per requested position, in request order. */
+  cursors: string[];
+}
+
+/** Current positions of cursors resolved by {@link MindooDB.resolveTextCursors}. */
+export interface MindooTextCursorPositionsResult {
+  path: Array<string | number>;
+  /** Heads of the document version the cursors were resolved against. */
+  heads: string[];
+  /** One character index per requested cursor, in request order. */
+  positions: number[];
 }
 
 /** Result returned after applying a JSON patch and materializing the document. */
@@ -5378,6 +5474,50 @@ export interface MindooDB {
    * back into `MindooRichTextPatch.baseHeads` when authoring the next edit.
    */
   getRichTextSnapshot(doc: MindooDoc, path: Array<string | number>): Promise<MindooRichTextSnapshot>;
+
+  /**
+   * Create stable cursors for character positions in the text at `path`.
+   *
+   * A cursor is an opaque string that identifies a character rather than an
+   * index, so it keeps pointing at the same spot while other users insert or
+   * delete text before it. It names the character at its index; text inserted
+   * exactly at that index lands before the character. To anchor a range,
+   * create cursors for its first and its last character and add 1 to the
+   * resolved end, so text typed right after the range does not extend it. Persist cursors in the document (e.g. as
+   * `MindooValue.atomic()` values) to anchor comments, highlights, bookmarks or
+   * annotations, and turn them back into indexes with
+   * {@link resolveTextCursors}. When the character a cursor points at is
+   * deleted, it resolves to the position where that character used to be.
+   *
+   * The field must be Automerge text (a string written with `set`, a text
+   * splice, or rich text); atomic strings have no cursors.
+   *
+   * @param doc The document
+   * @param path Path of the text field
+   * @param positions Character indexes (clamped to the text length), or
+   *   `"start"` / `"end"`
+   * @param options Optional `heads` to address the text as it was at that version
+   */
+  getTextCursors(
+    doc: MindooDoc,
+    path: Array<string | number>,
+    positions: MindooTextCursorPosition[],
+    options?: MindooTextCursorOptions,
+  ): Promise<MindooTextCursorsResult>;
+
+  /**
+   * Resolve cursors from {@link getTextCursors} to character indexes in the
+   * text at `path`, for the current document or, with `options.heads`, for a
+   * historical version.
+   *
+   * @throws Error if a cursor does not belong to this text field
+   */
+  resolveTextCursors(
+    doc: MindooDoc,
+    path: Array<string | number>,
+    cursors: string[],
+    options?: MindooTextCursorOptions,
+  ): Promise<MindooTextCursorPositionsResult>;
 
   /**
    * Export the full internal Automerge document as a binary snapshot.
