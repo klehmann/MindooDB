@@ -1,6 +1,6 @@
 {
   "name": "mindoodb",
-  "version": "0.0.68",
+  "version": "0.0.69",
   "packageManager": "pnpm@11.1.1",
   "engines": {
     "node": ">=22.13.0"
