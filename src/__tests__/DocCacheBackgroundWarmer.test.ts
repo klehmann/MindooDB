@@ -667,7 +667,11 @@ describe("BaseMindooDB background L2 warmer", () => {
 
   it("lets the summary catch up first and does not load its docs a second time", async () => {
     await createFlushedDocsAndRestart("warmsummary", 12);
-    const db2 = await tenant.openDB("warmsummary", { documentCacheConfig: { maxEntries: 4 } });
+    // The iteration prefetch window exceeds this tiny L1 and would reload
+    // docs on its own; keep it out of the count.
+    const db2 = await tenant.openDB("warmsummary", {
+      documentCacheConfig: { maxEntries: 4, iteratePrefetchWindowDocs: 0 },
+    });
     const summary = db2.getSummaryStore!();
     // Pretend the L2 records are missing, as after an initial replication:
     // every document has to be materialized once.
@@ -687,5 +691,59 @@ describe("BaseMindooDB background L2 warmer", () => {
     expect(loadedDocIds).toHaveLength(12);
     expect(new Set(loadedDocIds).size).toBe(12);
     expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 12, total: 12 });
+  }, 60000);
+
+  // ---------------------------------------------------------------------------
+  // Test: local writes are not re-sequenced by the next syncStoreChanges
+  // ---------------------------------------------------------------------------
+
+  function changeSeqsById(db: any): Map<string, number> {
+    return new Map(db.index.map((entry: any) => [entry.docId, entry.changeSeq]));
+  }
+
+  it("syncStoreChanges does not re-sequence uncached, locally written docs", async () => {
+    const db = await tenant.openDB("localseq", { documentCacheConfig: { maxEntries: 2 } });
+    const ids: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const d = await db.createDocument();
+      ids.push(d.getId());
+      await db.changeDoc(d, (doc: MindooDoc) => {
+        doc.getData().idx = i;
+      });
+    }
+    await db.deleteDocument(ids[7]);
+    const before = changeSeqsById(db);
+    expect((db as any).docCache.size).toBeLessThanOrEqual(2);
+
+    const events: string[][] = [];
+    const unsubscribe = db.addChangeListener!((event) => {
+      // Pending coalesced events of the local writes above are flushed as
+      // "local" when the run starts; only what the run itself emits counts.
+      if (event.origin === "ingest") {
+        events.push(event.changes.map((c) => c.docId));
+      }
+    });
+    await db.syncStoreChanges();
+    unsubscribe();
+
+    expect(changeSeqsById(db)).toEqual(before);
+    expect(events).toEqual([]);
+    expect((db as any).locallyIndexedEntryIds.size).toBe(0);
+  }, 60000);
+
+  it("keeps changeSeqs of locally written docs across a restart", async () => {
+    const db = await tenant.openDB("localseqrestart", { documentCacheConfig: { maxEntries: 2 } });
+    for (let i = 0; i < 6; i++) {
+      const d = await db.createDocument();
+      await db.changeDoc(d, (doc: MindooDoc) => {
+        doc.getData().idx = i;
+      });
+    }
+    const before = changeSeqsById(db);
+    await ((tenant as any).cacheManager as CacheManager).flush();
+    simulateRestartWithoutFlush();
+
+    const db2 = await tenant.openDB("localseqrestart", { documentCacheConfig: { maxEntries: 2 } });
+    expect(changeSeqsById(db2)).toEqual(before);
   }, 60000);
 });
