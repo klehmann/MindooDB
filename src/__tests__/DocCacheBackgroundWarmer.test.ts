@@ -146,6 +146,18 @@ describe("BaseMindooDB background L2 warmer", () => {
     t.databaseCache.clear();
   }
 
+  /**
+   * Delete every L2 document record, as if they were never written (e.g.
+   * after an initial replication). The next open drops the persisted
+   * per-doc L2 state for the missing records, so the warmer has to
+   * materialize every document again.
+   */
+  async function dropCachedDocRecords(): Promise<void> {
+    for (const key of await cacheStore.list("doc")) {
+      await cacheStore.delete("doc", key);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Test: warmer populates L2 across many docs without exceeding maxEntries
   // ---------------------------------------------------------------------------
@@ -172,6 +184,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     await cm.flush();
 
     simulateRestartWithoutFlush();
+    await dropCachedDocRecords();
 
     const db2 = await tenant.openDB("warmpopulate", {
       documentCacheConfig: {
@@ -235,6 +248,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const cm = (tenant as any).cacheManager as CacheManager;
     await cm.flush();
     simulateRestartWithoutFlush();
+    await dropCachedDocRecords();
 
     const db2 = await tenant.openDB("warmstop", {
       documentCacheConfig: {
@@ -296,6 +310,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const cm = (tenant as any).cacheManager as CacheManager;
     await cm.flush();
     simulateRestartWithoutFlush();
+    await dropCachedDocRecords();
 
     const db2 = await tenant.openDB("warmsingleflight", {
       documentCacheConfig: {
@@ -405,6 +420,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const cm = (tenant as any).cacheManager as CacheManager;
     await cm.flush();
     simulateRestartWithoutFlush();
+    await dropCachedDocRecords();
 
     const db2 = await tenant.openDB("warmcoexist", {
       documentCacheConfig: {
@@ -463,6 +479,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const cm = (tenant as any).cacheManager as CacheManager;
     await cm.flush();
     simulateRestartWithoutFlush();
+    await dropCachedDocRecords();
 
     const db2 = await tenant.openDB("warmprogress", {
       documentCacheConfig: {
@@ -527,6 +544,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const cm = (tenant as any).cacheManager as CacheManager;
     await cm.flush();
     simulateRestartWithoutFlush();
+    await dropCachedDocRecords();
 
     const db2 = await tenant.openDB("warmprogresscancel", {
       documentCacheConfig: {
@@ -584,6 +602,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const cm = (tenant as any).cacheManager as CacheManager;
     await cm.flush();
     simulateRestartWithoutFlush();
+    await dropCachedDocRecords();
 
     const db2 = await tenant.openDB("warmprogresssnapshot", {
       documentCacheConfig: {
@@ -638,11 +657,34 @@ describe("BaseMindooDB background L2 warmer", () => {
 
     expect(tryLoadFromL2).not.toHaveBeenCalled();
     expect(loadDocumentInternal).not.toHaveBeenCalled();
-    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 12, total: 12 });
+    // The persisted per-doc L2 state rules every doc out up front: no
+    // record is read and the pass reports nothing to do.
+    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 0, total: 0 });
 
     for (const id of ids) {
       expect((await db2.getDocument(id)).getData().idx).toBe(ids.indexOf(id));
     }
+  }, 60000);
+
+  it("checks the record header once for docs with unknown L2 state (legacy checkpoint)", async () => {
+    await createFlushedDocsAndRestart("warmlegacy", 12);
+    const db2 = await tenant.openDB("warmlegacy", { documentCacheConfig: { maxEntries: 4 } });
+    // A checkpoint written before the per-doc L2 state was persisted.
+    (db2 as any).l2RecordChangeSeqs.clear();
+    (db2 as any).lastFlushedDocState.clear();
+    const tryLoadFromL2 = jest.spyOn(db2 as any, "tryLoadFromL2");
+    const loadDocumentInternal = jest.spyOn(db2 as any, "loadDocumentInternal");
+    await db2.startBackgroundWarmer!();
+
+    expect(tryLoadFromL2).not.toHaveBeenCalled();
+    expect(loadDocumentInternal).not.toHaveBeenCalled();
+    // The 4 docs restored into L1 are not part of the pass; the other 8
+    // get a header check each.
+    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 8, total: 8 });
+
+    // The header checks were remembered: the next pass has nothing to do.
+    await db2.startBackgroundWarmer!();
+    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 0, total: 0 });
   }, 60000);
 
   it("still loads docs whose L2 record is stale", async () => {
@@ -661,23 +703,22 @@ describe("BaseMindooDB background L2 warmer", () => {
     await db2.startBackgroundWarmer!();
 
     const visited = tryLoadFromL2.mock.calls.map((call) => call[0]);
-    expect(visited).toContain(ids[0]);
+    // Only the changed doc is part of the pass, not the whole database.
+    expect(visited.filter((id) => ids.includes(id as string))).toEqual([ids[0]]);
     expect((await db2.getDocument(ids[0])).getData().idx).toBe(100);
   }, 60000);
 
   it("lets the summary catch up first and does not load its docs a second time", async () => {
     await createFlushedDocsAndRestart("warmsummary", 12);
+    // The L2 records are missing, as after an initial replication: every
+    // document has to be materialized once.
+    await dropCachedDocRecords();
     // The iteration prefetch window exceeds this tiny L1 and would reload
     // docs on its own; keep it out of the count.
     const db2 = await tenant.openDB("warmsummary", {
       documentCacheConfig: { maxEntries: 4, iteratePrefetchWindowDocs: 0 },
     });
     const summary = db2.getSummaryStore!();
-    // Pretend the L2 records are missing, as after an initial replication:
-    // every document has to be materialized once.
-    for (const id of await db2.getAllDocumentIds()) {
-      await (db2 as any).cacheManager.getStore().delete("doc", `${(db2 as any).getCachePrefix()}/${id}`);
-    }
 
     const loadDocumentInternal = jest.spyOn(db2 as any, "loadDocumentInternal");
     await db2.startBackgroundWarmer!();
@@ -690,7 +731,9 @@ describe("BaseMindooDB background L2 warmer", () => {
       .filter((id) => docIds.has(id));
     expect(loadedDocIds).toHaveLength(12);
     expect(new Set(loadedDocIds).size).toBe(12);
-    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 12, total: 12 });
+    // What the summary already wrote to L2 (or still holds in L1) is not
+    // part of the pass.
+    expect(db2.getBackgroundWarmerProgress?.()).toMatchObject({ phase: "done", processed: 0, total: 0 });
   }, 60000);
 
   // ---------------------------------------------------------------------------

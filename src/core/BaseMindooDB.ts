@@ -934,6 +934,15 @@ export class BaseMindooDB implements MindooDB {
    * that were merely loaded and cached, not changed).
    */
   private lastFlushedDocState = new Map<string, string>();
+  /**
+   * Per-document `changeSeq` of the record known to be in the L2 cache.
+   * Unlike {@link lastFlushedDocState} it is persisted in the metadata
+   * checkpoint, so after a restart the background warmer can tell which
+   * documents need work without reading every L2 record. A missing entry
+   * means "unknown" (legacy checkpoint): the record header is read once.
+   * Maintained only via {@link rememberL2Record} / {@link forgetL2Record}.
+   */
+  private l2RecordChangeSeqs = new Map<string, number>();
 
   /**
    * Tenant KeyBag fingerprint observed at the time the in-memory index
@@ -2283,7 +2292,35 @@ export class BaseMindooDB implements MindooDB {
     value.set(amBinary, 4 + headerBytes.length);
 
     await store.put("doc", `${prefix}/${docId}`, value);
+    this.rememberL2Record(docId, changeSeq, flushKey);
+  }
+
+  /**
+   * Record that the L2 cache holds `docId` at `changeSeq` (with the given
+   * `changeSeq:automergeHeads` fingerprint). Marks the metadata checkpoint
+   * dirty when the persisted per-doc changeSeq moved, so the next flush
+   * carries it (flush-before-evict writes records outside a flush).
+   */
+  private rememberL2Record(
+    docId: string,
+    changeSeq: number,
+    flushKey: string,
+  ): void {
     this.lastFlushedDocState.set(docId, flushKey);
+    if (this.l2RecordChangeSeqs.get(docId) !== changeSeq) {
+      this.l2RecordChangeSeqs.set(docId, changeSeq);
+      this.cacheMetaDirty = true;
+      this.cacheManager?.markDirty();
+    }
+  }
+
+  /** Forget everything known about the L2 record of `docId`. */
+  private forgetL2Record(docId: string): void {
+    this.lastFlushedDocState.delete(docId);
+    if (this.l2RecordChangeSeqs.delete(docId)) {
+      this.cacheMetaDirty = true;
+      this.cacheManager?.markDirty();
+    }
   }
 
   private exportMetadataCheckpoint(): Uint8Array {
@@ -2317,6 +2354,14 @@ export class BaseMindooDB implements MindooDB {
     if (this.locallyIndexedEntryIds.size > 0) {
       checkpoint.locallyIndexedEntryIds = Array.from(
         this.locallyIndexedEntryIds,
+      );
+    }
+
+    // Additive field: older checkpoints restore an empty map, which makes
+    // the warmer read each record header once (the previous behavior).
+    if (this.l2RecordChangeSeqs.size > 0) {
+      checkpoint.l2RecordChangeSeqs = Object.fromEntries(
+        this.l2RecordChangeSeqs,
       );
     }
 
@@ -2395,6 +2440,19 @@ export class BaseMindooDB implements MindooDB {
             )
           : [],
       );
+      this.l2RecordChangeSeqs.clear();
+      if (
+        checkpoint.l2RecordChangeSeqs &&
+        typeof checkpoint.l2RecordChangeSeqs === "object"
+      ) {
+        for (const [docId, changeSeq] of Object.entries(
+          checkpoint.l2RecordChangeSeqs as Record<string, unknown>,
+        )) {
+          if (typeof changeSeq === "number") {
+            this.l2RecordChangeSeqs.set(docId, changeSeq);
+          }
+        }
+      }
       this.lastReconciledKeyBagFingerprint =
         typeof checkpoint.keyBagFingerprint === "string"
           ? checkpoint.keyBagFingerprint
@@ -2548,6 +2606,20 @@ export class BaseMindooDB implements MindooDB {
       const docPrefix = `${prefix}/`;
       const allOwnedKeys = docIds.filter((id) => id.startsWith(docPrefix));
 
+      // The persisted per-doc L2 state must not outlive its record (a
+      // record lost outside this instance would otherwise be skipped by the
+      // warmer forever).
+      if (this.l2RecordChangeSeqs.size > 0) {
+        const ownedDocIds = new Set(
+          allOwnedKeys.map((key) => key.slice(docPrefix.length)),
+        );
+        for (const docId of Array.from(this.l2RecordChangeSeqs.keys())) {
+          if (!ownedDocIds.has(docId)) {
+            this.forgetL2Record(docId);
+          }
+        }
+      }
+
       if (this.restoreToL2) {
         // L2-only restore: leave L1 empty; let lazy reads via
         // tryLoadFromL2 promote individual docs as they are needed. We
@@ -2612,8 +2684,17 @@ export class BaseMindooDB implements MindooDB {
               const docId = batch[i].slice(docPrefix.length);
               await store.delete("doc", batch[i]);
               this.docCache.delete(docId);
-              this.lastFlushedDocState.delete(docId);
+              this.forgetL2Record(docId);
               continue;
+            }
+            // Legacy checkpoints lack the per-doc L2 state; the header
+            // just read provides it for free.
+            if (!this.l2RecordChangeSeqs.has(deserialized.internal.id)) {
+              this.rememberL2Record(
+                deserialized.internal.id,
+                deserialized.persistedChangeSeq,
+                `${deserialized.persistedChangeSeq}:${deserialized.persistedHeads.join(",")}`,
+              );
             }
             await this.storeCachedDocument(deserialized.internal);
             restoredDocs++;
@@ -3648,7 +3729,7 @@ export class BaseMindooDB implements MindooDB {
   private async purgeMaterializedDocument(docId: string): Promise<void> {
     this.docCache.delete(docId);
     this.dirtyDocIds.delete(docId);
-    this.lastFlushedDocState.delete(docId);
+    this.forgetL2Record(docId);
     this.automergeHashToEntryId.delete(docId);
     this.forgetScannedEntryMetadata(docId);
     // Plaintext summary values must not outlive the purge either.
@@ -4077,6 +4158,7 @@ export class BaseMindooDB implements MindooDB {
     this.indexLookupStaleFrom = null;
     this.docCache.clear();
     this.lastFlushedDocState.clear();
+    this.l2RecordChangeSeqs.clear();
     this.automergeHashToEntryId.clear();
     this.clearScannedEntryMetadata();
     this.processedEntryIds = [];
@@ -13593,7 +13675,7 @@ export class BaseMindooDB implements MindooDB {
       );
       try {
         await store.delete("doc", key);
-        this.lastFlushedDocState.delete(docId);
+        this.forgetL2Record(docId);
       } catch (deleteError) {
         this.logger.warn(
           `Failed to evict corrupt L2 record for ${docId}: ${deleteError}`,
@@ -13623,7 +13705,7 @@ export class BaseMindooDB implements MindooDB {
       // L2 record is orphaned. Drop and fall through.
       try {
         await store.delete("doc", key);
-        this.lastFlushedDocState.delete(docId);
+        this.forgetL2Record(docId);
       } catch (deleteError) {
         this.logger.warn(
           `Failed to evict orphaned L2 record for ${docId}: ${deleteError}`,
@@ -13638,8 +13720,9 @@ export class BaseMindooDB implements MindooDB {
     if (persistedChangeSeq === currentChangeSeq) {
       // Seed the flush-skip fingerprint with the state just read from L2 so
       // the next periodic flush doesn't rewrite an identical record.
-      this.lastFlushedDocState.set(
+      this.rememberL2Record(
         docId,
+        persistedChangeSeq,
         `${persistedChangeSeq}:${Automerge.getHeads(internal.doc).join(",")}`,
       );
       await this.storeCachedDocument(internal);
@@ -13742,9 +13825,11 @@ export class BaseMindooDB implements MindooDB {
    * First waits until the changefeed consumers (summary buffer, an
    * enabled full-text index) have caught up: they materialize every
    * changed document anyway, so running next to them would do the same
-   * work twice. Then walks a snapshot of the in-memory document index and
-   * skips every doc that is in L1 or whose L2 record is already at the
-   * current changeSeq (checked from the record header, no deserialization).
+   * work twice. Then walks the visible documents whose L2 record is not
+   * known to be at the current changeSeq (see {@link l2RecordChangeSeqs},
+   * persisted across restarts, so a pass after a small sync only visits
+   * what changed). It skips every doc that is in L1 or turns out current
+   * (record header check for docs with unknown state, no deserialization).
    * For the rest it calls {@link tryLoadFromL2}. That path either:
    *
    *  - hits L2 fresh and just promotes the doc to L1, or
@@ -13877,20 +13962,34 @@ export class BaseMindooDB implements MindooDB {
     };
     this.warmerProgress = {
       processed: 0,
-      total: this.index.length,
+      // Unknown until the consumers caught up and the pass is planned.
+      total: 0,
       phase: "warming",
     };
     await this.awaitChangefeedConsumersForWarmer(signal);
     if (signal.aborted) {
-      emitProgress({ processed: 0, total: this.index.length, phase: "cancelled" });
+      emitProgress({ processed: 0, total: 0, phase: "cancelled" });
       return;
     }
 
-    // Snapshot the docId list so concurrent index updates don't shift
-    // our iteration mid-pass. Iterating the index directly would also
-    // work but a snapshot makes the loop's behavior easier to reason
-    // about under sync activity.
-    const docIds = this.index.map((entry) => entry.docId);
+    // Snapshot the docs that may need work, so concurrent index updates
+    // don't shift our iteration mid-pass. Docs whose L2 record is known to
+    // be at the current changeSeq are left out up front: after a small sync
+    // the pass (and its progress total) covers only what actually changed
+    // instead of the whole database. Docs held in L1 are left out as well:
+    // loads and changes mark them dirty, so the next flush (or
+    // flush-before-evict) persists them anyway. Unknown docs (legacy
+    // checkpoint) stay in and are checked against their record header below.
+    const docIds: string[] = [];
+    for (const entry of this.index) {
+      if (
+        entry.accessState === "visible" &&
+        this.l2RecordChangeSeqs.get(entry.docId) !== entry.changeSeq &&
+        !this.docCache.has(entry.docId)
+      ) {
+        docIds.push(entry.docId);
+      }
+    }
     const total = docIds.length;
 
     // Progress snapshot is replaced (not mutated in place) so polled
@@ -13899,7 +13998,7 @@ export class BaseMindooDB implements MindooDB {
     this.warmerProgress = { processed: 0, total, phase: "warming" };
 
     if (total === 0) {
-      this.logger.debug("Warmer: nothing to warm, index is empty.");
+      this.logger.debug("Warmer: nothing to warm, every L2 record is current.");
       emitProgress({ processed: 0, total: 0, phase: "done" });
       return;
     }
@@ -14007,9 +14106,9 @@ export class BaseMindooDB implements MindooDB {
 
   /**
    * Whether L2 already holds this document at its current changeSeq, so
-   * the warmer can skip it without deserializing. Answered from
-   * {@link lastFlushedDocState} for records written in this session,
-   * otherwise from the record header (no Automerge load).
+   * the warmer can skip it without deserializing. Answered from the
+   * persisted {@link l2RecordChangeSeqs}; only when that has no entry for
+   * the doc (legacy checkpoint) from the record header (no Automerge load).
    */
   private async isL2RecordCurrent(docId: string): Promise<boolean> {
     const indexEntryIdx = this.getDocIndexPosition(docId);
@@ -14022,10 +14121,12 @@ export class BaseMindooDB implements MindooDB {
       return false;
     }
     const currentChangeSeq = entry.changeSeq;
-    const flushed = this.lastFlushedDocState.get(docId);
-    if (flushed !== undefined) {
-      return flushed.startsWith(`${currentChangeSeq}:`);
+    const knownChangeSeq = this.l2RecordChangeSeqs.get(docId);
+    if (knownChangeSeq !== undefined) {
+      return knownChangeSeq === currentChangeSeq;
     }
+    // Unknown (checkpoint from before the per-doc state was persisted):
+    // read the record header once and remember the answer.
     try {
       const bytes = await store.get("doc", `${this.getCachePrefix()}/${docId}`);
       if (!bytes) {
@@ -14039,8 +14140,9 @@ export class BaseMindooDB implements MindooDB {
       ) {
         return false;
       }
-      this.lastFlushedDocState.set(
+      this.rememberL2Record(
         docId,
+        currentChangeSeq,
         `${currentChangeSeq}:${header.automergeHeads.join(",")}`,
       );
       return true;
