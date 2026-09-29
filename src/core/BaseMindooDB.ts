@@ -912,6 +912,19 @@ export class BaseMindooDB implements MindooDB {
    * flushed to L2 under the new changeSeq) as if it were current.
    */
   private docEntryGeneration: Map<string, number> = new Map();
+  /**
+   * Ids of entries this instance wrote itself (local writes) that the next
+   * {@link syncStoreChanges} run has not consumed yet. Local writes update
+   * the index directly but do not advance the processed-entry cursor, so
+   * that run (at the latest on the next open) re-reads them as "new". For a
+   * cached doc that is a no-op; for an uncached one the metadata-first path
+   * used to force a changeSeq bump, re-emitting unchanged documents to every
+   * changefeed consumer (summary, views, full-text) and invalidating their
+   * L2 records. Entries listed here are known to be indexed already, so the
+   * bump is only taken when the recomputed index state actually differs.
+   * Persisted in the metadata checkpoint (the restart case).
+   */
+  private locallyIndexedEntryIds: Set<string> = new Set();
   private cacheMetaDirty: boolean = false;
   /**
    * Per-document fingerprint (`changeSeq:automergeHeads`) of the state last
@@ -2299,6 +2312,14 @@ export class BaseMindooDB implements MindooDB {
       checkpoint.processedEntryIds = this.processedEntryIds;
     }
 
+    // Additive field: older checkpoints restore an empty set (the next
+    // syncStoreChanges then re-emits those local writes once, as before).
+    if (this.locallyIndexedEntryIds.size > 0) {
+      checkpoint.locallyIndexedEntryIds = Array.from(
+        this.locallyIndexedEntryIds,
+      );
+    }
+
     // Persist the KeyBag fingerprint observed at the last reconciliation
     // so the next restore can decide whether to skip the visibility
     // metadata scan. `null` is acceptable - older checkpoints simply
@@ -2367,6 +2388,13 @@ export class BaseMindooDB implements MindooDB {
       if (checkpoint.processedEntryIds) {
         this.processedEntryIds = checkpoint.processedEntryIds;
       }
+      this.locallyIndexedEntryIds = new Set(
+        Array.isArray(checkpoint.locallyIndexedEntryIds)
+          ? checkpoint.locallyIndexedEntryIds.filter(
+              (id: unknown): id is string => typeof id === "string",
+            )
+          : [],
+      );
       this.lastReconciledKeyBagFingerprint =
         typeof checkpoint.keyBagFingerprint === "string"
           ? checkpoint.keyBagFingerprint
@@ -3074,6 +3102,18 @@ export class BaseMindooDB implements MindooDB {
       this.indexLookup.set(this.index[i].docId, i);
     }
     this.indexLookupStaleFrom = null;
+  }
+
+  /**
+   * Write entries created by this instance to the docs store. The callers
+   * index the affected documents right away (see
+   * {@link locallyIndexedEntryIds}).
+   */
+  private async putLocalEntries(entries: StoreEntry[]): Promise<void> {
+    await this.store.putEntries(entries);
+    for (const entry of entries) {
+      this.locallyIndexedEntryIds.add(entry.id);
+    }
   }
 
   /**
@@ -4041,6 +4081,7 @@ export class BaseMindooDB implements MindooDB {
     this.clearScannedEntryMetadata();
     this.processedEntryIds = [];
     this.processedEntryCursor = null;
+    this.locallyIndexedEntryIds.clear();
     this.nextChangeSeq = 1;
     this.cacheMetaDirty = true;
     this.cacheManager?.markDirty();
@@ -4312,8 +4353,13 @@ export class BaseMindooDB implements MindooDB {
               // Force the re-emit only when the batch contains actual replay
               // entries (create/change/delete/undelete): a snapshot-only batch
               // changes nothing observable and may keep the idempotent skip.
-              const batchHasReplayEntries = docLifecycleEntries.some((e) =>
-                this.isDocumentReplayEntry(e),
+              // Replay entries this instance wrote itself are already indexed
+              // (the local write bumped changeSeq), so they only re-emit when
+              // the recomputed state differs.
+              const batchHasReplayEntries = docLifecycleEntries.some(
+                (e) =>
+                  this.isDocumentReplayEntry(e) &&
+                  !this.locallyIndexedEntryIds.has(e.id),
               );
               this.updateIndex(
                 docId,
@@ -4461,6 +4507,9 @@ export class BaseMindooDB implements MindooDB {
     // avoid growing an unbounded in-memory id list.
     if (!this.supportsCursorScan(this.store)) {
       this.processedEntryIds.push(...newEntryMetadata.map((em) => em.id));
+    }
+    for (const entryMeta of newEntryMetadata) {
+      this.locallyIndexedEntryIds.delete(entryMeta.id);
     }
     this.processedEntryCursor = nextCursor;
     this.cacheMetaDirty = true;
@@ -5309,7 +5358,7 @@ export class BaseMindooDB implements MindooDB {
       allEntries.push(...preparedDoc.entries);
     }
     if (allEntries.length > 0) {
-      await this.store.putEntries(allEntries);
+      await this.putLocalEntries(allEntries);
     }
 
     for (const { index, internalDoc } of prepared) {
@@ -5752,7 +5801,7 @@ export class BaseMindooDB implements MindooDB {
     };
 
     // Store entry
-    await this.store.putEntries([fullEntry]);
+    await this.putLocalEntries([fullEntry]);
 
     // Register automerge hash -> entry ID mapping
     this.registerAutomergeHashMapping(docId, automergeHash, entryId);
@@ -9267,7 +9316,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
 
-    await this.store.putEntries(prepared.map((p) => p.fullEntry));
+    await this.putLocalEntries(prepared.map((p) => p.fullEntry));
     for (const p of prepared) {
       await this.applyLifecycleEntryLocally(p, { markDirty: false });
     }
@@ -9346,7 +9395,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPassword,
       bypassPrecheck,
     );
-    await this.store.putEntries([prepared.fullEntry]);
+    await this.putLocalEntries([prepared.fullEntry]);
     await this.applyLifecycleEntryLocally(prepared, { markDirty: true });
   }
 
@@ -12055,7 +12104,7 @@ export class BaseMindooDB implements MindooDB {
       });
     }
 
-    await this.store.putEntries(entries);
+    await this.putLocalEntries(entries);
 
     internalDoc.doc = newDoc;
     internalDoc.lastModified = now;
@@ -12327,7 +12376,7 @@ export class BaseMindooDB implements MindooDB {
             : undefined,
         );
 
-      await this.store.putEntries([snapshotEntry]);
+      await this.putLocalEntries([snapshotEntry]);
       this.writesSinceSnapshotCheck.set(docId, 0);
       this.logger.debug(
         `Created snapshot for document ${docId} with ${headHashes.length} heads and ${changesSinceSnapshot} changes since previous snapshot`,
@@ -17044,7 +17093,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPassword: signing?.signingKeyPassword,
       attachmentRefs: this.collectAttachmentRefs(newDoc),
     });
-    await this.store.putEntries([entry]);
+    await this.putLocalEntries([entry]);
     this.registerAutomergeHashMapping(
       docId,
       Automerge.decodeChange(changeBytes).hash,
