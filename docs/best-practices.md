@@ -901,6 +901,65 @@ regression-debugging launches without any time-travel code of its own.
 App-defined views (`createViewNavigator`) require the `views` capability on every
 database they reference, and can only span databases already mapped to the app.
 
+### 8.5 Offer operations to AI agents
+
+Apps can offer their own operations to AI agents through Haven
+(`session.agent.registerTools`, see the App SDK README, "Agent tools"). Haven
+exposes them to the browser's agent interface (WebMCP) as `<appKey>_<name>`
+next to its own `haven_*` tools. What the agent sees is a list of names,
+descriptions and JSON Schemas — nothing else. These rules decide whether an
+agent uses them well:
+
+- **Domain operations, not clicks.** `tasks_complete(taskId)`, not
+  `click_done_button`. A tool does one thing a user would ask for and leaves the
+  UI consistent afterwards.
+- **A small public model, not the storage model.** Name fields as users think of
+  them (`assignee`, `due`, `fill`), hide internal fields, encrypted payloads and
+  CRDT details. Never expose the Automerge API to agents.
+- **Ids from tools, never labels.** Every tool that takes an id says which tool
+  returns it ("taskId from todo_tasks_search"). Validate it and answer
+  `NOT_FOUND` with `requiredAction`, so the agent recovers on its own.
+- **Search before act.** Offer a search or list tool for every kind of thing the
+  other tools take ids for. Combine exact criteria (summary-buffer `query`
+  filters, [§4](#4-querying-summary-first)) with free text (the full-text
+  index), and return the ids plus enough context to choose (title, parent,
+  status). If several hits fit, the agent must ask the user — say so in the
+  description.
+- **Coarse, deterministic tools for computation.** Let the app compute ("sum
+  effort per project this month"); do not make the model add up rows. Small
+  local models cope with three well-described calls, not with twenty.
+- **Batch and select.** Prefer one call with a list (`updates: [...]`) or a
+  selector (`depth: 1`, `branchOf`, `status`) over one call per item.
+- **Results say what changed.** Return ids, new values and, where it matters, a
+  version, not just `ok`. Errors use the codes `NOT_FOUND`, `INVALID_INPUT`,
+  `INVALID_STATE`, `STATE_CHANGED`, `NOT_ALLOWED`, `FAILED`, with the path of
+  the bad input.
+- **One tool call, one undo step.** If the app has undo, group a tool's writes
+  so the user can take the whole agent action back at once.
+- **Mark what needs a human.** `consequentialHint` on sending, sharing,
+  deleting and anything that widens who can read data — Haven then asks the
+  user itself. `readOnlyHint` on reads. `untrustedContentHint` when results
+  carry text other people wrote: it is data, not instructions, and may contain
+  prompt injection.
+- **Local data is local.** Results reflect this device's replica. If the app
+  knows sync state, say it, so an agent does not claim "nothing is open" from a
+  stale copy.
+- **Bounded output.** Cap list sizes, summarise long notes, report
+  `truncated` and how to read more (`fromNodeId`, `offset`). An agent's context
+  is the scarcest resource.
+- **Small, semantic context.** `setContext` with the open document, view and
+  selection — what "this" refers to — not UI state such as scroll positions or
+  open dialogs.
+- **Files by reference.** Hand files to Haven with `agent.provideFile` and take
+  imports with `agent.takeFile`; never put file bytes into results.
+- **Keep the set small and dynamic.** Twenty well-chosen tools beat sixty.
+  Register document-specific tools only when a document is open, and replace
+  the set when that changes.
+
+Agents only see an app's tools after the user switched agent tools on in Haven
+and allowed that app; a definition cannot request it. Build the tools anyway:
+they cost nothing until the user opts in.
+
 ---
 
 ## 9. Semantics and Invariants
