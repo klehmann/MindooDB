@@ -139,6 +139,11 @@ import {
   formatDocumentConflictPath,
 } from "./DocumentConflictAnalysis";
 import { planAttachmentReadByWalkingMetadata } from "./appendonlystores/AttachmentReadPlanner";
+import { guardStoreAgainstPurgedDocuments } from "./appendonlystores/purgedDocumentGuard";
+import {
+  purgeDocumentHistoryFromStores,
+  type DocumentHistoryPurgeOutcome,
+} from "./appendonlystores/purgeDocumentHistory";
 import {
   generateDocEntryId,
   computeContentHash,
@@ -3750,6 +3755,60 @@ export class BaseMindooDB implements MindooDB {
         );
       }
     }
+  }
+
+  /**
+   * Physically purge a document's history from this database (see
+   * {@link MindooDB.purgeDocumentHistory}).
+   */
+  public async purgeDocumentHistory(docId: string): Promise<DocumentHistoryPurgeOutcome> {
+    this.assertWritable("purgeDocumentHistory");
+    const outcome = await purgeDocumentHistoryFromStores(
+      { docsStore: this.store, attachmentStore: this.attachmentStore },
+      docId,
+    );
+    await this.forgetPurgedDocument(docId);
+    // Open time-travel snapshots and persisted snapshot caches hold their own
+    // plaintext copies of the document. Skipped on a repeated purge (callers
+    // re-apply all purge requests on every directory sync), which would
+    // otherwise wipe every snapshot cache each time.
+    if (outcome.docEntriesPurged > 0 || outcome.attachmentChunksPurged > 0) {
+      await this.tenant.forgetPurgedDocumentInSnapshots(this.store.getId(), docId);
+    }
+    return outcome;
+  }
+
+  /**
+   * Drop everything this instance derived from a document whose store entries
+   * were purged: the L1/L2 caches, summary values and full-text tokens (via
+   * {@link purgeMaterializedDocument}), and the live index entry, which turns
+   * into a deleted tombstone so changefeed consumers and views remove the
+   * document. Safe to call on time-travel snapshots and when nothing is known
+   * about the document.
+   *
+   * @internal Called by {@link purgeDocumentHistory} and the tenant.
+   */
+  async forgetPurgedDocument(docId: string): Promise<void> {
+    await this.purgeMaterializedDocument(docId);
+    const position = this.getDocIndexPosition(docId);
+    // Already a tombstone (soft-deleted earlier, or purged before): views have
+    // removed it, and bumping it again on every repeated purge would only
+    // churn the changefeed.
+    if (position !== undefined && !this.index[position].isDeleted) {
+      const existing = this.index[position];
+      this.updateIndex(
+        docId,
+        Math.max(existing.lastModified, semanticNow()),
+        true,
+        existing.decryptionKeyId,
+        existing.accessState,
+        false,
+        false,
+        true,
+      );
+    }
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
   }
 
   /**
@@ -17330,8 +17389,20 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<SyncResult> {
     this.assertWritable("pullChangesFrom");
     const storeKind = options?.storeKind ?? StoreKind.docs;
-    const localStore = this.getStoreForKind(storeKind);
     const remoteStore = this.resolveStore(remote, storeKind);
+    // Entries of documents purged by an admin-signed request are refused on the
+    // way in, so a replica that has not executed the purge yet cannot hand the
+    // erased history back (docs/accesscontrol.md §13). Never applied to the
+    // directory, which carries the purge requests themselves.
+    const dbId = this.store.getId();
+    const localStore =
+      dbId === "directory"
+        ? this.getStoreForKind(storeKind)
+        : guardStoreAgainstPurgedDocuments(
+            this.getStoreForKind(storeKind),
+            () => this.tenant.getPurgedDocumentIds(dbId),
+            this.logger,
+          );
 
     if (
       localStore.getId() !== remoteStore.getId() ||

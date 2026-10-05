@@ -610,33 +610,59 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       return;
     }
     
-    // Remove each entry and decrement content reference counts
-    for (const id of docEntryIds) {
+    const purgedCount = docEntryIds.size;
+    this.removeEntries([...docEntryIds]);
+
+    this.logger.info(`Purged ${purgedCount} entries for document ${docId}`);
+  }
+
+  /**
+   * Delete specific entries by id, keeping every other entry of their
+   * documents. Content bytes are released only when no remaining entry
+   * references them (content is deduplicated by hash).
+   */
+  async deleteEntriesById(entryIds: string[]): Promise<number> {
+    return this.removeEntries(entryIds);
+  }
+
+  /**
+   * Remove entries plus their doc-index slots, and release content whose last
+   * reference they held. Unknown ids are ignored. Returns how many were removed.
+   */
+  private removeEntries(entryIds: Iterable<string>): number {
+    let removed = 0;
+    for (const id of [...entryIds]) {
       const metadata = this.entries.get(id);
-      if (metadata) {
-        // Decrement ref count; clean up content when no longer referenced
-        const newCount =
-          (this.contentRefCount.get(metadata.contentHash) || 1) - 1;
-        if (newCount <= 0) {
-          this.contentStore.delete(metadata.contentHash);
-          this.contentRefCount.delete(metadata.contentHash);
-          this.logger.debug(
-            `Cleaned up orphaned content ${metadata.contentHash.substring(0, 8)}...`
-          );
-        } else {
-          this.contentRefCount.set(metadata.contentHash, newCount);
-        }
-        this.entries.delete(id);
+      if (!metadata) {
+        continue;
       }
+      // Decrement ref count; clean up content when no longer referenced
+      const newCount =
+        (this.contentRefCount.get(metadata.contentHash) || 1) - 1;
+      if (newCount <= 0) {
+        this.contentStore.delete(metadata.contentHash);
+        this.contentRefCount.delete(metadata.contentHash);
+        this.logger.debug(
+          `Cleaned up orphaned content ${metadata.contentHash.substring(0, 8)}...`
+        );
+      } else {
+        this.contentRefCount.set(metadata.contentHash, newCount);
+      }
+      this.entries.delete(id);
+      const docEntries = this.docIndex.get(metadata.docId);
+      if (docEntries) {
+        docEntries.delete(id);
+        if (docEntries.size === 0) {
+          this.docIndex.delete(metadata.docId);
+        }
+      }
+      removed++;
     }
-    
-    // Remove document from docIndex
-    this.docIndex.delete(docId);
-    
-    // Invalidate sorted entries cache
-    this.sortedEntriesCache = null;
-    
-    this.logger.info(`Purged ${docEntryIds.size} entries for document ${docId}`);
+    if (removed > 0) {
+      // Invalidate sorted entries cache
+      this.sortedEntriesCache = null;
+    }
+    return removed;
   }
   
   /**

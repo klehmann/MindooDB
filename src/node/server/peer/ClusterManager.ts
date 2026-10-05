@@ -61,6 +61,10 @@ export interface ClusterManagerDeps {
    * (or when `iroh.enabled` is off). Replicators treat that as a reconnect.
    */
   getIrohStreamIO?: () => IrohStreamIO | null;
+  /** See {@link PeerReplicatorHost.getPurgedDocIds}. */
+  getPurgedDocIds?(tenantId: string, dbId: string): ReadonlySet<string>;
+  /** See {@link PeerReplicatorHost.onDirectoryPulled}. */
+  onDirectoryPulled?(tenantId: string): Promise<void>;
   logger?: Logger;
 }
 
@@ -139,6 +143,8 @@ export class ClusterManager {
           this.deps.getLocalStore(tenantId, dbId, storeKind),
         eventBus: this.deps.eventBus,
         getIrohStreamIO: this.deps.getIrohStreamIO,
+        getPurgedDocIds: this.deps.getPurgedDocIds?.bind(this.deps),
+        onDirectoryPulled: this.deps.onDirectoryPulled?.bind(this.deps),
         logger: this.logger,
       });
       this.replicators.set(name, replicator);

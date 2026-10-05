@@ -41,6 +41,7 @@ import type {
   ServerTrustedWitnessResolver,
 } from "../../appendonlystores/network/ServerNetworkContentAddressedStore";
 import { PurgedDocRegistry } from "./PurgedDocRegistry";
+import { purgeDocumentHistoryFromStores } from "../../core/appendonlystores/purgeDocumentHistory";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import { Ed25519WitnessProvider } from "../../core/accesscontrol/timestamp/Ed25519WitnessProvider";
@@ -1386,6 +1387,14 @@ export class TenantManager {
     return tenant.storeFactory.getStore(dbId, storeKind);
   }
 
+  /**
+   * Documents purged from `dbId` on this server (the persistent purge
+   * registry). Peer pull replication refuses their entries.
+   */
+  getPurgedDocIds(tenantId: string, dbId: string): ReadonlySet<string> {
+    return this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
+  }
+
   /** The (lazily-loaded, cached) purge registry for a tenant. */
   private getPurgedDocRegistry(tenantId: string): PurgedDocRegistry {
     const normalizedId = tenantId.toLowerCase();
@@ -1465,6 +1474,8 @@ export class TenantManager {
     if (requests.length === 0) return;
 
     const registry = this.getPurgedDocRegistry(normalizedId);
+    const purgedNow = new Set<string>();
+    const touchedDbIds = new Set<string>();
     for (const request of requests) {
       if (registry.isRequestProcessed(request.purgeRequestDocId)) {
         continue;
@@ -1482,25 +1493,51 @@ export class TenantManager {
         // kept regardless of per-store outcome so re-pushes are rejected even
         // if one store had nothing to purge.
         registry.recordPurgedDoc(request.dbId, docId);
-        for (const storeKind of [StoreKind.docs, StoreKind.attachments]) {
-          try {
-            const store = await this.getStore(
-              normalizedId,
-              request.dbId,
-              storeKind,
-            );
-            await store.purgeDocHistory(docId);
-          } catch (error) {
-            console.error(
-              `[TenantManager] executePendingPurges: failed to purge ${docId} in ${normalizedId}/${request.dbId}/${storeKind}:`,
-              error,
-            );
-          }
-        }
+        await this.purgeDocumentFromDatabase(normalizedId, request.dbId, docId);
+        purgedNow.add(`${request.dbId}\u0000${docId}`);
+        touchedDbIds.add(request.dbId);
       }
       registry.markRequestProcessed(request.purgeRequestDocId);
       console.log(
         `[TenantManager] Executed purge request ${request.purgeRequestDocId} (${request.docIds.length} doc(s)) for ${normalizedId}/${request.dbId}`,
+      );
+    }
+
+    // A purge keeps attachment chunks that another document's history still
+    // references (an in-place copy). Once that document is purged as well,
+    // the earlier purge's leftovers are unreferenced: sweep them now, since a
+    // processed request is never executed again.
+    for (const dbId of touchedDbIds) {
+      for (const docId of registry.getPurgedDocIds(dbId)) {
+        if (!purgedNow.has(`${dbId}\u0000${docId}`)) {
+          await this.purgeDocumentFromDatabase(normalizedId, dbId, docId);
+        }
+      }
+    }
+  }
+
+  /**
+   * Purge one document from a database's docs and attachment stores. Attachment
+   * chunks still referenced by another document are kept (see
+   * `purgeDocumentHistory.ts`). Failures are logged, never thrown.
+   */
+  private async purgeDocumentFromDatabase(
+    tenantId: string,
+    dbId: string,
+    docId: string,
+  ): Promise<void> {
+    try {
+      await purgeDocumentHistoryFromStores(
+        {
+          docsStore: await this.getStore(tenantId, dbId, StoreKind.docs),
+          attachmentStore: await this.getStore(tenantId, dbId, StoreKind.attachments),
+        },
+        docId,
+      );
+    } catch (error) {
+      console.error(
+        `[TenantManager] executePendingPurges: failed to purge ${docId} in ${tenantId}/${dbId}:`,
+        error,
       );
     }
   }

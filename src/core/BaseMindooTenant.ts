@@ -1397,6 +1397,51 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   /**
+   * Ids of the documents an admin-signed purge request removed from `dbId`
+   * (see {@link MindooTenant.getPurgedDocumentIds}). Read from the local
+   * directory; empty for the directory itself.
+   */
+  async getPurgedDocumentIds(dbId: string): Promise<ReadonlySet<string>> {
+    const purged = new Set<string>();
+    if (dbId === "directory") {
+      return purged;
+    }
+    const directory = await this.openDirectory();
+    for (const request of await directory.getRequestedDocHistoryPurges()) {
+      if (request.dbId !== dbId || !Array.isArray(request.docIds)) {
+        continue;
+      }
+      for (const docId of request.docIds) {
+        if (typeof docId === "string" && docId.length > 0) {
+          purged.add(docId);
+        }
+      }
+    }
+    return purged;
+  }
+
+  /**
+   * After a document's history was purged from a live database: scrub it from
+   * every open time-travel snapshot of that database, and drop the persisted
+   * snapshot caches, which hold materialized plaintext, summaries and full-text
+   * tokens of the document as of their cutoffs. Those caches are rebuilt on the
+   * next open.
+   *
+   * @internal Called by {@link BaseMindooDB.purgeDocumentHistory}.
+   */
+  async forgetPurgedDocumentInSnapshots(dbId: string, docId: string): Promise<void> {
+    const snapshotKeyPrefix = `${dbId}::tt:`;
+    for (const [key, db] of this.databaseCache) {
+      if (key.startsWith(snapshotKeyPrefix)) {
+        await (db as BaseMindooDB).forgetPurgedDocument(docId);
+      }
+    }
+    for (const cutoff of await this.listTimeTravelCacheDates(dbId)) {
+      await this.purgeTimeTravelCache(dbId, cutoff);
+    }
+  }
+
+  /**
    * Remove every persisted cache record of a time-travel snapshot (see
    * {@link MindooTenant.purgeTimeTravelCache}). Deletes all records whose id
    * equals or lives under the cutoff-scoped prefix
