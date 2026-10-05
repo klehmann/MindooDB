@@ -4658,6 +4658,23 @@ export interface DocumentConflictBaseValue {
 /**
  * Result of reconstructing one branch-local document state for a selected DAG head.
  */
+/** What {@link MindooDB.restoreDocumentToEntry} changed. */
+export interface DocumentRestoreResult {
+  docId: string;
+  /** The DAG entry whose state was restored. */
+  restoredFromEntryId: string;
+  /** True when the document was deleted and had to be undeleted first. */
+  undeleted: boolean;
+  /** Top-level fields set back to their earlier value. */
+  changedFields: string[];
+  /** Top-level fields the earlier state did not have, now removed. */
+  removedFields: string[];
+  /** Attachments put back (missing, or changed since). */
+  restoredAttachmentIds: string[];
+  /** Attachments added after that state, now removed. */
+  removedAttachmentIds: string[];
+}
+
 export interface DocumentDagBranchMaterializationResult {
   docId: string;
   headEntryId: string;
@@ -5077,6 +5094,30 @@ export interface MindooDB {
     docId: string,
     headEntryId: string
   ): Promise<DocumentDagBranchMaterializationResult | null>;
+
+  /**
+   * Restore a document to the state it had at a DAG entry, as
+   * {@link materializeDocumentBranchAtEntry} shows it — for example to undo
+   * vandalism. Nothing is erased: the restore is one new signed change on top
+   * of the current heads (plus an undelete first when the document is
+   * deleted now), so the replaced state stays in the history and the restore
+   * itself can be undone the same way.
+   *
+   * Fields that differ are set to their earlier values, fields the earlier
+   * state lacks are removed, and the attachment set is put back as it was:
+   * attachments added since are removed, and earlier attachment states are
+   * re-pointed at their stored chunks (no re-upload, ids unchanged). Fields
+   * starting with `_` are managed by MindooDB and left alone. The change goes
+   * through the same access checks as {@link changeDoc}.
+   *
+   * @throws when no state exists at that entry, when the document is deleted
+   *   in that state, or when an attachment chunk it needs was purged.
+   */
+  restoreDocumentToEntry(
+    docId: string,
+    entryId: string,
+    options?: ChangeOptions
+  ): Promise<DocumentRestoreResult>;
 
   /**
    * Reconstruct the branch-local document state for a selected head within a

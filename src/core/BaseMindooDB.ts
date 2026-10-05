@@ -34,6 +34,7 @@ import {
   DocumentDagAnalysisTimestamp,
   DocumentDagAnalysisResult,
   DocumentDagBranchMaterializationResult,
+  DocumentRestoreResult,
   DocumentDagDecodedChangeSummary,
   DocumentDagEntryDetails,
   DocumentConflictAnalysisEvent,
@@ -7461,6 +7462,35 @@ export class BaseMindooDB implements MindooDB {
     docId: string,
     headEntryId: string,
   ): Promise<DocumentDagBranchMaterializationResult | null> {
+    const materialized = await this.materializeBranchInternalAtEntry(docId, headEntryId);
+    if (!materialized) {
+      return null;
+    }
+    const { plan, internalDoc } = materialized;
+    return {
+      docId,
+      headEntryId: plan.headEntryId,
+      headCreatedAt: plan.headCreatedAt,
+      headCreatedByPublicKey: plan.headCreatedByPublicKey,
+      snapshotEntryId: plan.snapshotEntryId,
+      entryIdsApplied: [...plan.entryIdsToApply],
+      branchEntryIds: [...plan.branchEntryIds],
+      doc: this.wrapDocument(internalDoc),
+    };
+  }
+
+  /**
+   * {@link materializeDocumentBranchAtEntry} without the public wrapper: the
+   * raw Automerge state (counters, immutable strings and dates intact), for
+   * callers that copy it into another document.
+   */
+  private async materializeBranchInternalAtEntry(
+    docId: string,
+    headEntryId: string,
+  ): Promise<{
+    plan: NonNullable<ReturnType<typeof computeBranchMaterializationPlan>>;
+    internalDoc: InternalDoc;
+  } | null> {
     const startedAt = Date.now();
     const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
     const plan = computeBranchMaterializationPlan(
@@ -7504,16 +7534,128 @@ export class BaseMindooDB implements MindooDB {
     if (!internalDoc) {
       return null;
     }
+    return { plan, internalDoc };
+  }
+
+  /**
+   * Restore a document to an earlier state (see
+   * {@link MindooDB.restoreDocumentToEntry}).
+   */
+  async restoreDocumentToEntry(
+    docId: string,
+    entryId: string,
+    options: ChangeOptions = {},
+  ): Promise<DocumentRestoreResult> {
+    this.assertWritable("restoreDocumentToEntry");
+    const materialized = await this.materializeBranchInternalAtEntry(docId, entryId);
+    if (!materialized) {
+      throw new Error(
+        `restoreDocumentToEntry: no state of document ${docId} at entry ${entryId}`,
+      );
+    }
+    const { plan, internalDoc: source } = materialized;
+    if (source.isDeleted) {
+      throw new Error(
+        `restoreDocumentToEntry: document ${docId} is deleted at entry ${entryId}; delete the document instead`,
+      );
+    }
+    const sourceData = source.doc as unknown as Record<string, unknown>;
+    const sourceAttachments =
+      (sourceData._attachments as AttachmentReference[] | undefined) ?? [];
+
+    // Every chunk chain the restored state points at must still be stored
+    // (a history purge can have removed it).
+    for (const ref of sourceAttachments) {
+      const head = await this.attachmentStore.getEntryMetadata(ref.lastChunkId);
+      if (!head || head.docId !== docId) {
+        throw new Error(
+          `restoreDocumentToEntry: attachment ${ref.attachmentId} of document ${docId} is no longer stored`,
+        );
+      }
+    }
+
+    let undeleted = false;
+    let target = await this.getInternalDocumentForRestore(docId);
+    if (target.isDeleted) {
+      await this.undeleteDocument(docId, {
+        signingKeyPair: options.signingKeyPair,
+        signingKeyPassword: options.signingKeyPassword,
+        bypassAccessControlPrecheck: options.bypassAccessControlPrecheck,
+      });
+      undeleted = true;
+      target = await this.getInternalDocumentForRestore(docId);
+    }
+
+    // Compare raw Automerge values on both sides, so an unchanged counter or
+    // immutable string is not rewritten.
+    const targetData = target.doc as unknown as Record<string, unknown>;
+    const changedFields = Object.keys(sourceData).filter(
+      (key) =>
+        !key.startsWith("_") &&
+        stableValueKey(targetData[key]) !== stableValueKey(sourceData[key]),
+    );
+    const removedFields = Object.keys(targetData).filter(
+      (key) => !key.startsWith("_") && !(key in sourceData),
+    );
+    const targetAttachments =
+      (targetData._attachments as AttachmentReference[] | undefined) ?? [];
+    const restoredAttachments = sourceAttachments.filter((ref) => {
+      const now = targetAttachments.find((a) => a.attachmentId === ref.attachmentId);
+      return !now || stableValueKey(now) !== stableValueKey(ref);
+    });
+    const sourceAttachmentIds = new Set(sourceAttachments.map((ref) => ref.attachmentId));
+    const removedAttachmentIds = targetAttachments
+      .map((ref) => ref.attachmentId)
+      .filter((id) => !sourceAttachmentIds.has(id));
+
+    if (
+      changedFields.length > 0 ||
+      removedFields.length > 0 ||
+      restoredAttachments.length > 0 ||
+      removedAttachmentIds.length > 0
+    ) {
+      await this.changeDocInternal(
+        this.wrapDocument(target),
+        async (draft) => {
+          // Fields starting with "_" are managed by MindooDB; attachments are
+          // restored separately, the rest follows from the change itself.
+          const data = draft.getData() as Record<string, unknown>;
+          for (const key of changedFields) {
+            data[key] = this.hydrateTypedValues(sourceData[key]);
+          }
+          for (const key of removedFields) {
+            delete data[key];
+          }
+          for (const attachmentId of removedAttachmentIds) {
+            await draft.removeAttachment(attachmentId);
+          }
+        },
+        options.signingKeyPair,
+        options.signingKeyPassword,
+        options.bypassAccessControlPrecheck,
+        restoredAttachments,
+      );
+    }
+
     return {
       docId,
-      headEntryId: plan.headEntryId,
-      headCreatedAt: plan.headCreatedAt,
-      headCreatedByPublicKey: plan.headCreatedByPublicKey,
-      snapshotEntryId: plan.snapshotEntryId,
-      entryIdsApplied: [...plan.entryIdsToApply],
-      branchEntryIds: [...plan.branchEntryIds],
-      doc: this.wrapDocument(internalDoc),
+      restoredFromEntryId: plan.headEntryId,
+      undeleted,
+      changedFields,
+      removedFields,
+      restoredAttachmentIds: restoredAttachments.map((ref) => ref.attachmentId),
+      removedAttachmentIds,
     };
+  }
+
+  /** The current document, deleted or not, for {@link restoreDocumentToEntry}. */
+  private async getInternalDocumentForRestore(docId: string): Promise<InternalDoc> {
+    const internalDoc =
+      this.getCachedDocument(docId) ?? (await this.loadDocumentInternal(docId));
+    if (!internalDoc) {
+      throw new DocumentNotFoundError(docId);
+    }
+    return internalDoc;
   }
 
   async materializeDocumentAtHeads(
@@ -10542,6 +10684,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
     bypassPrecheck?: boolean,
+    restoredAttachments: AttachmentReference[] = [],
   ): Promise<void> {
     this.assertWritable("changeDoc");
     const docId = doc.getId();
@@ -11008,7 +11151,8 @@ export class BaseMindooDB implements MindooDB {
             pendingAttachmentAdditions.length > 0 ||
             pendingAttachmentRemovals.size > 0 ||
             pendingAttachmentAppends.size > 0 ||
-            pendingAttachmentTextUpdates.size > 0
+            pendingAttachmentTextUpdates.size > 0 ||
+            restoredAttachments.length > 0
           ) {
             // Initialize _attachments array if needed
             if (!automergeDoc._attachments) {
@@ -11039,6 +11183,20 @@ export class BaseMindooDB implements MindooDB {
                 attachment.lastChunkId = lastChunkId;
                 attachment.size += sizeIncrease;
               }
+            }
+
+            // Re-point at earlier attachment states whose chunks are already
+            // stored (restoreDocumentToEntry). Kept out of the pending
+            // additions on purpose: a failed change cleans up the pending
+            // additions' chunks, and these chunks are part of the history.
+            for (const ref of restoredAttachments) {
+              const index = attachments.findIndex(
+                (a) => a.attachmentId === ref.attachmentId,
+              );
+              if (index >= 0) {
+                attachments.splice(index, 1);
+              }
+              attachments.push(JSON.parse(JSON.stringify(ref)));
             }
 
             // Add new attachments
@@ -17572,4 +17730,31 @@ export class BaseMindooDB implements MindooDB {
       restoreAuthOverride();
     }
   }
+}
+
+/**
+ * Comparable serialization of a document value: Automerge counters, immutable
+ * strings, dates and byte arrays included, key order ignored. Used to restore
+ * only the fields that actually differ.
+ */
+function stableValueKey(value: unknown): string {
+  const normalize = (input: unknown): unknown => {
+    if (input === null || input === undefined) return input ?? null;
+    if (input instanceof Uint8Array) return { $bytes: Array.from(input) };
+    if (input instanceof Date) return { $date: input.getTime() };
+    if (typeof input !== "object") return input;
+    if (input instanceof Automerge.Counter) return { $counter: input.value };
+    const immutable = (Automerge as any).ImmutableString;
+    if (immutable && input instanceof immutable) {
+      return { $atomic: String((input as { val: string }).val) };
+    }
+    if (Array.isArray(input)) return input.map(normalize);
+    const record = input as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(record).sort()) {
+      out[key] = normalize(record[key]);
+    }
+    return out;
+  };
+  return JSON.stringify(normalize(value));
 }
