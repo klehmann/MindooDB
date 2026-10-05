@@ -5,7 +5,7 @@
  * no join-response URI required.
  */
 
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../../core/utils/idGeneration";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
 import type { DeviceTenantDelivery } from "../../core/types";
@@ -52,7 +52,7 @@ export class DeviceDiscoveryService {
     if (!trimmed) {
       throw new Error("signingPublicKey is required");
     }
-    const challenge = uuidv7();
+    const challenge = generateRandomUuid();
     const now = Date.now();
     this.challenges.set(challenge, {
       challenge,

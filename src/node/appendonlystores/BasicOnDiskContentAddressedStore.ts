@@ -62,7 +62,7 @@ import {
   StoreIdBloomSummary,
   StoreHead,
 } from "../../core/appendonlystores/types";
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../../core/utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
@@ -336,7 +336,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
    * `store-epoch.json`; regenerated on store reset and on legacy
    * receipt-order migration so peers discard stale persisted scan cursors.
    */
-  private storeEpoch: string = uuidv7();
+  private storeEpoch: string = generateRandomUuid();
 
   /** Current phase and progress of the index build (building / ready). */
   private indexStatus: StoreIndexBuildStatus;
@@ -1072,7 +1072,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
         this.logger.warn(`Failed to read store epoch, creating a new one: ${String(err)}`);
       }
     }
-    this.storeEpoch = uuidv7();
+    this.storeEpoch = generateRandomUuid();
     await this.writeFileAtomic(this.storeEpochPath, JSON.stringify({ epoch: this.storeEpoch }));
   }
 

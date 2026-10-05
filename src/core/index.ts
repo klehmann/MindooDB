@@ -363,6 +363,8 @@ export {
   generateDepsFingerprint,
   generateAttachmentChunkId,
   generateUniqueAttachmentChunkId,
+  generateAttachmentId,
+  generateRandomUuid,
   generateFileUuid7,
   generateChunkUuid7,
   parseDocEntryId,

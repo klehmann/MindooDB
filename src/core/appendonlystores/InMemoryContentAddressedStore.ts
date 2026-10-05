@@ -17,7 +17,7 @@ import {
   StoreIdBloomSummary,
   StoreHead,
 } from "./types";
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "./AttachmentReadPlanner";
 import { createIdBloomSummary } from "./bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "./MaterializationPlanner";
@@ -62,7 +62,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
    * Cursor-lineage epoch (see {@link StoreHead}). Regenerated whenever the
    * store is cleared so peers holding a persisted scan cursor re-scan.
    */
-  private storeEpoch: string = uuidv7();
+  private storeEpoch: string = generateRandomUuid();
   
   /** Reference count per contentHash for O(1) orphan detection during purge */
   private contentRefCount: Map<string, number> = new Map();
@@ -663,7 +663,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     this.sortedEntriesCache = null;
     this.nextReceiptOrder = 1;
     // New cursor lineage: peers must discard persisted scan cursors.
-    this.storeEpoch = uuidv7();
+    this.storeEpoch = generateRandomUuid();
   }
 
   /**

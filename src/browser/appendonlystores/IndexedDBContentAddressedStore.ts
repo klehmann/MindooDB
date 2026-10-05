@@ -35,7 +35,7 @@ import type {
   StoreHead,
   OpenStoreOptions,
 } from "../../core/appendonlystores/types";
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../../core/utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
 import { scanDocScopedEntries } from "../../core/appendonlystores/scanUtils";
@@ -1161,7 +1161,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
         ? epochRecord.value
         : null;
       if (!epoch) {
-        epoch = uuidv7();
+        epoch = generateRandomUuid();
         await reqToPromise(
           metaOS.put({ key: STORE_EPOCH_KEY, value: epoch } satisfies MetaStringValueRecord)
         );

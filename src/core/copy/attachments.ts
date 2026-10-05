@@ -1,7 +1,7 @@
 /**
  * Attachment chunk copying.
  *
- * Chunk entry ids embed the document id (`<docId>_a_<fileUuid7>_<chunkUuid>`)
+ * Chunk entry ids embed the document id (`<docId>_a_<attachmentId>_<chunkObjectId>`)
  * and a document's payload points at them by id through
  * `_attachments[].lastChunkId`. That forces two different strategies depending
  * on whether the copy crosses a store boundary:

@@ -9,7 +9,7 @@
  * write as a peer.
  */
 
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../../../core/utils/idGeneration";
 import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
 import type { TrustedServer } from "../types";
 
@@ -83,7 +83,7 @@ export class PeerAuthService {
       throw new Error("Unknown peer");
     }
 
-    const challenge = uuidv7();
+    const challenge = generateRandomUuid();
     this.challenges.set(challenge, {
       challenge,
       serverName: server.name,

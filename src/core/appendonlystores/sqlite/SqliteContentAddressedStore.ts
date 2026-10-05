@@ -1,4 +1,4 @@
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../../utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "../AttachmentReadPlanner";
 import { createIdBloomSummary } from "../bloom";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../MaterializationPlanner";
@@ -72,7 +72,7 @@ function deserializeMetadata(json: string): StoreEntryMetadata {
 export class SqliteContentAddressedStore implements ContentAddressedStore {
   private ready: Promise<void>;
   private nextReceiptOrder = 1;
-  private storeEpoch = uuidv7();
+  private storeEpoch = generateRandomUuid();
   private readonly logger: Logger;
   private readonly indexingEnabled: boolean;
 
@@ -377,7 +377,7 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
     await this.ready;
     await this.backend.clearAll();
     this.nextReceiptOrder = 1;
-    this.storeEpoch = uuidv7();
+    this.storeEpoch = generateRandomUuid();
     await this.persistCounters();
   }
 

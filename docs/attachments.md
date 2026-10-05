@@ -33,7 +33,7 @@ Each store entry has two distinct identifiers:
 
 - **`id`**: Unique identifier (primary key) for the entry
   - For doc_* entries: `<docId>_d_<depsFingerprint>_<automergeHash>`
-  - For attachment_chunk: `<docId>_a_<fileUuid7>_<chunkObjectId>`
+  - For attachment_chunk: `<docId>_a_<attachmentId>_<chunkObjectId>`
   
 - **`contentHash`**: SHA-256 hash of the encrypted data
   - Used for storage-level deduplication
@@ -55,11 +55,11 @@ This separation enables:
 
 **Attachment Chunk ID Format:**
 ```
-<docId>_a_<fileUuid7>_<chunkObjectId>
+<docId>_a_<attachmentId>_<chunkObjectId>
 ```
 - `docId`: ID of the document this attachment belongs to (see above)
 - `a`: Type marker for "attachment"
-- `fileUuid7`: UUID7 for the whole file (same for all chunks)
+- `attachmentId`: ID of the whole file (same for all chunks); a MongoDB-style ObjectId for new attachments, a UUID7 for attachments written by older MindooDB versions
 - `chunkObjectId`: MongoDB-style ObjectId for this specific chunk (leading timestamp bytes, so chunk IDs sort chronologically)
 
 #### 3. MindooDB Two-Store Architecture
@@ -145,7 +145,7 @@ interface AttachmentReference {
       fileName: "report.pdf",
       mimeType: "application/pdf",
       size: 5242880,
-      lastChunkId: "<docId>_a_<file-uuid7>_<chunk-object-id>",
+      lastChunkId: "<docId>_a_<attachment-id>_<chunk-object-id>",
       decryptionKeyId: "default",
       createdAt: 1234567890,
       createdBy: "-----BEGIN PUBLIC KEY-----..."
