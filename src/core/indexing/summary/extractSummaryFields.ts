@@ -353,9 +353,8 @@ export function buildSummaryEvaluationDoc(
  * Whether a field path is covered by the summary configuration, i.e.
  * queries against it can be answered from the summary buffer.
  *
- * Top-level fields (and nested paths below them) are covered by
- * auto-include; nested paths are additionally covered when explicitly
- * included. Excluded paths are never covered. Note that coverage is a
+ * Top-level fields are covered by auto-include; nested paths only when they
+ * (or a prefix of them) are explicitly included. Excluded paths are never covered. Note that coverage is a
  * configuration-level statement — an individual document may still lack a
  * value (missing field, non-scalar value, or above the size cap).
  */
@@ -386,7 +385,11 @@ export function isFieldPathCovered(path: string, config: ResolvedSummaryConfig):
     if (isEncryptedConventionField(topLevel)) {
       return false;
     }
-    return true;
+    // Auto-include only stores scalars and scalar arrays, so nothing below a
+    // top-level field is ever in the summary. Claiming such a path would make
+    // a query answer from the summary and silently match nothing; only an
+    // explicit include (above) covers nested paths.
+    return path === topLevel;
   }
   return false;
 }

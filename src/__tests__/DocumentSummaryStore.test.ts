@@ -93,7 +93,9 @@ describe("summary field extraction", () => {
     const config = resolveSummaryConfig({ include: ["meta.owner"], exclude: ["secret"] });
 
     expect(isFieldPathCovered("name", config)).toBe(true);
-    expect(isFieldPathCovered("name.sub", config)).toBe(true);
+    // Auto-include stores top-level scalars only: nothing below them is in the summary.
+    expect(isFieldPathCovered("name.sub", config)).toBe(false);
+    expect(isFieldPathCovered("meta.other", config)).toBe(false);
     expect(isFieldPathCovered("meta.owner", config)).toBe(true);
     expect(isFieldPathCovered("meta.owner.deep", config)).toBe(true);
     expect(isFieldPathCovered("secret", config)).toBe(false);
