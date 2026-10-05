@@ -100,6 +100,100 @@ describe("MindooDB.restoreDocumentToEntry", () => {
     expect((await db.getDocument(doc.getId())).getData().stats).toEqual({ views: 7 });
   }, 60000);
 
+  it("restores rich text with its marks and blocks, plain text, dates and atomic strings", async () => {
+    const created = new Date("2026-01-02T03:04:05.000Z");
+    const doc = await db.createDocument({
+      initialValues: {
+        due: created,
+        code: MindooValue.atomic("ABC-1"),
+        note: "plain collaborative text",
+        meta: { inner: "nested text" },
+      },
+    });
+    const goodSpans = [
+      { type: "block" as const, value: { type: "paragraph", parents: [], attrs: {} } },
+      { type: "text" as const, value: "Hello " },
+      { type: "text" as const, value: "bold", marks: { bold: true } },
+      { type: "text" as const, value: " world" },
+    ];
+    await db.applyRichTextPatch(await db.getDocument(doc.getId()), {
+      path: ["body"],
+      spans: goodSpans,
+    });
+    await db.applyTextPatch(await db.getDocument(doc.getId()), {
+      path: ["meta", "inner"],
+      edits: [{ index: 0, deleteCount: 0, insert: ">> " }],
+    });
+    const good = await headEntryId(db, doc.getId());
+    const goodBody = await db.getRichTextSnapshot(await db.getDocument(doc.getId()), ["body"]);
+
+    // The vandal keeps the text but drops the formatting, edits text in place
+    // and replaces the typed values with plain ones.
+    await db.applyRichTextPatch(await db.getDocument(doc.getId()), {
+      path: ["body"],
+      spans: [
+        { type: "block", value: { type: "heading", parents: [], attrs: { level: 1 } } },
+        { type: "text", value: "Hello bold world" },
+      ],
+    });
+    await db.applyTextPatch(await db.getDocument(doc.getId()), {
+      path: ["note"],
+      edits: [{ index: 0, deleteCount: 5, insert: "spam" }],
+    });
+    await db.changeDoc(await db.getDocument(doc.getId()), (draft) => {
+      const data = draft.getData();
+      data.due = "tomorrow";
+      data.code = "abc-1";
+      data.meta = { inner: "gone" };
+    });
+
+    const result = await db.restoreDocumentToEntry(doc.getId(), good);
+
+    expect(result.changedFields.sort()).toEqual(["body", "code", "due", "meta", "note"]);
+    const restoredDoc = await db.getDocument(doc.getId());
+    const restoredBody = await db.getRichTextSnapshot(restoredDoc, ["body"]);
+    expect(restoredBody.spans).toEqual(goodBody.spans);
+    const data = restoredDoc.getData() as Record<string, unknown>;
+    expect(data.note).toBe("plain collaborative text");
+    expect(data.meta).toEqual({ inner: ">> nested text" });
+    expect(data.due).toEqual(created);
+    expect(data.due).toBeInstanceOf(Date);
+    expect(data.code).toBe("ABC-1");
+
+    // Still collaborative text afterwards: a positional text patch applies.
+    await db.applyTextPatch(restoredDoc, {
+      path: ["note"],
+      edits: [{ index: 0, deleteCount: 0, insert: "a " }],
+    });
+    expect((await db.getDocument(doc.getId())).getData().note).toBe("a plain collaborative text");
+    // And the atomic string is still atomic: text patches refuse it.
+    await expect(
+      db.applyTextPatch(await db.getDocument(doc.getId()), {
+        path: ["code"],
+        edits: [{ index: 0, deleteCount: 0, insert: "x" }],
+      }),
+    ).rejects.toThrow();
+  }, 60000);
+
+  it("restores formatting that was the only thing changed", async () => {
+    const doc = await db.createDocument();
+    await db.applyRichTextPatch(await db.getDocument(doc.getId()), {
+      path: ["body"],
+      spans: [{ type: "text", value: "important", marks: { bold: true } }],
+    });
+    const good = await headEntryId(db, doc.getId());
+    await db.applyRichTextPatch(await db.getDocument(doc.getId()), {
+      path: ["body"],
+      spans: [{ type: "text", value: "important" }],
+    });
+
+    const result = await db.restoreDocumentToEntry(doc.getId(), good);
+
+    expect(result.changedFields).toEqual(["body"]);
+    const body = await db.getRichTextSnapshot(await db.getDocument(doc.getId()), ["body"]);
+    expect(body.spans).toEqual([{ type: "text", value: "important", marks: { bold: true } }]);
+  }, 60000);
+
   it("puts the attachment set back without re-uploading", async () => {
     const bytes = payloadBytes(700);
     const doc = await db.createDocument();

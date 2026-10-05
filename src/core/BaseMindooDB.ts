@@ -7587,12 +7587,17 @@ export class BaseMindooDB implements MindooDB {
     }
 
     // Compare raw Automerge values on both sides, so an unchanged counter or
-    // immutable string is not rewritten.
-    const targetData = target.doc as unknown as Record<string, unknown>;
+    // immutable string is not rewritten, and text compares with its marks and
+    // block markers rather than just its characters.
+    const sourceDoc = source.doc;
+    const targetDoc = target.doc;
+    const targetData = targetDoc as unknown as Record<string, unknown>;
     const changedFields = Object.keys(sourceData).filter(
       (key) =>
         !key.startsWith("_") &&
-        stableValueKey(targetData[key]) !== stableValueKey(sourceData[key]),
+        (!(key in targetData) ||
+          this.restoreValueKey(targetDoc, [key], targetData[key]) !==
+            this.restoreValueKey(sourceDoc, [key], sourceData[key])),
     );
     const removedFields = Object.keys(targetData).filter(
       (key) => !key.startsWith("_") && !(key in sourceData),
@@ -7618,14 +7623,8 @@ export class BaseMindooDB implements MindooDB {
         this.wrapDocument(target),
         async (draft) => {
           // Fields starting with "_" are managed by MindooDB; attachments are
-          // restored separately, the rest follows from the change itself.
-          const data = draft.getData() as Record<string, unknown>;
-          for (const key of changedFields) {
-            data[key] = this.hydrateTypedValues(sourceData[key]);
-          }
-          for (const key of removedFields) {
-            delete data[key];
-          }
+          // restored separately. Field values are written in the mutation
+          // below, at Automerge level.
           for (const attachmentId of removedAttachmentIds) {
             await draft.removeAttachment(attachmentId);
           }
@@ -7634,6 +7633,15 @@ export class BaseMindooDB implements MindooDB {
         options.signingKeyPassword,
         options.bypassAccessControlPrecheck,
         restoredAttachments,
+        (automergeDoc) => {
+          const data = automergeDoc as unknown as Record<string, unknown>;
+          for (const key of changedFields) {
+            this.restoreValueAt(automergeDoc, sourceDoc, data, key, [key]);
+          }
+          for (const key of removedFields) {
+            delete data[key];
+          }
+        },
       );
     }
 
@@ -7646,6 +7654,136 @@ export class BaseMindooDB implements MindooDB {
       restoredAttachmentIds: restoredAttachments.map((ref) => ref.attachmentId),
       removedAttachmentIds,
     };
+  }
+
+  /** True for a nested map: not a list, and none of the Automerge/JS scalar objects. */
+  private isPlainRestoreRecord(value: unknown): value is Record<string, unknown> {
+    return (
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      !(value instanceof Date) &&
+      !(value instanceof Uint8Array) &&
+      !this.isAutomergeCounter(value) &&
+      !this.isAutomergeImmutableString(value)
+    );
+  }
+
+  /**
+   * Comparable key of a value inside an Automerge document. Text is keyed by
+   * its spans, so a change of formatting or block structure counts as a
+   * change even when the characters are the same.
+   */
+  private restoreValueKey(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    path: AutomergeTypes.Prop[],
+    value: unknown,
+  ): string {
+    if (typeof value === "string") {
+      return JSON.stringify({ $text: (Automerge as any).spans(doc, path) });
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((entry, index) => this.restoreValueKey(doc, [...path, index], entry)).join(",")}]`;
+    }
+    if (this.isPlainRestoreRecord(value)) {
+      return `{${Object.keys(value)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${this.restoreValueKey(doc, [...path, key], value[key])}`)
+        .join(",")}}`;
+    }
+    return stableValueKey(value);
+  }
+
+  /**
+   * Inside an `Automerge.change`: make `parent[key]` (at `path`) equal to the
+   * value at the same path in `sourceDoc`. Maps are merged key by key, text is
+   * brought over with `updateSpans` (characters, marks and block markers,
+   * as a diff, so it stays collaborative text), lists and scalars are
+   * replaced. Counters, dates, immutable strings and bytes keep their type.
+   */
+  private restoreValueAt(
+    targetDoc: MindooDocPayload,
+    sourceDoc: AutomergeTypes.Doc<MindooDocPayload>,
+    parent: Record<string, unknown> | unknown[],
+    key: string | number,
+    path: AutomergeTypes.Prop[],
+  ): void {
+    const sourceValue = this.readValueAtPath(
+      sourceDoc as MindooDocPayload,
+      path as Array<string | number>,
+    );
+    const container = parent as Record<string | number, unknown>;
+    if (typeof sourceValue === "string") {
+      if (typeof container[key] !== "string") {
+        container[key] = "";
+      }
+      this.restoreTextAt(targetDoc, sourceDoc, path);
+      return;
+    }
+    if (this.isPlainRestoreRecord(sourceValue)) {
+      if (!this.isPlainRestoreRecord(container[key])) {
+        container[key] = {};
+      }
+      const targetRecord = container[key] as Record<string, unknown>;
+      for (const childKey of Object.keys(sourceValue)) {
+        const childPath = [...path, childKey];
+        if (
+          !(childKey in targetRecord) ||
+          this.restoreValueKey(targetDoc as AutomergeTypes.Doc<MindooDocPayload>, childPath, targetRecord[childKey]) !==
+            this.restoreValueKey(sourceDoc, childPath, sourceValue[childKey])
+        ) {
+          this.restoreValueAt(targetDoc, sourceDoc, targetRecord, childKey, childPath);
+        }
+      }
+      for (const childKey of Object.keys(targetRecord)) {
+        if (!(childKey in sourceValue)) {
+          delete targetRecord[childKey];
+        }
+      }
+      return;
+    }
+    container[key] = this.hydrateTypedValues(sourceValue);
+    if (Array.isArray(sourceValue)) {
+      // The copied list holds plain strings; bring their marks along.
+      this.forEachTextPath(sourceValue, path, (textPath) =>
+        this.restoreTextAt(targetDoc, sourceDoc, textPath),
+      );
+    }
+  }
+
+  private forEachTextPath(
+    value: unknown,
+    path: AutomergeTypes.Prop[],
+    visit: (path: AutomergeTypes.Prop[]) => void,
+  ): void {
+    if (typeof value === "string") {
+      visit(path);
+    } else if (Array.isArray(value)) {
+      value.forEach((entry, index) => this.forEachTextPath(entry, [...path, index], visit));
+    } else if (this.isPlainRestoreRecord(value)) {
+      for (const key of Object.keys(value)) {
+        this.forEachTextPath(value[key], [...path, key], visit);
+      }
+    }
+  }
+
+  /** Copy a text field's spans (characters, marks, blocks) from `sourceDoc`. */
+  private restoreTextAt(
+    targetDoc: MindooDocPayload,
+    sourceDoc: AutomergeTypes.Doc<MindooDocPayload>,
+    path: AutomergeTypes.Prop[],
+  ): void {
+    const spans = (Automerge as any).spans(sourceDoc, path);
+    try {
+      (Automerge as any).updateSpans(targetDoc, path, spans);
+    } catch (error) {
+      if (!this.isRichTextUpdateSpansBoundsError(error)) {
+        throw error;
+      }
+      // Same recovery as applyRichTextPatch: start the field from scratch.
+      this.setJsonValueAtPath(targetDoc, path as Array<string | number>, "");
+      (Automerge as any).updateSpans(targetDoc, path, spans);
+    }
   }
 
   /** The current document, deleted or not, for {@link restoreDocumentToEntry}. */
@@ -10685,6 +10823,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPassword?: string,
     bypassPrecheck?: boolean,
     restoredAttachments: AttachmentReference[] = [],
+    internalMutation?: (automergeDoc: MindooDocPayload) => void,
   ): Promise<void> {
     this.assertWritable("changeDoc");
     const docId = doc.getId();
@@ -11140,6 +11279,10 @@ export class BaseMindooDB implements MindooDB {
           for (const key of pendingDeletions) {
             delete (automergeDoc as any)[key];
           }
+
+          // Engine-internal edits that need the raw Automerge document, e.g.
+          // restoreDocumentToEntry's rich-text spans.
+          internalMutation?.(automergeDoc);
 
           for (const { path, delta } of pendingCounterIncrements) {
             this.incrementCounterAtPath(automergeDoc, path, delta);
