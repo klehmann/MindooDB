@@ -1,4 +1,4 @@
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../../utils/idGeneration";
 import type { CryptoAdapter } from "../../crypto/CryptoAdapter";
 import type { MindooTenantDirectory } from "../../types";
 import type {
@@ -218,7 +218,7 @@ export class AuthenticationService {
 
   /** Persist a fresh challenge and return its string. */
   private storeChallenge(fields: { username?: string; signingPublicKey?: string }): string {
-    const challenge = uuidv7();
+    const challenge = generateRandomUuid();
     const now = Date.now();
     const authChallenge: AuthChallenge = {
       challenge,

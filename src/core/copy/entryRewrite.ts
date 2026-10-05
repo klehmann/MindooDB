@@ -29,7 +29,7 @@ export function isDocumentDagEntry(entry: StoreEntryMetadata): boolean {
  * Re-point an entry id from one document to another.
  *
  * Every entry id — document (`<docId>_d_<depsFingerprint>_<automergeHash>`) and
- * attachment chunk (`<docId>_a_<fileUuid7>_<chunkUuid>`) alike — begins with the
+ * attachment chunk (`<docId>_a_<attachmentId>_<chunkObjectId>`) alike — begins with the
  * document id followed by `_`, so re-homing an entry is a prefix swap.
  *
  * This is exact rather than a shortcut, and it is what makes a replay cheap:

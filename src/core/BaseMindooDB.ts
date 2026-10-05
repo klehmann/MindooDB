@@ -16,7 +16,6 @@ import {
 } from "./storeEntryTime";
 // Import types from WASM package (types are compatible across implementations)
 import type * as AutomergeTypes from "@automerge/automerge/slim";
-import { v7 as uuidv7 } from "uuid";
 import {
   MindooDB,
   CreateOptions,
@@ -147,7 +146,8 @@ import {
   generateDocId,
   matchesDocIdPrefix,
   generateUniqueAttachmentChunkId,
-  generateFileUuid7,
+  generateAttachmentId,
+  generateRandomUuid,
 } from "./utils/idGeneration";
 import { semanticNow } from "./utils/timeSource";
 import {
@@ -12401,7 +12401,7 @@ export class BaseMindooDB implements MindooDB {
         encryptedPayload,
         this.getSubtle(),
       );
-      const pseudoSnapshotHash = `snapshot-${uuidv7()}`;
+      const pseudoSnapshotHash = `snapshot-${generateRandomUuid()}`;
       const entryId = await generateDocEntryId(
         docId,
         pseudoSnapshotHash,
@@ -16486,7 +16486,7 @@ export class BaseMindooDB implements MindooDB {
 
     const store = this.getEffectiveAttachmentStore();
     const currentUser = await this.tenant.getCurrentUserId();
-    const attachmentId = generateFileUuid7();
+    const attachmentId = generateAttachmentId();
 
     // Chunk the file
     const chunks: StoreEntry[] = [];
@@ -16697,7 +16697,7 @@ export class BaseMindooDB implements MindooDB {
 
     const store = this.getEffectiveAttachmentStore();
     const currentUser = await this.tenant.getCurrentUserId();
-    const attachmentId = generateFileUuid7();
+    const attachmentId = generateAttachmentId();
     let totalSize = 0;
     let prevChunkId: string | null = null;
     let lastChunkId: string = "";

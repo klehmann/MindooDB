@@ -149,7 +149,7 @@ interface StoreEntry extends StoreEntryMetadata {
   - **Parent linkage**:
     - `depsFingerprint` commits the *set* of Automerge deps into the ID (hash-of-dep-set)
     - `dependencyIds` carries the actual parent entry IDs
-- **Attachment chunks** (`attachment_chunk`): `<docId>_a_<fileUuid7>_<chunkObjectId>`
+- **Attachment chunks** (`attachment_chunk`): `<docId>_a_<attachmentId>_<chunkObjectId>`
   - `dependencyIds` is `[prevChunkId]` (or `[]` for the first chunk), forming a chain suitable for `resolveDependencies()`.
 
 **Performance Optimization:**

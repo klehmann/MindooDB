@@ -8,8 +8,6 @@
  * - Blockchain-like integrity for document entries
  */
 
-import { v7 as uuidv7 } from 'uuid';
-
 /** MongoDB-style ObjectId length: 12 bytes → 24 lowercase hex chars. */
 export const OBJECT_ID_LENGTH = 24;
 
@@ -22,6 +20,20 @@ function randomBytes(length: number): Uint8Array {
   for (let i = 0; i < length; i++) {
     bytes[i] = Math.floor(Math.random() * 256);
   }
+  return bytes;
+}
+
+/**
+ * Cryptographically secure random bytes. Unlike {@link randomBytes} there is
+ * no `Math.random` fallback: callers use these for nonces and ids that must
+ * not be guessable.
+ */
+function secureRandomBytes(length: number): Uint8Array {
+  if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function") {
+    throw new Error("crypto.getRandomValues is not available");
+  }
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
   return bytes;
 }
 
@@ -170,21 +182,22 @@ export async function generateDepsFingerprint(
 
 /**
  * Generate an attachment chunk ID.
- * Format: <docId>_a_<fileUuid7>_<objectId>
+ * Format: <docId>_a_<attachmentId>_<objectId>
  *
  * @param docId The document ID this attachment belongs to
- * @param fileUuid7 The UUID7 for the whole file (same for all chunks)
+ * @param attachmentId The id of the whole file (same for all chunks): an
+ *   ObjectId for new attachments, a UUID7 for older ones
  * @param chunkObjectId Optional 24-char ObjectId for this chunk. If omitted, a
  *   fresh ObjectId is generated.
  * @returns The generated chunk ID
  */
 export function generateAttachmentChunkId(
   docId: string,
-  fileUuid7: string,
+  attachmentId: string,
   chunkObjectId?: string
 ): string {
   const chunkId = chunkObjectId ?? generateObjectId();
-  return `${docId}_a_${fileUuid7}_${chunkId}`;
+  return `${docId}_a_${attachmentId}_${chunkId}`;
 }
 
 /**
@@ -198,18 +211,19 @@ export function generateAttachmentChunkId(
  * expected to be scoped to a single attachment write.
  *
  * @param docId The document ID this attachment belongs to
- * @param fileUuid7 The UUID7 for the whole file (same for all chunks)
+ * @param attachmentId The id of the whole file (same for all chunks): an
+ *   ObjectId for new attachments, a UUID7 for older ones
  * @param usedCaseFoldedIds Case-folded ids already used in this write; the
  *   returned id's folded form is added to the set.
  * @returns The generated chunk ID
  */
 export function generateUniqueAttachmentChunkId(
   docId: string,
-  fileUuid7: string,
+  attachmentId: string,
   usedCaseFoldedIds: Set<string>,
 ): string {
   for (;;) {
-    const id = generateAttachmentChunkId(docId, fileUuid7);
+    const id = generateAttachmentChunkId(docId, attachmentId);
     const folded = id.toLowerCase();
     if (!usedCaseFoldedIds.has(folded)) {
       usedCaseFoldedIds.add(folded);
@@ -219,9 +233,55 @@ export function generateUniqueAttachmentChunkId(
 }
 
 /**
+ * Generate a new attachment id: a MongoDB-style ObjectId (24-char lowercase
+ * hex), like document ids. Call once per file and reuse it for all chunks.
+ *
+ * Attachments written before this change carry a UUID7 here instead; both
+ * formats parse via {@link parseAttachmentChunkId}.
+ */
+export function generateAttachmentId(): string {
+  return generateObjectId();
+}
+
+/**
+ * Generate a random RFC 4122 version 4 UUID from `crypto.getRandomValues`.
+ * Used for single-use auth challenges and store epochs, where the value only
+ * has to be unique and unguessable, not sortable.
+ *
+ * Deliberately not `crypto.randomUUID()`: that is missing in insecure browser
+ * contexts and in some React Native crypto polyfills.
+ */
+export function generateRandomUuid(): string {
+  const b = secureRandomBytes(16);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = bytesToHex(b);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * Generate an RFC 9562 version 7 UUID (48-bit Unix-ms timestamp + random).
+ */
+function uuidv7(): string {
+  const b = secureRandomBytes(16);
+  const ms = Date.now();
+  b[0] = Math.floor(ms / 2 ** 40) & 0xff;
+  b[1] = Math.floor(ms / 2 ** 32) & 0xff;
+  b[2] = (ms >>> 24) & 0xff;
+  b[3] = (ms >>> 16) & 0xff;
+  b[4] = (ms >>> 8) & 0xff;
+  b[5] = ms & 0xff;
+  b[6] = (b[6] & 0x0f) | 0x70;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = bytesToHex(b);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
  * Generate a new file UUID7.
- * This should be called once per file and reused for all chunks of that file.
- * 
+ *
+ * @deprecated MindooDB now uses {@link generateAttachmentId} (ObjectId) for new
+ *   attachments. Kept for API compatibility.
  * @returns A new UUID7 string
  */
 export function generateFileUuid7(): string {
@@ -230,8 +290,9 @@ export function generateFileUuid7(): string {
 
 /**
  * Generate a new chunk UUID7.
- * This should be called for each chunk within a file.
- * 
+ *
+ * @deprecated Chunk ids use ObjectIds (see {@link generateAttachmentChunkId}).
+ *   Kept for API compatibility.
  * @returns A new UUID7 string
  */
 export function generateChunkUuid7(): string {
@@ -268,10 +329,11 @@ export function parseDocEntryId(id: string): {
  */
 export function parseAttachmentChunkId(id: string): {
   docId: string;
+  /** Attachment id: ObjectId for new attachments, UUID7 for older ones. */
   fileUuid7: string;
   chunkObjectId: string;
 } | null {
-  // Match: <docId>_a_<fileUuid7>_<chunkObjectId> (legacy suffixes also parse)
+  // Match: <docId>_a_<attachmentId>_<chunkObjectId> (legacy suffixes also parse)
   const match = id.match(/^(.+)_a_([^_]+)_(.+)$/);
   if (!match) return null;
   return {

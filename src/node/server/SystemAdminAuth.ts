@@ -8,7 +8,7 @@
  * the issued JWT can carry both fields for capability matching.
  */
 
-import { v7 as uuidv7 } from "uuid";
+import { generateRandomUuid } from "../../core/utils/idGeneration";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
 import {
@@ -116,7 +116,7 @@ export class SystemAdminAuthService {
       throw new Error("Unknown system admin principal");
     }
 
-    const challenge = uuidv7();
+    const challenge = generateRandomUuid();
     const now = Date.now();
 
     this.challenges.set(challenge, {

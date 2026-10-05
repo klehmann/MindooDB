@@ -1272,7 +1272,7 @@ export interface StoreEntryMetadata {
   /**
    * Unique identifier for this entry (primary key in the store).
    * - For doc_* entries: "<docId>_d_<depsFingerprint>_<automergeHash>"
-   * - For attachment_chunk: "<docId>_a_<fileUuid7>_<chunkObjectId>"
+   * - For attachment_chunk: "<docId>_a_<attachmentId>_<chunkObjectId>"
    * 
    * The structured ID format enables:
    * - Guaranteed uniqueness across documents
