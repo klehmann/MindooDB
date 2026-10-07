@@ -310,6 +310,9 @@ export class MindooDBServer {
       listDatabases: (tenantId) => this.tenantManager.listDatabases(tenantId),
       getLocalStore: (tenantId, dbId, storeKind) =>
         this.tenantManager.getStore(tenantId, dbId, storeKind),
+      getPurgedDocIds: (tenantId, dbId) =>
+        this.tenantManager.getPurgedDocIds(tenantId, dbId),
+      onDirectoryPulled: (tenantId) => this.tenantManager.executePendingPurges(tenantId),
       localRole: this.serverConfig.cluster?.role,
       getIrohStreamIO: () => this.irohEndpoint.getStreamIO(),
     });

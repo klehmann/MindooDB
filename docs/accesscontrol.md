@@ -1253,6 +1253,18 @@ also throws synchronously).
   `mdb://doc-history-purge/...` URI), but only the admin signature makes it
   effective. Use `listDocHistoryPurges()` to enumerate pending requests and
   `deleteDocHistoryPurge(requestId, ...)` to withdraw one before it is acted on.
+  Executing a request (server: `executePendingPurges`; client:
+  `MindooDB.purgeDocumentHistory()`) removes the document's docs-store entries
+  and those of its attachment chunks no other document still references: an
+  in-place copy's history keeps pointing at the source's chunks (visible in the
+  signed cleartext `attachmentRefs`), and content blobs shared through
+  deterministic attachment encryption stay while another entry uses them. On a
+  client it also drops cached documents, summary values, full-text tokens and
+  time-travel snapshots of the document. Entries of a purged document are
+  refused wherever they would be stored again: server pushes, client pulls
+  (`pullChangesFrom`, via `MindooTenant.getPurgedDocumentIds()`), server pull
+  replication (which also executes purge requests that arrive with a pulled
+  directory) and Haven's Iroh peer listener.
 
 ### 10.1 The quarantine log
 

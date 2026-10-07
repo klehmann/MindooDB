@@ -3,6 +3,7 @@ import type { KeyType } from "./keys/KeyContext";
 import type { PublicUserId, PrivateUserId } from "./userid";
 import { StoreKind } from "./appendonlystores/types";
 import type { ContentAddressedStore, OpenStoreOptions, RejectedPutEntry, StoreScanCursor } from "./appendonlystores/types";
+import type { DocumentHistoryPurgeOutcome } from "./appendonlystores/purgeDocumentHistory";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import type { EntryProvenance } from "./crypto/EntrySignature";
 import type {
@@ -1035,6 +1036,15 @@ export interface MindooTenant {
    * @return The database instance
    */
   openDB(id: string, options?: OpenDBOptions): Promise<MindooDB>;
+
+  /**
+   * Ids of the documents that admin-signed purge requests in the tenant
+   * directory removed from database `dbId` (docs/accesscontrol.md §13), as
+   * known to the local directory replica. `MindooDB.pullChangesFrom` refuses
+   * incoming entries of these documents; listeners that accept pushed entries
+   * from peers should do the same. Always empty for the directory itself.
+   */
+  getPurgedDocumentIds(dbId: string): Promise<ReadonlySet<string>>;
 
   /**
    * List the time-travel cutoff dates (epoch milliseconds, ascending) for
@@ -4887,6 +4897,26 @@ export interface MindooDB {
    * @return The content-addressed store for attachments
    */
   getAttachmentStore(): ContentAddressedStore;
+
+  /**
+   * Physically and irreversibly remove a document's history from this
+   * database on this device (docs/accesscontrol.md §13): every docs-store
+   * entry, and every attachment chunk no other document still references
+   * (an in-place copy's history can point at the source's chunks; shared
+   * content blobs stay while another entry uses them). Also drops all
+   * derived state: cached documents, summary values, full-text tokens,
+   * open time-travel snapshots and their persisted caches. The index entry
+   * becomes a deleted tombstone so views remove the document.
+   *
+   * This is the local half of an admin-signed purge request; it does not
+   * stop other replicas from sending the entries again (see
+   * {@link MindooTenant.getPurgedDocumentIds}). Not allowed in time-travel
+   * mode.
+   *
+   * @param docId The document to purge
+   * @return Counts of removed and retained entries
+   */
+  purgeDocumentHistory(docId: string): Promise<DocumentHistoryPurgeOutcome>;
 
   /**
    * Entries this device refused to materialize, grouped per document and

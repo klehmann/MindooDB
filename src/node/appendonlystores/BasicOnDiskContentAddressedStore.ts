@@ -1798,12 +1798,38 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     await this.ensureInitialized();
 
     const all = await this.listAllMetadata();
-    const toDelete = all.filter((meta) => meta.docId === docId);
+    // GDPR purge removes all metadata for one document, then drops orphaned payloads.
+    await this.deleteMetadataEntries(all.filter((meta) => meta.docId === docId));
+  }
+
+  /**
+   * Delete specific entries by id, keeping every other entry of their
+   * documents. A content blob is removed only when no remaining entry
+   * references its hash (content is deduplicated by hash).
+   */
+  async deleteEntriesById(entryIds: string[]): Promise<number> {
+    await this.ensureInitialized();
+    if (entryIds.length === 0) {
+      return 0;
+    }
+    const ids = new Set(entryIds);
+    const all = await this.listAllMetadata();
+    const toDelete = all.filter((meta) => ids.has(meta.id));
+    await this.deleteMetadataEntries(toDelete);
+    return toDelete.length;
+  }
+
+  /**
+   * Shared removal path of {@link purgeDocHistory} and
+   * {@link deleteEntriesById}: delete the metadata files, update the index,
+   * drop content blobs no remaining entry references, and append "delete"
+   * segment records so the index stays consistent across restarts.
+   */
+  private async deleteMetadataEntries(toDelete: StoreEntryMetadata[]): Promise<void> {
     if (toDelete.length === 0) {
       return;
     }
 
-    // GDPR purge removes all metadata for one document, then drops orphaned payloads.
     const deletedHashes = new Set<string>();
     const deletedIds: string[] = [];
     for (const meta of toDelete) {

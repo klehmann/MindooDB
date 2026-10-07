@@ -21,6 +21,7 @@ import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { MindooDBServer } from "../node/server/MindooDBServer";
+import { StoreKind } from "../core/types";
 import type { ContentAddressedStore, StoreEntryMetadata } from "../core/types";
 import type { ServerConfig } from "../node/server/types";
 
@@ -207,5 +208,95 @@ describe("server-side document-history purge (HTTP)", () => {
     const thirdPush = await mainDb.pushChangesTo(remoteMain);
     expect(thirdPush.cancelled).toBe(false);
     expect(thirdPush.rejectedEntries ?? []).toHaveLength(0);
+  }, 120000);
+
+  test("purges a document's attachment chunks but keeps content another document shares", async () => {
+    const cryptoAdapter = new NodeCryptoAdapter();
+    const localFactory = new BaseMindooTenantFactory(
+      new InMemoryContentAddressedStoreFactory(),
+      cryptoAdapter,
+    );
+    const tenantId = `purge-att-${Date.now()}`;
+    const adminPassword = "admin-pass";
+    const result = await localFactory.createTenant({
+      tenantId,
+      adminName: `cn=admin/o=${tenantId}`,
+      adminPassword,
+      userName: `cn=user1/o=${tenantId}`,
+      userPassword: "user-pass",
+    });
+    await result.tenant.publishToServer(baseUrl, {
+      systemAdminUser: systemAdmin,
+      systemAdminPassword: "sysadmin-pass",
+      adminUsername: result.adminUser.username,
+    });
+    const directoryDb = await result.tenant.openDB("directory");
+    const remoteDirectory = await result.tenant.connectToServer(baseUrl, "directory");
+    const pushDirectory = () =>
+      directoryDb.pushChangesTo(remoteDirectory, {
+        networkAuthOverride: { user: result.adminUser, password: adminPassword },
+      });
+    await pushDirectory();
+
+    // Two documents carrying the same bytes: deterministic attachment
+    // encryption gives them identical ciphertext, stored once.
+    const mainDb = await result.tenant.openDB("main", { attachmentConfig: { chunkSizeBytes: 128 } });
+    const bytes = new Uint8Array(900).map((_, index) => (index * 7 + 3) % 251);
+    const addDoc = async (title: string) => {
+      const doc = await mainDb.createDocument();
+      await mainDb.changeDoc(doc, async (draft) => {
+        draft.getData().title = title;
+        await draft.addAttachment(bytes, "same.bin", "application/octet-stream");
+      });
+      return doc.getId();
+    };
+    const purgedId = await addDoc("purge me");
+    const keptId = await addDoc("keep me");
+
+    const remoteMain = await result.tenant.connectToServer(baseUrl, "main");
+    const remoteAttachments = await result.tenant.connectToServer(
+      baseUrl,
+      "main",
+      StoreKind.attachments,
+    );
+    await mainDb.pushChangesTo(remoteMain);
+    await mainDb.pushChangesTo(remoteAttachments, { storeKind: StoreKind.attachments });
+
+    const keptChunks = (await entriesForDoc(mainDb.getAttachmentStore(), keptId)).filter(
+      (entry) => entry.entryType === "attachment_chunk",
+    );
+    expect(keptChunks.length).toBeGreaterThan(1);
+    expect((await entriesForDoc(remoteAttachments, purgedId)).length).toBeGreaterThan(0);
+
+    const directory = await result.tenant.openDirectory();
+    await directory.publishDocHistoryPurge!(
+      {
+        v: 1,
+        tenantId,
+        requestId: `req-att-${Date.now()}`,
+        dbId: "main",
+        docIds: [purgedId],
+        preparedByPublicKey: "",
+      },
+      result.adminUser.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+    await pushDirectory();
+
+    expect(
+      await waitFor(async () => (await entriesForDoc(remoteAttachments, purgedId)).length === 0),
+    ).toBe(true);
+    expect(await entriesForDoc(remoteMain, purgedId)).toHaveLength(0);
+
+    // The other document's chunks are all still served, payload included.
+    const served = await remoteAttachments.getEntries(keptChunks.map((entry) => entry.id));
+    expect(served).toHaveLength(keptChunks.length);
+    const local = await mainDb.getAttachmentStore().getEntries(keptChunks.map((entry) => entry.id));
+    const localById = new Map(local.map((entry) => [entry.id, entry]));
+    for (const entry of served) {
+      expect(Array.from(entry.encryptedData)).toEqual(
+        Array.from(localById.get(entry.id)!.encryptedData),
+      );
+    }
   }, 120000);
 });
