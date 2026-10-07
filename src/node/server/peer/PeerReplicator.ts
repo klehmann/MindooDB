@@ -35,13 +35,14 @@ import { ClientNetworkContentAddressedStore } from "../../../appendonlystores/ne
 import { IrohNetworkTransport } from "../../../core/appendonlystores/network/IrohNetworkTransport";
 import { isIrohLocator, parseIrohLocator } from "../../../core/appendonlystores/network/irohLocator";
 import type { IrohStreamIO } from "../../../core/appendonlystores/network/IrohStreamIO";
-import { StoreKind, type ContentAddressedStore } from "../../../core/types";
+import { DIRECTORY_DB_ID, StoreKind, type ContentAddressedStore } from "../../../core/types";
 import { NetworkError } from "../../../core/appendonlystores/network/types";
 import { IrohPeerLink } from "./IrohPeerLink";
 import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../../core/logging";
 import { createIdBloomSummary } from "../../../core/appendonlystores/bloom";
 import { rejectionClassOf } from "../../../core/appendonlystores/types";
+import { guardStoreAgainstPurgedDocuments } from "../../../core/appendonlystores/purgedDocumentGuard";
 import {
   syncEntriesBetweenStores,
   syncScanCursorKey,
@@ -96,6 +97,18 @@ export interface PeerReplicatorHost {
   eventBus: SyncEventBus;
   /** Bound Iroh endpoint for `iroh:` peer urls. Missing / null → reconnect. */
   getIrohStreamIO?: () => IrohStreamIO | null;
+  /**
+   * Documents purged from a database on this server (the purge registry).
+   * Entries of these documents are refused when pulled from the peer, the
+   * same way the server refuses them on a push (docs/accesscontrol.md §13).
+   */
+  getPurgedDocIds?(tenantId: string, dbId: string): ReadonlySet<string>;
+  /**
+   * Called after a pull brought new `directory` entries, before the tenant's
+   * other databases are mirrored: executes purge requests that arrived by
+   * replication, which no client push would otherwise trigger here.
+   */
+  onDirectoryPulled?(tenantId: string): Promise<void>;
   logger?: Logger;
 }
 
@@ -741,12 +754,38 @@ export class PeerReplicator {
     // tenant's other databases. Treating it as a tenant-level failure would let
     // one purged document stop the whole mirror.
     if (directionAllowsPull(this.direction)) {
-      const result = await this.transfer(remoteStore, localStore);
+      const getPurgedDocIds = this.host.getPurgedDocIds?.bind(this.host);
+      const pullTarget =
+        dbId === DIRECTORY_DB_ID || !getPurgedDocIds
+          ? localStore
+          : guardStoreAgainstPurgedDocuments(
+              localStore,
+              async () => getPurgedDocIds(tenantId, dbId),
+              this.logger,
+            );
+      const result = await this.transfer(remoteStore, pullTarget);
       pulled = result.transferred;
       bytes += result.bytes;
       rejected += result.rejected;
       held ||= result.held;
       deniedReason ??= result.deniedReason;
+
+      // The directory is mirrored first, so purges it carries are executed
+      // (and the registry armed) before any database they apply to.
+      if (
+        dbId === DIRECTORY_DB_ID &&
+        storeKind === StoreKind.docs &&
+        pulled > 0 &&
+        this.host.onDirectoryPulled
+      ) {
+        try {
+          await this.host.onDirectoryPulled(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Executing replicated purge requests for ${tenantId} failed: ${errorMessage(error)}`,
+          );
+        }
+      }
     }
 
     if (directionAllowsPush(this.direction)) {

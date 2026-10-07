@@ -528,6 +528,122 @@ describe("two servers replicating a shared tenant", () => {
     expect(status.peers.find((entry) => entry.name === beta.name)).toBeDefined();
   });
 
+  /** Publish an admin-signed purge request into the tenant's local directory. */
+  async function publishPurge(
+    seeded: SeededTenant,
+    tenantId: string,
+    dbId: string,
+    docIds: string[],
+  ): Promise<void> {
+    const directory = await seeded.tenant.openDirectory();
+    await directory.publishDocHistoryPurge(
+      {
+        v: 1,
+        tenantId,
+        requestId: `req-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        dbId,
+        docIds,
+        preparedByPublicKey: "",
+      },
+      seeded.adminUser.userSigningKeyPair.privateKey,
+      "admin-pass",
+    );
+  }
+
+  async function docEntryIds(
+    node: PeerNode,
+    tenantId: string,
+    dbId: string,
+    docId: string,
+  ): Promise<string[]> {
+    const store = await node.server.getTenantManager().getStore(tenantId, dbId, StoreKind.docs);
+    return (await store.findNewEntriesForDoc([], docId)).map((entry) => entry.id);
+  }
+
+  async function waitUntil(predicate: () => Promise<boolean>): Promise<boolean> {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      if (await predicate()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return predicate();
+  }
+
+  /** A tenant on both nodes whose `notes` doc exists on both. */
+  async function seedNoteOnBoth(tenantId: string) {
+    const seeded = await seedTenant([alpha, beta], tenantId);
+    await pushDb(seeded, alpha, "directory");
+    await pushDb(seeded, beta, "directory");
+    const notes = await seeded.tenant.openDB("notes");
+    const doc = await notes.createDocument();
+    await notes.changeDoc(doc, (d: any) => {
+      d.getData().title = "secret";
+    });
+    await pushDb(seeded, alpha, "notes");
+    await pushDb(seeded, beta, "notes");
+    expect((await docEntryIds(alpha, tenantId, "notes", doc.getId())).length).toBeGreaterThan(0);
+    expect((await docEntryIds(beta, tenantId, "notes", doc.getId())).length).toBeGreaterThan(0);
+    return { seeded, docId: doc.getId() };
+  }
+
+  test("a purge request that arrives by pull replication is executed", async () => {
+    // Only beta receives the request from a client. Alpha mirrors beta by pull
+    // alone, so no push ever reaches alpha that would trigger the purge.
+    const tenantId = "pull-purge-hook";
+    const { seeded, docId } = await seedNoteOnBoth(tenantId);
+    await publishPurge(seeded, tenantId, "notes", [docId]);
+    await pushDb(seeded, beta, "directory");
+    expect(
+      await waitUntil(async () => (await docEntryIds(beta, tenantId, "notes", docId)).length === 0),
+    ).toBe(true);
+
+    trust(alpha, beta, { direction: "pull" });
+    try {
+      const replicator = alpha.server.getClusterManager().getReplicator(beta.name)!;
+      await replicator.refreshIntersection();
+      const run = await replicator.syncNow({ tenantId });
+      expect(run.errors).toEqual([]);
+      expect(run.pulled).toBeGreaterThan(0);
+
+      expect(await docEntryIds(alpha, tenantId, "notes", docId)).toEqual([]);
+      expect(alpha.server.getTenantManager().getPurgedDocIds(tenantId, "notes").has(docId)).toBe(
+        true,
+      );
+    } finally {
+      trust(alpha, beta);
+    }
+  });
+
+  test("a pull from a peer that has not purged yet cannot resurrect the document", async () => {
+    // Alpha executed the purge; beta never heard of it and still holds the
+    // document. Pulling from beta must not bring the history back.
+    const tenantId = "pull-purge-guard";
+    const { seeded, docId } = await seedNoteOnBoth(tenantId);
+    await publishPurge(seeded, tenantId, "notes", [docId]);
+    await pushDb(seeded, alpha, "directory");
+    expect(
+      await waitUntil(async () => (await docEntryIds(alpha, tenantId, "notes", docId)).length === 0),
+    ).toBe(true);
+
+    trust(alpha, beta, { direction: "pull" });
+    try {
+      const replicator = alpha.server.getClusterManager().getReplicator(beta.name)!;
+      await replicator.refreshIntersection();
+      const first = await replicator.syncNow({ tenantId });
+      expect(first.errors).toEqual([]);
+      expect(first.rejected).toBeGreaterThan(0);
+      expect(first.held).toBe(0);
+      expect(await docEntryIds(alpha, tenantId, "notes", docId)).toEqual([]);
+
+      // Refused for good: the cursor moved past the entries.
+      const second = await replicator.syncNow({ tenantId });
+      expect(second.rejected).toBe(0);
+      expect(await docEntryIds(alpha, tenantId, "notes", docId)).toEqual([]);
+    } finally {
+      trust(alpha, beta);
+    }
+  });
+
   test("cluster status reports the peer, its role and its health", async () => {
     trust(alpha, beta, { role: "hub", attachments: "lazy" });
     const status = alpha.server.getClusterManager().status();
