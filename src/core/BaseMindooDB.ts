@@ -10331,12 +10331,11 @@ export class BaseMindooDB implements MindooDB {
     try {
       newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) => {
         if (patch.baseHeads && patch.baseHeads.length > 0) {
-          const result = Automerge.changeAt(
+          return this.changeOnForkAt(
             doc,
             patch.baseHeads as AutomergeTypes.Heads,
             applySpans,
           );
-          return result.newDoc as AutomergeTypes.Doc<MindooDocPayload>;
         }
         return Automerge.change(doc, applySpans);
       });
@@ -12274,6 +12273,43 @@ export class BaseMindooDB implements MindooDB {
    * {@link applyNewEntriesToCachedDocument} (line ~6606) for the sync
    * pipeline; this helper centralizes it for the patch / changeDoc paths.
    */
+  /**
+   * `Automerge.changeAt(doc, baseHeads, apply)` for changes that call
+   * `updateSpans`. Automerge 3.5's `updateSpans` inside `changeAt` diffs
+   * against the text as of `baseHeads` but applies the resulting indexes to the
+   * current text, so once a concurrent edit of that text is in the document it
+   * throws "out of bounds" (and the reset-and-retry recovery would then drop
+   * the concurrent edit) or edits the wrong characters. `splice`, `updateText`
+   * and `mark` are not affected.
+   *
+   * The change is made on a fork that stands exactly at `baseHeads` and then
+   * merged back: the same causal result `changeAt` would produce. The fork
+   * writes as this replica's actor, unless that actor changed the document
+   * after `baseHeads` (its next sequence number is taken then); in that case a
+   * fresh actor writes the one change.
+   */
+  private changeOnForkAt(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    baseHeads: AutomergeTypes.Heads,
+    apply: (doc: MindooDocPayload) => void,
+  ): AutomergeTypes.Doc<MindooDocPayload> {
+    const current = Automerge.getHeads(doc);
+    if (
+      current.length === baseHeads.length &&
+      current.every((head) => baseHeads.includes(head))
+    ) {
+      return Automerge.change(doc, apply);
+    }
+    const base = Automerge.view(doc, baseHeads);
+    const actor = Automerge.getActorId(doc);
+    const ownChangeSince = Automerge.getChanges(base, doc).some(
+      (change) => Automerge.decodeChange(change).actor === actor,
+    );
+    const fork = Automerge.clone(base, ownChangeSince ? undefined : { actor });
+    const changed = Automerge.change(fork, apply);
+    return Automerge.merge(doc, changed) as AutomergeTypes.Doc<MindooDocPayload>;
+  }
+
   private runChangeWithOutdatedDocRecovery<T>(
     internalDoc: InternalDoc,
     apply: (doc: AutomergeTypes.Doc<MindooDocPayload>) => T,
