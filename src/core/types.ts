@@ -2891,6 +2891,37 @@ export interface MindooTextCursorPositionsResult {
 }
 
 /** Result returned after applying a JSON patch and materializing the document. */
+/** The edits {@link MindooDB.applyDocumentUpdate} applies as one change. */
+export interface MindooDocumentUpdate {
+  set?: Record<string, unknown>;
+  unset?: string[];
+  json?: MindooJsonPatch;
+  text?: MindooTextPatch[];
+  richText?: MindooRichTextPatch[];
+  richTextSteps?: MindooRichTextStepPatch[];
+}
+
+/**
+ * The common `baseHeads` of an update's parts: `undefined` when none carries any,
+ * `null` when they differ (then the parts need separate changes).
+ */
+export function commonUpdateBaseHeads(update: MindooDocumentUpdate): string[] | undefined | null {
+  const all = [
+    update.json?.baseHeads,
+    ...(update.text ?? []).map((p) => p.baseHeads),
+    ...(update.richText ?? []).map((p) => p.baseHeads),
+    ...(update.richTextSteps ?? []).map((p) => p.baseHeads),
+  ].filter((heads): heads is string[] => Array.isArray(heads) && heads.length > 0);
+  if (all.length === 0) return undefined;
+  const first = [...all[0]!].sort().join(",");
+  return all.every((heads) => [...heads].sort().join(",") === first) ? all[0]! : null;
+}
+
+/** Whether {@link MindooDB.applyDocumentUpdate} can take `update` (common base heads). */
+export function canApplyAsOneChange(update: MindooDocumentUpdate): boolean {
+  return commonUpdateBaseHeads(update) !== null;
+}
+
 export interface MindooJsonPatchResult {
   doc: MindooDoc;
   heads: string[];
@@ -5534,6 +5565,20 @@ export interface MindooDB {
    * Automerge version using `changeAt`, then merged into the current document.
    */
   applyRichTextStepsPatch(doc: MindooDoc, patch: MindooRichTextStepPatch): Promise<MindooRichTextPatchResult>;
+
+  /**
+   * Apply several kinds of edits to one document as ONE Automerge change (one
+   * history entry): top-level `set`/`unset`, then `json`, `text`, `richText` and
+   * `richTextSteps` patches, in that order, all or nothing.
+   *
+   * Every part that carries `baseHeads` must carry the same ones (see
+   * {@link canApplyAsOneChange}); the change is then authored at those heads and
+   * merged into the current document, like the single-kind methods do. Parts
+   * without `baseHeads` (and `set`/`unset`) apply within the same change, after
+   * the parts before them — e.g. a rich text for an element the `json` part
+   * creates.
+   */
+  applyDocumentUpdate(doc: MindooDoc, update: MindooDocumentUpdate): Promise<MindooJsonPatchResult>;
 
   /**
    * Read the current Automerge rich-text spans from a document path.

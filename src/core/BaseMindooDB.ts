@@ -87,6 +87,7 @@ import {
   MindooRichTextPatch,
   MindooRichTextPatchResult,
   MindooRichTextStepPatch,
+  MindooDocumentUpdate,
   MindooRichTextSnapshot,
   MindooAutomergeSnapshot,
   MindooAutomergeChangesPatch,
@@ -103,6 +104,7 @@ import {
   RejectedPutEntry,
   PutEntriesAck,
 } from "./types";
+import { commonUpdateBaseHeads } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { StoreKind } from "./appendonlystores/types";
 import type {
@@ -10331,12 +10333,11 @@ export class BaseMindooDB implements MindooDB {
     try {
       newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) => {
         if (patch.baseHeads && patch.baseHeads.length > 0) {
-          const result = Automerge.changeAt(
+          return this.changeOnForkAt(
             doc,
             patch.baseHeads as AutomergeTypes.Heads,
             applySpans,
           );
-          return result.newDoc as AutomergeTypes.Doc<MindooDocPayload>;
         }
         return Automerge.change(doc, applySpans);
       });
@@ -10367,6 +10368,161 @@ export class BaseMindooDB implements MindooDB {
       heads: wrapped.getHeads(),
       data: wrapped.getData(),
     };
+  }
+
+  async applyDocumentUpdate(
+    doc: MindooDoc,
+    update: MindooDocumentUpdate,
+  ): Promise<MindooJsonPatchResult> {
+    this.assertWritable("applyDocumentUpdate");
+    const docId = doc.getId();
+    let internalDoc = this.getCachedDocument(docId);
+    if (!internalDoc) {
+      const loadedDoc = await this.loadDocumentInternal(docId);
+      if (!loadedDoc) {
+        throw new DocumentNotFoundError(docId);
+      }
+      internalDoc = loadedDoc;
+    }
+    if (internalDoc.isDeleted) {
+      throw new DocumentDeletedError(docId);
+    }
+
+    const baseHeads = commonUpdateBaseHeads(update);
+    if (baseHeads === null) {
+      throw new Error(
+        "applyDocumentUpdate: the parts of one update must share their baseHeads",
+      );
+    }
+    const hasFields =
+      Object.keys(update.set ?? {}).length > 0 || (update.unset?.length ?? 0) > 0;
+    if (update.json) this.validateJsonPatch(update.json);
+    for (const patch of update.text ?? []) this.validateTextPatch(patch);
+    for (const patch of update.richText ?? []) this.validateRichTextPatch(patch);
+    for (const patch of update.richTextSteps ?? []) this.validateRichTextStepPatch(patch);
+    // top-level fields go through changeDoc elsewhere, which checks sealed access
+    if (hasFields) await this.assertCurrentSealedAccess(internalDoc);
+
+    const now = semanticNow();
+    const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
+    const applyAll = (automergeDoc: MindooDocPayload) => {
+      for (const [key, value] of Object.entries(update.set ?? {})) {
+        if (value !== undefined) {
+          (automergeDoc as any)[key] = this.hydrateTypedValues(value);
+        }
+      }
+      for (const key of update.unset ?? []) {
+        delete (automergeDoc as any)[key];
+      }
+      if (update.json) this.applyJsonPatchOperations(automergeDoc, update.json);
+      for (const patch of update.text ?? []) this.applyTextEditsInChange(automergeDoc, patch);
+      for (const patch of update.richText ?? []) this.applyRichTextSpansInChange(automergeDoc, patch, docId);
+      for (const patch of update.richTextSteps ?? []) this.applyRichTextStepsInChange(automergeDoc, patch);
+      automergeDoc._lastModified = now;
+    };
+
+    let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
+    try {
+      newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (current) =>
+        baseHeads
+          ? this.changeOnForkAt(current, baseHeads as AutomergeTypes.Heads, applyAll)
+          : Automerge.change(current, applyAll),
+      );
+    } catch (error) {
+      this.logger.error(`Error applying document update for document ${docId}:`, error);
+      throw error;
+    }
+
+    await this.persistDocumentChange({
+      internalDoc,
+      newDoc,
+      now,
+      headsBeforeChange,
+      useCustomKey: false,
+      successMessage: "document updated",
+    });
+
+    const wrapped = this.wrapDocument(internalDoc);
+    return {
+      doc: wrapped,
+      heads: wrapped.getHeads(),
+      data: wrapped.getData(),
+    };
+  }
+
+  /** The edits of one text patch, inside a change. */
+  private applyTextEditsInChange(automergeDoc: MindooDocPayload, patch: MindooTextPatch): void {
+    this.ensureTextPath(automergeDoc, patch.path);
+    for (const edit of patch.edits) {
+      Automerge.splice(
+        automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+        patch.path as AutomergeTypes.Prop[],
+        edit.index,
+        edit.deleteCount,
+        edit.insert ?? "",
+      );
+    }
+  }
+
+  /** One rich-text snapshot (or sequence), inside a change, with the reset-and-retry recovery. */
+  private applyRichTextSpansInChange(
+    automergeDoc: MindooDocPayload,
+    patch: MindooRichTextPatch,
+    docId: string,
+  ): void {
+    this.ensureRichTextPath(automergeDoc, patch.path);
+    const spansSequence = patch.spansSequence ?? (patch.spans ? [patch.spans] : []);
+    for (const spans of spansSequence) {
+      const revivedSpans = this.reviveRichTextSpans(spans);
+      try {
+        (Automerge as any).updateSpans(
+          automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+          patch.path as AutomergeTypes.Prop[],
+          revivedSpans,
+          patch.updateSpansConfig,
+        );
+      } catch (error) {
+        if (!this.isRichTextUpdateSpansBoundsError(error)) {
+          throw error;
+        }
+        this.logger.warn(
+          `updateSpans failed for document ${docId} at '${patch.path.map(String).join(".")}', resetting rich-text field and applying snapshot from scratch`,
+          error,
+        );
+        this.setJsonValueAtPath(automergeDoc, patch.path, "");
+        (Automerge as any).updateSpans(
+          automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+          patch.path as AutomergeTypes.Prop[],
+          revivedSpans,
+          patch.updateSpansConfig,
+        );
+      }
+    }
+  }
+
+  /** Positional rich-text steps (splices and marks), inside a change. */
+  private applyRichTextStepsInChange(automergeDoc: MindooDocPayload, patch: MindooRichTextStepPatch): void {
+    this.ensureRichTextPath(automergeDoc, patch.path);
+    for (const step of patch.steps) {
+      Automerge.splice(
+        automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+        patch.path as AutomergeTypes.Prop[],
+        step.index,
+        step.deleteCount,
+        step.insert ?? "",
+      );
+      for (const markRange of step.marks ?? []) {
+        for (const [name, value] of Object.entries(markRange.marks)) {
+          (Automerge as any).mark(
+            automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+            patch.path as AutomergeTypes.Prop[],
+            { start: markRange.index, end: markRange.index + markRange.length, expand: "none" },
+            name,
+            this.reviveRichTextValue(value),
+          );
+        }
+      }
+    }
   }
 
   async applyRichTextStepsPatch(
@@ -12274,6 +12430,43 @@ export class BaseMindooDB implements MindooDB {
    * {@link applyNewEntriesToCachedDocument} (line ~6606) for the sync
    * pipeline; this helper centralizes it for the patch / changeDoc paths.
    */
+  /**
+   * `Automerge.changeAt(doc, baseHeads, apply)` for changes that call
+   * `updateSpans`. Automerge 3.5's `updateSpans` inside `changeAt` diffs
+   * against the text as of `baseHeads` but applies the resulting indexes to the
+   * current text, so once a concurrent edit of that text is in the document it
+   * throws "out of bounds" (and the reset-and-retry recovery would then drop
+   * the concurrent edit) or edits the wrong characters. `splice`, `updateText`
+   * and `mark` are not affected.
+   *
+   * The change is made on a fork that stands exactly at `baseHeads` and then
+   * merged back: the same causal result `changeAt` would produce. The fork
+   * writes as this replica's actor, unless that actor changed the document
+   * after `baseHeads` (its next sequence number is taken then); in that case a
+   * fresh actor writes the one change.
+   */
+  private changeOnForkAt(
+    doc: AutomergeTypes.Doc<MindooDocPayload>,
+    baseHeads: AutomergeTypes.Heads,
+    apply: (doc: MindooDocPayload) => void,
+  ): AutomergeTypes.Doc<MindooDocPayload> {
+    const current = Automerge.getHeads(doc);
+    if (
+      current.length === baseHeads.length &&
+      current.every((head) => baseHeads.includes(head))
+    ) {
+      return Automerge.change(doc, apply);
+    }
+    const base = Automerge.view(doc, baseHeads);
+    const actor = Automerge.getActorId(doc);
+    const ownChangeSince = Automerge.getChanges(base, doc).some(
+      (change) => Automerge.decodeChange(change).actor === actor,
+    );
+    const fork = Automerge.clone(base, ownChangeSince ? undefined : { actor });
+    const changed = Automerge.change(fork, apply);
+    return Automerge.merge(doc, changed) as AutomergeTypes.Doc<MindooDocPayload>;
+  }
+
   private runChangeWithOutdatedDocRecovery<T>(
     internalDoc: InternalDoc,
     apply: (doc: AutomergeTypes.Doc<MindooDocPayload>) => T,

@@ -147,6 +147,61 @@ describe("applyRichTextPatch", () => {
     expect(reloaded?.getData().body).toContain(" from B");
   }, 30000);
 
+  /*
+   * Automerge 3.5's updateSpans inside changeAt indexes the current text: with a
+   * concurrent edit already in the document it threw "out of bounds", and the
+   * reset-and-retry recovery dropped that edit. Snapshots at older heads now
+   * apply on a fork at those heads and merge.
+   */
+  it("keeps a concurrent edit when a snapshot arrives at older base heads", async () => {
+    const doc = await db.createDocument();
+    await db.applyRichTextPatch(doc, {
+      path: ["body"],
+      spans: [{ type: "block", value: { type: "p" } }, { type: "text", value: "Hello world" }],
+    });
+    const baseHeads = doc.getHeads();
+
+    // someone else's edit, already merged into this replica
+    await db.applyRichTextStepsPatch(doc, {
+      path: ["body"],
+      baseHeads,
+      steps: [{ type: "splice", index: 7, deleteCount: 0, insert: "brave " }],
+    });
+
+    // a client that read the text at baseHeads saves its snapshot
+    const result = await db.applyRichTextPatch(doc, {
+      path: ["body"],
+      baseHeads,
+      spans: [{ type: "block", value: { type: "p" } }, { type: "text", value: "Hello world!", marks: { b: true } }],
+    });
+
+    expect(result.data.body).toBe("\uFFFCHello brave world!");
+    const snapshot = await db.getRichTextSnapshot(doc, ["body"]);
+    const text = snapshot.spans.filter((span) => span.type === "text").map((span) => span.value).join("");
+    expect(text).toBe("Hello brave world!");
+    const reloaded = await db.getDocument(doc.getId());
+    expect(reloaded?.getData().body).toBe("\uFFFCHello brave world!");
+  }, 30000);
+
+  it("applies a snapshot sequence at older base heads on top of a concurrent edit", async () => {
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (draft) => {
+      draft.getData().body = "Hello";
+    });
+    const baseHeads = doc.getHeads();
+    await db.applyRichTextStepsPatch(doc, {
+      path: ["body"],
+      baseHeads,
+      steps: [{ type: "splice", index: 5, deleteCount: 0, insert: " there" }],
+    });
+    const result = await db.applyRichTextPatch(doc, {
+      path: ["body"],
+      baseHeads,
+      spansSequence: [[{ type: "text", value: "XHello" }], [{ type: "text", value: "XYHello" }]],
+    });
+    expect(result.data.body).toBe("XYHello there");
+  }, 30000);
+
   it("rejects empty positional rich-text steps", async () => {
     const doc = await db.createDocument();
     await db.changeDoc(doc, (draft) => {
