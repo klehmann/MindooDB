@@ -15,6 +15,7 @@ import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { StoreKind } from "../core/types";
 import type { MindooDB, MindooDoc, MindooTenant } from "../core/types";
 import type { PrivateUserId } from "../core/userid";
+import { installManualSemanticClock } from "./_helpers/manualSemanticClock";
 
 const ADMIN_PASSWORD = "admin-pass";
 const attachmentConfig = { attachmentConfig: { chunkSizeBytes: 128 } };
@@ -200,23 +201,27 @@ describe("MindooDB.purgeDocumentHistory", () => {
     }, 60000);
 
     it("scrubs an open time-travel snapshot", async () => {
-      const doc = await db.createDocument();
-      await db.changeDoc(doc, (draft) => {
-        draft.getData().title = "visible in the past";
-      });
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      const cutoff = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      const clock = installManualSemanticClock();
+      try {
+        const doc = await db.createDocument();
+        await db.changeDoc(doc, (draft) => {
+          draft.getData().title = "visible in the past";
+        });
+        const cutoff = clock.advance();
+        clock.advance();
 
-      const snapshot = await tenant.openDB("main", { timeTravelDate: cutoff });
-      expect((await snapshot.getDocument(doc.getId())).getData().title).toBe(
-        "visible in the past",
-      );
+        const snapshot = await tenant.openDB("main", { timeTravelDate: cutoff });
+        expect((await snapshot.getDocument(doc.getId())).getData().title).toBe(
+          "visible in the past",
+        );
 
-      await db.purgeDocumentHistory(doc.getId());
+        await db.purgeDocumentHistory(doc.getId());
 
-      expect(await snapshot.getAllDocumentIds()).not.toContain(doc.getId());
-      await expect(snapshot.getDocument(doc.getId())).rejects.toThrow();
+        expect(await snapshot.getAllDocumentIds()).not.toContain(doc.getId());
+        await expect(snapshot.getDocument(doc.getId())).rejects.toThrow();
+      } finally {
+        clock.restore();
+      }
     }, 60000);
 
     it("is not allowed on a time-travel snapshot", async () => {

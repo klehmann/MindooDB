@@ -5,6 +5,7 @@ import {
   type CopyTestTenant,
 } from "./_helpers/copyTestHarness";
 import type { MindooDB } from "../core/types";
+import { installManualSemanticClock } from "./_helpers/manualSemanticClock";
 
 describe("copyDocumentTo", () => {
   let alpha: CopyTestTenant;
@@ -148,22 +149,27 @@ describe("copyDocumentTo", () => {
     }, 30000);
 
     it("copies the state as of a past timestamp when asked", async () => {
-      const doc = await sourceDb.createDocument();
-      await sourceDb.changeDoc(doc, (draft) => {
-        draft.getData().stage = "draft";
-      });
-      const cutoff = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      await sourceDb.changeDoc(doc, (draft) => {
-        draft.getData().stage = "final";
-      });
+      const clock = installManualSemanticClock();
+      try {
+        const doc = await sourceDb.createDocument();
+        await sourceDb.changeDoc(doc, (draft) => {
+          draft.getData().stage = "draft";
+        });
+        const cutoff = clock.now();
+        clock.advance();
+        await sourceDb.changeDoc(doc, (draft) => {
+          draft.getData().stage = "final";
+        });
 
-      const result = await sourceDb.copyDocumentTo(doc.getId(), targetDb, {
-        atTimestamp: cutoff,
-      });
+        const result = await sourceDb.copyDocumentTo(doc.getId(), targetDb, {
+          atTimestamp: cutoff,
+        });
 
-      const copy = await targetDb.getDocument(result.targetDocId);
-      expect(copy.getData().stage).toBe("draft");
+        const copy = await targetDb.getDocument(result.targetDocId);
+        expect(copy.getData().stage).toBe("draft");
+      } finally {
+        clock.restore();
+      }
     }, 30000);
 
     it("records document-level provenance in the payload by default", async () => {
@@ -338,26 +344,31 @@ describe("copyDocumentTo", () => {
     }, 30000);
 
     it("preserves the full revision history so time travel still works", async () => {
-      const doc = await sourceDb.createDocument();
-      await sourceDb.changeDoc(doc, (draft) => {
-        draft.getData().stage = "draft";
-      });
-      const cutoff = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      await sourceDb.changeDoc(doc, (draft) => {
-        draft.getData().stage = "final";
-      });
+      const clock = installManualSemanticClock();
+      try {
+        const doc = await sourceDb.createDocument();
+        await sourceDb.changeDoc(doc, (draft) => {
+          draft.getData().stage = "draft";
+        });
+        const cutoff = clock.now();
+        clock.advance();
+        await sourceDb.changeDoc(doc, (draft) => {
+          draft.getData().stage = "final";
+        });
 
-      await sourceDb.copyDocumentTo(doc.getId(), targetDb, {
-        mode: "history",
-        targetDocId: "same",
-        authorship: "preserve",
-      });
+        await sourceDb.copyDocumentTo(doc.getId(), targetDb, {
+          mode: "history",
+          targetDocId: "same",
+          authorship: "preserve",
+        });
 
-      const head = await targetDb.getDocument(doc.getId());
-      expect(head.getData().stage).toBe("final");
-      const past = await targetDb.getDocumentAtTimestamp(doc.getId(), cutoff);
-      expect(past?.getData().stage).toBe("draft");
+        const head = await targetDb.getDocument(doc.getId());
+        expect(head.getData().stage).toBe("final");
+        const past = await targetDb.getDocumentAtTimestamp(doc.getId(), cutoff);
+        expect(past?.getData().stage).toBe("draft");
+      } finally {
+        clock.restore();
+      }
     }, 30000);
 
     it("strips the source database's witness receipt fields", async () => {

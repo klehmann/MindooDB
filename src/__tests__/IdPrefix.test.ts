@@ -156,9 +156,6 @@ describe("createDocument with idPrefix", () => {
     for (let i = 0; i < 5; i++) {
       const doc = await db.createDocument({ idPrefix: "sort" });
       ids.push(doc.getId());
-      // Ensure consecutive creates land in different UUID7 milliseconds so the
-      // assertion doesn't depend on the uuid library's intra-ms counter.
-      await new Promise((resolve) => setTimeout(resolve, 3));
     }
     const sorted = [...ids].sort();
     expect(sorted).toEqual(ids);

@@ -675,14 +675,9 @@ describe("fulltextSetup (dbsetup document)", () => {
 });
 
 describe("full-text open-time auto-activation", () => {
-  async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
-    const start = Date.now();
-    while (!predicate()) {
-      if (Date.now() - start > timeoutMs) {
-        throw new Error("Timed out waiting for condition");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+  /** Wait until the open-time probe and every catch-up it triggers have run. */
+  async function whenIdle(db: unknown): Promise<void> {
+    await (db as { whenBackgroundIdle(): Promise<boolean> }).whenBackgroundIdle();
   }
 
   it("activates the index at open when the setup document enables it", async () => {
@@ -705,9 +700,10 @@ describe("full-text open-time auto-activation", () => {
     expect((db2 as any).fulltextIndex).toBeNull();
     await db2.initialize();
 
-    await waitFor(() => (db2 as any).fulltextIndex !== null);
+    await whenIdle(db2);
     const index = (db2 as any).fulltextIndex as DocumentFullTextIndex;
-    await waitFor(() => index.getSize() === 1);
+    expect(index).not.toBeNull();
+    expect(index.getSize()).toBe(1);
     const result = await index.search("opentime");
     expect(result.hits.map((h) => h.docId)).toEqual([doc.getId()]);
   }, 30000);
@@ -727,9 +723,9 @@ describe("full-text open-time auto-activation", () => {
     );
     await db2.initialize();
 
-    // Give the fire-and-forget probe time to settle, then verify no
-    // index was created (fulltextSetup is absent).
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Let the fire-and-forget probe finish, then verify no index was
+    // created (fulltextSetup is absent).
+    await whenIdle(db2);
     expect((db2 as any).fulltextIndex).toBeNull();
   }, 30000);
 
@@ -745,7 +741,7 @@ describe("full-text open-time auto-activation", () => {
     });
 
     // Setup enabled plus change events would normally auto-activate.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await whenIdle(db);
     expect((db as any).fulltextIndex).toBeNull();
 
     // Only the automatic pass is gated — explicit use still indexes.

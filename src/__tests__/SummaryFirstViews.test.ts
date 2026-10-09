@@ -202,14 +202,9 @@ describe("Summary-first view data providers", () => {
 });
 
 describe("Summary auto-follow", () => {
-  async function waitFor(check: () => boolean, timeoutMs = 5000): Promise<void> {
-    const start = Date.now();
-    while (!check()) {
-      if (Date.now() - start > timeoutMs) {
-        throw new Error("condition not met in time");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+  /** Wait until the change event and every catch-up it triggers have run. */
+  async function whenIdle(db: MindooDB): Promise<void> {
+    await (db as unknown as { whenBackgroundIdle(): Promise<boolean> }).whenBackgroundIdle();
   }
 
   /** Peek at the private store WITHOUT lazily creating it. */
@@ -227,7 +222,8 @@ describe("Summary auto-follow", () => {
     await seedDb(db, [{ name: "Alice" }, { name: "Bob" }]);
     // No explicit update() call — the coalesced change event triggers a
     // background catch-up run.
-    await waitFor(() => summary.getSize() === 2);
+    await whenIdle(db);
+    expect(summary.getSize()).toBe(2);
   }, 30000);
 
   it("activates the summary store when a dbsetup config appears", async () => {
@@ -240,14 +236,15 @@ describe("Summary auto-follow", () => {
 
     // The dbsetup change auto-creates the store; subsequent events keep it
     // current — all without any query/getSummaryStore call.
-    await waitFor(() => (peekSummaryStore(db)?.getSize() ?? 0) === 2);
+    await whenIdle(db);
+    expect(peekSummaryStore(db)?.getSize()).toBe(2);
   }, 30000);
 
   it("does not activate anything without a dbsetup config", async () => {
     const ctx = await createWitnessingTenant("test-tenant-noactivate");
     const db = await ctx.tenant.openDB("noactivate-db");
     await seedDb(db, [{ name: "Alice" }]);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await whenIdle(db);
     expect(peekSummaryStore(db)).toBeNull();
   }, 30000);
 
@@ -259,17 +256,12 @@ describe("Summary auto-follow", () => {
 
     db.setSummaryAutoUpdateEnabled!(false);
     await seedDb(db, [{ name: "Alice" }]);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await whenIdle(db);
     expect(summary.getSize()).toBe(0);
 
     // Re-enabling schedules a catch-up immediately.
     db.setSummaryAutoUpdateEnabled!(true);
-    const start = Date.now();
-    while (summary.getSize() !== 1) {
-      if (Date.now() - start > 5000) {
-        throw new Error("summary did not catch up after re-enable");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+    await whenIdle(db);
+    expect(summary.getSize()).toBe(1);
   }, 30000);
 });

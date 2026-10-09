@@ -93,11 +93,7 @@ import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptEncryptedField } from "./crypto/encryptedFields";
 
 const DIRECTORY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
-
-// How long the resolved storage-format floor (`requireMetadataSignatureSince`)
-// is reused before re-reading the directory head. Short, because it is consulted
-// on the entry-verification hot path; the cutoff itself changes very rarely.
-const METADATA_SIGNATURE_CUTOFF_TTL_MS = 30 * 1000;
+const MAX_UNKNOWN_KEYS_TRACKED = 1000;
 
 /** De-duplicated union of two string lists, preserving first-seen order. */
 function unionStrings(existing: string[], added: string[]): string[] {
@@ -196,11 +192,24 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
   // Unified cache cursor for all document types
   private unifiedCacheLastCursor: ProcessChangesCursor | null = null;
+  // Directory index `changeSeq` the last completed updateUnifiedCache pass
+  // covered. Compared against the live index instead of the cursor, because
+  // the cursor can lag behind entries that iterateChangesSince skips.
+  private unifiedCacheIndexChangeSeq: number | null = null;
+  // Last store poll (syncStoreChanges) for trust validation. Polling only
+  // discovers entries this process has not seen yet; entries already in the
+  // directory index are applied via the changeSeq check, independent of time.
   private lastDirectorySyncTimestamp = 0;
-  // Cached storage-format floor (`requireMetadataSignatureSince`) with re-entrancy
-  // guard; see getRequireMetadataSignatureSince.
+  // Unknown signing keys -> time their cache miss last polled the store. Keeps
+  // repeated lookups of a key that is not granted from polling the store (and,
+  // for remote stores, the server) on every call.
+  private unknownKeyPolledAt = new Map<string, number>();
+  // Cached storage-format floor (`requireMetadataSignatureSince`), keyed by the
+  // directory changefeed `changeSeq` it was resolved at, with re-entrancy guard;
+  // see getRequireMetadataSignatureSince.
   private metadataSignatureCutoffCache: number | undefined = undefined;
-  private metadataSignatureCutoffCachedAt = 0;
+  private metadataSignatureCutoffResolved = false;
+  private metadataSignatureCutoffChangeSeq: number | null = null;
   private resolvingMetadataSignatureCutoff = false;
   private logger: Logger;
 
@@ -232,7 +241,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       // would otherwise go un-reconciled until the next network sync. Runs only
       // once per directory object (the creation branch); the driver's own
       // getDirectoryDB calls reuse the now-set instance and do not re-trigger.
-      void this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
+      this.tenant.trackBackgroundTask(this.tenant.reconcileKeyDistributionsForCurrentUserSafe());
     }
     return this.directoryDB;
   }
@@ -668,35 +677,39 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }
     }
     
-    // Refresh directory state at most once per interval — unless the caller
-    // forces a refresh (audit #4): the server push path must observe a freshly
-    // pushed revocation immediately rather than lagging by up to
-    // DIRECTORY_SYNC_INTERVAL_MS, which would let a just-revoked key keep
-    // pushing entries.
+    // Store poll: discovers entries this process has not seen yet, so it is
+    // throttled to once per interval — unless the caller forces it (audit #4):
+    // the server push path must observe a freshly pushed revocation
+    // immediately, which would otherwise let a just-revoked key keep pushing.
     const now = Date.now();
-    let didSync = false;
+    let didPoll = false;
     if (
       opts?.forceRefresh ||
       now - this.lastDirectorySyncTimestamp >= DIRECTORY_SYNC_INTERVAL_MS
     ) {
-      const directoryDB = await this.getDirectoryDB();
-      await directoryDB.syncStoreChanges();
-      await this.updateUnifiedCache();
-      this.lastDirectorySyncTimestamp = now;
-      didSync = true;
+      await this.pollDirectoryStore();
+      didPoll = true;
     }
+    // Apply whatever the directory index already holds (local writes, pulls,
+    // the poll above). Cheap and time-independent: a grant or revocation this
+    // process knows about takes effect on the next validation.
+    await this.applyDirectoryIndexChanges();
 
     let cachedResult = this.trustedKeysCache.get(publicKey);
-    if (cachedResult === undefined && !didSync) {
-      // Cache miss and not synced yet - sync once and re-check immediately.
-      const directoryDB = await this.getDirectoryDB();
-      await directoryDB.syncStoreChanges();
-      await this.updateUnifiedCache();
-      this.lastDirectorySyncTimestamp = Date.now();
+    if (cachedResult === undefined && !didPoll && this.mayPollForUnknownKey(publicKey, now)) {
+      // Cache miss: the grant may sit in the store without this process
+      // having seen it yet, so poll once and re-check.
+      await this.pollDirectoryStore();
+      await this.applyDirectoryIndexChanges();
       cachedResult = this.trustedKeysCache.get(publicKey);
+      didPoll = true;
+    }
+    if (cachedResult === undefined && didPoll) {
+      this.recordUnknownKeyPoll(publicKey, now);
     }
 
     if (cachedResult !== undefined) {
+      this.unknownKeyPolledAt.delete(publicKey);
       this.logger.debug(`Public key validation result (from cache): ${cachedResult}`);
       return cachedResult;
     }
@@ -707,18 +720,55 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
-   * Force-refresh the directory trust caches from the (already synced local)
-   * directory store, bypassing the TTL used by
-   * {@link validatePublicSigningKey}. Called right after a directory pull so
-   * newly arrived grantaccess documents are diffed immediately and the
-   * author-trust reconcile of open databases fires without waiting up to
-   * DIRECTORY_SYNC_INTERVAL_MS for the next cache-miss validation.
+   * Whether a cache miss for `publicKey` may poll the store. A key that missed
+   * within the last DIRECTORY_SYNC_INTERVAL_MS does not poll again; it still
+   * becomes trusted as soon as its grant reaches the directory index.
    */
-  async refreshTrustCaches(): Promise<void> {
+  private mayPollForUnknownKey(publicKey: string, now: number): boolean {
+    const polledAt = this.unknownKeyPolledAt.get(publicKey);
+    return polledAt === undefined || now - polledAt >= DIRECTORY_SYNC_INTERVAL_MS;
+  }
+
+  /** Remember that the store was polled and `publicKey` was still unknown. */
+  private recordUnknownKeyPoll(publicKey: string, now: number): void {
+    this.unknownKeyPolledAt.delete(publicKey);
+    if (this.unknownKeyPolledAt.size >= MAX_UNKNOWN_KEYS_TRACKED) {
+      const oldest = this.unknownKeyPolledAt.keys().next().value;
+      if (oldest !== undefined) this.unknownKeyPolledAt.delete(oldest);
+    }
+    this.unknownKeyPolledAt.set(publicKey, now);
+  }
+
+  /** Read new directory entries from the store into the directory index. */
+  private async pollDirectoryStore(): Promise<void> {
     const directoryDB = await this.getDirectoryDB();
     await directoryDB.syncStoreChanges();
-    await this.updateUnifiedCache();
     this.lastDirectorySyncTimestamp = Date.now();
+  }
+
+  /**
+   * Bring the unified cache up to the directory index when the index has
+   * advanced since the last pass. No store access.
+   */
+  private async applyDirectoryIndexChanges(): Promise<void> {
+    const directoryDB = await this.getDirectoryDB();
+    const latestSeq = directoryDB.getLatestChangeCursor?.()?.changeSeq ?? null;
+    if (
+      this.unifiedCacheLastCursor === null ||
+      latestSeq !== this.unifiedCacheIndexChangeSeq
+    ) {
+      await this.updateUnifiedCache();
+    }
+  }
+
+  /**
+   * Refresh the directory trust caches from the directory index right after a
+   * directory pull (which already read the pulled entries into the index), so
+   * newly arrived grantaccess documents are diffed immediately and the
+   * author-trust reconcile of open databases fires.
+   */
+  async refreshTrustCaches(): Promise<void> {
+    await this.applyDirectoryIndexChanges();
   }
 
   /**
@@ -728,6 +778,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    */
   private async updateUnifiedCache(): Promise<void> {
     const directoryDB = await this.getDirectoryDB();
+    // Captured before iterating: entries added during the pass carry a higher
+    // changeSeq, so the next applyDirectoryIndexChanges picks them up.
+    const indexChangeSeqAtStart = directoryDB.getLatestChangeCursor?.()?.changeSeq ?? null;
     // Determine starting cursor (null = process all, otherwise incremental)
     const startCursor = this.unifiedCacheLastCursor;
 
@@ -930,7 +983,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }
     }
     if (newlyTrustedKeys.size > 0) {
-      void this.tenant.reconcileAuthorTrustChangesSafe(newlyTrustedKeys);
+      this.tenant.trackBackgroundTask(this.tenant.reconcileAuthorTrustChangesSafe(newlyTrustedKeys));
     }
     if (sawGrantAccessChange) {
       this.tenant.scheduleUserKeyReconcile?.();
@@ -985,6 +1038,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }
     }
 
+    this.unifiedCacheIndexChangeSeq = indexChangeSeqAtStart;
   }
 
   /**
@@ -1327,30 +1381,36 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * signature, or `undefined` when no floor is configured (fully backward
    * compatible). Tenant-level only, read from the `acl_defaultpolicy` head.
    *
-   * Cached with a short TTL and guarded against re-entrancy: resolving the
-   * cutoff loads the directory head, and directory materialization itself runs
-   * signature verification — without the guard a verify→resolve→materialize→
-   * verify cycle could recurse. During such re-entry we return the last known
-   * value (the directory store is anyway exempt from the floor by its callers).
+   * Cached until the directory changefeed `changeSeq` advances, so a newly set
+   * floor applies to the very next verification, and guarded against
+   * re-entrancy: resolving the cutoff loads the directory head, and directory
+   * materialization itself runs signature verification — without the guard a
+   * verify→resolve→materialize→verify cycle could recurse. During such re-entry
+   * we return the last known value (the directory store is anyway exempt from
+   * the floor by its callers).
    */
   async getRequireMetadataSignatureSince(): Promise<number | undefined> {
-    const now = Date.now();
     if (this.resolvingMetadataSignatureCutoff) {
       return this.metadataSignatureCutoffCache;
     }
     if (
-      this.metadataSignatureCutoffCachedAt !== 0 &&
-      now - this.metadataSignatureCutoffCachedAt < METADATA_SIGNATURE_CUTOFF_TTL_MS
+      this.metadataSignatureCutoffResolved &&
+      this.directoryDB &&
+      (this.directoryDB.getLatestChangeCursor?.()?.changeSeq ?? null) ===
+        this.metadataSignatureCutoffChangeSeq
     ) {
       return this.metadataSignatureCutoffCache;
     }
     this.resolvingMetadataSignatureCutoff = true;
     try {
+      const directoryDB = await this.getDirectoryDB();
+      const changeSeq = directoryDB.getLatestChangeCursor?.()?.changeSeq ?? null;
       const head = await this.getDirectoryStateHead();
       const since = head.defaultPolicy?.requireMetadataSignatureSince;
       this.metadataSignatureCutoffCache =
         typeof since === "number" && Number.isFinite(since) ? since : undefined;
-      this.metadataSignatureCutoffCachedAt = now;
+      this.metadataSignatureCutoffChangeSeq = changeSeq;
+      this.metadataSignatureCutoffResolved = true;
     } finally {
       this.resolvingMetadataSignatureCutoff = false;
     }

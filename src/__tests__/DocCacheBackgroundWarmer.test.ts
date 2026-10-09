@@ -222,11 +222,16 @@ describe("BaseMindooDB background L2 warmer", () => {
     // enough to abort.
     let release: (() => void) | null = null;
     let yieldCount = 0;
+    let signalFirstYield!: () => void;
+    const firstYield = new Promise<void>((resolve) => {
+      signalFirstYield = resolve;
+    });
     const pausingScheduler: WarmerScheduler = {
       yield(): Promise<void> {
         yieldCount++;
         return new Promise<void>((resolve) => {
           release = resolve;
+          signalFirstYield();
         });
       },
     };
@@ -260,11 +265,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const warmerPromise = db2.startBackgroundWarmer!();
     expect(db2.isWarmerRunning?.()).toBe(true);
 
-    // Wait for the warmer to enter its first yield. Loop a few times to
-    // give the loop a chance to run.
-    for (let attempt = 0; attempt < 20 && release === null; attempt++) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
+    await firstYield;
     expect(release).not.toBeNull();
 
     // Abort the warmer. The release() below lets the yield() resolve so
@@ -287,10 +288,15 @@ describe("BaseMindooDB background L2 warmer", () => {
 
   it("startBackgroundWarmer is single-flight while running", async () => {
     let release: (() => void) | null = null;
+    let signalFirstYield!: () => void;
+    const firstYield = new Promise<void>((resolve) => {
+      signalFirstYield = resolve;
+    });
     const pausingScheduler: WarmerScheduler = {
       yield(): Promise<void> {
         return new Promise<void>((resolve) => {
           release = resolve;
+          signalFirstYield();
         });
       },
     };
@@ -325,9 +331,7 @@ describe("BaseMindooDB background L2 warmer", () => {
 
     // Wait for the warmer to be paused inside yield, then release and
     // let it finish.
-    for (let attempt = 0; attempt < 20 && release === null; attempt++) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
+    await firstYield;
     expect(release).not.toBeNull();
 
     // Drain all subsequent yields by repeatedly releasing until the
@@ -395,10 +399,15 @@ describe("BaseMindooDB background L2 warmer", () => {
 
   it("a foreground getDocument cooperates with a running warmer", async () => {
     let release: (() => void) | null = null;
+    let signalFirstYield!: () => void;
+    const firstYield = new Promise<void>((resolve) => {
+      signalFirstYield = resolve;
+    });
     const pausingScheduler: WarmerScheduler = {
       yield(): Promise<void> {
         return new Promise<void>((resolve) => {
           release = resolve;
+          signalFirstYield();
         });
       },
     };
@@ -432,9 +441,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     const warmerPromise = db2.startBackgroundWarmer!();
 
     // Wait for warmer to pause inside yield.
-    for (let attempt = 0; attempt < 20 && release === null; attempt++) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
+    await firstYield;
 
     // Issue a foreground read while the warmer is paused mid-pass.
     const docPromise = db2.getDocument(ids[3]);
@@ -521,10 +528,15 @@ describe("BaseMindooDB background L2 warmer", () => {
 
   it("onProgress emits phase=cancelled when stopBackgroundWarmer aborts the pass", async () => {
     let release: (() => void) | null = null;
+    let signalFirstYield!: () => void;
+    const firstYield = new Promise<void>((resolve) => {
+      signalFirstYield = resolve;
+    });
     const pausingScheduler: WarmerScheduler = {
       yield(): Promise<void> {
         return new Promise<void>((resolve) => {
           release = resolve;
+          signalFirstYield();
         });
       },
     };
@@ -561,9 +573,7 @@ describe("BaseMindooDB background L2 warmer", () => {
     });
 
     // Wait for the warmer to enter its first yield.
-    for (let attempt = 0; attempt < 20 && release === null; attempt++) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
+    await firstYield;
     expect(release).not.toBeNull();
 
     // Abort. release() lets the paused yield resolve so the loop sees

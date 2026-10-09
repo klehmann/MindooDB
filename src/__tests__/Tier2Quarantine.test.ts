@@ -12,6 +12,7 @@ import {
   SigningKeyPair,
 } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
+import { AccessDeniedError } from "../core/accesscontrol/AccessDeniedError";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
 /**
@@ -174,14 +175,19 @@ describe("Tier 2 content-rule quarantine (materialization)", () => {
     );
 
     // Bob (NOT an editor) tries to bump v -> 99: a valid signed entry that must
-    // be quarantined on materialization.
+    // be quarantined on materialization. The local precheck refuses this, so
+    // bypass it to stand in for a peer that produced the entry anyway.
     const docForBob = await crm.getDocument(docId);
     await crm.changeDoc(
       docForBob,
       async (d) => {
         d.getData().v = 99;
       },
-      { signingKeyPair: bobSigning, signingKeyPassword: bobPassword },
+      {
+        signingKeyPair: bobSigning,
+        signingKeyPassword: bobPassword,
+        bypassAccessControlPrecheck: true,
+      },
     );
 
     // Read on a FRESH replica that shares the same store but never applied the
@@ -212,6 +218,52 @@ describe("Tier 2 content-rule quarantine (materialization)", () => {
           (r.reason === "tier2_denied" || r.reason === "tier1_recheck_denied"),
       ),
     ).toBe(true);
+  }, 60000);
+
+  it("enforces a just-enabled policy on the next local write of an already-used database", async () => {
+    const crm = await writerTenant.openDB("crm");
+    const aliceSigning: SigningKeyPair = {
+      publicKey: alice.userSigningKeyPair.publicKey,
+      privateKey: alice.userSigningKeyPair.privateKey,
+    };
+    const bobSigning: SigningKeyPair = {
+      publicKey: bob.userSigningKeyPair.publicKey,
+      privateKey: bob.userSigningKeyPair.privateKey,
+    };
+
+    // A write while access control is still off: the database has already
+    // judged "not enforced" once before the policy appears.
+    const doc = await crm.createDocument({
+      signingKeyPair: aliceSigning,
+      signingKeyPassword: alicePassword,
+      initialValues: { title: "Gamma", myeditors: [aliceUsername], v: 1 },
+    });
+
+    const directory = (await writerTenant.openDirectory()) as Required<
+      Pick<
+        Awaited<ReturnType<typeof writerTenant.openDirectory>>,
+        "setDefaultAccessPolicy" | "setDatabaseAccessPolicy"
+      >
+    >;
+    await directory.setDefaultAccessPolicy({}, admin.userSigningKeyPair.privateKey, adminPassword);
+    await directory.setDatabaseAccessPolicy(
+      "crm",
+      { denyDocChange: true },
+      admin.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+
+    // No rule allows Bob's change, so the precheck must refuse it right away.
+    const docForBob = await crm.getDocument(doc.getId());
+    await expect(
+      crm.changeDoc(
+        docForBob,
+        async (d) => {
+          d.getData().v = 2;
+        },
+        { signingKeyPair: bobSigning, signingKeyPassword: bobPassword },
+      ),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
   }, 60000);
 
   it("quarantines a change matched by an explicit Tier 2 deny rule", async () => {

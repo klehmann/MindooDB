@@ -28,9 +28,15 @@ export function semanticNow(): number {
 /**
  * Install (or remove, with `null`) a test-only override for
  * {@link semanticNow}. Not intended for production use.
+ *
+ * @returns The previously installed override, so callers can restore it.
  */
-export function setSemanticTimeSourceForTesting(fn: (() => number) | null): void {
+export function setSemanticTimeSourceForTesting(
+  fn: (() => number) | null,
+): (() => number) | null {
+  const previous = overrideFn;
   overrideFn = fn;
+  return previous;
 }
 
 /**

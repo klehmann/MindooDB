@@ -259,6 +259,7 @@ import type {
 import { executeQueryLive } from "./query/queryLive";
 import type { MindooQuerySubscription } from "./query/queryLive";
 import type { VirtualViewUpdateOptions } from "./indexing/virtualviews/IVirtualViewDataProvider";
+import { BackgroundTaskTracker } from "./BackgroundTaskTracker";
 
 /**
  * Default chunk size for attachments: 256KB
@@ -643,10 +644,12 @@ export class BaseMindooDB implements MindooDB {
    */
   private quarantineLog: Map<string, QuarantineRecord[]> = new Map();
   /**
-   * Short-TTL cache of "is access control active for this tenant?" so the
-   * materialization fast-path does not re-query the directory on every load.
+   * Last known "is access control active for this tenant?" verdict. Only used
+   * as the fail-closed fallback when the directory cannot be consulted; the
+   * live check itself is cheap because the directory skips its rebuild while
+   * its changefeed `changeSeq` is unchanged.
    */
-  private aclActiveCache: { value: boolean; at: number } | null = null;
+  private aclActiveLastKnown: boolean | null = null;
   /**
    * Per-document cache of the original creator's signing public key and the
    * trusted time of the `doc_create` entry. Used by the client write prechecks
@@ -886,6 +889,8 @@ export class BaseMindooDB implements MindooDB {
   private changeNotifyTimer: ReturnType<typeof setTimeout> | null = null;
   /** While > 0, timer-based emission is suppressed (e.g. during a sync batch). */
   private changeNotificationHolds: number = 0;
+  /** Fire-and-forget work of this database; see {@link whenBackgroundIdle}. */
+  private readonly backgroundTasks = new BackgroundTaskTracker();
 
   // ---------------------------------------------------------------------------
   // Summary auto-follow (see setSummaryAutoUpdateEnabled): keeps the summary
@@ -1599,7 +1604,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
     this.summarySetupProbed = true;
-    void this.activateSummaryFromSetupDoc();
+    this.backgroundTasks.run(this.activateSummaryFromSetupDoc());
   }
 
   /** Create the summary store when the setup document configures one. */
@@ -1633,7 +1638,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
     this.summaryAutoUpdateRunning = true;
-    void (async () => {
+    this.backgroundTasks.run((async () => {
       try {
         do {
           this.summaryAutoUpdatePending = false;
@@ -1647,7 +1652,7 @@ export class BaseMindooDB implements MindooDB {
       } finally {
         this.summaryAutoUpdateRunning = false;
       }
-    })();
+    })());
   }
 
   // ---------------------------------------------------------------------------
@@ -1875,7 +1880,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
     this.fulltextSetupProbed = true;
-    void this.activateFulltextFromSetupDoc();
+    this.backgroundTasks.run(this.activateFulltextFromSetupDoc());
   }
 
   /** Create the full-text index when the setup document enables one. */
@@ -1908,7 +1913,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
     this.fulltextAutoUpdateRunning = true;
-    void (async () => {
+    this.backgroundTasks.run((async () => {
       try {
         do {
           this.fulltextAutoUpdatePending = false;
@@ -1922,7 +1927,7 @@ export class BaseMindooDB implements MindooDB {
       } finally {
         this.fulltextAutoUpdateRunning = false;
       }
-    })();
+    })());
   }
 
   // ---------------------------------------------------------------------------
@@ -1944,6 +1949,30 @@ export class BaseMindooDB implements MindooDB {
     return () => {
       this.changeListeners.delete(listener);
     };
+  }
+
+  /**
+   * Resolve once this database has no background work left: no coalesced
+   * change event waiting for its timer and no auto-follow catch-up or setup
+   * probe in flight (including work those start). Returns whether there was
+   * anything to wait for.
+   *
+   * @internal Shutdown and test hook; not part of the {@link MindooDB}
+   *   interface.
+   */
+  async whenBackgroundIdle(): Promise<boolean> {
+    let waited = false;
+    for (;;) {
+      if (this.changeNotifyTimer !== null) {
+        waited = true;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        continue;
+      }
+      if (!(await this.backgroundTasks.settle())) {
+        return waited;
+      }
+      waited = true;
+    }
   }
 
   /** Record a document transition for the coalesced change event. */
@@ -3511,7 +3540,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
     this.summarySetupProbed = true;
-    void (async () => {
+    this.backgroundTasks.run((async () => {
       try {
         const config = await this.getSummarySetup();
         if (config === null || this.summaryStore) {
@@ -3525,7 +3554,7 @@ export class BaseMindooDB implements MindooDB {
       } catch (error) {
         this.logger.warn(`Time-travel summary activation failed: ${error}`);
       }
-    })();
+    })());
   }
 
   /**
@@ -3556,7 +3585,7 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
     this.fulltextSetupProbed = true;
-    void this.activateFulltextFromSetupDoc();
+    this.backgroundTasks.run(this.activateFulltextFromSetupDoc());
   }
 
   /**
@@ -14723,23 +14752,18 @@ export class BaseMindooDB implements MindooDB {
    * Whether access control is active for this tenant and should gate
    * materialization. Admin-only databases (incl. the directory itself) are
    * always exempt — admin is the root of trust, and exempting the directory DB
-   * also avoids re-entrancy. Cached briefly to keep the load fast-path cheap.
-   * Fails closed-to-disabled on any directory error so document loads never
-   * break due to a transient directory issue (Tier 2 only gates honest clients).
+   * also avoids re-entrancy. Not cached by wall-clock time: a policy change must
+   * take effect on the very next write or load, independent of machine speed.
    */
   private async isAclEnforced(): Promise<boolean> {
     if (this._isAdminOnlyDb) return false;
-    const now = Date.now();
-    if (this.aclActiveCache && now - this.aclActiveCache.at < 3000) {
-      return this.aclActiveCache.value;
-    }
     try {
       const directory = await this.tenant.openDirectory();
       let value = false;
       if (typeof directory.isAccessControlActive === "function") {
         value = await directory.isAccessControlActive();
       }
-      this.aclActiveCache = { value, at: now };
+      this.aclActiveLastKnown = value;
       return value;
     } catch (error) {
       // Fail closed (audit finding #2): a transient directory error must never
@@ -14747,11 +14771,11 @@ export class BaseMindooDB implements MindooDB {
       // materialization gate entirely). Reuse the last known verdict if we have
       // one; otherwise assume enforced so the materialization path governs the
       // load and retries once the directory is reachable again.
-      if (this.aclActiveCache) {
+      if (this.aclActiveLastKnown !== null) {
         this.logger.debug(
-          `[ACL] active-check failed, reusing last known verdict (${this.aclActiveCache.value}): ${error}`,
+          `[ACL] active-check failed, reusing last known verdict (${this.aclActiveLastKnown}): ${error}`,
         );
-        return this.aclActiveCache.value;
+        return this.aclActiveLastKnown;
       }
       this.logger.warn(
         `[ACL] active-check failed with no prior verdict, assuming enforced (fail closed): ${error}`,

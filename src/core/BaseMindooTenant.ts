@@ -63,6 +63,7 @@ import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
 import { CacheManager } from "./cache/CacheManager";
 import { validateDatabaseId } from "./databaseIdValidation";
+import { BackgroundTaskTracker } from "./BackgroundTaskTracker";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -140,6 +141,8 @@ export class BaseMindooTenant implements MindooTenant {
   // harmless — the next trigger re-runs it.
   private reconcileInFlight = false;
   private userKeyReconcileScheduled = false;
+  /** Fire-and-forget work of this tenant; see {@link whenBackgroundIdle}. */
+  private readonly backgroundTasks = new BackgroundTaskTracker();
   private readonly userKeys = new UserKeyManager(this);
   private readonly sealedGenerations = new Map<string, Uint8Array[]>();
 
@@ -219,7 +222,11 @@ export class BaseMindooTenant implements MindooTenant {
       // Fire-and-forget: errors are surfaced via the reconcile path itself.
       // We intentionally do not await here to keep the mutation call site
       // synchronous from the listener's perspective.
-      void this.reconcileKeyBagChanges();
+      this.trackBackgroundTask(
+        this.reconcileKeyBagChanges().catch((error) => {
+          this.logger.warn(`reconcileKeyBagChanges: ${error}`);
+        }),
+      );
     });
 
     // Pre-warm the per-user CryptoKey caches so getDecryptedSigningKey()
@@ -288,6 +295,9 @@ export class BaseMindooTenant implements MindooTenant {
     // times - the disposer is nulled out after the first call.
     this.unsubscribeKeyBagChanges?.();
     this.unsubscribeKeyBagChanges = null;
+    // Background catch-ups write into the cache; let them finish before the
+    // final flush instead of racing the teardown.
+    await this.whenBackgroundIdle();
     if (this.cacheManager) {
       await this.cacheManager.dispose();
       this.cacheManager = null;
@@ -339,11 +349,43 @@ export class BaseMindooTenant implements MindooTenant {
   scheduleUserKeyReconcile(): void {
     if (this.userKeys.isReconciling() || this.userKeyReconcileScheduled) return;
     this.userKeyReconcileScheduled = true;
-    queueMicrotask(() => {
-      this.userKeyReconcileScheduled = false;
-      if (this.userKeys.isReconciling()) return;
-      void this.reconcileUserKeysSafe();
-    });
+    this.trackBackgroundTask(
+      Promise.resolve().then(() => {
+        this.userKeyReconcileScheduled = false;
+        if (this.userKeys.isReconciling()) return;
+        return this.reconcileUserKeysSafe();
+      }),
+    );
+  }
+
+  /**
+   * Register fire-and-forget work so {@link whenBackgroundIdle} and shutdown
+   * wait for it. The task must handle its own errors.
+   */
+  trackBackgroundTask(task: Promise<unknown>): void {
+    this.backgroundTasks.run(task);
+  }
+
+  /**
+   * Resolve once neither this tenant nor any of its open databases has
+   * background work left (trust/key reconciles, auto-follow catch-ups,
+   * pending change events), including work that finishing tasks start.
+   *
+   * @internal Shutdown and test hook.
+   */
+  async whenBackgroundIdle(): Promise<void> {
+    for (;;) {
+      let waited = await this.backgroundTasks.settle();
+      for (const db of Array.from(this.databaseCache.values())) {
+        const idle = (db as { whenBackgroundIdle?: () => Promise<boolean> }).whenBackgroundIdle;
+        if (idle && (await idle.call(db))) {
+          waited = true;
+        }
+      }
+      if (!waited) {
+        return;
+      }
+    }
   }
 
   noteUserDirectoryFetched(): void {

@@ -14,6 +14,7 @@ import {
 } from "../core/types";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { createViewLanguage } from "../core/expressions";
+import { installManualSemanticClock, ManualSemanticClock } from "./_helpers/manualSemanticClock";
 
 /**
  * A store factory that caches and returns the same store instance for a
@@ -62,16 +63,6 @@ async function listIdsUnderPrefix(
   return matches;
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 5000): Promise<void> {
-  const start = Date.now();
-  while (!condition()) {
-    if (Date.now() - start > timeoutMs) {
-      throw new Error("waitFor: condition not met within timeout");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
-
 /**
  * Coverage for summary-first time travel (persisted snapshot caches):
  *
@@ -92,8 +83,10 @@ describe("Time travel summary + persisted cache", () => {
   let factory: BaseMindooTenantFactory;
   let tenant: BaseMindooTenant;
   let liveDb: MindooDB;
+  let clock: ManualSemanticClock;
 
   beforeEach(async () => {
+    clock = installManualSemanticClock();
     cacheStore = new InMemoryLocalCacheStore();
     factory = new BaseMindooTenantFactory(
       new PersistentInMemoryStoreFactory(),
@@ -135,6 +128,7 @@ describe("Time travel summary + persisted cache", () => {
 
   afterEach(async () => {
     await tenant.disposeCacheManager?.();
+    clock.restore();
   });
 
   /**
@@ -156,9 +150,9 @@ describe("Time travel summary + persisted cache", () => {
       d.getData().amount = 2;
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 15));
-    const cutoff = Date.now();
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    clock.advance();
+    const cutoff = clock.now();
+    clock.advance();
 
     // Post-cutoff changes: modify docA, create docC.
     await liveDb.changeDoc(docA, (d) => {
@@ -350,17 +344,15 @@ describe("Time travel summary + persisted cache", () => {
     });
     await liveDb.setSummarySetup!({ include: ["name"] });
 
-    await new Promise((resolve) => setTimeout(resolve, 15));
-    const cutoff = Date.now();
+    clock.advance();
+    const cutoff = clock.now();
 
     const ttDb = await tenant.openDB(dbId, { timeTravelDate: cutoff });
 
-    // The open-time probe is fire-and-forget: wait for the store to appear
-    // and fill without any explicit getSummaryStore()/update() call.
-    await waitFor(() => {
-      const store = (ttDb as any).summaryStore;
-      return store != null && store.getSize() > 0;
-    });
+    // The open-time probe is fire-and-forget: once it has finished, the
+    // store exists and is filled without any explicit getSummaryStore()/update().
+    await (ttDb as any).whenBackgroundIdle();
+    expect((ttDb as any).summaryStore?.getSize()).toBeGreaterThan(0);
 
     const summary = ttDb.getSummaryStore!();
     expect(summary.getEntry(docA.getId())?.fields.name).toBe("Alpha");

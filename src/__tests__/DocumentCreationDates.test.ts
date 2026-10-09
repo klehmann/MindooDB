@@ -8,6 +8,7 @@ import {
 } from "../core/types";
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
+import { installManualSemanticClock, ManualSemanticClock } from "./_helpers/manualSemanticClock";
 
 /**
  * `listDocumentCreationDates()` orders documents by the author time of their
@@ -23,8 +24,11 @@ describe("listDocumentCreationDates", () => {
   let factory: BaseMindooTenantFactory;
   let tenant: MindooTenant;
   let db: MindooDB;
+  // Separates entries in time: creation dates are compared by timestamp.
+  let clock: ManualSemanticClock;
 
   beforeEach(async () => {
+    clock = installManualSemanticClock();
     factory = new BaseMindooTenantFactory(
       new InMemoryContentAddressedStoreFactory(),
       new NodeCryptoAdapter(),
@@ -69,19 +73,15 @@ describe("listDocumentCreationDates", () => {
     await (
       tenant as unknown as { disposeCacheManager?: () => Promise<void> }
     ).disposeCacheManager?.();
+    clock.restore();
   });
-
-  /** Entries carry millisecond timestamps, so separate the creates. */
-  async function tick(): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
 
   async function createNote(title: string): Promise<string> {
     const doc = await db.createDocument({ idPrefix: "note" });
     await db.changeDoc(doc, (mutable) => {
       mutable.getData().title = title;
     });
-    await tick();
+    clock.advance();
     return doc.getId();
   }
 
@@ -174,9 +174,9 @@ describe("listDocumentCreationDates", () => {
   it("evaluates existence and deletion at a time-travel cutoff", async () => {
     const first = await createNote("first");
     const second = await createNote("second");
-    await tick();
-    const cutoff = Date.now();
-    await tick();
+    clock.advance();
+    const cutoff = clock.now();
+    clock.advance();
 
     const third = await createNote("third");
     await db.deleteDocument(second);
@@ -202,9 +202,9 @@ describe("listDocumentCreationDates", () => {
   it("lists a document deleted before the cutoff as deleted there", async () => {
     const first = await createNote("first");
     await db.deleteDocument(first);
-    await tick();
-    const cutoff = Date.now();
-    await tick();
+    clock.advance();
+    const cutoff = clock.now();
+    clock.advance();
     await db.undeleteDocument(first);
 
     expect(

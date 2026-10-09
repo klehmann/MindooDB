@@ -17,6 +17,7 @@ module.exports = {
   // quantize all semantic timestamps so same-instant collisions become the
   // norm instead of a rare race. See _helpers/setupSemanticClock.ts.
   setupFiles: ['<rootDir>/src/__tests__/_helpers/setupSemanticClock.ts'],
+  setupFilesAfterEnv: ['<rootDir>/src/__tests__/_helpers/awaitBackgroundIdle.ts'],
   transform: {
     '^.+\\.ts$': ['ts-jest', {
       tsconfig: 'tsconfig.test.json',
