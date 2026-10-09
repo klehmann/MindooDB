@@ -18,6 +18,7 @@ import {
 } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { semanticNow } from "./utils/timeSource";
+import { SingleFlight } from "./utils/singleFlight";
 import { Logger, MindooLogger, getDefaultLogLevel } from "./logging";
 import {
   extractSigningPublicKeys,
@@ -100,6 +101,15 @@ function unionStrings(existing: string[], added: string[]): string[] {
   return Array.from(new Set([...existing, ...added]));
 }
 
+/** One group document's contribution to its (normalized) group name. */
+interface GroupDocEntry {
+  normalizedName: string;
+  membersHashes: string[];
+  membersEncrypted: string[];
+  deleted: boolean;
+  seenOrder: number;
+}
+
 export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagReconciler {
   private tenant: BaseMindooTenant;
   private directoryDB: MindooDB | null = null;
@@ -130,6 +140,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   // Cache for groups: key -> merged group data (key: lowercase groupName)
   // We store merged data separately to avoid mutating MindooDoc objects.
   private groupsCache: Map<string, { docId: string; members_hashes: string[]; members_encrypted: string[] }> = new Map();
+  // Every group document seen, by doc id. Several documents can carry the same
+  // group name (offline creation on two devices); groupsCache is their merge,
+  // recomputed per name from this map so an incremental pass that sees only
+  // one of them does not drop the others' members.
+  private groupDocsById: Map<string, GroupDocEntry> = new Map();
+  // Monotonic counter giving group documents their "latest seen" order.
+  private groupDocSeenCounter = 0;
 
   // Cache for key-distribution documents (acl_keydistribution_<keyId>), keyed by
   // keyId. Folded incrementally in updateUnifiedCache (singleton per keyId,
@@ -196,6 +213,15 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   // covered. Compared against the live index instead of the cursor, because
   // the cursor can lag behind entries that iterateChangesSince skips.
   private unifiedCacheIndexChangeSeq: number | null = null;
+  private readonly unifiedCachePass = new SingleFlight(() => this.runUnifiedCachePass());
+  private readonly timeTravelPass = new SingleFlight(() => this.runTimeTravelPass());
+  // Set when the feed changed stored revisions; cleared only once the chain
+  // was rebuilt from them, so a pass that fails in between is redone.
+  private timeTravelNeedsRebuild = false;
+  // Set by invalidateUnifiedCache; the next pass starts from scratch. A flag
+  // rather than resetting the cursor directly, which a running pass would
+  // overwrite with its own progress.
+  private unifiedCacheResetRequested = false;
   // Last store poll (syncStoreChanges) for trust validation. Polling only
   // discovers entries this process has not seen yet; entries already in the
   // directory index are applied via the changeSeq check, independent of time.
@@ -755,6 +781,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const latestSeq = directoryDB.getLatestChangeCursor?.()?.changeSeq ?? null;
     if (
       this.unifiedCacheLastCursor === null ||
+      this.unifiedCacheResetRequested ||
       latestSeq !== this.unifiedCacheIndexChangeSeq
     ) {
       await this.updateUnifiedCache();
@@ -772,15 +799,39 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
-   * Update all caches (trusted keys, groups, settings) by processing new changes since the last cursor.
-   * This unified method processes all document types in a single loop for efficiency.
-   * No signature verification is needed since the DB already enforces admin-only access.
+   * Bring all caches (trusted keys, groups, settings) up to date with the
+   * directory index.
+   *
+   * Single-flight: passes mutate shared caches across awaits, so overlapping
+   * passes would read each other's half-built state and multiply the work
+   * under load. A caller arriving while a pass runs waits for one follow-up
+   * pass that starts after it arrived (so it observes its own preceding
+   * writes); all such callers share that follow-up.
    */
-  private async updateUnifiedCache(): Promise<void> {
+  private updateUnifiedCache(): Promise<void> {
+    return this.unifiedCachePass.run();
+  }
+
+  /** Make the next unified-cache pass rebuild every cache from scratch. */
+  private invalidateUnifiedCache(): void {
+    this.unifiedCacheResetRequested = true;
+  }
+
+  /**
+   * One pass over the directory changes since the last cursor. Processes all
+   * document types in a single loop. No signature verification is needed
+   * since the DB already enforces admin-only access. Only called through
+   * {@link updateUnifiedCache}.
+   */
+  private async runUnifiedCachePass(): Promise<void> {
     const directoryDB = await this.getDirectoryDB();
     // Captured before iterating: entries added during the pass carry a higher
     // changeSeq, so the next applyDirectoryIndexChanges picks them up.
     const indexChangeSeqAtStart = directoryDB.getLatestChangeCursor?.()?.changeSeq ?? null;
+    if (this.unifiedCacheResetRequested) {
+      this.unifiedCacheResetRequested = false;
+      this.unifiedCacheLastCursor = null;
+    }
     // Determine starting cursor (null = process all, otherwise incremental)
     const startCursor = this.unifiedCacheLastCursor;
 
@@ -789,21 +840,35 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // author-trust reconcile of open databases (entries previously skipped
     // because their author was unknown get re-materialized).
     const previouslyTrustedKeys = new Set(this.trustedKeysCache.keys());
-    
-    // If processing from the beginning, clear all caches first
-    if (startCursor === null) {
-      this.trustedKeysCache.clear();
-      this.grantDocIdToSigningKeys.clear();
-      this.userLookupCache.clear();
-      this.wipeKeyToGrantDocId.clear();
-      this.tenantSettingsCache = null;
-      this.dbSettingsCache.clear();
-      this.groupsCache.clear();
-      this.keyDistributionCache.clear();
-    }
-    
-    // Track group documents by name for merging (handles offline sync scenarios)
-    const groupDocsByName: Map<string, MindooDoc[]> = new Map();
+
+    // Build and swap. The pass awaits between documents, and readers (also
+    // ones iterating a cache across their own awaits) must never see a cache
+    // that a full rebuild has cleared but not refilled. A full rebuild fills
+    // fresh maps and installs them at the end, synchronously; an incremental
+    // pass only adds/overwrites entries in place. The cursor is committed at
+    // the end too, so a pass that throws midway is simply redone (all updates
+    // are idempotent) instead of leaving its documents half-applied.
+    const fullRebuild = startCursor === null;
+    const grantDocIdToSigningKeys = fullRebuild ? new Map<string, string[]>() : this.grantDocIdToSigningKeys;
+    const userLookupCache = fullRebuild ? new Map<string, DirectoryUserLookup>() : this.userLookupCache;
+    const wipeKeyToGrantDocId = fullRebuild ? new Map<string, string>() : this.wipeKeyToGrantDocId;
+    let tenantSettingsCache = fullRebuild ? null : this.tenantSettingsCache;
+    const dbSettingsCache = fullRebuild ? new Map<string, MindooDoc>() : this.dbSettingsCache;
+    const groupDocsById = fullRebuild ? new Map<string, GroupDocEntry>() : this.groupDocsById;
+    const groupsCache: typeof this.groupsCache = fullRebuild ? new Map() : this.groupsCache;
+    const keyDistributionCache: typeof this.keyDistributionCache = fullRebuild
+      ? new Map()
+      : this.keyDistributionCache;
+    const appDistributionCache: typeof this.appDistributionCache = fullRebuild
+      ? new Map()
+      : this.appDistributionCache;
+    const syncSetupPolicyCache: typeof this.syncSetupPolicyCache = fullRebuild
+      ? new Map()
+      : this.syncSetupPolicyCache;
+    let lastCursor = startCursor;
+
+    // Group names whose merged entry must be recomputed at the end of the pass.
+    const dirtyGroupNames = new Set<string>();
     let sawGrantAccessChange = false;
     
     // Process changes (documents are returned in order by lastModified, oldest to newest)
@@ -823,7 +888,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         // to wipe. Maps each wipe-targeted signing key to this grant doc's id.
         if (data.type === "grantaccess") {
           for (const wipeKey of extractWipeRequestedSigningKeys(data)) {
-            this.wipeKeyToGrantDocId.set(wipeKey, doc.getId());
+            wipeKeyToGrantDocId.set(wipeKey, doc.getId());
           }
         }
         if (data.type === "grantaccess") {
@@ -835,7 +900,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
               // all grant documents once the change loop completes, so a key
               // dropped from this document is no longer trusted unless another
               // grant still lists it.
-              this.grantDocIdToSigningKeys.set(doc.getId(), grantedSigningKeys);
+              grantDocIdToSigningKeys.set(doc.getId(), grantedSigningKeys);
 
               if (grantedSigningKeys.length > 0) {
                 // One cache entry per device key pair (§6.5). Reusing a single
@@ -845,35 +910,48 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
                 // then fails with a WebCrypto OperationError on the iPad.
                 const lookups = await this.buildUserLookups(data);
                 for (const lookup of lookups) {
-                  this.userLookupCache.set(lookup.signingPublicKey, lookup);
+                  userLookupCache.set(lookup.signingPublicKey, lookup);
                 }
               }
             }
       }
 
-      // Process group documents
+      // Process group documents. The previous name of a re-seen doc is marked
+      // dirty too, so a renamed or no-longer-group doc leaves its old merge.
+      const previousGroupEntry = groupDocsById.get(doc.getId());
+      if (previousGroupEntry) {
+        dirtyGroupNames.add(previousGroupEntry.normalizedName);
+      }
       if (data.form === "group" && 
           data.type === "group" &&
           data.groupName &&
           typeof data.groupName === "string") {
         const normalizedGroupName = this.normalizeGroupName(data.groupName);
-        if (!groupDocsByName.has(normalizedGroupName)) {
-          groupDocsByName.set(normalizedGroupName, []);
-        }
-        groupDocsByName.get(normalizedGroupName)!.push(doc);
+        const stringArray = (value: unknown): string[] =>
+          Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+        groupDocsById.set(doc.getId(), {
+          normalizedName: normalizedGroupName,
+          membersHashes: stringArray(data.members_hashes),
+          membersEncrypted: stringArray(data.members_encrypted),
+          deleted: doc.isDeleted(),
+          seenOrder: ++this.groupDocSeenCounter,
+        });
+        dirtyGroupNames.add(normalizedGroupName);
+      } else if (previousGroupEntry) {
+        groupDocsById.delete(doc.getId());
       }
       
       // Process tenant settings (no signature verification needed - Automerge handles merging)
       if (data.form === "tenantsettings") {
         // Just overwrite - last one seen will be the latest
-        this.tenantSettingsCache = doc;
+        tenantSettingsCache = doc;
       }
       
       // Process DB settings (no signature verification needed - Automerge handles merging)
       if (data.form === "dbsettings" && data.dbid && typeof data.dbid === "string") {
         const dbId = data.dbid;
         // Just overwrite - last one seen will be the latest
-        this.dbSettingsCache.set(dbId, doc);
+        dbSettingsCache.set(dbId, doc);
       }
 
       // Process key-distribution documents (acl_keydistribution_<keyId>); a
@@ -883,9 +961,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       if (data.type === KEY_DISTRIBUTION_TYPE && typeof data.keyId === "string") {
         const keyId = data.keyId;
         if (doc.isDeleted()) {
-          this.keyDistributionCache.delete(keyId);
+          keyDistributionCache.delete(keyId);
         } else {
-          this.keyDistributionCache.set(keyId, {
+          keyDistributionCache.set(keyId, {
             keyVersions: Array.isArray(data.keyVersions)
               ? (data.keyVersions as unknown[])
                   .filter(
@@ -919,11 +997,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       if (data.type === APP_DISTRIBUTION_TYPE && typeof data.appId === "string") {
         const appId = data.appId;
         if (doc.isDeleted()) {
-          this.appDistributionCache.delete(appId);
+          appDistributionCache.delete(appId);
         } else {
           const stringArray = (value: unknown): string[] =>
             Array.isArray(value) ? value.filter((h): h is string => typeof h === "string") : [];
-          this.appDistributionCache.set(appId, {
+          appDistributionCache.set(appId, {
             pushto_users_hashes: stringArray(data.pushto_users_hashes),
             pushto_groups_hashes: stringArray(data.pushto_groups_hashes),
             pullfrom_users_hashes: stringArray(data.pullfrom_users_hashes),
@@ -939,11 +1017,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       if (data.type === SYNC_SETUP_POLICY_TYPE && typeof data.policyId === "string") {
         const policyId = data.policyId;
         if (doc.isDeleted()) {
-          this.syncSetupPolicyCache.delete(policyId);
+          syncSetupPolicyCache.delete(policyId);
         } else {
           const stringArray = (value: unknown): string[] =>
             Array.isArray(value) ? value.filter((h): h is string => typeof h === "string") : [];
-          this.syncSetupPolicyCache.set(policyId, {
+          syncSetupPolicyCache.set(policyId, {
             mode: data.mode === "permanent" ? "permanent" : "initial",
             pushto_users_hashes: stringArray(data.pushto_users_hashes),
             pushto_groups_hashes: stringArray(data.pushto_groups_hashes),
@@ -953,9 +1031,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         }
       }
 
-      // Update cursor after each document
-      this.unifiedCacheLastCursor = cursor;
+      lastCursor = cursor;
     }
+
+    // From here to the end of the method there is no await: readers see
+    // either the previous state or this pass's complete state.
 
     // Rebuild the trusted signing-key set as the union of every grant
     // document's current keys (docs/accesscontrol.md §6.5). Revocation removes
@@ -963,12 +1043,62 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // validatePublicSigningKey treats "not present" as untrusted. This is
     // recomputed on every pass (full or incremental) because the per-grant map
     // is the source of truth and persists across incremental updates.
-    this.trustedKeysCache.clear();
-    for (const signingKeys of this.grantDocIdToSigningKeys.values()) {
+    const trustedKeysCache = new Map<string, boolean>();
+    for (const signingKeys of grantDocIdToSigningKeys.values()) {
       for (const key of signingKeys) {
-        this.trustedKeysCache.set(key, true);
+        trustedKeysCache.set(key, true);
       }
     }
+
+    // Merge the group documents of every touched name (handles the same group
+    // created offline on several devices). A name is deleted as soon as any of
+    // its documents is deleted; docId points at the latest-seen document.
+    if (dirtyGroupNames.size > 0) {
+      const entriesByName = new Map<string, Array<[string, GroupDocEntry]>>();
+      for (const [docId, entry] of groupDocsById) {
+        if (!dirtyGroupNames.has(entry.normalizedName)) continue;
+        let list = entriesByName.get(entry.normalizedName);
+        if (!list) {
+          list = [];
+          entriesByName.set(entry.normalizedName, list);
+        }
+        list.push([docId, entry]);
+      }
+      for (const normalizedGroupName of dirtyGroupNames) {
+        const entries = entriesByName.get(normalizedGroupName);
+        if (!entries || entries.some(([, entry]) => entry.deleted)) {
+          groupsCache.delete(normalizedGroupName);
+          continue;
+        }
+        let latest = entries[0];
+        const allMembersHashes = new Set<string>();
+        const allMembersEncrypted = new Set<string>();
+        for (const item of entries) {
+          if (item[1].seenOrder > latest[1].seenOrder) latest = item;
+          for (const h of item[1].membersHashes) allMembersHashes.add(h);
+          for (const e of item[1].membersEncrypted) allMembersEncrypted.add(e);
+        }
+        groupsCache.set(normalizedGroupName, {
+          docId: latest[0],
+          members_hashes: Array.from(allMembersHashes),
+          members_encrypted: Array.from(allMembersEncrypted),
+        });
+      }
+    }
+
+    this.trustedKeysCache = trustedKeysCache;
+    this.grantDocIdToSigningKeys = grantDocIdToSigningKeys;
+    this.userLookupCache = userLookupCache;
+    this.wipeKeyToGrantDocId = wipeKeyToGrantDocId;
+    this.tenantSettingsCache = tenantSettingsCache;
+    this.dbSettingsCache = dbSettingsCache;
+    this.groupDocsById = groupDocsById;
+    this.groupsCache = groupsCache;
+    this.keyDistributionCache = keyDistributionCache;
+    this.appDistributionCache = appDistributionCache;
+    this.syncSetupPolicyCache = syncSetupPolicyCache;
+    this.unifiedCacheLastCursor = lastCursor;
+    this.unifiedCacheIndexChangeSeq = indexChangeSeqAtStart;
 
     // Author-trust hook: keys that just became trusted (new grantaccess docs)
     // may unblock entries that open databases skipped earlier because the
@@ -988,57 +1118,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     if (sawGrantAccessChange) {
       this.tenant.scheduleUserKeyReconcile?.();
     }
-
-    // Merge group documents with the same name
-    for (const [normalizedGroupName, docs] of groupDocsByName.entries()) {
-      // Collect all member hashes and encrypted values from all documents with this group name
-      const allMembersHashes = new Set<string>();
-      const allMembersEncrypted = new Set<string>();
-      let latestDoc: MindooDoc | null = null;
-      let isDeleted = false;
-      
-      for (const doc of docs) {
-        const data = doc.getData();
-        // Track the latest document (by iteration order, which is by lastModified)
-        latestDoc = doc;
-        // Check if document is deleted via lifecycle metadata.
-        if (doc.isDeleted()) {
-          isDeleted = true;
-        }
-        // Use members_hashes for membership lookups.
-        if (data.members_hashes && Array.isArray(data.members_hashes)) {
-          for (const memberHash of data.members_hashes) {
-            if (typeof memberHash === "string") {
-              allMembersHashes.add(memberHash);
-            }
-          }
-        }
-        if (data.members_encrypted && Array.isArray(data.members_encrypted)) {
-          for (const encryptedMember of data.members_encrypted) {
-            if (typeof encryptedMember === "string") {
-              allMembersEncrypted.add(encryptedMember);
-            }
-          }
-        }
-      }
-      
-      // If latest version is deleted, remove from cache
-      if (isDeleted) {
-        this.groupsCache.delete(normalizedGroupName);
-        continue;
-      }
-      
-      // Store merged group data in cache (without mutating the MindooDoc)
-      if (latestDoc) {
-        this.groupsCache.set(normalizedGroupName, {
-          docId: latestDoc.getId(),
-          members_hashes: Array.from(allMembersHashes),
-          members_encrypted: Array.from(allMembersEncrypted),
-        });
-      }
-    }
-
-    this.unifiedCacheIndexChangeSeq = indexChangeSeqAtStart;
   }
 
   /**
@@ -1069,8 +1148,16 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * The (potentially expensive) feed rebuild is skipped when the directory's
    * changefeed cursor has not advanced since the previous build and no
    * un-witnessed revisions are pending a possible trusted-time re-stamp.
+   *
+   * Single-flight: the pass creates the index across an await and advances
+   * the shared index cursor per revision, so overlapping passes would create
+   * and register two indexes or interleave their feed reads.
    */
-  private async ensureTimeTravelCurrent(): Promise<DirectoryTimeTravelIndex> {
+  private ensureTimeTravelCurrent(): Promise<DirectoryTimeTravelIndex> {
+    return this.timeTravelPass.run();
+  }
+
+  private async runTimeTravelPass(): Promise<DirectoryTimeTravelIndex> {
     const directoryDB = await this.getDirectoryDB();
 
     // Projection used to (re)build the chain from stored revisions in
@@ -1118,14 +1205,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // (notably when a re-stamped entry is re-discovered with a `receivedAt`), so
     // we do not need to re-run the feed on every call just to refresh the
     // provisional `now` of un-witnessed entries.
-    if (this.lastTimeTravelChangeSeq !== null && latestSeq === this.lastTimeTravelChangeSeq) {
+    if (
+      !this.timeTravelNeedsRebuild &&
+      this.lastTimeTravelChangeSeq !== null &&
+      latestSeq === this.lastTimeTravelChangeSeq
+    ) {
       return index;
     }
 
     // Incrementally advance the feed from the persisted cursor; the feed parks
     // the cursor before the earliest un-witnessed entry so those revisions are
     // re-discovered (and re-stamped/superseded as needed) on this resume.
-    let changed = false;
     for await (const rev of directoryDB.iterateChangeRevisionsSince(index.cursor)) {
       const revChanged = index.upsertRevision(
         {
@@ -1138,14 +1228,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         },
         rev.cursor,
       );
-      changed = changed || revChanged;
+      if (revChanged) {
+        this.timeTravelNeedsRebuild = true;
+      }
     }
 
     // Replay all revisions into the chain in trusted-time order. This absorbs
     // out-of-order arrivals and supersessions (a re-emitted revision replaced its
     // prior record above) without any special-casing in the chain builder.
-    if (changed) {
+    if (this.timeTravelNeedsRebuild) {
       index.rebuild(project);
+      this.timeTravelNeedsRebuild = false;
     }
 
     this.lastTimeTravelChangeSeq = latestSeq;
@@ -4131,7 +4224,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     
     // Invalidate cache
     this.tenantSettingsCache = null;
-    this.unifiedCacheLastCursor = null;
+    this.invalidateUnifiedCache();
   }
 
   async changeDBSettings(
@@ -4179,7 +4272,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     
     // Invalidate cache for this dbId
     this.dbSettingsCache.delete(dbId);
-    this.unifiedCacheLastCursor = null;
+    this.invalidateUnifiedCache();
   }
 
   async getGroups(): Promise<string[]> {
@@ -4239,6 +4332,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const newMembersHashes = await Promise.all(username.map(u => this.hashUsernameForWrite(u)));
     const newMembersEncrypted = await Promise.all(username.map(u => this.encryptGroupMemberForTenant(u)));
     
+    // Bring the cache up to date first: a stale miss (e.g. right after the
+    // previous call invalidated it) would create a second document for an
+    // existing group name.
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+
     // Get the actual document from the database (using cached docId if available)
     const cachedGroup = this.groupsCache.get(normalizedGroupName);
     let groupDoc: MindooDoc;
@@ -4299,7 +4398,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     
     // Invalidate cache for this group
     this.groupsCache.delete(normalizedGroupName);
-    this.unifiedCacheLastCursor = null;
+    this.invalidateUnifiedCache();
   }
 
   async removeUsersFromGroup(
@@ -4324,9 +4423,6 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       return;
     }
     
-    // Load the actual document from the database
-    const groupDoc = await directoryDB.getDocument(cachedGroup.docId);
-    
     const adminSigningKeyPair: SigningKeyPair = {
       publicKey: baseTenant.getAdministrationPublicKey(),
       privateKey: administrationPrivateKey,
@@ -4338,45 +4434,57 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       (await Promise.all(username.map(u => this.usernameHashCandidates(u)))).flat()
     );
     
-    // Remove users from members arrays
-    await directoryDB.changeDoc(
-      groupDoc,
-      async (d: MindooDoc) => {
-        const data = d.getData();
+    // Membership is the union over every document carrying this group name,
+    // so the users must be removed from all of them, not only the latest.
+    const groupDocIds = new Set<string>([cachedGroup.docId]);
+    for (const [docId, entry] of this.groupDocsById) {
+      if (entry.normalizedName === normalizedGroupName && !entry.deleted) {
+        groupDocIds.add(docId);
+      }
+    }
+
+    for (const groupDocId of groupDocIds) {
+      const groupDoc = await directoryDB.getDocument(groupDocId);
+      // Remove users from members arrays
+      await directoryDB.changeDoc(
+        groupDoc,
+        async (d: MindooDoc) => {
+          const data = d.getData();
         
-        if (!data.members_hashes || !Array.isArray(data.members_hashes) ||
-            !data.members_encrypted || !Array.isArray(data.members_encrypted)) {
-          return;
-        }
-        
-        // Filter out members whose hashes match the ones to remove
-        // Keep arrays in sync by filtering indices
-        const indicesToKeep: number[] = [];
-        const hashesArray = data.members_hashes as string[];
-        for (let i = 0; i < hashesArray.length; i++) {
-          if (!hashesToRemove.has(hashesArray[i])) {
-            indicesToKeep.push(i);
+          if (!data.members_hashes || !Array.isArray(data.members_hashes) ||
+              !data.members_encrypted || !Array.isArray(data.members_encrypted)) {
+            return;
           }
-        }
         
-        const encryptedArray = data.members_encrypted as string[];
-        data.members_hashes = indicesToKeep.map(i => hashesArray[i]);
-        data.members_encrypted = indicesToKeep.map(i => encryptedArray[i]);
+          // Filter out members whose hashes match the ones to remove
+          // Keep arrays in sync by filtering indices
+          const indicesToKeep: number[] = [];
+          const hashesArray = data.members_hashes as string[];
+          for (let i = 0; i < hashesArray.length; i++) {
+            if (!hashesToRemove.has(hashesArray[i])) {
+              indicesToKeep.push(i);
+            }
+          }
         
-        // Ensure form, type, and groupName fields are always correct
-        data.form = "group";
-        data.type = "group";
-        data.groupName = normalizedGroupName;
-      },
-      {
-        signingKeyPair: adminSigningKeyPair,
-        signingKeyPassword: administrationPrivateKeyPassword,
-      },
-    );
+          const encryptedArray = data.members_encrypted as string[];
+          data.members_hashes = indicesToKeep.map(i => hashesArray[i]);
+          data.members_encrypted = indicesToKeep.map(i => encryptedArray[i]);
+        
+          // Ensure form, type, and groupName fields are always correct
+          data.form = "group";
+          data.type = "group";
+          data.groupName = normalizedGroupName;
+        },
+        {
+          signingKeyPair: adminSigningKeyPair,
+          signingKeyPassword: administrationPrivateKeyPassword,
+        },
+      );
+    }
     
     // Invalidate cache for this group
     this.groupsCache.delete(normalizedGroupName);
-    this.unifiedCacheLastCursor = null;
+    this.invalidateUnifiedCache();
   }
 
   async deleteGroup(
@@ -4413,7 +4521,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     
     // Remove from cache
     this.groupsCache.delete(normalizedGroupName);
-    this.unifiedCacheLastCursor = null;
+    this.invalidateUnifiedCache();
   }
 
   async getUserNamesList(username: string): Promise<string[]> {

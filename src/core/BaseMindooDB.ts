@@ -1470,7 +1470,7 @@ export class BaseMindooDB implements MindooDB {
     this.dirtyDocIds.clear();
     this.cacheMetaDirty = false;
     this.summaryStore?.discardDirtyState();
-    this.fulltextIndex?.clearDirty();
+    this.fulltextIndex?.discardDirtyState();
     void cacheManager.deregister(this as unknown as ICacheable);
     if (this.summaryStore) {
       void cacheManager.deregister(this.summaryStore);

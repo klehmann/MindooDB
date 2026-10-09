@@ -52,7 +52,12 @@ export class CacheManager {
   private cacheables: Set<ICacheable> = new Set();
   private flushIntervalMs: number;
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private flushInProgress: boolean = false;
+  // Single-flight flush with one shared follow-up: a flush requested while
+  // another runs (e.g. dispose during a timer flush) must still persist the
+  // state changed since that run started, not return early.
+  private flushRun: Promise<void> | null = null;
+  private flushQueued: Promise<void> | null = null;
+  private queuedFlushForce: boolean = false;
   private disposed: boolean = false;
   private logger: Logger;
 
@@ -78,6 +83,14 @@ export class CacheManager {
    * Triggers an immediate flush for this cacheable before removal.
    */
   async deregister(cacheable: ICacheable): Promise<void> {
+    if (!cacheable.hasDirtyState()) {
+      // Remove synchronously: purge paths discard the dirty state first and
+      // rely on a running flush no longer reaching this cacheable.
+      this.cacheables.delete(cacheable);
+      return;
+    }
+    // Never flush one cacheable from two places at once.
+    await this.flushRun?.catch(() => undefined);
     if (cacheable.hasDirtyState()) {
       try {
         await cacheable.flushToCache(this.store, { force: true });
@@ -112,24 +125,41 @@ export class CacheManager {
    * @param options `force: true` bypasses per-cacheable flush deferral
    *   (used on dispose so shutdown never skips pending state)
    */
-  async flush(options?: { force?: boolean }): Promise<void> {
-    if (this.flushInProgress) return;
-    this.flushInProgress = true;
-
-    try {
-      for (const cacheable of this.cacheables) {
-        if (!cacheable.hasDirtyState()) continue;
-
-        try {
-          const count = await cacheable.flushToCache(this.store, options);
-          cacheable.clearDirty();
-          this.logger.debug(`Flushed ${count} entries for ${cacheable.getCachePrefix()}`);
-        } catch (e) {
-          this.logger.warn(`Cache flush failed for ${cacheable.getCachePrefix()}: ${e}`);
+  flush(options?: { force?: boolean }): Promise<void> {
+    if (!this.flushRun) {
+      const run = this.runFlush(options).finally(() => {
+        if (this.flushRun === run) {
+          this.flushRun = null;
         }
+      });
+      this.flushRun = run;
+      return run;
+    }
+    if (options?.force) {
+      this.queuedFlushForce = true;
+    }
+    if (!this.flushQueued) {
+      this.flushQueued = this.flushRun.then(() => {
+        this.flushQueued = null;
+        const force = this.queuedFlushForce;
+        this.queuedFlushForce = false;
+        return this.flush(force ? { force } : undefined);
+      });
+    }
+    return this.flushQueued;
+  }
+
+  private async runFlush(options?: { force?: boolean }): Promise<void> {
+    for (const cacheable of this.cacheables) {
+      if (!cacheable.hasDirtyState()) continue;
+
+      try {
+        const count = await cacheable.flushToCache(this.store, options);
+        cacheable.clearDirty();
+        this.logger.debug(`Flushed ${count} entries for ${cacheable.getCachePrefix()}`);
+      } catch (e) {
+        this.logger.warn(`Cache flush failed for ${cacheable.getCachePrefix()}: ${e}`);
       }
-    } finally {
-      this.flushInProgress = false;
     }
   }
 

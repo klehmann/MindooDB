@@ -15,6 +15,7 @@ import {
 import { InMemoryLocalCacheStore } from "../core/cache/LocalCacheStore";
 import { CacheManager } from "../core/cache/CacheManager";
 import { createWitnessingTenant } from "./_helpers/witnessingTenant";
+import { pauseNextFeedRead } from "./_helpers/pauseFeed";
 
 /**
  * Coverage for the document summary buffer (docs/adhoc-queries.md):
@@ -483,6 +484,29 @@ describe("DocumentSummaryStore", () => {
     expect(summary.getCoverage()).toBe("full");
     expect(summary.getEntry(id1)?.fields.secret).toBeUndefined();
     expect(summary.getEntry(id1)?.fields.name).toBe("Alice");
+  }, 30000);
+
+  it("restarts a backfill when the config changes again mid-backfill, so earlier entries are re-extracted", async () => {
+    for (let i = 0; i < 3; i++) {
+      await createDoc({ name: `doc-${i}`, secret: `s-${i}` });
+    }
+    const summary = new DocumentSummaryStore(db);
+    await summary.update();
+
+    summary.setConfig({ exclude: ["secret"] });
+    const feed = pauseNextFeedRead(db, null);
+    const backfill = summary.update();
+    await feed.paused;
+    summary.setConfig({ exclude: ["name"] });
+    feed.release();
+    await backfill;
+    await summary.update();
+
+    expect(summary.getCoverage()).toBe("full");
+    for (const entry of summary.getAllEntries()) {
+      expect(entry.fields.name).toBeUndefined();
+      expect(entry.fields.secret).toBeDefined();
+    }
   }, 30000);
 
   it("schedules a backfill on restore when the config fingerprint differs, resumable after interruption", async () => {

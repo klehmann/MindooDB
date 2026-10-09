@@ -26,6 +26,7 @@ import { InMemoryLocalCacheStore } from "../core/cache/LocalCacheStore";
 import { CacheManager } from "../core/cache/CacheManager";
 import { BaseMindooDB } from "../core/BaseMindooDB";
 import { createWitnessingTenant } from "./_helpers/witnessingTenant";
+import { pauseNextFeedRead } from "./_helpers/pauseFeed";
 
 /**
  * Coverage for the document full-text index (docs/fulltext-search.md):
@@ -393,6 +394,79 @@ describe("DocumentFullTextIndex", () => {
     const noField = await index.search("pineapple", { fields: ["title"] });
     expect(noField.hits).toHaveLength(0);
   }, 30000);
+
+  describe("overlapping runs", () => {
+    function gate(): { wait: Promise<void>; open: () => void } {
+      let open!: () => void;
+      const wait = new Promise<void>((resolve) => (open = resolve));
+      return { wait, open };
+    }
+
+    it("a search arriving during a run also sees documents written meanwhile", async () => {
+      await createDoc({ body: "early apple" });
+      await createDoc({ body: "early pear" });
+      const index = new DocumentFullTextIndex(db, { enabled: true });
+
+      const feed = pauseNextFeedRead(db, "any");
+      const first = index.update();
+      await feed.paused;
+      const lateId = await createDoc({ body: "late apple" });
+      const search = index.search("apple");
+      feed.release();
+      await first;
+
+      expect((await search).hits.map((h) => h.docId)).toContain(lateId);
+    }, 30000);
+
+    it("a config change during a backfill restarts it, so earlier documents are re-indexed", async () => {
+      const ids = [
+        await createDoc({ title: "first title", body: "kiwi one" }),
+        await createDoc({ title: "second title", body: "kiwi two" }),
+        await createDoc({ title: "third title", body: "kiwi three" }),
+      ];
+      const index = new DocumentFullTextIndex(db, { enabled: true });
+      await index.update();
+
+      index.setConfig({ enabled: true, include: ["title"] });
+      const feed = pauseNextFeedRead(db, null);
+      const backfill = index.update();
+      await feed.paused;
+      index.setConfig({ enabled: true, include: ["body"] });
+      feed.release();
+      await backfill;
+      await index.update();
+
+      expect(index.getCoverage()).toBe("full");
+      expect((await index.search("kiwi")).hits.map((h) => h.docId).sort()).toEqual([...ids].sort());
+    }, 30000);
+
+    it("keeps changes made during a flush dirty for the next flush", async () => {
+      await createDoc({ body: "flushed banana" });
+      const putGate = gate();
+      const putStarted = gate();
+      const cacheStore = new InMemoryLocalCacheStore();
+      const originalPut = cacheStore.put.bind(cacheStore);
+      cacheStore.put = async (...args: Parameters<typeof cacheStore.put>) => {
+        putStarted.open();
+        await putGate.wait;
+        return originalPut(...args);
+      };
+      const cacheManager = new CacheManager(cacheStore, { flushIntervalMs: 60000 });
+      const index = new DocumentFullTextIndex(db, { enabled: true });
+      index.attachCache(cacheManager, "testdb/fulltext");
+      await index.update();
+
+      const flush = cacheManager.flush();
+      await putStarted.wait;
+      await createDoc({ body: "unflushed banana" });
+      await index.update();
+      putGate.open();
+      await flush;
+
+      expect(index.hasDirtyState()).toBe(true);
+      await cacheManager.dispose();
+    }, 30000);
+  });
 });
 
 describe("attachment extraction results (setAttachmentExtractedText)", () => {

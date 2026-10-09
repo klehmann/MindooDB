@@ -76,12 +76,16 @@ export class DocumentFullTextIndex implements ICacheable {
   private cachePrefix: string | null = null;
   private engineDirty: boolean = false;
   private metaDirty: boolean = false;
+  /** True between a flush taking its snapshot and the CacheManager's clearDirty. */
+  private flushHandledDirty: boolean = false;
   private restorePromise: Promise<void> | null = null;
   private restored: boolean = false;
 
   // --- backfill state (config changed while the index already has content) ---
   private needsBackfill: boolean = false;
   private backfillCursor: ProcessChangesCursor | null = null;
+  /** Bumped by every scheduleBackfill, so a running backfill sees it was restarted. */
+  private backfillGeneration: number = 0;
 
   // --- single-flight update ---
   private updatePromise: Promise<void> | null = null;
@@ -158,6 +162,7 @@ export class DocumentFullTextIndex implements ICacheable {
   private scheduleBackfill(): void {
     this.needsBackfill = true;
     this.backfillCursor = null;
+    this.backfillGeneration++;
   }
 
   /**
@@ -275,16 +280,37 @@ export class DocumentFullTextIndex implements ICacheable {
    *
    * Accepts the same batching/progress/cancellation options as summary
    * updates; an interrupted run resumes from the saved cursors. Calls are
-   * single-flight: concurrent callers share one run.
+   * single-flight: concurrent callers share one run. A caller that finds a
+   * run in flight waits for it and then starts a follow-up run when the
+   * changefeed moved on meanwhile (same contract as the summary store), so
+   * the promise never resolves on a state older than the call.
    */
   async update(options?: VirtualViewUpdateOptions): Promise<void> {
     if (this.updatePromise) {
-      return this.updatePromise;
+      while (this.updatePromise) {
+        try {
+          await this.updatePromise;
+        } catch {
+          // The follow-up run below reports its own errors.
+        }
+      }
+      if (this.isCaughtUp()) {
+        return;
+      }
     }
     this.updatePromise = this.runUpdate(options).finally(() => {
       this.updatePromise = null;
     });
     return this.updatePromise;
+  }
+
+  /** Whether the last run consumed the whole changefeed and no backfill is pending. */
+  private isCaughtUp(): boolean {
+    if (!this.restored || this.needsBackfill || !this.config.enabled) {
+      return false;
+    }
+    const remaining = this.db.countChangesSince?.(this.cursor);
+    return remaining !== undefined && remaining === 0;
   }
 
   private async runUpdate(options?: VirtualViewUpdateOptions): Promise<void> {
@@ -350,10 +376,19 @@ export class DocumentFullTextIndex implements ICacheable {
     // Pass 2: configuration backfill (re-index everything with the new
     // config/engine). The feed yields each document's latest state once,
     // so plain re-adds converge; docs changing mid-backfill are
-    // re-processed by the next pass 1 anyway.
-    if (this.needsBackfill) {
+    // re-processed by the next pass 1 anyway. A config change during the
+    // backfill (setConfig, or the setup doc in the feed) schedules a new one
+    // from the start; the loop then restarts instead of finishing the old
+    // one and clearing needsBackfill with the earlier docs not re-indexed.
+    while (this.needsBackfill) {
+      const generation = this.backfillGeneration;
+      let restarted = false;
       for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor)) {
         await this.applyDocument(doc.getId(), doc as MindooDoc);
+        if (generation !== this.backfillGeneration) {
+          restarted = true;
+          break;
+        }
         this.backfillCursor = cursor;
         processed++;
         processedInBatch++;
@@ -369,9 +404,11 @@ export class DocumentFullTextIndex implements ICacheable {
           return;
         }
       }
-      this.needsBackfill = false;
-      this.backfillCursor = null;
-      this.metaDirty = true;
+      if (!restarted) {
+        this.needsBackfill = false;
+        this.backfillCursor = null;
+        this.metaDirty = true;
+      }
     }
 
     this.cacheManager?.markDirty();
@@ -562,8 +599,24 @@ export class DocumentFullTextIndex implements ICacheable {
   }
 
   clearDirty(): void {
+    if (this.flushHandledDirty) {
+      // Follow-up of a flush that already took its snapshot: anything dirty
+      // now changed during the flush and must stay dirty.
+      this.flushHandledDirty = false;
+      return;
+    }
+    this.discardDirtyState();
+  }
+
+  /**
+   * Unconditionally drop all dirty markers (unlike {@link clearDirty}, which
+   * after a flush only acknowledges that flush). Used when the persisted
+   * records are about to be deleted and must not be rewritten.
+   */
+  discardDirtyState(): void {
     this.engineDirty = false;
     this.metaDirty = false;
+    this.flushHandledDirty = false;
   }
 
   private markEngineDirty(): void {
@@ -572,23 +625,40 @@ export class DocumentFullTextIndex implements ICacheable {
   }
 
   async flushToCache(store: LocalCacheStore, _options?: { force?: boolean }): Promise<number> {
+    // Snapshot engine and meta synchronously before the first await: both
+    // records must describe the same state (a cursor ahead of the engine
+    // would skip documents after a restore), and changes an update run makes
+    // while the writes are in flight must stay dirty for the next flush.
     const prefix = this.getCachePrefix();
-    let written = 0;
-
-    if (this.engineDirty) {
-      await store.put("fulltext", `${prefix}/engine`, this.engine.serialize());
-      written++;
-    }
-
+    const engineBytes = this.engineDirty ? this.engine.serialize() : null;
     const meta: FulltextMetaPayload = {
       cursor: this.cursor,
       configFingerprint: this.configFingerprint,
       needsBackfill: this.needsBackfill,
       backfillCursor: this.backfillCursor,
     };
-    await store.put("fulltext", `${prefix}/meta`, new TextEncoder().encode(JSON.stringify(meta)));
-    written++;
+    this.engineDirty = false;
+    this.metaDirty = false;
+    this.flushHandledDirty = true;
 
+    let written = 0;
+    try {
+      if (engineBytes) {
+        await store.put("fulltext", `${prefix}/engine`, engineBytes);
+        written++;
+      }
+      await store.put("fulltext", `${prefix}/meta`, new TextEncoder().encode(JSON.stringify(meta)));
+      written++;
+    } catch (error) {
+      // Nothing is lost: re-dirty the snapshot for the next attempt. The
+      // CacheManager skips clearDirty on errors, so reset the handoff flag.
+      if (engineBytes) {
+        this.engineDirty = true;
+      }
+      this.metaDirty = true;
+      this.flushHandledDirty = false;
+      throw error;
+    }
     return written;
   }
 

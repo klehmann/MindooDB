@@ -64,6 +64,7 @@ import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
 import { CacheManager } from "./cache/CacheManager";
 import { validateDatabaseId } from "./databaseIdValidation";
 import { BackgroundTaskTracker } from "./BackgroundTaskTracker";
+import { SingleFlight } from "./utils/singleFlight";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -106,11 +107,12 @@ export class BaseMindooTenant implements MindooTenant {
    */
   private unsubscribeKeyBagChanges: (() => void) | null = null;
   /**
-   * Single-flight latch for {@link reconcileKeyBagChanges}. Concurrent calls
-   * coalesce onto the same in-flight reconcile so live listener firings and
-   * explicit calls cannot race against each other or duplicate work.
+   * Single-flight for {@link reconcileKeyBagChanges}. Concurrent calls
+   * coalesce so live listener firings and explicit calls cannot race; a call
+   * arriving mid-run gets one follow-up run, so a KeyBag change made while
+   * databases were being reconciled is not left unconsumed.
    */
-  private keyBagReconcilePromise: Promise<void> | null = null;
+  private readonly keyBagReconcile = new SingleFlight(() => this.runKeyBagReconcile());
 
   // Cache for decrypted keys (to avoid repeated decryption)
   private decryptedTenantKeyCache?: Uint8Array;
@@ -133,13 +135,19 @@ export class BaseMindooTenant implements MindooTenant {
   private static readonly MAX_IMPORTED_KEY_CACHE_ENTRIES = 128;
   private logger: Logger;
 
-  // Single-flight guard for SDK-driven key-distribution reconcile (§13). The
-  // reconcile driver itself calls getDirectoryDB / updateUnifiedCache /
-  // syncStoreChanges, any of which can re-enter a trigger; this flag keeps the
-  // run-always trigger (directory bring-up + after each directory pull) from
-  // recursing or overlapping. Reconcile is idempotent, so a skipped overlap is
-  // harmless — the next trigger re-runs it.
-  private reconcileInFlight = false;
+  // Single-flight for the SDK-driven key-distribution reconcile (§13), fired on
+  // directory bring-up and after each directory pull. A trigger arriving
+  // mid-run (e.g. a pull that brought a new distribution) gets one follow-up
+  // run instead of being dropped. The driver's own re-trigger (directory
+  // bring-up inside getDirectoryDB) is fire-and-forget, never awaited inside
+  // the run, so it queues a follow-up rather than waiting for itself.
+  private readonly keyDistributionReconcile = new SingleFlight(async () => {
+    try {
+      await this.reconcileKeyDistributionsForCurrentUser();
+    } catch (error) {
+      this.logger.warn(`reconcileKeyDistributionsForCurrentUserSafe: ${error}`);
+    }
+  });
   private userKeyReconcileScheduled = false;
   /** Fire-and-forget work of this tenant; see {@link whenBackgroundIdle}. */
   private readonly backgroundTasks = new BackgroundTaskTracker();
@@ -1551,12 +1559,14 @@ export class BaseMindooTenant implements MindooTenant {
    * Designed as the single barrier callers can `await` to be certain that
    * subsequent reads observe the latest add/remove of doc keys. Behaviour:
    *
-   *  - Idempotent and concurrency-safe. Concurrent callers share the same
-   *    in-flight reconcile via {@link keyBagReconcilePromise}, and a second
-   *    call after the cursor catches up is a fast no-op.
+   *  - Idempotent and concurrency-safe. Concurrent callers share one run;
+   *    a call arriving mid-run gets one follow-up run (see
+   *    {@link keyBagReconcile}), and a call after the cursor catches up is a
+   *    fast no-op.
    *  - Cursor-based. Replays from the persisted cursor in
    *    {@link keyBagChangeCursor}, so missed live notifications are
-   *    automatically recovered.
+   *    automatically recovered. The cursor advances only after every open
+   *    database was reconciled, so a failed run is retried by the next call.
    *  - Tenant-scoped. Events for other tenants in a shared KeyBag are
    *    consumed (the cursor still advances) but ignored.
    *  - Invalidates the cached tenant default key when its add/remove was
@@ -1565,39 +1575,34 @@ export class BaseMindooTenant implements MindooTenant {
    *    cuts and never participate in visibility reconciliation.
    */
   async reconcileKeyBagChanges(): Promise<void> {
-    if (this.keyBagReconcilePromise) {
-      return this.keyBagReconcilePromise;
+    return this.keyBagReconcile.run();
+  }
+
+  private async runKeyBagReconcile(): Promise<void> {
+    let sawTenantDocKeyChange = false;
+    let latestCursor = this.keyBagChangeCursor;
+
+    // Consume every pending event so the cursor advances even for
+    // unrelated tenants sharing the same bag. We only need to react to
+    // doc keys for our own tenant though.
+    for await (const event of this.keyBag.iterateChangesSince(this.keyBagChangeCursor)) {
+      latestCursor = { changeSeq: event.changeSeq };
+      if (event.type !== "doc" || event.tenantId !== this.tenantId) {
+        continue;
+      }
+
+      sawTenantDocKeyChange = true;
+      if (event.keyId === DEFAULT_TENANT_KEY_ID) {
+        // The cached plaintext default key may now refer to a rotated
+        // or removed version; drop it so the next access re-resolves.
+        this.decryptedTenantKeyCache = undefined;
+      }
     }
 
-    this.keyBagReconcilePromise = (async () => {
-      let sawTenantDocKeyChange = false;
-      let latestCursor = this.keyBagChangeCursor;
-
-      // Consume every pending event so the cursor advances even for
-      // unrelated tenants sharing the same bag. We only need to react to
-      // doc keys for our own tenant though.
-      for await (const event of this.keyBag.iterateChangesSince(this.keyBagChangeCursor)) {
-        latestCursor = { changeSeq: event.changeSeq };
-        if (event.type !== "doc" || event.tenantId !== this.tenantId) {
-          continue;
-        }
-
-        sawTenantDocKeyChange = true;
-        if (event.keyId === DEFAULT_TENANT_KEY_ID) {
-          // The cached plaintext default key may now refer to a rotated
-          // or removed version; drop it so the next access re-resolves.
-          this.decryptedTenantKeyCache = undefined;
-        }
-      }
-
-      this.keyBagChangeCursor = latestCursor;
-      if (!sawTenantDocKeyChange) {
-        return;
-      }
-
+    if (sawTenantDocKeyChange) {
       // Notify every open live database; time-travel views are read-only
       // historical snapshots and intentionally skip reconciliation.
-      for (const db of this.databaseCache.values()) {
+      for (const db of Array.from(this.databaseCache.values())) {
         if (db.isTimeTravelMode()) {
           continue;
         }
@@ -1606,13 +1611,9 @@ export class BaseMindooTenant implements MindooTenant {
           await reconcile.call(db);
         }
       }
-    })();
-
-    try {
-      await this.keyBagReconcilePromise;
-    } finally {
-      this.keyBagReconcilePromise = null;
     }
+
+    this.keyBagChangeCursor = latestCursor;
   }
 
   /**
@@ -2756,22 +2757,11 @@ export class BaseMindooTenant implements MindooTenant {
    * Single-flight, best-effort wrapper around
    * {@link reconcileKeyDistributionsForCurrentUser} for the run-always trigger
    * (docs/accesscontrol.md §13). Fired on directory bring-up and after every
-   * directory pull. Never throws and never blocks sync: a reconcile error is
-   * logged and swallowed. The in-flight guard prevents the driver's own
-   * directory access from re-triggering it.
+   * directory pull. Never throws: a reconcile error is logged and swallowed.
+   * Resolves after a run that started after this call.
    */
   async reconcileKeyDistributionsForCurrentUserSafe(): Promise<void> {
-    if (this.reconcileInFlight) {
-      return;
-    }
-    this.reconcileInFlight = true;
-    try {
-      await this.reconcileKeyDistributionsForCurrentUser();
-    } catch (error) {
-      this.logger.warn(`reconcileKeyDistributionsForCurrentUserSafe: ${error}`);
-    } finally {
-      this.reconcileInFlight = false;
-    }
+    await this.keyDistributionReconcile.run();
   }
 
   /**

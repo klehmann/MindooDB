@@ -87,6 +87,8 @@ export class DocumentSummaryStore implements ICacheable {
   // --- backfill state (config changed while entries already exist) ---
   private needsBackfill: boolean = false;
   private backfillCursor: ProcessChangesCursor | null = null;
+  /** Bumped by every scheduleBackfill, so a running backfill sees it was restarted. */
+  private backfillGeneration: number = 0;
 
   // --- single-flight update ---
   private updatePromise: Promise<void> | null = null;
@@ -151,6 +153,7 @@ export class DocumentSummaryStore implements ICacheable {
   private scheduleBackfill(): void {
     this.needsBackfill = true;
     this.backfillCursor = null;
+    this.backfillGeneration++;
   }
 
   /**
@@ -323,10 +326,19 @@ export class DocumentSummaryStore implements ICacheable {
     // Pass 2: configuration backfill (re-extract everything with the new
     // config). The feed yields each document's latest state once, so plain
     // overwrites converge; docs changing mid-backfill are re-processed by
-    // the next pass 1 anyway.
-    if (this.needsBackfill) {
+    // the next pass 1 anyway. A config change during the backfill
+    // (setConfig, or the setup doc in the feed) schedules a new one from the
+    // start; the loop then restarts instead of finishing the old one and
+    // clearing needsBackfill with the earlier docs not re-extracted.
+    while (this.needsBackfill) {
+      const generation = this.backfillGeneration;
+      let restarted = false;
       for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor)) {
         this.applyDocument(doc.getId(), doc, cursor);
+        if (generation !== this.backfillGeneration) {
+          restarted = true;
+          break;
+        }
         this.backfillCursor = cursor;
         processed++;
         processedInBatch++;
@@ -339,9 +351,11 @@ export class DocumentSummaryStore implements ICacheable {
           }
         }
       }
-      this.needsBackfill = false;
-      this.backfillCursor = null;
-      this.metaDirty = true;
+      if (!restarted) {
+        this.needsBackfill = false;
+        this.backfillCursor = null;
+        this.metaDirty = true;
+      }
     }
 
     this.cacheManager?.markDirty();

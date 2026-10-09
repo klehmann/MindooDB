@@ -640,5 +640,87 @@ describe("Group Management", () => {
       expect(members).toContain("CN=bob/O=testtenant");
       expect(members).toContain("CN=charlie/O=testtenant");
     });
+
+    // Writes a separate group document for an existing name, as a second
+    // device would while offline. Uses directory internals because the public
+    // API deliberately reuses the existing document.
+    async function writeGroupDoc(
+      directory: any,
+      groupName: string,
+      usernames: string[],
+      existingDocId?: string,
+    ): Promise<string> {
+      const directoryDB = await directory.getDirectoryDB();
+      const signingKeyPair = {
+        publicKey: (tenant as any).getAdministrationPublicKey(),
+        privateKey: adminUser.userSigningKeyPair.privateKey,
+      };
+      const doc = existingDocId
+        ? await directoryDB.getDocument(existingDocId)
+        : await directoryDB.createDocumentWithSigningKey(signingKeyPair, adminUserPassword, PUBLIC_INFOS_KEY_ID);
+      const hashes: string[] = await Promise.all(usernames.map((u) => directory.hashUsernameForWrite(u)));
+      const encrypted: string[] = await Promise.all(usernames.map((u) => directory.encryptGroupMemberForTenant(u)));
+      await directoryDB.changeDoc(
+        doc,
+        async (d: any) => {
+          const data = d.getData();
+          data.members_hashes = [...(Array.isArray(data.members_hashes) ? data.members_hashes : []), ...hashes];
+          data.members_encrypted = [...(Array.isArray(data.members_encrypted) ? data.members_encrypted : []), ...encrypted];
+          data.form = "group";
+          data.type = "group";
+          data.groupName = groupName;
+        },
+        { signingKeyPair, signingKeyPassword: adminUserPassword },
+      );
+      return doc.getId();
+    }
+
+    function groupDocIds(directory: any, groupName: string): string[] {
+      return Array.from((directory.groupDocsById as Map<string, { normalizedName: string }>).entries())
+        .filter(([, entry]) => entry.normalizedName === groupName)
+        .map(([docId]) => docId);
+    }
+
+    it("keeps one document per group when users are added in consecutive calls", async () => {
+      const directory = await tenant.openDirectory();
+      await directory.addUsersToGroup("developers", ["CN=alice/O=testtenant"], adminUser.userSigningKeyPair.privateKey, adminUserPassword);
+      await directory.addUsersToGroup("developers", ["CN=bob/O=testtenant"], adminUser.userSigningKeyPair.privateKey, adminUserPassword);
+
+      await directory.getGroupMembers("developers");
+      expect(groupDocIds(directory, "developers")).toHaveLength(1);
+    });
+
+    it("keeps the members of all same-name documents when a later pass sees only one of them", async () => {
+      const directory = await tenant.openDirectory();
+      const alice = "CN=alice/O=testtenant";
+      const bob = "CN=bob/O=testtenant";
+      const charlie = "CN=charlie/O=testtenant";
+      await writeGroupDoc(directory, "developers", [alice]);
+      const secondDocId = await writeGroupDoc(directory, "developers", [bob]);
+      expect(await directory.getGroupMembers("developers")).toEqual(expect.arrayContaining([alice, bob]));
+
+      // Incremental pass: only the second document changes.
+      await writeGroupDoc(directory, "developers", [charlie], secondDocId);
+      const members = await directory.getGroupMembers("developers");
+      expect(members).toEqual(expect.arrayContaining([alice, bob, charlie]));
+      expect(await directory.getUserNamesList(alice)).toContain("developers");
+    });
+
+    it("removes a user from every document of a group, not only the latest one", async () => {
+      const directory = await tenant.openDirectory();
+      const alice = "CN=alice/O=testtenant";
+      const bob = "CN=bob/O=testtenant";
+      await writeGroupDoc(directory, "developers", [alice]);
+      await writeGroupDoc(directory, "developers", [alice, bob]);
+      expect(await directory.getGroupMembers("developers")).toEqual(expect.arrayContaining([alice, bob]));
+      expect(groupDocIds(directory, "developers")).toHaveLength(2);
+
+      await directory.removeUsersFromGroup("developers", [alice], adminUser.userSigningKeyPair.privateKey, adminUserPassword);
+
+      const members = await directory.getGroupMembers("developers");
+      expect(members).not.toContain(alice);
+      expect(members).toContain(bob);
+      expect(await directory.getUserNamesList(alice)).not.toContain("developers");
+    });
   });
 });

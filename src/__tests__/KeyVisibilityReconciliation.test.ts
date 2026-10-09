@@ -157,6 +157,42 @@ describe("key visibility reconciliation", () => {
     expect(events[1].changeSeq).toBeGreaterThan(events[0].changeSeq);
   }, 30000);
 
+  it("reconciles a key that arrives while another reconcile is still running", async () => {
+    // Opened after "secrets", so a reconcile visits it last.
+    const otherDb = await readerTenant.openDB("other");
+    const patched = otherDb as unknown as { reconcileKeyVisibility: () => Promise<void> };
+    const original = patched.reconcileKeyVisibility;
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+    let signalBlocked!: () => void;
+    const blocked = new Promise<void>((resolve) => (signalBlocked = resolve));
+    let calls = 0;
+    patched.reconcileKeyVisibility = async function (this: unknown) {
+      if (calls++ === 0) {
+        signalBlocked();
+        await gate;
+      }
+      return original.call(this);
+    };
+    try {
+      // First run: "secrets" is reconciled without the named key, then the
+      // run waits in "other".
+      await readerKeyBag.createDocKey(tenantId, "unrelated-key");
+      const first = readerTenant.reconcileKeyBagChanges!();
+      await blocked;
+
+      // The named key lands while that run is still busy.
+      await readerKeyBag.set("doc", tenantId, namedKeyId, (await creatorKeyBag.get("doc", tenantId, namedKeyId))!);
+      releaseGate();
+      await first;
+      await (readerTenant as unknown as { whenBackgroundIdle(): Promise<void> }).whenBackgroundIdle();
+
+      expect(await readerDb.getAllDocumentIds()).toEqual([secretDocId]);
+    } finally {
+      patched.reconcileKeyVisibility = original;
+    }
+  }, 30000);
+
   it("hides, reveals, purges, and re-reveals named-key documents and view entries", async () => {
     expect(await readerDb.getAllDocumentIds()).toEqual([]);
 
