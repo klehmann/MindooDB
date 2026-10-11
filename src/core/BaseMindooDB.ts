@@ -12642,19 +12642,32 @@ export class BaseMindooDB implements MindooDB {
       throw new Error("Failed to get change bytes from Automerge document");
     }
 
-    await this.persistAutomergeDocumentChanges({
-      internalDoc,
-      newDoc,
-      now,
-      changeBytesList: [changeBytes],
-      useCustomKey,
-      signingKeyPair,
-      signingKeyPassword,
-      successMessage,
-      attachmentIds,
-      bypassPrecheck,
-      recipients: options.recipients,
-    });
+    try {
+      await this.persistAutomergeDocumentChanges({
+        internalDoc,
+        newDoc,
+        now,
+        changeBytesList: [changeBytes],
+        useCustomKey,
+        signingKeyPair,
+        signingKeyPassword,
+        successMessage,
+        attachmentIds,
+        bypassPrecheck,
+        recipients: options.recipients,
+      });
+    } catch (error) {
+      // Automerge.change() outdated the cached document and moved its WASM
+      // handle to `newDoc`, so reads of the cache slot would return the change
+      // that was just refused (denied precheck, wrong signing password, failed
+      // store write). Fork the cache back to the heads the change started from.
+      if (internalDoc.doc !== newDoc && headsBeforeChange) {
+        internalDoc.doc = Automerge.clone(
+          Automerge.view(newDoc, headsBeforeChange as AutomergeTypes.Heads),
+        ) as AutomergeTypes.Doc<MindooDocPayload>;
+      }
+      throw error;
+    }
   }
 
   private async persistAutomergeDocumentChanges(options: {
