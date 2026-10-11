@@ -48,7 +48,10 @@ const FORWARDED_METHODS = new Set([
   "getCompactionStatus",
 ]);
 
-const SAFE_SEGMENT = /^[A-Za-z0-9._:@-]{1,200}$/;
+/** Scope and db id are opaque keys (hosts map them to files themselves); keep them sane. */
+function isValidKey(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 500 && !/[\u0000-\u001f]/.test(value);
+}
 
 export class StoreRpcServer {
   private readonly factories = new Map<string, ContentAddressedStoreFactory>();
@@ -58,7 +61,7 @@ export class StoreRpcServer {
 
   private store(request: StoreRpcRequest): ContentAddressedStore {
     const { scope, dbId, kind, options } = request.target;
-    if (!SAFE_SEGMENT.test(scope) || !SAFE_SEGMENT.test(dbId)) {
+    if (!isValidKey(scope) || !isValidKey(dbId)) {
       throw new Error("Store RPC: invalid scope or database id");
     }
     if (kind !== StoreKind.docs && kind !== StoreKind.attachments) {
