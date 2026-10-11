@@ -122,10 +122,19 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
 
   async putEntries(entries: StoreEntry[]): Promise<void> {
     await this.ready;
+    if (entries.length > 0) {
+      await this.backend.transaction(() => this.insertNewEntries(entries));
+    }
+  }
+
+  /** One transaction per batch, one existence query for all ids. */
+  private async insertNewEntries(entries: StoreEntry[]): Promise<void> {
+    const present = new Set(await this.backend.hasEntries(entries.map((entry) => entry.id)));
     for (const entry of entries) {
-      if (await this.backend.hasEntry(entry.id)) {
+      if (present.has(entry.id)) {
         continue;
       }
+      present.add(entry.id);
       const { encryptedData, receiptOrder: _ignored, ...rest } = entry;
       const metadata: StoreEntryMetadata = {
         ...rest,
@@ -147,6 +156,10 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
 
   async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
     await this.ready;
+    await this.backend.transaction(() => this.updateReceipts(receipts));
+  }
+
+  private async updateReceipts(receipts: StoreEntryMetadata[]): Promise<void> {
     for (const receipt of receipts) {
       if (receipt.receivedAt === undefined) {
         continue;
@@ -177,9 +190,10 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
 
   async getEntries(ids: string[]): Promise<StoreEntry[]> {
     await this.ready;
+    const rows = new Map((await this.backend.getEntryRows(ids)).map((row) => [row.id, row]));
     const result: StoreEntry[] = [];
     for (const id of ids) {
-      const row = await this.backend.getEntryRow(id);
+      const row = rows.get(id);
       if (row) {
         result.push({ ...deserializeMetadata(row.metaJson), encryptedData: row.data });
       }
@@ -203,13 +217,8 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
 
   async hasEntries(ids: string[]): Promise<string[]> {
     await this.ready;
-    const existing: string[] = [];
-    for (const id of ids) {
-      if (await this.backend.hasEntry(id)) {
-        existing.push(id);
-      }
-    }
-    return existing;
+    const present = new Set(await this.backend.hasEntries(ids));
+    return ids.filter((id) => present.has(id));
   }
 
   async findNewEntries(knownIds: string[]): Promise<StoreEntryMetadata[]> {
@@ -365,12 +374,12 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
   async purgeDocHistory(docId: string): Promise<void> {
     await this.ready;
     const ids = (await this.metadataForDoc(docId)).map((meta) => meta.id);
-    await this.backend.deleteEntries(ids);
+    await this.backend.transaction(() => this.backend.deleteEntries(ids));
   }
 
   async deleteEntriesById(entryIds: string[]): Promise<number> {
     await this.ready;
-    return this.backend.deleteEntries(entryIds);
+    return this.backend.transaction(() => this.backend.deleteEntries(entryIds));
   }
 
   async clearAllLocalData(): Promise<void> {

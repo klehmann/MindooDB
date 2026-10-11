@@ -15,6 +15,15 @@ export interface SqliteExecutor {
 
 export interface SqliteStoreBackend {
   init(): Promise<void>;
+  /**
+   * Runs `work` in one transaction, so a batch of writes costs one commit
+   * instead of one per row. Transactions of a backend run one at a time.
+   */
+  transaction<T>(work: () => Promise<T>): Promise<T>;
+  /** Ids of `ids` present in the store. */
+  hasEntries(ids: string[]): Promise<string[]>;
+  /** Metadata JSON and bytes for every id present, in one round of queries. */
+  getEntryRows(ids: string[]): Promise<Array<{ id: string; metaJson: string; data: Uint8Array }>>;
   getMeta(key: string): Promise<string | null>;
   setMeta(key: string, value: string): Promise<void>;
   hasEntry(id: string): Promise<boolean>;
@@ -74,10 +83,75 @@ function asBytes(value: unknown): Uint8Array {
   throw new Error("Expected BLOB column to be binary");
 }
 
+/** Max bound parameters per `IN (...)` list (SQLite's limit is 32766; stay well below). */
+const IN_LIST_CHUNK = 500;
+
+function chunks<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
+
+function placeholders(count: number): string {
+  return new Array(count).fill("?").join(",");
+}
+
+/** Serializes async work: each call starts after the previous one settled. */
+function createQueue() {
+  let tail: Promise<unknown> = Promise.resolve();
+  return function enqueue<T>(work: () => Promise<T>): Promise<T> {
+    const run = tail.then(work, work);
+    tail = run.catch(() => undefined);
+    return run;
+  };
+}
+
 export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
+  const enqueue = createQueue();
   return {
     async init() {
       await executor.exec(SCHEMA);
+    },
+
+    transaction(work) {
+      return enqueue(async () => {
+        await executor.exec("BEGIN IMMEDIATE");
+        try {
+          const result = await work();
+          await executor.exec("COMMIT");
+          return result;
+        } catch (error) {
+          await executor.exec("ROLLBACK").catch(() => undefined);
+          throw error;
+        }
+      });
+    },
+
+    async hasEntries(ids) {
+      const present: string[] = [];
+      for (const slice of chunks(ids, IN_LIST_CHUNK)) {
+        const rows = await executor.all(`SELECT id FROM entries WHERE id IN (${placeholders(slice.length)})`, slice);
+        for (const row of rows) {
+          present.push(String(row.id));
+        }
+      }
+      return present;
+    },
+
+    async getEntryRows(ids) {
+      const result: Array<{ id: string; metaJson: string; data: Uint8Array }> = [];
+      for (const slice of chunks(ids, IN_LIST_CHUNK)) {
+        const rows = await executor.all(
+          `SELECT e.id AS id, e.metadata_json AS metadata_json, c.bytes AS bytes FROM entries e JOIN content c ON c.content_hash = e.content_hash WHERE e.id IN (${placeholders(slice.length)})`,
+          slice,
+        );
+        for (const row of rows) {
+          result.push({ id: String(row.id), metaJson: String(row.metadata_json), data: asBytes(row.bytes) });
+        }
+      }
+      return result;
     },
 
     async getMeta(key) {
@@ -251,9 +325,27 @@ export function createMemorySqliteBackend(): SqliteStoreBackend {
   }>();
   const content = new Map<string, { data: Uint8Array; refCount: number }>();
 
+  const enqueue = createQueue();
   return {
     async init() {
       /* no-op */
+    },
+    transaction(work) {
+      return enqueue(work);
+    },
+    async hasEntries(ids) {
+      return ids.filter((id) => entries.has(id));
+    },
+    async getEntryRows(ids) {
+      const result: Array<{ id: string; metaJson: string; data: Uint8Array }> = [];
+      for (const id of ids) {
+        const row = entries.get(id);
+        const blob = row ? content.get(row.contentHash) : undefined;
+        if (row && blob) {
+          result.push({ id, metaJson: row.metadataJson, data: blob.data });
+        }
+      }
+      return result;
     },
     async getMeta(key) {
       return meta.get(key) ?? null;

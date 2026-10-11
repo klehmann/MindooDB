@@ -410,6 +410,28 @@ export {
   InMemoryContentAddressedStore,
   InMemoryContentAddressedStoreFactory,
 } from "./appendonlystores/InMemoryContentAddressedStore";
+export {
+  RpcContentAddressedStore,
+  RpcContentAddressedStoreFactory,
+  SQLITE_STORE_RPC_METHODS,
+  type RpcContentAddressedStoreFactoryOptions,
+  type StoreRpcClientTransport,
+  type StoreRpcGetEntriesResult,
+  type StoreRpcOptionalMethod,
+  type StoreRpcRequest,
+  type StoreRpcTarget,
+} from "./appendonlystores/rpc/RpcContentAddressedStore";
+export {
+  MigratingContentAddressedStoreFactory,
+  migrateStoreEntries,
+  withStoreMigration,
+  type StoreMigrationOptions,
+} from "./appendonlystores/migration/StoreMigration";
+export {
+  StoreRpcServer,
+  type StoreRpcServerBytes,
+  type StoreRpcServerOptions,
+} from "./appendonlystores/rpc/StoreRpcServer";
 
 // Network
 export { AuthenticationService } from "./appendonlystores/network/AuthenticationService";
