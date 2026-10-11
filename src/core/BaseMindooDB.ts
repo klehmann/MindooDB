@@ -11148,6 +11148,17 @@ export class BaseMindooDB implements MindooDB {
       delta: number;
     }> = [];
 
+    // Assignments and deletions are applied before the increments, so an
+    // assignment or deletion of a field supersedes the increments queued on it
+    // (or below it) earlier in the callback; later increments still apply.
+    const dropPendingCounterIncrements = (field: string) => {
+      for (let i = pendingCounterIncrements.length - 1; i >= 0; i--) {
+        if (pendingCounterIncrements[i].path[0] === field) {
+          pendingCounterIncrements.splice(i, 1);
+        }
+      }
+    };
+
     // Reference to db for closures
     const db = this;
 
@@ -11196,6 +11207,7 @@ export class BaseMindooDB implements MindooDB {
           set: (target, prop, value) => {
             throwIfCallbackInactive("set property");
             if (typeof prop === "string") {
+              dropPendingCounterIncrements(prop);
               // If this property was marked for deletion, remove it from deletions
               pendingDeletions.delete(prop);
               // Track the change
@@ -11208,6 +11220,7 @@ export class BaseMindooDB implements MindooDB {
           deleteProperty: (target, prop) => {
             throwIfCallbackInactive("delete property");
             if (typeof prop === "string") {
+              dropPendingCounterIncrements(prop);
               // Mark for deletion
               pendingDeletions.add(prop);
               // Remove from pending changes if it was there
@@ -11859,7 +11872,10 @@ export class BaseMindooDB implements MindooDB {
       return value;
     }
     if (Array.isArray(value)) {
-      return value.map((entry) => this.hydrateTypedValues(entry, depth + 1));
+      // Array.from, not map: map keeps the realm of an array that came from
+      // another realm (structuredClone in a VM context, another frame), and
+      // Automerge only assigns arrays that pass `instanceof Array`.
+      return Array.from(value, (entry) => this.hydrateTypedValues(entry, depth + 1));
     }
     const record = value as Record<string, unknown>;
     if (Object.prototype.hasOwnProperty.call(record, MINDOO_VALUE_TAG)) {
@@ -12642,19 +12658,32 @@ export class BaseMindooDB implements MindooDB {
       throw new Error("Failed to get change bytes from Automerge document");
     }
 
-    await this.persistAutomergeDocumentChanges({
-      internalDoc,
-      newDoc,
-      now,
-      changeBytesList: [changeBytes],
-      useCustomKey,
-      signingKeyPair,
-      signingKeyPassword,
-      successMessage,
-      attachmentIds,
-      bypassPrecheck,
-      recipients: options.recipients,
-    });
+    try {
+      await this.persistAutomergeDocumentChanges({
+        internalDoc,
+        newDoc,
+        now,
+        changeBytesList: [changeBytes],
+        useCustomKey,
+        signingKeyPair,
+        signingKeyPassword,
+        successMessage,
+        attachmentIds,
+        bypassPrecheck,
+        recipients: options.recipients,
+      });
+    } catch (error) {
+      // Automerge.change() outdated the cached document and moved its WASM
+      // handle to `newDoc`, so reads of the cache slot would return the change
+      // that was just refused (denied precheck, wrong signing password, failed
+      // store write). Fork the cache back to the heads the change started from.
+      if (internalDoc.doc !== newDoc && headsBeforeChange) {
+        internalDoc.doc = Automerge.clone(
+          Automerge.view(newDoc, headsBeforeChange as AutomergeTypes.Heads),
+        ) as AutomergeTypes.Doc<MindooDocPayload>;
+      }
+      throw error;
+    }
   }
 
   private async persistAutomergeDocumentChanges(options: {
