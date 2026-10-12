@@ -128,12 +128,15 @@ export class RpcContentAddressedStore implements ContentAddressedStore {
     optionalMethods: StoreRpcOptionalMethod[],
   ) {
     for (const method of optionalMethods) {
+      // No async arrow with rest parameters here: React Native's Babel setup
+      // (Metro, Hermes profile) fails to compile one that uses `this`.
       const forward: Callable =
         method === "awaitIndexReady"
-          ? async (...args) => {
-              this.indexStatus = (await this.invoke(method, args)) as StoreIndexBuildStatus;
-              return this.indexStatus;
-            }
+          ? (...args) =>
+              this.invoke(method, args).then((status) => {
+                this.indexStatus = status as StoreIndexBuildStatus;
+                return this.indexStatus;
+              })
           : (...args) => this.invoke(method, args);
       (this as unknown as Record<string, Callable>)[method] = forward;
     }
