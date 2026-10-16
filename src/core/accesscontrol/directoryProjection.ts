@@ -7,6 +7,7 @@ import {
   ACL_DEFAULT_POLICY_DOC_ID,
   AclRuleDoc,
   DefaultAccessPolicyDoc,
+  LlmEndpointPolicy,
   RULE_TYPES,
   RuleType,
   TrustedWitnessDoc,
@@ -51,7 +52,31 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
       Number.isFinite(data.requireMetadataSignatureSince)
         ? data.requireMetadataSignatureSince
         : undefined,
+    llm: parseLlmEndpointPolicy(data.llm),
   };
+}
+
+/**
+ * Parse the `llm` block of a default policy. Malformed members are dropped
+ * rather than failing the whole policy; a block without usable members still
+ * counts as present (and restricts nothing).
+ */
+export function parseLlmEndpointPolicy(value: unknown): LlmEndpointPolicy | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as Record<string, unknown>;
+  const result: LlmEndpointPolicy = {};
+  if (Array.isArray(raw.allowedEndpoints)) {
+    result.allowedEndpoints = raw.allowedEndpoints
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  }
+  if (typeof raw.defaultEndpoint === "string" && raw.defaultEndpoint.trim()) {
+    result.defaultEndpoint = raw.defaultEndpoint.trim();
+  }
+  return result;
 }
 
 /** Parse a rule document's fields into an {@link AclRuleDoc}. */

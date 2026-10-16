@@ -59,6 +59,7 @@ import {
   RuleTargets,
   RuleType,
   WithFieldClause,
+  LlmEndpointPolicy,
   aclRuleDocId,
   aclDbPolicyDocId,
   aclKeyDistributionDocId,
@@ -1469,6 +1470,32 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * The tenant's language-model endpoint policy (`llm` in `acl_defaultpolicy`)
+   * at the current head state, or `null` when there is no default policy or no
+   * `llm` block. Tenant-level only, never layered per-db.
+   *
+   * Like `requireMetadataSignatureSince` it does not follow the master switch
+   * `disableAllAccessChecksAndPolicies`: that switch turns off access *checks*,
+   * and new tenants are created with it on (only the storage-format floor
+   * active), so honoring it here would make the setting inert in most tenants.
+   *
+   * The directory only accepts admin-signed entries, so the result is what the
+   * tenant admin wrote. Enforcing it is the client's job (it decides where it
+   * sends data); see {@link LlmEndpointPolicy}.
+   */
+  async getLlmEndpointPolicy(): Promise<LlmEndpointPolicy | null> {
+    const head = await this.getDirectoryStateHead();
+    const policy = head.defaultPolicy;
+    if (policy === null || !policy.llm) {
+      return null;
+    }
+    return {
+      ...(policy.llm.allowedEndpoints ? { allowedEndpoints: [...policy.llm.allowedEndpoints] } : {}),
+      ...(policy.llm.defaultEndpoint ? { defaultEndpoint: policy.llm.defaultEndpoint } : {}),
+    };
+  }
+
+  /**
    * The tenant-wide storage-format floor (`requireMetadataSignatureSince`): the
    * trusted-time cutoff at/after which entries must carry the v2 metadata-binding
    * signature, or `undefined` when no floor is configured (fully backward
@@ -1623,6 +1650,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
     validateAccessPolicy(policy);
+    if (policy.llm !== undefined) {
+      throw new Error("llm is a tenant-level setting; set it on the default policy");
+    }
     await this.writePolicyDoc(
       aclDbPolicyDocId(dbid),
       policy,

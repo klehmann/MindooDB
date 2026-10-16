@@ -237,6 +237,34 @@ export interface DefaultAccessPolicyDoc {
    * whole tenant is v2-only from entry #1.
    */
   requireMetadataSignatureSince?: number;
+  /**
+   * Which language-model endpoints clients may send tenant data to (an AI
+   * assistant built into the client, such as Haven's). **Tenant-level only**:
+   * read from the tenant default policy (`acl_defaultpolicy`), never layered
+   * per-db. Client-enforced; the sync server does not interpret it.
+   *
+   * Absent = no restriction. `{}` (or an object without `allowedEndpoints`)
+   * also restricts nothing, which is how an admin lifts a restriction again:
+   * the whole object is replaced on write. See {@link LlmEndpointPolicy}.
+   */
+  llm?: LlmEndpointPolicy;
+}
+
+/**
+ * The `llm` block of the tenant default policy.
+ *
+ * Patterns follow the hosted-app network allowlist: a whole URL with `*` as
+ * the only wildcard, matched case-insensitively against the endpoint's base
+ * URL (e.g. `https://api.openai.com/v1`, no trailing slash).
+ */
+export interface LlmEndpointPolicy {
+  /**
+   * Endpoint patterns clients may use. An empty array allows none (switches
+   * the assistant off for members of this tenant); absent allows any.
+   */
+  allowedEndpoints?: string[];
+  /** Endpoint clients should suggest (base URL, `http(s)`, no credentials or query). */
+  defaultEndpoint?: string;
 }
 
 /**
@@ -253,6 +281,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "databaseCreationPolicy"
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
+    | "llm"
   >
 > = {
   denyDocCreate: false,
@@ -521,6 +550,70 @@ export function validateAccessPolicy(
       );
     }
   }
+
+  if (policy.llm !== undefined) {
+    validateLlmEndpointPolicy(policy.llm);
+  }
+}
+
+const LLM_ENDPOINT_PATTERN_MAX_LENGTH = 2048;
+const LLM_ALLOWED_ENDPOINTS_MAX = 100;
+
+/** True for an `http(s)` URL usable as an endpoint: no credentials, query or fragment. */
+export function isValidLlmEndpointUrl(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return (
+    (url.protocol === "https:" || url.protocol === "http:") &&
+    url.hostname.length > 0 &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash
+  );
+}
+
+/** Validate the `llm` block of a policy before it is written. Throws on violation. */
+export function validateLlmEndpointPolicy(llm: unknown): void {
+  if (typeof llm !== "object" || llm === null || Array.isArray(llm)) {
+    throw new Error("llm must be an object");
+  }
+  const { allowedEndpoints, defaultEndpoint } = llm as LlmEndpointPolicy;
+  for (const key of Object.keys(llm)) {
+    if (key !== "allowedEndpoints" && key !== "defaultEndpoint") {
+      throw new Error(`llm.${key} is not a known field`);
+    }
+  }
+  if (allowedEndpoints !== undefined) {
+    if (!Array.isArray(allowedEndpoints)) {
+      throw new Error("llm.allowedEndpoints must be an array of URL patterns");
+    }
+    if (allowedEndpoints.length > LLM_ALLOWED_ENDPOINTS_MAX) {
+      throw new Error(`llm.allowedEndpoints may list at most ${LLM_ALLOWED_ENDPOINTS_MAX} patterns`);
+    }
+    for (const pattern of allowedEndpoints) {
+      if (
+        typeof pattern !== "string" ||
+        pattern.length > LLM_ENDPOINT_PATTERN_MAX_LENGTH ||
+        !/^https?:\/\/[^\s]+$/i.test(pattern)
+      ) {
+        throw new Error(
+          `llm.allowedEndpoints entry "${String(pattern)}" must be an http(s) URL pattern without spaces`,
+        );
+      }
+    }
+  }
+  if (defaultEndpoint !== undefined) {
+    if (typeof defaultEndpoint !== "string" || !isValidLlmEndpointUrl(defaultEndpoint)) {
+      throw new Error(
+        "llm.defaultEndpoint must be an http(s) URL without credentials, query or fragment",
+      );
+    }
+  }
 }
 
 /**
@@ -543,6 +636,7 @@ export function effectivePolicy(
     | "databaseCreationPolicy"
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
+    | "llm"
   >
 > & {
   defaultCreateKeyId?: string;
