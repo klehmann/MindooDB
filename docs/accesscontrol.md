@@ -481,6 +481,11 @@ interface DefaultAccessPolicyDoc {
    *  listed; every other id (including "main") must appear explicitly. Ignored
    *  in "open" mode. Tenant-level only. See section 6.7. */
   allowedDbIds?: string[];
+
+  /** Which language-model endpoints clients may send tenant data to (an AI
+   *  assistant built into the client). TENANT-LEVEL ONLY, client-enforced.
+   *  See section 6.9. */
+  llm?: { allowedEndpoints?: string[]; defaultEndpoint?: string };
 }
 ```
 
@@ -932,6 +937,43 @@ plus the admin/`"directory"` exemptions:
 The §6.7 database-id allowlist and the §6.8 read gate are **orthogonal**: a
 database must clear *both* — the id must be permitted, and the user must have
 read access to it.
+
+### 6.9 Language-model endpoints (`llm`)
+
+Clients with a built-in AI assistant (Haven's) send what the assistant reads —
+messages, page context, document content returned by tools — to a language
+model the user configures. A tenant admin can restrict where that may go with a
+**tenant-level** block on `acl_defaultpolicy`:
+
+```ts
+llm?: {
+  /** Endpoint patterns clients may use: a whole URL, `*` as the only wildcard,
+   *  case-insensitive, matched against the endpoint's base URL
+   *  (e.g. "https://api.openai.com/v1"). [] allows none; absent allows any. */
+  allowedEndpoints?: string[];
+  /** Endpoint clients should suggest: http(s), no credentials/query/fragment. */
+  defaultEndpoint?: string;
+}
+```
+
+- **Read** with `MindooTenantDirectory.getLlmEndpointPolicy()`, which returns
+  the block at the directory head, or `null` when there is no default policy or
+  no `llm` block. The directory only accepts admin-signed entries, so the result
+  is what the admin wrote.
+- **Independent of the master switch**: like `requireMetadataSignatureSince`,
+  the block applies even while `disableAllAccessChecksAndPolicies` is on. That
+  switch turns off access *checks*, and new tenants are created with it on (only
+  the storage-format floor active), so following it would make `llm` inert.
+- **Write** with `setDefaultAccessPolicy({ llm })`. The block is replaced as a
+  whole; `{ llm: {} }` lifts a restriction again. `setDefaultAccessPolicy`
+  validates it (`validateLlmEndpointPolicy`); `setDatabaseAccessPolicy` rejects
+  `llm`, since it is never layered per-db.
+- **Enforcement is the client's job**: the client decides where it sends data,
+  so the sync server does not interpret this block. A client whose user belongs
+  to several tenants should require an endpoint to be allowed by every tenant
+  that sets `allowedEndpoints` (Haven does).
+- **Backward compatibility**: absent means unrestricted, so existing tenants and
+  older clients are unaffected; older clients simply ignore the field.
 
 ## 7. Evaluation algorithm
 

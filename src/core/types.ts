@@ -17,6 +17,7 @@ import type {
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import type {
   DefaultAccessPolicyDoc,
+  LlmEndpointPolicy,
   KeyDistributionPushRecipient,
   KeyDistributionRequest,
   KeyDistributionView,
@@ -3921,6 +3922,18 @@ export interface MindooTenantDirectory {
     mode: "open" | "directory-restricted";
     allowedDbIds: string[];
   }>;
+
+  /**
+   * Returns the tenant's language-model endpoint policy (the `llm` block of the
+   * access-control default policy): which endpoints a client's AI assistant may
+   * send tenant data to, and which one it should suggest. `null` when the tenant
+   * sets none. Independent of `disableAllAccessChecksAndPolicies`. Client-enforced.
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   *
+   * @returns The admin-signed `llm` block at the current head, or `null`.
+   */
+  getLlmEndpointPolicy?(): Promise<LlmEndpointPolicy | null>;
 
   /**
    * The tenant-wide storage-format floor: the trusted-time cutoff (ms since
