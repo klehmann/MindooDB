@@ -599,10 +599,11 @@ export function validateLlmEndpointPolicy(llm: unknown): void {
       if (
         typeof pattern !== "string" ||
         pattern.length > LLM_ENDPOINT_PATTERN_MAX_LENGTH ||
-        !/^https?:\/\/[^\s]+$/i.test(pattern)
+        // `*` alone allows every endpoint (an explicit "no restriction").
+        (pattern !== "*" && !/^https?:\/\/[^\s]+$/i.test(pattern))
       ) {
         throw new Error(
-          `llm.allowedEndpoints entry "${String(pattern)}" must be an http(s) URL pattern without spaces`,
+          `llm.allowedEndpoints entry "${String(pattern)}" must be * or an http(s) URL pattern without spaces`,
         );
       }
     }
