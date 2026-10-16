@@ -949,7 +949,8 @@ model the user configures. A tenant admin can restrict where that may go with a
 llm?: {
   /** Endpoint patterns clients may use: a whole URL, `*` as the only wildcard,
    *  case-insensitive, matched against the endpoint's base URL
-   *  (e.g. "https://api.openai.com/v1"). [] allows none; absent allows any. */
+   *  (e.g. "https://api.openai.com/v1"). ["*"] allows any; [] allows none;
+   *  absent allows any. */
   allowedEndpoints?: string[];
   /** Endpoint clients should suggest: http(s), no credentials/query/fragment. */
   defaultEndpoint?: string;
