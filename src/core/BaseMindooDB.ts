@@ -5812,7 +5812,7 @@ export class BaseMindooDB implements MindooDB {
           // change so a doc_create Tier 2 rule can evaluate them in the
           // "after" state (docs/accesscontrol.md §6.3, §9).
           for (const [key, value] of initialValueEntries) {
-            (doc as Record<string, unknown>)[key] = value;
+            this.assignHydrated(doc, key, value);
           }
         });
         if (this.isDebugEnabled())
@@ -6112,7 +6112,7 @@ export class BaseMindooDB implements MindooDB {
         // Seed caller-provided initial values within the same doc_create change
         // so a doc_create Tier 2 rule can evaluate them in the "after" state.
         for (const [key, value] of initialValueEntries) {
-          (doc as Record<string, unknown>)[key] = value;
+          this.assignHydrated(doc, key, value);
         }
       });
       const localChange = Automerge.getLastLocalChange(seedDoc);
@@ -6134,7 +6134,7 @@ export class BaseMindooDB implements MindooDB {
         { time: now },
         (doc: MindooDocPayload) => {
           for (const [key, value] of initialValueEntries) {
-            (doc as Record<string, unknown>)[key] = value;
+            this.assignHydrated(doc, key, value);
           }
         },
       );
@@ -7832,7 +7832,7 @@ export class BaseMindooDB implements MindooDB {
       }
       return;
     }
-    container[key] = this.hydrateTypedValues(sourceValue);
+    this.assignHydrated(container, key, this.hydrateTypedValues(sourceValue));
     if (Array.isArray(sourceValue)) {
       // The copied list holds plain strings; bring their marks along.
       this.forEachTextPath(sourceValue, path, (textPath) =>
@@ -10437,7 +10437,7 @@ export class BaseMindooDB implements MindooDB {
     const applyAll = (automergeDoc: MindooDocPayload) => {
       for (const [key, value] of Object.entries(update.set ?? {})) {
         if (value !== undefined) {
-          (automergeDoc as any)[key] = this.hydrateTypedValues(value);
+          this.assignHydrated(automergeDoc, key, this.hydrateTypedValues(value));
         }
       }
       for (const key of update.unset ?? []) {
@@ -11529,7 +11529,7 @@ export class BaseMindooDB implements MindooDB {
         Automerge.change(doc, (automergeDoc: MindooDocPayload) => {
           // Apply all pending changes (sets/updates)
           for (const [key, value] of pendingChanges) {
-            (automergeDoc as any)[key] = this.hydrateTypedValues(value);
+            this.assignHydrated(automergeDoc, key, this.hydrateTypedValues(value));
           }
 
           // Apply all pending deletions
@@ -11858,7 +11858,50 @@ export class BaseMindooDB implements MindooDB {
    * CRDT scalars, dates or bytes pass through. Throws for malformed tags, so
    * it doubles as validation.
    */
+  /**
+   * Assigns a hydrated value to an Automerge container. Automerge turns a
+   * Float64 nested in an assigned object or list into a map, so those leaves
+   * (integers beyond the safe range, see hydrateTypedValues) are assigned
+   * once more on their own.
+   */
+  private assignHydrated(container: any, key: string | number, hydrated: unknown): void {
+    container[key] = this.withoutNestedFloats(hydrated);
+    this.restoreNestedFloats(container[key], hydrated);
+  }
+
+  /** The value with nested Float64 leaves as null, so the first assignment writes no clamped integer. */
+  private withoutNestedFloats(hydrated: unknown, depth = 0): unknown {
+    if (depth > 0 && hydrated instanceof Automerge.Float64) return null;
+    if (depth > 100 || hydrated === null || typeof hydrated !== "object") return hydrated;
+    if (hydrated instanceof Automerge.Float64 || hydrated instanceof Uint8Array || hydrated instanceof Date) return hydrated;
+    if (this.isAutomergeCounter(hydrated) || this.isAutomergeImmutableString(hydrated)) return hydrated;
+    if (Array.isArray(hydrated)) return Array.from(hydrated, (entry) => this.withoutNestedFloats(entry, depth + 1));
+    return Object.fromEntries(
+      Object.entries(hydrated as Record<string, unknown>).map(([k, v]) => [k, this.withoutNestedFloats(v, depth + 1)]),
+    );
+  }
+
+  private restoreNestedFloats(target: any, hydrated: unknown, depth = 0): void {
+    if (depth > 100 || target === null || typeof target !== "object") return;
+    if (hydrated === null || typeof hydrated !== "object") return;
+    if (hydrated instanceof Automerge.Float64 || hydrated instanceof Uint8Array || hydrated instanceof Date) return;
+    if (this.isAutomergeCounter(hydrated) || this.isAutomergeImmutableString(hydrated)) return;
+    const entries: Array<[string | number, unknown]> = Array.isArray(hydrated)
+      ? hydrated.map((entry, index) => [index, entry])
+      : Object.entries(hydrated as Record<string, unknown>);
+    for (const [key, entry] of entries) {
+      if (entry instanceof Automerge.Float64) target[key] = new Automerge.Float64(entry.value);
+      else this.restoreNestedFloats(target[key], entry, depth + 1);
+    }
+  }
+
   private hydrateTypedValues(value: unknown, depth = 0): unknown {
+    // Automerge stores a JS integer as int64, clamps larger ones (1e20 became
+    // 9223372036854775807, which no reader can decode as a number) and reads
+    // 2^53 − 1 and beyond back as BigInt: a 64-bit float holds what was written.
+    if (typeof value === "number" && Number.isInteger(value) && Math.abs(value) >= Number.MAX_SAFE_INTEGER) {
+      return new Automerge.Float64(value);
+    }
     if (value === null || typeof value !== "object") return value;
     if (depth > 100) {
       throw new Error("Document value is nested too deeply");
@@ -12177,11 +12220,12 @@ export class BaseMindooDB implements MindooDB {
     }
     for (const operation of patch.listInsert ?? []) {
       const list = this.ensureJsonListAtPath(automergeDoc, operation.path);
-      list.splice(
-        operation.index,
-        0,
-        ...(this.hydrateTypedValues(structuredClone(operation.values)) as unknown[]),
-      );
+      const values = this.hydrateTypedValues(structuredClone(operation.values)) as unknown[];
+      list.splice(operation.index, 0, ...(this.withoutNestedFloats(values) as unknown[]));
+      values.forEach((value, offset) => {
+        if (value instanceof Automerge.Float64) list[operation.index + offset] = new Automerge.Float64(value.value);
+        else this.restoreNestedFloats(list[operation.index + offset], value);
+      });
     }
     for (const operation of patch.textSplice ?? []) {
       this.spliceJsonTextAtPath(
@@ -12299,7 +12343,7 @@ export class BaseMindooDB implements MindooDB {
     value: unknown,
   ): void {
     const parent = this.ensureJsonParentAtPath(target, path);
-    parent[path[path.length - 1]] = value;
+    this.assignHydrated(parent, path[path.length - 1], value);
   }
 
   private unsetJsonValueAtPath(
