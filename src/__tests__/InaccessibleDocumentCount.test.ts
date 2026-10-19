@@ -242,7 +242,13 @@ describe("inaccessible document count", () => {
 
     const metaKey = (await cacheStore.list("db-meta")).find((key) => key.endsWith("/projects"));
     expect(metaKey).toBeTruthy();
-    const encryptedCache = new EncryptedLocalCacheStore(cacheStore, readerPassword, crypto);
+    const encryptedCache = new EncryptedLocalCacheStore(
+      cacheStore,
+      readerPassword,
+      crypto,
+      undefined,
+      reader.userSigningKeyPair.publicKey,
+    );
     const rawMeta = await encryptedCache.get("db-meta", metaKey!);
     expect(rawMeta).toBeTruthy();
     const checkpoint = JSON.parse(new TextDecoder().decode(rawMeta!)) as Record<string, unknown>;

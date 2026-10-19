@@ -276,7 +276,13 @@ describe("author-trust reconcile after delayed directory sync", () => {
     // simulating a device whose skip happened on a build BEFORE this fix.
     const metaKey = (await setup.cacheStoreA.list("db-meta")).find((key) => key.endsWith("/contacts"));
     expect(metaKey).toBeTruthy();
-    const encryptedCache = new EncryptedLocalCacheStore(setup.cacheStoreA, userAPassword, crypto);
+    const encryptedCache = new EncryptedLocalCacheStore(
+      setup.cacheStoreA,
+      userAPassword,
+      crypto,
+      undefined,
+      setup.userA.userSigningKeyPair.publicKey,
+    );
     const rawMeta = await encryptedCache.get("db-meta", metaKey!);
     expect(rawMeta).toBeTruthy();
     const checkpoint = JSON.parse(new TextDecoder().decode(rawMeta!)) as Record<string, unknown>;

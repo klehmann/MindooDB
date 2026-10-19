@@ -126,7 +126,13 @@ describe("BaseMindooDB cache integration", () => {
   async function loadContactsCheckpoint() {
     const metaKey = (await cacheStore.list("db-meta")).find((key) => key.endsWith("/contacts"));
     expect(metaKey).toBeTruthy();
-    const encryptedCacheStore = new EncryptedLocalCacheStore(cacheStore, userPassword, crypto);
+    const encryptedCacheStore = new EncryptedLocalCacheStore(
+      cacheStore,
+      userPassword,
+      crypto,
+      undefined,
+      appUser.userSigningKeyPair.publicKey,
+    );
     const rawMeta = await encryptedCacheStore.get("db-meta", metaKey!);
     expect(rawMeta).toBeTruthy();
     const checkpoint = JSON.parse(new TextDecoder().decode(rawMeta!)) as {
