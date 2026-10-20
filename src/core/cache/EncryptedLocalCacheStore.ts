@@ -41,22 +41,27 @@ export class EncryptedLocalCacheStore implements LocalCacheStore {
 
   /**
    * Construct from a user password (legacy form). The cache encryption key is
-   * derived once via PBKDF2 on the first encrypt/decrypt call.
+   * derived once via PBKDF2 when the store is constructed.
    *
    * @deprecated Prefer the {@link EncryptedLocalCacheStoreKeyOptions} form to
    *   avoid holding the plaintext password in the cache store and to skip
    *   the per-instance PBKDF2 derivation.
    *
    * @param inner        The underlying (plaintext) cache store
-   * @param userPassword The user's password used to derive the encryption key
+   * @param userPassword The user's password used to derive the encryption key.
+   *   Must not be empty: a key derived from `""` is the same for everybody.
    * @param cryptoAdapter Platform-agnostic crypto interface
    * @param logger       Optional logger
+   * @param saltContext  Optional per-identity salt input (e.g. the user's
+   *   signing public key), see {@link deriveCacheKey}
+   * @throws if `userPassword` is empty
    */
   constructor(
     inner: LocalCacheStore,
     userPassword: string,
     cryptoAdapter: CryptoAdapter,
     logger?: Logger,
+    saltContext?: string,
   );
   /**
    * Construct from a pre-derived AES-GCM cache key. Typical production form
@@ -69,6 +74,7 @@ export class EncryptedLocalCacheStore implements LocalCacheStore {
     userPasswordOrOptions: string | EncryptedLocalCacheStoreKeyOptions,
     cryptoAdapter?: CryptoAdapter,
     logger?: Logger,
+    saltContext?: string,
   ) {
     this.inner = inner;
     if (typeof userPasswordOrOptions === "object" && userPasswordOrOptions !== null) {
@@ -82,32 +88,59 @@ export class EncryptedLocalCacheStore implements LocalCacheStore {
     if (!cryptoAdapter) {
       throw new Error("EncryptedLocalCacheStore: cryptoAdapter is required when constructing with a password.");
     }
+    if (!userPasswordOrOptions) {
+      throw new Error(
+        "EncryptedLocalCacheStore: refusing to derive a cache key from an empty password " +
+          "(the key would be the same for everybody). Pass a cacheKey instead.",
+      );
+    }
     this.cryptoAdapter = cryptoAdapter;
     this.logger = logger || new MindooLogger(getDefaultLogLevel(), "EncryptedLocalCacheStore", true);
-    this.keyPromise = this.deriveKey(userPasswordOrOptions);
+    const iterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
+    if (iterations !== DEFAULT_PBKDF2_ITERATIONS) {
+      this.logger.warn(`Using overridden PBKDF2 iterations for cache key derivation: ${iterations}`);
+    }
+    this.keyPromise = EncryptedLocalCacheStore.deriveCacheKey(userPasswordOrOptions, cryptoAdapter, {
+      saltContext,
+    }).then((key) => {
+      this.derivedKey = key;
+      return key;
+    });
   }
 
   /**
    * Derive the AES-GCM cache encryption key that this store uses internally.
    *
-   * Equivalent to the password-based derivation the legacy constructor runs
-   * on its first encrypt/decrypt call. Pass the returned key to the
-   * {@link EncryptedLocalCacheStoreKeyOptions} constructor overload to
-   * avoid retaining the plaintext password in the cache store.
+   * Equivalent to the password-based derivation the legacy constructor runs.
+   * Pass the returned key to the {@link EncryptedLocalCacheStoreKeyOptions}
+   * constructor overload to avoid retaining the plaintext password in the
+   * cache store.
    *
-   * @param password Plain user password.
+   * Salt: `mindoodb-cache-encryption:v1` without `saltContext` (kept for
+   * existing caches); `mindoodb-cache-encryption:v2:<saltContext>` with it.
+   * A per-identity `saltContext` (such as the signing public key) keeps one
+   * precomputed table from attacking every installation's weak passwords.
+   *
+   * @param password Plain user password. Must not be empty.
    * @param cryptoAdapter Crypto adapter to derive against.
    * @param options.extractable Whether the returned key should be
    *   extractable. Defaults to `false`.
+   * @param options.saltContext Optional per-identity salt input.
+   * @throws if `password` is empty
    */
   static async deriveCacheKey(
     password: string,
     cryptoAdapter: CryptoAdapter,
-    options?: { extractable?: boolean },
+    options?: { extractable?: boolean; saltContext?: string },
   ): Promise<CryptoKey> {
+    if (!password) {
+      throw new Error("EncryptedLocalCacheStore.deriveCacheKey: password must not be empty.");
+    }
     const subtle = cryptoAdapter.getSubtle();
 
-    const saltString = "mindoodb-cache-encryption:v1";
+    const saltString = options?.saltContext
+      ? `mindoodb-cache-encryption:v2:${options.saltContext}`
+      : "mindoodb-cache-encryption:v1";
     const salt = new TextEncoder().encode(saltString);
 
     const passwordInput = new TextEncoder().encode(password);
@@ -132,43 +165,6 @@ export class EncryptedLocalCacheStore implements LocalCacheStore {
       options?.extractable ?? false,
       ["encrypt", "decrypt"],
     );
-  }
-
-  private async deriveKey(password: string): Promise<CryptoKey> {
-    const subtle = this.cryptoAdapter.getSubtle();
-
-    const saltString = "mindoodb-cache-encryption:v1";
-    const salt = new TextEncoder().encode(saltString);
-
-    const passwordInput = new TextEncoder().encode(password);
-    const baseKey = await subtle.importKey(
-      "raw",
-      passwordInput.buffer as ArrayBuffer,
-      "PBKDF2",
-      false,
-      ["deriveKey"],
-    );
-
-    const iterations = resolvePbkdf2Iterations(DEFAULT_PBKDF2_ITERATIONS);
-    if (iterations !== DEFAULT_PBKDF2_ITERATIONS) {
-      this.logger.warn(`Using overridden PBKDF2 iterations for cache key derivation: ${iterations}`);
-    }
-
-    const key = await subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: salt.buffer as ArrayBuffer,
-        iterations,
-        hash: "SHA-256",
-      },
-      baseKey,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt", "decrypt"],
-    );
-
-    this.derivedKey = key;
-    return key;
   }
 
   private async getKey(): Promise<CryptoKey> {

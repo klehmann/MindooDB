@@ -59,7 +59,7 @@ import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { encodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import { decodeJoinRequestUri } from "./uri/joinRequestUri";
-import type { LocalCacheStore } from "./cache/LocalCacheStore";
+import { InMemoryLocalCacheStore, type LocalCacheStore } from "./cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
 import { CacheManager } from "./cache/CacheManager";
 import { validateDatabaseId } from "./databaseIdValidation";
@@ -253,20 +253,31 @@ export class BaseMindooTenant implements MindooTenant {
     // Set up cache if a local cache store is provided. When a pre-derived
     // cache encryption key is available, prefer that to skip the password
     // path and avoid retaining the plaintext password inside the encrypted
-    // cache wrapper.
+    // cache wrapper. Without either, a persistent cache would be encrypted
+    // with a key everybody can derive, so it stays in memory instead.
     if (localCacheStore) {
-      const encryptedStore = preDecryptedMaterial?.cacheEncryptionKey
-        ? new EncryptedLocalCacheStore(localCacheStore, {
-            cacheKey: preDecryptedMaterial.cacheEncryptionKey,
-            cryptoAdapter: this.cryptoAdapter,
-            logger: this.logger.createChild("EncryptedCache"),
-          })
-        : new EncryptedLocalCacheStore(
-            localCacheStore,
-            currentUserPassword,
-            this.cryptoAdapter,
-            this.logger.createChild("EncryptedCache"),
-          );
+      let encryptedStore: LocalCacheStore;
+      if (preDecryptedMaterial?.cacheEncryptionKey) {
+        encryptedStore = new EncryptedLocalCacheStore(localCacheStore, {
+          cacheKey: preDecryptedMaterial.cacheEncryptionKey,
+          cryptoAdapter: this.cryptoAdapter,
+          logger: this.logger.createChild("EncryptedCache"),
+        });
+      } else if (currentUserPassword) {
+        encryptedStore = new EncryptedLocalCacheStore(
+          localCacheStore,
+          currentUserPassword,
+          this.cryptoAdapter,
+          this.logger.createChild("EncryptedCache"),
+          currentUser.userSigningKeyPair.publicKey,
+        );
+      } else {
+        this.logger.warn(
+          "No cache encryption key and no password: the local cache is kept in memory only. " +
+            "Pass preDecryptedUserKeys.cacheEncryptionKey to persist it encrypted.",
+        );
+        encryptedStore = new InMemoryLocalCacheStore();
+      }
       this.cacheManager = new CacheManager(
         encryptedStore,
         undefined,

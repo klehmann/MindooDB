@@ -293,6 +293,29 @@ describe("EncryptedLocalCacheStore", () => {
     expect(await store.getMany("doc", [])).toEqual([]);
     expect(innerSpy).not.toHaveBeenCalled();
   });
+
+  it("refuses an empty password, whose key would be the same for everybody", async () => {
+    const inner = new InMemoryLocalCacheStore();
+    expect(() => new EncryptedLocalCacheStore(inner, "", crypto)).toThrow(/empty password/);
+    await expect(EncryptedLocalCacheStore.deriveCacheKey("", crypto)).rejects.toThrow(/must not be empty/);
+  });
+
+  it("derives a different key per salt context", async () => {
+    const inner = new InMemoryLocalCacheStore();
+    const writer = new EncryptedLocalCacheStore(inner, password, crypto, undefined, "signing-key-a");
+    const sameContext = new EncryptedLocalCacheStore(inner, password, crypto, undefined, "signing-key-a");
+    const otherContext = new EncryptedLocalCacheStore(inner, password, crypto, undefined, "signing-key-b");
+    const noContext = new EncryptedLocalCacheStore(inner, password, crypto);
+
+    await writer.put("doc", "id1", new Uint8Array([7]));
+    expect(await sameContext.get("doc", "id1")).toEqual(new Uint8Array([7]));
+    expect(await otherContext.get("doc", "id1")).toBeNull();
+    expect(await noContext.get("doc", "id1")).toBeNull();
+
+    const derived = await EncryptedLocalCacheStore.deriveCacheKey(password, crypto, { saltContext: "signing-key-a" });
+    const fromKey = new EncryptedLocalCacheStore(inner, { cacheKey: derived, cryptoAdapter: crypto });
+    expect(await fromKey.get("doc", "id1")).toEqual(new Uint8Array([7]));
+  });
 });
 
 // ---------------------------------------------------------------------------
