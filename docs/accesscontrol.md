@@ -485,7 +485,7 @@ interface DefaultAccessPolicyDoc {
   /** Which language-model endpoints clients may send tenant data to (an AI
    *  assistant built into the client). TENANT-LEVEL ONLY, client-enforced.
    *  See section 6.9. */
-  llm?: { allowedEndpoints?: string[]; defaultEndpoint?: string };
+  llm?: { allowedEndpoints?: string[]; defaultEndpoint?: string; denyUse?: boolean };
 }
 ```
 
@@ -523,7 +523,8 @@ tenant-level only and are ignored if set on a per-database policy (see section 6
 type RuleType =
   | "doc_create" | "doc_change" | "doc_delete"
   | "doc_undelete" | "doc_snapshot"
-  | "doc_read";  // database-level read/sync gate (section 6.8); dbid-scoped, no withfields
+  | "doc_read"   // database-level read/sync gate (section 6.8); dbid-scoped, no withfields
+  | "llm_use";   // may use an AI assistant with this tenant's data (section 6.9); dbid "*", no withfields
 
 type Operator =
   | "equals" | "notEquals"
@@ -953,6 +954,9 @@ llm?: {
   allowedEndpoints?: string[];
   /** Endpoint clients should suggest: http(s), no credentials/query/fragment. */
   defaultEndpoint?: string;
+  /** Baseline for llm_use rules: true = members may not use the assistant with
+   *  this tenant's data unless an llm_use allow rule matches them. */
+  denyUse?: boolean;
 }
 ```
 
@@ -974,6 +978,29 @@ llm?: {
   that sets `allowedEndpoints` (Haven does).
 - **Backward compatibility**: absent means unrestricted, so existing tenants and
   older clients are unaffected; older clients simply ignore the field.
+
+**Who may use the assistant (`llm_use`).** The endpoint list says *where* data
+may go; `denyUse` plus `llm_use` rules say *who* may send this tenant's data to
+a language model at all. It follows the same pattern as the database read gate
+(§6.8):
+
+- **Baseline** `llm.denyUse` (default `false`). With `true`, members are denied
+  unless an `llm_use` allow rule matches them.
+- **Rules** are ordinary `acl_rule_<ruleId>` documents with `type: "llm_use"`,
+  `action: "allow" | "deny"` and `users_hashes` (users, groups incl. nested,
+  DN wildcards, `$everyone`). `dbid` must be `"*"` and `withfields` is rejected,
+  because the decision is about the tenant, not a database or its content.
+  Deny overrides allow, and rules apply even without a default policy.
+- **Read** with `MindooTenantDirectory.canUseLlm()`, which evaluates the current
+  user at the directory head (`evaluateLlmUse`). The tenant admin is always
+  allowed. Like the endpoint list it ignores the master switch.
+- **Scope is this tenant's data.** A client that is denied for one tenant must
+  send none of that tenant's data to a model, but may keep using the assistant
+  with the data of other tenants the user belongs to (for example a private
+  tenant). A typical setup is `{ llm: { denyUse: true } }` plus one allow rule
+  for a group such as `ai-users`.
+- **Client-enforced**, like the rest of the block: a modified client can ignore
+  it. Older clients ignore unknown rule types, so they do not apply it either.
 
 ## 7. Evaluation algorithm
 

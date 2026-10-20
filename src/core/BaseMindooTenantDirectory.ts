@@ -89,7 +89,7 @@ import {
   aclDocHistoryPurgeDocId,
   validateDocHistoryPurge,
 } from "./accesscontrol/types";
-import { IdentitySet, evaluateAccess } from "./accesscontrol/evaluate";
+import { IdentitySet, evaluateAccess, evaluateLlmUse } from "./accesscontrol/evaluate";
 import { AccessDecision } from "./accesscontrol/types";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptEncryptedField } from "./crypto/encryptedFields";
@@ -1492,7 +1492,33 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return {
       ...(policy.llm.allowedEndpoints ? { allowedEndpoints: [...policy.llm.allowedEndpoints] } : {}),
       ...(policy.llm.defaultEndpoint ? { defaultEndpoint: policy.llm.defaultEndpoint } : {}),
+      ...(policy.llm.denyUse !== undefined ? { denyUse: policy.llm.denyUse } : {}),
     };
+  }
+
+  /**
+   * Whether the current user may use a client's AI assistant with this
+   * tenant's data (`llm_use`, §6.9), at the directory head. The baseline is
+   * `llm.denyUse`; `llm_use` allow/deny rules target users and groups like any
+   * other rule. Independent of the master switch, like
+   * {@link getLlmEndpointPolicy}. The tenant admin is always allowed.
+   *
+   * Client-enforced: a client that gets `allowed: false` must not send any of
+   * this tenant's data to a language model, while it may still use the
+   * assistant with other tenants' data.
+   */
+  async canUseLlm(): Promise<AccessDecision> {
+    const currentUser = await this.tenant.getCurrentUserId();
+    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+    if (currentUser.userSigningPublicKey === adminKey) {
+      return { allowed: true, reason: "tenant admin", tier: "tier1" };
+    }
+    // Head selector, NOT Date.now() — see canDo.
+    const node = await this.getDirectoryStateAt(Number.MAX_SAFE_INTEGER);
+    const identity = await this.identitySetForSigningKey(currentUser.userSigningPublicKey, node, {
+      isAuthor: false,
+    });
+    return evaluateLlmUse({ identity, node });
   }
 
   /**

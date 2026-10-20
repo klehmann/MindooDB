@@ -30,6 +30,12 @@ export const ACCESS_CONTROL_FORM = "accesscontrol" as const;
  * (a user who cannot read a database cannot create data in it either); `dbid`
  * is therefore the only scope that matters for a `doc_read` rule, and content
  * (`withfields`) clauses are not allowed on it.
+ *
+ * `llm_use` is not about databases at all: it decides whether a user/group may
+ * use a client's built-in AI assistant with this tenant's data (§6.9). Its
+ * rules are tenant-wide (`dbid` must be `"*"`), carry no `withfields`, and are
+ * evaluated by {@link evaluateLlmUse}, independent of the master switch. Like
+ * the rest of the `llm` block it is client-enforced.
  */
 export type RuleType =
   | "doc_create"
@@ -37,7 +43,8 @@ export type RuleType =
   | "doc_delete"
   | "doc_undelete"
   | "doc_snapshot"
-  | "doc_read";
+  | "doc_read"
+  | "llm_use";
 
 /** All valid {@link RuleType} values, for validation and iteration. */
 export const RULE_TYPES: readonly RuleType[] = [
@@ -47,6 +54,7 @@ export const RULE_TYPES: readonly RuleType[] = [
   "doc_undelete",
   "doc_snapshot",
   "doc_read",
+  "llm_use",
 ];
 
 /** Comparison operators usable in a {@link WithFieldClause}. Closed set. */
@@ -265,6 +273,13 @@ export interface LlmEndpointPolicy {
   allowedEndpoints?: string[];
   /** Endpoint clients should suggest (base URL, `http(s)`, no credentials or query). */
   defaultEndpoint?: string;
+  /**
+   * Baseline for `llm_use` rules: when true, members may not use an AI
+   * assistant with this tenant's data unless an `llm_use` allow rule matches
+   * them. Absent/false = allowed unless a deny rule matches. The tenant admin
+   * is exempt.
+   */
+  denyUse?: boolean;
 }
 
 /**
@@ -292,9 +307,12 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
   denyDocRead: false,
 };
 
-/** Map a {@link RuleType} to the policy `deny<Op>` field that gates it. */
+/**
+ * Map a database-scoped {@link RuleType} to the policy `deny<Op>` field that
+ * gates it. `llm_use` is not listed: its baseline is `llm.denyUse` (§6.9).
+ */
 export const RULE_TYPE_TO_DENY_FIELD: Record<
-  RuleType,
+  Exclude<RuleType, "llm_use">,
   keyof typeof DEFAULT_POLICY_DEFAULTS
 > = {
   doc_create: "denyDocCreate",
@@ -504,6 +522,16 @@ export function validateAclRule(rule: {
   if (rule.type === "doc_read" && (rule.withfields?.length ?? 0) > 0) {
     throw new Error("doc_read rules are database-level and cannot use `withfields`");
   }
+  // `llm_use` is a tenant-wide decision about the assistant (§6.9), not about
+  // a database or its documents.
+  if (rule.type === "llm_use") {
+    if (rule.dbid !== "*") {
+      throw new Error('llm_use rules are tenant-wide and require dbid "*"');
+    }
+    if ((rule.withfields?.length ?? 0) > 0) {
+      throw new Error("llm_use rules cannot use `withfields`");
+    }
+  }
   for (const clause of rule.withfields ?? []) {
     validateWithFieldClause(clause, rule.type);
   }
@@ -582,9 +610,9 @@ export function validateLlmEndpointPolicy(llm: unknown): void {
   if (typeof llm !== "object" || llm === null || Array.isArray(llm)) {
     throw new Error("llm must be an object");
   }
-  const { allowedEndpoints, defaultEndpoint } = llm as LlmEndpointPolicy;
+  const { allowedEndpoints, defaultEndpoint, denyUse } = llm as LlmEndpointPolicy;
   for (const key of Object.keys(llm)) {
-    if (key !== "allowedEndpoints" && key !== "defaultEndpoint") {
+    if (key !== "allowedEndpoints" && key !== "defaultEndpoint" && key !== "denyUse") {
       throw new Error(`llm.${key} is not a known field`);
     }
   }
@@ -613,6 +641,9 @@ export function validateLlmEndpointPolicy(llm: unknown): void {
         "llm.defaultEndpoint must be an http(s) URL without credentials, query or fragment",
       );
     }
+  }
+  if (denyUse !== undefined && typeof denyUse !== "boolean") {
+    throw new Error("llm.denyUse must be a boolean");
   }
 }
 
