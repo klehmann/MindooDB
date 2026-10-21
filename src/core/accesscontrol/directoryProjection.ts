@@ -76,6 +76,9 @@ export function parseLlmEndpointPolicy(value: unknown): LlmEndpointPolicy | unde
   if (typeof raw.defaultEndpoint === "string" && raw.defaultEndpoint.trim()) {
     result.defaultEndpoint = raw.defaultEndpoint.trim();
   }
+  if (typeof raw.denyUse === "boolean") {
+    result.denyUse = raw.denyUse;
+  }
   return result;
 }
 

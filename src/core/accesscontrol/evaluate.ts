@@ -97,6 +97,11 @@ function deny(reason: string, tier: "tier1" | "tier2", matchedRuleId?: string): 
 export function evaluateAccess(input: EvaluateAccessInput): AccessDecision {
   const { op, dbid, identity, node, isServer } = input;
 
+  // `llm_use` is tenant-wide and follows its own baseline (§6.9).
+  if (op === "llm_use") {
+    return evaluateLlmUse({ identity, node });
+  }
+
   // No policy document has ever existed -> access control was never enabled ->
   // everything is allowed (§6.1, the "no acl_defaultpolicy" state).
   if (node.defaultPolicy === null) {
@@ -181,6 +186,35 @@ export function evaluateAccess(input: EvaluateAccessInput): AccessDecision {
   return baselineDenied
     ? deny(`denied by baseline policy for ${op}`, "tier1")
     : allow(`allowed by baseline policy for ${op}`, "tier1");
+}
+
+/**
+ * Whether the acting user may use a client's AI assistant with this tenant's
+ * data (`llm_use`, docs/accesscontrol.md §6.9).
+ *
+ * Same shape as §7 (baseline, then deny-overrides-allow over the matching
+ * rules), with two differences: the baseline is `llm.denyUse` of the tenant
+ * default policy, and the master switch does not apply. Like the rest of the
+ * `llm` block, the setting stays in force while access checks are switched off,
+ * because new tenants are created with that switch on. Rules apply even when no
+ * default policy exists, so a deny rule alone is enough.
+ */
+export function evaluateLlmUse(input: { identity: IdentitySet; node: DirectoryStateNode }): AccessDecision {
+  const { identity, node } = input;
+  const rules = (node.rulesByType.get("llm_use") ?? []).filter(
+    (r) => r.dbid === "*" && (r.withfields?.length ?? 0) === 0 && intersects(r.users_hashes, identity.hashes)
+  );
+  const denyRule = rules.find((r) => r.action === "deny");
+  if (denyRule) {
+    return deny(`denied by rule ${denyRule.ruleId}`, "tier1", denyRule.ruleId);
+  }
+  const allowRule = rules.find((r) => r.action === "allow");
+  if (allowRule) {
+    return allow(`allowed by rule ${allowRule.ruleId}`, "tier1", allowRule.ruleId);
+  }
+  return node.defaultPolicy?.llm?.denyUse === true
+    ? deny("denied by baseline policy for llm_use", "tier1")
+    : allow("allowed by baseline policy for llm_use", "tier1");
 }
 
 /** Returns true if any element of `hashes` is in `set`. */

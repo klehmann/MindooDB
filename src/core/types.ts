@@ -3936,6 +3936,17 @@ export interface MindooTenantDirectory {
   getLlmEndpointPolicy?(): Promise<LlmEndpointPolicy | null>;
 
   /**
+   * Whether the current user may use a client's AI assistant with this
+   * tenant's data (`llm_use` rules over the `llm.denyUse` baseline). The tenant
+   * admin is always allowed. Independent of `disableAllAccessChecksAndPolicies`.
+   * Client-enforced: on `allowed: false`, send none of this tenant's data to a
+   * language model.
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   */
+  canUseLlm?(): Promise<AccessDecision>;
+
+  /**
    * The tenant-wide storage-format floor: the trusted-time cutoff (ms since
    * epoch) at/after which a store entry MUST carry the v2 metadata-binding
    * author signature, or `undefined` when no floor is configured. Read from the

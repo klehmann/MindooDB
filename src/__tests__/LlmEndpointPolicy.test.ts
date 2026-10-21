@@ -13,7 +13,7 @@ import {
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { parseLlmEndpointPolicy, parsePolicyDoc } from "../core/accesscontrol/directoryProjection";
-import { validateAccessPolicy, validateLlmEndpointPolicy } from "../core/accesscontrol/types";
+import { validateAccessPolicy, validateAclRule, validateLlmEndpointPolicy } from "../core/accesscontrol/types";
 
 /**
  * Language-model endpoint policy: the `llm` block of the tenant default policy
@@ -74,6 +74,22 @@ describe("parseLlmEndpointPolicy / validateLlmEndpointPolicy", () => {
     ).not.toThrow();
     expect(() => validateAccessPolicy({ llm: {} })).not.toThrow();
   });
+
+  it("parses and validates denyUse", () => {
+    expect(parseLlmEndpointPolicy({ denyUse: true })).toEqual({ denyUse: true });
+    expect(parseLlmEndpointPolicy({ denyUse: "yes" })).toEqual({});
+    expect(() => validateLlmEndpointPolicy({ denyUse: true })).not.toThrow();
+    expect(() => validateLlmEndpointPolicy({ denyUse: 1 })).toThrow(/denyUse must be a boolean/);
+  });
+
+  it("requires llm_use rules to be tenant-wide and content-free", () => {
+    const base = { type: "llm_use" as const, action: "allow" as const, users_hashes: ["$everyone"] };
+    expect(() => validateAclRule({ ...base, dbid: "*" })).not.toThrow();
+    expect(() => validateAclRule({ ...base, dbid: "main" })).toThrow(/tenant-wide/);
+    expect(() =>
+      validateAclRule({ ...base, dbid: "*", withfields: [{ key: "a", op: "exists", value: true }] }),
+    ).toThrow(/withfields/);
+  });
 });
 
 describe("tenant LLM endpoint policy (directory round trip)", () => {
@@ -89,7 +105,13 @@ describe("tenant LLM endpoint policy (directory round trip)", () => {
   type AclDirectory = Awaited<ReturnType<MindooTenant["openDirectory"]>> & {
     setDefaultAccessPolicy(policy: Record<string, unknown>, key: string, password: string): Promise<unknown>;
     setDatabaseAccessPolicy(dbid: string, policy: Record<string, unknown>, key: string, password: string): Promise<unknown>;
-    getLlmEndpointPolicy(): Promise<{ allowedEndpoints?: string[]; defaultEndpoint?: string } | null>;
+    getLlmEndpointPolicy(): Promise<{ allowedEndpoints?: string[]; defaultEndpoint?: string; denyUse?: boolean } | null>;
+    canUseLlm(): Promise<{ allowed: boolean; matchedRuleId?: string }>;
+    createAccessRule(
+      rule: { ruleId: string; type: string; dbid?: string; action?: "allow" | "deny"; usernames?: string[]; groups?: string[] },
+      key: string,
+      password: string,
+    ): Promise<unknown>;
   };
 
   beforeEach(async () => {
@@ -183,4 +205,72 @@ describe("tenant LLM endpoint policy (directory round trip)", () => {
     ).rejects.toThrow(/http\(s\)/);
     expect(await d.getLlmEndpointPolicy()).toBeNull();
   }, 90000);
+
+  describe("llm_use (who may use the assistant with this tenant's data)", () => {
+    const memberName = "CN=member/O=llm";
+
+    it("allows everyone when nothing is configured", async () => {
+      const d = await dir();
+      expect((await d.canUseLlm()).allowed).toBe(true);
+      await d.setDefaultAccessPolicy({}, admin.userSigningKeyPair.privateKey, adminPassword);
+      expect((await d.canUseLlm()).allowed).toBe(true);
+    }, 90000);
+
+    it("denyUse blocks members unless an allow rule matches one of their groups", async () => {
+      const d = await dir();
+      await d.setDefaultAccessPolicy({ llm: { denyUse: true } }, admin.userSigningKeyPair.privateKey, adminPassword);
+      expect(await d.getLlmEndpointPolicy()).toEqual({ denyUse: true });
+      expect((await d.canUseLlm()).allowed).toBe(false);
+
+      await d.createAccessRule(
+        { ruleId: "llm-ai-users", type: "llm_use", action: "allow", groups: ["ai-users"] },
+        admin.userSigningKeyPair.privateKey,
+        adminPassword,
+      );
+      expect((await d.canUseLlm()).allowed).toBe(false);
+
+      await d.addUsersToGroup("ai-users", [memberName], admin.userSigningKeyPair.privateKey, adminPassword);
+      expect(await d.canUseLlm()).toMatchObject({ allowed: true, matchedRuleId: "llm-ai-users" });
+    }, 90000);
+
+    it("a deny rule wins over an allow rule and over the open baseline", async () => {
+      const d = await dir();
+      await d.createAccessRule(
+        { ruleId: "llm-deny-member", type: "llm_use", action: "deny", usernames: [memberName] },
+        admin.userSigningKeyPair.privateKey,
+        adminPassword,
+      );
+      // No default policy at all: the deny rule still applies.
+      expect(await d.canUseLlm()).toMatchObject({ allowed: false, matchedRuleId: "llm-deny-member" });
+
+      await d.createAccessRule(
+        { ruleId: "llm-allow-all", type: "llm_use", action: "allow", usernames: [memberName] },
+        admin.userSigningKeyPair.privateKey,
+        adminPassword,
+      );
+      expect((await d.canUseLlm()).allowed).toBe(false);
+    }, 90000);
+
+    it("applies with the master switch on and leaves the database gates alone", async () => {
+      const d = await dir();
+      await d.setDefaultAccessPolicy(
+        { llm: { denyUse: true }, disableAllAccessChecksAndPolicies: true },
+        admin.userSigningKeyPair.privateKey,
+        adminPassword,
+      );
+      expect((await d.canUseLlm()).allowed).toBe(false);
+      await expect(memberTenant.openDB("main")).resolves.toBeDefined();
+    }, 90000);
+
+    it("rejects database-scoped llm_use rules", async () => {
+      const d = await dir();
+      await expect(
+        d.createAccessRule(
+          { ruleId: "llm-main", type: "llm_use", dbid: "main", action: "allow", usernames: [memberName] },
+          admin.userSigningKeyPair.privateKey,
+          adminPassword,
+        ),
+      ).rejects.toThrow(/tenant-wide/);
+    }, 90000);
+  });
 });
