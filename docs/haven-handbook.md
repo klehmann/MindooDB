@@ -206,6 +206,60 @@ The App Builder asks Haven for one unusual permission, propose applications, whi
 
 The builder is itself open source, and the hosted copy is a convenience rather than a requirement. If you would rather the Cursor key never passed through a server you do not run, clone [`mindoodb-app-builder`](https://github.com/klehmann/mindoodb-app-builder) and run it yourself; it serves on a loopback address, which counts as a secure origin, so an HTTPS Haven can still embed it. Point Haven at your own copy with New app → From URL in the App Store, using the loopback address it prints on start, instead of installing the catalog entry. It is the same application, and the Cursor key then never leaves your machine.
 
+## Working with AI agents
+
+Your work in Haven is spread across apps: minutes and quotes in TeamEdit, figures in TeamGrid, plans in Vega. An AI agent that can reach all of them takes over the tedious part, across app boundaries. It reads last week's minutes and turns the decisions into tasks with owners and dates in a Vega map. It imports a spreadsheet from a folder on your computer into TeamGrid and adds a chart. It goes through a contract and suggests changes as tracked changes that you accept or reject. It tidies up a workspace page, installs the app you were about to look for, or starts a sync before you leave the office. You describe the result, the agent does the clicks, and you keep the final say.
+
+Haven does not bring its own model for this, and it does not hand your data to anyone. It acts as the broker between an agent and your apps: it decides which tools an agent sees, asks you before anything consequential happens, and keeps your data where it is — encrypted, on your device. The agent's model only sees what the tools return to it. Which model that is stays your choice: a cloud provider, a model hosted in Europe, or one running on your own computer through Ollama or LM Studio.
+
+### Tools, not screen scraping
+
+Agents do not look at Haven's screens and guess where to click. Haven offers them tools through WebMCP, the web standard for tools a page offers to AI agents: named actions with a description and a schema for their input, which an agent calls the way a program calls a function. Two kinds come together.
+
+Haven's own tools all start with `haven_`. With them an agent finds out where you are and what is open, lists and describes your apps and tenants, opens an app, arranges workspace pages and tiles, searches and installs apps from the App Store, passes files through an exchange folder, and starts or watches a sync. Every change an agent makes to the workspace becomes a step in the workspace's undo history.
+
+On top of those come the tools of your apps. Any MindooDB app can bring its own, named after the app — `vega_…` for mind maps, `teamgrid_…` for spreadsheets, `teamedit_…` for documents — and they do what the app does: read a sheet, add a chart, insert a paragraph, suggest a tracked change. An agent sees the tools of the app in front of you, so a typical conversation opens TeamGrid, reads a sheet and adds a chart in a few steps. On an app's page in the Haven App Store, the Use with AI section shows what an agent can do with that app, with example requests and its limits.
+
+### Switching it on
+
+Nothing is offered until you switch it on, and the switches live in Preferences → General under Agent tools. Offer agent tools is the main one: as long as it is off, no agent outside Haven sees a single tool. Below it, Apps that may offer tools lists every installed app with its own switch, because each app needs your consent separately — the same switch appears as Offer tools to AI agents in the app's own settings. Apps an admin distributes by tenant policy may come with that decision already made; Haven then shows it as managed by the policy.
+
+Exchange folder is optional and only matters when files should travel between Haven and an agent: exports, attachments, a spreadsheet to import. You pick a folder on this computer, and agents receive files there and hand files over through it. Files in that folder are not encrypted, so choose a place you would also use for ordinary downloads. If you enter its location on disk, agents get absolute paths and find exported files without asking.
+
+### Connecting an agent
+
+Which way you connect depends on where Haven runs.
+
+In Chrome, Haven's tools reach an agent through the open-source [Haven Agent Bridge](https://github.com/klehmann/haven-agent-bridge). A Chrome extension picks up the tools in the Haven tab, and a small local service passes them on to your MCP client. Goose, Claude Code and other clients that start MCP servers as a local program start the bridge that way; clients that speak Streamable HTTP connect to `http://127.0.0.1:13300/mcp` with the token the bridge writes to `~/.haven-agent-bridge/token`. The bridge listens only on `127.0.0.1`, guards every connection with that token, only talks to the Haven sites on its allowlist, and records no content unless you turn that on. You install it from GitHub — build it once, then load its `extension` folder in Chrome under Load unpacked — and the README has the configuration for each client. Chrome's own WebMCP support is still behind a flag or trial; Preferences tells you when this browser does not offer it yet.
+
+Haven's native apps for macOS and Windows, which are coming soon, have the connection built in, without Chrome, Node or an open network port. There, Preferences → General shows an Agent access … button that lists the agent apps Haven knows. For Goose, Claude Desktop and Codex, one click writes Haven into their configuration and keeps a backup of the old file. For Cursor, VS Code and LM Studio, Haven opens their install link. For Claude Code, Gemini CLI and others, it shows the command to copy. When an agent connects for the first time, Haven asks whether you trust that program, and checks it by path and code signature. While it is connected, a small banner names it, with Disconnect one click away. The phone apps for iOS and Android do not offer agent tools.
+
+### The built-in assistant
+
+Haven Enterprise also brings an assistant of its own, so an agent is available without installing anything else. It opens from the assistant button in the top bar or in the App Drawer, works with the same tools as an outside agent, and shows every step it takes as a card in the conversation, with the tool's input and result one click away. It also plans larger tasks as a short checklist you can follow.
+
+The assistant talks to a language model you choose under Preferences → Assistant. Any endpoint that speaks the OpenAI-compatible API works: OpenAI itself, a company proxy, or a local server such as Ollama or LM Studio. You give it a name, the endpoint, the model, and say whether the model understands images. The API key can be kept encrypted on this device, for this session only, or left out for a local server; a stored key is encrypted with a key of your unlocked user id, is not synced, is not part of backups, and never reaches apps. Test connection checks the endpoint and whether the model calls tools, which the assistant needs. A local server has to allow Haven's address — for Ollama that is `OLLAMA_ORIGINS`, in LM Studio it is the CORS switch.
+
+Before the first message goes to an endpoint, Haven says what it will send there — your messages, and what the assistant reads through tools — and asks for your agreement once per endpoint. The conversation lives in memory only and is discarded when Haven locks.
+
+### You stay in control
+
+Tools that remove something, install apps, export files or start a sync are marked as consequential, and Haven asks you before they run. For an outside agent that is a dialog on top of Haven; the built-in assistant asks inside the conversation, where Allow for the rest of this conversation saves you repeating yourself during a longer task.
+
+Workspace changes can be undone. Every change an agent makes is a step it can take back itself, and if you have changed something since, Haven refuses until the agent explicitly includes your steps too — and the agent is told to ask you first.
+
+Your data stays local. Tools run in your Haven, on your device, against its local replicas. The agent's model sees what the tools return, so the apps you allow decide what it can see, and results that contain text other people wrote are marked as data rather than instructions.
+
+### For tenant admins: who may use AI agents, and where data may go
+
+A tenant admin decides how AI agents may be used with the tenant's data. The settings are part of the tenant's access policy, in the AI assistant section of the tenant directory's policy dialog; editing access policies is a Haven Enterprise feature.
+
+Restrict the endpoints of the AI assistant limits where the built-in assistant may send the tenant's data: a list of endpoint addresses with `*` as wildcard, one per line. `*` alone allows every endpoint, and an empty list allows none. A user who belongs to several tenants can only use an endpoint that every tenant with a list allows. Suggested endpoint is offered to members when they set the assistant up.
+
+Only members allowed by a rule may use AI agents with this tenant's data decides who may use agents at all. With it on, Haven keeps the tenant's data away from every AI agent — the built-in assistant and outside agents alike — for everyone except the members an access rule of type llm_use allows; a deny rule of the same type excludes single users even when the switch is off. For a member who is not allowed, the tenant simply disappears from what agents see: it is not listed, apps that work with its databases do not appear and offer no tools, and its tiles on a workspace page show up only as hidden placeholders. Their other tenants are not affected, so a private tenant keeps working with the assistant. If a tenant forbids agents in the middle of a conversation, the built-in assistant starts that conversation over, because the earlier messages may already contain the tenant's data.
+
+Both settings are enforced by Haven on the member's device rather than by the server, and they apply even while the tenant's access checks are switched off. The details for developers are in [access control §6.9](accesscontrol.md#69-language-model-endpoints-llm).
+
 ## Sync
 
 Sync is how the data in your local replicas stays in step with the server. Everybody can sync the databases they already have access to — you do not need to be an admin.
@@ -296,7 +350,7 @@ Nothing in the DAG Explorer can be edited. It is a faithful, read-only record of
 
 ## Preferences
 
-Preferences is the one screen that is organized as a tab bar instead of a single page. It has six tabs: General, User ids, Tenants, Backup, Restore, and Stats. Everything on these tabs lives in this browser, with a few deliberate exceptions: the actions in Tenants, the opt-in Roamed workspace setting, and the endpoint that Device-to-device sync publishes so other devices can find this one.
+Preferences is the one screen that is organized as a tab bar instead of a single page. It has six tabs: General, User ids, Tenants, Backup, Restore, and Stats, plus a seventh, Assistant, with Haven Enterprise. Everything on these tabs lives in this browser, with a few deliberate exceptions: the actions in Tenants, the opt-in Roamed workspace setting, and the endpoint that Device-to-device sync publishes so other devices can find this one.
 
 ### General
 
@@ -311,6 +365,8 @@ Add Haven to your home screen is a one-tap card that offers a shortcut to the in
 An Optimize for iOS multitasking toggle tells Haven that it is used in iPad split-screen or slide-over mode, where the system adds window controls that overlap Haven's own chrome. Turning it on shifts Haven's controls clear of them. Under Motion, Reduce animations strips out Haven's transitions for anyone who finds them distracting or whose system already asks for less movement.
 
 Device-to-device sync is where the receiving half of peer-to-peer sync lives. The checkbox is Accept incoming device sync, and the card also shows this device's endpoint — the identifier other devices dial to reach it — along with whether anyone can currently see it. The section on peer-to-peer sync under Sync explains what the two sides do; this is the switch that makes this device one of them.
+
+Agent tools is where AI agents get access to Haven: the main switch, the apps that may offer their own tools, and the exchange folder for files. Working with AI agents, earlier in this handbook, explains all three and how to connect an agent.
 
 Roamed workspace is the one setting on this tab that leaves the browser, and it is off until you turn it on. It makes the workspace pages, tiles, groups and the application list of the active user id follow you to your other devices, and it lets you keep several environments and switch between them — office and home, or desktop and mobile. It is a Haven Enterprise feature: without an active license the toggle stays off, this device neither saves its workspace nor takes one over, and environments you set up earlier are left exactly as they are until a license is imported again. Switching the toggle on reveals two fields: the tenant the workspace is synced through, and the name of the saved workspace. The name is how devices find each other, so "office" on your laptop and "office" on your phone share one workspace; the field opens a drop-down of the names already saved for this user id, and typing a name that is not in that list starts a new one. Neither field takes effect while you edit it — Apply commits both, Cancel puts back what is in force. What Apply does follows from the name: a new one is created from this device's workspace, an existing one is taken over, and the tabs and tiles arranged here are replaced by it. That replacement only costs you something when roaming was off, so that is the single case Haven asks about first; once roaming is on, this device's state is already in its saved workspace and moving to another name is free. Switching the toggle off stops roaming right away and leaves every saved workspace untouched.
 
@@ -510,6 +566,18 @@ Haven App Store — the catalog of ready-made MindooDB applications, opened from
 
 App Builder — the app in the store that builds other apps. You describe what you need; it creates the repository, publishes the app, has an AI agent write it, and hands it to Haven for installation. The result is an ordinary MindooDB app with source code in your own GitHub account.
 
+AI agent — a program driven by a language model that carries out tasks by calling tools, for example Goose, Claude Code or Cursor. In Haven it works through agent tools and never reaches your data directly.
+
+Agent tools — the actions Haven and its apps offer to AI agents: Haven's own `haven_*` tools plus the tools each app brings, named after the app. Offered only after you switch them on under Preferences → General, and per app.
+
+WebMCP — the web standard through which a page offers tools to AI agents. Haven uses it to offer its agent tools.
+
+Haven Agent Bridge — an open-source Chrome extension plus a small local service that passes Haven's agent tools on to an MCP client such as Goose or Claude Code.
+
+Built-in assistant — the AI assistant inside Haven Enterprise. It uses the same agent tools as an outside agent and talks to a language model you choose under Preferences → Assistant.
+
+Exchange folder — a folder on your computer through which agents receive files from Haven and hand files to Haven. Files in it are not encrypted.
+
 Application registration — the saved Haven-side definition of a MindooDB app: where to launch it from, how to run it, and which databases or views it is allowed to see.
 
 Hosted bundle — a packaged set of web assets imported into Haven so it can serve the app locally, even when offline.
@@ -556,7 +624,7 @@ Haven Community is also a complete platform for custom app development. You can 
 
 The underlying MindooDB platform is open source under the Apache 2.0 license. That matters beyond the price tag: there is no data lock-in. The data model, the content-addressed store, and the sync protocol are all documented and reimplementable, which means a team can take their encrypted data with them at any time — and it is even possible to build entirely alternative clients on top of the same platform if Haven is not the right fit for a particular use case. Haven is the official client; it is not the only possible one.
 
-Haven Enterprise is a commercial edition Mindoo GmbH is building out, on exactly the same MindooDB core. Its features unlock with an Enterprise license key, and they arrive one at a time rather than all at once. Workspace roaming across devices and browser profiles is the first one you can use today: the Roamed workspace setting under Preferences → General is exactly this feature, which is why the toggle stays off until a license is imported. Still being built are custom branding (logo, colors, product name, and domain so Haven feels like your own product), a managed user interface with organisation-specific defaults, managed workspace templates pushed to users so they land in a configured environment, an in-house app store for curating internal and third-party MindooDB apps, automatic scheduled backups of in-browser data, first-class backup tooling for the tenant data stored on your server, and inline editing of common Office and text attachments without having to download them. The list continues to grow as the Enterprise client matures — customer feedback shapes the roadmap directly.
+Haven Enterprise is a commercial edition Mindoo GmbH is building out, on exactly the same MindooDB core. Its features unlock with an Enterprise license key, and they arrive one at a time rather than all at once. Workspace roaming across devices and browser profiles was the first one you can use today: the Roamed workspace setting under Preferences → General is exactly this feature, which is why the toggle stays off until a license is imported. The built-in AI assistant is the second; agent tools for outside agents stay free in every edition. Still being built are custom branding (logo, colors, product name, and domain so Haven feels like your own product), a managed user interface with organisation-specific defaults, managed workspace templates pushed to users so they land in a configured environment, an in-house app store for curating internal and third-party MindooDB apps, automatic scheduled backups of in-browser data, first-class backup tooling for the tenant data stored on your server, and inline editing of common Office and text attachments without having to download them. The list continues to grow as the Enterprise client matures — customer feedback shapes the roadmap directly.
 
 Choosing Haven Enterprise never takes you off the open platform. The MindooDB core and the Haven PWA remain free and open; Enterprise is a separate, commercial client layered on top. You can start on Community, move to Enterprise later, and in either direction your data and your server stay exactly where they were.
 

@@ -1001,6 +1001,13 @@ a language model at all. It follows the same pattern as the database read gate
   for a group such as `ai-users`.
 - **Client-enforced**, like the rest of the block: a modified client can ignore
   it. Older clients ignore unknown rule types, so they do not apply it either.
+- **In Haven** a denied tenant disappears from every agent, the built-in
+  assistant as well as WebMCP and Haven Desktop agents: it is left out of the
+  tenant list and sync tools, apps whose mappings touch it are hidden together
+  with their tools, context and embedded components, and its workspace tiles
+  are listed as `hidden`. A tenant counts as allowed only once its policy has
+  been read. The built-in assistant starts a conversation over when a tenant
+  whose data it may already hold forbids agents.
 
 ## 7. Evaluation algorithm
 

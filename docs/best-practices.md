@@ -958,7 +958,15 @@ agent uses them well:
 
 Agents only see an app's tools after the user switched agent tools on in Haven
 and allowed that app; a definition cannot request it. Build the tools anyway:
-they cost nothing until the user opts in.
+they cost nothing until the user opts in. The same tools serve Haven's built-in
+assistant and outside agents (through WebMCP or Haven Desktop) alike.
+
+A tenant can also keep its data from AI agents for some or all members
+(`llm.denyUse` plus `llm_use` rules, [access control §6.9](accesscontrol.md#69-language-model-endpoints-llm)).
+Haven then hides every app whose mappings touch that tenant from agents: its
+tools, its context and its embedded components. Tool results are opaque to
+Haven, so an app that maps several tenants is hidden as a whole as soon as one
+of them forbids agents — another reason to keep mappings narrow.
 
 ---
 

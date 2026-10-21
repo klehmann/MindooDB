@@ -206,6 +206,60 @@ De App Builder vraagt Haven om één ongebruikelijk recht, Apps voorstellen, en 
 
 De builder is zelf open source, en de gehoste kopie is een gemak en geen vereiste. Wil je liever dat de Cursor-sleutel nooit langs een server komt die je zelf niet beheert, kloon dan [`mindoodb-app-builder`](https://github.com/klehmann/mindoodb-app-builder) en draai hem zelf; hij serveert op een loopbackadres, wat als beveiligde origin geldt, zodat een Haven op HTTPS hem nog steeds kan insluiten. Wijs Haven naar je eigen kopie met Nieuwe applicatie → Vanaf een URL in de App Store, met het loopbackadres dat hij bij het starten afdrukt, in plaats van de catalogusvermelding te installeren. Het is dezelfde applicatie, en de Cursor-sleutel verlaat je machine dan nooit.
 
+## Werken met AI-agents
+
+Je werk in Haven is verdeeld over apps: notulen en offertes in TeamEdit, cijfers in TeamGrid, plannen in Vega. Een AI-agent die ze allemaal kan bereiken, neemt het saaie deel over, over de grenzen van apps heen. Hij leest de notulen van vorige week en maakt van de besluiten taken met eigenaren en data in een Vega-map. Hij importeert een spreadsheet uit een map op je computer in TeamGrid en voegt een grafiek toe. Hij loopt een contract door en stelt wijzigingen voor als bijgehouden wijzigingen, die jij accepteert of afwijst. Hij ruimt een werkruimtepagina op, installeert de app die je net wilde gaan zoeken, of start een synchronisatie voordat je het kantoor verlaat. Jij beschrijft het resultaat, de agent doet de klikken, en het laatste woord is aan jou.
+
+Haven brengt hiervoor geen eigen model mee, en het geeft je gegevens aan niemand. Het is de bemiddelaar tussen een agent en je apps: het bepaalt welke tools een agent ziet, vraagt het je voordat er iets met gevolgen gebeurt, en laat je gegevens waar ze zijn — versleuteld, op je apparaat. Het model van de agent ziet alleen wat de tools aan hem teruggeven. Welk model dat is, blijft jouw keuze: een cloudaanbieder, een model dat in Europa wordt gehost, of een dat via Ollama of LM Studio op je eigen computer draait.
+
+### Tools, geen schermschrapen
+
+Agents kijken niet naar Havens schermen om te raden waar ze moeten klikken. Haven biedt ze tools aan via WebMCP, de webstandaard voor tools die een pagina aan AI-agents aanbiedt: benoemde acties met een beschrijving en een schema voor hun invoer, die een agent aanroept zoals een programma een functie aanroept. Twee soorten komen samen.
+
+Havens eigen tools beginnen allemaal met `haven_`. Daarmee komt een agent te weten waar je bent en wat er openstaat, somt hij je apps en tenants op en beschrijft hij ze, opent hij een app, ordent hij werkruimtepagina's en tegels, zoekt en installeert hij apps uit de App Store, geeft hij bestanden door via een uitwisselmap, en start of volgt hij een synchronisatie. Elke wijziging die een agent in de werkruimte aanbrengt, wordt een stap in de geschiedenis voor ongedaan maken van de werkruimte.
+
+Daarbovenop komen de tools van je apps. Elke MindooDB-app kan eigen tools meebrengen, genoemd naar de app — `vega_…` voor mindmaps, `teamgrid_…` voor spreadsheets, `teamedit_…` voor documenten — en ze doen wat de app doet: een werkblad lezen, een grafiek toevoegen, een alinea invoegen, een bijgehouden wijziging voorstellen. Een agent ziet de tools van de app die je voor je hebt, dus een typisch gesprek opent TeamGrid, leest een werkblad en voegt in een paar stappen een grafiek toe. Op de pagina van een app in de Haven App Store laat het onderdeel Gebruiken met AI zien wat een agent met die app kan doen, met voorbeeldverzoeken en beperkingen.
+
+### Inschakelen
+
+Er wordt niets aangeboden totdat je het inschakelt, en de schakelaars staan onder Instellingen → Algemeen bij Agenttools. Agenttools aanbieden is de belangrijkste: zolang die uit staat, ziet geen enkele agent buiten Haven ook maar één tool. Daaronder somt Apps die tools mogen aanbieden elke geïnstalleerde app op met een eigen schakelaar, omdat elke app afzonderlijk je toestemming nodig heeft — dezelfde schakelaar staat als Tools aanbieden aan AI-agents in de instellingen van de app zelf. Apps die een beheerder via tenantbeleid uitrolt, kunnen met die beslissing al genomen binnenkomen; Haven toont dat dan als beheerd door het beleid.
+
+Uitwisselmap is optioneel en telt alleen wanneer bestanden tussen Haven en een agent moeten reizen: exports, bijlagen, een spreadsheet om te importeren. Je kiest een map op deze computer, en agents krijgen daar bestanden binnen en geven er bestanden via door. Bestanden in die map zijn niet versleuteld, dus kies een plek die je ook voor gewone downloads zou gebruiken. Vul je de locatie op de schijf in, dan krijgen agents absolute paden en vinden ze geëxporteerde bestanden zonder te vragen.
+
+### Een agent verbinden
+
+Hoe je verbindt, hangt af van waar Haven draait.
+
+In Chrome bereiken Havens tools een agent via de opensource [Haven Agent Bridge](https://github.com/klehmann/haven-agent-bridge). Een Chrome-extensie pikt de tools op in het Haven-tabblad, en een kleine lokale dienst geeft ze door aan je MCP-client. Goose, Claude Code en andere clients die MCP-servers als lokaal programma starten, starten de bridge op die manier; clients die Streamable HTTP spreken, maken verbinding met `http://127.0.0.1:13300/mcp` met het token dat de bridge naar `~/.haven-agent-bridge/token` schrijft. De bridge luistert alleen op `127.0.0.1`, beveiligt elke verbinding met dat token, praat alleen met de Haven-sites op zijn toegestane lijst, en legt geen inhoud vast tenzij je dat inschakelt. Je installeert hem vanaf GitHub — één keer bouwen, daarna de map `extension` in Chrome laden via Uitgepakte extensie laden — en de README bevat de configuratie voor elke client. Chromes eigen WebMCP-ondersteuning zit nog achter een flag of proef; Instellingen laat je weten wanneer deze browser die nog niet biedt.
+
+Havens native apps voor macOS en Windows, die binnenkort verschijnen, hebben de verbinding ingebouwd, zonder Chrome, Node of een open netwerkpoort. Daar toont Instellingen → Algemeen een knop Agenttoegang … die de agent-apps opsomt die Haven kent. Voor Goose, Claude Desktop en Codex zet één klik Haven in hun configuratie en bewaart een back-up van het oude bestand. Voor Cursor, VS Code en LM Studio opent Haven hun installatielink. Voor Claude Code, Gemini CLI en andere toont het de opdracht om te kopiëren. Wanneer een agent voor het eerst verbinding maakt, vraagt Haven of je dat programma vertrouwt, en controleert het dat op pad en codehandtekening. Zolang de agent verbonden is, noemt een kleine banner zijn naam, met Verbinding verbreken op één klik afstand. De telefoonapps voor iOS en Android bieden geen agenttools aan.
+
+### De ingebouwde assistent
+
+Haven Enterprise brengt ook een eigen assistent mee, zodat er een agent beschikbaar is zonder dat je iets anders hoeft te installeren. Hij opent vanaf de knop van de assistent in de bovenbalk of in de app-lade, werkt met dezelfde tools als een externe agent, en toont elke stap die hij zet als kaart in het gesprek, met de invoer en het resultaat van de tool op één klik afstand. Grotere taken plant hij ook als korte checklist die je kunt volgen.
+
+De assistent praat met een taalmodel dat je kiest onder Instellingen → Assistent. Elk endpoint dat de OpenAI-compatibele API spreekt werkt: OpenAI zelf, een bedrijfsproxy, of een lokale server zoals Ollama of LM Studio. Je geeft het een naam, het endpoint en het model, en geeft aan of het model afbeeldingen begrijpt. De API-sleutel kan versleuteld op dit apparaat worden bewaard, alleen voor deze sessie, of worden weggelaten voor een lokale server; een opgeslagen sleutel is versleuteld met een sleutel van je ontgrendelde gebruikers-ID, wordt niet gesynchroniseerd, zit niet in back-ups en komt nooit bij een app terecht. Verbinding testen controleert het endpoint en of het model tools aanroept, wat de assistent nodig heeft. Een lokale server moet het adres van Haven toestaan — voor Ollama is dat `OLLAMA_ORIGINS`, in LM Studio is het de CORS-schakelaar.
+
+Voordat het eerste bericht naar een endpoint gaat, zegt Haven wat het daarheen stuurt — je berichten, en wat de assistent via tools leest — en vraagt het één keer per endpoint om je akkoord. Het gesprek leeft alleen in het geheugen en wordt weggegooid wanneer Haven vergrendelt.
+
+### Jij houdt de regie
+
+Tools die iets verwijderen, apps installeren, bestanden exporteren of een synchronisatie starten, zijn gemarkeerd als tools met gevolgen, en Haven vraagt het je voordat ze worden uitgevoerd. Voor een externe agent is dat een dialoog bovenop Haven; de ingebouwde assistent vraagt het in het gesprek zelf, waar Toestaan voor de rest van dit gesprek je herhaling bespaart tijdens een langere taak.
+
+Wijzigingen in de werkruimte kunnen ongedaan worden gemaakt. Elke wijziging die een agent aanbrengt, is een stap die hij zelf kan terugdraaien, en als jij intussen iets hebt gewijzigd, weigert Haven totdat de agent jouw stappen uitdrukkelijk meeneemt — en de agent krijgt de opdracht je eerst te vragen.
+
+Je gegevens blijven lokaal. Tools draaien in jouw Haven, op jouw apparaat, tegen de lokale replica's daarvan. Het model van de agent ziet wat de tools teruggeven, dus de apps die je toestaat bepalen wat het kan zien, en resultaten met tekst die anderen hebben geschreven worden gemarkeerd als gegevens en niet als instructies.
+
+### Voor tenantbeheerders: wie AI-agents mag gebruiken, en waar gegevens heen mogen
+
+Een tenantbeheerder bepaalt hoe AI-agents met de gegevens van de tenant mogen worden gebruikt. De instellingen maken deel uit van het toegangsbeleid van de tenant, in het onderdeel AI-assistent van de beleidsdialoog van de tenantdirectory; toegangsbeleid bewerken is een functie van Haven Enterprise.
+
+Endpoints van de AI-assistent beperken legt vast waar de ingebouwde assistent de gegevens van de tenant heen mag sturen: een lijst met endpointadressen met `*` als jokerteken, één per regel. `*` alleen staat elk endpoint toe, en een lege lijst staat er geen toe. Een gebruiker die bij meerdere tenants hoort, kan alleen een endpoint gebruiken dat elke tenant met een lijst toestaat. Voorgesteld endpoint wordt aan leden aangeboden wanneer ze de assistent instellen.
+
+Alleen leden die een regel toestaat mogen AI-agents gebruiken met de gegevens van deze tenant bepaalt wie überhaupt agents mag gebruiken. Staat die aan, dan houdt Haven de gegevens van de tenant weg bij elke AI-agent — de ingebouwde assistent en externe agents gelijk — voor iedereen behalve de leden die een toegangsregel van het type llm_use toestaat; een weigerregel van hetzelfde type sluit afzonderlijke gebruikers uit, ook als de schakelaar uit staat. Voor een lid dat niet is toegestaan, verdwijnt de tenant simpelweg uit wat agents zien: hij wordt niet opgesomd, apps die met zijn databases werken verschijnen niet en bieden geen tools aan, en zijn tegels op een werkruimtepagina verschijnen alleen als verborgen plaatshouders. Hun andere tenants worden niet beïnvloed, dus een privétenant blijft gewoon met de assistent werken. Verbiedt een tenant agents midden in een gesprek, dan begint de ingebouwde assistent dat gesprek opnieuw, omdat de eerdere berichten de gegevens van de tenant al kunnen bevatten.
+
+Beide instellingen worden door Haven op het apparaat van het lid gehandhaafd en niet door de server, en ze gelden ook terwijl de toegangscontroles van de tenant zijn uitgeschakeld. De details voor ontwikkelaars staan in [toegangscontrole §6.9](accesscontrol.md#69-language-model-endpoints-llm).
+
 ## Synchronisatie
 
 Synchronisatie is hoe de gegevens in je lokale replica's in de pas blijven met de server. Iedereen kan de databases synchroniseren waartoe hij al toegang heeft — je hoeft geen beheerder te zijn.
@@ -296,7 +350,7 @@ Niets in de DAG-verkenner kan worden bewerkt. Het is een getrouwe, alleen-lezen 
 
 ## Instellingen
 
-Instellingen is het ene scherm dat als tabbalk is opgebouwd in plaats van als één pagina. Het heeft zes tabbladen: Algemeen, Gebruikers-ID's, Tenants, Back-up, Herstellen en Statistieken. Alles op deze tabbladen leeft in deze browser, met een paar bewuste uitzonderingen: de acties in Tenants, de optionele instelling Meereizende werkruimte, en het eindpunt dat Synchronisatie tussen apparaten publiceert zodat andere apparaten dit apparaat kunnen vinden.
+Instellingen is het ene scherm dat als tabbalk is opgebouwd in plaats van als één pagina. Het heeft zes tabbladen: Algemeen, Gebruikers-ID's, Tenants, Back-up, Herstellen en Statistieken, plus een zevende, Assistent, met Haven Enterprise. Alles op deze tabbladen leeft in deze browser, met een paar bewuste uitzonderingen: de acties in Tenants, de optionele instelling Meereizende werkruimte, en het eindpunt dat Synchronisatie tussen apparaten publiceert zodat andere apparaten dit apparaat kunnen vinden.
 
 ### Algemeen
 
@@ -311,6 +365,8 @@ Haven aan je beginscherm toevoegen is een kaart met één tik die je een snelkop
 Een schakelaar Optimaliseren voor iOS-multitasking vertelt Haven dat het in de gesplitste weergave of slide-over van de iPad wordt gebruikt, waar het systeem vensterbedieningen toevoegt die Havens eigen chroom overlappen. Die aanzetten schuift Havens bedieningselementen daarvan weg. Onder Bewegingen haalt Animaties verminderen Havens overgangen eruit voor wie ze storend vindt of wiens systeem al om minder beweging vraagt.
 
 Synchronisatie tussen apparaten is waar de ontvangende helft van de peer-to-peer-synchronisatie woont. Het aanvinkvakje is Inkomende apparaatsynchronisatie accepteren, en de kaart toont ook het eindpunt van dit apparaat — de identificatie die andere apparaten bellen om het te bereiken — samen met of iemand het op dat moment kan zien. De paragraaf over peer-to-peer-synchronisatie onder Synchronisatie legt uit wat de twee kanten doen; dit is de schakelaar die dit apparaat een van die twee maakt.
+
+Agenttools is waar AI-agents toegang tot Haven krijgen: de hoofdschakelaar, de apps die eigen tools mogen aanbieden, en de uitwisselmap voor bestanden. Werken met AI-agents, eerder in dit handboek, legt alle drie uit en hoe je een agent verbindt.
 
 Meereizende werkruimte is de ene instelling op dit tabblad die de browser verlaat, en die staat uit tot je hem aanzet. Hij laat de werkruimtepagina's, tegels, groepen en de applicatielijst van de actieve gebruikers-ID met je meereizen naar je andere apparaten, en hij laat je meerdere omgevingen bijhouden en daartussen wisselen — kantoor en thuis, of desktop en mobiel. Het is een functie van Haven Enterprise: zonder actieve licentie blijft de schakelaar uit, bewaart dit apparaat zijn werkruimte niet en neemt het er ook geen over, en blijven omgevingen die je eerder hebt opgezet precies zoals ze zijn tot er weer een licentie is geïmporteerd. De schakelaar aanzetten laat twee velden zien: de tenant waarmee de werkruimte wordt gesynchroniseerd, en de naam van de opgeslagen werkruimte. De naam is hoe apparaten elkaar vinden, dus "kantoor" op je laptop en "kantoor" op je telefoon delen één werkruimte; het veld opent een uitklaplijst met de namen die al voor deze gebruikers-ID zijn opgeslagen, en een naam typen die niet in die lijst staat begint een nieuwe. Geen van beide velden wordt van kracht terwijl je eraan werkt — Toepassen legt beide vast, Annuleren zet terug wat van kracht is. Wat Toepassen doet volgt uit de naam: een nieuwe wordt aangemaakt uit de werkruimte van dit apparaat, een bestaande wordt overgenomen, en de tabbladen en tegels die hier zijn ingericht worden erdoor vervangen. Die vervanging kost je alleen iets wanneer meereizen uit stond, en dat is dus het enige geval waarover Haven eerst een vraag stelt; zodra meereizen aan staat, staat de stand van dit apparaat al in zijn opgeslagen werkruimte en is overstappen naar een andere naam gratis. De schakelaar uitzetten stopt het meereizen direct en laat elke opgeslagen werkruimte onaangeroerd.
 
@@ -510,6 +566,18 @@ Haven App Store — de catalogus met kant-en-klare MindooDB-applicaties, geopend
 
 App Builder — de app in de store die andere apps bouwt. Je beschrijft wat je nodig hebt; hij maakt de repository aan, publiceert de app, laat een AI-agent die schrijven, en geeft die aan Haven om te installeren. Het resultaat is een gewone MindooDB-app met broncode in je eigen GitHub-account.
 
+AI-agent — een programma dat door een taalmodel wordt aangestuurd en taken uitvoert door tools aan te roepen, bijvoorbeeld Goose, Claude Code of Cursor. In Haven werkt het via agenttools en bereikt het je gegevens nooit rechtstreeks.
+
+Agenttools — de acties die Haven en zijn apps aan AI-agents aanbieden: Havens eigen `haven_*`-tools plus de tools die elke app meebrengt, genoemd naar de app. Worden pas aangeboden nadat je ze onder Instellingen → Algemeen hebt ingeschakeld, en per app.
+
+WebMCP — de webstandaard waarmee een pagina tools aan AI-agents aanbiedt. Haven gebruikt die om zijn agenttools aan te bieden.
+
+Haven Agent Bridge — een opensource Chrome-extensie plus een kleine lokale dienst die Havens agenttools doorgeeft aan een MCP-client zoals Goose of Claude Code.
+
+Ingebouwde assistent — de AI-assistent binnen Haven Enterprise. Hij gebruikt dezelfde agenttools als een externe agent en praat met een taalmodel dat je kiest onder Instellingen → Assistent.
+
+Uitwisselmap — een map op je computer waarmee agents bestanden van Haven krijgen en bestanden aan Haven geven. Bestanden daarin zijn niet versleuteld.
+
 Applicatieregistratie — de aan Havens kant opgeslagen definitie van een MindooDB-app: waar die vandaan wordt gestart, hoe die draait, en welke databases of weergaven die mag zien.
 
 Gehoste bundel — een gebundelde set webassets die in Haven wordt geïmporteerd zodat het de app lokaal kan serveren, ook offline.
@@ -556,7 +624,7 @@ Haven Community is ook een volledig platform voor eigen appontwikkeling. Je kunt
 
 Het onderliggende MindooDB-platform is open source onder de Apache 2.0-licentie. Dat doet meer dan het prijskaartje: er is geen data-lock-in. Het gegevensmodel, de content-geadresseerde opslag en het synchronisatieprotocol zijn allemaal gedocumenteerd en opnieuw te implementeren, wat betekent dat een team zijn versleutelde gegevens altijd mee kan nemen — en het is zelfs mogelijk om volledig alternatieve clients op hetzelfde platform te bouwen als Haven voor een bepaald gebruik niet past. Haven is de officiële client; het is niet de enige mogelijke.
 
-Haven Enterprise is een commerciële editie die Mindoo GmbH verder uitbouwt, gebouwd op precies dezelfde MindooDB-kern. De functies worden vrijgeschakeld met een Enterprise-licentiesleutel en komen één voor één beschikbaar in plaats van allemaal tegelijk. De eerste die je vandaag al kunt gebruiken is de meereizende werkruimte over apparaten en browserprofielen heen: de instelling Meereizende werkruimte onder Instellingen → Algemeen is precies deze functie, en daarom blijft de schakelaar uit tot er een licentie is ingelezen. Nog in aanbouw zijn eigen branding (logo, kleuren, productnaam en domein, zodat Haven als je eigen product voelt), een beheerde gebruikersinterface met organisatiespecifieke standaarden, beheerde werkruimtesjablonen die naar gebruikers worden gestuurd zodat zij in een ingerichte omgeving landen, een interne app store om interne en externe MindooDB-apps te cureren, automatische geplande back-ups van de gegevens in de browser, eersteklas back-upgereedschap voor de tenantgegevens op je server, en inline bewerken van gangbare Office- en tekstbijlagen zonder die te hoeven downloaden. De lijst blijft groeien terwijl de Enterprise-client volwassen wordt — klantfeedback vormt de roadmap direct.
+Haven Enterprise is een commerciële editie die Mindoo GmbH verder uitbouwt, gebouwd op precies dezelfde MindooDB-kern. De functies worden vrijgeschakeld met een Enterprise-licentiesleutel en komen één voor één beschikbaar in plaats van allemaal tegelijk. De eerste die je vandaag al kunt gebruiken, was de meereizende werkruimte over apparaten en browserprofielen heen: de instelling Meereizende werkruimte onder Instellingen → Algemeen is precies deze functie, en daarom blijft de schakelaar uit tot er een licentie is ingelezen. De ingebouwde AI-assistent is de tweede; agenttools voor externe agents blijven in elke editie gratis. Nog in aanbouw zijn eigen branding (logo, kleuren, productnaam en domein, zodat Haven als je eigen product voelt), een beheerde gebruikersinterface met organisatiespecifieke standaarden, beheerde werkruimtesjablonen die naar gebruikers worden gestuurd zodat zij in een ingerichte omgeving landen, een interne app store om interne en externe MindooDB-apps te cureren, automatische geplande back-ups van de gegevens in de browser, eersteklas back-upgereedschap voor de tenantgegevens op je server, en inline bewerken van gangbare Office- en tekstbijlagen zonder die te hoeven downloaden. De lijst blijft groeien terwijl de Enterprise-client volwassen wordt — klantfeedback vormt de roadmap direct.
 
 Voor Haven Enterprise kiezen haalt je nooit van het open platform. De MindooDB-kern en de Haven-PWA blijven gratis en open; Enterprise is een aparte, commerciële client die erbovenop ligt. Je kunt op Community beginnen, later naar Enterprise gaan, en in beide richtingen blijven je gegevens en je server precies waar ze waren.
 
