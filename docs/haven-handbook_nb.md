@@ -206,6 +206,60 @@ App Builder ber Haven om én uvanlig rettighet, Foreslå apper, som er det som l
 
 Byggeren er selv åpen kildekode, og den hostede kopien er en bekvemmelighet og ikke et krav. Vil du heller at Cursor-nøkkelen aldri passerer en server du ikke drifter selv, klon [`mindoodb-app-builder`](https://github.com/klehmann/mindoodb-app-builder) og kjør den selv; den serverer på en loopback-adresse, som teller som en sikker origin, så en Haven på HTTPS kan fortsatt bygge den inn. Pek Haven mot din egen kopi med Ny app → Fra URL i App Store, med loopback-adressen den skriver ut ved oppstart, i stedet for å installere katalogoppføringen. Det er den samme applikasjonen, og Cursor-nøkkelen forlater da aldri maskinen din.
 
+## Arbeide med KI-agenter
+
+Arbeidet ditt i Haven er fordelt på mange apper: referater og tilbud i TeamEdit, tall i TeamGrid, planer i Vega. En KI-agent som når alle sammen, tar seg av den kjedelige delen, på tvers av appene. Den leser forrige ukes referat og gjør vedtakene om til oppgaver med ansvarlige og frister i et Vega-kart. Den importerer et regneark fra en mappe på datamaskinen din til TeamGrid og legger til et diagram. Den går gjennom en kontrakt og foreslår endringer som sporede endringer, som du godtar eller avviser. Den rydder opp på en arbeidsområdeside, installerer appen du akkurat skulle lete etter, eller starter en synkronisering før du går fra kontoret. Du beskriver resultatet, agenten tar klikkene, og du har siste ord.
+
+Haven tar ikke med en egen modell til dette, og den gir ikke dataene dine til noen. Den er mellomleddet mellom en agent og appene dine: den bestemmer hvilke verktøy en agent ser, spør deg før noe med konsekvenser skjer, og lar dataene dine bli der de er — kryptert, på enheten din. Agentens modell ser bare det verktøyene returnerer til den. Hvilken modell det er, er fortsatt ditt valg: en skyleverandør, en modell som driftes i Europa, eller en som kjører på din egen datamaskin gjennom Ollama eller LM Studio.
+
+### Verktøy, ikke skjermskraping
+
+Agenter ser ikke på Havens skjermer og gjetter hvor de skal klikke. Haven tilbyr dem verktøy gjennom WebMCP, webstandarden for verktøy en side tilbyr KI-agenter: navngitte handlinger med en beskrivelse og et skjema for inndataene, som en agent kaller slik et program kaller en funksjon. To typer møtes.
+
+Havens egne verktøy begynner alle med `haven_`. Med dem finner en agent ut hvor du er og hva som er åpent, lister opp og beskriver appene og tenantene dine, åpner en app, ordner sider og fliser i arbeidsområdet, søker etter og installerer apper fra App Store, sender filer gjennom en utvekslingsmappe, og starter eller følger med på en synkronisering. Hver endring en agent gjør i arbeidsområdet, blir et trinn i arbeidsområdets angrehistorikk.
+
+Oppå dem kommer verktøyene til appene dine. Hver MindooDB-app kan ta med sine egne, oppkalt etter appen — `vega_…` for tankekart, `teamgrid_…` for regneark, `teamedit_…` for dokumenter — og de gjør det appen gjør: leser et ark, legger til et diagram, setter inn et avsnitt, foreslår en sporet endring. En agent ser verktøyene til appen du har foran deg, så en typisk samtale åpner TeamGrid, leser et ark og legger til et diagram i noen få trinn. På siden til en app i Haven App Store viser delen Bruk med KI hva en agent kan gjøre med den appen, med eksempler på oppdrag og begrensningene dens.
+
+### Slå det på
+
+Ingenting tilbys før du slår det på, og bryterne ligger under Agentverktøy i Innstillinger → Generelt. Tilby agentverktøy er hovedbryteren: så lenge den er av, ser ingen agent utenfor Haven et eneste verktøy. Under den lister Apper som kan tilby verktøy opp hver installerte app med sin egen bryter, fordi hver app trenger samtykket ditt for seg — den samme bryteren dukker opp som Tilby verktøy til KI-agenter i appens egne innstillinger. Apper som en administrator distribuerer med en tenant-policy, kan komme med den avgjørelsen allerede tatt; Haven viser den da som styrt av policyen.
+
+Utvekslingsmappe er valgfri og betyr bare noe når filer skal reise mellom Haven og en agent: eksporter, vedlegg, et regneark som skal importeres. Du velger en mappe på denne datamaskinen, og agenter får filer der og leverer filer gjennom den. Filene i den mappen er ikke kryptert, så velg et sted du også ville brukt til vanlige nedlastinger. Fyller du inn plasseringen på disken, får agenter absolutte stier og finner eksporterte filer uten å spørre.
+
+### Koble til en agent
+
+Hvilken vei du kobler til, avhenger av hvor Haven kjører.
+
+I Chrome når Havens verktøy en agent gjennom [Haven Agent Bridge](https://github.com/klehmann/haven-agent-bridge) med åpen kildekode. En Chrome-utvidelse fanger opp verktøyene i Haven-fanen, og en liten lokal tjeneste sender dem videre til MCP-klienten din. Goose, Claude Code og andre klienter som starter MCP-servere som et lokalt program, starter broen på den måten; klienter som snakker Streamable HTTP, kobler til `http://127.0.0.1:13300/mcp` med tokenet broen skriver til `~/.haven-agent-bridge/token`. Broen lytter bare på `127.0.0.1`, beskytter hver tilkobling med det tokenet, snakker bare med Haven-sidene på tillatelseslisten sin, og registrerer ikke noe innhold med mindre du slår det på. Du installerer den fra GitHub — bygg den én gang, og last deretter inn mappen `extension` i Chrome med Last inn upakket — og README-en har konfigurasjonen for hver klient. Chromes egen WebMCP-støtte ligger fortsatt bak et flagg eller en prøve; Innstillinger forteller deg når denne nettleseren ikke tilbyr den ennå.
+
+Havens native apper for macOS og Windows, som kommer snart, har tilkoblingen innebygd, uten Chrome, Node eller en åpen nettverksport. Der viser Innstillinger → Generelt en Agenttilgang …-knapp som lister opp agentappene Haven kjenner. For Goose, Claude Desktop og Codex skriver ett klikk Haven inn i konfigurasjonen deres og tar vare på en sikkerhetskopi av den gamle filen. For Cursor, VS Code og LM Studio åpner Haven installasjonslenken deres. For Claude Code, Gemini CLI og andre viser den kommandoen du kan kopiere. Når en agent kobler til for første gang, spør Haven om du stoler på programmet, og kontrollerer det etter sti og kodesignatur. Mens det er tilkoblet, viser et lite banner navnet på det, med Disconnect ett klikk unna. Telefonappene for iOS og Android tilbyr ikke agentverktøy.
+
+### Den innebygde assistenten
+
+Haven Enterprise tar også med en egen assistent, så en agent er tilgjengelig uten å installere noe annet. Den åpnes fra assistentknappen i topplinjen eller i appskuffen, jobber med de samme verktøyene som en ekstern agent, og viser hvert trinn den tar som et kort i samtalen, med verktøyets inndata og resultat ett klikk unna. Større oppgaver planlegger den også som en kort sjekkliste du kan følge med på.
+
+Assistenten snakker med en språkmodell du velger under Innstillinger → Assistent. Ethvert endepunkt som snakker det OpenAI-kompatible API-et, fungerer: OpenAI selv, en bedriftsproxy eller en lokal server som Ollama eller LM Studio. Du gir den et navn, endepunktet og modellen, og sier om modellen forstår bilder. API-nøkkelen kan beholdes kryptert på denne enheten, bare for denne økten, eller utelates for en lokal server; en lagret nøkkel krypteres med en nøkkel fra den opplåste bruker-ID-en din, synkroniseres ikke, er ikke med i backuper og når aldri en app. Test tilkoblingen sjekker endepunktet og om modellen kaller verktøy, noe assistenten trenger. En lokal server må tillate Havens adresse — for Ollama er det `OLLAMA_ORIGINS`, i LM Studio er det CORS-bryteren.
+
+Før den første meldingen går til et endepunkt, sier Haven hva den vil sende dit — meldingene dine, og det assistenten leser gjennom verktøy — og ber om samtykket ditt én gang per endepunkt. Samtalen lever bare i minnet og forkastes når Haven låses.
+
+### Du har kontrollen
+
+Verktøy som fjerner noe, installerer apper, eksporterer filer eller starter en synkronisering, er merket som verktøy med konsekvenser, og Haven spør deg før de kjøres. For en ekstern agent er det en dialog oppå Haven; den innebygde assistenten spør inne i samtalen, der Tillat resten av denne samtalen sparer deg for å gjenta deg selv under en lengre oppgave.
+
+Endringer i arbeidsområdet kan angres. Hver endring en agent gjør, er et trinn den kan trekke tilbake selv, og har du endret noe siden, nekter Haven til agenten uttrykkelig tar med dine trinn også — og agenten får beskjed om å spørre deg først.
+
+Dataene dine blir lokalt. Verktøyene kjører i din Haven, på enheten din, mot de lokale replikaene. Agentens modell ser det verktøyene returnerer, så appene du tillater, avgjør hva den kan se, og resultater som inneholder tekst andre har skrevet, er merket som data og ikke som instruksjoner.
+
+### For tenant-administratorer: hvem som kan bruke KI-agenter, og hvor data kan gå
+
+En tenant-administrator bestemmer hvordan KI-agenter kan brukes med tenantens data. Innstillingene er en del av tenantens tilgangspolicy, i delen KI-assistent i policydialogen til tenant-katalogen; å redigere tilgangspolicyer er en Haven Enterprise-funksjon.
+
+Begrens endepunktene til KI-assistenten avgrenser hvor den innebygde assistenten kan sende tenantens data: en liste over endepunktadresser med `*` som jokertegn, én per linje. `*` alene tillater alle endepunkter, og en tom liste tillater ingen. En bruker som hører til flere tenanter, kan bare bruke et endepunkt som hver tenant med en liste tillater. Foreslått endepunkt tilbys medlemmene når de setter opp assistenten.
+
+Bare medlemmer som en regel tillater, kan bruke KI-agenter med dataene i denne tenanten avgjør hvem som i det hele tatt kan bruke agenter. Med den på holder Haven tenantens data unna alle KI-agenter — den innebygde assistenten og eksterne agenter likt — for alle unntatt medlemmene en tilgangsregel av typen llm_use tillater; en avslagsregel av samme type utelukker enkeltbrukere selv når bryteren er av. For et medlem som ikke har tillatelse, forsvinner tenanten rett og slett fra det agenter ser: den listes ikke opp, apper som jobber med databasene dens, dukker ikke opp og tilbyr ingen verktøy, og flisene dens på en arbeidsområdeside vises bare som skjulte plassholdere. De andre tenantene deres berøres ikke, så en privat tenant fortsetter å fungere med assistenten. Forbyr en tenant agenter midt i en samtale, starter den innebygde assistenten samtalen på nytt, fordi de tidligere meldingene allerede kan inneholde tenantens data.
+
+Begge innstillingene håndheves av Haven på medlemmets enhet og ikke av serveren, og de gjelder selv mens tenantens tilgangssjekker er slått av. Detaljene for utviklere står i [tilgangskontroll §6.9](accesscontrol.md#69-language-model-endpoints-llm).
+
 ## Synkronisering
 
 Synkronisering er måten dataene i de lokale replikaene dine holder følge med serveren på. Alle kan synkronisere databasene de allerede har tilgang til — du trenger ikke å være administrator.
@@ -296,7 +350,7 @@ Ingenting i DAG-utforskeren kan redigeres. Det er en tro, skrivebeskyttet gjengi
 
 ## Innstillinger
 
-Innstillinger er den ene skjermen som er organisert som en fanerad i stedet for som én enkelt side. Den har seks faner: Generelt, Bruker-ID-er, Tenants, Backup, Gjenoppretting og Statistikk. Alt på disse fanene bor i denne nettleseren, med noen få bevisste unntak: handlingene i Tenants, den frivillige innstillingen Arbeidsflate som følger med, og endepunktet som Synkronisering mellom enheter publiserer slik at andre enheter kan finne denne.
+Innstillinger er den ene skjermen som er organisert som en fanerad i stedet for som én enkelt side. Den har seks faner: Generelt, Bruker-ID-er, Tenants, Backup, Gjenoppretting og Statistikk, pluss en sjuende, Assistent, med Haven Enterprise. Alt på disse fanene bor i denne nettleseren, med noen få bevisste unntak: handlingene i Tenants, den frivillige innstillingen Arbeidsflate som følger med, og endepunktet som Synkronisering mellom enheter publiserer slik at andre enheter kan finne denne.
 
 ### Generelt
 
@@ -311,6 +365,8 @@ Legg Haven til på Hjem-skjermen er et kort med ett trykk som tilbyr en snarvei 
 En bryter som heter Optimaliser for iOS-multitasking forteller Haven at den brukes i delt skjerm eller slide over på iPad, der systemet legger på vinduskontroller som overlapper Havens egne. Slår du den på, flyttes Havens kontroller unna dem. Under Bevegelse fjerner Reduser animasjoner Havens overganger for alle som synes de forstyrrer, eller hvis system allerede ber om mindre bevegelse.
 
 Synkronisering mellom enheter er der den mottakende halvdelen av node-til-node-synkronisering ligger. Avkrysningsboksen er Godta innkommende enhetssynkronisering, og kortet viser også endepunktet til denne enheten — identifikatoren andre enheter ringer for å nå den — sammen med om noen kan se den akkurat nå. Avsnittet om node-til-node-synkronisering under Synkronisering forklarer hva de to sidene gjør; dette er bryteren som gjør denne enheten til en av dem.
+
+Agentverktøy er der KI-agenter får tilgang til Haven: hovedbryteren, appene som kan tilby egne verktøy, og utvekslingsmappen for filer. Arbeide med KI-agenter, tidligere i denne håndboken, forklarer alle tre og hvordan du kobler til en agent.
 
 Arbeidsflate som følger med er den ene innstillingen på denne fanen som forlater nettleseren, og den er av til du slår den på. Den lar arbeidsområdesidene, flisene, gruppene og applikasjonslisten til den aktive bruker-ID-en følge deg til de andre enhetene dine, og den lar deg ha flere miljøer og bytte mellom dem — kontor og hjem, eller desktop og mobil. Det er en Haven Enterprise-funksjon: uten en aktiv lisens blir bryteren stående av, denne enheten verken lagrer arbeidsflaten sin eller overtar en, og miljøer du satte opp tidligere, blir liggende nøyaktig som de er til en lisens importeres igjen. Å slå bryteren på avdekker to felter: tenanten arbeidsflaten synkroniseres gjennom, og navnet på den lagrede arbeidsflaten. Navnet er måten enhetene finner hverandre på, så «kontor» på laptopen din og «kontor» på telefonen din deler én arbeidsflate; feltet åpner en nedtrekksliste over navnene som allerede er lagret for denne bruker-ID-en, og skriver du et navn som ikke står i listen, starter du en ny. Ingen av feltene trer i kraft mens du redigerer det — Bruk bekrefter begge, Avbryt setter tilbake det som gjelder. Hva Bruk gjør, følger av navnet: et nytt opprettes fra denne enhetens arbeidsflate, et eksisterende overtas, og fanene og flisene som er ordnet her, erstattes av det. Den erstatningen koster deg bare noe når funksjonen var av, så det er det ene tilfellet Haven spør om først; når den først er på, ligger denne enhetens tilstand allerede i den lagrede arbeidsflaten, og å flytte til et annet navn er gratis. Å slå bryteren av stopper det med én gang og lar hver lagret arbeidsflate være urørt.
 
@@ -510,6 +566,18 @@ Haven App Store — katalogen over ferdige MindooDB-applikasjoner, åpnet fra St
 
 App Builder — appen i butikken som bygger andre apper. Du beskriver hva du trenger; den oppretter repositoriet, publiserer appen, lar en AI-agent skrive den, og gir den til Haven for installasjon. Resultatet er en helt vanlig MindooDB-app med kildekode i din egen GitHub-konto.
 
+KI-agent — et program styrt av en språkmodell som utfører oppgaver ved å kalle verktøy, for eksempel Goose, Claude Code eller Cursor. I Haven jobber den gjennom agentverktøy og når aldri dataene dine direkte.
+
+Agentverktøy — handlingene Haven og appene dens tilbyr KI-agenter: Havens egne `haven_*`-verktøy pluss verktøyene hver app tar med, oppkalt etter appen. Tilbys først etter at du har slått dem på under Innstillinger → Generelt, og per app.
+
+WebMCP — webstandarden en side tilbyr verktøy til KI-agenter gjennom. Haven bruker den til å tilby agentverktøyene sine.
+
+Haven Agent Bridge — en Chrome-utvidelse med åpen kildekode pluss en liten lokal tjeneste som sender Havens agentverktøy videre til en MCP-klient som Goose eller Claude Code.
+
+Innebygd assistent — KI-assistenten inne i Haven Enterprise. Den bruker de samme agentverktøyene som en ekstern agent og snakker med en språkmodell du velger under Innstillinger → Assistent.
+
+Utvekslingsmappe — en mappe på datamaskinen din der agenter får filer fra Haven og leverer filer til Haven. Filene i den er ikke kryptert.
+
 Applikasjonsregistrering — den lagrede definisjonen på Haven-siden av en MindooDB-app: hvor den skal startes fra, hvordan den skal kjøre, og hvilke databaser eller visninger den har lov til å se.
 
 Hostet pakke — et pakket sett med webressurser importert til Haven så den kan servere appen lokalt, også når du er offline.
@@ -556,7 +624,7 @@ Haven Community er også en komplett plattform for utvikling av egne apper. Du k
 
 Den underliggende MindooDB-plattformen er åpen kildekode under Apache 2.0-lisensen. Det betyr noe utover prislappen: det finnes ingen datainnlåsing. Datamodellen, det innholdsadresserte lageret og synkroniseringsprotokollen er alle dokumentert og mulige å implementere på nytt, som betyr at et team kan ta de krypterte dataene sine med seg når som helst — og det er til og med mulig å bygge helt alternative klienter oppå den samme plattformen hvis Haven ikke passer for et bestemt bruksområde. Haven er den offisielle klienten; den er ikke den eneste mulige.
 
-Haven Enterprise er en kommersiell utgave som Mindoo GmbH bygger videre på, bygget på nøyaktig den samme MindooDB-kjernen. Funksjonene låses opp med en Enterprise-lisensnøkkel, og de kommer én etter én i stedet for alle på én gang. Den første du kan bruke allerede i dag, er at arbeidsflaten følger med på tvers av enheter og nettleserprofiler: innstillingen Arbeidsflate som følger med under Innstillinger → Generelt er nettopp denne funksjonen, og derfor står bryteren av til en lisens er importert. Fortsatt under arbeid er egen merkevarebygging (logo, farger, produktnavn og domene, så Haven føles som ditt eget produkt), et administrert brukergrensesnitt med organisasjonsspesifikke standardvalg, administrerte arbeidsområdemaler som sendes ut til brukerne så de lander i et ferdig konfigurert miljø, en intern app-butikk for å kuratere interne MindooDB-apper og apper fra tredjeparter, automatiske planlagte backuper av data i nettleseren, førsteklasses backup-verktøy for tenant-dataene som ligger på serveren din, og redigering av vanlige Office- og tekstvedlegg direkte, uten å måtte laste dem ned. Listen fortsetter å vokse etter hvert som Enterprise-klienten modnes — tilbakemeldinger fra kunder former veikartet direkte.
+Haven Enterprise er en kommersiell utgave som Mindoo GmbH bygger videre på, bygget på nøyaktig den samme MindooDB-kjernen. Funksjonene låses opp med en Enterprise-lisensnøkkel, og de kommer én etter én i stedet for alle på én gang. Den første du kunne bruke, er at arbeidsflaten følger med på tvers av enheter og nettleserprofiler: innstillingen Arbeidsflate som følger med under Innstillinger → Generelt er nettopp denne funksjonen, og derfor står bryteren av til en lisens er importert. Den innebygde KI-assistenten er den andre; agentverktøy for eksterne agenter forblir gratis i alle utgaver. Fortsatt under arbeid er egen merkevarebygging (logo, farger, produktnavn og domene, så Haven føles som ditt eget produkt), et administrert brukergrensesnitt med organisasjonsspesifikke standardvalg, administrerte arbeidsområdemaler som sendes ut til brukerne så de lander i et ferdig konfigurert miljø, en intern app-butikk for å kuratere interne MindooDB-apper og apper fra tredjeparter, automatiske planlagte backuper av data i nettleseren, førsteklasses backup-verktøy for tenant-dataene som ligger på serveren din, og redigering av vanlige Office- og tekstvedlegg direkte, uten å måtte laste dem ned. Listen fortsetter å vokse etter hvert som Enterprise-klienten modnes — tilbakemeldinger fra kunder former veikartet direkte.
 
 Å velge Haven Enterprise tar deg aldri ut av den åpne plattformen. MindooDB-kjernen og Haven-PWA-en forblir gratis og åpne; Enterprise er en separat, kommersiell klient lagt oppå. Du kan starte på Community, gå over til Enterprise senere, og i begge retninger blir dataene dine og serveren din nøyaktig der de var.
 

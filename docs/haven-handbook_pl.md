@@ -206,6 +206,60 @@ App Builder prosi Haven o jedno niezwykłe uprawnienie, Proponowanie aplikacji, 
 
 Sam builder jest otwartoźródłowy, a hostowana kopia jest wygodą, nie wymogiem. Jeśli wolisz, żeby klucz Cursora nigdy nie przechodził przez serwer, którego nie prowadzisz, sklonuj [`mindoodb-app-builder`](https://github.com/klehmann/mindoodb-app-builder) i uruchom go sam; wydaje się na adresie pętli zwrotnej, który liczy się jako bezpieczny origin, więc Haven po HTTPS wciąż może go osadzić. Skieruj Haven na własną kopię przez Nowa aplikacja → Z adresu URL w App Store, używając adresu pętli zwrotnej, który builder wypisuje przy starcie, zamiast instalować wpis z katalogu. To jest ta sama aplikacja, a klucz Cursora nigdy wtedy nie opuszcza Twojej maszyny.
 
+## Praca z agentami AI
+
+Twoja praca w Haven jest rozłożona na wiele aplikacji: protokoły i oferty w TeamEdit, liczby w TeamGrid, plany w Vega. Agent AI, który sięga do nich wszystkich, przejmuje żmudną część pracy, ponad granicami aplikacji. Czyta protokół z zeszłego tygodnia i zamienia ustalenia w zadania z osobami odpowiedzialnymi i terminami na mapie Vega. Importuje arkusz z folderu na Twoim komputerze do TeamGrid i dodaje wykres. Przegląda umowę i proponuje zmiany jako śledzone zmiany, które akceptujesz lub odrzucasz. Porządkuje stronę obszaru roboczego, instaluje aplikację, której właśnie miałeś szukać, albo uruchamia synchronizację, zanim wyjdziesz z biura. Ty opisujesz wynik, agent wykonuje kliknięcia, a ostatnie słowo należy do Ciebie.
+
+Haven nie przynosi do tego własnego modelu i nikomu nie przekazuje Twoich danych. Działa jako pośrednik między agentem a Twoimi aplikacjami: decyduje, jakie narzędzia widzi agent, pyta Cię, zanim stanie się coś istotnego w skutkach, i zostawia Twoje dane tam, gdzie są — zaszyfrowane, na Twoim urządzeniu. Model agenta widzi tylko to, co zwracają mu narzędzia. Który to model, pozostaje Twoim wyborem: dostawca chmurowy, model hostowany w Europie albo model działający na Twoim własnym komputerze przez Ollama lub LM Studio.
+
+### Narzędzia, nie odczytywanie ekranu
+
+Agenci nie patrzą na ekrany Haven i nie zgadują, gdzie kliknąć. Haven udostępnia im narzędzia przez WebMCP, standard sieciowy dla narzędzi, które strona udostępnia agentom AI: nazwane akcje z opisem i schematem danych wejściowych, które agent wywołuje tak, jak program wywołuje funkcję. Łączą się tu dwa rodzaje narzędzi.
+
+Własne narzędzia Haven zaczynają się wszystkie od `haven_`. Za ich pomocą agent dowiaduje się, gdzie jesteś i co jest otwarte, wyświetla i opisuje Twoje aplikacje i tenanty, otwiera aplikację, układa strony i kafelki obszaru roboczego, wyszukuje i instaluje aplikacje z App Store, przekazuje pliki przez folder wymiany oraz uruchamia albo obserwuje synchronizację. Każda zmiana, którą agent wprowadza w obszarze roboczym, staje się krokiem w historii cofania obszaru roboczego.
+
+Do tego dochodzą narzędzia Twoich aplikacji. Każda aplikacja MindooDB może przynieść własne, nazwane od aplikacji — `vega_…` dla map myśli, `teamgrid_…` dla arkuszy kalkulacyjnych, `teamedit_…` dla dokumentów — a robią one to, co robi aplikacja: odczytują arkusz, dodają wykres, wstawiają akapit, proponują śledzoną zmianę. Agent widzi narzędzia aplikacji, którą masz przed sobą, więc typowa rozmowa otwiera TeamGrid, odczytuje arkusz i dodaje wykres w kilku krokach. Na stronie aplikacji w Haven App Store sekcja Używaj z AI pokazuje, co agent może zrobić z tą aplikacją, z przykładowymi poleceniami i jej ograniczeniami.
+
+### Włączanie
+
+Nic nie jest udostępniane, dopóki tego nie włączysz, a przełączniki znajdują się w Ustawienia → Ogólne pod Narzędzia dla agentów. Głównym jest Udostępnij narzędzia dla agentów: dopóki jest wyłączony, żaden agent spoza Haven nie widzi ani jednego narzędzia. Pod nim Aplikacje, które mogą udostępniać narzędzia wymienia każdą zainstalowaną aplikację z jej własnym przełącznikiem, bo każda aplikacja potrzebuje Twojej zgody osobno — ten sam przełącznik pojawia się jako Udostępniaj narzędzia agentom AI w ustawieniach samej aplikacji. Aplikacje, które administrator rozprowadza polityką tenanta, mogą przyjść z tą decyzją już podjętą; Haven pokazuje ją wtedy jako zarządzaną przez politykę.
+
+Folder wymiany jest opcjonalny i ma znaczenie tylko wtedy, gdy pliki mają wędrować między Haven a agentem: eksporty, załączniki, arkusz do zaimportowania. Wybierasz folder na tym komputerze, a agenci odbierają w nim pliki i przez niego przekazują pliki. Pliki w tym folderze nie są szyfrowane, więc wybierz miejsce, którego użyłbyś też na zwykłe pobrane pliki. Jeśli wpiszesz jego lokalizację na dysku, agenci dostają ścieżki bezwzględne i znajdują wyeksportowane pliki bez pytania.
+
+### Podłączanie agenta
+
+To, jak się łączysz, zależy od tego, gdzie działa Haven.
+
+W Chrome narzędzia Haven docierają do agenta przez otwartoźródłowy [Haven Agent Bridge](https://github.com/klehmann/haven-agent-bridge). Rozszerzenie Chrome przechwytuje narzędzia w karcie Haven, a mała lokalna usługa przekazuje je do Twojego klienta MCP. Goose, Claude Code i inne klienty, które uruchamiają serwery MCP jako lokalny program, uruchamiają bridge właśnie w ten sposób; klienty obsługujące Streamable HTTP łączą się z `http://127.0.0.1:13300/mcp` za pomocą tokenu, który bridge zapisuje w `~/.haven-agent-bridge/token`. Bridge nasłuchuje tylko na `127.0.0.1`, chroni każde połączenie tym tokenem, komunikuje się tylko z witrynami Haven ze swojej listy dozwolonych i nie zapisuje żadnych treści, chyba że to włączysz. Instalujesz go z GitHuba — zbuduj go raz, a potem wczytaj jego folder `extension` w Chrome przez Załaduj rozpakowane — a README zawiera konfigurację dla każdego klienta. Własna obsługa WebMCP w Chrome jest wciąż ukryta za flagą lub wersją próbną; Ustawienia mówią Ci, kiedy ta przeglądarka jeszcze jej nie oferuje.
+
+Natywne aplikacje Haven dla macOS i Windows, które pojawią się wkrótce, mają to połączenie wbudowane, bez Chrome, bez Node i bez otwartego portu sieciowego. Tam Ustawienia → Ogólne pokazują przycisk Dostęp agentów …, który wymienia znane Haven aplikacje agentów. Dla Goose, Claude Desktop i Codex jedno kliknięcie wpisuje Haven do ich konfiguracji i zachowuje kopię zapasową starego pliku. Dla Cursor, VS Code i LM Studio Haven otwiera ich link instalacyjny. Dla Claude Code, Gemini CLI i innych pokazuje polecenie do skopiowania. Gdy agent łączy się po raz pierwszy, Haven pyta, czy ufasz temu programowi, i sprawdza go na podstawie ścieżki i podpisu kodu. Dopóki agent jest połączony, mały baner pokazuje jego nazwę, a Disconnect jest o jedno kliknięcie. Aplikacje na telefony z iOS i Androidem nie udostępniają narzędzi dla agentów.
+
+### Wbudowany asystent
+
+Haven Enterprise przynosi też własnego asystenta, więc agent jest dostępny bez instalowania czegokolwiek innego. Otwierasz go przyciskiem asystenta na górnym pasku albo w szufladzie aplikacji; pracuje tymi samymi narzędziami co agent zewnętrzny i pokazuje każdy wykonany krok jako kartę w rozmowie, z danymi wejściowymi i wynikiem narzędzia o jedno kliknięcie. Większe zadania planuje też jako krótką listę kontrolną, którą możesz śledzić.
+
+Asystent rozmawia z modelem językowym, który wybierasz w Ustawienia → Asystent. Działa każdy endpoint obsługujący API zgodne z OpenAI: samo OpenAI, firmowe proxy albo serwer lokalny, taki jak Ollama lub LM Studio. Podajesz nazwę, endpoint, model i to, czy model rozumie obrazy. Klucz API może być przechowywany zaszyfrowany na tym urządzeniu, tylko na tę sesję albo pominięty w przypadku serwera lokalnego; zapisany klucz jest szyfrowany kluczem Twojego odblokowanego identyfikatora użytkownika, nie jest synchronizowany, nie trafia do kopii zapasowych i nigdy nie dociera do aplikacji. Testuj połączenie sprawdza endpoint i to, czy model wywołuje narzędzia, czego asystent potrzebuje. Serwer lokalny musi zezwalać na adres Haven — w Ollama służy do tego `OLLAMA_ORIGINS`, w LM Studio przełącznik CORS.
+
+Zanim pierwsza wiadomość trafi do endpointu, Haven mówi, co będzie tam wysyłać — Twoje wiadomości i to, co asystent odczytuje za pomocą narzędzi — i prosi o Twoją zgodę raz na każdy endpoint. Rozmowa istnieje tylko w pamięci i jest odrzucana, gdy Haven się blokuje.
+
+### Kontrola pozostaje u Ciebie
+
+Narzędzia, które coś usuwają, instalują aplikacje, eksportują pliki lub uruchamiają synchronizację, są oznaczone jako istotne w skutkach, a Haven pyta Cię, zanim zostaną wykonane. W przypadku agenta zewnętrznego jest to okno dialogowe nad Haven; wbudowany asystent pyta w samej rozmowie, gdzie Zezwalaj do końca tej rozmowy oszczędza Ci powtarzania się podczas dłuższego zadania.
+
+Zmiany w obszarze roboczym da się cofnąć. Każda zmiana, którą wprowadza agent, jest krokiem, który może sam wycofać, a jeśli w międzyczasie coś zmieniłeś, Haven odmawia, dopóki agent wyraźnie nie uwzględni także Twoich kroków — a agent dostaje polecenie, by najpierw zapytać Ciebie.
+
+Twoje dane zostają lokalnie. Narzędzia działają w Twoim Haven, na Twoim urządzeniu, na jego lokalnych replikach. Model agenta widzi to, co zwracają narzędzia, więc to dopuszczone przez Ciebie aplikacje decydują, co może zobaczyć, a wyniki zawierające tekst napisany przez inne osoby są oznaczane jako dane, a nie polecenia.
+
+### Dla administratorów tenanta: kto może używać agentów AI i dokąd mogą trafiać dane
+
+Administrator tenanta decyduje, jak agenci AI mogą być używani z danymi tenanta. Ustawienia są częścią polityki dostępu tenanta, w sekcji Asystent AI okna polityki w katalogu tenanta; edycja polityk dostępu jest funkcją Haven Enterprise.
+
+Ogranicz endpointy asystenta AI zawęża, dokąd wbudowany asystent może wysyłać dane tenanta: lista adresów endpointów z `*` jako symbolem wieloznacznym, jeden w wierszu. Sam `*` zezwala na każdy endpoint, a pusta lista nie zezwala na żaden. Użytkownik należący do kilku tenantów może używać tylko endpointu, na który zezwala każdy tenant mający taką listę. Sugerowany endpoint jest proponowany członkom, gdy konfigurują asystenta.
+
+Tylko członkowie dopuszczeni regułą mogą używać agentów AI z danymi tego tenanta decyduje, kto w ogóle może używać agentów. Gdy jest włączone, Haven trzyma dane tenanta z dala od każdego agenta AI — zarówno wbudowanego asystenta, jak i agentów zewnętrznych — dla wszystkich poza członkami, na których pozwala reguła dostępu typu llm_use; reguła odmowy tego samego typu wyklucza pojedynczych użytkowników nawet przy wyłączonym przełączniku. Dla członka, który nie jest dopuszczony, tenant po prostu znika z tego, co widzą agenci: nie jest wymieniany, aplikacje pracujące z jego bazami danych się nie pojawiają i nie udostępniają narzędzi, a jego kafelki na stronie obszaru roboczego pokazują się tylko jako ukryte zastępniki. Jego inne tenanty nie są objęte, więc prywatny tenant dalej działa z asystentem. Jeśli tenant zabroni agentów w trakcie rozmowy, wbudowany asystent zaczyna tę rozmowę od nowa, bo wcześniejsze wiadomości mogą już zawierać dane tenanta.
+
+Oba ustawienia egzekwuje Haven na urządzeniu członka, a nie serwer, i obowiązują nawet wtedy, gdy kontrola dostępu tenanta jest wyłączona. Szczegóły dla programistów są w [kontroli dostępu §6.9](accesscontrol.md#69-language-model-endpoints-llm).
+
 ## Synchronizacja
 
 Synchronizacja jest tym, co utrzymuje dane w Twoich lokalnych replikach w zgodzie z serwerem. Każdy może synchronizować bazy danych, do których już ma dostęp — nie musisz być administratorem.
@@ -296,7 +350,7 @@ Niczego w eksploratorze DAG nie da się edytować. Jest to wierny, tylko do odcz
 
 ## Ustawienia
 
-Ustawienia są jedynym ekranem zorganizowanym jako pasek kart, a nie jedna strona. Mają sześć kart: Ogólne, Identyfikatory użytkowników, Tenanty, Kopia zapasowa, Przywracanie i Statystyki. Wszystko na tych kartach leży w tej przeglądarce, z kilkoma celowymi wyjątkami: akcjami na karcie Tenanty, włączanym opcjonalnie ustawieniem Przenoszony obszar roboczy oraz punktem końcowym, który publikuje Synchronizacja między urządzeniami, żeby inne urządzenia mogły znaleźć to.
+Ustawienia są jedynym ekranem zorganizowanym jako pasek kart, a nie jedna strona. Mają sześć kart: Ogólne, Identyfikatory użytkowników, Tenanty, Kopia zapasowa, Przywracanie i Statystyki, a z Haven Enterprise także siódmą, Asystent. Wszystko na tych kartach leży w tej przeglądarce, z kilkoma celowymi wyjątkami: akcjami na karcie Tenanty, włączanym opcjonalnie ustawieniem Przenoszony obszar roboczy oraz punktem końcowym, który publikuje Synchronizacja między urządzeniami, żeby inne urządzenia mogły znaleźć to.
 
 ### Ogólne
 
@@ -311,6 +365,8 @@ Dodaj Haven do ekranu głównego to karta na jedno dotknięcie, która oferuje s
 Przełącznik Optymalizuj dla wielozadaniowości iOS mówi Haven, że jest używany w trybie podzielonego ekranu albo slide over na iPadzie, gdzie system dodaje elementy okna nachodzące na własne elementy Haven. Włączenie go odsuwa elementy Haven od nich. Pod nagłówkiem Ruch opcja Ogranicz animacje usuwa przejścia Haven dla każdego, kogo rozpraszają albo kogo system już prosi o mniej ruchu.
 
 Synchronizacja między urządzeniami jest miejscem, w którym leży odbiorcza połowa synchronizacji peer-to-peer. Polem wyboru jest Akceptuj przychodzącą synchronizację urządzeń, a karta pokazuje też punkt końcowy tego urządzenia — identyfikator, pod który dzwonią inne urządzenia, żeby do niego dotrzeć — wraz z tym, czy ktokolwiek może je w tej chwili zobaczyć. Co robią obie strony, wyjaśnia sekcja o synchronizacji peer-to-peer pod Synchronizacją; to jest przełącznik, który czyni to urządzenie jedną z nich.
+
+Narzędzia dla agentów to miejsce, w którym agenci AI dostają dostęp do Haven: główny przełącznik, aplikacje, które mogą udostępniać własne narzędzia, oraz folder wymiany na pliki. Rozdział Praca z agentami AI, wcześniej w tym podręczniku, wyjaśnia wszystkie trzy elementy i to, jak podłączyć agenta.
 
 Przenoszony obszar roboczy to jedyne ustawienie na tej karcie, które opuszcza przeglądarkę, i jest wyłączone, dopóki go nie włączysz. Sprawia, że strony obszaru roboczego, kafelki, grupy i lista aplikacji aktywnego identyfikatora użytkownika idą za Tobą na Twoje inne urządzenia, i pozwala trzymać kilka środowisk oraz przełączać się między nimi — biuro i dom albo komputer i urządzenie mobilne. Jest to funkcja Haven Enterprise: bez aktywnej licencji przełącznik zostaje wyłączony, to urządzenie ani nie zapisuje swojego obszaru roboczego, ani nie przejmuje żadnego, a środowiska założone wcześniej zostają dokładnie takie, jakie są, dopóki licencja nie zostanie ponownie zaimportowana. Włączenie przełącznika odsłania dwa pola: tenanta, przez którego obszar roboczy jest synchronizowany, i nazwę zapisanego obszaru roboczego. Nazwa jest tym, po czym urządzenia się znajdują, więc „biuro” na Twoim laptopie i „biuro” na Twoim telefonie dzielą jeden obszar roboczy; pole otwiera listę rozwijaną nazw już zapisanych dla tego identyfikatora użytkownika, a wpisanie nazwy, której na tej liście nie ma, zaczyna nową. Żadne z pól nie działa w trakcie edycji — Zastosuj zatwierdza oba, Anuluj przywraca to, co obowiązuje. Co robi Zastosuj, wynika z nazwy: nowa jest tworzona z obszaru roboczego tego urządzenia, istniejąca jest przejmowana, a ułożone tutaj karty i kafelki są przez nią zastępowane. To zastąpienie kosztuje Cię coś tylko wtedy, gdy przenoszenie było wyłączone, więc to jedyny przypadek, o który Haven najpierw pyta; gdy przenoszenie jest włączone, stan tego urządzenia leży już w jego zapisanym obszarze roboczym, a przejście na inną nazwę jest darmowe. Wyłączenie przełącznika zatrzymuje przenoszenie od razu i zostawia każdy zapisany obszar roboczy nietknięty.
 
@@ -510,6 +566,18 @@ Haven App Store — katalog gotowych aplikacji MindooDB, otwierany ze Startu. In
 
 App Builder — aplikacja w store, która buduje inne aplikacje. Opisujesz, czego potrzebujesz; ona tworzy repozytorium, publikuje aplikację, każe agentowi AI ją napisać i przekazuje ją Haven do instalacji. Wynikiem jest zwykła aplikacja MindooDB z kodem źródłowym na Twoim własnym koncie GitHub.
 
+Agent AI — program sterowany przez model językowy, który wykonuje zadania, wywołując narzędzia, na przykład Goose, Claude Code albo Cursor. W Haven działa przez narzędzia dla agentów i nigdy nie sięga bezpośrednio do Twoich danych.
+
+Narzędzia dla agentów — akcje, które Haven i jego aplikacje udostępniają agentom AI: własne narzędzia Haven `haven_*` oraz narzędzia, które przynosi każda aplikacja, nazwane od aplikacji. Udostępniane dopiero po włączeniu ich w Ustawienia → Ogólne, i to dla każdej aplikacji osobno.
+
+WebMCP — standard sieciowy, przez który strona udostępnia narzędzia agentom AI. Haven używa go do udostępniania swoich narzędzi dla agentów.
+
+Haven Agent Bridge — otwartoźródłowe rozszerzenie Chrome wraz z małą lokalną usługą, które przekazują narzędzia dla agentów Haven do klienta MCP, takiego jak Goose albo Claude Code.
+
+Wbudowany asystent — asystent AI wewnątrz Haven Enterprise. Używa tych samych narzędzi dla agentów co agent zewnętrzny i rozmawia z modelem językowym, który wybierasz w Ustawienia → Asystent.
+
+Folder wymiany — folder na Twoim komputerze, przez który agenci odbierają pliki z Haven i przekazują pliki do Haven. Pliki w nim nie są szyfrowane.
+
 Rejestracja aplikacji — zapisana po stronie Haven definicja aplikacji MindooDB: skąd ją uruchamiać, jak ją uruchamiać i które bazy danych lub widoki wolno jej zobaczyć.
 
 Hostowany pakiet — spakowany zestaw zasobów webowych zaimportowany do Haven, żeby mógł wydawać aplikację lokalnie, także offline.
@@ -556,7 +624,7 @@ Haven Community jest też kompletną platformą do tworzenia własnych aplikacji
 
 Leżąca pod tym platforma MindooDB jest otwartoźródłowa na licencji Apache 2.0. Ma to znaczenie wykraczające poza cenę: nie ma uzależnienia od dostawcy w warstwie danych. Model danych, magazyn adresowany treścią i protokół synchronizacji są udokumentowane i da się je zaimplementować od nowa, co oznacza, że zespół może w dowolnym momencie zabrać swoje zaszyfrowane dane ze sobą — a na tej samej platformie da się nawet zbudować całkowicie alternatywne klienty, jeśli Haven nie jest właściwym wyborem do konkretnego zastosowania. Haven jest klientem oficjalnym; nie jest jedynym możliwym.
 
-Haven Enterprise to komercyjna edycja, którą Mindoo GmbH wciąż rozbudowuje, zbudowana na dokładnie tym samym rdzeniu MindooDB. Jej funkcje odblokowuje klucz licencyjny Enterprise, a pojawiają się pojedynczo, nie wszystkie naraz. Pierwsza, z której możesz korzystać już dziś, to przenoszenie obszaru roboczego między urządzeniami i profilami przeglądarki: ustawienie Przenoszony obszar roboczy w Ustawienia → Ogólne to dokładnie ta funkcja i dlatego przełącznik pozostaje wyłączony, dopóki nie zaimportujesz licencji. Wciąż powstają własny branding (logo, kolory, nazwa produktu i domena, żeby Haven czuł się jak Twój własny produkt), zarządzany interfejs użytkownika z domyślnymi ustawieniami specyficznymi dla organizacji, zarządzane szablony obszaru roboczego wypychane do użytkowników, żeby lądowali w skonfigurowanym środowisku, wewnętrzny app store do kurowania własnych i zewnętrznych aplikacji MindooDB, automatyczne kopie zapasowe danych w przeglądarce według harmonogramu, pełnoprawne narzędzia kopii zapasowej dla danych tenanta przechowywanych na Twoim serwerze oraz edycja typowych załączników Office i tekstowych na miejscu, bez pobierania ich. Lista rośnie dalej wraz z dojrzewaniem klienta Enterprise — informacja zwrotna od klientów kształtuje plan rozwoju bezpośrednio.
+Haven Enterprise to komercyjna edycja, którą Mindoo GmbH wciąż rozbudowuje, zbudowana na dokładnie tym samym rdzeniu MindooDB. Jej funkcje odblokowuje klucz licencyjny Enterprise, a pojawiają się pojedynczo, nie wszystkie naraz. Pierwszą, z której możesz korzystać już dziś, było przenoszenie obszaru roboczego między urządzeniami i profilami przeglądarki: ustawienie Przenoszony obszar roboczy w Ustawienia → Ogólne to dokładnie ta funkcja i dlatego przełącznik pozostaje wyłączony, dopóki nie zaimportujesz licencji. Drugą jest wbudowany asystent AI; narzędzia dla agentów zewnętrznych pozostają darmowe w każdej edycji. Wciąż powstają własny branding (logo, kolory, nazwa produktu i domena, żeby Haven czuł się jak Twój własny produkt), zarządzany interfejs użytkownika z domyślnymi ustawieniami specyficznymi dla organizacji, zarządzane szablony obszaru roboczego wypychane do użytkowników, żeby lądowali w skonfigurowanym środowisku, wewnętrzny app store do kurowania własnych i zewnętrznych aplikacji MindooDB, automatyczne kopie zapasowe danych w przeglądarce według harmonogramu, pełnoprawne narzędzia kopii zapasowej dla danych tenanta przechowywanych na Twoim serwerze oraz edycja typowych załączników Office i tekstowych na miejscu, bez pobierania ich. Lista rośnie dalej wraz z dojrzewaniem klienta Enterprise — informacja zwrotna od klientów kształtuje plan rozwoju bezpośrednio.
 
 Wybór Haven Enterprise nigdy nie zabiera Cię z otwartej platformy. Rdzeń MindooDB i PWA Haven zostają darmowe i otwarte; Enterprise jest osobnym, komercyjnym klientem położonym na wierzchu. Możesz zacząć na Community, przejść później na Enterprise, a w każdym z tych kierunków Twoje dane i Twój serwer zostają dokładnie tam, gdzie były.
 
