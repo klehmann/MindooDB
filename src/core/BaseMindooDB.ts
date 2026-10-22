@@ -4468,9 +4468,30 @@ export class BaseMindooDB implements MindooDB {
             // Before indexing, verify the user has the decryption key so that
             // documents the user cannot access do not appear in getAllDocumentIds.
             const representativeEntry = docLifecycleEntries[0];
+            // A sealed doc's wrap list rides only on its create and recipient
+            // mutation entries, so an incremental batch of plain changes has
+            // none. With a cold session cache (fresh session, warm start that
+            // skipped reconcileKeyVisibility) the key must come from the doc's
+            // full history, or the doc is wrongly flipped to "inaccessible"
+            // and that state is persisted with the next cache flush.
+            let fullDocMetadata: StoreEntryMetadata[] | undefined;
+            let sealedIngestEntries: StoreEntryMetadata[] = docLifecycleEntries;
+            if (
+              !coldSync &&
+              isSealedKeyId(representativeEntry.decryptionKeyId) &&
+              !newestRecipientBlock(docLifecycleEntries) &&
+              !(await this.tenant.hasDecryptionKey(
+                representativeEntry.decryptionKeyId,
+              ))
+            ) {
+              fullDocMetadata = await this.scanAllMetadata(this.store, {
+                docId,
+              });
+              sealedIngestEntries = fullDocMetadata;
+            }
             await this.tenant.ingestSealedFromEntries?.(
               representativeEntry.decryptionKeyId,
-              docLifecycleEntries,
+              sealedIngestEntries,
             );
             const keyAvailable = await this.tenant.hasDecryptionKey(
               representativeEntry.decryptionKeyId,
@@ -4506,7 +4527,8 @@ export class BaseMindooDB implements MindooDB {
               // have recent entries, so re-scan that doc for prior lifecycle state.
               const allDocMetadata = coldSync
                 ? entryMetadataList
-                : await this.scanAllMetadata(this.store, { docId });
+                : (fullDocMetadata ??
+                  (await this.scanAllMetadata(this.store, { docId })));
               const mutationEntries = allDocMetadata.filter((e) =>
                 this.isDocumentReplayEntry(e),
               );
