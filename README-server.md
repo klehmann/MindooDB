@@ -12,7 +12,7 @@ A Node.js/Express server implementing the MindooDB sync API with:
 ## Prerequisites
 
 - **Docker** — the recommended way to build and run the server
-- Node.js 20 or later (only needed for local development without Docker)
+- Node.js 24 LTS (minimum 22.13; only needed for local development without Docker — the Docker image ships its own Node.js)
 
 ## Quick Start
 

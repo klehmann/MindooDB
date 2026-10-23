@@ -2,7 +2,12 @@
 # Build from repository root:
 #   docker build -f src/node/server/Dockerfile -t mindoodb-server .
 
-FROM node:22-alpine AS builder
+# Pinned to an exact Node.js LTS patch release so a rebuild always pulls the
+# security-patched runtime instead of reusing a stale cached `node:<major>`
+# image. Bump NODE_VERSION when Node.js publishes a security release.
+ARG NODE_VERSION=24.22.1
+
+FROM node:${NODE_VERSION}-alpine AS builder
 WORKDIR /build
 
 # corepack downloads the exact pnpm version pinned in package.json ("packageManager").
@@ -26,14 +31,14 @@ RUN pnpm exec tsc
 #     packages recorded in the lockfile stay out of the server image.
 RUN rm -rf node_modules \
   && pnpm add --save-prod --lockfile-only --config.auto-install-peers=false \
-    express@^4.18.2 \
+    express@^4.22.3 \
     cors@^2.8.6 \
-    helmet@^8.1.0 \
-    express-rate-limit@^8.2.1 \
+    helmet@^8.3.0 \
+    express-rate-limit@^8.7.1 \
     @number0/iroh@^1.0.0 \
   && pnpm install --prod --no-frozen-lockfile --ignore-scripts --config.auto-install-peers=false
 
-FROM node:22-alpine
+FROM node:${NODE_VERSION}-alpine
 
 RUN addgroup -S app && adduser -S app -G app
 WORKDIR /app
