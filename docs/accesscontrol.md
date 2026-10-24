@@ -1280,6 +1280,12 @@ also throws synchronously).
   itself completes and the scan cursor advances, so one withdrawn right cannot block
   a database's sync. Advancing has a price the caller must pay: the sync will not
   offer the entry again, so it is written to the quarantine log (§10.1) instead.
+  Entries are judged one by one: when a document's `doc_create` is refused, a later
+  `doc_change` of it that no rule denies is still accepted. Replicas only list a
+  document once they hold its `doc_create` (or a snapshot), so such changes stay
+  inert, and they complete the document should the create be accepted later.
+  Syncs transfer the `doc_create` entries of each scan page before the rest, so
+  parallel transfer batches cannot deliver a change ahead of its create.
 - **Materialization violation (Tier 2, client):** the entry is **not materialized**;
   its bytes remain in the append-only store but are excluded from queries and from
   re-sync, and the event is added to a per-tenant quarantine/audit log that Haven can

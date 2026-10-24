@@ -606,6 +606,15 @@ function getCustomIdInitialChangeBytes(): Uint8Array {
 }
 
 /**
+ * Whether a document's entries contain what it starts from: its `doc_create`, or a
+ * snapshot (the only entry a dense sync may transfer). Change entries alone do not
+ * make a document; they wait for their create (docs/accesscontrol.md §10).
+ */
+function hasDocumentOrigin(metadata: readonly StoreEntryMetadata[]): boolean {
+  return metadata.some((entry) => entry.entryType === "doc_create" || entry.entryType === "doc_snapshot");
+}
+
+/**
  * BaseMindooDB is a platform-agnostic implementation of MindooDB
  * that works in both browser and server environments.
  *
@@ -3722,7 +3731,7 @@ export class BaseMindooDB implements MindooDB {
         entry.entryType === "doc_undelete" ||
         entry.entryType === "doc_snapshot",
     );
-    if (lifecycleEntries.length === 0) {
+    if (lifecycleEntries.length === 0 || !hasDocumentOrigin(lifecycleEntries)) {
       return null;
     }
     lifecycleEntries.sort((left, right) =>
@@ -4529,6 +4538,16 @@ export class BaseMindooDB implements MindooDB {
                 ? entryMetadataList
                 : (fullDocMetadata ??
                   (await this.scanAllMetadata(this.store, { docId })));
+              if (!hasDocumentOrigin(allDocMetadata)) {
+                // Changes whose create has not arrived (parallel transfer
+                // batches) or never will (refused by the server's access
+                // rules). Indexing them would list an id `getDocument` cannot
+                // load; the create's arrival indexes the document then.
+                this.logger.debug(
+                  `Skipping metadata-first index for doc ${docId} — no doc_create (or snapshot) yet`,
+                );
+                return;
+              }
               const mutationEntries = allDocMetadata.filter((e) =>
                 this.isDocumentReplayEntry(e),
               );

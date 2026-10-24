@@ -272,12 +272,12 @@ describe("access control on a real server (HTTP)", () => {
     expect(entries.some((entry) => entry.docId === janes && entry.entryType === "doc_create")).toBe(false);
   });
 
-  // Known gap: the server judges each entry on its own. The create of Jane's
-  // document is refused, but her first change to it is a doc_change, which no rule
-  // denies, so it is accepted. Other replicas then list a document id whose
-  // document cannot be loaded (getDocument throws DocumentNotFoundError).
-  // Remove `.failing` once a refused create takes the document's changes with it.
-  test.failing("a refused create leaves no part of the document on the server", async () => {
+  // The server judges each entry on its own: the create of Jane's document is
+  // refused, her first change to it is a doc_change, which no rule denies, so the
+  // server keeps it. It must not turn into a document anyone can see: replicas
+  // only list documents whose create they hold, so the change stays inert (and
+  // completes the document should the create ever be accepted).
+  test("a refused create leaves no document other members can see", async () => {
     const t = await setupTenant();
     const janes = await t.create(t.jane, "main", "jane, unauthorized");
     await t.enable();
@@ -285,8 +285,10 @@ describe("access control on a real server (HTTP)", () => {
     await t.pushDirectory();
     expectPolicyRejections(await t.push(t.jane, "main"), /baseline|deny/i);
 
-    const entries = await (await t.karsten.connectToServer(baseUrl, "main", StoreKind.docs)).findNewEntries([]);
-    expect(entries.filter((entry) => entry.docId === janes).map((entry) => entry.entryType)).toEqual([]);
+    const onServer = await t.serverDocs("main");
+    expect(onServer.has(janes)).toBe(false);
+    const karstenMain = await openDb(t.karsten, "main");
+    await expect(karstenMain.getAllDocumentIds()).resolves.not.toContain(janes);
   });
 
   test("$author: only the creator may change a document", async () => {

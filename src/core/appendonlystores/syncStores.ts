@@ -331,6 +331,56 @@ function resolveTransferBatchSize(options?: SyncOptions): number {
 }
 
 /**
+ * The ids of a scan, `doc_create` entries first.
+ *
+ * Batches run in parallel (`maxConcurrentBatches`), so a document's change can
+ * reach the target before its create if the two land in different batches. A
+ * replica then holds changes it cannot materialize until the create follows, and
+ * stores them in that order, which the next hop passes on. Transferring every
+ * create of the page before anything else keeps creates ahead of their changes on
+ * every store a sync writes to.
+ */
+export function createsFirst(entries: ReadonlyArray<{ id: string; entryType?: string }>, ids: readonly string[]): string[][] {
+  const creates = new Set(entries.filter((entry) => entry.entryType === "doc_create").map((entry) => entry.id));
+  if (creates.size === 0) return [ids.slice()];
+  return [ids.filter((id) => creates.has(id)), ids.filter((id) => !creates.has(id))].filter((phase) => phase.length > 0);
+}
+
+/**
+ * {@link transferEntriesInBatches} for several phases in turn: each phase is
+ * fully transferred (its batches in parallel) before the next one starts.
+ */
+async function transferInPhases(
+  sourceStore: ContentAddressedStore,
+  targetStore: ContentAddressedStore,
+  phases: string[][],
+  options: SyncOptions | undefined,
+  state: Parameters<typeof transferEntriesInBatches>[4],
+  logger: Logger,
+): ReturnType<typeof transferEntriesInBatches> {
+  let result: Awaited<ReturnType<typeof transferEntriesInBatches>> = {
+    transferred: state.transferred,
+    transferredBytes: state.transferredBytes,
+    cancelled: false,
+    rejected: [],
+  };
+  const rejected: RejectedPutEntry[] = [];
+  for (const ids of phases) {
+    result = await transferEntriesInBatches(
+      sourceStore,
+      targetStore,
+      ids,
+      options,
+      { ...state, transferred: result.transferred, transferredBytes: result.transferredBytes },
+      logger,
+    );
+    rejected.push(...result.rejected);
+    if (result.cancelled) break;
+  }
+  return { ...result, rejected };
+}
+
+/**
  * Transfer a set of entry IDs from source to target in fixed-size batches,
  * emitting progress and checking for cancellation between each batch.
  *
@@ -727,10 +777,10 @@ export async function syncEntriesBetweenStores(
         }
 
         if (missingIds.length > 0) {
-          const transferResult = await transferEntriesInBatches(
+          const transferResult = await transferInPhases(
             sourceStore,
             targetStore,
-            missingIds,
+            createsFirst(pageEntries, missingIds),
             options,
             {
               transferred,
@@ -897,10 +947,10 @@ export async function syncEntriesBetweenStores(
     totalSourceEntries: sourceNewMetadata.length,
   });
 
-  const transferResult = await transferEntriesInBatches(
+  const transferResult = await transferInPhases(
     sourceStore,
     targetStore,
-    sourceNewMetadata.map((m) => m.id),
+    createsFirst(sourceNewMetadata, sourceNewMetadata.map((m) => m.id)),
     options,
     {
       transferred,
