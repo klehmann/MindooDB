@@ -43,6 +43,7 @@ import type {
 import { PurgedDocRegistry } from "./PurgedDocRegistry";
 import { purgeDocumentHistoryFromStores } from "../../core/appendonlystores/purgeDocumentHistory";
 import type { WitnessSigner } from "../../core/crypto/WitnessReceipt";
+import type { AccessDecision, RuleType } from "../../core/accesscontrol/types";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import { Ed25519WitnessProvider } from "../../core/accesscontrol/timestamp/Ed25519WitnessProvider";
 import type { BaseMindooTenantDirectory } from "../../core/BaseMindooTenantDirectory";
@@ -263,7 +264,12 @@ class CompositeMindooDirectory implements Pick<
           | "resolveUsernameHashForSigningKey"
         >
       > &
-      Partial<Pick<BaseMindooTenantDirectory, "evaluateDbAccessForSigningKey">>,
+      Partial<
+        Pick<
+          BaseMindooTenantDirectory,
+          "evaluateDbAccessForSigningKey" | "evaluateAccessForSigningKey" | "isSamePerson"
+        >
+      >,
     private trustedServers: TrustedServer[],
     private adminBootstrapIdentity?: {
       username: string;
@@ -452,6 +458,41 @@ class CompositeMindooDirectory implements Pick<
     }
     // Config-based directories carry no database-open policy -> unrestricted.
     return true;
+  }
+
+  /**
+   * Forwarded so the witness enforces Tier 1 rules on push
+   * (docs/accesscontrol.md §7). `buildTier1Evaluator` only wires the check when
+   * the directory it is given has this method; without the forward every push
+   * was accepted, whatever the tenant's rules said. Config-based directories
+   * have no rules and therefore no method, which keeps their legacy behavior.
+   */
+  get evaluateAccessForSigningKey():
+    | ((input: {
+        op: RuleType;
+        dbid: string;
+        signingKey: string;
+        trustedTime: number;
+        isAuthor?: boolean;
+      }) => Promise<AccessDecision>)
+    | undefined {
+    const inner = this.inner;
+    return typeof inner.evaluateAccessForSigningKey === "function"
+      ? (input) => inner.evaluateAccessForSigningKey!(input)
+      : undefined;
+  }
+
+  /** Forwarded with {@link evaluateAccessForSigningKey}: `$author` at grant level. */
+  get isSamePerson():
+    | ((input: {
+        creatorSigningKey: string;
+        signerSigningKey: string;
+        creatorTrustedTime: number;
+        signerTrustedTime: number;
+      }) => Promise<boolean>)
+    | undefined {
+    const inner = this.inner;
+    return typeof inner.isSamePerson === "function" ? (input) => inner.isSamePerson!(input) : undefined;
   }
 
   /**
