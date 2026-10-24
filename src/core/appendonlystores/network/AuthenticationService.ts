@@ -448,6 +448,12 @@ export class AuthenticationService {
             if (lookup?.username) username = lookup.username;
           }
           const universe = await this.directory.getUserSigningKeyUniverse(username);
+          // A wipe directive issued after this token was: narrow the token now
+          // instead of letting the device sync normally until it expires (§6.5).
+          if (universe.wipeRequested.includes(deviceKey)) {
+            this.logger.debug(`Device key targeted for remote wipe: ${payload.sub}`);
+            return { ...payload, wipe: true };
+          }
           const keyInactive = !universe.active.includes(deviceKey);
           const userRevoked = await this.directory.isUserRevoked(username);
           if (keyInactive || userRevoked) {
