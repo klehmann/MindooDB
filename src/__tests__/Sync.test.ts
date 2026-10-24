@@ -770,6 +770,47 @@ describe("sync test", () => {
       expect(allContacts2.length).toBe(6);
     });
 
+    it("stores every document's create before its changes, even when create batches are slower", async () => {
+      await setupTenant2AndPull();
+
+      const contactsDB1 = await tenant1.openDB("contacts");
+      await createContacts(contactsDB1, 4);
+      const contactsStore1 = contactsDB1.getStore();
+      const typeById = new Map((await contactsStore1.findNewEntries([])).map((m) => [m.id, m.entryType]));
+
+      // Creates take long to fetch: without ordering, the parallel change batches
+      // would overtake them.
+      const originalGetEntries = contactsStore1.getEntries.bind(contactsStore1);
+      contactsStore1.getEntries = async (ids: string[]) => {
+        const slow = ids.some((id) => typeById.get(id) === "doc_create");
+        await new Promise((resolve) => setTimeout(resolve, slow ? 40 : 1));
+        return originalGetEntries(ids);
+      };
+      const contactsDB2 = await tenant2.openDB("contacts");
+      const targetStore = contactsDB2.getStore();
+      const stored: Array<{ docId: string; entryType: string }> = [];
+      const originalPut = targetStore.putEntries.bind(targetStore);
+      targetStore.putEntries = async (entries) => {
+        for (const entry of entries) stored.push({ docId: entry.docId, entryType: entry.entryType });
+        return originalPut(entries);
+      };
+
+      const result = await contactsDB2.pullChangesFrom(contactsStore1, {
+        pageSize: 1000,
+        transferBatchSize: 1,
+        maxConcurrentBatches: 3,
+      });
+
+      expect(result.cancelled).toBe(false);
+      for (const { docId } of stored.filter((entry) => entry.entryType === "doc_change")) {
+        const createAt = stored.findIndex((entry) => entry.docId === docId && entry.entryType === "doc_create");
+        const firstChangeAt = stored.findIndex((entry) => entry.docId === docId && entry.entryType === "doc_change");
+        expect(createAt).toBeGreaterThanOrEqual(0);
+        expect(createAt).toBeLessThan(firstChangeAt);
+      }
+      expect(await contactsDB2.getAllDocumentIds()).toHaveLength(4);
+    });
+
     it("maxConcurrentBatches=1 keeps transfers strictly sequential", async () => {
       await setupTenant2AndPull();
 
