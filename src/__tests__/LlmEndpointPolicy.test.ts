@@ -73,6 +73,9 @@ describe("parseLlmEndpointPolicy / validateLlmEndpointPolicy", () => {
       }),
     ).not.toThrow();
     expect(() => validateAccessPolicy({ llm: {} })).not.toThrow();
+    // `*` alone allows every endpoint; it is not a URL but a valid pattern.
+    expect(() => validateLlmEndpointPolicy({ allowedEndpoints: ["*"] })).not.toThrow();
+    expect(() => validateLlmEndpointPolicy({ allowedEndpoints: ["**x"] })).toThrow(/http\(s\)/);
   });
 
   it("parses and validates denyUse", () => {
@@ -173,6 +176,8 @@ describe("tenant LLM endpoint policy (directory round trip)", () => {
     expect(await d.getLlmEndpointPolicy()).toEqual({ allowedEndpoints: [] });
     await d.setDefaultAccessPolicy({ llm: {} }, admin.userSigningKeyPair.privateKey, adminPassword);
     expect(await d.getLlmEndpointPolicy()).toEqual({});
+    await d.setDefaultAccessPolicy({ llm: { allowedEndpoints: ["*"] } }, admin.userSigningKeyPair.privateKey, adminPassword);
+    expect(await d.getLlmEndpointPolicy()).toEqual({ allowedEndpoints: ["*"] });
   }, 90000);
 
   it("is tenant-level only and applies even with the master switch on (as new tenants have it)", async () => {
