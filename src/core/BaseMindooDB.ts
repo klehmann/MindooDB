@@ -14,6 +14,12 @@ import {
   isVersioned,
   metadataWitnessState,
 } from "./storeEntryTime";
+import {
+  decodeChangeAttribution,
+  encodeChangeAttribution,
+  type ChangeAttribution,
+  type ChangeAttributionInput,
+} from "./changeAttribution";
 // Import types from WASM package (types are compatible across implementations)
 import type * as AutomergeTypes from "@automerge/automerge/slim";
 import {
@@ -27,6 +33,7 @@ import {
   IterateChangesOptions,
   UndeleteOptions,
   ChangeOptions,
+  PatchOptions,
   CUSTOM_DOC_ID_REGEX,
   DOC_ID_PREFIX_REGEX,
   DIRECTORY_DB_ID,
@@ -5510,6 +5517,7 @@ export class BaseMindooDB implements MindooDB {
       }
       this.validateIdPrefixOption("createDocuments", options);
       this.validateAssumeUniqueIdOption("createDocuments", options);
+      encodeChangeAttribution(options.attribution);
     }
 
     const results: Array<MindooDoc | null> = new Array(inputs.length).fill(
@@ -5556,6 +5564,9 @@ export class BaseMindooDB implements MindooDB {
               options.signingKeyPair,
               options.signingKeyPassword,
               options.bypassAccessControlPrecheck,
+              undefined,
+              undefined,
+              options.attribution,
             );
           }
           results[index] = existingDoc;
@@ -5708,6 +5719,9 @@ export class BaseMindooDB implements MindooDB {
     // of concurrent same-id creates is then not a concern and the create can
     // follow the generated-ID path (initialValues baked into doc_create).
     const useDeterministicSeed = useCustomDocId && !options.assumeUniqueId;
+    // Validated before anything is written. The deterministic seed change of a
+    // convergent custom id is fixed bytes and cannot carry it.
+    const changeMessage = encodeChangeAttribution(options.attribution);
 
     // Sanitize caller-provided initial values: internal/reserved fields (those
     // starting with "_", e.g. "_attachments") are managed by MindooDB and must
@@ -5780,6 +5794,8 @@ export class BaseMindooDB implements MindooDB {
             docId,
             signingKeyPair,
             signingKeyPassword,
+            undefined,
+            options.attribution,
           );
           const undeleted = await this.loadDocumentInternal(docId);
           if (!undeleted || undeleted.isDeleted) {
@@ -5842,20 +5858,24 @@ export class BaseMindooDB implements MindooDB {
       );
       const initialDoc = Automerge.init<MindooDocPayload>();
       try {
-        newDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
-          // Store metadata in the document payload
-          // We need to modify the document to ensure a change is created
-          doc._attachments = [];
-          if (sealedCreate) {
-            applyEncryptForCreate(doc, sealedCreate.encryptFor);
-          }
-          // Seed caller-provided initial values within the same doc_create
-          // change so a doc_create Tier 2 rule can evaluate them in the
-          // "after" state (docs/accesscontrol.md §6.3, §9).
-          for (const [key, value] of initialValueEntries) {
-            this.assignHydrated(doc, key, value);
-          }
-        });
+        newDoc = Automerge.change(
+          initialDoc,
+          changeMessage ? { message: changeMessage } : {},
+          (doc: MindooDocPayload) => {
+            // Store metadata in the document payload
+            // We need to modify the document to ensure a change is created
+            doc._attachments = [];
+            if (sealedCreate) {
+              applyEncryptForCreate(doc, sealedCreate.encryptFor);
+            }
+            // Seed caller-provided initial values within the same doc_create
+            // change so a doc_create Tier 2 rule can evaluate them in the
+            // "after" state (docs/accesscontrol.md §6.3, §9).
+            for (const [key, value] of initialValueEntries) {
+              this.assignHydrated(doc, key, value);
+            }
+          },
+        );
         if (this.isDebugEnabled())
           this.logger.debug(
             `Successfully created Automerge change, document heads: ${JSON.stringify(Automerge.getHeads(newDoc))}`,
@@ -6091,6 +6111,7 @@ export class BaseMindooDB implements MindooDB {
     // out of the deterministic seed, so initialValues fold into doc_create
     // and the document costs a single store entry.
     const useDeterministicSeed = useCustomDocId && !options.assumeUniqueId;
+    const changeMessage = encodeChangeAttribution(options.attribution);
     if (useDeterministicSeed && options.recipients !== undefined) {
       throw new Error(
         "createDocuments: recipients is not supported together with a convergent custom id; pass assumeUniqueId",
@@ -6145,17 +6166,21 @@ export class BaseMindooDB implements MindooDB {
       seedDoc = appliedDoc;
     } else {
       const initialDoc = Automerge.init<MindooDocPayload>();
-      seedDoc = Automerge.change(initialDoc, (doc: MindooDocPayload) => {
-        doc._attachments = [];
-        if (sealedCreate) {
-          applyEncryptForCreate(doc, sealedCreate.encryptFor);
-        }
-        // Seed caller-provided initial values within the same doc_create change
-        // so a doc_create Tier 2 rule can evaluate them in the "after" state.
-        for (const [key, value] of initialValueEntries) {
-          this.assignHydrated(doc, key, value);
-        }
-      });
+      seedDoc = Automerge.change(
+        initialDoc,
+        changeMessage ? { message: changeMessage } : {},
+        (doc: MindooDocPayload) => {
+          doc._attachments = [];
+          if (sealedCreate) {
+            applyEncryptForCreate(doc, sealedCreate.encryptFor);
+          }
+          // Seed caller-provided initial values within the same doc_create change
+          // so a doc_create Tier 2 rule can evaluate them in the "after" state.
+          for (const [key, value] of initialValueEntries) {
+            this.assignHydrated(doc, key, value);
+          }
+        },
+      );
       const localChange = Automerge.getLastLocalChange(seedDoc);
       if (!localChange) {
         throw new Error("Failed to get change bytes from Automerge document");
@@ -6172,7 +6197,7 @@ export class BaseMindooDB implements MindooDB {
     if (useDeterministicSeed && initialValueEntries.length > 0) {
       finalDoc = Automerge.change(
         seedDoc,
-        { time: now },
+        { time: now, message: changeMessage },
         (doc: MindooDocPayload) => {
           for (const [key, value] of initialValueEntries) {
             this.assignHydrated(doc, key, value);
@@ -6799,12 +6824,17 @@ export class BaseMindooDB implements MindooDB {
         // Wrap and yield (including lifecycle terminal entries)
         const wrappedDoc = this.wrapDocument(internalDoc);
 
+        const attribution = this.attributionFromChangePayload(
+          entryMetadata.entryType,
+          decryptedPayload,
+        );
         yield {
           changeEntryId: entryMetadata.id,
           doc: wrappedDoc,
           changeCreatedAt: entryMetadata.createdAt,
           changeCreatedByPublicKey: entryMetadata.createdByPublicKey,
           changeDependencyIds: [...entryMetadata.dependencyIds],
+          ...(attribution ? { attribution } : {}),
         };
       }
     }
@@ -7438,6 +7468,50 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
+  /**
+   * The agent attribution carried by a document change payload (the Automerge
+   * change message), if any. Snapshots and undecodable payloads yield none.
+   */
+  private attributionFromChangePayload(
+    entryType: StoreEntryType,
+    payload: Uint8Array,
+  ): ChangeAttribution | undefined {
+    if (
+      entryType !== "doc_create" &&
+      entryType !== "doc_change" &&
+      entryType !== "doc_delete" &&
+      entryType !== "doc_undelete"
+    ) {
+      return undefined;
+    }
+    try {
+      return decodeChangeAttribution(Automerge.decodeChange(payload).message);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Verify, decrypt and read the attribution of one stored entry. Entries with
+   * an invalid signature or a payload this replica cannot decrypt yield none.
+   */
+  private async readStoreEntryAttribution(
+    entry: StoreEntry,
+  ): Promise<ChangeAttribution | undefined> {
+    try {
+      if (!(await this.tenant.verifyEntrySignature(entry, entry.encryptedData))) {
+        return undefined;
+      }
+      const payload = await this.tenant.decryptPayload(
+        entry.encryptedData,
+        entry.decryptionKeyId,
+      );
+      return this.attributionFromChangePayload(entry.entryType, payload);
+    } catch {
+      return undefined;
+    }
+  }
+
   async getDocumentHistoryPage(
     docId: string,
     options?: DocumentHistoryPageOptions,
@@ -7481,6 +7555,20 @@ export class BaseMindooDB implements MindooDB {
         ),
       }),
     );
+    if (options?.includeAttribution && slice.length > 0) {
+      // Opt-in: costs one load + signature check + decrypt per returned entry,
+      // still bounded by the page size.
+      await this.ingestSealedKeyFromEntries(slice);
+      const loaded = await this.store.getEntries(slice.map((entry) => entry.id));
+      const loadedById = new Map(loaded.map((entry) => [entry.id, entry]));
+      for (const pageEntry of entries) {
+        const stored = loadedById.get(pageEntry.entryId);
+        const attribution = stored
+          ? await this.readStoreEntryAttribution(stored)
+          : undefined;
+        if (attribution) pageEntry.attribution = attribution;
+      }
+    }
     const nextOffset = offset + entries.length;
     const hasMore = nextOffset < relevantEntries.length;
     const result: DocumentHistoryPageResult = {
@@ -9713,6 +9801,7 @@ export class BaseMindooDB implements MindooDB {
       options.signingKeyPair,
       options.signingKeyPassword,
       options.bypassAccessControlPrecheck,
+      options.attribution,
     );
   }
 
@@ -9738,6 +9827,7 @@ export class BaseMindooDB implements MindooDB {
     if (docIds.length === 0) {
       return;
     }
+    const changeMessage = encodeChangeAttribution(options.attribution);
     // One gate call per document id: inside `userdirectory` the applicable rule
     // depends on the id (personal documents are owned by their creator), so a
     // single batch-wide check would deny an owner deleting their own data.
@@ -9797,6 +9887,7 @@ export class BaseMindooDB implements MindooDB {
             options.signingKeyPair,
             options.signingKeyPassword,
             options.bypassAccessControlPrecheck,
+            changeMessage,
           );
         }
       }),
@@ -9838,6 +9929,7 @@ export class BaseMindooDB implements MindooDB {
       options.signingKeyPair,
       options.signingKeyPassword,
       options.bypassAccessControlPrecheck,
+      options.attribution,
     );
   }
 
@@ -9880,6 +9972,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
     bypassPrecheck?: boolean,
+    attribution?: ChangeAttributionInput,
   ): Promise<void> {
     const prepared = await this.prepareLifecycleEntry(
       internalDoc,
@@ -9887,6 +9980,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPair,
       signingKeyPassword,
       bypassPrecheck,
+      encodeChangeAttribution(attribution),
     );
     await this.putLocalEntries([prepared.fullEntry]);
     await this.applyLifecycleEntryLocally(prepared, { markDirty: true });
@@ -9904,6 +9998,7 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
     bypassPrecheck?: boolean,
+    changeMessage?: string,
   ): Promise<{
     internalDoc: InternalDoc;
     entryType: "doc_delete" | "doc_undelete";
@@ -9936,18 +10031,23 @@ export class BaseMindooDB implements MindooDB {
     // keeping causal ancestry intact.
     const headsBefore = Automerge.getHeads(internalDoc.doc);
     let newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) =>
-      Automerge.change(doc, { time: now }, (mutableDoc: MindooDocPayload) => {
-        if (!Array.isArray(mutableDoc._attachments)) {
-          mutableDoc._attachments = [];
-        }
-        mutableDoc._lastModified = now;
-      }),
+      Automerge.change(
+        doc,
+        { time: now, message: changeMessage },
+        (mutableDoc: MindooDocPayload) => {
+          if (!Array.isArray(mutableDoc._attachments)) {
+            mutableDoc._attachments = [];
+          }
+          mutableDoc._lastModified = now;
+        },
+      ),
     );
     if (
       Automerge.getHeads(newDoc).every((head) => headsBefore.includes(head))
     ) {
       newDoc = Automerge.emptyChange(newDoc, {
         time: now,
+        message: changeMessage,
       }) as AutomergeTypes.Doc<MindooDocPayload>;
     }
 
@@ -10163,7 +10263,9 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
     bypassPrecheck?: boolean,
+    attribution?: ChangeAttributionInput,
   ): Promise<void> {
+    encodeChangeAttribution(attribution);
     const useCustomSigningKey =
       signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(
@@ -10188,6 +10290,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPair,
       signingKeyPassword,
       bypassPrecheck,
+      attribution,
     );
     this.logger.info(`Document ${docId} deleted successfully`);
   }
@@ -10197,7 +10300,9 @@ export class BaseMindooDB implements MindooDB {
     signingKeyPair?: SigningKeyPair,
     signingKeyPassword?: string,
     bypassPrecheck?: boolean,
+    attribution?: ChangeAttributionInput,
   ): Promise<void> {
+    encodeChangeAttribution(attribution);
     const useCustomSigningKey =
       signingKeyPair !== undefined && signingKeyPassword !== undefined;
     this.logger.debug(
@@ -10227,6 +10332,7 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPair,
       signingKeyPassword,
       bypassPrecheck,
+      attribution,
     );
     this.logger.info(`Document ${docId} undeleted successfully`);
   }
@@ -10242,6 +10348,9 @@ export class BaseMindooDB implements MindooDB {
       options.signingKeyPair,
       options.signingKeyPassword,
       options.bypassAccessControlPrecheck,
+      undefined,
+      undefined,
+      options.attribution,
     );
   }
 
@@ -10260,8 +10369,10 @@ export class BaseMindooDB implements MindooDB {
   async applyTextPatch(
     doc: MindooDoc,
     patch: MindooTextPatch,
+    options: PatchOptions = {},
   ): Promise<MindooTextPatchResult> {
     this.assertWritable("applyTextPatch");
+    const changeMessage = encodeChangeAttribution(options.attribution);
     const docId = doc.getId();
     this.logger.debug(
       `===== applyTextPatch called for document ${docId} =====`,
@@ -10305,11 +10416,12 @@ export class BaseMindooDB implements MindooDB {
           const result = Automerge.changeAt(
             doc,
             baseHeads as AutomergeTypes.Heads,
+            { message: changeMessage },
             applyEdits,
           );
           return result.newDoc as AutomergeTypes.Doc<MindooDocPayload>;
         }
-        return Automerge.change(doc, applyEdits);
+        return Automerge.change(doc, { message: changeMessage }, applyEdits);
       });
       if (this.isDebugEnabled())
         this.logger.debug(
@@ -10343,8 +10455,10 @@ export class BaseMindooDB implements MindooDB {
   async applyRichTextPatch(
     doc: MindooDoc,
     patch: MindooRichTextPatch,
+    options: PatchOptions = {},
   ): Promise<MindooRichTextPatchResult> {
     this.assertWritable("applyRichTextPatch");
+    const changeMessage = encodeChangeAttribution(options.attribution);
     const docId = doc.getId();
     this.logger.debug(
       `===== applyRichTextPatch called for document ${docId} =====`,
@@ -10407,9 +10521,10 @@ export class BaseMindooDB implements MindooDB {
             doc,
             patch.baseHeads as AutomergeTypes.Heads,
             applySpans,
+            changeMessage,
           );
         }
-        return Automerge.change(doc, applySpans);
+        return Automerge.change(doc, { message: changeMessage }, applySpans);
       });
       if (this.isDebugEnabled())
         this.logger.debug(
@@ -10443,8 +10558,10 @@ export class BaseMindooDB implements MindooDB {
   async applyDocumentUpdate(
     doc: MindooDoc,
     update: MindooDocumentUpdate,
+    options: PatchOptions = {},
   ): Promise<MindooJsonPatchResult> {
     this.assertWritable("applyDocumentUpdate");
+    const changeMessage = encodeChangeAttribution(options.attribution);
     const docId = doc.getId();
     let internalDoc = this.getCachedDocument(docId);
     if (!internalDoc) {
@@ -10495,8 +10612,8 @@ export class BaseMindooDB implements MindooDB {
     try {
       newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (current) =>
         baseHeads
-          ? this.changeOnForkAt(current, baseHeads as AutomergeTypes.Heads, applyAll)
-          : Automerge.change(current, applyAll),
+          ? this.changeOnForkAt(current, baseHeads as AutomergeTypes.Heads, applyAll, changeMessage)
+          : Automerge.change(current, { message: changeMessage }, applyAll),
       );
     } catch (error) {
       this.logger.error(`Error applying document update for document ${docId}:`, error);
@@ -10598,8 +10715,10 @@ export class BaseMindooDB implements MindooDB {
   async applyRichTextStepsPatch(
     doc: MindooDoc,
     patch: MindooRichTextStepPatch,
+    options: PatchOptions = {},
   ): Promise<MindooRichTextPatchResult> {
     this.assertWritable("applyRichTextStepsPatch");
+    const changeMessage = encodeChangeAttribution(options.attribution);
     const docId = doc.getId();
     this.logger.debug(
       `===== applyRichTextStepsPatch called for document ${docId} =====`,
@@ -10673,11 +10792,12 @@ export class BaseMindooDB implements MindooDB {
           const result = Automerge.changeAt(
             doc,
             patch.baseHeads as AutomergeTypes.Heads,
+            { message: changeMessage },
             applySteps,
           );
           return result.newDoc as AutomergeTypes.Doc<MindooDocPayload>;
         }
-        return Automerge.change(doc, applySteps);
+        return Automerge.change(doc, { message: changeMessage }, applySteps);
       });
       if (this.isDebugEnabled())
         this.logger.debug(
@@ -11031,8 +11151,10 @@ export class BaseMindooDB implements MindooDB {
   async applyJsonPatch(
     doc: MindooDoc,
     patch: MindooJsonPatch,
+    options: PatchOptions = {},
   ): Promise<MindooJsonPatchResult> {
     this.assertWritable("applyJsonPatch");
+    const changeMessage = encodeChangeAttribution(options.attribution);
     const docId = doc.getId();
     this.logger.debug(
       `===== applyJsonPatch called for document ${docId} =====`,
@@ -11066,11 +11188,12 @@ export class BaseMindooDB implements MindooDB {
           const result = Automerge.changeAt(
             doc,
             patch.baseHeads as AutomergeTypes.Heads,
+            { message: changeMessage },
             applyPatch,
           );
           return result.newDoc as AutomergeTypes.Doc<MindooDocPayload>;
         }
-        return Automerge.change(doc, applyPatch);
+        return Automerge.change(doc, { message: changeMessage }, applyPatch);
       });
       if (this.isDebugEnabled())
         this.logger.debug(
@@ -11109,8 +11232,10 @@ export class BaseMindooDB implements MindooDB {
     bypassPrecheck?: boolean,
     restoredAttachments: AttachmentReference[] = [],
     internalMutation?: (automergeDoc: MindooDocPayload) => void,
+    attribution?: ChangeAttributionInput,
   ): Promise<void> {
     this.assertWritable("changeDoc");
+    const changeMessage = encodeChangeAttribution(attribution);
     const docId = doc.getId();
     if ((signingKeyPair !== undefined) !== (signingKeyPassword !== undefined)) {
       throw new Error(
@@ -11567,7 +11692,7 @@ export class BaseMindooDB implements MindooDB {
     let newDoc: AutomergeTypes.Doc<MindooDocPayload>;
     try {
       newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) =>
-        Automerge.change(doc, (automergeDoc: MindooDocPayload) => {
+        Automerge.change(doc, { message: changeMessage }, (automergeDoc: MindooDocPayload) => {
           // Apply all pending changes (sets/updates)
           for (const [key, value] of pendingChanges) {
             this.assignHydrated(automergeDoc, key, this.hydrateTypedValues(value));
@@ -12579,13 +12704,14 @@ export class BaseMindooDB implements MindooDB {
     doc: AutomergeTypes.Doc<MindooDocPayload>,
     baseHeads: AutomergeTypes.Heads,
     apply: (doc: MindooDocPayload) => void,
+    changeMessage?: string,
   ): AutomergeTypes.Doc<MindooDocPayload> {
     const current = Automerge.getHeads(doc);
     if (
       current.length === baseHeads.length &&
       current.every((head) => baseHeads.includes(head))
     ) {
-      return Automerge.change(doc, apply);
+      return Automerge.change(doc, { message: changeMessage }, apply);
     }
     const base = Automerge.view(doc, baseHeads);
     const actor = Automerge.getActorId(doc);
@@ -12593,7 +12719,7 @@ export class BaseMindooDB implements MindooDB {
       (change) => Automerge.decodeChange(change).actor === actor,
     );
     const fork = Automerge.clone(base, ownChangeSince ? undefined : { actor });
-    const changed = Automerge.change(fork, apply);
+    const changed = Automerge.change(fork, { message: changeMessage }, apply);
     return Automerge.merge(doc, changed) as AutomergeTypes.Doc<MindooDocPayload>;
   }
 
@@ -13675,6 +13801,9 @@ export class BaseMindooDB implements MindooDB {
         typeof decodedChange.message === "string"
           ? decodedChange.message
           : null,
+      attribution: decodeChangeAttribution(
+        typeof decodedChange.message === "string" ? decodedChange.message : null,
+      ),
       dependencyHashes: Array.isArray(decodedChange.deps)
         ? decodedChange.deps.filter(
             (dep): dep is string => typeof dep === "string",
@@ -15194,6 +15323,7 @@ export class BaseMindooDB implements MindooDB {
     options?: RecipientChangeOptions,
   ): Promise<RecipientChangeResult> {
     this.assertWritable("changeDoc");
+    const changeMessage = encodeChangeAttribution(options?.attribution);
     if (!isSealedKeyId(doc.getDecryptionKeyId())) {
       throw new Error(
         "Recipient mutators require a document created with `recipients`",
@@ -15339,6 +15469,7 @@ export class BaseMindooDB implements MindooDB {
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
     const newDoc = Automerge.change(
       internalDoc.doc,
+      { message: changeMessage },
       (draft: MindooDocPayload) => {
         if (addedTargets.length > 0) {
           const addMap: Record<
@@ -15383,6 +15514,7 @@ export class BaseMindooDB implements MindooDB {
         signingKeyPair: options.signingKeyPair,
         signingKeyPassword: options.signingKeyPassword,
         bypassAccessControlPrecheck: options.bypassAccessControlPrecheck,
+        attribution: options.attribution,
       });
     }
     const wrapped = this.wrapDocument(internalDoc);

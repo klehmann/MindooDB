@@ -215,6 +215,8 @@ for await (const result of db.iterateDocumentHistory(docId)) {
 }
 ```
 
+Changes made by an AI agent on the user's behalf also carry `result.attribution` (channel, app, tool, model); see [Change Attribution](./change-attribution.md).
+
 ### Handling Deleted Documents
 
 When a document is deleted, `iterateDocumentHistory()` includes the deletion entry in the history:
