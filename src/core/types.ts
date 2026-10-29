@@ -6,6 +6,7 @@ import type { ContentAddressedStore, OpenStoreOptions, RejectedPutEntry, StoreSc
 import type { DocumentHistoryPurgeOutcome } from "./appendonlystores/purgeDocumentHistory";
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
 import type { EntryProvenance } from "./crypto/EntrySignature";
+import type { ChangeAttribution, ChangeAttributionInput } from "./changeAttribution";
 import type {
   CopyDocumentOptions,
   CopyDocumentResult,
@@ -2014,6 +2015,13 @@ export interface CreateOptions {
    * the rules. Defaults to `false`.
    */
   bypassAccessControlPrecheck?: boolean;
+
+  /**
+   * Marks the produced entry as written by an AI agent on the user's behalf
+   * (see `ChangeAttribution`). Stored encrypted inside the change, never in
+   * plaintext entry metadata; read back via `iterateDocumentHistory()`.
+   */
+  attribution?: ChangeAttributionInput;
 }
 
 /**
@@ -2042,6 +2050,13 @@ export interface DeleteOptions {
    * quarantine-on-materialization still enforce the rules. Defaults to `false`.
    */
   bypassAccessControlPrecheck?: boolean;
+
+  /**
+   * Marks the produced entry as written by an AI agent on the user's behalf
+   * (see `ChangeAttribution`). Stored encrypted inside the change, never in
+   * plaintext entry metadata; read back via `iterateDocumentHistory()`.
+   */
+  attribution?: ChangeAttributionInput;
 }
 
 /**
@@ -2069,6 +2084,13 @@ export interface UndeleteOptions {
    * quarantine-on-materialization still enforce the rules. Defaults to `false`.
    */
   bypassAccessControlPrecheck?: boolean;
+
+  /**
+   * Marks the produced entry as written by an AI agent on the user's behalf
+   * (see `ChangeAttribution`). Stored encrypted inside the change, never in
+   * plaintext entry metadata; read back via `iterateDocumentHistory()`.
+   */
+  attribution?: ChangeAttributionInput;
 }
 
 /**
@@ -2185,6 +2207,23 @@ export interface ChangeOptions {
    * quarantine-on-materialization still enforce the rules. Defaults to `false`.
    */
   bypassAccessControlPrecheck?: boolean;
+
+  /**
+   * Marks the produced entry as written by an AI agent on the user's behalf
+   * (see `ChangeAttribution`). Stored encrypted inside the change, never in
+   * plaintext entry metadata; read back via `iterateDocumentHistory()`.
+   */
+  attribution?: ChangeAttributionInput;
+}
+
+/**
+ * Options accepted by the patch methods (`applyDocumentUpdate()`,
+ * `applyJsonPatch()`, `applyTextPatch()`, `applyRichTextPatch()`,
+ * `applyRichTextStepsPatch()`).
+ */
+export interface PatchOptions {
+  /** See {@link ChangeOptions.attribution}. */
+  attribution?: ChangeAttributionInput;
 }
 
 /**
@@ -4168,6 +4207,13 @@ export interface DocumentHistoryResult {
   changeCreatedByPublicKey: string;
 
   /**
+   * Set when the change was marked as produced by an AI agent (see
+   * {@link CreateOptions.attribution}). Absent for ordinary user changes,
+   * for entries written before attribution existed, and for snapshots.
+   */
+  attribution?: ChangeAttribution;
+
+  /**
    * Parent DAG entry ids of this change — the edges of the signed change graph,
    * and the heads to pass to {@link MindooDB.materializeDocumentAtHeads} to get
    * the state this change was written against.
@@ -4415,6 +4461,11 @@ export interface DocumentHistoryPageEntry {
   changeCreatedByPublicKey: string;
   dependencyIds: string[];
   isDeleted: boolean;
+  /**
+   * Agent attribution of this change. Only filled when the page was requested
+   * with `includeAttribution: true`; see {@link DocumentHistoryResult.attribution}.
+   */
+  attribution?: ChangeAttribution;
 }
 
 /**
@@ -4423,6 +4474,12 @@ export interface DocumentHistoryPageEntry {
 export interface DocumentHistoryPageOptions {
   cursor?: DocumentHistoryPageCursor | null;
   limit?: number;
+  /**
+   * Also read each returned entry's agent attribution. The page is otherwise
+   * metadata-only; this loads, verifies and decrypts the returned entries
+   * (bounded by `limit`). Defaults to `false`.
+   */
+  includeAttribution?: boolean;
 }
 
 /**
@@ -4458,6 +4515,8 @@ export interface DocumentDagDecodedChangeSummary {
   hash: string | null;
   seq: number | null;
   message: string | null;
+  /** Agent attribution decoded from `message`, if it carries one. */
+  attribution?: ChangeAttribution;
   dependencyHashes: string[];
   opCount: number;
   actionCounts: Record<string, number>;
@@ -5551,7 +5610,7 @@ export interface MindooDB {
    * apps flush buffered text operations based on a stale local copy without
    * overwriting concurrent edits that arrived meanwhile.
    */
-  applyTextPatch(doc: MindooDoc, patch: MindooTextPatch): Promise<MindooTextPatchResult>;
+  applyTextPatch(doc: MindooDoc, patch: MindooTextPatch, options?: PatchOptions): Promise<MindooTextPatchResult>;
 
   /**
    * Apply granular JSON edits at document paths.
@@ -5561,7 +5620,7 @@ export interface MindooDB {
    * apps flush buffered object/list operations based on a stale local copy
    * without replacing concurrent changes that arrived meanwhile.
    */
-  applyJsonPatch(doc: MindooDoc, patch: MindooJsonPatch): Promise<MindooJsonPatchResult>;
+  applyJsonPatch(doc: MindooDoc, patch: MindooJsonPatch, options?: PatchOptions): Promise<MindooJsonPatchResult>;
 
   /**
    * Apply a rich-text span snapshot at a document path.
@@ -5580,7 +5639,7 @@ export interface MindooDB {
    * does not yet exist; applying a rich-text patch on top of a non-string
    * value at the same path is rejected.
    */
-  applyRichTextPatch(doc: MindooDoc, patch: MindooRichTextPatch): Promise<MindooRichTextPatchResult>;
+  applyRichTextPatch(doc: MindooDoc, patch: MindooRichTextPatch, options?: PatchOptions): Promise<MindooRichTextPatchResult>;
 
   /**
    * Apply ordered positional rich-text operations at a document path.
@@ -5588,7 +5647,7 @@ export interface MindooDB {
    * If `baseHeads` is provided, the operations are authored at that historical
    * Automerge version using `changeAt`, then merged into the current document.
    */
-  applyRichTextStepsPatch(doc: MindooDoc, patch: MindooRichTextStepPatch): Promise<MindooRichTextPatchResult>;
+  applyRichTextStepsPatch(doc: MindooDoc, patch: MindooRichTextStepPatch, options?: PatchOptions): Promise<MindooRichTextPatchResult>;
 
   /**
    * Apply several kinds of edits to one document as ONE Automerge change (one
@@ -5602,7 +5661,7 @@ export interface MindooDB {
    * the parts before them — e.g. a rich text for an element the `json` part
    * creates.
    */
-  applyDocumentUpdate(doc: MindooDoc, update: MindooDocumentUpdate): Promise<MindooJsonPatchResult>;
+  applyDocumentUpdate(doc: MindooDoc, update: MindooDocumentUpdate, options?: PatchOptions): Promise<MindooJsonPatchResult>;
 
   /**
    * Read the current Automerge rich-text spans from a document path.
