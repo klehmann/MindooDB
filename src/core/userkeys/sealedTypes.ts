@@ -40,6 +40,8 @@ export interface RecipientChangeOptions {
   signingKeyPair?: import("../types").SigningKeyPair;
   signingKeyPassword?: string;
   bypassAccessControlPrecheck?: boolean;
+  /** See `ChangeOptions.attribution`. */
+  attribution?: import("../changeAttribution").ChangeAttributionInput;
   change?: (doc: import("../types").MindooDoc) => void | Promise<void>;
   strict?: boolean;
   /** When setting the list, also keep the caller (default true). */
