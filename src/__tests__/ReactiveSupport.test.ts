@@ -18,6 +18,7 @@ import {
 import { createViewLanguage } from "../core/expressions";
 import type { MindooQueryResult } from "../core/query/types";
 import { createWitnessingTenant } from "./_helpers/witnessingTenant";
+import { setSemanticTimeSourceForTesting } from "../core/utils/timeSource";
 
 const v = createViewLanguage<Record<string, unknown>>();
 
@@ -34,6 +35,25 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000): Promise<void
       throw new Error("waitFor: condition not met within timeout");
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** Store factory returning the same store instance per dbId (shared data). */
+class SharedStoreFactory implements ContentAddressedStoreFactory {
+  private stores = new Map<string, InMemoryContentAddressedStore>();
+
+  createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
+    let docStore = this.stores.get(`${dbId}/docs`);
+    if (!docStore) {
+      docStore = new InMemoryContentAddressedStore(dbId, StoreKind.docs);
+      this.stores.set(`${dbId}/docs`, docStore);
+    }
+    let attachmentStore = this.stores.get(`${dbId}/attachments`);
+    if (!attachmentStore) {
+      attachmentStore = new InMemoryContentAddressedStore(dbId, StoreKind.attachments);
+      this.stores.set(`${dbId}/attachments`, attachmentStore);
+    }
+    return { docStore, attachmentStore };
   }
 }
 
@@ -224,25 +244,6 @@ describe("change listeners (db.addChangeListener)", () => {
 });
 
 describe("one coalesced event per sync batch", () => {
-  /** Store factory returning the same store instance per dbId (shared data). */
-  class SharedStoreFactory implements ContentAddressedStoreFactory {
-    private stores = new Map<string, InMemoryContentAddressedStore>();
-
-    createStore(dbId: string, _options?: OpenStoreOptions): CreateStoreResult {
-      let docStore = this.stores.get(`${dbId}/docs`);
-      if (!docStore) {
-        docStore = new InMemoryContentAddressedStore(dbId, StoreKind.docs);
-        this.stores.set(`${dbId}/docs`, docStore);
-      }
-      let attachmentStore = this.stores.get(`${dbId}/attachments`);
-      if (!attachmentStore) {
-        attachmentStore = new InMemoryContentAddressedStore(dbId, StoreKind.attachments);
-        this.stores.set(`${dbId}/attachments`, attachmentStore);
-      }
-      return { docStore, attachmentStore };
-    }
-  }
-
   it("emits a single event for a whole sync ingest", async () => {
     const cryptoAdapter = new NodeCryptoAdapter();
     const storeFactory = new SharedStoreFactory();
@@ -435,6 +436,68 @@ describe("live queries (db.queryLive)", () => {
 
     subscription.unsubscribe();
   }, 30000);
+
+  it("re-fires for a synced change that leaves lastModified as it was", async () => {
+    // lastModified is the newest change's time. A change synced in that is not
+    // newer than the replica's own last edit changes the content, not the
+    // fingerprint. Both edits share one millisecond here to make that certain.
+    const cryptoAdapter = new NodeCryptoAdapter();
+    const storeFactory = new SharedStoreFactory();
+    const tenantId = `t-livequery-synced-${Date.now()}`;
+    const setup = await new BaseMindooTenantFactory(storeFactory, cryptoAdapter).createTenant({
+      tenantId,
+      adminName: "CN=admin/O=livequery",
+      adminPassword: "admin-pass",
+      userName: "CN=user/O=livequery",
+      userPassword: "user-pass",
+    });
+    const writer = await setup.tenant.openDB("synced-db");
+    const readerBag = new KeyBag(setup.appUser.userEncryptionKeyPair.privateKey, "user-pass", cryptoAdapter);
+    for (const keyId of [PUBLIC_INFOS_KEY_ID, DEFAULT_TENANT_KEY_ID]) {
+      await readerBag.set("doc", tenantId, keyId, (await setup.keyBag.get("doc", tenantId, keyId))!);
+    }
+    const readerTenant = await new BaseMindooTenantFactory(storeFactory, cryptoAdapter).openTenant(
+      tenantId,
+      setup.adminUser.userSigningKeyPair.publicKey,
+      setup.adminUser.userEncryptionKeyPair.publicKey,
+      setup.appUser,
+      "user-pass",
+      readerBag,
+    );
+    const reader = await readerTenant.openDB("synced-db");
+
+    const created = await writer.createDocument();
+    await writer.changeDoc(created, (d) => {
+      Object.assign(d.getData(), { type: "task", name: "Alpha" });
+    });
+    await reader.syncStoreChanges();
+    const results: MindooQueryResult[] = [];
+    const subscription = reader.queryLive!({ filter: v.eq(v.field("type"), "task") }, (result) => {
+      results.push(result);
+    });
+    await waitFor(() => results.length === 1);
+
+    const pinned = Date.now() + 60_000;
+    const previous = setSemanticTimeSourceForTesting(() => pinned);
+    try {
+      await writer.changeDoc(await writer.getDocument(created.getId()), (d) => {
+        d.getData().name = "Alpha by writer";
+      });
+      await reader.changeDoc(await reader.getDocument(created.getId()), (d) => {
+        d.getData().note = "reader";
+      });
+      await waitFor(() => results.length === 2);
+
+      await reader.syncStoreChanges();
+      await waitFor(() => results.length === 3);
+      expect(results[2].rows[0].lastModified).toBe(results[1].rows[0].lastModified);
+      const merged = await reader.getDocument(created.getId());
+      expect(merged.getData()).toMatchObject({ name: "Alpha by writer", note: "reader" });
+    } finally {
+      setSemanticTimeSourceForTesting(previous);
+      subscription.unsubscribe();
+    }
+  }, 60000);
 
   it("stops after unsubscribe and supports forced refresh", async () => {
     await createDoc({ type: "task", name: "Alpha" });
