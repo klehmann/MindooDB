@@ -34,6 +34,11 @@ export interface MindooQuerySubscription {
  * Included rows participate recursively. Without that, editing a line
  * item would leave the invoice's own `lastModified` untouched and the
  * subscriber would never hear about a change to data it was handed.
+ *
+ * `lastModified` is the newest change's creation time, so a change that
+ * arrives by sync but was made before the replica's own latest edit leaves
+ * it untouched. The fingerprint alone misses that; synced changes to a
+ * document in the result count as well (see {@link resultContainsDoc}).
  */
 function fingerprintResult(result: MindooQueryResult): string {
   const parts: string[] = [String(result.total)];
@@ -69,6 +74,33 @@ function appendRowFingerprint(parts: string[], row: MindooQueryRow): void {
   }
 }
 
+/** Whether one of `docIds` is a row of the result or of its includes. */
+function resultContainsDoc(result: MindooQueryResult, docIds: ReadonlySet<string>): boolean {
+  if (docIds.size === 0) {
+    return false;
+  }
+  return result.rows.some((row) => rowContainsDoc(row, docIds));
+}
+
+function rowContainsDoc(row: MindooQueryRow, docIds: ReadonlySet<string>): boolean {
+  if (docIds.has(row.docId)) {
+    return true;
+  }
+  if (!row.includes) {
+    return false;
+  }
+  for (const slotValue of Object.values(row.includes)) {
+    if (slotValue === null) {
+      continue;
+    }
+    const children = Array.isArray(slotValue) ? slotValue : [slotValue];
+    if (children.some((child) => rowContainsDoc(child, docIds))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Every database a query reads from: the root plus each `include.db`
  * (recursively; an include without one stays on its parent's database).
@@ -102,7 +134,7 @@ function collectQueryDatabases(db: MindooDB, query: MindooQuery): MindooDB[] {
  * Live query: delivers the initial result, keeps the summary current via
  * the database's change listener, and re-evaluates the query after every
  * (coalesced) change event. `onResult` only fires when the result
- * fingerprint actually changed.
+ * fingerprint changed or a document in the result was synced in.
  *
  * Re-evaluations are single-flight with a pending flag, so bursts of
  * change events never queue up more than one follow-up run. Evaluation
@@ -126,6 +158,9 @@ export function executeQueryLive(
   }
 
   let lastFingerprint: string | null = null;
+  // Documents synced in since the last evaluation started. Local writes are
+  // the newest changes and always move `lastModified` on their own.
+  let changedDocIds = new Set<string>();
   let unsubscribed = false;
   let running = false;
   let pending = false;
@@ -139,12 +174,14 @@ export function executeQueryLive(
   };
 
   const evaluate = async (force: boolean): Promise<void> => {
+    const changed = changedDocIds;
+    changedDocIds = new Set<string>();
     const result = await executeQuery(db, summary, query, options);
     if (unsubscribed) {
       return;
     }
     const fingerprint = fingerprintResult(result);
-    if (force || fingerprint !== lastFingerprint) {
+    if (force || fingerprint !== lastFingerprint || resultContainsDoc(result, changed)) {
       lastFingerprint = fingerprint;
       onResult(result);
     }
@@ -172,8 +209,13 @@ export function executeQueryLive(
   };
 
   const removeListeners = databases.map((database) =>
-    database.addChangeListener!(() => {
+    database.addChangeListener!((event) => {
       if (!unsubscribed) {
+        if (event.origin === "ingest") {
+          for (const change of event.changes) {
+            changedDocIds.add(change.docId);
+          }
+        }
         void run(false);
       }
     })
