@@ -854,7 +854,7 @@ export class HttpTransport implements NetworkTransport {
   async subscribeToChanges(
     token: string,
     onEvent: (event: StoreChangeEvent) => void,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; onOpen?: () => void },
   ): Promise<void> {
     const dbId = this.config.dbId ?? "directory";
     const url = `${this.getSyncBasePath()}/events?dbId=${encodeURIComponent(dbId)}`;
@@ -890,6 +890,9 @@ export class HttpTransport implements NetworkTransport {
         "Change feed requires fetch response streaming, which this environment does not support",
       );
     }
+
+    // The server subscribes before it sends response headers.
+    options?.onOpen?.();
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();

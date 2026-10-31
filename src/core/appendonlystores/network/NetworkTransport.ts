@@ -313,11 +313,14 @@ export interface NetworkTransport {
    * when the stream ends (resolves on orderly close or abort, rejects on
    * transport errors). Reconnect/backoff is the caller's responsibility —
    * see `ClientNetworkContentAddressedStore.subscribeToChanges`.
+   *
+   * `onOpen` runs once the server has accepted the subscription. Changes
+   * announced before that are not replayed.
    */
   subscribeToChanges?(
     token: string,
     onEvent: (event: StoreChangeEvent) => void,
-    options?: { signal?: AbortSignal }
+    options?: { signal?: AbortSignal; onOpen?: () => void }
   ): Promise<void>;
 
   /**

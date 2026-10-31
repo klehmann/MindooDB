@@ -586,18 +586,27 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * subscription deactivates itself silently — callers keep their existing
    * polling behavior.
    *
+   * The server does not replay changes announced while the stream was down
+   * (server restart, network loss, before the first connect). `onConnected`
+   * runs every time the stream is (re)established, so the caller can catch
+   * up with a pull.
+   *
    * @returns an unsubscribe function that closes the stream and stops
    *          reconnecting.
    */
-  subscribeToChanges(onChange: (event: StoreChangeEvent) => void): () => void {
+  subscribeToChanges(
+    onChange: (event: StoreChangeEvent) => void,
+    options?: { onConnected?: () => void },
+  ): () => void {
     const controller = new AbortController();
-    void this.runChangeSubscriptionLoop(onChange, controller.signal);
+    void this.runChangeSubscriptionLoop(onChange, controller.signal, options?.onConnected);
     return () => controller.abort();
   }
 
   private async runChangeSubscriptionLoop(
     onChange: (event: StoreChangeEvent) => void,
     signal: AbortSignal,
+    onConnected?: () => void,
   ): Promise<void> {
     const initialBackoffMs = 1_000;
     const maxBackoffMs = 60_000;
@@ -619,7 +628,17 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
             backoffMs = initialBackoffMs;
             onChange(event);
           },
-          { signal },
+          {
+            signal,
+            onOpen: () => {
+              backoffMs = initialBackoffMs;
+              try {
+                onConnected?.();
+              } catch (error) {
+                this.logger.warn("Change subscription onConnected callback failed", error);
+              }
+            },
+          },
         );
         // Orderly stream end (server restart / idle close): reconnect quickly.
         backoffMs = initialBackoffMs;
