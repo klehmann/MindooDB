@@ -113,6 +113,32 @@ describe("HttpTransport.subscribeToChanges SSE parsing (sync-v5 phase 5)", () =>
     expect((init.headers as Record<string, string>)["Authorization"]).toBe("Bearer token");
   });
 
+  test("reports the open stream before the first event", async () => {
+    global.fetch = jest.fn(async () =>
+      sseResponse([
+        'event: hello\ndata: {"protocolVersion":"sync-v5"}\n\n',
+        'event: change\ndata: {"dbId":"contacts","storeKind":"docs"}\n\n',
+      ]),
+    ) as typeof fetch;
+
+    const seen: string[] = [];
+    await makeTransport().subscribeToChanges("token", (event) => seen.push(`change:${event.dbId}`), {
+      onOpen: () => seen.push("open"),
+    });
+
+    expect(seen).toEqual(["open", "change:contacts"]);
+  });
+
+  test("does not report an open stream on a failed subscribe", async () => {
+    global.fetch = jest.fn(async () =>
+      new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 }),
+    ) as typeof fetch;
+
+    const onOpen = jest.fn();
+    await expect(makeTransport().subscribeToChanges("bad-token", () => {}, { onOpen })).rejects.toBeDefined();
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
   test("ignores malformed change payloads instead of failing the stream", async () => {
     global.fetch = jest.fn(async () =>
       sseResponse([

@@ -303,7 +303,7 @@ export class IrohNetworkTransport implements NetworkTransport {
   async subscribeToChanges(
     token: string,
     onEvent: (event: StoreChangeEvent) => void,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; onOpen?: () => void },
   ): Promise<void> {
     // Dedicated stream so the RPC session stays usable. When openConnection
     // exists this is a second bi-stream on the shared QUIC connection;
@@ -339,6 +339,7 @@ export class IrohNetworkTransport implements NetworkTransport {
       if (!ack.ok) {
         throw new NetworkError(NetworkErrorType.NETWORK_ERROR, ack.error ?? "Iroh RPC failed");
       }
+      options?.onOpen?.();
       while (!options?.signal?.aborted) {
         const bytes = await stream.recv();
         if (!bytes) {
