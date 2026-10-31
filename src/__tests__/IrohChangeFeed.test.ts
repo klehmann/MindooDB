@@ -95,10 +95,13 @@ describe("Iroh change feed", () => {
 
     const events: StoreChangeEvent[] = [];
     const abort = new AbortController();
+    let opened = 0;
     const subscribed = transport.subscribeToChanges("token", (event) => events.push(event), {
       signal: abort.signal,
+      onOpen: () => opened++,
     });
     await waitFor(() => bus.listenerCount === 1);
+    await waitFor(() => opened === 1);
 
     expect(seenCtx.some((ctx) => (ctx as { tenantId?: string })?.tenantId === "acme")).toBe(true);
 

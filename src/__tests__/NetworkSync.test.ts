@@ -714,6 +714,40 @@ describe("Network Sync", () => {
       expect(activeSignal!.aborted).toBe(true);
     });
 
+    test("should report every (re)connect so callers can catch up on missed changes", async () => {
+      const baseGetCapabilities = mockTransport.getCapabilities.bind(mockTransport);
+      jest.spyOn(mockTransport, "getCapabilities").mockImplementation(async (token: string) => ({
+        ...(await baseGetCapabilities(token)),
+        supportsChangeEvents: true,
+      }));
+      let opened = 0;
+      // The first stream opens and then ends (server restart); the second one
+      // stays open until the subscriber aborts.
+      (mockTransport as unknown as { subscribeToChanges: NetworkTransport["subscribeToChanges"] }).subscribeToChanges =
+        async (_token, _onEvent, options) => {
+          opened++;
+          options?.onOpen?.();
+          if (opened === 1) return;
+          await new Promise<void>((resolve) => {
+            if (options?.signal?.aborted) return resolve();
+            options?.signal?.addEventListener("abort", () => resolve());
+          });
+        };
+
+      let connected = 0;
+      const unsubscribe = clientStore.subscribeToChanges(() => undefined, {
+        onConnected: () => {
+          connected++;
+        },
+      });
+      const deadline = Date.now() + 3000;
+      while (connected < 2 && Date.now() < deadline) await sleep(20);
+
+      expect(opened).toBe(2);
+      expect(connected).toBe(2);
+      unsubscribe();
+    });
+
     test("should silently disable the subscription when change events are unsupported", async () => {
       // Default MockNetworkTransport: no supportsChangeEvents capability, no
       // subscribeToChanges method — the loop must exit without retry noise.
