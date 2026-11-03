@@ -4,20 +4,32 @@ This guide shows how a JVM application (Kotlin or Java, for example a Spring or 
 
 The JVM side is the Kotlin library [`mindoodb-kmp-client`](https://github.com/klehmann/mindoodb-kmp-client). It talks to a small Node.js process, the [`mindoodb-jvm-bridge`](https://github.com/klehmann/mindoodb-jvm-bridge) sidecar, which runs the real `mindoodb` engine. Everything MindooDB guarantees (end-to-end encryption, signed changes, CRDT merging, access control) is done by the same TypeScript code that Node.js, browsers, React Native and Haven use. There is no second implementation to drift apart.
 
-> **Status:** beta, like MindooDB itself. Both projects build from source today; they are not on Maven Central or npm yet.
+> **Status:** the Kotlin/JVM client is beta: its APIs may still change. MindooDB and Haven themselves are not beta. Both projects build from source today; they are not on Maven Central or npm yet.
 
 ---
 
 ## How it works
 
-```
-JVM application
-  └─ mindoodb-kmp-client (Kotlin, coroutines)
-       │  loopback WebSocket: JSON-RPC + binary attachment frames
-       ▼
-mindoodb-jvm-bridge supervisor (Node.js)
-  └─ one child process per user session
-       └─ mindoodb engine + decrypted KeyBag + on-disk replica
+```mermaid
+flowchart LR
+    subgraph JVM["JVM application"]
+        C["mindoodb-kmp-client<br/>suspend functions and Flows"]
+    end
+    subgraph Node["mindoodb-jvm-bridge (Node.js)"]
+        S["Supervisor<br/>loopback only, bootstrap token"]
+        A["Session child: Alice<br/>mindoodb engine + KeyBag"]
+        B["Session child: Bob<br/>mindoodb engine + KeyBag"]
+    end
+    RA[("Replica Alice")]
+    RB[("Replica Bob")]
+    Srv["MindooDB server<br/>stores ciphertext only"]
+    C -- "WebSocket: JSON-RPC +<br/>binary attachment frames" --> S
+    S -- "fork per session" --> A
+    S -- "fork per session" --> B
+    A --- RA
+    B --- RB
+    A -. "encrypted sync" .-> Srv
+    B -. "encrypted sync" .-> Srv
 ```
 
 - **One session = one user = one child process.** Each session unlocks one user's KeyBag in its own OS process. Several users in one JVM means several sessions, and their keys and replicas never mix.
@@ -101,16 +113,20 @@ import kotlinx.coroutines.runBlocking
 runBlocking {
     val created = MindooDBBridge.createTenant(
         endpoint,
-        tenantId = "acme",                       // lowercase letters, digits, - and _
+        tenantId = null,                         // generated: random and time-sortable, like Haven
+        tenantLabel = "Acme",                    // the name members see; the admin can rename it
         adminName = "cn=admin/o=acme",
         adminPassword = "a long admin passphrase",
         userId = "cn=service/o=acme",
         password = "a long user passphrase",
         databases = listOf("orders"),
     )
+    println("Created ${created.tenantLabel} (${created.tenantId})")
     // Keep created.adminIdentity (password-locked) if this process will approve join requests.
 }
 ```
+
+Let MindooDB generate the tenant ID (`tenantId = null`), as Haven does: a random, time-sortable ID never collides with tenants other people publish to the same server. Store `created.tenantId` to open the tenant later; show `tenantLabel` to people. The admin renames the tenant with `session.setTenantLabel("Acme Corp", adminPassword)`, and every member reads the current name with `session.getTenantLabel()` (it lives encrypted in the admin-signed directory and arrives with the next sync).
 
 The **admin** is the root of trust: it signs the directory (who belongs to the tenant, grants, policies). The **app user** is the identity your code works as. Use strong passphrases; they protect private keys that never leave this machine.
 
@@ -281,16 +297,46 @@ nav.close()
 
 The navigator walks the tree (`gotoFirst`, `gotoNext`, `gotoParent`, `gotoPos("1.2")`, siblings), expands and collapses categories, and selects entries (`select`, `readSelected`). While `changes()` is collected the view updates itself; otherwise call `nav.refresh()`.
 
-### Changefeed
+### Incremental reads and the changefeed
+
+Every database has a changefeed: each document appears once, at its latest state, ordered by when it last changed. A cursor marks how far you have read. That makes incremental processing cheap: a job reads what changed since its last run, saves the cursor, and stops. Cost grows with the number of changes, not with the size of the database.
 
 ```kotlin
-orders.changes(sinceCursor = savedCursor).collect { change ->
-    exportToWarehouse(change.doc)
-    savedCursor = change.cursor          // persist to resume later
-}
+var stored: String? = loadCursor()                 // e.g. from your own database; null = from the start
+println("${orders.countChanges(ChangeCursors.parse(stored), idPrefix = "inv")} invoices to process")
+do {
+    val page = orders.readChanges(ChangeCursors.parse(stored), limit = 500, idPrefix = "inv")
+    page.changes.forEach { exportToWarehouse(it.doc) }
+    stored = ChangeCursors.serialize(page.cursor)
+    saveCursor(stored)                             // only after the page is processed
+} while (!page.done)
 ```
 
-The changefeed replays every document changed since the cursor, then follows new changes. It is the right tool to mirror MindooDB data into another system.
+```mermaid
+flowchart LR
+    L["Load the stored cursor<br/>(null = from the start)"] --> R["readChanges(cursor, limit)"]
+    R --> P["Process the page"]
+    P --> W["Save page.cursor"]
+    W --> D{"page.done?"}
+    D -- no --> R
+    D -- yes --> E["Stop until the next run"]
+```
+
+- `readChanges(cursor, limit, idPrefix)` returns one page up to the current end (`ChangePage(changes, cursor, done)`) and does not wait for new changes. `changesUntilNow(...)` is the same as a `Flow` that pages internally.
+- `readChangeMetadata(...)` returns only document id, deleted flag and time, without decrypting anything. Use it to find out *which* documents changed (or were deleted), and load only those you need with `documents.get`.
+- `countChanges(cursor, idPrefix)` counts what is left, for progress bars or to skip a run.
+- `idPrefix` filters by ID prefix before documents are loaded, so give document types their own prefix (`create(values, idPrefix = "inv")`).
+- A cursor is an opaque JSON object. Store it with `ChangeCursors.serialize` and pass `ChangeCursors.parse(...)` back unchanged. Save it after you processed a page: if the job dies mid-page, the page is read again (at-least-once), so make processing idempotent.
+- Deleted documents appear in the feed too (`doc.isDeleted` / `meta.isDeleted`), so a mirror can remove them.
+
+To follow changes live instead of polling, collect `changes(cursor, idPrefix)` (or `changeMetadata(...)`): it replays everything after the cursor and then emits each new change, including changes that arrive through sync.
+
+```kotlin
+orders.changes(sinceCursor = ChangeCursors.parse(stored)).collect { change ->
+    exportToWarehouse(change.doc)
+    saveCursor(ChangeCursors.serialize(change.cursor))
+}
+```
 
 ---
 
@@ -314,6 +360,19 @@ println(r.databases.map { "${it.dbId}: +${it.pulledEntries} / ${it.pushedEntries
 session.refresh("orders", SyncDirection.Pull)
 ```
 
+To show progress, for example during the first sync of a large tenant, collect `session.syncProgress()`. It reports every push and pull of the session (refresh, publish, approval and the background loop) per database and store: phase (`preparing`, `planning`, `transferring`, `processing`, `complete`), scanned and transferred entries and bytes, and `totalSourceEntries` when known, so `scannedEntries / totalSourceEntries` is a completion ratio. Each push or pull ends with `complete`. The background loop starts 5 seconds after a session opens, so subscribe first or call `refresh` yourself.
+
+```kotlin
+val progress = launch {
+    session.syncProgress().collect { p ->
+        val ratio = p.totalSourceEntries?.let { total -> p.scannedEntries * 100 / maxOf(total, 1) }
+        println("${p.dbId} ${p.direction} ${p.store}: ${p.phase} ${ratio ?: "?"}% (${p.transferredEntries} entries)")
+    }
+}
+session.refresh()
+progress.cancel()
+```
+
 `rejectedEntries > 0` means the server refused some of your changes (typically because an access policy forbids them). A tenant created elsewhere (for example in Haven) can be used from the JVM through the join flow below.
 
 ---
@@ -322,13 +381,32 @@ session.refresh("orders", SyncDirection.Pull)
 
 Joining never moves a private key: the new user creates their identity locally, the admin approves a request, and the response carries the keys wrapped for that user.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as New user (JVM or Haven)
+    participant A as Tenant admin (JVM or Haven)
+    participant S as MindooDB server
+    U->>U: createUser + createJoinRequest
+    U->>A: join request (mdb://join-request/…), e.g. by mail or chat
+    A->>A: inspectJoinRequest: name, device, key fingerprints
+    U-->>A: compare fingerprints (phone, in person)
+    A->>S: approveJoinRequest pushes the grant (directory)
+    A->>U: join response (mdb://join-response/…)
+    U->>S: joinTenant pulls directory + userdirectory
+    U->>S: openSession + refresh pull the data
+```
+
 ```kotlin
 // On the joining side (another machine, or the same sidecar):
 val user = MindooDBBridge.createUser(endpoint, "cn=billing/o=acme", "billing passphrase")
 val request = MindooDBBridge.createJoinRequest(endpoint, user.identity, label = "Billing service")
 // send request.joinRequest (an mdb:// URI) to the admin
 
-// On the admin side, in a session of the tenant:
+// On the admin side, in a session of the tenant: look at the request first
+val info = session.inspectJoinRequest(request.joinRequest)
+println("${info.username} wants access for '${info.label}', key ${info.signingPublicKeyFingerprint}")
+if (info.directoryUser?.exists == true) println("adds a device to an existing person")
 val approved = session.approveJoinRequest(
     request.joinRequest,
     adminPassword = "a long admin passphrase",
@@ -343,6 +421,8 @@ MindooDBBridge.joinTenant(
 )
 val billing = MindooDBBridge.openSession(endpoint, "acme", "cn=billing/o=acme", "billing passphrase", listOf("orders"))
 ```
+
+`inspectJoinRequest` decodes the request without approving it. Compare `signingPublicKeyFingerprint` with the fingerprint the joining device shows (Haven uses the same format), so nobody can slip in their own keys. `directoryUser` tells you whether the name already exists (approving then adds a device to that person; pass `username` to choose the person yourself) and whether this exact device is already granted. `hasUserKey = false` means the requesting identity has no User-Key; create users with `createUser`, which adds one.
 
 Haven users can approve the same request in Haven, and a JVM admin can approve requests created in Haven: it is the same protocol.
 
