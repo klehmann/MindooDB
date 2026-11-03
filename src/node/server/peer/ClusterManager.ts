@@ -13,8 +13,8 @@ import { StoreKind, type ContentAddressedStore } from "../../../core/types";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../../core/logging";
 import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
 import type { IrohStreamIO } from "../../../core/appendonlystores/network/IrohStreamIO";
-import type { TrustedServer } from "../types";
-import type { SyncEventBus } from "../SyncEventBus";
+import type { TrustedServer } from "../../../server/types";
+import type { SyncEventBus } from "../../../server/SyncEventBus";
 import { PeerAuthService } from "./PeerAuthService";
 import { PeerReplicator, rollUpHealth, type PeerSyncScope } from "./PeerReplicator";
 import { ClusterJobRunner } from "./ClusterJobRunner";
@@ -28,7 +28,7 @@ import {
   type ClusterTenantStatusResponse,
   type ClusterTopologyResponse,
   type PeerRole,
-} from "./types";
+} from "../../../server/peer/types";
 
 /** Result of dispatching an admin action; `accepted` discriminates the union. */
 export type ClusterActionOutcome =

@@ -12,6 +12,8 @@
  * in all contexts (URLs, QR codes, email, chat).
  */
 
+import { base64ToUtf8, utf8ToBase64 } from "../utils/base64";
+
 /**
  * Supported MindooDB URI types.
  */
@@ -327,21 +329,7 @@ export function decodeDocHistoryPurgeRequest(uri: string): DocHistoryPurgeReques
  * Encode a UTF-8 string to base64url (URL-safe, no padding).
  */
 function toBase64Url(str: string): string {
-  // Use Buffer if available (Node.js), otherwise TextEncoder + btoa (browser)
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(str, "utf-8")
-      .toString("base64")
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
-  }
-
-  const bytes = new TextEncoder().encode(str);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary)
+  return utf8ToBase64(str)
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
@@ -355,16 +343,5 @@ function fromBase64Url(base64url: string): string {
   let base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
   const paddingNeeded = (4 - (base64.length % 4)) % 4;
   base64 += "=".repeat(paddingNeeded);
-
-  // Use Buffer if available (Node.js), otherwise atob + TextDecoder (browser)
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(base64, "base64").toString("utf-8");
-  }
-
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return new TextDecoder().decode(bytes);
+  return base64ToUtf8(base64);
 }

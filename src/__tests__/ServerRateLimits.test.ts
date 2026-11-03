@@ -1,7 +1,7 @@
 import {
   buildSyncRateLimitKey,
   resolveGlobalRateLimit,
-} from "../node/server/rateLimits";
+} from "../server/rateLimits";
 
 const TIERS = {
   sync: { windowMs: 60_000, max: 3_000 },

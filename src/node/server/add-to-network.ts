@@ -13,7 +13,7 @@ import { MindooDBServerAdmin } from "../../core/MindooDBServerAdmin";
 import type { MindooDBServerInfo } from "../../core/types";
 import type { PrivateUserId } from "../../core/userid";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
-import { isPeerRole } from "./peer/types";
+import { isPeerRole } from "../../server/peer/types";
 
 const ENV_PASSWORD = "MINDOODB_SYSTEM_ADMIN_PASSWORD";
 

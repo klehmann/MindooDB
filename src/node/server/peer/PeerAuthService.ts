@@ -11,7 +11,7 @@
 
 import { generateRandomUuid } from "../../../core/utils/idGeneration";
 import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
-import type { TrustedServer } from "../types";
+import type { TrustedServer } from "../../../server/types";
 
 export interface PeerTokenPayload {
   /** Trusted-server name that authenticated. */

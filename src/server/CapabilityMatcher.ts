@@ -12,7 +12,7 @@
  */
 
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
-import { isWildcardSystemAdminPrincipal } from "./config";
+import { isWildcardSystemAdminPrincipal } from "./serverConfig";
 
 interface ParsedRule {
   method: string;

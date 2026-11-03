@@ -29,7 +29,7 @@ import {
   type MindooTenantDirectory,
   type PrivateUserId,
 } from "../core/types";
-import type { ServerConfig } from "../node/server/types";
+import type { ServerConfig } from "../server/types";
 
 const PASSWORD = "member-pass";
 const SYSTEM_ADMIN_PASSWORD = "sysadmin-pass";

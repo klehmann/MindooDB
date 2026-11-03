@@ -1,5 +1,5 @@
 import { SimpleMindooDirectory } from "../node/server/TenantManager";
-import type { TenantConfig } from "../node/server/types";
+import type { TenantConfig } from "../server/types";
 
 /**
  * The config-based directory (`config.users[]`) is a public-key allowlist:

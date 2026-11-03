@@ -16,7 +16,7 @@ import {
 import { rpcCall } from "../../../core/appendonlystores/network/IrohNetworkTransport";
 import { NetworkError, NetworkErrorType } from "../../../core/appendonlystores/network/types";
 import { IROH_CHANGE_FEED_HEARTBEAT } from "../IrohServerRpc";
-import type { SyncChangeEvent } from "../SyncEventBus";
+import type { SyncChangeEvent } from "../../../server/SyncEventBus";
 
 export class IrohPeerLink {
   private connection: Promise<IrohConnectionHandle> | null = null;

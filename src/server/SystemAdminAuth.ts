@@ -8,13 +8,13 @@
  * the issued JWT can carry both fields for capability matching.
  */
 
-import { generateRandomUuid } from "../../core/utils/idGeneration";
-import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import { generateRandomUuid } from "../core/utils/idGeneration";
+import type { CryptoAdapter } from "../core/crypto/CryptoAdapter";
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
 import {
   extractAllPrincipals,
   hasTenantCreationWildcardPrincipal,
-} from "./config";
+} from "./serverConfig";
 
 // ---------------------------------------------------------------------------
 // Types

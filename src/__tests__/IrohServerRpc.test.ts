@@ -4,7 +4,7 @@ import { createLoopbackIrohPair } from "../core/appendonlystores/network/IrohStr
 import { isIrohLocator, parseIrohLocator } from "../core/appendonlystores/network/irohLocator";
 import { createMindooDBServerIrohHandler } from "../node/server/IrohServerRpc";
 import { validateServerConfig } from "../node/server/config";
-import { DEFAULT_SERVER_IROH_CONFIG } from "../node/server/types";
+import { DEFAULT_SERVER_IROH_CONFIG } from "../server/types";
 import { StoreKind } from "../core/appendonlystores/types";
 
 describe("Iroh server locator and config", () => {

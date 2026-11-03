@@ -30,8 +30,8 @@ import { InMemoryContentAddressedStoreFactory } from "../../appendonlystores/InM
 
 import { CANONICAL_NAME_HINT, toCanonicalSetupName } from "./canonicalSetupName";
 import { resolveServerPassword } from "./resolveServerPassword";
-import { DEFAULT_SERVER_IROH_CONFIG, ENV_VARS } from "./types";
-import type { ServerConfig } from "./types";
+import { DEFAULT_SERVER_IROH_CONFIG, ENV_VARS } from "../../server/types";
+import type { ServerConfig } from "../../server/types";
 
 interface InitOptions {
   name: string;

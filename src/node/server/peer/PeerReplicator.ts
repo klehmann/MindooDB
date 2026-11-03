@@ -49,8 +49,8 @@ import {
   type SyncScanCursorRecord,
   type SyncScanCursorStore,
 } from "../../../core/appendonlystores/syncStores";
-import type { TrustedServer } from "../types";
-import type { SyncEventBus, SyncChangeEvent } from "../SyncEventBus";
+import type { TrustedServer } from "../../../server/types";
+import type { SyncEventBus, SyncChangeEvent } from "../../../server/SyncEventBus";
 import {
   classifyPeerError,
   directionAllowsPull,
@@ -69,7 +69,7 @@ import {
   type PeerAttachmentMode,
   type PeerRole,
   type PeerSyncDirection,
-} from "./types";
+} from "../../../server/peer/types";
 
 /** What a replicator needs from the surrounding server to do its job. */
 export interface PeerReplicatorHost {

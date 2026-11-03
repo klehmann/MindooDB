@@ -5,7 +5,7 @@
 import { InMemoryContentAddressedStore } from "../../core/appendonlystores/InMemoryContentAddressedStore";
 import { BasicOnDiskContentAddressedStore } from "../appendonlystores/BasicOnDiskContentAddressedStore";
 import { StoreKind, type ContentAddressedStore } from "../../core/types";
-import type { StoreType, TenantConfig } from "./types";
+import type { StoreType, TenantConfig } from "../../server/types";
 
 /**
  * Factory for creating ContentAddressedStore instances based on configuration.

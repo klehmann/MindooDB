@@ -10,7 +10,7 @@ import {
   type IrohPeerClusterHost,
   type IrohServerStore,
 } from "../node/server/IrohServerRpc";
-import { SyncEventBus } from "../node/server/SyncEventBus";
+import { SyncEventBus } from "../server/SyncEventBus";
 import type { PeerTokenPayload } from "../node/server/peer/PeerAuthService";
 
 const PEER_TOKEN = "peer-jwt";

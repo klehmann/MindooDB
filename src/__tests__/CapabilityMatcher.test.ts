@@ -2,8 +2,8 @@
  * Unit tests for the capability matching engine.
  */
 
-import { CapabilityMatcher, parseSystemTenantItemPath } from "../node/server/CapabilityMatcher";
-import type { ServerConfig } from "../node/server/types";
+import { CapabilityMatcher, parseSystemTenantItemPath } from "../server/CapabilityMatcher";
+import type { ServerConfig } from "../server/types";
 
 describe("CapabilityMatcher", () => {
   const key1 = "-----BEGIN PUBLIC KEY-----\nKEY1\n-----END PUBLIC KEY-----";

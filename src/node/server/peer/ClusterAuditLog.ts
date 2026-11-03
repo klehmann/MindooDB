@@ -26,7 +26,7 @@
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "fs";
 import { join } from "path";
-import type { ClusterJobKind, ClusterJobScope } from "./types";
+import type { ClusterJobKind, ClusterJobScope } from "../../../server/peer/types";
 
 /** Rotate once the active file passes this size. */
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;

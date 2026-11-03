@@ -5,11 +5,11 @@
  * by enforcing strict rules on all user-supplied identifiers and arrays.
  */
 
-import { getDatabaseIdValidationError } from "../../core/databaseIdValidation";
+import { getDatabaseIdValidationError } from "../core/databaseIdValidation";
 import {
   getTenantIdValidationError,
   RESERVED_TENANT_NAMES,
-} from "../../core/tenantIdValidation";
+} from "../core/tenantIdValidation";
 
 /**
  * Validates an identifier (dbId, serverName, etc.).

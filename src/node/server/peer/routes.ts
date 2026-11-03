@@ -32,16 +32,16 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import type { StoreIdBloomSummary } from "../../../core/appendonlystores/types";
 import { bloomMightContainId } from "../../../core/appendonlystores/bloom";
-import type { SyncEventBus } from "../SyncEventBus";
+import type { SyncEventBus } from "../../../server/SyncEventBus";
 import type { ClusterManager } from "./ClusterManager";
-import type { TrustedServer } from "../types";
+import type { TrustedServer } from "../../../server/types";
 import {
   isPeerAttachmentMode,
   isPeerRole,
   isPeerSyncDirection,
   type ClusterJobKind,
   type ClusterJobScope,
-} from "./types";
+} from "../../../server/peer/types";
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace

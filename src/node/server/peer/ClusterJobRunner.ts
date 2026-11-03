@@ -21,7 +21,7 @@ import {
   type ClusterJobKind,
   type ClusterJobResult,
   type ClusterJobScope,
-} from "./types";
+} from "../../../server/peer/types";
 
 /** How many finished jobs to keep for polling before evicting the oldest. */
 const DEFAULT_HISTORY_LIMIT = 200;

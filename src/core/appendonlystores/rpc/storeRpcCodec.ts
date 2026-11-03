@@ -5,30 +5,10 @@
  * the transport's binary channel (see {@link StoreRpcClientTransport}).
  */
 
+import { base64ToBytes, bytesToBase64 } from "../../utils/base64";
+
 const BYTES_KEY = "$bytes";
 
-function bytesToBase64(bytes: Uint8Array): string {
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
-  }
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  if (typeof Buffer !== "undefined") {
-    return new Uint8Array(Buffer.from(value, "base64"));
-  }
-  const binary = atob(value);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
-}
 
 /** Deep copy of `value` with Uint8Arrays replaced by `{ $bytes }` objects. */
 export function encodeRpcValue(value: unknown): unknown {
