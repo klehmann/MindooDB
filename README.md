@@ -7,8 +7,6 @@ Apps collaborate and sync data without ever giving a server access to the conten
 
 Data is encrypted on the client before it leaves the device. Even someone with full access to your infrastructure — database dumps, backups, logs — gets nothing but ciphertext. No plaintext on the server, no server-side keys, no trust required.
 
-> ⚠️ **Beta software**: This project is in early development and not yet recommended for production use. APIs may change without notice.
-
 Use AI to explore this repository:
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/klehmann/MindooDB)
@@ -71,7 +69,7 @@ Haven is the fastest way to see MindooDB in action, and a real home for day-to-d
 - **Multi-tenant by design** — run work, personal, and cross-company tenants side by side, each cryptographically independent, all in one browser.
 - **Installable PWA** — add it to an iPhone, iPad, or Android home screen and launch it in standalone mode; encrypted `.mdbhaven-backup` files move a whole environment between browsers.
 
-Haven Community is **free** (in beta) and is the same client the MindooDB team uses in-house. Try it at **[haven.mindoodb.com](https://haven.mindoodb.com)**, read the full [Haven Handbook](./docs/haven-handbook.md), or explore more at [mindoodb.com](https://www.mindoodb.com).
+Haven Community is **free** and is the same client the MindooDB team uses in-house. Try it at **[haven.mindoodb.com](https://haven.mindoodb.com)**, read the full [Haven Handbook](./docs/haven-handbook.md), or explore more at [mindoodb.com](https://www.mindoodb.com).
 
 > Prefer to build directly on the engine? Keep reading — the Quick Start below is all code.
 
@@ -83,7 +81,7 @@ Haven Community is **free** (in beta) and is the same client the MindooDB team u
 pnpm add mindoodb
 ```
 
-> 📦 **Published regularly on npm.** We ship new versions frequently to [npmjs.com/package/mindoodb](https://www.npmjs.com/package/mindoodb), so pull updates often to stay current with fixes and API changes during the beta.
+> 📦 **Published regularly on npm.** We ship new versions frequently to [npmjs.com/package/mindoodb](https://www.npmjs.com/package/mindoodb), so pull updates often to stay current with fixes and API changes.
 
 > 📱 **React Native / Expo?** See the [React Native setup guide](./docs/reactnative.md) for mobile-specific instructions with native performance.
 >
