@@ -9,6 +9,8 @@ import { DatabaseSync } from "node:sqlite";
 import {
   createDurableObjectStore,
   DurableObjectServerDataStore,
+  R2_CONTENT_THRESHOLD_BYTES,
+  r2ContentStore,
 } from "../cloudflare/DurableObjectSql";
 import { clientAddressKey, matchRoute } from "../cloudflare/http";
 import type { SqlStorage, SqlStorageCursor } from "../cloudflare/types";
@@ -86,6 +88,41 @@ describe("Durable Object SQL adapters", () => {
     expect((await reopened.getAllIds()).sort()).toEqual(["n1", "n2"]);
     const scan = await reopened.scanEntriesSince!(null, 10);
     expect(scan.entries.map((e) => e.id).sort()).toEqual(["n1", "n2"]);
+  });
+
+  test("large payloads go to the external store and come back", async () => {
+    const sql = sqlStorage();
+    const objects = new Map<string, Uint8Array>();
+    const bucket = {
+      put: async (key: string, value: ArrayBuffer | ArrayBufferView) => {
+        objects.set(key, new Uint8Array(value instanceof ArrayBuffer ? value : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)));
+      },
+      get: async (key: string) => {
+        const bytes = objects.get(key);
+        return bytes ? { arrayBuffer: async () => bytes.slice().buffer } : null;
+      },
+      delete: async (keys: string | string[]) => {
+        for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key);
+      },
+      list: async ({ prefix = "" }: { prefix?: string } = {}) => ({
+        objects: [...objects.keys()].filter((key) => key.startsWith(prefix)).map((key) => ({ key })),
+        truncated: false,
+      }),
+    };
+    const store = createDurableObjectStore(sql, "notes", StoreKind.docs, "d_", r2ContentStore(bucket, "acme/notes/d_"));
+
+    const big = Array.from({ length: R2_CONTENT_THRESHOLD_BYTES + 10 }, (_, i) => i % 251);
+    await store.putEntries([entry("big", "doc-a", big), entry("small", "doc-a", [1, 2, 3])]);
+    expect([...objects.keys()]).toEqual(["acme/notes/d_hash-big"]);
+
+    const [loadedBig, loadedSmall] = await store.getEntries(["big", "small"]);
+    expect(loadedBig.encryptedData.byteLength).toBe(big.length);
+    expect(loadedBig.encryptedData[1000]).toBe(1000 % 251);
+    expect(Array.from(loadedSmall.encryptedData)).toEqual([1, 2, 3]);
+
+    await store.deleteEntriesById!(["big"]);
+    expect(objects.size).toBe(0);
+    expect(await store.getAllIds()).toEqual(["small"]);
   });
 
   test("server data store keeps keys, values and directories", () => {

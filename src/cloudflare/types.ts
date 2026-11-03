@@ -45,6 +45,18 @@ export interface DurableObjectNamespace {
   get(id: DurableObjectId): DurableObjectStub;
 }
 
+/** The slice of an R2 bucket binding used for large entries. */
+export interface R2Bucket {
+  put(key: string, value: ArrayBuffer | ArrayBufferView): Promise<unknown>;
+  get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer> } | null>;
+  delete(keys: string | string[]): Promise<void>;
+  list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{
+    objects: Array<{ key: string }>;
+    truncated: boolean;
+    cursor?: string;
+  }>;
+}
+
 /** Workers Rate Limiting binding (`ratelimits` in the wrangler config). */
 export interface RateLimitBinding {
   limit(options: { key: string }): Promise<{ success: boolean }>;
@@ -58,6 +70,11 @@ export interface ExecutionContext {
 export interface MindooCloudflareEnv {
   MINDOODB_SERVER: DurableObjectNamespace;
   MINDOODB_DATABASES: DurableObjectNamespace;
+  /**
+   * Optional R2 bucket for entries too large for Durable Object SQLite
+   * (rows are capped at 2 MB). Without it such entries are refused.
+   */
+  MINDOODB_LARGE_ENTRIES?: R2Bucket;
 
   /** `server.identity.json` content (secret). Created by `cloudflare/scripts/setup.mjs`. */
   MINDOODB_SERVER_IDENTITY?: string;

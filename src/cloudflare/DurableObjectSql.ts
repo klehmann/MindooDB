@@ -10,6 +10,7 @@
 
 import {
   createSqlBackend,
+  type ExternalContentStore,
   type SqliteExecutor,
   type SqliteStoreBackend,
   type SqliteValue,
@@ -17,11 +18,12 @@ import {
 import { SqliteContentAddressedStore } from "../core/appendonlystores/sqlite/SqliteContentAddressedStore";
 import type { StoreKind } from "../core/appendonlystores/types";
 import type { ServerDataStore } from "../server/ServerDataStore";
-import type { SqlStorage } from "./types";
+import type { R2Bucket, SqlStorage } from "./types";
 
 /**
  * Durable Object SQLite limits a BLOB, and a row, to 2 MB. Entries above this
- * are refused with a clear error instead of a storage exception mid-batch.
+ * are refused with a clear error instead of a storage exception mid-batch —
+ * unless an R2 bucket takes them (see {@link r2ContentStore}).
  */
 export const MAX_DURABLE_OBJECT_ENTRY_BYTES = 2 * 1024 * 1024 - 64 * 1024;
 
@@ -58,10 +60,54 @@ export function createDurableObjectSqlExecutor(sql: SqlStorage): SqliteExecutor 
   };
 }
 
-export function createDurableObjectStoreBackend(sql: SqlStorage, tablePrefix: string): SqliteStoreBackend {
+/** Payloads from this size on go to R2; well below the row limit, rare in practice. */
+export const R2_CONTENT_THRESHOLD_BYTES = 1024 * 1024;
+
+/**
+ * Payloads of one store in R2, under `<keyPrefix><contentHash>`. The key
+ * prefix names the tenant, database and store, so stores never share
+ * objects and a database's objects can be removed by prefix.
+ */
+export function r2ContentStore(bucket: R2Bucket, keyPrefix: string): ExternalContentStore {
+  return {
+    thresholdBytes: R2_CONTENT_THRESHOLD_BYTES,
+    async put(contentHash, bytes) {
+      await bucket.put(`${keyPrefix}${contentHash}`, bytes);
+    },
+    async get(contentHash) {
+      const object = await bucket.get(`${keyPrefix}${contentHash}`);
+      return object ? new Uint8Array(await object.arrayBuffer()) : null;
+    },
+    async delete(contentHash) {
+      await bucket.delete(`${keyPrefix}${contentHash}`);
+    },
+    async clear() {
+      await deleteR2Prefix(bucket, keyPrefix);
+    },
+  };
+}
+
+/** Remove every object under `prefix`. */
+export async function deleteR2Prefix(bucket: R2Bucket, prefix: string): Promise<void> {
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor, limit: 1000 });
+    if (page.objects.length > 0) {
+      await bucket.delete(page.objects.map((object) => object.key));
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+}
+
+export function createDurableObjectStoreBackend(
+  sql: SqlStorage,
+  tablePrefix: string,
+  externalContent?: ExternalContentStore,
+): SqliteStoreBackend {
   return createSqlBackend(createDurableObjectSqlExecutor(sql), {
     tablePrefix,
     explicitTransactions: false,
+    externalContent,
   });
 }
 
@@ -71,11 +117,12 @@ export function createDurableObjectStore(
   dbId: string,
   storeKind: StoreKind,
   tablePrefix: string,
+  externalContent?: ExternalContentStore,
 ): SqliteContentAddressedStore {
   return new SqliteContentAddressedStore(
     dbId,
     storeKind,
-    createDurableObjectStoreBackend(sql, tablePrefix),
+    createDurableObjectStoreBackend(sql, tablePrefix, externalContent),
   );
 }
 

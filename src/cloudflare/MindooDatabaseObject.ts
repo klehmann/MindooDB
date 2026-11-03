@@ -45,7 +45,12 @@ import { guardStoreAgainstPurgedDocuments } from "../core/appendonlystores/purge
 import { StoreRpcServer } from "../core/appendonlystores/rpc/StoreRpcServer";
 import type { StoreRpcRequest } from "../core/appendonlystores/rpc/RpcContentAddressedStore";
 import { StoreRpcBytes } from "./storeRpc";
-import { createDurableObjectStore, DurableObjectServerDataStore } from "./DurableObjectSql";
+import {
+  createDurableObjectStore,
+  deleteR2Prefix,
+  DurableObjectServerDataStore,
+  r2ContentStore,
+} from "./DurableObjectSql";
 import { WorkersCryptoAdapter } from "./WorkersCryptoAdapter";
 import {
   INTERNAL_HEADER,
@@ -166,10 +171,22 @@ export class MindooDatabaseObject {
     }
     let store = this.stores.get(prefix);
     if (!store) {
-      store = createDurableObjectStore(this.ctx.storage.sql, dbId, storeKind, prefix);
+      const bucket = this.env.MINDOODB_LARGE_ENTRIES;
+      store = createDurableObjectStore(
+        this.ctx.storage.sql,
+        dbId,
+        storeKind,
+        prefix,
+        bucket ? r2ContentStore(bucket, `${this.r2Prefix()}${prefix}`) : undefined,
+      );
       this.stores.set(prefix, store);
     }
     return store;
+  }
+
+  /** R2 keys of this object's large entries start with this. */
+  private r2Prefix(): string {
+    return `${encodeURIComponent(this.tenantId!)}/${encodeURIComponent(this.dbId!)}/`;
   }
 
   // ==================== Tenant state ====================
@@ -556,6 +573,9 @@ export class MindooDatabaseObject {
           return jsonResponse(500, { error: `Wiping ${dbId} failed` });
         }
       }
+    }
+    if (this.env.MINDOODB_LARGE_ENTRIES) {
+      await deleteR2Prefix(this.env.MINDOODB_LARGE_ENTRIES, this.r2Prefix());
     }
     await this.ctx.storage.deleteAll();
     this.tenantState = null;

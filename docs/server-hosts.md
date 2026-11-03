@@ -89,6 +89,10 @@ differences to Node: see `cloudflare/README.md`).
 - Sync tokens are HMAC-signed with a per-tenant key derived from
   `MINDOODB_JWT_SECRET`, so a token issued by the directory object is valid in
   every database object of the tenant (`TenantManagerOptions.jwtSecretForTenant`).
+- Entries of 1 MB and more go to R2 (`MINDOODB_LARGE_ENTRIES`) through the
+  SQLite driver's `externalContent` option: the content row keeps an empty
+  BLOB and `<prefix>content_external` lists the hashes kept outside, under
+  `<tenantId>/<dbId>/<table prefix><hash>`. A tenant wipe deletes them by prefix.
 - Purge requests are executed by each database object for its own database
   (`executePendingPurges(tenantId, { dbIds })`).
 - **Peer replication** runs in the server object: the `ClusterManager` of the

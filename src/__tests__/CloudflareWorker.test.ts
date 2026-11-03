@@ -159,6 +159,15 @@ describeWorker("MindooDB server on Cloudflare (wrangler dev)", () => {
     const remoteAttachmentsA = await a.tenant.connectToServer(worker.baseUrl, "notes", StoreKind.attachments);
     await remoteAttachmentsA.putEntries(await localAttachments.getEntries(await localAttachments.getAllIds()));
     await addDoc(a.tenant, "tasks", "a-task-1");
+    // A document change larger than a Durable Object SQLite row (2 MB): its
+    // entry is kept in R2.
+    const bigText = Buffer.from(new Uint8Array(2_600_000).map(() => Math.floor(Math.random() * 256))).toString("base64");
+    const tasksA = await a.tenant.openDB("tasks");
+    const bigDoc = await tasksA.createDocument();
+    await tasksA.changeDoc(bigDoc, async (d) => {
+      d.getData().title = "a-task-big";
+      d.getData().body = bigText;
+    });
     await push(a.tenant, worker.baseUrl, "notes");
     await push(a.tenant, worker.baseUrl, "tasks");
     // Tenant B writes to a database of the same name.
@@ -187,7 +196,9 @@ describeWorker("MindooDB server on Cloudflare (wrangler dev)", () => {
     const copied = await (await notes2.getDocument(withAttachment.getId())).getAttachment(attachmentId);
     expect(copied.length).toBe(attachmentBytes.length);
     expect(Buffer.from(copied).equals(Buffer.from(attachmentBytes))).toBe(true);
-    expect(await titles(device2, "tasks")).toEqual(["a-task-1"]);
+    expect(await titles(device2, "tasks")).toEqual(["a-task-1", "a-task-big"]);
+    const bigCopy = await (await device2.openDB("tasks")).getDocument(bigDoc.getId());
+    expect(bigCopy.getData().body).toBe(bigText);
 
     // A subscriber on the event stream, gated on `notes`.
     const token = await tokenFor(worker.baseUrl, tenantA, a.appUser, PASSWORD);

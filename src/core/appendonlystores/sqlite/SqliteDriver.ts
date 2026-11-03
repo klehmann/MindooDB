@@ -124,6 +124,23 @@ export interface SqlBackendOptions {
    * writes of one event-loop turn atomically. Batches still run one at a time.
    */
   explicitTransactions?: boolean;
+  /**
+   * Keep payloads of at least {@link ExternalContentStore.thresholdBytes}
+   * outside SQLite, for engines that cap BLOB or row size (Durable Object
+   * SQLite: 2 MB). The content row stays, with an empty BLOB, and an extra
+   * table records which hashes live outside.
+   */
+  externalContent?: ExternalContentStore;
+}
+
+/** Where a backend keeps payloads too large for its SQLite (e.g. Cloudflare R2). */
+export interface ExternalContentStore {
+  thresholdBytes: number;
+  put(contentHash: string, bytes: Uint8Array): Promise<void>;
+  get(contentHash: string): Promise<Uint8Array | null>;
+  delete(contentHash: string): Promise<void>;
+  /** Remove every payload of this store (`clearAll`). */
+  clear?(): Promise<void>;
 }
 
 export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOptions = {}): SqliteStoreBackend {
@@ -132,10 +149,37 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
     throw new Error(`Invalid SQLite table prefix: ${prefix}`);
   }
   const explicitTransactions = options.explicitTransactions !== false;
+  const external = options.externalContent;
   const enqueue = createQueue();
+
+  /** The payload of a content row, fetched from the external store when it lives there. */
+  async function resolveBytes(hash: string, stored: unknown): Promise<Uint8Array> {
+    const bytes = asBytes(stored);
+    if (!external || bytes.byteLength > 0) {
+      return bytes;
+    }
+    const marked = await executor.get(
+      `SELECT 1 AS present FROM ${prefix}content_external WHERE content_hash = ?`,
+      [hash],
+    );
+    if (!marked) {
+      return bytes;
+    }
+    const loaded = await external.get(hash);
+    if (!loaded) {
+      throw new Error(`External content ${hash} is missing`);
+    }
+    return loaded;
+  }
+
   return {
     async init() {
       await executor.exec(schema(prefix));
+      if (external) {
+        await executor.exec(
+          `CREATE TABLE IF NOT EXISTS ${prefix}content_external (content_hash TEXT PRIMARY KEY NOT NULL);`,
+        );
+      }
     },
 
     transaction(work) {
@@ -170,11 +214,15 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
       const result: Array<{ id: string; metaJson: string; data: Uint8Array }> = [];
       for (const slice of chunks(ids, IN_LIST_CHUNK)) {
         const rows = await executor.all(
-          `SELECT e.id AS id, e.metadata_json AS metadata_json, c.bytes AS bytes FROM ${prefix}entries e JOIN ${prefix}content c ON c.content_hash = e.content_hash WHERE e.id IN (${placeholders(slice.length)})`,
+          `SELECT e.id AS id, e.metadata_json AS metadata_json, e.content_hash AS content_hash, c.bytes AS bytes FROM ${prefix}entries e JOIN ${prefix}content c ON c.content_hash = e.content_hash WHERE e.id IN (${placeholders(slice.length)})`,
           slice,
         );
         for (const row of rows) {
-          result.push({ id: String(row.id), metaJson: String(row.metadata_json), data: asBytes(row.bytes) });
+          result.push({
+            id: String(row.id),
+            metaJson: String(row.metadata_json),
+            data: await resolveBytes(String(row.content_hash), row.bytes),
+          });
         }
       }
       return result;
@@ -224,13 +272,13 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
 
     async getEntryRow(id) {
       const row = await executor.get(
-        `SELECT e.metadata_json AS metadata_json, c.bytes AS bytes FROM ${prefix}entries e JOIN ${prefix}content c ON c.content_hash = e.content_hash WHERE e.id = ?`,
+        `SELECT e.metadata_json AS metadata_json, e.content_hash AS content_hash, c.bytes AS bytes FROM ${prefix}entries e JOIN ${prefix}content c ON c.content_hash = e.content_hash WHERE e.id = ?`,
         [id],
       );
       if (!row) {
         return null;
       }
-      return { metaJson: String(row.metadata_json), data: asBytes(row.bytes) };
+      return { metaJson: String(row.metadata_json), data: await resolveBytes(String(row.content_hash), row.bytes) };
     },
 
     async getMetadataJson(id) {
@@ -295,10 +343,25 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
       if (!row) {
         return null;
       }
-      return { data: asBytes(row.bytes), refCount: Number(row.ref_count) };
+      return { data: await resolveBytes(hash, row.bytes), refCount: Number(row.ref_count) };
     },
 
     async putContent(hash, data, refCount) {
+      if (external && data.byteLength >= external.thresholdBytes) {
+        // Payload first: a crash in between leaves an unreferenced object
+        // behind, never a row without its payload.
+        await external.put(hash, data);
+        // X'' rather than a bound empty buffer: some drivers bind that as NULL.
+        await executor.run(
+          `INSERT INTO ${prefix}content(content_hash, bytes, ref_count) VALUES(?, X'', ?)`,
+          [hash, refCount],
+        );
+        await executor.run(
+          `INSERT OR IGNORE INTO ${prefix}content_external(content_hash) VALUES(?)`,
+          [hash],
+        );
+        return;
+      }
       await executor.run(
         `INSERT INTO ${prefix}content(content_hash, bytes, ref_count) VALUES(?, ?, ?)`,
         [hash, data, refCount],
@@ -311,6 +374,15 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
 
     async deleteContent(hash) {
       await executor.run(`DELETE FROM ${prefix}content WHERE content_hash = ?`, [hash]);
+      if (external) {
+        const { changes } = await executor.run(
+          `DELETE FROM ${prefix}content_external WHERE content_hash = ?`,
+          [hash],
+        );
+        if (changes > 0) {
+          await external.delete(hash);
+        }
+      }
     },
 
     async countEntries() {
@@ -330,6 +402,10 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
 
     async clearAll() {
       await executor.exec(`DELETE FROM ${prefix}entries; DELETE FROM ${prefix}content; DELETE FROM ${prefix}store_meta;`);
+      if (external) {
+        await executor.exec(`DELETE FROM ${prefix}content_external;`);
+        await external.clear?.();
+      }
     },
   };
 }

@@ -58,7 +58,8 @@ folder only holds the Worker's configuration. To update, bump `mindoodb` in
    ```
 
 Without the button: clone MindooDB, `cd cloudflare`, `npm install`,
-`npx wrangler login`, `npm run setup`, `npm run deploy`.
+`npx wrangler login`, `npx wrangler r2 bucket create mindoodb-large-entries`
+(or remove the `r2_buckets` entry), `npm run setup`, `npm run deploy`.
 
 ### Own domain
 
@@ -127,9 +128,11 @@ npm run dev                # wrangler dev, storage stays local
   (periods of 10 or 60 seconds), not from `rateLimits` in `config.json`. The
   timestamp proxy's daily cap is not enforced. The admin IP allowlist
   (`MINDOODB_ADMIN_ALLOWED_IPS`) does not exist; use Cloudflare WAF rules.
-- **Entry size:** a single entry may be at most about 1.9 MB (the row limit of
-  Durable Object SQLite). Attachments are split into 256 KB chunks and are
-  not affected.
+- **Large entries:** Durable Object SQLite caps a row at 2 MB, so entries of
+  1 MB and more are kept in the R2 bucket bound as `MINDOODB_LARGE_ENTRIES`
+  (`mindoodb-large-entries` in `wrangler.jsonc`). Without the binding, entries
+  above about 1.9 MB are refused. Attachments are split into 256 KB chunks
+  and stay in SQLite.
 - **Key derivation:** Workers allow at most 100 000 PBKDF2 iterations, so the
   server identity and server key bag use that count (the Node server uses
   310 000). Client identities are never decrypted on the server.
@@ -146,3 +149,4 @@ npm run dev                # wrangler dev, storage stays local
 | `MINDOODB_CORS_ORIGIN` | var | you |
 | `MINDOODB_JSON_BODY_LIMIT` | var | default `5mb` |
 | `MINDOODB_TSA_PROVIDERS` | var | optional, as on Node |
+| `MINDOODB_LARGE_ENTRIES` | R2 binding | optional; entries of 1 MB and more |

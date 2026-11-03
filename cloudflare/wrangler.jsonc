@@ -15,6 +15,12 @@
       { "name": "MINDOODB_DATABASES", "class_name": "MindooDatabaseObject" }
     ]
   },
+  // Entries of 1 MB and more are kept in R2 (Durable Object SQLite rows are
+  // capped at 2 MB). Remove the binding to refuse entries above ~1.9 MB instead.
+  "r2_buckets": [
+    { "binding": "MINDOODB_LARGE_ENTRIES", "bucket_name": "mindoodb-large-entries" }
+  ],
+
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["MindooServerObject", "MindooDatabaseObject"] }
   ],
