@@ -131,6 +131,12 @@ export interface SqlBackendOptions {
    * table records which hashes live outside.
    */
   externalContent?: ExternalContentStore;
+  /**
+   * Most bound parameters the engine accepts in one statement; `IN (...)`
+   * lists are split accordingly. SQLite allows 32766, Durable Object SQLite
+   * only 100.
+   */
+  maxBoundParameters?: number;
 }
 
 /** Where a backend keeps payloads too large for its SQLite (e.g. Cloudflare R2). */
@@ -150,6 +156,7 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
   }
   const explicitTransactions = options.explicitTransactions !== false;
   const external = options.externalContent;
+  const inListChunk = Math.max(1, Math.min(IN_LIST_CHUNK, options.maxBoundParameters ?? IN_LIST_CHUNK));
   const enqueue = createQueue();
 
   /** The payload of a content row, fetched from the external store when it lives there. */
@@ -201,7 +208,7 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
 
     async hasEntries(ids) {
       const present: string[] = [];
-      for (const slice of chunks(ids, IN_LIST_CHUNK)) {
+      for (const slice of chunks(ids, inListChunk)) {
         const rows = await executor.all(`SELECT id FROM ${prefix}entries WHERE id IN (${placeholders(slice.length)})`, slice);
         for (const row of rows) {
           present.push(String(row.id));
@@ -212,7 +219,7 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
 
     async getEntryRows(ids) {
       const result: Array<{ id: string; metaJson: string; data: Uint8Array }> = [];
-      for (const slice of chunks(ids, IN_LIST_CHUNK)) {
+      for (const slice of chunks(ids, inListChunk)) {
         const rows = await executor.all(
           `SELECT e.id AS id, e.metadata_json AS metadata_json, e.content_hash AS content_hash, c.bytes AS bytes FROM ${prefix}entries e JOIN ${prefix}content c ON c.content_hash = e.content_hash WHERE e.id IN (${placeholders(slice.length)})`,
           slice,

@@ -99,6 +99,9 @@ export async function deleteR2Prefix(bucket: R2Bucket, prefix: string): Promise<
   } while (cursor);
 }
 
+/** Durable Object SQLite refuses statements with more bound parameters than this. */
+export const DURABLE_OBJECT_MAX_BOUND_PARAMETERS = 100;
+
 export function createDurableObjectStoreBackend(
   sql: SqlStorage,
   tablePrefix: string,
@@ -108,6 +111,7 @@ export function createDurableObjectStoreBackend(
     tablePrefix,
     explicitTransactions: false,
     externalContent,
+    maxBoundParameters: DURABLE_OBJECT_MAX_BOUND_PARAMETERS,
   });
 }
 

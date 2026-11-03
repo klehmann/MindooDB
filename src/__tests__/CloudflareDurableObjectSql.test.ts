@@ -25,6 +25,10 @@ function sqlStorage(): SqlStorage {
       if (/^\s*(BEGIN|COMMIT|ROLLBACK)/i.test(query)) {
         throw new Error("Durable Object SQL rejects transaction statements");
       }
+      // Like Durable Object SQLite: at most 100 bound parameters per statement.
+      if (bindings.length > 100) {
+        throw new Error("too many SQL variables: SQLITE_ERROR");
+      }
       const params = bindings.map((value) => (value instanceof ArrayBuffer ? new Uint8Array(value) : value));
       let rows: T[] = [];
       let rowsWritten = 0;
@@ -123,6 +127,15 @@ describe("Durable Object SQL adapters", () => {
     await store.deleteEntriesById!(["big"]);
     expect(objects.size).toBe(0);
     expect(await store.getAllIds()).toEqual(["small"]);
+  });
+
+  test("batches above the bound-parameter limit are split", async () => {
+    const store = createDurableObjectStore(sqlStorage(), "notes", StoreKind.docs, "d_");
+    const entries = Array.from({ length: 250 }, (_, i) => entry(`e${i}`, `doc-${i % 7}`, [i % 256]));
+    await store.putEntries(entries);
+    const ids = entries.map((e) => e.id);
+    expect((await store.hasEntries(ids)).length).toBe(250);
+    expect((await store.getEntries(ids)).length).toBe(250);
   });
 
   test("server data store keeps keys, values and directories", () => {
