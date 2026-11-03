@@ -334,6 +334,19 @@ println(r.databases.map { "${it.dbId}: +${it.pulledEntries} / ${it.pushedEntries
 session.refresh("orders", SyncDirection.Pull)
 ```
 
+To show progress, for example during the first sync of a large tenant, collect `session.syncProgress()`. It reports every push and pull of the session (refresh, publish, approval and the background loop) per database and store: phase (`preparing`, `planning`, `transferring`, `processing`, `complete`), scanned and transferred entries and bytes, and `totalSourceEntries` when known, so `scannedEntries / totalSourceEntries` is a completion ratio. Each push or pull ends with `complete`. The background loop starts 5 seconds after a session opens, so subscribe first or call `refresh` yourself.
+
+```kotlin
+val progress = launch {
+    session.syncProgress().collect { p ->
+        val ratio = p.totalSourceEntries?.let { total -> p.scannedEntries * 100 / maxOf(total, 1) }
+        println("${p.dbId} ${p.direction} ${p.store}: ${p.phase} ${ratio ?: "?"}% (${p.transferredEntries} entries)")
+    }
+}
+session.refresh()
+progress.cancel()
+```
+
 `rejectedEntries > 0` means the server refused some of your changes (typically because an access policy forbids them). A tenant created elsewhere (for example in Haven) can be used from the JVM through the join flow below.
 
 ---
@@ -348,7 +361,10 @@ val user = MindooDBBridge.createUser(endpoint, "cn=billing/o=acme", "billing pas
 val request = MindooDBBridge.createJoinRequest(endpoint, user.identity, label = "Billing service")
 // send request.joinRequest (an mdb:// URI) to the admin
 
-// On the admin side, in a session of the tenant:
+// On the admin side, in a session of the tenant: look at the request first
+val info = session.inspectJoinRequest(request.joinRequest)
+println("${info.username} wants access for '${info.label}', key ${info.signingPublicKeyFingerprint}")
+if (info.directoryUser?.exists == true) println("adds a device to an existing person")
 val approved = session.approveJoinRequest(
     request.joinRequest,
     adminPassword = "a long admin passphrase",
@@ -363,6 +379,8 @@ MindooDBBridge.joinTenant(
 )
 val billing = MindooDBBridge.openSession(endpoint, "acme", "cn=billing/o=acme", "billing passphrase", listOf("orders"))
 ```
+
+`inspectJoinRequest` decodes the request without approving it. Compare `signingPublicKeyFingerprint` with the fingerprint the joining device shows (Haven uses the same format), so nobody can slip in their own keys. `directoryUser` tells you whether the name already exists (approving then adds a device to that person; pass `username` to choose the person yourself) and whether this exact device is already granted. `hasUserKey = false` means the requesting identity has no User-Key; create users with `createUser`, which adds one.
 
 Haven users can approve the same request in Haven, and a JVM admin can approve requests created in Haven: it is the same protocol.
 
