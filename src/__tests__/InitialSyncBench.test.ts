@@ -16,6 +16,7 @@
  *     npx jest --runInBand InitialSyncBench
  */
 import fs from "fs";
+import * as inspector from "inspector";
 import * as zlib from "zlib";
 import { Server } from "http";
 
@@ -41,6 +42,16 @@ const RUN = process.env.BENCH === "1";
 const DOCS = Number(process.env.BENCH_DOCS ?? 1000);
 const CHANGES = Number(process.env.BENCH_CHANGES ?? 3);
 const LATENCY_MS = Number(process.env.BENCH_LATENCY_MS ?? 0);
+/** Writes a CPU profile of the measured section to this path. */
+const PROFILE_PATH = process.env.BENCH_PROFILE;
+/**
+ * Local indexes on the receiving replica: "both" (summary buffer + full-text
+ * index, the default), "summary" (summary buffer only, as in Haven for a
+ * database without `fulltextSetup`) or "none".
+ */
+const INDEX_MODE = process.env.BENCH_INDEXES ?? "both";
+const SUMMARY = INDEX_MODE !== "none";
+const FULLTEXT = INDEX_MODE === "both";
 const DB_ID = "main";
 
 const PASSWORD = "bench-pass";
@@ -214,6 +225,11 @@ maybe("initial sync benchmark", () => {
       // ── Seed ──────────────────────────────────────────────────────────
       const tSeed = performance.now();
       const mainDb = await device1Tenant.openDB(DB_ID);
+      if (FULLTEXT) {
+        // Synced `dbsetup`: the joining replica activates its full-text
+        // index from it while the documents stream in.
+        await mainDb.setFulltextSetup({ enabled: true });
+      }
       for (let i = 0; i < DOCS; i++) {
         const doc = await mainDb.createDocument();
         for (let c = 0; c < CHANGES; c++) {
@@ -288,6 +304,12 @@ maybe("initial sync benchmark", () => {
       ];
       wire.clear();
       stats.clear();
+      const profiler = PROFILE_PATH ? new inspector.Session() : null;
+      if (profiler) {
+        profiler.connect();
+        await new Promise<void>((resolve) => profiler.post("Profiler.enable", () => resolve()));
+        await new Promise<void>((resolve) => profiler.post("Profiler.start", () => resolve()));
+      }
       wireEnabled = true;
       const t0 = performance.now();
       // Same sequence as Haven's syncDatabaseTargetToConnection (scope "full",
@@ -302,6 +324,32 @@ maybe("initial sync benchmark", () => {
         }
       };
       const local = await step("openDB", () => joined.tenant.openDB(DB_ID));
+      // Document loads during and after the pull, split into cache hits and
+      // materializations (the database's own performance hook).
+      const loads = { hits: 0, misses: 0, automergeMs: 0, verifyMs: 0, decryptMs: 0, totalMs: 0 };
+      (local as unknown as { performanceCallback?: unknown }).performanceCallback = {
+        onDocumentLoad: (m: {
+          cacheHit: boolean;
+          automergeTime: number;
+          signatureVerificationTime: number;
+          decryptionTime: number;
+          totalTime: number;
+        }) => {
+          if (m.cacheHit) {
+            loads.hits++;
+            return;
+          }
+          loads.misses++;
+          loads.automergeMs += m.automergeTime;
+          loads.verifyMs += m.signatureVerificationTime;
+          loads.decryptMs += m.decryptionTime;
+          loads.totalMs += m.totalTime;
+        },
+      };
+      if (SUMMARY) {
+        // Haven's cold-start pattern: summary buffer active before the pull.
+        local.getSummaryStore();
+      }
       await step("syncStoreChanges (pre)", () => local.syncStoreChanges());
       const remote = await step("connect docs", () =>
         joined.tenant.connectToServer(baseUrl, DB_ID, StoreKind.docs),
@@ -322,6 +370,13 @@ maybe("initial sync benchmark", () => {
       const tProc = performance.now();
       await local.syncStoreChanges();
       const tailMs = performance.now() - tProc;
+      // Summary buffer and full-text index follow the changefeed in the
+      // background; the replica is fully usable once they have caught up.
+      const tIdx = performance.now();
+      await (joined.tenant as { whenBackgroundIdle?: () => Promise<void> }).whenBackgroundIdle?.();
+      if (SUMMARY) await local.getSummaryStore().update();
+      if (FULLTEXT) await local.getFullTextIndex().update();
+      const indexMs = performance.now() - tIdx;
       const tQuery = performance.now();
       const allIds = await local.getAllDocumentIds();
       const queryMs = performance.now() - tQuery;
@@ -334,14 +389,30 @@ maybe("initial sync benchmark", () => {
       const totalMs = performance.now() - t0;
       wireEnabled = false;
       restores.forEach((r) => r());
+      if (profiler) {
+        const profile = await new Promise<unknown>((resolve) =>
+          profiler.post("Profiler.stop", (_err, result) => resolve(result?.profile)),
+        );
+        fs.writeFileSync(PROFILE_PATH!, JSON.stringify(profile));
+        profiler.disconnect();
+      }
 
-      expect(allIds.length).toBe(DOCS);
+      // The `dbsetup` document carrying the full-text setup is one more.
+      expect(allIds.length).toBe(DOCS + (FULLTEXT ? 1 : 0));
+      if (FULLTEXT) {
+        const { hits } = await local.getFullTextIndex().search("Document");
+        expect(hits.length).toBeGreaterThan(0);
+      }
 
       const fmt = (ms: number) => `${(ms / 1000).toFixed(2)} s`;
       const lines: string[] = [];
-      lines.push(`docs=${DOCS} changes/doc=${CHANGES} latency=${LATENCY_MS}ms`);
+      lines.push(`docs=${DOCS} changes/doc=${CHANGES} latency=${LATENCY_MS}ms indexes=${INDEX_MODE}`);
       lines.push(`entries transferred=${result.transferredEntries} bytes=${result.transferredBytes}`);
-      lines.push(`total=${fmt(totalMs)} pull=${fmt(pullMs)} tail syncStoreChanges=${fmt(tailMs)} getAllDocumentIds=${fmt(queryMs)} first getDocument of all=${fmt(readMs)}`);
+      lines.push(`total=${fmt(totalMs)} pull=${fmt(pullMs)} tail syncStoreChanges=${fmt(tailMs)} indexes caught up after pull=${fmt(indexMs)} getAllDocumentIds=${fmt(queryMs)} first getDocument of all=${fmt(readMs)}`);
+      lines.push(
+        `document loads: ${loads.misses} materialized (${fmt(loads.totalMs)}: automerge ${fmt(loads.automergeMs)}, ` +
+          `verify ${fmt(loads.verifyMs)}, decrypt ${fmt(loads.decryptMs)}), ${loads.hits} cache hits`,
+      );
       lines.push("-- steps (Haven sequence) --");
       for (const [name, ms] of steps) lines.push(`${name.padEnd(30)} ${fmt(ms)}`);
       lines.push("-- wire (per endpoint) --");
