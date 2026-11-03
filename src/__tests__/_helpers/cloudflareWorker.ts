@@ -90,6 +90,7 @@ export async function startCloudflareWorker(options: {
     MINDOODB_SERVER_CONFIG: JSON.stringify({
       ...options.serverConfig,
       capabilities: {
+        ...(options.serverConfig?.capabilities as Record<string, unknown> | undefined),
         "ALL:/system/*": [
           {
             username: options.systemAdmin.username,

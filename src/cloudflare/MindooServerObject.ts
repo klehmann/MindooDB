@@ -421,10 +421,7 @@ export class MindooServerObject {
         return jsonResponse(404, { error: "Not found" });
       }
       const req = await this.parse(request, handler.params);
-      // Like the Node server, cluster capabilities are matched against
-      // "/system" + the path below /system/cluster.
-      const guardPath = cluster ? `/system/${segments.slice(1).join("/")}` : path;
-      const rejection = await this.core.systemAdminGuard(req, guardPath);
+      const rejection = await this.core.systemAdminGuard(req, path);
       if (rejection) return toResponse(rejection);
       return toResponse(await handler.run(req));
     }

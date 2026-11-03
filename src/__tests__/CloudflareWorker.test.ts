@@ -94,6 +94,8 @@ describeWorker("MindooDB server on Cloudflare (wrangler dev)", () => {
   const crypto = new NodeCryptoAdapter();
   let worker: RunningWorker;
   let sysadmin: PrivateUserId;
+  let auditor: PrivateUserId;
+  let statusOnly: PrivateUserId;
 
   beforeAll(async () => {
     const bootstrap = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
@@ -104,15 +106,40 @@ describeWorker("MindooDB server on Cloudflare (wrangler dev)", () => {
     const serverIdentity = await bootstrap.createUserId("CN=cf-test-server", SERVER_PASSWORD);
     delete globals.__MINDOODB_PBKDF2_ITERATIONS;
     sysadmin = await bootstrap.createUserId("cn=sysadmin/o=cf-test", SYSADMIN_PASSWORD);
+    auditor = await bootstrap.createUserId("cn=auditor/o=cf-test", SYSADMIN_PASSWORD);
+    statusOnly = await bootstrap.createUserId("cn=status-only/o=cf-test", SYSADMIN_PASSWORD);
+    const principal = (user: PrivateUserId) => ({
+      username: user.username,
+      publicsignkey: user.userSigningKeyPair.publicKey,
+    });
     worker = await startCloudflareWorker({
       serverIdentity,
       serverPassword: SERVER_PASSWORD,
       systemAdmin: sysadmin,
+      serverConfig: {
+        capabilities: {
+          "GET:/system/cluster/*": [principal(auditor)],
+          "GET:/system/status": [principal(statusOnly)],
+        },
+      },
     });
   });
 
   afterAll(async () => {
     await worker?.stop();
+  });
+
+  test("cluster capabilities match the full /system/cluster path", async () => {
+    const client = (user: PrivateUserId) =>
+      new MindooDBServerAdmin({
+        serverUrl: worker.baseUrl,
+        systemAdminUser: user,
+        systemAdminPassword: SYSADMIN_PASSWORD,
+        cryptoAdapter: crypto,
+      });
+    await expect(client(auditor).getClusterStatus()).resolves.toEqual(expect.objectContaining({ peers: [] }));
+    await expect(client(auditor).runClusterAction("sync", {})).rejects.toThrow(/HTTP 403/);
+    await expect(client(statusOnly).getClusterStatus()).rejects.toThrow(/HTTP 403/);
   });
 
   async function createPublishedTenant(tenantId: string) {

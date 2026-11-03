@@ -661,21 +661,24 @@ export class MindooDBServer {
     router.post("/auth/challenge", challengeRateLimit, route((req) => core.systemChallenge(req)));
     router.post("/auth/authenticate", authenticateRateLimit, route((req) => core.systemAuthenticate(req)));
 
-    // Capabilities are matched against "/system" + the path relative to the
-    // mount the middleware runs under (req.path).
-    const authMiddleware = (req: Request, res: Response, next: NextFunction) =>
-      guard((serverRequest) => core.systemAdminGuard(serverRequest, `/system${req.path}`))(
-        req,
-        res,
-        next,
-      );
+    // Capabilities are matched against the full path below /system. req.path
+    // is relative to the mount the middleware runs under, so a middleware
+    // mounted below /system names its own prefix.
+    const authMiddlewareFor = (prefix: string) =>
+      (req: Request, res: Response, next: NextFunction) =>
+        guard((serverRequest) => core.systemAdminGuard(serverRequest, `${prefix}${req.path}`))(
+          req,
+          res,
+          next,
+        );
+    const authMiddleware = authMiddlewareFor("/system");
 
     // Cluster administration. Behind the same JWT + capability middleware as
     // the rest of /system, so config.json can grant an auditor principal the
     // GET routes without granting the POST/PATCH/DELETE ones.
     router.use(
       "/cluster",
-      authMiddleware,
+      authMiddlewareFor("/system/cluster"),
       createClusterRouter({
         cluster: this.cluster,
         listTrustedServers: () => this.tenantManager.listTrustedServers(),
