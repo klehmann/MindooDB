@@ -704,6 +704,11 @@ export class BaseMindooDB implements MindooDB {
 
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
+  /** Document loads in progress; see {@link loadDocumentInternal}. */
+  private documentLoadsInFlight = new Map<
+    string,
+    { generation: number; promise: Promise<InternalDoc | null> }
+  >();
   private wrappedInternalDocs: WeakMap<MindooDoc, InternalDoc> = new WeakMap();
   private readonly maxCachedDocs: number;
   private readonly iteratePrefetchWindowDocs: number;
@@ -16105,7 +16110,34 @@ export class BaseMindooDB implements MindooDB {
     this.dirtyDocIds.delete(docId);
   }
 
-  private async loadDocumentInternal(
+  /**
+   * Materialize a document, sharing a load that is already running for it.
+   *
+   * Several readers often want the same document at the same moment: the
+   * summary buffer and the full-text index follow the same changefeed after
+   * every sync page, each with its own prefetch window. Without sharing, both
+   * windows miss the L1 cache for documents the other is still loading and
+   * each materializes them, so a first sync with both indexes paid every
+   * document twice. A load is only shared while no newer entries for the
+   * document were indexed since it started, so no caller gets a state older
+   * than its call.
+   */
+  private loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
+    const generation = this.docEntryGeneration.get(docId) ?? 0;
+    const inFlight = this.documentLoadsInFlight.get(docId);
+    if (inFlight && inFlight.generation === generation) {
+      return inFlight.promise;
+    }
+    const promise = this.loadDocumentUncoalesced(docId).finally(() => {
+      if (this.documentLoadsInFlight.get(docId)?.promise === promise) {
+        this.documentLoadsInFlight.delete(docId);
+      }
+    });
+    this.documentLoadsInFlight.set(docId, { generation, promise });
+    return promise;
+  }
+
+  private async loadDocumentUncoalesced(
     docId: string,
   ): Promise<InternalDoc | null> {
     const startedAt = Date.now();
