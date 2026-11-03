@@ -10,14 +10,26 @@ The JVM side is the Kotlin library [`mindoodb-kmp-client`](https://github.com/kl
 
 ## How it works
 
-```
-JVM application
-  └─ mindoodb-kmp-client (Kotlin, coroutines)
-       │  loopback WebSocket: JSON-RPC + binary attachment frames
-       ▼
-mindoodb-jvm-bridge supervisor (Node.js)
-  └─ one child process per user session
-       └─ mindoodb engine + decrypted KeyBag + on-disk replica
+```mermaid
+flowchart LR
+    subgraph JVM["JVM application"]
+        C["mindoodb-kmp-client<br/>suspend functions and Flows"]
+    end
+    subgraph Node["mindoodb-jvm-bridge (Node.js)"]
+        S["Supervisor<br/>loopback only, bootstrap token"]
+        A["Session child: Alice<br/>mindoodb engine + KeyBag"]
+        B["Session child: Bob<br/>mindoodb engine + KeyBag"]
+    end
+    RA[("Replica Alice")]
+    RB[("Replica Bob")]
+    Srv["MindooDB server<br/>stores ciphertext only"]
+    C -- "WebSocket: JSON-RPC +<br/>binary attachment frames" --> S
+    S -- "fork per session" --> A
+    S -- "fork per session" --> B
+    A --- RA
+    B --- RB
+    A -. "encrypted sync" .-> Srv
+    B -. "encrypted sync" .-> Srv
 ```
 
 - **One session = one user = one child process.** Each session unlocks one user's KeyBag in its own OS process. Several users in one JVM means several sessions, and their keys and replicas never mix.
@@ -101,16 +113,20 @@ import kotlinx.coroutines.runBlocking
 runBlocking {
     val created = MindooDBBridge.createTenant(
         endpoint,
-        tenantId = "acme",                       // lowercase letters, digits, - and _
+        tenantId = null,                         // generated: random and time-sortable, like Haven
+        tenantLabel = "Acme",                    // the name members see; the admin can rename it
         adminName = "cn=admin/o=acme",
         adminPassword = "a long admin passphrase",
         userId = "cn=service/o=acme",
         password = "a long user passphrase",
         databases = listOf("orders"),
     )
+    println("Created ${created.tenantLabel} (${created.tenantId})")
     // Keep created.adminIdentity (password-locked) if this process will approve join requests.
 }
 ```
+
+Let MindooDB generate the tenant ID (`tenantId = null`), as Haven does: a random, time-sortable ID never collides with tenants other people publish to the same server. Store `created.tenantId` to open the tenant later; show `tenantLabel` to people. The admin renames the tenant with `session.setTenantLabel("Acme Corp", adminPassword)`, and every member reads the current name with `session.getTenantLabel()` (it lives encrypted in the admin-signed directory and arrives with the next sync).
 
 The **admin** is the root of trust: it signs the directory (who belongs to the tenant, grants, policies). The **app user** is the identity your code works as. Use strong passphrases; they protect private keys that never leave this machine.
 
@@ -296,6 +312,16 @@ do {
 } while (!page.done)
 ```
 
+```mermaid
+flowchart LR
+    L["Load the stored cursor<br/>(null = from the start)"] --> R["readChanges(cursor, limit)"]
+    R --> P["Process the page"]
+    P --> W["Save page.cursor"]
+    W --> D{"page.done?"}
+    D -- no --> R
+    D -- yes --> E["Stop until the next run"]
+```
+
 - `readChanges(cursor, limit, idPrefix)` returns one page up to the current end (`ChangePage(changes, cursor, done)`) and does not wait for new changes. `changesUntilNow(...)` is the same as a `Flow` that pages internally.
 - `readChangeMetadata(...)` returns only document id, deleted flag and time, without decrypting anything. Use it to find out *which* documents changed (or were deleted), and load only those you need with `documents.get`.
 - `countChanges(cursor, idPrefix)` counts what is left, for progress bars or to skip a run.
@@ -354,6 +380,22 @@ progress.cancel()
 ## Step 8: Add users and devices
 
 Joining never moves a private key: the new user creates their identity locally, the admin approves a request, and the response carries the keys wrapped for that user.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as New user (JVM or Haven)
+    participant A as Tenant admin (JVM or Haven)
+    participant S as MindooDB server
+    U->>U: createUser + createJoinRequest
+    U->>A: join request (mdb://join-request/…), e.g. by mail or chat
+    A->>A: inspectJoinRequest: name, device, key fingerprints
+    U-->>A: compare fingerprints (phone, in person)
+    A->>S: approveJoinRequest pushes the grant (directory)
+    A->>U: join response (mdb://join-response/…)
+    U->>S: joinTenant pulls directory + userdirectory
+    U->>S: openSession + refresh pull the data
+```
 
 ```kotlin
 // On the joining side (another machine, or the same sidecar):
