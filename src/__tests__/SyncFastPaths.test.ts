@@ -141,6 +141,31 @@ describe("sync fast paths for fresh replicas", () => {
     expect(offered.sort()).toEqual(["e1", "e3"]);
   });
 
+  test("a small delta into a large target asks for the ids instead of the bloom", async () => {
+    const existing = Array.from({ length: 500 }, (_, i) => `e${i}`);
+    const source = await createStore(existing);
+    const target = await createStore(existing);
+    const cursors = createCursorStore();
+    const firstCalls = spyOnStore(target);
+
+    // First sync: no cursor yet, all 500 source entries are offered, so the
+    // bloom is the cheaper pre-screen.
+    await syncEntriesBetweenStores(source, target, undefined, { logger: silentLogger, cursors });
+    expect(firstCalls).toContain("getIdBloomSummary");
+
+    // Routine sync: one new entry against 500 on the target.
+    await source.putEntries([createEntry("new1")]);
+    firstCalls.length = 0;
+    const result = await syncEntriesBetweenStores(source, target, undefined, {
+      logger: silentLogger,
+      cursors,
+    });
+
+    expect(result.transferred).toBe(1);
+    expect(firstCalls).not.toContain("getIdBloomSummary");
+    expect(firstCalls).toContain("hasEntries");
+  });
+
   test("the next page transfers while the previous one is processed", async () => {
     const source = await createStore(["e1", "e2", "e3", "e4"]);
     const target = await createStore([]);

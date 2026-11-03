@@ -541,6 +541,43 @@ export async function transferEntriesInBatches(
   return { transferred, transferredBytes, cancelled: false, rejected };
 }
 
+/**
+ * Rough wire cost per id of the two ways to learn which ids a target already
+ * has: a bloom summary costs about 2 bytes per entry the TARGET holds, an
+ * exact `hasEntries` check about 100 bytes per id the SOURCE offers (ids are
+ * ~90 characters, plus the echo of those that exist).
+ */
+const BLOOM_BYTES_PER_TARGET_ENTRY = 2;
+const HAS_ENTRIES_BYTES_PER_OFFERED_ID = 100;
+
+/**
+ * Whether downloading the target's bloom summary is cheaper than asking it
+ * about each scanned id.
+ *
+ * The bloom grows with the target, the exact check with the delta. A routine
+ * sync of a few new entries into a large server database would otherwise
+ * download the whole bloom (about 200 KB at 100,000 entries) to pre-screen a
+ * handful of ids. Without the numbers to compare (older stores report no
+ * entry count) the bloom is used as before.
+ */
+function targetBloomPaysOff(
+  sourceHead: StoreHead | null,
+  targetHead: StoreHead | null,
+  cursor: StoreScanCursor | null,
+): boolean {
+  const targetEntries = targetHead?.entryCount;
+  if (!sourceHead || targetEntries === undefined) {
+    return true;
+  }
+  // Receipt orders are assigned densely, so the distance from the cursor to
+  // the source head bounds how many entries the scan will offer.
+  const offeredIds = Math.max(0, sourceHead.maxReceiptOrder - (cursor?.receiptOrder ?? 0));
+  return (
+    offeredIds * HAS_ENTRIES_BYTES_PER_OFFERED_ID >
+    targetEntries * BLOOM_BYTES_PER_TARGET_ENTRY
+  );
+}
+
 function supportsCursorScan(store: ContentAddressedStore): boolean {
   return typeof store.scanEntriesSince === "function";
 }
@@ -685,7 +722,9 @@ export async function syncEntriesBetweenStores(
     // extra request on network stores). The target bloom stays dedicated to
     // missing-id pre-screening.
     const [targetBloom, totalSourceEstimate] = await Promise.all([
-      targetIsEmpty ? Promise.resolve(null) : getStoreBloomSummary(targetStore, logger),
+      targetIsEmpty || !targetBloomPaysOff(sourceHead, targetHead, cursor)
+        ? Promise.resolve(null)
+        : getStoreBloomSummary(targetStore, logger),
       sourceHead?.entryCount !== undefined
         ? Promise.resolve(sourceHead.entryCount)
         : getStoreBloomSummary(sourceStore, logger).then((bloom) => bloom?.totalIds),
