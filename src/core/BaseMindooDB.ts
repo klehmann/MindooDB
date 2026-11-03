@@ -17124,6 +17124,16 @@ export class BaseMindooDB implements MindooDB {
       totalSize += plaintext.length;
     }
 
+    // The store resolves the whole chain or throws, but a store that drops
+    // ids from getEntries() would still hand back a short file. The size is
+    // recorded in the attachment reference, so a gap cannot go unnoticed.
+    if (totalSize !== ref.size) {
+      throw new Error(
+        `Attachment ${ref.attachmentId} is incomplete: read ${totalSize} of ${ref.size} bytes ` +
+          `from ${chunks.length} of ${chunkIds.length} chunks (last chunk ${ref.lastChunkId}).`,
+      );
+    }
+
     // Concatenate all chunks into final result
     const result = new Uint8Array(totalSize);
     let offset = 0;

@@ -1,3 +1,4 @@
+import { MissingDependencyError } from "../../errors";
 import { generateRandomUuid } from "../../utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "../AttachmentReadPlanner";
 import { createIdBloomSummary } from "../bloom";
@@ -339,10 +340,10 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
     const includeStart = options?.includeStart !== false;
     const result: string[] = [];
     const visited = new Set<string>();
-    const queue: Array<{ id: string; depth: number }> = [{ id: startId, depth: 0 }];
+    const queue: Array<{ id: string; depth: number; from: string | null }> = [{ id: startId, depth: 0, from: null }];
     let queueIdx = 0;
     while (queueIdx < queue.length) {
-      const { id, depth } = queue[queueIdx++];
+      const { id, depth, from } = queue[queueIdx++];
       if (visited.has(id)) {
         continue;
       }
@@ -352,7 +353,13 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
       }
       const entry = await this.getEntryMetadata(id);
       if (!entry) {
-        continue;
+        throw new MissingDependencyError({
+          startId,
+          missingId: id,
+          referencedBy: from,
+          depth,
+          resolvedCount: result.length,
+        });
       }
       if (stopAtEntryType && entry.entryType === stopAtEntryType && id !== startId) {
         result.push(id);
@@ -363,7 +370,7 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
       }
       for (const depId of entry.dependencyIds) {
         if (!visited.has(depId)) {
-          queue.push({ id: depId, depth: depth + 1 });
+          queue.push({ id: depId, depth: depth + 1, from: id });
         }
       }
     }

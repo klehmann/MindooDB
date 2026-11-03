@@ -17,6 +17,7 @@ import http2 from "http2";
 import path from "path";
 import { readFileSync, existsSync } from "fs";
 import helmet from "helmet";
+import { isMissingDependencyError } from "../../core/errors";
 import cors from "cors";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { jsonCompressionMiddleware } from "./compressionMiddleware";
@@ -2610,6 +2611,13 @@ export class MindooDBServer {
       // back to matching on the message text. Carry the type so it does not
       // have to.
       res.status(status).json({ error: networkError.message, type: networkError.type });
+      return;
+    }
+
+    if (isMissingDependencyError(error)) {
+      // Not a server fault: the requested chain is incomplete in this store.
+      // Pass the details on so the caller can tell what is missing.
+      res.status(409).json({ error: (error as Error).message, type: "MISSING_DEPENDENCY" });
       return;
     }
 

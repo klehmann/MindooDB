@@ -663,6 +663,9 @@ export interface ContentAddressedStore {
    *   - maxDepth: Maximum number of hops to traverse
    *   - includeStart: Whether to include startId in the result (default: true)
    * @return A list of entry IDs in dependency order (oldest first by default)
+   * @throws MissingDependencyError when the start entry or an entry on the
+   *   chain is not in the store (entries cut off by `maxDepth` or behind a
+   *   `stopAtEntryType` entry are not visited, so they never count as missing)
    */
   resolveDependencies(
     startId: string,

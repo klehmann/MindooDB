@@ -17,6 +17,7 @@ import {
   StoreIdBloomSummary,
   StoreHead,
 } from "./types";
+import { MissingDependencyError } from "../errors";
 import { generateRandomUuid } from "../utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "./AttachmentReadPlanner";
 import { createIdBloomSummary } from "./bloom";
@@ -537,11 +538,11 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
 
     const result: string[] = [];
     const visited = new Set<string>();
-    const queue: Array<{ id: string; depth: number }> = [{ id: startId, depth: 0 }];
+    const queue: Array<{ id: string; depth: number; from: string | null }> = [{ id: startId, depth: 0, from: null }];
     let queueIdx = 0;
 
     while (queueIdx < queue.length) {
-      const { id, depth } = queue[queueIdx++];
+      const { id, depth, from } = queue[queueIdx++];
 
       // Skip if already visited
       if (visited.has(id)) {
@@ -557,8 +558,13 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       // Get the entry metadata
       const entry = this.entries.get(id);
       if (!entry) {
-        this.logger.warn(`Entry ${id} not found during dependency resolution`);
-        continue;
+        throw new MissingDependencyError({
+          startId,
+          missingId: id,
+          referencedBy: from,
+          depth,
+          resolvedCount: result.length,
+        });
       }
 
       // Check stop condition
@@ -576,7 +582,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
       // Queue dependencies for traversal
       for (const depId of entry.dependencyIds) {
         if (!visited.has(depId)) {
-          queue.push({ id: depId, depth: depth + 1 });
+          queue.push({ id: depId, depth: depth + 1, from: id });
         }
       }
     }
