@@ -86,6 +86,8 @@ pnpm add mindoodb
 > 📦 **Published regularly on npm.** We ship new versions frequently to [npmjs.com/package/mindoodb](https://www.npmjs.com/package/mindoodb), so pull updates often to stay current with fixes and API changes during the beta.
 
 > 📱 **React Native / Expo?** See the [React Native setup guide](./docs/reactnative.md) for mobile-specific instructions with native performance.
+>
+> ☕ **Kotlin or Java?** See [MindooDB for Kotlin and Java](./docs/kotlin-jvm.md): a coroutine client that drives the same engine through a Node.js sidecar.
 
 ### Pick Your Runtime
 
@@ -339,6 +341,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Example Snippets](./docs/examples/README.md) — Copy-paste Todo starters for all runtimes
 - [Architecture Specification](./docs/specification.md) — Full technical details
 - [React Native Guide](./docs/reactnative.md) — Native Automerge setup and troubleshooting
+- [Kotlin and Java](./docs/kotlin-jvm.md) — JVM backends via the Kotlin client and the Node.js sidecar
 - [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
 - [Ad-hoc Queries & Reactive Updates](./docs/adhoc-queries.md) — Summary buffer, `db.query()`, nested `include` lookups, ephemeral views, live queries and change listeners
 - [Full-Text Search](./docs/fulltext-search.md) — Client-side encrypted full-text index, `db.searchText()`, the query `text` clause, attachment text extraction
