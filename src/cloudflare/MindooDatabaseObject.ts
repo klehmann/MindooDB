@@ -83,6 +83,8 @@ const DIRECTORY_POLL_INTERVAL_MS = 2_000;
 const DIRECTORY_PAGE_SIZE = 200;
 const REPLICA_CURSOR_KEY = "directory-replica-cursor.json";
 const DATABASES_KEY = "databases.json";
+/** Sync routes whose request or response carries entry payloads. */
+const PAYLOAD_ROUTES = new Set(["getEntries", "getEntriesBinary", "putEntries", "putEntriesBinary"]);
 const TRUSTED_SERVERS_KEY = "trusted-servers.json";
 
 interface TenantState {
@@ -113,6 +115,18 @@ export class MindooDatabaseObject {
   private replicaRefresh: Promise<boolean> | null = null;
   /** Payload buffers of store RPC exchanges with the server object. */
   private readonly rpcBytes = new StoreRpcBytes();
+  /**
+   * Requests that carry entry payloads run one at a time: a batch of
+   * attachment chunks is up to ~25 MB plus its encrypted copies, and the
+   * isolate has 128 MB. Metadata requests are not queued.
+   */
+  private payloadQueue: Promise<unknown> = Promise.resolve();
+
+  private withPayloadSlot<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.payloadQueue.then(work, work);
+    this.payloadQueue = run.catch(() => undefined);
+    return run;
+  }
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -485,7 +499,7 @@ export class MindooDatabaseObject {
     if (bytes) return bytes;
     switch (path) {
       case "/internal/store-rpc":
-        return this.storeRpc(request);
+        return this.withPayloadSlot(() => this.storeRpc(request));
       case "/internal/databases":
         if (!this.isDirectory) break;
         return jsonResponse(200, { databases: [DIRECTORY_DB_ID, ...this.registeredDatabases()] });
@@ -671,7 +685,9 @@ export class MindooDatabaseObject {
         : toResponse(response);
     }
 
-    let response = await core.sync(name, req, storeKind);
+    const carriesPayload = PAYLOAD_ROUTES.has(name);
+    const run = () => core.sync(name, req, storeKind);
+    let response = carriesPayload ? await this.withPayloadSlot(run) : await run();
     // A grant or a new device key may have reached the directory a moment
     // ago: refresh the replica once and retry a denied request.
     if (
@@ -679,7 +695,7 @@ export class MindooDatabaseObject {
       (response.status === 401 || response.status === 403 || response.status === 404) &&
       (await this.refreshDirectoryReplica(true))
     ) {
-      response = await core.sync(name, req, storeKind);
+      response = carriesPayload ? await this.withPayloadSlot(run) : await run();
     }
     return toResponse(response);
   }

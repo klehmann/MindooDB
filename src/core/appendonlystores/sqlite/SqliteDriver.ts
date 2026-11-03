@@ -257,16 +257,20 @@ export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOp
       if (existing) {
         return false;
       }
-      await executor.run(
-        `INSERT INTO ${prefix}entries(id, doc_id, entry_type, created_at, content_hash, receipt_order, metadata_json) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-        [id, docId, entryType, createdAt, contentHash, receiptOrder, metaJson],
-      );
+      // Content before the entry row: where a batch is not one transaction
+      // (external content is real I/O, which ends a Durable Object's implicit
+      // transaction), an interruption then leaves at worst unreferenced
+      // content, never an entry whose payload is missing.
       const content = await this.getContent(contentHash);
       if (content) {
         await this.updateContentRef(contentHash, content.refCount + 1);
       } else {
         await this.putContent(contentHash, data, 1);
       }
+      await executor.run(
+        `INSERT INTO ${prefix}entries(id, doc_id, entry_type, created_at, content_hash, receipt_order, metadata_json) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+        [id, docId, entryType, createdAt, contentHash, receiptOrder, metaJson],
+      );
       return true;
     },
 

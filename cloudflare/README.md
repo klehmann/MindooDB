@@ -133,6 +133,26 @@ npm run dev                # wrangler dev, storage stays local
   (`mindoodb-large-entries` in `wrangler.jsonc`). Without the binding, entries
   above about 1.9 MB are refused. Attachments are split into 256 KB chunks
   and stay in SQLite.
+- **Platform limits** (Workers Paid, as of 2026) and how the server stays
+  inside them:
+  - *128 MB memory per isolate:* requests that carry entry payloads run one at
+    a time per database object, and peer replication moves one small batch at
+    a time (16 attachment chunks). Directory caches grow by roughly 50–60 KB
+    per directory user (≈ 30 MB at 500 users).
+  - *CPU time per request:* raised to 5 minutes in `wrangler.jsonc`
+    (`limits.cpu_ms`); a cron tick replicates for at most 4 minutes and
+    continues on the next tick.
+  - *10 GB per Durable Object:* one database of a tenant (R2 content not
+    counted). When full, writes fail and reads keep working.
+  - *2 MB per stored value:* also applies to the server's key bag in the server
+    object, which holds one key per tenant; this becomes tight only at about
+    10,000+ tenants.
+  - *SQL:* at most 100 bound parameters per statement (lists are split
+    accordingly), no `BEGIN`/`COMMIT` (writes without real I/O in between
+    commit atomically; content is written before its entry row and receipt
+    numbers are reserved per batch, so an interruption never leaves an entry
+    without content).
+  - *About 1,000 requests per second per object*, i.e. per tenant database.
 - **Key derivation:** Workers allow at most 100 000 PBKDF2 iterations, so the
   server identity and server key bag use that count (the Node server uses
   310 000). Client identities are never decrypted on the server.

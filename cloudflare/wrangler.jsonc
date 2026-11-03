@@ -7,6 +7,10 @@
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
 
+  // CPU time per request (default 30 s). Raised for the first mirror of a
+  // large tenant with a peer and for cold starts of big directories.
+  "limits": { "cpu_ms": 300000 },
+
   "durable_objects": {
     "bindings": [
       // Server-wide state: config.json, tenants, server key bag.

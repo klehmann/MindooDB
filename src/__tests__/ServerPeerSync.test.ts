@@ -398,6 +398,25 @@ describe("two servers replicating a shared tenant", () => {
     expect(second.held).toBe(0);
   });
 
+  test("a run past its deadline is deferred and the next run finishes it", async () => {
+    const seeded = await seedTenant([alpha, beta], "deadline-tenant");
+    await pushDb(seeded, beta, "directory");
+    const replicator = alpha.server.getClusterManager().getReplicator(beta.name)!;
+    await replicator.refreshIntersection();
+
+    const cut = await replicator.syncNow({ tenantId: "deadline-tenant", deadline: Date.now() - 1 });
+    expect(cut.deferred).toBe(true);
+    expect(cut.pulled).toBe(0);
+    expect(await localEntryIds(alpha, "deadline-tenant", "directory")).toEqual([]);
+
+    const rest = await replicator.syncNow({ tenantId: "deadline-tenant" });
+    expect(rest.deferred).toBeUndefined();
+    expect(rest.errors).toEqual([]);
+    expect(await localEntryIds(alpha, "deadline-tenant", "directory")).toEqual(
+      await localEntryIds(beta, "deadline-tenant", "directory"),
+    );
+  });
+
   test("replicated entries keep the original witness receipt (invariant 3)", async () => {
     const alphaStore = await alpha.server
       .getTenantManager()
