@@ -24,6 +24,8 @@ MindooDB runs on three platforms. The API is identical across all of them — on
 | **Web Browser** | `import { BaseMindooTenantFactory, ... } from "mindoodb/browser"` |
 | **React Native** | `import { BaseMindooTenantFactory, ... } from "mindoodb"` (with native Automerge setup, see [React Native Guide](./reactnative.md)) |
 
+On the JVM, use the Kotlin client described in [MindooDB for Kotlin and Java](./kotlin-jvm.md); the steps below map one to one onto its API.
+
 For this guide, we use Node.js imports. Replace them with the browser or React Native imports if you are targeting those platforms — every other line of code stays the same.
 
 To sync over [Iroh](./iroh.md) instead of HTTP (no public server URL), a Node CLI uses `createNodeIrohStreamIO` from `mindoodb/iroh/node` plus the same `ClientNetworkContentAddressedStore` as HTTPS. The browser needs the separate Haven WASM build; that is not required for CLI tools.
