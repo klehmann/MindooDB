@@ -16,6 +16,7 @@ import {
   DIRECTORY_DB_ID,
   USER_DIRECTORY_DB_ID,
 } from "./types";
+import { DocumentDeletedError, DocumentNotFoundError } from "./errors";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { semanticNow } from "./utils/timeSource";
 import { SingleFlight } from "./utils/singleFlight";
@@ -111,6 +112,46 @@ interface GroupDocEntry {
   seenOrder: number;
 }
 
+/**
+ * Grant documents by `username_hash`, maintained by the unified cache pass.
+ * Keeps ids only, never documents, so its size is independent of the
+ * document cache.
+ */
+class GrantDocumentIndex {
+  private readonly idsByHash = new Map<string, Set<string>>();
+  /** id -> hash and position in modification order (grows on every re-seen change). */
+  private readonly entries = new Map<string, { hash: string; order: number }>();
+  private nextOrder = 0;
+
+  /** Latest state of a document: its `username_hash` if it is a grant, else undefined. */
+  record(docId: string, usernameHash: unknown): void {
+    const previous = this.entries.get(docId);
+    if (previous) {
+      this.entries.delete(docId);
+      const ids = this.idsByHash.get(previous.hash);
+      ids?.delete(docId);
+      if (ids && ids.size === 0) this.idsByHash.delete(previous.hash);
+    }
+    if (typeof usernameHash !== "string") return;
+    this.entries.set(docId, { hash: usernameHash, order: this.nextOrder++ });
+    let ids = this.idsByHash.get(usernameHash);
+    if (!ids) {
+      ids = new Set();
+      this.idsByHash.set(usernameHash, ids);
+    }
+    ids.add(docId);
+  }
+
+  /** Ids of the grants carrying any of `hashes`, oldest change first. */
+  docIdsFor(hashes: Iterable<string>): string[] {
+    const ids: string[] = [];
+    for (const hash of hashes) {
+      for (const id of this.idsByHash.get(hash) ?? []) ids.push(id);
+    }
+    return ids.sort((a, b) => this.entries.get(a)!.order - this.entries.get(b)!.order);
+  }
+}
+
 export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagReconciler {
   private tenant: BaseMindooTenant;
   private directoryDB: MindooDB | null = null;
@@ -125,6 +166,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   // (docs/accesscontrol.md §6.5), so the set of trusted keys is recomputed as
   // the union of all grant documents' current key arrays after each cache pass.
   private grantDocIdToSigningKeys: Map<string, string[]> = new Map();
+  // Index of grant documents: `username_hash` -> ids of the (non-deleted,
+  // readable) grant documents carrying it, plus each id's position in
+  // modification order. findGrantAccessDocuments loads only the documents
+  // it returns instead of re-scanning the whole directory: the token check
+  // runs it on every sync request, and with more grants than the document
+  // cache holds the scan rebuilt every grant from its changes each time.
+  private grantIndex: GrantDocumentIndex = new GrantDocumentIndex();
   // Best-effort reverse lookup cache for public signing key -> user details.
   // Entries remain available even after revocation so historical UIs can still show identity labels.
   private userLookupCache: Map<string, DirectoryUserLookup> = new Map();
@@ -550,26 +598,27 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // identity round-trips: a cleartext name never collides with a 64-char hex
     // hash, so this is safe (docs/accesscontrol.md §6.5).
     targetHashes.add(username);
-    const matchesTarget = (value: unknown): boolean =>
-      typeof value === "string" && targetHashes.has(value);
     
     const matchingDocs: MindooDoc[] = [];
 
-    // Use the generator-based iteration API for cleaner code.
+    // The unified cache pass above indexed the grant documents by
+    // username_hash; only the matches are loaded, oldest first as the former
+    // full scan returned them.
     // No signature verification needed - DB already enforces admin-only.
     // Revocation no longer uses a separate document: it removes keys from the
     // grant document in place (docs/accesscontrol.md §6.5). A fully-revoked user
     // therefore still has a grant document here, but with empty key arrays.
     // Callers that need "active access" should inspect the key arrays (see
     // {@link isUserRevoked} / {@link getUserPublicKeys}).
-    for await (const { doc } of directoryDB.iterateChangesSince(null)) {
-      const data = doc.getData();
-
-      if (data.form === "useroperation" &&
-          data.type === "grantaccess" &&
-          matchesTarget(data.username_hash)) {
+    for (const docId of this.grantIndex.docIdsFor(targetHashes)) {
+      try {
+        matchingDocs.push(await directoryDB.getDocument(docId));
         this.logger.debug(`Found grant access document for username: ${username}`);
-        matchingDocs.push(doc);
+      } catch (error) {
+        // Deleted since the cache pass: no longer a grant, as for the scan.
+        if (!(error instanceof DocumentDeletedError) && !(error instanceof DocumentNotFoundError)) {
+          throw error;
+        }
       }
     }
 
@@ -851,6 +900,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // are idempotent) instead of leaving its documents half-applied.
     const fullRebuild = startCursor === null;
     const grantDocIdToSigningKeys = fullRebuild ? new Map<string, string[]>() : this.grantDocIdToSigningKeys;
+    const grantIndex = fullRebuild ? new GrantDocumentIndex() : this.grantIndex;
     const userLookupCache = fullRebuild ? new Map<string, DirectoryUserLookup>() : this.userLookupCache;
     const wipeKeyToGrantDocId = fullRebuild ? new Map<string, string>() : this.wipeKeyToGrantDocId;
     let tenantSettingsCache = fullRebuild ? null : this.tenantSettingsCache;
@@ -875,7 +925,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // Process changes (documents are returned in order by lastModified, oldest to newest)
     for await (const { doc, cursor } of directoryDB.iterateChangesSince(startCursor)) {
       const data = doc.getData();
-      
+
+      // Deleted and unreadable documents arrive as tombstones with empty
+      // data and drop out, as they never matched the former full scan.
+      grantIndex.record(
+        doc.getId(),
+        data.form === "useroperation" && data.type === "grantaccess" ? data.username_hash : undefined,
+      );
+
       // Process user operation documents (grant/revoke access)
       if (data.form === "useroperation") {
       // Check if this is a grant access document. A grant may carry MULTIPLE
@@ -1089,6 +1146,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
     this.trustedKeysCache = trustedKeysCache;
     this.grantDocIdToSigningKeys = grantDocIdToSigningKeys;
+    this.grantIndex = grantIndex;
     this.userLookupCache = userLookupCache;
     this.wipeKeyToGrantDocId = wipeKeyToGrantDocId;
     this.tenantSettingsCache = tenantSettingsCache;

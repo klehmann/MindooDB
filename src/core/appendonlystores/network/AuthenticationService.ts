@@ -409,6 +409,25 @@ export class AuthenticationService {
    * @param token The JWT token to validate
    * @returns The token payload if valid, null otherwise
    */
+  /**
+   * The payload of a token this service issued and that has not expired,
+   * without asking the directory whether the user or device is still
+   * granted. For deciding *who* is calling (e.g. a rate-limit bucket) where
+   * a forged token must not pass but revocation is checked later by
+   * {@link validateToken}; never use it to authorize anything.
+   */
+  async readIssuedToken(token: string): Promise<NetworkAuthTokenPayload | null> {
+    try {
+      const payload = await this.verifyToken(token);
+      if (!payload || payload.exp < Math.floor(Date.now() / 1000)) {
+        return null;
+      }
+      return payload;
+    } catch {
+      return null;
+    }
+  }
+
   async validateToken(token: string): Promise<NetworkAuthTokenPayload | null> {
     this.logger.debug(`Validating token`);
     

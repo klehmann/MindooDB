@@ -1538,7 +1538,10 @@ export class MindooDBServer {
     try {
       const token = this.extractToken(req);
       const authService = await this.tenantManager.getAuthService(req.tenantId!);
-      const payload = await authService.validateToken(token);
+      // Signature and expiry are enough to name the caller; the handler runs
+      // the full check (revocation, wipe) right after, so the directory is
+      // evaluated once per request rather than twice.
+      const payload = await authService.readIssuedToken(token);
       if (payload && payload.tenantId === req.tenantId) {
         req.syncPrincipal = payload.deviceSigningKey ?? payload.sub;
       }
