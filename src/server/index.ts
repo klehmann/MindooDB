@@ -30,6 +30,7 @@ export {
   SimpleMindooDirectory,
   type LoadedTenant,
   type RegisterTenantResult,
+  type ExecutePendingPurgesOptions,
   type TenantManagerOptions,
 } from "./TenantManager";
 export {

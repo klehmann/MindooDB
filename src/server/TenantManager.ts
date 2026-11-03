@@ -524,6 +524,28 @@ export interface TenantManagerOptions {
   cryptoAdapter: CryptoAdapter;
   /** Unlocks the server identity's private keys and the server key bag. */
   serverPassword?: string;
+  /**
+   * HMAC secret for a tenant's sync tokens. Without it every loaded tenant
+   * gets a random secret, so tokens die with the process — fine for one
+   * server process, wrong for a host that spreads one tenant over several
+   * instances which must accept each other's tokens.
+   */
+  jwtSecretForTenant?: (tenantId: string) => Promise<Uint8Array>;
+  /**
+   * Source of a tenant's `$publicinfos` keys when they are not kept in this
+   * manager's own `server.keybag` (e.g. a host instance that serves one
+   * tenant database and gets the keys from a central registry).
+   */
+  publicInfosKeysResolver?: (tenantId: string) => Promise<Uint8Array[]>;
+}
+
+export interface ExecutePendingPurgesOptions {
+  /**
+   * Only purge in these databases; requests for other databases stay
+   * unprocessed in this manager's registry. For hosts that serve a subset of
+   * a tenant's databases per instance.
+   */
+  dbIds?: ReadonlySet<string>;
 }
 
 /**
@@ -541,6 +563,8 @@ export class TenantManager {
   private readonly storeProvider: ServerStoreProvider;
   private serverPassword: string | undefined;
   private cryptoAdapter: CryptoAdapter;
+  private readonly jwtSecretForTenant: TenantManagerOptions["jwtSecretForTenant"];
+  private readonly publicInfosKeysResolver: TenantManagerOptions["publicInfosKeysResolver"];
   private loadedTenants: Map<string, LoadedTenant> = new Map();
 
   private serverIdentity: PrivateUserId | null = null;
@@ -564,6 +588,8 @@ export class TenantManager {
     this.storeProvider = options.storeProvider;
     this.serverPassword = options.serverPassword;
     this.cryptoAdapter = options.cryptoAdapter;
+    this.jwtSecretForTenant = options.jwtSecretForTenant;
+    this.publicInfosKeysResolver = options.publicInfosKeysResolver;
 
     // Load global server identity
     const identityJson = this.dataStore.readText(SERVER_IDENTITY_KEY);
@@ -931,6 +957,9 @@ export class TenantManager {
   private async getStoredPublicInfosKeys(
     tenantId: string,
   ): Promise<Uint8Array[]> {
+    if (this.publicInfosKeysResolver) {
+      return this.mergeUniqueKeys(await this.publicInfosKeysResolver(tenantId));
+    }
     const keys: Uint8Array[] = [];
     if (
       this.serverIdentity &&
@@ -1431,11 +1460,14 @@ export class TenantManager {
    * the directory does not expose the purge reader). Runs are serialized per
    * tenant; concurrent callers share the in-flight promise.
    */
-  async executePendingPurges(tenantId: string): Promise<void> {
+  async executePendingPurges(
+    tenantId: string,
+    options?: ExecutePendingPurgesOptions,
+  ): Promise<void> {
     const normalizedId = tenantId.toLowerCase();
     const existing = this.purgeInFlight.get(normalizedId);
     if (existing) return existing;
-    const run = this.executePendingPurgesInternal(normalizedId).finally(() => {
+    const run = this.executePendingPurgesInternal(normalizedId, options?.dbIds).finally(() => {
       this.purgeInFlight.delete(normalizedId);
     });
     this.purgeInFlight.set(normalizedId, run);
@@ -1444,6 +1476,7 @@ export class TenantManager {
 
   private async executePendingPurgesInternal(
     normalizedId: string,
+    dbIds: ReadonlySet<string> | undefined,
   ): Promise<void> {
     const tenant = await this.getTenant(normalizedId);
     if (!tenant.mindooTenant) {
@@ -1491,6 +1524,9 @@ export class TenantManager {
         continue;
       }
       if (typeof request.dbId !== "string" || request.dbId.length === 0) {
+        continue;
+      }
+      if (dbIds && !dbIds.has(request.dbId)) {
         continue;
       }
       for (const docId of request.docIds) {
@@ -1648,6 +1684,9 @@ export class TenantManager {
       this.cryptoAdapter,
       directory,
       tenantId,
+      this.jwtSecretForTenant
+        ? { jwtSecret: await this.jwtSecretForTenant(tenantId) }
+        : undefined,
     );
 
     console.log(`[TenantManager] Loaded tenant: ${tenantId}`);

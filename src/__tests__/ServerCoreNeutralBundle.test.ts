@@ -1,6 +1,7 @@
 /**
- * The server core (`src/server`) must run on runtimes without Node built-ins,
- * such as Cloudflare Workers. Bundling it for esbuild's neutral platform
+ * The server core (`src/server`) and the Cloudflare host (`src/cloudflare`)
+ * must run on runtimes without Node built-ins, such as Cloudflare Workers.
+ * Bundling them for esbuild's neutral platform
  * fails on any `fs`, `path`, `node:*`, … import that creeps in, directly or
  * through a dependency.
  */
@@ -9,9 +10,12 @@ import path from "path";
 import { build } from "esbuild";
 
 describe("server core platform neutrality", () => {
-  test("src/server bundles for a neutral platform without Node built-ins", async () => {
+  test.each([
+    ["src/server", path.join(__dirname, "..", "server", "index.ts")],
+    ["src/cloudflare", path.join(__dirname, "..", "cloudflare", "index.ts")],
+  ])("%s bundles for a neutral platform without Node built-ins", async (_name, entryPoint) => {
     const result = await build({
-      entryPoints: [path.join(__dirname, "..", "server", "index.ts")],
+      entryPoints: [entryPoint],
       bundle: true,
       platform: "neutral",
       format: "esm",

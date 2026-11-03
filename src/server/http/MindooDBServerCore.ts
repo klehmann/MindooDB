@@ -155,6 +155,12 @@ export interface MindooDBServerCoreOptions {
   cluster?: ServerClusterHooks;
   /** Where post-response work goes; defaults to fire-and-forget. */
   runInBackground?: BackgroundTaskScheduler;
+  /**
+   * Runs after a write to a tenant's `directory` database was accepted.
+   * Defaults to executing the purge requests it may carry. A host that keeps
+   * other databases elsewhere passes the change on to them instead.
+   */
+  onDirectoryWrite?: (tenantId: string) => Promise<void>;
 }
 
 /** HTTP status of each {@link NetworkError} type. */
@@ -1319,8 +1325,10 @@ export class MindooDBServerCore {
       this.publishSyncChangeEvent(tenantId, dbId, storeKind, serverStore, token);
     }
     if (dbId === "directory") {
+      const onDirectoryWrite =
+        this.options.onDirectoryWrite ?? ((id: string) => this.tenantManager.executePendingPurges(id));
       this.runInBackground(
-        this.tenantManager.executePendingPurges(tenantId).catch((error) => {
+        onDirectoryWrite(tenantId).catch((error) => {
           console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
         }),
       );

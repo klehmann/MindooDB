@@ -1,0 +1,27 @@
+{
+  "name": "mindoodb-server-cloudflare",
+  "private": true,
+  "type": "module",
+  "description": "MindooDB sync server on Cloudflare Workers and Durable Objects",
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "cloudflare": {
+    "bindings": {
+      "MINDOODB_CORS_ORIGIN": {
+        "description": "Comma-separated browser origins allowed to call the server, e.g. https://haven.example.com. Leave empty to disable CORS."
+      },
+      "MINDOODB_JSON_BODY_LIMIT": {
+        "description": "Maximum JSON request body, e.g. 5mb."
+      }
+    }
+  },
+  "dependencies": {
+    "mindoodb": "^0.0.86"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
+  }
+}

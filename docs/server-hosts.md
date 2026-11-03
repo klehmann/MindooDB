@@ -7,11 +7,13 @@ run it.
 |---|---|---|
 | `src/server/` | Route handlers (`http/MindooDBServerCore.ts`), `TenantManager`, auth services, config validation, rate-limit policy, persistence interfaces | Any JavaScript runtime with WebCrypto |
 | `src/node/server/` | The Node host: Express, HTTP/2 + TLS, static files, Iroh, peer replication and cluster jobs, file-backed persistence | Node.js (Docker image, `pnpm server:start`) |
+| `src/cloudflare/` | The Cloudflare host: Worker router and Durable Objects (see below) | Cloudflare Workers |
 
-The core must not import Node built-ins. `ServerCoreNeutralBundle.test.ts`
-bundles `src/server/index.ts` for esbuild's neutral platform and fails on any
-`fs`, `path` or `node:*` import. The package exports the core as
-`mindoodb/server`.
+The core and the Cloudflare host must not import Node built-ins.
+`ServerCoreNeutralBundle.test.ts` bundles `src/server/index.ts` and
+`src/cloudflare/index.ts` for esbuild's neutral platform and fails on any
+`fs`, `path` or `node:*` import. The package exports them as
+`mindoodb/server` and `mindoodb/cloudflare`.
 
 ## What a host provides
 
@@ -57,3 +59,36 @@ itself (`node/server/peer`) is Node-only for now.
 
 Iroh is not part of the core; the Node host wires it in when `config.json`
 enables it.
+
+## The Cloudflare host
+
+`src/cloudflare` runs the same handlers on Workers and Durable Objects;
+`cloudflare/` is the deployable Worker project (setup, Deploy button,
+differences to Node: see `cloudflare/README.md`).
+
+- **`MindooServerObject`** (one instance) is the server's data directory
+  without entry stores: `config.json` and backups, trusted servers, the server
+  key bag and tenant configs in a `ServerDataStore` on the object's SQLite. It
+  serves `/system/*` and discovery, and hands a tenant's config and
+  `$publicinfos` keys to the objects serving its databases.
+- **`MindooDatabaseObject`** (one per tenant and database) holds the docs and
+  attachments stores of its database (`SqliteContentAddressedStore` with a
+  table prefix and without BEGIN/COMMIT, which Durable Object SQL rejects).
+  It runs its own `TenantManager`. Access control therefore runs locally,
+  with the code the Node server uses, against a replica of the tenant's
+  directory store. The replica is pulled from the directory object: at most
+  every 2 s, on a change notice from the directory, and again before a
+  request would be denied.
+- The tenant's **`directory` object** also answers the auth handshake,
+  proxies RFC 3161 requests, keeps the SSE streams (the other databases
+  forward their change events to it) and knows the tenant's databases, which
+  it wipes when the tenant is deleted.
+- Sync tokens are HMAC-signed with a per-tenant key derived from
+  `MINDOODB_JWT_SECRET`, so a token issued by the directory object is valid in
+  every database object of the tenant (`TenantManagerOptions.jwtSecretForTenant`).
+- Purge requests are executed by each database object for its own database
+  (`executePendingPurges(tenantId, { dbIds })`).
+
+The end-to-end test `CloudflareWorker.test.ts` runs the host under
+`wrangler dev` with real clients (opt-in: `MINDOODB_CLOUDFLARE_TESTS=1`, and
+`WRANGLER_BIN` or `cloudflare/node_modules`).
