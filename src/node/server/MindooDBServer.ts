@@ -20,7 +20,7 @@ import helmet from "helmet";
 import { isMissingDependencyError } from "../../core/errors";
 import cors from "cors";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
-import { jsonCompressionMiddleware } from "./compressionMiddleware";
+import { jsonCompressionMiddleware, sendBinaryEntryBody } from "./compressionMiddleware";
 import {
   BINARY_ENTRIES_CONTENT_TYPE,
   BINARY_GET_ENTRIES_FORMAT,
@@ -2022,6 +2022,7 @@ export class MindooDBServer {
         capabilities: {
           ...(capabilities as NetworkSyncCapabilities),
           supportsBinaryEntries: true,
+          supportsPayloadOnlyEntries: true,
           supportsChangeEvents: true,
         },
       });
@@ -2200,7 +2201,7 @@ export class MindooDBServer {
   private async handleGetEntriesBinary(req: Request, res: Response): Promise<void> {
     try {
       const token = this.extractToken(req);
-      const { dbId, ids } = req.body;
+      const { dbId, ids, payloadOnly } = req.body;
 
       const validDbId = this.validateDbId(dbId);
       validateArraySize(ids, MAX_ENTRY_IDS, "ids");
@@ -2208,22 +2209,30 @@ export class MindooDBServer {
       const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
       const batch = await serverStore.handleGetEntriesSessionWrapped(token, ids || []);
 
+      // `payloadOnly` (capability supportsPayloadOnlyEntries): the client
+      // already holds the metadata from its scan, so each frame carries only
+      // what it cannot have yet. Same entries, same session-key encryption.
       const body = encodeBinaryEntryMessage({
         header: {
           format: BINARY_GET_ENTRIES_FORMAT,
           wrappedSessionKey: this.uint8ArrayToBase64(batch.wrappedSessionKey),
+          ...(payloadOnly === true ? { payloadOnly: true } : {}),
         },
         entries: batch.entries.map((e) => ({
-          meta: {
-            ...this.serializeEntryMetadata(e),
-            iv: this.uint8ArrayToBase64(e.iv),
-          },
+          meta:
+            payloadOnly === true
+              ? { id: e.id, iv: this.uint8ArrayToBase64(e.iv) }
+              : { ...this.serializeEntryMetadata(e), iv: this.uint8ArrayToBase64(e.iv) },
           payload: e.sessionEncryptedPayload,
         })),
       });
+      const payloadBytes = batch.entries.reduce(
+        (sum, e) => sum + e.sessionEncryptedPayload.byteLength,
+        0,
+      );
 
       res.setHeader("Content-Type", BINARY_ENTRIES_CONTENT_TYPE);
-      res.send(Buffer.from(body.buffer, body.byteOffset, body.byteLength));
+      await sendBinaryEntryBody(req, res, body, body.byteLength - payloadBytes);
     } catch (error) {
       this.handleRequestError(error, res);
     }

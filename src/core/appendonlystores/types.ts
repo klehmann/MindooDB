@@ -121,6 +121,14 @@ export interface StoreScanResult {
 export interface StoreHead {
   epoch: string;
   maxReceiptOrder: number;
+  /**
+   * Number of entries currently in the store, when the store can tell
+   * without a scan. Sync uses it as the progress denominator so a pull does
+   * not have to download the remote bloom summary just to read its
+   * `totalIds`. Optional: older servers and stores without a cheap count
+   * leave it out, and sync then falls back to the bloom summary.
+   */
+  entryCount?: number;
 }
 
 /**

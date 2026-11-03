@@ -23,6 +23,7 @@ import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
+  NetworkSessionEncryptedEntry,
   SessionEncryptedEntriesBatch,
   StoreChangeEvent,
   NetworkSyncCapabilities,
@@ -49,6 +50,13 @@ type MindooDBGlobalAuthState = typeof globalThis & {
  * auth-share cache and the persisted sync-cursor key.
  */
 const UNKNOWN_TRANSPORT_IDENTITY = "unknown";
+
+/**
+ * Upper bound for remembered scan metadata (payload-only getEntries). A sync
+ * holds at most the page in transfer plus the prefetched next one (2 × 1,000
+ * at the default page size); the margin covers larger pages.
+ */
+const SCANNED_METADATA_LIMIT = 10_000;
 
 function resolveTransportIdentity(transport: NetworkTransport): string {
   const identity = transport.getIdentity?.();
@@ -108,6 +116,14 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     privateEncryptionKey?: CryptoKey | string;
   } | null = null;
   private _syncAbortSignal?: AbortSignal;
+  /**
+   * Metadata of entries returned by recent `scanEntriesSince` pages, kept
+   * until `getEntries` fetches their payloads (capability
+   * `supportsPayloadOnlyEntries`). A sync always fetches the entries of the
+   * page it just scanned, so this lets the payload request skip the metadata
+   * the client already has. Bounded: see {@link SCANNED_METADATA_LIMIT}.
+   */
+  private scannedMetadata = new Map<string, StoreEntryMetadata>();
   /**
    * Supplies a ready-made bearer token instead of running the tenant
    * challenge-response handshake.
@@ -256,6 +272,16 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
 
       // Binary wire format v2 (sync-v5, phase 3): same session-key encryption,
       // but octet-stream framing instead of JSON+base64.
+      if (
+        capabilities.supportsBinaryEntries &&
+        capabilities.supportsSessionKeyWrap &&
+        capabilities.supportsPayloadOnlyEntries &&
+        this.transport.getEntryPayloadsBinary &&
+        ids.some((id) => this.scannedMetadata.has(id))
+      ) {
+        return this.getEntriesUsingScannedMetadata(ids);
+      }
+
       if (
         capabilities.supportsBinaryEntries &&
         capabilities.supportsSessionKeyWrap &&
@@ -431,7 +457,11 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
         this.supportsReceiptOrderCursorProtocol(capabilities)
       ) {
         const token = await this.ensureAuthenticated();
-        return this.transport.scanEntriesSince(token, cursor, limit, filters);
+        const result = await this.transport.scanEntriesSince(token, cursor, limit, filters);
+        if (capabilities.supportsPayloadOnlyEntries && this.transport.getEntryPayloadsBinary) {
+          this.rememberScannedMetadata(result.entries);
+        }
+        return result;
       }
 
       // Compatibility fallback: fetch metadata via legacy endpoint and paginate client-side.
@@ -901,6 +931,62 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     );
     
     return new Uint8Array(signature);
+  }
+
+  private rememberScannedMetadata(entries: StoreEntryMetadata[]): void {
+    for (const entry of entries) {
+      this.scannedMetadata.set(entry.id, entry);
+    }
+    // Oldest first (Map keeps insertion order). Only a scan nobody fetched
+    // from gets this far; the next getEntries just asks for full frames.
+    while (this.scannedMetadata.size > SCANNED_METADATA_LIMIT) {
+      const oldest = this.scannedMetadata.keys().next().value as string;
+      this.scannedMetadata.delete(oldest);
+    }
+  }
+
+  /**
+   * Binary getEntries for ids whose metadata came with a recent scan: those
+   * are fetched payload-only and joined with the remembered metadata; any
+   * other id in the batch is fetched with full frames as before.
+   */
+  private async getEntriesUsingScannedMetadata(ids: string[]): Promise<StoreEntry[]> {
+    const known = ids.filter((id) => this.scannedMetadata.has(id));
+    const unknown = ids.filter((id) => !this.scannedMetadata.has(id));
+    const token = await this.ensureAuthenticated();
+
+    const [payloads, fullBatch] = await Promise.all([
+      this.transport.getEntryPayloadsBinary!(token, known),
+      unknown.length > 0 && this.transport.getEntriesBinary
+        ? this.transport.getEntriesBinary(token, unknown)
+        : Promise.resolve(null),
+    ]);
+    this.throwIfSyncAborted();
+
+    const joined: NetworkSessionEncryptedEntry[] = [];
+    for (const payload of payloads.entries) {
+      const metadata = this.scannedMetadata.get(payload.id);
+      if (!metadata) {
+        // The server answered for an id it was not asked for.
+        throw new Error(`Remote returned a payload for unrequested entry ${payload.id}`);
+      }
+      joined.push({ ...metadata, iv: payload.iv, sessionEncryptedPayload: payload.sessionEncryptedPayload });
+    }
+    for (const id of known) {
+      this.scannedMetadata.delete(id);
+    }
+
+    const entries = await this.decryptSessionEncryptedEntries({
+      wrappedSessionKey: payloads.wrappedSessionKey,
+      entries: joined,
+    });
+    if (fullBatch) {
+      entries.push(...(await this.decryptSessionEncryptedEntries(fullBatch)));
+    }
+    this.logger.debug(
+      `Decrypted ${entries.length} entries (binary, ${known.length} payload-only)`,
+    );
+    return entries;
   }
 
   /**

@@ -485,6 +485,7 @@ export class InMemoryContentAddressedStore implements ContentAddressedStore {
     return {
       epoch: this.storeEpoch,
       maxReceiptOrder: this.nextReceiptOrder - 1,
+      entryCount: this.entries.size,
     };
   }
 
