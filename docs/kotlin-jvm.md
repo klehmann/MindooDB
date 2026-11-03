@@ -261,6 +261,58 @@ orders.liveQuery(mindooQuery { filter = field("status") eq "open" })
     .collect { println("${it.total} open orders") }   // re-emits on every change, also after sync
 ```
 
+### The view language
+
+Filters, sort keys and view columns use the complete MindooDB view language, the same expressions TypeScript apps build with `createViewLanguage()` (see [Virtual views](./virtualview.md) and [Ad-hoc queries](./adhoc-queries.md)). Arguments typed `Any?` take an expression or a plain value.
+
+| Group | Functions |
+|---|---|
+| Values | `lit`, `str`, `num`, `bool`, `field("a.b")`, `value(column)`, `origin()`, `parent(field)` |
+| Document metadata | `docId()`, `parentDocId()`, `createdAt()`, `lastModifiedAt()`, `decryptionKeyId()`, `isWitnessed()`, `isAwaitingWitness()`, `attachmentNames()`, `attachmentLengths()`, `attachmentCount()` |
+| View counters | `childCount()`, `childCategoryCount()`, `childDocumentCount()`, `descendantCount()`, `descendantCategoryCount()`, `descendantDocumentCount()`, `siblingCount()` |
+| Arithmetic | `+ - * / %` on expressions, or `add`, `sub`, `mul`, `div`, `mod` |
+| Comparison, logic | `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `and`, `or`, `not`, `allOf`, `anyOf` |
+| Text | `concat`, `lower`, `upper`, `trim`, `left`, `right`, `contains`, `startsWith`, `endsWith`, `pathJoin` |
+| Conversion, nulls | `asNumber`, `asString`, `asBoolean`, `coalesce`, `exists`, `notExists`, `datePart(x, DatePart.Year/Month/Day/Quarter)` |
+| Encrypted, JSON | `decryptField`, `decryptJson`, `json(field, path)` |
+| Branching | `ifElse(cond, a, cond2, b, default)`, `let("x" to expr) { it["x"] * 2 }` |
+| Anything newer | `rawExpr(json)` |
+
+```kotlin
+// A computed amount, a label with let + ifElse, sorting by a computed key
+val amount = field("hours") * field("rate")
+val label = let("h" to field("hours")) { ifElse(it["h"] gte 8, "full day", it["h"] gt 0, "part time", "off") }
+work.query(mindooQuery {
+    filter = (field("type") eq "time") and (amount gt 40) and (datePart(field("day"), DatePart.Year) eq 2026)
+    sort(lower(field("employee")))
+})
+
+// The same filter as formula source text, e.g. stored in a settings document
+work.query(mindooQuery { filterFormula = "v.eq(v.field(\"type\"), \"time\")" })
+```
+
+Numbers compare numerically, dates by time, other values as strings (the numeric part of `gt`/`lt` and friends needs the next MindooDB release after 0.0.85). Queries only see summary fields; `decryptField` and `decryptJson` need a full scan.
+
+**Joins.** `include` adds related rows to every result row, from the same or another database of the session, with one indexed lookup instead of a query per row:
+
+```kotlin
+val entries = work.query(mindooQuery {
+    filter = field("type") eq "time"
+    include("customer", Cardinality.One) { db = "crm"; localKey = "customer" }   // customer holds a docId
+})
+entries.rows.forEach { println("${it.fields["hours"]} h for ${it.included("customer")?.fields?.get("name")}") }
+
+val customers = crm.query(mindooQuery {
+    filter = field("type") eq "customer"
+    include("entries", Cardinality.Many) {
+        db = "work"
+        filter = field("customer") eq parentDocId()                              // child field = parent's ID
+        sort("hours", SortDirection.DESCENDING)
+    }
+})
+customers.rows.forEach { println("${it.fields["name"]}: ${it.includedList("entries").size} entries") }
+```
+
 ### Full-text search
 
 Enable it per database once (the setting syncs to every member), then add a text clause:
@@ -282,7 +334,8 @@ val nav = orders.openViewNavigator(
     viewDefinition {
         filter = field("type") eq "order"
         category("customer")
-        column("total", totalMode = "sum")
+        column("total", field("total"), totals = TotalMode.Sum, sorting = ColumnSorting.Descending)
+        column("net", value("total") / 1.19)                // an earlier column's value
         column("status")
     },
     navigatorOptions = navigatorOptions(expandAll = true),
@@ -293,6 +346,23 @@ nav.readForward(limit = 100).forEach { e ->
 }
 nav.changes().collect { /* the view followed the database; read again */ }
 nav.close()
+```
+
+Category columns build sub-categories from `\`-separated paths (`pathJoin(datePart(field("day"), DatePart.Year), field("customer"))`) and one entry per value from lists. `categorizationStyle` puts categories before or after documents, and `childCount()` and the other view counters work in column formulas.
+
+A view can span several databases of the session (also of different tenants): pass `sources`, and each source contributes its entries under its own `origin()`, optionally with its own filter:
+
+```kotlin
+val everything = work.openViewNavigator(
+    viewDefinition {
+        category("source", expression = origin())
+        column("label", coalesce(field("name"), field("employee")))
+    },
+    sources = listOf(
+        ViewSource("work", filter = field("type") eq "time", origin = "work"),
+        ViewSource("crm", filter = field("type") eq "customer", origin = "crm"),
+    ),
+)
 ```
 
 The navigator walks the tree (`gotoFirst`, `gotoNext`, `gotoParent`, `gotoPos("1.2")`, siblings), expands and collapses categories, and selects entries (`select`, `readSelected`). While `changes()` is collected the view updates itself; otherwise call `nav.refresh()`.
