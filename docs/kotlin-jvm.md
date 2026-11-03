@@ -281,16 +281,36 @@ nav.close()
 
 The navigator walks the tree (`gotoFirst`, `gotoNext`, `gotoParent`, `gotoPos("1.2")`, siblings), expands and collapses categories, and selects entries (`select`, `readSelected`). While `changes()` is collected the view updates itself; otherwise call `nav.refresh()`.
 
-### Changefeed
+### Incremental reads and the changefeed
+
+Every database has a changefeed: each document appears once, at its latest state, ordered by when it last changed. A cursor marks how far you have read. That makes incremental processing cheap: a job reads what changed since its last run, saves the cursor, and stops. Cost grows with the number of changes, not with the size of the database.
 
 ```kotlin
-orders.changes(sinceCursor = savedCursor).collect { change ->
-    exportToWarehouse(change.doc)
-    savedCursor = change.cursor          // persist to resume later
-}
+var stored: String? = loadCursor()                 // e.g. from your own database; null = from the start
+println("${orders.countChanges(ChangeCursors.parse(stored), idPrefix = "inv")} invoices to process")
+do {
+    val page = orders.readChanges(ChangeCursors.parse(stored), limit = 500, idPrefix = "inv")
+    page.changes.forEach { exportToWarehouse(it.doc) }
+    stored = ChangeCursors.serialize(page.cursor)
+    saveCursor(stored)                             // only after the page is processed
+} while (!page.done)
 ```
 
-The changefeed replays every document changed since the cursor, then follows new changes. It is the right tool to mirror MindooDB data into another system.
+- `readChanges(cursor, limit, idPrefix)` returns one page up to the current end (`ChangePage(changes, cursor, done)`) and does not wait for new changes. `changesUntilNow(...)` is the same as a `Flow` that pages internally.
+- `readChangeMetadata(...)` returns only document id, deleted flag and time, without decrypting anything. Use it to find out *which* documents changed (or were deleted), and load only those you need with `documents.get`.
+- `countChanges(cursor, idPrefix)` counts what is left, for progress bars or to skip a run.
+- `idPrefix` filters by ID prefix before documents are loaded, so give document types their own prefix (`create(values, idPrefix = "inv")`).
+- A cursor is an opaque JSON object. Store it with `ChangeCursors.serialize` and pass `ChangeCursors.parse(...)` back unchanged. Save it after you processed a page: if the job dies mid-page, the page is read again (at-least-once), so make processing idempotent.
+- Deleted documents appear in the feed too (`doc.isDeleted` / `meta.isDeleted`), so a mirror can remove them.
+
+To follow changes live instead of polling, collect `changes(cursor, idPrefix)` (or `changeMetadata(...)`): it replays everything after the cursor and then emits each new change, including changes that arrive through sync.
+
+```kotlin
+orders.changes(sinceCursor = ChangeCursors.parse(stored)).collect { change ->
+    exportToWarehouse(change.doc)
+    saveCursor(ChangeCursors.serialize(change.cursor))
+}
+```
 
 ---
 
