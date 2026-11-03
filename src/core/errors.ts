@@ -59,3 +59,67 @@ export function isDocumentMissingError(error: unknown): boolean {
     (error.name === "DocumentNotFoundError" || error.name === "DocumentDeletedError")
   );
 }
+
+/**
+ * Error thrown by `ContentAddressedStore.resolveDependencies()` when the walk
+ * reaches an entry id the store does not hold — the start entry itself, or a
+ * dependency some entry on the chain points to.
+ *
+ * Returning the chain up to the gap would hand callers an incomplete result
+ * that looks complete: an attachment read from it comes back empty or
+ * truncated without any error. The fields name the gap so it can be analysed
+ * (which chain, which id, who referenced it, how far the walk got).
+ *
+ * The message starts with `"Missing dependency"` so a caller can still
+ * recognise it after a network hop, where only the message survives; use
+ * {@link isMissingDependencyError}.
+ */
+export class MissingDependencyError extends Error {
+  /** The entry the walk started from. */
+  public readonly startId: string;
+  /** The entry id that is not in the store. */
+  public readonly missingId: string;
+  /** The entry whose `dependencyIds` named `missingId`; `null` when the start entry itself is missing. */
+  public readonly referencedBy: string | null;
+  /** Hops from the start entry to the missing one (0 = the start entry). */
+  public readonly depth: number;
+  /** Entries found before the walk hit the gap. */
+  public readonly resolvedCount: number;
+
+  constructor(details: {
+    startId: string;
+    missingId: string;
+    referencedBy: string | null;
+    depth: number;
+    resolvedCount: number;
+  }) {
+    super(
+      details.referencedBy === null
+        ? `Missing dependency: start entry ${details.missingId} is not in the store`
+        : `Missing dependency: entry ${details.missingId} (referenced by ${details.referencedBy}, ` +
+            `${details.depth} hop(s) from ${details.startId}, ${details.resolvedCount} entries resolved before it) ` +
+            `is not in the store`,
+    );
+    this.name = "MissingDependencyError";
+    this.startId = details.startId;
+    this.missingId = details.missingId;
+    this.referencedBy = details.referencedBy;
+    this.depth = details.depth;
+    this.resolvedCount = details.resolvedCount;
+  }
+}
+
+/**
+ * True when `error` is a {@link MissingDependencyError}, also when it crossed a
+ * network or RPC boundary and arrives as a plain error carrying its message, or
+ * when two module copies of mindoodb are loaded.
+ */
+export function isMissingDependencyError(error: unknown): boolean {
+  if (error instanceof MissingDependencyError) {
+    return true;
+  }
+  return (
+    error instanceof Error &&
+    (error.name === "MissingDependencyError" || error.message.includes("Missing dependency:"))
+  );
+}

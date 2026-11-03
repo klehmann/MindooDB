@@ -62,6 +62,7 @@ import {
   StoreIdBloomSummary,
   StoreHead,
 } from "../../core/appendonlystores/types";
+import { MissingDependencyError } from "../../core/errors";
 import { generateRandomUuid } from "../../core/utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
@@ -1743,10 +1744,10 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     // We reverse at the end to return dependency-first order.
     const result: string[] = [];
     const visited = new Set<string>();
-    const queue: Array<{ id: string; depth: number }> = [{ id: startId, depth: 0 }];
+    const queue: Array<{ id: string; depth: number; from: string | null }> = [{ id: startId, depth: 0, from: null }];
 
     while (queue.length > 0) {
-      const { id, depth } = queue.shift()!;
+      const { id, depth, from } = queue.shift()!;
       if (visited.has(id)) {
         continue;
       }
@@ -1758,7 +1759,13 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
 
       const entry = await this.readMetadataById(id);
       if (!entry) {
-        continue;
+        throw new MissingDependencyError({
+          startId,
+          missingId: id,
+          referencedBy: from,
+          depth,
+          resolvedCount: result.length,
+        });
       }
 
       if (stopAtEntryType && entry.entryType === stopAtEntryType && id !== startId) {
@@ -1772,7 +1779,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
 
       for (const depId of entry.dependencyIds) {
         if (!visited.has(depId)) {
-          queue.push({ id: depId, depth: depth + 1 });
+          queue.push({ id: depId, depth: depth + 1, from: id });
         }
       }
     }

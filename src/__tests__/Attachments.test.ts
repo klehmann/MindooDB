@@ -297,6 +297,59 @@ describe("Attachments", () => {
         .rejects.toThrow("attachment payload may not be synced locally yet");
     }, 30000);
 
+    it("throws instead of returning an empty or truncated file when chunks are missing", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000);
+      for (let i = 0; i < testData.length; i++) {
+        testData[i] = i % 256;
+      }
+      let attachmentId: string | undefined;
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const attachmentRef = reloadedDoc.getAttachments()[0]!;
+      const attachmentStore = db.getAttachmentStore() as any;
+      // A chunk in the middle (128-byte chunks → 8 of them): the chain breaks there.
+      const chain: string[] = await attachmentStore.resolveDependencies(attachmentRef.lastChunkId);
+      attachmentStore.entries.delete(chain[3]);
+      await expect(reloadedDoc.getAttachment(attachmentId!)).rejects.toMatchObject({
+        name: "MissingDependencyError",
+        missingId: chain[3],
+        referencedBy: chain[4],
+      });
+
+      // The last chunk: nothing to start from.
+      attachmentStore.entries.delete(attachmentRef.lastChunkId);
+      await expect(reloadedDoc.getAttachment(attachmentId!)).rejects.toMatchObject({
+        name: "MissingDependencyError",
+        missingId: attachmentRef.lastChunkId,
+        referencedBy: null,
+      });
+    }, 30000);
+
+    it("throws when the store returns fewer chunks than the chain names", async () => {
+      const doc = await db.createDocument();
+      const testData = new Uint8Array(1000).fill(7);
+      let attachmentId: string | undefined;
+      await db.changeDoc(doc, async (d) => {
+        const ref = await d.addAttachment(testData, "test.bin", "application/octet-stream");
+        attachmentId = ref.attachmentId;
+      });
+
+      const reloadedDoc = await db.getDocument(doc.getId());
+      const attachmentStore = db.getAttachmentStore() as any;
+      const getEntries = attachmentStore.getEntries.bind(attachmentStore);
+      jest.spyOn(attachmentStore, "getEntries").mockImplementation(async (...args: unknown[]) => {
+        const entries = await getEntries(...(args as [string[]]));
+        return entries.slice(1);
+      });
+
+      await expect(reloadedDoc.getAttachment(attachmentId!)).rejects.toThrow("is incomplete: read 872 of 1000 bytes");
+    }, 30000);
+
     it("keeps range reads correct when chunkSizeBytes changes between write and read", async () => {
       const doc = await db.createDocument();
       const testData = new Uint8Array(1000);

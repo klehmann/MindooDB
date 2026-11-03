@@ -21,6 +21,7 @@ import type {
   StoreHead,
 } from "../../core/appendonlystores/types";
 import { PUT_REJECTION_CLASSES, StoreKind } from "../../core/appendonlystores/types";
+import { isMissingDependencyError } from "../../core/errors";
 import type { NetworkTransport, NetworkTransportConfig } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
@@ -990,6 +991,9 @@ export class HttpTransport implements NetworkTransport {
         // the last attempt this method throws a generic NETWORK_ERROR, so an
         // answer as specific as "this write is not allowed" would arrive
         // looking like a broken connection.
+        if (isMissingDependencyError(error)) {
+          throw error;
+        }
         if (error instanceof NetworkError) {
           if (
             error.type === NetworkErrorType.INVALID_TOKEN ||
@@ -1094,6 +1098,13 @@ export class HttpTransport implements NetworkTransport {
             );
           }
           default:
+            if (errorData.type === "MISSING_DEPENDENCY") {
+              // The server's store lacks an entry of the requested chain.
+              // Same name as MissingDependencyError, so callers recognise it.
+              const missing = new Error(errorData.error || "Missing dependency: unknown entry");
+              missing.name = "MissingDependencyError";
+              throw missing;
+            }
             throw new NetworkError(
               NetworkErrorType.SERVER_ERROR,
               errorData.error || `HTTP ${response.status}`

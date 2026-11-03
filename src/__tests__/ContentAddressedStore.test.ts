@@ -1,6 +1,7 @@
 import { InMemoryContentAddressedStore, InMemoryContentAddressedStoreFactory } from "../core/appendonlystores/InMemoryContentAddressedStore";
 import { StoreEntry, StoreEntryMetadata } from "../core/types";
 import { bloomMightContainId } from "../core/appendonlystores/bloom";
+import { MissingDependencyError, isMissingDependencyError } from "../core/errors";
 
 describe("InMemoryContentAddressedStore", () => {
   let store: InMemoryContentAddressedStore;
@@ -280,6 +281,53 @@ describe("InMemoryContentAddressedStore", () => {
       
       const deps = await store.resolveDependencies("id3", { stopAtEntryType: "doc_snapshot" });
       expect(deps).toEqual(["id2", "id3"]); // Stops at snapshot, includes it
+    });
+
+    test("throws with details when an entry in the middle of the chain is missing", async () => {
+      const entry1 = createTestEntry("doc1", "id1", "c1", []);
+      const entry2 = createTestEntry("doc1", "id2", "c2", ["id1"]);
+      const entry3 = createTestEntry("doc1", "id3", "c3", ["id2"]);
+      // id2 never arrived: the chain id3 -> id2 -> id1 has a gap.
+      await store.putEntries([entry1, entry3]);
+
+      const error = await store.resolveDependencies("id3").catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(MissingDependencyError);
+      expect(error).toMatchObject({
+        startId: "id3",
+        missingId: "id2",
+        referencedBy: "id3",
+        depth: 1,
+        resolvedCount: 1,
+      });
+      expect(isMissingDependencyError(error)).toBe(true);
+      expect((error as Error).message).toContain("id2");
+    });
+
+    test("throws when the start entry itself is missing", async () => {
+      await expect(store.resolveDependencies("nope")).rejects.toMatchObject({
+        name: "MissingDependencyError",
+        missingId: "nope",
+        referencedBy: null,
+        depth: 0,
+      });
+    });
+
+    test("does not count entries behind a stop entry or beyond maxDepth as missing", async () => {
+      const entry2 = createTestEntry("doc1", "id2", "c2", ["id1"], "doc_snapshot");
+      const entry3 = createTestEntry("doc1", "id3", "c3", ["id2"], "doc_change");
+      await store.putEntries([entry2, entry3]);
+
+      await expect(store.resolveDependencies("id3", { stopAtEntryType: "doc_snapshot" })).resolves.toEqual([
+        "id2",
+        "id3",
+      ]);
+      await expect(store.resolveDependencies("id3", { maxDepth: 1 })).resolves.toEqual(["id2", "id3"]);
+    });
+
+    test("recognises the error by its message after a network hop", () => {
+      const relayed = new Error("Missing dependency: entry x (referenced by y, 1 hop(s) from y, 1 entries resolved before it) is not in the store");
+      expect(isMissingDependencyError(relayed)).toBe(true);
+      expect(isMissingDependencyError(new Error("something else"))).toBe(false);
     });
   });
 

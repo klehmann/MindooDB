@@ -35,6 +35,7 @@ import type {
   StoreHead,
   OpenStoreOptions,
 } from "../../core/appendonlystores/types";
+import { MissingDependencyError } from "../../core/errors";
 import { generateRandomUuid } from "../../core/utils/idGeneration";
 import { planAttachmentReadByWalkingMetadata } from "../../core/appendonlystores/AttachmentReadPlanner";
 import { computeBatchMaterializationPlan, computeDocumentMaterializationPlan } from "../../core/appendonlystores/MaterializationPlanner";
@@ -1256,13 +1257,13 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
     const result: string[] = [];
     const visited = new Set<string>();
-    const queue: Array<{ id: string; depth: number }> = [
-      { id: startId, depth: 0 },
+    const queue: Array<{ id: string; depth: number; from: string | null }> = [
+      { id: startId, depth: 0, from: null },
     ];
     let queueIdx = 0;
 
     while (queueIdx < queue.length) {
-      const { id, depth } = queue[queueIdx++];
+      const { id, depth, from } = queue[queueIdx++];
 
       if (visited.has(id)) continue;
       visited.add(id);
@@ -1273,10 +1274,13 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
         entriesOS.get(id)
       )) as StoreEntryMetadata | undefined;
       if (!entry) {
-        this.logger.warn(
-          `Entry ${id} not found during dependency resolution`
-        );
-        continue;
+        throw new MissingDependencyError({
+          startId,
+          missingId: id,
+          referencedBy: from,
+          depth,
+          resolvedCount: result.length,
+        });
       }
 
       if (stopAtEntryType && entry.entryType === stopAtEntryType && id !== startId) {
@@ -1290,7 +1294,7 @@ export class IndexedDBContentAddressedStore implements ContentAddressedStore {
 
       for (const depId of entry.dependencyIds) {
         if (!visited.has(depId)) {
-          queue.push({ id: depId, depth: depth + 1 });
+          queue.push({ id: depId, depth: depth + 1, from: id });
         }
       }
     }

@@ -344,6 +344,8 @@ export {
   DocumentNotFoundError,
   DocumentDeletedError,
   isDocumentMissingError,
+  MissingDependencyError,
+  isMissingDependencyError,
 } from "./errors";
 
 // Cache
