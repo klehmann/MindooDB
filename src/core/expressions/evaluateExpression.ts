@@ -131,6 +131,28 @@ export function expressionToBoolean(value: unknown): boolean {
   return Boolean(value);
 }
 
+/**
+ * Ordering for `gt`/`gte`/`lt`/`lte`. Numbers compare numerically (a numeric
+ * string next to a number counts as a number) and dates by time (an ISO
+ * string next to a date counts as a date); everything else, including a
+ * missing value, compares as strings, so `10 > 9` holds and `"10" > "9"`
+ * stays a string comparison.
+ */
+export function compareOrdered(a: unknown, b: unknown): number {
+  if (a instanceof Date || b instanceof Date) {
+    const ta = toDate(a)?.getTime();
+    const tb = toDate(b)?.getTime();
+    if (ta !== undefined && tb !== undefined) return ta - tb;
+  } else if (typeof a === "number" || typeof b === "number") {
+    const na = expressionToNumber(a);
+    const nb = expressionToNumber(b);
+    if (na !== null && nb !== null) return na - nb;
+  }
+  const sa = String(a ?? "");
+  const sb = String(b ?? "");
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
 function toDate(value: unknown): Date | null {
   if (value instanceof Date) {
     return Number.isNaN(value.getTime()) ? null : value;
@@ -237,13 +259,13 @@ function evaluateOperation(
     case "neq":
       return args[0] !== args[1];
     case "gt":
-      return String(args[0] ?? "") > String(args[1] ?? "");
+      return compareOrdered(args[0], args[1]) > 0;
     case "gte":
-      return String(args[0] ?? "") >= String(args[1] ?? "");
+      return compareOrdered(args[0], args[1]) >= 0;
     case "lt":
-      return String(args[0] ?? "") < String(args[1] ?? "");
+      return compareOrdered(args[0], args[1]) < 0;
     case "lte":
-      return String(args[0] ?? "") <= String(args[1] ?? "");
+      return compareOrdered(args[0], args[1]) <= 0;
     case "and":
       return args.every((value) => expressionToBoolean(value));
     case "or":

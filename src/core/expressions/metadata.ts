@@ -144,19 +144,19 @@ export const mindooDBViewLanguageHelpers = [
     { name: "left", kind: "expression", description: "The left expression." },
     { name: "right", kind: "expression", description: "The right expression." },
   ], ["v.neq(v.field(\"status\"), v.string(\"draft\"))"]),
-  helper("gt", "comparison", "Check whether the left expression sorts after the right expression.", "Performs runtime ordering comparison; numeric fields should usually be wrapped in toNumber() first.", "gt(left, right)", "BooleanExpression", [
+  helper("gt", "comparison", "Check whether the left expression sorts after the right expression.", "Numbers compare numerically and dates by time; other values compare as strings, so wrap numeric text in number() first.", "gt(left, right)", "BooleanExpression", [
     { name: "left", kind: "expression", description: "The left expression." },
     { name: "right", kind: "expression", description: "The right expression." },
   ], ["v.gt(v.toNumber(v.field(\"hours\")), v.number(0))"]),
-  helper("gte", "comparison", "Check whether the left expression sorts after or equal to the right expression.", "Performs runtime ordering comparison; numeric fields should usually be wrapped in toNumber() first.", "gte(left, right)", "BooleanExpression", [
+  helper("gte", "comparison", "Check whether the left expression sorts after or equal to the right expression.", "Numbers compare numerically and dates by time; other values compare as strings, so wrap numeric text in number() first.", "gte(left, right)", "BooleanExpression", [
     { name: "left", kind: "expression", description: "The left expression." },
     { name: "right", kind: "expression", description: "The right expression." },
   ]),
-  helper("lt", "comparison", "Check whether the left expression sorts before the right expression.", "Performs runtime ordering comparison; numeric fields should usually be wrapped in toNumber() first.", "lt(left, right)", "BooleanExpression", [
+  helper("lt", "comparison", "Check whether the left expression sorts before the right expression.", "Numbers compare numerically and dates by time; other values compare as strings, so wrap numeric text in number() first.", "lt(left, right)", "BooleanExpression", [
     { name: "left", kind: "expression", description: "The left expression." },
     { name: "right", kind: "expression", description: "The right expression." },
   ]),
-  helper("lte", "comparison", "Check whether the left expression sorts before or equal to the right expression.", "Performs runtime ordering comparison; numeric fields should usually be wrapped in toNumber() first.", "lte(left, right)", "BooleanExpression", [
+  helper("lte", "comparison", "Check whether the left expression sorts before or equal to the right expression.", "Numbers compare numerically and dates by time; other values compare as strings, so wrap numeric text in number() first.", "lte(left, right)", "BooleanExpression", [
     { name: "left", kind: "expression", description: "The left expression." },
     { name: "right", kind: "expression", description: "The right expression." },
   ]),

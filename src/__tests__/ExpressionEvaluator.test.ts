@@ -77,6 +77,28 @@ describe("expression evaluation", () => {
     })).toBe("Ada");
   });
 
+  it("orders numbers numerically, dates by time and the rest as strings", () => {
+    const ctx = { doc: documents[0]!.data, values: {}, origin: "tenant/db", variables: {} };
+    const check = (expression: ReturnType<typeof v.gt>) => evaluateExpression(expression, ctx);
+    expect(check(v.gt(v.number(10), v.number(9)))).toBe(true);
+    expect(check(v.lt(v.number(300), v.number(1000)))).toBe(true);
+    expect(check(v.gt(v.number(300), v.number(1000)))).toBe(false);
+    expect(check(v.gte(v.number(2.5), v.number(2.5)))).toBe(true);
+    expect(check(v.lte(v.number(-1), v.number(0)))).toBe(true);
+    // a numeric string next to a number counts as a number
+    expect(check(v.gt(v.string("300"), v.number(1000)))).toBe(false);
+    expect(check(v.gt(v.field("hours"), v.number(7)))).toBe(true);
+    // two strings stay a string comparison
+    expect(check(v.gt(v.string("9"), v.string("10")))).toBe(true);
+    expect(check(v.gt(v.string("b"), v.string("a")))).toBe(true);
+    // ISO dates compare correctly as strings and as dates
+    expect(check(v.lt(v.field("workDate"), v.string("2026-04-02")))).toBe(true);
+    expect(check(v.gt(v.datePart(v.field("workDate"), "year"), v.number(2025)))).toBe(true);
+    // a missing value sorts first, as before
+    expect(check(v.lt(v.field("missing" as "note"), v.number(0)))).toBe(true);
+    expect(check(v.gt(v.number(0), v.field("missing" as "note")))).toBe(true);
+  });
+
   it("evaluates left and right string helpers with delimiters and counts", () => {
     const base = { doc: {}, values: {}, origin: "tenant/db", variables: {} };
     expect(evaluateExpression(v.left("xyz_d", "_d"), base)).toBe("xyz");
