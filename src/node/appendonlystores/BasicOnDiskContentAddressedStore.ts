@@ -1676,6 +1676,7 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     return {
       epoch: this.storeEpoch,
       maxReceiptOrder: this.nextReceiptOrder - 1,
+      ...(this.indexingEnabled ? { entryCount: this.orderedMetadata.length } : {}),
     };
   }
 
