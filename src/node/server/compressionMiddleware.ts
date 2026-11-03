@@ -52,7 +52,14 @@ function chooseEncoding(acceptEncoding: string | undefined): SupportedEncoding |
   return null;
 }
 
-function compress(raw: Buffer, encoding: SupportedEncoding): Promise<Buffer> {
+function compress(
+  raw: Buffer,
+  encoding: SupportedEncoding,
+  level: { brotliQuality: number; gzipLevel: number } = {
+    brotliQuality: BROTLI_DYNAMIC_QUALITY,
+    gzipLevel: zlib.constants.Z_DEFAULT_COMPRESSION,
+  },
+): Promise<Buffer> {
   // Re-view the buffer to satisfy zlib's InputType (excludes SharedArrayBuffer-backed views).
   const input = new Uint8Array(raw.buffer as ArrayBuffer, raw.byteOffset, raw.byteLength);
   return new Promise((resolve, reject) => {
@@ -61,16 +68,62 @@ function compress(raw: Buffer, encoding: SupportedEncoding): Promise<Buffer> {
         input,
         {
           params: {
-            [zlib.constants.BROTLI_PARAM_QUALITY]: BROTLI_DYNAMIC_QUALITY,
+            [zlib.constants.BROTLI_PARAM_QUALITY]: level.brotliQuality,
             [zlib.constants.BROTLI_PARAM_SIZE_HINT]: raw.length,
           },
         },
         (err, buf) => (err ? reject(err) : resolve(buf)),
       );
     } else {
-      zlib.gzip(input, (err, buf) => (err ? reject(err) : resolve(buf)));
+      zlib.gzip(input, { level: level.gzipLevel }, (err, buf) => (err ? reject(err) : resolve(buf)));
     }
   });
+}
+
+/**
+ * Below this share of compressible bytes a binary entry body is sent as is:
+ * the encrypted payloads do not shrink, so compressing an attachment batch
+ * would only burn server CPU.
+ */
+const BINARY_MIN_COMPRESSIBLE_SHARE = 0.25;
+
+/**
+ * Send a binary entry body (`application/octet-stream`, see
+ * binaryEntryFraming.ts), compressed when the client accepts it and enough
+ * of the body is metadata.
+ *
+ * The metadata JSON in each frame (ids, hashes, keys, signatures) shrinks by
+ * roughly 40 %; the encrypted payloads are incompressible. Fastest settings
+ * on purpose: at brotli quality 1 a 250-entry batch compresses in about a
+ * millisecond and saves as much as quality 4, and the payload part costs
+ * almost nothing because brotli stores incompressible blocks raw.
+ *
+ * @param compressibleBytes How many bytes of `body` are metadata.
+ */
+export async function sendBinaryEntryBody(
+  req: Request,
+  res: Response,
+  body: Uint8Array,
+  compressibleBytes: number,
+): Promise<void> {
+  const raw = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  const encoding =
+    raw.length >= COMPRESSION_THRESHOLD_BYTES &&
+    compressibleBytes >= raw.length * BINARY_MIN_COMPRESSIBLE_SHARE
+      ? chooseEncoding(req.headers["accept-encoding"] as string | undefined)
+      : null;
+  if (encoding) {
+    try {
+      const compressed = await compress(raw, encoding, { brotliQuality: 1, gzipLevel: 1 });
+      res.setHeader("Content-Encoding", encoding);
+      res.setHeader("Vary", "Accept-Encoding");
+      res.send(compressed);
+      return;
+    } catch {
+      // Fall through to the uncompressed body.
+    }
+  }
+  res.send(raw);
 }
 
 /**

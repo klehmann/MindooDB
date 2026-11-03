@@ -26,6 +26,8 @@ import type {
   NetworkEncryptedEntry,
   NetworkSessionEncryptedEntry,
   SessionEncryptedEntriesBatch,
+  SessionEncryptedPayloadBatch,
+  NetworkSessionEncryptedPayload,
   StoreChangeEvent,
   AuthResult,
   NetworkSyncCapabilities,
@@ -632,7 +634,58 @@ export class HttpTransport implements NetworkTransport {
     ids: string[]
   ): Promise<SessionEncryptedEntriesBatch> {
     this.logger.debug(`Getting ${ids.length} entries (binary v2 format)`);
+    const { wrappedSessionKey, frames } = await this.fetchBinaryEntries(token, ids, false);
 
+    const entries: NetworkSessionEncryptedEntry[] = frames.map((frame) => {
+      const meta = frame.meta as unknown as SerializedEntryMetadata & { iv: string };
+      return {
+        ...this.deserializeEntryMetadata(meta),
+        iv: this.base64ToUint8Array(meta.iv),
+        sessionEncryptedPayload: frame.payload,
+      };
+    });
+
+    this.logger.debug(`Retrieved ${entries.length} session-encrypted entries (binary)`);
+    return { wrappedSessionKey, entries };
+  }
+
+  /**
+   * Payload-only variant of {@link getEntriesBinary} (capability
+   * `supportsPayloadOnlyEntries`): each frame carries only id and IV next to
+   * the payload. A server that ignores the flag still answers with full
+   * frames, which read the same way here.
+   */
+  async getEntryPayloadsBinary(
+    token: string,
+    ids: string[]
+  ): Promise<SessionEncryptedPayloadBatch> {
+    this.logger.debug(`Getting ${ids.length} entry payloads (binary v2 format)`);
+    const { wrappedSessionKey, frames } = await this.fetchBinaryEntries(token, ids, true);
+
+    const entries: NetworkSessionEncryptedPayload[] = frames.map((frame) => {
+      const meta = frame.meta as { id?: unknown; iv?: unknown };
+      if (typeof meta.id !== "string" || typeof meta.iv !== "string") {
+        throw new NetworkError(
+          NetworkErrorType.SERVER_ERROR,
+          "Binary getEntries response frame is missing id or iv",
+        );
+      }
+      return {
+        id: meta.id,
+        iv: this.base64ToUint8Array(meta.iv),
+        sessionEncryptedPayload: frame.payload,
+      };
+    });
+
+    this.logger.debug(`Retrieved ${entries.length} session-encrypted payloads (binary)`);
+    return { wrappedSessionKey, entries };
+  }
+
+  private async fetchBinaryEntries(
+    token: string,
+    ids: string[],
+    payloadOnly: boolean,
+  ): Promise<{ wrappedSessionKey: Uint8Array; frames: BinaryEntryFrame[] }> {
     const response = await this.fetchWithRetry(
       `${this.getSyncBasePath()}/getEntriesBinary`,
       {
@@ -646,6 +699,7 @@ export class HttpTransport implements NetworkTransport {
           tenantId: this.config.tenantId,
           dbId: this.config.dbId,
           ids,
+          ...(payloadOnly ? { payloadOnly: true } : {}),
         }),
       }
     );
@@ -664,20 +718,9 @@ export class HttpTransport implements NetworkTransport {
         "Binary getEntries response is missing the wrapped session key",
       );
     }
-
-    const entries: NetworkSessionEncryptedEntry[] = message.entries.map((frame) => {
-      const meta = frame.meta as unknown as SerializedEntryMetadata & { iv: string };
-      return {
-        ...this.deserializeEntryMetadata(meta),
-        iv: this.base64ToUint8Array(meta.iv),
-        sessionEncryptedPayload: frame.payload,
-      };
-    });
-
-    this.logger.debug(`Retrieved ${entries.length} session-encrypted entries (binary)`);
     return {
       wrappedSessionKey: this.base64ToUint8Array(message.header.wrappedSessionKey),
-      entries,
+      frames: message.entries,
     };
   }
 

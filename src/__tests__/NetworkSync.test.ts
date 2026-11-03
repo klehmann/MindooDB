@@ -667,6 +667,67 @@ describe("Network Sync", () => {
       expect(retrieved[0].encryptedData).toEqual(entry.encryptedData);
     });
 
+    test("should fetch only payloads for entries the client just scanned", async () => {
+      const entries = [
+        createMockEntry("doc1", "hash1", 1000),
+        createMockEntry("doc2", "hash2", 1001),
+        createMockEntry("doc3", "hash3", 1002),
+      ];
+      await serverStore.putEntries(entries);
+
+      // Binary transport with payload-only support (HTTP-layer capabilities
+      // in production), backed by the session-wrapped server handler.
+      const baseGetCapabilities = mockTransport.getCapabilities.bind(mockTransport);
+      jest.spyOn(mockTransport, "getCapabilities").mockImplementation(async (token: string) => ({
+        ...(await baseGetCapabilities(token)),
+        supportsBinaryEntries: true,
+        supportsPayloadOnlyEntries: true,
+      }));
+      const fullRequests: string[][] = [];
+      const payloadRequests: string[][] = [];
+      const transport = mockTransport as unknown as {
+        getEntriesBinary: NetworkTransport["getEntriesBinary"];
+        getEntryPayloadsBinary: NetworkTransport["getEntryPayloadsBinary"];
+      };
+      transport.getEntriesBinary = async (token, ids) => {
+        fullRequests.push(ids);
+        return serverHandler.handleGetEntriesSessionWrapped(token, ids);
+      };
+      transport.getEntryPayloadsBinary = async (token, ids) => {
+        payloadRequests.push(ids);
+        const batch = await serverHandler.handleGetEntriesSessionWrapped(token, ids);
+        return {
+          wrappedSessionKey: batch.wrappedSessionKey,
+          entries: batch.entries.map((e) => ({
+            id: e.id,
+            iv: e.iv,
+            sessionEncryptedPayload: e.sessionEncryptedPayload,
+          })),
+        };
+      };
+
+      const page = await clientStore.scanEntriesSince!(null, 2);
+      expect(page.entries.map((e) => e.id)).toEqual(["hash1", "hash2"]);
+
+      const retrieved = await clientStore.getEntries(["hash1", "hash2", "hash3"]);
+
+      // Scanned ids travel payload-only; the unscanned one with full frames.
+      expect(payloadRequests).toEqual([["hash1", "hash2"]]);
+      expect(fullRequests).toEqual([["hash3"]]);
+      const byId = new Map(retrieved.map((e) => [e.id, e]));
+      for (const entry of entries) {
+        const got = byId.get(entry.id)!;
+        expect(got.encryptedData).toEqual(entry.encryptedData);
+        expect(got.docId).toBe(entry.docId);
+        expect(got.createdAt).toBe(entry.createdAt);
+      }
+
+      // Remembered metadata is used once: a repeat fetch takes full frames.
+      await clientStore.getEntries(["hash1"]);
+      expect(payloadRequests).toHaveLength(1);
+      expect(fullRequests).toEqual([["hash3"], ["hash1"]]);
+    });
+
     // --- sync-v5 phase 5: live change subscription via the client store ---
 
     test("should forward change events from the transport and stop on unsubscribe", async () => {
