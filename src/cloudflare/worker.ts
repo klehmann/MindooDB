@@ -2,13 +2,15 @@
  * The MindooDB Worker: routes every request of the MindooDB HTTP API to the
  * Durable Object that serves it.
  *
- * - `/system/*` and discovery → the server object (config, tenants, key bag)
+ * - `/system/*` (including `/system/peer/*` and `/system/cluster/*`) and
+ *   discovery → the server object (config, tenants, key bag, peer replication)
  * - `/:tenantId/auth/*`, `/:tenantId/timestamps/*`, the event stream → the
  *   tenant's `directory` object
  * - `/:tenantId/sync/:kind/:op` → the object of the database named by `dbId`
  *   (query string for GET, JSON body, or the binary message header)
  *
- * Paths, status codes and bodies match the Node server.
+ * Paths, status codes and bodies match the Node server. The cron trigger
+ * drives peer replication (`scheduled`).
  */
 
 import {
@@ -27,7 +29,14 @@ import {
   parseCorsOrigins,
   type MatchedRoute,
 } from "./http";
-import { createHostSettings, databaseObject, OBJECT_HEADER, rateLimited, serverObject } from "./host";
+import {
+  createHostSettings,
+  databaseObject,
+  internalHeaders,
+  OBJECT_HEADER,
+  rateLimited,
+  serverObject,
+} from "./host";
 import type { ExecutionContext, MindooCloudflareEnv } from "./types";
 
 const DIRECTORY_DB_ID = "directory";
@@ -96,12 +105,21 @@ async function handle(
     case "publicInfosFingerprints":
       return serverObject(env).fetch(forward(request, url, null, internal));
 
+    case "peer":
     case "system": {
-      const limited = await rateLimited(
-        env.MINDOODB_RATE_LIMIT_SYSTEM,
-        `system:${clientAddressKey(clientIp)}`,
-        "Too many system requests, please try again later",
-      );
+      // Peer routes are server-to-server traffic with their own budget, as on
+      // Node: the admin budget would throttle replication to a crawl.
+      const limited = route.kind === "peer"
+        ? await rateLimited(
+            env.MINDOODB_RATE_LIMIT_PEER,
+            `peer:${clientAddressKey(clientIp)}`,
+            "Too many peer requests, please try again later",
+          )
+        : await rateLimited(
+            env.MINDOODB_RATE_LIMIT_SYSTEM,
+            `system:${clientAddressKey(clientIp)}`,
+            "Too many system requests, please try again later",
+          );
       if (limited) return limited;
       const body = request.body ? new Uint8Array(await request.arrayBuffer()) : null;
       return serverObject(env).fetch(forward(request, url, body, internal));
@@ -187,5 +205,19 @@ export default {
       console.error("[MindooDB Worker] Unhandled error:", error);
       return decorateResponse(request, jsonResponse(500, { error: "Internal server error" }), origins);
     }
+  },
+
+  /**
+   * Cron trigger (`triggers.crons` in wrangler.jsonc): one peer replication
+   * pass. Replication runs only when `config.json` sets `cluster.autoSync`.
+   */
+  async scheduled(_controller: unknown, env: MindooCloudflareEnv, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      serverObject(env)
+        .fetch(`${INTERNAL_ORIGIN}/internal/cluster/tick`, { method: "POST", headers: internalHeaders() })
+        .then(async (response) => {
+          if (!response.ok) console.error(`[MindooDB Worker] Cluster tick failed: ${await response.text()}`);
+        }),
+    );
   },
 };

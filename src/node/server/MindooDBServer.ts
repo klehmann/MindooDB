@@ -27,7 +27,9 @@ import cors from "cors";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { jsonCompressionMiddleware } from "./compressionMiddleware";
 import { SyncEventBus } from "../../server/SyncEventBus";
-import { ClusterManager } from "./peer/ClusterManager";
+import { ClusterManager } from "../../server/peer/ClusterManager";
+import { FileClusterAuditStorage } from "./peer/FileClusterAuditStorage";
+import { IrohPeerLink } from "./peer/IrohPeerLink";
 import { createClusterRouter, createPeerRouter } from "./peer/routes";
 import { StoreKind } from "../../core/appendonlystores/types";
 
@@ -174,7 +176,7 @@ export class MindooDBServer {
     );
     this.cluster = new ClusterManager({
       cryptoAdapter,
-      dataDir,
+      auditStorage: new FileClusterAuditStorage(dataDir),
       eventBus: this.syncEventBus,
       listTrustedServers: () => this.tenantManager.listTrustedServers(),
       localServerName: () => this.tenantManager.getServerPublicInfo()?.name ?? null,
@@ -191,6 +193,7 @@ export class MindooDBServer {
       onDirectoryPulled: (tenantId) => this.tenantManager.executePendingPurges(tenantId),
       localRole: this.serverConfig.cluster?.role,
       getIrohStreamIO: () => this.irohEndpoint.getStreamIO(),
+      openIrohLink: (io, ticket) => new IrohPeerLink(io, ticket),
     });
     // Peer tokens are accepted by the tenant sync routes so a peer can mirror
     // the encrypted stores through the ordinary protocol; the store bypasses

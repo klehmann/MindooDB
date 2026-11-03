@@ -39,7 +39,12 @@ import { DeviceDiscoveryService } from "../server/DeviceDiscoveryService";
 import { SyncEventBus, type SyncChangeEvent } from "../server/SyncEventBus";
 import { buildAuthRateLimitKey, buildSyncRateLimitKey, buildTimestampRateLimitKey } from "../server/rateLimits";
 import { isEventStreamResponse, type ServerRequest, type SyncEventPublisher, type SyncEventStreamSpec } from "../server/http/types";
-import type { TenantConfig } from "../server/types";
+import type { TenantConfig, TrustedServer } from "../server/types";
+import { PeerAuthService } from "../server/peer/PeerAuthService";
+import { guardStoreAgainstPurgedDocuments } from "../core/appendonlystores/purgedDocumentGuard";
+import { StoreRpcServer } from "../core/appendonlystores/rpc/StoreRpcServer";
+import type { StoreRpcRequest } from "../core/appendonlystores/rpc/RpcContentAddressedStore";
+import { StoreRpcBytes } from "./storeRpc";
 import { createDurableObjectStore, DurableObjectServerDataStore } from "./DurableObjectSql";
 import { WorkersCryptoAdapter } from "./WorkersCryptoAdapter";
 import {
@@ -54,6 +59,7 @@ import {
 import {
   createHostSettings,
   databaseObject,
+  derivePeerJwtSecret,
   deriveTenantJwtSecret,
   OBJECT_HEADER,
   internalHeaders,
@@ -72,11 +78,16 @@ const DIRECTORY_POLL_INTERVAL_MS = 2_000;
 const DIRECTORY_PAGE_SIZE = 200;
 const REPLICA_CURSOR_KEY = "directory-replica-cursor.json";
 const DATABASES_KEY = "databases.json";
+const TRUSTED_SERVERS_KEY = "trusted-servers.json";
 
 interface TenantState {
   exists: boolean;
   config?: TenantConfig;
   publicInfosKeys: Uint8Array[];
+  /** `trusted-servers.json` of the server: peers may sync with their peer token. */
+  trustedServers: TrustedServer[];
+  /** Peer replication runs; accepted writes are reported to the server object. */
+  clusterActive: boolean;
   loadedAt: number;
 }
 
@@ -95,6 +106,8 @@ export class MindooDatabaseObject {
   private readonly eventBus = new SyncEventBus();
   private replicaCheckedAt = 0;
   private replicaRefresh: Promise<boolean> | null = null;
+  /** Payload buffers of store RPC exchanges with the server object. */
+  private readonly rpcBytes = new StoreRpcBytes();
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -187,24 +200,35 @@ export class MindooDatabaseObject {
       exists: boolean;
       config?: TenantConfig;
       publicInfosKeys?: string[];
+      trustedServers?: TrustedServer[];
+      clusterActive?: boolean;
     };
     const state: TenantState = {
       exists: body.exists,
       config: body.config,
       publicInfosKeys: (body.publicInfosKeys ?? []).map((key) => base64ToBytes(key)),
+      trustedServers: body.trustedServers ?? [],
+      clusterActive: body.clusterActive === true,
       loadedAt: Date.now(),
     };
 
     const configKey = `${tenantId}/config.json`;
     const configJson = state.config ? JSON.stringify(state.config, null, 2) : null;
+    const trustedJson = JSON.stringify(state.trustedServers, null, 2);
     const changed =
       !this.tenantState ||
       this.dataStore.readText(configKey) !== configJson ||
+      this.dataStore.readText(TRUSTED_SERVERS_KEY) !== trustedJson ||
       this.tenantState.publicInfosKeys.map(String).join() !== state.publicInfosKeys.map(String).join();
     if (configJson === null) {
       this.dataStore.deleteTree(configKey);
     } else if (changed) {
       this.dataStore.writeText(configKey, configJson);
+    }
+    // The tenant manager reads trusted servers when it is created: they count
+    // as directory members (peer pushes) and as trusted witnesses.
+    if (changed) {
+      this.dataStore.writeText(TRUSTED_SERVERS_KEY, trustedJson);
     }
     this.tenantState = state;
     if (changed || !this.core) {
@@ -246,13 +270,47 @@ export class MindooDatabaseObject {
       publicInfosKeysResolver: async () => this.tenantState?.publicInfosKeys ?? [],
     });
 
+    // Peers replicate through the ordinary sync routes with a peer token from
+    // the server object (same key derivation), as on the Node server.
+    const trustedServers = () => this.tenantState?.trustedServers ?? [];
+    let peerAuth: Promise<PeerAuthService> | null = null;
+    const getPeerAuth = () =>
+      (peerAuth ??= derivePeerJwtSecret(env).then(
+        (jwtSecret) => new PeerAuthService(this.cryptoAdapter, trustedServers, { jwtSecret }),
+      ));
+    this.tenantManager.setPeerAccessControl({
+      peerTokenResolver: async (token) => {
+        const auth = await getPeerAuth();
+        const payload = await auth.validateToken(token);
+        const trusted = payload ? auth.findTrustedServerByKey(payload.publicsignkey) : null;
+        return trusted
+          ? {
+              name: trusted.name,
+              signingPublicKey: trusted.signingPublicKey,
+              encryptionPublicKey: trusted.encryptionPublicKey,
+            }
+          : null;
+      },
+      trustedWitnessResolver: (receivedByPublicKey) =>
+        trustedServers().some(
+          (server) => server.signingPublicKey.replace(/\s+/g, "") === receivedByPublicKey.replace(/\s+/g, ""),
+        ),
+    });
+
     const config = { capabilities: {} };
-    const syncEvents: SyncEventPublisher = this.isDirectory
-      ? this.eventBus
-      : {
-          listenerCount: 1,
-          publish: (event) => this.ctx.waitUntil(this.forwardEvent(event)),
-        };
+    const syncEvents: SyncEventPublisher = {
+      listenerCount: 1,
+      publish: (event) => {
+        if (this.isDirectory) {
+          this.eventBus.publish(event);
+        } else {
+          this.ctx.waitUntil(this.forwardEvent(event));
+        }
+        if (this.tenantState?.clusterActive) {
+          this.ctx.waitUntil(this.reportToCluster(event));
+        }
+      },
+    };
     this.core = new MindooDBServerCore({
       tenantManager: this.tenantManager,
       // System administration runs in the server object; these are inert here.
@@ -273,6 +331,11 @@ export class MindooDatabaseObject {
       jsonBodyLimit: this.settings.jsonBodyLimit,
       allowInsecureSyncUrls: this.settings.allowInsecureSyncUrls,
       runInBackground: (task) => this.ctx.waitUntil(task),
+      cluster: {
+        mirrorsForTenant: () => [],
+        syncReplicators: () => undefined,
+        resolvePeerName: async (token) => (await (await getPeerAuth()).validateToken(token))?.sub,
+      },
       onDirectoryWrite: async (id) => {
         this.notifyDatabasesOfDirectoryChange(id);
       },
@@ -281,6 +344,19 @@ export class MindooDatabaseObject {
 
   private directoryObject() {
     return databaseObject(this.env, this.tenantId!, DIRECTORY_DB_ID);
+  }
+
+  /** Let the server object push an accepted write on to the peers. */
+  private async reportToCluster(event: SyncChangeEvent): Promise<void> {
+    try {
+      await serverObject(this.env).fetch(`${INTERNAL_ORIGIN}/internal/cluster/change`, {
+        method: "POST",
+        headers: internalHeaders(),
+        body: JSON.stringify(event),
+      });
+    } catch (error) {
+      console.warn("[MindooDatabaseObject] Could not report change to the cluster:", error);
+    }
   }
 
   private async forwardEvent(event: SyncChangeEvent): Promise<void> {
@@ -388,7 +464,19 @@ export class MindooDatabaseObject {
   // ==================== Internal routes ====================
 
   private async internal(path: string, request: Request): Promise<Response> {
+    const bytes = await this.rpcBytes.handle(path, request);
+    if (bytes) return bytes;
     switch (path) {
+      case "/internal/store-rpc":
+        return this.storeRpc(request);
+      case "/internal/databases":
+        if (!this.isDirectory) break;
+        return jsonResponse(200, { databases: [DIRECTORY_DB_ID, ...this.registeredDatabases()] });
+      case "/internal/directory/announce":
+        // Directory entries arrived by peer replication.
+        if (!this.isDirectory) break;
+        this.notifyDatabasesOfDirectoryChange(this.tenantId!);
+        return jsonResponse(200, { ok: true });
       case "/internal/wipe":
         return this.wipe();
       case "/internal/directory/changed":
@@ -412,6 +500,48 @@ export class MindooDatabaseObject {
       }
     }
     return jsonResponse(404, { error: "Not found" });
+  }
+
+  /**
+   * This object's stores for peer replication in the server object. Pulled
+   * entries of purged documents are refused, as on Node.
+   */
+  private async storeRpc(request: Request): Promise<Response> {
+    const state = await this.loadTenantState();
+    if (!state.exists) {
+      return jsonResponse(404, { error: "Tenant not found" });
+    }
+    const tenantId = this.tenantId!;
+    const dbId = this.dbId!;
+    const server = new StoreRpcServer({
+      bytes: this.rpcBytes,
+      createFactory: (scope) => ({
+        createStore: (requestedDbId) => {
+          if (scope !== tenantId || requestedDbId !== dbId) {
+            throw new Error(`Store RPC for ${scope}/${requestedDbId} reached ${tenantId}/${dbId}`);
+          }
+          const guard = (store: ContentAddressedStore) =>
+            dbId === DIRECTORY_DB_ID || !this.tenantManager
+              ? store
+              : guardStoreAgainstPurgedDocuments(store, async () =>
+                  this.tenantManager!.getPurgedDocIds(tenantId, dbId),
+                );
+          return {
+            docStore: guard(this.store(dbId, StoreKind.docs)),
+            attachmentStore: guard(this.store(dbId, StoreKind.attachments)),
+          };
+        },
+      }),
+    });
+    try {
+      const result = await server.handle((await request.json()) as StoreRpcRequest);
+      if (dbId !== DIRECTORY_DB_ID) {
+        await this.registerWithDirectory();
+      }
+      return jsonResponse(200, { result });
+    } catch (error) {
+      return jsonResponse(500, { error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   /** Delete everything of a removed tenant (the directory object first wipes the others). */

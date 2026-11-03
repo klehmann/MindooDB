@@ -43,6 +43,7 @@ export type MatchedRoute =
   | { kind: "publicInfosFingerprints"; tenantId: string }
   | { kind: "unsupported"; feature: string }
   | { kind: "system"; path: string }
+  | { kind: "peer"; path: string }
   | { kind: "tenantAuth"; tenantId: string; phase: "challenge" | "authenticate" }
   | { kind: "timestamp"; tenantId: string }
   | { kind: "sync"; tenantId: string; storeKind: StoreKind; name: SyncRouteName }
@@ -83,9 +84,7 @@ export function matchRoute(method: string, pathname: string): MatchedRoute {
   }
   if (lower[0] === "device") return { kind: "unsupported", feature: "Device discovery" };
   if (lower[0] === "system") {
-    if (lower[1] === "peer" || lower[1] === "cluster") {
-      return { kind: "unsupported", feature: "Server-to-server replication" };
-    }
+    if (lower[1] === "peer") return { kind: "peer", path: trimmed };
     return { kind: "system", path: trimmed };
   }
   if (lower.length < 2 || segments[0] === "") return { kind: "notFound" };

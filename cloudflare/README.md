@@ -11,7 +11,7 @@ exactly as they talk to the Node/Docker server: same paths, same protocol.
 | Piece | What it holds |
 |---|---|
 | Worker | Routes each request; CORS, security headers, global rate limit |
-| `MindooServerObject` (one) | `config.json`, the tenant list and configs, the server key bag; serves `/system/*` and discovery |
+| `MindooServerObject` (one) | `config.json`, the tenant list and configs, the server key bag; serves `/system/*` and discovery; runs peer replication |
 | `MindooDatabaseObject` (one per tenant and database) | The database's entry stores in the object's SQLite. Each object checks access with the same code as the Node server, using a replica of the tenant's `directory` database. The `directory` object also handles login, the change-event stream (SSE) and the RFC 3161 proxy |
 
 Because every database has its own object, tenants and databases scale
@@ -87,6 +87,28 @@ in the SDK, or Haven's "publish to server"). `config.json` follows the format
 of the Node server (see `README-server.md` in the MindooDB repository) and can
 be changed at runtime with `PUT /system/config`.
 
+## Replicating with other servers
+
+A Cloudflare server joins a MindooDB cluster like a Node server: both trust
+each other's server identity and replicate every tenant they both host, over
+the same `/system/peer/*` protocol.
+
+1. Enable replication in `config.json`:
+   `PUT /system/config` with `"cluster": { "autoSync": true }` (or put it into
+   the initial config before `npm run setup`).
+2. On the Cloudflare server, add the other server, with its url
+   (`/system/trusted-servers` or `POST /system/cluster/peers/<name>`; keys
+   from its `/.well-known/mindoodb-server-info`).
+3. On the other server, add the Cloudflare server the same way (or with
+   `pnpm server:add-to-network` on Node).
+4. Publish the tenant to both servers.
+
+Cloudflare pulls from its peers on a cron trigger every minute and pushes a
+write to them as soon as it is accepted. A Node peer additionally pulls
+promptly over `/system/peer/events`. The cluster admin API
+(`/system/cluster/status`, `jobs`, `audit`, `actions/sync`, …) works as on
+Node.
+
 ## Local development
 
 ```bash
@@ -96,9 +118,11 @@ npm run dev                # wrangler dev, storage stays local
 
 ## Differences from the Node server
 
-- **Not available yet:** server-to-server replication (`/system/peer/*`,
-  `/system/cluster/*`), device discovery (`/device/*`) and Iroh. These answer
-  `501`.
+- **Not available:** device discovery (`/device/*`) answers `501`; Iroh
+  (neither for clients nor between peers).
+- **Peer replication** pulls on the cron trigger (every minute) instead of
+  keeping an event stream open to each peer, which would keep the server
+  object running permanently. Pushes still go out immediately.
 - **Rate limits** come from the `ratelimits` bindings in `wrangler.jsonc`
   (periods of 10 or 60 seconds), not from `rateLimits` in `config.json`. The
   timestamp proxy's daily cap is not enforced. The admin IP allowlist

@@ -43,6 +43,8 @@ export interface ServerRequest {
   syncPrincipal?: string;
   /** Caller of a timestamp request. */
   timestampPrincipal?: string;
+  /** Trusted server behind a peer token ({@link PeerHttpHandlers.peerGuard}). */
+  peerName?: string;
 }
 
 /** A sync event subscription the host keeps open as a Server-Sent-Events stream. */

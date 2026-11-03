@@ -11,7 +11,7 @@ import {
   type IrohServerStore,
 } from "../node/server/IrohServerRpc";
 import { SyncEventBus } from "../server/SyncEventBus";
-import type { PeerTokenPayload } from "../node/server/peer/PeerAuthService";
+import type { PeerTokenPayload } from "../server/peer/PeerAuthService";
 
 const PEER_TOKEN = "peer-jwt";
 const PEER_NAME = "CN=peer";

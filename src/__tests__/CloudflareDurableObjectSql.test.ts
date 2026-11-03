@@ -130,7 +130,9 @@ describe("Worker routing helpers", () => {
     });
     // Wrong method on a sync route: no route under an existing tenant.
     expect(matchRoute("GET", "/acme/sync/docs/putEntries")).toEqual({ kind: "tenantNotFound", tenantId: "acme" });
-    expect(matchRoute("GET", "/system/peer/status")).toMatchObject({ kind: "unsupported" });
+    expect(matchRoute("GET", "/system/peer/events")).toEqual({ kind: "peer", path: "/system/peer/events" });
+    expect(matchRoute("GET", "/system/cluster/status")).toEqual({ kind: "system", path: "/system/cluster/status" });
+    expect(matchRoute("POST", "/device/challenge")).toMatchObject({ kind: "unsupported" });
     expect(matchRoute("DELETE", "/system/tenants/acme")).toEqual({ kind: "system", path: "/system/tenants/acme" });
   });
 

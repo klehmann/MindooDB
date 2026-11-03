@@ -46,6 +46,8 @@ async function freePort(): Promise<number> {
 
 export interface RunningWorker {
   baseUrl: string;
+  /** Fire the cron trigger once (as Cloudflare does every minute). */
+  triggerCron(): Promise<void>;
   stop(): Promise<void>;
   /** Everything wrangler printed, for failure diagnostics. */
   log(): string;
@@ -55,6 +57,8 @@ export async function startCloudflareWorker(options: {
   serverIdentity: PrivateUserId;
   serverPassword: string;
   systemAdmin: PrivateUserId;
+  /** Extra `config.json` fields besides the system admin capability (e.g. `cluster`). */
+  serverConfig?: Record<string, unknown>;
   /** Extra `vars` for the Worker. */
   vars?: Record<string, string>;
 }): Promise<RunningWorker> {
@@ -84,6 +88,7 @@ export async function startCloudflareWorker(options: {
     MINDOODB_SERVER_PASSWORD: options.serverPassword,
     MINDOODB_JWT_SECRET: randomBytes(32).toString("base64"),
     MINDOODB_SERVER_CONFIG: JSON.stringify({
+      ...options.serverConfig,
       capabilities: {
         "ALL:/system/*": [
           {
@@ -106,7 +111,16 @@ export async function startCloudflareWorker(options: {
   let output = "";
   const child: ChildProcess = spawn(
     wrangler,
-    ["dev", "--local", "--ip", "127.0.0.1", "--port", String(port), "--show-interactive-dev-session=false"],
+    [
+      "dev",
+      "--local",
+      "--test-scheduled",
+      "--ip",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--show-interactive-dev-session=false",
+    ],
     { cwd: dir, env: { ...process.env, WRANGLER_SEND_METRICS: "false" }, stdio: ["ignore", "pipe", "pipe"] },
   );
   child.stdout?.on("data", (chunk) => (output += chunk.toString()));
@@ -123,6 +137,10 @@ export async function startCloudflareWorker(options: {
 
   return {
     baseUrl: `http://127.0.0.1:${port}`,
+    triggerCron: async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/__scheduled?cron=*+*+*+*+*`);
+      if (!response.ok) throw new Error(`Cron trigger failed: HTTP ${response.status}`);
+    },
     log: () => output,
     stop: async () => {
       if (child.exitCode === null) {

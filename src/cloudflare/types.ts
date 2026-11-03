@@ -81,4 +81,5 @@ export interface MindooCloudflareEnv {
   MINDOODB_RATE_LIMIT_SYNC?: RateLimitBinding;
   MINDOODB_RATE_LIMIT_SYSTEM?: RateLimitBinding;
   MINDOODB_RATE_LIMIT_TIMESTAMP?: RateLimitBinding;
+  MINDOODB_RATE_LIMIT_PEER?: RateLimitBinding;
 }

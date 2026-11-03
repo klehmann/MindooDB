@@ -26,6 +26,19 @@ import { validateTenantIdFormat } from "../server/validation";
 import { buildAuthRateLimitKey } from "../server/rateLimits";
 import type { ServerConfig } from "../server/types";
 import type { ServerRequest, ServerResponse } from "../server/http/types";
+import { ClusterManager } from "../server/peer/ClusterManager";
+import type { ClusterAuditStorage } from "../server/peer/ClusterAuditLog";
+import { ClusterAdminHandlers, formatPeerChangeEvent, PeerHttpHandlers } from "../server/peer/clusterHttp";
+import type { SyncChangeEvent } from "../server/SyncEventBus";
+import { StoreKind } from "../core/appendonlystores/types";
+import type { ContentAddressedStore } from "../core/types";
+import {
+  formatSyncHeartbeat,
+  formatSyncHelloEvent,
+  SYNC_EVENT_HEARTBEAT_MS,
+} from "../server/http/MindooDBServerCore";
+import { remoteObjectStore } from "./storeRpc";
+import type { SqlStorage } from "./types";
 import { DurableObjectServerDataStore } from "./DurableObjectSql";
 import { WorkersCryptoAdapter } from "./WorkersCryptoAdapter";
 import {
@@ -39,6 +52,7 @@ import {
 import {
   createHostSettings,
   databaseObject,
+  derivePeerJwtSecret,
   internalHeaders,
   rateLimited,
   seedServerIdentity,
@@ -84,6 +98,33 @@ class StoredServerConfigRepository implements ServerConfigRepository {
   }
 }
 
+/** Most recent audit records kept; older ones are dropped. */
+const MAX_AUDIT_RECORDS = 10_000;
+
+/** The cluster audit log as rows of the server object's SQLite. */
+class SqlClusterAuditStorage implements ClusterAuditStorage {
+  constructor(private readonly sql: SqlStorage) {
+    sql.exec(
+      "CREATE TABLE IF NOT EXISTS mindoo_cluster_audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT NOT NULL)",
+    );
+  }
+
+  appendLine(line: string): void {
+    this.sql.exec("INSERT INTO mindoo_cluster_audit(line) VALUES(?)", line);
+    this.sql.exec(
+      "DELETE FROM mindoo_cluster_audit WHERE seq <= (SELECT MAX(seq) FROM mindoo_cluster_audit) - ?",
+      MAX_AUDIT_RECORDS,
+    );
+  }
+
+  readLines(): string[] {
+    return this.sql
+      .exec<{ line: string }>("SELECT line FROM mindoo_cluster_audit ORDER BY seq")
+      .toArray()
+      .map((row) => row.line);
+  }
+}
+
 export class MindooServerObject {
   private readonly settings: HostSettings;
   private readonly dataStore: DurableObjectServerDataStore;
@@ -92,9 +133,14 @@ export class MindooServerObject {
   private readonly systemAdminAuth: SystemAdminAuthService;
   private readonly core: MindooDBServerCore;
   private serverConfig: ServerConfig;
+  /** Change events of all tenants: peer replication and the peer event feed listen. */
+  private readonly eventBus = new SyncEventBus();
+  private cluster: ClusterManager | null = null;
+  private clusterInit: Promise<ClusterManager> | null = null;
+  private readonly localStores = new Map<string, ContentAddressedStore>();
 
   constructor(
-    ctx: DurableObjectState,
+    private readonly ctx: DurableObjectState,
     private readonly env: MindooCloudflareEnv,
   ) {
     this.settings = createHostSettings(env);
@@ -155,7 +201,108 @@ export class MindooServerObject {
       jsonBodyLimit: this.settings.jsonBodyLimit,
       allowInsecureSyncUrls: this.settings.allowInsecureSyncUrls,
       runInBackground: (task) => ctx.waitUntil(task),
+      cluster: {
+        mirrorsForTenant: (tenantId) => this.cluster?.mirrorsForTenant(tenantId) ?? [],
+        syncReplicators: () => this.cluster?.syncReplicators(),
+        resolvePeerName: async (token) => (await this.getCluster()).auth.validateToken(token).then((p) => p?.sub),
+      },
     });
+  }
+
+  // ==================== Peer replication ====================
+
+  private get autoSync(): boolean {
+    return this.serverConfig.cluster?.autoSync === true;
+  }
+
+  /**
+   * The cluster of this server: peer sessions and replicators, as on Node.
+   * Local stores are the database objects' stores, reached by store RPC.
+   * Replication runs on the cron tick and on reported writes instead of on a
+   * long-lived event stream to each peer.
+   */
+  private getCluster(): Promise<ClusterManager> {
+    if (this.cluster) return Promise.resolve(this.cluster);
+    this.clusterInit ??= derivePeerJwtSecret(this.env).then((peerJwtSecret) => {
+      const env = this.env;
+      const tenantManager = this.tenantManager;
+      this.cluster = new ClusterManager({
+        cryptoAdapter: tenantManager.getCryptoAdapter(),
+        auditStorage: new SqlClusterAuditStorage(this.ctx.storage.sql),
+        eventBus: this.eventBus,
+        peerJwtSecret,
+        liveEventStream: false,
+        localRole: this.serverConfig.cluster?.role,
+        listTrustedServers: () => tenantManager.listTrustedServers(),
+        localServerName: () => tenantManager.getServerPublicInfo()?.name ?? null,
+        localSigningPublicKey: () => tenantManager.getServerPublicInfo()?.signingPublicKey ?? null,
+        getSigningKey: async () => (await tenantManager.getWitnessSigner())?.signingPrivateKey,
+        getEncryptionKey: () => tenantManager.getServerEncryptionPrivateKey(),
+        listTenants: () => tenantManager.listTenants(),
+        listDatabases: async (tenantId) => {
+          const response = await databaseObject(env, tenantId, "directory").fetch(
+            `${INTERNAL_ORIGIN}/internal/databases`,
+            { headers: internalHeaders(tenantId, "directory") },
+          );
+          if (!response.ok) return ["directory"];
+          return ((await response.json()) as { databases: string[] }).databases;
+        },
+        getLocalStore: async (tenantId, dbId, storeKind) => this.localStore(tenantId, dbId, storeKind),
+        onDirectoryPulled: async (tenantId) => {
+          await databaseObject(env, tenantId, "directory").fetch(
+            `${INTERNAL_ORIGIN}/internal/directory/announce`,
+            { method: "POST", headers: internalHeaders(tenantId, "directory") },
+          );
+        },
+      });
+      return this.cluster;
+    });
+    return this.clusterInit;
+  }
+
+  private localStore(tenantId: string, dbId: string, storeKind: StoreKind): ContentAddressedStore {
+    const key = `${tenantId}\u0000${dbId}\u0000${storeKind}`;
+    let store = this.localStores.get(key);
+    if (!store) {
+      store = remoteObjectStore(
+        databaseObject(this.env, tenantId, dbId),
+        internalHeaders(tenantId, dbId),
+        tenantId,
+        dbId,
+        storeKind,
+      );
+      this.localStores.set(key, store);
+    }
+    return store;
+  }
+
+  /** Start replication when `config.json` enables it (`cluster.autoSync`). */
+  private async startClusterIfEnabled(): Promise<ClusterManager> {
+    const cluster = await this.getCluster();
+    if (this.autoSync && !cluster.autoSyncEnabled) {
+      cluster.start();
+    }
+    return cluster;
+  }
+
+  /** Cron tick: one replication pass with every peer. */
+  private async tick(): Promise<Response> {
+    const cluster = await this.startClusterIfEnabled();
+    if (cluster.autoSyncEnabled) {
+      await cluster.syncAll();
+    }
+    return jsonResponse(200, { autoSync: cluster.autoSyncEnabled, peers: cluster.status().peers.length });
+  }
+
+  /** A database object accepted a write: tell peers (feed) and push to them. */
+  private async localChange(request: Request): Promise<Response> {
+    const event = (await request.json()) as SyncChangeEvent;
+    this.eventBus.publish(event);
+    const cluster = await this.startClusterIfEnabled();
+    if (cluster.autoSyncEnabled) {
+      await cluster.replicateLocalChange(event);
+    }
+    return jsonResponse(200, { ok: true });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -170,9 +317,11 @@ export class MindooServerObject {
 
   private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const internal = /^\/internal\/tenants\/([^/]+)$/.exec(url.pathname);
-    if (internal && isInternalCall(request)) {
-      return this.tenantState(decodeURIComponent(internal[1]));
+    if (isInternalCall(request)) {
+      const internal = /^\/internal\/tenants\/([^/]+)$/.exec(url.pathname);
+      if (internal) return this.tenantState(decodeURIComponent(internal[1]));
+      if (url.pathname === "/internal/cluster/tick") return this.tick();
+      if (url.pathname === "/internal/cluster/change") return this.localChange(request);
     }
 
     const route = matchRoute(request.method, url.pathname);
@@ -180,7 +329,10 @@ export class MindooServerObject {
       case "serverInfo":
         return toResponse(this.core.serverInfo());
       case "clusterMirrors":
+        await this.startClusterIfEnabled();
         return toResponse(this.core.clusterMirrors(await this.parse(request, {})));
+      case "peer":
+        return this.peer(request, route.path);
       case "publicInfosFingerprints":
         return toResponse(
           await this.core.publicInfosFingerprints(await this.parse(request, { tenantId: route.tenantId })),
@@ -219,10 +371,13 @@ export class MindooServerObject {
     }
     const config = JSON.parse(this.dataStore.readText(`${tenantId}/config.json`)!);
     const keys = await this.tenantManager.getPublicInfosKeysForTenant(tenantId);
+    const trustedServers = this.tenantManager.listTrustedServers();
     return jsonResponse(200, {
       exists: true,
       config,
       publicInfosKeys: keys.map((key) => bytesToBase64(key)),
+      trustedServers,
+      clusterActive: this.autoSync && trustedServers.some((server) => Boolean(server.url)),
     });
   }
 
@@ -258,15 +413,130 @@ export class MindooServerObject {
         }
       }
 
-      const handler = this.systemHandler(method, segments, lower);
+      const cluster = lower[0] === "cluster";
+      const handler = cluster
+        ? this.clusterHandler(method, segments.slice(1), lower.slice(1), await this.startClusterIfEnabled())
+        : this.systemHandler(method, segments, lower);
       if (!handler) {
         return jsonResponse(404, { error: "Not found" });
       }
       const req = await this.parse(request, handler.params);
-      const rejection = await this.core.systemAdminGuard(req, path);
+      // Like the Node server, cluster capabilities are matched against
+      // "/system" + the path below /system/cluster.
+      const guardPath = cluster ? `/system/${segments.slice(1).join("/")}` : path;
+      const rejection = await this.core.systemAdminGuard(req, guardPath);
       if (rejection) return toResponse(rejection);
       return toResponse(await handler.run(req));
     }
+  }
+
+  private clusterHandler(
+    method: string,
+    segments: string[],
+    lower: string[],
+    cluster: ClusterManager,
+  ): { params: Record<string, string>; run: (req: ServerRequest) => ServerResponse | Promise<ServerResponse> } | null {
+    const handlers = new ClusterAdminHandlers({
+      cluster,
+      listTrustedServers: () => this.tenantManager.listTrustedServers(),
+      saveTrustedServer: (peer) => this.tenantManager.saveTrustedServer(peer),
+      removeTrustedServer: (name) => this.tenantManager.removeTrustedServer(name),
+    });
+    const [first, second, third] = lower;
+    if (method === "GET" && lower.length === 1 && first === "topology") return { params: {}, run: () => handlers.topology() };
+    if (method === "GET" && lower.length === 1 && first === "status") return { params: {}, run: () => handlers.status() };
+    if (method === "GET" && lower.length === 3 && first === "status" && second === "tenants") {
+      return { params: { tenantId: segments[2] }, run: (req) => handlers.tenantStatus(req) };
+    }
+    if (method === "GET" && lower.length === 1 && first === "jobs") return { params: {}, run: (req) => handlers.jobs(req) };
+    if (method === "GET" && lower.length === 2 && first === "jobs") {
+      return { params: { jobId: segments[1] }, run: (req) => handlers.job(req) };
+    }
+    if (method === "GET" && lower.length === 1 && first === "audit") return { params: {}, run: (req) => handlers.audit(req) };
+    if (method === "POST" && lower.length === 2 && first === "actions") {
+      return { params: { action: segments[1] }, run: (req) => handlers.action(req) };
+    }
+    if (lower.length === 1 && first === "peers" && method === "GET") return { params: {}, run: () => handlers.peers() };
+    if (lower.length === 2 && first === "peers") {
+      const params = { name: segments[1] };
+      if (method === "POST") return { params, run: (req) => handlers.createPeer(req) };
+      if (method === "PATCH") return { params, run: (req) => handlers.updatePeer(req) };
+      if (method === "DELETE") return { params, run: (req) => handlers.deletePeer(req) };
+    }
+    void third;
+    return null;
+  }
+
+  /** `/system/peer/*`: the server-to-server protocol, authenticated by peer tokens. */
+  private async peer(request: Request, path: string): Promise<Response> {
+    const cluster = await this.startClusterIfEnabled();
+    const handlers = new PeerHttpHandlers({
+      cluster,
+      listTenants: () => this.tenantManager.listTenants(),
+      listDatabases: async (tenantId) => {
+        const response = await databaseObject(this.env, tenantId, "directory").fetch(
+          `${INTERNAL_ORIGIN}/internal/databases`,
+          { headers: internalHeaders(tenantId, "directory") },
+        );
+        return response.ok ? ((await response.json()) as { databases: string[] }).databases : [];
+      },
+    });
+    const method = request.method.toUpperCase();
+    const name = path.split("/")[3]?.toLowerCase() ?? "";
+    const req = await this.parse(request, {});
+
+    if (method === "POST" && name === "challenge") return toResponse(await handlers.challenge(req));
+    if (method === "POST" && name === "authenticate") return toResponse(await handlers.authenticate(req));
+
+    const known =
+      (method === "POST" && (name === "tenant-bloom" || name === "sync")) ||
+      (method === "GET" && (name === "databases" || name === "events"));
+    if (!known) return jsonResponse(404, { error: "Not found" });
+    const rejection = await handlers.peerGuard(req);
+    if (rejection) return toResponse(rejection);
+
+    switch (name) {
+      case "tenant-bloom":
+        return toResponse(handlers.tenantBloom(req));
+      case "databases":
+        return toResponse(await handlers.databases(req));
+      case "sync":
+        return toResponse(handlers.sync(req, (task) => this.ctx.waitUntil(task)));
+      default:
+        return this.peerEventStream(cluster, req.peerName!);
+    }
+  }
+
+  /** Change feed for a peer (Node peers keep it open to pull our writes promptly). */
+  private peerEventStream(cluster: ClusterManager, peerName: string): Response {
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+      writer.close().catch(() => undefined);
+    };
+    const write = (frame: string) => {
+      if (!closed) writer.write(encoder.encode(frame)).catch(cleanup);
+    };
+    write(formatSyncHelloEvent());
+    const unsubscribe = this.eventBus.subscribe((event) => {
+      const frame = formatPeerChangeEvent(cluster, peerName, event);
+      if (frame) write(frame);
+    });
+    const heartbeat = setInterval(() => write(formatSyncHeartbeat(Date.now())), SYNC_EVENT_HEARTBEAT_MS);
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+      },
+    });
   }
 
   private systemHandler(

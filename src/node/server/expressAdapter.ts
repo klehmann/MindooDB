@@ -34,6 +34,7 @@ export function toServerRequest(req: Request): ServerRequest {
     systemAdmin: req.systemAdmin,
     syncPrincipal: req.syncPrincipal,
     timestampPrincipal: req.timestampPrincipal,
+    peerName: req.peerName,
   };
 }
 
@@ -43,6 +44,7 @@ function applyGuardResults(req: Request, serverRequest: ServerRequest): void {
   req.systemAdmin = serverRequest.systemAdmin;
   req.syncPrincipal = serverRequest.syncPrincipal;
   req.timestampPrincipal = serverRequest.timestampPrincipal;
+  req.peerName = serverRequest.peerName;
 }
 
 /** Write a JSON or binary response. Event streams are the caller's business. */

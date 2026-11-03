@@ -97,10 +97,19 @@ export async function rateLimited(
  * Every object serving the tenant derives the same key, so a token issued by
  * the tenant's directory object is accepted by all of its databases.
  */
-export async function deriveTenantJwtSecret(
-  env: MindooCloudflareEnv,
-  tenantId: string,
-): Promise<Uint8Array> {
+export function deriveTenantJwtSecret(env: MindooCloudflareEnv, tenantId: string): Promise<Uint8Array> {
+  return deriveJwtSecret(env, `tenant:${tenantId}`);
+}
+
+/**
+ * Peer-token key, HMAC-SHA256(MINDOODB_JWT_SECRET, "peer"): the server object
+ * issues peer tokens, the database objects accept them on the sync routes.
+ */
+export function derivePeerJwtSecret(env: MindooCloudflareEnv): Promise<Uint8Array> {
+  return deriveJwtSecret(env, "peer");
+}
+
+async function deriveJwtSecret(env: MindooCloudflareEnv, label: string): Promise<Uint8Array> {
   const secret = env.MINDOODB_JWT_SECRET?.trim();
   if (!secret) {
     throw new Error("MINDOODB_JWT_SECRET is not set; run cloudflare/scripts/setup.mjs");
@@ -113,6 +122,6 @@ export async function deriveTenantJwtSecret(
     false,
     ["sign"],
   );
-  const mac = await subtle.sign("HMAC", key, new TextEncoder().encode(`tenant:${tenantId}`));
+  const mac = await subtle.sign("HMAC", key, new TextEncoder().encode(label));
   return new Uint8Array(mac);
 }

@@ -30,27 +30,27 @@
  *    in `ServerNetworkContentAddressedStore`; this side just transports.
  */
 
-import { HttpTransport } from "../../../appendonlystores/network/HttpTransport";
-import { ClientNetworkContentAddressedStore } from "../../../appendonlystores/network/ClientNetworkContentAddressedStore";
-import { IrohNetworkTransport } from "../../../core/appendonlystores/network/IrohNetworkTransport";
-import { isIrohLocator, parseIrohLocator } from "../../../core/appendonlystores/network/irohLocator";
-import type { IrohStreamIO } from "../../../core/appendonlystores/network/IrohStreamIO";
-import { DIRECTORY_DB_ID, StoreKind, type ContentAddressedStore } from "../../../core/types";
-import { NetworkError } from "../../../core/appendonlystores/network/types";
-import { IrohPeerLink } from "./IrohPeerLink";
-import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
-import { Logger, MindooLogger, getDefaultLogLevel } from "../../../core/logging";
-import { createIdBloomSummary } from "../../../core/appendonlystores/bloom";
-import { rejectionClassOf } from "../../../core/appendonlystores/types";
-import { guardStoreAgainstPurgedDocuments } from "../../../core/appendonlystores/purgedDocumentGuard";
+import { HttpTransport } from "../../appendonlystores/network/HttpTransport";
+import { ClientNetworkContentAddressedStore } from "../../appendonlystores/network/ClientNetworkContentAddressedStore";
+import { IrohNetworkTransport } from "../../core/appendonlystores/network/IrohNetworkTransport";
+import { isIrohLocator, parseIrohLocator } from "../../core/appendonlystores/network/irohLocator";
+import type { IrohStreamIO } from "../../core/appendonlystores/network/IrohStreamIO";
+import { DIRECTORY_DB_ID, StoreKind, type ContentAddressedStore } from "../../core/types";
+import { NetworkError } from "../../core/appendonlystores/network/types";
+import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
+import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
+import { base64ToBytes, bytesToBase64 } from "../../core/utils/base64";
+import { rejectionClassOf } from "../../core/appendonlystores/types";
+import { guardStoreAgainstPurgedDocuments } from "../../core/appendonlystores/purgedDocumentGuard";
 import {
   syncEntriesBetweenStores,
   syncScanCursorKey,
   type SyncScanCursorRecord,
   type SyncScanCursorStore,
-} from "../../../core/appendonlystores/syncStores";
-import type { TrustedServer } from "../../../server/types";
-import type { SyncEventBus, SyncChangeEvent } from "../../../server/SyncEventBus";
+} from "../../core/appendonlystores/syncStores";
+import type { TrustedServer } from "../types";
+import type { SyncEventBus, SyncChangeEvent } from "../SyncEventBus";
 import {
   classifyPeerError,
   directionAllowsPull,
@@ -69,7 +69,23 @@ import {
   type PeerAttachmentMode,
   type PeerRole,
   type PeerSyncDirection,
-} from "../../../server/peer/types";
+} from "./types";
+
+/**
+ * An established Iroh connection to a peer (Node: `IrohPeerLink`). Injected so
+ * the replicator itself does not depend on Iroh; hosts without Iroh leave it
+ * out and `iroh:` peer urls fail with a clear error.
+ */
+export interface PeerIrohLink {
+  rpc(method: string, args: unknown[]): Promise<unknown>;
+  asStreamIO(): IrohStreamIO;
+  subscribeEvents(
+    token: string,
+    onEvent: (event: SyncChangeEvent) => void,
+    signal: AbortSignal,
+  ): Promise<void>;
+  close(): Promise<void>;
+}
 
 /** What a replicator needs from the surrounding server to do its job. */
 export interface PeerReplicatorHost {
@@ -87,7 +103,7 @@ export interface PeerReplicatorHost {
   /** Tenant ids hosted locally. */
   listTenants(): string[];
   /** Database ids held locally for a tenant. */
-  listDatabases(tenantId: string): string[];
+  listDatabases(tenantId: string): string[] | Promise<string[]>;
   /** Local store for a (tenant, db, kind) triple, created on demand. */
   getLocalStore(
     tenantId: string,
@@ -97,6 +113,14 @@ export interface PeerReplicatorHost {
   eventBus: SyncEventBus;
   /** Bound Iroh endpoint for `iroh:` peer urls. Missing / null → reconnect. */
   getIrohStreamIO?: () => IrohStreamIO | null;
+  /** Dial a peer over Iroh; required for `iroh:` peer urls. */
+  openIrohLink?: (io: IrohStreamIO, ticket: string) => PeerIrohLink;
+  /**
+   * Keep a Server-Sent-Events subscription to the peer open so its changes
+   * are pulled right away (default). A host that cannot hold a connection
+   * open cheaply turns this off and pulls on a schedule instead.
+   */
+  liveEventStream?: boolean;
   /**
    * Documents purged from a database on this server (the purge registry).
    * Entries of these documents are refused when pulled from the peer, the
@@ -176,12 +200,12 @@ export class PeerReplicator {
 
   private syncInFlight: Promise<PeerSyncRunResult> | null = null;
   private pendingScopes = new Set<string>();
-  private pushTimer: NodeJS.Timeout | null = null;
-  private idleTimer: NodeJS.Timeout | null = null;
-  private reconnectTimer: NodeJS.Timeout | null = null;
+  private pushTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleTimer: ReturnType<typeof setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private sseAbort: AbortController | null = null;
-  private irohLink: IrohPeerLink | null = null;
+  private irohLink: PeerIrohLink | null = null;
   private unsubscribeBus: (() => void) | null = null;
 
   private lastError: string | null = null;
@@ -388,7 +412,7 @@ export class PeerReplicator {
       method: "POST",
       body: {
         challenge,
-        signature: Buffer.from(new Uint8Array(signature)).toString("base64"),
+        signature: bytesToBase64(new Uint8Array(signature)),
       },
       authenticated: false,
     })) as { success?: boolean; token?: string; error?: string };
@@ -406,7 +430,7 @@ export class PeerReplicator {
     return typeof this.peer.url === "string" && isIrohLocator(this.peer.url);
   }
 
-  private async getIrohLink(): Promise<IrohPeerLink> {
+  private async getIrohLink(): Promise<PeerIrohLink> {
     if (this.irohLink) {
       return this.irohLink;
     }
@@ -422,7 +446,10 @@ export class PeerReplicator {
         `Iroh peer ${this.peer.name} url is an endpoint id only; store a full ticket to dial`,
       );
     }
-    this.irohLink = new IrohPeerLink(io, parsed.ticket);
+    if (!this.host.openIrohLink) {
+      throw new Error(`Iroh peer ${this.peer.name} cannot be dialled: Iroh is not available on this host`);
+    }
+    this.irohLink = this.host.openIrohLink(io, parsed.ticket);
     return this.irohLink;
   }
 
@@ -484,7 +511,7 @@ export class PeerReplicator {
         const bytes =
           signature instanceof Uint8Array
             ? signature
-            : new Uint8Array(Buffer.from(String(signature ?? ""), "base64"));
+            : base64ToBytes(String(signature ?? ""));
         return await link.rpc("peer.authenticate", [body.challenge, bytes]);
       }
       const token = init.authenticated !== false ? await this.ensureToken() : "";
@@ -707,7 +734,7 @@ export class PeerReplicator {
    * peer is exactly the thing a fresh mirror needs to pull.
    */
   private async databasesFor(tenantId: string, onlyDbId?: string): Promise<string[]> {
-    const local = this.host.listDatabases(tenantId);
+    const local = await this.host.listDatabases(tenantId);
     let remote: string[] = [];
     try {
       const response = (await this.peerFetch(
@@ -938,14 +965,33 @@ export class PeerReplicator {
 
   // ------------------------------------------------------------- live push
 
-  private onLocalChange(event: SyncChangeEvent): void {
-    if (!this.running || this.paused) return;
-    if (!directionAllowsPush(this.direction)) return;
+  private acceptsLocalChange(event: SyncChangeEvent): boolean {
+    if (!this.running || this.paused) return false;
+    if (!directionAllowsPush(this.direction)) return false;
     // Do not bounce a peer's own write straight back at it. Other peers still
     // receive it, which is how a spoke's write reaches the mesh via its hub.
-    if (event.originPeer === this.peer.name) return;
-    if (!this.intersection.includes(event.tenantId)) return;
-    if (this.attachments === "never" && event.storeKind === StoreKind.attachments) return;
+    if (event.originPeer === this.peer.name) return false;
+    if (!this.intersection.includes(event.tenantId)) return false;
+    if (this.attachments === "never" && event.storeKind === StoreKind.attachments) return false;
+    return true;
+  }
+
+  /**
+   * Push a local change now and resolve when done, instead of coalescing it
+   * on a timer. For hosts that cannot rely on timers outliving the request
+   * that reported the change.
+   */
+  async replicateLocalChange(event: SyncChangeEvent): Promise<void> {
+    if (!this.acceptsLocalChange(event)) return;
+    try {
+      await this.syncNow({ tenantId: event.tenantId, dbId: event.dbId });
+    } catch (error) {
+      this.recordError(error);
+    }
+  }
+
+  private onLocalChange(event: SyncChangeEvent): void {
+    if (!this.acceptsLocalChange(event)) return;
 
     this.pendingScopes.add(`${event.tenantId}\u0000${event.dbId}`);
     if (this.pushTimer) return;
@@ -979,6 +1025,7 @@ export class PeerReplicator {
   // -------------------------------------------------------------- SSE pull
 
   private startEventStream(): void {
+    if (this.host.liveEventStream === false) return;
     if (!this.running || this.paused) return;
     if (!directionAllowsPull(this.direction)) return;
     if (this.sseAbort) return;

@@ -13,7 +13,7 @@ import {
 } from "../../server/validation";
 import type { RegisterTenantRequest } from "../../server/types";
 import type { SyncEventBus } from "../../server/SyncEventBus";
-import type { PeerTokenPayload } from "./peer/PeerAuthService";
+import type { PeerTokenPayload } from "../../server/peer/PeerAuthService";
 import type { SystemAdminTokenPayload } from "../../server/SystemAdminAuth";
 
 /** QUIC idle timeout is ~30s; keep the feed alive below that. */

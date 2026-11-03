@@ -53,3 +53,22 @@ export * from "./rateLimits";
 export * from "./validation";
 export * from "./timestampProxy";
 export * from "./types";
+
+export { ClusterManager, type ClusterManagerDeps, type ClusterActionOutcome } from "./peer/ClusterManager";
+export { ClusterAuditLog, type ClusterAuditRecord, type ClusterAuditStorage } from "./peer/ClusterAuditLog";
+export { ClusterJobRunner } from "./peer/ClusterJobRunner";
+export { PeerAuthService } from "./peer/PeerAuthService";
+export {
+  PeerReplicator,
+  type PeerIrohLink,
+  type PeerReplicatorHost,
+  type PeerSyncScope,
+} from "./peer/PeerReplicator";
+export {
+  ClusterAdminHandlers,
+  formatPeerChangeEvent,
+  PeerHttpHandlers,
+  type ClusterAdminDeps,
+  type PeerHttpDeps,
+} from "./peer/clusterHttp";
+export * from "./peer/types";

@@ -14,14 +14,14 @@
  * action happened.
  */
 
-import { randomUUID } from "crypto";
+import { generateRandomUuid } from "../../core/utils/idGeneration";
 import {
   classifyPeerError,
   type ClusterJob,
   type ClusterJobKind,
   type ClusterJobResult,
   type ClusterJobScope,
-} from "../../../server/peer/types";
+} from "./types";
 
 /** How many finished jobs to keep for polling before evicting the oldest. */
 const DEFAULT_HISTORY_LIMIT = 200;
@@ -50,7 +50,7 @@ export class ClusterJobRunner {
     work: ClusterJobWork,
   ): ClusterJob {
     const job: ClusterJob = {
-      id: randomUUID(),
+      id: generateRandomUuid(),
       kind,
       scope,
       state: "queued",
