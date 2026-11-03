@@ -52,6 +52,23 @@ describe("MindooQuery (db.query)", () => {
     expect(names).toEqual(["Alpha", "Beta", "Gamma"]);
   }, 30000);
 
+  it("compares numbers numerically in gt/gte/lt/lte filters", async () => {
+    // 99 > 100 as strings ("99" > "100"), but not as numbers.
+    const doc = await db.createDocument();
+    await db.changeDoc(doc, (d) => {
+      Object.assign(d.getData(), { type: "task", name: "Epsilon", amount: 100, meta: { owner: "dan" } });
+    });
+
+    const names = async (filter: MindooDBAppBooleanExpression) =>
+      (await db.query!({ filter })).rows.map((r) => r.fields.name).sort();
+
+    expect(await names(v.gt(v.field("amount"), 25))).toEqual(["Alpha", "Delta", "Epsilon"]);
+    expect(await names(v.gte(v.field("amount"), 99))).toEqual(["Delta", "Epsilon"]);
+    expect(await names(v.lt(v.field("amount"), 99))).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(await names(v.lte(v.field("amount"), 10))).toEqual(["Beta"]);
+    expect(await names('v.gt(v.field("amount"), 25)')).toEqual(["Alpha", "Delta", "Epsilon"]);
+  }, 30000);
+
   it("sorts by field keys in both directions", async () => {
     const asc = await db.query!({
       filter: v.eq(v.field("type"), "task"),
