@@ -9,8 +9,8 @@
  * write as a peer.
  */
 
-import { generateRandomUuid } from "../../../core/utils/idGeneration";
-import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
+import { generateRandomUuid } from "../../core/utils/idGeneration";
+import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { TrustedServer } from "../types";
 
 export interface PeerTokenPayload {

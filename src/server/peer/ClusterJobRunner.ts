@@ -14,7 +14,7 @@
  * action happened.
  */
 
-import { randomUUID } from "crypto";
+import { generateRandomUuid } from "../../core/utils/idGeneration";
 import {
   classifyPeerError,
   type ClusterJob,
@@ -50,7 +50,7 @@ export class ClusterJobRunner {
     work: ClusterJobWork,
   ): ClusterJob {
     const job: ClusterJob = {
-      id: randomUUID(),
+      id: generateRandomUuid(),
       kind,
       scope,
       state: "queued",

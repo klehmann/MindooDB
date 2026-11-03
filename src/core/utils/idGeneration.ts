@@ -50,10 +50,22 @@ function bytesToHex(bytes: Uint8Array): string {
  * Regenerated once per JS realm so concurrent realms don't share the same
  * random prefix.
  */
-const OBJECT_ID_PROCESS_UNIQUE = randomBytes(5);
+let objectIdProcessUnique: Uint8Array | null = null;
 
 /** 3-byte counter; seeded randomly then incremented per id (wraps at 2^24). */
-let objectIdCounter = Math.floor(Math.random() * 0xffffff);
+let objectIdCounter = -1;
+
+/**
+ * Seed the per-process state on first use rather than at import: Cloudflare
+ * Workers forbid generating random values in global scope.
+ */
+function objectIdState(): Uint8Array {
+  if (objectIdProcessUnique === null) {
+    objectIdProcessUnique = randomBytes(5);
+    objectIdCounter = Math.floor(Math.random() * 0xffffff);
+  }
+  return objectIdProcessUnique;
+}
 
 /**
  * Generate a MongoDB-style ObjectId: 24 lowercase hex characters.
@@ -76,7 +88,7 @@ export function generateObjectId(timeSeconds?: number): string {
   bytes[1] = (seconds >>> 16) & 0xff;
   bytes[2] = (seconds >>> 8) & 0xff;
   bytes[3] = seconds & 0xff;
-  bytes.set(OBJECT_ID_PROCESS_UNIQUE, 4);
+  bytes.set(objectIdState(), 4);
   objectIdCounter = (objectIdCounter + 1) & 0xffffff;
   bytes[9] = (objectIdCounter >>> 16) & 0xff;
   bytes[10] = (objectIdCounter >>> 8) & 0xff;

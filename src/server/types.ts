@@ -1,4 +1,4 @@
-import type { MindooDBServerInfo } from "../../core/types";
+import type { MindooDBServerInfo } from "../core/types";
 import type { PeerSyncDirection, PeerRole, PeerAttachmentMode } from "./peer/types";
 
 /**

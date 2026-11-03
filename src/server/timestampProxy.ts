@@ -17,7 +17,7 @@
  * never supply a URL.
  */
 
-import { assertSafeSyncUrl, UnsafeUrlError } from "../../core/utils/urlSafety.js";
+import { assertSafeSyncUrl, UnsafeUrlError } from "../core/utils/urlSafety.js";
 
 /** Content type mandated by RFC 3161 §3.4 for a request. */
 export const TIMESTAMP_QUERY_CONTENT_TYPE = "application/timestamp-query";

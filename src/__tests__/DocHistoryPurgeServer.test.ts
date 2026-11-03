@@ -23,7 +23,7 @@ import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { MindooDBServer } from "../node/server/MindooDBServer";
 import { StoreKind } from "../core/types";
 import type { ContentAddressedStore, StoreEntryMetadata } from "../core/types";
-import type { ServerConfig } from "../node/server/types";
+import type { ServerConfig } from "../server/types";
 
 async function startServer(
   server: MindooDBServer,

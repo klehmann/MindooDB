@@ -11,7 +11,7 @@ import {
 } from "../core/appendonlystores/network/IrohStreamIO";
 import { StoreKind } from "../core/appendonlystores/types";
 import { createMindooDBServerIrohHandler, type IrohServerStore } from "../node/server/IrohServerRpc";
-import { SyncEventBus } from "../node/server/SyncEventBus";
+import { SyncEventBus } from "../server/SyncEventBus";
 
 function stubStore(): IrohServerStore {
   const missing = async () => {

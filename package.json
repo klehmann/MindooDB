@@ -40,6 +40,14 @@
       "default": "./dist/browser/index.mjs"
     },
     "./node": "./dist/node/index.js",
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "default": "./dist/server/index.js"
+    },
+    "./cloudflare": {
+      "types": "./dist/cloudflare/index.d.ts",
+      "default": "./dist/cloudflare/index.js"
+    },
     "./reactnative": "./dist/reactnative/index.js",
     "./sqlite": {
       "types": "./dist/sqlite/index.d.ts",

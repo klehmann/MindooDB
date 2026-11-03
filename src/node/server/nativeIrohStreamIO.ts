@@ -10,7 +10,7 @@ import {
   type IrohConnectionHandle,
   type IrohStreamIO,
 } from "../../core/appendonlystores/network/IrohStreamIO";
-import type { ServerIrohConfig } from "./types";
+import type { ServerIrohConfig } from "../../server/types";
 
 export interface NativeIrohStreamIO extends IrohStreamIO {
   endpointId?: string;

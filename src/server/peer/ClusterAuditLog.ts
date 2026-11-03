@@ -24,12 +24,7 @@
  * level and results are counts.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "fs";
-import { join } from "path";
 import type { ClusterJobKind, ClusterJobScope } from "./types";
-
-/** Rotate once the active file passes this size. */
-const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 
 export interface ClusterAuditRecord {
   at: string;
@@ -50,23 +45,23 @@ export interface ClusterAuditPage {
   nextCursor: string | null;
 }
 
-export class ClusterAuditLog {
-  private readonly dir: string;
-  private readonly file: string;
+/**
+ * Where the log lines live. On Node an append-only JSONL file with rotation
+ * (`node/server/peer/FileClusterAuditStorage.ts`); other hosts use their own
+ * storage. Lines are JSON records, oldest first.
+ */
+export interface ClusterAuditStorage {
+  appendLine(line: string): void;
+  /** The lines that are served (the active file on Node), oldest first. */
+  readLines(): string[];
+}
 
-  constructor(
-    dataDir: string,
-    private readonly maxBytes: number = DEFAULT_MAX_BYTES,
-  ) {
-    this.dir = join(dataDir, "cluster");
-    this.file = join(this.dir, "audit.jsonl");
-  }
+export class ClusterAuditLog {
+  constructor(private readonly storage: ClusterAuditStorage) {}
 
   append(record: ClusterAuditRecord): void {
     try {
-      if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true });
-      this.rotateIfNeeded();
-      appendFileSync(this.file, `${JSON.stringify(record)}\n`, "utf8");
+      this.storage.appendLine(JSON.stringify(record));
     } catch (error) {
       // A failing audit write must not fail the administrative action itself —
       // an operator locked out of pausing a runaway peer because a disk is full
@@ -78,18 +73,17 @@ export class ClusterAuditLog {
   /**
    * Read a page, newest first.
    *
-   * `before` is an ISO timestamp from a previous page's `nextCursor`. Only the
-   * active file is read: rotated files stay on disk for offline forensics but
-   * are not served, which keeps the endpoint's cost bounded no matter how long
-   * the node has been running.
+   * `before` is an ISO timestamp from a previous page's `nextCursor`. Only what
+   * the storage serves is read (on Node the active file: rotated files stay on
+   * disk for offline forensics but are not served, which keeps the endpoint's
+   * cost bounded no matter how long the node has been running).
    */
   read(options: { limit?: number; before?: string } = {}): ClusterAuditPage {
     const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
-    if (!existsSync(this.file)) return { records: [], nextCursor: null };
 
     let lines: string[];
     try {
-      lines = readFileSync(this.file, "utf8").split("\n").filter(Boolean);
+      lines = this.storage.readLines().filter(Boolean);
     } catch (error) {
       console.error("[ClusterAuditLog] Could not read audit log:", error);
       return { records: [], nextCursor: null };
@@ -110,11 +104,5 @@ export class ClusterAuditLog {
     const last = records[records.length - 1];
     const exhausted = records.length < limit;
     return { records, nextCursor: exhausted || !last ? null : last.at };
-  }
-
-  private rotateIfNeeded(): void {
-    if (!existsSync(this.file)) return;
-    if (statSync(this.file).size < this.maxBytes) return;
-    renameSync(this.file, `${this.file}.${Date.now()}`);
   }
 }

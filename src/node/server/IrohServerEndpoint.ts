@@ -3,7 +3,7 @@ import {
   type IrohRpcHandler,
 } from "../../core/appendonlystores/network/IrohNetworkTransport";
 import { MINDOODB_IROH_ALPN } from "../../core/appendonlystores/network/IrohStreamIO";
-import type { ServerIrohConfig } from "./types";
+import type { ServerIrohConfig } from "../../server/types";
 import { createNativeIrohStreamIO, type NativeIrohStreamIO } from "./nativeIrohStreamIO";
 
 export interface IrohServerEndpointStatus {

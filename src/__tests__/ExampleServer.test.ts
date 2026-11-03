@@ -16,7 +16,7 @@ import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemoryContentAddressedStoreFactory";
 import type { EncryptionKeyPair, MindooDBServerInfo, SigningKeyPair } from "../core/types";
 import type { PrivateUserId } from "../core/userid";
-import type { ServerConfig } from "../node/server/types";
+import type { ServerConfig } from "../server/types";
 
 // Import from example server
 import { MindooDBServer } from "../node/server/MindooDBServer";

@@ -1,0 +1,50 @@
+{
+  // MindooDB server on Cloudflare Workers + Durable Objects.
+  // See README.md for setup; secrets are created by `npm run setup`.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mindoodb-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+
+  "durable_objects": {
+    "bindings": [
+      // Server-wide state: config.json, tenants, server key bag.
+      { "name": "MINDOODB_SERVER", "class_name": "MindooServerObject" },
+      // One object per (tenant, database).
+      { "name": "MINDOODB_DATABASES", "class_name": "MindooDatabaseObject" }
+    ]
+  },
+  // Entries of 1 MB and more are kept in R2 (Durable Object SQLite rows are
+  // capped at 2 MB). Remove the binding to refuse entries above ~1.9 MB instead.
+  "r2_buckets": [
+    { "binding": "MINDOODB_LARGE_ENTRIES", "bucket_name": "mindoodb-large-entries" }
+  ],
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MindooServerObject", "MindooDatabaseObject"] }
+  ],
+
+  // Rate-limit tiers of the Node server. The Workers rate limiter supports
+  // periods of 10 or 60 seconds; remove a binding to disable its tier.
+  "ratelimits": [
+    { "name": "MINDOODB_RATE_LIMIT_GLOBAL", "namespace_id": "4801", "simple": { "limit": 4000, "period": 60 } },
+    { "name": "MINDOODB_RATE_LIMIT_AUTH", "namespace_id": "4802", "simple": { "limit": 120, "period": 60 } },
+    { "name": "MINDOODB_RATE_LIMIT_SYNC", "namespace_id": "4803", "simple": { "limit": 3000, "period": 60 } },
+    { "name": "MINDOODB_RATE_LIMIT_SYSTEM", "namespace_id": "4804", "simple": { "limit": 30, "period": 60 } },
+    { "name": "MINDOODB_RATE_LIMIT_TIMESTAMP", "namespace_id": "4805", "simple": { "limit": 10, "period": 60 } },
+    { "name": "MINDOODB_RATE_LIMIT_PEER", "namespace_id": "4806", "simple": { "limit": 600, "period": 60 } }
+  ],
+
+  // Peer replication pass every minute (runs only when config.json sets
+  // "cluster": { "autoSync": true } and trusted servers have a url).
+  "triggers": { "crons": ["* * * * *"] },
+
+  "vars": {
+    // Comma-separated origins allowed to call the API from a browser (e.g. Haven).
+    "MINDOODB_CORS_ORIGIN": "",
+    "MINDOODB_JSON_BODY_LIMIT": "5mb"
+  },
+
+  "observability": { "enabled": true }
+}
