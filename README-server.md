@@ -1,6 +1,7 @@
 # MindooDB reference server
 
 Node.js/Express sources: `src/node/server/`. Docker: `src/node/server/Dockerfile`.
+Serverless on Cloudflare Workers + Durable Objects: `cloudflare/README.md` (same API, same core: `docs/server-hosts.md`).
 
 A Node.js/Express server implementing the MindooDB sync API with:
 

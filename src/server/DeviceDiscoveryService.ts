@@ -5,10 +5,10 @@
  * no join-response URI required.
  */
 
-import { generateRandomUuid } from "../../core/utils/idGeneration";
-import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
-import { RSAEncryption } from "../../core/crypto/RSAEncryption";
-import type { DeviceTenantDelivery } from "../../core/types";
+import { generateRandomUuid } from "../core/utils/idGeneration";
+import type { CryptoAdapter } from "../core/crypto/CryptoAdapter";
+import { RSAEncryption } from "../core/crypto/RSAEncryption";
+import type { DeviceTenantDelivery } from "../core/types";
 import type { TenantManager } from "./TenantManager";
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;

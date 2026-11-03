@@ -46,12 +46,13 @@ export interface SqliteStoreBackend {
   clearAll(): Promise<void>;
 }
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS store_meta (
+function schema(prefix: string): string {
+  return `
+CREATE TABLE IF NOT EXISTS ${prefix}store_meta (
   key TEXT PRIMARY KEY NOT NULL,
   value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS entries (
+CREATE TABLE IF NOT EXISTS ${prefix}entries (
   id TEXT PRIMARY KEY NOT NULL,
   doc_id TEXT NOT NULL,
   entry_type TEXT NOT NULL,
@@ -60,15 +61,16 @@ CREATE TABLE IF NOT EXISTS entries (
   receipt_order INTEGER NOT NULL,
   metadata_json TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_entries_doc ON entries(doc_id);
-CREATE INDEX IF NOT EXISTS idx_entries_scan ON entries(receipt_order, id);
-CREATE INDEX IF NOT EXISTS idx_entries_type_created ON entries(entry_type, created_at);
-CREATE TABLE IF NOT EXISTS content (
+CREATE INDEX IF NOT EXISTS ${prefix}idx_entries_doc ON ${prefix}entries(doc_id);
+CREATE INDEX IF NOT EXISTS ${prefix}idx_entries_scan ON ${prefix}entries(receipt_order, id);
+CREATE INDEX IF NOT EXISTS ${prefix}idx_entries_type_created ON ${prefix}entries(entry_type, created_at);
+CREATE TABLE IF NOT EXISTS ${prefix}content (
   content_hash TEXT PRIMARY KEY NOT NULL,
   bytes BLOB NOT NULL,
   ref_count INTEGER NOT NULL
 );
 `;
+}
 
 function asBytes(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) {
@@ -77,8 +79,9 @@ function asBytes(value: unknown): Uint8Array {
   if (value instanceof ArrayBuffer) {
     return new Uint8Array(value);
   }
-  if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
-    return new Uint8Array(value);
+  // Node's Buffer, and any other typed-array view over a BLOB.
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   }
   throw new Error("Expected BLOB column to be binary");
 }
@@ -108,14 +111,88 @@ function createQueue() {
   };
 }
 
-export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
+export interface SqlBackendOptions {
+  /**
+   * Prefix for the store's tables and indexes, so several stores can share
+   * one SQLite database (e.g. every store of a Cloudflare Durable Object).
+   */
+  tablePrefix?: string;
+  /**
+   * Whether {@link SqliteStoreBackend.transaction} issues BEGIN/COMMIT.
+   * Turn off for engines that manage transactions themselves and reject
+   * these statements, such as Durable Object SQLite, which commits all
+   * writes of one event-loop turn atomically. Batches still run one at a time.
+   */
+  explicitTransactions?: boolean;
+  /**
+   * Keep payloads of at least {@link ExternalContentStore.thresholdBytes}
+   * outside SQLite, for engines that cap BLOB or row size (Durable Object
+   * SQLite: 2 MB). The content row stays, with an empty BLOB, and an extra
+   * table records which hashes live outside.
+   */
+  externalContent?: ExternalContentStore;
+  /**
+   * Most bound parameters the engine accepts in one statement; `IN (...)`
+   * lists are split accordingly. SQLite allows 32766, Durable Object SQLite
+   * only 100.
+   */
+  maxBoundParameters?: number;
+}
+
+/** Where a backend keeps payloads too large for its SQLite (e.g. Cloudflare R2). */
+export interface ExternalContentStore {
+  thresholdBytes: number;
+  put(contentHash: string, bytes: Uint8Array): Promise<void>;
+  get(contentHash: string): Promise<Uint8Array | null>;
+  delete(contentHash: string): Promise<void>;
+  /** Remove every payload of this store (`clearAll`). */
+  clear?(): Promise<void>;
+}
+
+export function createSqlBackend(executor: SqliteExecutor, options: SqlBackendOptions = {}): SqliteStoreBackend {
+  const prefix = options.tablePrefix ?? "";
+  if (!/^[A-Za-z0-9_]*$/.test(prefix)) {
+    throw new Error(`Invalid SQLite table prefix: ${prefix}`);
+  }
+  const explicitTransactions = options.explicitTransactions !== false;
+  const external = options.externalContent;
+  const inListChunk = Math.max(1, Math.min(IN_LIST_CHUNK, options.maxBoundParameters ?? IN_LIST_CHUNK));
   const enqueue = createQueue();
+
+  /** The payload of a content row, fetched from the external store when it lives there. */
+  async function resolveBytes(hash: string, stored: unknown): Promise<Uint8Array> {
+    const bytes = asBytes(stored);
+    if (!external || bytes.byteLength > 0) {
+      return bytes;
+    }
+    const marked = await executor.get(
+      `SELECT 1 AS present FROM ${prefix}content_external WHERE content_hash = ?`,
+      [hash],
+    );
+    if (!marked) {
+      return bytes;
+    }
+    const loaded = await external.get(hash);
+    if (!loaded) {
+      throw new Error(`External content ${hash} is missing`);
+    }
+    return loaded;
+  }
+
   return {
     async init() {
-      await executor.exec(SCHEMA);
+      await executor.exec(schema(prefix));
+      if (external) {
+        await executor.exec(
+          `CREATE TABLE IF NOT EXISTS ${prefix}content_external (content_hash TEXT PRIMARY KEY NOT NULL);`,
+        );
+      }
     },
 
     transaction(work) {
+      if (!explicitTransactions) {
+        return enqueue(work);
+      }
       return enqueue(async () => {
         await executor.exec("BEGIN IMMEDIATE");
         try {
@@ -131,8 +208,8 @@ export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
 
     async hasEntries(ids) {
       const present: string[] = [];
-      for (const slice of chunks(ids, IN_LIST_CHUNK)) {
-        const rows = await executor.all(`SELECT id FROM entries WHERE id IN (${placeholders(slice.length)})`, slice);
+      for (const slice of chunks(ids, inListChunk)) {
+        const rows = await executor.all(`SELECT id FROM ${prefix}entries WHERE id IN (${placeholders(slice.length)})`, slice);
         for (const row of rows) {
           present.push(String(row.id));
         }
@@ -142,32 +219,36 @@ export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
 
     async getEntryRows(ids) {
       const result: Array<{ id: string; metaJson: string; data: Uint8Array }> = [];
-      for (const slice of chunks(ids, IN_LIST_CHUNK)) {
+      for (const slice of chunks(ids, inListChunk)) {
         const rows = await executor.all(
-          `SELECT e.id AS id, e.metadata_json AS metadata_json, c.bytes AS bytes FROM entries e JOIN content c ON c.content_hash = e.content_hash WHERE e.id IN (${placeholders(slice.length)})`,
+          `SELECT e.id AS id, e.metadata_json AS metadata_json, e.content_hash AS content_hash, c.bytes AS bytes FROM ${prefix}entries e JOIN ${prefix}content c ON c.content_hash = e.content_hash WHERE e.id IN (${placeholders(slice.length)})`,
           slice,
         );
         for (const row of rows) {
-          result.push({ id: String(row.id), metaJson: String(row.metadata_json), data: asBytes(row.bytes) });
+          result.push({
+            id: String(row.id),
+            metaJson: String(row.metadata_json),
+            data: await resolveBytes(String(row.content_hash), row.bytes),
+          });
         }
       }
       return result;
     },
 
     async getMeta(key) {
-      const row = await executor.get("SELECT value FROM store_meta WHERE key = ?", [key]);
+      const row = await executor.get(`SELECT value FROM ${prefix}store_meta WHERE key = ?`, [key]);
       return row ? String(row.value) : null;
     },
 
     async setMeta(key, value) {
       await executor.run(
-        "INSERT INTO store_meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        `INSERT INTO ${prefix}store_meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
         [key, value],
       );
     },
 
     async hasEntry(id) {
-      const row = await executor.get("SELECT 1 AS present FROM entries WHERE id = ?", [id]);
+      const row = await executor.get(`SELECT 1 AS present FROM ${prefix}entries WHERE id = ?`, [id]);
       return Boolean(row);
     },
 
@@ -177,7 +258,7 @@ export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
         return false;
       }
       await executor.run(
-        "INSERT INTO entries(id, doc_id, entry_type, created_at, content_hash, receipt_order, metadata_json) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        `INSERT INTO ${prefix}entries(id, doc_id, entry_type, created_at, content_hash, receipt_order, metadata_json) VALUES(?, ?, ?, ?, ?, ?, ?)`,
         [id, docId, entryType, createdAt, contentHash, receiptOrder, metaJson],
       );
       const content = await this.getContent(contentHash);
@@ -191,52 +272,52 @@ export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
 
     async updateEntryMeta(id, metaJson, receiptOrder) {
       await executor.run(
-        "UPDATE entries SET metadata_json = ?, receipt_order = ? WHERE id = ?",
+        `UPDATE ${prefix}entries SET metadata_json = ?, receipt_order = ? WHERE id = ?`,
         [metaJson, receiptOrder, id],
       );
     },
 
     async getEntryRow(id) {
       const row = await executor.get(
-        "SELECT e.metadata_json AS metadata_json, c.bytes AS bytes FROM entries e JOIN content c ON c.content_hash = e.content_hash WHERE e.id = ?",
+        `SELECT e.metadata_json AS metadata_json, e.content_hash AS content_hash, c.bytes AS bytes FROM ${prefix}entries e JOIN ${prefix}content c ON c.content_hash = e.content_hash WHERE e.id = ?`,
         [id],
       );
       if (!row) {
         return null;
       }
-      return { metaJson: String(row.metadata_json), data: asBytes(row.bytes) };
+      return { metaJson: String(row.metadata_json), data: await resolveBytes(String(row.content_hash), row.bytes) };
     },
 
     async getMetadataJson(id) {
-      const row = await executor.get("SELECT metadata_json FROM entries WHERE id = ?", [id]);
+      const row = await executor.get(`SELECT metadata_json FROM ${prefix}entries WHERE id = ?`, [id]);
       return row ? String(row.metadata_json) : null;
     },
 
     async getAllMetadataJson() {
-      const rows = await executor.all("SELECT metadata_json FROM entries");
+      const rows = await executor.all(`SELECT metadata_json FROM ${prefix}entries`);
       return rows.map((row) => String(row.metadata_json));
     },
 
     async getMetadataJsonByDoc(docId) {
-      const rows = await executor.all("SELECT metadata_json FROM entries WHERE doc_id = ?", [docId]);
+      const rows = await executor.all(`SELECT metadata_json FROM ${prefix}entries WHERE doc_id = ?`, [docId]);
       return rows.map((row) => String(row.metadata_json));
     },
 
     async getAllIds() {
-      const rows = await executor.all("SELECT id FROM entries");
+      const rows = await executor.all(`SELECT id FROM ${prefix}entries`);
       return rows.map((row) => String(row.id));
     },
 
     async scanMetadataJson(cursorReceiptOrder, cursorId, limit) {
       if (cursorReceiptOrder === null || cursorId === null) {
         const rows = await executor.all(
-          "SELECT metadata_json FROM entries ORDER BY receipt_order ASC, id ASC LIMIT ?",
+          `SELECT metadata_json FROM ${prefix}entries ORDER BY receipt_order ASC, id ASC LIMIT ?`,
           [limit],
         );
         return rows.map((row) => String(row.metadata_json));
       }
       const rows = await executor.all(
-        "SELECT metadata_json FROM entries WHERE receipt_order > ? OR (receipt_order = ? AND id > ?) ORDER BY receipt_order ASC, id ASC LIMIT ?",
+        `SELECT metadata_json FROM ${prefix}entries WHERE receipt_order > ? OR (receipt_order = ? AND id > ?) ORDER BY receipt_order ASC, id ASC LIMIT ?`,
         [cursorReceiptOrder, cursorReceiptOrder, cursorId, limit],
       );
       return rows.map((row) => String(row.metadata_json));
@@ -245,12 +326,12 @@ export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
     async deleteEntries(ids) {
       let deleted = 0;
       for (const id of ids) {
-        const row = await executor.get("SELECT content_hash FROM entries WHERE id = ?", [id]);
+        const row = await executor.get(`SELECT content_hash FROM ${prefix}entries WHERE id = ?`, [id]);
         if (!row) {
           continue;
         }
         const hash = String(row.content_hash);
-        await executor.run("DELETE FROM entries WHERE id = ?", [id]);
+        await executor.run(`DELETE FROM ${prefix}entries WHERE id = ?`, [id]);
         deleted += 1;
         const content = await this.getContent(hash);
         if (content) {
@@ -265,45 +346,73 @@ export function createSqlBackend(executor: SqliteExecutor): SqliteStoreBackend {
     },
 
     async getContent(hash) {
-      const row = await executor.get("SELECT bytes, ref_count FROM content WHERE content_hash = ?", [hash]);
+      const row = await executor.get(`SELECT bytes, ref_count FROM ${prefix}content WHERE content_hash = ?`, [hash]);
       if (!row) {
         return null;
       }
-      return { data: asBytes(row.bytes), refCount: Number(row.ref_count) };
+      return { data: await resolveBytes(hash, row.bytes), refCount: Number(row.ref_count) };
     },
 
     async putContent(hash, data, refCount) {
+      if (external && data.byteLength >= external.thresholdBytes) {
+        // Payload first: a crash in between leaves an unreferenced object
+        // behind, never a row without its payload.
+        await external.put(hash, data);
+        // X'' rather than a bound empty buffer: some drivers bind that as NULL.
+        await executor.run(
+          `INSERT INTO ${prefix}content(content_hash, bytes, ref_count) VALUES(?, X'', ?)`,
+          [hash, refCount],
+        );
+        await executor.run(
+          `INSERT OR IGNORE INTO ${prefix}content_external(content_hash) VALUES(?)`,
+          [hash],
+        );
+        return;
+      }
       await executor.run(
-        "INSERT INTO content(content_hash, bytes, ref_count) VALUES(?, ?, ?)",
+        `INSERT INTO ${prefix}content(content_hash, bytes, ref_count) VALUES(?, ?, ?)`,
         [hash, data, refCount],
       );
     },
 
     async updateContentRef(hash, refCount) {
-      await executor.run("UPDATE content SET ref_count = ? WHERE content_hash = ?", [refCount, hash]);
+      await executor.run(`UPDATE ${prefix}content SET ref_count = ? WHERE content_hash = ?`, [refCount, hash]);
     },
 
     async deleteContent(hash) {
-      await executor.run("DELETE FROM content WHERE content_hash = ?", [hash]);
+      await executor.run(`DELETE FROM ${prefix}content WHERE content_hash = ?`, [hash]);
+      if (external) {
+        const { changes } = await executor.run(
+          `DELETE FROM ${prefix}content_external WHERE content_hash = ?`,
+          [hash],
+        );
+        if (changes > 0) {
+          await external.delete(hash);
+        }
+      }
     },
 
     async countEntries() {
-      const row = await executor.get("SELECT COUNT(*) AS n FROM entries");
+      const row = await executor.get(`SELECT COUNT(*) AS n FROM ${prefix}entries`);
       return Number(row?.n ?? 0);
     },
 
     async countContent() {
-      const row = await executor.get("SELECT COUNT(*) AS n FROM content");
+      const row = await executor.get(`SELECT COUNT(*) AS n FROM ${prefix}content`);
       return Number(row?.n ?? 0);
     },
 
     async countDocs() {
-      const row = await executor.get("SELECT COUNT(DISTINCT doc_id) AS n FROM entries");
+      const row = await executor.get(`SELECT COUNT(DISTINCT doc_id) AS n FROM ${prefix}entries`);
       return Number(row?.n ?? 0);
     },
 
     async clearAll() {
-      await executor.exec("DELETE FROM entries; DELETE FROM content; DELETE FROM store_meta;");
+      await executor.exec(`DELETE FROM ${prefix}entries; DELETE FROM ${prefix}content; DELETE FROM ${prefix}store_meta;`);
+      if (external) {
+        await executor.exec(`DELETE FROM ${prefix}content_external;`);
+        await external.clear?.();
+      }
     },
   };
 }

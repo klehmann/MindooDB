@@ -11,7 +11,7 @@ import {
   TimestampProxyError,
   toPublicTsaProviders,
   type TsaProviderConfig,
-} from "../node/server/timestampProxy";
+} from "../server/timestampProxy";
 
 const silent = () => undefined;
 

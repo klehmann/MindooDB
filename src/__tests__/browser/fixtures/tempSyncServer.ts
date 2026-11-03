@@ -14,7 +14,7 @@ import type { PrivateUserId } from "../../../core/userid";
 import { decryptPrivateKey } from "../../../core/crypto/privateKeyEncryption";
 import { NodeCryptoAdapter } from "../../../node/crypto/NodeCryptoAdapter";
 import { MindooDBServer } from "../../../node/server/MindooDBServer";
-import type { ServerConfig } from "../../../node/server/types";
+import type { ServerConfig } from "../../../server/types";
 
 export interface BrowserSyncServerContext {
   baseUrl: string;

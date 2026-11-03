@@ -22,7 +22,7 @@
 import { MindooDBServer } from "./MindooDBServer";
 import { loadServerConfig, resolveConfigPath } from "./config";
 import { resolveServerPassword } from "./resolveServerPassword";
-import { ENV_VARS } from "./types";
+import { ENV_VARS } from "../../server/types";
 
 interface CliOptions {
   dataDir: string;

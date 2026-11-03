@@ -36,7 +36,7 @@ import {
   type MindooTenant,
   type PrivateUserId,
 } from "../core/types";
-import type { ServerConfig } from "../node/server/types";
+import type { ServerConfig } from "../server/types";
 
 const RUN = process.env.BENCH === "1";
 const DOCS = Number(process.env.BENCH_DOCS ?? 1000);

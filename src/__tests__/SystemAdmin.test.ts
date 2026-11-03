@@ -17,7 +17,7 @@ import { ClientNetworkContentAddressedStore } from "../appendonlystores/network/
 import { MindooDBServerAdmin } from "../core/MindooDBServerAdmin";
 import { KeyBag } from "../core/keys/KeyBag";
 import type { PrivateUserId } from "../core/userid";
-import type { ServerConfig } from "../node/server/types";
+import type { ServerConfig } from "../server/types";
 import { MindooDBServer } from "../node/server/MindooDBServer";
 
 jest.setTimeout(30000);

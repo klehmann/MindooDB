@@ -6,6 +6,7 @@
  * {@link createLoopbackIrohPair}.
  */
 import { normalizeIrohEndpointId } from "./irohLocator";
+import { base64ToBytes, bytesToBase64 } from "../../utils/base64";
 
 export const MINDOODB_IROH_ALPN = "mindoodb/sync-v5";
 
@@ -248,28 +249,6 @@ function reviver(_key: string, value: unknown): unknown {
   return value;
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(bytes).toString("base64");
-  }
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  if (typeof Buffer !== "undefined") {
-    return new Uint8Array(Buffer.from(value, "base64"));
-  }
-  const binary = atob(value);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
-}
 
 class LoopbackStream implements IrohByteStream {
   private readonly inbound: Uint8Array[] = [];

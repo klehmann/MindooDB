@@ -1,4 +1,4 @@
-import { SyncEventBus, type SyncChangeEvent } from "../node/server/SyncEventBus";
+import { SyncEventBus, type SyncChangeEvent } from "../server/SyncEventBus";
 import { HttpTransport } from "../appendonlystores/network/HttpTransport";
 import { NetworkErrorType, type StoreChangeEvent } from "../core/appendonlystores/network/types";
 

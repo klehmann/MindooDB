@@ -1,5 +1,5 @@
 import { readFileSync } from "fs";
-import { ENV_VARS } from "./types";
+import { ENV_VARS } from "../../server/types";
 
 /**
  * Server identity password: optional file (preferred for Docker: avoids putting

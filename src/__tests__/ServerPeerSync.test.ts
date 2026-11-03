@@ -24,13 +24,13 @@ import { InMemoryContentAddressedStoreFactory } from "../appendonlystores/InMemo
 import { MindooDBServer } from "../node/server/MindooDBServer";
 import { StoreKind } from "../core/types";
 import type { PrivateUserId } from "../core/userid";
-import type { ServerConfig, TrustedServer } from "../node/server/types";
+import type { ServerConfig, TrustedServer } from "../server/types";
 import {
   directionAllowsPull,
   directionAllowsPush,
   orderDatabasesForReplication,
   shouldOpenSessionTo,
-} from "../node/server/peer/types";
+} from "../server/peer/types";
 import { createIdBloomSummary, bloomMightContainId } from "../core/appendonlystores/bloom";
 
 jest.setTimeout(240000);

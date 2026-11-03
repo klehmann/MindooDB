@@ -22,7 +22,7 @@ import {
   type MindooTenant,
   type PrivateUserId,
 } from "../core/types";
-import type { ServerConfig } from "../node/server/types";
+import type { ServerConfig } from "../server/types";
 
 const DEVICE1_PASSWORD = "device1-pass";
 const DEVICE2_PASSWORD = "device2-pass";

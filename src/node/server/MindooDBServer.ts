@@ -1,6 +1,12 @@
 /**
  * MindooDB Server - Express HTTP server implementing the sync API.
  *
+ * The route handlers themselves are platform-neutral and live in
+ * {@link MindooDBServerCore} (`src/server/http`); this class is the Node host:
+ * it wires the server's components, mounts the handlers on Express and adds
+ * what only a Node process provides — HTTP/2 + TLS, static files, Iroh, the
+ * peer and cluster routers, and the middleware stack below.
+ *
  * Security features:
  * - Capabilities-based system admin authorization via config.json
  * - Challenge/response (Ed25519) authentication for /system/* endpoints
@@ -17,115 +23,60 @@ import http2 from "http2";
 import path from "path";
 import { readFileSync, existsSync } from "fs";
 import helmet from "helmet";
-import { isMissingDependencyError } from "../../core/errors";
 import cors from "cors";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
-import { jsonCompressionMiddleware, sendBinaryEntryBody } from "./compressionMiddleware";
-import {
-  BINARY_ENTRIES_CONTENT_TYPE,
-  BINARY_GET_ENTRIES_FORMAT,
-  BINARY_PUT_ENTRIES_FORMAT,
-  decodeBinaryEntryMessage,
-  encodeBinaryEntryMessage,
-} from "../../core/appendonlystores/network/binaryEntryFraming";
-import {
-  deserializeEntryMetadata as decodeEntryMetadata,
-  deserializeStoreEntry,
-  serializeEntryMetadata as encodeEntryMetadata,
-  type SerializedEntry,
-  type SerializedEntryMetadata,
-} from "../../core/appendonlystores/network/entryWireCodec";
-import { SyncEventBus } from "./SyncEventBus";
-import { ClusterManager } from "./peer/ClusterManager";
+import { jsonCompressionMiddleware } from "./compressionMiddleware";
+import { SyncEventBus } from "../../server/SyncEventBus";
+import { ClusterManager } from "../../server/peer/ClusterManager";
+import { FileClusterAuditStorage } from "./peer/FileClusterAuditStorage";
+import { IrohPeerLink } from "./peer/IrohPeerLink";
 import { createClusterRouter, createPeerRouter } from "./peer/routes";
-import { isPeerAttachmentMode, isPeerRole, isPeerSyncDirection } from "./peer/types";
-import type {
-  StoreEntry,
-  StoreEntryMetadata,
-  StoreScanCursor,
-  StoreScanFilters,
-  StoreIdBloomSummary,
-  StoreCompactionStatus,
-} from "../../core/types";
-import {
-  StoreKind,
-} from "../../core/appendonlystores/types";
-import type {
-  AttachmentReadPlan,
-  AttachmentReadPlanOptions,
-  DocumentMaterializationBatchPlan,
-  DocumentMaterializationPlan,
-  MaterializationPlanOptions,
-} from "../../core/appendonlystores/types";
-import type { NetworkSyncCapabilities } from "../../core/appendonlystores/network/types";
-import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
+import { StoreKind } from "../../core/appendonlystores/types";
 
 import { TenantManager } from "./TenantManager";
-import {
-  CapabilityMatcher,
-  parseSystemTenantItemPath,
-} from "./CapabilityMatcher";
-import { SystemAdminAuthService } from "./SystemAdminAuth";
-import {
-  DeviceDiscoveryAuthError,
-  DeviceDiscoveryService,
-} from "./DeviceDiscoveryService";
-import {
-  validateServerConfig,
-  backupConfig,
-  writeConfig,
-  isConfigBackupFilename,
-  listConfigBackups,
-  loadConfigBackup,
-} from "./config";
+import { CapabilityMatcher } from "../../server/CapabilityMatcher";
+import { SystemAdminAuthService } from "../../server/SystemAdminAuth";
+import { DeviceDiscoveryService } from "../../server/DeviceDiscoveryService";
+import { FileServerConfigRepository } from "./config";
 import {
   isSystemIpAllowListDisabled,
   readSystemIpAllowListFromEnv,
   systemIpAllowlistMiddleware,
 } from "./SystemIpAllowlist";
-import type { ServerConfig } from "./types";
+import type { ServerConfig } from "../../server/types";
 import { createMindooDBServerIrohHandler } from "./IrohServerRpc";
 import { IrohServerEndpoint } from "./IrohServerEndpoint";
-import type {
-  RegisterTenantRequest,
-  RegisterTenantResponse,
-  ListTenantsResponse,
-  TenantPublicInfosFingerprintsResponse,
-  TrustedServer,
-} from "./types";
-import {
-  validateIdentifier,
-  validateTenantId,
-  validateTenantIdFormat,
-  validateUsername,
-  validateArraySize,
-  validateStringLength,
-  ValidationError,
-  MAX_HAVE_IDS,
-  MAX_ENTRY_IDS,
-  MAX_PUT_ENTRIES,
-  MAX_PEM_KEY_LENGTH,
-  MAX_SIGNATURE_LENGTH,
-  MAX_CHALLENGE_LENGTH,
-} from "./validation";
-import { assertSafeSyncUrl, UnsafeUrlError } from "../../core/utils/urlSafety";
-import { ENV_VARS } from "./types";
+import { ENV_VARS } from "../../server/types";
 import {
   MAX_TIMESTAMP_REQUEST_BYTES,
   parseTsaProviders,
-  requestTimestampToken,
-  toPublicTsaProviders,
-  TimestampProxyError,
   TIMESTAMP_QUERY_CONTENT_TYPE,
-  TIMESTAMP_REPLY_CONTENT_TYPE,
   type TsaProviderConfig,
-} from "./timestampProxy";
-import { buildSyncRateLimitKey, resolveGlobalRateLimit } from "./rateLimits";
+} from "../../server/timestampProxy";
+import {
+  buildAuthRateLimitKey,
+  buildSyncRateLimitKey,
+  buildTimestampRateLimitKey,
+  resolveServerRateLimits,
+  TIMESTAMP_DAILY_WINDOW_MS,
+  type ResolvedRateLimit,
+} from "../../server/rateLimits";
+import {
+  formatSyncChangeEvent,
+  formatSyncHeartbeat,
+  formatSyncHelloEvent,
+  MindooDBServerCore,
+  SYNC_EVENT_HEARTBEAT_MS,
+  SYNC_ROUTES,
+  SYNC_STORE_KINDS,
+} from "../../server/http/MindooDBServerCore";
+import { guard, route, sendServerResponse, toServerRequest } from "./expressAdapter";
+import { isEventStreamResponse, type SyncEventStreamSpec } from "../../server/http/types";
 
 /**
  * Augment Express Request with fields populated by our middleware:
- * - tenantId: set by tenantMiddleware after validating the :tenantId URL param
- * - systemAdmin: set by systemAdminMiddleware after JWT verification
+ * - tenantId: set by the tenant guard after validating the :tenantId URL param
+ * - systemAdmin: set by the system admin guard after JWT verification
  * - jsonBodyBytes: raw byte count captured during JSON body parsing (for diagnostics)
  */
 declare global {
@@ -134,92 +85,15 @@ declare global {
       tenantId?: string;
       systemAdmin?: { username: string; publicsignkey: string };
       jsonBodyBytes?: number;
-      /** Set by timestampAuthMiddleware; identifies the caller for per-identity throttling. */
+      /** Set by the timestamp auth guard; identifies the caller for per-identity throttling. */
       timestampPrincipal?: string;
-      /** Set by syncPrincipalMiddleware; identifies the caller for per-identity throttling. */
+      /** Set by the sync principal pass; identifies the caller for per-identity throttling. */
       syncPrincipal?: string;
     }
   }
 }
 
-/**
- * Wire-format types for the sync HTTP API live in
- * {@link ../../core/appendonlystores/network/entryWireCodec}: binary fields
- * (signature, encryptedData, rsaEncryptedPayload) are base64 strings in
- * transit. Client and server share that codec so signed trailing blocks
- * cannot drift off the wire.
- */
-
-/**
- * Rate-limit defaults. Auth and sync have separate tiers because a single
- * challenge/authenticate handshake is two requests; with multiple tenants,
- * store kinds, and token renewals the auth budget exhausts quickly if set
- * too low. These can be overridden in config.json under `rateLimits.auth`
- * and `rateLimits.sync`.
- */
-const DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS = 60_000;
-const DEFAULT_AUTH_RATE_LIMIT_MAX = 120;
-const DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
-/**
- * Sync is keyed per authenticated principal, and a client legitimately opens
- * several databases at once: a host like Teacher's Desk reads six, and a cold
- * pass over one of them costs a few hundred batched requests. A budget sized
- * for a single database turns that normal open into a throttled one.
- */
-const DEFAULT_SYNC_RATE_LIMIT_MAX = 3_000;
-
-/**
- * The global limiter is a coarse net for unauthenticated floods and unknown
- * routes; the per-tier limiters are the real budgets. It runs first, so a
- * global max below a tier max silently replaces that tier — the sync budget
- * was unreachable while this was a hardcoded 500. The default is therefore
- * derived from the tiers, and an override that would shadow one is honoured
- * but flagged at startup rather than quietly applied.
- */
-const DEFAULT_GLOBAL_RATE_LIMIT_WINDOW_MS = 60_000;
-const GLOBAL_RATE_LIMIT_TIER_HEADROOM = 500;
-
-/**
- * Timestamping gets its own budget rather than sharing the sync one. Sync is
- * chatty and high-volume; sealing a document is a deliberate, rare user action.
- * Sharing a bucket would let ordinary sync traffic starve the seal endpoint, and
- * a runaway seal loop degrade sync.
- *
- * The daily cap matters more than the burst cap: proxying collapses every user
- * onto the server's IP, so one tenant can exhaust an upstream's per-IP allowance
- * (open-tsa.eu publishes 60/minute) and lock out everyone else on this server.
- */
-const DEFAULT_TIMESTAMP_RATE_LIMIT_WINDOW_MS = 60_000;
-const DEFAULT_TIMESTAMP_RATE_LIMIT_MAX = 10;
-const DEFAULT_TIMESTAMP_DAILY_LIMIT_MAX = 500;
-const TIMESTAMP_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
-
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
-
-/** Parse a human-readable size string ("5mb", "1024", "100kb") into bytes. */
-function parseBodySizeLimitToBytes(limit: string): number | null {
-  const normalized = limit.trim().toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  if (/^\d+$/.test(normalized)) {
-    return Number(normalized);
-  }
-  const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)$/);
-  if (!match) {
-    return null;
-  }
-  const value = Number(match[1]);
-  const unit = match[2];
-  const multiplier = unit === "b"
-    ? 1
-    : unit === "kb"
-      ? 1024
-      : unit === "mb"
-        ? 1024 * 1024
-        : 1024 * 1024 * 1024;
-  return Math.round(value * multiplier);
-}
 
 export class MindooDBServer {
   private app: express.Application;
@@ -231,15 +105,16 @@ export class MindooDBServer {
   private deviceDiscovery: DeviceDiscoveryService;
   /** Peer sessions, replicators, cluster jobs and the audit log. */
   private cluster: ClusterManager;
+  /** The platform-neutral route handlers. */
+  private core: MindooDBServerCore;
   private readonly staticDir: string | undefined;
   private serverConfig: ServerConfig;
   private configPath: string;
   private readonly jsonBodyLimit: string;
-  private readonly jsonBodyLimitBytes: number | null;
   /**
    * Upstream TSAs the proxy may contact. Populated only from server env config —
    * a client names a provider by id, never by URL, so this list is the whole
-   * SSRF boundary for {@link handleTimestampRequest}.
+   * SSRF boundary for the timestamp proxy.
    */
   private readonly tsaProviders: TsaProviderConfig[];
   private readonly irohEndpoint = new IrohServerEndpoint();
@@ -266,10 +141,12 @@ export class MindooDBServer {
     this.staticDir = staticDir;
     this.configPath = configPath ?? path.join(dataDir, "config.json");
     this.jsonBodyLimit = process.env.MINDOODB_JSON_BODY_LIMIT?.trim() || "5mb";
-    this.jsonBodyLimitBytes = parseBodySizeLimitToBytes(this.jsonBodyLimit);
+    const allowInsecureSyncUrls = /^(1|true)$/i.test(
+      process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
+    );
 
     this.tsaProviders = parseTsaProviders(process.env[ENV_VARS.TSA_PROVIDERS], {
-      allowInsecureUrls: /^(1|true)$/i.test(process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? ""),
+      allowInsecureUrls: allowInsecureSyncUrls,
     });
     if (this.tsaProviders.length > 0) {
       console.log(
@@ -299,7 +176,7 @@ export class MindooDBServer {
     );
     this.cluster = new ClusterManager({
       cryptoAdapter,
-      dataDir,
+      auditStorage: new FileClusterAuditStorage(dataDir),
       eventBus: this.syncEventBus,
       listTrustedServers: () => this.tenantManager.listTrustedServers(),
       localServerName: () => this.tenantManager.getServerPublicInfo()?.name ?? null,
@@ -316,6 +193,7 @@ export class MindooDBServer {
       onDirectoryPulled: (tenantId) => this.tenantManager.executePendingPurges(tenantId),
       localRole: this.serverConfig.cluster?.role,
       getIrohStreamIO: () => this.irohEndpoint.getStreamIO(),
+      openIrohLink: (io, ticket) => new IrohPeerLink(io, ticket),
     });
     // Peer tokens are accepted by the tenant sync routes so a peer can mirror
     // the encrypted stores through the ordinary protocol; the store bypasses
@@ -334,6 +212,26 @@ export class MindooDBServer {
       },
       trustedWitnessResolver: (receivedByPublicKey) =>
         this.cluster.auth.findTrustedServerByKey(receivedByPublicKey) !== null,
+    });
+
+    this.core = new MindooDBServerCore({
+      tenantManager: this.tenantManager,
+      systemAdminAuth: this.systemAdminAuth,
+      capabilityMatcher: this.capabilityMatcher,
+      deviceDiscovery: this.deviceDiscovery,
+      syncEvents: this.syncEventBus,
+      configRepository: new FileServerConfigRepository(this.configPath),
+      getServerConfig: () => this.serverConfig,
+      reloadConfig: (newConfig) => this.reloadConfig(newConfig),
+      tsaProviders: this.tsaProviders,
+      jsonBodyLimit: this.jsonBodyLimit,
+      allowInsecureSyncUrls,
+      cluster: {
+        mirrorsForTenant: (tenantId) => this.cluster.mirrorsForTenant(tenantId),
+        syncReplicators: () => this.cluster.syncReplicators(),
+        resolvePeerName: (token) =>
+          this.cluster.auth.validateToken(token).then((payload) => payload?.sub),
+      },
     });
 
     const principalCount = Object.values(this.serverConfig.capabilities).reduce(
@@ -460,10 +358,7 @@ export class MindooDBServer {
         config: irohConfig,
         handler: createMindooDBServerIrohHandler({
           getServerPublicInfo: () => this.tenantManager.getServerPublicInfo(),
-          getJsonBodyLimit: () => ({
-            limit: this.jsonBodyLimit,
-            bytes: this.jsonBodyLimitBytes,
-          }),
+          getJsonBodyLimit: () => this.core.getJsonBodyLimit(),
           getClusterRole: () => this.serverConfig.cluster?.role ?? "peer",
           listTenantPublicInfosFingerprints: (tenantId) =>
             this.tenantManager.listTenantPublicInfosFingerprints(tenantId),
@@ -507,6 +402,11 @@ export class MindooDBServer {
     } catch (error) {
       console.error("[MindooDBServer] Failed to start Iroh listener:", error);
     }
+  }
+
+  /** Every limiter tier, resolved against the current config.json. */
+  private rateLimitPolicy() {
+    return resolveServerRateLimits(this.serverConfig.rateLimits);
   }
 
   /**
@@ -562,7 +462,6 @@ export class MindooDBServer {
     });
   }
 
-  /** Parse MINDOODB_CORS_ORIGIN env var; supports comma-separated multiple origins. */
   /**
    * Teach Express which upstream hops to trust for `X-Forwarded-For`, so
    * `req.ip` is the client rather than the proxy. Every rate limiter keys on
@@ -601,6 +500,7 @@ export class MindooDBServer {
     }
   }
 
+  /** Parse MINDOODB_CORS_ORIGIN env var; supports comma-separated multiple origins. */
   private readCorsOriginsFromEnv(): string | string[] | undefined {
     const raw = process.env.MINDOODB_CORS_ORIGIN?.trim();
     if (!raw) {
@@ -626,6 +526,8 @@ export class MindooDBServer {
    *  /:tenantId/*              — per-tenant sync & auth API
    */
   private setupRoutes(): void {
+    const core = this.core;
+
     this.app.get("/", (req: Request, res: Response) => {
       if (this.staticDir && existsSync(path.join(this.staticDir, "index.html"))) {
         res.redirect(302, "/statics/index.html");
@@ -634,15 +536,14 @@ export class MindooDBServer {
       }
     });
 
-    this.app.get("/health", (req, res) => {
-      res.json({ status: "ok", timestamp: Date.now() });
-    });
+    this.app.get("/health", route(() => core.health()));
 
     // Server-wide device discovery (before /:tenantId so "device" is not a tenant id).
     // Aggressive rate limit: challenge+discover scans every local tenant.
+    const deviceLimit = this.rateLimitPolicy().device;
     const deviceDiscoveryRateLimit = rateLimit({
-      windowMs: 60_000,
-      max: 10,
+      windowMs: deviceLimit.windowMs,
+      max: deviceLimit.max,
       standardHeaders: true,
       legacyHeaders: false,
       message: { error: "Too many device discovery requests, please try again later" },
@@ -650,92 +551,22 @@ export class MindooDBServer {
     this.app.post(
       "/device/challenge",
       deviceDiscoveryRateLimit,
-      this.handleDeviceChallenge.bind(this),
+      route((req) => core.deviceChallenge(req)),
     );
     this.app.post(
       "/device/discover",
       deviceDiscoveryRateLimit,
-      this.handleDeviceDiscover.bind(this),
+      route((req) => core.deviceDiscover(req)),
     );
 
     // .well-known endpoints are unauthenticated so clients can discover
     // server identity and tenant availability before attempting to authenticate.
-    this.app.get("/.well-known/mindoodb-server-info", (req, res) => {
-      const info = this.tenantManager.getServerPublicInfo();
-      if (!info) {
-        res.status(503).json({ error: "Server identity not initialized" });
-        return;
-      }
-      res.json({
-        ...info,
-        // Its own mesh role, so `add-to-network` can propagate it into the
-        // other side's trusted-servers entry instead of asking the operator to
-        // repeat it on every node.
-        clusterRole: this.serverConfig.cluster?.role ?? "peer",
-        maxJsonRequestBodyLimit: this.jsonBodyLimit,
-        maxJsonRequestBodyBytes: this.jsonBodyLimitBytes ?? undefined,
-        // Lets a client decide between calling a browser-reachable TSA directly
-        // and routing through this server, per tenant and without a probe.
-        timestamping: {
-          enabled: this.tsaProviders.length > 0,
-          providers: toPublicTsaProviders(this.tsaProviders),
-        },
-      });
-    });
-    /**
-     * Mirrors of one tenant, for client failover.
-     *
-     * Scoped to the tenant in the query on purpose: a client asking about
-     * tenant A must not learn which other tenants this server replicates, or
-     * to whom. Unauthenticated like the other discovery endpoints — a client
-     * needs it precisely when it cannot reach a server to authenticate with.
-     */
-    this.app.get("/.well-known/mindoodb-cluster", (req, res) => {
-      const tenantId = typeof req.query.tenantId === "string" ? req.query.tenantId.toLowerCase() : "";
-      if (!tenantId) {
-        res.status(400).json({ error: "tenantId query parameter is required" });
-        return;
-      }
-      try {
-        validateTenantId(tenantId);
-      } catch {
-        res.status(400).json({ error: "Invalid tenantId format" });
-        return;
-      }
-      if (!this.tenantManager.tenantExists(tenantId)) {
-        res.status(404).json({ error: "Tenant not found on server" });
-        return;
-      }
-      res.json({ tenantId, mirrors: this.cluster.mirrorsForTenant(tenantId) });
-    });
-
-    this.app.get("/.well-known/mindoodb-tenants/:tenantId/publicinfos-fingerprints", async (req, res) => {
-      const tenantId = req.params.tenantId.toLowerCase();
-      try {
-        validateTenantId(tenantId);
-        const fingerprints = await this.tenantManager.listTenantPublicInfosFingerprints(tenantId);
-        if (fingerprints.length === 0) {
-          res.status(404).json({ error: "Tenant not found on server" });
-          return;
-        }
-        const response: TenantPublicInfosFingerprintsResponse = {
-          tenantId,
-          fingerprints,
-        };
-        res.json(response);
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          res.status(400).json({ error: error.message });
-          return;
-        }
-        if (error instanceof Error && error.message.includes("not found")) {
-          res.status(404).json({ error: "Tenant not found on server" });
-          return;
-        }
-        console.error("[MindooDBServer] Error reading tenant publicInfos fingerprints:", error);
-        res.status(500).json({ error: "Failed to read tenant publicInfos fingerprints" });
-      }
-    });
+    this.app.get("/.well-known/mindoodb-server-info", route(() => core.serverInfo()));
+    this.app.get("/.well-known/mindoodb-cluster", route((req) => core.clusterMirrors(req)));
+    this.app.get(
+      "/.well-known/mindoodb-tenants/:tenantId/publicinfos-fingerprints",
+      route((req) => core.publicInfosFingerprints(req)),
+    );
 
     // Static file serving
     if (this.staticDir) {
@@ -761,9 +592,10 @@ export class MindooDBServer {
       );
     }
 
+    const systemLimit = this.rateLimitPolicy().system;
     const systemRateLimit = rateLimit({
-      windowMs: this.serverConfig.rateLimits?.system?.windowMs ?? 60_000,
-      max: this.serverConfig.rateLimits?.system?.max ?? 30,
+      windowMs: systemLimit.windowMs,
+      max: systemLimit.max,
       standardHeaders: true,
       legacyHeaders: false,
       message: { error: "Too many system requests, please try again later" },
@@ -774,11 +606,12 @@ export class MindooDBServer {
     // would lock out the operator's own cluster, and 30 req/min would throttle
     // replication to a crawl. They are protected by the peer JWT, which is only
     // issued to a key in trusted-servers.json.
+    const peerLimit = this.rateLimitPolicy().peer;
     this.app.use(
       "/system/peer",
       rateLimit({
-        windowMs: 60_000,
-        max: 600,
+        windowMs: peerLimit.windowMs,
+        max: peerLimit.max,
         standardHeaders: true,
         legacyHeaders: false,
         message: { error: "Too many peer requests, please try again later" },
@@ -800,119 +633,16 @@ export class MindooDBServer {
       systemRouter,
     );
 
-    // Tenant-scoped routes: tenantMiddleware validates the :tenantId param
+    // Tenant-scoped routes: the tenant guard validates the :tenantId param
     // and rejects unknown tenants before any handler runs.
-    this.app.use("/:tenantId", this.tenantMiddleware.bind(this), this.createTenantRouter());
+    this.app.use(
+      "/:tenantId",
+      guard((req) => core.tenantGuard(req)),
+      this.createTenantRouter(),
+    );
 
     // Express error handler — must be registered last and have the 4-arg signature
     this.app.use(this.errorHandler.bind(this));
-  }
-
-  // ==================== System Admin Auth Middleware ====================
-
-  /**
-   * JWT-based middleware for /system/* routes (excluding /system/auth/*).
-   * Extracts and validates the bearer token, then checks capabilities
-   * for the current (method, path, username, publicsignkey).
-   *
-   * `DELETE /system/tenants/:tenantId` is also allowed when the JWT signing
-   * key is that tenant's registered `adminSigningPublicKey` (own-tenant
-   * delete). Sub-resources and other tenants stay capability-gated.
-   */
-  private async systemAdminMiddleware(
-    req: Request,
-    res: Response,
-    next: NextFunction,
-  ): Promise<void> {
-    const auth = req.headers.authorization;
-    if (!auth || !auth.startsWith("Bearer ")) {
-      res.status(401).json({ error: "Missing or invalid Authorization header" });
-      return;
-    }
-
-    const token = auth.substring(7);
-    const payload = await this.systemAdminAuth.validateToken(token);
-    if (!payload) {
-      res.status(401).json({ error: "Invalid or expired token" });
-      return;
-    }
-
-    // The original request path relative to the /system mount is in req.path,
-    // but we need the full path for capability matching.
-    const fullPath = `/system${req.path}`;
-    const method = req.method.toUpperCase();
-
-    const capabilityAuthorized = this.capabilityMatcher.isAuthorized(
-      method,
-      fullPath,
-      payload.sub,
-      payload.publicsignkey,
-    );
-    const ownerDeleteAuthorized =
-      !capabilityAuthorized &&
-      this.isOwnTenantDeleteAuthorized(method, fullPath, payload.publicsignkey);
-
-    if (!capabilityAuthorized && !ownerDeleteAuthorized) {
-      res.status(403).json({ error: "Forbidden: insufficient capabilities" });
-      return;
-    }
-
-    req.systemAdmin = {
-      username: payload.sub,
-      publicsignkey: payload.publicsignkey,
-    };
-    next();
-  }
-
-  /**
-   * Owner bypass for deleting the caller's own tenant. Matches only
-   * `DELETE /system/tenants/:tenantId` (no sub-resource) and requires the
-   * JWT public key to equal that tenant's stored admin signing key.
-   */
-  private isOwnTenantDeleteAuthorized(
-    method: string,
-    fullPath: string,
-    publicsignkey: string,
-  ): boolean {
-    if (method !== "DELETE") {
-      return false;
-    }
-    const tenantId = parseSystemTenantItemPath(fullPath);
-    if (!tenantId) {
-      return false;
-    }
-    try {
-      validateTenantIdFormat(tenantId);
-    } catch {
-      return false;
-    }
-    return this.tenantManager.isTenantAdminSigningKeyFor(tenantId, publicsignkey);
-  }
-
-  // ==================== Tenant Middleware ====================
-
-  private tenantMiddleware(req: Request, res: Response, next: NextFunction): void {
-    const rawTenantId = req.params.tenantId?.toLowerCase();
-
-    if (!rawTenantId) {
-      res.status(400).json({ error: "Tenant ID required" });
-      return;
-    }
-
-    try {
-      validateTenantIdFormat(rawTenantId);
-    } catch {
-      res.status(400).json({ error: "Invalid tenant ID format" });
-      return;
-    }
-
-    if (!this.tenantManager.tenantExists(rawTenantId)) {
-      res.status(404).json({ error: this.formatTenantNotFoundOnServerError(rawTenantId) });
-      return;
-    }
-
-    req.tenantId = rawTenantId;
-    next();
   }
 
   // ==================== System Routes ====================
@@ -924,20 +654,31 @@ export class MindooDBServer {
    * passes through the CapabilityMatcher for fine-grained authorization.
    */
   private setupSystemRoutes(router: Router): void {
+    const core = this.core;
     const challengeRateLimit = this.createAuthRateLimit("system", "challenge");
     const authenticateRateLimit = this.createAuthRateLimit("system", "authenticate");
 
-    router.post("/auth/challenge", challengeRateLimit, this.handleSystemChallenge.bind(this));
-    router.post("/auth/authenticate", authenticateRateLimit, this.handleSystemAuthenticate.bind(this));
+    router.post("/auth/challenge", challengeRateLimit, route((req) => core.systemChallenge(req)));
+    router.post("/auth/authenticate", authenticateRateLimit, route((req) => core.systemAuthenticate(req)));
 
-    const authMiddleware = this.systemAdminMiddleware.bind(this);
+    // Capabilities are matched against the full path below /system. req.path
+    // is relative to the mount the middleware runs under, so a middleware
+    // mounted below /system names its own prefix.
+    const authMiddlewareFor = (prefix: string) =>
+      (req: Request, res: Response, next: NextFunction) =>
+        guard((serverRequest) => core.systemAdminGuard(serverRequest, `${prefix}${req.path}`))(
+          req,
+          res,
+          next,
+        );
+    const authMiddleware = authMiddlewareFor("/system");
 
     // Cluster administration. Behind the same JWT + capability middleware as
     // the rest of /system, so config.json can grant an auditor principal the
     // GET routes without granting the POST/PATCH/DELETE ones.
     router.use(
       "/cluster",
-      authMiddleware,
+      authMiddlewareFor("/system/cluster"),
       createClusterRouter({
         cluster: this.cluster,
         listTrustedServers: () => this.tenantManager.listTrustedServers(),
@@ -947,409 +688,29 @@ export class MindooDBServer {
     );
 
     // Tenant CRUD
-    router.get("/tenants", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const tenants = this.tenantManager.listTenants();
-        const response: ListTenantsResponse = { tenants };
-        res.json(response);
-      } catch (error) {
-        console.error("[MindooDBServer] Error listing tenants:", error);
-        res.status(500).json({ error: "Failed to list tenants" });
-      }
-    });
-
-    // Tenant registration is idempotent: re-POSTing with the same tenantId
-    // and matching $publicinfos key returns 200 instead of 409.
-    router.post("/tenants/:tenantId", authMiddleware, async (req: Request, res: Response) => {
-      try {
-        const tenantId = req.params.tenantId.toLowerCase();
-
-        try {
-          validateTenantId(tenantId);
-        } catch (validationError) {
-          res.status(400).json({
-            error: validationError instanceof ValidationError
-              ? validationError.message
-              : "Invalid tenantId format",
-          });
-          return;
-        }
-
-        const request: RegisterTenantRequest = {
-          ...req.body,
-          tenantId,
-        };
-
-        if (!request.adminSigningPublicKey) {
-          res.status(400).json({ error: "adminSigningPublicKey is required" });
-          return;
-        }
-        if (!request.adminEncryptionPublicKey) {
-          res.status(400).json({ error: "adminEncryptionPublicKey is required" });
-          return;
-        }
-        if (request.adminUsername !== undefined) {
-          validateUsername(request.adminUsername);
-        }
-
-        validateStringLength(request.adminSigningPublicKey, MAX_PEM_KEY_LENGTH, "adminSigningPublicKey");
-        validateStringLength(request.adminEncryptionPublicKey, MAX_PEM_KEY_LENGTH, "adminEncryptionPublicKey");
-        if (!request.encryptedPublicInfosKey && !request.publicInfosKey) {
-          res.status(400).json({ error: "encryptedPublicInfosKey or publicInfosKey is required" });
-          return;
-        }
-        if (request.publicInfosKey !== undefined) {
-          validateStringLength(request.publicInfosKey, MAX_PEM_KEY_LENGTH, "publicInfosKey");
-        }
-        if (request.encryptedPublicInfosKey !== undefined) {
-          validateStringLength(request.encryptedPublicInfosKey, MAX_PEM_KEY_LENGTH, "encryptedPublicInfosKey");
-        }
-
-        const result = await this.tenantManager.registerTenant(request);
-
-        const response: RegisterTenantResponse = {
-          success: true,
-          tenantId: result.context.tenantId,
-          created: result.created,
-          message: result.created
-            ? `Tenant ${result.context.tenantId} registered successfully`
-            : `Tenant ${result.context.tenantId} already exists with matching $publicinfos key`,
-        };
-
-        res.status(result.created ? 201 : 200).json(response);
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          res.status(400).json({ error: error.message });
-          return;
-        }
-        if (error instanceof Error && error.message.includes("different $publicinfos key")) {
-          res.status(409).json({ error: error.message });
-          return;
-        }
-        console.error("[MindooDBServer] Error registering tenant:", error);
-        res.status(500).json({ error: "Failed to register tenant" });
-      }
-    });
-
-    router.put("/tenants/:tenantId", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const tenantId = req.params.tenantId.toLowerCase();
-        try {
-          validateTenantId(tenantId);
-        } catch {
-          res.status(400).json({ error: "Invalid tenantId format" });
-          return;
-        }
-
-        if (!this.tenantManager.tenantExists(tenantId)) {
-          res.status(404).json({ error: "Tenant not found" });
-          return;
-        }
-
-        this.tenantManager.updateTenantConfig(tenantId, req.body);
-        res.json({ success: true, message: `Tenant ${tenantId} updated` });
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          res.status(400).json({ error: error.message });
-          return;
-        }
-        console.error("[MindooDBServer] Error updating tenant:", error);
-        res.status(500).json({ error: "Failed to update tenant" });
-      }
-    });
-
-    router.delete("/tenants/:tenantId", authMiddleware, async (req: Request, res: Response) => {
-      try {
-        const tenantId = req.params.tenantId.toLowerCase();
-
-        try {
-          validateTenantId(tenantId);
-        } catch {
-          res.status(400).json({ error: "Invalid tenantId format" });
-          return;
-        }
-
-        if (!this.tenantManager.tenantExists(tenantId)) {
-          res.status(404).json({ error: "Tenant not found" });
-          return;
-        }
-
-        await this.tenantManager.removeTenant(tenantId);
-        res.json({ success: true, message: `Tenant ${tenantId} removed` });
-      } catch (error) {
-        console.error("[MindooDBServer] Error removing tenant:", error);
-        res.status(500).json({ error: "Failed to remove tenant" });
-      }
-    });
+    router.get("/tenants", authMiddleware, route(() => core.listTenants()));
+    router.post("/tenants/:tenantId", authMiddleware, route((req) => core.registerTenant(req)));
+    router.put("/tenants/:tenantId", authMiddleware, route((req) => core.updateTenant(req)));
+    router.delete("/tenants/:tenantId", authMiddleware, route((req) => core.deleteTenant(req)));
 
     // Trusted server management
-    router.get("/trusted-servers", authMiddleware, (req: Request, res: Response) => {
-      try {
-        res.json({ servers: this.tenantManager.listTrustedServers() });
-      } catch (error) {
-        console.error("[MindooDBServer] Error listing trusted servers:", error);
-        res.status(500).json({ error: "Failed to list trusted servers" });
-      }
-    });
-
-    router.post("/trusted-servers", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const { name, signingPublicKey, encryptionPublicKey, url, direction, role, attachments } =
-          req.body;
-
-        if (!name || !signingPublicKey || !encryptionPublicKey) {
-          res.status(400).json({ error: "name, signingPublicKey, and encryptionPublicKey are required" });
-          return;
-        }
-
-        validateStringLength(name, 256, "name");
-        validateStringLength(signingPublicKey, MAX_PEM_KEY_LENGTH, "signingPublicKey");
-        validateStringLength(encryptionPublicKey, MAX_PEM_KEY_LENGTH, "encryptionPublicKey");
-
-        const server: TrustedServer = { name, signingPublicKey, encryptionPublicKey };
-
-        // Replication settings are optional: an entry without a url is a trust
-        // relationship only (inbound peers may authenticate, we never dial).
-        if (url !== undefined) {
-          validateStringLength(url, 2048, "url");
-          const allowInsecure = /^(1|true)$/i.test(
-            process.env[ENV_VARS.ALLOW_INSECURE_SYNC_URLS] ?? "",
-          );
-          try {
-            assertSafeSyncUrl(url, {
-              requireHttps: !allowInsecure,
-              allowPrivate: allowInsecure,
-            });
-          } catch (e) {
-            if (e instanceof UnsafeUrlError) {
-              res.status(400).json({ error: e.message });
-              return;
-            }
-            throw e;
-          }
-          server.url = url;
-        }
-        for (const [field, value, guard] of [
-          ["direction", direction, isPeerSyncDirection],
-          ["role", role, isPeerRole],
-          ["attachments", attachments, isPeerAttachmentMode],
-        ] as const) {
-          if (value === undefined) continue;
-          if (!guard(value)) {
-            res.status(400).json({ error: `Invalid ${field}: ${String(value)}` });
-            return;
-          }
-          Object.assign(server, { [field]: value });
-        }
-
-        this.tenantManager.addTrustedServer(server);
-        this.cluster.syncReplicators();
-
-        res.status(201).json({ success: true, message: `Trusted server "${name}" added` });
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          res.status(400).json({ error: error.message });
-          return;
-        }
-        if (error instanceof Error && error.message.includes("already exists")) {
-          res.status(409).json({ error: error.message });
-          return;
-        }
-        console.error("[MindooDBServer] Error adding trusted server:", error);
-        res.status(500).json({ error: "Failed to add trusted server" });
-      }
-    });
-
-    router.delete("/trusted-servers/:serverName", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const serverName = req.params.serverName;
-        validateStringLength(serverName, 256, "serverName");
-
-        const removed = this.tenantManager.removeTrustedServer(serverName);
-        if (!removed) {
-          res.status(404).json({ error: "Trusted server not found" });
-          return;
-        }
-        // Revoking trust must also stop replicating with that server.
-        this.cluster.syncReplicators();
-
-        res.json({ success: true, message: `Trusted server "${serverName}" removed` });
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          res.status(400).json({ error: error.message });
-          return;
-        }
-        console.error("[MindooDBServer] Error removing trusted server:", error);
-        res.status(500).json({ error: "Failed to remove trusted server" });
-      }
-    });
+    router.get("/trusted-servers", authMiddleware, route(() => core.listTrustedServers()));
+    router.post("/trusted-servers", authMiddleware, route((req) => core.addTrustedServer(req)));
+    router.delete(
+      "/trusted-servers/:serverName",
+      authMiddleware,
+      route((req) => core.removeTrustedServer(req)),
+    );
 
     // Runtime config management
-    router.get("/config/backups", authMiddleware, (req: Request, res: Response) => {
-      try {
-        res.json({ backups: listConfigBackups(this.configPath) });
-      } catch (error) {
-        console.error("[MindooDBServer] Error listing config backups:", error);
-        res.status(500).json({ error: "Failed to list config backups" });
-      }
-    });
-
-    router.get("/config/backups/:backupFile", authMiddleware, (req: Request, res: Response) => {
-      try {
-        const backupFile = decodeURIComponent(req.params.backupFile);
-        if (!isConfigBackupFilename(backupFile)) {
-          res.status(400).json({ error: "Invalid config backup filename" });
-          return;
-        }
-
-        const config = loadConfigBackup(this.configPath, backupFile);
-        res.json({ file: backupFile, config });
-      } catch (error) {
-        if (error instanceof Error && error.message.startsWith("Config backup not found:")) {
-          res.status(404).json({ error: "Config backup not found" });
-          return;
-        }
-        if (error instanceof Error && error.message.startsWith("Invalid config backup filename:")) {
-          res.status(400).json({ error: "Invalid config backup filename" });
-          return;
-        }
-        console.error("[MindooDBServer] Error reading config backup:", error);
-        res.status(500).json({ error: "Failed to read config backup" });
-      }
-    });
-
-    router.get("/config", authMiddleware, (req: Request, res: Response) => {
-      res.json(this.serverConfig);
-    });
-
-    router.put("/config", authMiddleware, this.handleUpdateConfig.bind(this));
-  }
-
-  // ==================== System Auth Handlers ====================
-
-  private async handleSystemChallenge(req: Request, res: Response): Promise<void> {
-    try {
-      const { username, publicsignkey } = req.body;
-
-      if (!username || typeof username !== "string") {
-        res.status(400).json({ error: "username is required" });
-        return;
-      }
-      if (!publicsignkey || typeof publicsignkey !== "string") {
-        res.status(400).json({ error: "publicsignkey is required" });
-        return;
-      }
-
-      validateUsername(username);
-      validateStringLength(publicsignkey, MAX_PEM_KEY_LENGTH, "publicsignkey");
-
-      const challenge = await this.systemAdminAuth.generateChallenge(
-        username,
-        publicsignkey,
-      );
-      res.json({ challenge });
-    } catch (error) {
-      if (error instanceof Error && error.message === "Unknown system admin principal") {
-        res.status(404).json({ error: "System admin principal not found" });
-        return;
-      }
-      if (error instanceof ValidationError) {
-        res.status(400).json({ error: error.message });
-        return;
-      }
-      console.error("[MindooDBServer] System challenge error:", error);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  }
-
-  private async handleSystemAuthenticate(req: Request, res: Response): Promise<void> {
-    try {
-      const { challenge, signature } = req.body;
-
-      if (!challenge || !signature) {
-        res.status(400).json({ error: "challenge and signature are required" });
-        return;
-      }
-
-      validateStringLength(challenge, MAX_CHALLENGE_LENGTH, "challenge");
-      validateStringLength(signature, MAX_SIGNATURE_LENGTH, "signature");
-
-      const signatureBytes = this.base64ToUint8Array(signature);
-      const result = await this.systemAdminAuth.authenticate(challenge, signatureBytes);
-      // Return 401 on a failed authentication instead of 200 (audit, Low).
-      if (!result.success) {
-        res.status(401).json(result);
-        return;
-      }
-      res.json(result);
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        res.status(400).json({ error: error.message });
-        return;
-      }
-      console.error("[MindooDBServer] System authenticate error:", error);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  }
-
-  // ==================== Config Update Handler ====================
-
-  private async handleUpdateConfig(req: Request, res: Response): Promise<void> {
-    try {
-      let newConfig: ServerConfig;
-      try {
-        newConfig = validateServerConfig(req.body, "request body");
-      } catch (err) {
-        res.status(400).json({
-          error: err instanceof Error ? err.message : "Invalid config format",
-        });
-        return;
-      }
-
-      // Self-lockout protection: simulate the proposed config against the calling
-      // admin's identity — reject if they would lose their own config access.
-      const callingAdmin = req.systemAdmin!;
-      const proposedMatcher = new CapabilityMatcher(newConfig);
-      if (
-        !proposedMatcher.isAuthorized(
-          "PUT",
-          "/system/config",
-          callingAdmin.username,
-          callingAdmin.publicsignkey,
-        )
-      ) {
-        res.status(400).json({
-          error: "This change would remove your own access to PUT /system/config",
-        });
-        return;
-      }
-
-      // Backup the current config before overwriting
-      const { existsSync: fsExists } = await import("fs");
-      let backupFile: string | null = null;
-      if (fsExists(this.configPath)) {
-        backupFile = backupConfig(this.configPath);
-      }
-
-      // Persist new config to disk
-      writeConfig(this.configPath, newConfig);
-
-      // Hot-swap in-memory state
-      this.reloadConfig(newConfig);
-
-      console.log(
-        `[MindooDBServer] Config updated by ${callingAdmin.username}` +
-          (backupFile ? ` (backup: ${backupFile})` : ""),
-      );
-
-      res.json({
-        success: true,
-        ...(backupFile ? { backupFile } : {}),
-      });
-    } catch (error) {
-      console.error("[MindooDBServer] Error updating config:", error);
-      res.status(500).json({ error: "Failed to update config" });
-    }
+    router.get("/config/backups", authMiddleware, route(() => core.listConfigBackups()));
+    router.get(
+      "/config/backups/:backupFile",
+      authMiddleware,
+      route((req) => core.getConfigBackup(req)),
+    );
+    router.get("/config", authMiddleware, route(() => core.getConfig()));
+    router.put("/config", authMiddleware, route((req) => core.updateConfig(req)));
   }
 
   // ==================== Tenant Routes ====================
@@ -1360,9 +721,10 @@ export class MindooDBServer {
    * createSyncRateLimit), sync with a much higher ceiling.
    *
    * Both "docs" and "attachments" store kinds expose the same set of sync
-   * operations, mounted at /sync/docs/* and /sync/attachments/*.
+   * operations (SYNC_ROUTES), mounted at /sync/docs/* and /sync/attachments/*.
    */
   private createTenantRouter(): Router {
+    const core = this.core;
     const router = Router({ mergeParams: true });
     const authRateLimitConfig = this.getAuthRateLimitConfig();
 
@@ -1371,7 +733,10 @@ export class MindooDBServer {
 
     // Identity resolution precedes the limiter so it can key on the caller.
     const syncGuards = [
-      this.syncPrincipalMiddleware.bind(this),
+      guard(async (req) => {
+        await core.resolveSyncPrincipal(req);
+        return null;
+      }),
       this.createSyncRateLimit(),
     ];
 
@@ -1379,53 +744,41 @@ export class MindooDBServer {
       `[MindooDBServer] Tenant auth rate limit configured windowMs=${authRateLimitConfig.windowMs} max=${authRateLimitConfig.max}`,
     );
 
-    router.post("/auth/challenge", challengeRateLimit, this.handleChallenge.bind(this));
-    router.post("/auth/authenticate", authenticateRateLimit, this.handleAuthenticate.bind(this));
+    router.post("/auth/challenge", challengeRateLimit, route((req) => core.challenge(req)));
+    router.post("/auth/authenticate", authenticateRateLimit, route((req) => core.authenticate(req)));
 
     // RFC 3161 proxy. Authentication runs *before* the limiters so they can key
     // on the identity rather than only the IP — otherwise everyone behind one
     // NAT shares a budget, and a single tenant can lock out the rest.
     router.post(
       "/timestamps/rfc3161",
-      this.timestampAuthMiddleware.bind(this),
+      guard((req) => core.timestampAuthGuard(req)),
       this.createTimestampRateLimit("burst"),
       this.createTimestampRateLimit("daily"),
       express.raw({ type: TIMESTAMP_QUERY_CONTENT_TYPE, limit: MAX_TIMESTAMP_REQUEST_BYTES }),
-      this.handleTimestampRequest.bind(this),
+      route((req) => core.timestampRequest(req)),
     );
 
-    for (const storeKind of ["docs", "attachments"] as const) {
-      const syncBase = `/sync/${storeKind}`;
-      router.post(`${syncBase}/findNewEntries`, syncGuards, this.handleFindNewEntries.bind(this));
-      router.post(`${syncBase}/findNewEntriesForDoc`, syncGuards, this.handleFindNewEntriesForDoc.bind(this));
-      router.post(`${syncBase}/findEntries`, syncGuards, this.handleFindEntries.bind(this));
-      router.post(`${syncBase}/scanEntriesSince`, syncGuards, this.handleScanEntriesSince.bind(this));
-      router.post(`${syncBase}/getStoreHead`, syncGuards, this.handleGetStoreHead.bind(this));
-      router.post(`${syncBase}/getIdBloomSummary`, syncGuards, this.handleGetIdBloomSummary.bind(this));
-      router.post(`${syncBase}/getCompactionStatus`, syncGuards, this.handleGetCompactionStatus.bind(this));
-      router.get(`${syncBase}/capabilities`, syncGuards, this.handleGetCapabilities.bind(this));
-      // SSE live change feed (sync-v5, phase 5): one long-lived GET per
-      // subscriber; putEntries publishes into the in-process event bus.
-      router.get(`${syncBase}/events`, syncGuards, this.handleSyncEvents.bind(this));
-      router.post(`${syncBase}/getEntries`, syncGuards, this.handleGetEntries.bind(this));
-      // Binary wire format v2 (sync-v5, phase 3): octet-stream framing for the
-      // two payload-heavy endpoints. putEntriesBinary needs its own raw body
-      // parser (the global JSON parser only handles application/json).
-      router.post(`${syncBase}/getEntriesBinary`, syncGuards, this.handleGetEntriesBinary.bind(this));
-      router.post(
-        `${syncBase}/putEntriesBinary`,
-        syncGuards,
-        express.raw({ type: BINARY_ENTRIES_CONTENT_TYPE, limit: this.jsonBodyLimit }),
-        this.handlePutEntriesBinary.bind(this),
-      );
-      router.post(`${syncBase}/getEntryMetadata`, syncGuards, this.handleGetEntryMetadata.bind(this));
-      router.post(`${syncBase}/putEntries`, syncGuards, this.handlePutEntries.bind(this));
-      router.post(`${syncBase}/hasEntries`, syncGuards, this.handleHasEntries.bind(this));
-      router.get(`${syncBase}/getAllIds`, syncGuards, this.handleGetAllIds.bind(this));
-      router.post(`${syncBase}/resolveDependencies`, syncGuards, this.handleResolveDependencies.bind(this));
-      router.post(`${syncBase}/planDocumentMaterialization`, syncGuards, this.handlePlanDocumentMaterialization.bind(this));
-      router.post(`${syncBase}/planDocumentMaterializationBatch`, syncGuards, this.handlePlanDocumentMaterializationBatch.bind(this));
-      router.post(`${syncBase}/planAttachmentReadByWalkingMetadata`, syncGuards, this.handlePlanAttachmentReadByWalkingMetadata.bind(this));
+    for (const storeKind of SYNC_STORE_KINDS) {
+      for (const syncRoute of SYNC_ROUTES) {
+        const routePath = `/sync/${storeKind}/${syncRoute.name}`;
+        const handlers = [...syncGuards];
+        if ("rawBodyType" in syncRoute) {
+          // The global JSON parser only handles application/json.
+          handlers.push(express.raw({ type: syncRoute.rawBodyType, limit: this.jsonBodyLimit }));
+        }
+        handlers.push(
+          syncRoute.name === "events"
+            ? (req: Request, res: Response, next: NextFunction) =>
+                this.handleSyncEvents(storeKind, req, res).catch(next)
+            : route((req) => core.sync(syncRoute.name, req, storeKind)),
+        );
+        if (syncRoute.method === "GET") {
+          router.get(routePath, handlers);
+        } else {
+          router.post(routePath, handlers);
+        }
+      }
     }
 
     return router;
@@ -1436,13 +789,8 @@ export class MindooDBServer {
    * and auth tiers to spend their full budgets inside the global window, so
    * the net catches only traffic no tier claims.
    */
-  private getGlobalRateLimitConfig(): { windowMs: number; max: number } {
-    const resolved = resolveGlobalRateLimit(this.serverConfig.rateLimits?.global, {
-      sync: this.getSyncRateLimitConfig(),
-      auth: this.getAuthRateLimitConfig(),
-      defaultWindowMs: DEFAULT_GLOBAL_RATE_LIMIT_WINDOW_MS,
-      headroom: GLOBAL_RATE_LIMIT_TIER_HEADROOM,
-    });
+  private getGlobalRateLimitConfig(): ResolvedRateLimit {
+    const resolved = this.rateLimitPolicy().global;
     if (resolved.shadowsTiers) {
       console.warn(
         `[MindooDBServer] rateLimits.global.max=${resolved.max} is below the ${resolved.tierFloor} ` +
@@ -1454,33 +802,8 @@ export class MindooDBServer {
   }
 
   /** Resolved auth rate-limit config; falls back to defaults when not set in config.json. */
-  private getAuthRateLimitConfig(): { windowMs: number; max: number } {
-    return {
-      windowMs: this.serverConfig.rateLimits?.auth?.windowMs ?? DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS,
-      max: this.serverConfig.rateLimits?.auth?.max ?? DEFAULT_AUTH_RATE_LIMIT_MAX,
-    };
-  }
-
-  /** Resolved sync rate-limit config; falls back to defaults when not set in config.json. */
-  private getSyncRateLimitConfig(): { windowMs: number; max: number } {
-    return {
-      windowMs: this.serverConfig.rateLimits?.sync?.windowMs ?? DEFAULT_SYNC_RATE_LIMIT_WINDOW_MS,
-      max: this.serverConfig.rateLimits?.sync?.max ?? DEFAULT_SYNC_RATE_LIMIT_MAX,
-    };
-  }
-
-  /** Resolved timestamp rate-limit config; falls back to defaults when not set in config.json. */
-  private getTimestampRateLimitConfig(): {
-    windowMs: number;
-    max: number;
-    dailyMax: number;
-  } {
-    const configured = this.serverConfig.rateLimits?.timestamps;
-    return {
-      windowMs: configured?.windowMs ?? DEFAULT_TIMESTAMP_RATE_LIMIT_WINDOW_MS,
-      max: configured?.max ?? DEFAULT_TIMESTAMP_RATE_LIMIT_MAX,
-      dailyMax: configured?.dailyMax ?? DEFAULT_TIMESTAMP_DAILY_LIMIT_MAX,
-    };
+  private getAuthRateLimitConfig(): ResolvedRateLimit {
+    return this.rateLimitPolicy().auth;
   }
 
   /**
@@ -1488,11 +811,11 @@ export class MindooDBServer {
    * misbehaving client from hammering an upstream, and a daily cap that bounds
    * total consumption of a shared (often free) upstream allowance.
    *
-   * Both key on tenant + principal + IP. The principal is present because
-   * {@link timestampAuthMiddleware} runs first.
+   * Both key on tenant + principal + IP. The principal is present because the
+   * timestamp auth guard runs first.
    */
   private createTimestampRateLimit(tier: "burst" | "daily") {
-    const config = this.getTimestampRateLimitConfig();
+    const config = this.rateLimitPolicy().timestamp;
     const windowMs = tier === "burst" ? config.windowMs : TIMESTAMP_DAILY_WINDOW_MS;
     const max = tier === "burst" ? config.max : config.dailyMax;
     return rateLimit({
@@ -1500,11 +823,13 @@ export class MindooDBServer {
       max,
       standardHeaders: true,
       legacyHeaders: false,
-      keyGenerator: (req: Request) => {
-        const tenantId = req.tenantId ?? "unknown";
-        const principal = req.timestampPrincipal ?? "anonymous";
-        return `timestamp:${tier}:${tenantId}:${principal}:${this.getClientIpForRateLimit(req)}`;
-      },
+      keyGenerator: (req: Request) =>
+        buildTimestampRateLimitKey(
+          tier,
+          req.tenantId,
+          req.timestampPrincipal,
+          this.getClientIpForRateLimit(req),
+        ),
       handler: (req, res, _next, options) => {
         console.warn(
           `[MindooDBServer] Timestamp rate limit hit (${tier}) tenant=${req.tenantId} ip=${req.ip}`,
@@ -1521,44 +846,13 @@ export class MindooDBServer {
   }
 
   /**
-   * Resolve the caller of a sync request so {@link createSyncRateLimit} can
-   * bucket per identity instead of per address.
-   *
-   * Unlike {@link timestampAuthMiddleware} this never rejects: the route
-   * handlers do their own token validation and own the 401, and this pass only
-   * needs to know whose budget to spend. An unverifiable token simply falls
-   * back to address-only bucketing — a forged one must not be able to conjure
-   * a fresh budget, which is why the token is verified rather than decoded.
-   */
-  private async syncPrincipalMiddleware(
-    req: Request,
-    _res: Response,
-    next: NextFunction,
-  ): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const authService = await this.tenantManager.getAuthService(req.tenantId!);
-      // Signature and expiry are enough to name the caller; the handler runs
-      // the full check (revocation, wipe) right after, so the directory is
-      // evaluated once per request rather than twice.
-      const payload = await authService.readIssuedToken(token);
-      if (payload && payload.tenantId === req.tenantId) {
-        req.syncPrincipal = payload.deviceSigningKey ?? payload.sub;
-      }
-    } catch {
-      // No usable token; fall through to address-only bucketing.
-    }
-    next();
-  }
-
-  /**
    * Sync budget, keyed on tenant + principal + IP like the auth and timestamp
    * tiers. Address-only keying would put every user behind one NAT or reverse
    * proxy in a single bucket, so one client opening several databases would
    * throttle everyone else on that address.
    */
   private createSyncRateLimit() {
-    const config = this.getSyncRateLimitConfig();
+    const config = this.rateLimitPolicy().sync;
     console.log(
       `[MindooDBServer] Tenant sync rate limit configured windowMs=${config.windowMs} max=${config.max}`,
     );
@@ -1585,99 +879,11 @@ export class MindooDBServer {
   }
 
   /**
-   * Authenticate a timestamp request with the tenant's existing bearer token and
-   * record the principal for rate-limit bucketing.
-   *
-   * The proxy makes outbound requests on the caller's behalf, so it must never
-   * be open: unauthenticated it would be a free relay to third-party services.
-   */
-  private async timestampAuthMiddleware(
-    req: Request,
-    res: Response,
-    next: NextFunction,
-  ): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const authService = await this.tenantManager.getAuthService(req.tenantId!);
-      const payload = await authService.validateToken(token);
-      if (!payload || payload.tenantId !== req.tenantId) {
-        res.status(401).json({ error: "Invalid or expired token" });
-        return;
-      }
-      req.timestampPrincipal = payload.deviceSigningKey ?? payload.sub;
-      next();
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  /**
-   * Forward a DER TimeStampReq to a configured TSA and return the DER
-   * TimeStampResp verbatim.
-   *
-   * The server neither parses nor validates the ASN.1: the client checks that
-   * the returned token's `messageImprint` matches the digest it sent and that
-   * the token chains to a trusted root. That is what reduces a hostile proxy —
-   * ours or anyone's — from a forgery risk to a denial-of-service risk.
-   */
-  private async handleTimestampRequest(req: Request, res: Response): Promise<void> {
-    if (this.tsaProviders.length === 0) {
-      res.status(503).json({ error: "Timestamping is not enabled on this server" });
-      return;
-    }
-
-    const body = req.body;
-    if (!Buffer.isBuffer(body)) {
-      res.status(415).json({
-        error: `Timestamp requests must be sent as ${TIMESTAMP_QUERY_CONTENT_TYPE}`,
-      });
-      return;
-    }
-
-    // The provider is named by id and resolved against the env allowlist; a
-    // client-supplied URL would make this an SSRF gadget.
-    const requestedProvider = req.query.provider;
-    let preferredProviderId: string | undefined;
-    if (typeof requestedProvider === "string" && requestedProvider.length > 0) {
-      preferredProviderId = requestedProvider.toLowerCase();
-    } else if (requestedProvider !== undefined) {
-      res.status(400).json({ error: "provider must be a single string value" });
-      return;
-    }
-
-    try {
-      const result = await requestTimestampToken({
-        providers: this.tsaProviders,
-        request: new Uint8Array(body),
-        preferredProviderId,
-      });
-
-      res.setHeader("content-type", TIMESTAMP_REPLY_CONTENT_TYPE);
-      res.setHeader("x-mindoodb-tsa-provider", result.providerId);
-      res.status(200).send(Buffer.from(result.response));
-    } catch (error) {
-      if (error instanceof TimestampProxyError) {
-        if (error.attempts.length > 0) {
-          console.warn(
-            `[MindooDBServer] Timestamp request failed for tenant ${req.tenantId}: ${error.attempts
-              .map((attempt) => `${attempt.providerId}=${attempt.error ?? "ok"}`)
-              .join("; ")}`,
-          );
-        }
-        res.status(error.status).json({ error: error.message });
-        return;
-      }
-      console.error("[MindooDBServer] Unexpected timestamp proxy error:", error);
-      res.status(500).json({ error: "Failed to obtain a timestamp" });
-    }
-  }
-
-  /**
    * Create a rate-limiter for authentication endpoints. Challenge and
    * authenticate get separate limiters so that one phase can't starve the
-   * other. The custom keyGenerator buckets by (scope, tenant, phase, IP,
-   * username) — this prevents users behind a shared IP (NAT / reverse
-   * proxy) from exhausting each other's budgets.
+   * other. The key buckets by (scope, tenant, phase, IP, username) — this
+   * prevents users behind a shared IP (NAT / reverse proxy) from exhausting
+   * each other's budgets.
    */
   private createAuthRateLimit(
     scope: "system" | "tenant",
@@ -1689,44 +895,20 @@ export class MindooDBServer {
       max: authRateLimitConfig.max,
       standardHeaders: true,
       legacyHeaders: false,
-      keyGenerator: (req: Request) => this.getAuthRateLimitKey(req, scope, phase),
+      keyGenerator: (req: Request) =>
+        buildAuthRateLimitKey(
+          scope,
+          phase,
+          req.tenantId ?? req.params.tenantId?.toLowerCase(),
+          this.getClientIpForRateLimit(req),
+          req.body,
+        ),
       handler: (req, res, _next, options) => {
         this.logAuthRateLimitHit(req, scope, phase);
         res.status(options.statusCode).json(options.message);
       },
       message: { error: "Too many authentication attempts, please try again later" },
     });
-  }
-
-  /**
-   * Composite rate-limit key. Challenge requests include the username so
-   * that brute-forcing one account doesn't block legitimate users on the
-   * same IP. Authenticate requests omit username because the challenge
-   * token is already scoped to a single principal.
-   */
-  private getAuthRateLimitKey(
-    req: Request,
-    scope: "system" | "tenant",
-    phase: "challenge" | "authenticate",
-  ): string {
-    const tenantId = scope === "tenant"
-      ? req.tenantId ?? req.params.tenantId?.toLowerCase() ?? "-"
-      : "system";
-    const clientIp = this.getClientIpForRateLimit(req);
-
-    if (phase === "challenge") {
-      // Bucket by username when supplied, otherwise by the signing public key a
-      // key-based client identifies with, so key-based clients still get a
-      // stable per-principal bucket instead of all sharing "-".
-      const principal = typeof req.body?.username === "string" && req.body.username.trim()
-        ? req.body.username.trim().toLowerCase()
-        : typeof req.body?.signingPublicKey === "string" && req.body.signingPublicKey.trim()
-          ? req.body.signingPublicKey.trim()
-          : "-";
-      return `${scope}:${tenantId}:${phase}:${clientIp}:${principal}`;
-    }
-
-    return `${scope}:${tenantId}:${phase}:${clientIp}`;
   }
 
   /**
@@ -1768,892 +950,54 @@ export class MindooDBServer {
     return ipKeyGenerator(raw);
   }
 
-  // ==================== Validation Helpers ====================
-
-  private validateDbId(dbId: unknown): string {
-    return validateIdentifier(dbId, "dbId");
-  }
-
-  private formatTenantNotFoundOnServerError(tenantId: string): string {
-    const serverName = this.tenantManager.getServerPublicInfo()?.name ?? "unknown";
-    return `Tenant ${tenantId} not found on server ${serverName}`;
-  }
-
-  // ==================== Device Discovery (server-wide) ====================
-
-  private async handleDeviceChallenge(req: Request, res: Response): Promise<void> {
-    try {
-      const { signingPublicKey } = req.body ?? {};
-      if (typeof signingPublicKey !== "string" || !signingPublicKey.trim()) {
-        res.status(400).json({ error: "signingPublicKey is required" });
-        return;
-      }
-      validateStringLength(signingPublicKey, MAX_PEM_KEY_LENGTH, "signingPublicKey");
-      const challenge = this.deviceDiscovery.createChallenge(signingPublicKey);
-      res.json({ challenge });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleDeviceDiscover(req: Request, res: Response): Promise<void> {
-    try {
-      const { challenge, signature } = req.body ?? {};
-      if (typeof challenge !== "string" || !challenge.trim()) {
-        res.status(400).json({ error: "challenge is required" });
-        return;
-      }
-      if (typeof signature !== "string" || !signature.trim()) {
-        res.status(400).json({ error: "signature is required" });
-        return;
-      }
-      validateStringLength(challenge, MAX_CHALLENGE_LENGTH, "challenge");
-      validateStringLength(signature, MAX_SIGNATURE_LENGTH, "signature");
-      const signatureBytes = this.base64ToUint8Array(signature);
-      const result = await this.deviceDiscovery.discover(challenge, signatureBytes);
-      res.json(result);
-    } catch (error) {
-      if (error instanceof DeviceDiscoveryAuthError) {
-        res.status(401).json({ error: error.message });
-        return;
-      }
-      this.handleRequestError(error, res);
-    }
-  }
-
-  // ==================== Tenant Auth Handlers ====================
-  // Two-step challenge-response flow:
-  //  1. POST /auth/challenge  → client sends username, server returns a random nonce
-  //  2. POST /auth/authenticate → client signs the nonce with its Ed25519 private key,
-  //     server verifies the signature and returns a JWT for subsequent sync calls
-
-  private async handleChallenge(req: Request, res: Response): Promise<void> {
-    try {
-      const { username, signingPublicKey } = req.body;
-
-      // The username is optional: a client may identify itself by its device
-      // signing public key instead, so the server never needs the cleartext
-      // name. Validate whichever was supplied.
-      if (username !== undefined && username !== null) {
-        validateUsername(username);
-      }
-      if (signingPublicKey !== undefined && signingPublicKey !== null) {
-        validateStringLength(signingPublicKey, MAX_SIGNATURE_LENGTH, "signingPublicKey");
-      }
-
-      const authService = await this.tenantManager.getAuthService(req.tenantId!);
-      const challenge = await authService.generateChallenge(
-        typeof username === "string" ? username : undefined,
-        typeof signingPublicKey === "string" ? { signingPublicKey } : undefined,
-      );
-
-      res.json({ challenge });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleAuthenticate(req: Request, res: Response): Promise<void> {
-    try {
-      const { challenge, signature } = req.body;
-
-      if (!challenge || !signature) {
-        res.status(400).json({ error: "challenge and signature are required" });
-        return;
-      }
-
-      validateStringLength(challenge, MAX_CHALLENGE_LENGTH, "challenge");
-      validateStringLength(signature, MAX_SIGNATURE_LENGTH, "signature");
-
-      const authService = await this.tenantManager.getAuthService(req.tenantId!);
-      const signatureBytes = this.base64ToUint8Array(signature);
-      const result = await authService.authenticate(challenge, signatureBytes);
-
-      // Return 401 on a failed authentication instead of 200 (audit, Low): a
-      // failed credential check must not look like a success at the HTTP layer.
-      if (!result.success) {
-        res.status(401).json(result);
-        return;
-      }
-      res.json(result);
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  // ==================== Sync Handlers ====================
-
-  private async handleFindNewEntries(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, haveIds } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-      validateArraySize(haveIds, MAX_HAVE_IDS, "haveIds");
-
-      const serverStore = await this.tenantManager.getServerStore(
-        req.tenantId!,
-        validDbId,
-        this.getStoreKindFromRequest(req),
-      );
-      const entries = await serverStore.handleFindNewEntries(token, haveIds || []);
-
-      res.json({
-        entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
-      });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleFindNewEntriesForDoc(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, haveIds, docId } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-      if (!docId) {
-        res.status(400).json({ error: "docId is required" });
-        return;
-      }
-      validateArraySize(haveIds, MAX_HAVE_IDS, "haveIds");
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const entries = await serverStore.handleFindNewEntriesForDoc(token, haveIds || [], docId);
-
-      res.json({
-        entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
-      });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleFindEntries(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, type, creationDateFrom, creationDateUntil } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const entries = await serverStore.handleFindEntries(
-        token,
-        type,
-        creationDateFrom ?? null,
-        creationDateUntil ?? null,
-      );
-
-      res.json({
-        entries: entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
-      });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleScanEntriesSince(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, cursor, limit, filters } = req.body as {
-        dbId?: string;
-        cursor?: StoreScanCursor | null;
-        limit?: number;
-        filters?: StoreScanFilters;
-      };
-
-      const validDbId = this.validateDbId(dbId);
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const result = await serverStore.handleScanEntriesSince(
-        token,
-        cursor ?? null,
-        limit,
-        filters,
-      );
-
-      res.json({
-        entries: result.entries.map((e: StoreEntryMetadata) => this.serializeEntryMetadata(e)),
-        nextCursor: result.nextCursor,
-        hasMore: result.hasMore,
-      });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleGetStoreHead(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId } = req.body as { dbId?: string };
-
-      const validDbId = this.validateDbId(dbId);
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const head = await serverStore.handleGetStoreHead(token);
-      res.json({ head });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleGetIdBloomSummary(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId } = req.body as { dbId?: string };
-
-      const validDbId = this.validateDbId(dbId);
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const summary = await serverStore.handleGetIdBloomSummary(token);
-      res.json({ summary: summary as StoreIdBloomSummary });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleGetCapabilities(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const validDbId = this.validateDbId(req.query.dbId);
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const capabilities = await serverStore.handleGetCapabilities(token);
-      // HTTP-layer features on top of the transport-agnostic capability set:
-      // binary octet-stream framing routes (phase 3) and the SSE change feed
-      // (phase 5) exist only in this Express host.
-      res.json({
-        capabilities: {
-          ...(capabilities as NetworkSyncCapabilities),
-          supportsBinaryEntries: true,
-          supportsPayloadOnlyEntries: true,
-          supportsChangeEvents: true,
-        },
-      });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
+  // ==================== Sync Event Stream ====================
 
   /**
-   * SSE live change feed (sync-v5, phase 5).
-   *
-   * `GET /:tenantId/sync/:storeKind/events` — Bearer-authenticated like every
-   * other sync route (fetch-streaming clients can set headers; native
-   * EventSource cannot, which is why the SDK uses a fetch reader).
-   *
-   * The subscribe-time read gate runs via `handleGetCapabilities` against the
-   * database given in `?dbId=` (default `directory`, which every tenant member
-   * can read): it validates the token and runs the database-open gate. Events
-   * carry only `{dbId, storeKind, epoch, maxReceiptOrder}` — metadata, never
-   * content. A heartbeat comment every 30 s keeps proxies from closing the
-   * stream. Token expiry does not tear down an open stream; the events are
-   * non-sensitive change hints and a reconnect re-authenticates.
+   * SSE transport for the change feed: the core runs the subscribe-time read
+   * gate, this keeps the stream open on the in-process event bus with a
+   * heartbeat every 30 s.
    */
-  private async handleSyncEvents(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const tenantId = req.tenantId!;
-      const storeKind = this.getStoreKindFromRequest(req);
-      const gateDbId = this.validateDbId(
-        typeof req.query.dbId === "string" && req.query.dbId ? req.query.dbId : "directory",
-      );
-
-      // Validates the token and runs the database-open/read gate before any
-      // event is delivered.
-      const serverStore = await this.tenantManager.getServerStore(tenantId, gateDbId, storeKind);
-      await serverStore.handleGetCapabilities(token);
-
-      res.status(200);
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache, no-transform");
-      res.setHeader("X-Accel-Buffering", "no");
-      if (!req.httpVersion.startsWith("2")) {
-        // Forbidden (and unnecessary) on HTTP/2 streams.
-        res.setHeader("Connection", "keep-alive");
-      }
-      res.flushHeaders();
-      res.write(`event: hello\ndata: ${JSON.stringify({ protocolVersion: "sync-v5" })}\n\n`);
-
-      const unsubscribe = this.syncEventBus.subscribe((event) => {
-        if (event.tenantId !== tenantId || event.storeKind !== storeKind) {
-          return;
-        }
-        res.write(
-          `event: change\ndata: ${JSON.stringify({
-            dbId: event.dbId,
-            storeKind: event.storeKind,
-            epoch: event.epoch,
-            maxReceiptOrder: event.maxReceiptOrder,
-          })}\n\n`,
-        );
-      });
-
-      const heartbeat = setInterval(() => {
-        res.write(`: heartbeat ${Date.now()}\n\n`);
-      }, 30_000);
-
-      const cleanup = () => {
-        clearInterval(heartbeat);
-        unsubscribe();
-      };
-      req.on("close", cleanup);
-      res.on("close", cleanup);
-      console.log(
-        `[MindooDBServer] SSE subscriber connected tenant=${tenantId} storeKind=${storeKind} subscribers=${this.syncEventBus.listenerCount}`,
-      );
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  /**
-   * Publish a change event after an accepted putEntries write (sync-v5,
-   * phase 5). Fire-and-forget: head lookup failures must never affect the
-   * write path.
-   */
-  private publishSyncChangeEvent(
-    tenantId: string,
-    dbId: string,
-    storeKind: StoreKind,
-    serverStore: { handleGetStoreHead(token: string): Promise<{ epoch: string; maxReceiptOrder: number }> },
-    token: string,
-  ): void {
-    if (this.syncEventBus.listenerCount === 0) {
+  private async handleSyncEvents(storeKind: StoreKind, req: Request, res: Response): Promise<void> {
+    const response = await this.core.sync("events", toServerRequest(req), storeKind);
+    if (!isEventStreamResponse(response)) {
+      await sendServerResponse(req, res, response);
       return;
     }
-    // Peer replicators subscribe to this bus, so a write that arrived from a
-    // peer has to be labelled: without the label it would be pushed straight
-    // back to its origin, and two bidirectional peers would ping-pong.
-    const originPeer = this.cluster?.auth
-      ? this.cluster.auth.validateToken(token).then((payload) => payload?.sub)
-      : Promise.resolve(undefined);
+    this.openSyncEventStream(req, res, response.events);
+  }
 
-    void Promise.all([serverStore.handleGetStoreHead(token).catch(() => null), originPeer]).then(
-      ([head, peerName]) => {
-        this.syncEventBus.publish({
-          tenantId,
-          dbId,
-          storeKind,
-          epoch: head?.epoch,
-          maxReceiptOrder: head?.maxReceiptOrder,
-          originPeer: peerName,
-        });
-      },
+  private openSyncEventStream(req: Request, res: Response, subscription: SyncEventStreamSpec): void {
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (!req.httpVersion.startsWith("2")) {
+      // Forbidden (and unnecessary) on HTTP/2 streams.
+      res.setHeader("Connection", "keep-alive");
+    }
+    res.flushHeaders();
+    res.write(formatSyncHelloEvent());
+
+    const unsubscribe = this.syncEventBus.subscribe((event) => {
+      const frame = formatSyncChangeEvent(subscription, event);
+      if (frame) {
+        res.write(frame);
+      }
+    });
+
+    const heartbeat = setInterval(() => {
+      res.write(formatSyncHeartbeat(Date.now()));
+    }, SYNC_EVENT_HEARTBEAT_MS);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+    console.log(
+      `[MindooDBServer] SSE subscriber connected tenant=${subscription.tenantId} storeKind=${subscription.storeKind} subscribers=${this.syncEventBus.listenerCount}`,
     );
-  }
-
-  private async handleGetCompactionStatus(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId } = req.body as { dbId?: string };
-
-      const validDbId = this.validateDbId(dbId);
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const status = await serverStore.handleGetCompactionStatus(token);
-      res.json({ status: status as StoreCompactionStatus });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleGetEntries(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, ids, sessionKeyWrap } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-      validateArraySize(ids, MAX_ENTRY_IDS, "ids");
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-
-      // Session-key transport format (sync-v5, phase 2): one RSA-wrapped
-      // AES-256-GCM key per response instead of per-entry RSA. Negotiated via
-      // the `sessionKeyWrap` request flag; legacy clients get the old format.
-      if (sessionKeyWrap === true) {
-        const batch = await serverStore.handleGetEntriesSessionWrapped(token, ids || []);
-        res.json({
-          wrappedSessionKey: this.uint8ArrayToBase64(batch.wrappedSessionKey),
-          entries: batch.entries.map((e) => ({
-            ...this.serializeEntryMetadata(e),
-            iv: this.uint8ArrayToBase64(e.iv),
-            sessionEncryptedPayload: this.uint8ArrayToBase64(e.sessionEncryptedPayload),
-          })),
-        });
-        return;
-      }
-
-      const entries = await serverStore.handleGetEntries(token, ids || []);
-
-      res.json({
-        entries: entries.map((e: { rsaEncryptedPayload: Uint8Array } & StoreEntryMetadata) => ({
-          ...this.serializeEntryMetadata(e),
-          rsaEncryptedPayload: this.uint8ArrayToBase64(e.rsaEncryptedPayload),
-        })),
-      });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  /**
-   * Binary variant of getEntries (sync-v5, phase 3): always session-key
-   * encrypted, response framed as `application/octet-stream` (see
-   * binaryEntryFraming.ts). The request stays JSON (small).
-   */
-  private async handleGetEntriesBinary(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, ids, payloadOnly } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-      validateArraySize(ids, MAX_ENTRY_IDS, "ids");
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const batch = await serverStore.handleGetEntriesSessionWrapped(token, ids || []);
-
-      // `payloadOnly` (capability supportsPayloadOnlyEntries): the client
-      // already holds the metadata from its scan, so each frame carries only
-      // what it cannot have yet. Same entries, same session-key encryption.
-      const body = encodeBinaryEntryMessage({
-        header: {
-          format: BINARY_GET_ENTRIES_FORMAT,
-          wrappedSessionKey: this.uint8ArrayToBase64(batch.wrappedSessionKey),
-          ...(payloadOnly === true ? { payloadOnly: true } : {}),
-        },
-        entries: batch.entries.map((e) => ({
-          meta:
-            payloadOnly === true
-              ? { id: e.id, iv: this.uint8ArrayToBase64(e.iv) }
-              : { ...this.serializeEntryMetadata(e), iv: this.uint8ArrayToBase64(e.iv) },
-          payload: e.sessionEncryptedPayload,
-        })),
-      });
-      const payloadBytes = batch.entries.reduce(
-        (sum, e) => sum + e.sessionEncryptedPayload.byteLength,
-        0,
-      );
-
-      res.setHeader("Content-Type", BINARY_ENTRIES_CONTENT_TYPE);
-      await sendBinaryEntryBody(req, res, body, body.byteLength - payloadBytes);
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleGetEntryMetadata(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, id } = req.body as { dbId?: string; id?: string };
-
-      const validDbId = this.validateDbId(dbId);
-      if (!id) {
-        res.status(400).json({ error: "id is required" });
-        return;
-      }
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const entry = await serverStore.handleGetEntryMetadata(token, id);
-
-      res.json({
-        entry: entry ? this.serializeEntryMetadata(entry) : null,
-      });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  /**
-   * Ingest encrypted entries from a client. The `stage` variable tracks
-   * progress through the pipeline so that error logs pinpoint the failing
-   * step (token extraction → body parsing → deserialization → storage).
-   */
-  private async handlePutEntries(req: Request, res: Response): Promise<void> {
-    let stage = "extract-token";
-    try {
-      const token = this.extractToken(req);
-      stage = "read-body";
-      const { dbId, entries } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-      validateArraySize(entries, MAX_PUT_ENTRIES, "entries");
-      const serializedEntries = Array.isArray(entries) ? entries as SerializedEntry[] : [];
-      const serializedEntryTypeCounts = serializedEntries.reduce<Record<string, number>>((acc, entry) => {
-        const key = entry?.entryType ?? "unknown";
-        acc[key] = (acc[key] ?? 0) + 1;
-        return acc;
-      }, {});
-      console.log(
-        `[MindooDBServer] putEntries request tenant=${req.tenantId ?? "-"} db=${validDbId} entries=${serializedEntries.length} parsed-bytes=${req.jsonBodyBytes ?? "-"} content-length=${req.headers["content-length"] ?? "-"} types=${JSON.stringify(serializedEntryTypeCounts)}`,
-      );
-
-      stage = "load-server-store";
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      stage = "deserialize-entries";
-      const deserializedEntries = serializedEntries.map((entry, index) => {
-        try {
-          return this.deserializeEntry(entry);
-        } catch (error) {
-          console.error("[MindooDBServer] putEntries failed while deserializing entry", {
-            index,
-            id: entry?.id ?? "-",
-            type: entry?.entryType ?? "-",
-            docId: entry?.docId ?? "-",
-            encryptedSize: entry?.encryptedSize ?? "-",
-            originalSize: entry?.originalSize ?? "-",
-            signatureLength: entry?.signature?.length ?? "-",
-            encryptedDataLength: entry?.encryptedData?.length ?? "-",
-            error,
-          });
-          throw error;
-        }
-      });
-      const totalEncryptedBytes = deserializedEntries.reduce((sum, entry) => sum + entry.encryptedData.byteLength, 0);
-      const totalOriginalBytes = deserializedEntries.reduce((sum, entry) => sum + entry.originalSize, 0);
-      console.log(
-        `[MindooDBServer] putEntries deserialized tenant=${req.tenantId ?? "-"} db=${validDbId} entries=${deserializedEntries.length} totalEncryptedBytes=${totalEncryptedBytes} totalOriginalBytes=${totalOriginalBytes}`,
-      );
-
-      stage = "store-entries";
-      const ack = await serverStore.handlePutEntries(token, deserializedEntries);
-      stage = "respond-success";
-
-      // Return witness receipts for accepted entries so the pushing client (and
-      // every replica it later syncs with) can persist the attestation
-      // (docs/accesscontrol.md §5.3), plus per-entry rejections for
-      // signature-class failures the server skipped. Older clients ignore the
-      // extra fields.
-      res.json({
-        success: true,
-        receipts: ack.receipts.map((e) => this.serializeEntryMetadata(e)),
-        rejected: ack.rejected,
-      });
-
-      // Announce the accepted write to SSE subscribers (sync-v5, phase 5).
-      if (ack.receipts.length > 0) {
-        this.publishSyncChangeEvent(
-          req.tenantId!,
-          validDbId,
-          this.getStoreKindFromRequest(req),
-          serverStore,
-          token,
-        );
-      }
-
-      // A directory push may carry new admin-signed purge requests
-      // (docs/accesscontrol.md §13). Execute any pending purges after the
-      // response so the server physically removes purged history from its own
-      // stores and arms the re-push denylist. Fire-and-forget: failures are
-      // logged and retried on the next directory push.
-      if (validDbId === "directory") {
-        const tenantId = req.tenantId!;
-        void this.tenantManager.executePendingPurges(tenantId).catch((error) => {
-          console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
-        });
-      }
-    } catch (error) {
-      console.error("[MindooDBServer] putEntries failed", {
-        stage,
-        tenantId: req.tenantId ?? "-",
-        dbId: req.body?.dbId ?? "-",
-        parsedBytes: req.jsonBodyBytes ?? "-",
-        contentLength: req.headers["content-length"] ?? "-",
-        entryCount: Array.isArray(req.body?.entries) ? req.body.entries.length : "-",
-        error,
-      });
-      this.handleRequestError(error, res);
-    }
-  }
-
-  /**
-   * Binary variant of putEntries (sync-v5, phase 3). The request body is
-   * octet-stream framing; `dbId` travels in the message header JSON because
-   * there is no JSON body. Receipts are returned as JSON like putEntries.
-   */
-  private async handlePutEntriesBinary(req: Request, res: Response): Promise<void> {
-    let stage = "extract-token";
-    try {
-      const token = this.extractToken(req);
-      stage = "decode-body";
-      if (!Buffer.isBuffer(req.body)) {
-        res.status(400).json({ error: `putEntriesBinary requires a ${BINARY_ENTRIES_CONTENT_TYPE} body` });
-        return;
-      }
-      const message = decodeBinaryEntryMessage(new Uint8Array(req.body.buffer, req.body.byteOffset, req.body.byteLength));
-      if (message.header.format !== BINARY_PUT_ENTRIES_FORMAT) {
-        res.status(400).json({ error: `Unsupported binary entry format: ${String(message.header.format)}` });
-        return;
-      }
-
-      const validDbId = this.validateDbId(message.header.dbId);
-      validateArraySize(message.entries, MAX_PUT_ENTRIES, "entries");
-      console.log(
-        `[MindooDBServer] putEntriesBinary request tenant=${req.tenantId ?? "-"} db=${validDbId} entries=${message.entries.length} content-length=${req.headers["content-length"] ?? "-"}`,
-      );
-
-      stage = "load-server-store";
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-
-      stage = "deserialize-entries";
-      const deserializedEntries = message.entries.map((frame, index) => {
-        const meta = frame.meta as unknown as SerializedEntryMetadata;
-        try {
-          return {
-            ...this.deserializeEntryMetadata(meta),
-            encryptedData: frame.payload,
-          };
-        } catch (error) {
-          console.error("[MindooDBServer] putEntriesBinary failed while deserializing entry", {
-            index,
-            id: meta?.id ?? "-",
-            type: meta?.entryType ?? "-",
-            docId: meta?.docId ?? "-",
-            payloadLength: frame.payload?.byteLength ?? "-",
-            error,
-          });
-          throw error;
-        }
-      });
-
-      stage = "store-entries";
-      const ack = await serverStore.handlePutEntries(token, deserializedEntries);
-      stage = "respond-success";
-
-      res.json({
-        success: true,
-        receipts: ack.receipts.map((e) => this.serializeEntryMetadata(e)),
-        rejected: ack.rejected,
-      });
-
-      // Announce the accepted write to SSE subscribers (sync-v5, phase 5).
-      if (ack.receipts.length > 0) {
-        this.publishSyncChangeEvent(
-          req.tenantId!,
-          validDbId,
-          this.getStoreKindFromRequest(req),
-          serverStore,
-          token,
-        );
-      }
-
-      // Same post-response purge hook as the JSON putEntries path.
-      if (validDbId === "directory") {
-        const tenantId = req.tenantId!;
-        void this.tenantManager.executePendingPurges(tenantId).catch((error) => {
-          console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
-        });
-      }
-    } catch (error) {
-      console.error("[MindooDBServer] putEntriesBinary failed", {
-        stage,
-        tenantId: req.tenantId ?? "-",
-        contentLength: req.headers["content-length"] ?? "-",
-        error,
-      });
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleHasEntries(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, ids } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-      validateArraySize(ids, MAX_ENTRY_IDS, "ids");
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const existingIds = await serverStore.handleHasEntries(token, ids || []);
-
-      res.json({ ids: existingIds });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleGetAllIds(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const validDbId = this.validateDbId(req.query.dbId);
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const ids = await serverStore.handleGetAllIds(token);
-
-      res.json({ ids });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handleResolveDependencies(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, startId, options } = req.body;
-
-      const validDbId = this.validateDbId(dbId);
-      if (!startId) {
-        res.status(400).json({ error: "startId is required" });
-        return;
-      }
-
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const ids = await serverStore.handleResolveDependencies(token, startId, options);
-
-      res.json({ ids });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handlePlanDocumentMaterialization(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, docId, options } = req.body as {
-        dbId?: string;
-        docId?: string;
-        options?: MaterializationPlanOptions;
-      };
-      const validDbId = this.validateDbId(dbId);
-      if (!docId) {
-        res.status(400).json({ error: "docId is required" });
-        return;
-      }
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const plan = await (serverStore as any).handlePlanDocumentMaterialization(token, docId, options);
-      res.json({ plan: plan as DocumentMaterializationPlan });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handlePlanDocumentMaterializationBatch(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, docIds, options } = req.body as {
-        dbId?: string;
-        docIds?: string[];
-        options?: MaterializationPlanOptions;
-      };
-      const validDbId = this.validateDbId(dbId);
-      validateArraySize(docIds, MAX_HAVE_IDS, "docIds");
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const batchPlan = await (serverStore as any).handlePlanDocumentMaterializationBatch(token, docIds || [], options);
-      res.json({ batchPlan: batchPlan as DocumentMaterializationBatchPlan });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  private async handlePlanAttachmentReadByWalkingMetadata(req: Request, res: Response): Promise<void> {
-    try {
-      const token = this.extractToken(req);
-      const { dbId, lastChunkId, attachmentSize, options } = req.body as {
-        dbId?: string;
-        lastChunkId?: string;
-        attachmentSize?: number;
-        options?: AttachmentReadPlanOptions;
-      };
-      const validDbId = this.validateDbId(dbId);
-      if (!lastChunkId) {
-        res.status(400).json({ error: "lastChunkId is required" });
-        return;
-      }
-      if (typeof attachmentSize !== "number" || !Number.isFinite(attachmentSize)) {
-        res.status(400).json({ error: "attachmentSize is required" });
-        return;
-      }
-      if (!options || typeof options.startByte !== "number") {
-        res.status(400).json({ error: "options.startByte is required" });
-        return;
-      }
-      const serverStore = await this.tenantManager.getServerStore(req.tenantId!, validDbId, this.getStoreKindFromRequest(req));
-      const plan = await (serverStore as any).handlePlanAttachmentReadByWalkingMetadata(
-        token,
-        lastChunkId,
-        attachmentSize,
-        options,
-      );
-      res.json({ plan: plan as AttachmentReadPlan });
-    } catch (error) {
-      this.handleRequestError(error, res);
-    }
-  }
-
-  // ==================== Management Handlers ====================
-
-  // ==================== Helper Methods ====================
-
-  /**
-   * Derive the StoreKind from the request path. Both "docs" and
-   * "attachments" share the same handler implementations; the store kind
-   * selects which on-disk append-only store to operate against.
-   */
-  private getStoreKindFromRequest(req: Request): StoreKind {
-    const trimmedPath = req.path.replace(/\/$/, "");
-    if (trimmedPath.startsWith("/sync/docs/") || trimmedPath === "/sync/docs/capabilities" || trimmedPath === "/sync/docs/getAllIds") {
-      return StoreKind.docs;
-    }
-    if (trimmedPath.startsWith("/sync/attachments/") || trimmedPath === "/sync/attachments/capabilities" || trimmedPath === "/sync/attachments/getAllIds") {
-      return StoreKind.attachments;
-    }
-    throw new Error(`Unsupported sync store kind for path: ${req.path}`);
-  }
-
-  private extractToken(req: Request): string {
-    const auth = req.headers.authorization;
-    if (!auth || !auth.startsWith("Bearer ")) {
-      throw new NetworkError("INVALID_TOKEN" as any, "Missing or invalid Authorization header");
-    }
-    return auth.substring(7);
-  }
-
-  /** Map domain errors to HTTP status codes; unknown errors become 500. */
-  private handleRequestError(error: unknown, res: Response): void {
-    if (error instanceof ValidationError) {
-      res.status(400).json({ error: error.message });
-      return;
-    }
-
-    if (error instanceof Error && error.name === "NetworkError") {
-      const networkError = error as NetworkError;
-      const status = this.getStatusForErrorType(networkError.type);
-      // The status alone loses the distinction the client needs: several
-      // NetworkErrorTypes map onto the same code (USER_REVOKED and
-      // ACCESS_DENIED both become 403), and a client that has to guess falls
-      // back to matching on the message text. Carry the type so it does not
-      // have to.
-      res.status(status).json({ error: networkError.message, type: networkError.type });
-      return;
-    }
-
-    if (isMissingDependencyError(error)) {
-      // Not a server fault: the requested chain is incomplete in this store.
-      // Pass the details on so the caller can tell what is missing.
-      res.status(409).json({ error: (error as Error).message, type: "MISSING_DEPENDENCY" });
-      return;
-    }
-
-    console.error("[MindooDBServer] Request error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-
-  private getStatusForErrorType(type: string): number {
-    switch (type) {
-      case "INVALID_TOKEN":
-        return 401;
-      case "USER_REVOKED":
-        return 403;
-      case "USER_NOT_FOUND":
-        return 404;
-      case "INVALID_SIGNATURE":
-        return 403;
-      case "CHALLENGE_EXPIRED":
-        return 401;
-      case "ACCESS_DENIED":
-        return 403;
-      default:
-        return 500;
-    }
   }
 
   /**
@@ -2701,30 +1045,5 @@ export class MindooDBServer {
       error: err,
     });
     res.status(500).json({ error: "Internal server error" });
-  }
-
-  // ==================== Serialization ====================
-  // Entries are stored with binary fields (Uint8Array) internally but
-  // transmitted as base64 strings over JSON. Shared with the client
-  // (entryWireCodec) so signed trailing blocks cannot drift off the wire.
-
-  private serializeEntryMetadata(metadata: StoreEntryMetadata): SerializedEntryMetadata {
-    return encodeEntryMetadata(metadata);
-  }
-
-  private deserializeEntryMetadata(serialized: SerializedEntryMetadata): StoreEntryMetadata {
-    return decodeEntryMetadata(serialized);
-  }
-
-  private deserializeEntry(serialized: SerializedEntry): StoreEntry {
-    return deserializeStoreEntry(serialized);
-  }
-
-  private uint8ArrayToBase64(bytes: Uint8Array): string {
-    return Buffer.from(bytes).toString("base64");
-  }
-
-  private base64ToUint8Array(base64: string): Uint8Array {
-    return new Uint8Array(Buffer.from(base64, "base64"));
   }
 }

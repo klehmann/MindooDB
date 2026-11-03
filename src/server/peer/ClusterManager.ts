@@ -9,16 +9,16 @@
  * class, and the read model both need is the same in-memory replication state.
  */
 
-import { StoreKind, type ContentAddressedStore } from "../../../core/types";
-import { Logger, MindooLogger, getDefaultLogLevel } from "../../../core/logging";
-import type { CryptoAdapter } from "../../../core/crypto/CryptoAdapter";
-import type { IrohStreamIO } from "../../../core/appendonlystores/network/IrohStreamIO";
+import { StoreKind, type ContentAddressedStore } from "../../core/types";
+import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
+import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import type { IrohStreamIO } from "../../core/appendonlystores/network/IrohStreamIO";
 import type { TrustedServer } from "../types";
 import type { SyncEventBus } from "../SyncEventBus";
 import { PeerAuthService } from "./PeerAuthService";
-import { PeerReplicator, rollUpHealth, type PeerSyncScope } from "./PeerReplicator";
+import { PeerReplicator, rollUpHealth, type PeerIrohLink, type PeerSyncScope } from "./PeerReplicator";
 import { ClusterJobRunner } from "./ClusterJobRunner";
-import { ClusterAuditLog } from "./ClusterAuditLog";
+import { ClusterAuditLog, type ClusterAuditStorage } from "./ClusterAuditLog";
 import {
   type ClusterJob,
   type ClusterJobKind,
@@ -37,7 +37,8 @@ export type ClusterActionOutcome =
 
 export interface ClusterManagerDeps {
   cryptoAdapter: CryptoAdapter;
-  dataDir: string;
+  /** Where the audit log is kept (on Node `<dataDir>/cluster/audit.jsonl`). */
+  auditStorage: ClusterAuditStorage;
   eventBus: SyncEventBus;
   /** Trusted servers, re-read on every call so peer CRUD takes effect at once. */
   listTrustedServers(): TrustedServer[];
@@ -48,7 +49,7 @@ export interface ClusterManagerDeps {
   getSigningKey(): Promise<CryptoKey | undefined>;
   getEncryptionKey(): Promise<CryptoKey | undefined>;
   listTenants(): string[];
-  listDatabases(tenantId: string): string[];
+  listDatabases(tenantId: string): string[] | Promise<string[]>;
   getLocalStore(
     tenantId: string,
     dbId: string,
@@ -61,6 +62,15 @@ export interface ClusterManagerDeps {
    * (or when `iroh.enabled` is off). Replicators treat that as a reconnect.
    */
   getIrohStreamIO?: () => IrohStreamIO | null;
+  /** Dial a peer over Iroh; without it `iroh:` peer urls cannot be replicated. */
+  openIrohLink?: (io: IrohStreamIO, ticket: string) => PeerIrohLink;
+  /** See {@link PeerReplicatorHost.liveEventStream}. */
+  liveEventStream?: boolean;
+  /**
+   * HMAC secret of peer tokens. Defaults to a random one per process; a host
+   * that validates peer tokens in several places passes a shared secret.
+   */
+  peerJwtSecret?: Uint8Array;
   /** See {@link PeerReplicatorHost.getPurgedDocIds}. */
   getPurgedDocIds?(tenantId: string, dbId: string): ReadonlySet<string>;
   /** See {@link PeerReplicatorHost.onDirectoryPulled}. */
@@ -92,8 +102,12 @@ export class ClusterManager {
     this.logger =
       deps.logger?.createChild("Cluster") ??
       new MindooLogger(getDefaultLogLevel(), "Cluster", true);
-    this.auth = new PeerAuthService(deps.cryptoAdapter, () => deps.listTrustedServers());
-    this.audit = new ClusterAuditLog(deps.dataDir);
+    this.auth = new PeerAuthService(
+      deps.cryptoAdapter,
+      () => deps.listTrustedServers(),
+      deps.peerJwtSecret ? { jwtSecret: deps.peerJwtSecret } : undefined,
+    );
+    this.audit = new ClusterAuditLog(deps.auditStorage);
   }
 
   private get localRole(): PeerRole {
@@ -143,6 +157,8 @@ export class ClusterManager {
           this.deps.getLocalStore(tenantId, dbId, storeKind),
         eventBus: this.deps.eventBus,
         getIrohStreamIO: this.deps.getIrohStreamIO,
+        openIrohLink: this.deps.openIrohLink,
+        liveEventStream: this.deps.liveEventStream,
         getPurgedDocIds: this.deps.getPurgedDocIds?.bind(this.deps),
         onDirectoryPulled: this.deps.onDirectoryPulled?.bind(this.deps),
         logger: this.logger,
@@ -178,6 +194,25 @@ export class ClusterManager {
 
   getReplicator(name: string): PeerReplicator | null {
     return this.replicators.get(name) ?? null;
+  }
+
+  /**
+   * One replication pass with every peer, resolved when all are done. For
+   * hosts that drive replication from a schedule rather than from timers.
+   */
+  async syncAll(): Promise<void> {
+    await Promise.all(
+      [...this.replicators.values()].map((replicator) =>
+        replicator.syncNow().catch(() => undefined),
+      ),
+    );
+  }
+
+  /** Push a local change to every peer that takes it; see {@link PeerReplicator.replicateLocalChange}. */
+  async replicateLocalChange(event: Parameters<PeerReplicator["replicateLocalChange"]>[0]): Promise<void> {
+    await Promise.all(
+      [...this.replicators.values()].map((replicator) => replicator.replicateLocalChange(event)),
+    );
   }
 
   /** Record what a peer's Bloom handshake matched; see {@link peerIntersections}. */

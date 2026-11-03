@@ -12,7 +12,7 @@ import type { MindooTenant, PrivateUserId } from "../../core/types";
 import { NodeCryptoAdapter } from "../../node/crypto/NodeCryptoAdapter";
 import { MindooDBServer } from "../../node/server/MindooDBServer";
 import { createNativeIrohStreamIO, tryImportNumber0Iroh } from "../../node/server/nativeIrohStreamIO";
-import type { ServerConfig } from "../../node/server/types";
+import type { ServerConfig } from "../../server/types";
 import { IsolatedInMemoryStoreFactory } from "./multiDevice";
 
 export const IROH_LIVE_ENV = "MINDOODB_IROH_LIVE";

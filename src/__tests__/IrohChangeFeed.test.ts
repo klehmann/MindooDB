@@ -7,7 +7,7 @@ import {
   IROH_CHANGE_FEED_HEARTBEAT_MS,
   type IrohServerStore,
 } from "../node/server/IrohServerRpc";
-import { SyncEventBus } from "../node/server/SyncEventBus";
+import { SyncEventBus } from "../server/SyncEventBus";
 
 function stubStore(overrides: Partial<IrohServerStore> = {}): IrohServerStore {
   const missing = async () => {

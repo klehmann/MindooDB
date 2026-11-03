@@ -14,7 +14,7 @@
  * never write as a peer.
  */
 
-import { DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID } from "../../../core/types";
+import { DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID } from "../../core/types";
 
 /**
  * Which way entries flow to a peer.
