@@ -4,7 +4,7 @@ This guide shows how a JVM application (Kotlin or Java, for example a Spring or 
 
 The JVM side is the Kotlin library [`mindoodb-kmp-client`](https://github.com/klehmann/mindoodb-kmp-client). It talks to a small Node.js process, the [`mindoodb-jvm-bridge`](https://github.com/klehmann/mindoodb-jvm-bridge) sidecar, which runs the real `mindoodb` engine. Everything MindooDB guarantees (end-to-end encryption, signed changes, CRDT merging, access control) is done by the same TypeScript code that Node.js, browsers, React Native and Haven use. There is no second implementation to drift apart.
 
-> **Status:** beta, like MindooDB itself. Both projects build from source today; they are not on Maven Central or npm yet.
+> **Status:** the Kotlin/JVM client is beta: its APIs may still change. MindooDB and Haven themselves are not beta. Both projects build from source today; they are not on Maven Central or npm yet.
 
 ---
 
