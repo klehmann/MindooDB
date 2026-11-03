@@ -52,6 +52,24 @@ export interface SessionEncryptedEntriesBatch {
   entries: NetworkSessionEncryptedEntry[];
 }
 
+/**
+ * One entry of a payload-only `getEntries` response (capability
+ * `supportsPayloadOnlyEntries`): the payload, AES-GCM-encrypted with the
+ * batch session key, and only the id it belongs to. The caller joins it with
+ * the metadata it got from the scan.
+ */
+export interface NetworkSessionEncryptedPayload {
+  id: string;
+  iv: Uint8Array;
+  sessionEncryptedPayload: Uint8Array;
+}
+
+/** Payload-only counterpart of {@link SessionEncryptedEntriesBatch}. */
+export interface SessionEncryptedPayloadBatch {
+  wrappedSessionKey: Uint8Array;
+  entries: NetworkSessionEncryptedPayload[];
+}
+
 export type { RejectedPutEntry, PutEntriesAck } from "../types";
 
 /**
@@ -284,6 +302,13 @@ export interface NetworkSyncCapabilities {
    * avoids Base64 and large-JSON overhead.
    */
   supportsBinaryEntries?: boolean;
+  /**
+   * Binary `getEntries` accepts `payloadOnly`: the response frames carry only
+   * id, IV and payload, without the metadata the client already received
+   * from `scanEntriesSince`. Halves what a pull downloads per entry; the
+   * session-key encryption is the same.
+   */
+  supportsPayloadOnlyEntries?: boolean;
   /**
    * Server exposes a Server-Sent-Events change feed (`GET .../events`) that
    * announces new entries per database (sync-v5, phase 5). Clients can

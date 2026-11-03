@@ -21,6 +21,7 @@ import type {
 import type {
   NetworkEncryptedEntry,
   SessionEncryptedEntriesBatch,
+  SessionEncryptedPayloadBatch,
   StoreChangeEvent,
   AuthResult,
   NetworkSyncCapabilities,
@@ -254,6 +255,16 @@ export interface NetworkTransport {
     token: string,
     ids: string[]
   ): Promise<SessionEncryptedEntriesBatch>;
+
+  /**
+   * Like {@link getEntriesBinary}, but the response carries only id, IV and
+   * payload per entry: for callers that already hold the metadata from
+   * `scanEntriesSince`. Gated by the `supportsPayloadOnlyEntries` capability.
+   */
+  getEntryPayloadsBinary?(
+    token: string,
+    ids: string[]
+  ): Promise<SessionEncryptedPayloadBatch>;
 
   /**
    * Get metadata for a single entry from the remote store.

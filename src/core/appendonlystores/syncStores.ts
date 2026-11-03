@@ -541,6 +541,43 @@ export async function transferEntriesInBatches(
   return { transferred, transferredBytes, cancelled: false, rejected };
 }
 
+/**
+ * Rough wire cost per id of the two ways to learn which ids a target already
+ * has: a bloom summary costs about 2 bytes per entry the TARGET holds, an
+ * exact `hasEntries` check about 100 bytes per id the SOURCE offers (ids are
+ * ~90 characters, plus the echo of those that exist).
+ */
+const BLOOM_BYTES_PER_TARGET_ENTRY = 2;
+const HAS_ENTRIES_BYTES_PER_OFFERED_ID = 100;
+
+/**
+ * Whether downloading the target's bloom summary is cheaper than asking it
+ * about each scanned id.
+ *
+ * The bloom grows with the target, the exact check with the delta. A routine
+ * sync of a few new entries into a large server database would otherwise
+ * download the whole bloom (about 200 KB at 100,000 entries) to pre-screen a
+ * handful of ids. Without the numbers to compare (older stores report no
+ * entry count) the bloom is used as before.
+ */
+function targetBloomPaysOff(
+  sourceHead: StoreHead | null,
+  targetHead: StoreHead | null,
+  cursor: StoreScanCursor | null,
+): boolean {
+  const targetEntries = targetHead?.entryCount;
+  if (!sourceHead || targetEntries === undefined) {
+    return true;
+  }
+  // Receipt orders are assigned densely, so the distance from the cursor to
+  // the source head bounds how many entries the scan will offer.
+  const offeredIds = Math.max(0, sourceHead.maxReceiptOrder - (cursor?.receiptOrder ?? 0));
+  return (
+    offeredIds * HAS_ENTRIES_BYTES_PER_OFFERED_ID >
+    targetEntries * BLOOM_BYTES_PER_TARGET_ENTRY
+  );
+}
+
 function supportsCursorScan(store: ContentAddressedStore): boolean {
   return typeof store.scanEntriesSince === "function";
 }
@@ -580,10 +617,22 @@ export async function syncEntriesBetweenStores(
     // also anchor the epochs persisted with the cursor.
     const cursorKey = syncScanCursorKey(sourceStore, targetStore);
     const persisted = options?.forceFullScan ? null : cursors.get(cursorKey);
-    const [sourceHead, targetHead] = await Promise.all([
-      getStoreHeadSafe(sourceStore, logger),
-      getStoreHeadSafe(targetStore, logger),
-    ]);
+    // Source head first: a source that never held an entry (an empty local
+    // replica on push, an empty attachment store on pull) ends the sync here,
+    // before any request to the other side. Sequential costs no round trip in
+    // practice: one of the two stores is always local.
+    const sourceHead = await getStoreHeadSafe(sourceStore, logger);
+    if (sourceHead && sourceHead.maxReceiptOrder === 0) {
+      logger.info(`Sync skip: source store is empty (${cursorKey})`);
+      onProgress?.({
+        phase: "preparing",
+        message: "Source is empty, nothing to sync",
+        transferredEntries: 0,
+        scannedEntries: 0,
+      });
+      return { transferred: 0, scanned: 0, cancelled: false };
+    }
+    const targetHead = await getStoreHeadSafe(targetStore, logger);
 
     let cursor: StoreScanCursor | null = null;
     let cursorDecision: "skip" | "resume" | "full-scan" = "full-scan";
@@ -655,14 +704,31 @@ export async function syncEntriesBetweenStores(
       }
     };
 
-    const targetBloom = await getStoreBloomSummary(targetStore, logger);
+    // A target that never held an entry is missing everything the scan finds:
+    // no bloom pre-screen and no `hasEntries` round trip per page (the first
+    // sync of a fresh replica, or the first push to a new server database).
+    const targetIsEmpty = targetHead?.maxReceiptOrder === 0;
+
+    // The first scan page, the target bloom and the progress denominator are
+    // independent, so they travel together instead of one after the other.
+    let nextPagePromise: Promise<StoreScanResult> | null = sourceStore.scanEntriesSince!(
+      cursor,
+      pageSize,
+    );
     // Fixed progress denominator: the SOURCE's total entry count. The cursor
     // scan below examines every source entry, so scannedEntries/totalSourceEntries
-    // is a real completion ratio. (Local stores serve this from a cached bloom
-    // summary; network stores answer with one extra request.) The target bloom
-    // stays dedicated to missing-id pre-screening.
-    const sourceBloom = await getStoreBloomSummary(sourceStore, logger);
-    const totalSourceEstimate = sourceBloom?.totalIds;
+    // is a real completion ratio. The source head carries the count when the
+    // store knows it; otherwise the bloom summary's `totalIds` stands in (one
+    // extra request on network stores). The target bloom stays dedicated to
+    // missing-id pre-screening.
+    const [targetBloom, totalSourceEstimate] = await Promise.all([
+      targetIsEmpty || !targetBloomPaysOff(sourceHead, targetHead, cursor)
+        ? Promise.resolve(null)
+        : getStoreBloomSummary(targetStore, logger),
+      sourceHead?.entryCount !== undefined
+        ? Promise.resolve(sourceHead.entryCount)
+        : getStoreBloomSummary(sourceStore, logger).then((bloom) => bloom?.totalIds),
+    ]);
 
     onProgress?.({
       phase: "preparing",
@@ -688,79 +754,66 @@ export async function syncEntriesBetweenStores(
 
     let currentPage = 0;
     // Scan-page pipelining (sync-v5, phase 4): while page N is being filtered
-    // and transferred, page N+1 is already being fetched.
-    let nextPagePromise: Promise<StoreScanResult> | null = null;
+    // and transferred, page N+1 is already being fetched (`nextPagePromise`,
+    // seeded with the first page above).
+    //
+    // Local processing of a transferred page (`onPageTransferred`: the local
+    // index, and through its change event the summary buffer and full-text
+    // index) runs while the next page is transferred. At most one page is in
+    // processing at a time, so a slow consumer slows the transfer down instead
+    // of piling up work; its errors surface at the next page or at the end.
+    let pendingPageProcessing: Promise<void> | null = null;
+    const settlePageProcessing = async (): Promise<void> => {
+      const pending = pendingPageProcessing;
+      pendingPageProcessing = null;
+      if (pending) {
+        await pending;
+      }
+    };
     const discardPrefetch = (): void => {
       // Swallow errors of an in-flight prefetch we will never consume
       // (abort/cancel paths) to avoid unhandled rejections.
       nextPagePromise?.catch(() => {});
       nextPagePromise = null;
     };
-    while (true) {
-      if (signal?.aborted) {
-        discardPrefetch();
-        persistScanCursor(cursor);
-        return {
-          transferred,
-          transferredBytes,
-          scanned,
-          cancelled: true,
-          rejected,
-          cursorHeldForRetry: cursorIsHeld,
-          abandoned,
-        };
-      }
-
-      const cursorAtPageStart = cursor;
-      const page: StoreScanResult = nextPagePromise
-        ? await nextPagePromise
-        : await sourceStore.scanEntriesSince!(cursor, pageSize);
-      nextPagePromise = page.hasMore
-        ? sourceStore.scanEntriesSince!(page.nextCursor, pageSize)
-        : null;
-      currentPage++;
-
-      // Clamp the page to the scan bound. Pages are ordered by
-      // (receiptOrder, id), so everything past the first out-of-bound entry is
-      // out of bound as well.
-      let pageEntries = page.entries;
-      let reachedScanBound = false;
-      if (scanUpperBound !== undefined && pageEntries.length > 0) {
-        const inBound = pageEntries.filter((m) => (m.receiptOrder ?? 0) <= scanUpperBound);
-        if (inBound.length < pageEntries.length) {
-          reachedScanBound = true;
-          pageEntries = inBound;
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          discardPrefetch();
+          persistScanCursor(cursor);
+          return {
+            transferred,
+            transferredBytes,
+            scanned,
+            cancelled: true,
+            rejected,
+            cursorHeldForRetry: cursorIsHeld,
+            abandoned,
+          };
         }
-      }
-      scanned += pageEntries.length;
 
-      if (signal?.aborted) {
-        discardPrefetch();
-        persistScanCursor(cursor);
-        return {
-          transferred,
-          transferredBytes,
-          scanned,
-          cancelled: true,
-          rejected,
-          cursorHeldForRetry: cursorIsHeld,
-          abandoned,
-        };
-      }
+        const cursorAtPageStart = cursor;
+        const page: StoreScanResult = nextPagePromise
+          ? await nextPagePromise
+          : await sourceStore.scanEntriesSince!(cursor, pageSize);
+        nextPagePromise = page.hasMore
+          ? sourceStore.scanEntriesSince!(page.nextCursor, pageSize)
+          : null;
+        currentPage++;
 
-      if (pageEntries.length > 0) {
-        onProgress?.({
-          phase: "transferring",
-          message: `Scanned ${scanned} entries, checking for changes (page ${currentPage})...`,
-          transferredEntries: transferred,
-          scannedEntries: scanned,
-          totalSourceEntries: totalSourceEstimate,
-          currentPage,
-        });
-
-        const ids = pageEntries.map((m) => m.id).filter((id) => !transferredThisSync.has(id));
-        const missingIds =
-          ids.length > 0 ? await filterMissingIds(targetStore, ids, targetBloom) : [];
+        // Clamp the page to the scan bound. Pages are ordered by
+        // (receiptOrder, id), so everything past the first out-of-bound entry is
+        // out of bound as well.
+        let pageEntries = page.entries;
+        let reachedScanBound = false;
+        if (scanUpperBound !== undefined && pageEntries.length > 0) {
+          const inBound = pageEntries.filter((m) => (m.receiptOrder ?? 0) <= scanUpperBound);
+          if (inBound.length < pageEntries.length) {
+            reachedScanBound = true;
+            pageEntries = inBound;
+          }
+        }
+        scanned += pageEntries.length;
 
         if (signal?.aborted) {
           discardPrefetch();
@@ -776,86 +829,25 @@ export async function syncEntriesBetweenStores(
           };
         }
 
-        if (missingIds.length > 0) {
-          const transferResult = await transferInPhases(
-            sourceStore,
-            targetStore,
-            createsFirst(pageEntries, missingIds),
-            options,
-            {
-              transferred,
-              transferredBytes,
-              scanned,
-              totalSourceEntries: totalSourceEstimate,
-              currentPage,
-            },
-            logger,
-          );
-          transferred = transferResult.transferred;
-          transferredBytes = transferResult.transferredBytes;
-          rejected.push(...transferResult.rejected);
+        if (pageEntries.length > 0) {
+          onProgress?.({
+            phase: "transferring",
+            message: `Scanned ${scanned} entries, checking for changes (page ${currentPage})...`,
+            transferredEntries: transferred,
+            scannedEntries: scanned,
+            totalSourceEntries: totalSourceEstimate,
+            currentPage,
+          });
 
-          // Clamp the cursor at the first rejection so the retry actually
-          // re-offers the entry. Only the earliest one matters: everything
-          // after it is re-scanned anyway.
-          //
-          // Only self-resolving rejections are worth holding for. Holding for a
-          // purged document or a withdrawn right pins the cursor to an entry
-          // that earns the same refusal every time: the pair re-scans from
-          // there and re-offers it on every run, and never reports clean.
-          // Those are reported through `rejected` instead, which is where the
-          // caller can record them.
-          const holdable = holdCursorOnRejection
-            ? transferResult.rejected.filter((entry) =>
-                isSelfResolvingRejection(rejectionClassOf(entry)),
-              )
-            : [];
-          // Everything the cursor will not wait for is gone after this run.
-          abandoned.push(
-            ...transferResult.rejected.filter((entry) => !holdable.includes(entry)),
-          );
+          const ids = pageEntries.map((m) => m.id).filter((id) => !transferredThisSync.has(id));
+          const missingIds =
+            ids.length === 0
+              ? []
+              : targetIsEmpty
+                ? ids
+                : await filterMissingIds(targetStore, ids, targetBloom);
 
-          if (holdable.length > 0 && !cursorIsHeld) {
-            const rejectedIds = new Set(holdable.map((entry) => entry.id));
-            const firstRejectedIndex = pageEntries.findIndex((m) => rejectedIds.has(m.id));
-            if (firstRejectedIndex >= 0) {
-              const waitingOn = pageEntries[firstRejectedIndex].id;
-              // Continue the count only while it is the same entry; a different
-              // one means the previous wait ended, one way or another.
-              const attempts =
-                persisted?.hold?.id === waitingOn ? persisted.hold.attempts + 1 : 1;
-
-              if (attempts > maxHoldAttempts) {
-                // The refusal was classified as one that passes on its own, and
-                // it has not. Waiting further would only re-scan from here on
-                // every future run, so give up on these and let the cursor run.
-                logger.warn(
-                  `Giving up on ${holdable.length} entr${holdable.length === 1 ? "y" : "ies"} for ` +
-                    `${cursorKey} after ${attempts - 1} attempts: rejected as ` +
-                    `${rejectionClassOf(holdable[0])} but never accepted. ` +
-                    `First reason: ${holdable[0].reason}`,
-                );
-                abandoned.push(...holdable);
-              } else {
-                cursorIsHeld = true;
-                holdState = { id: waitingOn, attempts };
-                const previous =
-                  firstRejectedIndex > 0 ? pageEntries[firstRejectedIndex - 1] : null;
-                heldCursor = previous
-                  ? { receiptOrder: previous.receiptOrder ?? 0, id: previous.id }
-                  : cursorAtPageStart;
-                logger.warn(
-                  `Holding sync cursor at receiptOrder=${heldCursor?.receiptOrder ?? "start"} for ${cursorKey}: ` +
-                    `${holdable.length} entr${holdable.length === 1 ? "y was" : "ies were"} rejected and must be retried ` +
-                    `(attempt ${attempts} of ${maxHoldAttempts})`,
-                );
-              }
-            }
-          }
-
-          if (transferResult.cancelled) {
-            // The current page's transfer did not complete: persist the
-            // boundary of the last fully transferred page instead.
+          if (signal?.aborted) {
             discardPrefetch();
             persistScanCursor(cursor);
             return {
@@ -868,58 +860,162 @@ export async function syncEntriesBetweenStores(
               abandoned,
             };
           }
-          for (const id of missingIds) {
-            transferredThisSync.add(id);
-          }
-          if (ctx.onPageTransferred && !signal?.aborted) {
-            try {
-              await ctx.onPageTransferred();
-            } catch (error) {
+
+          if (missingIds.length > 0) {
+            const transferResult = await transferInPhases(
+              sourceStore,
+              targetStore,
+              createsFirst(pageEntries, missingIds),
+              options,
+              {
+                transferred,
+                transferredBytes,
+                scanned,
+                totalSourceEntries: totalSourceEstimate,
+                currentPage,
+              },
+              logger,
+            );
+            transferred = transferResult.transferred;
+            transferredBytes = transferResult.transferredBytes;
+            rejected.push(...transferResult.rejected);
+
+            // Clamp the cursor at the first rejection so the retry actually
+            // re-offers the entry. Only the earliest one matters: everything
+            // after it is re-scanned anyway.
+            //
+            // Only self-resolving rejections are worth holding for. Holding for a
+            // purged document or a withdrawn right pins the cursor to an entry
+            // that earns the same refusal every time: the pair re-scans from
+            // there and re-offers it on every run, and never reports clean.
+            // Those are reported through `rejected` instead, which is where the
+            // caller can record them.
+            const holdable = holdCursorOnRejection
+              ? transferResult.rejected.filter((entry) =>
+                  isSelfResolvingRejection(rejectionClassOf(entry)),
+                )
+              : [];
+            // Everything the cursor will not wait for is gone after this run.
+            abandoned.push(
+              ...transferResult.rejected.filter((entry) => !holdable.includes(entry)),
+            );
+
+            if (holdable.length > 0 && !cursorIsHeld) {
+              const rejectedIds = new Set(holdable.map((entry) => entry.id));
+              const firstRejectedIndex = pageEntries.findIndex((m) => rejectedIds.has(m.id));
+              if (firstRejectedIndex >= 0) {
+                const waitingOn = pageEntries[firstRejectedIndex].id;
+                // Continue the count only while it is the same entry; a different
+                // one means the previous wait ended, one way or another.
+                const attempts =
+                  persisted?.hold?.id === waitingOn ? persisted.hold.attempts + 1 : 1;
+
+                if (attempts > maxHoldAttempts) {
+                  // The refusal was classified as one that passes on its own, and
+                  // it has not. Waiting further would only re-scan from here on
+                  // every future run, so give up on these and let the cursor run.
+                  logger.warn(
+                    `Giving up on ${holdable.length} entr${holdable.length === 1 ? "y" : "ies"} for ` +
+                      `${cursorKey} after ${attempts - 1} attempts: rejected as ` +
+                      `${rejectionClassOf(holdable[0])} but never accepted. ` +
+                      `First reason: ${holdable[0].reason}`,
+                  );
+                  abandoned.push(...holdable);
+                } else {
+                  cursorIsHeld = true;
+                  holdState = { id: waitingOn, attempts };
+                  const previous =
+                    firstRejectedIndex > 0 ? pageEntries[firstRejectedIndex - 1] : null;
+                  heldCursor = previous
+                    ? { receiptOrder: previous.receiptOrder ?? 0, id: previous.id }
+                    : cursorAtPageStart;
+                  logger.warn(
+                    `Holding sync cursor at receiptOrder=${heldCursor?.receiptOrder ?? "start"} for ${cursorKey}: ` +
+                      `${holdable.length} entr${holdable.length === 1 ? "y was" : "ies were"} rejected and must be retried ` +
+                      `(attempt ${attempts} of ${maxHoldAttempts})`,
+                  );
+                }
+              }
+            }
+
+            if (transferResult.cancelled) {
+              // The current page's transfer did not complete: persist the
+              // boundary of the last fully transferred page instead.
               discardPrefetch();
-              throw error;
+              persistScanCursor(cursor);
+              return {
+                transferred,
+                transferredBytes,
+                scanned,
+                cancelled: true,
+                rejected,
+                cursorHeldForRetry: cursorIsHeld,
+                abandoned,
+              };
+            }
+            for (const id of missingIds) {
+              transferredThisSync.add(id);
+            }
+            if (ctx.onPageTransferred && !signal?.aborted) {
+              try {
+                await settlePageProcessing();
+              } catch (error) {
+                discardPrefetch();
+                throw error;
+              }
+              const processing = ctx.onPageTransferred();
+              // Observed here so a failure is never an unhandled rejection; it
+              // is rethrown where the promise is settled.
+              processing.catch(() => {});
+              pendingPageProcessing = processing;
             }
           }
         }
-      }
 
-      onProgress?.({
-        phase: "transferring",
-        message: `Transferred ${transferred} entries (page ${currentPage}, scanned ${scanned})`,
-        transferredEntries: transferred,
-        transferredBytes,
-        scannedEntries: scanned,
-        totalSourceEntries: totalSourceEstimate,
-        currentPage,
-      });
+        onProgress?.({
+          phase: "transferring",
+          message: `Transferred ${transferred} entries (page ${currentPage}, scanned ${scanned})`,
+          transferredEntries: transferred,
+          transferredBytes,
+          scannedEntries: scanned,
+          totalSourceEntries: totalSourceEstimate,
+          currentPage,
+        });
 
-      if (reachedScanBound) {
-        // Persist the last in-bound position (NOT page.nextCursor, which
-        // already points into the out-of-bound tail): a concurrent write that
-        // landed between the bound and the re-anchored tail must be scanned by
-        // the next sync.
-        const lastInBound = pageEntries.length > 0 ? pageEntries[pageEntries.length - 1] : null;
-        if (lastInBound) {
-          cursor = { receiptOrder: lastInBound.receiptOrder ?? 0, id: lastInBound.id };
+        if (reachedScanBound) {
+          // Persist the last in-bound position (NOT page.nextCursor, which
+          // already points into the out-of-bound tail): a concurrent write that
+          // landed between the bound and the re-anchored tail must be scanned by
+          // the next sync.
+          const lastInBound = pageEntries.length > 0 ? pageEntries[pageEntries.length - 1] : null;
+          if (lastInBound) {
+            cursor = { receiptOrder: lastInBound.receiptOrder ?? 0, id: lastInBound.id };
+          }
+          discardPrefetch();
+          break;
         }
-        discardPrefetch();
-        break;
-      }
 
-      cursor = page.nextCursor;
-      if (!page.hasMore) {
-        break;
+        cursor = page.nextCursor;
+        if (!page.hasMore) {
+          break;
+        }
       }
+      persistScanCursor(cursor);
+      return {
+        transferred,
+        transferredBytes,
+        scanned,
+        cancelled: false,
+        rejected,
+        cursorHeldForRetry: cursorIsHeld,
+        abandoned,
+      };
+    } finally {
+      // Every exit waits for the last page's processing: callers rely on a
+      // finished pull having been processed, and a processing error fails
+      // the sync like a transfer error.
+      await settlePageProcessing();
     }
-    persistScanCursor(cursor);
-    return {
-      transferred,
-      transferredBytes,
-      scanned,
-      cancelled: false,
-      rejected,
-      cursorHeldForRetry: cursorIsHeld,
-      abandoned,
-    };
   }
 
   onProgress?.({
