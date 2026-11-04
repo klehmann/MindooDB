@@ -2342,9 +2342,16 @@ export interface MindooDoc {
    *
    * Collaborative text and atomic strings are returned as strings, counters
    * as plain numbers and timestamps as `Date` objects. Inside changeDoc()
-   * top-level fields can be assigned and deleted on the returned object
-   * (assign `MindooValue` typed values for atomic strings, counters and
-   * timestamps); use {@link incrementCounter} to change counters.
+   * the returned object can be edited at any depth: assign and delete fields
+   * of nested objects, and change lists with `push`, `pop`, `shift`,
+   * `unshift`, `splice`, `sort`, `reverse`, `fill` or by index. List methods
+   * are stored as list inserts and deletes, so they merge with concurrent
+   * edits like the equivalent `applyJsonPatch()` operations; use
+   * {@link updateText} for text that should merge the same way. Assign
+   * `MindooValue` typed values for atomic strings, counters and timestamps;
+   * use {@link incrementCounter} to change counters. Lists cannot have holes
+   * or named properties, and an object removed from the document (e.g. by
+   * `splice`) can no longer be edited in the same callback.
    *
    * @return The payload of the document
    */
@@ -2478,6 +2485,20 @@ export interface MindooDoc {
    *   change is applied) if the value at `path` exists but is not a counter
    */
   incrementCounter(path: string | Array<string | number>, delta: number): void;
+
+  /**
+   * Set the text at `path` to `value`, stored as a splice of the part that
+   * changed. Concurrent edits elsewhere in the text then merge character by
+   * character, as with `applyJsonPatch()` `textSplice`; a plain assignment of a
+   * string replaces the whole value instead. Only works within the changeDoc()
+   * callback. A missing field is created.
+   *
+   * @param path Field name or path segments (e.g. `["meta", "title"]`)
+   * @param value The new text
+   * @throws Error if called outside of changeDoc() callback, or if the value
+   *   at `path` exists and is not text
+   */
+  updateText(path: string | Array<string | number>, value: string): void;
 
   // ========== Attachment Read Methods ==========
   // These methods work both inside and outside of changeDoc().

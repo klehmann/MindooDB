@@ -486,13 +486,22 @@ Mutate exactly what changed inside `changeDoc`:
 
 ```typescript
 await db.changeDoc(doc, (d) => {
-  d.getData().status = "approved";   // one field
+  const data = d.getData();
+  data.status = "approved";          // one field
+  data.reviewers.push("cn=jane");    // a list insert, not a new list
+  data.meta.reviewedBy = "cn=jane";  // a nested field
+  d.updateText("notes", newNotes);   // only the changed part of the text
 });
 ```
 
-For text, use the granular text APIs so concurrent typing merges character by
-character. For lists, use list insert/delete operations so concurrent inserts
-interleave instead of one overwriting the other. Apps built on the App SDK get
+Edits inside `changeDoc` are recorded at the depth they happen: list methods
+(`push`, `splice`, ...) become list inserts/deletes, so concurrent inserts
+interleave instead of one overwriting the other. `d.updateText(path, value)`
+stores only the changed part of a text, so it merges with concurrent typing.
+A plain assignment replaces the whole value (`data.reviewers = [...]`,
+`data.notes = "..."`) and does not merge. For edits that already arrive as operations
+(an editor's keystrokes, a sync protocol), use the granular text and JSON patch
+APIs directly. Apps built on the App SDK get
 the same guarantees through its patch flavors (field set/unset, granular JSON
 patches, text patches, rich-text patches), each carrying the `baseHeads` the app
 composed against.

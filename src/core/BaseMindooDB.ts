@@ -2,6 +2,7 @@
 // React Native: native Rust (react-native-automerge-generated)
 // Browser/Node.js: WASM (@automerge/automerge/slim)
 import { Automerge } from "./automerge-adapter";
+import { ChangeDocDraft, diffTextSplice, type DraftOp } from "./ChangeDocDraft";
 import {
   MINDOO_VALUE_TAG,
   assertCounterAmount,
@@ -11290,8 +11291,6 @@ export class BaseMindooDB implements MindooDB {
     //
     // We use a two-phase approach: the callback can do async work and collect
     // what needs to be changed, then we apply those changes in Automerge.change()
-    const pendingChanges = new Map<string, unknown>();
-    const pendingDeletions = new Set<string>();
 
     // Track pending attachment operations
     const pendingAttachmentAdditions: AttachmentReference[] = [];
@@ -11322,9 +11321,10 @@ export class BaseMindooDB implements MindooDB {
     // Assignments and deletions are applied before the increments, so an
     // assignment or deletion of a field supersedes the increments queued on it
     // (or below it) earlier in the callback; later increments still apply.
-    const dropPendingCounterIncrements = (field: string) => {
+    const dropPendingCounterIncrements = (replaced: Array<string | number>) => {
       for (let i = pendingCounterIncrements.length - 1; i >= 0; i--) {
-        if (pendingCounterIncrements[i].path[0] === field) {
+        const path = pendingCounterIncrements[i].path;
+        if (replaced.every((segment, index) => path[index] === segment)) {
           pendingCounterIncrements.splice(i, 1);
         }
       }
@@ -11344,6 +11344,15 @@ export class BaseMindooDB implements MindooDB {
         );
       }
     };
+
+    // getData() edits a lazily built shadow copy and logs every edit, at any
+    // depth, for replay inside Automerge.change() below.
+    const draft = new ChangeDocDraft(internalDoc.doc as object, {
+      isScalarObject: (value) => db.isAutomergeCounter(value) || db.isAutomergeImmutableString(value),
+      readScalar: (value) => db.readAutomergeScalar(value),
+      assertActive: throwIfCallbackInactive,
+      onReplace: dropPendingCounterIncrements,
+    });
 
     // Create a document wrapper that collects changes
     const collectingDoc: MindooDoc = {
@@ -11371,62 +11380,7 @@ export class BaseMindooDB implements MindooDB {
           Array.isArray(users) ? users : [users],
         ),
       getHeads: () => Automerge.getHeads(internalDoc.doc),
-      getData: () => {
-        // Return a proxy that collects property assignments and deletions
-        const currentData = internalDoc.doc as unknown as MindooDocPayload;
-        return new Proxy(currentData, {
-          set: (target, prop, value) => {
-            throwIfCallbackInactive("set property");
-            if (typeof prop === "string") {
-              dropPendingCounterIncrements(prop);
-              // If this property was marked for deletion, remove it from deletions
-              pendingDeletions.delete(prop);
-              // Track the change
-              pendingChanges.set(prop, value);
-              // NOTE: Don't set on target immediately - Automerge requires changes
-              // to be made inside Automerge.change(). Pending changes are applied later.
-            }
-            return true;
-          },
-          deleteProperty: (target, prop) => {
-            throwIfCallbackInactive("delete property");
-            if (typeof prop === "string") {
-              dropPendingCounterIncrements(prop);
-              // Mark for deletion
-              pendingDeletions.add(prop);
-              // Remove from pending changes if it was there
-              pendingChanges.delete(prop);
-              // NOTE: Don't delete from target immediately - Automerge requires changes
-              // to be made inside Automerge.change(). Pending deletions are applied later.
-            }
-            return true;
-          },
-          get: (target, prop) => {
-            // If marked for deletion, return undefined
-            if (typeof prop === "string" && pendingDeletions.has(prop)) {
-              return undefined;
-            }
-            // Check pending changes first, then target
-            if (typeof prop === "string" && pendingChanges.has(prop)) {
-              return pendingChanges.get(prop);
-            }
-            // Counters read as numbers and immutable strings as strings here
-            // too; change counters with incrementCounter().
-            return db.readAutomergeScalar((target as any)[prop]);
-          },
-          has: (target, prop) => {
-            // If marked for deletion, it doesn't exist
-            if (typeof prop === "string" && pendingDeletions.has(prop)) {
-              return false;
-            }
-            // Check pending changes first, then target
-            if (typeof prop === "string" && pendingChanges.has(prop)) {
-              return true;
-            }
-            return prop in target;
-          },
-        }) as MindooDocPayload;
-      },
+      getData: () => draft.getRoot<MindooDocPayload>(),
 
       // ========== Attachment Write Methods (work in changeDoc context) ==========
 
@@ -11628,6 +11582,12 @@ export class BaseMindooDB implements MindooDB {
 
       // ========== Counter Write Methods ==========
 
+      updateText: (path: string | Array<string | number>, value: string) => {
+        const segments = typeof path === "string" ? [path] : [...path];
+        db.validateJsonPath(segments, "updateText");
+        draft.updateText(segments, value);
+      },
+
       incrementCounter: (
         path: string | Array<string | number>,
         delta: number,
@@ -11698,15 +11658,8 @@ export class BaseMindooDB implements MindooDB {
     try {
       newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) =>
         Automerge.change(doc, { message: changeMessage }, (automergeDoc: MindooDocPayload) => {
-          // Apply all pending changes (sets/updates)
-          for (const [key, value] of pendingChanges) {
-            this.assignHydrated(automergeDoc, key, this.hydrateTypedValues(value));
-          }
-
-          // Apply all pending deletions
-          for (const key of pendingDeletions) {
-            delete (automergeDoc as any)[key];
-          }
+          // Replay the callback's field edits in the order they were made
+          this.applyChangeDocDraftOps(automergeDoc, draft.ops);
 
           // Engine-internal edits that need the raw Automerge document, e.g.
           // restoreDocumentToEntry's rich-text spans.
@@ -11860,6 +11813,50 @@ export class BaseMindooDB implements MindooDB {
         this.clearPendingAttachmentUploadLedger(ref.attachmentId),
       ),
     );
+  }
+
+  /** Replays the edits a changeDoc() callback made through getData(), see ChangeDocDraft. */
+  private applyChangeDocDraftOps(automergeDoc: MindooDocPayload, ops: DraftOp[]): void {
+    const containerAt = (path: Array<string | number>): any => {
+      let current: any = automergeDoc;
+      for (const segment of path) current = current[segment];
+      return current;
+    };
+    for (const op of ops) {
+      if (op.kind === "splice") {
+        const list = containerAt(op.path) as unknown[];
+        const values = this.hydrateTypedValues(op.items) as unknown[];
+        list.splice(op.index, op.deleteCount, ...(this.withoutNestedFloats(values) as unknown[]));
+        values.forEach((value, offset) => {
+          if (value instanceof Automerge.Float64) list[op.index + offset] = new Automerge.Float64(value.value);
+          else this.restoreNestedFloats(list[op.index + offset], value);
+        });
+        continue;
+      }
+      const parent = containerAt(op.path.slice(0, -1));
+      const key = op.path[op.path.length - 1];
+      if (op.kind === "delete") {
+        delete parent[key];
+        continue;
+      }
+      const current = parent[key];
+      if (op.kind === "text" && typeof current === "string") {
+        // Splice only the changed middle, so the edit merges with concurrent
+        // typing instead of replacing the whole text.
+        const splice = diffTextSplice(current, op.value);
+        if (splice) {
+          Automerge.splice(
+            automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+            op.path as AutomergeTypes.Prop[],
+            splice.index,
+            splice.deleteCount,
+            splice.insert,
+          );
+        }
+        continue;
+      }
+      this.assignHydrated(parent, key, this.hydrateTypedValues(op.value));
+    }
   }
 
   private validateTextPatch(patch: MindooTextPatch): void {
@@ -16925,6 +16922,12 @@ export class BaseMindooDB implements MindooDB {
       setAttachmentExtractedText: () => {
         throw new Error(
           "setAttachmentExtractedText() can only be called within changeDoc() callback",
+        );
+      },
+
+      updateText: () => {
+        throw new Error(
+          "updateText() can only be called within changeDoc() callback; use applyJsonPatch() with textSplice outside of it",
         );
       },
 
