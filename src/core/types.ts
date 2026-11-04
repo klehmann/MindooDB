@@ -2505,6 +2505,21 @@ export interface MindooDoc {
    */
   updateText(path: string | Array<string | number>, value: string): void;
 
+  /**
+   * The type of the value at `path`, or `undefined` when nothing is there.
+   *
+   * `getData()` reads collaborative text and atomic strings both as strings,
+   * counters as numbers and timestamps as `Date`; this tells them apart, so a
+   * caller can pick the matching write: plain assignment, {@link updateText}
+   * (`"text"`), {@link incrementCounter} (`"counter"`), or
+   * `MindooDB.applyRichTextPatch()` (`"richText"`, a text with marks or block
+   * markers). Inside changeDoc() the answer includes the callback's own edits
+   * so far (a `MindooValue` just assigned reports its kind).
+   *
+   * @param path Field name or path segments (e.g. `["meta", "status"]`)
+   */
+  getFieldType(path: string | Array<string | number>): MindooFieldType | undefined;
+
   // ========== Attachment Read Methods ==========
   // These methods work both inside and outside of changeDoc().
 
@@ -2892,6 +2907,25 @@ export interface MindooJsonCounterIncrementPatch {
   path: Array<string | number>;
   delta: number;
 }
+
+/**
+ * What a document field holds, as reported by `MindooDoc.getFieldType()`.
+ * `text` is collaborative plain text, `richText` a text with marks or block
+ * markers, `atomic` a string that is replaced as a whole, `counter` a CRDT
+ * counter, `timestamp` a date; `list` and `map` are arrays and objects.
+ */
+export type MindooFieldType =
+  | "text"
+  | "richText"
+  | "atomic"
+  | "counter"
+  | "timestamp"
+  | "number"
+  | "boolean"
+  | "null"
+  | "bytes"
+  | "list"
+  | "map";
 
 /**
  * Granular JSON mutation batch for a MindooDoc payload.
@@ -5699,6 +5733,12 @@ export interface MindooDB {
    * back into `MindooRichTextPatch.baseHeads` when authoring the next edit.
    */
   getRichTextSnapshot(doc: MindooDoc, path: Array<string | number>): Promise<MindooRichTextSnapshot>;
+
+  /**
+   * The type of the value at `path` of `doc`, or `undefined` when nothing is
+   * there; same as {@link MindooDoc.getFieldType}.
+   */
+  getFieldType(doc: MindooDoc, path: string | Array<string | number>): Promise<MindooFieldType | undefined>;
 
   /**
    * Create stable cursors for character positions in the text at `path`.

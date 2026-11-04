@@ -24,6 +24,8 @@
  * root, so an element proxy kept across a `splice` still edits that element.
  */
 
+import type { MindooFieldType } from "./types";
+
 export type DraftPath = Array<string | number>;
 
 export type DraftOp =
@@ -34,10 +36,14 @@ export type DraftOp =
   | { kind: "splice"; path: DraftPath; index: number; deleteCount: number; items: unknown[] };
 
 export interface ChangeDocDraftHooks {
-  /** True for CRDT scalars that read as plain values (counters, immutable strings). */
-  isScalarObject(value: unknown): boolean;
+  /** The kind of a CRDT scalar that reads as a plain value, or null for anything else. */
+  scalarKind(value: unknown): "counter" | "atomic" | null;
   /** The plain read value of a CRDT scalar. */
   readScalar(value: unknown): unknown;
+  /** A CRDT counter holding `value`, for the shadow copy. */
+  makeCounter(value: number): unknown;
+  /** Whether the text at `path` of the base document carries marks or blocks. */
+  isRichTextInBase(path: DraftPath): boolean;
   /** Throws once the callback has completed. */
   assertActive(operation: string): void;
 }
@@ -54,6 +60,12 @@ export class ChangeDocDraft {
   private readonly parents = new WeakMap<object, { parent: Node; key: string | number }>();
   private readonly proxies = new WeakMap<object, object>();
   private readonly proxyNodes = new WeakMap<object, Node>();
+  /** Where a node copied from the base document sits in the base document. */
+  private readonly basePaths = new WeakMap<object, DraftPath>();
+  /** Keys of a node that this callback assigned, deleted or replaced the text of. */
+  private readonly writtenKeys = new WeakMap<object, Set<string | number>>();
+  /** Lists whose elements this callback moved (splice, sort, ...). */
+  private readonly reorderedLists = new WeakSet<object>();
 
   constructor(
     private readonly base: object,
@@ -64,6 +76,7 @@ export class ChangeDocDraft {
   getRoot<T>(): T {
     if (!this.root) {
       this.root = this.shallowCopy(this.base);
+      this.basePaths.set(this.root, []);
     }
     return this.proxyFor(this.root) as T;
   }
@@ -91,6 +104,7 @@ export class ChangeDocDraft {
     }
     this.ops.push({ kind: "text", path: [...path], value });
     (node as any)[key] = value;
+    this.markWritten(node, key);
   }
 
   /**
@@ -108,8 +122,51 @@ export class ChangeDocDraft {
     }
     const key = path[path.length - 1];
     const current = (node as any)[key];
-    if (typeof current === "number") (node as any)[key] = current + delta;
-    else if (current === undefined || current === null) (node as any)[key] = delta;
+    if (this.hooks.scalarKind(current) === "counter") {
+      (node as any)[key] = this.hooks.makeCounter((this.hooks.readScalar(current) as number) + delta);
+    } else if (this.isTypedValue(current, "counter")) {
+      (node as any)[key] = { ...(current as object), value: (current as { value: number }).value + delta };
+    } else if (current === undefined || current === null) {
+      (node as any)[key] = this.hooks.makeCounter(delta);
+    }
+  }
+
+  /**
+   * The type of the value at `path` as this callback sees it, including its
+   * own edits so far; undefined when nothing is there.
+   */
+  getFieldType(path: DraftPath): MindooFieldType | undefined {
+    this.getRoot();
+    if (path.length === 0) return "map";
+    let node = this.root as Node;
+    for (const segment of path.slice(0, -1)) {
+      if (!this.isContainer((node as any)[segment]) || this.isTypedValue((node as any)[segment])) return undefined;
+      node = this.childNode(node, segment);
+    }
+    const key = path[path.length - 1];
+    if (!Object.prototype.hasOwnProperty.call(node, key)) return undefined;
+    const value = (node as any)[key];
+    if (typeof value === "string") {
+      const basePath = this.basePaths.get(node);
+      const unchanged =
+        basePath !== undefined &&
+        !this.writtenKeys.get(node)?.has(key) &&
+        !(Array.isArray(node) && this.reorderedLists.has(node));
+      return unchanged && this.hooks.isRichTextInBase([...basePath, key]) ? "richText" : "text";
+    }
+    return fieldTypeOf(value, this.hooks);
+  }
+
+  private markWritten(node: Node, key: string | number): void {
+    let keys = this.writtenKeys.get(node);
+    if (!keys) this.writtenKeys.set(node, (keys = new Set()));
+    keys.add(key);
+  }
+
+  private isTypedValue(value: unknown, kind?: string): boolean {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const tag = (value as Record<string, unknown>).$mindoo;
+    return typeof tag === "string" && (kind === undefined || tag === kind);
   }
 
   // ---- reading -------------------------------------------------------------
@@ -120,17 +177,21 @@ export class ChangeDocDraft {
       typeof value === "object" &&
       !(value instanceof Date) &&
       !(value instanceof Uint8Array) &&
-      !this.hooks.isScalarObject(value)
+      this.hooks.scalarKind(value) === null
     );
   }
 
+  /** Copies one level of a base node; CRDT scalars stay as they are so their type is known. */
   private shallowCopy(base: object): Node {
-    const read = (value: unknown) => (this.hooks.isScalarObject(value) ? this.hooks.readScalar(value) : value);
     const copy: Node = Array.isArray(base)
-      ? Array.from(base as unknown[], read)
-      : Object.fromEntries(Object.keys(base).map((key) => [key, read((base as Record<string, unknown>)[key])]));
+      ? Array.from(base as unknown[])
+      : Object.fromEntries(Object.keys(base).map((key) => [key, (base as Record<string, unknown>)[key]]));
     this.shadowNodes.add(copy);
     return copy;
+  }
+
+  private readValue(value: unknown): unknown {
+    return this.hooks.scalarKind(value) !== null ? this.hooks.readScalar(value) : value;
   }
 
   /** The shadow node held at `node[key]`, copying it from the base on first access. */
@@ -140,6 +201,11 @@ export class ChangeDocDraft {
     const copy = this.shallowCopy(value);
     (node as any)[key] = copy;
     this.parents.set(copy, { parent: node, key });
+    // Map keys stay put; list indices only while the list keeps its order.
+    const parentBase = this.basePaths.get(node);
+    if (parentBase && !(Array.isArray(node) && this.reorderedLists.has(node))) {
+      this.basePaths.set(copy, [...parentBase, key]);
+    }
     return copy;
   }
 
@@ -180,7 +246,7 @@ export class ChangeDocDraft {
     const key = Array.isArray(node) ? Number(prop) : prop;
     const value = (node as any)[prop];
     if (this.isContainer(value)) return this.proxyFor(this.childNode(node, key));
-    return value;
+    return this.readValue(value);
   }
 
   // ---- writing -------------------------------------------------------------
@@ -208,25 +274,26 @@ export class ChangeDocDraft {
     return path;
   }
 
-  /** A plain deep copy of a value the callback assigns; proxies of this draft are unwrapped. */
-  private cloneIn(value: unknown, depth = 0): unknown {
+  /**
+   * A plain deep copy of a value the callback assigns; proxies of this draft
+   * are unwrapped. CRDT scalars copied out of the document become the plain
+   * values a read returns (like assigning what `getData()` gave you); CRDT
+   * objects the caller created on purpose are kept for hydration.
+   */
+  private cloneIn(value: unknown, depth = 0, fromDraft = false): unknown {
     if (depth > MAX_DEPTH) throw new Error("Document value is nested too deeply");
     if (value === null || typeof value !== "object") return value;
     const node = this.proxyNodes.get(value as object);
     if (node) value = node;
+    if (node || this.shadowNodes.has(value as object)) fromDraft = true;
     if (value instanceof Date) return new Date(value.getTime());
     if (value instanceof Uint8Array) return value.slice();
-    if (this.hooks.isScalarObject(value)) {
-      // Leaves read from the base document copy as plain values; CRDT objects
-      // the caller created on purpose are kept for hydration.
-      return this.shadowNodes.has(value as object) ? this.hooks.readScalar(value) : value;
-    }
-    if (Array.isArray(value)) return Array.from(value, (entry) => this.cloneIn(entry, depth + 1));
-    if (!this.isContainer(value)) return value;
+    if (this.hooks.scalarKind(value) !== null) return fromDraft ? this.hooks.readScalar(value) : value;
+    if (Array.isArray(value)) return Array.from(value, (entry) => this.cloneIn(entry, depth + 1, fromDraft));
     const result: Record<string, unknown> = {};
-    for (const key of Object.keys(value)) {
+    for (const key of Object.keys(value as object)) {
       const entry = (value as Record<string, unknown>)[key];
-      if (entry !== undefined) result[key] = this.cloneIn(entry, depth + 1);
+      if (entry !== undefined) result[key] = this.cloneIn(entry, depth + 1, fromDraft);
     }
     return result;
   }
@@ -255,6 +322,7 @@ export class ChangeDocDraft {
     const clone = this.cloneIn(value);
     this.ops.push({ kind: "set", path, value: clone });
     (node as any)[prop] = this.adopt(node, prop, this.cloneIn(clone));
+    this.markWritten(node, prop);
   }
 
   private setListProperty(list: unknown[], prop: string, value: unknown): void {
@@ -281,6 +349,7 @@ export class ChangeDocDraft {
     const clone = this.cloneIn(value);
     this.ops.push({ kind: "set", path, value: clone });
     list[index] = this.adopt(list, index, this.cloneIn(clone));
+    this.markWritten(list, index);
   }
 
   private deleteProperty(node: Node, prop: string | symbol): void {
@@ -293,6 +362,7 @@ export class ChangeDocDraft {
     const path = [...this.pathOf(node), prop];
     this.ops.push({ kind: "delete", path });
     delete (node as any)[prop];
+    this.markWritten(node, prop);
   }
 
   private splice(list: unknown[], index: number, deleteCount: number, items: unknown[]): unknown[] {
@@ -305,7 +375,8 @@ export class ChangeDocDraft {
     const placed = clones.map((clone) => this.cloneIn(clone));
     const removed = list.splice(index, deleteCount, ...placed);
     placed.forEach((item, offset) => this.adopt(list, index + offset, item));
-    return removed.map((entry) => (this.isContainer(entry) ? this.cloneIn(entry) : entry));
+    this.reorderedLists.add(list);
+    return removed.map((entry) => this.cloneIn(entry, 0, true));
   }
 
   private listMethod(list: unknown[], method: string, args: unknown[]): unknown {
@@ -348,11 +419,12 @@ export class ChangeDocDraft {
           for (let index = start; index < end; index++) list[index] = this.cloneIn(value);
         } else if (method === "sort") {
           const compare = args[0] as ((a: unknown, b: unknown) => number) | undefined;
-          const read = (entry: unknown) => (this.isContainer(entry) ? this.proxyFor(entry as Node) : entry);
+          const read = (entry: unknown) => (this.isContainer(entry) ? this.proxyFor(entry as Node) : this.readValue(entry));
           list.sort(compare ? (a, b) => compare(read(a), read(b)) : undefined);
         } else {
           (Array.prototype as any)[method].apply(list, args);
         }
+        this.reorderedLists.add(list);
         const path = this.pathOf(list);
         const seen = new Set<unknown>();
         list.forEach((entry, index) => {
@@ -367,6 +439,28 @@ export class ChangeDocDraft {
       }
     }
   }
+}
+
+/**
+ * The type of a non-string value: a plain one, a CRDT scalar, or a `MindooValue`
+ * tag that this callback assigned and that is not hydrated yet.
+ */
+export function fieldTypeOf(
+  value: unknown,
+  hooks: Pick<ChangeDocDraftHooks, "scalarKind">,
+): MindooFieldType {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") return "text";
+  if (typeof value === "number" || typeof value === "bigint") return "number";
+  if (typeof value === "boolean") return "boolean";
+  if (value instanceof Date) return "timestamp";
+  if (value instanceof Uint8Array) return "bytes";
+  const kind = hooks.scalarKind(value);
+  if (kind) return kind;
+  if (Array.isArray(value)) return "list";
+  const tag = (value as Record<string, unknown>).$mindoo;
+  if (tag === "atomic" || tag === "counter" || tag === "timestamp") return tag;
+  return "map";
 }
 
 /**

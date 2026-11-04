@@ -2,7 +2,7 @@
 // React Native: native Rust (react-native-automerge-generated)
 // Browser/Node.js: WASM (@automerge/automerge/slim)
 import { Automerge } from "./automerge-adapter";
-import { ChangeDocDraft, diffTextSplice, type DraftOp } from "./ChangeDocDraft";
+import { ChangeDocDraft, diffTextSplice, fieldTypeOf, type DraftOp } from "./ChangeDocDraft";
 import {
   MINDOO_VALUE_TAG,
   assertCounterAmount,
@@ -58,6 +58,7 @@ import {
   ConflictScanCheckpoint,
   MindooDoc,
   MindooDocPayload,
+  MindooFieldType,
   StoreEntry,
   StoreEntryMetadata,
   StoreEntryAttachmentRef,
@@ -11329,8 +11330,10 @@ export class BaseMindooDB implements MindooDB {
     // getData() edits a lazily built shadow copy and logs every edit, at any
     // depth, for replay inside Automerge.change() below.
     const draft = new ChangeDocDraft(internalDoc.doc as object, {
-      isScalarObject: (value) => db.isAutomergeCounter(value) || db.isAutomergeImmutableString(value),
+      scalarKind: (value) => db.automergeScalarKind(value),
       readScalar: (value) => db.readAutomergeScalar(value),
+      makeCounter: (value) => new Automerge.Counter(value),
+      isRichTextInBase: (path) => db.isRichTextAt(internalDoc.doc, path),
       assertActive: throwIfCallbackInactive,
     });
 
@@ -11565,8 +11568,18 @@ export class BaseMindooDB implements MindooDB {
       updateText: (path: string | Array<string | number>, value: string) => {
         const segments = typeof path === "string" ? [path] : [...path];
         db.validateJsonPath(segments, "updateText");
-        db.assertNotRichText(internalDoc.doc, segments);
+        if (draft.getFieldType(segments) === "richText") {
+          throw new Error(
+            `updateText: '${segments.map(String).join(".")}' is rich text (marks or blocks); use applyRichTextPatch() or applyRichTextStepsPatch()`,
+          );
+        }
         draft.updateText(segments, value);
+      },
+
+      getFieldType: (path: string | Array<string | number>) => {
+        const segments = typeof path === "string" ? [path] : [...path];
+        db.validateJsonPath(segments, "getFieldType");
+        return draft.getFieldType(segments);
       },
 
       incrementCounter: (
@@ -11795,25 +11808,55 @@ export class BaseMindooDB implements MindooDB {
     );
   }
 
-  /**
-   * updateText() diffs plain characters and knows nothing of marks and block
-   * markers, so it refuses text that carries either; rich text goes through
-   * applyRichTextPatch() / applyRichTextStepsPatch().
-   */
-  private assertNotRichText(automergeDoc: unknown, path: Array<string | number>): void {
-    if (typeof this.readValueAtPath(automergeDoc as MindooDocPayload, path) !== "string") return;
+  /** "counter" / "atomic" for the CRDT scalars that read as plain values, otherwise null. */
+  private automergeScalarKind(value: unknown): "counter" | "atomic" | null {
+    if (this.isAutomergeCounter(value)) return "counter";
+    if (this.isAutomergeImmutableString(value)) return "atomic";
+    return null;
+  }
+
+  /** Whether the text at `path` carries marks or block markers (rich text). */
+  private isRichTextAt(automergeDoc: unknown, path: Array<string | number>): boolean {
+    if (typeof this.readValueAtPath(automergeDoc as MindooDocPayload, path) !== "string") return false;
     const spans = (Automerge as any).spans(
       automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
       path as AutomergeTypes.Prop[],
     ) as Array<{ type: string; marks?: Record<string, unknown> }>;
-    const rich = spans.some(
+    return spans.some(
       (span) => span.type === "block" || (span.marks !== undefined && Object.keys(span.marks).length > 0),
     );
-    if (rich) {
-      throw new Error(
-        `updateText: '${path.map(String).join(".")}' is rich text (marks or blocks); use applyRichTextPatch() or applyRichTextStepsPatch()`,
-      );
+  }
+
+  private fieldTypeAt(automergeDoc: unknown, path: Array<string | number>): MindooFieldType | undefined {
+    if (path.length === 0) return "map";
+    let parent: any = automergeDoc;
+    for (const segment of path.slice(0, -1)) {
+      parent = parent?.[segment];
+      if (parent === null || typeof parent !== "object" || this.automergeScalarKind(parent) !== null) return undefined;
     }
+    const key = path[path.length - 1];
+    if (!Object.prototype.hasOwnProperty.call(parent, key)) return undefined;
+    const value = parent[key];
+    if (typeof value === "string") return this.isRichTextAt(automergeDoc, path) ? "richText" : "text";
+    return fieldTypeOf(value, { scalarKind: (v) => this.automergeScalarKind(v) });
+  }
+
+  async getFieldType(
+    doc: MindooDoc,
+    path: string | Array<string | number>,
+  ): Promise<MindooFieldType | undefined> {
+    const segments = typeof path === "string" ? [path] : [...path];
+    this.validateJsonPath(segments, "getFieldType");
+    const docId = doc.getId();
+    let internalDoc = this.wrappedInternalDocs.get(doc) ?? this.getCachedDocument(docId);
+    if (!internalDoc) {
+      const loadedDoc = await this.loadDocumentInternal(docId);
+      if (!loadedDoc) {
+        throw new DocumentNotFoundError(docId);
+      }
+      internalDoc = loadedDoc;
+    }
+    return this.fieldTypeAt(internalDoc.doc, segments);
   }
 
   /** Replays the edits a changeDoc() callback made through getData(), see ChangeDocDraft. */
@@ -16928,6 +16971,12 @@ export class BaseMindooDB implements MindooDB {
         throw new Error(
           "setAttachmentExtractedText() can only be called within changeDoc() callback",
         );
+      },
+
+      getFieldType: (path: string | Array<string | number>) => {
+        const segments = typeof path === "string" ? [path] : [...path];
+        this.validateJsonPath(segments, "getFieldType");
+        return this.fieldTypeAt(internalDoc.doc, segments);
       },
 
       updateText: () => {

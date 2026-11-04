@@ -240,6 +240,69 @@ describe("changeDoc: nested edits", () => {
     expect((await read(db, id)).plain).toBe("Hallo Welt");
   });
 
+  test("getFieldType tells the stored types apart, also inside changeDoc", async () => {
+    const id = await seed({
+      title: "Plan",
+      status: MindooValue.atomic("open"),
+      votes: MindooValue.counter(1),
+      due: MindooValue.timestamp("2027-01-15T00:00:00Z"),
+      amount: 12.5,
+      done: false,
+      none: null,
+      blob: new Uint8Array([1, 2]),
+      tags: ["a"],
+      meta: { owner: "Jane" },
+    });
+    await db.applyRichTextPatch(await db.getDocument(id), {
+      path: ["meta", "content"],
+      spans: [{ type: "block", value: { type: "p" } }, { type: "text", value: "Hallo" }],
+    });
+    const doc = await db.getDocument(id);
+    const expected = {
+      title: "text",
+      status: "atomic",
+      votes: "counter",
+      due: "timestamp",
+      amount: "number",
+      done: "boolean",
+      none: "null",
+      blob: "bytes",
+      tags: "list",
+      meta: "map",
+    } as const;
+    for (const [field, type] of Object.entries(expected)) {
+      expect([field, doc.getFieldType(field)]).toEqual([field, type]);
+    }
+    expect(doc.getFieldType(["meta", "content"])).toBe("richText");
+    expect(doc.getFieldType(["tags", 0])).toBe("text");
+    expect(doc.getFieldType("missing")).toBeUndefined();
+    expect(doc.getFieldType(["title", "x"])).toBeUndefined();
+    expect(await db.getFieldType(doc, ["meta", "owner"])).toBe("text");
+
+    await db.changeDoc(doc, (d) => {
+      const data = d.getData() as any;
+      expect(d.getFieldType(["meta", "content"])).toBe("richText");
+      expect(d.getFieldType("votes")).toBe("counter");
+      d.incrementCounter("votes", 1);
+      expect(d.getFieldType("votes")).toBe("counter");
+      data.status = "closed"; // plain assignment: now text
+      expect(d.getFieldType("status")).toBe("text");
+      data.kind = MindooValue.atomic("task");
+      expect(d.getFieldType("kind")).toBe("atomic");
+      data.meta.content = "plain now";
+      expect(d.getFieldType(["meta", "content"])).toBe("text");
+      data.tags.push({ n: 1 });
+      expect(d.getFieldType(["tags", 1])).toBe("map");
+      delete data.amount;
+      expect(d.getFieldType("amount")).toBeUndefined();
+    });
+    const after = await db.getDocument(id);
+    expect(after.getFieldType("status")).toBe("text");
+    expect(after.getFieldType("kind")).toBe("atomic");
+    expect(after.getFieldType("votes")).toBe("counter");
+    expect((await read(db, id)).votes).toBe(2);
+  });
+
   test("diffTextSplice", () => {
     expect(diffTextSplice("Projektplan", "Neuer Projektplan")).toEqual({ index: 0, deleteCount: 0, insert: "Neuer " });
     expect(diffTextSplice("Projektplan", "Projektplan 2027")).toEqual({ index: 11, deleteCount: 0, insert: " 2027" });
