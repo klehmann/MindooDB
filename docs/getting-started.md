@@ -135,15 +135,17 @@ await db.pushChangesTo(remote);
 
 Every document change is automatically signed with the user's Ed25519 key and encrypted with the tenant's default encryption key (AES-256-GCM) before it is stored. When you push to the server, only the encrypted entries travel over the wire.
 
-> **Change granularity:** Inside a `changeDoc()` callback, assigning a top-level field (e.g. `d.getData().title = "..."` or replacing a whole array/object) records the replacement of that entire value in the change history. For small values this is fine, but repeatedly rewriting large fields (long strings, big arrays) produces large change entries and grows the document history quickly. For fine-grained edits, use the dedicated patch APIs instead: `db.applyTextPatch()` for character-level text edits and `db.applyJsonPatch()` for granular object/list operations at specific paths. These record only the actual delta and merge cleanly with concurrent edits.
+> **Change granularity:** Inside a `changeDoc()` callback you edit `d.getData()` like a plain object, at any depth: `d.getData().meta.owner = "Jane"`, `d.getData().tags.push("urgent")`, `d.getData().rows.splice(2, 1)`. MindooDB records each edit as the matching granular operation, so list methods become list inserts and deletes that record only the delta and merge cleanly with concurrent edits. For text, `d.updateText("body", newBody)` stores just the changed part as a text splice. A plain assignment (`d.getData().title = "..."`, `d.getData().tags = [...]`) still replaces the entire value. `db.applyTextPatch()` and `db.applyJsonPatch()` remain available for edits that arrive as operations, e.g. from an editor.
 
-> **Typed values:** Strings you write are collaborative text (concurrent edits merge character by character) and numbers are last-writer-wins. For values that need other semantics, write a typed value from `MindooValue` (exported by `mindoodb`) wherever you write a value: in `createDocument({ initialValues })`, in `changeDoc()` assignments, and in `applyJsonPatch()` `set` / `listInsert` values, also nested inside objects.
+> **Typed values:** Strings you write are collaborative text (edits through `d.updateText()` or `textSplice` merge character by character; a plain assignment replaces the value) and numbers are last-writer-wins. For values that need other semantics, write a typed value from `MindooValue` (exported by `mindoodb`) wherever you write a value: in `createDocument({ initialValues })`, in `changeDoc()` assignments, and in `applyJsonPatch()` `set` / `listInsert` values, also nested inside objects.
 >
 > - `MindooValue.atomic("open")` for ids, status values, URLs and hashes: replaced as a whole, never mixed. Reads back as a string.
 > - `MindooValue.counter(0)` for votes, likes or stock levels: concurrent increments are summed. Change it with `d.incrementCounter(["stats", "views"], 1)` inside `changeDoc()` or `applyJsonPatch(doc, { counterIncrement: [{ path: ["stats", "views"], delta: 1 }] })`. Reads back as a number.
 > - `MindooValue.timestamp(new Date())` for dates. Reads back as a `Date`.
 >
-> Reads return plain values, so write the typed value again when you change such a field.
+> Reads return plain values, so write the typed value again when you change such a field. `doc.getFieldType("status")` tells you how a field is stored (`"text"`, `"richText"`, `"atomic"`, `"counter"`, `"timestamp"`, ...).
+>
+> More examples for every field type, rich text and how concurrent edits merge: [Reading and Writing Documents](./reading-and-writing.md).
 >
 > **Text cursors:** To anchor comments or highlights in a text field, create stable cursors with `db.getTextCursors(doc, ["body"], [120, 134])` (a cursor names the character at its index, so anchor a range on its first and last character and add 1 to the resolved end), store them as `MindooValue.atomic(cursor)`, and turn them back into positions with `db.resolveTextCursors(doc, ["body"], cursors)`. Cursors keep pointing at the same characters while others edit the text.
 

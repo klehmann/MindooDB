@@ -486,13 +486,23 @@ Mutate exactly what changed inside `changeDoc`:
 
 ```typescript
 await db.changeDoc(doc, (d) => {
-  d.getData().status = "approved";   // one field
+  const data = d.getData();
+  data.status = "approved";          // one field
+  data.reviewers.push("cn=jane");    // a list insert, not a new list
+  data.meta.reviewedBy = "cn=jane";  // a nested field
+  d.updateText("notes", newNotes);   // only the changed part of the text
 });
 ```
 
-For text, use the granular text APIs so concurrent typing merges character by
-character. For lists, use list insert/delete operations so concurrent inserts
-interleave instead of one overwriting the other. Apps built on the App SDK get
+Edits inside `changeDoc` are recorded at the depth they happen: list methods
+(`push`, `splice`, ...) become list inserts/deletes, so concurrent inserts
+interleave instead of one overwriting the other. `d.updateText(path, value)`
+stores only the changed part of a text, so it merges with concurrent typing.
+A plain assignment replaces the whole value (`data.reviewers = [...]`,
+`data.notes = "..."`) and does not merge. [Reading and Writing
+Documents](./reading-and-writing.md) has examples for every field type. For edits that already arrive as operations
+(an editor's keystrokes, a sync protocol), use the granular text and JSON patch
+APIs directly. Apps built on the App SDK get
 the same guarantees through its patch flavors (field set/unset, granular JSON
 patches, text patches, rich-text patches), each carrying the `baseHeads` the app
 composed against.
@@ -699,10 +709,12 @@ Every value you write has merge semantics, whether you chose them or not. JSON
 gives you one kind of string and one kind of number, and their defaults are
 right for some fields and wrong for others:
 
-- A **plain string** is collaborative text. Concurrent edits are merged
+- A **plain string** is collaborative text. Concurrent text edits
+  (`updateText()`, `textSplice`, editor and App SDK text patches) are merged
   character by character. That is right for titles, notes and bodies. For a
   `status` that one user changes from `"open"` to `"closed"` while another
-  changes it to `"blocked"`, it can produce a mix of both words.
+  changes it to `"blocked"` through a text edit, it can produce a mix of both
+  words.
 - A **plain number** is last-writer-wins. Two users who both read `votes: 4`
   and save `5` lose a vote.
 - An **ISO date written as a string** is text, not a date.
@@ -716,9 +728,9 @@ value is written: `createDocument({ initialValues })` / `documents.create({ set
 
 | Field holds | Write it as | Merges | Reads back as |
 |---|---|---|---|
-| Prose: titles, notes, bodies | plain string | character by character | string |
+| Prose: titles, notes, bodies | plain string, changed with `updateText()` / `textSplice` | character by character | string |
 | Ids, status and enum values, URLs, hashes, stored cursors | `MindooValue.atomic("open")` | whole value, one concurrent write wins | string |
-| Tallies several people change: votes, likes, stock, seats | `MindooValue.counter(0)`, then `counterIncrement` | concurrent increments are summed | number |
+| Tallies several people change: votes, likes, stock, seats | `MindooValue.counter(0)`, then `incrementCounter()` / `counterIncrement` | concurrent increments are summed | number |
 | Dates and times | `MindooValue.timestamp(date)` | whole value | `Date` from `getData()`, ISO 8601 string through the App SDK |
 | Settings, flags, other numbers | plain value | last writer wins | as written |
 
