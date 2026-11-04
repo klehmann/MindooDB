@@ -160,11 +160,13 @@ await db.applyRichTextStepsPatch(doc, {
 
 ```javascript
 await db.changeDoc(doc, (d) => {
-  d.incrementCounter("votes", 1);                // +1
-  d.incrementCounter(["rows", 1, "amount"], -5); // nested, also in lists
+  d.incrementCounter("votes", 1);                // votes + 1
+  d.incrementCounter(["rows", 1, "amount"], -5); // rows[1].amount - 5
   d.getData().votes;                             // already the new value
 });
 ```
+
+The path is the list of keys from the document root: `["rows", 1, "amount"]` is the field `amount` of the second element (index 1) of the list `rows`, i.e. `data.rows[1].amount`. In the document created above that is the counter of the row `r2`. A single string (`"votes"`) is a top-level field.
 
 Two devices that each add 1 to `votes: 3` give `5` after syncing. Never write `data.votes = data.votes + 1`: that replaces the counter with a plain number, and concurrent updates are lost. A missing field is created as a counter by the first increment; incrementing a plain number throws.
 
