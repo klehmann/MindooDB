@@ -140,7 +140,7 @@ Every document change is automatically signed with the user's Ed25519 key and en
 > **Typed values:** Strings you write are collaborative text (edits through `d.updateText()` or `textSplice` merge character by character; a plain assignment replaces the value) and numbers are last-writer-wins. For values that need other semantics, write a typed value from `MindooValue` (exported by `mindoodb`) wherever you write a value: in `createDocument({ initialValues })`, in `changeDoc()` assignments, and in `applyJsonPatch()` `set` / `listInsert` values, also nested inside objects.
 >
 > - `MindooValue.atomic("open")` for ids, status values, URLs and hashes: replaced as a whole, never mixed. Reads back as a string.
-> - `MindooValue.counter(0)` for votes, likes or stock levels: concurrent increments are summed. Change it with `d.incrementCounter(["stats", "views"], 1)` inside `changeDoc()` or `applyJsonPatch(doc, { counterIncrement: [{ path: ["stats", "views"], delta: 1 }] })`. Reads back as a number.
+> - `MindooValue.counter(0)` for votes, likes or stock levels: concurrent increments are summed. Change it with `d.incrementCounter(["stats", "views"], 1)` (adds 1 to `data.stats.views`) inside `changeDoc()` or `applyJsonPatch(doc, { counterIncrement: [{ path: ["stats", "views"], delta: 1 }] })`. Reads back as a number.
 > - `MindooValue.timestamp(new Date())` for dates. Reads back as a `Date`.
 >
 > Reads return plain values, so write the typed value again when you change such a field. `doc.getFieldType("status")` tells you how a field is stored (`"text"`, `"richText"`, `"atomic"`, `"counter"`, `"timestamp"`, ...).
