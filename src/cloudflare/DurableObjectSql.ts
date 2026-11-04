@@ -175,6 +175,11 @@ export class DurableObjectServerDataStore implements ServerDataStore {
   }
 
   writeBytes(key: string, value: Uint8Array): void {
+    if (value.byteLength > MAX_DURABLE_OBJECT_ENTRY_BYTES) {
+      throw new Error(
+        `Server state "${key}" is ${value.byteLength} bytes; Durable Object storage holds at most 2 MB per value`,
+      );
+    }
     this.sql.exec(
       "INSERT INTO mindoo_server_kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       DurableObjectServerDataStore.normalize(key),

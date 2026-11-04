@@ -87,6 +87,15 @@ export interface PeerIrohLink {
   close(): Promise<void>;
 }
 
+export interface PeerTransferLimits {
+  /** Batches transferred in parallel per store pair. */
+  maxConcurrentBatches?: number;
+  /** Entries per batch for document stores. */
+  docsBatchSize?: number;
+  /** Entries per batch for attachment stores (chunks of up to 256 KB each). */
+  attachmentsBatchSize?: number;
+}
+
 /** What a replicator needs from the surrounding server to do its job. */
 export interface PeerReplicatorHost {
   cryptoAdapter: CryptoAdapter;
@@ -122,6 +131,12 @@ export interface PeerReplicatorHost {
    */
   liveEventStream?: boolean;
   /**
+   * Bounds on what one transfer holds in memory, for hosts with a small heap
+   * (Cloudflare: 128 MB per isolate). Default: the sync defaults (up to 250
+   * entries per batch, 3 batches in parallel).
+   */
+  transferLimits?: PeerTransferLimits;
+  /**
    * Documents purged from a database on this server (the purge registry).
    * Entries of these documents are refused when pulled from the peer, the
    * same way the server refuses them on a push (docs/accesscontrol.md §13).
@@ -139,6 +154,12 @@ export interface PeerReplicatorHost {
 export interface PeerSyncScope {
   tenantId?: string;
   dbId?: string;
+  /**
+   * Stop starting new store pairs after this time (epoch ms), for hosts that
+   * limit how long one invocation may run. The next run resumes with the
+   * tenant this one did not finish.
+   */
+  deadline?: number;
 }
 
 export interface PeerSyncRunResult {
@@ -151,6 +172,8 @@ export interface PeerSyncRunResult {
   /** Pairs whose cursor is clamped waiting for trust to replicate (invariant 2). */
   held: number;
   errors: string[];
+  /** The deadline ended the run before every store pair was mirrored. */
+  deferred?: boolean;
 }
 
 /** Token lifetime is an hour on the server; refresh well before that. */
@@ -193,6 +216,8 @@ export class PeerReplicator {
   private tokenPromise: Promise<string> | null = null;
 
   private intersection: string[] = [];
+  /** Tenant a run that hit its deadline did not finish; the next run starts there. */
+  private resumeTenantId: string | null = null;
   private intersectionAt: string | null = null;
   private tenants = new Map<string, TenantRuntime>();
   private transferredEntries = 0;
@@ -633,11 +658,21 @@ export class PeerReplicator {
       });
     }
 
-    const tenantIds = scope?.tenantId
+    let tenantIds = scope?.tenantId
       ? this.intersection.filter((id) => id === scope.tenantId)
       : this.intersection;
+    const resumeAt = this.resumeTenantId ? tenantIds.indexOf(this.resumeTenantId) : -1;
+    if (resumeAt > 0) {
+      tenantIds = [...tenantIds.slice(resumeAt), ...tenantIds.slice(0, resumeAt)];
+    }
+    const pastDeadline = () => scope?.deadline !== undefined && Date.now() >= scope.deadline;
 
     for (const tenantId of tenantIds) {
+      if (pastDeadline()) {
+        result.deferred = true;
+        this.resumeTenantId = tenantId;
+        break;
+      }
       const runtime = this.tenants.get(tenantId);
       if (!runtime) continue;
       runtime.rejectedEntries = 0;
@@ -652,6 +687,10 @@ export class PeerReplicator {
         result.tenants += 1;
 
         for (const [dbId, storeKind] of this.mirrorPlan(databases)) {
+          if (pastDeadline()) {
+            result.deferred = true;
+            break;
+          }
           if (storeKind === StoreKind.docs) result.databases += 1;
           const pair = await this.syncStorePair(tenantId, dbId, storeKind);
           result.pushed += pair.pushed;
@@ -674,6 +713,10 @@ export class PeerReplicator {
             this.lastErrorAt = new Date().toISOString();
           }
         }
+        if (result.deferred) {
+          this.resumeTenantId = tenantId;
+          break;
+        }
         runtime.lastSyncAt = new Date().toISOString();
       } catch (error) {
         const message = errorMessage(error);
@@ -683,6 +726,9 @@ export class PeerReplicator {
       }
     }
 
+    if (!result.deferred && !scope?.tenantId) {
+      this.resumeTenantId = null;
+    }
     this.lastSyncAt = new Date().toISOString();
     // A held pair is not a clean run: the backoff has to stay visible until the
     // entries actually land, or the status flips to healthy while the mirror is
@@ -858,10 +904,20 @@ export class PeerReplicator {
     deniedReason?: string;
   }> {
     try {
+      const limits = this.host.transferLimits;
       const result = await syncEntriesBetweenStores(source, target, undefined, {
         logger: this.logger,
         cursors: this.cursorStore(),
         rejectionPolicy: "hold",
+        ...(limits?.maxConcurrentBatches ? { maxConcurrentBatches: limits.maxConcurrentBatches } : {}),
+        ...(limits
+          ? {
+              transferBatchSize:
+                source.getStoreKind() === StoreKind.attachments
+                  ? limits.attachmentsBatchSize
+                  : limits.docsBatchSize,
+            }
+          : {}),
       });
       // Entries the cursor moved past will not be offered again — either
       // because the refusal can never pass, or because it was supposed to and

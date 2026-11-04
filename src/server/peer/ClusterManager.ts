@@ -16,7 +16,13 @@ import type { IrohStreamIO } from "../../core/appendonlystores/network/IrohStrea
 import type { TrustedServer } from "../types";
 import type { SyncEventBus } from "../SyncEventBus";
 import { PeerAuthService } from "./PeerAuthService";
-import { PeerReplicator, rollUpHealth, type PeerIrohLink, type PeerSyncScope } from "./PeerReplicator";
+import {
+  PeerReplicator,
+  rollUpHealth,
+  type PeerIrohLink,
+  type PeerSyncScope,
+  type PeerTransferLimits,
+} from "./PeerReplicator";
 import { ClusterJobRunner } from "./ClusterJobRunner";
 import { ClusterAuditLog, type ClusterAuditStorage } from "./ClusterAuditLog";
 import {
@@ -66,6 +72,8 @@ export interface ClusterManagerDeps {
   openIrohLink?: (io: IrohStreamIO, ticket: string) => PeerIrohLink;
   /** See {@link PeerReplicatorHost.liveEventStream}. */
   liveEventStream?: boolean;
+  /** See {@link PeerReplicatorHost.transferLimits}. */
+  transferLimits?: PeerTransferLimits;
   /**
    * HMAC secret of peer tokens. Defaults to a random one per process; a host
    * that validates peer tokens in several places passes a shared secret.
@@ -159,6 +167,7 @@ export class ClusterManager {
         getIrohStreamIO: this.deps.getIrohStreamIO,
         openIrohLink: this.deps.openIrohLink,
         liveEventStream: this.deps.liveEventStream,
+        transferLimits: this.deps.transferLimits,
         getPurgedDocIds: this.deps.getPurgedDocIds?.bind(this.deps),
         onDirectoryPulled: this.deps.onDirectoryPulled?.bind(this.deps),
         logger: this.logger,
@@ -200,12 +209,13 @@ export class ClusterManager {
    * One replication pass with every peer, resolved when all are done. For
    * hosts that drive replication from a schedule rather than from timers.
    */
-  async syncAll(): Promise<void> {
-    await Promise.all(
+  async syncAll(options: { deadline?: number } = {}): Promise<{ deferred: boolean }> {
+    const runs = await Promise.all(
       [...this.replicators.values()].map((replicator) =>
-        replicator.syncNow().catch(() => undefined),
+        replicator.syncNow({ deadline: options.deadline }).catch(() => null),
       ),
     );
+    return { deferred: runs.some((run) => run?.deferred === true) };
   }
 
   /** Push a local change to every peer that takes it; see {@link PeerReplicator.replicateLocalChange}. */

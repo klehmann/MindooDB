@@ -129,6 +129,51 @@ describe("Durable Object SQL adapters", () => {
     expect(await store.getAllIds()).toEqual(["small"]);
   });
 
+  test("a batch interrupted by external storage leaves no entry without content", async () => {
+    const sql = sqlStorage();
+    const objects = new Map<string, Uint8Array>();
+    let failNextPut = false;
+    const external = {
+      thresholdBytes: 4,
+      put: async (hash: string, bytes: Uint8Array) => {
+        if (failNextPut) {
+          failNextPut = false;
+          throw new Error("R2 unavailable");
+        }
+        objects.set(hash, bytes);
+      },
+      get: async (hash: string) => objects.get(hash) ?? null,
+      delete: async (hash: string) => {
+        objects.delete(hash);
+      },
+    };
+    const store = createDurableObjectStore(sql, "notes", StoreKind.docs, "d_", external);
+    await store.putEntries([entry("a", "doc-a", [1, 2, 3, 4, 5])]);
+
+    // The second large payload of the batch fails to upload.
+    const batch = [entry("b", "doc-b", [6, 7, 8, 9, 10]), entry("c", "doc-c", [11, 12, 13, 14, 15])];
+    const originalPut = external.put;
+    let uploads = 0;
+    external.put = async (hash, bytes) => {
+      uploads += 1;
+      if (uploads === 2) failNextPut = true;
+      return originalPut(hash, bytes);
+    };
+    await expect(store.putEntries(batch)).rejects.toThrow("R2 unavailable");
+
+    // Whatever the store reports as present can be read back.
+    const present = await store.hasEntries(["a", "b", "c"]);
+    expect((await store.getEntries(present)).map((e) => e.id).sort()).toEqual([...present].sort());
+    expect(present).not.toContain("c");
+
+    // A retry completes the batch with distinct receipt orders.
+    external.put = originalPut;
+    await store.putEntries(batch);
+    const metadata = await Promise.all(["a", "b", "c"].map((id) => store.getEntryMetadata(id)));
+    const orders = metadata.map((m) => m!.receiptOrder);
+    expect(new Set(orders).size).toBe(3);
+  });
+
   test("batches above the bound-parameter limit are split", async () => {
     const store = createDurableObjectStore(sqlStorage(), "notes", StoreKind.docs, "d_");
     const entries = Array.from({ length: 250 }, (_, i) => entry(`e${i}`, `doc-${i % 7}`, [i % 256]));

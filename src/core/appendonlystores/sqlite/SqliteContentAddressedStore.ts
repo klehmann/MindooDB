@@ -110,15 +110,27 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
   /** One transaction per batch, one existence query for all ids. */
   private async insertNewEntries(entries: StoreEntry[]): Promise<void> {
     const present = new Set(await this.backend.hasEntries(entries.map((entry) => entry.id)));
+    const fresh: StoreEntry[] = [];
     for (const entry of entries) {
-      if (present.has(entry.id)) {
-        continue;
+      if (!present.has(entry.id)) {
+        present.add(entry.id);
+        fresh.push(entry);
       }
-      present.add(entry.id);
+    }
+    if (fresh.length === 0) {
+      return;
+    }
+    // Reserve the receipt orders before writing: should the batch not commit
+    // as a whole (see SqlBackendOptions.externalContent), an interrupted batch
+    // leaves a gap in the sequence, never two entries with one order.
+    let receiptOrder = this.nextReceiptOrder;
+    this.nextReceiptOrder += fresh.length;
+    await this.persistCounters();
+    for (const entry of fresh) {
       const { encryptedData, receiptOrder: _ignored, ...rest } = entry;
       const metadata: StoreEntryMetadata = {
         ...rest,
-        receiptOrder: this.nextReceiptOrder++,
+        receiptOrder: receiptOrder++,
       };
       await this.backend.insertEntry(
         serializeMetadata(metadata),
@@ -131,7 +143,6 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
         entry.id,
       );
     }
-    await this.persistCounters();
   }
 
   async applyWitnessReceipts(receipts: StoreEntryMetadata[]): Promise<void> {

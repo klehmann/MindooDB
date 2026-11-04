@@ -98,6 +98,13 @@ class StoredServerConfigRepository implements ServerConfigRepository {
   }
 }
 
+/**
+ * Wall-time budget of one cron tick's replication pass. Each pass starts new
+ * store pairs only within it; cron invocations may run 15 minutes, and the
+ * CPU limit is raised to 5 minutes in wrangler.jsonc (`limits.cpu_ms`).
+ */
+const CLUSTER_TICK_BUDGET_MS = 4 * 60 * 1000;
+
 /** Most recent audit records kept; older ones are dropped. */
 const MAX_AUDIT_RECORDS = 10_000;
 
@@ -232,6 +239,9 @@ export class MindooServerObject {
         eventBus: this.eventBus,
         peerJwtSecret,
         liveEventStream: false,
+        // 128 MB per isolate: one small batch in flight (attachment chunks are
+        // up to 256 KB, so a batch holds at most ~4 MB plus its copies).
+        transferLimits: { maxConcurrentBatches: 1, docsBatchSize: 100, attachmentsBatchSize: 16 },
         localRole: this.serverConfig.cluster?.role,
         listTrustedServers: () => tenantManager.listTrustedServers(),
         localServerName: () => tenantManager.getServerPublicInfo()?.name ?? null,
@@ -285,13 +295,22 @@ export class MindooServerObject {
     return cluster;
   }
 
-  /** Cron tick: one replication pass with every peer. */
+  /**
+   * Cron tick: one replication pass with every peer, within a time budget so
+   * that a large first mirror stays inside the per-request CPU and subrequest
+   * limits. What the budget does not cover continues on the next tick.
+   */
   private async tick(): Promise<Response> {
     const cluster = await this.startClusterIfEnabled();
+    let deferred = false;
     if (cluster.autoSyncEnabled) {
-      await cluster.syncAll();
+      ({ deferred } = await cluster.syncAll({ deadline: Date.now() + CLUSTER_TICK_BUDGET_MS }));
     }
-    return jsonResponse(200, { autoSync: cluster.autoSyncEnabled, peers: cluster.status().peers.length });
+    return jsonResponse(200, {
+      autoSync: cluster.autoSyncEnabled,
+      peers: cluster.status().peers.length,
+      deferred,
+    });
   }
 
   /** A database object accepted a write: tell peers (feed) and push to them. */

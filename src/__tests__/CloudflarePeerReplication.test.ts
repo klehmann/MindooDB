@@ -25,7 +25,7 @@ import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
 import { MindooDBServerAdmin } from "../core/MindooDBServerAdmin";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { MindooDBServer } from "../node/server/MindooDBServer";
-import type { MindooTenant, PrivateUserId } from "../core/types";
+import { StoreKind, type MindooTenant, type PrivateUserId } from "../core/types";
 
 const enabled = process.env.MINDOODB_CLOUDFLARE_TESTS === "1" && findWrangler() !== null;
 const describeWorker = enabled ? describe : describe.skip;
@@ -188,7 +188,20 @@ describeWorker("peer replication Node <-> Cloudflare (wrangler dev)", () => {
     }
     await push(device1, nodeUrl, "directory", { user: adminUser, password: PASSWORD });
     await addDoc(device1, "notes", "from-node-1");
+    // An attachment of 18 chunks: more than one transfer batch on Cloudflare,
+    // which mirrors at most 16 attachment chunks at a time (128 MB isolates).
+    const attachmentBytes = new Uint8Array(4_500_000).map((_, i) => (i * 7) % 253);
+    const notes1 = await device1.openDB("notes");
+    const withAttachment = await notes1.createDocument();
+    let attachmentId = "";
+    await notes1.changeDoc(withAttachment, async (d) => {
+      d.getData().title = "from-node-attachment";
+      attachmentId = (await d.addAttachment(attachmentBytes, "blob.bin", "application/octet-stream")).attachmentId;
+    });
     await push(device1, nodeUrl, "notes");
+    const localAttachments = notes1.getAttachmentStore();
+    const nodeAttachments = await device1.connectToServer(nodeUrl, "notes", StoreKind.attachments);
+    await nodeAttachments.putEntries(await localAttachments.getEntries(await localAttachments.getAllIds()));
 
     // A second device that only talks to Cloudflare.
     const device2 = await new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto).openTenant(
@@ -205,13 +218,23 @@ describeWorker("peer replication Node <-> Cloudflare (wrangler dev)", () => {
       async () => {
         try {
           await pullTitles(device2, worker.baseUrl, "directory");
-          return (await pullTitles(device2, worker.baseUrl, "notes")).includes("from-node-1");
+          const cfAttachments = await device2.connectToServer(worker.baseUrl, "notes", StoreKind.attachments);
+          return (
+            (await pullTitles(device2, worker.baseUrl, "notes")).includes("from-node-attachment") &&
+            (await cfAttachments.getAllIds()).length === (await localAttachments.getAllIds()).length
+          );
         } catch {
           return false;
         }
       },
       () => worker.triggerCron(),
     );
+
+    const cfAttachments = await device2.connectToServer(worker.baseUrl, "notes", StoreKind.attachments);
+    const notes2 = await device2.openDB("notes");
+    await notes2.getAttachmentStore().putEntries(await cfAttachments.getEntries(await cfAttachments.getAllIds()));
+    const copied = await (await notes2.getDocument(withAttachment.getId())).getAttachment(attachmentId);
+    expect(Buffer.from(copied).equals(Buffer.from(attachmentBytes))).toBe(true);
 
     // 2. A write on Cloudflare is pushed to the Node server.
     await addDoc(device2, "notes", "from-cf-1");
@@ -224,8 +247,8 @@ describeWorker("peer replication Node <-> Cloudflare (wrangler dev)", () => {
     await push(device1, nodeUrl, "notes");
     await eventually(async () => (await pullTitles(device2, worker.baseUrl, "notes")).includes("from-node-2"));
 
-    expect(await pullTitles(device2, worker.baseUrl, "notes")).toEqual(["from-cf-1", "from-node-1", "from-node-2"]);
-    expect(await pullTitles(device1, nodeUrl, "notes")).toEqual(["from-cf-1", "from-node-1", "from-node-2"]);
+    expect(await pullTitles(device2, worker.baseUrl, "notes")).toEqual(["from-cf-1", "from-node-1", "from-node-2", "from-node-attachment"]);
+    expect(await pullTitles(device1, nodeUrl, "notes")).toEqual(["from-cf-1", "from-node-1", "from-node-2", "from-node-attachment"]);
 
     // The cluster admin surface on Cloudflare reports the link.
     const cfAdmin = new MindooDBServerAdmin({
