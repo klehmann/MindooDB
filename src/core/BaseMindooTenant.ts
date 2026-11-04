@@ -86,6 +86,9 @@ export class BaseMindooTenant implements MindooTenant {
   private administrationPublicKey: string; // Administration public key (Ed25519, PEM format)
   private administrationEncryptionPublicKey: string; // Administration encryption public key (RSA-OAEP, PEM format)
   private currentUser: PrivateUserId;
+  /** Open withDecryptedKeyReuse scopes and their shared decryptions. */
+  private decryptedKeyReuseScopes = 0;
+  private decryptedKeyReuse: WeakMap<EncryptedPrivateKey, Map<string, Promise<ArrayBuffer>>> | null = null;
   private currentUserPassword: string; // Password to decrypt user's private keys
   protected cryptoAdapter: CryptoAdapter;
   private keyBag: KeyBag;
@@ -2499,6 +2502,54 @@ export class BaseMindooTenant implements MindooTenant {
    * @returns The decrypted private key as ArrayBuffer
    */
   public async decryptPrivateKey(
+    encryptedKey: EncryptedPrivateKey,
+    password: string,
+    saltString: string
+  ): Promise<ArrayBuffer> {
+    if (this.decryptedKeyReuse) {
+      // Inside withDecryptedKeyReuse: the same key object, password and salt
+      // decrypt to the same bytes, so the PBKDF2 run is shared. A wrong
+      // password is its own cache entry and fails like before.
+      let byKey = this.decryptedKeyReuse.get(encryptedKey);
+      if (!byKey) {
+        byKey = new Map();
+        this.decryptedKeyReuse.set(encryptedKey, byKey);
+      }
+      const cacheKey = `${saltString}\u0000${password}`;
+      let pending = byKey.get(cacheKey);
+      if (!pending) {
+        pending = this.decryptPrivateKeyUncached(encryptedKey, password, saltString);
+        byKey.set(cacheKey, pending);
+        pending.catch(() => byKey!.delete(cacheKey));
+      }
+      return (await pending).slice(0);
+    }
+    return this.decryptPrivateKeyUncached(encryptedKey, password, saltString);
+  }
+
+  /**
+   * Shares private key decryption (PBKDF2, the dominant cost of an admin
+   * operation) between all calls made while `fn` runs, e.g. a batch of
+   * user registrations signed with the same administration key. Checks are
+   * unchanged: every caller still passes key and password, a different
+   * password is decrypted on its own, and signatures are still verified
+   * against the claimed public key. The decrypted keys are dropped when the
+   * last open scope ends.
+   */
+  async withDecryptedKeyReuse<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.decryptedKeyReuseScopes++ === 0) {
+      this.decryptedKeyReuse = new WeakMap();
+    }
+    try {
+      return await fn();
+    } finally {
+      if (--this.decryptedKeyReuseScopes === 0) {
+        this.decryptedKeyReuse = null;
+      }
+    }
+  }
+
+  private async decryptPrivateKeyUncached(
     encryptedKey: EncryptedPrivateKey,
     password: string,
     saltString: string
