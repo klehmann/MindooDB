@@ -25,7 +25,7 @@ const db = await tenant.openDB("projects");
 const doc = await db.getDocument(docId);
 const data = doc.getData();
 
-data.title;          // "Projektplan"
+data.title;          // "Project plan"
 data.tags[0];        // "urgent"
 data.meta.owner;     // "cn=jane/o=acme"
 data.due;            // Date (a timestamp field)
@@ -68,7 +68,7 @@ Pick the type when you create the field. Ids, status and enum values, URLs and h
 ```javascript
 const doc = await db.createDocument({
   initialValues: {
-    title: "Projektplan",
+    title: "Project plan",
     status: MindooValue.atomic("open"),
     votes: MindooValue.counter(0),
     tags: ["planning"],
@@ -111,7 +111,7 @@ await db.changeDoc(doc, (d) => {
   d.updateText(["rows", 0, "note"], "updated note");
 
   // Replaces the whole value: concurrent edits do not merge into it.
-  d.getData().title = "Neuer Titel";
+  d.getData().title = "New title";
 });
 ```
 
@@ -121,7 +121,7 @@ When an editor already knows the positions, send them directly. `baseHeads` (fro
 await db.applyTextPatch(doc, {
   path: ["body"],
   baseHeads,
-  edits: [{ index: 12, deleteCount: 3, insert: "neu" }],
+  edits: [{ index: 12, deleteCount: 3, insert: "new" }],
 });
 ```
 
@@ -138,10 +138,10 @@ await db.applyRichTextPatch(doc, {
   baseHeads: snapshot.heads,
   spans: [
     { type: "block", value: { type: "h1" } },
-    { type: "text", value: "Projektplan" },
+    { type: "text", value: "Project plan" },
     { type: "block", value: { type: "p" } },
-    { type: "text", value: "Start im " },
-    { type: "text", value: "Januar", marks: { bold: true } },
+    { type: "text", value: "Starts in " },
+    { type: "text", value: "January", marks: { bold: true } },
   ],
 });
 
@@ -150,8 +150,8 @@ await db.applyRichTextStepsPatch(doc, {
   path: ["content"],
   baseHeads: snapshot.heads,
   steps: [
-    { type: "splice", index: 20, deleteCount: 0, insert: " 2027",
-      marks: [{ index: 20, length: 5, marks: { italic: true } }] },
+    { type: "splice", index: 31, deleteCount: 0, insert: " 2027",
+      marks: [{ index: 31, length: 5, marks: { italic: true } }] },
   ],
 });
 ```
@@ -183,7 +183,7 @@ await db.applyJsonPatch(doc, {
   unset: [{ path: ["meta", "draft"] }],
   listInsert: [{ path: ["tags"], index: 1, values: ["q1"] }],
   listDelete: [{ path: ["tags"], index: 0, deleteCount: 1 }],
-  textSplice: [{ path: ["title"], index: 0, deleteCount: 0, insert: "Neuer " }],
+  textSplice: [{ path: ["title"], index: 0, deleteCount: 0, insert: "New " }],
   counterIncrement: [{ path: ["votes"], delta: 1 }],
 });
 ```
@@ -194,20 +194,20 @@ Several kinds in one change (one history step), all or nothing:
 await db.applyDocumentUpdate(doc, {
   set: { status: MindooValue.atomic("review") },
   json: { listInsert: [{ path: ["tags"], index: 0, values: ["review"] }] },
-  text: [{ path: ["body"], edits: [{ index: 0, deleteCount: 0, insert: "Entwurf: " }] }],
+  text: [{ path: ["body"], edits: [{ index: 0, deleteCount: 0, insert: "Draft: " }] }],
   richText: [{ path: ["content"], spans }],
 });
 ```
 
 ## How concurrent edits merge
 
-Karsten and Jane both start from `{ title: "Projektplan", tags: ["start"], status: "open" }` and edit offline:
+Karsten and Jane both start from `{ title: "Project plan", tags: ["start"], status: "open" }` and edit offline:
 
 | Karsten | Jane | After sync on both devices |
 |---|---|---|
 | `data.tags.push("karsten")` | `data.tags.push("jane")` | both entries kept |
-| `d.updateText("title", "Projektplan 2027")` | `d.updateText("title", "Neuer Projektplan")` | `"Neuer Projektplan 2027"` |
-| `data.meta.status = "in Arbeit"` | `data.meta.owner = "Jane"` | both fields set |
+| `d.updateText("title", "Project plan 2027")` | `d.updateText("title", "New project plan")` | `"New project plan 2027"` |
+| `data.meta.status = "in progress"` | `data.meta.owner = "Jane"` | both fields set |
 | `data.status = MindooValue.atomic("done")` | `data.status = MindooValue.atomic("blocked")` | one of the two, the same on both devices |
 | `d.incrementCounter("votes", 1)` | `d.incrementCounter("votes", 1)` | `+2` |
 | `data.tags = ["a"]` | `data.tags = ["b"]` | one of the two lists |
