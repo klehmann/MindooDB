@@ -29,6 +29,7 @@ export type DraftPath = Array<string | number>;
 export type DraftOp =
   | { kind: "set"; path: DraftPath; value: unknown }
   | { kind: "text"; path: DraftPath; value: string }
+  | { kind: "counter"; path: DraftPath; delta: number }
   | { kind: "delete"; path: DraftPath }
   | { kind: "splice"; path: DraftPath; index: number; deleteCount: number; items: unknown[] };
 
@@ -39,8 +40,6 @@ export interface ChangeDocDraftHooks {
   readScalar(value: unknown): unknown;
   /** Throws once the callback has completed. */
   assertActive(operation: string): void;
-  /** Called before an edit replaces or removes the value at `path`. */
-  onReplace(path: DraftPath): void;
 }
 
 type Node = Record<string | number, unknown> | unknown[];
@@ -90,9 +89,27 @@ export class ChangeDocDraft {
     if (Array.isArray(node) && !(typeof key === "number" && key < node.length)) {
       throw new Error("updateText: list text must target an existing element");
     }
-    this.hooks.onReplace(path);
     this.ops.push({ kind: "text", path: [...path], value });
     (node as any)[key] = value;
+  }
+
+  /**
+   * Adds `delta` to the counter at `path`. Logged in call order with the other
+   * edits; reads in the rest of the callback see the new value.
+   */
+  incrementCounter(path: DraftPath, delta: number): void {
+    this.hooks.assertActive("incrementCounter");
+    this.ops.push({ kind: "counter", path: [...path], delta });
+    this.getRoot();
+    let node = this.root as Node;
+    for (const segment of path.slice(0, -1)) {
+      if (!this.isContainer((node as any)[segment])) return;
+      node = this.childNode(node, segment);
+    }
+    const key = path[path.length - 1];
+    const current = (node as any)[key];
+    if (typeof current === "number") (node as any)[key] = current + delta;
+    else if (current === undefined || current === null) (node as any)[key] = delta;
   }
 
   // ---- reading -------------------------------------------------------------
@@ -236,7 +253,6 @@ export class ChangeDocDraft {
     }
     const path = [...this.pathOf(node), prop];
     const clone = this.cloneIn(value);
-    this.hooks.onReplace(path);
     this.ops.push({ kind: "set", path, value: clone });
     (node as any)[prop] = this.adopt(node, prop, this.cloneIn(clone));
   }
@@ -263,7 +279,6 @@ export class ChangeDocDraft {
     }
     const path = [...this.pathOf(list), index];
     const clone = this.cloneIn(value);
-    this.hooks.onReplace(path);
     this.ops.push({ kind: "set", path, value: clone });
     list[index] = this.adopt(list, index, this.cloneIn(clone));
   }
@@ -276,7 +291,6 @@ export class ChangeDocDraft {
     }
     if (!Object.prototype.hasOwnProperty.call(node, prop)) return;
     const path = [...this.pathOf(node), prop];
-    this.hooks.onReplace(path);
     this.ops.push({ kind: "delete", path });
     delete (node as any)[prop];
   }
@@ -346,7 +360,6 @@ export class ChangeDocDraft {
           if (this.isContainer(entry) && seen.has(entry)) entry = list[index] = this.cloneIn(entry);
           seen.add(entry);
           if (entry === before[index]) return;
-          this.hooks.onReplace([...path, index]);
           this.ops.push({ kind: "set", path: [...path, index], value: this.cloneIn(entry) });
           this.adopt(list, index, entry);
         });

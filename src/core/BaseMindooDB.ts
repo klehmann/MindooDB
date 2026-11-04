@@ -11311,25 +11311,6 @@ export class BaseMindooDB implements MindooDB {
       }
     >();
 
-    // incrementCounter() calls, applied in call order after the field
-    // assignments so they can target counters assigned in the same callback.
-    const pendingCounterIncrements: Array<{
-      path: Array<string | number>;
-      delta: number;
-    }> = [];
-
-    // Assignments and deletions are applied before the increments, so an
-    // assignment or deletion of a field supersedes the increments queued on it
-    // (or below it) earlier in the callback; later increments still apply.
-    const dropPendingCounterIncrements = (replaced: Array<string | number>) => {
-      for (let i = pendingCounterIncrements.length - 1; i >= 0; i--) {
-        const path = pendingCounterIncrements[i].path;
-        if (replaced.every((segment, index) => path[index] === segment)) {
-          pendingCounterIncrements.splice(i, 1);
-        }
-      }
-    };
-
     // Reference to db for closures
     const db = this;
 
@@ -11351,7 +11332,6 @@ export class BaseMindooDB implements MindooDB {
       isScalarObject: (value) => db.isAutomergeCounter(value) || db.isAutomergeImmutableString(value),
       readScalar: (value) => db.readAutomergeScalar(value),
       assertActive: throwIfCallbackInactive,
-      onReplace: dropPendingCounterIncrements,
     });
 
     // Create a document wrapper that collects changes
@@ -11585,6 +11565,7 @@ export class BaseMindooDB implements MindooDB {
       updateText: (path: string | Array<string | number>, value: string) => {
         const segments = typeof path === "string" ? [path] : [...path];
         db.validateJsonPath(segments, "updateText");
+        db.assertNotRichText(internalDoc.doc, segments);
         draft.updateText(segments, value);
       },
 
@@ -11596,7 +11577,7 @@ export class BaseMindooDB implements MindooDB {
         const segments = typeof path === "string" ? [path] : [...path];
         db.validateJsonPath(segments, "incrementCounter");
         assertCounterAmount(delta, "incrementCounter delta");
-        pendingCounterIncrements.push({ path: segments, delta });
+        draft.incrementCounter(segments, delta);
       },
 
 
@@ -11658,16 +11639,15 @@ export class BaseMindooDB implements MindooDB {
     try {
       newDoc = this.runChangeWithOutdatedDocRecovery(internalDoc, (doc) =>
         Automerge.change(doc, { message: changeMessage }, (automergeDoc: MindooDocPayload) => {
-          // Replay the callback's field edits in the order they were made
+          // Replay the callback's field edits and counter increments in the
+          // order they were made: an assignment after an increment replaces
+          // it, an increment after an assignment adds to the new counter, and
+          // a list index means the element it meant at that moment.
           this.applyChangeDocDraftOps(automergeDoc, draft.ops);
 
           // Engine-internal edits that need the raw Automerge document, e.g.
           // restoreDocumentToEntry's rich-text spans.
           internalMutation?.(automergeDoc);
-
-          for (const { path, delta } of pendingCounterIncrements) {
-            this.incrementCounterAtPath(automergeDoc, path, delta);
-          }
 
 
           // Apply pending attachment changes
@@ -11815,6 +11795,27 @@ export class BaseMindooDB implements MindooDB {
     );
   }
 
+  /**
+   * updateText() diffs plain characters and knows nothing of marks and block
+   * markers, so it refuses text that carries either; rich text goes through
+   * applyRichTextPatch() / applyRichTextStepsPatch().
+   */
+  private assertNotRichText(automergeDoc: unknown, path: Array<string | number>): void {
+    if (typeof this.readValueAtPath(automergeDoc as MindooDocPayload, path) !== "string") return;
+    const spans = (Automerge as any).spans(
+      automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+      path as AutomergeTypes.Prop[],
+    ) as Array<{ type: string; marks?: Record<string, unknown> }>;
+    const rich = spans.some(
+      (span) => span.type === "block" || (span.marks !== undefined && Object.keys(span.marks).length > 0),
+    );
+    if (rich) {
+      throw new Error(
+        `updateText: '${path.map(String).join(".")}' is rich text (marks or blocks); use applyRichTextPatch() or applyRichTextStepsPatch()`,
+      );
+    }
+  }
+
   /** Replays the edits a changeDoc() callback made through getData(), see ChangeDocDraft. */
   private applyChangeDocDraftOps(automergeDoc: MindooDocPayload, ops: DraftOp[]): void {
     const containerAt = (path: Array<string | number>): any => {
@@ -11823,6 +11824,10 @@ export class BaseMindooDB implements MindooDB {
       return current;
     };
     for (const op of ops) {
+      if (op.kind === "counter") {
+        this.incrementCounterAtPath(automergeDoc, op.path, op.delta);
+        continue;
+      }
       if (op.kind === "splice") {
         const list = containerAt(op.path) as unknown[];
         const values = this.hydrateTypedValues(op.items) as unknown[];

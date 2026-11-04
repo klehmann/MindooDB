@@ -2476,8 +2476,10 @@ export interface MindooDoc {
    * of overwriting each other, which is what makes counters safe for shared
    * tallies (votes, views, stock levels). Create counters with
    * `MindooValue.counter()`; a missing field is initialized as a counter
-   * holding `delta`. Repeated calls within one changeDoc() add up and are
-   * applied after the callback's field assignments.
+   * holding `delta`. Increments are applied in call order together with the
+   * callback's other edits: repeated calls add up, an assignment after an
+   * increment replaces the counter, and reads later in the callback see the
+   * incremented value.
    *
    * @param path Field name or path segments (e.g. `["stats", "views"]`)
    * @param delta Amount to add, a safe integer
@@ -2495,8 +2497,11 @@ export interface MindooDoc {
    *
    * @param path Field name or path segments (e.g. `["meta", "title"]`)
    * @param value The new text
-   * @throws Error if called outside of changeDoc() callback, or if the value
-   *   at `path` exists and is not text
+   * Rich text (a text with marks or block markers) is refused: use
+   * `MindooDB.applyRichTextPatch()` or `applyRichTextStepsPatch()` for it.
+   *
+   * @throws Error if called outside of changeDoc() callback, if the value
+   *   at `path` exists and is not text, or if it is rich text
    */
   updateText(path: string | Array<string | number>, value: string): void;
 

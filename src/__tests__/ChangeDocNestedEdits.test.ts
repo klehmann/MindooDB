@@ -159,6 +159,32 @@ describe("changeDoc: nested edits", () => {
     expect(await read(db, id)).toEqual({ stats: { views: 3 }, labels: ["open"] });
   });
 
+  test("counters: call order with other edits, list elements, reads", async () => {
+    const id = await seed({
+      rows: [{ votes: MindooValue.counter(0) }, { votes: MindooValue.counter(10) }],
+      total: MindooValue.counter(0),
+    });
+    await db.changeDoc(await db.getDocument(id), (d) => {
+      const data = d.getData() as any;
+      d.incrementCounter(["rows", 1, "votes"], 1); // the element with 10
+      data.rows.splice(0, 1);                       // it moves to index 0
+      d.incrementCounter(["rows", 0, "votes"], 1); // same element again
+      d.incrementCounter("total", 5);
+      expect(data.total).toBe(5);
+      expect(data.rows[0].votes).toBe(12);
+      data.rows.push({ votes: MindooValue.counter(100) });
+      d.incrementCounter(["rows", 1, "votes"], 1); // counter created in this callback
+    });
+    expect(await read(db, id)).toEqual({ rows: [{ votes: 12 }, { votes: 101 }], total: 5 });
+
+    await db.changeDoc(await db.getDocument(id), (d) => {
+      d.incrementCounter("total", 1);
+      (d.getData() as any).total = MindooValue.counter(50); // replaces the increment
+      d.incrementCounter("total", 2);                       // adds to the new counter
+    });
+    expect((await read(db, id)).total).toBe(52);
+  });
+
   test("async callbacks keep working", async () => {
     const id = await seed({ tags: [] });
     await change(db, id, async (data) => {
@@ -188,6 +214,30 @@ describe("changeDoc: nested edits", () => {
     ).rejects.toThrow(/not text/);
     const outside = await db.getDocument(id);
     expect(() => outside.updateText("status", "x")).toThrow(/only be called within changeDoc/);
+  });
+
+  test("updateText refuses rich text, plain text next to it is fine", async () => {
+    const id = await seed({ plain: "Hallo" });
+    await db.applyRichTextPatch(await db.getDocument(id), {
+      path: ["content"],
+      spans: [
+        { type: "block", value: { type: "p" } },
+        { type: "text", value: "fett", marks: { bold: true } },
+      ],
+    });
+    await expect(
+      db.changeDoc(await db.getDocument(id), (d) => d.updateText("content", "x")),
+    ).rejects.toThrow(/rich text/);
+    // Marks alone (no block) count as rich text too.
+    await db.applyRichTextPatch(await db.getDocument(id), {
+      path: ["marked"],
+      spans: [{ type: "text", value: "kursiv", marks: { italic: true } }],
+    });
+    await expect(
+      db.changeDoc(await db.getDocument(id), (d) => d.updateText("marked", "x")),
+    ).rejects.toThrow(/rich text/);
+    await db.changeDoc(await db.getDocument(id), (d) => d.updateText("plain", "Hallo Welt"));
+    expect((await read(db, id)).plain).toBe("Hallo Welt");
   });
 
   test("diffTextSplice", () => {
