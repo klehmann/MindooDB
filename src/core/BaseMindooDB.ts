@@ -802,6 +802,28 @@ export class BaseMindooDB implements MindooDB {
   private revisionFeedDocCache = new Map<string, RevisionFeedDocState>();
   private readonly revisionFeedCacheLimit = 256;
   /**
+   * Revisions of documents whose fold suffix holds un-witnessed entries, keyed
+   * by the exact fold (entry order, witness state and prefix). The feed
+   * re-discovers such entries on every resume, since their trusted time is the
+   * provisional `now`; while nothing about the document changed, only that
+   * trusted time differs, so the revisions are re-emitted from here instead
+   * of being loaded, verified, decrypted and folded again. Without it, every
+   * pass re-folded every un-witnessed document: registering N users offline
+   * cost O(N) per registration. An entry is replaced on any change and
+   * dropped once the document has no un-witnessed entries left.
+   *
+   * Each revision holds its own document state, so the cache is bounded: a
+   * document with a longer suffix, or one arriving when the cache is full, is
+   * folded every pass as before.
+   */
+  private provisionalRevisionCache = new Map<
+    string,
+    { key: string; revisions: Array<Omit<ChangeRevisionResult, "trustedTime" | "cursor">> }
+  >();
+  private provisionalRevisionCacheSize = 0;
+  private readonly provisionalRevisionCacheLimit = 4096;
+  private readonly provisionalRevisionCacheDocLimit = 32;
+  /**
    * Window size for batching encrypted-payload loads while folding a document's
    * revision suffix ({@link foldDocRevisions}): one {@link ContentAddressedStore.getEntries}
    * round trip per window instead of one per revision, while bounding peak
@@ -7100,6 +7122,28 @@ export class BaseMindooDB implements MindooDB {
       return;
     }
 
+    // Unchanged document whose suffix is still provisional: re-emit the
+    // previous fold with the current trusted times (see provisionalRevisionCache).
+    const suffix = ttSorted.slice(firstChangedIdx);
+    const hasProvisional = suffix.some((r) => !r.witnessed);
+    const foldKey = [
+      ttSorted.slice(0, firstChangedIdx).map((r) => r.meta.id).join(","),
+      suffix.map((r) => `${r.meta.id}:${r.meta.receivedAt ?? "-"}`).join(","),
+    ].join("|");
+    const cachedFold = this.provisionalRevisionCache.get(docId);
+    if (cachedFold && cachedFold.key === foldKey) {
+      for (let i = 0; i < cachedFold.revisions.length; i++) {
+        yield { ...cachedFold.revisions[i], trustedTime: suffix[i].tt, cursor: resumeCursor };
+      }
+      return;
+    }
+    if (cachedFold) {
+      this.provisionalRevisionCache.delete(docId);
+      this.provisionalRevisionCacheSize -= cachedFold.revisions.length;
+    }
+    const foldedRevisions: Array<Omit<ChangeRevisionResult, "trustedTime" | "cursor">> = [];
+    let foldComplete = true;
+
     // Origin time and key id come from the document's create entry, independent
     // of fold order (under the trusted-time rule un-witnessed entries can sort
     // before the create, so we must not rely on seeing the create first).
@@ -7173,6 +7217,7 @@ export class BaseMindooDB implements MindooDB {
         this.logger.warn(
           `Revision entry ${meta.id} unavailable (missing or invalid), skipping`,
         );
+        foldComplete = false;
         continue;
       }
       const entryData = ready.entry;
@@ -7206,16 +7251,27 @@ export class BaseMindooDB implements MindooDB {
         isDeleted: this.computeIsDeletedFromMetadata([...seenMeta]),
       };
 
-      yield {
+      const revision = {
         docId,
         entryId: meta.id,
         doc: this.wrapDocument(internalDoc),
         entryType: meta.entryType,
-        trustedTime: rev.tt,
         witnessed: rev.witnessed,
         createdByPublicKey: meta.createdByPublicKey,
-        cursor: resumeCursor,
       };
+      foldedRevisions.push(revision);
+      yield { ...revision, trustedTime: rev.tt, cursor: resumeCursor };
+    }
+
+    // Reached only when the consumer took every revision of this document.
+    if (
+      hasProvisional &&
+      foldComplete &&
+      foldedRevisions.length <= this.provisionalRevisionCacheDocLimit &&
+      this.provisionalRevisionCacheSize + foldedRevisions.length <= this.provisionalRevisionCacheLimit
+    ) {
+      this.provisionalRevisionCache.set(docId, { key: foldKey, revisions: foldedRevisions });
+      this.provisionalRevisionCacheSize += foldedRevisions.length;
     }
 
     // Cache the doc's full merged state for the next incremental advance.

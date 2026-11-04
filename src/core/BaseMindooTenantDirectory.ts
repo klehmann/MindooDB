@@ -321,7 +321,53 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return this.directoryDB;
   }
 
+  async registerUsers(
+    users: Array<{
+      userId: PublicUserId;
+      userDetails?: DirectoryUserDetails;
+      label?: string;
+      options?: { distributeKeyIds?: string[] };
+    }>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.tenant.withDecryptedKeyReuse(async () => {
+      for (const user of users) {
+        await this.registerUserWithKeyReuse(
+          user.userId,
+          administrationPrivateKey,
+          administrationPrivateKeyPassword,
+          user.userDetails,
+          user.label,
+          user.options,
+        );
+      }
+    });
+  }
+
   async registerUser(
+    userId: PublicUserId,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+    userDetails?: DirectoryUserDetails,
+    label?: string,
+    options?: { distributeKeyIds?: string[] },
+  ): Promise<void> {
+    // One registration signs several directory changes and key distributions
+    // with the administration key; decrypt it once instead of for each.
+    await this.tenant.withDecryptedKeyReuse(() =>
+      this.registerUserWithKeyReuse(
+        userId,
+        administrationPrivateKey,
+        administrationPrivateKeyPassword,
+        userDetails,
+        label,
+        options,
+      ),
+    );
+  }
+
+  private async registerUserWithKeyReuse(
     userId: PublicUserId,
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
