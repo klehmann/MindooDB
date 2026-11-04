@@ -3149,6 +3149,24 @@ export interface MindooTenantDirectory {
   ): Promise<void>;
 
   /**
+   * Registers several users like {@link registerUser}, one after another,
+   * decrypting the administration key only once for the whole batch instead
+   * of several times per user. Each registration is checked and signed
+   * exactly as a single call would; a failure stops the batch, users before
+   * it stay registered.
+   */
+  registerUsers?(
+    users: Array<{
+      userId: PublicUserId;
+      userDetails?: DirectoryUserDetails;
+      label?: string;
+      options?: { distributeKeyIds?: string[] };
+    }>,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
    * Revokes a user's access by removing their keys from the grant document
    * (docs/accesscontrol.md §6.5). Revocation is an in-place edit of the grant
    * document's key arrays; there is no separate revocation document. This
