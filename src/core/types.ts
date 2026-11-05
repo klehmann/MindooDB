@@ -6093,15 +6093,16 @@ export interface MindooDB {
    * — a peer sync — and therefore have to apply the admin/owner rules
    * themselves before storing anything.
    *
-   * Deliberately the same check the load path uses, so an entry admitted on
-   * this answer is one that will also materialize. Returns false for databases
-   * without a builtin invariant, so it can be asked unconditionally.
+   * Applies the server's write rule, not the lenient load-path filter: an
+   * owner that cannot be resolved is a refusal. `batch` is the rest of the
+   * delivery, so a new document's `doc_create` in the same batch names its
+   * owner. Everything admitted also passes the load path. Returns false for
+   * databases without a builtin invariant, so it can be asked unconditionally.
    */
-  violatesBuiltinWriteInvariant(entry: {
-    entryType?: string;
-    createdByPublicKey: string;
-    docId?: string;
-  }): Promise<boolean>;
+  violatesBuiltinWriteInvariant(
+    entry: BuiltinIngestEntry,
+    batch?: readonly BuiltinIngestEntry[],
+  ): Promise<boolean>;
 
   /**
    * Reconcile local document visibility with the current tenant KeyBag.
@@ -6262,4 +6263,18 @@ export interface MindooDB {
    * @return A promise that resolves with the sync result
    */
   pushChangesTo(remote: ContentAddressedStore | MindooDB, options?: SyncOptions): Promise<SyncResult>;
+}
+
+/**
+ * The parts of an incoming entry the builtin `directory` / `userdirectory`
+ * ingest check reads. A full {@link StoreEntry} fits; `encryptedData` and
+ * `decryptionKeyId` are only needed to read the owner out of a userkey
+ * document's `doc_create`.
+ */
+export interface BuiltinIngestEntry {
+  entryType?: string;
+  createdByPublicKey: string;
+  docId?: string;
+  encryptedData?: Uint8Array;
+  decryptionKeyId?: string;
 }

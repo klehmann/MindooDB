@@ -114,6 +114,7 @@ import {
   PutEntriesAck,
 } from "./types";
 import { commonUpdateBaseHeads } from "./types";
+import type { BuiltinIngestEntry } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { StoreKind } from "./appendonlystores/types";
 import type {
@@ -196,13 +197,14 @@ import {
 import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
 import type { RuleType, AccessDecision } from "./accesscontrol/types";
 import { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
-import { grantForSigningKey } from "./accesscontrol/DirectoryStateNode";
+import { grantForSigningKey, signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { validateDatabaseId } from "./databaseIdValidation";
 import {
   evaluateBuiltinWrite,
   hasBuiltinWriteInvariant,
   isPersonalUserdirectoryDocId,
+  entryTypeToBuiltinOp,
   shouldSkipLoadedEntry,
   usernameHashFromCreateChangeBytes,
   type BuiltinWriteOp,
@@ -1327,20 +1329,110 @@ export class BaseMindooDB implements MindooDB {
    * — a peer sync — and therefore have to apply the admin/owner rules
    * themselves.
    *
-   * Deliberately the same check the load path uses, so an entry admitted here
-   * is one that will also materialize. The alternative, accepting on ingest
-   * and dropping on load, leaves the entry sitting in the store and pushes it
-   * on to the server at the next sync, where it is refused and fails the run.
+   * This is the server's write rule ({@link evaluateBuiltinWrite}), not the
+   * lenient load-path filter. The load path may fail open because whatever it
+   * reads already passed a server; an entry arriving from a peer has passed
+   * nothing, so an owner hash that cannot be resolved is a refusal here, as it
+   * is on the server. Everything this admits also passes the load path, so an
+   * admitted entry still materializes.
+   *
+   * `batch` is the rest of the delivery: a new document arrives as its
+   * `doc_create` plus later changes in one batch, and the create is what names
+   * the owner. Pass entries with their payload (`encryptedData`) where you have
+   * it; a `doc_create` of a userkey document is decrypted to read
+   * `username_hash`.
    *
    * Returns false for databases without a builtin invariant, so callers can
    * ask unconditionally.
    */
-  async violatesBuiltinWriteInvariant(entry: {
-    entryType?: string;
-    createdByPublicKey: string;
-    docId?: string;
-  }): Promise<boolean> {
-    return this.shouldSkipLoadedEntryForBuiltin(entry);
+  async violatesBuiltinWriteInvariant(
+    entry: BuiltinIngestEntry,
+    batch: readonly BuiltinIngestEntry[] = [],
+  ): Promise<boolean> {
+    return (await this.builtinIngestDenial(entry, batch)) !== null;
+  }
+
+  /** Reason the builtin invariant refuses `entry` from a peer, or null. */
+  private async builtinIngestDenial(
+    entry: BuiltinIngestEntry,
+    batch: readonly BuiltinIngestEntry[],
+  ): Promise<string | null> {
+    const dbId = this.effectiveBuiltinDbId();
+    if (!hasBuiltinWriteInvariant(dbId)) {
+      return null;
+    }
+    const entryType = entry.entryType ?? "doc_change";
+    const op = entryTypeToBuiltinOp(entryType);
+    if (!op) {
+      // Not a document lifecycle entry (attachment chunks and the like). The
+      // admin-only rule still holds for `directory`; `userdirectory` has no
+      // rule for them, exactly as on the server.
+      if (dbId === DIRECTORY_DB_ID && !this.isAdminKey(entry.createdByPublicKey)) {
+        return "Admin-only database: only the admin key can modify data";
+      }
+      return null;
+    }
+    let documentUsernameHash: string | null = null;
+    let signerUsernameHash: string | null = null;
+    let creatorUsernameHash: string | null = null;
+    if (dbId === USER_DIRECTORY_DB_ID) {
+      // Fresh, not the load-path cache: that one remembers a miss for a key
+      // that has since been granted.
+      signerUsernameHash = await this.resolveSignerUsernameHash(entry.createdByPublicKey);
+      const createInBatch =
+        entryType === "doc_create"
+          ? entry
+          : batch.find(
+              (candidate) =>
+                candidate.entryType === "doc_create" && candidate.docId === entry.docId,
+            );
+      if (isPersonalUserdirectoryDocId(entry.docId)) {
+        if (op === "doc_create") {
+          creatorUsernameHash = signerUsernameHash;
+        } else if (createInBatch) {
+          creatorUsernameHash = await this.resolveSignerUsernameHash(
+            createInBatch.createdByPublicKey,
+          );
+        } else if (entry.docId) {
+          creatorUsernameHash = await this.ensurePersonalDocCreatorHash(entry.docId);
+        }
+      } else if (createInBatch?.encryptedData) {
+        documentUsernameHash = await this.usernameHashFromCreateEntry(createInBatch);
+      } else if (entry.docId && op !== "doc_create") {
+        documentUsernameHash = await this.ensureUserdirectoryDocHash(entry.docId);
+      }
+    }
+    const decision = evaluateBuiltinWrite({
+      dbId,
+      op,
+      signerKey: entry.createdByPublicKey,
+      adminPublicKey: this.getAdminPublicKey(),
+      documentUsernameHash,
+      signerUsernameHash,
+      docId: entry.docId,
+      creatorUsernameHash,
+    });
+    return decision.allowed ? null : decision.reason;
+  }
+
+  private isAdminKey(publicKey: string): boolean {
+    return signingKeysEqual(publicKey, this.getAdminPublicKey());
+  }
+
+  /** `username_hash` out of a userkey document's `doc_create` payload. */
+  private async usernameHashFromCreateEntry(entry: BuiltinIngestEntry): Promise<string | null> {
+    if (!entry.encryptedData || !entry.decryptionKeyId) {
+      return null;
+    }
+    try {
+      const decrypted = await this.tenant.decryptPayload(
+        entry.encryptedData,
+        entry.decryptionKeyId,
+      );
+      return usernameHashFromCreateChangeBytes(decrypted);
+    } catch {
+      return null;
+    }
   }
 
   private async ensureSignerUsernameHash(

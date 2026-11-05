@@ -580,6 +580,12 @@ export function createStoreIrohHandler(
     if (typeof fn !== "function") {
       throw new Error(`Unknown Iroh store method ${method}`);
     }
+    // `apply` takes any array-like, so `{"0": [...], "length": 1}` reaches the
+    // store exactly like `[[...]]` while a caller that checks `Array.isArray`
+    // first sees no arguments at all. Only a real array gets through.
+    if (!Array.isArray(args)) {
+      throw new Error(`Iroh store method ${method} needs its arguments as an array`);
+    }
     return fn.apply(store, args);
   };
 }
@@ -605,6 +611,12 @@ export async function serveIrohRpc(stream: IrohByteStream, handler: IrohRpcHandl
       }
       const request = decodeIrohFrame(bytes) as IrohRpcRequest;
       try {
+        // The frame is the caller's JSON, so the declared `unknown[]` is only a
+        // hope. Handlers check `args[0]` and then pass `args` on; an array-like
+        // object would make those two disagree.
+        if (request.args !== undefined && !Array.isArray(request.args)) {
+          throw new Error(`Iroh RPC ${String(request.method)} needs its arguments as an array`);
+        }
         const result = await handler(
           request.method,
           request.args,
