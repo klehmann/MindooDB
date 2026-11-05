@@ -1,3 +1,4 @@
+import { issueAuthChallenge } from "../core/crypto/AuthChallenge";
 /**
  * Comprehensive tests for the rollout checklist items in
  * docs/db-open-and-sync-optimization.md.
@@ -590,7 +591,8 @@ describe("protocol compatibility", () => {
    */
   class OldServerTransport implements NetworkTransport {
     async requestChallenge(_username: string): Promise<string> {
-      return "mock-challenge";
+      // Clients only sign challenges in a known format (crypto/AuthChallenge.ts).
+      return issueAuthChallenge();
     }
     async authenticate(_challenge: string, _signature: Uint8Array): Promise<AuthResult> {
       return { success: true, token: "mock-token" };
