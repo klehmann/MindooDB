@@ -87,6 +87,7 @@ export const SQLITE_STORE_RPC_METHODS: StoreRpcOptionalMethod[] = [
   "scanEntriesSince",
   "getIdBloomSummary",
   "getStoreHead",
+  "deleteEntriesForAttachment",
   "deleteEntriesById",
   "clearAllLocalData",
   "awaitIndexReady",
@@ -137,9 +138,38 @@ export class RpcContentAddressedStore implements ContentAddressedStore {
                 this.indexStatus = status as StoreIndexBuildStatus;
                 return this.indexStatus;
               })
-          : (...args) => this.invoke(method, args);
+          : method === "deleteEntriesForAttachment"
+            ? (...args) =>
+                this.invoke(method, args).catch((error: unknown) =>
+                  this.deleteAttachmentChunksOnOlderServer(error, args[0] as string, args[1] as string),
+                )
+            : (...args) => this.invoke(method, args);
       (this as unknown as Record<string, Callable>)[method] = forward;
     }
+  }
+
+  /**
+   * A store server built before its SQLite store had `deleteEntriesForAttachment`
+   * (e.g. an older Haven Desktop shell next to a newer Haven) refuses the call:
+   * select the attachment's chunks here and delete them by id instead.
+   */
+  private async deleteAttachmentChunksOnOlderServer(
+    error: unknown,
+    docId: string,
+    attachmentId: string,
+  ): Promise<number> {
+    if (!(error instanceof Error) || !/is not supported by this store/.test(error.message)) {
+      throw error;
+    }
+    const prefix = `${docId}_a_${attachmentId}_`;
+    const ids = (await this.findNewEntriesForDoc([], docId))
+      .filter(
+        (meta) =>
+          meta.entryType === "attachment_chunk" &&
+          (meta.attachmentId === attachmentId || meta.id.startsWith(prefix)),
+      )
+      .map((meta) => meta.id);
+    return ids.length === 0 ? 0 : ((await this.invoke("deleteEntriesById", [ids])) as number);
   }
 
   private async invoke(method: string, args: unknown[], blobId?: string): Promise<unknown> {

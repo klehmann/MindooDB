@@ -23,11 +23,24 @@ function entry(docId: string, id: string, size = 8, dependencyIds: string[] = []
 }
 
 /** In-process transport: JSON round trip for calls, a map for the binary channel. */
-function setup() {
+function setup(options: { olderServer?: boolean } = {}) {
   const toServer = new Map<string, Uint8Array>();
   const toClient = new Map<string, Uint8Array>();
   const server = new StoreRpcServer({
-    createFactory: () => new SqliteContentAddressedStoreFactory(() => createMemorySqliteBackend()),
+    createFactory: () => {
+      const sqlite = new SqliteContentAddressedStoreFactory(() => createMemorySqliteBackend());
+      if (!options.olderServer) return sqlite;
+      // A server from before deleteEntriesForAttachment existed on SQLite stores.
+      return {
+        createStore(dbId: string, openOptions?: Parameters<typeof sqlite.createStore>[1]) {
+          const created = sqlite.createStore(dbId, openOptions);
+          for (const store of [created.docStore, created.attachmentStore]) {
+            Object.defineProperty(store, "deleteEntriesForAttachment", { value: undefined });
+          }
+          return created;
+        },
+      };
+    },
     bytes: {
       async take(blobId) {
         const bytes = toServer.get(blobId) ?? null;
@@ -60,7 +73,28 @@ function setup() {
   return { factory, callCount: () => calls, pendingBytes: () => toServer.size + toClient.size };
 }
 
+function chunk(docId: string, attachmentId: string, id: string, dependencyIds: string[] = []): StoreEntry {
+  return { ...entry(docId, id, 16, dependencyIds), entryType: "attachment_chunk", attachmentId };
+}
+
 describe("RpcContentAddressedStore", () => {
+  test.each([
+    ["a current server", false],
+    ["an older server without it", true],
+  ])("deletes one attachment's chunks on %s", async (_label, olderServer) => {
+    const { factory } = setup({ olderServer });
+    const { attachmentStore } = factory.createStore("db1");
+    await attachmentStore.putEntries([
+      chunk("doc-a", "att1", "doc-a_a_att1_1"),
+      chunk("doc-a", "att1", "doc-a_a_att1_2", ["doc-a_a_att1_1"]),
+      chunk("doc-a", "att2", "doc-a_a_att2_1"),
+      chunk("doc-b", "att1", "doc-b_a_att1_1"),
+    ]);
+    expect(await attachmentStore.deleteEntriesForAttachment!("doc-a", "att1")).toBe(2);
+    expect((await attachmentStore.getAllIds()).sort()).toEqual(["doc-a_a_att2_1", "doc-b_a_att1_1"]);
+    expect(await attachmentStore.deleteEntriesForAttachment!("doc-a", "att1")).toBe(0);
+  });
+
   test("round-trips entries with payloads and binary metadata", async () => {
     const { factory, pendingBytes } = setup();
     const { docStore } = factory.createStore("db1");

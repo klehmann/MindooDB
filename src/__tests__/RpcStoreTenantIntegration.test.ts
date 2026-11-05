@@ -89,6 +89,32 @@ describe("tenant on RPC stores", () => {
     expect(reloaded.getData().counter).toBe(19);
     expect(Array.from(await reloaded.getAttachment(attachmentId))).toEqual(Array.from(payload));
     expect(await db.getAllDocumentIds()).toContain(doc.getId());
+
+    // Freeing one attachment's local copy (Haven's unpin, upload cleanup)
+    // deletes exactly its chunks, through the RPC into SQLite.
+    let keptId = "";
+    let keptLastChunkId = "";
+    const keptPayload = new Uint8Array(3_000).map((_, i) => (i * 7) % 251);
+    await db.changeDoc(await db.getDocument(doc.getId()), async (d) => {
+      const ref = await d.addAttachment(keptPayload, "kept.bin", "application/octet-stream");
+      keptId = ref.attachmentId;
+      keptLastChunkId = ref.lastChunkId;
+    });
+    const attachmentStore = db.getAttachmentStore();
+    expect(typeof attachmentStore.deleteEntriesForAttachment).toBe("function");
+    const freedRef = (await db.getDocument(doc.getId())).getAttachments().find((a) => a.attachmentId === attachmentId)!;
+    const freedChain = await attachmentStore.resolveDependencies(freedRef.lastChunkId, { includeStart: true });
+    expect(freedChain).toHaveLength(Math.ceil(payload.length / 1024));
+    const docEntriesBefore = (await db.getStore().getAllIds()).length;
+
+    expect(await attachmentStore.deleteEntriesForAttachment!(doc.getId(), attachmentId)).toBe(freedChain.length);
+    expect(await attachmentStore.hasEntries(freedChain)).toEqual([]);
+    expect(await attachmentStore.deleteEntriesForAttachment!(doc.getId(), attachmentId)).toBe(0);
+    const keptChain = await attachmentStore.resolveDependencies(keptLastChunkId, { includeStart: true });
+    expect(await attachmentStore.hasEntries(keptChain)).toEqual(keptChain);
+    expect((await db.getStore().getAllIds()).length).toBe(docEntriesBefore);
+    const afterFree = await db.getDocument(doc.getId());
+    expect(Array.from(await afterFree.getAttachment(keptId))).toEqual(Array.from(keptPayload));
     await (tenant as unknown as { disposeCacheManager?: () => Promise<void> }).disposeCacheManager?.();
   }, 60000);
 });

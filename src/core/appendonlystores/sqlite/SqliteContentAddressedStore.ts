@@ -374,6 +374,28 @@ export class SqliteContentAddressedStore implements ContentAddressedStore {
     await this.backend.transaction(() => this.backend.deleteEntries(ids));
   }
 
+  /**
+   * Deletes the chunks of one attachment (local copies only; append-only
+   * stores elsewhere keep them). Same selection as the IndexedDB store: chunk
+   * entries of `docId` with that attachment id, or with the chunk-id prefix of
+   * attachments written before chunks carried their attachment id.
+   */
+  async deleteEntriesForAttachment(docId: string, attachmentId: string): Promise<number> {
+    await this.ready;
+    const prefix = `${docId}_a_${attachmentId}_`;
+    const ids = (await this.metadataForDoc(docId))
+      .filter(
+        (meta) =>
+          meta.entryType === "attachment_chunk" &&
+          (meta.attachmentId === attachmentId || meta.id.startsWith(prefix)),
+      )
+      .map((meta) => meta.id);
+    if (ids.length === 0) {
+      return 0;
+    }
+    return this.backend.transaction(() => this.backend.deleteEntries(ids));
+  }
+
   async deleteEntriesById(entryIds: string[]): Promise<number> {
     await this.ready;
     return this.backend.transaction(() => this.backend.deleteEntries(entryIds));
