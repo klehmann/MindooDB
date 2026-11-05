@@ -674,6 +674,18 @@ export interface PublishToServerOptions {
    * locator. Browsers cannot CORS-fetch `iroh:` URLs.
    */
   irohStreamIO?: import("./appendonlystores/network/IrohStreamIO").IrohStreamIO;
+  /**
+   * The tenant's administration private key. With it (and {@link adminPassword})
+   * the publish flow adds the server as a trusted witness (docs/accesscontrol.md
+   * §6.4), so the receipts it stamps on pushed entries are accepted once access
+   * control is enabled. Not needed when `systemAdminUser` is the tenant admin
+   * (demo servers with open tenant creation).
+   */
+  adminSigningKey?: EncryptedPrivateKey;
+  /** Password for {@link adminSigningKey}. */
+  adminPassword?: string;
+  /** Do not add the server as a trusted witness (e.g. a pure relay the admin does not trust). */
+  skipTrustedWitness?: boolean;
 }
 
 /**

@@ -14,6 +14,10 @@
  * 5. Both change the same document offline at the same time (different fields, the
  *    same text, the same list, the same atomic field); after syncing both ways
  *    Automerge has merged the edits and both devices hold the same state.
+ * 6. Publishing added the server as a trusted witness and the server stamped every
+ *    entry it accepted. With access control switched on, both devices still read
+ *    all documents. Counter-check (second test): a tenant published without the
+ *    witness gets its stamped entries quarantined once access control is on.
  *
  * `JoinNewUserServer` covers the join itself in more depth; this test is about the
  * data round trip around it.
@@ -112,6 +116,29 @@ async function snapshot(tenant: MindooTenant, dbId: string): Promise<Record<stri
     result[id] = JSON.parse(JSON.stringify((await db.getDocument(id)).getData()));
   }
   return result;
+}
+
+/** Server signing (witness) key from its well-known info. */
+async function serverSigningKey(baseUrl: string): Promise<string> {
+  const info = (await (await fetch(`${baseUrl}/.well-known/mindoodb-server-info`)).json()) as { signingPublicKey: string };
+  expect(typeof info.signingPublicKey).toBe("string");
+  return info.signingPublicKey;
+}
+
+/** Switches access control on (admin writes the directory) and drops the cached documents. */
+async function enableAccessControl(tenant: MindooTenant, admin: PrivateUserId, password: string): Promise<void> {
+  const directory = await tenant.openDirectory();
+  await directory.setDefaultAccessPolicy!(
+    { disableAllAccessChecksAndPolicies: false },
+    admin.userSigningKeyPair.privateKey,
+    password,
+  );
+}
+
+/** Forgets materialized documents so the next read replays (and re-checks) the entries. */
+async function dropDocCache(tenant: MindooTenant, dbId: string): Promise<void> {
+  const db = (await openDb(tenant, dbId)) as unknown as { docCache: Map<string, unknown> };
+  db.docCache.clear();
 }
 
 async function update(tenant: MindooTenant, docId: string, fn: (data: any) => void): Promise<void> {
@@ -283,5 +310,82 @@ describe("two users on a demo server: create, publish, join, sync, merge", () =>
     expect(["hoch", "niedrig"]).toContain(plan.priority);
     // The other document was not touched by the merge.
     expect(karstenView[shoppingId]).toMatchObject({ title: "Einkaufsliste", tags: ["start"], items: ["Milch", "Brot"] });
+
+    // --- The server is a trusted witness and stamped every entry -----------------
+    const serverKey = await serverSigningKey(baseUrl);
+    for (const tenant of [karsten, jane]) {
+      const trusted = await (await tenant.openDirectory()).getTrustedWitnessKeysAt!(Date.now());
+      expect([...trusted]).toEqual([serverKey]);
+    }
+    for (const docId of docIds) {
+      const metas = await (await openDb(karsten, NOTES_DB)).getStore().findNewEntriesForDoc([], docId);
+      expect(metas.length).toBeGreaterThan(0);
+      for (const meta of metas) expect(meta.receivedByPublicKey).toBe(serverKey);
+    }
+    expect((await (await openDb(karsten, NOTES_DB)).getDocument(planId)).isWitnessed()).toBe(true);
+
+    // --- With access control on, both devices still read everything -----------------
+    await enableAccessControl(karsten, adminUser, KARSTEN_PASSWORD);
+    await push(karsten, baseUrl, "directory", adminAuth);
+    await pull(jane, baseUrl, "directory");
+    for (const tenant of [karsten, jane]) {
+      await dropDocCache(tenant, NOTES_DB);
+      expect(await snapshot(tenant, NOTES_DB)).toEqual(karstenView);
+    }
+  });
+
+  test("without the server as trusted witness, its receipts are quarantined once access control is on", async () => {
+    demo = await startServer("demo-server-nowitness", DEMO_CONFIG);
+    const baseUrl = demo.baseUrl;
+    const tenantId = `demo-nw-${Date.now().toString(16)}`;
+    const factory = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
+    const adminUser = await factory.createUserId(`cn=admin/o=${tenantId}`, KARSTEN_PASSWORD);
+    const user = await factory.createUserId(`cn=karsten/o=${tenantId}`, KARSTEN_PASSWORD);
+    await factory.ensureUserKeyPair(user, KARSTEN_PASSWORD);
+    const { tenant } = await factory.createTenant({
+      tenantId,
+      adminUser,
+      adminPassword: KARSTEN_PASSWORD,
+      appUser: user,
+      userPassword: KARSTEN_PASSWORD,
+    });
+    tenant.noteUserDirectoryFetched!();
+    await tenant.reconcileUserKeys!({ allowSelfCreate: true });
+    await tenant.publishToServer(baseUrl, {
+      systemAdminUser: adminUser,
+      systemAdminPassword: KARSTEN_PASSWORD,
+      adminUsername: adminUser.username,
+      skipTrustedWitness: true,
+    });
+    expect((await (await tenant.openDirectory()).getTrustedWitnessKeysAt!(Date.now())).size).toBe(0);
+
+    const adminAuth = { user: adminUser, password: KARSTEN_PASSWORD };
+    await push(tenant, baseUrl, "directory", adminAuth);
+    await push(tenant, baseUrl, USER_DIRECTORY_DB_ID);
+    const notes = await openDb(tenant, NOTES_DB);
+    const doc = await notes.createDocument();
+    await notes.changeDoc(doc, (d) => {
+      d.getData().title = "stamped by an untrusted server";
+    });
+    await push(tenant, baseUrl, NOTES_DB);
+    const metas = await notes.getStore().findNewEntriesForDoc([], doc.getId());
+    expect(metas.some((m) => m.receivedByPublicKey === undefined)).toBe(false);
+
+    // Readable while access control is off ...
+    await dropDocCache(tenant, NOTES_DB);
+    expect((await notes.getDocument(doc.getId())).getData().title).toBe("stamped by an untrusted server");
+    // ... quarantined once it is on.
+    await enableAccessControl(tenant, adminUser, KARSTEN_PASSWORD);
+    await dropDocCache(tenant, NOTES_DB);
+    await expect(notes.getDocument(doc.getId())).rejects.toThrow(/not found/i);
+    // Trust counts from when the witness was added, so adding it now does not
+    // make the earlier receipt trusted.
+    await (await tenant.openDirectory()).addTrustedWitness!(
+      { witnessPublicKey: await serverSigningKey(baseUrl), serverUrl: baseUrl },
+      adminUser.userSigningKeyPair.privateKey,
+      KARSTEN_PASSWORD,
+    );
+    await dropDocCache(tenant, NOTES_DB);
+    await expect(notes.getDocument(doc.getId())).rejects.toThrow(/not found/i);
   });
 });

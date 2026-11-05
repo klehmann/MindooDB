@@ -528,10 +528,12 @@ Once a tenant is created locally, it can be registered on a MindooDB sync server
 ```typescript
 await tenant.publishToServer("https://sync.example.com", {
   registerUsers: [factory.toPublicUserId(appUser)],
+  adminSigningKey: adminUser.userSigningKeyPair.privateKey,
+  adminPassword: "strong-admin-password",
 });
 ```
 
-The server uses the `$publicinfos` key to read the directory database and validate incoming sync requests. Pre-registering users is optional but allows them to sync immediately.
+The server uses the `$publicinfos` key to read the directory database and validate incoming sync requests. Pre-registering users is optional but allows them to sync immediately. With the administration key, publishing also adds the server's signing key as a trusted witness, so the receipts it stamps on incoming entries are accepted once access control is enabled.
 
 ### Inviting a User (Join Request / Response)
 

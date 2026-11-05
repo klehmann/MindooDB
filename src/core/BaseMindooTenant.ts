@@ -2019,6 +2019,7 @@ export class BaseMindooTenant implements MindooTenant {
       adminSigningPublicKey: this.administrationPublicKey,
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
     };
+    let serverSigningPublicKey: string | undefined;
     try {
       const serverInfoResponse = await fetch(`${baseUrl}/.well-known/mindoodb-server-info`, {
         headers: {
@@ -2046,6 +2047,7 @@ export class BaseMindooTenant implements MindooTenant {
       ) {
         throw new Error("The server returned an invalid .well-known payload.");
       }
+      serverSigningPublicKey = readServerSigningPublicKey(serverInfoBody);
       const rsaEncryption = new RSAEncryption(this.cryptoAdapter);
       requestBody.encryptedPublicInfosKey = this.uint8ArrayToBase64(
         await rsaEncryption.encrypt(
@@ -2101,6 +2103,61 @@ export class BaseMindooTenant implements MindooTenant {
 
     console.log(`[publishToServer] ✓ Tenant "${this.tenantId}" published to server successfully`);
     this.logger.info(`Tenant "${this.tenantId}" published to server successfully`);
+    await this.trustServerAsWitness(serverSigningPublicKey, baseUrl, options);
+  }
+
+  /**
+   * Adds the server the tenant was just published to as a trusted witness
+   * (docs/accesscontrol.md §6.4). The server stamps every entry it accepts;
+   * without this directory document those receipts come from an untrusted key,
+   * and once access control is switched on every stamped entry is quarantined.
+   * Trust is evaluated at the receipt's `receivedAt`, so it has to be in place
+   * before the first entry is pushed: that is why the publish flow writes it.
+   *
+   * Needs the administration private key: {@link PublishToServerOptions.adminSigningKey}
+   * and `adminPassword`, or a `systemAdminUser` that is the tenant admin (demo
+   * servers with open tenant creation). Without it a warning is logged and the
+   * admin has to call `MindooTenantDirectory.addTrustedWitness()` before pushing.
+   */
+  private async trustServerAsWitness(
+    serverSigningPublicKey: string | undefined,
+    serverUrl: string,
+    options?: PublishToServerOptions,
+  ): Promise<void> {
+    if (options?.skipTrustedWitness) return;
+    if (!serverSigningPublicKey) {
+      this.logger.warn(
+        `[publishToServer] ${serverUrl} did not report a signing key; it was not added as a trusted witness`,
+      );
+      return;
+    }
+    let adminKey = options?.adminSigningKey;
+    let adminPassword = options?.adminPassword;
+    if (
+      (!adminKey || adminPassword === undefined) &&
+      options?.systemAdminUser &&
+      options.systemAdminPassword !== undefined &&
+      options.systemAdminUser.userSigningKeyPair.publicKey === this.administrationPublicKey
+    ) {
+      adminKey = options.systemAdminUser.userSigningKeyPair.privateKey as EncryptedPrivateKey;
+      adminPassword = options.systemAdminPassword;
+    }
+    const directory = await this.openDirectory();
+    const trustedNow = await directory.getTrustedWitnessKeysAt?.(Date.now());
+    if (trustedNow?.has(serverSigningPublicKey)) return;
+    if (!adminKey || adminPassword === undefined || !directory.addTrustedWitness) {
+      console.warn(
+        `[publishToServer] ${serverUrl} was not added as a trusted witness (no administration key given). ` +
+          `Call directory.addTrustedWitness() before pushing data, or entries it stamps are quarantined once access control is enabled.`,
+      );
+      return;
+    }
+    await directory.addTrustedWitness(
+      { witnessPublicKey: serverSigningPublicKey, serverUrl },
+      adminKey,
+      adminPassword,
+    );
+    this.logger.info(`Added ${serverUrl} as a trusted witness of tenant "${this.tenantId}"`);
   }
 
   private resolveIrohDial(
@@ -2140,6 +2197,7 @@ export class BaseMindooTenant implements MindooTenant {
       adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
     };
     let supportsSystemAdmin = false;
+    let serverSigningPublicKey: string | undefined;
     try {
       const serverInfo = await transport.getServerInfo();
       if (
@@ -2151,6 +2209,7 @@ export class BaseMindooTenant implements MindooTenant {
         throw new Error("The server returned an invalid Iroh server-info payload.");
       }
       supportsSystemAdmin = (serverInfo as { supportsSystemAdmin?: unknown }).supportsSystemAdmin === true;
+      serverSigningPublicKey = readServerSigningPublicKey(serverInfo);
       const rsaEncryption = new RSAEncryption(this.cryptoAdapter);
       requestBody.encryptedPublicInfosKey = this.uint8ArrayToBase64(
         await rsaEncryption.encrypt(
@@ -2189,6 +2248,7 @@ export class BaseMindooTenant implements MindooTenant {
     await transport.registerTenant(token, this.tenantId, requestBody);
     console.log(`[publishToServer] ✓ Tenant "${this.tenantId}" published to server successfully`);
     this.logger.info(`Tenant "${this.tenantId}" published to server successfully`);
+    await this.trustServerAsWitness(serverSigningPublicKey, `iroh:${target.ticket}`, options);
   }
 
   private async authenticateAsSystemAdminOverIroh(
@@ -3184,3 +3244,8 @@ export class BaseMindooTenant implements MindooTenant {
   }
 }
 
+/** The server's Ed25519 signing key (its witness key) from its server-info payload. */
+function readServerSigningPublicKey(serverInfo: unknown): string | undefined {
+  const key = (serverInfo as { signingPublicKey?: unknown } | null)?.signingPublicKey;
+  return typeof key === "string" && key.length > 0 ? key : undefined;
+}

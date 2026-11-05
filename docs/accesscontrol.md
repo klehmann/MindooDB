@@ -629,10 +629,20 @@ interface TrustedWitnessDoc {
 }
 ```
 
-A witness is added automatically on the **first push of the tenant to a server**
-(the publish flow asks the server for its signing key) and can also be added/removed
-manually via `MindooTenantDirectory` (section 9). Rotation is "add the new witness
-doc, drop the old one".
+`publishToServer()` adds the server as a witness when the tenant is published: it
+reads the server's signing key (`signingPublicKey` in
+`/.well-known/mindoodb-server-info`) and writes this document with the
+administration key, which it takes from `adminSigningKey` / `adminPassword` or from
+`systemAdminUser` when that is the tenant admin. Without an administration key it
+only logs a warning; `skipTrustedWitness: true` skips the step on purpose. Witnesses
+can also be added/removed manually via `MindooTenantDirectory` (section 9).
+Rotation is "add the new witness doc, drop the old one".
+
+Trust is evaluated at the receipt's `receivedAt` (`getTrustedWitnessKeysAt`), so a
+witness must be in the directory **before** the server stamps the first entry. A
+witness added later does not make earlier receipts trusted: with access control
+switched on, those entries stay quarantined as "receipt from an untrusted witness
+key".
 
 ### 6.5 Grants, groups, and revocation-by-key-removal
 

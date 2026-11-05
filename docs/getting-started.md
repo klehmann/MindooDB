@@ -79,10 +79,15 @@ await tenant.publishToServer("https://sync.example.com", {
   adminUsername: adminUser.username,
   systemAdminUser: systemAdminIdentity,
   systemAdminPassword: "system-admin-password",
+  // Adds the server as a trusted witness (see below).
+  adminSigningKey: adminUser.userSigningKeyPair.privateKey,
+  adminPassword: "strong-admin-password",
 });
 ```
 
-This authenticates as the system admin (challenge/response with Ed25519 signature), then registers the tenant on the server. The server receives the admin's public signing key, public encryption key, and the `$publicinfos` key from `doc:<tenantId>:$publicinfos` — it uses that key to read the directory database and validate incoming sync requests against the admin-signed user registry.
+This authenticates as the system admin (challenge/response with Ed25519 signature), then registers the tenant on the server.
+
+> **Trusted witness:** The server stamps every entry it accepts with a signed receipt (the trusted time used by access control). With the administration key, `publishToServer()` also writes the server's signing key into the directory as a trusted witness, before any data is pushed. Without it, the receipts come from an untrusted key and every stamped entry is quarantined as soon as access control is switched on. When `systemAdminUser` is the tenant admin itself (demo servers with open tenant creation), its key is used and `adminSigningKey` is not needed. Trust applies from the moment the witness is added, so add it before the first push; see [Access Control §6.4](./accesscontrol.md). The server receives the admin's public signing key, public encryption key, and the `$publicinfos` key from `doc:<tenantId>:$publicinfos` — it uses that key to read the directory database and validate incoming sync requests against the admin-signed user registry.
 
 If you want to pre-register users on the server at the same time (so they can sync immediately after joining), pass them as an option:
 
@@ -91,6 +96,8 @@ await tenant.publishToServer("https://sync.example.com", {
   adminUsername: adminUser.username,
   systemAdminUser: systemAdminIdentity,
   systemAdminPassword: "system-admin-password",
+  adminSigningKey: adminUser.userSigningKeyPair.privateKey,
+  adminPassword: "strong-admin-password",
   registerUsers: [factory.toPublicUserId(appUser)],
 });
 ```
