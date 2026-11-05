@@ -1,4 +1,4 @@
-import { generateRandomUuid } from "../../utils/idGeneration";
+import { issueAuthChallenge, verifyAuthChallengeSignature } from "../../crypto/AuthChallenge";
 import type { CryptoAdapter } from "../../crypto/CryptoAdapter";
 import type { MindooTenantDirectory } from "../../types";
 import type {
@@ -45,6 +45,7 @@ export class AuthenticationService {
   
   // Configuration
   private challengeExpirationMs: number;
+  private readonly acceptLegacyChallengeSignatures: boolean;
   private tokenExpirationMs: number;
   private logger: Logger;
 
@@ -57,8 +58,14 @@ export class AuthenticationService {
       challengeExpirationMs?: number;
       tokenExpirationMs?: number;
       logger?: Logger;
+      /**
+       * Accept a raw signature over a v2 challenge from clients that predate
+       * the signing domain (see `crypto/AuthChallenge.ts`). Default true.
+       */
+      acceptLegacyChallengeSignatures?: boolean;
     }
   ) {
+    this.acceptLegacyChallengeSignatures = options?.acceptLegacyChallengeSignatures !== false;
     this.cryptoAdapter = cryptoAdapter;
     this.directory = directory;
     this.tenantId = tenantId;
@@ -218,7 +225,7 @@ export class AuthenticationService {
 
   /** Persist a fresh challenge and return its string. */
   private storeChallenge(fields: { username?: string; signingPublicKey?: string }): string {
-    const challenge = generateRandomUuid();
+    const challenge = issueAuthChallenge();
     const now = Date.now();
     const authChallenge: AuthChallenge = {
       challenge,
@@ -500,7 +507,7 @@ export class AuthenticationService {
    * Verify an Ed25519 signature.
    */
   private async verifySignature(
-    message: string,
+    challenge: string,
     signature: Uint8Array,
     publicKeyPem: string
   ): Promise<boolean> {
@@ -523,16 +530,10 @@ export class AuthenticationService {
         ["verify"]
       );
       
-      // Verify signature
-      const messageBytes = new TextEncoder().encode(message);
-      const isValid = await subtle.verify(
-        { name: "Ed25519" },
-        publicKey,
-        signature.buffer.slice(signature.byteOffset, signature.byteOffset + signature.byteLength) as ArrayBuffer,
-        messageBytes.buffer as ArrayBuffer
-      );
-      
-      return isValid;
+      // The v2 domain form, plus the raw string from clients that predate it.
+      return await verifyAuthChallengeSignature(subtle, publicKey, challenge, signature, {
+        acceptLegacySignatures: this.acceptLegacyChallengeSignatures,
+      });
     } catch (error) {
       this.logger.error(`Signature verification error:`, error);
       return false;

@@ -260,8 +260,8 @@ describe("Network Sync", () => {
       expect(challenge2).toBeDefined();
       expect(challenge1).not.toBe(challenge2);
       
-      // Should be a random UUID v4 (122 bits of entropy, no timestamp)
-      expect(challenge1).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      // A v2 challenge: fixed prefix + random UUID v4 (122 bits of entropy, no timestamp)
+      expect(challenge1).toMatch(/^mindoodb-auth-challenge\/v2:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     });
 
     test("should authenticate with valid signature", async () => {

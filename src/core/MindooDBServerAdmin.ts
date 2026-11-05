@@ -7,6 +7,7 @@
  */
 
 import type { CryptoAdapter } from "./crypto/CryptoAdapter";
+import { authChallengeSigningBytes } from "./crypto/AuthChallenge";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import type { PrivateUserId } from "./userid";
@@ -650,7 +651,7 @@ export class MindooDBServerAdmin {
 
     const { challenge } = (await challengeRes.json()) as { challenge: string };
 
-    const messageBytes = new TextEncoder().encode(challenge);
+    const messageBytes = authChallengeSigningBytes(challenge);
     const signatureBuffer = await subtle.sign(
       { name: "Ed25519" },
       signingKey,

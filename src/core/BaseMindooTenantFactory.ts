@@ -24,6 +24,7 @@ import {
 import { PrivateUserId, PublicUserId } from "./userid";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
+import { authChallengeSigningBytes } from "./crypto/AuthChallenge";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword, encryptPrivateKey as encryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import { generateRsaOaep3072 } from "./crypto/rsaOaep3072";
 import { USERKEY_PRIVATE_SALT } from "./userkeys/types";
@@ -781,7 +782,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       throw new Error("Device discovery challenge response missing challenge");
     }
 
-    const messageBytes = new TextEncoder().encode(challenge);
+    const messageBytes = authChallengeSigningBytes(challenge);
     const signatureBuffer = await subtle.sign({ name: "Ed25519" }, signingKey, messageBytes);
     const signature = this.uint8ArrayToBase64(new Uint8Array(signatureBuffer));
 

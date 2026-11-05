@@ -25,6 +25,7 @@ import {
 } from "./types";
 import { PrivateUserId, PublicUserId, usernamesEqual } from "./userid";
 import { CryptoAdapter } from "./crypto/CryptoAdapter";
+import { authChallengeSigningBytes } from "./crypto/AuthChallenge";
 import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
@@ -2220,7 +2221,7 @@ export class BaseMindooTenant implements MindooTenant {
       adminUser.username,
       adminUser.userSigningKeyPair.publicKey,
     );
-    const messageBytes = new TextEncoder().encode(challenge);
+    const messageBytes = authChallengeSigningBytes(challenge);
     const signatureBuffer = await subtle.sign({ name: "Ed25519" }, signingKey, messageBytes);
     const result = await transport.authenticateSystem(challenge, new Uint8Array(signatureBuffer));
     if (!result.success || !result.token) {
@@ -2273,7 +2274,7 @@ export class BaseMindooTenant implements MindooTenant {
     const { challenge } = (await challengeRes.json()) as { challenge: string };
 
     // Step 2: Sign the challenge
-    const messageBytes = new TextEncoder().encode(challenge);
+    const messageBytes = authChallengeSigningBytes(challenge);
     const signatureBuffer = await subtle.sign(
       { name: "Ed25519" },
       signingKey,

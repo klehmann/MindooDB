@@ -20,6 +20,7 @@ import type {
   StoreKind,
 } from "../../core/appendonlystores/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import { authChallengeSigningBytes } from "../../core/crypto/AuthChallenge";
 import type { NetworkTransport } from "../../core/appendonlystores/network/NetworkTransport";
 import type {
   NetworkEncryptedEntry,
@@ -922,7 +923,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
 
   private async signChallengeWithKey(challenge: string, signingKey: CryptoKey): Promise<Uint8Array> {
     const subtle = this.cryptoAdapter.getSubtle();
-    const messageBytes = new TextEncoder().encode(challenge);
+    const messageBytes = authChallengeSigningBytes(challenge);
     
     const signature = await subtle.sign(
       { name: "Ed25519" },

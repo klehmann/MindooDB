@@ -8,7 +8,7 @@
  * the issued JWT can carry both fields for capability matching.
  */
 
-import { generateRandomUuid } from "../core/utils/idGeneration";
+import { issueAuthChallenge, verifyAuthChallengeSignature } from "../core/crypto/AuthChallenge";
 import type { CryptoAdapter } from "../core/crypto/CryptoAdapter";
 import type { ServerConfig, SystemAdminPrincipal } from "./types";
 import {
@@ -116,7 +116,7 @@ export class SystemAdminAuthService {
       throw new Error("Unknown system admin principal");
     }
 
-    const challenge = generateRandomUuid();
+    const challenge = issueAuthChallenge();
     const now = Date.now();
 
     this.challenges.set(challenge, {
@@ -254,16 +254,7 @@ export class SystemAdminAuthService {
         ["verify"],
       );
 
-      const messageBytes = new TextEncoder().encode(message);
-      return await subtle.verify(
-        { name: "Ed25519" },
-        publicKey,
-        signature.buffer.slice(
-          signature.byteOffset,
-          signature.byteOffset + signature.byteLength,
-        ) as ArrayBuffer,
-        messageBytes.buffer as ArrayBuffer,
-      );
+      return await verifyAuthChallengeSignature(subtle, publicKey, message, signature);
     } catch {
       return false;
     }

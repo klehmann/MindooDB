@@ -38,6 +38,7 @@ import type { IrohStreamIO } from "../../core/appendonlystores/network/IrohStrea
 import { DIRECTORY_DB_ID, StoreKind, type ContentAddressedStore } from "../../core/types";
 import { NetworkError } from "../../core/appendonlystores/network/types";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
+import { authChallengeSigningBytes } from "../../core/crypto/AuthChallenge";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import { base64ToBytes, bytesToBase64 } from "../../core/utils/base64";
@@ -430,7 +431,7 @@ export class PeerReplicator {
     const signature = await subtle.sign(
       { name: "Ed25519" },
       signingKey,
-      new TextEncoder().encode(challenge),
+      authChallengeSigningBytes(challenge),
     );
 
     const authResponse = (await this.peerFetch("/system/peer/authenticate", {
