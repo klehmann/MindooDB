@@ -9,7 +9,7 @@
  * write as a peer.
  */
 
-import { generateRandomUuid } from "../../core/utils/idGeneration";
+import { issueAuthChallenge, verifyAuthChallengeSignature } from "../../core/crypto/AuthChallenge";
 import type { CryptoAdapter } from "../../core/crypto/CryptoAdapter";
 import type { TrustedServer } from "../types";
 
@@ -83,7 +83,7 @@ export class PeerAuthService {
       throw new Error("Unknown peer");
     }
 
-    const challenge = generateRandomUuid();
+    const challenge = issueAuthChallenge();
     this.challenges.set(challenge, {
       challenge,
       serverName: server.name,
@@ -190,16 +190,7 @@ export class PeerAuthService {
         false,
         ["verify"],
       );
-      const messageBytes = new TextEncoder().encode(message);
-      return await subtle.verify(
-        { name: "Ed25519" },
-        publicKey,
-        signature.buffer.slice(
-          signature.byteOffset,
-          signature.byteOffset + signature.byteLength,
-        ) as ArrayBuffer,
-        messageBytes.buffer as ArrayBuffer,
-      );
+      return await verifyAuthChallengeSignature(subtle, publicKey, message, signature);
     } catch {
       return false;
     }

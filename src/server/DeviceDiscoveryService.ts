@@ -5,7 +5,7 @@
  * no join-response URI required.
  */
 
-import { generateRandomUuid } from "../core/utils/idGeneration";
+import { issueAuthChallenge, verifyAuthChallengeSignature } from "../core/crypto/AuthChallenge";
 import type { CryptoAdapter } from "../core/crypto/CryptoAdapter";
 import { RSAEncryption } from "../core/crypto/RSAEncryption";
 import type { DeviceTenantDelivery } from "../core/types";
@@ -52,7 +52,7 @@ export class DeviceDiscoveryService {
     if (!trimmed) {
       throw new Error("signingPublicKey is required");
     }
-    const challenge = generateRandomUuid();
+    const challenge = issueAuthChallenge();
     const now = Date.now();
     this.challenges.set(challenge, {
       challenge,
@@ -195,16 +195,7 @@ export class DeviceDiscoveryService {
         false,
         ["verify"],
       );
-      const data = new TextEncoder().encode(challenge);
-      return await subtle.verify(
-        "Ed25519",
-        key,
-        signature.buffer.slice(
-          signature.byteOffset,
-          signature.byteOffset + signature.byteLength,
-        ) as ArrayBuffer,
-        data.buffer as ArrayBuffer,
-      );
+      return await verifyAuthChallengeSignature(subtle, key, challenge, signature);
     } catch {
       return false;
     }

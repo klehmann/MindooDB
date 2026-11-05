@@ -14,9 +14,11 @@
  *
  * and `domain` must come from {@link SIGNING_DOMAINS}. Because every allowed
  * domain starts with an ASCII letter while the entry layout starts with its
- * version byte `0x01`, and challenges are random tokens that never begin with
- * `"mindoodb-"`, the three input spaces cannot overlap. The `0x00` separator
- * stops one domain from being a prefix of another.
+ * version byte `0x01`, the two cannot overlap. Login challenges are signed
+ * under their own domain `mindoodb-auth/v2`, or — against servers older than
+ * that — only when they are a bare UUID (`crypto/AuthChallenge.ts`), so they
+ * stay out of both spaces too. The `0x00` separator stops one domain from
+ * being a prefix of another.
  */
 
 /**

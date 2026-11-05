@@ -1769,6 +1769,29 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     );
   }
 
+  async requireV2EntrySignatures(
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<{ since: number; changed: boolean }> {
+    const head = await this.getDirectoryStateHead();
+    const existing = head.defaultPolicy?.requireMetadataSignatureSince;
+    if (typeof existing === "number" && Number.isFinite(existing)) {
+      return { since: existing, changed: false };
+    }
+    const since = semanticNow();
+    await this.setDefaultAccessPolicy(
+      head.defaultPolicy
+        ? { requireMetadataSignatureSince: since }
+        : // No policy document yet: writing one is what activates access
+          // control, so it carries the master switch, exactly as a new tenant
+          // gets it from the factory.
+          { disableAllAccessChecksAndPolicies: true, requireMetadataSignatureSince: since },
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+    return { since, changed: true };
+  }
+
   /**
    * Create or update a per-database policy override (§6.2). Fields set here
    * override the tenant default for `dbid`; unset fields inherit it.
