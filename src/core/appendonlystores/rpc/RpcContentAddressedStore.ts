@@ -87,6 +87,7 @@ export const SQLITE_STORE_RPC_METHODS: StoreRpcOptionalMethod[] = [
   "scanEntriesSince",
   "getIdBloomSummary",
   "getStoreHead",
+  "deleteEntriesForAttachment",
   "deleteEntriesById",
   "clearAllLocalData",
   "awaitIndexReady",
