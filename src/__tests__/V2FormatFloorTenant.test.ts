@@ -25,6 +25,10 @@ class SharedInMemoryStoreFactory implements ContentAddressedStoreFactory {
 type FloorDirectory = Awaited<ReturnType<MindooTenant["openDirectory"]>> & {
   getRequireMetadataSignatureSince(): Promise<number | undefined>;
   isAccessControlActive(): Promise<boolean>;
+  requireV2EntrySignatures(
+    administrationPrivateKey: unknown,
+    administrationPrivateKeyPassword: string,
+  ): Promise<{ since: number; changed: boolean }>;
 };
 
 /**
@@ -88,5 +92,59 @@ describe("createTenant v2 storage-format floor", () => {
     const dir = (await tenant.openDirectory()) as FloorDirectory;
     expect(await dir.getRequireMetadataSignatureSince()).toBeUndefined();
     expect(await dir.isAccessControlActive()).toBe(false);
+  }, 90000);
+
+  it("lets an admin turn the floor on for a tenant created without it", async () => {
+    const adminPassword = "adminpass123";
+    const userPassword = "userpass123";
+    const { tenant, adminUser, appUser } = await factory.createTenant({
+      tenantId: "v2-later",
+      adminName: "CN=admin/O=v2later",
+      userName: "CN=alice/O=v2later",
+      adminPassword,
+      userPassword,
+      requireV2Entries: false,
+    });
+    const dir = (await tenant.openDirectory()) as FloorDirectory;
+    expect(await dir.getRequireMetadataSignatureSince()).toBeUndefined();
+
+    const before = Date.now();
+    const first = await dir.requireV2EntrySignatures(adminUser.userSigningKeyPair.privateKey, adminPassword);
+    expect(first.changed).toBe(true);
+    expect(first.since).toBeGreaterThanOrEqual(before);
+    expect(await dir.getRequireMetadataSignatureSince()).toBe(first.since);
+    // Writing the policy document must not switch on ACL deny-gates.
+    expect(await dir.isAccessControlActive()).toBe(false);
+
+    // Asking again keeps the cutoff that is already in force.
+    const second = await dir.requireV2EntrySignatures(adminUser.userSigningKeyPair.privateKey, adminPassword);
+    expect(second).toEqual({ since: first.since, changed: false });
+
+    const db = await tenant.openDB("main");
+    const doc = await db.createDocument({
+      signingKeyPair: {
+        publicKey: appUser.userSigningKeyPair.publicKey,
+        privateKey: appUser.userSigningKeyPair.privateKey,
+      },
+      signingKeyPassword: userPassword,
+      initialValues: { title: "still writable" },
+    });
+    expect((await db.getDocument(doc.getId()))?.getData().title).toBe("still writable");
+  }, 90000);
+
+  it("leaves a tenant that already has a floor alone", async () => {
+    const adminPassword = "adminpass123";
+    const { tenant, adminUser } = await factory.createTenant({
+      tenantId: "v2-already",
+      adminName: "CN=admin/O=v2already",
+      userName: "CN=alice/O=v2already",
+      adminPassword,
+      userPassword: "userpass123",
+    });
+    const dir = (await tenant.openDirectory()) as FloorDirectory;
+    const cutoff = await dir.getRequireMetadataSignatureSince();
+    await expect(
+      dir.requireV2EntrySignatures(adminUser.userSigningKeyPair.privateKey, adminPassword),
+    ).resolves.toEqual({ since: cutoff, changed: false });
   }, 90000);
 });

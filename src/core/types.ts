@@ -3229,6 +3229,23 @@ export interface MindooTenantDirectory {
   ): Promise<void>;
 
   /**
+   * Require the v2 metadata-binding entry signature from now on, for a tenant
+   * created before that became the default (`requireMetadataSignatureSince`).
+   *
+   * New entries then must carry `metadataSignature`; history from before the
+   * cutoff keeps verifying with the legacy signature. Safe to call on any
+   * tenant: one that already has a cutoff is left alone, and a tenant without
+   * a default policy document gets one with access checks still switched off,
+   * because creating that document is otherwise what turns access control on.
+   *
+   * @returns The cutoff now in force, and whether this call set it.
+   */
+  requireV2EntrySignatures?(
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<{ since: number; changed: boolean }>;
+
+  /**
    * Create or update a per-database access policy override (§6.2). Fields set
    * here override the tenant default for `dbid`; unset fields inherit it.
    *
