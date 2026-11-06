@@ -113,6 +113,7 @@ describe("doc_deposit on a real server (HTTP)", () => {
     name: string,
     pushDirectory: () => Promise<void>,
     depositPrefixes?: string[],
+    accessPrefixes?: string[],
   ) {
     const deviceFactory = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
     const user = await deviceFactory.createUserId(name, PASSWORD);
@@ -125,6 +126,7 @@ describe("doc_deposit on a real server (HTTP)", () => {
       username: name,
       sharedDocKeyIds: [PUBLIC_INFOS_KEY_ID],
       ...(depositPrefixes ? { depositPrefixes } : {}),
+      ...(accessPrefixes ? { accessPrefixes } : {}),
     });
     await pushDirectory();
     const delivery = (await deviceFactory.discoverTenantsOnServer(baseUrl, { user, password: PASSWORD })).find(
@@ -136,10 +138,12 @@ describe("doc_deposit on a real server (HTTP)", () => {
     await pull(tenant, USER_DIRECTORY_DB_ID);
     tenant.noteUserDirectoryFetched!();
     await tenant.reconcileUserKeys!({ allowSelfCreate: false });
+    // Publish this device's wrap of its user key, so others can seal to it.
+    await push(tenant, USER_DIRECTORY_DB_ID);
     return { tenant, user: joined.user, factory: deviceFactory, delivery };
   }
 
-  async function setup(options: { acl?: boolean; gatewayDepositPrefixes?: string[] } = {}) {
+  async function setup(options: { acl?: boolean; gatewayDepositPrefixes?: string[]; gatewayAccessPrefixes?: string[] } = {}) {
     const acl = options.acl ?? true;
     const tenantId = `deposit-${Date.now().toString(16)}`;
     const founderFactory = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
@@ -192,7 +196,7 @@ describe("doc_deposit on a real server (HTTP)", () => {
     expect(await jane.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
 
     const gatewayName = `cn=mail-gateway/o=${tenantId}`;
-    const gateway = await joinPublicInfosOnly(karsten, admin, tenantId, gatewayName, pushDirectory, options.gatewayDepositPrefixes);
+    const gateway = await joinPublicInfosOnly(karsten, admin, tenantId, gatewayName, pushDirectory, options.gatewayDepositPrefixes, options.gatewayAccessPrefixes);
     expect(await gateway.tenant.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(false);
 
     // Access control: mmail_* is read-gated; Jane reads hers, the gateway deposits.
@@ -202,7 +206,8 @@ describe("doc_deposit on a real server (HTTP)", () => {
       (await directory.findGrantAccessDocuments!(username)).find((doc) => !doc.isDeleted())!.getId();
     const janeMail = `mmail_${await grantId(janeUser.username)}`;
     const karstenMail = `mmail_${await grantId(karstenUser.username)}`;
-    const base = { tenantId, admin, karsten, karstenUser, jane, janeUser, gateway, gatewayName, directory, adminKey, pushDirectory, janeMail, karstenMail };
+    const janeOutbox = `mmailout_${await grantId(janeUser.username)}`;
+    const base = { tenantId, admin, karsten, karstenUser, jane, janeUser, gateway, gatewayName, directory, adminKey, pushDirectory, janeMail, karstenMail, janeOutbox };
     if (!acl) {
       for (const tenant of [gateway.tenant, jane, karsten]) {
         await pull(tenant, "directory");
@@ -429,6 +434,38 @@ describe("doc_deposit on a real server (HTTP)", () => {
       const janeNotesDb = await openDb(t.jane, janeNotes);
       await janeNotesDb.createDocument({ recipients: [], initialValues: { n: 1 } });
       expect((await push(t.jane, janeNotes)).docs.rejectedEntries ?? []).toHaveLength(0);
+    });
+
+    test("an outbox (mmailout_): the owner writes, a service with accessPrefixes reads and answers, others are out", async () => {
+      const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"], gatewayAccessPrefixes: ["mmailout_"] });
+      const gatewayName = t.gatewayName;
+      // Jane puts a message into her outbox, sealed to herself and the gateway.
+      const janeOutboxDb = await openDb(t.jane, t.janeOutbox);
+      const outgoing = await janeOutboxDb.createDocument({
+        recipients: [gatewayName],
+        recipientOptions: { strict: true },
+        initialValues: { type: "outgoing", subject: "to the world" },
+      });
+      expect((await push(t.jane, t.janeOutbox)).docs.rejectedEntries ?? []).toHaveLength(0);
+
+      // The gateway reads it and answers with a status document of its own.
+      const gatewayDb = await pull(t.gateway.tenant, t.janeOutbox);
+      expect((await gatewayDb.getDocument(outgoing.getId())).getData().subject).toBe("to the world");
+      const status = await gatewayDb.createDocument({
+        recipients: [t.janeUser.username],
+        initialValues: { type: "outgoingstatus", outgoingDocId: outgoing.getId(), state: "sending" },
+      });
+      await gatewayDb.changeDoc(status, (d) => {
+        d.getData().state = "sent";
+      });
+      expect((await push(t.gateway.tenant, t.janeOutbox)).docs.rejectedEntries ?? []).toHaveLength(0);
+      const janeView = await pull(t.jane, t.janeOutbox);
+      expect((await janeView.getDocument(status.getId())).getData().state).toBe("sent");
+
+      // Karsten cannot open Jane's outbox; the gateway's access is per prefix (not her mailbox).
+      await expect(openDb(t.karsten, t.janeOutbox)).rejects.toThrow(/read access/);
+      const gatewayMailRemote = await t.gateway.tenant.connectToServer(baseUrl, t.janeMail, StoreKind.docs);
+      await expect(gatewayMailRemote.findNewEntries([])).rejects.toThrow(DENIED);
     });
   });
 });

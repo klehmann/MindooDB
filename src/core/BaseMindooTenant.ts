@@ -1795,13 +1795,16 @@ export class BaseMindooTenant implements MindooTenant {
         distributeKeyIds: [],
       },
     );
-    if (options.depositPrefixes && options.depositPrefixes.length > 0) {
-      if (typeof directory.setGrantDepositPrefixes !== "function") {
-        throw new Error("This directory cannot record deposit rights (depositPrefixes)");
+    if ((options.depositPrefixes?.length ?? 0) > 0 || (options.accessPrefixes?.length ?? 0) > 0) {
+      if (typeof directory.setGrantPersonalDatabaseRights !== "function") {
+        throw new Error("This directory cannot record personal-database rights (depositPrefixes, accessPrefixes)");
       }
-      await directory.setGrantDepositPrefixes(
+      await directory.setGrantPersonalDatabaseRights(
         publicUserId.username,
-        options.depositPrefixes,
+        {
+          ...(options.depositPrefixes?.length ? { depositPrefixes: options.depositPrefixes } : {}),
+          ...(options.accessPrefixes?.length ? { accessPrefixes: options.accessPrefixes } : {}),
+        },
         options.adminSigningKey,
         options.adminPassword,
       );

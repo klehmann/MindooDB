@@ -1806,11 +1806,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     if (grant && extractActiveKeyPairs(grant).some((pair) => signingKeysEqual(pair.signingPublicKey, input.signingKey))) {
       return { mode: "read", reason: "a device of the owner" };
     }
-    for (const signerGrant of await this.grantsForSigningKey(input.signingKey)) {
-      const prefixes = Array.isArray(signerGrant.depositPrefixes) ? signerGrant.depositPrefixes : [];
-      if (prefixes.includes(owner.prefix)) {
-        return { mode: "deposit", maxRecipients: 1, reason: `deposit into ${owner.prefix}* granted` };
-      }
+    const signerGrants = await this.grantsForSigningKey(input.signingKey);
+    const listed = (grant: Record<string, unknown>, field: string) =>
+      Array.isArray(grant[field]) && (grant[field] as unknown[]).includes(owner.prefix);
+    if (signerGrants.some((grant) => listed(grant, "accessPrefixes"))) {
+      return { mode: "read", reason: `service access to ${owner.prefix}* granted` };
+    }
+    if (signerGrants.some((grant) => listed(grant, "depositPrefixes"))) {
+      return { mode: "deposit", maxRecipients: 1, reason: `deposit into ${owner.prefix}* granted` };
     }
     return { mode: "none", reason: grant ? "personal database of another person" : "personal database without a matching grant" };
   }
@@ -1850,7 +1853,28 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
-    for (const prefix of prefixes) {
+    await this.setGrantPersonalDatabaseRights(
+      username,
+      { depositPrefixes: prefixes },
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /**
+   * The rights an identity has in other people's personal databases (§6.11):
+   * `depositPrefixes` (push sealed creates only) and `accessPrefixes` (read
+   * and sync, for a service such as the mail gateway serving every outbox).
+   * Written on the identity's grant, admin-signed; a field left out stays as
+   * it is, an empty list removes the right.
+   */
+  async setGrantPersonalDatabaseRights(
+    username: string,
+    rights: { depositPrefixes?: string[]; accessPrefixes?: string[] },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    for (const prefix of [...(rights.depositPrefixes ?? []), ...(rights.accessPrefixes ?? [])]) {
       if (!PERSONAL_DATABASE_PREFIX_REGEX.test(prefix)) {
         throw new Error(`depositPrefixes: "${prefix}" is not a personal-database prefix like "mmail_"`);
       }
@@ -1866,7 +1890,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       await directoryDB.changeDoc(
         grant,
         (d: MindooDoc) => {
-          d.getData().depositPrefixes = [...new Set(prefixes)];
+          const data = d.getData();
+          if (rights.depositPrefixes) data.depositPrefixes = [...new Set(rights.depositPrefixes)];
+          if (rights.accessPrefixes) data.accessPrefixes = [...new Set(rights.accessPrefixes)];
         },
         { signingKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
       );

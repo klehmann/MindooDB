@@ -437,6 +437,13 @@ export interface ApproveJoinRequestOptions {
    */
   depositPrefixes?: string[];
   /**
+   * Personal-database prefixes the joining identity may read and sync in
+   * everyone's databases (docs/accesscontrol.md §6.11), e.g. `["mmailout_"]`
+   * for a mail gateway that sends what people put in their outbox. Stored on
+   * its grant (`accessPrefixes`), admin-signed. Omit for ordinary members.
+   */
+  accessPrefixes?: string[];
+  /**
    * Human-readable label for the joining device's key pair. When set,
    * it overrides any label the joining user suggested in the join request and
    * is stored on the grant document's key-pair entry (docs/accesscontrol.md
@@ -3961,6 +3968,17 @@ export interface MindooTenantDirectory {
   setGrantDepositPrefixes?(
     username: string,
     prefixes: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Deposit and access rights in other people's personal databases (§6.11);
+   * fields left out stay as they are.
+   */
+  setGrantPersonalDatabaseRights?(
+    username: string,
+    rights: { depositPrefixes?: string[]; accessPrefixes?: string[] },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;

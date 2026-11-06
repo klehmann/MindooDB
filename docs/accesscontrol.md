@@ -1115,11 +1115,16 @@ any configured policy and even while the master switch is on.
 | Who | May |
 |---|---|
 | a device on the grant `<grantDocId>` (every device of the owner) | open, pull, push, as usual |
+| an identity whose grant lists the prefix in `accessPrefixes` | open, pull, push in **every** person's database with that prefix (a service such as the mail gateway serving each outbox) |
 | an identity whose grant lists the prefix in `depositPrefixes` | deposit only (§6.10 semantics, at most one recipient wrap per document) |
 | the tenant admin | open, pull, push (exempt, see below) |
 | everyone else | nothing; the server refuses every sync call, the client refuses to open |
 
-- **Prefixes.** Built in: `mmail_` (`BUILTIN_PERSONAL_DATABASE_PREFIXES`). The
+- **Prefixes.** Built in: `mmail_` (MindooMail's mailbox; the mail gateway
+  deposits incoming mail) and `mmailout_` (MindooMail's outbox; the person
+  writes outgoing mail sealed to themselves and the gateway, the gateway reads
+  it with `accessPrefixes`, sends it and answers with status documents)
+  (`BUILTIN_PERSONAL_DATABASE_PREFIXES`). The
   tenant default policy can add more with `personalDatabasePrefixes`
   (`["notes_"]`); adding one only ever makes databases more private. A prefix
   is lowercase letters and digits ending in `_`.
@@ -1127,11 +1132,14 @@ any configured policy and even while the master switch is on.
   server looks up the grant by id and compares its active device keys with the
   caller's signing key. A database id whose remainder is not a grant id is open
   to the admin only.
-- **Deposit rights** are part of the depositor's grant: `depositPrefixes:
-  ["mmail_"]`, admin-signed. The admin sets it when approving the gateway's join
-  request (`approveJoinRequest({ ..., depositPrefixes: ["mmail_"] })`) or later
-  with `directory.setGrantDepositPrefixes(username, prefixes, …)`; an empty list
-  takes it away. Admin UIs should show it as its own decision ("this identity
+- **Deposit and access rights** are part of the service's grant:
+  `depositPrefixes: ["mmail_"]`, `accessPrefixes: ["mmailout_"]`, admin-signed.
+  The admin sets them when approving the gateway's join request
+  (`approveJoinRequest({ ..., depositPrefixes: ["mmail_"], accessPrefixes: ["mmailout_"] })`)
+  or later with `directory.setGrantPersonalDatabaseRights(username, { depositPrefixes, accessPrefixes }, …)`;
+  an empty list takes a right away. `accessPrefixes` is the stronger right
+  (it can read everything in those databases that is sealed to it, and write
+  there), so grant it only to the service that needs it. Admin UIs should show it as its own decision ("this identity
   may deliver into every person's mailbox"), not as part of the key choice.
 - **A configured policy tightens, never loosens.** The built-in rule decides
   first; for the owner, the configured read gate (§6.8) still applies on top,

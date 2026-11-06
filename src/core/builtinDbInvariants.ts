@@ -81,16 +81,21 @@ export interface BuiltinWriteDecision {
  * person whose `grantaccess` document has that id (docs/accesscontrol.md
  * §6.11). Built in, like the `directory` and `userdirectory` invariants:
  *
- * - read and sync only for the devices on that grant (and the tenant admin),
+ * - read and sync only for the devices on that grant, identities whose grant
+ *   lists the prefix in `accessPrefixes` (a service such as the mail gateway
+ *   that serves every person's outbox), and the tenant admin,
  * - deposit (push of sealed creates only, §6.10) only for identities whose
  *   grant lists the prefix in `depositPrefixes`,
  *
  * whatever a configured policy says; a policy can add prefixes
  * (`personalDatabasePrefixes`) and can deny more, never allow more.
  *
- * `mmail_` — MindooMail's mailbox (`mmail_${user.persondocid}` in Haven).
+ * `mmail_` — MindooMail's mailbox (`mmail_${user.persondocid}` in Haven); the
+ *   mail gateway deposits incoming mail.
+ * `mmailout_` — MindooMail's outbox: the person writes outgoing mail, the mail
+ *   gateway (accessPrefixes) reads it, sends it and writes status documents.
  */
-export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_"] as const;
+export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_", "mmailout_"] as const;
 
 /** A valid personal-database prefix: lowercase letters and digits, ending in `_`. */
 export const PERSONAL_DATABASE_PREFIX_REGEX = /^[a-z][a-z0-9]*_$/;
