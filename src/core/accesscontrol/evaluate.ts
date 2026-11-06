@@ -101,6 +101,10 @@ export function evaluateAccess(input: EvaluateAccessInput): AccessDecision {
   if (op === "llm_use") {
     return evaluateLlmUse({ identity, node });
   }
+  // `doc_read_all` only matters in a `docReadScope: "own"` database (§6.12).
+  if (op === "doc_read_all") {
+    return evaluateDocReadAll({ dbid, identity, node });
+  }
 
   // No policy document has ever existed -> access control was never enabled ->
   // everything is allowed (§6.1, the "no acl_defaultpolicy" state).
@@ -215,6 +219,48 @@ export function evaluateLlmUse(input: { identity: IdentitySet; node: DirectorySt
   return node.defaultPolicy?.llm?.denyUse === true
     ? deny("denied by baseline policy for llm_use", "tier1")
     : allow("allowed by baseline policy for llm_use", "tier1");
+}
+
+/**
+ * Whether the acting user reads every document of a database whose
+ * `docReadScope` is `"own"` (`doc_read_all`, docs/accesscontrol.md §6.12).
+ *
+ * Baseline is deny (only the own documents); a matching allow rule for this
+ * database (or `"*"`) opens all documents, deny overrides allow. The master
+ * switch turns the whole scope off (everyone reads everything), as it does
+ * every other check. The tenant admin is handled by the caller.
+ */
+export function evaluateDocReadAll(input: {
+  dbid: string;
+  identity: IdentitySet;
+  node: DirectoryStateNode;
+}): AccessDecision {
+  const { dbid, identity, node } = input;
+  if (node.defaultPolicy === null) {
+    return allow("access control not enabled (no default policy)", "tier1");
+  }
+  const eff = effectivePolicy(node.defaultPolicy, node.dbPolicies.get(dbid) ?? null);
+  if (eff.disableAllAccessChecksAndPolicies) {
+    return allow("access control disabled by master switch", "tier1");
+  }
+  if (eff.docReadScope !== "own") {
+    return allow(`docReadScope of ${dbid} is "all"`, "tier1");
+  }
+  const rules = (node.rulesByType.get("doc_read_all") ?? []).filter(
+    (r) =>
+      (r.dbid === dbid || r.dbid === "*") &&
+      (r.withfields?.length ?? 0) === 0 &&
+      intersects(r.users_hashes, identity.hashes)
+  );
+  const denyRule = rules.find((r) => r.action === "deny");
+  if (denyRule) {
+    return deny(`denied by rule ${denyRule.ruleId}`, "tier1", denyRule.ruleId);
+  }
+  const allowRule = rules.find((r) => r.action === "allow");
+  if (allowRule) {
+    return allow(`allowed by rule ${allowRule.ruleId}`, "tier1", allowRule.ruleId);
+  }
+  return deny(`docReadScope of ${dbid} is "own"`, "tier1");
 }
 
 /** Returns true if any element of `hashes` is in `set`. */

@@ -4129,6 +4129,22 @@ export interface MindooTenantDirectory {
   canReadDatabase?(dbId: string): Promise<boolean>;
 
   /**
+   * The current user's read scope in `dbId` (docs/accesscontrol.md §6.12):
+   * `"own"` when the database's `docReadScope` is `"own"` and the user is
+   * neither the tenant admin nor a `doc_read_all` reader; the server then
+   * serves only documents the user created. Otherwise `"all"`.
+   *
+   * Optional capability.
+   */
+  getReadScope?(dbId: string): Promise<"all" | "own">;
+
+  /**
+   * Server-side variant of {@link getReadScope} for a request principal's
+   * signing key. Optional capability.
+   */
+  evaluateReadScopeForSigningKey?(input: { dbid: string; signingKey: string }): Promise<"all" | "own">;
+
+  /**
    * Create or update database-specific settings.
    * Automatically uses the cached settings document for the given dbId if it exists, or creates a new one.
    * 

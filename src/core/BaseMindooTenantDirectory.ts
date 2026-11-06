@@ -1726,6 +1726,39 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * The read scope of a principal in `dbid` (docs/accesscontrol.md §6.12):
+   * `"all"` when it reads every document, `"own"` when the database's
+   * `docReadScope` is `"own"` and the principal is neither the tenant admin nor
+   * matched by a `doc_read_all` allow rule. The directory databases are never
+   * scoped. Evaluated at the directory head, like the read gate.
+   */
+  async evaluateReadScopeForSigningKey(input: {
+    dbid: string;
+    signingKey: string;
+  }): Promise<"all" | "own"> {
+    if (input.dbid === DIRECTORY_DB_ID || input.dbid === USER_DIRECTORY_DB_ID) return "all";
+    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+    if (input.signingKey === adminKey) return "all";
+    const decision = await this.evaluateAccessForSigningKey({
+      op: "doc_read_all",
+      dbid: input.dbid,
+      signingKey: input.signingKey,
+      trustedTime: Number.MAX_SAFE_INTEGER,
+    });
+    return decision.allowed ? "all" : "own";
+  }
+
+  /**
+   * The current user's read scope in `dbid` (§6.12), the client-side
+   * counterpart of {@link evaluateReadScopeForSigningKey}, e.g. to tell the
+   * user that a list only shows their own documents.
+   */
+  async getReadScope(dbid: string): Promise<"all" | "own"> {
+    const currentUser = await this.tenant.getCurrentUserId();
+    return this.evaluateReadScopeForSigningKey({ dbid, signingKey: currentUser.userSigningPublicKey });
+  }
+
+  /**
    * Whether the current user may open and sync `dbid` under the database read
    * gate (`doc_read`, §6.6). The client-side counterpart of
    * {@link evaluateDbAccessForSigningKey}'s read gate: it evaluates the
