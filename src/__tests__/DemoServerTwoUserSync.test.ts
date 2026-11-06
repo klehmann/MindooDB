@@ -16,7 +16,11 @@
  *    Automerge has merged the edits and both devices hold the same state.
  * 6. Publishing added the server as a trusted witness and the server stamped every
  *    entry it accepted. With access control switched on, both devices still read
- *    all documents. Counter-check (second test): a tenant published without the
+ *    all documents.
+ * 7. The admin makes the notes database read-only. Jane syncs that first, and her
+ *    local write fails right away (client precheck). Karsten had already edited a
+ *    document offline before the policy reached him; his push is refused by the
+ *    server's Tier 1 check, the edit never reaches Jane, and reading stays open. Counter-check (second test): a tenant published without the
  *    witness gets its stamped entries quarantined once access control is on.
  *
  * `JoinNewUserServer` covers the join itself in more depth; this test is about the
@@ -36,6 +40,7 @@ import {
   type PrivateUserId,
 } from "../core/types";
 import { MindooValue } from "../core/values";
+import { AccessDeniedError } from "../core/accesscontrol/AccessDeniedError";
 import type { ServerConfig } from "../server/types";
 
 const KARSTEN_PASSWORD = "karsten-pass";
@@ -100,6 +105,12 @@ async function push(
   );
   expect(result.cancelled).toBe(false);
   expect(result.rejectedEntries ?? []).toEqual([]);
+}
+
+/** Push without asserting: returns what the server accepted and rejected. */
+async function pushResult(tenant: MindooTenant, baseUrl: string, dbId: string) {
+  const local = await openDb(tenant, dbId);
+  return local.pushChangesTo(await tenant.connectToServer(baseUrl, dbId));
 }
 
 async function pull(tenant: MindooTenant, baseUrl: string, dbId: string): Promise<void> {
@@ -332,6 +343,62 @@ describe("two users on a demo server: create, publish, join, sync, merge", () =>
       await dropDocCache(tenant, NOTES_DB);
       expect(await snapshot(tenant, NOTES_DB)).toEqual(karstenView);
     }
+
+    // --- The admin makes the notes database read-only -------------------------------
+    // Karsten edits offline first: his device does not have the policy yet when
+    // the change is written, so only the server can stop it.
+    await update(karsten, shoppingId, (data) => {
+      data.items = ["Milch", "Brot", "Butter"];
+    });
+    const readOnly = { denyDocCreate: true, denyDocChange: true, denyDocDelete: true, denyDocUndelete: true };
+    // The admin key is on Karsten's device, but the admin is a separate identity:
+    // the policy binds Karsten's app user like everyone else. His edit above was
+    // written before the policy existed anywhere.
+    await (await karsten.openDirectory()).setDatabaseAccessPolicy!(
+      NOTES_DB,
+      readOnly,
+      adminUser.userSigningKeyPair.privateKey,
+      KARSTEN_PASSWORD,
+    );
+    await push(karsten, baseUrl, "directory", adminAuth);
+
+    // Jane syncs the policy first: her local write fails immediately.
+    await pull(jane, baseUrl, "directory");
+    const janeNotes = await openDb(jane, NOTES_DB);
+    await expect(
+      janeNotes.changeDoc(await janeNotes.getDocument(planId), (d) => {
+        d.getData().owner = "Jane (after read-only)";
+      }),
+    ).rejects.toThrow(AccessDeniedError);
+    await expect(janeNotes.createDocument()).rejects.toThrow(AccessDeniedError);
+    await expect(janeNotes.deleteDocument(planId)).rejects.toThrow(AccessDeniedError);
+
+    // Karsten pushes his offline edit: the server's Tier 1 check refuses it.
+    const refused = await pushResult(karsten, baseUrl, NOTES_DB);
+    expect(refused.rejectedEntries?.length ?? 0).toBeGreaterThan(0);
+    for (const rejection of refused.rejectedEntries ?? []) {
+      expect(rejection.rejectionClass).toBe("policy");
+    }
+    await pull(jane, baseUrl, NOTES_DB);
+    await dropDocCache(jane, NOTES_DB);
+    expect((await snapshot(jane, NOTES_DB))[shoppingId]).toMatchObject({ items: ["Milch", "Brot"] });
+
+    // Karsten's device drops the refused edit instead of keeping a private fork,
+    // and does not offer it again on the next push.
+    await dropDocCache(karsten, NOTES_DB);
+    expect((await snapshot(karsten, NOTES_DB))[shoppingId]).toMatchObject({ items: ["Milch", "Brot"] });
+    expect((await pushResult(karsten, baseUrl, NOTES_DB)).rejectedEntries ?? []).toEqual([]);
+
+    // New local writes fail for Karsten as well.
+    await expect(
+      update(karsten, planId, (data) => {
+        data.owner = "Karsten (after read-only)";
+      }),
+    ).rejects.toThrow(AccessDeniedError);
+
+    // Read-only, not unreadable: both still read the server's state.
+    await dropDocCache(jane, NOTES_DB);
+    expect(await snapshot(jane, NOTES_DB)).toEqual(karstenView);
   });
 
   test("without the server as trusted witness, its receipts are quarantined once access control is on", async () => {
