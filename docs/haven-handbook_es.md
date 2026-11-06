@@ -12,7 +12,7 @@ Hay unas cuantas cosas que diferencian a Haven de una app web al uso.
 
 Haven es local-first. Casi todo lo que ves se sirve desde una copia —una réplica local— guardada dentro de este navegador. Navegar, editar, buscar e incluso construir vistas virtuales ocurre todo contra la réplica local, así que Haven es rápido y sigue siendo utilizable cuando no hay red. Solo se contacta con el servidor al sincronizar, y los datos que van por el cable están siempre cifrados de extremo a extremo.
 
-Haven es una progressive web app. Se puede instalar en teléfonos y tabletas, incluidos iPhone, iPad y Android, y arrancar directamente desde la pantalla de inicio como una aplicación nativa. Una vez instalada, se abre en modo autónomo sin el marco del navegador, lo que te da más espacio en pantalla y una sensación más serena. En el iPhone puedes incluso añadir Haven a la pantalla de inicio más de una vez: cada copia instalada tiene su propio almacenamiento privado, que es una manera limpia de mantener los datos personales, de trabajo y de demostración completamente separados en un mismo dispositivo.
+Haven es una progressive web app. Se puede instalar en teléfonos y tabletas, incluidos iPhone, iPad y Android, y arrancar directamente desde la pantalla de inicio como una aplicación nativa. Una vez instalada, se abre en modo autónomo sin el marco del navegador, lo que te da más espacio en pantalla y una sensación más serena. En el iPhone puedes incluso añadir Haven a la pantalla de inicio más de una vez: cada copia instalada tiene su propio almacenamiento privado, que es una manera limpia de mantener los datos personales, de trabajo y de demostración completamente separados en un mismo dispositivo. Las apps nativas para macOS, Windows, iOS y Android, que meten el mismo Haven en una app propia, llegarán pronto; la sección Haven como app nativa, más abajo, explica lo que aportan.
 
 Haven es el hogar de ejecución de las apps de MindooDB. Las apps de MindooDB son pequeñas herramientas web construidas con el App SDK de MindooDB. Haven lanza cada una dentro de un iframe aislado en un origen aparte, le entrega una vista limitada de los datos que decidiste compartir e intermedia cada lectura y cada escritura a través de un puente seguro. Las apps alojadas pueden incluso servirse desde el propio service worker de Haven y seguir funcionando cuando no hay red.
 
@@ -282,6 +282,22 @@ Un botón Detener aparece mientras una sincronización se ejecuta. Envía una se
 
 Un pequeño tropiezo: si esperabas que una base de datos apareciera en la cola y no está, la razón habitual es que la identidad de usuario que tiene la réplica todavía no está desbloqueada. La sincronización necesita las claves del KeyBag local, y el KeyBag solo se abre cuando la identidad activa se desbloquea desde la barra superior.
 
+### Adjuntos: todos o solo cuando se necesiten
+
+Los adjuntos suelen ser la parte pesada de una base de datos. Los documentos son pequeños; una presentación, un contrato escaneado o una carpeta de fotos pueden pesar más que todos los documentos que los rodean juntos. Por eso decides, por base de datos, si una sincronización trae también los adjuntos a este dispositivo.
+
+Te encuentras con esa elección por primera vez cuando instalas una app en un tenant que ya está conectado a un servidor. Haven pregunta ¿Sincronizar los datos de la app desde el servidor?, para que la app no arranque vacía, y en Avanzado enumera cada base de datos que usa la app con una opción para sus adjuntos. Transferir todos los adjuntos los copia en ambas direcciones, así que cada archivo está en el dispositivo y se abre sin conexión. Cargar adjuntos cuando se necesiten sincroniza todos los documentos como siempre y sube los adjuntos que añades tú, pero deja los de los demás en el servidor. Para ti y para la app no cambia nada más: cuando un documento necesita un archivo que no está en este dispositivo, Haven lo trae del servidor, lo descifra aquí y lo entrega como si siempre hubiera estado ahí. El servidor envía los mismos fragmentos cifrados que en cualquier sincronización, así que no se entera de nada nuevo.
+
+El sentido de la segunda opción es un dispositivo más ligero y más rápido. Un teléfono que trabaja con los documentos de este mes no tiene que guardar años de adjuntos, la primera sincronización de una base de datos grande termina mucho antes y cada sincronización posterior transfiere menos bytes. El precio: un archivo que aún no está en el dispositivo necesita conexión la primera vez que se abre. La elección no es definitiva: la columna Adjuntos de la página de Sincronización muestra el modo de cada fila, y al pulsarla se abre un menú para cambiarlo.
+
+Por cierto, Haven recurre al servidor siempre que falta un archivo en local, no solo en este modo. Cualquier base de datos con un destino de sincronización puede abrir también un archivo que una sincronización interrumpida nunca llegó a descargar.
+
+Para los archivos que necesitas donde no hay red, las apps pueden fijar adjuntos: se quedan en el dispositivo aunque la base de datos cargue los adjuntos cuando se necesitan. Una app fija un solo archivo o un documento entero, y fijar un documento abarca también todos los adjuntos que se le añadan más tarde: la presentación para la reunión sin cobertura, o todo lo archivado para un cliente. Haven descarga los archivos fijados en segundo plano, la app puede mostrar el progreso y marcar qué archivos están solo en el servidor, y una descarga fallida se reintenta en la siguiente sincronización. Muchas apps lo ofrecen en el menú del documento, como forma de dejar un documento disponible sin conexión. Los anclajes pertenecen a la app y al dispositivo que los crearon; no viajan a tus otros dispositivos.
+
+Los archivos fijados aparecen también en la página de Sincronización. En cuanto una app tiene anclajes en una base de datos, el menú de adjuntos de la fila gana una entrada Guardados sin conexión por apps con su número. Abre la lista de esos archivos con su estado y un botón Liberar. Liberar un anclaje deja espacio libre, pero Haven solo borra la copia local cuando el servidor tiene el archivo completo, así que un archivo que aún no se ha subido nunca se pierde.
+
+Para desarrolladores, todo esto forma parte de la API de adjuntos del App SDK. `info().attachmentStorage` le dice a una app si una base de datos guarda los adjuntos en local, cuando se necesitan o solo en el servidor, y `attachments.pin`, `unpin`, `availability`, `listPins` y `onAvailabilityChange` cubren los anclajes y el estado. Un `pin` sin nombre de adjunto fija el documento entero, incluidos los adjuntos que lleguen después. El [README del App SDK](https://github.com/klehmann/mindoodb-app-sdk) tiene ejemplos.
+
 ### Sincronización entre pares sin servidor
 
 La sincronización no tiene que pasar por un servidor en absoluto. Dos dispositivos de Haven del mismo tenant pueden intercambiar datos directamente, y eso resulta importar en dos situaciones bastante distintas. La obvia es una caída del servidor: el equipo sigue trabajando y los datos siguen moviéndose, porque nada en el camino depende de que el servidor esté en pie. La más sutil es la redacción corriente. Dos personas que trabajan sobre el mismo documento pueden sincronizar directamente entre sí mientras iteran y enviar el resultado terminado al servidor una sola vez, en lugar de hacer pasar por él cada estado intermedio.
@@ -436,7 +452,7 @@ Un número grande en la parte de arriba suma todo lo que Haven guarda ahora mism
 
 Debajo del total, una sección Por tenant muestra un bloque por tenant. La cabecera de cada tenant tiene su tamaño combinado más un botón Vaciar caché que quita solo las partes reconstruibles: cachés e índices que Haven volverá a llenar la próxima vez que uses el tenant. Vaciar caché no elimina documentos ni adjuntos.
 
-Dentro de cada tenant, cada fila es una base de datos local. Documentos es el contenido cifrado de los documentos, Adjuntos son los fragmentos cifrados de adjuntos y Total es la suma de los dos. Eliminar borra el contenido local de esa base de datos solo en este navegador: la copia del servidor no se toca. La base de datos de directorio protegida no se puede eliminar porque Haven la necesita para funcionar. Antes de eliminar, abre la base de datos y ejecuta una sincronización; si hay cambios locales sin sincronizar, al eliminar se pierden. Prefiere Vaciar caché cuando solo quieras liberar espacio, porque es reversible.
+Dentro de cada tenant, cada fila es una base de datos local. Documentos es el contenido cifrado de los documentos, Adjuntos son los fragmentos cifrados de adjuntos y Total es la suma de los dos. En una base de datos que carga los adjuntos cuando se necesitan, Adjuntos cuenta solo los archivos que están en este dispositivo. Eliminar borra el contenido local de esa base de datos solo en este navegador: la copia del servidor no se toca. La base de datos de directorio protegida no se puede eliminar porque Haven la necesita para funcionar. Antes de eliminar, abre la base de datos y ejecuta una sincronización; si hay cambios locales sin sincronizar, al eliminar se pierden. Prefiere Vaciar caché cuando solo quieras liberar espacio, porque es reversible.
 
 Debajo de las bases de datos de cada tenant verás también sus cachés: una caché local del tenant para el estado general por tenant, una caché de destino de servidor para cada servidor MindooDB con el que habla el tenant, una caché de vista virtual para cada vista guardada y una entrada Índice de texto completo (MiniSearch) por cada base de datos que tenga activada la indexación de texto completo. Cada caché muestra su propio tamaño, y las cachés de vistas virtuales se pueden vaciar por separado si una vista concreta ha crecido demasiado.
 
@@ -453,6 +469,28 @@ iOS tiene un extra interesante: puedes añadir Haven a la pantalla de inicio má
 En Android, abre Haven en un navegador moderno como Chrome o Edge. Si Haven muestra un botón Instalar, acéptalo y tu navegador añadirá Haven a la pantalla de inicio y al cajón de aplicaciones en un solo paso. Si no hay aviso, abre el menú del navegador (normalmente tres puntos en una esquina) y busca Instalar aplicación o Añadir a pantalla de inicio: cada navegador lo dice de otra manera, pero el resultado es el mismo. Confirma el aviso del navegador y Haven aparece en la pantalla de inicio como un icono de app de Android normal.
 
 Después de instalarlo, en el teléfono arranca Haven siempre desde el icono de la pantalla de inicio: es una experiencia notablemente más agradable que una pestaña del navegador.
+
+## Haven como app nativa
+
+Todo lo que cuenta este manual funciona en el navegador, y en el navegador es donde Haven está disponible hoy, en [haven.mindoodb.com](https://haven.mindoodb.com). Las apps nativas para macOS, Windows, iOS y Android llegarán pronto. No son un segundo Haven: cada una mete el mismo Haven en una app propia, así que las pantallas, el modelo de datos, el cifrado y las apps que usas siguen siendo los mismos. Lo que cambia es lo que rodea a Haven: lo que una app instalada en el dispositivo puede hacer y una pestaña del navegador no.
+
+Parte de ello vale para las cuatro.
+
+Tus datos viven en los archivos de base de datos propios de la app en lugar del almacenamiento del navegador. Los almacenes de MindooDB pasan a ser archivos SQLite dentro de la carpeta de datos de la app, así que Haven ya no depende del presupuesto de almacenamiento de un navegador ni de que un navegador borre los datos de los sitios. También convierte la app nativa y la versión del navegador en dos lugares separados: un tenant que usas en ambos se sincroniza a través del servidor como en cualquier segundo dispositivo, y en un Haven solo local una copia de seguridad cifrada lleva todo de uno a otro.
+
+Haven se mantiene al día solo. La app trae una versión de Haven y busca otras más nuevas en un canal de actualizaciones firmado; comprueba la firma, te pide recargar y vuelve a la versión anterior si una nueva no arranca. Las apps de escritorio actualizan del mismo modo la app que rodea a Haven y solo se reinician cuando tú lo dices.
+
+Las passkeys siguen funcionando. Las apps usan el soporte de passkeys del sistema para haven.mindoodb.com —el Llavero de iCloud en dispositivos Apple, el Gestor de contraseñas de Google en Android, Windows Hello en Windows—, así que una passkey que creaste en el navegador también desbloquea tu identidad en la app.
+
+Las páginas web que se niegan a incrustarse aparecen de todos modos. Muchos sitios prohíben mostrarse dentro de otra página, lo que deja su tesela web en blanco en el navegador. Las apps nativas abren ese sitio en una vista nativa colocada justo sobre la tesela, de modo que aparece en vivo, con atrás, adelante y recargar.
+
+Las apps obtienen más de la red. Una app de MindooDB como MindooMail puede hablar directamente con un servidor de correo por IMAP y SMTP, algo que ninguna pestaña del navegador puede hacer.
+
+En el escritorio —macOS y Windows— se suman tres cosas. Los agentes de IA se conectan sin Chrome, sin la extensión puente y sin un puerto de red abierto; Trabajar con agentes de IA describe la ventana Acceso de agentes. La carpeta de intercambio se elige en el diálogo del propio sistema, y Haven conoce su ruta real. Y las apps que guardan archivos grandes en el dispositivo, como mapas sin conexión, los almacenan como archivos normales en la carpeta de datos de la app.
+
+En el teléfono —iOS y Android— Haven pasa a formar parte del sistema. El contenido de otras apps llega a Haven por la hoja de compartir o Abrir con, y Haven se lo ofrece a una app que pueda aprovecharlo: una foto para un documento, un PDF para el expediente de un cliente. En iPhone y iPad, Atajos y Siri pueden enviar archivos y texto a Haven, las apps y bases de datos de Haven se abren desde Atajos y Spotlight, y la carpeta de Haven en la app Archivos sirve de carpeta de importación. Las apps pueden programar recordatorios que llegan como notificaciones del sistema aunque Haven esté cerrado, con Hecho y En 1 hora directamente en la notificación. Y cuando cambias a otra app, Haven termina de guardar antes de que el sistema lo duerma.
+
+Algunas cosas siguen siendo del navegador. Las apps de teléfono no ofrecen herramientas para agentes. Una app nativa se instala una vez por dispositivo, así que el truco del iPhone de añadir Haven varias veces a la pantalla de inicio, cada copia con su propio almacenamiento, pertenece a la versión del navegador; en la app, separa mundos distintos con tenants e identidades separados. Y la versión del navegador sigue siendo gratuita y completa: todo lo que añaden las apps nativas es una comodidad extra, nunca un requisito.
 
 ## El modelo de seguridad de un vistazo
 
@@ -552,6 +590,10 @@ Revisión — una versión de un documento en un momento dado. Cada cambio crea 
 
 Adjunto — un archivo adjuntado a un documento. Se guarda en fragmentos cifrados y se transmite a demanda.
 
+Adjuntos bajo demanda — un ajuste de sincronización por base de datos, Cargar adjuntos cuando se necesiten, que deja los adjuntos de otras personas en el servidor y los trae cuando se abren. Ahorra espacio y acelera las sincronizaciones; tus propios adjuntos nuevos se siguen subiendo. Se elige al instalar una app o más tarde en la página de Sincronización.
+
+Adjunto fijado — un archivo que una app mantiene en este dispositivo aunque su base de datos cargue los adjuntos bajo demanda. Un anclaje abarca un adjunto o un documento entero, incluidos los adjuntos posteriores, y pertenece a una app en un dispositivo.
+
 Automerge — el motor de fusión sin conflictos que MindooDB usa por debajo. Dos personas pueden editar el mismo documento a la vez y Automerge fusiona sus cambios automáticamente.
 
 Explorador DAG — una vista en grafo de todos los cambios aplicados a un documento, incluido cómo se fusionaron las ediciones concurrentes.
@@ -601,6 +643,8 @@ Modo autónomo — un modo de visualización en el que Haven se lanza sin los co
 Añadir a pantalla de inicio — la acción del navegador que guarda Haven como un icono lanzable en la pantalla de inicio de un teléfono o una tableta.
 
 Aviso de instalación — la hoja nativa del navegador que confirma añadir una progressive web app como Haven al dispositivo.
+
+App nativa — Haven dentro de una app propia para macOS, Windows, iOS o Android; llegará pronto. Por dentro, el mismo Haven, más almacenamiento SQLite, actualizaciones propias firmadas y funciones del sistema como la hoja de compartir, los recordatorios o el acceso de agentes integrado.
 
 Copia de seguridad cifrada — un único archivo que contiene todo lo que Haven guarda en este navegador, cifrado con una contraseña que eliges tú. Sin esa contraseña el archivo es ilegible.
 

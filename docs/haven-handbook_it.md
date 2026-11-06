@@ -12,7 +12,7 @@ Alcune cose rendono Haven diverso da una normale applicazione web.
 
 Haven è local-first. Quasi tutto ciò che vedi arriva da una copia — una replica locale — conservata dentro questo browser. Navigare, modificare, cercare e persino costruire viste virtuali avviene tutto sulla replica locale, quindi Haven è rapido e resta utilizzabile quando la rete non c'è. Il server viene contattato solo quando sincronizzi, e i dati che viaggiano sono sempre cifrati end-to-end.
 
-Haven è una progressive web app. Può essere installata su telefoni e tablet, iPhone, iPad e Android compresi, e avviata direttamente dalla schermata Home come un'applicazione nativa. Una volta installata si apre in modalità standalone, senza i comandi del browser, il che ti dà più spazio sullo schermo e una sensazione più tranquilla. Su iPhone puoi persino aggiungere Haven alla schermata Home più di una volta: ogni copia installata riceve il proprio spazio di archiviazione privato, ed è un modo pulito per tenere completamente separati dati personali, di lavoro e di prova su un unico dispositivo.
+Haven è una progressive web app. Può essere installata su telefoni e tablet, iPhone, iPad e Android compresi, e avviata direttamente dalla schermata Home come un'applicazione nativa. Una volta installata si apre in modalità standalone, senza i comandi del browser, il che ti dà più spazio sullo schermo e una sensazione più tranquilla. Su iPhone puoi persino aggiungere Haven alla schermata Home più di una volta: ogni copia installata riceve il proprio spazio di archiviazione privato, ed è un modo pulito per tenere completamente separati dati personali, di lavoro e di prova su un unico dispositivo. Le app native per macOS, Windows, iOS e Android, che racchiudono lo stesso Haven in un'app tutta sua, sono in arrivo; la sezione Haven come app nativa, più avanti, spiega cosa aggiungono.
 
 Haven è la casa di esecuzione delle app MindooDB. Le app MindooDB sono piccoli strumenti web costruiti con l'App SDK di MindooDB. Haven avvia ognuna di esse dentro un iframe in sandbox su un'origine separata, le consegna una vista ristretta dei dati che hai scelto di condividere e fa passare ogni lettura e ogni scrittura attraverso un bridge sicuro. Le app ospitate possono persino essere servite dal service worker di Haven e continuare a funzionare quando la rete non c'è.
 
@@ -282,6 +282,22 @@ Quando conviene sincronizzare? La risposta breve è: prima di fidarti di un nume
 
 Un piccolo inconveniente: se ti aspettavi che un database comparisse nella coda e non c'è, di solito il motivo è che l'identità utente che possiede la replica non è ancora sbloccata. La sincronizzazione ha bisogno delle chiavi del KeyBag locale, e il KeyBag si apre solo quando l'identità attiva viene sbloccata dalla barra superiore.
 
+### Allegati: tutti, o solo quando servono
+
+Gli allegati sono di solito la parte pesante di un database. I documenti sono piccoli; una presentazione, un contratto scansionato o una cartella di foto possono pesare più di tutti i documenti intorno messi insieme. Per questo decidi, database per database, se una sincronizzazione porta anche gli allegati su questo dispositivo.
+
+Incontri questa scelta la prima volta quando installi un'app in un tenant già collegato a un server. Haven chiede Sincronizzare i dati dell'app dal server?, perché l'app non parta vuota, e sotto Avanzate elenca ogni database usato dall'app con una scelta per i suoi allegati. Trasferisci tutti gli allegati li copia in entrambe le direzioni, così ogni file è sul dispositivo e si apre anche offline. Carica gli allegati quando servono sincronizza tutti i documenti come sempre e carica gli allegati che aggiungi tu, ma lascia quelli degli altri sul server. Per te e per l'app non cambia nient'altro: quando un documento ha bisogno di un file che non è su questo dispositivo, Haven lo prende dal server, lo decifra qui e lo consegna come se ci fosse sempre stato. Il server invia gli stessi chunk cifrati di qualsiasi sincronizzazione, quindi non viene a sapere nulla di nuovo.
+
+Il senso della seconda opzione è un dispositivo più leggero e più veloce. Un telefono che lavora con i documenti di questo mese non deve conservare anni di allegati, la prima sincronizzazione di un database grande finisce molto prima e ogni sincronizzazione successiva trasferisce meno byte. Il prezzo: un file che non è ancora sul dispositivo richiede una connessione la prima volta che lo apri. La scelta non è definitiva: la colonna Allegati della pagina di sincronizzazione mostra la modalità di ogni riga, e un clic apre un menu per cambiarla.
+
+Del resto Haven ricorre al server ogni volta che un file manca in locale, non solo in questa modalità. Qualsiasi database con una destinazione di sincronizzazione può aprire anche un file che una sincronizzazione interrotta non ha mai scaricato.
+
+Per i file che ti servono dove la rete non c'è, le app possono fissare gli allegati: restano sul dispositivo anche se il database carica gli allegati quando servono. Un'app fissa un singolo file oppure un intero documento, e fissare un documento copre anche tutti gli allegati che gli verranno aggiunti in seguito: la presentazione per la riunione senza campo, o tutto ciò che è archiviato per un cliente. Haven scarica i file fissati in background, l'app può mostrare l'avanzamento e segnalare quali file sono solo sul server, e un download non riuscito viene ritentato alla sincronizzazione successiva. Molte app lo offrono nel menu del documento, come modo per rendere un documento disponibile offline. I file fissati appartengono all'app e al dispositivo che li hanno fissati; non passano ai tuoi altri dispositivi.
+
+I file fissati compaiono anche nella pagina di sincronizzazione. Appena un'app tiene file fissati in un database, il menu degli allegati della riga si arricchisce di una voce Tenuti offline dalle app con il loro numero. Apre l'elenco di quei file con il loro stato e un pulsante Libera. Liberare un file fa spazio, ma Haven elimina la copia locale solo quando il server ha il file completo, così un file non ancora caricato non va mai perso.
+
+Per gli sviluppatori, tutto questo fa parte dell'API degli allegati dell'App SDK. `info().attachmentStorage` dice a un'app se un database tiene gli allegati in locale, su richiesta o solo sul server, e `attachments.pin`, `unpin`, `availability`, `listPins` e `onAvailabilityChange` coprono il fissaggio e lo stato. Un `pin` senza nome di allegato fissa l'intero documento, compresi gli allegati aggiunti in seguito. Il [README dell'App SDK](https://github.com/klehmann/mindoodb-app-sdk) contiene esempi.
+
 ### Sincronizzazione peer-to-peer senza server
 
 La sincronizzazione non deve per forza passare da un server. Due dispositivi Haven nello stesso tenant possono scambiarsi dati direttamente, e questo si rivela utile in due situazioni piuttosto diverse. Quella ovvia è un'interruzione del server: la squadra continua a lavorare e i dati continuano a muoversi, perché niente nel percorso dipende dal fatto che il server sia attivo. Quella più sottile è la normale stesura a quattro mani. Due persone che lavorano sullo stesso documento possono sincronizzarsi direttamente fra loro mentre iterano e inviare al server una volta sola il risultato finito, invece di far passare da lì ogni stato intermedio.
@@ -436,7 +452,7 @@ Un numero grande in cima somma tutto ciò che Haven conserva attualmente in ques
 
 Sotto il totale, una sezione per tenant mostra un blocco per ciascun tenant. L'intestazione di ogni tenant riporta la sua dimensione complessiva più un pulsante Svuota cache che rimuove solo le parti ricostruibili: cache e indici che Haven riempirà di nuovo la prossima volta che userai il tenant. Svuota cache non elimina documenti né allegati.
 
-Dentro ogni tenant, ogni riga è un database locale. Documenti è il contenuto cifrato dei documenti, Allegati sono i chunk cifrati degli allegati e Totale è la somma dei due. Elimina cancella il contenuto locale di quel database solo in questo browser: la copia sul server non viene toccata. Il database directory protetto non può essere eliminato perché Haven ne ha bisogno per funzionare. Prima di eliminare, apri il database ed esegui una sincronizzazione; se ci sono modifiche locali non sincronizzate, eliminando le perdi. Preferisci Svuota cache quando vuoi solo liberare spazio, perché è reversibile.
+Dentro ogni tenant, ogni riga è un database locale. Documenti è il contenuto cifrato dei documenti, Allegati sono i chunk cifrati degli allegati e Totale è la somma dei due. Per un database che carica gli allegati quando servono, Allegati conta solo i file che si trovano su questo dispositivo. Elimina cancella il contenuto locale di quel database solo in questo browser: la copia sul server non viene toccata. Il database directory protetto non può essere eliminato perché Haven ne ha bisogno per funzionare. Prima di eliminare, apri il database ed esegui una sincronizzazione; se ci sono modifiche locali non sincronizzate, eliminando le perdi. Preferisci Svuota cache quando vuoi solo liberare spazio, perché è reversibile.
 
 Sotto i database di ogni tenant vedrai anche le sue cache: una cache locale del tenant per lo stato generale di quel tenant, una cache della destinazione server per ogni server MindooDB con cui il tenant dialoga una cache della vista virtuale per ogni vista salvata e una voce Indice full-text (MiniSearch) per ogni database con l'indicizzazione full-text attiva. Ogni cache mostra la propria dimensione, e le cache delle viste virtuali possono essere svuotate singolarmente se una vista in particolare è cresciuta troppo.
 
@@ -453,6 +469,28 @@ iOS ha un bel vantaggio in più: puoi aggiungere Haven alla schermata Home più 
 Su Android, apri Haven in un browser moderno come Chrome o Edge. Se Haven mostra un pulsante Installa, accetta e il browser aggiungerà Haven alla schermata Home e al drawer delle app in un solo passaggio. Se non compare alcuna richiesta, apri il menu del browser (di solito tre puntini in un angolo) e cerca Installa app oppure Aggiungi alla schermata Home — i browser lo scrivono in modi diversi ma il risultato è lo stesso. Conferma la richiesta del browser e Haven compare sulla schermata Home come una normale icona di app Android.
 
 Dopo l'installazione, su un telefono avvia sempre Haven dall'icona nella schermata Home: è un'esperienza decisamente più piacevole di una scheda del browser.
+
+## Haven come app nativa
+
+Tutto ciò che descrive questo manuale funziona nel browser, ed è nel browser che Haven è disponibile oggi, su [haven.mindoodb.com](https://haven.mindoodb.com). Le app native per macOS, Windows, iOS e Android sono in arrivo. Non sono un secondo Haven: ognuna racchiude lo stesso Haven in un'app tutta sua, così le schermate, il modello dei dati, la cifratura e le app che usi restano le stesse. Cambia ciò che circonda Haven: le cose che un'app installata sul dispositivo può fare e una scheda del browser no.
+
+Una parte vale per tutte e quattro.
+
+I tuoi dati vivono nei file di database dell'app invece che nello spazio di archiviazione del browser. Gli store di MindooDB diventano file SQLite nella cartella dati dell'app, così Haven non dipende più dal budget di spazio di un browser né da un browser che ripulisce i dati dei siti. Questo rende però l'app nativa e la versione browser due luoghi separati: un tenant che usi in entrambe si sincronizza tramite il server come su qualsiasi secondo dispositivo, e per un Haven solo locale un backup cifrato porta tutto dall'una all'altra.
+
+Haven si tiene aggiornato da solo. L'app include una versione di Haven e ne scarica di più recenti da un canale di aggiornamento firmato; verifica la firma, ti chiede di ricaricare e torna alla versione precedente se una nuova non si avvia. Le app desktop aggiornano allo stesso modo l'app che circonda Haven e si riavviano solo quando lo dici tu.
+
+Le passkey continuano a funzionare. Le app usano il supporto passkey del sistema per haven.mindoodb.com — il Portachiavi iCloud sui dispositivi Apple, Gestore delle password di Google su Android, Windows Hello su Windows —, così una passkey creata nel browser sblocca la tua identità anche nell'app.
+
+Le pagine web che rifiutano di essere incorporate compaiono lo stesso. Molti siti vietano di essere mostrati dentro un'altra pagina, e il loro riquadro web nel browser resta vuoto. Le app native aprono un sito del genere in una vista nativa posata esattamente sul riquadro, così compare dal vivo, con indietro, avanti e ricarica.
+
+Le app ottengono di più dalla rete. Un'app MindooDB come MindooMail può parlare direttamente con un server di posta via IMAP e SMTP, cosa che nessuna scheda del browser sa fare.
+
+Sul desktop — macOS e Windows — si aggiungono tre cose. Gli agenti IA si collegano senza Chrome, senza l'estensione ponte e senza una porta di rete aperta; Lavorare con gli agenti IA descrive la finestra Accesso agenti. La cartella di scambio si sceglie nella finestra di dialogo del sistema, e Haven ne conosce il percorso reale. E le app che tengono file grandi sul dispositivo, come le mappe offline, li salvano come normali file nella cartella dati dell'app.
+
+Sul telefono — iOS e Android — Haven diventa parte del sistema. I contenuti di altre app arrivano a Haven tramite il foglio di condivisione o Apri con, e Haven li offre a un'app che sa usarli: una foto per un documento, un PDF per la pratica di un cliente. Su iPhone e iPad, Comandi Rapidi e Siri possono inviare file e testo a Haven, le app e i database di Haven si aprono da Comandi Rapidi e Spotlight, e la cartella di Haven nell'app File funge da cartella di importazione. Le app possono impostare promemoria che arrivano come notifiche di sistema anche quando Haven è chiuso, con Fatto e Tra 1 ora direttamente sulla notifica. E quando passi a un'altra app, Haven finisce di salvare prima che il sistema lo metta a riposo.
+
+Alcune cose restano del browser. Le app per telefono non offrono strumenti per agenti. Un'app nativa si installa una volta per dispositivo, quindi il trucco dell'iPhone di aggiungere Haven più volte alla schermata Home, ogni copia con il proprio spazio, appartiene alla versione browser; nell'app, tieni separati mondi diversi con tenant e identità separati. E la versione browser resta gratuita e completa: tutto ciò che le app native aggiungono è una comodità in più, mai un requisito.
 
 ## Il modello di sicurezza in breve
 
@@ -552,6 +590,10 @@ Revisione — una versione di un documento in un dato momento. Ogni modifica cre
 
 Allegato — un file allegato a un documento. Archiviato in chunk cifrati e trasmesso su richiesta.
 
+Allegati su richiesta — un'impostazione di sincronizzazione per database, Carica gli allegati quando servono, che lascia gli allegati degli altri sul server e li scarica quando vengono aperti. Risparmia spazio e rende le sincronizzazioni più veloci; i tuoi nuovi allegati vengono comunque caricati. Si sceglie all'installazione di un'app o più tardi nella pagina di sincronizzazione.
+
+Allegato fissato — un file che un'app tiene su questo dispositivo anche se il suo database carica gli allegati su richiesta. Un fissaggio copre un allegato o un intero documento, compresi gli allegati successivi, e appartiene a un'app su un dispositivo.
+
 Automerge — il motore di unione senza conflitti che MindooDB usa sotto il cofano. Due persone possono modificare lo stesso documento nello stesso momento e Automerge unisce le loro modifiche automaticamente.
 
 Esploratore DAG — una vista a grafo di ogni modifica mai applicata a un documento, compreso il modo in cui le modifiche concorrenti sono state unite.
@@ -601,6 +643,8 @@ Modalità standalone — una modalità di visualizzazione in cui Haven si avvia 
 Aggiungi alla schermata Home — l'azione del browser che salva Haven come icona avviabile sulla schermata Home di un telefono o di un tablet.
 
 Richiesta di installazione — il pannello nativo del browser che conferma l'aggiunta al dispositivo di una progressive web app come Haven.
+
+App nativa — Haven in un'app tutta sua per macOS, Windows, iOS o Android; in arrivo. Dentro lo stesso Haven, in più archiviazione SQLite, aggiornamenti automatici firmati e funzioni di sistema come il foglio di condivisione, i promemoria o l'accesso agenti integrato.
 
 Backup cifrato — un unico file che contiene tutto ciò che Haven conserva in questo browser, mescolato con una password che scegli tu. Senza quella password il file è illeggibile.
 

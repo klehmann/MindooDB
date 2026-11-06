@@ -12,7 +12,7 @@ Quelques traits distinguent Haven d'une application web classique.
 
 Haven est local-first. Presque tout ce que vous voyez est servi depuis une copie — une réplique locale — stockée à l'intérieur de ce navigateur. La navigation, l'édition, la recherche et même la construction de vues virtuelles se font toutes sur la réplique locale : Haven est donc rapide et reste utilisable quand le réseau disparaît. Le serveur n'est contacté que lors d'une synchronisation, et les données qui transitent sont toujours chiffrées de bout en bout.
 
-Haven est une progressive web app. Il peut être installé sur téléphone et tablette, iPhone, iPad et Android compris, et lancé directement depuis l'écran d'accueil comme une application native. Une fois installé, il s'ouvre en mode autonome, sans l'habillage du navigateur, ce qui vous laisse plus de place à l'écran et donne une impression plus calme. Sur iPhone, vous pouvez même ajouter Haven plusieurs fois à l'écran d'accueil — chaque copie installée dispose de son propre stockage privé, ce qui est une façon propre de séparer complètement des données personnelles, professionnelles et de démonstration sur un même appareil.
+Haven est une progressive web app. Il peut être installé sur téléphone et tablette, iPhone, iPad et Android compris, et lancé directement depuis l'écran d'accueil comme une application native. Une fois installé, il s'ouvre en mode autonome, sans l'habillage du navigateur, ce qui vous laisse plus de place à l'écran et donne une impression plus calme. Sur iPhone, vous pouvez même ajouter Haven plusieurs fois à l'écran d'accueil — chaque copie installée dispose de son propre stockage privé, ce qui est une façon propre de séparer complètement des données personnelles, professionnelles et de démonstration sur un même appareil. Des apps natives pour macOS, Windows, iOS et Android, qui emballent le même Haven dans une app à part entière, arrivent bientôt ; la section Haven en app native, plus bas, explique ce qu'elles apportent.
 
 Haven est un environnement d'exécution pour les apps MindooDB. Les apps MindooDB sont de petits outils web construits avec le MindooDB App SDK. Haven lance chacune d'elles dans une iframe en bac à sable sur une origine distincte, lui remet une vue restreinte des données que vous avez choisi de partager et arbitre chaque lecture et chaque écriture à travers un pont sécurisé. Les apps hébergées peuvent même être servies par le service worker de Haven et continuer à fonctionner quand le réseau a disparu.
 
@@ -282,6 +282,22 @@ Quand faut-il synchroniser ? La réponse courte : avant de vous fier à un chiff
 
 Un petit piège : si vous vous attendiez à voir une base de données dans la file et qu'elle manque, la raison habituelle est que l'identité utilisateur détenant la réplique n'est pas encore déverrouillée. La synchronisation a besoin des clés du KeyBag local, et le KeyBag ne s'ouvre qu'une fois l'identité active déverrouillée depuis la barre supérieure.
 
+### Pièces jointes : toutes, ou seulement à la demande
+
+Les pièces jointes sont en général la partie lourde d'une base de données. Les documents sont petits ; une présentation, un contrat numérisé ou un dossier de photos peut peser plus lourd que tous les documents autour réunis. C'est pourquoi vous décidez, base par base, si une synchronisation amène aussi les pièces jointes sur cet appareil.
+
+Vous rencontrez ce choix pour la première fois en installant une app dans un tenant déjà relié à un serveur. Haven demande Synchroniser les données de l'app depuis le serveur ?, pour que l'app ne démarre pas vide, et sous Avancé il liste chaque base de données de l'app avec un choix pour ses pièces jointes. Transférer toutes les pièces jointes les copie dans les deux sens, si bien que chaque fichier est sur l'appareil et s'ouvre hors ligne. Charger les pièces jointes à la demande synchronise tous les documents comme d'habitude et envoie les pièces jointes que vous ajoutez vous-même, mais laisse celles des autres sur le serveur. Pour vous comme pour l'app, rien d'autre ne change : quand un document a besoin d'un fichier absent de cet appareil, Haven le récupère sur le serveur, le déchiffre ici et le transmet comme s'il avait toujours été là. Le serveur envoie les mêmes fragments chiffrés que lors de n'importe quelle synchronisation, il n'apprend donc rien de nouveau.
+
+L'intérêt de la seconde option, c'est un appareil plus léger et plus rapide. Un téléphone qui travaille avec les documents du mois n'a pas à stocker des années de pièces jointes, la première synchronisation d'une grosse base se termine bien plus tôt, et chaque synchronisation suivante transporte moins d'octets. Le prix : un fichier qui n'est pas encore sur l'appareil demande une connexion la première fois qu'on l'ouvre. Ce choix n'est pas définitif : la colonne Pièces jointes de la page de synchronisation affiche le mode de chaque ligne, et un clic dessus ouvre un menu pour en changer.
+
+D'ailleurs, Haven se rabat sur le serveur dès qu'un fichier manque en local, pas seulement dans ce mode. Toute base de données dotée d'une cible de synchronisation peut ouvrir aussi un fichier qu'une synchronisation interrompue n'a jamais rapatrié.
+
+Pour les fichiers dont vous avez besoin là où il n'y a pas de réseau, les apps peuvent épingler des pièces jointes : elles restent sur l'appareil même si la base charge les pièces jointes à la demande. Une app épingle soit un seul fichier, soit un document entier, et épingler un document couvre aussi toutes les pièces jointes qui s'y ajouteront plus tard — la présentation pour la réunion en zone blanche, ou tout ce qui est classé pour un client. Haven télécharge les fichiers épinglés en arrière-plan, l'app peut afficher la progression et signaler les fichiers qui ne sont que sur le serveur, et un téléchargement échoué est relancé à la synchronisation suivante. Beaucoup d'apps le proposent dans le menu du document, comme moyen de rendre un document disponible hors ligne. Les épinglages appartiennent à l'app et à l'appareil qui les ont posés ; ils ne voyagent pas vers vos autres appareils.
+
+Les fichiers épinglés apparaissent aussi sur la page de synchronisation. Dès qu'une app détient des épinglages dans une base, le menu des pièces jointes de la ligne gagne une entrée Conservés hors ligne par des apps avec leur nombre. Elle ouvre la liste de ces fichiers avec leur état et un bouton Libérer. Libérer un épinglage fait de la place, mais Haven ne supprime la copie locale qu'une fois que le serveur détient le fichier complet, si bien qu'un fichier pas encore envoyé n'est jamais perdu.
+
+Pour les développeurs, tout cela fait partie de l'API de pièces jointes de l'App SDK. `info().attachmentStorage` indique à une app si une base garde ses pièces jointes en local, à la demande ou seulement sur le serveur, et `attachments.pin`, `unpin`, `availability`, `listPins` et `onAvailabilityChange` couvrent l'épinglage et l'état. Un `pin` sans nom de pièce jointe épingle le document entier, pièces jointes ajoutées plus tard comprises. Le [README de l'App SDK](https://github.com/klehmann/mindoodb-app-sdk) contient des exemples.
+
 ### Synchronisation pair-à-pair sans serveur
 
 La synchronisation n'a pas forcément à passer par un serveur. Deux appareils Haven d'un même tenant peuvent échanger des données directement, et cela s'avère utile dans deux situations bien différentes. La plus évidente est la panne de serveur : l'équipe continue de travailler et les données continuent de circuler, parce que rien sur le chemin ne dépend du serveur. La plus subtile est la rédaction ordinaire. Deux personnes qui travaillent sur le même document peuvent se synchroniser directement l'une avec l'autre pendant qu'elles itèrent, et n'envoyer le résultat final au serveur qu'une seule fois, au lieu d'y faire transiter chaque état intermédiaire.
@@ -436,7 +452,7 @@ Un grand nombre en haut additionne tout ce que Haven conserve actuellement dans 
 
 Sous le total, une section par tenant affiche un bloc par tenant. L'en-tête de chaque tenant indique sa taille cumulée, plus un bouton Vider le cache qui ne retire que les parties reconstructibles — caches et index que Haven remplira à nouveau la prochaine fois que vous utiliserez le tenant. Vider le cache ne supprime ni documents ni pièces jointes.
 
-À l'intérieur de chaque tenant, chaque ligne correspond à une base de données locale. Docs désigne le contenu chiffré des documents, Pièces jointes les fragments chiffrés de pièces jointes, et Total la somme des deux. Supprimer efface le contenu local de cette base de données dans ce navigateur uniquement — la copie serveur n'est pas touchée. La base de données d'annuaire protégée ne peut pas être supprimée, parce que Haven en a besoin pour fonctionner. Avant de supprimer, ouvrez la base de données et lancez une synchronisation ; s'il reste des modifications locales non synchronisées, la suppression les perd. Préférez Vider le cache quand vous voulez seulement libérer de l'espace, parce que c'est réversible.
+À l'intérieur de chaque tenant, chaque ligne correspond à une base de données locale. Docs désigne le contenu chiffré des documents, Pièces jointes les fragments chiffrés de pièces jointes, et Total la somme des deux. Pour une base de données qui charge les pièces jointes à la demande, Pièces jointes ne compte que les fichiers présents sur cet appareil. Supprimer efface le contenu local de cette base de données dans ce navigateur uniquement — la copie serveur n'est pas touchée. La base de données d'annuaire protégée ne peut pas être supprimée, parce que Haven en a besoin pour fonctionner. Avant de supprimer, ouvrez la base de données et lancez une synchronisation ; s'il reste des modifications locales non synchronisées, la suppression les perd. Préférez Vider le cache quand vous voulez seulement libérer de l'espace, parce que c'est réversible.
 
 Sous les bases de données de chaque tenant, vous verrez aussi ses caches : un cache de tenant local pour l'état général propre au tenant, un cache de cible serveur pour chaque serveur MindooDB avec lequel le tenant dialogue, un cache de vue virtuelle pour chaque vue enregistrée, et une entrée Index plein texte (MiniSearch) pour chaque base de données dont l'indexation plein texte est activée. Chaque cache affiche sa propre taille, et les caches de vues virtuelles peuvent être vidés individuellement si une vue en particulier a trop grossi.
 
@@ -453,6 +469,28 @@ iOS offre un bonus appréciable : vous pouvez ajouter Haven plusieurs fois à l'
 Sur Android, ouvrez Haven dans un navigateur moderne comme Chrome ou Edge. Si Haven affiche un bouton Installer, acceptez-le et votre navigateur ajoutera Haven à l'écran d'accueil et au tiroir d'applications en une seule étape. S'il n'y a pas d'invite, ouvrez le menu du navigateur (généralement trois points dans un coin) et cherchez Installer l'application ou Ajouter à l'écran d'accueil — les navigateurs le formulent différemment, mais le résultat est le même. Confirmez l'invite du navigateur et Haven apparaît sur l'écran d'accueil comme une icône d'application Android normale.
 
 Après l'installation, lancez toujours Haven depuis l'icône de l'écran d'accueil quand vous êtes sur un téléphone — l'expérience est nettement plus agréable qu'un onglet de navigateur.
+
+## Haven en app native
+
+Tout ce que décrit ce manuel fonctionne dans le navigateur, et c'est dans le navigateur que Haven est disponible aujourd'hui, à l'adresse [haven.mindoodb.com](https://haven.mindoodb.com). Des apps natives pour macOS, Windows, iOS et Android arrivent bientôt. Ce ne sont pas un second Haven : chacune emballe le même Haven dans une app à part entière, si bien que les écrans, le modèle de données, le chiffrement et les apps que vous utilisez restent les mêmes. Ce qui change, c'est ce qui entoure Haven — ce qu'une app installée sur l'appareil a le droit de faire et un onglet de navigateur non.
+
+Une partie vaut pour les quatre.
+
+Vos données vivent dans les fichiers de base de données propres à l'app plutôt que dans le stockage du navigateur. Les stores de MindooDB deviennent des fichiers SQLite dans le dossier de données de l'app, si bien que Haven ne dépend plus du budget de stockage d'un navigateur ni d'un navigateur qui efface les données des sites. Cela fait aussi de l'app native et de la version navigateur deux endroits distincts : un tenant que vous utilisez dans les deux se synchronise via le serveur comme sur n'importe quel second appareil, et pour un Haven purement local une sauvegarde chiffrée emporte tout de l'un à l'autre.
+
+Haven se tient lui-même à jour. L'app embarque une version de Haven et en récupère de plus récentes sur un canal de mise à jour signé ; elle vérifie la signature, vous propose de recharger et revient à la version précédente si une nouvelle ne démarre pas. Les apps de bureau mettent à jour de la même façon l'app qui entoure Haven et ne redémarrent que lorsque vous le décidez.
+
+Les passkeys continuent de fonctionner. Les apps utilisent la prise en charge des passkeys du système pour haven.mindoodb.com — le trousseau iCloud sur les appareils Apple, le Gestionnaire de mots de passe de Google sous Android, Windows Hello sous Windows —, si bien qu'une passkey créée dans le navigateur déverrouille aussi votre identité dans l'app.
+
+Les pages web qui refusent d'être intégrées s'affichent malgré tout. Beaucoup de sites interdisent d'être affichés dans une autre page, ce qui laisse leur tuile web vide dans le navigateur. Les apps natives ouvrent un tel site dans une vue native posée exactement sur la tuile, si bien qu'il apparaît en direct, avec précédent, suivant et recharger.
+
+Les apps profitent davantage du réseau. Une app MindooDB comme MindooMail peut parler directement à un serveur de messagerie en IMAP et SMTP, ce qu'aucun onglet de navigateur ne sait faire.
+
+Sur ordinateur — macOS et Windows — trois choses s'ajoutent. Les agents IA se connectent sans Chrome, sans l'extension passerelle et sans port réseau ouvert ; Travailler avec des agents IA décrit la fenêtre Accès des agents. Le dossier d'échange se choisit dans la boîte de dialogue du système, et Haven connaît son vrai chemin. Et les apps qui gardent de gros fichiers sur l'appareil, comme des cartes hors ligne, les stockent comme des fichiers ordinaires dans le dossier de données de l'app.
+
+Sur téléphone — iOS et Android — Haven fait partie du système. Le contenu d'autres apps arrive dans Haven par la feuille de partage ou Ouvrir avec, et Haven le propose à une app capable de s'en servir : une photo pour un document, un PDF pour le dossier d'un client. Sur iPhone et iPad, Raccourcis et Siri peuvent envoyer fichiers et texte à Haven, les apps et bases de données de Haven s'ouvrent depuis Raccourcis et Spotlight, et le dossier de Haven dans l'app Fichiers sert de dossier d'import. Les apps peuvent programmer des rappels qui arrivent comme notifications du système même quand Haven est fermé, avec Fait et Dans 1 heure directement sur la notification. Et quand vous passez à une autre app, Haven termine d'enregistrer avant que le système ne le mette en veille.
+
+Certaines choses restent propres au navigateur. Les apps pour téléphone ne proposent pas d'outils pour agents. Une app native s'installe une fois par appareil, donc l'astuce de l'iPhone consistant à ajouter Haven plusieurs fois à l'écran d'accueil, chaque copie avec son propre stockage, relève de la version navigateur ; dans l'app, séparez les mondes avec des tenants et des identités distincts. Et la version navigateur reste gratuite et complète : tout ce qu'ajoutent les apps natives est un confort en plus, jamais une condition.
 
 ## Le modèle de sécurité en un coup d'œil
 
@@ -552,6 +590,10 @@ Révision — une version d'un document à un instant donné. Chaque modificatio
 
 Pièce jointe — un fichier attaché à un document. Stocké en fragments chiffrés et diffusé à la demande.
 
+Pièces jointes à la demande — un réglage de synchronisation par base de données, Charger les pièces jointes à la demande, qui laisse les pièces jointes des autres sur le serveur et les récupère à l'ouverture. Économise de la place et accélère les synchronisations ; vos propres nouvelles pièces jointes sont quand même envoyées. Se choisit à l'installation d'une app ou plus tard sur la page de synchronisation.
+
+Pièce jointe épinglée — un fichier qu'une app garde sur cet appareil bien que sa base charge les pièces jointes à la demande. Un épinglage couvre une pièce jointe ou un document entier, pièces jointes ultérieures comprises, et appartient à une app sur un appareil.
+
 Automerge — le moteur de fusion sans conflit que MindooDB utilise sous le capot. Deux personnes peuvent modifier le même document en même temps, et Automerge fusionne automatiquement leurs modifications.
 
 Explorateur DAG — une vue en graphe de toutes les modifications jamais appliquées à un document, y compris la façon dont les éditions concurrentes ont été fusionnées.
@@ -601,6 +643,8 @@ Mode autonome — un mode d'affichage dans lequel Haven se lance sans les contr�
 Ajouter à l'écran d'accueil — l'action du navigateur qui enregistre Haven sous forme d'icône lançable sur l'écran d'accueil d'un téléphone ou d'une tablette.
 
 Invite d'installation — la fiche native du navigateur qui confirme l'ajout d'une progressive web app comme Haven sur l'appareil.
+
+App native — Haven dans une app à part entière pour macOS, Windows, iOS ou Android ; arrive bientôt. Le même Haven à l'intérieur, plus le stockage SQLite, des mises à jour signées automatiques et des fonctions du système comme la feuille de partage, les rappels ou l'accès des agents intégré.
 
 Sauvegarde chiffrée — un fichier unique contenant tout ce que Haven garde dans ce navigateur, brouillé avec un mot de passe que vous choisissez. Sans ce mot de passe, le fichier est illisible.
 

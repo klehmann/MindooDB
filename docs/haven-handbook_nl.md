@@ -12,7 +12,7 @@ Een paar dingen maken Haven anders dan een doorsnee webapp.
 
 Haven is local-first. Bijna alles wat je ziet komt uit een kopie — een lokale replica — die in deze browser is opgeslagen. Bladeren, bewerken, zoeken en zelfs het opbouwen van virtuele weergaven gebeurt allemaal tegen de lokale replica, waardoor Haven snel is en bruikbaar blijft als het netwerk weg is. De server wordt alleen benaderd wanneer je synchroniseert, en de gegevens op de lijn zijn altijd end-to-end versleuteld.
 
-Haven is een progressive web app. Het kan op telefoons en tablets worden geïnstalleerd, inclusief iPhone, iPad en Android, en direct vanaf het beginscherm worden gestart zoals een native applicatie. Eenmaal geïnstalleerd opent het in standalone-modus zonder browserchroom, wat je meer schermruimte en een rustiger gevoel geeft. Op de iPhone kun je Haven zelfs meer dan één keer aan je beginscherm toevoegen — elke geïnstalleerde kopie krijgt zijn eigen privéopslag, een nette manier om persoonlijke, werk- en demogegevens op één apparaat volledig te scheiden.
+Haven is een progressive web app. Het kan op telefoons en tablets worden geïnstalleerd, inclusief iPhone, iPad en Android, en direct vanaf het beginscherm worden gestart zoals een native applicatie. Eenmaal geïnstalleerd opent het in standalone-modus zonder browserchroom, wat je meer schermruimte en een rustiger gevoel geeft. Op de iPhone kun je Haven zelfs meer dan één keer aan je beginscherm toevoegen — elke geïnstalleerde kopie krijgt zijn eigen privéopslag, een nette manier om persoonlijke, werk- en demogegevens op één apparaat volledig te scheiden. Native apps voor macOS, Windows, iOS en Android, die dezelfde Haven in een eigen app verpakken, verschijnen binnenkort; de sectie Haven als native app, verderop, beschrijft wat ze toevoegen.
 
 Haven is een runtime-thuis voor MindooDB-apps. MindooDB-apps zijn kleine webtools die met de MindooDB App SDK zijn gebouwd. Haven start elke app in een sandboxed iframe op een aparte origin, geeft die een afgebakend zicht op de gegevens die je hebt gedeeld, en bemiddelt elke lees- en schrijfactie via een beveiligde bridge. Gehoste apps kunnen zelfs door Havens eigen service worker worden geserveerd en blijven werken als het netwerk weg is.
 
@@ -282,6 +282,22 @@ Wanneer moet je synchroniseren? Het korte antwoord is: voordat je een getal vert
 
 Eén klein struikelblok: verwacht je een database in de wachtrij en staat die er niet, dan is de gebruikelijke oorzaak dat de gebruikersidentiteit die de replica bezit nog niet is ontgrendeld. Synchronisatie heeft de sleutels uit de lokale KeyBag nodig, en de KeyBag opent alleen zodra de actieve identiteit vanuit de bovenbalk is ontgrendeld.
 
+### Bijlagen: allemaal, of alleen wanneer nodig
+
+Bijlagen zijn meestal het zware deel van een database. Documenten zijn klein; een presentatie, een gescand contract of een map met foto's kan meer wegen dan alle documenten eromheen samen. Daarom beslis je per database of een synchronisatie ook de bijlagen naar dit apparaat haalt.
+
+Je komt die keuze voor het eerst tegen wanneer je een app installeert in een tenant die al met een server verbonden is. Haven vraagt dan App-gegevens synchroniseren vanaf de server?, zodat de app niet leeg start, en onder Geavanceerd staat elke database van de app met een keuze voor zijn bijlagen. Alle bijlagen overdragen kopieert ze in beide richtingen, zodat elk bestand op het apparaat staat en ook offline opent. Bijlagen laden wanneer nodig synchroniseert alle documenten zoals altijd en uploadt de bijlagen die je zelf toevoegt, maar laat die van anderen op de server. Voor jou en voor de app verandert er verder niets: als een document een bestand nodig heeft dat niet op dit apparaat staat, haalt Haven het van de server, ontsleutelt het hier en geeft het door alsof het er altijd al was. De server stuurt dezelfde versleutelde brokken als bij elke synchronisatie en komt dus niets nieuws te weten.
+
+Het nut van de tweede optie is een lichter en sneller apparaat. Een telefoon die met de documenten van deze maand werkt, hoeft geen jaren aan bijlagen op te slaan, de eerste synchronisatie van een grote database is veel eerder klaar en elke latere synchronisatie verstuurt minder bytes. De prijs: een bestand dat nog niet op het apparaat staat, heeft de eerste keer dat het opent een verbinding nodig. De keuze is niet definitief: de kolom Bijlagen op de pagina Synchronisatie toont per rij de modus, en een klik erop opent een menu om te wisselen.
+
+Haven valt trouwens altijd terug op de server wanneer een bestand lokaal ontbreekt, niet alleen in deze modus. Elke database met een synchronisatiedoel kan ook een bestand openen dat een onderbroken synchronisatie nooit heeft binnengehaald.
+
+Voor de bestanden die je nodig hebt waar geen netwerk is, kunnen apps bijlagen vastzetten: ze blijven op het apparaat, ook al laadt de database bijlagen wanneer nodig. Een app zet één bestand vast of een heel document, en een vastgezet document omvat ook alle bijlagen die er later bij komen — de presentatie voor de vergadering zonder bereik, of alles wat voor één klant is opgeslagen. Haven downloadt vastgezette bestanden op de achtergrond, de app kan de voortgang tonen en aangeven welke bestanden alleen op de server staan, en een mislukte download wordt bij de volgende synchronisatie opnieuw geprobeerd. Veel apps bieden dit aan in het documentmenu, als manier om een document offline beschikbaar te maken. Vastzettingen horen bij de app en het apparaat die ze hebben gemaakt; ze reizen niet mee naar je andere apparaten.
+
+Vastgezette bestanden verschijnen ook op de pagina Synchronisatie. Zodra een app in een database iets heeft vastgezet, krijgt het bijlagemenu van de rij een item Offline bewaard door apps met hun aantal. Het opent de lijst van die bestanden met hun status en een knop Vrijgeven. Vrijgeven maakt ruimte vrij, maar Haven verwijdert de lokale kopie pas wanneer de server het hele bestand heeft, zodat een bestand dat nog niet is geüpload nooit verloren gaat.
+
+Voor ontwikkelaars hoort dit bij de bijlage-API van de App SDK. `info().attachmentStorage` vertelt een app of een database bijlagen lokaal, op aanvraag of alleen op de server bewaart, en `attachments.pin`, `unpin`, `availability`, `listPins` en `onAvailabilityChange` dekken vastzetten en status. Een `pin` zonder bijlagenaam zet het hele document vast, inclusief bijlagen die later komen. De [README van de App SDK](https://github.com/klehmann/mindoodb-app-sdk) bevat voorbeelden.
+
 ### Peer-to-peer-synchronisatie zonder server
 
 Synchronisatie hoeft helemaal niet via een server te lopen. Twee Haven-apparaten in dezelfde tenant kunnen direct gegevens uitwisselen, en dat blijkt in twee heel verschillende situaties uit te maken. De duidelijke is een serverstoring: het team werkt door en de gegevens blijven bewegen, omdat niets in het pad afhangt van een server die aan staat. De subtielere is gewoon schrijven. Twee mensen die samen door hetzelfde document lopen, kunnen rechtstreeks met elkaar synchroniseren terwijl ze werken en het afgeronde resultaat één keer naar de server sturen, in plaats van elke tussenstand erlangs te leiden.
@@ -436,7 +452,7 @@ Een groot getal bovenaan telt alles op wat Haven op dat moment in deze browser b
 
 Onder het totaal toont een gedeelte per tenant één blok per tenant. Elke tenantkop heeft de gecombineerde grootte plus een knop Cache wissen die alleen de opnieuw op te bouwen delen weghaalt — caches en indexen die Haven de volgende keer dat je de tenant gebruikt weer vult. Cache wissen verwijdert geen documenten of bijlagen.
 
-Binnen elke tenant is elke rij één lokale database. Documenten is de versleutelde documentinhoud, Bijlagen is versleutelde bijlagebrokken, en Totaal is de som van de twee. Verwijderen wist de lokale inhoud van die database alleen in deze browser — de serverkopie blijft onaangeroerd. De beschermde directory-database kan niet worden verwijderd, omdat Haven die nodig heeft om te werken. Open voordat je verwijdert de database en voer een synchronisatie uit; zijn er niet-gesynchroniseerde lokale wijzigingen, dan raakt verwijderen die kwijt. Kies Cache wissen wanneer je alleen ruimte wilt vrijmaken, want dat is omkeerbaar.
+Binnen elke tenant is elke rij één lokale database. Documenten is de versleutelde documentinhoud, Bijlagen is versleutelde bijlagebrokken, en Totaal is de som van de twee. Bij een database die bijlagen laadt wanneer nodig, telt Bijlagen alleen de bestanden die op dit apparaat staan. Verwijderen wist de lokale inhoud van die database alleen in deze browser — de serverkopie blijft onaangeroerd. De beschermde directory-database kan niet worden verwijderd, omdat Haven die nodig heeft om te werken. Open voordat je verwijdert de database en voer een synchronisatie uit; zijn er niet-gesynchroniseerde lokale wijzigingen, dan raakt verwijderen die kwijt. Kies Cache wissen wanneer je alleen ruimte wilt vrijmaken, want dat is omkeerbaar.
 
 Onder de databases van elke tenant zie je ook zijn caches: een lokale tenantcache voor algemene status per tenant, een serverdoelcache voor elke MindooDB-server waarmee de tenant praat, een cache van de virtuele weergave voor elke opgeslagen weergave, en een vermelding Full-text-index (MiniSearch) voor elke database waarvoor full-text-indexering aanstaat. Elke cache toont zijn eigen grootte, en caches van virtuele weergaven kunnen afzonderlijk worden gewist als één bepaalde weergave te groot is geworden.
 
@@ -453,6 +469,28 @@ iOS heeft een leuke bonus: je kunt Haven meer dan één keer aan het beginscherm
 Op Android open je Haven in een moderne browser zoals Chrome of Edge. Toont Haven een knop Installeren, accepteer die dan en je browser voegt Haven in één stap toe aan het beginscherm en de app-lade. Is er geen prompt, open dan het browsermenu (meestal drie puntjes in de hoek) en kijk naar Installeren of Zet op beginscherm — verschillende browsers verwoorden het anders, maar het resultaat is hetzelfde. Bevestig de prompt van de browser en Haven verschijnt op het beginscherm als een normaal Android-app-icoon.
 
 Start Haven na het installeren op een telefoon altijd vanaf het icoon op het beginscherm — dat is een merkbaar prettigere ervaring dan een browsertabblad.
+
+## Haven als native app
+
+Alles in dit handboek werkt in de browser, en in de browser is Haven vandaag beschikbaar, op [haven.mindoodb.com](https://haven.mindoodb.com). Native apps voor macOS, Windows, iOS en Android verschijnen binnenkort. Ze zijn geen tweede Haven: elk verpakt dezelfde Haven in een eigen app, zodat de schermen, het datamodel, de versleuteling en de apps die je gebruikt hetzelfde blijven. Wat verandert, is wat Haven omringt — wat een op het apparaat geïnstalleerde app mag en een browsertabblad niet.
+
+Een deel daarvan geldt voor alle vier.
+
+Je gegevens staan in de eigen databasebestanden van de app in plaats van in de opslag van de browser. De stores van MindooDB worden SQLite-bestanden in de gegevensmap van de app, zodat Haven niet langer afhangt van het opslagbudget van een browser of van een browser die sitegegevens opruimt. Het maakt de native app en de browserversie ook tot twee aparte plekken: een tenant die je in beide gebruikt, synchroniseert via de server zoals op elk tweede apparaat, en bij een puur lokale Haven neemt een versleutelde back-up alles van de ene naar de andere mee.
+
+Haven houdt zichzelf bij. De app wordt geleverd met een Haven-versie en haalt nieuwere uit een ondertekend updatekanaal; ze controleert de handtekening, vraagt je om opnieuw te laden en gaat terug naar de vorige versie als een nieuwe niet start. De desktopapps werken de app rond Haven op dezelfde manier bij en herstarten pas wanneer jij dat zegt.
+
+Passkeys blijven werken. De apps gebruiken de passkey-ondersteuning van het systeem voor haven.mindoodb.com — de iCloud-sleutelhanger op Apple-apparaten, Google Wachtwoordmanager op Android, Windows Hello op Windows —, zodat een passkey die je in de browser hebt gemaakt je identiteit ook in de app ontgrendelt.
+
+Webpagina's die niet ingesloten willen worden, verschijnen toch. Veel sites verbieden dat ze binnen een andere pagina worden getoond, waardoor hun webtegel in de browser leeg blijft. De native apps openen zo'n site in een native weergave die precies over de tegel ligt, zodat hij live verschijnt, met terug, vooruit en opnieuw laden.
+
+Apps krijgen meer van het netwerk. Een MindooDB-app als MindooMail kan rechtstreeks via IMAP en SMTP met een mailserver praten, wat geen browsertabblad kan.
+
+Op de desktop — macOS en Windows — komen er drie dingen bij. AI-agents verbinden zonder Chrome, zonder de brugextensie en zonder open netwerkpoort; Werken met AI-agents beschrijft het venster Agenttoegang. De uitwisselmap kies je in het eigen dialoogvenster van het systeem, en Haven kent het echte pad. En apps die grote bestanden op het apparaat bewaren, zoals offline kaarten, slaan ze op als gewone bestanden in de gegevensmap van de app.
+
+Op de telefoon — iOS en Android — wordt Haven deel van het systeem. Inhoud uit andere apps komt via het deelmenu of Open met bij Haven terecht, en Haven biedt die aan een app aan die er iets mee kan: een foto voor een document, een pdf voor het dossier van een klant. Op iPhone en iPad kunnen Opdrachten en Siri bestanden en tekst naar Haven sturen, openen de apps en databases van Haven vanuit Opdrachten en Spotlight, en dient de map van Haven in de Bestanden-app als importmap. Apps kunnen herinneringen instellen die als systeemmeldingen binnenkomen, ook als Haven gesloten is, met Klaar en Over 1 uur direct op de melding. En wanneer je naar een andere app wisselt, slaat Haven alles op voordat het systeem het laat slapen.
+
+Een paar dingen blijven van de browser. De telefoonapps bieden geen agenttools aan. Een native app installeer je één keer per apparaat, dus de iPhone-truc om Haven meerdere keren aan het beginscherm toe te voegen, elke kopie met eigen opslag, hoort bij de browserversie; in de app houd je verschillende werelden uit elkaar met aparte tenants en identiteiten. En de browserversie blijft gratis en volledig: alles wat de native apps toevoegen is extra gemak, nooit een vereiste.
 
 ## Het beveiligingsmodel in één oogopslag
 
@@ -552,6 +590,10 @@ Revisie — een versie van een document op een bepaald moment. Elke wijziging ma
 
 Bijlage — een bestand dat aan een document is gehangen. Opgeslagen in versleutelde brokken en op aanvraag gestreamd.
 
+Bijlagen op aanvraag — een synchronisatie-instelling per database, Bijlagen laden wanneer nodig, die de bijlagen van anderen op de server laat en ze ophaalt wanneer ze worden geopend. Spaart ruimte en maakt synchronisaties sneller; je eigen nieuwe bijlagen worden nog steeds geüpload. Te kiezen bij het installeren van een app of later op de pagina Synchronisatie.
+
+Vastgezette bijlage — een bestand dat een app op dit apparaat bewaart, ook al laadt de database bijlagen op aanvraag. Een vastzetting omvat één bijlage of een heel document, latere bijlagen inbegrepen, en hoort bij één app op één apparaat.
+
 Automerge — de conflictvrije samenvoegengine die MindooDB onder water gebruikt. Twee mensen kunnen hetzelfde document tegelijk bewerken en Automerge voegt hun wijzigingen automatisch samen.
 
 DAG-verkenner — een grafische weergave van elke wijziging die ooit op een document is toegepast, inclusief hoe gelijktijdige bewerkingen zijn samengevoegd.
@@ -601,6 +643,8 @@ Standalone-modus — een weergavemodus waarin Haven start zonder de normale brow
 Zet op beginscherm — de browseractie die Haven als startbaar icoon op het beginscherm van een telefoon of tablet opslaat.
 
 Installatieprompt — het browsereigen venster dat het toevoegen van een progressive web app zoals Haven aan het apparaat bevestigt.
+
+Native app — Haven verpakt in een eigen app voor macOS, Windows, iOS of Android; verschijnt binnenkort. Binnenin dezelfde Haven, plus SQLite-opslag, ondertekende zelfupdates en systeemfuncties zoals het deelmenu, herinneringen of ingebouwde agenttoegang.
 
 Versleutelde back-up — één bestand met alles wat Haven in deze browser bewaart, versleuteld met een wachtwoord dat je zelf kiest. Zonder dat wachtwoord is het bestand onleesbaar.
 

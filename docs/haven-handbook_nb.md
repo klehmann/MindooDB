@@ -12,7 +12,7 @@ Noen få ting skiller Haven fra en vanlig webapp.
 
 Haven er lokal-først. Nesten alt du ser, serveres fra en kopi — en lokal replika — som ligger i denne nettleseren. Å bla, redigere, søke og til og med bygge virtuelle visninger skjer mot den lokale replikaen, så Haven er raskt og fortsetter å virke når nettet er borte. Serveren kontaktes bare når du synkroniserer, og dataene på linja er alltid ende-til-ende-kryptert.
 
-Haven er en progressiv webapp. Den kan installeres på telefoner og nettbrett, inkludert iPhone, iPad og Android, og startes rett fra Hjem-skjermen som en vanlig app. Når den er installert, åpnes den i frittstående modus uten nettleserramme, noe som gir deg mer skjermplass og en roligere følelse. På iPhone kan du til og med legge Haven til på Hjem-skjermen mer enn én gang — hver installerte kopi får sitt eget private lager, og det er en ryddig måte å holde private data, jobbdata og demodata helt adskilt på én enhet.
+Haven er en progressiv webapp. Den kan installeres på telefoner og nettbrett, inkludert iPhone, iPad og Android, og startes rett fra Hjem-skjermen som en vanlig app. Når den er installert, åpnes den i frittstående modus uten nettleserramme, noe som gir deg mer skjermplass og en roligere følelse. På iPhone kan du til og med legge Haven til på Hjem-skjermen mer enn én gang — hver installerte kopi får sitt eget private lager, og det er en ryddig måte å holde private data, jobbdata og demodata helt adskilt på én enhet. Native apper for macOS, Windows, iOS og Android, som pakker den samme Haven inn i en egen app, kommer snart; avsnittet Haven som native app lenger ned forteller hva de tilfører.
 
 Haven er et kjøremiljø for MindooDB-apper. MindooDB-apper er små webverktøy bygget med MindooDB App SDK. Haven starter hver av dem i en iframe med sandkasse på en egen origin, gir den et avgrenset innsyn i dataene du valgte å dele, og formidler hver lesing og skriving gjennom en sikker bridge. Hostede apper kan til og med serveres av Havens egen service worker og fortsette å virke når nettet er borte.
 
@@ -282,6 +282,22 @@ Når bør du synkronisere? Det korte svaret er: før du stoler på et tall du sk
 
 En liten felle: hvis du ventet at en database skulle dukke opp i køen og den mangler, er den vanlige grunnen at brukeridentiteten som holder replikaen, ikke er låst opp ennå. Synkronisering trenger nøklene fra den lokale KeyBag-en, og KeyBag-en åpner seg først når den aktive identiteten er låst opp fra topplinjen.
 
+### Vedlegg: alle, eller bare ved behov
+
+Vedlegg er som regel den tunge delen av en database. Dokumenter er små; en presentasjon, en skannet kontrakt eller en mappe med bilder kan veie mer enn alle dokumentene rundt til sammen. Derfor bestemmer du, database for database, om en synkronisering også henter vedleggene til denne enheten.
+
+Første gang du møter valget, er når du installerer en app i en tenant som allerede er koblet til en server. Haven spør Synkronisere appdata fra serveren?, slik at appen ikke starter tom, og under Avansert lister den hver database appen bruker, med et valg for vedleggene. Overfør alle vedlegg kopierer dem begge veier, så hver fil ligger på enheten og åpnes uten nett. Last inn vedlegg ved behov synkroniserer alle dokumenter som før og laster opp vedleggene du legger til selv, men lar de andres ligge på serveren. For deg og for appen endres ingenting annet: Når et dokument trenger en fil som ikke ligger på denne enheten, henter Haven den fra serveren, dekrypterer den her og leverer den som om den alltid hadde vært der. Serveren sender de samme krypterte bitene som ved enhver synkronisering og får ikke vite noe nytt.
+
+Poenget med det andre valget er en lettere og raskere enhet. En telefon som jobber med denne månedens dokumenter, trenger ikke lagre årevis med vedlegg, den første synkroniseringen av en stor database blir ferdig mye tidligere, og hver senere synkronisering frakter færre byte. Prisen er at en fil som ennå ikke ligger på enheten, trenger en tilkobling første gang den åpnes. Valget er ikke endelig: Kolonnen Vedlegg på Synkroniseringssiden viser modusen for hver rad, og et klikk åpner en meny for å bytte.
+
+Haven faller for øvrig tilbake på serveren når en fil mangler lokalt, ikke bare i denne modusen. Enhver database med et synkroniseringsmål kan også åpne en fil som en avbrutt synkronisering aldri fikk hentet ned.
+
+For filene du trenger der det ikke er nett, kan apper feste vedlegg: De blir liggende på enheten selv om databasen laster inn vedlegg ved behov. En app fester enten én enkelt fil eller et helt dokument, og et festet dokument omfatter også alle vedlegg som legges til senere — presentasjonen til møtet uten dekning, eller alt som er arkivert for én kunde. Haven laster ned festede filer i bakgrunnen, appen kan vise fremdriften og markere hvilke filer som bare ligger på serveren, og en mislykket nedlasting prøves igjen ved neste synkronisering. Mange apper tilbyr dette i dokumentmenyen, som en måte å gjøre et dokument tilgjengelig uten nett. Festene tilhører appen og enheten som satte dem; de reiser ikke til de andre enhetene dine.
+
+Festede filer dukker også opp på Synkroniseringssiden. Så snart en app har fester i en database, får radens vedleggsmeny en oppføring Holdt uten nett av apper med antallet. Den åpner listen over disse filene med tilstanden deres og en Frigi-knapp. Å frigi et feste gir plass, men Haven sletter den lokale kopien først når serveren har hele filen, så en fil som ikke er lastet opp ennå, går aldri tapt.
+
+For utviklere er dette en del av vedleggs-API-et i App SDK. `info().attachmentStorage` forteller en app om en database holder vedlegg lokalt, ved behov eller bare på serveren, og `attachments.pin`, `unpin`, `availability`, `listPins` og `onAvailabilityChange` dekker festing og status. En `pin` uten vedleggsnavn fester hele dokumentet, inkludert vedlegg som kommer senere. [README-en til App SDK](https://github.com/klehmann/mindoodb-app-sdk) har eksempler.
+
 ### Node-til-node-synkronisering uten server
 
 Synkronisering trenger ikke å gå gjennom en server i det hele tatt. To Haven-enheter i samme tenant kan utveksle data direkte, og det viser seg å bety noe i to ganske ulike situasjoner. Den åpenbare er et serverutfall: teamet fortsetter å jobbe og dataene fortsetter å bevege seg, fordi ingenting i veien er avhengig av at serveren er oppe. Den mer subtile er vanlig utkastarbeid. To personer som jobber seg gjennom det samme dokumentet, kan synkronisere rett til hverandre mens de går runder, og sende det ferdige resultatet til serveren én gang, i stedet for å rute hver mellomtilstand gjennom den.
@@ -436,7 +452,7 @@ Et stort tall øverst summerer alt Haven holder i denne nettleseren akkurat nå:
 
 Under totalen viser en del per tenant én blokk per tenant. Hver tenant-overskrift har den samlede størrelsen sin pluss en Tøm cache-knapp som bare fjerner de delene som kan bygges opp igjen — cacher og indekser som Haven fyller på nytt neste gang du bruker tenanten. Tøm cache sletter ikke dokumenter eller vedlegg.
 
-Inne i hver tenant er hver rad én lokal database. Dokumenter er det krypterte dokumentinnholdet, Vedlegg er krypterte vedleggsbiter, og Totalt er summen av de to. Slett visker ut den databasens lokale innhold i bare denne nettleseren — serverkopien røres ikke. Den beskyttede katalogdatabasen kan ikke slettes, fordi Haven trenger den for å virke. Før du sletter, åpne databasen og kjør Synkroniser; finnes det usynkroniserte lokale endringer, mister du dem ved sletting. Foretrekk Tøm cache når du bare vil frigjøre plass, fordi det kan gjøres om.
+Inne i hver tenant er hver rad én lokal database. Dokumenter er det krypterte dokumentinnholdet, Vedlegg er krypterte vedleggsbiter, og Totalt er summen av de to. For en database som laster inn vedlegg ved behov, teller Vedlegg bare filene som ligger på denne enheten. Slett visker ut den databasens lokale innhold i bare denne nettleseren — serverkopien røres ikke. Den beskyttede katalogdatabasen kan ikke slettes, fordi Haven trenger den for å virke. Før du sletter, åpne databasen og kjør Synkroniser; finnes det usynkroniserte lokale endringer, mister du dem ved sletting. Foretrekk Tøm cache når du bare vil frigjøre plass, fordi det kan gjøres om.
 
 Under databasene i hver tenant ser du også cachene dens: en lokal tenant-cache for generell tilstand per tenant, en servermål-cache for hver MindooDB-server tenanten snakker med, en cache for virtuell visning for hver lagrede visning, og en oppføring Fulltekstindeks (MiniSearch) for hver database som har fulltekstindeksering slått på. Hver cache viser sin egen størrelse, og cacher for virtuelle visninger kan tømmes enkeltvis hvis én bestemt visning har vokst seg for stor.
 
@@ -453,6 +469,28 @@ iOS har en fin bonus: du kan legge Haven til på Hjem-skjermen mer enn én gang.
 På Android, åpne Haven i en moderne nettleser som Chrome eller Edge. Viser Haven en Installer-knapp, godta den, så legger nettleseren Haven til på Hjem-skjermen og i appskuffen i ett steg. Kommer det ingen forespørsel, åpne nettlesermenyen (som regel tre prikker i hjørnet) og se etter Installer app eller Legg til på Hjem-skjerm — ulike nettlesere ordlegger seg forskjellig, men resultatet er det samme. Bekreft nettleserens dialog, og Haven dukker opp på Hjem-skjermen som et helt vanlig Android-appikon.
 
 Etter installasjon, start alltid Haven fra ikonet på Hjem-skjermen når du er på telefon — det er en merkbart hyggeligere opplevelse enn en nettleserfane.
+
+## Haven som native app
+
+Alt i denne håndboken fungerer i nettleseren, og det er i nettleseren Haven er tilgjengelig i dag, på [haven.mindoodb.com](https://haven.mindoodb.com). Native apper for macOS, Windows, iOS og Android kommer snart. De er ikke en ny Haven: Hver av dem pakker den samme Haven inn i en egen app, så skjermbildene, datamodellen, krypteringen og appene du bruker, forblir de samme. Det som endres, er det som omgir Haven — det en app installert på enheten får lov til og en nettleserfane ikke.
+
+Noe av det gjelder for alle fire.
+
+Dataene dine ligger i appens egne databasefiler i stedet for i nettleserens lagring. MindooDBs lagre blir SQLite-filer i appens datamappe, så Haven er ikke lenger bundet til en nettlesers lagringsbudsjett eller til at en nettleser rydder bort nettstedsdata. Det gjør også den native appen og nettleserversjonen til to atskilte steder: En tenant du bruker i begge, synkroniseres via serveren som på en hvilken som helst enhet nummer to, og for en ren lokal Haven tar en kryptert backup med alt fra den ene til den andre.
+
+Haven holder seg selv oppdatert. Appen leveres med en Haven-versjon og henter nyere fra en signert oppdateringskanal; den sjekker signaturen, ber deg laste inn på nytt og går tilbake til forrige versjon hvis en ny ikke starter. Skrivebordsappene oppdaterer appen rundt Haven på samme måte og starter bare på nytt når du sier det.
+
+Passnøkler fungerer fortsatt. Appene bruker systemets passnøkkelstøtte for haven.mindoodb.com — iCloud-nøkkelringen på Apple-enheter, Google Passordlagring på Android, Windows Hello på Windows —, så en passnøkkel du opprettet i nettleseren, låser også opp identiteten din i appen.
+
+Nettsider som nekter å bli innebygd, vises likevel. Mange nettsteder forbyr å bli vist inne i en annen side, og da blir webflisen deres tom i nettleseren. De native appene åpner et slikt nettsted i en native visning lagt nøyaktig over flisen, så den vises live, med tilbake, frem og last inn på nytt.
+
+Apper får mer av nettverket. En MindooDB-app som MindooMail kan snakke direkte med en e-postserver over IMAP og SMTP, noe ingen nettleserfane kan.
+
+På skrivebordet — macOS og Windows — kommer tre ting i tillegg. KI-agenter kobler seg til uten Chrome, uten broutvidelsen og uten en åpen nettverksport; Arbeide med KI-agenter beskriver vinduet Agenttilgang. Utvekslingsmappen velges i systemets egen dialog, og Haven kjenner den virkelige stien. Og apper som holder store filer på enheten, som frakoblede kart, lagrer dem som vanlige filer i appens datamappe.
+
+På telefonen — iOS og Android — blir Haven en del av systemet. Innhold fra andre apper kommer til Haven via delingsarket eller Åpne med, og Haven tilbyr det til en app som kan bruke det: et bilde til et dokument, en PDF til en kundes mappe. På iPhone og iPad kan Snarveier og Siri sende filer og tekst til Haven, Havens apper og databaser kan åpnes fra Snarveier og Spotlight, og Havens mappe i Filer-appen fungerer som importmappe. Apper kan sette påminnelser som kommer som systemvarsler også når Haven er lukket, med Ferdig og Om 1 time rett på varselet. Og når du bytter til en annen app, lagrer Haven ferdig før systemet legger den i dvale.
+
+Noen ting forblir nettleserens. Telefonappene tilbyr ikke agentverktøy. En native app installeres én gang per enhet, så iPhone-trikset med å legge Haven til Hjem-skjermen flere ganger, hver kopi med egen lagring, hører til nettleserversjonen; i appen holder du ulike verdener fra hverandre med separate tenanter og identiteter. Og nettleserversjonen forblir gratis og komplett: Alt de native appene legger til, er en bekvemmelighet på toppen, aldri et krav.
 
 ## Sikkerhetsmodellen i korte trekk
 
@@ -552,6 +590,10 @@ Revisjon — en versjon av et dokument på et gitt tidspunkt. Hver endring lager
 
 Vedlegg — en fil festet til et dokument. Lagret i krypterte biter og strømmet ved behov.
 
+Vedlegg ved behov — en synkroniseringsinnstilling per database, Last inn vedlegg ved behov, som lar andres vedlegg ligge på serveren og henter dem når de åpnes. Sparer plass og gjør synkroniseringer raskere; dine egne nye vedlegg lastes fortsatt opp. Velges når en app installeres, eller senere på Synkroniseringssiden.
+
+Festet vedlegg — en fil en app holder på denne enheten selv om databasen laster inn vedlegg ved behov. Et feste omfatter ett vedlegg eller et helt dokument, senere vedlegg inkludert, og tilhører én app på én enhet.
+
 Automerge — den konfliktfrie flettemotoren MindooDB bruker under panseret. To personer kan redigere det samme dokumentet samtidig, og Automerge fletter endringene deres automatisk.
 
 DAG-utforsker — en grafvisning av hver endring som noen gang er brukt på et dokument, inkludert hvordan samtidige redigeringer ble flettet sammen.
@@ -601,6 +643,8 @@ Frittstående modus — en visningsmodus der Haven starter uten vanlige nettlese
 Legg til på Hjem-skjerm — nettleserhandlingen som lagrer Haven som et startbart ikon på en telefons eller et nettbretts Hjem-skjerm.
 
 Installasjonsdialog — det nettleserinnebygde arket som bekrefter at en progressiv webapp som Haven legges til på enheten.
+
+Native app — Haven pakket inn i en egen app for macOS, Windows, iOS eller Android; kommer snart. Samme Haven inni, pluss SQLite-lagring, signerte egenoppdateringer og systemfunksjoner som delingsarket, påminnelser eller innebygd agenttilgang.
 
 Kryptert backup — én enkelt fil som inneholder alt Haven holder i denne nettleseren, kryptert med et passord du velger. Uten det passordet er filen uleselig.
 

@@ -12,7 +12,7 @@ Kilka rzeczy odróżnia Haven od typowej aplikacji webowej.
 
 Haven jest local-first. Niemal wszystko, co widzisz, pochodzi z kopii — lokalnej repliki — przechowywanej w tej przeglądarce. Przeglądanie, edycja, wyszukiwanie, a nawet budowanie widoków wirtualnych odbywa się na lokalnej replice, dzięki czemu Haven jest szybki i pozostaje użyteczny, gdy sieci nie ma. Serwer jest odpytywany tylko przy synchronizacji, a dane w transmisji są zawsze szyfrowane end-to-end.
 
-Haven jest progresywną aplikacją webową (PWA). Możesz go zainstalować na telefonach i tabletach, w tym na iPhonie, iPadzie i Androidzie, i uruchamiać wprost z ekranu głównego jak aplikację natywną. Po instalacji otwiera się w trybie samodzielnym, bez elementów przeglądarki, co daje więcej miejsca na ekranie i spokojniejsze wrażenie. Na iPhonie możesz nawet dodać Haven do ekranu głównego więcej niż raz — każda zainstalowana kopia dostaje własny prywatny magazyn, co jest czystym sposobem na całkowite rozdzielenie danych prywatnych, służbowych i demonstracyjnych na jednym urządzeniu.
+Haven jest progresywną aplikacją webową (PWA). Możesz go zainstalować na telefonach i tabletach, w tym na iPhonie, iPadzie i Androidzie, i uruchamiać wprost z ekranu głównego jak aplikację natywną. Po instalacji otwiera się w trybie samodzielnym, bez elementów przeglądarki, co daje więcej miejsca na ekranie i spokojniejsze wrażenie. Na iPhonie możesz nawet dodać Haven do ekranu głównego więcej niż raz — każda zainstalowana kopia dostaje własny prywatny magazyn, co jest czystym sposobem na całkowite rozdzielenie danych prywatnych, służbowych i demonstracyjnych na jednym urządzeniu. Natywne aplikacje dla macOS, Windows, iOS i Androida, które zamykają ten sam Haven we własnej aplikacji, pojawią się wkrótce; sekcja Haven jako aplikacja natywna, dalej w tekście, opisuje, co wnoszą.
 
 Haven jest domem uruchomieniowym dla aplikacji MindooDB. Aplikacje MindooDB to małe narzędzia webowe zbudowane na MindooDB App SDK. Haven uruchamia każde z nich w piaskownicy iframe na osobnym originie, przekazuje mu zawężony widok danych, które wybrałeś do udostępnienia, i pośredniczy w każdym odczycie i zapisie przez bezpieczny mostek. Hostowane aplikacje może wydawać nawet własny service worker Haven i działają dalej, gdy sieci nie ma.
 
@@ -282,6 +282,22 @@ Kiedy synchronizować? Krótka odpowiedź brzmi: przed tym, jak zaufasz liczbie,
 
 Jedno małe potknięcie: jeśli spodziewałeś się bazy danych w kolejce, a jej nie ma, zwykłym powodem jest to, że tożsamość użytkownika trzymająca replikę nie jest jeszcze odblokowana. Synchronizacja potrzebuje kluczy z lokalnego KeyBaga, a KeyBag otwiera się dopiero wtedy, gdy aktywna tożsamość zostanie odblokowana z górnego paska.
 
+### Załączniki: wszystkie albo tylko w razie potrzeby
+
+Załączniki są zwykle najcięższą częścią bazy danych. Dokumenty są małe; prezentacja, zeskanowana umowa albo folder zdjęć potrafią ważyć więcej niż wszystkie otaczające je dokumenty razem. Dlatego dla każdej bazy danych decydujesz, czy synchronizacja ma przynosić na to urządzenie także załączniki.
+
+Po raz pierwszy spotykasz ten wybór, gdy instalujesz aplikację w tenancie, który jest już połączony z serwerem. Haven pyta wtedy Zsynchronizować dane aplikacji z serwera?, żeby aplikacja nie startowała pusta, a w sekcji Zaawansowane wymienia każdą bazę danych aplikacji z wyborem dla jej załączników. Przesyłaj wszystkie załączniki kopiuje je w obie strony, więc każdy plik jest na urządzeniu i otwiera się offline. Wczytuj załączniki w razie potrzeby synchronizuje wszystkie dokumenty jak dotąd i wysyła załączniki, które dodajesz sam, ale załączniki innych zostawia na serwerze. Dla ciebie i dla aplikacji nic więcej się nie zmienia: gdy dokument potrzebuje pliku, którego nie ma na tym urządzeniu, Haven pobiera go z serwera, odszyfrowuje tutaj i przekazuje dalej, jakby był tu od zawsze. Serwer wysyła te same zaszyfrowane fragmenty co przy każdej synchronizacji, więc nie dowiaduje się niczego nowego.
+
+Sens drugiej opcji to lżejsze i szybsze urządzenie. Telefon, który pracuje z dokumentami z bieżącego miesiąca, nie musi przechowywać załączników z wielu lat, pierwsza synchronizacja dużej bazy kończy się znacznie wcześniej, a każda kolejna przenosi mniej bajtów. Cena: plik, którego jeszcze nie ma na urządzeniu, przy pierwszym otwarciu wymaga połączenia. Wybór nie jest ostateczny: kolumna Załączniki na stronie synchronizacji pokazuje tryb każdego wiersza, a kliknięcie otwiera menu do jego zmiany.
+
+Nawiasem mówiąc, Haven sięga po serwer zawsze, gdy pliku brakuje lokalnie, nie tylko w tym trybie. Każda baza danych z celem synchronizacji może otworzyć także plik, którego przerwana synchronizacja nigdy nie pobrała.
+
+Dla plików, których potrzebujesz tam, gdzie nie ma sieci, aplikacje mogą przypinać załączniki: zostają one na urządzeniu, mimo że baza wczytuje załączniki w razie potrzeby. Aplikacja przypina albo pojedynczy plik, albo cały dokument, a przypięty dokument obejmuje też wszystkie załączniki dodane do niego później — prezentację na spotkanie bez zasięgu albo wszystko, co zapisano dla jednego klienta. Haven pobiera przypięte pliki w tle, aplikacja może pokazywać postęp i oznaczać pliki, które są tylko na serwerze, a nieudane pobieranie jest ponawiane przy następnej synchronizacji. Wiele aplikacji oferuje to w menu dokumentu jako sposób na udostępnienie dokumentu offline. Przypięcia należą do aplikacji i urządzenia, które je ustawiły; nie wędrują na twoje inne urządzenia.
+
+Przypięte pliki widać też na stronie synchronizacji. Gdy tylko aplikacja ma przypięcia w bazie danych, menu załączników wiersza zyskuje pozycję Przechowywane offline przez aplikacje z ich liczbą. Otwiera ona listę tych plików z ich stanem i przyciskiem Zwolnij. Zwolnienie przypięcia zwalnia miejsce, ale Haven usuwa lokalną kopię dopiero wtedy, gdy serwer ma cały plik, więc plik, który nie został jeszcze wysłany, nigdy nie przepada.
+
+Dla programistów to część API załączników w App SDK. `info().attachmentStorage` mówi aplikacji, czy baza trzyma załączniki lokalnie, na żądanie czy tylko na serwerze, a `attachments.pin`, `unpin`, `availability`, `listPins` i `onAvailabilityChange` obsługują przypinanie i stan. `pin` bez nazwy załącznika przypina cały dokument, łącznie z załącznikami dodanymi później. [README App SDK](https://github.com/klehmann/mindoodb-app-sdk) zawiera przykłady.
+
 ### Synchronizacja peer-to-peer bez serwera
 
 Synchronizacja wcale nie musi iść przez serwer. Dwa urządzenia z Haven w tym samym tenancie mogą wymieniać dane bezpośrednio, a okazuje się, że ma to znaczenie w dwóch całkiem różnych sytuacjach. Oczywista jest awaria serwera: zespół pracuje dalej i dane dalej płyną, bo nic na tej drodze nie zależy od tego, czy serwer działa. Subtelniejsza to zwykłe pisanie wersji roboczej. Dwie osoby pracujące nad tym samym dokumentem mogą synchronizować się wprost między sobą, gdy iterują, i wypchnąć gotowy wynik na serwer raz, zamiast przeprowadzać przez niego każdy stan pośredni.
@@ -436,7 +452,7 @@ Duża liczba u góry sumuje wszystko, co Haven trzyma w tej chwili w tej przegl�
 
 Pod sumą sekcja z podziałem na tenanty pokazuje po jednym bloku na tenanta. Nagłówek każdego tenanta ma jego łączny rozmiar plus przycisk Wyczyść pamięć podręczną, który usuwa tylko części dające się odbudować — pamięci podręczne i indeksy, które Haven wypełni ponownie przy następnym użyciu tenanta. Wyczyść pamięć podręczną nie usuwa dokumentów ani załączników.
 
-Wewnątrz każdego tenanta każdy wiersz to jedna lokalna baza danych. Dokumenty to zaszyfrowana treść dokumentów, Załączniki to zaszyfrowane fragmenty załączników, a Łącznie to suma obu. Usuń wymazuje lokalną zawartość tej bazy danych wyłącznie w tej przeglądarce — kopia na serwerze nie jest dotykana. Chronionej bazy danych katalogu nie da się usunąć, bo Haven jej potrzebuje do działania. Przed usunięciem otwórz bazę danych i uruchom synchronizację; jeśli są niezsynchronizowane zmiany lokalne, usunięcie je traci. Wybieraj raczej Wyczyść pamięć podręczną, gdy chcesz tylko zwolnić miejsce, bo jest odwracalne.
+Wewnątrz każdego tenanta każdy wiersz to jedna lokalna baza danych. Dokumenty to zaszyfrowana treść dokumentów, Załączniki to zaszyfrowane fragmenty załączników, a Łącznie to suma obu. W bazie danych, która wczytuje załączniki w razie potrzeby, Załączniki liczą tylko pliki znajdujące się na tym urządzeniu. Usuń wymazuje lokalną zawartość tej bazy danych wyłącznie w tej przeglądarce — kopia na serwerze nie jest dotykana. Chronionej bazy danych katalogu nie da się usunąć, bo Haven jej potrzebuje do działania. Przed usunięciem otwórz bazę danych i uruchom synchronizację; jeśli są niezsynchronizowane zmiany lokalne, usunięcie je traci. Wybieraj raczej Wyczyść pamięć podręczną, gdy chcesz tylko zwolnić miejsce, bo jest odwracalne.
 
 Pod bazami danych każdego tenanta zobaczysz też jego pamięci podręczne: lokalną pamięć podręczną tenanta na ogólny stan per tenant, pamięć podręczną celu serwerowego dla każdego serwera MindooDB, z którym tenant rozmawia, pamięć podręczną widoku wirtualnego dla każdego zapisanego widoku oraz wpis Indeks pełnotekstowy (MiniSearch) dla każdej bazy danych z włączonym indeksowaniem pełnotekstowym. Każda pamięć podręczna pokazuje własny rozmiar, a pamięci podręczne widoków wirtualnych da się czyścić pojedynczo, jeśli jeden konkretny widok zbyt się rozrósł.
 
@@ -453,6 +469,28 @@ iOS ma miły dodatek: możesz dodać Haven do ekranu głównego więcej niż raz
 Na Androidzie otwórz Haven w nowoczesnej przeglądarce, takiej jak Chrome albo Edge. Jeśli Haven pokaże przycisk instalacji, przyjmij go, a przeglądarka doda Haven do ekranu głównego i do szuflady aplikacji w jednym kroku. Jeśli nie ma żadnej propozycji, otwórz menu przeglądarki (zwykle trzy kropki w narożniku) i poszukaj pozycji instalacji aplikacji albo dodania do ekranu głównego — różne przeglądarki formułują to różnie, ale wynik jest ten sam. Potwierdź propozycję przeglądarki i Haven pojawi się na ekranie głównym jako zwykła ikona aplikacji Android.
 
 Po instalacji zawsze uruchamiaj Haven z ikony na ekranie głównym, gdy jesteś na telefonie — jest to wyraźnie przyjemniejsze doświadczenie niż karta przeglądarki.
+
+## Haven jako aplikacja natywna
+
+Wszystko, co opisuje ten podręcznik, działa w przeglądarce, i to w przeglądarce Haven jest dostępny dziś, pod adresem [haven.mindoodb.com](https://haven.mindoodb.com). Natywne aplikacje dla macOS, Windows, iOS i Androida pojawią się wkrótce. Nie są drugim Havenem: każda zamyka ten sam Haven we własnej aplikacji, więc ekrany, model danych, szyfrowanie i aplikacje, z których korzystasz, pozostają takie same. Zmienia się to, co otacza Haven — to, co wolno aplikacji zainstalowanej na urządzeniu, a czego nie wolno karcie przeglądarki.
+
+Część z tego dotyczy wszystkich czterech.
+
+Twoje dane mieszkają we własnych plikach bazy danych aplikacji zamiast w pamięci przeglądarki. Magazyny MindooDB stają się plikami SQLite w folderze danych aplikacji, więc Haven nie zależy już od limitu pamięci przeglądarki ani od tego, że przeglądarka czyści dane witryn. To jednak sprawia też, że aplikacja natywna i wersja przeglądarkowa to dwa osobne miejsca: tenant, którego używasz w obu, synchronizuje się przez serwer jak na każdym drugim urządzeniu, a w przypadku Havena wyłącznie lokalnego zaszyfrowana kopia zapasowa przenosi wszystko z jednego miejsca do drugiego.
+
+Haven sam dba o aktualność. Aplikacja ma wbudowaną wersję Havena i pobiera nowsze z podpisanego kanału aktualizacji; sprawdza podpis, prosi o przeładowanie i wraca do poprzedniej wersji, jeśli nowa się nie uruchomi. Aplikacje desktopowe w ten sam sposób aktualizują aplikację otaczającą Haven i uruchamiają się ponownie dopiero wtedy, gdy na to pozwolisz.
+
+Passkeye działają dalej. Aplikacje korzystają z systemowej obsługi passkeyów dla haven.mindoodb.com — pęku kluczy iCloud na urządzeniach Apple, Menedżera haseł Google na Androidzie, Windows Hello na Windows — więc passkey utworzony w przeglądarce odblokowuje twoją tożsamość także w aplikacji.
+
+Strony, które nie pozwalają się osadzać, i tak się pojawiają. Wiele witryn zabrania wyświetlania ich wewnątrz innej strony, przez co ich kafelek treści internetowej w przeglądarce pozostaje pusty. Aplikacje natywne otwierają taką witrynę w natywnym widoku położonym dokładnie nad kafelkiem, więc pojawia się na żywo, z przyciskami wstecz, dalej i odśwież.
+
+Aplikacje dostają więcej z sieci. Aplikacja MindooDB taka jak MindooMail może rozmawiać z serwerem poczty bezpośrednio przez IMAP i SMTP, czego nie potrafi żadna karta przeglądarki.
+
+Na komputerze — macOS i Windows — dochodzą trzy rzeczy. Agenci AI łączą się bez Chrome, bez rozszerzenia-mostu i bez otwartego portu sieciowego; Praca z agentami AI opisuje okno Dostęp agentów. Folder wymiany wybierasz w systemowym oknie dialogowym, a Haven zna jego prawdziwą ścieżkę. A aplikacje, które trzymają na urządzeniu duże pliki, takie jak mapy offline, zapisują je jako zwykłe pliki w folderze danych aplikacji.
+
+Na telefonie — iOS i Android — Haven staje się częścią systemu. Treści z innych aplikacji trafiają do Havena przez arkusz udostępniania lub Otwórz za pomocą, a Haven proponuje je aplikacji, która potrafi z nich skorzystać: zdjęcie do dokumentu, PDF do teczki klienta. Na iPhonie i iPadzie Skróty i Siri mogą wysyłać pliki i tekst do Havena, aplikacje i bazy danych Havena otwierają się ze Skrótów i Spotlight, a folder Havena w aplikacji Pliki służy jako folder importu. Aplikacje mogą ustawiać przypomnienia, które przychodzą jako powiadomienia systemowe, nawet gdy Haven jest zamknięty, z przyciskami Gotowe i Za 1 godzinę bezpośrednio na powiadomieniu. A gdy przełączasz się do innej aplikacji, Haven kończy zapisywanie, zanim system go uśpi.
+
+Kilka rzeczy pozostaje domeną przeglądarki. Aplikacje na telefon nie oferują narzędzi dla agentów. Aplikację natywną instaluje się raz na urządzenie, więc sztuczka z iPhone'a polegająca na wielokrotnym dodaniu Havena do ekranu głównego, każda kopia z własną pamięcią, należy do wersji przeglądarkowej; w aplikacji różne światy rozdzielasz osobnymi tenantami i tożsamościami. A wersja przeglądarkowa pozostaje darmowa i kompletna: wszystko, co dodają aplikacje natywne, to wygoda na dokładkę, nigdy wymóg.
 
 ## Model bezpieczeństwa w skrócie
 
@@ -552,6 +590,10 @@ Rewizja — wersja dokumentu z konkretnego punktu w czasie. Każda zmiana tworzy
 
 Załącznik — plik dołączony do dokumentu. Przechowywany w zaszyfrowanych fragmentach i strumieniowany na żądanie.
 
+Załączniki na żądanie — ustawienie synchronizacji dla danej bazy danych, Wczytuj załączniki w razie potrzeby, które zostawia załączniki innych osób na serwerze i pobiera je przy otwarciu. Oszczędza miejsce i przyspiesza synchronizacje; twoje własne nowe załączniki nadal są wysyłane. Wybierane przy instalacji aplikacji albo później na stronie synchronizacji.
+
+Przypięty załącznik — plik, który aplikacja trzyma na tym urządzeniu, mimo że jej baza danych wczytuje załączniki na żądanie. Przypięcie obejmuje jeden załącznik albo cały dokument łącznie z późniejszymi załącznikami i należy do jednej aplikacji na jednym urządzeniu.
+
 Automerge — silnik scalania bez konfliktów, którego MindooDB używa pod spodem. Dwie osoby mogą edytować ten sam dokument w tym samym czasie, a Automerge scali ich zmiany automatycznie.
 
 Eksplorator DAG — widok grafowy każdej zmiany, jaka kiedykolwiek została zastosowana do dokumentu, w tym tego, jak równoległe edycje zostały scalone razem.
@@ -601,6 +643,8 @@ Tryb samodzielny — tryb wyświetlania, w którym Haven startuje bez zwykłych 
 Dodaj do ekranu początkowego — akcja przeglądarki, która zapisuje Haven jako uruchamialną ikonę na ekranie głównym telefonu albo tabletu.
 
 Propozycja instalacji — systemowy arkusz przeglądarki, który potwierdza dodanie progresywnej aplikacji webowej, takiej jak Haven, do urządzenia.
+
+Aplikacja natywna — Haven zamknięty we własnej aplikacji dla macOS, Windows, iOS lub Androida; pojawi się wkrótce. W środku ten sam Haven, do tego pamięć SQLite, podpisane samodzielne aktualizacje i funkcje systemu, takie jak arkusz udostępniania, przypomnienia czy wbudowany dostęp agentów.
 
 Zaszyfrowana kopia zapasowa — jeden plik zawierający wszystko, co Haven trzyma w tej przeglądarce, zaszyfrowany wybranym przez Ciebie hasłem. Bez tego hasła plik jest nieczytelny.
 

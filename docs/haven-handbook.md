@@ -12,7 +12,7 @@ A few things make Haven different from a typical web app.
 
 Haven is local-first. Almost everything you see is served from a copy — a local replica — stored inside this browser. Browsing, editing, searching, and even building virtual views all happen against the local replica, so Haven is fast and stays usable when the network is gone. The server is only contacted when you sync, and the data on the wire is always end-to-end encrypted.
 
-Haven is a progressive web app. It can be installed on phones and tablets, including iPhone, iPad, and Android, and launched directly from the home screen like a native application. Once installed, it opens in standalone mode without browser chrome, which gives you more screen space and a calmer feel. On iPhone you can even add Haven to your home screen more than once — each installed copy gets its own private storage, which is a clean way to keep personal, work, and demo data fully separate on a single device.
+Haven is a progressive web app. It can be installed on phones and tablets, including iPhone, iPad, and Android, and launched directly from the home screen like a native application. Once installed, it opens in standalone mode without browser chrome, which gives you more screen space and a calmer feel. On iPhone you can even add Haven to your home screen more than once — each installed copy gets its own private storage, which is a clean way to keep personal, work, and demo data fully separate on a single device. Native apps for macOS, Windows, iOS, and Android, which pack the same Haven into an app of its own, are coming soon; Haven as a native app, further down, says what they add.
 
 Haven is a runtime home for MindooDB apps. MindooDB apps are small web tools built with the MindooDB App SDK. Haven launches each one inside a sandboxed iframe on a separate origin, hands it a scoped view of the data you chose to share, and brokers every read and write through a secure bridge. Hosted apps can even be served by Haven's own service worker and keep running when the network is gone.
 
@@ -282,6 +282,22 @@ When should you sync? The short answer is: before you trust a number you are abo
 
 One small gotcha: if you expected a database to appear in the queue and it is missing, the usual reason is that the user identity holding the replica is not unlocked yet. Sync needs the keys from the local KeyBag, and the KeyBag only opens once the active identity is unlocked from the top bar.
 
+### Attachments: all of them, or only when needed
+
+Attachments are usually the heavy part of a database. Documents are small; a slide deck, a scanned contract, or a folder of photos can outweigh all the documents around it together. So Haven lets you decide, per database, whether a sync brings the attachments to this device as well.
+
+You meet that choice first when you install an app into a tenant that is already connected to a server. Haven asks Sync app data from server?, so that the app does not start empty, and under Advanced it lists every database the app uses with a choice for its attachments. Transfer all attachments copies them in both directions, so every file is on the device and opens offline. Load attachments when needed syncs every document as before and uploads the attachments you add yourself, but leaves everybody else's on the server. For you and for the app nothing else changes: when a document needs a file that is not on this device, Haven fetches it from the server, decrypts it here, and hands it over as if it had been there all along. The server sends the same encrypted chunks it sends in any sync, so it learns nothing new.
+
+The point of the second option is a lighter, faster device. A phone that works with this month's documents does not have to store years of attachments, the first sync of a large database finishes far sooner, and every later sync carries fewer bytes. The price is that a file not yet on the device needs a connection the first time it is opened. The choice is not final: the Attachments column on the Sync page shows each row's mode, and clicking it opens a menu to switch.
+
+Haven falls back to the server whenever a file is missing locally, not only in this mode. Any database with a sync target can still open a file that an interrupted sync never brought down.
+
+For the files you need where there is no network, apps can pin attachments: keep them on the device even though the database loads attachments when needed. An app pins either a single file or a whole document, and a document pin also covers every attachment added to that document later — the presentation for a meeting in a dead zone, or everything filed for one customer. Haven downloads pinned files in the background, the app can show the progress and mark which files are only on the server, and a failed download is retried on the next sync. Many apps offer this in their document menu as a way to make a document available offline. Pins belong to the app and the device that set them; they do not travel to your other devices.
+
+Pinned files show up on the Sync page too. Once an app holds pins in a database, the row's attachment menu gains an entry Kept offline by apps with their number. It opens the list of those files with their state and a Release button. Releasing a pin frees the space, but Haven deletes the local copy only once the server holds the whole file, so a file that has not been uploaded yet is never lost.
+
+For developers, this is part of the App SDK's attachment API. `info().attachmentStorage` tells an app whether a database keeps attachments locally, on demand, or only on the server, and `attachments.pin`, `unpin`, `availability`, `listPins`, and `onAvailabilityChange` cover pinning and status. A pin without an attachment name is the document pin, including attachments added later. The [App SDK README](https://github.com/klehmann/mindoodb-app-sdk) has examples.
+
 ### Peer-to-peer sync without a server
 
 Sync does not have to go through a server at all. Two Haven devices in the same tenant can exchange data directly, and that turns out to matter in two quite different situations. The obvious one is a server outage: the team keeps working and the data keeps moving, because nothing in the path depends on the server being up. The subtler one is ordinary drafting. Two people working through the same document can sync straight to each other while they iterate and push the finished result to the server once, instead of routing every intermediate state through it.
@@ -436,7 +452,7 @@ A big number at the top sums everything Haven currently keeps in this browser: e
 
 Below the total, a By tenant section shows one block per tenant. Each tenant header has its combined size plus a Clear cache button that removes only the rebuildable parts — caches and indexes that Haven will refill the next time you use the tenant. Clear cache does not delete documents or attachments.
 
-Inside each tenant, every row is one local database. Docs is the encrypted document content, Attachments is encrypted attachment chunks, and Total is the sum of the two. Delete wipes that database's local content in this browser only — the server copy is not touched. The protected directory database cannot be deleted because Haven needs it to operate. Before you delete, open the database and run Sync; if there are unsynced local changes, deleting loses them. Prefer Clear cache when you only want to free space, because it is reversible.
+Inside each tenant, every row is one local database. Docs is the encrypted document content, Attachments is encrypted attachment chunks, and Total is the sum of the two. For a database that loads attachments when needed, Attachments counts only the files that are on this device. Delete wipes that database's local content in this browser only — the server copy is not touched. The protected directory database cannot be deleted because Haven needs it to operate. Before you delete, open the database and run Sync; if there are unsynced local changes, deleting loses them. Prefer Clear cache when you only want to free space, because it is reversible.
 
 Below each tenant's databases you will also see its caches: a local tenant cache for general per-tenant state, a server target cache for each MindooDB server the tenant talks to, a virtual view cache for each saved view, and a Full-text index (MiniSearch) entry for every database that has full-text indexing switched on. Each cache shows its own size, and virtual view caches can be cleared individually if one particular view has grown too large.
 
@@ -453,6 +469,28 @@ iOS has a neat bonus: you can add Haven to the home screen more than once. Each 
 On Android, open Haven in a modern browser like Chrome or Edge. If Haven shows an Install button, accept it and your browser will add Haven to the home screen and the app drawer in one step. If there is no prompt, open the browser menu (usually three dots in the corner) and look for Install app or Add to Home screen — different browsers word it differently but the result is the same. Confirm the browser's prompt and Haven appears on the home screen as a normal Android app icon.
 
 After install, always launch Haven from the home screen icon when you are on a phone — it is a noticeably nicer experience than a browser tab.
+
+## Haven as a native app
+
+Everything in this handbook works in the browser, and the browser is where Haven is available today, at [haven.mindoodb.com](https://haven.mindoodb.com). Native apps for macOS, Windows, iOS, and Android are coming soon. They are not a second Haven: each one packs the same Haven into an app of its own, so the screens, the data model, the encryption, and the apps you run stay the same. What changes is what surrounds Haven — the things an app installed on the device may do and a browser tab may not.
+
+Some of that applies to all four.
+
+Your data lives in the app's own database files rather than in the browser's storage. MindooDB's stores become SQLite files inside the app's data folder, so Haven is no longer tied to a browser's storage budget or to a browser clearing site data. It also makes the native app and the browser version two separate places: a tenant you use in both syncs through the server like on any second device, and for a local-only Haven an encrypted backup carries everything from one to the other.
+
+Haven keeps itself up to date. The app ships with a Haven build and fetches newer ones from a signed update channel; it checks the signature, asks you to reload, and goes back to the previous build if a new one fails to start. The desktop apps update the app around Haven the same way, and only restart when you say so.
+
+Passkeys keep working. The apps use the system's passkey support for haven.mindoodb.com — iCloud Keychain on Apple devices, Google Password Manager on Android, Windows Hello on Windows — so a passkey you created in the browser also unlocks your identity in the app.
+
+Web pages that refuse to be framed show up anyway. Many sites forbid being shown inside another page, which leaves their web tile blank in the browser. The native apps open such a site in a native view laid exactly over the tile, so it appears live, with back, forward, and reload.
+
+Apps get more of the network. A MindooDB app like MindooMail can talk to a mail server directly over IMAP and SMTP, which no browser tab can do.
+
+On the desktop — macOS and Windows — three more things come with it. AI agents connect without Chrome, the bridge extension, or an open network port; Working with AI agents describes the Agent access window. The exchange folder is chosen in the system's own dialog, and Haven knows its real path. And apps that keep large files on the device, such as offline maps, store them as ordinary files in the app's data folder.
+
+On the phone — iOS and Android — Haven becomes part of the system. Content from other apps reaches Haven through the share sheet or Open with, and Haven offers it to an app that can take it: a photo for a document, a PDF for a customer's file. On iPhone and iPad, Shortcuts and Siri can send files and text to Haven, Haven's apps and databases open from Shortcuts and Spotlight, and Haven's folder in the Files app works as an import folder. Apps can set reminders that arrive as system notifications even while Haven is closed, with Done and In 1 hour right on the notification. And when you switch to another app, Haven finishes saving before the system puts it to sleep.
+
+A few things remain the browser's. The phone apps do not offer agent tools. A native app is installed once per device, so the iPhone trick of adding Haven to the home screen several times, each copy with its own storage, belongs to the browser version; in the app, keep different worlds apart with separate tenants and identities. And the browser version stays free and complete: everything the native apps add is a convenience on top, never a requirement.
 
 ## Security model at a glance
 
@@ -552,6 +590,10 @@ Revision — a point-in-time version of a document. Every change creates a new r
 
 Attachment — a file attached to a document. Stored in encrypted chunks and streamed on demand.
 
+Attachments on demand — a per-database sync setting, Load attachments when needed, that leaves other people's attachments on the server and fetches them when they are opened. Saves space and makes syncs faster; your own new attachments are still uploaded. Chosen when an app is installed or later on the Sync page.
+
+Pinned attachment — a file an app keeps on this device although its database loads attachments on demand. A pin covers one attachment or a whole document, later attachments included, and belongs to one app on one device.
+
 Automerge — the conflict-free merging engine MindooDB uses under the hood. Two people can edit the same document at the same time and Automerge merges their changes automatically.
 
 DAG Explorer — a graph view of every change ever applied to a document, including how concurrent edits were merged together.
@@ -601,6 +643,8 @@ Standalone mode — a display mode where Haven launches without normal browser c
 Add to Home Screen — the browser action that saves Haven as a launchable icon on a phone or tablet home screen.
 
 Install prompt — the browser-native sheet that confirms adding a progressive web app like Haven to the device.
+
+Native app — Haven packed into an app of its own for macOS, Windows, iOS, or Android; coming soon. The same Haven inside, plus SQLite storage, signed self-updates, and system features such as the share sheet, reminders, or built-in agent access.
 
 Encrypted backup — a single file containing everything Haven keeps in this browser, scrambled with a password you choose. Without that password the file is unreadable.
 
