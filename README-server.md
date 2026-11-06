@@ -209,7 +209,7 @@ await result.tenant.publishToServer("http://localhost:1661", {
 });
 ```
 
-Here, `systemAdminUser` is the delegated tenant admin identity, while `adminUsername: result.adminUser.username` tells the server which tenant admin identity should be stored in the new tenant's `config.json`.
+Here, `systemAdminUser` is the delegated tenant admin identity, while `adminUsername: result.adminUser.username` tells the server which tenant admin identity should be stored in the new tenant's `config.json`. Because that identity is the tenant admin, publishing also adds this server as a trusted witness of the tenant (its signing key from `/.well-known/mindoodb-server-info`), so the receipts the server stamps on incoming entries are accepted when access control is enabled. When a separate system admin publishes, pass `adminSigningKey` and `adminPassword` for the same effect.
 
 ```typescript
 const remoteStore = await result.tenant.connectToServer(
@@ -575,11 +575,14 @@ for (const url of ["http://server1:1661", "http://server2:3001"]) {
     systemAdminUser: systemAdminIdentity,
     systemAdminPassword: "sysadmin-pass",
     adminUsername: result.adminUser.username,
+    // Each server becomes a trusted witness of the tenant.
+    adminSigningKey: result.adminUser.userSigningKeyPair.privateKey,
+    adminPassword: "admin-pass",
   });
 }
 ```
 
-Publishing registers the tenant and its admin keys. The data itself arrives through replication; you do not have to push it to both servers by hand.
+Publishing registers the tenant and its admin keys, and adds each server as a trusted witness. The first server that accepts an entry stamps it; the receipt replicates with the entry. The data itself arrives through replication; you do not have to push it to both servers by hand.
 
 To add a mirror for a tenant that already exists, publish that same tenant object to the new server and let the mesh fill it.
 

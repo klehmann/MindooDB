@@ -14,6 +14,14 @@
  * 5. Both change the same document offline at the same time (different fields, the
  *    same text, the same list, the same atomic field); after syncing both ways
  *    Automerge has merged the edits and both devices hold the same state.
+ * 6. Publishing added the server as a trusted witness and the server stamped every
+ *    entry it accepted. With access control switched on, both devices still read
+ *    all documents.
+ * 7. The admin makes the notes database read-only. Jane syncs that first, and her
+ *    local write fails right away (client precheck). Karsten had already edited a
+ *    document offline before the policy reached him; his push is refused by the
+ *    server's Tier 1 check, the edit never reaches Jane, and reading stays open. Counter-check (second test): a tenant published without the
+ *    witness gets its stamped entries quarantined once access control is on.
  *
  * `JoinNewUserServer` covers the join itself in more depth; this test is about the
  * data round trip around it.
@@ -32,6 +40,7 @@ import {
   type PrivateUserId,
 } from "../core/types";
 import { MindooValue } from "../core/values";
+import { AccessDeniedError } from "../core/accesscontrol/AccessDeniedError";
 import type { ServerConfig } from "../server/types";
 
 const KARSTEN_PASSWORD = "karsten-pass";
@@ -98,6 +107,12 @@ async function push(
   expect(result.rejectedEntries ?? []).toEqual([]);
 }
 
+/** Push without asserting: returns what the server accepted and rejected. */
+async function pushResult(tenant: MindooTenant, baseUrl: string, dbId: string) {
+  const local = await openDb(tenant, dbId);
+  return local.pushChangesTo(await tenant.connectToServer(baseUrl, dbId));
+}
+
 async function pull(tenant: MindooTenant, baseUrl: string, dbId: string): Promise<void> {
   const local = await openDb(tenant, dbId);
   await local.pullChangesFrom(await tenant.connectToServer(baseUrl, dbId));
@@ -112,6 +127,29 @@ async function snapshot(tenant: MindooTenant, dbId: string): Promise<Record<stri
     result[id] = JSON.parse(JSON.stringify((await db.getDocument(id)).getData()));
   }
   return result;
+}
+
+/** Server signing (witness) key from its well-known info. */
+async function serverSigningKey(baseUrl: string): Promise<string> {
+  const info = (await (await fetch(`${baseUrl}/.well-known/mindoodb-server-info`)).json()) as { signingPublicKey: string };
+  expect(typeof info.signingPublicKey).toBe("string");
+  return info.signingPublicKey;
+}
+
+/** Switches access control on (admin writes the directory) and drops the cached documents. */
+async function enableAccessControl(tenant: MindooTenant, admin: PrivateUserId, password: string): Promise<void> {
+  const directory = await tenant.openDirectory();
+  await directory.setDefaultAccessPolicy!(
+    { disableAllAccessChecksAndPolicies: false },
+    admin.userSigningKeyPair.privateKey,
+    password,
+  );
+}
+
+/** Forgets materialized documents so the next read replays (and re-checks) the entries. */
+async function dropDocCache(tenant: MindooTenant, dbId: string): Promise<void> {
+  const db = (await openDb(tenant, dbId)) as unknown as { docCache: Map<string, unknown> };
+  db.docCache.clear();
 }
 
 async function update(tenant: MindooTenant, docId: string, fn: (data: any) => void): Promise<void> {
@@ -283,5 +321,138 @@ describe("two users on a demo server: create, publish, join, sync, merge", () =>
     expect(["hoch", "niedrig"]).toContain(plan.priority);
     // The other document was not touched by the merge.
     expect(karstenView[shoppingId]).toMatchObject({ title: "Einkaufsliste", tags: ["start"], items: ["Milch", "Brot"] });
+
+    // --- The server is a trusted witness and stamped every entry -----------------
+    const serverKey = await serverSigningKey(baseUrl);
+    for (const tenant of [karsten, jane]) {
+      const trusted = await (await tenant.openDirectory()).getTrustedWitnessKeysAt!(Date.now());
+      expect([...trusted]).toEqual([serverKey]);
+    }
+    for (const docId of docIds) {
+      const metas = await (await openDb(karsten, NOTES_DB)).getStore().findNewEntriesForDoc([], docId);
+      expect(metas.length).toBeGreaterThan(0);
+      for (const meta of metas) expect(meta.receivedByPublicKey).toBe(serverKey);
+    }
+    expect((await (await openDb(karsten, NOTES_DB)).getDocument(planId)).isWitnessed()).toBe(true);
+
+    // --- With access control on, both devices still read everything -----------------
+    await enableAccessControl(karsten, adminUser, KARSTEN_PASSWORD);
+    await push(karsten, baseUrl, "directory", adminAuth);
+    await pull(jane, baseUrl, "directory");
+    for (const tenant of [karsten, jane]) {
+      await dropDocCache(tenant, NOTES_DB);
+      expect(await snapshot(tenant, NOTES_DB)).toEqual(karstenView);
+    }
+
+    // --- The admin makes the notes database read-only -------------------------------
+    // Karsten edits offline first: his device does not have the policy yet when
+    // the change is written, so only the server can stop it.
+    await update(karsten, shoppingId, (data) => {
+      data.items = ["Milch", "Brot", "Butter"];
+    });
+    const readOnly = { denyDocCreate: true, denyDocChange: true, denyDocDelete: true, denyDocUndelete: true };
+    // The admin key is on Karsten's device, but the admin is a separate identity:
+    // the policy binds Karsten's app user like everyone else. His edit above was
+    // written before the policy existed anywhere.
+    await (await karsten.openDirectory()).setDatabaseAccessPolicy!(
+      NOTES_DB,
+      readOnly,
+      adminUser.userSigningKeyPair.privateKey,
+      KARSTEN_PASSWORD,
+    );
+    await push(karsten, baseUrl, "directory", adminAuth);
+
+    // Jane syncs the policy first: her local write fails immediately.
+    await pull(jane, baseUrl, "directory");
+    const janeNotes = await openDb(jane, NOTES_DB);
+    await expect(
+      janeNotes.changeDoc(await janeNotes.getDocument(planId), (d) => {
+        d.getData().owner = "Jane (after read-only)";
+      }),
+    ).rejects.toThrow(AccessDeniedError);
+    await expect(janeNotes.createDocument()).rejects.toThrow(AccessDeniedError);
+    await expect(janeNotes.deleteDocument(planId)).rejects.toThrow(AccessDeniedError);
+
+    // Karsten pushes his offline edit: the server's Tier 1 check refuses it.
+    const refused = await pushResult(karsten, baseUrl, NOTES_DB);
+    expect(refused.rejectedEntries?.length ?? 0).toBeGreaterThan(0);
+    for (const rejection of refused.rejectedEntries ?? []) {
+      expect(rejection.rejectionClass).toBe("policy");
+    }
+    await pull(jane, baseUrl, NOTES_DB);
+    await dropDocCache(jane, NOTES_DB);
+    expect((await snapshot(jane, NOTES_DB))[shoppingId]).toMatchObject({ items: ["Milch", "Brot"] });
+
+    // Karsten's device drops the refused edit instead of keeping a private fork,
+    // and does not offer it again on the next push.
+    await dropDocCache(karsten, NOTES_DB);
+    expect((await snapshot(karsten, NOTES_DB))[shoppingId]).toMatchObject({ items: ["Milch", "Brot"] });
+    expect((await pushResult(karsten, baseUrl, NOTES_DB)).rejectedEntries ?? []).toEqual([]);
+
+    // New local writes fail for Karsten as well.
+    await expect(
+      update(karsten, planId, (data) => {
+        data.owner = "Karsten (after read-only)";
+      }),
+    ).rejects.toThrow(AccessDeniedError);
+
+    // Read-only, not unreadable: both still read the server's state.
+    await dropDocCache(jane, NOTES_DB);
+    expect(await snapshot(jane, NOTES_DB)).toEqual(karstenView);
+  });
+
+  test("without the server as trusted witness, its receipts are quarantined once access control is on", async () => {
+    demo = await startServer("demo-server-nowitness", DEMO_CONFIG);
+    const baseUrl = demo.baseUrl;
+    const tenantId = `demo-nw-${Date.now().toString(16)}`;
+    const factory = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
+    const adminUser = await factory.createUserId(`cn=admin/o=${tenantId}`, KARSTEN_PASSWORD);
+    const user = await factory.createUserId(`cn=karsten/o=${tenantId}`, KARSTEN_PASSWORD);
+    await factory.ensureUserKeyPair(user, KARSTEN_PASSWORD);
+    const { tenant } = await factory.createTenant({
+      tenantId,
+      adminUser,
+      adminPassword: KARSTEN_PASSWORD,
+      appUser: user,
+      userPassword: KARSTEN_PASSWORD,
+    });
+    tenant.noteUserDirectoryFetched!();
+    await tenant.reconcileUserKeys!({ allowSelfCreate: true });
+    await tenant.publishToServer(baseUrl, {
+      systemAdminUser: adminUser,
+      systemAdminPassword: KARSTEN_PASSWORD,
+      adminUsername: adminUser.username,
+      skipTrustedWitness: true,
+    });
+    expect((await (await tenant.openDirectory()).getTrustedWitnessKeysAt!(Date.now())).size).toBe(0);
+
+    const adminAuth = { user: adminUser, password: KARSTEN_PASSWORD };
+    await push(tenant, baseUrl, "directory", adminAuth);
+    await push(tenant, baseUrl, USER_DIRECTORY_DB_ID);
+    const notes = await openDb(tenant, NOTES_DB);
+    const doc = await notes.createDocument();
+    await notes.changeDoc(doc, (d) => {
+      d.getData().title = "stamped by an untrusted server";
+    });
+    await push(tenant, baseUrl, NOTES_DB);
+    const metas = await notes.getStore().findNewEntriesForDoc([], doc.getId());
+    expect(metas.some((m) => m.receivedByPublicKey === undefined)).toBe(false);
+
+    // Readable while access control is off ...
+    await dropDocCache(tenant, NOTES_DB);
+    expect((await notes.getDocument(doc.getId())).getData().title).toBe("stamped by an untrusted server");
+    // ... quarantined once it is on.
+    await enableAccessControl(tenant, adminUser, KARSTEN_PASSWORD);
+    await dropDocCache(tenant, NOTES_DB);
+    await expect(notes.getDocument(doc.getId())).rejects.toThrow(/not found/i);
+    // Trust counts from when the witness was added, so adding it now does not
+    // make the earlier receipt trusted.
+    await (await tenant.openDirectory()).addTrustedWitness!(
+      { witnessPublicKey: await serverSigningKey(baseUrl), serverUrl: baseUrl },
+      adminUser.userSigningKeyPair.privateKey,
+      KARSTEN_PASSWORD,
+    );
+    await dropDocCache(tenant, NOTES_DB);
+    await expect(notes.getDocument(doc.getId())).rejects.toThrow(/not found/i);
   });
 });
