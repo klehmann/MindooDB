@@ -32,6 +32,7 @@ enterprise-ready infrastructure.
 |------------|:-----------------:|:------------------------:|
 | End-to-end encryption, local-first sync, zero-trust server | ✅ | ✅ |
 | Read access by key possession | ✅ | ✅ |
+| **Built-in database invariants** — `directory` (admin-only writes), `userdirectory` (owner-only key documents), **personal databases** such as MindooMail's `mmail_<grantDocId>` (owner-only sync, deposit by designated gateways) | ✅ (§6.11) | ✅ |
 | **Write governance** — who may create / change / delete / snapshot, scoped to database *and* content | — | ✅ (§2–§12) |
 | **Read governance** — who may *see* which data, by encryption-key possession (admin-blind key distribution + revoke/rotate) | — | ✅ (§13) |
 | **Group & identity management** — DN-hierarchy identities, nested groups, wildcard targeting | — | ✅ (§6.5, §8.1) |
@@ -1099,7 +1100,8 @@ fingerprint, for instance from the grant (`$publicinfos`), and a `$recipient`
 condition on the rule. That is noted as an option (§15), not implemented.
 A depositor also learns whether an id it guesses exists (`exists`, `hasEntries`);
 document ids it picks itself are the intended use. Like the other write rules,
-`doc_deposit` belongs to the Enterprise access-control layer.
+Configured `doc_deposit` rules belong to the Enterprise access-control layer;
+the deposit right into personal databases (§6.11) does not.
 
 ### 6.11 Personal databases (`<prefix><grantDocId>`, built in)
 
@@ -1141,10 +1143,14 @@ any configured policy and even while the master switch is on.
   and metadata (document count, sizes, timing) but cannot read mail. A tenant
   that wants the admin out as well needs a further, not yet implemented switch.
 
-**Edition.** The built-in rule is enforced in the open core: in the
-evaluation path the server always runs, independent of the access-control
-layer, the same way the `userdirectory` invariant is. Whether it stays there or
-moves to the Enterprise layer is a product decision (§15).
+**Edition: Community, not Enterprise.** Like the `directory` and
+`userdirectory` invariants, this rule is part of the open core and holds on
+every server and tenant, Community Edition included: it needs no policy, no
+license and no Enterprise access-control layer, and it applies even while the
+master switch is on. Only the configurable parts on top of it belong to
+Enterprise: `doc_read`/`doc_deposit` rules that tighten it further (§6.8,
+§6.10). The deposit semantics it uses (§6.10: push of sealed creates only,
+`exists`) are part of the open core with it.
 
 **Migration of existing databases.** Before this rule a `mmail_` database was
 open to every member's sync. Once the server enforces it:
@@ -2291,10 +2297,6 @@ can ratchet restrictions up safely over time.
   proposal.
 - **p2p witnessing.** Trusted witness peers / threshold witnessing for serverless
   groups.
-- **Edition of the personal-database rule (§6.11).** Implemented in the open
-  core next to the `userdirectory` invariant, so a MindooMail mailbox is
-  private on every server. Moving it to the Enterprise layer would leave
-  community tenants with mailboxes that every member can sync.
 - **Admin out of personal databases.** A switch that also refuses the tenant
   admin (and with it tenant-wide backup of those databases).
 - **Deposits bound to the database owner (`$recipient`).** §6.10 checks only how
