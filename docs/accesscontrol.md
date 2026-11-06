@@ -1030,6 +1030,8 @@ a language model at all. It follows the same pattern as the database read gate
 
 ### 6.12 Author-scoped read (`docReadScope: "own"` + `doc_read_all` rules)
 
+**Edition: Enterprise** (like the rest of the access-control layer).
+
 §6.8 decides *whether* a member may sync a database at all. This section
 narrows *which documents* a member gets from it: in a database with
 `docReadScope: "own"` every member reads **only the documents they created
