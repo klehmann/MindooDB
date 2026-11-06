@@ -441,6 +441,19 @@ Usernames are matched case-insensitively and canonically, so `Alice/Contoso`, `c
 
 An empty recipient list with `includeSelf: false` is rejected — it would produce a document nobody can read.
 
+Because a writer with `includeSelf: false` cannot change the document after the create, attachments can go into the create entry itself:
+
+```ts
+await db.createDocument({
+  recipients: ["CN=bob/O=contoso"],
+  recipientOptions: { includeSelf: false },
+  initialValues: { subject: "Invoice" },
+  attachments: [{ data: pdfBytes, fileName: "invoice.pdf", mimeType: "application/pdf" }],
+});
+```
+
+The chunks are encrypted with the document's own key and referenced from the `doc_create` entry, so the document arrives complete in one entry. This is what a writer without read access needs: a `doc_deposit` principal (docs/accesscontrol.md §6.10) may push only sealed creates and their chunks into a database it cannot read, which is how a mail gateway delivers into a person's mailbox. For MindooMail's `mmail_<grantDocId>` this right is built in and granted on the gateway's grant (`depositPrefixes`, docs/accesscontrol.md §6.11). Attachments in the create are not supported on the convergent custom-id path or in `createDocuments()`.
+
 ### 6.3 Changing the recipient list
 
 Three methods change the list, and the difference between adding and removing is the most important thing to understand about them.

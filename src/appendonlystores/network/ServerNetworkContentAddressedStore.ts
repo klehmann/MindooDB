@@ -51,6 +51,9 @@ import { AuthenticationService } from "../../core/appendonlystores/network/Authe
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import type { AccessDecision } from "../../core/accesscontrol/types";
+import { DEFAULT_DEPOSIT_MAX_RECIPIENTS } from "../../core/accesscontrol/types";
+import { sealedKeyId } from "../../core/userkeys/sealedTypes";
+import { StoreKind } from "../../core/types";
 
 /**
  * Server-side Tier 1 access evaluator (docs/accesscontrol.md §7). Given a
@@ -85,6 +88,17 @@ export type ServerDbAccessEvaluator = (
   principal: { signingKey?: string },
   dbid: string
 ) => Promise<boolean>;
+
+/**
+ * Like {@link ServerDbAccessEvaluator}, but also reports the deposit right
+ * (docs/accesscontrol.md §6.10): `"read"` syncs normally, `"deposit"` may only
+ * push sealed `doc_create` entries (and their attachment chunks), `"none"` is
+ * rejected. When supplied it takes precedence over `dbAccessEvaluator`.
+ */
+export type ServerDbAccessModeEvaluator = (
+  principal: { signingKey?: string },
+  dbid: string
+) => Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; reason?: string }>;
 
 /**
  * Resolves the per-user revoked decryption-key-id blacklist for the
@@ -136,7 +150,11 @@ export type ServerTrustedWitnessResolver = (receivedByPublicKey: string) => bool
  * A validated token payload, plus the peer identity when the caller
  * authenticated as a trusted server rather than as a tenant user.
  */
-type ResolvedTokenPayload = NetworkAuthTokenPayload & { peer?: ServerPeerPrincipal };
+type ResolvedTokenPayload = NetworkAuthTokenPayload & {
+  peer?: ServerPeerPrincipal;
+  /** Set for a principal that may only deposit into this database (§6.10). */
+  deposit?: { maxRecipients: number };
+};
 
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
 export interface ServerAccessControlOptions {
@@ -158,6 +176,8 @@ export interface ServerAccessControlOptions {
    * Absent keeps the legacy behavior (any synced database id is accepted).
    */
   dbAccessEvaluator?: ServerDbAccessEvaluator;
+  /** Database-open gate with deposit support (§6.10); preferred over `dbAccessEvaluator`. */
+  dbAccessModeEvaluator?: ServerDbAccessModeEvaluator;
   /**
    * Per-user revoked-key blacklist resolver (§13). When present, store entries
    * whose `decryptionKeyId` is revoked for the principal are silently omitted
@@ -234,6 +254,7 @@ export class ServerNetworkContentAddressedStore {
   private wipeGrantDocIdResolver?: WipeGrantDocIdResolver;
   /** Optional database-open gate; undefined keeps any-database serving. */
   private dbAccessEvaluator?: ServerDbAccessEvaluator;
+  private dbAccessModeEvaluator?: ServerDbAccessModeEvaluator;
   /** Optional per-user revoked-key blacklist resolver; undefined disables it. */
   private revokedKeyResolver?: ServerRevokedKeyResolver;
   /** Optional purged-document denylist resolver; undefined disables it. */
@@ -289,6 +310,7 @@ export class ServerNetworkContentAddressedStore {
     this.tier1Evaluator = accessControl?.tier1Evaluator;
     this.wipeGrantDocIdResolver = accessControl?.wipeGrantDocIdResolver;
     this.dbAccessEvaluator = accessControl?.dbAccessEvaluator;
+    this.dbAccessModeEvaluator = accessControl?.dbAccessModeEvaluator;
     this.revokedKeyResolver = accessControl?.revokedKeyResolver;
     this.purgedDocResolver = accessControl?.purgedDocResolver;
     this.builtinWriteContext = accessControl?.builtinWriteContext;
@@ -671,7 +693,7 @@ export class ServerNetworkContentAddressedStore {
    * Handle sync capability negotiation.
    */
   async handleGetCapabilities(token: string): Promise<NetworkSyncCapabilities> {
-    const tokenPayload = await this.validateToken(token);
+    const tokenPayload = await this.validateToken(token, true);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
 
     return {
@@ -926,7 +948,7 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Handling putEntries request for ${entries.length} entries`);
     
     // Validate token
-    const tokenPayload = await this.validateToken(token);
+    const tokenPayload = await this.validateToken(token, true);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
 
     // Server-to-server push: enables witness-receipt preservation below.
@@ -1096,6 +1118,18 @@ export class ServerNetworkContentAddressedStore {
         continue;
       }
 
+      // Deposit-only principal (docs/accesscontrol.md §6.10): the deposit check
+      // replaces Tier 1 for its entries, because the doc_deposit rule is what
+      // authorizes them. Anything that is not a sealed create (or a chunk of
+      // one) is refused.
+      if (tokenPayload.deposit) {
+        const denied = await this.evaluateDepositEntry(entry, tokenPayload, tokenPayload.deposit.maxRecipients);
+        if (denied) {
+          this.rejectEntry(rejected, entry.id, denied.reason, denied.rejectionClass);
+          continue;
+        }
+      }
+
       // Builtin `userdirectory` write invariant (docs/userkeys.md §6.5). Runs
       // before Tier 1 so it holds even when the ACL master switch is on.
       const dbId = this.witnessDbid ?? this.localStore.getId();
@@ -1110,7 +1144,7 @@ export class ServerNetworkContentAddressedStore {
       // Rule-based Tier 1 enforcement (docs/accesscontrol.md §7). The server can
       // only decide the identity tier; content-tier (Tier 2) gates are deferred
       // to clients and treated as allowed here.
-      if (this.tier1Evaluator) {
+      if (this.tier1Evaluator && !tokenPayload.deposit) {
         const decision = await this.tier1Evaluator(entry, this.witnessDbid ?? this.localStore.getId());
         if (!decision.allowed) {
           this.rejectEntry(
@@ -1182,6 +1216,50 @@ export class ServerNetworkContentAddressedStore {
         (rejected.length > 0 ? ` (${rejected.length} rejected)` : ""),
     );
     return { receipts: stampedMetadata, rejected };
+  }
+
+  /**
+   * What a deposit-only principal may push (docs/accesscontrol.md §6.10):
+   *
+   * - `doc_create` of a sealed document (`decryptionKeyId` is
+   *   `$sealed:<docId>`) carrying 1..`maxRecipients` recipient wraps, signed
+   *   by the depositing device itself, for a document id the store does not
+   *   hold yet. An existing id is refused as `"exists"`, which a depositor
+   *   reads as "already delivered".
+   * - `attachment_chunk` entries of such a document, signed by the depositor.
+   *
+   * Changes, deletes, undeletes and snapshots are always refused: a depositor
+   * cannot read the document, so it has no business editing it.
+   */
+  private async evaluateDepositEntry(
+    entry: StoreEntry,
+    tokenPayload: ResolvedTokenPayload,
+    maxRecipients: number,
+  ): Promise<{ reason: string; rejectionClass: PutRejectionClass } | null> {
+    const policy = (reason: string) => ({ reason: `Entry ${entry.id}: ${reason}`, rejectionClass: "policy" as const });
+    if (!entry.docId || entry.decryptionKeyId !== sealedKeyId(entry.docId)) {
+      return policy("deposit-only principals may only push documents sealed with their own key ($sealed:<docId>)");
+    }
+    if (tokenPayload.deviceSigningKey && entry.createdByPublicKey !== tokenPayload.deviceSigningKey) {
+      return policy("deposit-only principals may only push entries they signed themselves");
+    }
+    if (entry.entryType === "attachment_chunk") {
+      return this.localStore.getStoreKind() === StoreKind.attachments
+        ? null
+        : policy("attachment chunks belong in the attachment store");
+    }
+    if (entry.entryType !== "doc_create") {
+      return policy(`deposit-only principals may only create documents, not push ${entry.entryType}`);
+    }
+    const wraps = entry.recipients?.wraps?.length ?? 0;
+    if (wraps < 1 || wraps > maxRecipients) {
+      return policy(`a deposited document needs 1 to ${maxRecipients} recipient wraps (has ${wraps})`);
+    }
+    const existing = await this.localStore.findNewEntriesForDoc([], entry.docId);
+    if (existing.length > 0) {
+      return { reason: `Entry ${entry.id}: document ${entry.docId} already exists`, rejectionClass: "exists" };
+    }
+    return null;
   }
 
   /**
@@ -1388,7 +1466,7 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Handling hasEntries request for ${ids.length} IDs`);
     
     // Validate token
-    const tokenPayload = await this.validateToken(token);
+    const tokenPayload = await this.validateToken(token, true);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     
     // Check which IDs exist in local store
@@ -1500,7 +1578,13 @@ export class ServerNetworkContentAddressedStore {
    * @returns The token payload
    * @throws NetworkError if token is invalid
    */
-  private async validateToken(token: string): Promise<ResolvedTokenPayload> {
+  /**
+   * @param allowDeposit Whether a deposit-only principal (§6.10) may perform
+   *   this operation. Only pushing (`putEntries`), the existence check push
+   *   relies on (`hasEntries`) and the capability probe pass it; every read is
+   *   refused for such a principal.
+   */
+  private async validateToken(token: string, allowDeposit = false): Promise<ResolvedTokenPayload> {
     const payload = await this.authService.validateToken(token);
 
     if (!payload) {
@@ -1535,7 +1619,27 @@ export class ServerNetworkContentAddressedStore {
     // Applied here so it covers every authenticated sync operation (reads and
     // writes) in one place. The directory store is never wired with an
     // evaluator, so it always syncs.
-    if (this.dbAccessEvaluator) {
+    if (this.dbAccessModeEvaluator) {
+      const dbid = this.witnessDbid ?? this.localStore.getId();
+      const access = await this.dbAccessModeEvaluator({ signingKey: payload.deviceSigningKey }, dbid);
+      if (access.mode === "none") {
+        throw new NetworkError(
+          NetworkErrorType.ACCESS_DENIED,
+          access.reason
+            ? `Access denied to database "${dbid}": ${access.reason}`
+            : `Database "${dbid}" is not in the tenant's allowed database list`,
+        );
+      }
+      if (access.mode === "deposit") {
+        if (!allowDeposit) {
+          throw new NetworkError(
+            NetworkErrorType.ACCESS_DENIED,
+            `Database "${dbid}" allows this user to deposit sealed documents only, not to read`,
+          );
+        }
+        return { ...payload, deposit: { maxRecipients: access.maxRecipients ?? DEFAULT_DEPOSIT_MAX_RECIPIENTS } };
+      }
+    } else if (this.dbAccessEvaluator) {
       const dbid = this.witnessDbid ?? this.localStore.getId();
       const allowed = await this.dbAccessEvaluator(
         { signingKey: payload.deviceSigningKey },

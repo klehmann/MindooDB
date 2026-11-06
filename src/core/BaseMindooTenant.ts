@@ -1253,6 +1253,12 @@ export class BaseMindooTenant implements MindooTenant {
     // canReadDatabase).
     if (typeof directory.canReadDatabase === "function") {
       const canRead = await directory.canReadDatabase(id);
+      // Deposit right (doc_deposit, §6.10): the database opens so the user can
+      // create sealed documents and push them; the server refuses every read.
+      if (!canRead && typeof directory.canDepositDatabase === "function" && (await directory.canDepositDatabase(id))) {
+        this.logger.info(`Opening database "${id}" for deposit only (no read access)`);
+        return;
+      }
       if (!canRead) {
         this.logger.warn(
           `Denied database open for ${currentUser.username}: no read access to database "${id}"`,
@@ -1789,6 +1795,17 @@ export class BaseMindooTenant implements MindooTenant {
         distributeKeyIds: [],
       },
     );
+    if (options.depositPrefixes && options.depositPrefixes.length > 0) {
+      if (typeof directory.setGrantDepositPrefixes !== "function") {
+        throw new Error("This directory cannot record deposit rights (depositPrefixes)");
+      }
+      await directory.setGrantDepositPrefixes(
+        publicUserId.username,
+        options.depositPrefixes,
+        options.adminSigningKey,
+        options.adminPassword,
+      );
+    }
 
     const userPublicKey =
       typeof request.userPublicKey === "string" ? request.userPublicKey.trim() : "";

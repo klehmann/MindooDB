@@ -5638,6 +5638,9 @@ export class BaseMindooDB implements MindooDB {
       }
       this.validateIdPrefixOption("createDocuments", options);
       this.validateAssumeUniqueIdOption("createDocuments", options);
+      if ((options.attachments?.length ?? 0) > 0) {
+        throw new Error("createDocuments: attachments are only supported by createDocument()");
+      }
       encodeChangeAttribution(options.attribution);
     }
 
@@ -5882,6 +5885,12 @@ export class BaseMindooDB implements MindooDB {
             "pass assumeUniqueId for random ids.",
         );
       }
+      if (useDeterministicSeed && (options.attachments?.length ?? 0) > 0) {
+        throw new Error(
+          "createDocument: attachments are not supported together with a convergent custom id; " +
+            "pass assumeUniqueId, or add them with changeDoc().",
+        );
+      }
     }
 
     const signerPublicKey = await this.resolveSignerPublicKey(
@@ -5978,6 +5987,21 @@ export class BaseMindooDB implements MindooDB {
         `Creating initial Automerge change for document ${docId}`,
       );
       const initialDoc = Automerge.init<MindooDocPayload>();
+      // Attachments of the first entry: chunks are written now, under the
+      // document's key, and referenced from the doc_create change below.
+      const createAttachments: AttachmentReference[] = [];
+      for (const attachment of options.attachments ?? []) {
+        createAttachments.push(
+          await this.addAttachmentInternal(
+            docId,
+            attachment.data,
+            attachment.fileName,
+            attachment.mimeType,
+            keyId,
+            now,
+          ),
+        );
+      }
       try {
         newDoc = Automerge.change(
           initialDoc,
@@ -5985,7 +6009,7 @@ export class BaseMindooDB implements MindooDB {
           (doc: MindooDocPayload) => {
             // Store metadata in the document payload
             // We need to modify the document to ensure a change is created
-            doc._attachments = [];
+            doc._attachments = createAttachments.map((ref) => ({ ...ref }));
             if (sealedCreate) {
               applyEncryptForCreate(doc, sealedCreate.encryptFor);
             }

@@ -22,6 +22,7 @@ import { ServerNetworkContentAddressedStore } from "../appendonlystores/network/
 import type {
   ServerTier1Evaluator,
   ServerDbAccessEvaluator,
+  ServerDbAccessModeEvaluator,
   ServerRevokedKeyResolver,
   ServerPurgedDocResolver,
   BuiltinWriteContext,
@@ -258,7 +259,10 @@ class CompositeMindooDirectory implements Pick<
       Partial<
         Pick<
           BaseMindooTenantDirectory,
-          "evaluateDbAccessForSigningKey" | "evaluateAccessForSigningKey" | "isSamePerson"
+          | "evaluateDbAccessForSigningKey"
+          | "evaluateDbAccessModeForSigningKey"
+          | "evaluateAccessForSigningKey"
+          | "isSamePerson"
         >
       >,
     private trustedServers: TrustedServer[],
@@ -449,6 +453,21 @@ class CompositeMindooDirectory implements Pick<
     }
     // Config-based directories carry no database-open policy -> unrestricted.
     return true;
+  }
+
+  /**
+   * Forwarded so the server can tell read from deposit (docs/accesscontrol.md
+   * §6.10). Without it the boolean gate above stays in charge and a depositor
+   * is refused like anyone else without read access.
+   */
+  async evaluateDbAccessModeForSigningKey(input: {
+    dbid: string;
+    signingKey: string;
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; reason?: string }> {
+    if (typeof this.inner.evaluateDbAccessModeForSigningKey === "function") {
+      return this.inner.evaluateDbAccessModeForSigningKey(input);
+    }
+    return { mode: (await this.evaluateDbAccessForSigningKey(input)) ? "read" : "none" };
   }
 
   /**
@@ -1229,6 +1248,9 @@ export class TenantManager {
     // directory store itself, which must always sync so the policy can be read.
     const dbAccessEvaluator =
       dbId === "directory" ? undefined : this.buildDbAccessEvaluator(directory);
+    // Same gate, also reporting the deposit right (docs/accesscontrol.md §6.10).
+    const dbAccessModeEvaluator =
+      dbId === "directory" ? undefined : this.buildDbAccessModeEvaluator(directory);
     // Per-user revoked-key blacklist (§13). Never applied to the directory store
     // itself (its policy, which defines the blacklist, must always sync).
     const revokedKeyResolver =
@@ -1259,6 +1281,7 @@ export class TenantManager {
         tier1Evaluator,
         wipeGrantDocIdResolver,
         dbAccessEvaluator,
+        dbAccessModeEvaluator,
         revokedKeyResolver,
         purgedDocResolver,
         builtinWriteContext,
@@ -1376,6 +1399,24 @@ export class TenantManager {
         signingKey: principal.signingKey ?? "",
       });
     };
+  }
+
+  /**
+   * Like {@link buildDbAccessEvaluator}, but reports read / deposit / none
+   * (docs/accesscontrol.md §6.10). Undefined when the directory predates it,
+   * in which case the boolean evaluator stays in charge.
+   */
+  private buildDbAccessModeEvaluator(
+    directory: MindooTenantDirectory,
+  ): ServerDbAccessModeEvaluator | undefined {
+    const evaluable = directory as unknown as {
+      evaluateDbAccessModeForSigningKey?: BaseMindooTenantDirectory["evaluateDbAccessModeForSigningKey"];
+    };
+    if (typeof evaluable.evaluateDbAccessModeForSigningKey !== "function") {
+      return undefined;
+    }
+    return async (principal, dbid) =>
+      evaluable.evaluateDbAccessModeForSigningKey!({ dbid, signingKey: principal.signingKey ?? "" });
   }
 
   /**
