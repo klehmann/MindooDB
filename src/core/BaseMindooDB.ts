@@ -39,6 +39,7 @@ import {
   DOC_ID_PREFIX_REGEX,
   DIRECTORY_DB_ID,
   USER_DIRECTORY_DB_ID,
+  PUBLIC_INFOS_KEY_ID,
   DocumentDagAnalysisTimestamp,
   DocumentDagAnalysisResult,
   DocumentDagBranchMaterializationResult,
@@ -207,6 +208,10 @@ import {
   entryTypeToBuiltinOp,
   shouldSkipLoadedEntry,
   usernameHashFromCreateChangeBytes,
+  isPurgeRequestDocId,
+  personalDatabaseOwner,
+  PURGE_REQUEST_FORM,
+  PURGE_REQUEST_ID_PREFIX,
   type BuiltinWriteOp,
 } from "./builtinDbInvariants";
 import {
@@ -3945,6 +3950,87 @@ export class BaseMindooDB implements MindooDB {
       await this.tenant.forgetPurgedDocumentInSnapshots(this.store.getId(), docId);
     }
     return outcome;
+  }
+
+  /**
+   * Request the hard delete of deleted documents in a personal database
+   * (`mmail_…`, `mmailout_…`; docs/accesscontrol.md §6.11, "Purge"). Writes a
+   * purge request document (`purgereq_…`, `$publicinfos`) that names the
+   * documents; push it like any change. The server accepts it only from the
+   * owner's devices, a service with a matching `accessPrefixes` grant or the
+   * tenant admin, and only for documents that are deleted; it then removes
+   * their history and refuses it from then on. Every replica (also this one)
+   * removes the documents when it next pulls the request
+   * ({@link applyPurgeRequests}).
+   *
+   * @returns The id of the purge request document.
+   */
+  public async requestPurgeOfDeletedDocuments(docIds: string[]): Promise<string> {
+    this.assertWritable("requestPurgeOfDeletedDocuments");
+    const dbId = this.store.getId();
+    if (!personalDatabaseOwner(dbId)) {
+      throw new Error(`Purge requests are only for personal databases, not ${dbId}`);
+    }
+    const ids = Array.from(new Set(docIds.filter((id) => typeof id === "string" && id.length > 0)));
+    if (ids.length === 0) throw new Error("No document ids to purge");
+    const deleted = new Set(await this.getDeletedDocumentIds());
+    for (const id of ids) {
+      if (isPurgeRequestDocId(id)) throw new Error(`A purge request cannot be purged: ${id}`);
+      if (!deleted.has(id)) throw new Error(`Document ${id} is not deleted; delete it before purging`);
+    }
+    const request = await this.createDocument({
+      idPrefix: PURGE_REQUEST_ID_PREFIX.slice(0, -1),
+      decryptionKeyId: PUBLIC_INFOS_KEY_ID,
+      initialValues: { form: PURGE_REQUEST_FORM, docIds: ids, requestedAt: Date.now() },
+    });
+    return request.getId();
+  }
+
+  /**
+   * The document ids the purge requests of this personal database name
+   * (§6.11). Empty for any other database. With `onlyAccepted`, only requests
+   * the server has accepted (their `doc_create` carries a witness receipt):
+   * a request that is still local, or that the server refused, purges
+   * nothing, so a refused request never loses data that stays on the server.
+   */
+  public async getPurgeRequestedDocIds(options?: { onlyAccepted?: boolean }): Promise<Set<string>> {
+    const result = new Set<string>();
+    if (!personalDatabaseOwner(this.store.getId())) return result;
+    for (const requestId of await this.getAllDocumentIds({ idPrefix: PURGE_REQUEST_ID_PREFIX.slice(0, -1) })) {
+      if (options?.onlyAccepted) {
+        const metas = await this.store.findNewEntriesForDoc([], requestId);
+        const create = metas.find((m) => m.entryType === "doc_create");
+        if (!create?.receivedAt) continue;
+      }
+      try {
+        const data = (await this.getDocument(requestId)).getData() as Record<string, unknown>;
+        if (data.form !== PURGE_REQUEST_FORM || !Array.isArray(data.docIds)) continue;
+        for (const id of data.docIds) {
+          const docId = String(id);
+          if (docId && !isPurgeRequestDocId(docId)) result.add(docId);
+        }
+      } catch {
+        // Not readable here (no $publicinfos yet): picked up on a later run.
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Execute the purge requests of this personal database locally (§6.11):
+   * remove every named document that still has entries here. Idempotent; runs
+   * after every docs pull of a personal database.
+   *
+   * @returns How many documents were removed in this run.
+   */
+  public async applyPurgeRequests(): Promise<number> {
+    this.assertWritable("applyPurgeRequests");
+    let removed = 0;
+    for (const docId of await this.getPurgeRequestedDocIds({ onlyAccepted: true })) {
+      const outcome = await this.purgeDocumentHistory(docId);
+      if (outcome.docEntriesPurged > 0 || outcome.attachmentChunksPurged > 0) removed++;
+    }
+    return removed;
   }
 
   /**
@@ -18430,12 +18516,20 @@ export class BaseMindooDB implements MindooDB {
     // erased history back (docs/accesscontrol.md §13). Never applied to the
     // directory, which carries the purge requests themselves.
     const dbId = this.store.getId();
+    // Personal databases carry their own purge requests (§6.11) on top.
+    const isPersonal = personalDatabaseOwner(dbId) !== null;
     const localStore =
       dbId === "directory"
         ? this.getStoreForKind(storeKind)
         : guardStoreAgainstPurgedDocuments(
             this.getStoreForKind(storeKind),
-            () => this.tenant.getPurgedDocumentIds(dbId),
+            async () => {
+              const fromDirectory = await this.tenant.getPurgedDocumentIds(dbId);
+              if (!isPersonal) return fromDirectory;
+              const own = await this.getPurgeRequestedDocIds();
+              for (const id of fromDirectory) own.add(id);
+              return own;
+            },
             this.logger,
           );
 
@@ -18577,6 +18671,15 @@ export class BaseMindooDB implements MindooDB {
       this.tenant.noteUserDirectoryFetched?.();
       await this.tenant.reconcileUserKeysSafe?.();
       await this.tenant.reconcileKeyDistributionsForCurrentUserSafe();
+    }
+    // Personal databases: execute the purge requests the server accepted (§6.11).
+    if (personalDatabaseOwner(this.store.getId())) {
+      try {
+        const removed = await this.applyPurgeRequests();
+        if (removed > 0) this.logger.info(`Purged ${removed} document(s) by purge request`);
+      } catch (error) {
+        this.logger.warn(`Applying purge requests failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
 

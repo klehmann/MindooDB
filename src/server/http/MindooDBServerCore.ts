@@ -12,6 +12,7 @@
  * neutral platform to keep it that way.
  */
 
+import { personalDatabaseOwner } from "../../core/builtinDbInvariants";
 import { isMissingDependencyError } from "../../core/errors";
 import {
   BINARY_ENTRIES_CONTENT_TYPE,
@@ -1333,6 +1334,14 @@ export class MindooDBServerCore {
       this.runInBackground(
         onDirectoryWrite(tenantId).catch((error) => {
           console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
+        }),
+      );
+    }
+    // Purge requests live inside personal databases (docs/accesscontrol.md §6.11).
+    if (receiptCount > 0 && storeKind === StoreKind.docs && personalDatabaseOwner(dbId)) {
+      this.runInBackground(
+        this.tenantManager.executePersonalPurges(tenantId, dbId).catch((error) => {
+          console.error(`[MindooDBServer] executePersonalPurges failed for ${tenantId}/${dbId}:`, error);
         }),
       );
     }

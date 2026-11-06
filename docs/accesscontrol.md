@@ -1172,6 +1172,48 @@ open to every member's sync. Once the server enforces it:
 - clients that open the database find it refused and should drop their local
   copy (not implemented yet).
 
+**Purge (hard delete) in personal databases.** Deleting only writes a
+tombstone; the history stays in the append-only store. A personal database
+carries its own purge requests, so the owner (and a service working on it)
+can remove deleted documents for good without an admin and without the
+directory:
+
+- **Request.** `db.requestPurgeOfDeletedDocuments(docIds)` writes a document
+  `purgereq_<id>` into the personal database: `$publicinfos`-encrypted (so the
+  server can read the ids), fields `form: "purgerequest"`, `docIds`,
+  `requestedAt`. It is pushed like any change. The client refuses ids that are
+  not deleted locally.
+- **Server check on push** (open core, independent of the master switch, like
+  the rule above):
+  - only a `doc_create` (purge requests cannot be changed or deleted);
+  - signed by someone with **read** access to the database: a device of the
+    owner, a service whose grant has a matching `accessPrefixes` entry (the mail
+    gateway for `mmailout_`), or the tenant admin. Depositors cannot purge:
+    their pushes must be sealed creates;
+  - every named document is **deleted** (its last delete/undelete is a delete,
+    on the server or in the same push); purge requests themselves cannot be
+    named.
+
+  Otherwise the entry is refused with `rejectionClass: "policy"`.
+- **Execution.** After an accepted write to a personal database the server
+  executes its unprocessed requests (`TenantManager.executePersonalPurges`): it
+  puts each document on the per-database denylist first, then removes its
+  docs and attachment entries (attachment chunks other documents still
+  reference stay). From then on pushes of the document are refused as
+  `"purged"`, exactly like an admin purge from the directory.
+- **Replicas.** After every docs pull of a personal database, a client removes
+  the documents that **accepted** requests name (those whose `doc_create`
+  carries the server's witness receipt): `applyPurgeRequests()`. A request that
+  is still local, or that the server refused, removes nothing, so a refused
+  request never loses data that stays on the server. Pulls also refuse incoming
+  entries of documents any local request names.
+- The requests themselves stay in the database (small, ids only); they are what
+  keeps a purged history out of every replica.
+- Not covered yet: the Cloudflare Worker server and servers that only receive
+  the request through peer replication do not execute personal purges (they run
+  the directory purge requests only); the Node server executes them when the
+  request is pushed to it.
+
 ## 7. Evaluation algorithm
 
 For an operation `op` on database `dbid` by user `U`, evaluated at time `T`:

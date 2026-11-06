@@ -468,4 +468,115 @@ describe("doc_deposit on a real server (HTTP)", () => {
       await expect(gatewayMailRemote.findNewEntries([])).rejects.toThrow(DENIED);
     });
   });
+
+  describe("hard delete in personal databases (purge requests, §6.11)", () => {
+    async function waitFor<T>(probe: () => Promise<T | undefined>, timeoutMs = 15000): Promise<T | undefined> {
+      const end = Date.now() + timeoutMs;
+      while (Date.now() < end) {
+        const value = await probe();
+        if (value !== undefined) return value;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      return undefined;
+    }
+
+    async function serverEntriesOf(tenant: MindooTenant, dbId: string, docId: string) {
+      const remote = await tenant.connectToServer(baseUrl, dbId, StoreKind.docs);
+      return remote.findNewEntriesForDoc([], docId);
+    }
+
+    test("the owner purges a sent mail and its status; server and replicas drop them and refuse them back", async () => {
+      const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"], gatewayAccessPrefixes: ["mmailout_"] });
+      const janeOutboxDb = await openDb(t.jane, t.janeOutbox);
+      const outgoing = await janeOutboxDb.createDocument({
+        recipients: [t.gatewayName],
+        recipientOptions: { strict: true },
+        initialValues: { type: "outgoing", subject: "to the world" },
+      });
+      await push(t.jane, t.janeOutbox);
+      const gatewayDb = await pull(t.gateway.tenant, t.janeOutbox);
+      const status = await gatewayDb.createDocument({
+        recipients: [t.janeUser.username],
+        initialValues: { type: "outgoingstatus", outgoingDocId: outgoing.getId(), state: "sent" },
+      });
+      await push(t.gateway.tenant, t.janeOutbox);
+
+      // Not deleted yet: refused locally and by the server.
+      await expect(janeOutboxDb.requestPurgeOfDeletedDocuments([outgoing.getId()])).rejects.toThrow(/not deleted/);
+
+      // Jane deletes her mail, the gateway its status; Jane requests the purge of both.
+      await janeOutboxDb.deleteDocument(outgoing.getId());
+      await push(t.jane, t.janeOutbox);
+      await gatewayDb.deleteDocument(status.getId());
+      await push(t.gateway.tenant, t.janeOutbox);
+      await pull(t.jane, t.janeOutbox);
+      const requestId = await janeOutboxDb.requestPurgeOfDeletedDocuments([outgoing.getId(), status.getId()]);
+      expect(requestId.startsWith("purgereq_")).toBe(true);
+      expect((await push(t.jane, t.janeOutbox)).docs.rejectedEntries ?? []).toHaveLength(0);
+
+      // The server executes it.
+      const gone = await waitFor(async () =>
+        (await serverEntriesOf(t.jane, t.janeOutbox, outgoing.getId())).length === 0 &&
+        (await serverEntriesOf(t.jane, t.janeOutbox, status.getId())).length === 0
+          ? true
+          : undefined,
+      );
+      expect(gone).toBe(true);
+
+      // The gateway still holds the history: a re-push is refused as purged.
+      const rePush = await gatewayDb.pushChangesTo(await t.gateway.tenant.connectToServer(baseUrl, t.janeOutbox, StoreKind.docs), {
+        forceFullScan: true,
+      } as never);
+      void rePush;
+      expect((await serverEntriesOf(t.jane, t.janeOutbox, status.getId())).length).toBe(0);
+
+      // Replicas purge on their next pull (the request carries the server's receipt).
+      await pull(t.gateway.tenant, t.janeOutbox);
+      expect(await gatewayDb.getStore().findNewEntriesForDoc([], status.getId())).toEqual([]);
+      expect(await gatewayDb.getStore().findNewEntriesForDoc([], outgoing.getId())).toEqual([]);
+      await pull(t.jane, t.janeOutbox);
+      expect(await janeOutboxDb.getStore().findNewEntriesForDoc([], outgoing.getId())).toEqual([]);
+      // The request itself stays (it is what keeps the history out).
+      expect(await janeOutboxDb.getAllDocumentIds()).toContain(requestId);
+    });
+
+    test("the service with accessPrefixes may purge; requests for live documents, changes and depositors are refused", async () => {
+      const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"], gatewayAccessPrefixes: ["mmailout_"] });
+      const janeOutboxDb = await openDb(t.jane, t.janeOutbox);
+      const live = await janeOutboxDb.createDocument({ recipients: [t.gatewayName], initialValues: { type: "outgoing" } });
+      const old = await janeOutboxDb.createDocument({ recipients: [t.gatewayName], initialValues: { type: "outgoing" } });
+      await push(t.jane, t.janeOutbox);
+      await janeOutboxDb.deleteDocument(old.getId());
+      await push(t.jane, t.janeOutbox);
+
+      // The gateway purges a deleted mail (the 30-day sweep).
+      const gatewayDb = await pull(t.gateway.tenant, t.janeOutbox);
+      await gatewayDb.requestPurgeOfDeletedDocuments([old.getId()]);
+      expect((await push(t.gateway.tenant, t.janeOutbox)).docs.rejectedEntries ?? []).toHaveLength(0);
+      expect(
+        await waitFor(async () => ((await serverEntriesOf(t.jane, t.janeOutbox, old.getId())).length === 0 ? true : undefined)),
+      ).toBe(true);
+
+      // A forged request for a live document (bypassing the local check) is refused by the server.
+      const forged = await gatewayDb.createDocument({
+        idPrefix: "purgereq",
+        decryptionKeyId: "$publicinfos",
+        initialValues: { form: "purgerequest", docIds: [live.getId()], requestedAt: Date.now() },
+      });
+      const result = (await push(t.gateway.tenant, t.janeOutbox)).docs;
+      expect((result.rejectedEntries ?? []).map((r) => r.reason).join(" ")).toMatch(/is not deleted/);
+      expect((await serverEntriesOf(t.jane, t.janeOutbox, live.getId())).length).toBeGreaterThan(0);
+      void forged;
+
+      // A depositor (mmail_, deposit only) cannot purge: only sealed creates pass.
+      const gatewayMail = await openDb(t.gateway.tenant, t.janeMail);
+      await gatewayMail.createDocument({
+        idPrefix: "purgereq",
+        decryptionKeyId: "$publicinfos",
+        initialValues: { form: "purgerequest", docIds: ["x"], requestedAt: Date.now() },
+      });
+      const depositResult = (await push(t.gateway.tenant, t.janeMail)).docs;
+      expect((depositResult.rejectedEntries ?? []).length).toBeGreaterThan(0);
+    });
+  });
 });

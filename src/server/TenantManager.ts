@@ -25,6 +25,7 @@ import type {
   ServerDbAccessModeEvaluator,
   ServerRevokedKeyResolver,
   ServerPurgedDocResolver,
+  ServerPurgeRequestValidator,
   BuiltinWriteContext,
   ServerPeerTokenResolver,
   ServerTrustedWitnessResolver,
@@ -58,7 +59,12 @@ import {
   StoreKind,
   USER_DIRECTORY_DB_ID,
 } from "../core/types";
-import { usernameHashFromCreateChangeBytes } from "../core/builtinDbInvariants";
+import {
+  isPurgeRequestDocId,
+  personalDatabaseOwner,
+  purgeRequestDocIdsFromCreateBytes,
+  usernameHashFromCreateChangeBytes,
+} from "../core/builtinDbInvariants";
 import { signingKeysEqual } from "../core/accesscontrol/DirectoryStateNode";
 import {
   buildTier1Evaluator,
@@ -1264,6 +1270,13 @@ export class TenantManager {
         ? undefined
         : () => this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
 
+    // Purge requests in personal databases (§6.11): checked on push (only in
+    // the docs store, where the request documents live).
+    const purgeRequestValidator: ServerPurgeRequestValidator | undefined =
+      storeKind === StoreKind.docs && personalDatabaseOwner(dbId)
+        ? this.buildPurgeRequestValidator(tenant, directory, localStore, dbId)
+        : undefined;
+
     const builtinWriteContext: BuiltinWriteContext | undefined =
       dbId === USER_DIRECTORY_DB_ID
         ? this.buildUserdirectoryWriteContext(tenant, localStore)
@@ -1284,6 +1297,7 @@ export class TenantManager {
         dbAccessModeEvaluator,
         revokedKeyResolver,
         purgedDocResolver,
+        purgeRequestValidator,
         builtinWriteContext,
         ...this.peerAccessControl,
       },
@@ -1600,6 +1614,111 @@ export class TenantManager {
           await this.purgeDocumentFromDatabase(normalizedId, dbId, docId);
         }
       }
+    }
+  }
+
+  /**
+   * The push check for purge requests in a personal database (§6.11): a
+   * `$publicinfos` create, signed by someone with read access to the database
+   * (a device of the owner, a service with a matching `accessPrefixes` grant,
+   * the tenant admin), naming only documents that are deleted (last
+   * delete/undelete is a delete, on the server or in the same push). Purge
+   * requests themselves cannot be purged, changed or deleted.
+   */
+  private buildPurgeRequestValidator(
+    tenant: LoadedTenant,
+    directory: MindooTenantDirectory,
+    localStore: ContentAddressedStore,
+    dbId: string,
+  ): ServerPurgeRequestValidator | undefined {
+    const mindooTenant = tenant.mindooTenant;
+    const dir = directory as unknown as {
+      evaluateDbAccessModeForSigningKey?: (input: { dbid: string; signingKey: string }) => Promise<{ mode: string }>;
+    };
+    return async (entry, batch) => {
+      if (entry.entryType !== "doc_create") {
+        return "a purge request can only be created, not changed or deleted";
+      }
+      if (entry.decryptionKeyId !== PUBLIC_INFOS_KEY_ID) {
+        return "a purge request must be encrypted with $publicinfos";
+      }
+      if (!mindooTenant || typeof dir.evaluateDbAccessModeForSigningKey !== "function") {
+        return "this server cannot check purge requests";
+      }
+      const access = await dir.evaluateDbAccessModeForSigningKey({ dbid: dbId, signingKey: entry.createdByPublicKey });
+      if (access.mode !== "read") {
+        return "only the owner, a service with access or the tenant admin may purge";
+      }
+      let docIds: string[] | null = null;
+      try {
+        docIds = purgeRequestDocIdsFromCreateBytes(
+          await mindooTenant.decryptPayload(entry.encryptedData, PUBLIC_INFOS_KEY_ID),
+        );
+      } catch {
+        docIds = null;
+      }
+      if (!docIds) return "not a readable purge request";
+      for (const docId of docIds) {
+        if (isPurgeRequestDocId(docId)) return "purge requests cannot be purged";
+        const history = [
+          ...(await localStore.findNewEntriesForDoc([], docId)),
+          ...batch.filter((e) => e.docId === docId),
+        ].filter((e) => e.entryType === "doc_delete" || e.entryType === "doc_undelete");
+        history.sort((a, b) => (a.receivedAt ?? a.createdAt) - (b.receivedAt ?? b.createdAt));
+        if (history.at(-1)?.entryType !== "doc_delete") {
+          return `document ${docId} is not deleted`;
+        }
+      }
+      return null;
+    };
+  }
+
+  /**
+   * Executes the purge requests of one personal database (§6.11): every
+   * document a request names is put on the denylist and removed from the docs
+   * and attachment stores. Called after accepted writes to the database;
+   * requests already executed are skipped. Serialized per database.
+   */
+  async executePersonalPurges(tenantId: string, dbId: string): Promise<void> {
+    const key = `${tenantId.toLowerCase()}\u0000${dbId}`;
+    const existing = this.purgeInFlight.get(key);
+    if (existing) return existing;
+    const run = this.executePersonalPurgesInternal(tenantId.toLowerCase(), dbId).finally(() => {
+      this.purgeInFlight.delete(key);
+    });
+    this.purgeInFlight.set(key, run);
+    return run;
+  }
+
+  private async executePersonalPurgesInternal(normalizedId: string, dbId: string): Promise<void> {
+    if (!personalDatabaseOwner(dbId)) return;
+    const tenant = await this.getTenant(normalizedId);
+    const mindooTenant = tenant.mindooTenant;
+    if (!mindooTenant) return;
+    const docsStore = await this.getStore(normalizedId, dbId, StoreKind.docs);
+    const creates = (await docsStore.findEntries("doc_create", null, null)).filter((m) => isPurgeRequestDocId(m.docId));
+    if (creates.length === 0) return;
+    const registry = this.getPurgedDocRegistry(normalizedId);
+    for (const meta of creates) {
+      const requestKey = `${dbId}/${meta.docId}`;
+      if (registry.isRequestProcessed(requestKey)) continue;
+      const [entry] = await docsStore.getEntries([meta.id]);
+      if (!entry) continue;
+      let docIds: string[] | null = null;
+      try {
+        docIds = purgeRequestDocIdsFromCreateBytes(await mindooTenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId));
+      } catch (error) {
+        console.error(`[TenantManager] purge request ${requestKey} is not readable:`, error);
+        continue;
+      }
+      for (const docId of docIds ?? []) {
+        if (isPurgeRequestDocId(docId)) continue;
+        // Denylist first, as for directory purge requests (see above).
+        registry.recordPurgedDoc(dbId, docId);
+        await this.purgeDocumentFromDatabase(normalizedId, dbId, docId);
+      }
+      registry.markRequestProcessed(requestKey);
+      console.log(`[TenantManager] Executed personal purge ${requestKey} (${docIds?.length ?? 0} doc(s)) for ${normalizedId}`);
     }
   }
 

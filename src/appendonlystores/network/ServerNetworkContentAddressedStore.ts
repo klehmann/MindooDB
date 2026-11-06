@@ -15,6 +15,7 @@ import {
   evaluateBuiltinWrite,
   entryTypeToBuiltinOp,
   isPersonalUserdirectoryDocId,
+  isPurgeRequestDocId,
   type BuiltinWriteOp,
 } from "../../core/builtinDbInvariants";
 import type {
@@ -125,6 +126,18 @@ export type ServerRevokedKeyResolver = (
 export type ServerPurgedDocResolver = () => Promise<Set<string>> | Set<string>;
 
 /**
+ * Checks a pushed entry of a purge request in a personal database
+ * (docs/accesscontrol.md §6.11, "Purge"): returns null to accept, or the
+ * reason to refuse. Supplied by the host server, which can decrypt the
+ * `$publicinfos` payload and resolve the signer's rights. `batch` is the whole
+ * push, so a `doc_delete` pushed together with the request counts.
+ */
+export type ServerPurgeRequestValidator = (
+  entry: StoreEntry,
+  batch: StoreEntry[],
+) => Promise<string | null>;
+
+/**
  * A trusted peer server, resolved from a `/system/peer/*` JWT.
  *
  * A peer is not a tenant user: it holds no grant in the tenant directory and
@@ -192,6 +205,11 @@ export interface ServerAccessControlOptions {
    * `"directory"` store.
    */
   purgedDocResolver?: ServerPurgedDocResolver;
+  /**
+   * Purge-request check for personal databases (§6.11). When present, every
+   * pushed entry of a `purgereq_` document goes through it.
+   */
+  purgeRequestValidator?: ServerPurgeRequestValidator;
   /**
    * Builtin write-invariant context for `userdirectory` (docs/userkeys.md §6.5).
    * When present, `handlePutEntries` rejects illegal creates/changes/deletes
@@ -265,6 +283,7 @@ export class ServerNetworkContentAddressedStore {
   private peerTokenResolver?: ServerPeerTokenResolver;
   /** Optional trusted-witness check used to preserve replicated receipts. */
   private trustedWitnessResolver?: ServerTrustedWitnessResolver;
+  private purgeRequestValidator?: ServerPurgeRequestValidator;
   /** Cached `username_hash` per userdirectory docId, filled as creates are seen. */
   private userdirectoryHashByDocId = new Map<string, string>();
   /** Cached create signing key per personal userdirectory docId (its owner). */
@@ -316,6 +335,7 @@ export class ServerNetworkContentAddressedStore {
     this.builtinWriteContext = accessControl?.builtinWriteContext;
     this.peerTokenResolver = accessControl?.peerTokenResolver;
     this.trustedWitnessResolver = accessControl?.trustedWitnessResolver;
+    this.purgeRequestValidator = accessControl?.purgeRequestValidator;
   }
 
   /**
@@ -1126,6 +1146,17 @@ export class ServerNetworkContentAddressedStore {
         const denied = await this.evaluateDepositEntry(entry, tokenPayload, tokenPayload.deposit.maxRecipients);
         if (denied) {
           this.rejectEntry(rejected, entry.id, denied.reason, denied.rejectionClass);
+          continue;
+        }
+      }
+
+      // Purge requests in personal databases (§6.11): only by someone who may
+      // read the database, only for documents that are already deleted.
+      // Independent of the ACL master switch, like the builtin invariants.
+      if (this.purgeRequestValidator && isPurgeRequestDocId(entry.docId)) {
+        const denied = await this.purgeRequestValidator(entry, entries);
+        if (denied) {
+          this.rejectEntry(rejected, entry.id, `Entry ${entry.id}: ${denied}`, "policy");
           continue;
         }
       }
