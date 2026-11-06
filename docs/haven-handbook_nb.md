@@ -12,7 +12,7 @@ Noen få ting skiller Haven fra en vanlig webapp.
 
 Haven er lokal-først. Nesten alt du ser, serveres fra en kopi — en lokal replika — som ligger i denne nettleseren. Å bla, redigere, søke og til og med bygge virtuelle visninger skjer mot den lokale replikaen, så Haven er raskt og fortsetter å virke når nettet er borte. Serveren kontaktes bare når du synkroniserer, og dataene på linja er alltid ende-til-ende-kryptert.
 
-Haven er en progressiv webapp. Den kan installeres på telefoner og nettbrett, inkludert iPhone, iPad og Android, og startes rett fra Hjem-skjermen som en vanlig app. Når den er installert, åpnes den i frittstående modus uten nettleserramme, noe som gir deg mer skjermplass og en roligere følelse. På iPhone kan du til og med legge Haven til på Hjem-skjermen mer enn én gang — hver installerte kopi får sitt eget private lager, og det er en ryddig måte å holde private data, jobbdata og demodata helt adskilt på én enhet.
+Haven er en progressiv webapp. Den kan installeres på telefoner og nettbrett, inkludert iPhone, iPad og Android, og startes rett fra Hjem-skjermen som en vanlig app. Når den er installert, åpnes den i frittstående modus uten nettleserramme, noe som gir deg mer skjermplass og en roligere følelse. På iPhone kan du til og med legge Haven til på Hjem-skjermen mer enn én gang — hver installerte kopi får sitt eget private lager, og det er en ryddig måte å holde private data, jobbdata og demodata helt adskilt på én enhet. Native apper pakker den samme Haven inn i en egen app: for macOS og Windows på [nedlastingssiden](https://mindoodb.com/nb/downloads/), for iOS og Android i testprogrammer; avsnittet Haven som native app lenger ned forteller hva de tilfører.
 
 Haven er et kjøremiljø for MindooDB-apper. MindooDB-apper er små webverktøy bygget med MindooDB App SDK. Haven starter hver av dem i en iframe med sandkasse på en egen origin, gir den et avgrenset innsyn i dataene du valgte å dele, og formidler hver lesing og skriving gjennom en sikker bridge. Hostede apper kan til og med serveres av Havens egen service worker og fortsette å virke når nettet er borte.
 
@@ -232,15 +232,19 @@ Hvilken vei du kobler til, avhenger av hvor Haven kjører.
 
 I Chrome når Havens verktøy en agent gjennom [Haven Agent Bridge](https://github.com/klehmann/haven-agent-bridge) med åpen kildekode. En Chrome-utvidelse fanger opp verktøyene i Haven-fanen, og en liten lokal tjeneste sender dem videre til MCP-klienten din. Goose, Claude Code og andre klienter som starter MCP-servere som et lokalt program, starter broen på den måten; klienter som snakker Streamable HTTP, kobler til `http://127.0.0.1:13300/mcp` med tokenet broen skriver til `~/.haven-agent-bridge/token`. Broen lytter bare på `127.0.0.1`, beskytter hver tilkobling med det tokenet, snakker bare med Haven-sidene på tillatelseslisten sin, og registrerer ikke noe innhold med mindre du slår det på. Du installerer den fra GitHub — bygg den én gang, og last deretter inn mappen `extension` i Chrome med Last inn upakket — og README-en har konfigurasjonen for hver klient. Chromes egen WebMCP-støtte ligger fortsatt bak et flagg eller en prøve; Innstillinger forteller deg når denne nettleseren ikke tilbyr den ennå.
 
-Havens native apper for macOS og Windows, som kommer snart, har tilkoblingen innebygd, uten Chrome, Node eller en åpen nettverksport. Der viser Innstillinger → Generelt en Agenttilgang …-knapp som lister opp agentappene Haven kjenner. For Goose, Claude Desktop og Codex skriver ett klikk Haven inn i konfigurasjonen deres og tar vare på en sikkerhetskopi av den gamle filen. For Cursor, VS Code og LM Studio åpner Haven installasjonslenken deres. For Claude Code, Gemini CLI og andre viser den kommandoen du kan kopiere. Når en agent kobler til for første gang, spør Haven om du stoler på programmet, og kontrollerer det etter sti og kodesignatur. Mens det er tilkoblet, viser et lite banner navnet på det, med Koble fra ett klikk unna. Telefonappene for iOS og Android tilbyr ikke agentverktøy.
+Havens native apper for macOS og Windows, tilgjengelige på [nedlastingssiden](https://mindoodb.com/nb/downloads/), har tilkoblingen innebygd, uten Chrome, Node eller en åpen nettverksport. Der viser Innstillinger → Generelt en Agenttilgang …-knapp som lister opp agentappene Haven kjenner. For Goose, Claude Desktop og Codex skriver ett klikk Haven inn i konfigurasjonen deres og tar vare på en sikkerhetskopi av den gamle filen. For Cursor, VS Code og LM Studio åpner Haven installasjonslenken deres. For Claude Code, Gemini CLI og andre viser den kommandoen du kan kopiere. Når en agent kobler til for første gang, spør Haven om du stoler på programmet, og kontrollerer det etter sti og kodesignatur. Mens det er tilkoblet, viser et lite banner navnet på det, med Koble fra ett klikk unna. Telefonappene for iOS og Android tilbyr ikke agentverktøy.
 
 ### Den innebygde assistenten
 
 Haven Enterprise tar også med en egen assistent, så en agent er tilgjengelig uten å installere noe annet. Den åpnes fra assistentknappen i topplinjen eller i appskuffen, jobber med de samme verktøyene som en ekstern agent, og viser hvert trinn den tar som et kort i samtalen, med verktøyets inndata og resultat ett klikk unna. Større oppgaver planlegger den også som en kort sjekkliste du kan følge med på.
 
-Assistenten snakker med en språkmodell du velger under Innstillinger → Assistent. Ethvert endepunkt som snakker det OpenAI-kompatible API-et, fungerer: OpenAI selv, en bedriftsproxy eller en lokal server som Ollama eller LM Studio. Du gir den et navn, endepunktet og modellen, og sier om modellen forstår bilder. API-nøkkelen kan beholdes kryptert på denne enheten, bare for denne økten, eller utelates for en lokal server; en lagret nøkkel krypteres med en nøkkel fra den opplåste bruker-ID-en din, synkroniseres ikke, er ikke med i backuper og når aldri en app. Test tilkoblingen sjekker endepunktet og om modellen kaller verktøy, noe assistenten trenger. En lokal server må tillate Havens adresse — for Ollama er det `OLLAMA_ORIGINS`, i LM Studio er det CORS-bryteren.
+Ved større datamengder kan assistenten også skrive et kort skript og kjøre det i en sandkasse inne i Haven. Slik sorterer, filtrerer eller summerer den det verktøyene returnerte, uten å sende alt til modellen. Sandkassen har ikke nett og kan ikke endre noe: Den ser bare resultatene assistenten gir den og det skrivebeskyttede verktøy returnerer, og kortet dens i samtalen viser koden.
 
-Før den første meldingen går til et endepunkt, sier Haven hva den vil sende dit — meldingene dine, og det assistenten leser gjennom verktøy — og ber om samtykket ditt én gang per endepunkt. Samtalen lever bare i minnet og forkastes når Haven låses.
+Assistenten snakker med en språkmodell du velger under Innstillinger → Assistent. Den snakker tre API-er: OpenAI Chat Completions, som nesten alle endepunkter tilbyr — en bedriftsproxy eller en lokal server som Ollama eller LM Studio —, pluss OpenAIs Responses-API og Anthropic Messages for Claude. Automatisk bruker Responses for api.openai.com, Messages for api.anthropic.com og Chat Completions for alt annet; modellen kan velges fra listen endepunktet oppgir. Du gir den et navn, endepunktet og modellen, og sier om modellen forstår bilder. API-nøkkelen kan beholdes kryptert på denne enheten, bare for denne økten, eller utelates for en lokal server; en lagret nøkkel krypteres med en nøkkel fra den opplåste bruker-ID-en din, synkroniseres ikke, er ikke med i backuper og når aldri en app. Test tilkoblingen sjekker endepunktet og om modellen kaller verktøy, noe assistenten trenger. En lokal server må tillate Havens adresse — for Ollama er det `OLLAMA_ORIGINS`, i LM Studio er det CORS-bryteren.
+
+Lange samtaler tar Haven seg av. En stolpe i panelet viser hvor mye av modellens kontekstvindu samtalen fyller, og i innstillingene kan du angi et mindre vindu når en lokal server kjører med mindre enn modellen tillater. Når en samtale vokser, oppsummerer Haven eldre meldinger i bakgrunnen — med en mindre modell på samme endepunkt hvis du angir en —, men beholder hver melding, så assistenten kan slå opp en tidligere detalj igjen i stedet for å miste den. Med La assistenten søke i de andre samtalene mine slått på søker den også i de andre lagrede samtalene dine.
+
+Før den første meldingen går til et endepunkt, sier Haven hva den vil sende dit — meldingene dine, og det assistenten leser gjennom verktøy — og ber om samtykket ditt én gang per endepunkt. Samtaler lagres kryptert på denne enheten, atskilt for hver bruker-ID, og synkroniseres ikke. Samtalelogg i panelet lister dem opp, så du kan gå tilbake til en tidligere eller slette den; når Haven låses, lukkes den åpne samtalen og kommer tilbake etter neste opplåsing.
 
 ### Du har kontrollen
 
@@ -281,6 +285,22 @@ En Stopp-knapp dukker opp mens en synkronisering pågår. Den sender et samarbei
 Når bør du synkronisere? Det korte svaret er: før du stoler på et tall du skal dele. Kjør synkronisering før du lager en eksport fra en virtuell visning, før du går inn i et møte basert på et dashbord, og når som helst nettet har vært nede en stund. Synkroniser alle er alltid trygt — den henter bare nye data og sender de køede endringene dine; den sletter aldri arbeid du ennå ikke har lagret.
 
 En liten felle: hvis du ventet at en database skulle dukke opp i køen og den mangler, er den vanlige grunnen at brukeridentiteten som holder replikaen, ikke er låst opp ennå. Synkronisering trenger nøklene fra den lokale KeyBag-en, og KeyBag-en åpner seg først når den aktive identiteten er låst opp fra topplinjen.
+
+### Vedlegg: alle, eller bare ved behov
+
+Vedlegg er som regel den tunge delen av en database. Dokumenter er små; en presentasjon, en skannet kontrakt eller en mappe med bilder kan veie mer enn alle dokumentene rundt til sammen. Derfor bestemmer du, database for database, om en synkronisering også henter vedleggene til denne enheten.
+
+Første gang du møter valget, er når du installerer en app i en tenant som allerede er koblet til en server. Haven spør Synkronisere appdata fra serveren?, slik at appen ikke starter tom, og under Avansert lister den hver database appen bruker, med et valg for vedleggene. Overfør alle vedlegg kopierer dem begge veier, så hver fil ligger på enheten og åpnes uten nett. Last inn vedlegg ved behov synkroniserer alle dokumenter som før og laster opp vedleggene du legger til selv, men lar de andres ligge på serveren. For deg og for appen endres ingenting annet: Når et dokument trenger en fil som ikke ligger på denne enheten, henter Haven den fra serveren, dekrypterer den her og leverer den som om den alltid hadde vært der. Serveren sender de samme krypterte bitene som ved enhver synkronisering og får ikke vite noe nytt.
+
+Poenget med det andre valget er en lettere og raskere enhet. En telefon som jobber med denne månedens dokumenter, trenger ikke lagre årevis med vedlegg, den første synkroniseringen av en stor database blir ferdig mye tidligere, og hver senere synkronisering frakter færre byte. Prisen er at en fil som ennå ikke ligger på enheten, trenger en tilkobling første gang den åpnes. Valget er ikke endelig: Kolonnen Vedlegg på Synkroniseringssiden viser modusen for hver rad, og et klikk åpner en meny for å bytte.
+
+Haven faller for øvrig tilbake på serveren når en fil mangler lokalt, ikke bare i denne modusen. Enhver database med et synkroniseringsmål kan også åpne en fil som en avbrutt synkronisering aldri fikk hentet ned.
+
+For filene du trenger der det ikke er nett, kan apper feste vedlegg: De blir liggende på enheten selv om databasen laster inn vedlegg ved behov. En app fester enten én enkelt fil eller et helt dokument, og et festet dokument omfatter også alle vedlegg som legges til senere — presentasjonen til møtet uten dekning, eller alt som er arkivert for én kunde. Haven laster ned festede filer i bakgrunnen, appen kan vise fremdriften og markere hvilke filer som bare ligger på serveren, og en mislykket nedlasting prøves igjen ved neste synkronisering. Mange apper tilbyr dette i dokumentmenyen, som en måte å gjøre et dokument tilgjengelig uten nett. Festene tilhører appen og enheten som satte dem; de reiser ikke til de andre enhetene dine.
+
+Festede filer dukker også opp på Synkroniseringssiden. Så snart en app har fester i en database, får radens vedleggsmeny en oppføring Holdt uten nett av apper med antallet. Den åpner listen over disse filene med tilstanden deres og en Frigi-knapp. Å frigi et feste gir plass, men Haven sletter den lokale kopien først når serveren har hele filen, så en fil som ikke er lastet opp ennå, går aldri tapt.
+
+For utviklere er dette en del av vedleggs-API-et i App SDK. `info().attachmentStorage` forteller en app om en database holder vedlegg lokalt, ved behov eller bare på serveren, og `attachments.pin`, `unpin`, `availability`, `listPins` og `onAvailabilityChange` dekker festing og status. En `pin` uten vedleggsnavn fester hele dokumentet, inkludert vedlegg som kommer senere. [README-en til App SDK](https://github.com/klehmann/mindoodb-app-sdk) har eksempler.
 
 ### Node-til-node-synkronisering uten server
 
@@ -436,7 +456,7 @@ Et stort tall øverst summerer alt Haven holder i denne nettleseren akkurat nå:
 
 Under totalen viser en del per tenant én blokk per tenant. Hver tenant-overskrift har den samlede størrelsen sin pluss en Tøm cache-knapp som bare fjerner de delene som kan bygges opp igjen — cacher og indekser som Haven fyller på nytt neste gang du bruker tenanten. Tøm cache sletter ikke dokumenter eller vedlegg.
 
-Inne i hver tenant er hver rad én lokal database. Dokumenter er det krypterte dokumentinnholdet, Vedlegg er krypterte vedleggsbiter, og Totalt er summen av de to. Slett visker ut den databasens lokale innhold i bare denne nettleseren — serverkopien røres ikke. Den beskyttede katalogdatabasen kan ikke slettes, fordi Haven trenger den for å virke. Før du sletter, åpne databasen og kjør Synkroniser; finnes det usynkroniserte lokale endringer, mister du dem ved sletting. Foretrekk Tøm cache når du bare vil frigjøre plass, fordi det kan gjøres om.
+Inne i hver tenant er hver rad én lokal database. Dokumenter er det krypterte dokumentinnholdet, Vedlegg er krypterte vedleggsbiter, og Totalt er summen av de to. For en database som laster inn vedlegg ved behov, teller Vedlegg bare filene som ligger på denne enheten. Slett visker ut den databasens lokale innhold i bare denne nettleseren — serverkopien røres ikke. Den beskyttede katalogdatabasen kan ikke slettes, fordi Haven trenger den for å virke. Før du sletter, åpne databasen og kjør Synkroniser; finnes det usynkroniserte lokale endringer, mister du dem ved sletting. Foretrekk Tøm cache når du bare vil frigjøre plass, fordi det kan gjøres om.
 
 Under databasene i hver tenant ser du også cachene dens: en lokal tenant-cache for generell tilstand per tenant, en servermål-cache for hver MindooDB-server tenanten snakker med, en cache for virtuell visning for hver lagrede visning, og en oppføring Fulltekstindeks (MiniSearch) for hver database som har fulltekstindeksering slått på. Hver cache viser sin egen størrelse, og cacher for virtuelle visninger kan tømmes enkeltvis hvis én bestemt visning har vokst seg for stor.
 
@@ -453,6 +473,28 @@ iOS har en fin bonus: du kan legge Haven til på Hjem-skjermen mer enn én gang.
 På Android, åpne Haven i en moderne nettleser som Chrome eller Edge. Viser Haven en Installer-knapp, godta den, så legger nettleseren Haven til på Hjem-skjermen og i appskuffen i ett steg. Kommer det ingen forespørsel, åpne nettlesermenyen (som regel tre prikker i hjørnet) og se etter Installer app eller Legg til på Hjem-skjerm — ulike nettlesere ordlegger seg forskjellig, men resultatet er det samme. Bekreft nettleserens dialog, og Haven dukker opp på Hjem-skjermen som et helt vanlig Android-appikon.
 
 Etter installasjon, start alltid Haven fra ikonet på Hjem-skjermen når du er på telefon — det er en merkbart hyggeligere opplevelse enn en nettleserfane.
+
+## Haven som native app
+
+Alt i denne håndboken fungerer i nettleseren, på [haven.mindoodb.com](https://haven.mindoodb.com), og i native apper også. Appene for macOS og Windows kan lastes ned fra [MindooDB-nettstedet](https://mindoodb.com/nb/downloads/). For iOS og Android finnes testprogrammer via TestFlight og Firebase App Distribution; vil du være med, skriv til [info@mindoo.de](mailto:info@mindoo.de). De er ikke en ny Haven: Hver av dem pakker den samme Haven inn i en egen app, så skjermbildene, datamodellen, krypteringen og appene du bruker, forblir de samme. Det som endres, er det som omgir Haven — det en app installert på enheten får lov til og en nettleserfane ikke.
+
+Noe av det gjelder for alle fire.
+
+Dataene dine ligger i appens egne databasefiler i stedet for i nettleserens lagring. MindooDBs lagre blir SQLite-filer i appens datamappe, så Haven er ikke lenger bundet til en nettlesers lagringsbudsjett eller til at en nettleser rydder bort nettstedsdata. Det gjør også den native appen og nettleserversjonen til to atskilte steder: En tenant du bruker i begge, synkroniseres via serveren som på en hvilken som helst enhet nummer to, og for en ren lokal Haven tar en kryptert backup med alt fra den ene til den andre.
+
+Haven holder seg selv oppdatert. Appen leveres med en Haven-versjon og henter nyere fra en signert oppdateringskanal; den sjekker signaturen, ber deg laste inn på nytt og går tilbake til forrige versjon hvis en ny ikke starter. Skrivebordsappene oppdaterer appen rundt Haven på samme måte og starter bare på nytt når du sier det.
+
+Passnøkler fungerer fortsatt. Appene bruker systemets passnøkkelstøtte for haven.mindoodb.com — iCloud-nøkkelringen på Apple-enheter, Google Passordlagring på Android, Windows Hello på Windows —, så en passnøkkel du opprettet i nettleseren, låser også opp identiteten din i appen.
+
+Nettsider som nekter å bli innebygd, vises likevel. Mange nettsteder forbyr å bli vist inne i en annen side, og da blir webflisen deres tom i nettleseren. De native appene åpner et slikt nettsted i en native visning lagt nøyaktig over flisen, så den vises live, med tilbake, frem og last inn på nytt.
+
+Apper får mer av nettverket. En MindooDB-app som MindooMail kan snakke direkte med en e-postserver over IMAP og SMTP, noe ingen nettleserfane kan.
+
+På skrivebordet — macOS og Windows — kommer tre ting i tillegg. KI-agenter kobler seg til uten Chrome, uten broutvidelsen og uten en åpen nettverksport; Arbeide med KI-agenter beskriver vinduet Agenttilgang. Utvekslingsmappen velges i systemets egen dialog, og Haven kjenner den virkelige stien. Og apper som holder store filer på enheten, som frakoblede kart, lagrer dem som vanlige filer i appens datamappe.
+
+På telefonen — iOS og Android — blir Haven en del av systemet. Innhold fra andre apper kommer til Haven via delingsarket eller Åpne med, og Haven tilbyr det til en app som kan bruke det: et bilde til et dokument, en PDF til en kundes mappe. På iPhone og iPad kan Snarveier og Siri sende filer og tekst til Haven, Havens apper og databaser kan åpnes fra Snarveier og Spotlight, og Havens mappe i Filer-appen fungerer som importmappe. Apper kan sette påminnelser som kommer som systemvarsler også når Haven er lukket, med Ferdig og Om 1 time rett på varselet. Og når du bytter til en annen app, lagrer Haven ferdig før systemet legger den i dvale.
+
+Noen ting forblir nettleserens. Telefonappene tilbyr ikke agentverktøy. En native app installeres én gang per enhet, så iPhone-trikset med å legge Haven til Hjem-skjermen flere ganger, hver kopi med egen lagring, hører til nettleserversjonen; i appen holder du ulike verdener fra hverandre med separate tenanter og identiteter. Og nettleserversjonen forblir gratis og komplett: Alt de native appene legger til, er en bekvemmelighet på toppen, aldri et krav.
 
 ## Sikkerhetsmodellen i korte trekk
 
@@ -552,6 +594,10 @@ Revisjon — en versjon av et dokument på et gitt tidspunkt. Hver endring lager
 
 Vedlegg — en fil festet til et dokument. Lagret i krypterte biter og strømmet ved behov.
 
+Vedlegg ved behov — en synkroniseringsinnstilling per database, Last inn vedlegg ved behov, som lar andres vedlegg ligge på serveren og henter dem når de åpnes. Sparer plass og gjør synkroniseringer raskere; dine egne nye vedlegg lastes fortsatt opp. Velges når en app installeres, eller senere på Synkroniseringssiden.
+
+Festet vedlegg — en fil en app holder på denne enheten selv om databasen laster inn vedlegg ved behov. Et feste omfatter ett vedlegg eller et helt dokument, senere vedlegg inkludert, og tilhører én app på én enhet.
+
 Automerge — den konfliktfrie flettemotoren MindooDB bruker under panseret. To personer kan redigere det samme dokumentet samtidig, og Automerge fletter endringene deres automatisk.
 
 DAG-utforsker — en grafvisning av hver endring som noen gang er brukt på et dokument, inkludert hvordan samtidige redigeringer ble flettet sammen.
@@ -601,6 +647,8 @@ Frittstående modus — en visningsmodus der Haven starter uten vanlige nettlese
 Legg til på Hjem-skjerm — nettleserhandlingen som lagrer Haven som et startbart ikon på en telefons eller et nettbretts Hjem-skjerm.
 
 Installasjonsdialog — det nettleserinnebygde arket som bekrefter at en progressiv webapp som Haven legges til på enheten.
+
+Native app — Haven pakket inn i en egen app for macOS, Windows, iOS eller Android. Skrivebordsversjoner på nedlastingssiden til MindooDB-nettstedet, telefonversjoner i testprogrammer. Samme Haven inni, pluss SQLite-lagring, signerte egenoppdateringer og systemfunksjoner som delingsarket, påminnelser eller innebygd agenttilgang.
 
 Kryptert backup — én enkelt fil som inneholder alt Haven holder i denne nettleseren, kryptert med et passord du velger. Uten det passordet er filen uleselig.
 
