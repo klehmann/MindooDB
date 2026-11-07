@@ -125,6 +125,9 @@ class StoreFactoryAdapter implements ContentAddressedStoreFactory {
 // SimpleMindooDirectory — config-based fallback
 // ---------------------------------------------------------------------------
 
+/** Document-id prefix of a document-history purge request in `directory` (§13). */
+const DIRECTORY_PURGE_REQUEST_ID_PREFIX = "acl_dochistorypurge_";
+
 export class SimpleMindooDirectory implements Pick<
   MindooTenantDirectory,
   | "getUserPublicKeys"
@@ -1288,11 +1291,17 @@ export class TenantManager {
       dbId === "directory"
         ? undefined
         : this.buildRevokedKeyResolver(directory);
-    // Purged-document denylist (§13). Never applied to the directory store (purge
-    // requests themselves live there and must always sync).
+    // Purged-document denylist (§13). In the directory store the purge requests
+    // themselves (`acl_dochistorypurge_…`) must always sync, so they are never
+    // on it; any other purged directory document is, or a member whose replica
+    // still holds it (it has not processed the request yet) would upload it
+    // again on its next push, and the server would keep it for good.
     const purgedDocResolver: ServerPurgedDocResolver | undefined =
       dbId === "directory"
-        ? undefined
+        ? () => {
+            const ids = this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
+            return new Set([...ids].filter((id) => !id.startsWith(DIRECTORY_PURGE_REQUEST_ID_PREFIX)));
+          }
         : () => this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
 
     // Author-scoped read (§6.12). Never for the directory databases. The

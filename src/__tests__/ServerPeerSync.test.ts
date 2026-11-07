@@ -492,7 +492,6 @@ describe("two servers replicating a shared tenant", () => {
 
     const purgeTenant = await seedTenant([alpha, beta], "purge-tenant");
     await pushDb(purgeTenant, alpha, "directory");
-    await pushDb(purgeTenant, beta, "directory");
 
     const notes = await purgeTenant.tenant.openDB("notes");
     const doc = await notes.createDocument();
@@ -502,8 +501,8 @@ describe("two servers replicating a shared tenant", () => {
     await pushDb(purgeTenant, alpha, "notes");
 
     // Beta purged this document's history, so it may never be re-ingested.
-    // Written before beta ever opens the `notes` store, since the registry is
-    // read from disk once and then cached.
+    // Written before beta ever opens the `notes` or `directory` store, since
+    // the registry is read from disk once and then cached.
     fs.writeFileSync(
       path.join(beta.dataDir, "purge-tenant", "purged-docs.json"),
       JSON.stringify({
@@ -513,6 +512,9 @@ describe("two servers replicating a shared tenant", () => {
       }),
       "utf-8",
     );
+    // Beta's directory store reads the registry too (purged directory
+    // documents are refused), so it is pushed only after the file exists.
+    await pushDb(purgeTenant, beta, "directory");
 
     trust(alpha, beta);
     const replicator = alpha.server.getClusterManager().getReplicator(beta.name)!;
