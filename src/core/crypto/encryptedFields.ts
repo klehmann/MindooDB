@@ -9,6 +9,11 @@ export interface EncryptedFieldDecryptor {
   decryptPayload(encryptedPayload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array>;
 }
 
+/** Minimal encryptor surface for {@link encryptEncryptedField} (a subset of `MindooTenant`). */
+export interface EncryptedFieldEncryptor {
+  encryptPayload(payload: Uint8Array, decryptionKeyId: string): Promise<Uint8Array>;
+}
+
 /** Suffix of the companion field naming the key id of an `_encrypted` field. */
 const KEY_FIELD_SUFFIX = "_key";
 
@@ -32,6 +37,29 @@ export function getEncryptedFieldKeyId(
     return companion;
   }
   return DEFAULT_TENANT_KEY_ID;
+}
+
+/** Encodes bytes as base64. */
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Encrypts UTF-8 `plaintext` for an `_encrypted` field with the symmetric key
+ * `keyId` (default: the tenant `default` key), the counterpart of
+ * {@link decryptEncryptedField}. Store a non-default `keyId` in the
+ * `<field>_key` companion field so readers find it.
+ */
+export async function encryptEncryptedField(
+  encryptor: EncryptedFieldEncryptor,
+  plaintext: string,
+  keyId: string = DEFAULT_TENANT_KEY_ID,
+): Promise<string> {
+  return uint8ArrayToBase64(await encryptor.encryptPayload(new TextEncoder().encode(plaintext), keyId));
 }
 
 /** Decodes a base64 string into bytes. */

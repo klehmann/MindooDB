@@ -227,8 +227,10 @@ export { RSAEncryption } from "./crypto/RSAEncryption";
 export { MindooDocSigner } from "./crypto/MindooDocSigner";
 export {
   decryptEncryptedField,
+  encryptEncryptedField,
   getEncryptedFieldKeyId,
   type EncryptedFieldDecryptor,
+  type EncryptedFieldEncryptor,
 } from "./crypto/encryptedFields";
 export type {
   EntryProvenance,
