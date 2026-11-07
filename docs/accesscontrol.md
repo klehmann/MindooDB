@@ -1040,6 +1040,22 @@ await directory.createAccessRule({
   action: "allow",
   usernames: ["cn=mail-gateway/o=acme"],
   maxRecipients: 1,         // optional, 1..100, default 1
+  docIdPrefixes: ["memo_"], // optional: allowed document ids (absent/empty: any)
+}, adminKey, adminPassword);
+```
+
+Example, a **proposal box**: members may drop proposals into a database they
+cannot read, and only proposals, no other kind of document:
+
+```ts
+await directory.setDatabaseAccessPolicy("proposals", { denyDocRead: true }, adminKey, adminPassword);
+await directory.createAccessRule({
+  ruleId: "everyone_proposes",
+  type: "doc_deposit",
+  dbid: "proposals",
+  action: "allow",
+  users_hashes: ["$everyone"],
+  docIdPrefixes: ["proposal_"],   // createDocument({ idPrefix: "proposal", recipients: [board] })
 }, adminKey, adminPassword);
 ```
 
@@ -1048,6 +1064,12 @@ await directory.createAccessRule({
   `withfields` is rejected (the decision is about the database, Tier 1 only).
 - **`dbid` may be a prefix pattern** (`"mmail_*"`), so one rule covers a family
   of per-person databases. Other rule types keep exact ids and `"*"`.
+- **`docIdPrefixes` fixes what a depositor may create.** With the field set,
+  every deposited entry (create and attachment chunks) must belong to a
+  document id that starts with one of the prefixes, otherwise it is refused as
+  `policy`. The owner's own documents use other prefixes (events, settings,
+  folders), so a depositor can never plant one of those. Absent or empty: any
+  id.
 - **It only matters where read is denied.** A user who passes the read gate
   syncs normally and the deposit rule is not consulted. So it takes effect on
   databases with `denyDocRead` (per database or tenant-wide) whose `doc_read`
@@ -1065,8 +1087,8 @@ Within `putEntries` the server accepts from a depositor only:
 
 | Entry | Condition |
 |---|---|
-| `doc_create` | `decryptionKeyId` is `$sealed:<docId>`; the entry carries a recipient block with 1..`maxRecipients` wraps; it is signed by the depositing device; the store does not hold `docId` yet |
-| `attachment_chunk` | on the attachment store, under `$sealed:<docId>`, signed by the depositing device |
+| `doc_create` | `decryptionKeyId` is `$sealed:<docId>`; the entry carries a recipient block with 1..`maxRecipients` wraps; it is signed by the depositing device; the store does not hold `docId` yet; `docId` matches `docIdPrefixes` when set |
+| `attachment_chunk` | on the attachment store, under `$sealed:<docId>`, signed by the depositing device; `docId` matches `docIdPrefixes` when set |
 
 Everything else is refused as `policy`: `doc_change`, `doc_delete`,
 `doc_undelete`, `doc_snapshot`, and any entry under a named key. A
@@ -1116,7 +1138,7 @@ any configured policy and even while the master switch is on.
 |---|---|
 | a device on the grant `<grantDocId>` (every device of the owner) | open, pull, push, as usual |
 | an identity whose grant lists the prefix in `accessPrefixes` | open, pull, push in **every** person's database with that prefix (a service such as the mail gateway serving each outbox) |
-| an identity whose grant lists the prefix in `depositPrefixes` | deposit only (§6.10 semantics, at most one recipient wrap per document) |
+| an identity whose grant lists the prefix in `depositPrefixes` | deposit only (§6.10 semantics, at most one recipient wrap per document; document ids: see below) |
 | the tenant admin | open, pull, push (exempt, see below) |
 | everyone else | nothing; the server refuses every sync call, the client refuses to open |
 
@@ -1137,7 +1159,15 @@ any configured policy and even while the master switch is on.
   The admin sets them when approving the gateway's join request
   (`approveJoinRequest({ ..., depositPrefixes: ["mmail_"], accessPrefixes: ["mmailout_"] })`)
   or later with `directory.setGrantPersonalDatabaseRights(username, { depositPrefixes, accessPrefixes }, …)`;
-  an empty list takes a right away. `accessPrefixes` is the stronger right
+  an empty list takes a right away.
+- **Deposited documents are messages.** In `mmail_` a depositor may only
+  create documents whose id starts with `memo_` (MindooMail's message id
+  prefix; `BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES`). Everything else in a
+  mailbox (events, status, folders, settings) therefore is always the owner's
+  own, and a client can rely on that without checking authors. The grant can
+  set other prefixes per database prefix:
+  `setGrantPersonalDatabaseRights(username, { depositDocIdPrefixes: { mmail_: ["memo_"] } }, …)`
+  (an empty list allows any id). `accessPrefixes` is the stronger right
   (it can read everything in those databases that is sealed to it, and write
   there), so grant it only to the service that needs it. Admin UIs should show it as its own decision ("this identity
   may deliver into every person's mailbox"), not as part of the key choice.

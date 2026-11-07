@@ -469,7 +469,7 @@ class CompositeMindooDirectory implements Pick<
   async evaluateDbAccessModeForSigningKey(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; reason?: string }> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason?: string }> {
     if (typeof this.inner.evaluateDbAccessModeForSigningKey === "function") {
       return this.inner.evaluateDbAccessModeForSigningKey(input);
     }

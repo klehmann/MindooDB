@@ -52,7 +52,7 @@ import { AuthenticationService } from "../../core/appendonlystores/network/Authe
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import type { TimestampProvider } from "../../core/accesscontrol/timestamp/TimestampProvider";
 import type { AccessDecision } from "../../core/accesscontrol/types";
-import { DEFAULT_DEPOSIT_MAX_RECIPIENTS } from "../../core/accesscontrol/types";
+import { DEFAULT_DEPOSIT_MAX_RECIPIENTS, docIdMatchesPrefixes } from "../../core/accesscontrol/types";
 import { sealedKeyId } from "../../core/userkeys/sealedTypes";
 import { StoreKind } from "../../core/types";
 
@@ -99,7 +99,7 @@ export type ServerDbAccessEvaluator = (
 export type ServerDbAccessModeEvaluator = (
   principal: { signingKey?: string },
   dbid: string
-) => Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; reason?: string }>;
+) => Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason?: string }>;
 
 /**
  * Resolves the per-user revoked decryption-key-id blacklist for the
@@ -166,7 +166,7 @@ export type ServerTrustedWitnessResolver = (receivedByPublicKey: string) => bool
 type ResolvedTokenPayload = NetworkAuthTokenPayload & {
   peer?: ServerPeerPrincipal;
   /** Set for a principal that may only deposit into this database (§6.10). */
-  deposit?: { maxRecipients: number };
+  deposit?: { maxRecipients: number; docIdPrefixes?: string[] };
 };
 
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
@@ -1143,7 +1143,12 @@ export class ServerNetworkContentAddressedStore {
       // authorizes them. Anything that is not a sealed create (or a chunk of
       // one) is refused.
       if (tokenPayload.deposit) {
-        const denied = await this.evaluateDepositEntry(entry, tokenPayload, tokenPayload.deposit.maxRecipients);
+        const denied = await this.evaluateDepositEntry(
+          entry,
+          tokenPayload,
+          tokenPayload.deposit.maxRecipients,
+          tokenPayload.deposit.docIdPrefixes,
+        );
         if (denied) {
           this.rejectEntry(rejected, entry.id, denied.reason, denied.rejectionClass);
           continue;
@@ -1266,8 +1271,13 @@ export class ServerNetworkContentAddressedStore {
     entry: StoreEntry,
     tokenPayload: ResolvedTokenPayload,
     maxRecipients: number,
+    docIdPrefixes?: string[],
   ): Promise<{ reason: string; rejectionClass: PutRejectionClass } | null> {
     const policy = (reason: string) => ({ reason: `Entry ${entry.id}: ${reason}`, rejectionClass: "policy" as const });
+    // Allowed document ids (§6.10 `docIdPrefixes`); applies to chunks too, which carry the docId.
+    if (entry.docId && !docIdMatchesPrefixes(entry.docId, docIdPrefixes)) {
+      return policy(`deposited document ids must start with ${docIdPrefixes!.map((p) => `"${p}"`).join(" or ")}`);
+    }
     if (!entry.docId || entry.decryptionKeyId !== sealedKeyId(entry.docId)) {
       return policy("deposit-only principals may only push documents sealed with their own key ($sealed:<docId>)");
     }
@@ -1668,7 +1678,13 @@ export class ServerNetworkContentAddressedStore {
             `Database "${dbid}" allows this user to deposit sealed documents only, not to read`,
           );
         }
-        return { ...payload, deposit: { maxRecipients: access.maxRecipients ?? DEFAULT_DEPOSIT_MAX_RECIPIENTS } };
+        return {
+          ...payload,
+          deposit: {
+            maxRecipients: access.maxRecipients ?? DEFAULT_DEPOSIT_MAX_RECIPIENTS,
+            ...(access.docIdPrefixes?.length ? { docIdPrefixes: access.docIdPrefixes } : {}),
+          },
+        };
       }
     } else if (this.dbAccessEvaluator) {
       const dbid = this.witnessDbid ?? this.localStore.getId();

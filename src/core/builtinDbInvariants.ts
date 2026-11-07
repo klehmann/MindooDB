@@ -97,6 +97,17 @@ export interface BuiltinWriteDecision {
  */
 export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_", "mmailout_"] as const;
 
+/**
+ * Default document-id prefixes a depositor may use in a built-in personal
+ * database (docs/accesscontrol.md §6.11): deposits into a mailbox are MindooMail
+ * messages (`memo_…`), so documents of other kinds (events, status, folders)
+ * there are always the owner's own. A grant's `depositDocIdPrefixes` overrides
+ * this per database prefix.
+ */
+export const BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES: Readonly<Record<string, readonly string[]>> = {
+  mmail_: ["memo_"],
+};
+
 /** A valid personal-database prefix: lowercase letters and digits, ending in `_`. */
 export const PERSONAL_DATABASE_PREFIX_REGEX = /^[a-z][a-z0-9]*_$/;
 
