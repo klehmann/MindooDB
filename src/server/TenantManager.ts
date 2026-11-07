@@ -25,6 +25,8 @@ import type {
   ServerDbAccessModeEvaluator,
   ServerRevokedKeyResolver,
   ServerPurgedDocResolver,
+  ServerReadScopeResolver,
+  ServerDocCreatorResolver,
   ServerPurgeRequestValidator,
   BuiltinWriteContext,
   ServerPeerTokenResolver,
@@ -269,6 +271,7 @@ class CompositeMindooDirectory implements Pick<
           | "evaluateDbAccessModeForSigningKey"
           | "evaluateAccessForSigningKey"
           | "isSamePerson"
+          | "evaluateReadScopeForSigningKey"
         >
       >,
     private trustedServers: TrustedServer[],
@@ -509,6 +512,16 @@ class CompositeMindooDirectory implements Pick<
     | undefined {
     const inner = this.inner;
     return typeof inner.isSamePerson === "function" ? (input) => inner.isSamePerson!(input) : undefined;
+  }
+
+  /** Forwarded for the author-scoped read (§6.12). */
+  get evaluateReadScopeForSigningKey():
+    | ((input: { dbid: string; signingKey: string }) => Promise<"all" | "own">)
+    | undefined {
+    const inner = this.inner;
+    return typeof inner.evaluateReadScopeForSigningKey === "function"
+      ? (input) => inner.evaluateReadScopeForSigningKey!(input)
+      : undefined;
   }
 
   /**
@@ -1276,6 +1289,20 @@ export class TenantManager {
         ? undefined
         : () => this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
 
+    // Author-scoped read (§6.12). Never for the directory databases. The
+    // attachments store finds a document's creator in the docs store.
+    const readScopeResolver =
+      dbId === "directory" || dbId === USER_DIRECTORY_DB_ID
+        ? undefined
+        : this.buildReadScopeResolver(directory, dbId);
+    const docCreatorResolver =
+      storeKind === StoreKind.attachments
+        ? this.buildDocCreatorResolver(
+            // Lazy as well: a refused request must not create the docs store.
+            lazyContentAddressedStore(dbId, StoreKind.docs, () => tenant.storeFactory.getStore(dbId, StoreKind.docs)),
+          )
+        : undefined;
+
     // Purge requests in personal databases (§6.11): checked on push (only in
     // the docs store, where the request documents live).
     const purgeRequestValidator: ServerPurgeRequestValidator | undefined =
@@ -1303,6 +1330,8 @@ export class TenantManager {
         dbAccessModeEvaluator,
         revokedKeyResolver,
         purgedDocResolver,
+        readScopeResolver,
+        docCreatorResolver,
         purgeRequestValidator,
         builtinWriteContext,
         ...this.peerAccessControl,
@@ -1374,6 +1403,58 @@ export class TenantManager {
             }
           }
         : undefined,
+    };
+  }
+
+  /**
+   * Read-scope resolver (§6.12): `null` (reads everything) unless the
+   * database's `docReadScope` is `"own"` for this principal; then the principal
+   * sees documents whose creator is the same person (grant level).
+   */
+  private buildReadScopeResolver(
+    directory: MindooTenantDirectory,
+    dbId: string,
+  ): ServerReadScopeResolver | undefined {
+    const dir = directory as unknown as {
+      evaluateReadScopeForSigningKey?: (input: { dbid: string; signingKey: string }) => Promise<"all" | "own">;
+      isSamePerson?: (input: {
+        creatorSigningKey: string;
+        signerSigningKey: string;
+        creatorTrustedTime: number;
+        signerTrustedTime: number;
+      }) => Promise<boolean>;
+    };
+    const evaluate = dir.evaluateReadScopeForSigningKey;
+    const isSamePerson = dir.isSamePerson;
+    if (typeof evaluate !== "function" || typeof isSamePerson !== "function") return undefined;
+    return async (principal) => {
+      const signingKey = principal.signingKey;
+      // No principal key: nothing to attribute documents to, so nothing is shown.
+      if (!signingKey) {
+        return { scopeId: "none", ownsDocument: async () => false };
+      }
+      if ((await evaluate({ dbid: dbId, signingKey })) === "all") return null;
+      return {
+        scopeId: "own",
+        ownsDocument: (creatorSigningKey, creatorTrustedTime) =>
+          isSamePerson({
+            creatorSigningKey,
+            signerSigningKey: signingKey,
+            creatorTrustedTime,
+            signerTrustedTime: Number.MAX_SAFE_INTEGER,
+          }),
+      };
+    };
+  }
+
+  /** Finds a document's `doc_create` creator in the given (docs) store. */
+  private buildDocCreatorResolver(docsStore: ContentAddressedStore): ServerDocCreatorResolver {
+    return async (docId) => {
+      const metas = await docsStore.findNewEntriesForDoc([], docId);
+      const create = metas.find((m) => m.entryType === "doc_create");
+      return create
+        ? { signingKey: create.createdByPublicKey, trustedTime: create.receivedAt ?? create.createdAt }
+        : null;
     };
   }
 
