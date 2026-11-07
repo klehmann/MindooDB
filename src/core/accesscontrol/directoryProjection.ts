@@ -105,6 +105,9 @@ export function parseRuleDoc(data: Record<string, unknown>, ruleType: RuleType):
     ...(ruleType === "doc_deposit" && typeof data.maxRecipients === "number"
       ? { maxRecipients: data.maxRecipients }
       : {}),
+    ...(ruleType === "doc_deposit" && Array.isArray(data.docIdPrefixes)
+      ? { docIdPrefixes: data.docIdPrefixes.filter((p): p is string => typeof p === "string" && p.length > 0) }
+      : {}),
   };
 }
 

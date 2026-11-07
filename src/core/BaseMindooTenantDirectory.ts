@@ -31,8 +31,12 @@ import {
   applyKeyPairFields,
   mergeKeyPairs,
 } from "./accesscontrol/grantKeys";
-import { aclTrustedWitnessDocId, DEFAULT_DEPOSIT_MAX_RECIPIENTS } from "./accesscontrol/types";
-import { PERSONAL_DATABASE_PREFIX_REGEX, personalDatabaseOwner } from "./builtinDbInvariants";
+import { aclTrustedWitnessDocId, DEFAULT_DEPOSIT_MAX_RECIPIENTS, validateDocIdPrefixes } from "./accesscontrol/types";
+import {
+  BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES,
+  PERSONAL_DATABASE_PREFIX_REGEX,
+  personalDatabaseOwner,
+} from "./builtinDbInvariants";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import {
   DirectoryStateNode,
@@ -1744,7 +1748,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async evaluateDbAccessModeForSigningKey(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; reason?: string }> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason?: string }> {
     // Built-in personal-database invariant (§6.11): decides first, and a
     // configured policy can only take away what it grants.
     const personal = await this.evaluatePersonalDatabaseAccess(input);
@@ -1782,7 +1786,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       trustedTime: Number.MAX_SAFE_INTEGER,
     });
     if (!decision.allowed) return { mode: "none" };
-    return { mode: "deposit", maxRecipients: await this.depositMaxRecipients(decision.matchedRuleId) };
+    const rule = await this.depositRule(decision.matchedRuleId);
+    return {
+      mode: "deposit",
+      maxRecipients: rule?.maxRecipients ?? DEFAULT_DEPOSIT_MAX_RECIPIENTS,
+      ...(rule?.docIdPrefixes?.length ? { docIdPrefixes: rule.docIdPrefixes } : {}),
+    };
   }
 
   /**
@@ -1795,7 +1804,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async evaluatePersonalDatabaseAccess(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; reason: string } | null> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason: string } | null> {
     const head = await this.getDirectoryStateHead();
     const owner = personalDatabaseOwner(input.dbid, head.defaultPolicy?.personalDatabasePrefixes ?? []);
     if (!owner) return null;
@@ -1812,8 +1821,24 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     if (signerGrants.some((grant) => listed(grant, "accessPrefixes"))) {
       return { mode: "read", reason: `service access to ${owner.prefix}* granted` };
     }
-    if (signerGrants.some((grant) => listed(grant, "depositPrefixes"))) {
-      return { mode: "deposit", maxRecipients: 1, reason: `deposit into ${owner.prefix}* granted` };
+    const depositors = signerGrants.filter((grant) => listed(grant, "depositPrefixes"));
+    if (depositors.length > 0) {
+      // Document ids a deposit may use: the grant's `depositDocIdPrefixes`
+      // (per database prefix, e.g. {"mmail_": ["memo_"]}), else the built-in
+      // default for the prefix (mmail_: "memo_", MindooMail messages).
+      const configured = depositors
+        .map((grant) => grant.depositDocIdPrefixes as Record<string, unknown> | undefined)
+        .map((byPrefix) => (byPrefix && Array.isArray(byPrefix[owner.prefix]) ? (byPrefix[owner.prefix] as unknown[]) : null))
+        .find((list) => list !== null);
+      const docIdPrefixes = configured
+        ? configured.map(String).filter((p) => p.length > 0)
+        : [...(BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES[owner.prefix] ?? [])];
+      return {
+        mode: "deposit",
+        maxRecipients: 1,
+        ...(docIdPrefixes.length ? { docIdPrefixes } : {}),
+        reason: `deposit into ${owner.prefix}* granted`,
+      };
     }
     return { mode: "none", reason: grant ? "personal database of another person" : "personal database without a matching grant" };
   }
@@ -1866,11 +1891,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * `depositPrefixes` (push sealed creates only) and `accessPrefixes` (read
    * and sync, for a service such as the mail gateway serving every outbox).
    * Written on the identity's grant, admin-signed; a field left out stays as
-   * it is, an empty list removes the right.
+   * it is, an empty list removes the right. `depositDocIdPrefixes` sets the
+   * document ids a deposit may use per database prefix (e.g.
+   * `{ mmail_: ["memo_"] }`, the built-in default); an empty list allows any id.
    */
   async setGrantPersonalDatabaseRights(
     username: string,
-    rights: { depositPrefixes?: string[]; accessPrefixes?: string[] },
+    rights: {
+      depositPrefixes?: string[];
+      accessPrefixes?: string[];
+      depositDocIdPrefixes?: Record<string, string[]>;
+    },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
@@ -1878,6 +1909,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       if (!PERSONAL_DATABASE_PREFIX_REGEX.test(prefix)) {
         throw new Error(`depositPrefixes: "${prefix}" is not a personal-database prefix like "mmail_"`);
       }
+    }
+    for (const [prefix, ids] of Object.entries(rights.depositDocIdPrefixes ?? {})) {
+      if (!PERSONAL_DATABASE_PREFIX_REGEX.test(prefix)) {
+        throw new Error(`depositDocIdPrefixes: "${prefix}" is not a personal-database prefix like "mmail_"`);
+      }
+      validateDocIdPrefixes(ids, `depositDocIdPrefixes.${prefix}`);
     }
     const grants = (await this.findGrantAccessDocuments(username)).filter((doc) => !doc.isDeleted());
     if (grants.length === 0) throw new Error(`No grant for ${username}`);
@@ -1893,6 +1930,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
           const data = d.getData();
           if (rights.depositPrefixes) data.depositPrefixes = [...new Set(rights.depositPrefixes)];
           if (rights.accessPrefixes) data.accessPrefixes = [...new Set(rights.accessPrefixes)];
+          if (rights.depositDocIdPrefixes) {
+            const merged = { ...((data.depositDocIdPrefixes as Record<string, string[]> | undefined) ?? {}) };
+            for (const [prefix, ids] of Object.entries(rights.depositDocIdPrefixes)) merged[prefix] = [...new Set(ids)];
+            data.depositDocIdPrefixes = merged;
+          }
         },
         { signingKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
       );
@@ -1912,11 +1954,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return access.mode === "deposit";
   }
 
-  private async depositMaxRecipients(ruleId: string | undefined): Promise<number> {
-    if (!ruleId) return DEFAULT_DEPOSIT_MAX_RECIPIENTS;
+  private async depositRule(ruleId: string | undefined): Promise<AclRuleDoc | null> {
+    if (!ruleId) return null;
     const head = await this.getDirectoryStateHead();
-    const rule = (head.rulesByType.get("doc_deposit") ?? []).find((r) => r.ruleId === ruleId);
-    return rule?.maxRecipients ?? DEFAULT_DEPOSIT_MAX_RECIPIENTS;
+    return (head.rulesByType.get("doc_deposit") ?? []).find((r) => r.ruleId === ruleId) ?? null;
   }
 
   /**
@@ -2071,6 +2112,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       description?: string;
       /** `doc_deposit` only (§6.10): largest number of recipient wraps per deposited document. */
       maxRecipients?: number;
+      /** `doc_deposit` only (§6.10): allowed prefixes of deposited document ids. */
+      docIdPrefixes?: string[];
     },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
@@ -2094,6 +2137,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }),
       action: rule.action ?? "allow",
       ...(rule.maxRecipients !== undefined ? { maxRecipients: rule.maxRecipients } : {}),
+      ...(rule.docIdPrefixes !== undefined ? { docIdPrefixes: [...new Set(rule.docIdPrefixes)] } : {}),
     };
     // Fail fast on malformed clauses / operators (§6.3 closed set).
     validateAclRule(ruleDoc);
@@ -2125,6 +2169,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         if (ruleDoc.withfields !== undefined) data.withfields = ruleDoc.withfields;
         if (ruleDoc.maxRecipients !== undefined) data.maxRecipients = ruleDoc.maxRecipients;
         else if (data.maxRecipients !== undefined) delete data.maxRecipients;
+        if (ruleDoc.docIdPrefixes?.length) data.docIdPrefixes = ruleDoc.docIdPrefixes;
+        else if (data.docIdPrefixes !== undefined) delete data.docIdPrefixes;
       },
       {
         signingKeyPair: adminSigningKeyPair,

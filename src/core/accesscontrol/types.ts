@@ -388,6 +388,11 @@ export interface AclRuleDoc {
    * {@link DEFAULT_DEPOSIT_MAX_RECIPIENTS}. Ignored on every other rule type.
    */
   maxRecipients?: number;
+  /**
+   * `doc_deposit` only: the document ids a depositor may create must start with
+   * one of these prefixes (e.g. `["proposal_"]`). Absent or empty: any id.
+   */
+  docIdPrefixes?: string[];
 }
 
 /**
@@ -539,6 +544,25 @@ export function validateWithFieldClause(clause: WithFieldClause, ruleType: RuleT
  * directory sets). Enforces the closed type/operator/placeholder sets and the
  * `withfields` constraints (§6.3). Throws on the first violation.
  */
+/**
+ * Document-id prefixes for deposits (§6.10): an array of non-empty strings
+ * made of the characters document ids use. Throws on violation.
+ */
+export function validateDocIdPrefixes(prefixes: unknown, what: string): void {
+  if (prefixes === undefined) return;
+  if (!Array.isArray(prefixes)) throw new Error(`${what} must be an array of strings`);
+  for (const prefix of prefixes) {
+    if (typeof prefix !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(prefix)) {
+      throw new Error(`${what}: "${String(prefix)}" is not a valid document-id prefix`);
+    }
+  }
+}
+
+/** Whether `docId` passes a deposit's `docIdPrefixes` (absent or empty: any id). */
+export function docIdMatchesPrefixes(docId: string, prefixes: readonly string[] | undefined): boolean {
+  return !prefixes || prefixes.length === 0 || prefixes.some((prefix) => docId.startsWith(prefix));
+}
+
 export function validateAclRule(rule: {
   type: RuleType;
   dbid: string;
@@ -546,6 +570,7 @@ export function validateAclRule(rule: {
   users_hashes: string[];
   withfields?: WithFieldClause[];
   maxRecipients?: number;
+  docIdPrefixes?: string[];
 }): void {
   if (!(RULE_TYPES as readonly string[]).includes(rule.type)) {
     throw new Error(`rule has unknown type "${rule.type}"`);
@@ -580,12 +605,16 @@ export function validateAclRule(rule: {
         throw new Error(`doc_deposit maxRecipients must be an integer from 1 to ${MAX_DEPOSIT_RECIPIENTS}`);
       }
     }
+    validateDocIdPrefixes(rule.docIdPrefixes, "doc_deposit docIdPrefixes");
   } else {
     if (rule.dbid !== "*" && rule.dbid.endsWith("*")) {
       throw new Error('only doc_deposit rules may use a dbid prefix pattern ending in "*"');
     }
     if (rule.maxRecipients !== undefined) {
       throw new Error("maxRecipients is only valid on doc_deposit rules");
+    }
+    if (rule.docIdPrefixes !== undefined) {
+      throw new Error("docIdPrefixes is only valid on doc_deposit rules");
     }
   }
   // `llm_use` is a tenant-wide decision about the assistant (§6.9), not about

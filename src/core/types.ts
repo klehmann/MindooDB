@@ -3330,6 +3330,8 @@ export interface MindooTenantDirectory {
       description?: string;
       /** `doc_deposit` only (docs/accesscontrol.md §6.10). */
       maxRecipients?: number;
+      /** `doc_deposit` only (§6.10): allowed prefixes of deposited document ids. */
+      docIdPrefixes?: string[];
     },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
@@ -3978,7 +3980,7 @@ export interface MindooTenantDirectory {
    */
   setGrantPersonalDatabaseRights?(
     username: string,
-    rights: { depositPrefixes?: string[]; accessPrefixes?: string[] },
+    rights: { depositPrefixes?: string[]; accessPrefixes?: string[]; depositDocIdPrefixes?: Record<string, string[]> },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
   ): Promise<void>;

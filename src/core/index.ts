@@ -11,6 +11,7 @@ export {
   isPersonalUserdirectoryDocId,
   PERSONAL_DOC_ID_PREFIXES,
   BUILTIN_PERSONAL_DATABASE_PREFIXES,
+  BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES,
   PERSONAL_DATABASE_PREFIX_REGEX,
   personalDatabaseOwner,
   shouldSkipLoadedEntry,

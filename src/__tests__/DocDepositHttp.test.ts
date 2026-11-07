@@ -9,6 +9,7 @@
  * documents sealed to someone else, with attachments in the create entry,
  * but it may not pull, list or change anything there.
  */
+import { docIdMatchesPrefixes, validateAclRule } from "../core/accesscontrol/types";
 import fs from "fs";
 import { Server } from "http";
 
@@ -235,8 +236,9 @@ describe("doc_deposit on a real server (HTTP)", () => {
     return base;
   }
 
-  async function depositFor(db: MindooDB, recipient: string, extra: Record<string, unknown> = {}) {
+  async function depositFor(db: MindooDB, recipient: string, extra: Record<string, unknown> = {}, idPrefix = "memo") {
     return db.createDocument({
+      idPrefix,
       recipients: [recipient],
       recipientOptions: { includeSelf: false, strict: true },
       initialValues: { type: "message", subject: "Hello Jane", ...extra },
@@ -374,6 +376,45 @@ describe("doc_deposit on a real server (HTTP)", () => {
     expect(hidden).toContain(wrongReader.getId());
   });
 
+  test("a deposit rule with docIdPrefixes takes only those ids (a proposal box)", async () => {
+    const t = await setup();
+    await t.directory.setDatabaseAccessPolicy!("proposals", { denyDocRead: true }, t.adminKey, PASSWORD);
+    await t.directory.createAccessRule!(
+      {
+        ruleId: "gateway_proposes",
+        type: "doc_deposit",
+        dbid: "proposals",
+        action: "allow",
+        usernames: [t.gatewayName],
+        maxRecipients: 1,
+        docIdPrefixes: ["proposal_"],
+      },
+      t.adminKey,
+      PASSWORD,
+    );
+    await t.pushDirectory();
+    await pull(t.gateway.tenant, "directory");
+    const box = await openDb(t.gateway.tenant, "proposals");
+    const ok = await depositFor(box, t.janeUser.username, { type: "proposal" }, "proposal");
+    await depositFor(box, t.janeUser.username, { type: "other" }, "other");
+    const rejected = (await push(t.gateway.tenant, "proposals")).docs.rejectedEntries ?? [];
+    expect(rejected.length).toBeGreaterThan(0);
+    for (const r of rejected) expect(r.reason).toMatch(/must start with "proposal_"/);
+    expect(rejected.some((r) => r.id.startsWith(ok.getId()))).toBe(false);
+  });
+
+  test("docIdPrefixes is validated and only allowed on doc_deposit rules", () => {
+    expect(() =>
+      validateAclRule({ type: "doc_read", dbid: "x", action: "allow", users_hashes: ["h"], docIdPrefixes: ["a_"] }),
+    ).toThrow(/only valid on doc_deposit/);
+    expect(() =>
+      validateAclRule({ type: "doc_deposit", dbid: "x", action: "allow", users_hashes: ["h"], docIdPrefixes: ["bad prefix"] }),
+    ).toThrow(/not a valid document-id prefix/);
+    expect(docIdMatchesPrefixes("proposal_1", ["proposal_"])).toBe(true);
+    expect(docIdMatchesPrefixes("other_1", ["proposal_"])).toBe(false);
+    expect(docIdMatchesPrefixes("other_1", [])).toBe(true);
+  });
+
   describe("built-in personal databases (mmail_<grantDocId>, §6.11), no configured policy", () => {
     test("the owner reads, a flagged gateway deposits, everyone else is out", async () => {
       const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"] });
@@ -397,6 +438,26 @@ describe("doc_deposit on a real server (HTTP)", () => {
       const own = await openDb(t.karsten, t.karstenMail);
       await own.createDocument({ recipients: [], initialValues: { subject: "mine" } });
       expect((await push(t.karsten, t.karstenMail)).docs.rejectedEntries ?? []).toHaveLength(0);
+    });
+
+    test("deposits into a mailbox must be messages (memo_ ids); the grant can change that", async () => {
+      const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"] });
+      const gatewayDb = await openDb(t.gateway.tenant, t.janeMail);
+      // An "event" or a folder of Jane's cannot be planted by a depositor.
+      await depositFor(gatewayDb, t.janeUser.username, { type: "event" }, "event");
+      const refused = (await push(t.gateway.tenant, t.janeMail)).docs.rejectedEntries ?? [];
+      expect(refused.length).toBeGreaterThan(0);
+      expect(refused.map((r) => r.reason).join(" ")).toMatch(/must start with "memo_"/);
+
+      // The admin allows another prefix on the gateway's grant.
+      await t.directory.setGrantPersonalDatabaseRights!(t.gatewayName, { depositDocIdPrefixes: { mmail_: ["note_"] } }, t.adminKey, PASSWORD);
+      await t.pushDirectory();
+      const fresh = await openDb(t.gateway.tenant, t.janeMail);
+      const note = await depositFor(fresh, t.janeUser.username, {}, "note");
+      const pushed = (await push(t.gateway.tenant, t.janeMail)).docs.rejectedEntries ?? [];
+      // Only the earlier event is still refused (now against "note_").
+      expect(pushed.some((r) => r.id.startsWith(note.getId()))).toBe(false);
+      expect(pushed.every((r) => r.id.startsWith("event_"))).toBe(true);
     });
 
     test("without depositPrefixes on its grant the gateway may not deposit", async () => {
