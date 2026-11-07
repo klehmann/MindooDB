@@ -31,7 +31,12 @@ import {
   applyKeyPairFields,
   mergeKeyPairs,
 } from "./accesscontrol/grantKeys";
-import { aclTrustedWitnessDocId } from "./accesscontrol/types";
+import { aclTrustedWitnessDocId, DEFAULT_DEPOSIT_MAX_RECIPIENTS, validateDocIdPrefixes } from "./accesscontrol/types";
+import {
+  BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES,
+  PERSONAL_DATABASE_PREFIX_REGEX,
+  personalDatabaseOwner,
+} from "./builtinDbInvariants";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import {
   DirectoryStateNode,
@@ -1699,6 +1704,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     dbid: string;
     signingKey: string;
   }): Promise<boolean> {
+    return (await this.evaluateDbAccessModeForSigningKey(input)).mode === "read";
+  }
+
+  /** The configured gates (§6.7 id allowlist, §6.8 read gate), without the personal-database invariant. */
+  private async evaluateConfiguredReadGate(input: {
+    dbid: string;
+    signingKey: string;
+  }): Promise<boolean> {
     // Gate 1 — tenant-wide database-id allowlist (`databaseCreationPolicy`).
     // Orthogonal to read access: a database must clear BOTH gates.
     if (!(await this.isDatabaseAllowed(input.dbid, { signingKey: input.signingKey }))) {
@@ -1726,6 +1739,228 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * Like {@link evaluateDbAccessForSigningKey}, but distinguishes the deposit
+   * right (docs/accesscontrol.md §6.10): `"read"` passes the read gate (all
+   * sync), `"deposit"` fails it but holds a `doc_deposit` allow (push of
+   * sealed creates only), `"none"` neither. `maxRecipients` is the bound from
+   * the matching deposit rule.
+   */
+  async evaluateDbAccessModeForSigningKey(input: {
+    dbid: string;
+    signingKey: string;
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason?: string }> {
+    // Built-in personal-database invariant (§6.11): decides first, and a
+    // configured policy can only take away what it grants.
+    const personal = await this.evaluatePersonalDatabaseAccess(input);
+    if (personal) {
+      if (personal.mode === "none") return personal;
+      if (signingKeysEqual(input.signingKey, (this.tenant as BaseMindooTenant).getAdministrationPublicKey())) {
+        return personal;
+      }
+      if (personal.mode === "read") {
+        return (await this.evaluateConfiguredReadGate(input)) ? personal : { mode: "none", reason: "denied by the configured policy" };
+      }
+      if (!(await this.isDatabaseAllowed(input.dbid, { signingKey: input.signingKey }))) return { mode: "none" };
+      const configured = await this.evaluateAccessForSigningKey({
+        op: "doc_deposit",
+        dbid: input.dbid,
+        signingKey: input.signingKey,
+        trustedTime: Number.MAX_SAFE_INTEGER,
+      });
+      // Only a matching deny rule counts here; the built-in grant replaces the allow rule.
+      return !configured.allowed && configured.matchedRuleId
+        ? { mode: "none", reason: `deposit denied by rule ${configured.matchedRuleId}` }
+        : personal;
+    }
+    if (await this.evaluateConfiguredReadGate(input)) {
+      return { mode: "read" };
+    }
+    // The id allowlist (gate 1) applies to depositors as well.
+    if (!(await this.isDatabaseAllowed(input.dbid, { signingKey: input.signingKey }))) {
+      return { mode: "none" };
+    }
+    const decision = await this.evaluateAccessForSigningKey({
+      op: "doc_deposit",
+      dbid: input.dbid,
+      signingKey: input.signingKey,
+      trustedTime: Number.MAX_SAFE_INTEGER,
+    });
+    if (!decision.allowed) return { mode: "none" };
+    const rule = await this.depositRule(decision.matchedRuleId);
+    return {
+      mode: "deposit",
+      maxRecipients: rule?.maxRecipients ?? DEFAULT_DEPOSIT_MAX_RECIPIENTS,
+      ...(rule?.docIdPrefixes?.length ? { docIdPrefixes: rule.docIdPrefixes } : {}),
+    };
+  }
+
+  /**
+   * The built-in rule for personal databases (§6.11), or `null` when `dbid` is
+   * not one. `<prefix><grantDocId>` may be read and synced by the devices on
+   * that grant and by the tenant admin; it may be deposited into by
+   * identities whose grant lists the prefix in `depositPrefixes`; nobody
+   * else gets anything. An unknown grant id leaves everyone but the admin out.
+   */
+  async evaluatePersonalDatabaseAccess(input: {
+    dbid: string;
+    signingKey: string;
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason: string } | null> {
+    const head = await this.getDirectoryStateHead();
+    const owner = personalDatabaseOwner(input.dbid, head.defaultPolicy?.personalDatabasePrefixes ?? []);
+    if (!owner) return null;
+    if (signingKeysEqual(input.signingKey, (this.tenant as BaseMindooTenant).getAdministrationPublicKey())) {
+      return { mode: "read", reason: "tenant admin" };
+    }
+    const grant = await this.loadGrantDocument(owner.grantDocId);
+    if (grant && extractActiveKeyPairs(grant).some((pair) => signingKeysEqual(pair.signingPublicKey, input.signingKey))) {
+      return { mode: "read", reason: "a device of the owner" };
+    }
+    const signerGrants = await this.grantsForSigningKey(input.signingKey);
+    const listed = (grant: Record<string, unknown>, field: string) =>
+      Array.isArray(grant[field]) && (grant[field] as unknown[]).includes(owner.prefix);
+    if (signerGrants.some((grant) => listed(grant, "accessPrefixes"))) {
+      return { mode: "read", reason: `service access to ${owner.prefix}* granted` };
+    }
+    const depositors = signerGrants.filter((grant) => listed(grant, "depositPrefixes"));
+    if (depositors.length > 0) {
+      // Document ids a deposit may use: the grant's `depositDocIdPrefixes`
+      // (per database prefix, e.g. {"mmail_": ["memo_"]}), else the built-in
+      // default for the prefix (mmail_: "memo_", MindooMail messages).
+      const configured = depositors
+        .map((grant) => grant.depositDocIdPrefixes as Record<string, unknown> | undefined)
+        .map((byPrefix) => (byPrefix && Array.isArray(byPrefix[owner.prefix]) ? (byPrefix[owner.prefix] as unknown[]) : null))
+        .find((list) => list !== null);
+      const docIdPrefixes = configured
+        ? configured.map(String).filter((p) => p.length > 0)
+        : [...(BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES[owner.prefix] ?? [])];
+      return {
+        mode: "deposit",
+        maxRecipients: 1,
+        ...(docIdPrefixes.length ? { docIdPrefixes } : {}),
+        reason: `deposit into ${owner.prefix}* granted`,
+      };
+    }
+    return { mode: "none", reason: grant ? "personal database of another person" : "personal database without a matching grant" };
+  }
+
+  /** A `grantaccess` document by id, or null (missing, deleted, or another kind of document). */
+  private async loadGrantDocument(grantDocId: string): Promise<Record<string, unknown> | null> {
+    const directoryDB = await this.getDirectoryDB();
+    try {
+      const doc = await directoryDB.getDocument(grantDocId);
+      if (doc.isDeleted()) return null;
+      const data = doc.getData() as Record<string, unknown>;
+      return data.form === "useroperation" && data.type === "grantaccess" ? data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The active grants that list `signingKey` as a device. */
+  private async grantsForSigningKey(signingKey: string): Promise<Array<Record<string, unknown>>> {
+    const lookup = await this.getUserBySigningPublicKey(signingKey);
+    if (!lookup) return [];
+    const grants = await this.findGrantAccessDocuments(lookup.username);
+    return grants
+      .filter((doc) => !doc.isDeleted())
+      .map((doc) => doc.getData() as Record<string, unknown>)
+      .filter((data) => extractActiveKeyPairs(data).some((pair) => signingKeysEqual(pair.signingPublicKey, signingKey)));
+  }
+
+  /**
+   * Let an identity deposit into personal databases with these prefixes
+   * (§6.11), e.g. `["mmail_"]` for a mail gateway. Written on the person's
+   * grant, admin-signed; an empty list takes the right away again.
+   */
+  async setGrantDepositPrefixes(
+    username: string,
+    prefixes: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.setGrantPersonalDatabaseRights(
+      username,
+      { depositPrefixes: prefixes },
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /**
+   * The rights an identity has in other people's personal databases (§6.11):
+   * `depositPrefixes` (push sealed creates only) and `accessPrefixes` (read
+   * and sync, for a service such as the mail gateway serving every outbox).
+   * Written on the identity's grant, admin-signed; a field left out stays as
+   * it is, an empty list removes the right. `depositDocIdPrefixes` sets the
+   * document ids a deposit may use per database prefix (e.g.
+   * `{ mmail_: ["memo_"] }`, the built-in default); an empty list allows any id.
+   */
+  async setGrantPersonalDatabaseRights(
+    username: string,
+    rights: {
+      depositPrefixes?: string[];
+      accessPrefixes?: string[];
+      depositDocIdPrefixes?: Record<string, string[]>;
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    for (const prefix of [...(rights.depositPrefixes ?? []), ...(rights.accessPrefixes ?? [])]) {
+      if (!PERSONAL_DATABASE_PREFIX_REGEX.test(prefix)) {
+        throw new Error(`depositPrefixes: "${prefix}" is not a personal-database prefix like "mmail_"`);
+      }
+    }
+    for (const [prefix, ids] of Object.entries(rights.depositDocIdPrefixes ?? {})) {
+      if (!PERSONAL_DATABASE_PREFIX_REGEX.test(prefix)) {
+        throw new Error(`depositDocIdPrefixes: "${prefix}" is not a personal-database prefix like "mmail_"`);
+      }
+      validateDocIdPrefixes(ids, `depositDocIdPrefixes.${prefix}`);
+    }
+    const grants = (await this.findGrantAccessDocuments(username)).filter((doc) => !doc.isDeleted());
+    if (grants.length === 0) throw new Error(`No grant for ${username}`);
+    const directoryDB = await this.getDirectoryDB();
+    const signingKeyPair: SigningKeyPair = {
+      publicKey: (this.tenant as BaseMindooTenant).getAdministrationPublicKey(),
+      privateKey: administrationPrivateKey,
+    };
+    for (const grant of grants) {
+      await directoryDB.changeDoc(
+        grant,
+        (d: MindooDoc) => {
+          const data = d.getData();
+          if (rights.depositPrefixes) data.depositPrefixes = [...new Set(rights.depositPrefixes)];
+          if (rights.accessPrefixes) data.accessPrefixes = [...new Set(rights.accessPrefixes)];
+          if (rights.depositDocIdPrefixes) {
+            const merged = { ...((data.depositDocIdPrefixes as Record<string, string[]> | undefined) ?? {}) };
+            for (const [prefix, ids] of Object.entries(rights.depositDocIdPrefixes)) merged[prefix] = [...new Set(ids)];
+            data.depositDocIdPrefixes = merged;
+          }
+        },
+        { signingKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
+      );
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Whether the current user holds the deposit right on `dbid` (§6.10): a
+   * `doc_deposit` allow rule matches and no deny does. Says nothing about the
+   * read gate; callers check {@link canReadDatabase} first.
+   */
+  async canDepositDatabase(dbid: string): Promise<boolean> {
+    if (dbid === DIRECTORY_DB_ID || dbid === USER_DIRECTORY_DB_ID) return false;
+    const currentUser = await this.tenant.getCurrentUserId();
+    const access = await this.evaluateDbAccessModeForSigningKey({ dbid, signingKey: currentUser.userSigningPublicKey });
+    return access.mode === "deposit";
+  }
+
+  private async depositRule(ruleId: string | undefined): Promise<AclRuleDoc | null> {
+    if (!ruleId) return null;
+    const head = await this.getDirectoryStateHead();
+    return (head.rulesByType.get("doc_deposit") ?? []).find((r) => r.ruleId === ruleId) ?? null;
+  }
+
+  /**
    * Whether the current user may open and sync `dbid` under the database read
    * gate (`doc_read`, §6.6). The client-side counterpart of
    * {@link evaluateDbAccessForSigningKey}'s read gate: it evaluates the
@@ -1739,6 +1974,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const currentUser = await this.tenant.getCurrentUserId();
     const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
     if (currentUser.userSigningPublicKey === adminKey) return true;
+    // The personal-database invariant (§6.11) decides first, policy on top.
+    const personal = await this.evaluatePersonalDatabaseAccess({ dbid, signingKey: currentUser.userSigningPublicKey });
+    if (personal && personal.mode !== "read") return false;
     const decision = await this.canDo("doc_read", dbid);
     return decision.allowed;
   }
@@ -1803,6 +2041,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     administrationPrivateKeyPassword: string,
   ): Promise<void> {
     validateAccessPolicy(policy);
+    if (policy.personalDatabasePrefixes !== undefined) {
+      throw new Error("personalDatabasePrefixes is a tenant-level setting; set it on the default policy");
+    }
     if (policy.llm !== undefined) {
       throw new Error("llm is a tenant-level setting; set it on the default policy");
     }
@@ -1869,6 +2110,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       groups?: string[];
       withfields?: WithFieldClause[];
       description?: string;
+      /** `doc_deposit` only (§6.10): largest number of recipient wraps per deposited document. */
+      maxRecipients?: number;
+      /** `doc_deposit` only (§6.10): allowed prefixes of deposited document ids. */
+      docIdPrefixes?: string[];
     },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
@@ -1891,6 +2136,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         groups: rule.groups ?? [],
       }),
       action: rule.action ?? "allow",
+      ...(rule.maxRecipients !== undefined ? { maxRecipients: rule.maxRecipients } : {}),
+      ...(rule.docIdPrefixes !== undefined ? { docIdPrefixes: [...new Set(rule.docIdPrefixes)] } : {}),
     };
     // Fail fast on malformed clauses / operators (§6.3 closed set).
     validateAclRule(ruleDoc);
@@ -1920,6 +2167,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         data.users_encrypted = ruleDoc.users_encrypted;
         if (ruleDoc.description !== undefined) data.description = ruleDoc.description;
         if (ruleDoc.withfields !== undefined) data.withfields = ruleDoc.withfields;
+        if (ruleDoc.maxRecipients !== undefined) data.maxRecipients = ruleDoc.maxRecipients;
+        else if (data.maxRecipients !== undefined) delete data.maxRecipients;
+        if (ruleDoc.docIdPrefixes?.length) data.docIdPrefixes = ruleDoc.docIdPrefixes;
+        else if (data.docIdPrefixes !== undefined) delete data.docIdPrefixes;
       },
       {
         signingKeyPair: adminSigningKeyPair,

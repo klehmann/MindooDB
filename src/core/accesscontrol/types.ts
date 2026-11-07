@@ -44,6 +44,7 @@ export type RuleType =
   | "doc_undelete"
   | "doc_snapshot"
   | "doc_read"
+  | "doc_deposit"
   | "llm_use";
 
 /** All valid {@link RuleType} values, for validation and iteration. */
@@ -54,8 +55,33 @@ export const RULE_TYPES: readonly RuleType[] = [
   "doc_undelete",
   "doc_snapshot",
   "doc_read",
+  "doc_deposit",
   "llm_use",
 ];
+
+/**
+ * `doc_deposit` (§6.10): a database-level right to put sealed documents into a
+ * database the principal may not read. Only an explicit allow rule grants it
+ * (there is no baseline flag), it never carries `withfields`, and its `dbid`
+ * may be exact, `"*"`, or a prefix pattern ending in `*` (e.g. `"mmail_*"`), so
+ * one rule can cover a family of per-person databases.
+ *
+ * {@link AclRuleDoc.maxRecipients} bounds how many recipient wraps a deposited
+ * `doc_create` may carry; it defaults to {@link DEFAULT_DEPOSIT_MAX_RECIPIENTS}.
+ */
+export const DEFAULT_DEPOSIT_MAX_RECIPIENTS = 1;
+/** Upper bound accepted for {@link AclRuleDoc.maxRecipients}. */
+export const MAX_DEPOSIT_RECIPIENTS = 100;
+
+/**
+ * Whether a rule's `dbid` applies to `dbid`. `"*"` matches every database; a
+ * pattern ending in `*` (only valid on `doc_deposit` rules, see
+ * {@link validateAclRule}) matches by prefix.
+ */
+export function ruleMatchesDbid(ruleDbid: string, dbid: string): boolean {
+  if (ruleDbid === "*" || ruleDbid === dbid) return true;
+  return ruleDbid.length > 1 && ruleDbid.endsWith("*") && dbid.startsWith(ruleDbid.slice(0, -1));
+}
 
 /** Comparison operators usable in a {@link WithFieldClause}. Closed set. */
 export type Operator =
@@ -255,7 +281,14 @@ export interface DefaultAccessPolicyDoc {
    * also restricts nothing, which is how an admin lifts a restriction again:
    * the whole object is replaced on write. See {@link LlmEndpointPolicy}.
    */
-  llm?: LlmEndpointPolicy;
+llm?: LlmEndpointPolicy;
+  /**
+   * More personal-database prefixes (§6.11), in addition to the built-in ones
+   * (`mmail_`). Tenant default policy only. Adding a prefix only ever makes
+   * databases more private: the built-in rule applies to every database id
+   * `<prefix><grantDocId>`. Like `llm` it holds while the master switch is on.
+   */
+  personalDatabasePrefixes?: string[];
 }
 
 /**
@@ -297,6 +330,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
     | "llm"
+    | "personalDatabasePrefixes"
   >
 > = {
   denyDocCreate: false,
@@ -310,9 +344,11 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
 /**
  * Map a database-scoped {@link RuleType} to the policy `deny<Op>` field that
  * gates it. `llm_use` is not listed: its baseline is `llm.denyUse` (§6.9).
+ * Neither is `doc_deposit`: it has no baseline flag and is always denied
+ * unless an allow rule grants it (§6.10).
  */
 export const RULE_TYPE_TO_DENY_FIELD: Record<
-  Exclude<RuleType, "llm_use">,
+  Exclude<RuleType, "llm_use" | "doc_deposit">,
   keyof typeof DEFAULT_POLICY_DEFAULTS
 > = {
   doc_create: "denyDocCreate",
@@ -346,6 +382,17 @@ export interface AclRuleDoc {
    */
   users_encrypted: string;
   action: "allow" | "deny";
+  /**
+   * `doc_deposit` only: the largest number of recipient wraps a deposited
+   * `doc_create` may carry (1..{@link MAX_DEPOSIT_RECIPIENTS}). Absent means
+   * {@link DEFAULT_DEPOSIT_MAX_RECIPIENTS}. Ignored on every other rule type.
+   */
+  maxRecipients?: number;
+  /**
+   * `doc_deposit` only: the document ids a depositor may create must start with
+   * one of these prefixes (e.g. `["proposal_"]`). Absent or empty: any id.
+   */
+  docIdPrefixes?: string[];
 }
 
 /**
@@ -497,12 +544,33 @@ export function validateWithFieldClause(clause: WithFieldClause, ruleType: RuleT
  * directory sets). Enforces the closed type/operator/placeholder sets and the
  * `withfields` constraints (§6.3). Throws on the first violation.
  */
+/**
+ * Document-id prefixes for deposits (§6.10): an array of non-empty strings
+ * made of the characters document ids use. Throws on violation.
+ */
+export function validateDocIdPrefixes(prefixes: unknown, what: string): void {
+  if (prefixes === undefined) return;
+  if (!Array.isArray(prefixes)) throw new Error(`${what} must be an array of strings`);
+  for (const prefix of prefixes) {
+    if (typeof prefix !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(prefix)) {
+      throw new Error(`${what}: "${String(prefix)}" is not a valid document-id prefix`);
+    }
+  }
+}
+
+/** Whether `docId` passes a deposit's `docIdPrefixes` (absent or empty: any id). */
+export function docIdMatchesPrefixes(docId: string, prefixes: readonly string[] | undefined): boolean {
+  return !prefixes || prefixes.length === 0 || prefixes.some((prefix) => docId.startsWith(prefix));
+}
+
 export function validateAclRule(rule: {
   type: RuleType;
   dbid: string;
   action: "allow" | "deny";
   users_hashes: string[];
   withfields?: WithFieldClause[];
+  maxRecipients?: number;
+  docIdPrefixes?: string[];
 }): void {
   if (!(RULE_TYPES as readonly string[]).includes(rule.type)) {
     throw new Error(`rule has unknown type "${rule.type}"`);
@@ -521,6 +589,33 @@ export function validateAclRule(rule: {
   // (client-only) when the server must be able to enforce the read gate.
   if (rule.type === "doc_read" && (rule.withfields?.length ?? 0) > 0) {
     throw new Error("doc_read rules are database-level and cannot use `withfields`");
+  }
+  // `doc_deposit` is a database-level right like `doc_read` (§6.10). It is the
+  // only type whose dbid may be a prefix pattern ("mmail_*").
+  if (rule.type === "doc_deposit") {
+    if ((rule.withfields?.length ?? 0) > 0) {
+      throw new Error("doc_deposit rules are database-level and cannot use `withfields`");
+    }
+    if (rule.maxRecipients !== undefined) {
+      if (
+        !Number.isInteger(rule.maxRecipients) ||
+        rule.maxRecipients < 1 ||
+        rule.maxRecipients > MAX_DEPOSIT_RECIPIENTS
+      ) {
+        throw new Error(`doc_deposit maxRecipients must be an integer from 1 to ${MAX_DEPOSIT_RECIPIENTS}`);
+      }
+    }
+    validateDocIdPrefixes(rule.docIdPrefixes, "doc_deposit docIdPrefixes");
+  } else {
+    if (rule.dbid !== "*" && rule.dbid.endsWith("*")) {
+      throw new Error('only doc_deposit rules may use a dbid prefix pattern ending in "*"');
+    }
+    if (rule.maxRecipients !== undefined) {
+      throw new Error("maxRecipients is only valid on doc_deposit rules");
+    }
+    if (rule.docIdPrefixes !== undefined) {
+      throw new Error("docIdPrefixes is only valid on doc_deposit rules");
+    }
   }
   // `llm_use` is a tenant-wide decision about the assistant (§6.9), not about
   // a database or its documents.
@@ -544,6 +639,14 @@ export function validateAclRule(rule: {
 export function validateAccessPolicy(
   policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>
 ): void {
+  if (policy.personalDatabasePrefixes !== undefined) {
+    if (
+      !Array.isArray(policy.personalDatabasePrefixes) ||
+      !policy.personalDatabasePrefixes.every((prefix) => typeof prefix === "string" && /^[a-z][a-z0-9]*_$/.test(prefix))
+    ) {
+      throw new Error('personalDatabasePrefixes must be prefixes like "notes_" (lowercase letters and digits, ending in "_")');
+    }
+  }
   if (
     policy.databaseCreationPolicy !== undefined &&
     policy.databaseCreationPolicy !== "open" &&
@@ -669,6 +772,7 @@ export function effectivePolicy(
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
     | "llm"
+    | "personalDatabasePrefixes"
   >
 > & {
   defaultCreateKeyId?: string;

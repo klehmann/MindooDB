@@ -430,6 +430,20 @@ export interface ApproveJoinRequestOptions {
    */
   sharedDocKeyIds?: string[];
   /**
+   * Personal-database prefixes the joining identity may deposit into
+   * (docs/accesscontrol.md §6.11), e.g. `["mmail_"]` for a mail gateway that
+   * delivers into every person's `mmail_<grantDocId>`. Stored on its grant
+   * (`depositPrefixes`), admin-signed. Omit for ordinary members.
+   */
+  depositPrefixes?: string[];
+  /**
+   * Personal-database prefixes the joining identity may read and sync in
+   * everyone's databases (docs/accesscontrol.md §6.11), e.g. `["mmailout_"]`
+   * for a mail gateway that sends what people put in their outbox. Stored on
+   * its grant (`accessPrefixes`), admin-signed. Omit for ordinary members.
+   */
+  accessPrefixes?: string[];
+  /**
    * Human-readable label for the joining device's key pair. When set,
    * it overrides any label the joining user suggested in the join request and
    * is stored on the grant document's key-pair entry (docs/accesscontrol.md
@@ -1989,6 +2003,16 @@ export interface CreateOptions {
   recipientOptions?: import("./userkeys/sealedTypes").RecipientOptions;
 
   /**
+   * Files to attach in the document's very first entry. They are encrypted
+   * with the document's key and referenced from the `doc_create` entry, so a
+   * writer that cannot change the document afterwards (a sealed create with
+   * `includeSelf: false`, a `doc_deposit` principal, docs/accesscontrol.md
+   * §6.10) can still deliver them. Not supported on the convergent custom-id
+   * path (an `id` without `assumeUniqueId`) or by `createDocuments()`.
+   */
+  attachments?: Array<{ data: Uint8Array; fileName: string; mimeType: string }>;
+
+  /**
    * Optional signing key pair to sign the initial document entry with. When
    * provided, `signingKeyPassword` must be provided as well. Replaces
    * `createDocumentWithSigningKey(signingKeyPair, signingKeyPassword, ...)`.
@@ -3304,6 +3328,10 @@ export interface MindooTenantDirectory {
       groups?: string[];
       withfields?: WithFieldClause[];
       description?: string;
+      /** `doc_deposit` only (docs/accesscontrol.md §6.10). */
+      maxRecipients?: number;
+      /** `doc_deposit` only (§6.10): allowed prefixes of deposited document ids. */
+      docIdPrefixes?: string[];
     },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
@@ -3935,6 +3963,29 @@ export interface MindooTenantDirectory {
   getWipeGrantDocId?(signingKey: string): Promise<string | null>;
 
   /**
+   * Let `username` deposit into personal databases with these prefixes
+   * (docs/accesscontrol.md §6.11). Admin-signed change of the person's grant;
+   * an empty list removes the right.
+   */
+  setGrantDepositPrefixes?(
+    username: string,
+    prefixes: string[],
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Deposit and access rights in other people's personal databases (§6.11);
+   * fields left out stay as they are.
+   */
+  setGrantPersonalDatabaseRights?(
+    username: string,
+    rights: { depositPrefixes?: string[]; accessPrefixes?: string[]; depositDocIdPrefixes?: Record<string, string[]> },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
    * Check if a user has been revoked.
    * 
    * @param username The username to check (format: "CN=<username>/O=<tenantId>")
@@ -4127,6 +4178,11 @@ export interface MindooTenantDirectory {
    * @returns True when the current user may open/sync the database.
    */
   canReadDatabase?(dbId: string): Promise<boolean>;
+  /**
+   * Whether the current user may deposit sealed documents into `dbId` without
+   * read access (`doc_deposit`, docs/accesscontrol.md §6.10).
+   */
+  canDepositDatabase?(dbId: string): Promise<boolean>;
 
   /**
    * Create or update database-specific settings.

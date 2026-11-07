@@ -11,6 +11,7 @@ import {
   WithFieldWhen,
   effectivePolicy,
   isPlaceholder,
+  ruleMatchesDbid,
 } from "./types";
 import { DirectoryStateNode } from "./DirectoryStateNode";
 
@@ -125,13 +126,15 @@ export function evaluateAccess(input: EvaluateAccessInput): AccessDecision {
     doc_undelete: eff.denyDocUndelete,
     doc_snapshot: eff.denyDocSnapshot,
     doc_read: eff.denyDocRead,
+    // No baseline flag: only an explicit allow rule grants deposit (§6.10).
+    doc_deposit: true,
   }[op];
   const baselineDenied = denyField === true;
 
   // Step 4: collect rules of this type whose dbid matches and whose users_hashes
   // intersect the identity set.
   const candidateRules = (node.rulesByType.get(op) ?? []).filter(
-    (r) => (r.dbid === dbid || r.dbid === "*") && intersects(r.users_hashes, identity.hashes)
+    (r) => ruleMatchesDbid(r.dbid, dbid) && intersects(r.users_hashes, identity.hashes)
   );
 
   // Partition into Tier 1 (no withfields) and Tier 2 (withfields) rules.

@@ -76,6 +76,57 @@ export interface BuiltinWriteDecision {
   reason: string;
 }
 
+/**
+ * Prefixes of **personal databases**: `<prefix><grantDocId>` belongs to the
+ * person whose `grantaccess` document has that id (docs/accesscontrol.md
+ * §6.11). Built in, like the `directory` and `userdirectory` invariants:
+ *
+ * - read and sync only for the devices on that grant, identities whose grant
+ *   lists the prefix in `accessPrefixes` (a service such as the mail gateway
+ *   that serves every person's outbox), and the tenant admin,
+ * - deposit (push of sealed creates only, §6.10) only for identities whose
+ *   grant lists the prefix in `depositPrefixes`,
+ *
+ * whatever a configured policy says; a policy can add prefixes
+ * (`personalDatabasePrefixes`) and can deny more, never allow more.
+ *
+ * `mmail_` — MindooMail's mailbox (`mmail_${user.persondocid}` in Haven); the
+ *   mail gateway deposits incoming mail.
+ * `mmailout_` — MindooMail's outbox: the person writes outgoing mail, the mail
+ *   gateway (accessPrefixes) reads it, sends it and writes status documents.
+ */
+export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_", "mmailout_"] as const;
+
+/**
+ * Default document-id prefixes a depositor may use in a built-in personal
+ * database (docs/accesscontrol.md §6.11): deposits into a mailbox are MindooMail
+ * messages (`memo_…`), so documents of other kinds (events, status, folders)
+ * there are always the owner's own. A grant's `depositDocIdPrefixes` overrides
+ * this per database prefix.
+ */
+export const BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES: Readonly<Record<string, readonly string[]>> = {
+  mmail_: ["memo_"],
+};
+
+/** A valid personal-database prefix: lowercase letters and digits, ending in `_`. */
+export const PERSONAL_DATABASE_PREFIX_REGEX = /^[a-z][a-z0-9]*_$/;
+
+/**
+ * The owner of a personal database: the matching prefix and the grant id
+ * that follows it, or `null` when `dbId` is not a personal database.
+ */
+export function personalDatabaseOwner(
+  dbId: string,
+  extraPrefixes: readonly string[] = [],
+): { prefix: string; grantDocId: string } | null {
+  for (const prefix of [...BUILTIN_PERSONAL_DATABASE_PREFIXES, ...extraPrefixes]) {
+    if (dbId.startsWith(prefix) && dbId.length > prefix.length) {
+      return { prefix, grantDocId: dbId.slice(prefix.length) };
+    }
+  }
+  return null;
+}
+
 export function hasBuiltinWriteInvariant(dbId: string): boolean {
   return dbId === DIRECTORY_DB_ID || dbId === USER_DIRECTORY_DB_ID;
 }

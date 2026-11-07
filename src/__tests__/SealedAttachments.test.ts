@@ -86,6 +86,37 @@ describe("sealed document attachments", () => {
     }
   });
 
+  it("carries attachments in the doc_create entry, readable for a recipient the author excluded itself from", async () => {
+    const db = await alice.tenant.openDB("attach-create");
+    const payload = new Uint8Array([9, 8, 7, 6]);
+    const doc = await db.createDocument({
+      recipients: [bob.username],
+      recipientOptions: { includeSelf: false },
+      initialValues: { subject: "with attachment" },
+      attachments: [{ data: payload, fileName: "scan.pdf", mimeType: "application/pdf" }],
+    });
+    // One entry for the document: the attachment rides on doc_create.
+    const docEntries = await db.getStore().findNewEntriesForDoc([], doc.getId());
+    expect(docEntries.map((entry) => entry.entryType)).toEqual(["doc_create"]);
+    expect(docEntries[0]!.attachmentRefs?.length).toBe(1);
+    const chunks = await chunkEntriesForDoc(db, doc.getId());
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks.every((chunk) => chunk.decryptionKeyId === `$sealed:${doc.getId()}`)).toBe(true);
+
+    await syncDocsAndAttachments(fixture, "attach-create");
+    const bobDoc = await (await bob.tenant.openDB("attach-create")).getDocument(doc.getId());
+    const [ref] = bobDoc.getAttachments();
+    expect(ref).toMatchObject({ fileName: "scan.pdf", mimeType: "application/pdf", size: 4 });
+    expect(await bobDoc.getAttachment(ref!.attachmentId)).toEqual(payload);
+  });
+
+  it("refuses attachments on a convergent custom id and in createDocuments()", async () => {
+    const db = await alice.tenant.openDB("attach-create-guard");
+    const attachments = [{ data: new Uint8Array([1]), fileName: "a.bin", mimeType: "application/octet-stream" }];
+    await expect(db.createDocument({ id: "settings_singleton", attachments })).rejects.toThrow(/convergent custom id/);
+    await expect(db.createDocuments([{ attachments }])).rejects.toThrow(/only supported by createDocument/);
+  });
+
   it("lets a recipient read attachment bytes and keeps them from a non-recipient", async () => {
     const db = await alice.tenant.openDB("attach-read");
     const doc = await db.createDocument({

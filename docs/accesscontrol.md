@@ -32,6 +32,7 @@ enterprise-ready infrastructure.
 |------------|:-----------------:|:------------------------:|
 | End-to-end encryption, local-first sync, zero-trust server | ✅ | ✅ |
 | Read access by key possession | ✅ | ✅ |
+| **Built-in database invariants** — `directory` (admin-only writes), `userdirectory` (owner-only key documents), **personal databases** such as MindooMail's `mmail_<grantDocId>` (owner-only sync, deposit by designated gateways) | ✅ (§6.11) | ✅ |
 | **Write governance** — who may create / change / delete / snapshot, scoped to database *and* content | — | ✅ (§2–§12) |
 | **Read governance** — who may *see* which data, by encryption-key possession (admin-blind key distribution + revoke/rotate) | — | ✅ (§13) |
 | **Group & identity management** — DN-hierarchy identities, nested groups, wildcard targeting | — | ✅ (§6.5, §8.1) |
@@ -928,7 +929,8 @@ either. This is intentional: a user who could write but not read would create
 documents they can never see. So **read access is required to create data**, and
 no separate coupling is needed — the read gate is simply the precondition for
 all sync on that database; write rules (§6.3) then apply on top for users who
-pass it.
+pass it. The one deliberate exception is the deposit right (§6.10): a writer
+that may *only* add documents sealed to other people, such as a mail gateway.
 
 **Enforcement points (defense in depth)** — the same two choke points as §6.7,
 plus the admin/`"directory"` exemptions:
@@ -1019,6 +1021,186 @@ a language model at all. It follows the same pattern as the database read gate
   are listed as `hidden`. A tenant counts as allowed only once its policy has
   been read. The built-in assistant starts a conversation over when a tenant
   whose data it may already hold forbids agents.
+
+### 6.10 Deposit without read access (`doc_deposit`)
+
+Some writers should be able to add data to a database they must never read. A
+mail gateway is the example this was built for: it receives a message for Jane,
+stores it as a document sealed to Jane, and must not be able to read Jane's
+mailbox, neither that message nor anything else in it. §6.8 alone cannot
+express that, because there the read gate is also the write gate.
+
+A **`doc_deposit` rule** grants exactly this:
+
+```ts
+await directory.createAccessRule({
+  ruleId: "gateway_deposits_mail",
+  type: "doc_deposit",
+  dbid: "mmail_*",          // exact id, "*" or a prefix pattern
+  action: "allow",
+  usernames: ["cn=mail-gateway/o=acme"],
+  maxRecipients: 1,         // optional, 1..100, default 1
+  docIdPrefixes: ["memo_"], // optional: allowed document ids (absent/empty: any)
+}, adminKey, adminPassword);
+```
+
+Example, a **proposal box**: members may drop proposals into a database they
+cannot read, and only proposals, no other kind of document:
+
+```ts
+await directory.setDatabaseAccessPolicy("proposals", { denyDocRead: true }, adminKey, adminPassword);
+await directory.createAccessRule({
+  ruleId: "everyone_proposes",
+  type: "doc_deposit",
+  dbid: "proposals",
+  action: "allow",
+  users_hashes: ["$everyone"],
+  docIdPrefixes: ["proposal_"],   // createDocument({ idPrefix: "proposal", recipients: [board] })
+}, adminKey, adminPassword);
+```
+
+- **Only explicit allow rules grant it.** There is no baseline flag; without an
+  allow rule the right does not exist, and a matching deny rule wins as usual.
+  `withfields` is rejected (the decision is about the database, Tier 1 only).
+- **`dbid` may be a prefix pattern** (`"mmail_*"`), so one rule covers a family
+  of per-person databases. Other rule types keep exact ids and `"*"`.
+- **`docIdPrefixes` fixes what a depositor may create.** With the field set,
+  every deposited entry (create and attachment chunks) must belong to a
+  document id that starts with one of the prefixes, otherwise it is refused as
+  `policy`. The owner's own documents use other prefixes (events, settings,
+  folders), so a depositor can never plant one of those. Absent or empty: any
+  id.
+- **It only matters where read is denied.** A user who passes the read gate
+  syncs normally and the deposit rule is not consulted. So it takes effect on
+  databases with `denyDocRead` (per database or tenant-wide) whose `doc_read`
+  rules do not include the depositor. The §6.7 id allowlist applies to
+  depositors as well.
+
+**What the server lets a depositor do.** The database-open gate reports one of
+three modes (`evaluateDbAccessModeForSigningKey`): `read`, `deposit` or `none`.
+A depositor may call only what a push needs: `putEntries`, the existence check
+`hasEntries`, and the capability probe. Pull, change feeds, entry and
+attachment reads, id listings and the bloom summary are all refused, on the
+document store and on the attachment store.
+
+Within `putEntries` the server accepts from a depositor only:
+
+| Entry | Condition |
+|---|---|
+| `doc_create` | `decryptionKeyId` is `$sealed:<docId>`; the entry carries a recipient block with 1..`maxRecipients` wraps; it is signed by the depositing device; the store does not hold `docId` yet; `docId` matches `docIdPrefixes` when set |
+| `attachment_chunk` | on the attachment store, under `$sealed:<docId>`, signed by the depositing device; `docId` matches `docIdPrefixes` when set |
+
+Everything else is refused as `policy`: `doc_change`, `doc_delete`,
+`doc_undelete`, `doc_snapshot`, and any entry under a named key. A
+`doc_create` for an id the store already holds is refused with the rejection
+class **`exists`**, which a depositor reads as "already delivered": a retried
+delivery from a device that lost its local copy cannot file a second document.
+The deposit check replaces Tier 1 for the depositor's entries (the deposit
+rule is what authorizes them); the signature, trust, revocation and purge
+checks run as for everyone.
+
+**On the client** `openDB` lets a depositor open such a database although
+`canReadDatabase` is false (`canDepositDatabase`). Writing works locally; the
+document is created with `recipients` and `recipientOptions.includeSelf:
+false`, and attachments go into the create entry (`createDocument({
+attachments })`), since the depositor cannot change the document afterwards.
+`pushChangesTo` works unchanged: the refused bloom summary makes it fall back
+to `hasEntries`.
+
+**What the readers check.** Readers decrypt a deposited document through the
+wraps addressed to them, like any sealed document (docs/userkeys.md §6). A
+wrap they cannot open, or a document sealed to someone else, leaves the
+document inaccessible, never an error, so a depositor cannot break a mailbox by
+sealing to the wrong person.
+
+**Limits.** The server can count wraps but cannot see whom they address (the
+recipient list is encrypted). A depositor could therefore seal a document to
+another tenant member and drop it into Jane's database; Jane would not see it,
+the other member would only see it if they could read that database. Binding
+deposits to the database owner needs the server to know the owner's key
+fingerprint, for instance from the grant (`$publicinfos`), and a `$recipient`
+condition on the rule. That is noted as an option (§15), not implemented.
+A depositor also learns whether an id it guesses exists (`exists`, `hasEntries`);
+document ids it picks itself are the intended use. Like the other write rules,
+Configured `doc_deposit` rules belong to the Enterprise access-control layer;
+the deposit right into personal databases (§6.11) does not.
+
+### 6.11 Personal databases (`<prefix><grantDocId>`, built in)
+
+Some databases belong to one person by their name. MindooMail keeps each
+person's mailbox in `mmail_<grantDocId>`, where `grantDocId` is the id of that
+person's `grantaccess` document (Haven fills it in as
+`mmail_${user.persondocid}`). For those databases MindooDB has a **built-in
+rule**, like the `directory` and `userdirectory` invariants: it holds without
+any configured policy and even while the master switch is on.
+
+| Who | May |
+|---|---|
+| a device on the grant `<grantDocId>` (every device of the owner) | open, pull, push, as usual |
+| an identity whose grant lists the prefix in `accessPrefixes` | open, pull, push in **every** person's database with that prefix (a service such as the mail gateway serving each outbox) |
+| an identity whose grant lists the prefix in `depositPrefixes` | deposit only (§6.10 semantics, at most one recipient wrap per document; document ids: see below) |
+| the tenant admin | open, pull, push (exempt, see below) |
+| everyone else | nothing; the server refuses every sync call, the client refuses to open |
+
+- **Prefixes.** Built in: `mmail_` (MindooMail's mailbox; the mail gateway
+  deposits incoming mail) and `mmailout_` (MindooMail's outbox; the person
+  writes outgoing mail sealed to themselves and the gateway, the gateway reads
+  it with `accessPrefixes`, sends it and answers with status documents)
+  (`BUILTIN_PERSONAL_DATABASE_PREFIXES`). The
+  tenant default policy can add more with `personalDatabasePrefixes`
+  (`["notes_"]`); adding one only ever makes databases more private. A prefix
+  is lowercase letters and digits ending in `_`.
+- **Owner resolution is Tier 1.** Grants are `$publicinfos`-readable, so the
+  server looks up the grant by id and compares its active device keys with the
+  caller's signing key. A database id whose remainder is not a grant id is open
+  to the admin only.
+- **Deposit and access rights** are part of the service's grant:
+  `depositPrefixes: ["mmail_"]`, `accessPrefixes: ["mmailout_"]`, admin-signed.
+  The admin sets them when approving the gateway's join request
+  (`approveJoinRequest({ ..., depositPrefixes: ["mmail_"], accessPrefixes: ["mmailout_"] })`)
+  or later with `directory.setGrantPersonalDatabaseRights(username, { depositPrefixes, accessPrefixes }, …)`;
+  an empty list takes a right away.
+- **Deposited documents are messages.** In `mmail_` a depositor may only
+  create documents whose id starts with `memo_` (MindooMail's message id
+  prefix; `BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES`). Everything else in a
+  mailbox (events, status, folders, settings) therefore is always the owner's
+  own, and a client can rely on that without checking authors. The grant can
+  set other prefixes per database prefix:
+  `setGrantPersonalDatabaseRights(username, { depositDocIdPrefixes: { mmail_: ["memo_"] } }, …)`
+  (an empty list allows any id). `accessPrefixes` is the stronger right
+  (it can read everything in those databases that is sealed to it, and write
+  there), so grant it only to the service that needs it. Admin UIs should show it as its own decision ("this identity
+  may deliver into every person's mailbox"), not as part of the key choice.
+- **A configured policy tightens, never loosens.** The built-in rule decides
+  first; for the owner, the configured read gate (§6.8) still applies on top,
+  and for a depositor a matching `doc_deposit` **deny** rule wins. A `doc_read`
+  or `doc_deposit` **allow** rule cannot open someone else's personal database.
+- **The admin is exempt**, as everywhere in the read gate: tenant-wide backup,
+  export and purge keep working, and the content stays sealed to the owner
+  (MindooMail seals every document to its user), so the admin syncs ciphertext
+  and metadata (document count, sizes, timing) but cannot read mail. A tenant
+  that wants the admin out as well needs a further, not yet implemented switch.
+
+**Edition: Community, not Enterprise.** Like the `directory` and
+`userdirectory` invariants, this rule is part of the open core and holds on
+every server and tenant, Community Edition included: it needs no policy, no
+license and no Enterprise access-control layer, and it applies even while the
+master switch is on. Only the configurable parts on top of it belong to
+Enterprise: `doc_read`/`doc_deposit` rules that tighten it further (§6.8,
+§6.10). The deposit semantics it uses (§6.10: push of sealed creates only,
+`exists`) are part of the open core with it.
+
+**Migration of existing databases.** Before this rule a `mmail_` database was
+open to every member's sync. Once the server enforces it:
+
+- other members' devices stop receiving it and can no longer push into it;
+- copies they already synced stay on their devices. MindooMail seals its
+  documents to the owner (`recipients: []`), so those copies are ciphertext they
+  cannot open. Documents written with the shared mode of MindooMail
+  (`decryptionKeyId`, for example `default`) are readable by every holder of
+  that key and should be rewritten as sealed documents;
+- clients that open the database find it refused and should drop their local
+  copy (not implemented yet).
 
 ## 7. Evaluation algorithm
 
@@ -2153,6 +2335,13 @@ can ratchet restrictions up safely over time.
   proposal.
 - **p2p witnessing.** Trusted witness peers / threshold witnessing for serverless
   groups.
+- **Admin out of personal databases.** A switch that also refuses the tenant
+  admin (and with it tenant-wide backup of those databases).
+- **Deposits bound to the database owner (`$recipient`).** §6.10 checks only how
+  many wraps a deposited document carries. If grants (`$publicinfos`) also carried
+  the fingerprint of the person's user key, a `doc_deposit` rule could require that
+  the wraps address exactly the owner of the database (or a listed set of people),
+  and the server could check it without decrypting anything. Not implemented.
 - **Field-level read access.** Document- and key-level read control ships in section
   13 as **key possession** (a reader sees a document iff it holds a key that decrypts
   it). True *field*-level read control would require additional keying so different

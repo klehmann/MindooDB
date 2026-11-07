@@ -408,6 +408,13 @@ export class BasicOnDiskContentAddressedStore implements ContentAddressedStore {
     };
 
     this.initPromise = this.initialize(options);
+    // Nobody may ever call this store (a server creates one for a request it
+    // then refuses), so a failed initialization must not become an unhandled
+    // rejection that takes the process down. Callers still get the error from
+    // ensureInitialized().
+    this.initPromise.catch((err) => {
+      this.logger.warn(`Store initialization failed for ${this.storeRoot}: ${String(err)}`);
+    });
   }
 
   /**
