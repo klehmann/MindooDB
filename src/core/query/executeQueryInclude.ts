@@ -470,6 +470,8 @@ export async function hydrateQueryIncludes(params: {
 
     const childDb = include.db ?? parentDb;
     const childSummary = resolveIncludeSummary(childDb, label);
+    // Coverage against the settled configuration (see executeQuery).
+    await childSummary.ensureConfigLoaded?.();
     checkIncludeCoverage(label, plan, include, childSummary, parentSummary);
 
     // Empty parent page: no keys to look up, but the slot must still exist

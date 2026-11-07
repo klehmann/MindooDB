@@ -31,7 +31,13 @@ import {
   applyKeyPairFields,
   mergeKeyPairs,
 } from "./accesscontrol/grantKeys";
-import { aclTrustedWitnessDocId, DEFAULT_DEPOSIT_MAX_RECIPIENTS, validateDocIdPrefixes } from "./accesscontrol/types";
+import {
+  aclTrustedWitnessDocId,
+  DEFAULT_DEPOSIT_MAX_RECIPIENTS,
+  DEFAULT_INTERNAL_MAIL_LIMITS,
+  validateDocIdPrefixes,
+  type InternalMailLimits,
+} from "./accesscontrol/types";
 import {
   BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES,
   PERSONAL_DATABASE_PREFIX_REGEX,
@@ -1781,7 +1787,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async evaluateDbAccessModeForSigningKey(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason?: string }> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason?: string }> {
     // Built-in personal-database invariant (§6.11): decides first, and a
     // configured policy can only take away what it grants.
     const personal = await this.evaluatePersonalDatabaseAccess(input);
@@ -1837,7 +1843,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async evaluatePersonalDatabaseAccess(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason: string } | null> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason: string } | null> {
     const head = await this.getDirectoryStateHead();
     const owner = personalDatabaseOwner(input.dbid, head.defaultPolicy?.personalDatabasePrefixes ?? []);
     if (!owner) return null;
@@ -1872,6 +1878,34 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         ...(docIdPrefixes.length ? { docIdPrefixes } : {}),
         reason: `deposit into ${owner.prefix}* granted`,
       };
+    }
+    // Internal mail (§6.11): members deposit MindooMail messages into each
+    // other's mailbox, under the tenant's `internalMail` setting.
+    if (owner.prefix === "mmail_" && grant && signerGrants.length > 0) {
+      const mode = head.defaultPolicy?.internalMail ?? "members";
+      let allowed = mode === "members";
+      if (mode === "rules") {
+        const decision = await this.evaluateAccessForSigningKey({
+          op: "doc_deposit",
+          dbid: input.dbid,
+          signingKey: input.signingKey,
+          trustedTime: Number.MAX_SAFE_INTEGER,
+        });
+        allowed = decision.allowed && decision.matchedRuleId !== undefined;
+      }
+      if (allowed) {
+        const limits = head.defaultPolicy?.internalMailLimits ?? {};
+        return {
+          mode: "deposit",
+          maxRecipients: 1,
+          docIdPrefixes: [...(BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES.mmail_ ?? [])],
+          internalMail: {
+            maxBytesPerMail: limits.maxBytesPerMail ?? DEFAULT_INTERNAL_MAIL_LIMITS.maxBytesPerMail,
+            maxMailsPerHour: limits.maxMailsPerHour ?? DEFAULT_INTERNAL_MAIL_LIMITS.maxMailsPerHour,
+          },
+          reason: `internal mail (${mode})`,
+        };
+      }
     }
     return { mode: "none", reason: grant ? "personal database of another person" : "personal database without a matching grant" };
   }
