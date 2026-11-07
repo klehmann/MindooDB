@@ -601,6 +601,32 @@ describe("doc_deposit on a real server (HTTP)", () => {
       expect(await janeOutboxDb.getAllDocumentIds()).toContain(requestId);
     });
 
+    test("delete and purge request in one push, one entry per batch: the request is accepted", async () => {
+      const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"], gatewayAccessPrefixes: ["mmailout_"] });
+      const janeOutboxDb = await openDb(t.jane, t.janeOutbox);
+      const docs = [];
+      for (let i = 0; i < 4; i++) {
+        docs.push(await janeOutboxDb.createDocument({ recipients: [t.gatewayName], initialValues: { type: "outgoing", i } }));
+      }
+      await push(t.jane, t.janeOutbox);
+      // Delete and request without pushing in between, then push with tiny batches.
+      for (const doc of docs) await janeOutboxDb.deleteDocument(doc.getId());
+      await janeOutboxDb.requestPurgeOfDeletedDocuments(docs.map((d) => d.getId()));
+      const result = await janeOutboxDb.pushChangesTo(await t.jane.connectToServer(baseUrl, t.janeOutbox, StoreKind.docs), {
+        transferBatchSize: 1,
+        maxConcurrentBatches: 3,
+      });
+      expect(result.rejectedEntries ?? []).toHaveLength(0);
+      expect(
+        await waitFor(async () => {
+          for (const doc of docs) {
+            if ((await serverEntriesOf(t.jane, t.janeOutbox, doc.getId())).length > 0) return undefined;
+          }
+          return true;
+        }),
+      ).toBe(true);
+    });
+
     test("the service with accessPrefixes may purge; requests for live documents, changes and depositors are refused", async () => {
       const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"], gatewayAccessPrefixes: ["mmailout_"] });
       const janeOutboxDb = await openDb(t.jane, t.janeOutbox);

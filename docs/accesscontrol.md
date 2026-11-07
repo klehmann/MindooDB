@@ -1211,7 +1211,9 @@ directory:
 - **Request.** `db.requestPurgeOfDeletedDocuments(docIds)` writes a document
   `purgereq_<id>` into the personal database: `$publicinfos`-encrypted (so the
   server can read the ids), fields `form: "purgerequest"`, `docIds`,
-  `requestedAt`. It is pushed like any change. The client refuses ids that are
+  `requestedAt`. It is pushed like any change; the sync pushes purge requests
+  in a phase of their own after the other entries of a page, so the deletes
+  written before them reach the server first. The client refuses ids that are
   not deleted locally.
 - **Server check on push** (open core, independent of the master switch, like
   the rule above):
