@@ -55,6 +55,7 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
         ? data.requireMetadataSignatureSince
         : undefined,
     llm: parseLlmEndpointPolicy(data.llm),
+    personalDatabasePrefixes: stringArray(data.personalDatabasePrefixes)?.filter((prefix) => /^[a-z][a-z0-9]*_$/.test(prefix)),
   };
 }
 
@@ -103,6 +104,12 @@ export function parseRuleDoc(data: Record<string, unknown>, ruleType: RuleType):
     users_hashes: usersHashes,
     users_encrypted: typeof data.users_encrypted === "string" ? data.users_encrypted : "",
     action: data.action === "deny" ? "deny" : "allow",
+    ...(ruleType === "doc_deposit" && typeof data.maxRecipients === "number"
+      ? { maxRecipients: data.maxRecipients }
+      : {}),
+    ...(ruleType === "doc_deposit" && Array.isArray(data.docIdPrefixes)
+      ? { docIdPrefixes: data.docIdPrefixes.filter((p): p is string => typeof p === "string" && p.length > 0) }
+      : {}),
   };
 }
 

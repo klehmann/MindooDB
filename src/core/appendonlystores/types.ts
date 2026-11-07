@@ -165,7 +165,13 @@ export type PutRejectionClass =
   | "untrusted-key"
   | "policy"
   | "purged"
-  | "revoked-key";
+  | "revoked-key"
+  /**
+   * A deposit-only principal (docs/accesscontrol.md §6.10) created a document
+   * id the store already holds. The depositor reads this as "already
+   * delivered"; it is never worth re-offering.
+   */
+  | "exists";
 
 /** Every value {@link PutRejectionClass} admits, for validating untrusted input. */
 export const PUT_REJECTION_CLASSES: readonly PutRejectionClass[] = [
@@ -174,6 +180,7 @@ export const PUT_REJECTION_CLASSES: readonly PutRejectionClass[] = [
   "policy",
   "purged",
   "revoked-key",
+  "exists",
 ] as const;
 
 /**

@@ -367,6 +367,7 @@ Since sync-v5, a refused entry is **reported per entry** instead. The server ski
 | `policy` | Tier 1 rule denial, or the builtin `userdirectory` write invariant | Only after an administrator restores the right |
 | `purged` | The document's history was purged on the server (accesscontrol.md §10, *Purge*) | No, and it must not be tried — see below |
 | `revoked-key` | The entry's `decryptionKeyId` is on the pushing user's revoked-key blacklist | No — the payload is sealed to a retired key, so it takes a re-encryption, which is a new entry |
+| `exists` | A deposit-only principal (accesscontrol.md §6.10) created a document id the store already holds | No, and it need not be: the document was already delivered |
 
 The class exists because the field's absence used to be silently ambiguous. A client reads it through `rejectionClassOf`, never directly: a server predating the field could only ever have reported signature-class failures per entry, so a missing value means exactly `"signature"`.
 
@@ -465,7 +466,7 @@ Client sync and server replication differ in one respect that changes the correc
 
 Two bounds keep that from turning into its own kind of outage:
 
-- **Only a self-resolving refusal is worth waiting on.** `untrusted-key` is the one class the sync itself can clear, because the `directory` replication that registers the key is normally a run or two away. Holding on any other class pins the cursor to an entry that will be refused for exactly the same reason on every future run: the pair re-scans from that position forever, the scan never falls back to the cheap resume path of 5.7.1, and a permanent condition presents as a permanent backoff. So `policy`, `purged`, `revoked-key` and `signature` are reported and passed.
+- **Only a self-resolving refusal is worth waiting on.** `untrusted-key` is the one class the sync itself can clear, because the `directory` replication that registers the key is normally a run or two away. Holding on any other class pins the cursor to an entry that will be refused for exactly the same reason on every future run: the pair re-scans from that position forever, the scan never falls back to the cheap resume path of 5.7.1, and a permanent condition presents as a permanent backoff. So `policy`, `purged`, `revoked-key`, `exists` and `signature` are reported and passed.
 - **Even a self-resolving refusal is only waited on for a bounded number of runs** (`DEFAULT_MAX_CURSOR_HOLD_ATTEMPTS`, currently 20). The bet that the key will show up can simply be wrong, and nothing else would ever end the wait. The budget is generous on purpose: overspending costs a re-scan, giving up too early costs an entry that would have been accepted.
 
 Whatever the cursor moves past — immediately or after the budget ran out — is reported in `SyncStoresResult.abandoned`, which is the set a caller must record if it wants the entries to stay findable. `PeerReplicator` logs exactly that set; it deliberately does not re-derive it by filtering `rejected` by class, which would miss the entries the budget just gave up on.
@@ -587,7 +588,8 @@ type PutRejectionClass =
   | "untrusted-key"  // the directory does not know the author key yet
   | "policy"         // Tier 1 rule or userdirectory invariant said no
   | "purged"         // the document's history was erased on purpose
-  | "revoked-key";   // sealed to a key the tenant retired
+  | "revoked-key"    // sealed to a key the tenant retired
+  | "exists";        // a deposit for a document id the store already holds
 
 interface RejectedPutEntry {
   id: string;
