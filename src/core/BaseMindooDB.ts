@@ -935,6 +935,16 @@ export class BaseMindooDB implements MindooDB {
   private syncStoreChangesInFlight: Promise<void> | null = null;
   /** Shared follow-up run for callers that arrive mid-sync. */
   private syncStoreChangesQueued: Promise<void> | null = null;
+  /**
+   * > 0 while this database hands a sealed document's wrap list to the tenant
+   * ({@link ingestSealed}). Unwrapping may resolve the own User-Key, which
+   * reads `directory` (grants, username hashes) and so calls
+   * {@link syncStoreChanges} on it. When this database *is* `directory` (a
+   * sealed admin document there, e.g. a mail gateway configuration sealed to
+   * the gateway), that call would wait for the very run that is waiting for
+   * it. Such nested calls return at once and read the index as it is.
+   */
+  private sealedIngestDepth = 0;
 
   private changeListeners: Set<DbChangeListener> = new Set();
   private pendingChangeNotifications: Map<string, DbChange> = new Map();
@@ -4132,7 +4142,7 @@ export class BaseMindooDB implements MindooDB {
       const existingIndex = this.getDocIndexPosition(docId);
       const existing =
         existingIndex === undefined ? undefined : this.index[existingIndex];
-      await this.tenant.ingestSealedFromEntries?.(
+      await this.ingestSealed(
         visibility.decryptionKeyId,
         metadataByDoc.get(docId)!,
       );
@@ -4506,6 +4516,10 @@ export class BaseMindooDB implements MindooDB {
    * {@link syncStoreChangesInFlight}).
    */
   async syncStoreChanges(): Promise<void> {
+    if (this.sealedIngestDepth > 0) {
+      // Called back from our own sealed ingest (see sealedIngestDepth).
+      return;
+    }
     if (this.syncStoreChangesInFlight) {
       if (!this.syncStoreChangesQueued) {
         // The running scan may have started before the entries this caller
@@ -4712,7 +4726,7 @@ export class BaseMindooDB implements MindooDB {
               });
               sealedIngestEntries = fullDocMetadata;
             }
-            await this.tenant.ingestSealedFromEntries?.(
+            await this.ingestSealed(
               representativeEntry.decryptionKeyId,
               sealedIngestEntries,
             );
@@ -6823,6 +6837,24 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Hands a sealed document's newest wrap list to the tenant, with nested
+   * {@link syncStoreChanges} calls on this database short-circuited meanwhile
+   * (see {@link sealedIngestDepth}).
+   */
+  private async ingestSealed(
+    keyId: string,
+    entries: Array<{ recipients?: EntryRecipients; createdAt: number }>,
+  ): Promise<void> {
+    if (!this.tenant.ingestSealedFromEntries) return;
+    this.sealedIngestDepth++;
+    try {
+      await this.tenant.ingestSealedFromEntries(keyId, entries);
+    } finally {
+      this.sealedIngestDepth--;
+    }
+  }
+
+  /**
    * Unwrap a `$sealed:` DEK from entry recipient wraps into the tenant session
    * cache. `loadDocumentInternal` already does this; history, timestamp, and
    * DAG reads must as well — otherwise Haven's revision list and DAG explorer
@@ -6841,7 +6873,7 @@ export class BaseMindooDB implements MindooDB {
     const keyId =
       entries.find((entry) => entry.entryType === "doc_create")
         ?.decryptionKeyId ?? entries[0].decryptionKeyId;
-    await this.tenant.ingestSealedFromEntries?.(keyId, entries);
+    await this.ingestSealed(keyId, entries);
   }
 
   /**
@@ -16562,7 +16594,7 @@ export class BaseMindooDB implements MindooDB {
       .join(", ");
     this.logger.debug(`Entry types for ${docId}: ${entryTypes}`);
 
-    await this.tenant.ingestSealedFromEntries?.(
+    await this.ingestSealed(
       allEntryMetadata.find((em) => em.entryType === "doc_create")
         ?.decryptionKeyId ?? allEntryMetadata[0].decryptionKeyId,
       allEntryMetadata,
