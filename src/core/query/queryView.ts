@@ -373,6 +373,8 @@ export async function createEphemeralSummaryView(
   definition: MindooQueryViewDefinition,
   options?: VirtualViewUpdateOptions
 ): Promise<EphemeralSummaryView> {
+  // Coverage is checked against the settled configuration (see executeQuery).
+  await summary.ensureConfigLoaded?.();
   const view = new EphemeralSummaryView(
     [{ db, summary, origin: defaultEphemeralOrigin(db) }],
     definition
@@ -411,7 +413,9 @@ export async function queryViewAcross(
   definition: MindooQueryViewDefinition,
   options?: VirtualViewUpdateOptions
 ): Promise<EphemeralSummaryView> {
-  const view = new EphemeralSummaryView(resolveSources(sources), definition);
+  const resolved = resolveSources(sources);
+  await Promise.all(resolved.map((source) => source.summary.ensureConfigLoaded?.()));
+  const view = new EphemeralSummaryView(resolved, definition);
   await view.update(options);
   return view;
 }
