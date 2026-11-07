@@ -94,8 +94,12 @@ export interface BuiltinWriteDecision {
  *   mail gateway deposits incoming mail.
  * `mmailout_` — MindooMail's outbox: the person writes outgoing mail, the mail
  *   gateway (accessPrefixes) reads it, sends it and writes status documents.
+ * `mbusy_` — free/busy: the person's client publishes the busy times of their
+ *   calendar (no details). The rights are the other way round: other members
+ *   may read it, read-only, under the tenant's `freeBusy` setting; only the
+ *   owner's devices write.
  */
-export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_", "mmailout_"] as const;
+export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_", "mmailout_", "mbusy_"] as const;
 
 /**
  * Default document-id prefixes a depositor may use in a built-in personal

@@ -1754,7 +1754,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async evaluateDbAccessModeForSigningKey(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason?: string }> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason?: string }> {
     // Built-in personal-database invariant (§6.11): decides first, and a
     // configured policy can only take away what it grants.
     const personal = await this.evaluatePersonalDatabaseAccess(input);
@@ -1806,11 +1806,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * that grant and by the tenant admin; it may be deposited into by
    * identities whose grant lists the prefix in `depositPrefixes`; nobody
    * else gets anything. An unknown grant id leaves everyone but the admin out.
+   * `mbusy_` (free/busy) is the exception: other members read it read-only
+   * (`readOnly`, pushes refused) under the tenant's `freeBusy` setting.
    */
   async evaluatePersonalDatabaseAccess(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason: string } | null> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason: string } | null> {
     const head = await this.getDirectoryStateHead();
     const owner = personalDatabaseOwner(input.dbid, head.defaultPolicy?.personalDatabasePrefixes ?? []);
     if (!owner) return null;
@@ -1826,6 +1828,23 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       Array.isArray(grant[field]) && (grant[field] as unknown[]).includes(owner.prefix);
     if (signerGrants.some((grant) => listed(grant, "accessPrefixes"))) {
       return { mode: "read", reason: `service access to ${owner.prefix}* granted` };
+    }
+    // Free/busy (§6.11): other members read the owner's busy times, read-only,
+    // under the tenant's `freeBusy` setting. Nobody but the owner writes.
+    if (owner.prefix === "mbusy_" && grant && signerGrants.length > 0) {
+      const mode = head.defaultPolicy?.freeBusy ?? "members";
+      let allowed = mode === "members";
+      if (mode === "rules") {
+        const decision = await this.evaluateAccessForSigningKey({
+          op: "doc_read",
+          dbid: input.dbid,
+          signingKey: input.signingKey,
+          trustedTime: Number.MAX_SAFE_INTEGER,
+        });
+        allowed = decision.allowed && decision.matchedRuleId !== undefined;
+      }
+      if (allowed) return { mode: "read", readOnly: true, reason: `free/busy (${mode})` };
+      return { mode: "none", reason: `free/busy of another person (${mode})` };
     }
     const depositors = signerGrants.filter((grant) => listed(grant, "depositPrefixes"));
     if (depositors.length > 0) {

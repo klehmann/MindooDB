@@ -94,13 +94,16 @@ export type ServerDbAccessEvaluator = (
  * Like {@link ServerDbAccessEvaluator}, but also reports the deposit right
  * (docs/accesscontrol.md §6.10): `"read"` syncs normally, `"deposit"` may only
  * push sealed `doc_create` entries (and their attachment chunks), `"none"` is
- * rejected. When supplied it takes precedence over `dbAccessEvaluator`.
+ * rejected. `readOnly` with `"read"` (free/busy readers, §6.11) pulls but
+ * every pushed entry is refused. When supplied it takes precedence over
+ * `dbAccessEvaluator`.
  */
 export type ServerDbAccessModeEvaluator = (
   principal: { signingKey?: string },
   dbid: string
 ) => Promise<{
   mode: "read" | "deposit" | "none";
+  readOnly?: boolean;
   maxRecipients?: number;
   docIdPrefixes?: string[];
   internalMail?: { maxBytesPerMail: number; maxMailsPerHour: number };
@@ -178,6 +181,8 @@ type ResolvedTokenPayload = NetworkAuthTokenPayload & {
     /** Internal mail between members (§6.11): size and rate limits per sender and mailbox. */
     internalMail?: { maxBytesPerMail: number; maxMailsPerHour: number };
   };
+  /** Set for a principal that may read this database but not write it (free/busy readers, §6.11). */
+  readOnly?: boolean;
 };
 
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
@@ -1170,6 +1175,17 @@ export class ServerNetworkContentAddressedStore {
         }
       }
 
+      // Read-only principal (free/busy readers, §6.11): nothing it pushes is accepted.
+      if (tokenPayload.readOnly) {
+        this.rejectEntry(
+          rejected,
+          entry.id,
+          `Entry ${entry.id}: this user may read database "${this.witnessDbid ?? this.localStore.getId()}" but not write it`,
+          "policy",
+        );
+        continue;
+      }
+
       // Purge requests in personal databases (§6.11): only by someone who may
       // read the database, only for documents that are already deleted.
       // Independent of the ACL master switch, like the builtin invariants.
@@ -1731,6 +1747,9 @@ export class ServerNetworkContentAddressedStore {
             ...(access.internalMail ? { internalMail: access.internalMail } : {}),
           },
         };
+      }
+      if (access.readOnly) {
+        return { ...payload, readOnly: true };
       }
     } else if (this.dbAccessEvaluator) {
       const dbid = this.witnessDbid ?? this.localStore.getId();
