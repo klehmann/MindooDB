@@ -467,6 +467,21 @@ describe("doc_deposit on a real server (HTTP)", () => {
       await expect(remote.hasEntries(["x"])).rejects.toThrow(DENIED);
     });
 
+    test("a refused request leaves no store behind on the server", async () => {
+      const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"] });
+      const storesDir = `${dataDir}/${t.tenantId}/stores`;
+      const remote = await t.karsten.connectToServer(baseUrl, t.janeMail, StoreKind.docs);
+      await expect(remote.findNewEntries([])).rejects.toThrow(DENIED);
+      const attachments = await t.karsten.connectToServer(baseUrl, t.janeMail, StoreKind.attachments);
+      await expect(attachments.getAllIds()).rejects.toThrow(DENIED);
+      expect(fs.existsSync(`${storesDir}/${t.janeMail}`)).toBe(false);
+      // Jane's own first push creates it.
+      const janeDb = await openDb(t.jane, t.janeMail);
+      await janeDb.createDocument({ recipients: [], initialValues: { subject: "mine" } });
+      await push(t.jane, t.janeMail);
+      expect(fs.existsSync(`${storesDir}/${t.janeMail}`)).toBe(true);
+    });
+
     test("a configured policy can tighten the rule but not loosen it", async () => {
       const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"] });
       await t.directory.setDefaultAccessPolicy!({ disableAllAccessChecksAndPolicies: false, personalDatabasePrefixes: ["notes_"] }, t.adminKey, PASSWORD);

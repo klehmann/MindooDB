@@ -1233,7 +1233,13 @@ export class TenantManager {
       return cached;
     }
 
-    const localStore = tenant.storeFactory.getStore(dbId, storeKind);
+    // Created on first real use, i.e. after the request's token and rights
+    // were checked: a refused or unauthenticated request must not leave a
+    // store directory behind for an arbitrary database id (disk, inodes, and
+    // listDatabases() would report it).
+    const localStore = lazyContentAddressedStore(dbId, storeKind, () =>
+      tenant.storeFactory.getStore(dbId, storeKind),
+    );
 
     // Access-control v1 wiring (docs/accesscontrol.md §5–§7). The witness signer
     // lets the server stamp receipts on accepted entries; the Tier 1 evaluator
@@ -1791,4 +1797,29 @@ export class TenantManager {
 
     return { tenant };
   }
+}
+
+/**
+ * A store that is only created when something other than its identity
+ * (`getId`, `getStoreKind`) is used. See {@link TenantManager.getServerStore}.
+ */
+export function lazyContentAddressedStore(
+  dbId: string,
+  storeKind: StoreKind,
+  create: () => ContentAddressedStore,
+): ContentAddressedStore {
+  let real: ContentAddressedStore | null = null;
+  const target = (): ContentAddressedStore => (real ??= create());
+  return new Proxy({} as ContentAddressedStore, {
+    get(_shell, prop) {
+      if (prop === "getId") return () => dbId;
+      if (prop === "getStoreKind") return () => storeKind;
+      const store = target();
+      const value = (store as unknown as Record<PropertyKey, unknown>)[prop];
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(store) : value;
+    },
+    has(_shell, prop) {
+      return prop in target();
+    },
+  });
 }
