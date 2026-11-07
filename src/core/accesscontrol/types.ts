@@ -302,7 +302,36 @@ llm?: LlmEndpointPolicy;
    * `<prefix><grantDocId>`. Like `llm` it holds while the master switch is on.
    */
   personalDatabasePrefixes?: string[];
+  /**
+   * Internal mail between tenant members (§6.11, "Internal mail"): who may
+   * deposit MindooMail messages (`memo_…`, sealed to the owner) into another
+   * person's `mmail_<grantDocId>`. `"members"` (default): every member with a
+   * grant. `"rules"`: only members matched by a `doc_deposit` allow rule for
+   * the mailbox (e.g. `dbid: "mmail_*"`, a group). `"off"`: nobody (only
+   * grants with `depositPrefixes`, such as the mail gateway). A `doc_deposit`
+   * deny rule always wins, so one member's right can be taken away. Tenant
+   * default policy only; holds while the master switch is on.
+   */
+  internalMail?: "off" | "members" | "rules";
+  /**
+   * Limits for internal mail deposits, enforced by the sync server per sender
+   * and mailbox: `maxBytesPerMail` (document plus attachments, default
+   * 25 MiB) and `maxMailsPerHour` (default 200). Tenant default policy only.
+   */
+  internalMailLimits?: InternalMailLimits;
 }
+
+/** {@link DefaultAccessPolicyDoc.internalMailLimits}. */
+export interface InternalMailLimits {
+  maxBytesPerMail?: number;
+  maxMailsPerHour?: number;
+}
+
+/** Defaults for {@link DefaultAccessPolicyDoc.internalMailLimits}. */
+export const DEFAULT_INTERNAL_MAIL_LIMITS: Required<InternalMailLimits> = {
+  maxBytesPerMail: 25 * 1024 * 1024,
+  maxMailsPerHour: 200,
+};
 
 /**
  * The `llm` block of the tenant default policy.
@@ -345,6 +374,8 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "requireMetadataSignatureSince"
     | "llm"
     | "personalDatabasePrefixes"
+    | "internalMail"
+    | "internalMailLimits"
   >
 > = {
   denyDocCreate: false,
@@ -658,6 +689,24 @@ export function validateAclRule(rule: {
 export function validateAccessPolicy(
   policy: Partial<Omit<DefaultAccessPolicyDoc, "form" | "type">>
 ): void {
+  if (
+    policy.internalMail !== undefined &&
+    policy.internalMail !== "off" &&
+    policy.internalMail !== "members" &&
+    policy.internalMail !== "rules"
+  ) {
+    throw new Error(`internalMail "${String(policy.internalMail)}" must be "off", "members" or "rules"`);
+  }
+  if (policy.internalMailLimits !== undefined) {
+    for (const [key, value] of Object.entries(policy.internalMailLimits)) {
+      if (!["maxBytesPerMail", "maxMailsPerHour"].includes(key)) {
+        throw new Error(`internalMailLimits.${key} is unknown`);
+      }
+      if (value !== undefined && (!Number.isInteger(value) || (value as number) < 1)) {
+        throw new Error(`internalMailLimits.${key} must be a positive integer`);
+      }
+    }
+  }
   if (policy.personalDatabasePrefixes !== undefined) {
     if (
       !Array.isArray(policy.personalDatabasePrefixes) ||
@@ -801,6 +850,8 @@ export function effectivePolicy(
     | "requireMetadataSignatureSince"
     | "llm"
     | "personalDatabasePrefixes"
+    | "internalMail"
+    | "internalMailLimits"
   >
 > & {
   defaultCreateKeyId?: string;

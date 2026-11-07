@@ -99,7 +99,13 @@ export type ServerDbAccessEvaluator = (
 export type ServerDbAccessModeEvaluator = (
   principal: { signingKey?: string },
   dbid: string
-) => Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; reason?: string }>;
+) => Promise<{
+  mode: "read" | "deposit" | "none";
+  maxRecipients?: number;
+  docIdPrefixes?: string[];
+  internalMail?: { maxBytesPerMail: number; maxMailsPerHour: number };
+  reason?: string;
+}>;
 
 /**
  * Resolves the per-user revoked decryption-key-id blacklist for the
@@ -199,7 +205,12 @@ export type ServerTrustedWitnessResolver = (receivedByPublicKey: string) => bool
 type ResolvedTokenPayload = NetworkAuthTokenPayload & {
   peer?: ServerPeerPrincipal;
   /** Set for a principal that may only deposit into this database (§6.10). */
-  deposit?: { maxRecipients: number; docIdPrefixes?: string[] };
+  deposit?: {
+    maxRecipients: number;
+    docIdPrefixes?: string[];
+    /** Internal mail between members (§6.11): size and rate limits per sender and mailbox. */
+    internalMail?: { maxBytesPerMail: number; maxMailsPerHour: number };
+  };
 };
 
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
@@ -297,6 +308,11 @@ export interface BuiltinWriteContext {
  * This is not a ContentAddressedStore implementation itself, but rather
  * a service that wraps a local ContentAddressedStore and handles network requests.
  */
+/** Sliding window of the internal-mail rate limit. */
+const INTERNAL_MAIL_WINDOW_MS = 60 * 60 * 1000;
+/** How often the internal-mail counters are pruned at most. */
+const INTERNAL_MAIL_PRUNE_INTERVAL_MS = 60 * 1000;
+
 export class ServerNetworkContentAddressedStore {
   private localStore: ContentAddressedStore;
   private directory: MindooTenantDirectory;
@@ -330,6 +346,12 @@ export class ServerNetworkContentAddressedStore {
   /** docId → creator of its `doc_create` (never changes once known). */
   private docCreatorByDocId = new Map<string, { signingKey: string; trustedTime: number }>();
   private purgeRequestValidator?: ServerPurgeRequestValidator;
+  /** Internal mail limits (§6.11): bytes per deposited document, accept times per sender. */
+  /** Bytes per internal mail doc and when it was last seen (pruned after an hour). */
+  private internalMailBytesByDocId = new Map<string, { bytes: number; at: number }>();
+  /** doc_create times per sender within the last hour (pruned, empty senders dropped). */
+  private internalMailTimesBySender = new Map<string, number[]>();
+  private internalMailPrunedAt = 0;
   /** Cached `username_hash` per userdirectory docId, filled as creates are seen. */
   private userdirectoryHashByDocId = new Map<string, string>();
   /** Cached create signing key per personal userdirectory docId (its owner). */
@@ -1299,12 +1321,13 @@ export class ServerNetworkContentAddressedStore {
       // authorizes them. Anything that is not a sealed create (or a chunk of
       // one) is refused.
       if (tokenPayload.deposit) {
-        const denied = await this.evaluateDepositEntry(
-          entry,
-          tokenPayload,
-          tokenPayload.deposit.maxRecipients,
-          tokenPayload.deposit.docIdPrefixes,
-        );
+        const denied =
+          (await this.evaluateDepositEntry(
+            entry,
+            tokenPayload,
+            tokenPayload.deposit.maxRecipients,
+            tokenPayload.deposit.docIdPrefixes,
+          )) ?? this.evaluateInternalMailLimits(entry, tokenPayload.deposit.internalMail);
         if (denied) {
           this.rejectEntry(rejected, entry.id, denied.reason, denied.rejectionClass);
           continue;
@@ -1473,6 +1496,64 @@ export class ServerNetworkContentAddressedStore {
       return { reason: `Entry ${entry.id}: document ${entry.docId} already exists`, rejectionClass: "exists" };
     }
     return null;
+  }
+
+  /**
+   * Size and rate limits of internal mail (§6.11): per sender (signing key)
+   * and mailbox (this store), a document plus its attachment chunks may not
+   * exceed `maxBytesPerMail` (each store counts its own entries), and at most
+   * `maxMailsPerHour` documents are accepted per sender in a sliding hour.
+   * Counters are in memory: a server restart resets them.
+   */
+  private evaluateInternalMailLimits(
+    entry: StoreEntry,
+    limits: { maxBytesPerMail: number; maxMailsPerHour: number } | undefined,
+  ): { reason: string; rejectionClass: PutRejectionClass } | null {
+    if (!limits) return null;
+    const now = Date.now();
+    this.pruneInternalMailCounters(now);
+    const policy = (reason: string) => ({ reason: `Entry ${entry.id}: ${reason}`, rejectionClass: "policy" as const });
+    const bytes = (this.internalMailBytesByDocId.get(entry.docId)?.bytes ?? 0) + entry.encryptedData.byteLength;
+    if (bytes > limits.maxBytesPerMail) {
+      return policy(`internal mail is limited to ${limits.maxBytesPerMail} bytes per mail`);
+    }
+    if (entry.entryType === "doc_create") {
+      const recent = (this.internalMailTimesBySender.get(entry.createdByPublicKey) ?? []).filter(
+        (t) => now - t < INTERNAL_MAIL_WINDOW_MS,
+      );
+      if (recent.length >= limits.maxMailsPerHour) {
+        this.internalMailTimesBySender.set(entry.createdByPublicKey, recent);
+        return policy(`internal mail is limited to ${limits.maxMailsPerHour} mails per hour per sender and mailbox`);
+      }
+      recent.push(now);
+      this.internalMailTimesBySender.set(entry.createdByPublicKey, recent);
+    }
+    this.internalMailBytesByDocId.set(entry.docId, { bytes, at: now });
+    return null;
+  }
+
+  /**
+   * Drops counters outside the one-hour window, at most once a minute: byte
+   * counts of mails not touched for an hour (a mail's document and attachment
+   * chunks arrive within minutes) and senders without a create in the last hour.
+   * Keeps memory bounded by the traffic of the last hour, for the server's lifetime.
+   */
+  private pruneInternalMailCounters(now: number): void {
+    if (now - this.internalMailPrunedAt < INTERNAL_MAIL_PRUNE_INTERVAL_MS) return;
+    this.internalMailPrunedAt = now;
+    for (const [docId, counter] of this.internalMailBytesByDocId) {
+      if (now - counter.at >= INTERNAL_MAIL_WINDOW_MS) this.internalMailBytesByDocId.delete(docId);
+    }
+    for (const [sender, times] of this.internalMailTimesBySender) {
+      const recent = times.filter((t) => now - t < INTERNAL_MAIL_WINDOW_MS);
+      if (recent.length === 0) this.internalMailTimesBySender.delete(sender);
+      else if (recent.length !== times.length) this.internalMailTimesBySender.set(sender, recent);
+    }
+  }
+
+  /** Test hook: sizes of the internal-mail counters. */
+  internalMailCounterSizes(): { docs: number; senders: number } {
+    return { docs: this.internalMailBytesByDocId.size, senders: this.internalMailTimesBySender.size };
   }
 
   /**
@@ -1901,6 +1982,7 @@ export class ServerNetworkContentAddressedStore {
           deposit: {
             maxRecipients: access.maxRecipients ?? DEFAULT_DEPOSIT_MAX_RECIPIENTS,
             ...(access.docIdPrefixes?.length ? { docIdPrefixes: access.docIdPrefixes } : {}),
+            ...(access.internalMail ? { internalMail: access.internalMail } : {}),
           },
         };
       }

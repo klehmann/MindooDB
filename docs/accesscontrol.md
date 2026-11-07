@@ -1210,6 +1210,45 @@ open to every member's sync. Once the server enforces it:
 - clients that open the database find it refused and should drop their local
   copy (not implemented yet).
 
+**Internal mail.** Members can mail each other without a mail server: the
+sender's client deposits a MindooMail message, sealed to the recipient only,
+into the recipient's `mmail_<grantDocId>` (the same deposit semantics as the
+mail gateway, §6.10). It is part of the built-in rule (open core):
+
+- **Who.** The tenant default policy's `internalMail`: `"members"` (default:
+  every member with a grant, so two users of a new tenant can write to each
+  other right away), `"rules"` (only members matched by a `doc_deposit` allow
+  rule for the mailbox, e.g. `{ dbid: "mmail_*", groups: ["staff"] }`; needs
+  access control switched on) or `"off"` (only grants with `depositPrefixes`,
+  such as the gateway). A `doc_deposit` deny rule for `mmail_*` always takes
+  the right away from that member or group.
+- **What.** Deposit only: sealed creates under `memo_` ids (messages, never
+  events, status or folders), at most one recipient wrap, no read, change or
+  delete. A depositor sees nothing of the mailbox.
+- **Limits** per sender and mailbox, enforced by the server
+  (`internalMailLimits` on the default policy): `maxBytesPerMail` (default
+  25 MiB; the document and its attachment chunks, each store counting its own)
+  and `maxMailsPerHour` (default 200, sliding hour). Over a limit the entry is
+  refused as `policy`. The counters live in the server's memory and restart
+  with it.
+  The limits apply only to deposits that `internalMail` alone allows: a grant
+  with a matching `depositPrefixes` (the mail gateway, which delivers all
+  external mail under its own signature) is never throttled by them; its mail
+  server sets its own limits.
+- **Sender.** The `doc_create` is signed by the sender's device, so the
+  recipient's client can always tell who wrote the message; it should check
+  that `from` belongs to the signer and quarantine the message otherwise.
+
+```ts
+await directory.setDefaultAccessPolicy({
+  internalMail: "rules",
+  internalMailLimits: { maxBytesPerMail: 10 * 1024 * 1024, maxMailsPerHour: 100 },
+}, adminKey, adminPassword);
+await directory.createAccessRule({
+  ruleId: "staff_mail", type: "doc_deposit", dbid: "mmail_*", action: "allow", groups: ["staff"],
+}, adminKey, adminPassword);
+```
+
 **Purge (hard delete) in personal databases.** Deleting only writes a
 tombstone; the history stays in the append-only store. A personal database
 carries its own purge requests, so the owner (and a service working on it)
