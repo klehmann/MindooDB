@@ -44,6 +44,7 @@ export type RuleType =
   | "doc_undelete"
   | "doc_snapshot"
   | "doc_read"
+  | "doc_read_all"
   | "doc_deposit"
   | "llm_use";
 
@@ -55,6 +56,7 @@ export const RULE_TYPES: readonly RuleType[] = [
   "doc_undelete",
   "doc_snapshot",
   "doc_read",
+  "doc_read_all",
   "doc_deposit",
   "llm_use",
 ];
@@ -214,6 +216,17 @@ export interface DefaultAccessPolicyDoc {
    * itself can be read). Defaults to false.
    */
   denyDocRead?: boolean; // default false (reading open unless explicitly denied)
+  /**
+   * Which documents of the database a member may read (§6.12). `"all"`
+   * (default): every document. `"own"`: only documents whose `doc_create` was
+   * signed by one of the member's own signing keys (same grant, any device);
+   * the sync server leaves out everything else on every read path and refuses
+   * writes into other people's documents. The tenant admin and members matched
+   * by a `doc_read_all` allow rule still read everything. Layers per-db over
+   * the tenant default in {@link effectivePolicy}; usually set per-db only.
+   * Server-enforced (Tier 1, metadata only).
+   */
+  docReadScope?: "all" | "own";
   /**
    * Optional default `decryptionKeyId` for a `doc_create` that does not specify
    * one in the governed scope (tenant default, or a single database when set on
@@ -383,6 +396,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "type"
     | "disableAllAccessChecksAndPolicies"
     | "defaultCreateKeyId"
+    | "docReadScope"
     | "databaseCreationPolicy"
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
@@ -409,7 +423,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
  * unless an allow rule grants it (§6.10).
  */
 export const RULE_TYPE_TO_DENY_FIELD: Record<
-  Exclude<RuleType, "llm_use" | "doc_deposit">,
+  Exclude<RuleType, "llm_use" | "doc_read_all" | "doc_deposit">,
   keyof typeof DEFAULT_POLICY_DEFAULTS
 > = {
   doc_create: "denyDocCreate",
@@ -651,6 +665,11 @@ export function validateAclRule(rule: {
   if (rule.type === "doc_read" && (rule.withfields?.length ?? 0) > 0) {
     throw new Error("doc_read rules are database-level and cannot use `withfields`");
   }
+  // `doc_read_all` names who reads every document of a `docReadScope: "own"`
+  // database (§6.12): database-level as well, so the server can enforce it.
+  if (rule.type === "doc_read_all" && (rule.withfields?.length ?? 0) > 0) {
+    throw new Error("doc_read_all rules are database-level and cannot use `withfields`");
+  }
   // `doc_deposit` is a database-level right like `doc_read` (§6.10). These two
   // are the only types whose dbid may be a prefix pattern ("mmail_*",
   // "mbusy_*" for free/busy readers).
@@ -741,6 +760,14 @@ export function validateAccessPolicy(
       throw new Error('personalDatabasePrefixes must be prefixes like "notes_" (lowercase letters and digits, ending in "_")');
     }
   }
+  if (
+    policy.docReadScope !== undefined &&
+    policy.docReadScope !== "all" &&
+    policy.docReadScope !== "own"
+  ) {
+    throw new Error(`docReadScope "${String(policy.docReadScope)}" must be "all" or "own"`);
+  }
+
   if (
     policy.databaseCreationPolicy !== undefined &&
     policy.databaseCreationPolicy !== "open" &&
@@ -862,6 +889,7 @@ export function effectivePolicy(
     | "form"
     | "type"
     | "defaultCreateKeyId"
+    | "docReadScope"
     | "databaseCreationPolicy"
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
@@ -874,6 +902,7 @@ export function effectivePolicy(
   >
 > & {
   defaultCreateKeyId?: string;
+  docReadScope: "all" | "own";
 } {
   const pick = <K extends keyof typeof DEFAULT_POLICY_DEFAULTS>(field: K): boolean => {
     if (dbPolicy && dbPolicy[field] !== undefined) return dbPolicy[field] as boolean;
@@ -898,6 +927,7 @@ export function effectivePolicy(
     denyDocSnapshot: pick("denyDocSnapshot"),
     denyDocRead: pick("denyDocRead"),
     defaultCreateKeyId,
+    docReadScope: dbPolicy?.docReadScope ?? tenantDefault?.docReadScope ?? "all",
   };
 }
 

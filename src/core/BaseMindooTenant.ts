@@ -39,7 +39,14 @@ import { currentUserKeyEpoch } from "./userkeys/types";
 import { asUserKeyPayload } from "./userkeys/validateUserKeyDocument";
 import { isSealedKeyId } from "./userkeys/sealedTypes";
 import type { EntryRecipients } from "./userkeys/sealedTypes";
-import { newestRecipientBlock } from "./userkeys/recipients";
+import { newestRecipientBlock, resolveRecipientSpecs, sealToTargets } from "./userkeys/recipients";
+import type { RecipientOptions, RecipientSpec } from "./userkeys/sealedTypes";
+import {
+  SEALED_VALUE_VERSION,
+  encryptSealedValueContent,
+  openSealedValueWithKeys,
+  type SealedValue,
+} from "./userkeys/sealedValues";
 import { openBundle } from "./userkeys/sealedCrypto";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
@@ -66,6 +73,7 @@ import { CacheManager } from "./cache/CacheManager";
 import { validateDatabaseId } from "./databaseIdValidation";
 import { BackgroundTaskTracker } from "./BackgroundTaskTracker";
 import { SingleFlight } from "./utils/singleFlight";
+import { namedExport } from "./utils/dynamicImportInterop";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -523,6 +531,47 @@ export class BaseMindooTenant implements MindooTenant {
       epoch,
     });
     this.sealedGenerations.delete(keyId);
+  }
+
+  /**
+   * Seals `value` to people (their published User-Keys) or devices, for a
+   * field of a document encrypted with another key (see {@link SealedValue}).
+   * `options` as for sealed documents: the current user is included unless
+   * `includeSelf` is false; `strict` fails on a recipient without a published
+   * User-Key instead of leaving them out.
+   */
+  async sealValue(
+    value: Uint8Array,
+    recipients: RecipientSpec[],
+    options?: RecipientOptions,
+  ): Promise<SealedValue> {
+    const resolved = await resolveRecipientSpecs({
+      tenant: this,
+      specs: recipients,
+      options,
+      addedBy: this.currentUser.userSigningKeyPair.publicKey,
+      now: semanticNow(),
+    });
+    const { contentKey, ciphertext } = await encryptSealedValueContent(this.cryptoAdapter, value);
+    const sealed = await sealToTargets({ tenant: this, generations: [contentKey], targets: resolved.targets, epoch: 1 });
+    return {
+      v: SEALED_VALUE_VERSION,
+      ciphertext,
+      recipients: sealed,
+      to: resolved.targets.map((target) => ({ kind: target.kind, keyFingerprint: target.keyFingerprint })),
+    };
+  }
+
+  /**
+   * Opens a {@link SealedValue} with this identity's User-Key (any generation)
+   * or device key. Returns null when it is not sealed to them.
+   */
+  async openSealedValue(sealed: SealedValue): Promise<Uint8Array | null> {
+    const privateKeys = [
+      ...(await this.userKeys.getUserKeyCryptoKeysForReconcile()),
+      await this.getEncryptionPrivateKeyForReconcile(),
+    ].filter((key): key is CryptoKey => !!key);
+    return openSealedValueWithKeys({ crypto: this.cryptoAdapter, sealed, privateKeys });
   }
 
   async ingestSealedFromEntries(
@@ -2204,7 +2253,10 @@ export class BaseMindooTenant implements MindooTenant {
     target: { ticket: string; io: NonNullable<PublishToServerOptions["irohStreamIO"]> },
     options?: PublishToServerOptions,
   ): Promise<void> {
-    const { IrohNetworkTransport } = await import("./appendonlystores/network/IrohNetworkTransport.js");
+    const IrohNetworkTransport = namedExport<typeof import("./appendonlystores/network/IrohNetworkTransport.js").IrohNetworkTransport>(
+      await import("./appendonlystores/network/IrohNetworkTransport.js"),
+      "IrohNetworkTransport",
+    );
     const transport = new IrohNetworkTransport(target.io, target.ticket, {
       tenantId: this.tenantId,
     });
@@ -2415,12 +2467,15 @@ export class BaseMindooTenant implements MindooTenant {
 
     const remoteStorePromise = (async () => {
       // Lazy-import network modules to avoid circular dependencies and keep core lightweight
-      const { ClientNetworkContentAddressedStore } = await import(
-        "../appendonlystores/network/ClientNetworkContentAddressedStore.js"
-      );
+      const ClientNetworkContentAddressedStore = namedExport<
+        typeof import("../appendonlystores/network/ClientNetworkContentAddressedStore.js").ClientNetworkContentAddressedStore
+      >(await import("../appendonlystores/network/ClientNetworkContentAddressedStore.js"), "ClientNetworkContentAddressedStore");
 
       const transport = irohTarget
-        ? new (await import("./appendonlystores/network/IrohNetworkTransport.js")).IrohNetworkTransport(
+        ? new (namedExport<typeof import("./appendonlystores/network/IrohNetworkTransport.js").IrohNetworkTransport>(
+            await import("./appendonlystores/network/IrohNetworkTransport.js"),
+            "IrohNetworkTransport",
+          ))(
             irohTarget.io,
             irohTarget.ticket,
             {
@@ -2429,7 +2484,10 @@ export class BaseMindooTenant implements MindooTenant {
               storeKind,
             },
           )
-        : new (await import("../appendonlystores/network/HttpTransport.js")).HttpTransport(
+        : new (namedExport<typeof import("../appendonlystores/network/HttpTransport.js").HttpTransport>(
+            await import("../appendonlystores/network/HttpTransport.js"),
+            "HttpTransport",
+          ))(
             {
               baseUrl: `${normalizedServerUrl}/${this.tenantId}`,
               tenantId: this.tenantId,

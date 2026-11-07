@@ -463,6 +463,13 @@ interface DefaultAccessPolicyDoc {
    *  never gated. See section 6.8. */
   denyDocRead: boolean;      // default false  (reading open unless explicitly denied)
 
+  /** Which documents a member reads (section 6.12). "all" (default): every
+   *  document. "own": only documents whose doc_create was signed by one of the
+   *  member's own keys (same grant, any device); the server leaves out all
+   *  others on every read path and refuses writes into them. The tenant admin
+   *  and doc_read_all readers still read everything. Usually set per-db. */
+  docReadScope?: "all" | "own"; // default "all"
+
   /** Optional default decryptionKeyId a doc_create uses when the caller does
    *  not specify one in this scope (replacing the hardcoded "default" fallback).
    *  This is a client-side convenience, NOT a security control — the server
@@ -525,6 +532,7 @@ type RuleType =
   | "doc_create" | "doc_change" | "doc_delete"
   | "doc_undelete" | "doc_snapshot"
   | "doc_read"   // database-level read/sync gate (section 6.8); dbid-scoped, no withfields
+  | "doc_read_all" // reads every document of a docReadScope "own" database (section 6.12); no withfields
   | "llm_use";   // may use an AI assistant with this tenant's data (section 6.9); dbid "*", no withfields
 
 type Operator =
@@ -1321,6 +1329,82 @@ directory:
   the request through peer replication do not execute personal purges (they run
   the directory purge requests only); the Node server executes them when the
   request is pushed to it.
+### 6.12 Author-scoped read (`docReadScope: "own"` + `doc_read_all` rules)
+
+**Edition: Enterprise** (like the rest of the access-control layer).
+
+§6.8 decides *whether* a member may sync a database at all. This section
+narrows *which documents* a member gets from it: in a database with
+`docReadScope: "own"` every member reads **only the documents they created
+themselves**, and the sync server enforces it. Typical uses: a shared outbox
+or request queue where each person files their own items and one service or
+team processes all of them; forms, applications or tickets that people should
+not see from each other.
+
+- **Policy.** `docReadScope` on `acl_dbpolicy_<dbid>` (or the tenant default,
+  layered like the `deny*` flags). `"all"` is the default; nothing changes for
+  existing databases.
+- **Own document.** A document is a member's own when its `doc_create` was
+  signed by a key of the **same person** at grant level (`isSamePerson`, the same
+  resolver as `$author` in §6.3): any of that person's devices, also after a key
+  rollover. The server decides from metadata alone (`createdByPublicKey`,
+  receipt time); it needs no key and reads no content.
+- **Who reads everything.** The tenant admin, and members matched by a
+  `doc_read_all` allow rule for the database (or `"*"`): users, groups,
+  `$everyone`, deny overrides allow, no `withfields`. Example: the mail gateway
+  service account for a queue, or the help desk group for tickets.
+- **Master switch / no policy.** With the master switch on (or no
+  `acl_defaultpolicy`), the scope is off and everyone reads everything, as with
+  every other check.
+
+**Enforcement (server, every transport that uses `ServerNetworkContentAddressedStore`: HTTP and Iroh).**
+The request principal's scope is resolved per request (`evaluateReadScopeForSigningKey`,
+forwarded through `CompositeMindooDirectory`). A scoped principal:
+
+1. **Reads** only entries of own documents on every path that returns entries,
+   metadata or ids: `findNewEntries(ForDoc)`, `findEntries`, `scanEntriesSince`
+   (a page may come back empty while the cursor moves on), `getEntries` (both
+   formats), `getEntryMetadata`, `getAllIds`, `resolveDependencies`,
+   `planDocumentMaterialization(Batch)` (a hidden document looks unknown) and
+   attachment read planning. The attachments store resolves a chunk's document
+   in the docs store of the same database. A document whose `doc_create` is not
+   on the server yet is hidden (fail-closed).
+2. **Writes** only own documents: a `doc_create` must be signed by the principal's
+   person; any other entry must belong to an own document (its `doc_create` in
+   the same batch or on the server). Pushes into other documents are rejected per
+   entry with `rejectionClass: "policy"`. Attachment chunks pushed before their
+   document are judged by their own author.
+3. **Gets its own cursor lineage.** `getStoreHead` returns `<epoch>:scope:own` for
+   a scoped principal, so when the scope changes (mode switched, reader rule added
+   or removed) the epoch differs and the client re-scans from the start instead
+   of trusting a cursor that skipped entries it could not see.
+
+**Deliberately not filtered** (they reveal nothing a member does not already
+hold, and filtering them would make clients re-push entries endlessly):
+`hasEntries` and the id bloom summary answer for ids the caller already knows;
+a duplicate push is acknowledged with the stored receipt; `getStoreHead`'s
+`maxReceiptOrder`/`entryCount` and the change feed (§10) are store-wide, so a
+member can see *that* the database changed, not *what*. Peers (server-to-server
+replication) and the `directory`/`userdirectory` databases are never scoped.
+
+**Not covered yet:** the Cloudflare Worker server (`MindooDatabaseObject`) does not
+apply the scope. A tenant that relies on it must sync such databases only through
+the Node or Iroh server until it does.
+
+**Clients** need no change; `MindooTenantDirectory.getReadScope(dbid)` tells an app
+that a list only shows the user's own documents. Local copies a member already holds
+from before the scope was set stay on that device (as with §6.8 and §13: the server
+cannot reach into a device); combine with a key change if that matters.
+
+A possible later extension is **recipient-scoped read** (serve sealed documents only
+to their recipients, using the recipients block in the entry metadata); not part of
+this mode.
+
+**With deposits and personal databases.** A depositor (§6.10) creates its own
+documents, so a deposit into an own-scoped database passes the write check; it
+still cannot read anything (deposit mode). The built-in personal databases
+(§6.11) are owner-only already; `docReadScope` adds nothing there.
+
 
 ## 7. Evaluation algorithm
 

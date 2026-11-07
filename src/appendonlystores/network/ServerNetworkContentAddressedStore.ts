@@ -135,6 +135,39 @@ export type ServerRevokedKeyResolver = (
 export type ServerPurgedDocResolver = () => Promise<Set<string>> | Set<string>;
 
 /**
+ * Author-scoped read (docs/accesscontrol.md §6.12): what one principal may see
+ * of a database whose `docReadScope` is `"own"`. `scopeId` distinguishes the
+ * scoped view in the store head's epoch, so a client re-scans from the start
+ * when its scope changes (mode switched, reader rule added or removed).
+ * `ownsDocument` decides whether the principal is the same person as the
+ * document's creator (grant level: any of their devices).
+ */
+export interface ServerReadScope {
+  scopeId: string;
+  ownsDocument(creatorSigningKey: string, creatorTrustedTime: number): Promise<boolean>;
+}
+
+/**
+ * Resolves the read scope of the authenticated principal for this store's
+ * database: `null` reads everything (scope `"all"`, the tenant admin, a
+ * `doc_read_all` reader); a {@link ServerReadScope} limits every read path to
+ * the principal's own documents and refuses writes into other documents.
+ * Supplied by the host server from the directory.
+ */
+export type ServerReadScopeResolver = (
+  principal: { signingKey?: string }
+) => Promise<ServerReadScope | null>;
+
+/**
+ * The signing key and trusted time of a document's `doc_create`, or null while
+ * it is unknown. Defaults to a lookup in the store itself; the attachments
+ * store of a database is given the lookup of its docs store.
+ */
+export type ServerDocCreatorResolver = (
+  docId: string
+) => Promise<{ signingKey: string; trustedTime: number } | null>;
+
+/**
  * Checks a pushed entry of a purge request in a personal database
  * (docs/accesscontrol.md §6.11, "Purge"): returns null to accept, or the
  * reason to refuse. Supplied by the host server, which can decrypt the
@@ -222,6 +255,15 @@ export interface ServerAccessControlOptions {
    */
   purgedDocResolver?: ServerPurgedDocResolver;
   /**
+   * Author-scoped read resolver (§6.12). When present and it returns a scope,
+   * every read path serves only documents created by the principal (same
+   * grant), and pushes into other documents are refused. Never wired for the
+   * `"directory"` or `"userdirectory"` store.
+   */
+  readScopeResolver?: ServerReadScopeResolver;
+  /** Where the creator of a document is looked up for {@link readScopeResolver}. */
+  docCreatorResolver?: ServerDocCreatorResolver;
+  /**
    * Purge-request check for personal databases (§6.11). When present, every
    * pushed entry of a `purgereq_` document goes through it.
    */
@@ -304,6 +346,10 @@ export class ServerNetworkContentAddressedStore {
   private peerTokenResolver?: ServerPeerTokenResolver;
   /** Optional trusted-witness check used to preserve replicated receipts. */
   private trustedWitnessResolver?: ServerTrustedWitnessResolver;
+  private readScopeResolver?: ServerReadScopeResolver;
+  private docCreatorResolver?: ServerDocCreatorResolver;
+  /** docId → creator of its `doc_create` (never changes once known). */
+  private docCreatorByDocId = new Map<string, { signingKey: string; trustedTime: number }>();
   private purgeRequestValidator?: ServerPurgeRequestValidator;
   /** Internal mail limits (§6.11): bytes per deposited document, accept times per sender. */
   /** Bytes per internal mail doc and when it was last seen (pruned after an hour). */
@@ -362,6 +408,8 @@ export class ServerNetworkContentAddressedStore {
     this.builtinWriteContext = accessControl?.builtinWriteContext;
     this.peerTokenResolver = accessControl?.peerTokenResolver;
     this.trustedWitnessResolver = accessControl?.trustedWitnessResolver;
+    this.readScopeResolver = accessControl?.readScopeResolver;
+    this.docCreatorResolver = accessControl?.docCreatorResolver;
     this.purgeRequestValidator = accessControl?.purgeRequestValidator;
   }
 
@@ -488,6 +536,101 @@ export class ServerNetworkContentAddressedStore {
   }
 
   /**
+   * The read scope of the request's principal (§6.12), or `null` when it reads
+   * everything. Peers mirror the store completely; the directory stores are
+   * never scoped.
+   */
+  private async resolveReadScope(payload: ResolvedTokenPayload): Promise<ServerReadScope | null> {
+    if (payload.peer) return null;
+    if (!this.readScopeResolver) return null;
+    const dbId = this.localStore.getId();
+    if (dbId === ServerNetworkContentAddressedStore.DIRECTORY_DB_ID || dbId === USER_DIRECTORY_DB_ID) {
+      return null;
+    }
+    return this.readScopeResolver(this.readPrincipal(payload));
+  }
+
+  /** The creator of `docId`'s `doc_create`, cached once known. */
+  private async docCreator(docId: string): Promise<{ signingKey: string; trustedTime: number } | null> {
+    const cached = this.docCreatorByDocId.get(docId);
+    if (cached) return cached;
+    let found: { signingKey: string; trustedTime: number } | null = null;
+    if (this.docCreatorResolver) {
+      found = await this.docCreatorResolver(docId);
+    } else {
+      const metas = await this.localStore.findNewEntriesForDoc([], docId);
+      const create = metas.find((m) => m.entryType === "doc_create");
+      if (create) {
+        found = { signingKey: create.createdByPublicKey, trustedTime: create.receivedAt ?? create.createdAt };
+      }
+    }
+    if (found) this.docCreatorByDocId.set(docId, found);
+    return found;
+  }
+
+  /**
+   * A per-request decision cache for "may the principal see this document".
+   * Fail-closed: a document whose `doc_create` is unknown is hidden.
+   */
+  private scopeChecker(scope: ServerReadScope): (docId: string) => Promise<boolean> {
+    const decided = new Map<string, Promise<boolean>>();
+    return (docId: string) => {
+      let decision = decided.get(docId);
+      if (!decision) {
+        decision = (async () => {
+          const creator = await this.docCreator(docId);
+          return creator ? scope.ownsDocument(creator.signingKey, creator.trustedTime) : false;
+        })();
+        decided.set(docId, decision);
+      }
+      return decision;
+    };
+  }
+
+  /** Drop metadata of documents outside the principal's read scope (§6.12). */
+  private async filterMetasByReadScope<T extends { docId: string }>(
+    metas: T[],
+    scope: ServerReadScope | null,
+  ): Promise<T[]> {
+    if (!scope || metas.length === 0) return metas;
+    const visible = this.scopeChecker(scope);
+    const kept: T[] = [];
+    for (const meta of metas) {
+      if (await visible(meta.docId)) kept.push(meta);
+    }
+    return kept;
+  }
+
+  /** Drop ids of entries outside the principal's read scope (§6.12). */
+  private async filterIdsByReadScope(ids: string[], scope: ServerReadScope | null): Promise<string[]> {
+    if (!scope || ids.length === 0) return ids;
+    const visible = this.scopeChecker(scope);
+    const kept: string[] = [];
+    for (const id of ids) {
+      const meta = await this.localStore.getEntryMetadata(id);
+      if (meta && (await visible(meta.docId))) kept.push(id);
+    }
+    return kept;
+  }
+
+  /** Both per-user read filters (§13 revoked keys, §6.12 read scope) on metadata. */
+  private async filterMetasForReader<T extends { docId: string; decryptionKeyId?: string }>(
+    metas: T[],
+    payload: ResolvedTokenPayload,
+  ): Promise<T[]> {
+    const revoked = await this.resolveRevokedKeyIds(payload);
+    const scope = await this.resolveReadScope(payload);
+    return this.filterMetasByReadScope(this.filterMetasByRevokedKeys(metas, revoked), scope);
+  }
+
+  /** Both per-user read filters (§13 revoked keys, §6.12 read scope) on ids. */
+  private async filterIdsForReader(ids: string[], payload: ResolvedTokenPayload): Promise<string[]> {
+    const revoked = await this.resolveRevokedKeyIds(payload);
+    const scope = await this.resolveReadScope(payload);
+    return this.filterIdsByReadScope(await this.filterIdsByRevokedKeys(ids, revoked), scope);
+  }
+
+  /**
    * Get the ID of the underlying store.
    */
   getId(): string {
@@ -552,8 +695,7 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
-    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
-    return this.filterMetasByRevokedKeys(scoped, revoked);
+    return this.filterMetasForReader(scoped, tokenPayload);
   }
 
   /**
@@ -582,8 +724,7 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? newEntries.filter((e) => allowed.has(e.id)) : newEntries;
-    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
-    return this.filterMetasByRevokedKeys(scoped, revoked);
+    return this.filterMetasForReader(scoped, tokenPayload);
   }
 
   /**
@@ -617,8 +758,7 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? entries.filter((e) => allowed.has(e.id)) : entries;
-    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
-    return this.filterMetasByRevokedKeys(scoped, revoked);
+    return this.filterMetasForReader(scoped, tokenPayload);
   }
 
   /**
@@ -665,11 +805,11 @@ export class ServerNetworkContentAddressedStore {
     // Per-user revoked-key blacklist (§13): silently omit revoked entries from
     // the page. Filtering after paging only shrinks a page; the store's own
     // cursor still advances so the client keeps making progress.
-    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
-
+    // The read scope (§6.12) filters the same way: a page may come back empty
+    // while `nextCursor`/`hasMore` still move on over hidden entries.
     if (this.localStore.scanEntriesSince) {
       const result = await this.localStore.scanEntriesSince(cursor, effectiveLimit, filters);
-      return { ...result, entries: this.filterMetasByRevokedKeys(result.entries, revoked) };
+      return { ...result, entries: await this.filterMetasForReader(result.entries, tokenPayload) };
     }
 
     // Fallback: emulate cursor scan using existing metadata query.
@@ -713,7 +853,7 @@ export class ServerNetworkContentAddressedStore {
     const page = sorted.slice(startIndex, startIndex + max);
     const last = page.length > 0 ? page[page.length - 1] : null;
     return {
-      entries: this.filterMetasByRevokedKeys(page, revoked),
+      entries: await this.filterMetasForReader(page, tokenPayload),
       nextCursor: last ? { receiptOrder: last.receiptOrder ?? 0, id: last.id } : cursor,
       hasMore: startIndex + page.length < sorted.length,
     };
@@ -777,14 +917,20 @@ export class ServerNetworkContentAddressedStore {
    * Cheap: token validation + an in-memory read on the local store.
    */
   async handleGetStoreHead(token: string): Promise<StoreHead> {
-    await this.validateToken(token);
+    const tokenPayload = await this.validateToken(token);
     if (!this.localStore.getStoreHead) {
       throw new NetworkError(
         NetworkErrorType.SERVER_ERROR,
         "Local store does not support getStoreHead",
       );
     }
-    return this.localStore.getStoreHead();
+    const head = await this.localStore.getStoreHead();
+    // A scoped reader (§6.12) gets its own epoch lineage: when the scope
+    // changes (mode switched, reader rule added or removed) the epoch differs
+    // and the client re-scans from the start instead of trusting a cursor that
+    // skipped entries it could not see before.
+    const scope = await this.resolveReadScope(tokenPayload);
+    return scope ? { ...head, epoch: `${head.epoch}:scope:${scope.scopeId}` } : head;
   }
 
   /**
@@ -943,8 +1089,8 @@ export class ServerNetworkContentAddressedStore {
     // path. Even if a client already knows a revoked entry's id, the server
     // never hands back its bytes. A StoreEntry carries its own decryptionKeyId,
     // so we filter without an extra metadata lookup.
-    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
-    const servableEntries = this.filterMetasByRevokedKeys(entries, revoked);
+    // Read scope (§6.12): fail-closed as well, by the entry's document.
+    const servableEntries = await this.filterMetasForReader(entries, tokenPayload);
 
     return { servableEntries, encryptionPublicKey, username };
   }
@@ -968,6 +1114,11 @@ export class ServerNetworkContentAddressedStore {
     // for a revoked entry.
     const revoked = await this.resolveRevokedKeyIds(tokenPayload);
     if (revoked && meta.decryptionKeyId && revoked.has(meta.decryptionKeyId)) {
+      return null;
+    }
+    // Read scope (§6.12): nothing about other people's documents.
+    const scope = await this.resolveReadScope(tokenPayload);
+    if (scope && (await this.filterMetasByReadScope([meta], scope)).length === 0) {
       return null;
     }
     return meta;
@@ -1023,6 +1174,11 @@ export class ServerNetworkContentAddressedStore {
     const purgedDocIds = this.purgedDocResolver
       ? await this.purgedDocResolver()
       : null;
+
+    // Author-scoped read (§6.12): a scoped principal may only write its own
+    // documents (create new ones, change its own), never into other people's.
+    const readScope = await this.resolveReadScope(tokenPayload);
+    const ownsForWrite = readScope ? this.scopeChecker(readScope) : null;
 
     // A single acceptance time for this batch so receipts are consistent and a
     // batch cannot interleave with the witness's own monotonic clock (§5.3).
@@ -1232,6 +1388,22 @@ export class ServerNetworkContentAddressedStore {
         }
       }
 
+      if (readScope && ownsForWrite) {
+        const ownsIt =
+          entry.entryType === "doc_create"
+            ? await readScope.ownsDocument(entry.createdByPublicKey, receivedAt)
+            : await this.ownsDocumentInBatch(entry, entries, readScope, ownsForWrite);
+        if (!ownsIt) {
+          this.rejectEntry(
+            rejected,
+            entry.id,
+            `Entry ${entry.id} writes into a document outside the principal's read scope`,
+            "policy",
+          );
+          continue;
+        }
+      }
+
       // Stamp a witness receipt onto the accepted entry (§5.3). Self-authored
       // entries (the witness pushing its own data) are not self-witnessed.
       //
@@ -1404,6 +1576,29 @@ export class ServerNetworkContentAddressedStore {
    * Enforce the hard-wired `userdirectory` write invariant. Returns a denial
    * message, or `null` when the entry is allowed.
    */
+  /**
+   * For a non-create entry under a read scope: is its document the principal's?
+   * The `doc_create` may be in the same batch (not yet stored).
+   */
+  private async ownsDocumentInBatch(
+    entry: StoreEntry,
+    batch: StoreEntry[],
+    scope: ServerReadScope,
+    owns: (docId: string) => Promise<boolean>,
+  ): Promise<boolean> {
+    const create = batch.find((e) => e.docId === entry.docId && e.entryType === "doc_create");
+    if (create && !(await this.localStore.hasEntries([create.id])).length) {
+      return scope.ownsDocument(create.createdByPublicKey, Date.now());
+    }
+    if (await this.docCreator(entry.docId)) {
+      return owns(entry.docId);
+    }
+    // The document is not on the server yet: attachment chunks are pushed
+    // before the document that references them. The entry's own author decides
+    // (the principal's own write); reads stay hidden until the doc_create is in.
+    return scope.ownsDocument(entry.createdByPublicKey, Date.now());
+  }
+
   private async evaluateUserdirectoryInvariant(
     entry: StoreEntry,
     trustedTime: number,
@@ -1637,8 +1832,7 @@ export class ServerNetworkContentAddressedStore {
     
     const allowed = await this.wipeAllowedIds(tokenPayload);
     const scoped = allowed ? allIds.filter((id) => allowed.has(id)) : allIds;
-    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
-    return this.filterIdsByRevokedKeys(scoped, revoked);
+    return this.filterIdsForReader(scoped, tokenPayload);
   }
 
   /**
@@ -1671,8 +1865,7 @@ export class ServerNetworkContentAddressedStore {
     const resolvedIds = await this.localStore.resolveDependencies(startId, options);
     this.logger.debug(`Resolved ${resolvedIds.length} dependencies`);
     
-    const revoked = await this.resolveRevokedKeyIds(tokenPayload);
-    return this.filterIdsByRevokedKeys(resolvedIds, revoked);
+    return this.filterIdsForReader(resolvedIds, tokenPayload);
   }
 
   async handlePlanDocumentMaterialization(
@@ -1682,6 +1875,11 @@ export class ServerNetworkContentAddressedStore {
   ): Promise<DocumentMaterializationPlan> {
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
+    const scope = await this.resolveReadScope(tokenPayload);
+    if (scope && !(await this.scopeChecker(scope)(docId))) {
+      // Read scope (§6.12): a document outside it looks like an unknown one.
+      return { docId, snapshotEntryId: null, entryIdsToApply: [] };
+    }
     return this.localStore.planDocumentMaterialization(docId, options);
   }
 
@@ -1692,7 +1890,20 @@ export class ServerNetworkContentAddressedStore {
   ): Promise<DocumentMaterializationBatchPlan> {
     const tokenPayload = await this.validateToken(token);
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
-    return this.localStore.planDocumentMaterializationBatch(docIds, options);
+    const scope = await this.resolveReadScope(tokenPayload);
+    if (!scope) {
+      return this.localStore.planDocumentMaterializationBatch(docIds, options);
+    }
+    const visible = this.scopeChecker(scope);
+    const shown: string[] = [];
+    for (const docId of docIds) if (await visible(docId)) shown.push(docId);
+    const plan = await this.localStore.planDocumentMaterializationBatch(shown, options);
+    const byId = new Map(plan.plans.map((p) => [p.docId, p]));
+    return {
+      plans: docIds.map(
+        (docId) => byId.get(docId) ?? { docId, snapshotEntryId: null, entryIdsToApply: [] },
+      ),
+    };
   }
 
   async handlePlanAttachmentReadByWalkingMetadata(
@@ -1705,6 +1916,13 @@ export class ServerNetworkContentAddressedStore {
     this.logger.debug(`Token validated for user: ${tokenPayload.sub}`);
     if (!this.localStore.planAttachmentReadByWalkingMetadata) {
       throw new Error("Remote store does not support attachment read planning");
+    }
+    const scope = await this.resolveReadScope(tokenPayload);
+    if (scope && (await this.filterIdsByReadScope([lastChunkId], scope)).length === 0) {
+      throw new NetworkError(
+        NetworkErrorType.ACCESS_DENIED,
+        "Attachment is outside the principal's read scope",
+      );
     }
     return this.localStore.planAttachmentReadByWalkingMetadata(lastChunkId, attachmentSize, options);
   }

@@ -59,3 +59,9 @@ export {
   unwrapPrivateKeyFromDevice,
 } from "./UserKeyDocument";
 export { UserKeyManager } from "./UserKeyManager";
+export {
+  SEALED_VALUE_VERSION,
+  isSealedValue,
+  readSealedValue,
+  type SealedValue,
+} from "./sealedValues";

@@ -25,6 +25,8 @@ import type {
   ServerDbAccessModeEvaluator,
   ServerRevokedKeyResolver,
   ServerPurgedDocResolver,
+  ServerReadScopeResolver,
+  ServerDocCreatorResolver,
   ServerPurgeRequestValidator,
   BuiltinWriteContext,
   ServerPeerTokenResolver,
@@ -122,6 +124,9 @@ class StoreFactoryAdapter implements ContentAddressedStoreFactory {
 // ---------------------------------------------------------------------------
 // SimpleMindooDirectory — config-based fallback
 // ---------------------------------------------------------------------------
+
+/** Document-id prefix of a document-history purge request in `directory` (§13). */
+const DIRECTORY_PURGE_REQUEST_ID_PREFIX = "acl_dochistorypurge_";
 
 export class SimpleMindooDirectory implements Pick<
   MindooTenantDirectory,
@@ -269,6 +274,7 @@ class CompositeMindooDirectory implements Pick<
           | "evaluateDbAccessModeForSigningKey"
           | "evaluateAccessForSigningKey"
           | "isSamePerson"
+          | "evaluateReadScopeForSigningKey"
         >
       >,
     private trustedServers: TrustedServer[],
@@ -516,6 +522,16 @@ class CompositeMindooDirectory implements Pick<
     | undefined {
     const inner = this.inner;
     return typeof inner.isSamePerson === "function" ? (input) => inner.isSamePerson!(input) : undefined;
+  }
+
+  /** Forwarded for the author-scoped read (§6.12). */
+  get evaluateReadScopeForSigningKey():
+    | ((input: { dbid: string; signingKey: string }) => Promise<"all" | "own">)
+    | undefined {
+    const inner = this.inner;
+    return typeof inner.evaluateReadScopeForSigningKey === "function"
+      ? (input) => inner.evaluateReadScopeForSigningKey!(input)
+      : undefined;
   }
 
   /**
@@ -1276,12 +1292,32 @@ export class TenantManager {
       dbId === "directory"
         ? undefined
         : this.buildRevokedKeyResolver(directory);
-    // Purged-document denylist (§13). Never applied to the directory store (purge
-    // requests themselves live there and must always sync).
+    // Purged-document denylist (§13). In the directory store the purge requests
+    // themselves (`acl_dochistorypurge_…`) must always sync, so they are never
+    // on it; any other purged directory document is, or a member whose replica
+    // still holds it (it has not processed the request yet) would upload it
+    // again on its next push, and the server would keep it for good.
     const purgedDocResolver: ServerPurgedDocResolver | undefined =
       dbId === "directory"
-        ? undefined
+        ? () => {
+            const ids = this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
+            return new Set([...ids].filter((id) => !id.startsWith(DIRECTORY_PURGE_REQUEST_ID_PREFIX)));
+          }
         : () => this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
+
+    // Author-scoped read (§6.12). Never for the directory databases. The
+    // attachments store finds a document's creator in the docs store.
+    const readScopeResolver =
+      dbId === "directory" || dbId === USER_DIRECTORY_DB_ID
+        ? undefined
+        : this.buildReadScopeResolver(directory, dbId);
+    const docCreatorResolver =
+      storeKind === StoreKind.attachments
+        ? this.buildDocCreatorResolver(
+            // Lazy as well: a refused request must not create the docs store.
+            lazyContentAddressedStore(dbId, StoreKind.docs, () => tenant.storeFactory.getStore(dbId, StoreKind.docs)),
+          )
+        : undefined;
 
     // Purge requests in personal databases (§6.11): checked on push (only in
     // the docs store, where the request documents live).
@@ -1310,6 +1346,8 @@ export class TenantManager {
         dbAccessModeEvaluator,
         revokedKeyResolver,
         purgedDocResolver,
+        readScopeResolver,
+        docCreatorResolver,
         purgeRequestValidator,
         builtinWriteContext,
         ...this.peerAccessControl,
@@ -1381,6 +1419,58 @@ export class TenantManager {
             }
           }
         : undefined,
+    };
+  }
+
+  /**
+   * Read-scope resolver (§6.12): `null` (reads everything) unless the
+   * database's `docReadScope` is `"own"` for this principal; then the principal
+   * sees documents whose creator is the same person (grant level).
+   */
+  private buildReadScopeResolver(
+    directory: MindooTenantDirectory,
+    dbId: string,
+  ): ServerReadScopeResolver | undefined {
+    const dir = directory as unknown as {
+      evaluateReadScopeForSigningKey?: (input: { dbid: string; signingKey: string }) => Promise<"all" | "own">;
+      isSamePerson?: (input: {
+        creatorSigningKey: string;
+        signerSigningKey: string;
+        creatorTrustedTime: number;
+        signerTrustedTime: number;
+      }) => Promise<boolean>;
+    };
+    const evaluate = dir.evaluateReadScopeForSigningKey;
+    const isSamePerson = dir.isSamePerson;
+    if (typeof evaluate !== "function" || typeof isSamePerson !== "function") return undefined;
+    return async (principal) => {
+      const signingKey = principal.signingKey;
+      // No principal key: nothing to attribute documents to, so nothing is shown.
+      if (!signingKey) {
+        return { scopeId: "none", ownsDocument: async () => false };
+      }
+      if ((await evaluate({ dbid: dbId, signingKey })) === "all") return null;
+      return {
+        scopeId: "own",
+        ownsDocument: (creatorSigningKey, creatorTrustedTime) =>
+          isSamePerson({
+            creatorSigningKey,
+            signerSigningKey: signingKey,
+            creatorTrustedTime,
+            signerTrustedTime: Number.MAX_SAFE_INTEGER,
+          }),
+      };
+    };
+  }
+
+  /** Finds a document's `doc_create` creator in the given (docs) store. */
+  private buildDocCreatorResolver(docsStore: ContentAddressedStore): ServerDocCreatorResolver {
+    return async (docId) => {
+      const metas = await docsStore.findNewEntriesForDoc([], docId);
+      const create = metas.find((m) => m.entryType === "doc_create");
+      return create
+        ? { signingKey: create.createdByPublicKey, trustedTime: create.receivedAt ?? create.createdAt }
+        : null;
     };
   }
 

@@ -1142,6 +1142,19 @@ export interface MindooTenant {
     keyId: string,
     recipients: import("./userkeys/sealedTypes").EntryRecipients,
   ): Promise<void>;
+  /**
+   * Seal `value` to people (published User-Keys) or devices, to store it as a
+   * field of a document encrypted with another key, e.g. `$publicinfos`
+   * (see `SealedValue`). Includes the current user unless
+   * `options.includeSelf` is false.
+   */
+  sealValue?(
+    value: Uint8Array,
+    recipients: import("./userkeys/sealedTypes").RecipientSpec[],
+    options?: import("./userkeys/sealedTypes").RecipientOptions,
+  ): Promise<import("./userkeys/sealedValues").SealedValue>;
+  /** Open a `SealedValue` with this identity's keys; null when not a recipient. */
+  openSealedValue?(sealed: import("./userkeys/sealedValues").SealedValue): Promise<Uint8Array | null>;
   ingestSealedFromEntries?(
     keyId: string,
     entries: Array<{ recipients?: import("./userkeys/sealedTypes").EntryRecipients; createdAt: number }>,
@@ -4183,6 +4196,22 @@ export interface MindooTenantDirectory {
    * read access (`doc_deposit`, docs/accesscontrol.md §6.10).
    */
   canDepositDatabase?(dbId: string): Promise<boolean>;
+
+  /**
+   * The current user's read scope in `dbId` (docs/accesscontrol.md §6.12):
+   * `"own"` when the database's `docReadScope` is `"own"` and the user is
+   * neither the tenant admin nor a `doc_read_all` reader; the server then
+   * serves only documents the user created. Otherwise `"all"`.
+   *
+   * Optional capability.
+   */
+  getReadScope?(dbId: string): Promise<"all" | "own">;
+
+  /**
+   * Server-side variant of {@link getReadScope} for a request principal's
+   * signing key. Optional capability.
+   */
+  evaluateReadScopeForSigningKey?(input: { dbid: string; signingKey: string }): Promise<"all" | "own">;
 
   /**
    * Create or update database-specific settings.
