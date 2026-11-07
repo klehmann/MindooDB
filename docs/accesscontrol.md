@@ -1223,6 +1223,10 @@ mail gateway, §6.10). It is part of the built-in rule (open core):
   and `maxMailsPerHour` (default 200, sliding hour). Over a limit the entry is
   refused as `policy`. The counters live in the server's memory and restart
   with it.
+  The limits apply only to deposits that `internalMail` alone allows: a grant
+  with a matching `depositPrefixes` (the mail gateway, which delivers all
+  external mail under its own signature) is never throttled by them; its mail
+  server sets its own limits.
 - **Sender.** The `doc_create` is signed by the sender's device, so the
   recipient's client can always tell who wrote the message; it should check
   that `from` belongs to the signer and quarantine the message otherwise.

@@ -617,6 +617,32 @@ describe("doc_deposit on a real server (HTTP)", () => {
       await expect(karstenWritesJane(t, "denied")).rejects.toThrow(/read access|denied|ACCESS_DENIED/i);
     });
 
+    test("the gateway (depositPrefixes) is not subject to the internal mail limits", async () => {
+      const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"] });
+      await t.directory.setDefaultAccessPolicy!(
+        { disableAllAccessChecksAndPolicies: true, internalMailLimits: { maxMailsPerHour: 2, maxBytesPerMail: 4096 } },
+        t.adminKey,
+        PASSWORD,
+      );
+      await t.pushDirectory();
+      await pull(t.gateway.tenant, "directory");
+      const gatewayDb = await openDb(t.gateway.tenant, t.janeMail);
+      for (let i = 0; i < 5; i++) await depositFor(gatewayDb, t.janeUser.username, { subject: `external ${i}` });
+      // One with an attachment far above the internal size limit.
+      await gatewayDb.createDocument({
+        idPrefix: "memo",
+        recipients: [t.janeUser.username],
+        recipientOptions: { includeSelf: false, strict: true },
+        initialValues: { type: "message", subject: "big" },
+        attachments: [{ data: new Uint8Array(64 * 1024), fileName: "big.bin", mimeType: "application/octet-stream" }],
+      });
+      const pushed = await push(t.gateway.tenant, t.janeMail);
+      expect(pushed.docs.rejectedEntries ?? []).toHaveLength(0);
+      expect(pushed.attachments.rejectedEntries ?? []).toHaveLength(0);
+      const janeDb = await pull(t.jane, t.janeMail);
+      expect((await janeDb.getAllDocumentIds({ idPrefix: "memo" })).length).toBe(6);
+    });
+
     test("size and rate limits per sender and mailbox", async () => {
       const t = await setup({ acl: false });
       await t.directory.setDefaultAccessPolicy!(
