@@ -309,6 +309,12 @@ describe("private gateway configuration in directory (HTTP)", () => {
     const remoteDirectory = await karsten.connectToServer(baseUrl, "directory", StoreKind.docs);
     const gone = await waitFor(async () => (await remoteDirectory.findNewEntries([])).every((e) => e.docId !== legacyId));
     expect(gone).toBe(true);
+    // A member whose replica still holds the legacy copy (Jane pulled it before
+    // the purge) cannot upload it again: the purged id stays refused.
+    const stale = await push(jane, "directory");
+    expect((stale.rejectedEntries ?? []).length).toBeGreaterThan(0);
+    expect((stale.rejectedEntries ?? []).every((r) => r.rejectionClass === "purged")).toBe(true);
+    expect((await remoteDirectory.findNewEntries([])).some((e) => e.docId === legacyId)).toBe(false);
     // The new copies are still there.
     const left = new Set((await remoteDirectory.findNewEntries([])).map((e) => e.docId));
     expect(left.has(cfgId) && left.has(sealId)).toBe(true);
