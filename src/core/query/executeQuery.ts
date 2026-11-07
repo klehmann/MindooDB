@@ -257,7 +257,11 @@ export async function executeQuery(
   }
 
   // Coverage check: every field referenced by filter/sort expressions and
-  // plain-field sort keys must be answerable from the summary.
+  // plain-field sort keys must be answerable from the summary. It is decided
+  // against the settled configuration: a fresh instance only learns nested
+  // includes from the synced setup document, so the first query must not be
+  // judged by the defaults.
+  await summary.ensureConfigLoaded?.();
   const referencedPaths = new Set<string>();
   for (const expression of expressions) {
     for (const path of getReferencedFields(expression)) {

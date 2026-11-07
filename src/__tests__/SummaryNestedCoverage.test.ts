@@ -1,4 +1,6 @@
 import { createViewDataProvider } from "../core/indexing/createViewDataProvider";
+import { DocumentSummaryStore } from "../core/indexing/summary/DocumentSummaryStore";
+import { executeQuery } from "../core/query/executeQuery";
 import { createViewLanguage } from "../core/expressions";
 import type { MindooDB } from "../core/types";
 import { createWitnessingTenant } from "./_helpers/witnessingTenant";
@@ -60,5 +62,13 @@ describe("summary coverage of nested fields", () => {
       filter: v.exists(v.field("crm.title")),
     });
     expect(source).toBe("summary");
+  }, 30000);
+
+  it("knows the included paths on the first query of a fresh summary (setup document not read yet)", async () => {
+    // Like a database opened again after a reload: the include lives only in
+    // the synced setup document, and the coverage check came before reading it.
+    const fresh = new DocumentSummaryStore(db);
+    const result = await executeQuery(db, fresh, { filter: v.exists(v.field("crm.title")), fields: ["crm.title"] });
+    expect(result.total).toBe(1);
   }, 30000);
 });
