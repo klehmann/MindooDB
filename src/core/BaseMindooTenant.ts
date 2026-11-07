@@ -66,6 +66,7 @@ import { CacheManager } from "./cache/CacheManager";
 import { validateDatabaseId } from "./databaseIdValidation";
 import { BackgroundTaskTracker } from "./BackgroundTaskTracker";
 import { SingleFlight } from "./utils/singleFlight";
+import { namedExport } from "./utils/dynamicImportInterop";
 
 /**
  * BaseMindooTenant is a platform-agnostic implementation of MindooTenant
@@ -2204,7 +2205,10 @@ export class BaseMindooTenant implements MindooTenant {
     target: { ticket: string; io: NonNullable<PublishToServerOptions["irohStreamIO"]> },
     options?: PublishToServerOptions,
   ): Promise<void> {
-    const { IrohNetworkTransport } = await import("./appendonlystores/network/IrohNetworkTransport.js");
+    const IrohNetworkTransport = namedExport<typeof import("./appendonlystores/network/IrohNetworkTransport.js").IrohNetworkTransport>(
+      await import("./appendonlystores/network/IrohNetworkTransport.js"),
+      "IrohNetworkTransport",
+    );
     const transport = new IrohNetworkTransport(target.io, target.ticket, {
       tenantId: this.tenantId,
     });
@@ -2415,12 +2419,15 @@ export class BaseMindooTenant implements MindooTenant {
 
     const remoteStorePromise = (async () => {
       // Lazy-import network modules to avoid circular dependencies and keep core lightweight
-      const { ClientNetworkContentAddressedStore } = await import(
-        "../appendonlystores/network/ClientNetworkContentAddressedStore.js"
-      );
+      const ClientNetworkContentAddressedStore = namedExport<
+        typeof import("../appendonlystores/network/ClientNetworkContentAddressedStore.js").ClientNetworkContentAddressedStore
+      >(await import("../appendonlystores/network/ClientNetworkContentAddressedStore.js"), "ClientNetworkContentAddressedStore");
 
       const transport = irohTarget
-        ? new (await import("./appendonlystores/network/IrohNetworkTransport.js")).IrohNetworkTransport(
+        ? new (namedExport<typeof import("./appendonlystores/network/IrohNetworkTransport.js").IrohNetworkTransport>(
+            await import("./appendonlystores/network/IrohNetworkTransport.js"),
+            "IrohNetworkTransport",
+          ))(
             irohTarget.io,
             irohTarget.ticket,
             {
@@ -2429,7 +2436,10 @@ export class BaseMindooTenant implements MindooTenant {
               storeKind,
             },
           )
-        : new (await import("../appendonlystores/network/HttpTransport.js")).HttpTransport(
+        : new (namedExport<typeof import("../appendonlystores/network/HttpTransport.js").HttpTransport>(
+            await import("../appendonlystores/network/HttpTransport.js"),
+            "HttpTransport",
+          ))(
             {
               baseUrl: `${normalizedServerUrl}/${this.tenantId}`,
               tenantId: this.tenantId,
