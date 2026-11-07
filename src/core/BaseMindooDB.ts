@@ -7383,6 +7383,24 @@ export class BaseMindooDB implements MindooDB {
     // before the create, so we must not rely on seeing the create first).
     const createMeta = replayMeta.find((m) => m.entryType === "doc_create");
 
+    // A document this replica holds no key for (e.g. an admin document in
+    // `directory` encrypted with `default` or sealed to someone else, read by a
+    // `$publicinfos`-only member or the sync server) is not part of its feed,
+    // just as it is not part of its index; decrypting it would throw and stop
+    // the whole feed (and with it the directory state and access checks).
+    const feedKeyId = createMeta?.decryptionKeyId ?? replayMeta[0]?.decryptionKeyId;
+    if (feedKeyId && !(await this.tenant.hasDecryptionKey(feedKeyId))) {
+      // Sealed: the wrap list may not be ingested yet. Not for admin-only
+      // databases: ingesting there can read `directory`, whose state this
+      // feed may be building (the directory sync already ingested them).
+      if (isSealedKeyId(feedKeyId) && !this._isAdminOnlyDb) {
+        await this.ingestSealed(feedKeyId, replayMeta);
+      }
+      if (!(await this.tenant.hasDecryptionKey(feedKeyId))) {
+        return;
+      }
+    }
+
     // Seed the running doc to the merge of the unchanged prefix.
     const prefix = ttSorted.slice(0, firstChangedIdx).map((r) => r.meta);
     const seed = await this.seedRevisionFold(docId, prefix, docAllMeta);

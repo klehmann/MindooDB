@@ -281,6 +281,22 @@ describe("private gateway configuration in directory (HTTP)", () => {
     expect(await probeDir.isUserRevoked(janeUser.username)).toBe(false);
     const gatewayDir = (await gateway.tenant.openDirectory()) as MindooTenantDirectory;
     expect((await gatewayDir.findGrantAccessDocuments!(janeUser.username)).length).toBeGreaterThan(0);
+    // The directory state (revision feed) skips what a replica cannot read
+    // instead of failing, so access checks see the real policy (not fail-closed).
+    for (const [tenant, hidden] of [
+      [probe.tenant, [cfgId, sealId]],
+      [gateway.tenant, [cfgId]],
+      [jane, [sealId]],
+    ] as const) {
+      const dir = (await tenant.openDirectory()) as MindooTenantDirectory & {
+        getDirectoryStateHead(): Promise<{ defaultPolicy: unknown }>;
+      };
+      await expect(dir.getDirectoryStateHead()).resolves.toMatchObject({ defaultPolicy: expect.anything() });
+      await expect(dir.isAccessControlActive!()).resolves.toBe(true);
+      const fed: string[] = [];
+      for await (const rev of (await openDb(tenant, "directory")).iterateChangeRevisionsSince(null)) fed.push(rev.docId);
+      for (const id of hidden) expect(fed).not.toContain(id);
+    }
     // Migration: delete and purge the legacy copy.
     await karstenDirectory.deleteDocument(legacyId, signing);
     await pushDirectory();
