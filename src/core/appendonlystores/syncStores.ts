@@ -24,6 +24,7 @@
  * replicated. Getting this wrong silently skips entries.
  */
 
+import { PURGE_REQUEST_ID_PREFIX } from "../builtinDbInvariants";
 import type {
   ContentAddressedStore,
   StoreScanCursor,
@@ -354,8 +355,18 @@ function resolveTransferBatchSize(options?: SyncOptions): number {
  */
 export function createsFirst(entries: ReadonlyArray<{ id: string; entryType?: string }>, ids: readonly string[]): string[][] {
   const creates = new Set(entries.filter((entry) => entry.entryType === "doc_create").map((entry) => entry.id));
-  if (creates.size === 0) return [ids.slice()];
-  return [ids.filter((id) => creates.has(id)), ids.filter((id) => !creates.has(id))].filter((phase) => phase.length > 0);
+  // Purge requests of personal databases (docs/accesscontrol.md §6.11) go in a
+  // phase of their own after everything else of the page: the server accepts
+  // them only once the documents they name are deleted, so the deletes of the
+  // same page must arrive first.
+  const isPurgeRequest = (id: string) => id.startsWith(PURGE_REQUEST_ID_PREFIX);
+  const purgeRequests = ids.filter(isPurgeRequest);
+  const rest = purgeRequests.length > 0 ? ids.filter((id) => !isPurgeRequest(id)) : ids.slice();
+  const phases =
+    creates.size === 0
+      ? [rest]
+      : [rest.filter((id) => creates.has(id)), rest.filter((id) => !creates.has(id))];
+  return [...phases, purgeRequests].filter((phase) => phase.length > 0);
 }
 
 /**

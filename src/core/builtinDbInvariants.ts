@@ -370,3 +370,41 @@ export function shouldSkipLoadedEntry(input: {
   }
   return false;
 }
+
+// ---------------------------------------------------------------------------
+// Hard delete in personal databases (docs/accesscontrol.md §6.11, "Purge")
+// ---------------------------------------------------------------------------
+
+/** Document-id prefix of a purge request inside a personal database. */
+export const PURGE_REQUEST_ID_PREFIX = "purgereq_";
+/** `form` of a purge request document. */
+export const PURGE_REQUEST_FORM = "purgerequest";
+
+/** Whether `docId` is a purge request of a personal database. */
+export function isPurgeRequestDocId(docId: string): boolean {
+  return docId.startsWith(PURGE_REQUEST_ID_PREFIX);
+}
+
+/**
+ * The document ids a purge request names, from its decrypted `doc_create`
+ * payload (`$publicinfos`), or null when the payload is not a purge request.
+ */
+export function purgeRequestDocIdsFromCreateBytes(changeBytes: Uint8Array): string[] | null {
+  const fromRecord = (record: Record<string, unknown> | null): string[] | null => {
+    if (!record || record.form !== PURGE_REQUEST_FORM || !Array.isArray(record.docIds)) return null;
+    const ids = record.docIds.map((id) => String(id)).filter((id) => id.length > 0);
+    return ids.length > 0 ? ids : null;
+  };
+  try {
+    const [doc] = Automerge.applyChanges(Automerge.init<Record<string, unknown>>(), [changeBytes]);
+    const ids = fromRecord(JSON.parse(JSON.stringify(doc)) as Record<string, unknown>);
+    if (ids) return ids;
+  } catch {
+    // Payload may be a full Automerge document rather than a change.
+  }
+  try {
+    return fromRecord(JSON.parse(JSON.stringify(Automerge.load<Record<string, unknown>>(changeBytes))));
+  } catch {
+    return null;
+  }
+}

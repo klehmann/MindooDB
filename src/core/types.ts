@@ -5196,6 +5196,26 @@ export interface MindooDB {
   purgeDocumentHistory(docId: string): Promise<DocumentHistoryPurgeOutcome>;
 
   /**
+   * Request the hard delete of deleted documents in a personal database
+   * (`mmail_…`, `mmailout_…`; docs/accesscontrol.md §6.11, "Purge"): writes a
+   * `purgereq_…` document; push it like any change. Throws for other databases
+   * and for documents that are not deleted. Returns the request's id.
+   */
+  requestPurgeOfDeletedDocuments(docIds: string[]): Promise<string>;
+
+  /**
+   * The document ids this personal database's purge requests name; with
+   * `onlyAccepted`, only requests the server has accepted. Empty elsewhere.
+   */
+  getPurgeRequestedDocIds(options?: { onlyAccepted?: boolean }): Promise<Set<string>>;
+
+  /**
+   * Remove locally the documents of accepted purge requests (runs after every
+   * docs pull of a personal database). Returns how many were removed.
+   */
+  applyPurgeRequests(): Promise<number>;
+
+  /**
    * Entries this device refused to materialize, grouped per document and
    * persisted in the metadata checkpoint (docs/accesscontrol.md §10).
    *
