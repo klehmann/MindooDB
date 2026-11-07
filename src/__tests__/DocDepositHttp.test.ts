@@ -415,9 +415,18 @@ describe("doc_deposit on a real server (HTTP)", () => {
     expect(docIdMatchesPrefixes("other_1", [])).toBe(true);
   });
 
+  async function internalMailOff(t: Awaited<ReturnType<typeof setup>>) {
+    await t.directory.setDefaultAccessPolicy!({ disableAllAccessChecksAndPolicies: true, internalMail: "off" }, t.adminKey, PASSWORD);
+    await t.pushDirectory();
+    for (const tenant of [t.gateway.tenant, t.karsten, t.jane]) await pull(tenant, "directory");
+  }
+
   describe("built-in personal databases (mmail_<grantDocId>, §6.11), no configured policy", () => {
     test("the owner reads, a flagged gateway deposits, everyone else is out", async () => {
       const t = await setup({ acl: false, gatewayDepositPrefixes: ["mmail_"] });
+      // Members' internal mail (§6.11) is on by default; this test is about the
+      // gateway's depositPrefixes right alone.
+      await internalMailOff(t);
       const gatewayDb = await openDb(t.gateway.tenant, t.janeMail);
       const doc = await depositFor(gatewayDb, t.janeUser.username);
       const pushed = await push(t.gateway.tenant, t.janeMail);
@@ -462,6 +471,7 @@ describe("doc_deposit on a real server (HTTP)", () => {
 
     test("without depositPrefixes on its grant the gateway may not deposit", async () => {
       const t = await setup({ acl: false });
+      await internalMailOff(t);
       await expect(openDb(t.gateway.tenant, t.janeMail)).rejects.toThrow(/read access/);
       const remote = await t.gateway.tenant.connectToServer(baseUrl, t.janeMail, StoreKind.docs);
       await expect(remote.hasEntries(["x"])).rejects.toThrow(DENIED);
@@ -542,6 +552,86 @@ describe("doc_deposit on a real server (HTTP)", () => {
       await expect(openDb(t.karsten, t.janeOutbox)).rejects.toThrow(/read access/);
       const gatewayMailRemote = await t.gateway.tenant.connectToServer(baseUrl, t.janeMail, StoreKind.docs);
       await expect(gatewayMailRemote.findNewEntries([])).rejects.toThrow(DENIED);
+    });
+  });
+
+  describe("internal mail between members (internalMail, §6.11)", () => {
+    async function karstenWritesJane(t: Awaited<ReturnType<typeof setup>>, subject: string, idPrefix = "memo", bytes = 9) {
+      const db = await openDb(t.karsten, t.janeMail);
+      const doc = await db.createDocument({
+        idPrefix,
+        recipients: [t.janeUser.username],
+        recipientOptions: { includeSelf: false, strict: true },
+        initialValues: { type: "message", subject },
+        attachments: [{ data: new Uint8Array(bytes), fileName: "a.bin", mimeType: "application/octet-stream" }],
+      });
+      const result = await push(t.karsten, t.janeMail);
+      return { doc, result };
+    }
+
+    test("by default every member delivers messages into another member's mailbox, and reads nothing there", async () => {
+      const t = await setup({ acl: false });
+      const { doc, result } = await karstenWritesJane(t, "Hi Jane");
+      expect(result.docs.rejectedEntries ?? []).toHaveLength(0);
+      expect(result.attachments.rejectedEntries ?? []).toHaveLength(0);
+      const janeDb = await pull(t.jane, t.janeMail, true);
+      expect((await janeDb.getDocument(doc.getId())).getData().subject).toBe("Hi Jane");
+      // Deposit only: Karsten cannot pull Jane's mailbox.
+      const remote = await t.karsten.connectToServer(baseUrl, t.janeMail, StoreKind.docs);
+      await expect(remote.findNewEntries([])).rejects.toThrow(DENIED);
+      // Only messages (memo_), never events or settings.
+      const other = await karstenWritesJane(t, "an event", "event");
+      expect((other.result.docs.rejectedEntries ?? []).map((r) => r.reason).join(" ")).toMatch(/must start with "memo_"/);
+    });
+
+    test('"off" closes it, a deny rule takes it from one member, "rules" opens it per rule', async () => {
+      const t = await setup({ acl: false });
+      await t.directory.setDefaultAccessPolicy!({ disableAllAccessChecksAndPolicies: true, internalMail: "off" }, t.adminKey, PASSWORD);
+      await t.pushDirectory();
+      await pull(t.karsten, "directory");
+      await expect(karstenWritesJane(t, "off")).rejects.toThrow(/read access|denied|ACCESS_DENIED/i);
+
+      // "rules" with access control on: only with an allow rule.
+      await t.directory.setDefaultAccessPolicy!({ disableAllAccessChecksAndPolicies: false, internalMail: "rules" }, t.adminKey, PASSWORD);
+      await t.pushDirectory();
+      await pull(t.karsten, "directory");
+      await expect(karstenWritesJane(t, "rules, no rule")).rejects.toThrow(/read access|denied|ACCESS_DENIED/i);
+      await t.directory.createAccessRule!(
+        { ruleId: "karsten_mails", type: "doc_deposit", dbid: "mmail_*", action: "allow", usernames: [t.karstenUser.username] },
+        t.adminKey,
+        PASSWORD,
+      );
+      await t.pushDirectory();
+      await pull(t.karsten, "directory");
+      expect((await karstenWritesJane(t, "rules, allowed")).result.docs.rejectedEntries ?? []).toHaveLength(0);
+
+      // "members" again, but a deny rule for Karsten wins.
+      await t.directory.setDefaultAccessPolicy!({ disableAllAccessChecksAndPolicies: false, internalMail: "members" }, t.adminKey, PASSWORD);
+      await t.directory.createAccessRule!(
+        { ruleId: "karsten_no_mail", type: "doc_deposit", dbid: "mmail_*", action: "deny", usernames: [t.karstenUser.username] },
+        t.adminKey,
+        PASSWORD,
+      );
+      await t.pushDirectory();
+      await pull(t.karsten, "directory");
+      await expect(karstenWritesJane(t, "denied")).rejects.toThrow(/read access|denied|ACCESS_DENIED/i);
+    });
+
+    test("size and rate limits per sender and mailbox", async () => {
+      const t = await setup({ acl: false });
+      await t.directory.setDefaultAccessPolicy!(
+        { disableAllAccessChecksAndPolicies: true, internalMailLimits: { maxMailsPerHour: 2, maxBytesPerMail: 4096 } },
+        t.adminKey,
+        PASSWORD,
+      );
+      await t.pushDirectory();
+      await pull(t.karsten, "directory");
+      expect((await karstenWritesJane(t, "1")).result.docs.rejectedEntries ?? []).toHaveLength(0);
+      expect((await karstenWritesJane(t, "2")).result.docs.rejectedEntries ?? []).toHaveLength(0);
+      const third = await karstenWritesJane(t, "3");
+      expect((third.result.docs.rejectedEntries ?? []).map((r) => r.reason).join(" ")).toMatch(/2 mails per hour/);
+      const big = await karstenWritesJane(t, "big", "memo", 64 * 1024);
+      expect((big.result.attachments.rejectedEntries ?? []).map((r) => r.reason).join(" ")).toMatch(/4096 bytes per mail/);
     });
   });
 

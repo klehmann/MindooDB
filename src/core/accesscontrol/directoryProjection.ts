@@ -54,7 +54,19 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
         : undefined,
     llm: parseLlmEndpointPolicy(data.llm),
     personalDatabasePrefixes: stringArray(data.personalDatabasePrefixes)?.filter((prefix) => /^[a-z][a-z0-9]*_$/.test(prefix)),
+    internalMail:
+      data.internalMail === "off" || data.internalMail === "members" || data.internalMail === "rules"
+        ? data.internalMail
+        : undefined,
+    internalMailLimits: parseInternalMailLimits(data.internalMailLimits),
   };
+}
+
+function parseInternalMailLimits(value: unknown): { maxBytesPerMail?: number; maxMailsPerHour?: number } | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const v = value as Record<string, unknown>;
+  const positive = (x: unknown) => (typeof x === "number" && Number.isInteger(x) && x > 0 ? x : undefined);
+  return { maxBytesPerMail: positive(v.maxBytesPerMail), maxMailsPerHour: positive(v.maxMailsPerHour) };
 }
 
 /**
