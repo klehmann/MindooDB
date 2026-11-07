@@ -1142,6 +1142,19 @@ export interface MindooTenant {
     keyId: string,
     recipients: import("./userkeys/sealedTypes").EntryRecipients,
   ): Promise<void>;
+  /**
+   * Seal `value` to people (published User-Keys) or devices, to store it as a
+   * field of a document encrypted with another key, e.g. `$publicinfos`
+   * (see `SealedValue`). Includes the current user unless
+   * `options.includeSelf` is false.
+   */
+  sealValue?(
+    value: Uint8Array,
+    recipients: import("./userkeys/sealedTypes").RecipientSpec[],
+    options?: import("./userkeys/sealedTypes").RecipientOptions,
+  ): Promise<import("./userkeys/sealedValues").SealedValue>;
+  /** Open a `SealedValue` with this identity's keys; null when not a recipient. */
+  openSealedValue?(sealed: import("./userkeys/sealedValues").SealedValue): Promise<Uint8Array | null>;
   ingestSealedFromEntries?(
     keyId: string,
     entries: Array<{ recipients?: import("./userkeys/sealedTypes").EntryRecipients; createdAt: number }>,
