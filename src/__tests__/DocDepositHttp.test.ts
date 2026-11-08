@@ -731,6 +731,53 @@ describe("doc_deposit on a real server (HTTP)", () => {
       expect(((await push(t.karsten, t.janeBusy)).docs.rejectedEntries ?? []).length).toBeGreaterThan(0);
     });
 
+    test("the tenant admin reads every mbusy_ but writes none, unlike its other personal databases", async () => {
+      const t = await setup({ acl: false });
+      const { doc, result } = await janePublishes(t, "2026-W46");
+      expect(result.docs.rejectedEntries ?? []).toHaveLength(0);
+      const adminAuth = { user: t.admin, password: PASSWORD };
+
+      // The admin pulls Jane's busy times (through Karsten's replica, as admin on the wire).
+      const replica = await openDb(t.karsten, t.janeBusy);
+      await replica.pullChangesFrom(await t.karsten.connectToServer(baseUrl, t.janeBusy, StoreKind.docs), {
+        networkAuthOverride: adminAuth,
+      });
+      await replica.syncStoreChanges();
+      const seen = await replica.getDocument(doc.getId());
+      expect(seen.getData().week).toBe("2026-W46");
+
+      // ...but a change, a new document, a delete and a purge request pushed as admin are all refused.
+      await replica.changeDoc(seen, (d) => {
+        d.getData().busy = [];
+      });
+      await replica.createDocument({ initialValues: { type: "freebusy", week: "2026-W47" } });
+      await replica.deleteDocument(doc.getId());
+      await replica.createDocument({
+        idPrefix: "purgereq",
+        decryptionKeyId: "$publicinfos",
+        initialValues: { form: "purgerequest", docIds: [doc.getId()], requestedAt: Date.now() },
+      });
+      const refused = (await push(t.karsten, t.janeBusy, adminAuth)).docs.rejectedEntries ?? [];
+      expect(refused.length).toBe(4);
+      expect(refused.every((r) => /may read database .* but not write it/.test(r.reason))).toBe(true);
+      const janeView = await pull(t.jane, t.janeBusy);
+      const janeDoc = await janeView.getDocument(doc.getId());
+      expect(janeDoc.isDeleted()).toBe(false);
+      expect(janeDoc.getData().busy).toHaveLength(1);
+
+      // The rule itself: read-only for the admin in mbusy_, whatever freeBusy says;
+      // full rights in the other personal databases are unchanged.
+      await t.directory.setDefaultAccessPolicy!({ freeBusy: "off" }, t.adminKey, PASSWORD);
+      const evaluate = (dbid: string) =>
+        (t.directory as unknown as {
+          evaluatePersonalDatabaseAccess(input: { dbid: string; signingKey: string }): Promise<{ mode: string; readOnly?: boolean; reason: string } | null>;
+        }).evaluatePersonalDatabaseAccess({ dbid, signingKey: t.admin.userSigningKeyPair.publicKey });
+      expect(await evaluate(t.janeBusy)).toEqual({ mode: "read", readOnly: true, reason: "tenant admin (free/busy, read-only)" });
+      expect(await evaluate(t.janeMail)).toEqual({ mode: "read", reason: "tenant admin" });
+      expect(await evaluate(t.janeOutbox)).toEqual({ mode: "read", reason: "tenant admin" });
+      expect(await evaluate("mbusy_notagrant")).toEqual({ mode: "read", readOnly: true, reason: "tenant admin (free/busy, read-only)" });
+    });
+
     test('"off" closes it for others, "rules" opens it per doc_read rule, a deny rule always wins', async () => {
       const t = await setup({ acl: false });
       expect((await janePublishes(t, "2026-W46")).result.docs.rejectedEntries ?? []).toHaveLength(0);

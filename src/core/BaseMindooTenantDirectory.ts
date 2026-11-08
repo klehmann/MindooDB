@@ -1840,7 +1840,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * identities whose grant lists the prefix in `depositPrefixes`; nobody
    * else gets anything. An unknown grant id leaves everyone but the admin out.
    * `mbusy_` (free/busy) is the exception: other members read it read-only
-   * (`readOnly`, pushes refused) under the tenant's `freeBusy` setting.
+   * (`readOnly`, pushes refused) under the tenant's `freeBusy` setting, and
+   * the tenant admin reads it read-only as well (whatever `freeBusy` says).
    */
   async evaluatePersonalDatabaseAccess(input: {
     dbid: string;
@@ -1849,12 +1850,19 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const head = await this.getDirectoryStateHead();
     const owner = personalDatabaseOwner(input.dbid, head.defaultPolicy?.personalDatabasePrefixes ?? []);
     if (!owner) return null;
-    if (signingKeysEqual(input.signingKey, (this.tenant as BaseMindooTenant).getAdministrationPublicKey())) {
+    const isAdmin = signingKeysEqual(input.signingKey, (this.tenant as BaseMindooTenant).getAdministrationPublicKey());
+    if (isAdmin && owner.prefix !== "mbusy_") {
       return { mode: "read", reason: "tenant admin" };
     }
     const grant = await this.loadGrantDocument(owner.grantDocId);
     if (grant && extractActiveKeyPairs(grant).some((pair) => signingKeysEqual(pair.signingPublicKey, input.signingKey))) {
       return { mode: "read", reason: "a device of the owner" };
+    }
+    // Free/busy (§6.11): the tenant admin reads every person's busy times but,
+    // like every other member, does not write them (unless the admin key is a
+    // device of the owner, checked above).
+    if (isAdmin) {
+      return { mode: "read", readOnly: true, reason: "tenant admin (free/busy, read-only)" };
     }
     const signerGrants = await this.grantsForSigningKey(input.signingKey);
     const listed = (grant: Record<string, unknown>, field: string) =>
