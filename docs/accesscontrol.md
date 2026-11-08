@@ -1071,7 +1071,8 @@ await directory.createAccessRule({
   allow rule the right does not exist, and a matching deny rule wins as usual.
   `withfields` is rejected (the decision is about the database, Tier 1 only).
 - **`dbid` may be a prefix pattern** (`"mmail_*"`), so one rule covers a family
-  of per-person databases. Other rule types keep exact ids and `"*"`.
+  of per-person databases. So may `doc_read` rules (`"mbusy_*"`, §6.11
+  free/busy); other rule types keep exact ids and `"*"`.
 - **`docIdPrefixes` fixes what a depositor may create.** With the field set,
   every deposited entry (create and attachment chunks) must belong to a
   document id that starts with one of the prefixes, otherwise it is refused as
@@ -1151,9 +1152,10 @@ any configured policy and even while the master switch is on.
 | everyone else | nothing; the server refuses every sync call, the client refuses to open |
 
 - **Prefixes.** Built in: `mmail_` (MindooMail's mailbox; the mail gateway
-  deposits incoming mail) and `mmailout_` (MindooMail's outbox; the person
+  deposits incoming mail), `mmailout_` (MindooMail's outbox; the person
   writes outgoing mail sealed to themselves and the gateway, the gateway reads
-  it with `accessPrefixes`, sends it and answers with status documents)
+  it with `accessPrefixes`, sends it and answers with status documents) and
+  `mbusy_` (free/busy, readable by other members, see below)
   (`BUILTIN_PERSONAL_DATABASE_PREFIXES`). The
   tenant default policy can add more with `personalDatabasePrefixes`
   (`["notes_"]`); adding one only ever makes databases more private. A prefix
@@ -1182,7 +1184,9 @@ any configured policy and even while the master switch is on.
 - **A configured policy tightens, never loosens.** The built-in rule decides
   first; for the owner, the configured read gate (§6.8) still applies on top,
   and for a depositor a matching `doc_deposit` **deny** rule wins. A `doc_read`
-  or `doc_deposit` **allow** rule cannot open someone else's personal database.
+  or `doc_deposit` **allow** rule cannot open someone else's personal database
+  (except where a tenant setting says so: `internalMail: "rules"` and
+  `freeBusy: "rules"`, below).
 - **The admin is exempt**, as everywhere in the read gate: tenant-wide backup,
   export and purge keep working, and the content stays sealed to the owner
   (MindooMail seals every document to its user), so the admin syncs ciphertext
@@ -1246,6 +1250,39 @@ await directory.setDefaultAccessPolicy({
 }, adminKey, adminPassword);
 await directory.createAccessRule({
   ruleId: "staff_mail", type: "doc_deposit", dbid: "mmail_*", action: "allow", groups: ["staff"],
+}, adminKey, adminPassword);
+```
+
+**Free/busy.** Colleagues see when someone is busy without any access to
+their mailbox: the person's client (Haven) publishes only the busy times of
+their calendar, one document per ISO week, into `mbusy_<grantDocId>`. The
+rights are the other way round than in a mailbox, and part of the built-in
+rule (open core):
+
+- **Owner.** The devices on the grant create, change, delete and purge, as in
+  every personal database. Nobody else writes.
+- **Readers.** The tenant default policy's `freeBusy`: `"members"` (default:
+  every member with a grant may pull, read-only), `"rules"` (only members
+  matched by a `doc_read` allow rule for the database, e.g.
+  `{ dbid: "mbusy_*", groups: ["staff"] }`; needs access control switched on)
+  or `"off"` (nobody but the owner and the tenant admin). A `doc_read` deny
+  rule for `mbusy_*` always takes the right away. `doc_read` rules accept a
+  prefix pattern (`"mbusy_*"`) for this, like `doc_deposit` rules.
+- **Read-only on the server.** A reader passes every read call; every entry
+  it pushes is refused as `policy` ("may read … but not write it"), purge
+  requests included.
+- **Content.** The documents are encrypted with the tenant `default` key, not
+  sealed, so every member can read them and the server sees ciphertext. They
+  carry times and a status (busy, tentative, out of office), never subjects,
+  places or attendees.
+- **`freeBusyWeeksAhead`** (default 12, 1 to 52) tells clients how far ahead
+  to publish (`effectiveFreeBusyWeeksAhead(policy)`); the server does not
+  enforce it.
+
+```ts
+await directory.setDefaultAccessPolicy({ freeBusy: "rules", freeBusyWeeksAhead: 8 }, adminKey, adminPassword);
+await directory.createAccessRule({
+  ruleId: "staff_free_busy", type: "doc_read", dbid: "mbusy_*", action: "allow", groups: ["staff"],
 }, adminKey, adminPassword);
 ```
 

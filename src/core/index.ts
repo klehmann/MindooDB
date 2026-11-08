@@ -141,6 +141,8 @@ export {
   type WithFieldWhen,
   type WithFieldClause,
   type DefaultAccessPolicyDoc,
+  DEFAULT_FREE_BUSY_WEEKS_AHEAD,
+  effectiveFreeBusyWeeksAhead,
   type LlmEndpointPolicy,
   validateLlmEndpointPolicy,
   isValidLlmEndpointUrl,

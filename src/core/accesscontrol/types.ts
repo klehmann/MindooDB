@@ -77,7 +77,7 @@ export const MAX_DEPOSIT_RECIPIENTS = 100;
 
 /**
  * Whether a rule's `dbid` applies to `dbid`. `"*"` matches every database; a
- * pattern ending in `*` (only valid on `doc_deposit` rules, see
+ * pattern ending in `*` (only valid on `doc_deposit` and `doc_read` rules, see
  * {@link validateAclRule}) matches by prefix.
  */
 export function ruleMatchesDbid(ruleDbid: string, dbid: string): boolean {
@@ -319,6 +319,34 @@ llm?: LlmEndpointPolicy;
    * 25 MiB) and `maxMailsPerHour` (default 200). Tenant default policy only.
    */
   internalMailLimits?: InternalMailLimits;
+  /**
+   * Free/busy (§6.11, "Free/busy"): who may read another person's
+   * `mbusy_<grantDocId>`, the database in which that person's client
+   * publishes only the busy times of their calendar. `"members"` (default):
+   * every member with a grant. `"rules"`: only members matched by a
+   * `doc_read` allow rule for the database (e.g. `dbid: "mbusy_*"`, a group).
+   * `"off"`: nobody but the owner (and the tenant admin). A `doc_read` deny
+   * rule always wins. Readers never write; only the owner's devices create,
+   * change, delete and purge. Tenant default policy only; holds while the
+   * master switch is on.
+   */
+  freeBusy?: "off" | "members" | "rules";
+  /**
+   * How many weeks ahead clients publish free/busy times (default 12, clamped
+   * to 1..52, see {@link effectiveFreeBusyWeeksAhead}). Not enforced by the
+   * server; clients read it from the policy.
+   */
+  freeBusyWeeksAhead?: number;
+}
+
+/** Default of {@link DefaultAccessPolicyDoc.freeBusyWeeksAhead}. */
+export const DEFAULT_FREE_BUSY_WEEKS_AHEAD = 12;
+
+/** {@link DefaultAccessPolicyDoc.freeBusyWeeksAhead} with its default, clamped to 1..52. */
+export function effectiveFreeBusyWeeksAhead(policy: Pick<DefaultAccessPolicyDoc, "freeBusyWeeksAhead"> | null | undefined): number {
+  const value = policy?.freeBusyWeeksAhead;
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_FREE_BUSY_WEEKS_AHEAD;
+  return Math.min(52, Math.max(1, Math.round(value)));
 }
 
 /** {@link DefaultAccessPolicyDoc.internalMailLimits}. */
@@ -376,6 +404,8 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "personalDatabasePrefixes"
     | "internalMail"
     | "internalMailLimits"
+    | "freeBusy"
+    | "freeBusyWeeksAhead"
   >
 > = {
   denyDocCreate: false,
@@ -640,8 +670,9 @@ export function validateAclRule(rule: {
   if (rule.type === "doc_read_all" && (rule.withfields?.length ?? 0) > 0) {
     throw new Error("doc_read_all rules are database-level and cannot use `withfields`");
   }
-  // `doc_deposit` is a database-level right like `doc_read` (§6.10). It is the
-  // only type whose dbid may be a prefix pattern ("mmail_*").
+  // `doc_deposit` is a database-level right like `doc_read` (§6.10). These two
+  // are the only types whose dbid may be a prefix pattern ("mmail_*",
+  // "mbusy_*" for free/busy readers).
   if (rule.type === "doc_deposit") {
     if ((rule.withfields?.length ?? 0) > 0) {
       throw new Error("doc_deposit rules are database-level and cannot use `withfields`");
@@ -657,8 +688,8 @@ export function validateAclRule(rule: {
     }
     validateDocIdPrefixes(rule.docIdPrefixes, "doc_deposit docIdPrefixes");
   } else {
-    if (rule.dbid !== "*" && rule.dbid.endsWith("*")) {
-      throw new Error('only doc_deposit rules may use a dbid prefix pattern ending in "*"');
+    if (rule.type !== "doc_read" && rule.dbid !== "*" && rule.dbid.endsWith("*")) {
+      throw new Error('only doc_deposit and doc_read rules may use a dbid prefix pattern ending in "*"');
     }
     if (rule.maxRecipients !== undefined) {
       throw new Error("maxRecipients is only valid on doc_deposit rules");
@@ -696,6 +727,20 @@ export function validateAccessPolicy(
     policy.internalMail !== "rules"
   ) {
     throw new Error(`internalMail "${String(policy.internalMail)}" must be "off", "members" or "rules"`);
+  }
+  if (
+    policy.freeBusy !== undefined &&
+    policy.freeBusy !== "off" &&
+    policy.freeBusy !== "members" &&
+    policy.freeBusy !== "rules"
+  ) {
+    throw new Error(`freeBusy "${String(policy.freeBusy)}" must be "off", "members" or "rules"`);
+  }
+  if (
+    policy.freeBusyWeeksAhead !== undefined &&
+    (!Number.isInteger(policy.freeBusyWeeksAhead) || policy.freeBusyWeeksAhead < 1 || policy.freeBusyWeeksAhead > 52)
+  ) {
+    throw new Error("freeBusyWeeksAhead must be an integer from 1 to 52");
   }
   if (policy.internalMailLimits !== undefined) {
     for (const [key, value] of Object.entries(policy.internalMailLimits)) {
@@ -852,6 +897,8 @@ export function effectivePolicy(
     | "personalDatabasePrefixes"
     | "internalMail"
     | "internalMailLimits"
+    | "freeBusy"
+    | "freeBusyWeeksAhead"
   >
 > & {
   defaultCreateKeyId?: string;

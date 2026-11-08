@@ -9,7 +9,7 @@
  * documents sealed to someone else, with attachments in the create entry,
  * but it may not pull, list or change anything there.
  */
-import { docIdMatchesPrefixes, validateAclRule } from "../core/accesscontrol/types";
+import { docIdMatchesPrefixes, effectiveFreeBusyWeeksAhead, validateAclRule } from "../core/accesscontrol/types";
 import fs from "fs";
 import { Server } from "http";
 
@@ -208,7 +208,8 @@ describe("doc_deposit on a real server (HTTP)", () => {
     const janeMail = `mmail_${await grantId(janeUser.username)}`;
     const karstenMail = `mmail_${await grantId(karstenUser.username)}`;
     const janeOutbox = `mmailout_${await grantId(janeUser.username)}`;
-    const base = { tenantId, admin, karsten, karstenUser, jane, janeUser, gateway, gatewayName, directory, adminKey, pushDirectory, janeMail, karstenMail, janeOutbox };
+    const janeBusy = `mbusy_${await grantId(janeUser.username)}`;
+    const base = { tenantId, admin, karsten, karstenUser, jane, janeUser, gateway, gatewayName, directory, adminKey, pushDirectory, janeMail, karstenMail, janeOutbox, janeBusy };
     if (!acl) {
       for (const tenant of [gateway.tenant, jane, karsten]) {
         await pull(tenant, "directory");
@@ -658,6 +659,127 @@ describe("doc_deposit on a real server (HTTP)", () => {
       expect((third.result.docs.rejectedEntries ?? []).map((r) => r.reason).join(" ")).toMatch(/2 mails per hour/);
       const big = await karstenWritesJane(t, "big", "memo", 64 * 1024);
       expect((big.result.attachments.rejectedEntries ?? []).map((r) => r.reason).join(" ")).toMatch(/4096 bytes per mail/);
+    });
+  });
+
+  describe("free/busy (mbusy_<grantDocId>, freeBusy, §6.11)", () => {
+    async function janePublishes(t: Awaited<ReturnType<typeof setup>>, week: string) {
+      const db = await openDb(t.jane, t.janeBusy);
+      const doc = await db.createDocument({ id: `fb_${week.replace("-W", "w").toLowerCase()}` });
+      await db.changeDoc(doc, (d) => {
+        const data = d.getData();
+        data.type = "freebusy";
+        data.week = week;
+        data.busy = [{ start: "2026-11-10T09:00:00.000Z", end: "2026-11-10T10:00:00.000Z", status: "busy" }];
+      });
+      const result = await push(t.jane, t.janeBusy);
+      return { db, doc, result };
+    }
+
+    async function karstenPullFails(t: Awaited<ReturnType<typeof setup>>) {
+      await expect(openDb(t.karsten, t.janeBusy)).rejects.toThrow(/read access/);
+      const remote = await t.karsten.connectToServer(baseUrl, t.janeBusy, StoreKind.docs);
+      await expect(remote.findNewEntries([])).rejects.toThrow(DENIED);
+    }
+
+    async function setPolicy(t: Awaited<ReturnType<typeof setup>>, policy: Record<string, unknown>) {
+      await t.directory.setDefaultAccessPolicy!(policy, t.adminKey, PASSWORD);
+      await t.pushDirectory();
+      for (const tenant of [t.karsten, t.jane]) await pull(tenant, "directory");
+    }
+
+    test("by default the owner writes and purges, other members only read", async () => {
+      const t = await setup({ acl: false });
+      const { db: janeDb, doc, result } = await janePublishes(t, "2026-W46");
+      expect(result.docs.rejectedEntries ?? []).toHaveLength(0);
+
+      // Karsten reads Jane's busy times.
+      const karstenDb = await pull(t.karsten, t.janeBusy);
+      const seen = await karstenDb.getDocument(doc.getId());
+      expect(seen.getData().week).toBe("2026-W46");
+
+      // ...but every write is refused: a change, a new document, a delete.
+      await karstenDb.changeDoc(seen, (d) => {
+        d.getData().busy = [];
+      });
+      await karstenDb.createDocument({ initialValues: { type: "freebusy", week: "2026-W47" } });
+      const refused = (await push(t.karsten, t.janeBusy)).docs.rejectedEntries ?? [];
+      expect(refused.length).toBe(2);
+      expect(refused.every((r) => /may read database .* but not write it/.test(r.reason))).toBe(true);
+      const janeView = await pull(t.jane, t.janeBusy);
+      expect((await janeView.getDocument(doc.getId())).getData().busy).toHaveLength(1);
+
+      // Jane deletes and purges; the server drops it and Karsten's replica follows.
+      await janeDb.deleteDocument(doc.getId());
+      await janeDb.requestPurgeOfDeletedDocuments([doc.getId()]);
+      expect((await push(t.jane, t.janeBusy)).docs.rejectedEntries ?? []).toHaveLength(0);
+      const remote = await t.jane.connectToServer(baseUrl, t.janeBusy, StoreKind.docs);
+      const end = Date.now() + 15000;
+      while (Date.now() < end && (await remote.findNewEntriesForDoc([], doc.getId())).length > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      expect(await remote.findNewEntriesForDoc([], doc.getId())).toEqual([]);
+      await pull(t.karsten, t.janeBusy);
+      expect(await karstenDb.getStore().findNewEntriesForDoc([], doc.getId())).toEqual([]);
+
+      // A purge request by a reader is refused as well.
+      await karstenDb.createDocument({
+        idPrefix: "purgereq",
+        decryptionKeyId: "$publicinfos",
+        initialValues: { form: "purgerequest", docIds: ["x"], requestedAt: Date.now() },
+      });
+      expect(((await push(t.karsten, t.janeBusy)).docs.rejectedEntries ?? []).length).toBeGreaterThan(0);
+    });
+
+    test('"off" closes it for others, "rules" opens it per doc_read rule, a deny rule always wins', async () => {
+      const t = await setup({ acl: false });
+      expect((await janePublishes(t, "2026-W46")).result.docs.rejectedEntries ?? []).toHaveLength(0);
+
+      await setPolicy(t, { disableAllAccessChecksAndPolicies: true, freeBusy: "off" });
+      await karstenPullFails(t);
+      // The owner is not affected.
+      expect((await janePublishes(t, "2026-W47")).result.docs.rejectedEntries ?? []).toHaveLength(0);
+
+      // "rules" needs access control on and an allow rule.
+      await setPolicy(t, { disableAllAccessChecksAndPolicies: false, freeBusy: "rules" });
+      await karstenPullFails(t);
+      await t.directory.createAccessRule!(
+        { ruleId: "staff_free_busy", type: "doc_read", dbid: "mbusy_*", action: "allow", usernames: [t.karstenUser.username] },
+        t.adminKey,
+        PASSWORD,
+      );
+      await t.pushDirectory();
+      await pull(t.karsten, "directory");
+      const karstenDb = await pull(t.karsten, t.janeBusy);
+      expect((await karstenDb.getAllDocumentIds()).sort()).toEqual(["fb_2026w46", "fb_2026w47"]);
+
+      // "members" again, but a doc_read deny rule for Karsten wins.
+      await t.directory.setDefaultAccessPolicy!({ freeBusy: "members" }, t.adminKey, PASSWORD);
+      await t.directory.createAccessRule!(
+        { ruleId: "karsten_no_free_busy", type: "doc_read", dbid: "mbusy_*", action: "deny", usernames: [t.karstenUser.username] },
+        t.adminKey,
+        PASSWORD,
+      );
+      await t.pushDirectory();
+      await pull(t.karsten, "directory");
+      await karstenPullFails(t);
+    });
+
+    test("freeBusy and freeBusyWeeksAhead are validated and projected", async () => {
+      const t = await setup({ acl: false });
+      await expect(
+        t.directory.setDefaultAccessPolicy!({ freeBusy: "everyone" as never }, t.adminKey, PASSWORD),
+      ).rejects.toThrow(/freeBusy/);
+      await expect(
+        t.directory.setDefaultAccessPolicy!({ freeBusyWeeksAhead: 53 }, t.adminKey, PASSWORD),
+      ).rejects.toThrow(/freeBusyWeeksAhead/);
+      await t.directory.setDefaultAccessPolicy!({ freeBusy: "rules", freeBusyWeeksAhead: 8 }, t.adminKey, PASSWORD);
+      const head = await (t.directory as unknown as { getDirectoryStateHead(): Promise<{ defaultPolicy?: { freeBusy?: string; freeBusyWeeksAhead?: number } }> }).getDirectoryStateHead();
+      expect(head.defaultPolicy?.freeBusy).toBe("rules");
+      expect(effectiveFreeBusyWeeksAhead(head.defaultPolicy)).toBe(8);
+      expect(effectiveFreeBusyWeeksAhead({})).toBe(12);
+      expect(effectiveFreeBusyWeeksAhead({ freeBusyWeeksAhead: 99 })).toBe(52);
+      expect(effectiveFreeBusyWeeksAhead({ freeBusyWeeksAhead: 0 })).toBe(1);
     });
   });
 

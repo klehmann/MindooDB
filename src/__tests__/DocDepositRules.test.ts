@@ -11,11 +11,12 @@ import { parseRuleDoc } from "../core/accesscontrol/directoryProjection";
 describe("doc_deposit rules", () => {
   const base = { type: "doc_deposit" as const, action: "allow" as const, users_hashes: ["h1"] };
 
-  test("dbid may be exact, * or a prefix pattern, but only on doc_deposit", () => {
+  test("dbid may be exact, * or a prefix pattern, but only on doc_deposit and doc_read", () => {
     expect(() => validateAclRule({ ...base, dbid: "mmail_*" })).not.toThrow();
     expect(() => validateAclRule({ ...base, dbid: "*" })).not.toThrow();
     expect(() => validateAclRule({ ...base, dbid: "mmail_abc" })).not.toThrow();
-    expect(() => validateAclRule({ ...base, type: "doc_read", dbid: "mmail_*" })).toThrow(/only doc_deposit/);
+    expect(() => validateAclRule({ ...base, type: "doc_read", dbid: "mbusy_*" })).not.toThrow();
+    expect(() => validateAclRule({ ...base, type: "doc_create", dbid: "mmail_*" })).toThrow(/only doc_deposit and doc_read/);
   });
 
   test("withfields and out-of-range maxRecipients are refused", () => {

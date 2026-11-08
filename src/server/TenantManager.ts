@@ -477,6 +477,7 @@ class CompositeMindooDirectory implements Pick<
     signingKey: string;
   }): Promise<{
     mode: "read" | "deposit" | "none";
+    readOnly?: boolean;
     maxRecipients?: number;
     docIdPrefixes?: string[];
     internalMail?: { maxBytesPerMail: number; maxMailsPerHour: number };
@@ -1735,7 +1736,7 @@ export class TenantManager {
   ): ServerPurgeRequestValidator | undefined {
     const mindooTenant = tenant.mindooTenant;
     const dir = directory as unknown as {
-      evaluateDbAccessModeForSigningKey?: (input: { dbid: string; signingKey: string }) => Promise<{ mode: string }>;
+      evaluateDbAccessModeForSigningKey?: (input: { dbid: string; signingKey: string }) => Promise<{ mode: string; readOnly?: boolean }>;
     };
     return async (entry, batch) => {
       if (entry.entryType !== "doc_create") {
@@ -1748,7 +1749,7 @@ export class TenantManager {
         return "this server cannot check purge requests";
       }
       const access = await dir.evaluateDbAccessModeForSigningKey({ dbid: dbId, signingKey: entry.createdByPublicKey });
-      if (access.mode !== "read") {
+      if (access.mode !== "read" || access.readOnly) {
         return "only the owner, a service with access or the tenant admin may purge";
       }
       let docIds: string[] | null = null;

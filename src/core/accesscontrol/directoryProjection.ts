@@ -61,6 +61,12 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
         ? data.internalMail
         : undefined,
     internalMailLimits: parseInternalMailLimits(data.internalMailLimits),
+    freeBusy:
+      data.freeBusy === "off" || data.freeBusy === "members" || data.freeBusy === "rules" ? data.freeBusy : undefined,
+    freeBusyWeeksAhead:
+      typeof data.freeBusyWeeksAhead === "number" && Number.isFinite(data.freeBusyWeeksAhead)
+        ? data.freeBusyWeeksAhead
+        : undefined,
   };
 }
 
