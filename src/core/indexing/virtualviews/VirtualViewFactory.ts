@@ -4,6 +4,7 @@ import { VirtualView, type ViewDataSourceInfo } from "./VirtualView";
 import { VirtualViewColumn, VirtualViewColumnOptions } from "./VirtualViewColumn";
 import type { VirtualViewEntryData } from "./VirtualViewEntryData";
 import { VirtualViewNavigator } from "./VirtualViewNavigator";
+import { VirtualViewMergedNavigator, type MergedNavigatorOptions } from "./VirtualViewMergedNavigator";
 import type { IVirtualViewDataProvider } from "./IVirtualViewDataProvider";
 import { MindooDBVirtualViewDataProvider, MindooDBVirtualViewDataProviderOptions } from "./MindooDBVirtualViewDataProvider";
 import type { IViewEntryAccessCheck } from "./IViewEntryAccessCheck";
@@ -416,6 +417,21 @@ export class VirtualViewFactory {
    */
   static createNavigator(view: VirtualView): VirtualViewNavigatorBuilder {
     return new VirtualViewNavigatorBuilder(view);
+  }
+
+  /**
+   * Create a navigator that reads the documents of several categories as
+   * one sorted, de-duplicated list (k-way merge over the document sort
+   * columns) — e.g. the inbox folders of several accounts from one
+   * "mail by folder" view. Each path is a category-value path from the
+   * top, like `["acc1/inbox"]`; paths that do not exist are ignored.
+   */
+  static createMergedNavigator(
+    view: VirtualView,
+    rootCategoryPaths: unknown[][],
+    options?: MergedNavigatorOptions
+  ): VirtualViewMergedNavigator {
+    return new VirtualViewMergedNavigator(view, rootCategoryPaths, options);
   }
 
   /**
