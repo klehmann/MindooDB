@@ -39,6 +39,17 @@ export interface MindooDBVirtualViewDataProviderOptions {
   dbKey?: string;
 }
 
+/** `"<tenantId>/<dbId>"`, or `null` for database doubles without that identity. */
+function physicalDbKey(db: MindooDB): string | null {
+  try {
+    const tenantId = db.getTenant?.()?.getId?.();
+    const dbId = db.getStore?.()?.getId?.();
+    return typeof tenantId === "string" && typeof dbId === "string" ? `${tenantId}/${dbId}` : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Filter function variant that also receives the folder lookup of the
  * view's joined filing stores (used for declarative filters converted to
@@ -67,7 +78,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
   /** Track documents currently in the view from this provider */
   private knownDocIds: Set<string> = new Set();
 
-  private readonly dbKey: string;
+  private readonly dbKey: string | null;
   /** Documents whose folder membership changed (see onFilingChanges). */
   private pendingFilingDocIds: Set<string> = new Set();
   /** Rescan the whole changefeed on the next update (first build, log overflow). */
@@ -78,7 +89,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     this.db = options.db;
     this.filterFunction = options.filterFunction ?? null;
     this.includeAllDocumentFields = options.includeAllDocumentFields ?? false;
-    this.dbKey = options.dbKey ?? `${options.db.getTenant().getId()}/${options.db.getStore().getId()}`;
+    this.dbKey = options.dbKey ?? physicalDbKey(options.db);
   }
 
   onFilingChanges(changes: FilingRefChanges): void {
@@ -87,7 +98,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
       this.pendingFilingDocIds.clear();
       return;
     }
-    if (this.pendingFilingAll) {
+    if (this.pendingFilingAll || !this.dbKey) {
       return;
     }
     const prefix = `${this.dbKey}/`;
@@ -100,7 +111,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
 
   private foldersLookup(docId: string): ((store: string) => readonly string[]) | undefined {
     const join = this.view?.getFilingJoin();
-    if (!join) {
+    if (!join || !this.dbKey) {
       return undefined;
     }
     const physRef = `${this.dbKey}/${docId}`;

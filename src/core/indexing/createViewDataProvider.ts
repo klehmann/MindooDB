@@ -89,7 +89,7 @@ export async function createViewDataProvider(
   options: CreateViewDataProviderOptions
 ): Promise<CreateViewDataProviderResult> {
   const { origin, db, filter } = options;
-  const dbKey = `${db.getTenant().getId()}/${db.getStore().getId()}`;
+  const dbKey = physicalDbKeyOfDatabase(db);
 
   const buildDocumentProvider = (fallbackReasons: string[]): CreateViewDataProviderResult => ({
     provider: new MindooDBVirtualViewDataProvider({
@@ -123,6 +123,21 @@ export async function createViewDataProvider(
     source: "summary",
     fallbackReasons: [],
   };
+}
+
+/**
+ * Physical identity `"<tenantId>/<dbId>"` of a database (matched against
+ * filing references), or `undefined` for database implementations that
+ * cannot tell (e.g. test doubles) — their documents then count as not filed.
+ */
+export function physicalDbKeyOfDatabase(db: MindooDB): string | undefined {
+  try {
+    const tenantId = db.getTenant?.()?.getId?.();
+    const dbId = db.getStore?.()?.getId?.();
+    return typeof tenantId === "string" && typeof dbId === "string" ? `${tenantId}/${dbId}` : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
