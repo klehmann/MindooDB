@@ -5,6 +5,9 @@
 export {
   MindooFilingStore,
   type FilingStoreOptions,
+  type FilingPruneOptions,
+  type FilingPruneResult,
+  DEFAULT_FILING_PRUNE_GRACE_MS,
   type FilingEntry,
   type CreateFolderInput,
   type UpdateFolderInput,

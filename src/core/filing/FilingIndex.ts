@@ -95,6 +95,14 @@ export class FilingIndex implements ICacheable {
   private generation: string = generateRandomUuid();
   private seq: number = 0;
   private cursor: ProcessChangesCursor | null = null;
+  /**
+   * Deletions of filed documents in the filing database itself (physical
+   * key -> deleted at), read from the database's metadata changefeed. Feeds
+   * the automatic cleanup (MindooFilingStore). Not persisted: rebuilt from
+   * the (in-memory, cheap) metadata index once per session.
+   */
+  private deletedTargets: Map<string, number> = new Map();
+  private targetCursor: ProcessChangesCursor | null = null;
   private sidecars: Map<string, SidecarState> = new Map();
   private sidecarsByRef: Map<string, Set<string>> = new Map();
   private membersByFolder: Map<string, Set<string>> = new Map();
@@ -228,6 +236,26 @@ export class FilingIndex implements ICacheable {
       this.cursor = cursor;
       this.dirty = true;
     }
+    // Deletions (and undeletions) of filed documents of this database:
+    // metadata only, nothing is loaded or decrypted.
+    const targetPrefix = `${this.base.tenantId}/${this.base.dbId}/`;
+    let deletionsChanged = false;
+    for await (const { docId, isDeleted, lastModified, cursor } of this.db.iterateChangeMetadataSince(this.targetCursor)) {
+      const physRef = `${targetPrefix}${docId}`;
+      if (isDeleted && this.sidecarsByRef.has(physRef)) {
+        if (this.deletedTargets.get(physRef) !== lastModified) {
+          this.deletedTargets.set(physRef, lastModified);
+          deletionsChanged = true;
+        }
+      } else if (this.deletedTargets.delete(physRef)) {
+        deletionsChanged = true;
+      }
+      this.targetCursor = cursor;
+    }
+    if (deletionsChanged) {
+      foldersChanged = true;
+    }
+
     if (changedRefs.size > 0) {
       this.appendLog(Array.from(changedRefs));
     }
@@ -420,6 +448,28 @@ export class FilingIndex implements ICacheable {
   /** Physical keys of every document whose sidecars list `folderId`, also when the folder is deleted. */
   allSidecarRefsInFolder(folderId: string): string[] {
     return Array.from(this.membersByFolder.get(folderId) ?? []);
+  }
+
+  /**
+   * Filed documents of the filing database itself whose latest state is
+   * "deleted", with the deletion time (physical key -> epoch ms).
+   */
+  getDeletedTargets(): ReadonlyMap<string, number> {
+    return this.deletedTargets;
+  }
+
+  /** Physical keys of every document with at least one membership key (also of deleted folders). */
+  allSidecarRefs(): string[] {
+    const result: string[] = [];
+    for (const [ref, ids] of this.sidecarsByRef) {
+      for (const id of ids) {
+        if (Object.keys(this.sidecars.get(id)?.folders ?? {}).length > 0) {
+          result.push(ref);
+          break;
+        }
+      }
+    }
+    return result;
   }
 
   /** Physical keys of every document filed in any (visible) folder. */
