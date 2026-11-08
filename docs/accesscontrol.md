@@ -1148,7 +1148,7 @@ any configured policy and even while the master switch is on.
 | a device on the grant `<grantDocId>` (every device of the owner) | open, pull, push, as usual |
 | an identity whose grant lists the prefix in `accessPrefixes` | open, pull, push in **every** person's database with that prefix (a service such as the mail gateway serving each outbox) |
 | an identity whose grant lists the prefix in `depositPrefixes` | deposit only (§6.10 semantics, at most one recipient wrap per document; document ids: see below) |
-| the tenant admin | open, pull, push (exempt, see below) |
+| the tenant admin | open, pull, push (exempt, see below); in `mbusy_` open and pull only (read-only, see "Free/busy") |
 | everyone else | nothing; the server refuses every sync call, the client refuses to open |
 
 - **Prefixes.** Built in: `mmail_` (MindooMail's mailbox; the mail gateway
@@ -1260,7 +1260,7 @@ rights are the other way round than in a mailbox, and part of the built-in
 rule (open core):
 
 - **Owner.** The devices on the grant create, change, delete and purge, as in
-  every personal database. Nobody else writes.
+  every personal database. Nobody else writes, the tenant admin included.
 - **Readers.** The tenant default policy's `freeBusy`: `"members"` (default:
   every member with a grant may pull, read-only), `"rules"` (only members
   matched by a `doc_read` allow rule for the database, e.g.
@@ -1268,6 +1268,13 @@ rule (open core):
   or `"off"` (nobody but the owner and the tenant admin). A `doc_read` deny
   rule for `mbusy_*` always takes the right away. `doc_read` rules accept a
   prefix pattern (`"mbusy_*"`) for this, like `doc_deposit` rules.
+- **Tenant admin.** Reads every person's `mbusy_` whatever `freeBusy` says
+  (backup, export), but read-only like any other reader: its pushes are
+  refused. Busy times are the owner's statement, so not even the admin
+  rewrites them. The admin's tenant-wide history purge through the directory
+  (`publishDocHistoryPurge`) is not a push into the database and still works.
+  Only if the admin key is itself a device on the owner's grant does it write,
+  as owner.
 - **Read-only on the server.** A reader passes every read call; every entry
   it pushes is refused as `policy` ("may read … but not write it"), purge
   requests included.
