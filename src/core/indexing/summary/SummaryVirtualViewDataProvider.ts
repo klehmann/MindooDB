@@ -18,7 +18,7 @@ import {
   type FilingRefChanges,
   type IFilingAwareDataProvider,
 } from "../virtualviews/VirtualViewFilingJoin";
-import type { DocumentSummaryEntry } from "./types";
+import type { DocumentSummaryEntry, SummaryStorePosition } from "./types";
 
 export interface SummaryVirtualViewDataProviderOptions {
   /** Unique origin identifier for this data provider */
@@ -78,7 +78,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
 
   private view: VirtualView | null = null;
   /** Highest summary entry changeSeq already applied to the view. */
-  private appliedChangeSeq: number = -1;
+  private appliedPosition: SummaryStorePosition | null = null;
   /** Documents currently present in the view from this provider. */
   private knownDocIds: Set<string> = new Set();
   /**
@@ -135,29 +135,49 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
   }
 
   /**
-   * The summary entries to look at in this run. Normally every entry (the
-   * watermark skips unchanged ones); when the filter is driven by one
-   * folder (`inFolder(store, id)` as (part of a top-level AND) filter),
-   * only that folder's members plus documents that must be re-checked.
+   * The summary entries to look at in this run:
+   * - without a usable delta (first run, summary rebuilt): every entry;
+   * - with a delta: the entries written since the last run plus documents
+   *   that must be re-checked (`forced`: folder or text-match changes);
+   * - when the filter is driven by one folder (`inFolder(store, id)` as
+   *   (part of a top-level AND) filter): that folder's members (plus
+   *   `forced`, plus known rows on a full run), skipping members that did
+   *   not change when a delta exists.
    */
-  private *candidateEntries(forced: ReadonlySet<string> | null, all: boolean): Iterable<DocumentSummaryEntry> {
+  private *candidateEntries(
+    forced: ReadonlySet<string>,
+    delta: { entries: DocumentSummaryEntry[]; changed: ReadonlySet<string> } | null,
+  ): Iterable<DocumentSummaryEntry> {
     const join = this.view?.getFilingJoin();
     const driving = findDrivingFolder(this.filter);
     if (!driving || !join || !join.has(driving.store) || !this.dbKey) {
-      yield* this.summary.getAllEntries();
+      if (!delta) {
+        yield* this.summary.getAllEntries();
+        return;
+      }
+      yield* delta.entries;
+      for (const docId of forced) {
+        if (!delta.changed.has(docId)) {
+          const entry = this.summary.getEntry(docId);
+          if (entry) yield entry;
+        }
+      }
       return;
     }
     const prefix = `${this.dbKey}/`;
     const docIds = new Set<string>();
     for (const ref of join.membersOf(driving.store, driving.folderId)) {
       if (ref.startsWith(prefix)) {
-        docIds.add(ref.slice(prefix.length));
+        const docId = ref.slice(prefix.length);
+        if (!delta || delta.changed.has(docId)) {
+          docIds.add(docId);
+        }
       }
     }
-    for (const docId of forced ?? []) {
+    for (const docId of forced) {
       docIds.add(docId);
     }
-    if (all) {
+    if (!delta) {
       for (const docId of this.knownDocIds) {
         docIds.add(docId);
       }
@@ -258,7 +278,6 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
 
     const columns = view.getColumns();
     const change = new VirtualViewDataChange(this.origin);
-    let maxSeenChangeSeq = this.appliedChangeSeq;
 
     // Filing changes consumed by this run (re-checked even when their
     // summary entry is unchanged; see onFilingChanges).
@@ -267,22 +286,21 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
     this.pendingFilingAll = false;
     this.pendingFilingDocIds = new Set();
 
-    for (const entry of this.candidateEntries(filingDocIds, filingAll)) {
-      // Incremental watermark: entries at or below the already-applied
-      // changefeed sequence are unchanged and already sit in the view with
-      // correct column values — recomputing them would make every update a
-      // full rebuild. Text-membership flips and folder-membership changes
-      // bypass the watermark.
-      if (
-        entry.changeSeq <= this.appliedChangeSeq &&
-        !filingAll &&
-        !filingDocIds.has(entry.docId) &&
-        !(flippedTextMatches?.has(entry.docId) ?? false)
-      ) {
-        continue;
-      }
-      maxSeenChangeSeq = Math.max(maxSeenChangeSeq, entry.changeSeq);
+    // Incremental read: only the entries the summary wrote since the last
+    // run (O(changes) instead of a scan of every entry). Without a usable
+    // position (first run, summary rebuilt, too far behind) or when
+    // everything must be re-checked, the run evaluates every entry.
+    const position = this.summary.getPosition();
+    const storeDelta = filingAll ? null : this.summary.getChangesSince(this.appliedPosition);
+    const delta = storeDelta
+      ? { entries: storeDelta.entries, changed: new Set(storeDelta.entries.map((entry) => entry.docId)) }
+      : null;
+    const forced = new Set<string>(filingDocIds);
+    for (const docId of flippedTextMatches ?? []) {
+      forced.add(docId);
+    }
 
+    for (const entry of this.candidateEntries(forced, delta)) {
       let evaluationDoc = buildSummaryEvaluationDoc(entry.fields, entry.lastModified);
       // Mirror the full-text relevance as managed pseudo-fields (like
       // `_lastModified`), so column/category formulas can grade match
@@ -326,11 +344,13 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
     }
 
     // Entries that vanished from the summary map entirely (tombstones/
-    // purges). Documents that merely stopped matching the filter are
-    // handled by the else-if branch above instead — their changeSeq rose
-    // above the watermark, so they were re-evaluated in this run.
-    for (const docId of this.knownDocIds) {
-      if (!this.summary.getEntry(docId)) {
+    // purges). Documents that merely stopped matching the filter were
+    // re-evaluated above (their entry changed, or they were forced).
+    const removalCandidates: Iterable<string> = storeDelta
+      ? [...storeDelta.removedDocIds, ...forced]
+      : Array.from(this.knownDocIds);
+    for (const docId of removalCandidates) {
+      if (this.knownDocIds.has(docId) && !this.summary.getEntry(docId)) {
         change.removeEntry(docId);
         this.knownDocIds.delete(docId);
       }
@@ -339,7 +359,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
     if (change.hasChanges()) {
       view.applyChanges(change);
     }
-    this.appliedChangeSeq = maxSeenChangeSeq;
+    this.appliedPosition = position;
     this.lastTextScores = textScores;
   }
 
@@ -361,7 +381,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
   }
 
   reset(): void {
-    this.appliedChangeSeq = -1;
+    this.appliedPosition = null;
     this.knownDocIds.clear();
     this.lastTextScores = null;
     this.pendingFilingAll = false;
@@ -375,7 +395,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
 
   exportCacheState(): unknown {
     return {
-      appliedChangeSeq: this.appliedChangeSeq,
+      appliedPosition: this.appliedPosition,
       knownDocIds: Array.from(this.knownDocIds),
       pendingFilingAll: this.pendingFilingAll || undefined,
       pendingFilingDocIds: this.pendingFilingDocIds.size > 0 ? Array.from(this.pendingFilingDocIds) : undefined,
@@ -384,13 +404,15 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
 
   importCacheState(state: unknown): void {
     const s = state as {
-      appliedChangeSeq?: number;
+      appliedPosition?: SummaryStorePosition | null;
       knownDocIds?: string[];
       cursor?: ProcessChangesCursor | null;
       pendingFilingAll?: boolean;
       pendingFilingDocIds?: string[];
     };
-    this.appliedChangeSeq = s.appliedChangeSeq ?? -1;
+    // Older caches stored a changefeed watermark instead: rescan once.
+    this.appliedPosition =
+      s.appliedPosition && typeof s.appliedPosition.generation === "string" ? { ...s.appliedPosition } : null;
     if (s.knownDocIds) {
       this.knownDocIds = new Set(s.knownDocIds);
     }

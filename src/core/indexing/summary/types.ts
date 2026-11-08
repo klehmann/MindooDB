@@ -185,6 +185,28 @@ export interface DocumentSummaryEntry {
   /** Changefeed sequence of the change this entry was extracted from. */
   changeSeq: number;
   decryptionKeyId: string | null;
+  /**
+   * The store's own modification sequence of this entry (see
+   * `DocumentSummaryStore.getChangesSince`): bumped on every write of the
+   * entry, including configuration backfills, unlike `changeSeq`.
+   * Missing on entries persisted by older versions.
+   */
+  updateSeq?: number;
+}
+
+/** Position in a summary store's modification sequence. */
+export interface SummaryStorePosition {
+  /** Changes when the store is reset or rebuilt from scratch. */
+  generation: string;
+  seq: number;
+}
+
+/** Result of `DocumentSummaryStore.getChangesSince`. */
+export interface SummaryStoreChanges extends SummaryStorePosition {
+  /** Entries written after the given position (latest state each). */
+  entries: DocumentSummaryEntry[];
+  /** Documents removed after the given position. */
+  removedDocIds: string[];
 }
 
 /**
@@ -207,4 +229,12 @@ export interface SummaryMetaPayload {
   bucketCount: number;
   needsBackfill: boolean;
   backfillCursor: ProcessChangesCursor | null;
+  /** Modification-sequence state (missing in caches of older versions). */
+  generation?: string;
+  updateSeq?: number;
+  /** First seq the tombstone list covers completely. */
+  tombstoneHorizon?: number;
+  tombstones?: Array<[number, string]>;
+  /** Sequence ranges (start exclusive, end inclusive) a crashed run may have handed out. */
+  lostSeqRanges?: Array<[number, number]>;
 }
