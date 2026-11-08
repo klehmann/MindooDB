@@ -43,9 +43,14 @@ describe("summary cache: snapshot + journal", () => {
     expect(put.mock.calls.map(([type]) => type)).toEqual(["summaryj"]);
     const segmentBytes = (put.mock.calls[0][2] as Uint8Array).length;
     put.mockRestore();
-    const bucketBytes = (await store.get("summary", "sum/bucket/0"))!.length;
-    // One changed entry + one removal versus a whole bucket (~1/64 of 600).
-    expect(segmentBytes).toBeLessThan(bucketBytes);
+    // Before, a flush rewrote every bucket holding a changed entry plus the
+    // meta; the segment carries just the one entry and the removal.
+    let snapshotBytes = 0;
+    for (const id of await store.list("summary")) {
+      snapshotBytes += (await store.get("summary", id))!.length;
+    }
+    expect(segmentBytes).toBeLessThan(2000);
+    expect(segmentBytes).toBeLessThan(snapshotBytes / 20);
 
     const s2 = new DocumentSummaryStore(db, undefined, { minFlushIntervalDuringUpdateMs: 0 });
     s2.attachCache(cacheManager, "sum");
