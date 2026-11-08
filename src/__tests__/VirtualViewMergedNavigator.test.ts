@@ -146,6 +146,13 @@ describe("VirtualViewMergedNavigator (rootCategoryPaths)", () => {
     expect(ids(nav.readForward({ after: { v: [5], o: "o", d: "p1" }, limit: 5 }).entries)).toEqual(["q1", "p2"]);
   });
 
+  it("follows categories that appear after the navigator was created (live views)", () => {
+    const nav = VirtualViewFactory.createMergedNavigator(view, [["acc1/inbox"], ["acc3/inbox"]]);
+    expect(nav.getRootEntries()).toHaveLength(1);
+    add(view, "mail", [["c1", "acc3/inbox", 8.5]]);
+    expect(ids(nav.readForward({ limit: 3 }).entries)).toEqual(["a1", "c1", "l1"]);
+  });
+
   it("returns nothing for no matching categories", () => {
     const nav = VirtualViewFactory.createMergedNavigator(view, [["nope"]]);
     expect(nav.readForward().entries).toEqual([]);

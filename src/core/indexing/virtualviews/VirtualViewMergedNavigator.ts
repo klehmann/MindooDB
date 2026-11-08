@@ -128,27 +128,31 @@ class CategoryDocumentStream {
  */
 export class VirtualViewMergedNavigator {
   private readonly view: VirtualView;
-  private readonly roots: VirtualViewEntryData[];
+  private readonly paths: unknown[][];
   private readonly accessCheck: ((entry: VirtualViewEntryData) => boolean) | null;
   private current: VirtualViewEntryData | null = null;
 
   constructor(view: VirtualView, rootCategoryPaths: unknown[][], options?: MergedNavigatorOptions) {
     this.view = view;
     this.accessCheck = options?.accessCheck ?? null;
-    const lookup = new VirtualViewNavigator(view, view.getRoot(), WithCategories.YES, WithDocuments.YES, null, false);
+    this.paths = rootCategoryPaths.filter((path) => Array.isArray(path) && path.length > 0);
+  }
+
+  /**
+   * The category entries of the paths, resolved on every read: in a live
+   * view a category appears with its first document and is removed (and
+   * later re-created) with its last one.
+   */
+  private get roots(): VirtualViewEntryData[] {
+    const lookup = new VirtualViewNavigator(this.view, this.view.getRoot(), WithCategories.YES, WithDocuments.YES, null, false);
     const roots: VirtualViewEntryData[] = [];
-    const seen = new Set<VirtualViewEntryData>();
-    for (const path of rootCategoryPaths) {
-      if (!Array.isArray(path) || path.length === 0) {
-        continue;
-      }
+    for (const path of this.paths) {
       const entry = lookup.findCategoryEntryByParts(path);
-      if (entry && !seen.has(entry)) {
-        seen.add(entry);
+      if (entry && !roots.includes(entry)) {
         roots.push(entry);
       }
     }
-    this.roots = roots;
+    return roots;
   }
 
   getView(): VirtualView {
@@ -180,7 +184,8 @@ export class VirtualViewMergedNavigator {
 
   /** Comparator for document sort keys (any leaf category's child comparator). */
   private comparator(): ViewEntrySortKeyComparator | null {
-    return this.roots.length > 0 ? this.roots[0].getChildrenComparator() : null;
+    const roots = this.roots;
+    return roots.length > 0 ? roots[0].getChildrenComparator() : null;
   }
 
   static keyOf(entry: VirtualViewEntryData): MergedEntryKey {
@@ -200,7 +205,8 @@ export class VirtualViewMergedNavigator {
     }
     const descending = direction === "backward";
     const seek = start ? VirtualViewMergedNavigator.toSortKey(start) : null;
-    const streams = this.roots.map((root) => new CategoryDocumentStream(root, comparator, descending, seek));
+    const roots = this.roots;
+    const streams = roots.map((root) => new CategoryDocumentStream(root, comparator, descending, seek));
     const heads = streams.map((stream) => stream.next());
     let last: ViewEntrySortKey | null = null;
     while (true) {
@@ -327,8 +333,9 @@ export class VirtualViewMergedNavigator {
     if (!entry || !entry.isDocument()) {
       return null;
     }
+    const roots = this.roots;
     for (let parent = entry.getParent(); parent; parent = parent.getParent()) {
-      if (this.roots.includes(parent)) {
+      if (roots.includes(parent)) {
         return entry;
       }
     }
