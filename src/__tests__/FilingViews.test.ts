@@ -17,7 +17,8 @@ import {
 import type { BaseMindooDB } from "../core/BaseMindooDB";
 import { InMemoryLocalCacheStore } from "../core/cache/LocalCacheStore";
 import { CacheManager } from "../core/cache/CacheManager";
-import { FilingIndex } from "../core/filing";
+import { FilingIndex, type MindooFilingStore } from "../core/filing";
+import { VirtualViewFilingJoin } from "../core/indexing/virtualviews/VirtualViewFilingJoin";
 import { createWitnessingTenant } from "./_helpers/witnessingTenant";
 
 interface MailDoc extends Record<string, unknown> {
@@ -305,6 +306,51 @@ describe("filing views: cache restore", () => {
     expect(await rows(view2)).toEqual(["done > one", "inbox > three", "inbox > two"]);
     // Only the two documents whose filing changed were re-evaluated.
     expect(stats).toEqual([{ addedCount: 2, removedCount: 0 }]);
+    await cacheManager.dispose();
+  }, 60000);
+});
+
+describe("filing views: crash after the view consumed unpersisted filing changes", () => {
+  it("does not skip filing changes when the index restores an older state", async () => {
+    const ctx = await createWitnessingTenant("tenant-filing-crash");
+    const db = await ctx.tenant.openDB("mail");
+    const m1 = await createMail(db, "one", 1);
+    const m2 = await createMail(db, "two", 2);
+    const m3 = await createMail(db, "three", 3);
+    const filing = db.filing!("mail");
+    await filing.add(m1, "inbox");
+    const index = await filing.getIndex();
+    await index.update();
+
+    const cacheStore = new InMemoryLocalCacheStore();
+    const cacheManager = new CacheManager(cacheStore, { flushIntervalMs: 600000 });
+    index.attachCache(cacheManager, "crash-test-index");
+    await index.flushToCache(cacheStore); // persisted: only m1 filed
+
+    // The live index moves on and a view consumes that, then the view's
+    // cache is written — but the index state is never flushed (crash).
+    await filing.add(m2, "inbox");
+    const view1 = await folderView(db, db).build();
+    await view1.setCacheManager(cacheManager, "crash-view", "v1", { minCacheFlushIntervalMs: 0 });
+    await view1.update();
+    expect(await rows(view1)).toEqual(["inbox > two", "inbox > one"]);
+    await view1.flushToCache(cacheStore, { force: true });
+
+    // Restart: a fresh index restores the older state and re-reads the
+    // changefeed from its persisted cursor, handing out new seqs.
+    const restoredIndex = new FilingIndex(db, "mail", (index as unknown as { idPrefix: string }).idPrefix);
+    restoredIndex.attachCache(cacheManager, "crash-test-index");
+    // Meanwhile (live index not running) m2 leaves the folder and m3 joins.
+    await filing.remove(m2);
+    await filing.add(m3, "inbox");
+    await restoredIndex.update();
+    const join = new VirtualViewFilingJoin();
+    join.add("mail", { getIndex: async () => restoredIndex, getDatabase: () => db } as unknown as MindooFilingStore);
+    const view2 = await folderView(db, db).build();
+    view2.setFilingJoin(join);
+    expect(await view2.setCacheManager(cacheManager, "crash-view", "v1")).toBe(true);
+    await view2.update();
+    expect(await rows(view2)).toEqual(["inbox > three", "inbox > one"]);
     await cacheManager.dispose();
   }, 60000);
 });

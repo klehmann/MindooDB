@@ -66,6 +66,7 @@ interface PersistedFilingIndex {
   folderIdByDocId: Array<[string, string]>;
   logStartSeq: number;
   log: Array<[number, string[]]>;
+  lostSeqRanges?: Array<[number, number]>;
 }
 
 /** Keep at most this many changed refs in the change log (older consumers get "all"). */
@@ -103,6 +104,8 @@ export class FilingIndex implements ICacheable {
   private logStartSeq: number = 0;
   private log: Array<[number, string[]]> = [];
   private logRefCount: number = 0;
+  /** Seq ranges a crashed previous run may have handed out (see DocumentSummaryStore). */
+  private lostSeqRanges: Array<[number, number]> = [];
 
   private updatePromise: Promise<void> | null = null;
   private updatePending: boolean = false;
@@ -349,7 +352,13 @@ export class FilingIndex implements ICacheable {
    */
   changesSince(position: { generation: string; seq: number } | null): FilingIndexChanges {
     const current = { generation: this.generation, seq: this.seq };
-    if (!position || position.generation !== this.generation || position.seq < this.logStartSeq) {
+    if (
+      !position ||
+      position.generation !== this.generation ||
+      position.seq < this.logStartSeq ||
+      position.seq > this.seq ||
+      this.lostSeqRanges.some(([start, end]) => position.seq > start && position.seq <= end)
+    ) {
       return { ...current, refs: "all" };
     }
     const refs = new Set<string>();
@@ -499,6 +508,7 @@ export class FilingIndex implements ICacheable {
       folderIdByDocId: Array.from(this.folderIdByDocId),
       logStartSeq: this.logStartSeq,
       log: this.log,
+      lostSeqRanges: this.lostSeqRanges,
     };
     await store.put("filing", this.getCachePrefix(), new TextEncoder().encode(JSON.stringify(payload)));
     return 1;
@@ -543,6 +553,16 @@ export class FilingIndex implements ICacheable {
     this.logStartSeq = payload.logStartSeq;
     this.log = payload.log ?? [];
     this.logRefCount = this.log.reduce((sum, [, refs]) => sum + refs.length, 0);
+    // A previous run may have handed out seqs after this persisted state
+    // (and views may have consumed them): jump past them.
+    const jump = 2 ** 30;
+    this.lostSeqRanges = [...(payload.lostSeqRanges ?? []), [this.seq, this.seq + jump]];
+    if (this.lostSeqRanges.length > 20) {
+      const dropped = this.lostSeqRanges.splice(0, this.lostSeqRanges.length - 20);
+      this.logStartSeq = Math.max(this.logStartSeq, dropped[dropped.length - 1][1]);
+    }
+    this.seq += jump;
+    this.dirty = true;
     for (const [id, ref, folders] of payload.sidecars) {
       this.sidecars.set(id, { ref, folders });
       let ids = this.sidecarsByRef.get(ref);
