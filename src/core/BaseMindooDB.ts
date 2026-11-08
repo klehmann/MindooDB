@@ -722,6 +722,8 @@ export class BaseMindooDB implements MindooDB {
   >();
   private wrappedInternalDocs: WeakMap<MindooDoc, InternalDoc> = new WeakMap();
   private readonly maxCachedDocs: number;
+  /** Tail of the serialized eviction passes (see evictCachedDocsIfNeeded). */
+  private evictionQueue: Promise<void> = Promise.resolve();
   private readonly iteratePrefetchWindowDocs: number;
   private readonly cacheRestoreLimit: number;
   private readonly cacheRestoreBatchSize: number;
@@ -2381,6 +2383,22 @@ export class BaseMindooDB implements MindooDB {
    * never opted into L2 see no behavior change.
    */
   private async evictCachedDocsIfNeeded(
+    protectedDocIds?: Set<string>,
+  ): Promise<void> {
+    if (this.docCache.size <= this.maxCachedDocs) {
+      return;
+    }
+    // One eviction pass at a time. Concurrent loads (prefetch windows load
+    // ~32 documents in parallel) would otherwise all pick the same LRU
+    // candidate while its flush is pending and persist it once each — up
+    // to ~30 encrypted L2 writes per document during a full scan.
+    const run = this.evictionQueue.then(() => this.evictCachedDocsNow(protectedDocIds));
+    this.evictionQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Serialized eviction pass (see {@link evictCachedDocsIfNeeded}). */
+  private async evictCachedDocsNow(
     protectedDocIds?: Set<string>,
   ): Promise<void> {
     if (this.docCache.size <= this.maxCachedDocs) {
