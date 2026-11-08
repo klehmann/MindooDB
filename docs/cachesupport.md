@@ -122,7 +122,7 @@ When `BaseMindooDB.initialize()` is called:
 
 ### Virtual View indexes (`VirtualView`)
 
-Each `VirtualView` caches a single snapshot (type `"vv"`) containing the full pre-built tree structure:
+Each `VirtualView` caches a snapshot (type `"vv"`) containing the full pre-built tree structure, plus a change journal (type `"vvj"`, see [Snapshot + journal](#snapshot--journal)):
 
 - `version` — the cache format version (currently `2`)
 - `categoryIdCounter` — the internal counter for category IDs
@@ -145,7 +145,7 @@ The `viewCacheId` is set by the application (e.g. `"contacts-by-department"`). T
 
 #### Dirty tracking
 
-The view is marked dirty after `applyChanges()` produces any index changes. On flush, the entire view snapshot is serialized and written.
+The view is marked dirty after `applyChanges()` produces any index changes. On flush, only the change batches applied since the previous flush are appended as a journal segment; the full snapshot is rewritten only now and then (see below).
 
 #### Startup sequence
 
@@ -162,6 +162,25 @@ if (!restoredFromCache) {
 ```
 
 `setCacheManager` registers the view with the `CacheManager` and immediately attempts a cache restore. It returns `true` if the tree was successfully restored, or `false` if the cache was missing, corrupt, or the version didn't match. Incremental changes can be applied on top of the restored state via `applyChanges()`.
+
+### Snapshot + journal
+
+Three caches persist as a **snapshot plus a change journal**, so a flush after a small change writes that change instead of the whole structure:
+
+| Cache | Snapshot | Journal segments |
+|---|---|---|
+| `VirtualView` | `vv` (tree + provider cursors) | `vvj`: applied change batches + provider cursors + filing positions |
+| `DocumentSummaryStore` | `summary` buckets + meta | `summaryj`: changed/removed entries, new tombstones, meta (cursors) |
+| `FilingIndex` | `filing` (all sidecars and folders) | `filingj`: changed sidecars/folders, change-log entries, cursor |
+
+Rules (the same for all three):
+
+- **Every snapshot and every segment carries the cursors** of the state it describes (changefeed cursors, summary positions, filing positions). Restoring loads the snapshot, replays the segments in order and continues from the cursors of the last replayed one; the changefeed catches up from there.
+- **Compaction happens inside the regular flush**: the snapshot is rewritten when the journal exceeds 10 % of it (view: at least 100 entries, summary: 500, filing: 200), on forced flushes (shutdown, deregister — "on close"), and as the first write of an instance restored from the cache. Old segments are deleted after a snapshot. (Full view snapshots are still throttled by the view's minimum flush interval; a throttled compaction writes a segment instead.)
+- **One journal chain per writer**: several instances may cache under one key (several navigators over one view, several browser tabs, a restarted app racing an old one). Each instance writes `…/<writer>/<n>` and a snapshot names the chain that continues it, so chains never interleave. Hosts should still avoid duplicate writers for efficiency — Haven shares one view per cache key and uses Web Locks across tabs.
+- **Failed writes** (e.g. disk full): the pending changes and cursors stay in memory and go out with the next flush; nothing on disk points past the last successful write. A missing or unreadable segment ends the replay; the data catches up from the last good cursor.
+
+Measured (one changed document): view cache 5.5 MB → 317 B per flush at 20,000 documents; summary buffer 61 KB → 725 B at 20,000 documents; filing index 321 KB → 434 B at 2,000 filed documents.
 
 ---
 
