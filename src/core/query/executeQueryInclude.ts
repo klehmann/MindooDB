@@ -318,6 +318,12 @@ function validateIncludeFilter(label: string, filter: MindooDBAppBooleanExpressi
     );
   }
   const requirements = analyzeExpressionRequirements(filter);
+  if (requirements.filingStores.length > 0) {
+    throw new MindooQueryError(
+      `Include "${label}" cannot use folders() / inFolder(); they need a view that joins the filing store (VirtualViewBuilder.withFilingStore); ` +
+        `ad-hoc queries and ephemeral query views cannot evaluate them.`
+    );
+  }
   if (requirements.needsViewContext) {
     throw new MindooQueryError(
       `Include "${label}" has a filter using view-tree operations ` +

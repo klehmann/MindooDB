@@ -1185,6 +1185,19 @@ export interface MindooTenant {
    * 
    * @return The crypto adapter
    */
+  /**
+   * Keyed hash (HMAC-SHA256, lowercase hex) of `data`, keyed with a subkey
+   * derived from the symmetric key `decryptionKeyId` ("default" = tenant
+   * key) for the given `purpose`. Everyone holding that key computes the
+   * same value; anyone without it (e.g. a sync server) cannot link the
+   * result to `data`. Used for deterministic, convergent document ids that
+   * must not reveal what they are about — e.g. filing sidecars, whose id
+   * would otherwise correlate with the filed document.
+   *
+   * @throws SymmetricKeyNotFoundError when the key is not in the key bag.
+   */
+  computeKeyedHash?(decryptionKeyId: string, purpose: string, data: string): Promise<string>;
+
   getCryptoAdapter(): CryptoAdapter;
 
   // ==================== Convenience Methods ====================
@@ -6061,6 +6074,15 @@ export interface MindooDB {
    *   documents (documents themselves are never rewritten).
    */
   getSummaryStore?(config?: SummaryConfig): DocumentSummaryStore;
+
+  /**
+   * The filing store `store` of this database: folders plus documents filed
+   * into them via sidecar documents, without changing the filed documents
+   * (see docs/folders.md). Join it into views with
+   * `VirtualViewBuilder.withFilingStore` and use `folders()` / `inFolder()`
+   * in column and filter expressions.
+   */
+  filing?(store: string, options?: import("./filing/MindooFilingStore").FilingStoreOptions): import("./filing/MindooFilingStore").MindooFilingStore;
 
   /**
    * Read the summary configuration from the synced setup document

@@ -5,6 +5,7 @@ import type { VirtualViewColumn } from "./VirtualViewColumn";
 import { VirtualViewDataChange } from "./VirtualViewDataChange";
 import type { DocumentFilterFunction } from "./types";
 import { evaluateExpression } from "../../expressions/evaluateExpression";
+import type { FilingRefChanges, IFilingAwareDataProvider } from "./VirtualViewFilingJoin";
 
 /**
  * Options for creating a MindooDBVirtualViewDataProvider
@@ -29,7 +30,23 @@ export interface MindooDBVirtualViewDataProviderOptions {
    * arbitrary fields at read time).
    */
   includeAllDocumentFields?: boolean;
+
+  /**
+   * Physical identity `"<tenantId>/<dbId>"` of `db`, used to match filing
+   * references (`folders()` / `inFolder()`). Defaults to the database's
+   * own tenant and store id.
+   */
+  dbKey?: string;
 }
+
+/**
+ * Filter function variant that also receives the folder lookup of the
+ * view's joined filing stores (used for declarative filters converted to
+ * functions, so `folders()` / `inFolder()` work on the document path).
+ */
+export type FilingAwareDocumentFilter = ((doc: MindooDoc) => boolean) & {
+  withFolders?: (doc: MindooDoc, folders: ((store: string) => readonly string[]) | undefined) => boolean;
+};
 
 /**
  * Data provider that reads documents from a MindooDB and provides them
@@ -38,7 +55,7 @@ export interface MindooDBVirtualViewDataProviderOptions {
  * and emits lightweight tombstones for deleted and inaccessible documents,
  * so removals never pay document materialization.
  */
-export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider {
+export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider, IFilingAwareDataProvider {
   private readonly origin: string;
   private readonly db: MindooDB;
   private readonly filterFunction: DocumentFilterFunction | null;
@@ -50,11 +67,79 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
   /** Track documents currently in the view from this provider */
   private knownDocIds: Set<string> = new Set();
 
+  private readonly dbKey: string;
+  /** Documents whose folder membership changed (see onFilingChanges). */
+  private pendingFilingDocIds: Set<string> = new Set();
+  /** Rescan the whole changefeed on the next update (first build, log overflow). */
+  private pendingFilingAll: boolean = false;
+
   constructor(options: MindooDBVirtualViewDataProviderOptions) {
     this.origin = options.origin;
     this.db = options.db;
     this.filterFunction = options.filterFunction ?? null;
     this.includeAllDocumentFields = options.includeAllDocumentFields ?? false;
+    this.dbKey = options.dbKey ?? `${options.db.getTenant().getId()}/${options.db.getStore().getId()}`;
+  }
+
+  onFilingChanges(changes: FilingRefChanges): void {
+    if (changes === "all") {
+      this.pendingFilingAll = true;
+      this.pendingFilingDocIds.clear();
+      return;
+    }
+    if (this.pendingFilingAll) {
+      return;
+    }
+    const prefix = `${this.dbKey}/`;
+    for (const ref of changes) {
+      if (ref.startsWith(prefix)) {
+        this.pendingFilingDocIds.add(ref.slice(prefix.length));
+      }
+    }
+  }
+
+  private foldersLookup(docId: string): ((store: string) => readonly string[]) | undefined {
+    const join = this.view?.getFilingJoin();
+    if (!join) {
+      return undefined;
+    }
+    const physRef = `${this.dbKey}/${docId}`;
+    return (store: string) => join.foldersOf(store, physRef);
+  }
+
+  private passesFilter(doc: MindooDoc): boolean {
+    if (!this.filterFunction) {
+      return true;
+    }
+    const filter = this.filterFunction as FilingAwareDocumentFilter;
+    return filter.withFolders
+      ? filter.withFolders(doc, this.foldersLookup(doc.getId()))
+      : filter(doc);
+  }
+
+  /** Re-evaluate one document (or drop it) after a filing change. */
+  private async reevaluate(
+    docId: string,
+    columns: VirtualViewColumn[],
+    change: VirtualViewDataChange,
+  ): Promise<void> {
+    let doc: MindooDoc | null = null;
+    try {
+      doc = await this.db.getDocument(docId);
+      if (doc.isDeleted()) {
+        doc = null;
+      }
+    } catch {
+      // Unknown, deleted or unreadable: not in the view.
+      doc = null;
+    }
+    if (doc && this.passesFilter(doc)) {
+      change.addEntry(docId, this.computeColumnValues(doc, columns), doc.getDecryptionKeyId());
+      this.knownDocIds.add(docId);
+    } else if (this.knownDocIds.has(docId)) {
+      change.removeEntry(docId);
+      this.knownDocIds.delete(docId);
+    }
   }
 
   getOrigin(): string {
@@ -105,12 +190,24 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
       return;
     }
 
+    // Folder membership changed for a set of documents that may not have
+    // changed themselves: re-evaluate them after the changefeed run. When
+    // everything has to be re-checked, simply rescan the changefeed.
+    if (this.pendingFilingAll) {
+      this.pendingFilingAll = false;
+      this.pendingFilingDocIds.clear();
+      this.cursor = null;
+    }
+    const filingDocIds = this.pendingFilingDocIds;
+    const processedDocIds = filingDocIds.size > 0 ? new Set<string>() : null;
+
     // Drive incremental updates from the document changefeed. Deleted and
     // inaccessible documents arrive as lightweight tombstones (never
     // materialized), and upcoming live documents are prefetched in parallel
     // by the iterator's built-in prefetch window.
     for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor)) {
       const docId = doc.getId();
+      processedDocIds?.add(docId);
 
       if (doc.isDeleted()) {
         if (this.knownDocIds.has(docId)) {
@@ -118,7 +215,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
           this.knownDocIds.delete(docId);
         }
       } else {
-        const passesFilter = !this.filterFunction || this.filterFunction(doc);
+        const passesFilter = this.passesFilter(doc);
 
         if (passesFilter) {
           const columnValues = this.computeColumnValues(doc, columns);
@@ -144,6 +241,21 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
         if (stopRequested()) {
           return;
         }
+      }
+    }
+
+    // Filing-driven re-evaluations (documents the changefeed run did not
+    // already cover).
+    if (filingDocIds.size > 0) {
+      for (const docId of filingDocIds) {
+        if (!processedDocIds!.has(docId)) {
+          await this.reevaluate(docId, columns, change);
+        }
+      }
+      if (this.pendingFilingDocIds === filingDocIds) {
+        this.pendingFilingDocIds = new Set();
+      } else {
+        for (const docId of filingDocIds) this.pendingFilingDocIds.delete(docId);
       }
     }
 
@@ -198,6 +310,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
           witnessed: doc.isWitnessed(),
           awaitingWitness: doc.isAwaitingWitness(),
           variables: {},
+          folders: this.foldersLookup(doc.getId()),
         });
       } else if (values[column.name] === undefined) {
         // If no value function and no value from doc, use the document data directly
@@ -215,6 +328,8 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
   reset(): void {
     this.cursor = null;
     this.knownDocIds.clear();
+    this.pendingFilingAll = false;
+    this.pendingFilingDocIds.clear();
   }
 
   /**
@@ -239,14 +354,23 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     return {
       cursor: this.cursor,
       knownDocIds: Array.from(this.knownDocIds),
+      pendingFilingAll: this.pendingFilingAll || undefined,
+      pendingFilingDocIds: this.pendingFilingDocIds.size > 0 ? Array.from(this.pendingFilingDocIds) : undefined,
     };
   }
 
   importCacheState(state: unknown): void {
-    const s = state as { cursor?: ProcessChangesCursor | null; knownDocIds?: string[] };
+    const s = state as {
+      cursor?: ProcessChangesCursor | null;
+      knownDocIds?: string[];
+      pendingFilingAll?: boolean;
+      pendingFilingDocIds?: string[];
+    };
     this.cursor = s.cursor ?? null;
     if (s.knownDocIds) {
       this.knownDocIds = new Set(s.knownDocIds);
     }
+    this.pendingFilingAll = s.pendingFilingAll === true;
+    this.pendingFilingDocIds = new Set(s.pendingFilingDocIds ?? []);
   }
 }

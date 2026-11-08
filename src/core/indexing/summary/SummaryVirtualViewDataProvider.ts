@@ -13,6 +13,12 @@ import { MindooQueryError, type MindooQueryTextClause } from "../../query/types"
 import type { DocumentFullTextIndex } from "../fulltext/DocumentFullTextIndex";
 import type { DocumentSummaryStore } from "./DocumentSummaryStore";
 import { buildSummaryEvaluationDoc, getSummaryFieldValue } from "./extractSummaryFields";
+import {
+  findDrivingFolder,
+  type FilingRefChanges,
+  type IFilingAwareDataProvider,
+} from "../virtualviews/VirtualViewFilingJoin";
+import type { DocumentSummaryEntry } from "./types";
 
 export interface SummaryVirtualViewDataProviderOptions {
   /** Unique origin identifier for this data provider */
@@ -41,6 +47,14 @@ export interface SummaryVirtualViewDataProviderOptions {
     index: DocumentFullTextIndex;
     clause: MindooQueryTextClause;
   };
+
+  /**
+   * Physical identity `"<tenantId>/<dbId>"` of the summarized database.
+   * Needed to match filing references (`folders()` / `inFolder()` against
+   * stores joined with `withFilingStore`); without it the provider sees
+   * every document as not filed.
+   */
+  dbKey?: string;
 }
 
 /**
@@ -56,7 +70,7 @@ export interface SummaryVirtualViewDataProviderOptions {
  * `valueFunction` columns are NOT supported here (there is no materialized
  * document to pass them).
  */
-export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider {
+export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider, IFilingAwareDataProvider {
   private readonly origin: string;
   private readonly summary: DocumentSummaryStore;
   private readonly filter: MindooDBAppBooleanExpression | null;
@@ -75,12 +89,85 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
    * which the changeSeq watermark alone would skip.
    */
   private lastTextScores: Map<string, number> | null = null;
+  private readonly dbKey: string | null;
+  /**
+   * Documents (ids of this database) whose folder membership changed and
+   * that must be re-evaluated on the next update even when their summary
+   * entry is unchanged — the filing counterpart of `lastTextScores`.
+   */
+  private pendingFilingDocIds: Set<string> = new Set();
+  /** Re-evaluate everything on the next update (first build, log overflow). */
+  private pendingFilingAll: boolean = false;
 
   constructor(options: SummaryVirtualViewDataProviderOptions) {
     this.origin = options.origin;
     this.summary = options.summary;
     this.filter = options.filter ?? null;
     this.text = options.text ?? null;
+    this.dbKey = options.dbKey ?? null;
+  }
+
+  onFilingChanges(changes: FilingRefChanges): void {
+    if (changes === "all") {
+      this.pendingFilingAll = true;
+      this.pendingFilingDocIds.clear();
+      return;
+    }
+    if (this.pendingFilingAll || !this.dbKey) {
+      return;
+    }
+    const prefix = `${this.dbKey}/`;
+    for (const ref of changes) {
+      if (ref.startsWith(prefix)) {
+        this.pendingFilingDocIds.add(ref.slice(prefix.length));
+      }
+    }
+  }
+
+  /** Build the `folders()` lookup for one document. */
+  private foldersLookup(docId: string): ((store: string) => readonly string[]) | undefined {
+    const join = this.view?.getFilingJoin();
+    if (!join || !this.dbKey) {
+      return undefined;
+    }
+    const physRef = `${this.dbKey}/${docId}`;
+    return (store: string) => join.foldersOf(store, physRef);
+  }
+
+  /**
+   * The summary entries to look at in this run. Normally every entry (the
+   * watermark skips unchanged ones); when the filter is driven by one
+   * folder (`inFolder(store, id)` as (part of a top-level AND) filter),
+   * only that folder's members plus documents that must be re-checked.
+   */
+  private *candidateEntries(forced: ReadonlySet<string> | null, all: boolean): Iterable<DocumentSummaryEntry> {
+    const join = this.view?.getFilingJoin();
+    const driving = findDrivingFolder(this.filter);
+    if (!driving || !join || !join.has(driving.store) || !this.dbKey) {
+      yield* this.summary.getAllEntries();
+      return;
+    }
+    const prefix = `${this.dbKey}/`;
+    const docIds = new Set<string>();
+    for (const ref of join.membersOf(driving.store, driving.folderId)) {
+      if (ref.startsWith(prefix)) {
+        docIds.add(ref.slice(prefix.length));
+      }
+    }
+    for (const docId of forced ?? []) {
+      docIds.add(docId);
+    }
+    if (all) {
+      for (const docId of this.knownDocIds) {
+        docIds.add(docId);
+      }
+    }
+    for (const docId of docIds) {
+      const entry = this.summary.getEntry(docId);
+      if (entry) {
+        yield entry;
+      }
+    }
   }
 
   getOrigin(): string {
@@ -172,19 +259,24 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
     const columns = view.getColumns();
     const change = new VirtualViewDataChange(this.origin);
     let maxSeenChangeSeq = this.appliedChangeSeq;
-    const presentDocIds = new Set<string>();
 
-    for (const entry of this.summary.getAllEntries()) {
-      // Record existence BEFORE the incremental skip: presentDocIds means
-      // "still in the summary", not "processed in this run", so the removal
-      // sweep below never drops unchanged (skipped) documents.
-      presentDocIds.add(entry.docId);
+    // Filing changes consumed by this run (re-checked even when their
+    // summary entry is unchanged; see onFilingChanges).
+    const filingAll = this.pendingFilingAll;
+    const filingDocIds = this.pendingFilingDocIds;
+    this.pendingFilingAll = false;
+    this.pendingFilingDocIds = new Set();
+
+    for (const entry of this.candidateEntries(filingDocIds, filingAll)) {
       // Incremental watermark: entries at or below the already-applied
       // changefeed sequence are unchanged and already sit in the view with
       // correct column values — recomputing them would make every update a
-      // full rebuild. Text-membership flips bypass the watermark.
+      // full rebuild. Text-membership flips and folder-membership changes
+      // bypass the watermark.
       if (
         entry.changeSeq <= this.appliedChangeSeq &&
+        !filingAll &&
+        !filingDocIds.has(entry.docId) &&
         !(flippedTextMatches?.has(entry.docId) ?? false)
       ) {
         continue;
@@ -213,6 +305,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
         lastModifiedAt: new Date(entry.lastModified).toISOString(),
         decryptionKeyId: entry.decryptionKeyId,
         variables: {},
+        folders: this.foldersLookup(entry.docId),
       };
 
       const passesFilter =
@@ -237,7 +330,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
     // handled by the else-if branch above instead — their changeSeq rose
     // above the watermark, so they were re-evaluated in this run.
     for (const docId of this.knownDocIds) {
-      if (!presentDocIds.has(docId)) {
+      if (!this.summary.getEntry(docId)) {
         change.removeEntry(docId);
         this.knownDocIds.delete(docId);
       }
@@ -271,6 +364,8 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
     this.appliedChangeSeq = -1;
     this.knownDocIds.clear();
     this.lastTextScores = null;
+    this.pendingFilingAll = false;
+    this.pendingFilingDocIds.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -282,14 +377,24 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider 
     return {
       appliedChangeSeq: this.appliedChangeSeq,
       knownDocIds: Array.from(this.knownDocIds),
+      pendingFilingAll: this.pendingFilingAll || undefined,
+      pendingFilingDocIds: this.pendingFilingDocIds.size > 0 ? Array.from(this.pendingFilingDocIds) : undefined,
     };
   }
 
   importCacheState(state: unknown): void {
-    const s = state as { appliedChangeSeq?: number; knownDocIds?: string[]; cursor?: ProcessChangesCursor | null };
+    const s = state as {
+      appliedChangeSeq?: number;
+      knownDocIds?: string[];
+      cursor?: ProcessChangesCursor | null;
+      pendingFilingAll?: boolean;
+      pendingFilingDocIds?: string[];
+    };
     this.appliedChangeSeq = s.appliedChangeSeq ?? -1;
     if (s.knownDocIds) {
       this.knownDocIds = new Set(s.knownDocIds);
     }
+    this.pendingFilingAll = s.pendingFilingAll === true;
+    this.pendingFilingDocIds = new Set(s.pendingFilingDocIds ?? []);
   }
 }

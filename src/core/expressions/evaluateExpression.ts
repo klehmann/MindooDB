@@ -43,6 +43,13 @@ export type ExpressionEvaluationContext = {
    * it.
    */
   parent?: ExpressionParentContext;
+  /**
+   * Folder membership lookup for `folders()` / `inFolder()`: returns the
+   * folder ids the current document is filed in for the named filing
+   * store. Hosts populate it when the view joins filing stores
+   * (`withFilingStore`); without it both operations see "not filed".
+   */
+  folders?: (store: string) => readonly string[];
 };
 
 /** The parent row a `parent` node reads from inside an include filter. */
@@ -195,6 +202,52 @@ function getViewRowCount(context: ExpressionEvaluationContext, key: keyof Expres
   return context.counts?.[key] ?? 0;
 }
 
+/** Flattens, drops empty values and de-duplicates (first occurrence wins). */
+function unionValues(values: unknown[]): unknown[] {
+  const seen = new Set<unknown>();
+  const result: unknown[] = [];
+  const add = (value: unknown) => {
+    if (value === null || value === undefined || value === "") {
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        add(item);
+      }
+      return;
+    }
+    if (!seen.has(value)) {
+      seen.add(value);
+      result.push(value);
+    }
+  };
+  for (const value of values) {
+    add(value);
+  }
+  return result;
+}
+
+/** Splits text (or every text of an array) at `separator`, dropping empty parts. */
+function splitValue(value: unknown, separator: string): string[] {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  const texts = Array.isArray(value) ? value : [value];
+  const result: string[] = [];
+  for (const text of texts) {
+    if (text === null || text === undefined) {
+      continue;
+    }
+    const parts = separator === "" ? [String(text)] : String(text).split(separator);
+    for (const part of parts) {
+      if (part !== "") {
+        result.push(part);
+      }
+    }
+  }
+  return result;
+}
+
 /** Evaluates a single operation node after its arguments have been recursively resolved. */
 function evaluateOperation(
   expression: Extract<MindooDBAppExpression, { kind: "operation" }>,
@@ -307,6 +360,19 @@ function evaluateOperation(
         .map((part) => String(part ?? "").trim())
         .filter(Boolean)
         .join("\\");
+    case "folders":
+      return [...(context.folders?.(String(args[0] ?? "")) ?? [])];
+    case "inFolder": {
+      const folders = context.folders?.(String(args[0] ?? "")) ?? [];
+      if (args.length < 2 || args[1] === null || args[1] === undefined || args[1] === "") {
+        return folders.length > 0;
+      }
+      return folders.includes(String(args[1]));
+    }
+    case "union":
+      return unionValues(args);
+    case "split":
+      return splitValue(args[0], String(args[1] ?? ""));
     case "datePart": {
       const date = toDate(args[0]);
       if (!date) {
@@ -512,6 +578,9 @@ export function collectDecryptRequests(expression: MindooDBAppExpression): Decry
   return requests;
 }
 
+/** Operations reading folder membership from a joined filing store. */
+export const FILING_OPERATIONS: ReadonlySet<string> = new Set(["folders", "inFolder"]);
+
 /**
  * Operations reading the document's managed `_attachments` array. They are
  * "context" operations (no `field` node), so the coverage machinery must
@@ -569,8 +638,10 @@ export function analyzeExpressionRequirements(expression: MindooDBAppExpression)
   needsViewContext: boolean;
   viewContextOperations: string[];
   needsParentContext: boolean;
+  filingStores: string[];
 } {
   let needsDecryption = false;
+  const filingStores = new Set<string>();
   let needsParentContext = false;
   const viewContextOperations = new Set<string>();
   walkExpression(expression, (node) => {
@@ -582,9 +653,13 @@ export function analyzeExpressionRequirements(expression: MindooDBAppExpression)
       needsParentContext = true;
     } else if (node.kind === "operation" && VIEW_CONTEXT_OPERATIONS.has(node.op)) {
       viewContextOperations.add(node.op);
+    } else if (node.kind === "operation" && FILING_OPERATIONS.has(node.op)) {
+      const store = node.args[0];
+      filingStores.add(store?.kind === "literal" ? String(store.value ?? "") : "*");
     }
   });
   return {
+    filingStores: Array.from(filingStores),
     needsDecryption,
     needsViewContext: viewContextOperations.size > 0,
     viewContextOperations: Array.from(viewContextOperations),

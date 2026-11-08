@@ -9,6 +9,8 @@ import { MindooDBVirtualViewDataProvider, MindooDBVirtualViewDataProviderOptions
 import type { IViewEntryAccessCheck } from "./IViewEntryAccessCheck";
 import { AllowAllAccessCheck, CallbackAccessCheck } from "./IViewEntryAccessCheck";
 import { createViewDataProvider } from "../createViewDataProvider";
+import { analyzeExpressionRequirements } from "../../expressions/evaluateExpression";
+import { VirtualViewFilingJoin, type FilingStoreSource } from "./VirtualViewFilingJoin";
 import {
   CategorizationStyle,
   ColumnSorting,
@@ -58,6 +60,8 @@ export class VirtualViewBuilder {
    * summary-vs-documents per source (summary-first).
    */
   private pendingDbSources: PendingDbSource[] = [];
+  /** Filing stores joined via `withFilingStore`, or null. */
+  private filingJoin: VirtualViewFilingJoin | null = null;
 
   /**
    * Add a column to the view
@@ -163,6 +167,47 @@ export class VirtualViewBuilder {
   }
 
   /**
+   * Join a filing store into the view under `name`: column and filter
+   * expressions can then use `folders(name)` (the folder ids the document
+   * is filed in — typically a multi-value category) and
+   * `inFolder(name, folderId?)` (a selection, AND-combined with the rest of
+   * the filter). Filing lives in sidecar documents of the filing database
+   * (see `db.filing(store)`); when filing changes, exactly the affected
+   * documents are re-evaluated. References to databases that are not a
+   * data source of this view are ignored.
+   *
+   * @param source `{ db, store }` (optionally `decryptionKeyId`) or a
+   *   filing store obtained from `db.filing(store)`.
+   */
+  withFilingStore(name: string, source: FilingStoreSource): this {
+    if (!this.filingJoin) {
+      this.filingJoin = new VirtualViewFilingJoin();
+    }
+    this.filingJoin.add(name, source);
+    return this;
+  }
+
+  /** Every filing store name the columns and filters reference. */
+  private collectReferencedFilingStores(): Set<string> {
+    const names = new Set<string>();
+    const visit = (expression: Parameters<typeof analyzeExpressionRequirements>[0] | undefined) => {
+      if (!expression) return;
+      for (const name of analyzeExpressionRequirements(expression).filingStores) {
+        names.add(name);
+      }
+    };
+    for (const column of this.columns) {
+      visit(column.expression);
+    }
+    for (const source of this.pendingDbSources) {
+      if (source.filter && typeof source.filter !== "function") {
+        visit(source.filter);
+      }
+    }
+    return names;
+  }
+
+  /**
    * Add a custom data provider
    */
   withDataProvider(provider: IVirtualViewDataProvider): this {
@@ -180,6 +225,14 @@ export class VirtualViewBuilder {
    * (possibly synced) summary configuration.
    */
   async build(): Promise<VirtualView> {
+    for (const name of this.collectReferencedFilingStores()) {
+      if (name !== "*" && !this.filingJoin?.has(name)) {
+        throw new Error(
+          `The view uses folders("${name}") / inFolder("${name}"), but no filing store "${name}" was ` +
+          `registered — add .withFilingStore("${name}", { db, store }).`
+        );
+      }
+    }
     const providers = [...this.dataProviders];
     const dataSourceInfos = new Map<string, ViewDataSourceInfo>();
     for (const source of this.pendingDbSources) {
@@ -208,6 +261,7 @@ export class VirtualViewBuilder {
 
     const view = new VirtualView(this.columns);
     view.setCategorizationStyle(this.categorizationStyle);
+    view.setFilingJoin(this.filingJoin);
 
     for (const provider of providers) {
       provider.init(view);

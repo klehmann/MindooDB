@@ -17,6 +17,7 @@ import type { LocalCacheStore } from "../../cache/LocalCacheStore";
 import type { ICacheable } from "../../cache/CacheManager";
 import type { CacheManager } from "../../cache/CacheManager";
 import type { MindooDB } from "../../types";
+import { VirtualViewFilingJoin, isFilingAwareDataProvider, type FilingJoinState } from "./VirtualViewFilingJoin";
 
 /** Statistics passed to {@link VirtualView.onDidUpdate} listeners. */
 export interface VirtualViewUpdateStats {
@@ -142,6 +143,9 @@ export class VirtualView {
   /** Data providers */
   private dataProviderByOrigin: Map<string, IVirtualViewDataProvider> = new Map();
 
+  /** Filing stores joined into this view (`withFilingStore`), or null. */
+  private filingJoin: VirtualViewFilingJoin | null = null;
+
   /** Build-time data-source decision per origin (only for builder `withDB` sources) */
   private dataSourceInfoByOrigin: Map<string, ViewDataSourceInfo> = new Map();
   
@@ -174,6 +178,7 @@ export class VirtualView {
   private liveUnsubscribes: Array<() => void> = [];
   private liveUpdateRunning: boolean = false;
   private liveUpdatePending: boolean = false;
+  private liveBoundDbs: Set<MindooDB> = new Set();
 
   constructor(columns: VirtualViewColumn[]) {
     this.columns = [...columns];
@@ -310,9 +315,46 @@ export class VirtualView {
    *   forwarded to each data provider (see {@link VirtualViewUpdateOptions}).
    */
   async update(options?: VirtualViewUpdateOptions): Promise<void> {
+    await this.refreshFilingJoin();
     for (const provider of this.dataProviderByOrigin.values()) {
       await provider.update(options);
     }
+  }
+
+  /**
+   * Attach the filing stores this view joins (`withFilingStore`). Called by
+   * the view builder before the first update; not intended for user code.
+   */
+  setFilingJoin(join: VirtualViewFilingJoin | null): this {
+    this.filingJoin = join;
+    return this;
+  }
+
+  /** The filing stores joined into this view, or `null`. */
+  getFilingJoin(): VirtualViewFilingJoin | null {
+    return this.filingJoin;
+  }
+
+  /**
+   * Bring the joined filing indexes up to date FIRST (otherwise a fresh
+   * build would briefly show rows without their folders) and hand the
+   * membership delta to every provider; providers keep it until they have
+   * processed it, so an interrupted provider update loses nothing.
+   */
+  private async refreshFilingJoin(): Promise<void> {
+    if (!this.filingJoin) {
+      return;
+    }
+    const changes = await this.filingJoin.refresh();
+    if (changes !== "all" && changes.size === 0) {
+      return;
+    }
+    for (const provider of this.dataProviderByOrigin.values()) {
+      if (isFilingAwareDataProvider(provider)) {
+        provider.onFilingChanges(changes);
+      }
+    }
+    this.markViewDirty();
   }
 
   /**
@@ -324,6 +366,7 @@ export class VirtualView {
   async updateOrigin(origin: string, options?: VirtualViewUpdateOptions): Promise<void> {
     const provider = this.dataProviderByOrigin.get(origin);
     if (provider) {
+      await this.refreshFilingJoin();
       await provider.update(options);
     }
   }
@@ -532,9 +575,31 @@ export class VirtualView {
     if (!db.addChangeListener) {
       throw new Error("This MindooDB instance does not support change listeners.");
     }
-    const unsubscribe = db.addChangeListener(() => {
-      this.scheduleLiveUpdate();
-    });
+    const unsubscribes: Array<() => void> = [
+      db.addChangeListener(() => {
+        this.scheduleLiveUpdate();
+      }),
+    ];
+    // Filing changes live in the filing databases: bind those too (once
+    // per view), so filing/moving documents updates the view live.
+    for (const filingDb of this.filingJoin?.getDatabases() ?? []) {
+      if (filingDb === db || this.liveBoundDbs.has(filingDb) || !filingDb.addChangeListener) {
+        continue;
+      }
+      this.liveBoundDbs.add(filingDb);
+      const unsubscribeFiling = filingDb.addChangeListener(() => {
+        this.scheduleLiveUpdate();
+      });
+      unsubscribes.push(() => {
+        unsubscribeFiling();
+        this.liveBoundDbs.delete(filingDb);
+      });
+    }
+    this.liveBoundDbs.add(db);
+    const unsubscribe = () => {
+      for (const fn of unsubscribes) fn();
+      this.liveBoundDbs.delete(db);
+    };
     this.liveUnsubscribes.push(unsubscribe);
     this.scheduleLiveUpdate();
     return () => {
@@ -1047,6 +1112,7 @@ export class VirtualView {
       categorizationStyle: this.categorizationStyle,
       docOrderDescending: [...this.docOrderDescending],
       providerStates,
+      filing: this.filingJoin?.exportState(),
       tree: this.serializeNode(root),
     };
 
@@ -1150,6 +1216,7 @@ export class VirtualView {
 
     const treeData = snapshot.tree;
     if (!treeData) return false;
+    this.filingJoin?.importState(snapshot.filing as FilingJoinState | undefined);
 
     this.rootEntry = this.deserializeNode(treeData, null, docOrderDesc);
     this.indexBuilt = true;

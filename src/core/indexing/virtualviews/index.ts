@@ -89,6 +89,17 @@ export {
   type MindooDBVirtualViewDataProviderOptions,
 } from "./MindooDBVirtualViewDataProvider";
 
+// Filing (folders) join
+export {
+  VirtualViewFilingJoin,
+  findDrivingFolder,
+  isFilingAwareDataProvider,
+  type FilingStoreSource,
+  type FilingRefChanges,
+  type FilingJoinState,
+  type IFilingAwareDataProvider,
+} from "./VirtualViewFilingJoin";
+
 // Access control
 export {
   type IViewEntryAccessCheck,

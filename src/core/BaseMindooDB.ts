@@ -1,6 +1,8 @@
 // Import platform-appropriate Automerge implementation
 // React Native: native Rust (react-native-automerge-generated)
 // Browser/Node.js: WASM (@automerge/automerge/slim)
+import { MindooFilingStore, type FilingStoreOptions } from "./filing/MindooFilingStore";
+import type { FilingIndex } from "./filing/FilingIndex";
 import { Automerge } from "./automerge-adapter";
 import { ChangeDocDraft, diffTextSplice, fieldTypeOf, type DraftOp } from "./ChangeDocDraft";
 import {
@@ -914,6 +916,9 @@ export class BaseMindooDB implements MindooDB {
    * called or the setup document enables indexing.
    */
   private fulltextIndex: DocumentFullTextIndex | null = null;
+  /** Filing stores (`filing(store)`) and their indexes, by store name. */
+  private filingStores: Map<string, MindooFilingStore> = new Map();
+  private filingIndexes: Set<FilingIndex> = new Set();
   /**
    * Attachment text extractors registered by the host environment (see
    * {@link registerAttachmentTextExtractor}). Consulted lazily by the
@@ -1604,6 +1609,45 @@ export class BaseMindooDB implements MindooDB {
       cacheManager,
       `${this.getCachePrefix()}/fulltext`,
     );
+    for (const index of this.filingIndexes) {
+      this.attachFilingIndexCache(index);
+    }
+  }
+
+  private attachFilingIndexCache(index: FilingIndex): void {
+    if (!this.cacheManager) {
+      return;
+    }
+    // The store name is hashed into the index's id prefix; reuse it so the
+    // cache key does not reveal store names either.
+    index.attachCache(this.cacheManager, `${this.getCachePrefix()}/filing/${index.getCachePrefix()}`);
+  }
+
+  /**
+   * The filing store `store` of this database: folders plus the documents
+   * filed into them through small sidecar documents (see docs/folders.md).
+   * Filing never changes the filed document — it only needs write access
+   * to this database, read access to the target suffices — and can file
+   * documents of other databases and tenants. Returns the same instance
+   * for the same store name.
+   */
+  filing(store: string, options?: FilingStoreOptions): MindooFilingStore {
+    let filingStore = this.filingStores.get(store);
+    if (!filingStore) {
+      filingStore = new MindooFilingStore(this as unknown as MindooDB, store, options, (index) => {
+        this.filingIndexes.add(index);
+        this.attachFilingIndexCache(index);
+      });
+      this.filingStores.set(store, filingStore);
+    } else if (
+      options?.decryptionKeyId !== undefined &&
+      options.decryptionKeyId !== filingStore.getDecryptionKeyId()
+    ) {
+      throw new Error(
+        `Filing store "${store}" is already open with key "${filingStore.getDecryptionKeyId()}".`,
+      );
+    }
+    return filingStore;
   }
 
   /**
@@ -1623,6 +1667,10 @@ export class BaseMindooDB implements MindooDB {
     this.cacheMetaDirty = false;
     this.summaryStore?.discardDirtyState();
     this.fulltextIndex?.discardDirtyState();
+    for (const index of this.filingIndexes) {
+      index.discardDirtyState();
+      void cacheManager.deregister(index);
+    }
     void cacheManager.deregister(this as unknown as ICacheable);
     if (this.summaryStore) {
       void cacheManager.deregister(this.summaryStore);

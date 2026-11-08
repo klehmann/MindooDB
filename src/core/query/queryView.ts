@@ -291,6 +291,12 @@ function assertKnownExpression(expression: MindooDBAppExpression, role: string):
       `parseMindooDBFormulaBooleanExpression()).`
     );
   }
+  if (analyzeExpressionRequirements(expression).filingStores.length > 0) {
+    throw new MindooQueryError(
+      `View ${role} cannot use folders() / inFolder(); they need a view that joins the filing store (VirtualViewBuilder.withFilingStore); ` +
+        `ad-hoc queries and ephemeral query views cannot evaluate them.`
+    );
+  }
 }
 
 /**

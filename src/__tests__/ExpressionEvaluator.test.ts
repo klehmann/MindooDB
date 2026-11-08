@@ -310,7 +310,10 @@ describe("expression analysis helpers", () => {
       needsViewContext: false,
       viewContextOperations: [],
       needsParentContext: false,
+      filingStores: [],
     });
+    expect(analyzeExpressionRequirements(v.and(v.inFolder("mail", "x"), v.exists(v.folders("crm")))).filingStores)
+      .toEqual(["mail", "crm"]);
 
     const withDecrypt = v.exists(v.decryptField("secret_encrypted"));
     expect(analyzeExpressionRequirements(withDecrypt).needsDecryption).toBe(true);

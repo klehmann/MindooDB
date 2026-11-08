@@ -11,7 +11,9 @@ export type MindooDBViewLanguageHelperCategory =
   | "path"
   | "control-flow"
   | "crypto"
-  | "json";
+  | "json"
+  | "list"
+  | "filing";
 
 export type MindooDBViewLanguageArgumentKind =
   | "expression"
@@ -217,6 +219,20 @@ export const mindooDBViewLanguageHelpers = [
   helper("pathJoin", "path", "Join path segments with backslashes.", "Stringifies, trims, and joins non-empty segments into a path-like string.", "pathJoin(...parts)", "Expression<string>", [
     { name: "parts", kind: "expression", description: "The path segments to join.", variadic: true },
   ], ["v.pathJoin(v.field(\"project.code\"), v.field(\"employee\"))"]),
+  helper("union", "list", "Combine values into one de-duplicated list.", "Flattens every argument (single values and arrays), drops null, undefined and empty strings, and removes duplicates while keeping the first occurrence. Useful for multi-value category columns built from several sources.", "union(...values)", "Expression<unknown[]>", [
+    { name: "values", kind: "expression", description: "Values or arrays to combine.", variadic: true },
+  ], ["v.union(v.split(v.field(\"mailboxTags\"), \"|\"), v.folders(\"mail\"))"]),
+  helper("split", "list", "Split text into a list.", "Splits the text at every occurrence of the separator and drops empty parts. An array input is split element by element and flattened.", "split(value, separator)", "Expression<string[]>", [
+    { name: "value", kind: "expression", description: "The text (or array of texts) to split." },
+    { name: "separator", kind: "expression", description: "The separator string." },
+  ], ["v.split(v.field(\"mailboxTags\"), \"|\")"]),
+  helper("folders", "filing", "Folder ids the current document is filed in.", "Returns the ids of the folders of a filing store (registered on the view with withFilingStore) that contain the current document, as an array; an empty array when the document is not filed. Folder membership lives in small sidecar documents, so filing never changes the document itself.", "folders(store)", "Expression<string[]>", [
+    { name: "store", kind: "string", description: "Name of the filing store as registered on the view." },
+  ], ["v.folders(\"mail\")"]),
+  helper("inFolder", "filing", "Check whether the current document is filed.", "Without a folder id: true when the document is in any folder of the filing store. With a folder id: true when it is in that folder. As (part of an AND) filter with a folder id, the view reads only that folder's members.", "inFolder(store, folderId?)", "BooleanExpression", [
+    { name: "store", kind: "string", description: "Name of the filing store as registered on the view." },
+    { name: "folderId", kind: "string", description: "Optional folder id.", optional: true },
+  ], ["v.inFolder(\"mail\")", "v.inFolder(\"mail\", \"fld_projects\")"]),
   helper("ifElse", "control-flow", "Branch between expressions (multi-branch, like Domino @If).", "Accepts any number of condition/value pairs followed by one final default value. Conditions are checked in order and the value of the first matching condition is returned; when none match, the default is returned. The classic three-argument form ifElse(condition, whenTrue, whenFalse) is the smallest case.", "ifElse(cond1, val1, cond2, val2, ..., default)", "Expression<T>", [
     { name: "condition", kind: "boolean-expression", description: "A condition checked in order; paired with the value that follows it.", variadic: true },
     { name: "value", kind: "expression", description: "The expression returned when the preceding condition is truthy.", variadic: true },
