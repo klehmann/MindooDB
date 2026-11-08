@@ -126,6 +126,12 @@ export class VirtualView {
   
   /** Categorization style (categories before/after documents) */
   private categorizationStyle: CategorizationStyle = CategorizationStyle.DOCUMENT_THEN_CATEGORY;
+
+  /**
+   * Shared child comparators (immutable): one per categorization style and
+   * category direction instead of one per entry.
+   */
+  private readonly comparators: Map<string, ViewEntrySortKeyComparator> = new Map();
   
   /** Whether the index has been built */
   private indexBuilt: boolean = false;
@@ -328,6 +334,27 @@ export class VirtualView {
     }
   }
 
+  /** The (shared) comparator for an entry's children. */
+  private comparatorFor(
+    categoryOrderDescending: boolean,
+    docOrderDescending: boolean[] = this.docOrderDescending,
+  ): ViewEntrySortKeyComparator {
+    const shareable =
+      docOrderDescending === this.docOrderDescending ||
+      (docOrderDescending.length === this.docOrderDescending.length &&
+        docOrderDescending.every((value, index) => value === this.docOrderDescending[index]));
+    if (!shareable) {
+      return new ViewEntrySortKeyComparator(this.categorizationStyle, categoryOrderDescending, docOrderDescending);
+    }
+    const key = `${this.categorizationStyle}|${categoryOrderDescending ? 1 : 0}`;
+    let comparator = this.comparators.get(key);
+    if (!comparator) {
+      comparator = new ViewEntrySortKeyComparator(this.categorizationStyle, categoryOrderDescending, this.docOrderDescending);
+      this.comparators.set(key, comparator);
+    }
+    return comparator;
+  }
+
   /**
    * Get the root entry of the view
    */
@@ -336,17 +363,9 @@ export class VirtualView {
       // Create root comparator
       let rootChildComparator: ViewEntrySortKeyComparator;
       if (this.categoryColumns.length === 0) {
-        rootChildComparator = new ViewEntrySortKeyComparator(
-          this.categorizationStyle,
-          false,
-          this.docOrderDescending
-        );
+        rootChildComparator = this.comparatorFor(false);
       } else {
-        rootChildComparator = new ViewEntrySortKeyComparator(
-          this.categorizationStyle,
-          this.categoryColumns[0].sorting === ColumnSorting.DESCENDING,
-          this.docOrderDescending
-        );
+        rootChildComparator = this.comparatorFor(this.categoryColumns[0].sorting === ColumnSorting.DESCENDING);
       }
 
       const rootSortKey = ViewEntrySortKey.createSortKey(true, [], ORIGIN_VIRTUALVIEW, "root");
@@ -639,11 +658,7 @@ export class VirtualView {
       }
 
       const sortKey = ViewEntrySortKey.createSortKey(false, docSortValues, origin, docId);
-      const childComparator = new ViewEntrySortKeyComparator(
-        this.categorizationStyle,
-        false,
-        this.docOrderDescending
-      );
+      const childComparator = this.comparatorFor(false);
 
       const newDocEntry = new VirtualViewEntryData(
         this,
@@ -724,11 +739,7 @@ export class VirtualView {
               childCategoryDescending = nextCatColumn?.sorting === ColumnSorting.DESCENDING;
             }
 
-            const childComparator = new ViewEntrySortKeyComparator(
-              this.categorizationStyle,
-              childCategoryDescending,
-              this.docOrderDescending
-            );
+            const childComparator = this.comparatorFor(childCategoryDescending);
 
             const newCategoryId = this.createNewCategoryId();
             existingCategory = new VirtualViewEntryData(
@@ -781,11 +792,7 @@ export class VirtualView {
           const nextCatColumn = remainingColumns.length > 0 ? remainingColumns[0] : null;
           const childCategoryDescending = nextCatColumn?.sorting === ColumnSorting.DESCENDING;
 
-          const childComparator = new ViewEntrySortKeyComparator(
-            this.categorizationStyle,
-            childCategoryDescending,
-            this.docOrderDescending
-          );
+          const childComparator = this.comparatorFor(childCategoryDescending);
 
           const newCategoryId = this.createNewCategoryId();
           existingCategory = new VirtualViewEntryData(
@@ -1172,11 +1179,7 @@ export class VirtualView {
         nodeData.sk.o,
         nodeData.sk.d,
       );
-      const comparator = new ViewEntrySortKeyComparator(
-        this.categorizationStyle,
-        nodeData.cod,
-        docOrderDesc,
-      );
+      const comparator = this.comparatorFor(nodeData.cod === true, docOrderDesc);
 
       const entry = new VirtualViewEntryData(
         this,

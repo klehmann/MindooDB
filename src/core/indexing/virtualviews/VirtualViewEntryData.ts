@@ -4,6 +4,60 @@ import { LOW_SORTVAL, HIGH_SORTVAL, LOW_ORIGIN, HIGH_ORIGIN, baseSensitivityColl
 import type { VirtualView } from "./VirtualView";
 
 /**
+ * State only entries with children need (categories and the root): the
+ * child index, counts and totals. Document entries — the vast majority —
+ * never allocate it.
+ */
+class ChildState {
+  /** Child entries by sort key */
+  readonly childEntriesBySortKey: Map<string, VirtualViewEntryData> = new Map();
+  /** Cached array of sorted child entries (maintained incrementally once built) */
+  sortedChildrenCache: VirtualViewEntryData[] | null = null;
+  /** Number of direct children */
+  childCount: number = 0;
+  /** Number of direct child categories */
+  childCategoryCount: number = 0;
+  /** Number of direct child documents */
+  childDocumentCount: number = 0;
+  /** Total number of descendants */
+  descendantCount: number = 0;
+  /** Total number of descendant documents */
+  descendantDocumentCount: number = 0;
+  /** Total number of descendant categories */
+  descendantCategoryCount: number = 0;
+  /** Totals for category aggregations (lower-cased column name -> sum) */
+  totalValues: Map<string, number> | null = null;
+}
+
+const EMPTY_CHILDREN: readonly VirtualViewEntryData[] = Object.freeze([]);
+const EMPTY_VALUES: Readonly<Record<string, unknown>> = Object.freeze({});
+
+/**
+ * Store column values as an ordinary object: entries of one view get the
+ * same keys in the same order, so V8 gives them one shared hidden class
+ * and stores the values inline — much smaller than a Map per entry.
+ * `__proto__` is defined as an own property instead of being assigned.
+ */
+function toValueRecord(values: Record<string, unknown>): Record<string, unknown> {
+  let record: Record<string, unknown> | null = null;
+  for (const key in values) {
+    if (!Object.prototype.hasOwnProperty.call(values, key)) continue;
+    const value = values[key];
+    if (value === undefined) continue;
+    if (record === null) record = {};
+    if (key === "__proto__") {
+      Object.defineProperty(record, key, { value, enumerable: true, writable: true, configurable: true });
+    } else {
+      record[key] = value;
+    }
+  }
+  return record ?? (EMPTY_VALUES as Record<string, unknown>);
+}
+
+const hasOwn = (record: Record<string, unknown>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(record, key);
+
+/**
  * Entry in a VirtualView, representing a document or category.
  * Forms a tree structure with sorted child entries.
  */
@@ -26,8 +80,8 @@ export class VirtualViewEntryData {
   /** Comparator for ordering child entries */
   private readonly childrenComparator: ViewEntrySortKeyComparator;
   
-  /** Column values for this entry */
-  private columnValues: Map<string, unknown> = new Map();
+  /** Column values for this entry (treated as immutable; replaced on change) */
+  private columnValues: Record<string, unknown> = EMPTY_VALUES as Record<string, unknown>;
 
   /**
    * Encryption key id of the source document at the time this entry was
@@ -41,11 +95,8 @@ export class VirtualViewEntryData {
    */
   private decryptionKeyId?: string;
   
-  /** Sorted child entries by sort key */
-  private childEntriesBySortKey: Map<string, VirtualViewEntryData> = new Map();
-  
-  /** Cached array of sorted child entries (invalidated on changes) */
-  private sortedChildrenCache: VirtualViewEntryData[] | null = null;
+  /** Children, counts and totals; created with the first child (see {@link ChildState}) */
+  private children: ChildState | null = null;
   
   /** Sibling index within parent (1-based) */
   private siblingIndex: number = 0;
@@ -56,28 +107,6 @@ export class VirtualViewEntryData {
   /** Indent levels for subcategories (e.g., "2024\03" has indent 1 for "03") */
   private indentLevels: number = 0;
   
-  /** Cached position array */
-  private _position: number[] | null = null;
-  
-  /** Cached position string */
-  private _positionStr: string | null = null;
-
-  // Counts
-  /** Number of direct children */
-  private _childCount: number = 0;
-  /** Number of direct child categories */
-  private _childCategoryCount: number = 0;
-  /** Number of direct child documents */
-  private _childDocumentCount: number = 0;
-  /** Total number of descendants */
-  private _descendantCount: number = 0;
-  /** Total number of descendant documents */
-  private _descendantDocumentCount: number = 0;
-  /** Total number of descendant categories */
-  private _descendantCategoryCount: number = 0;
-
-  // Totals for category entries
-  private totalValues: Map<string, number> = new Map();
 
   constructor(
     parentView: VirtualView,
@@ -146,27 +175,31 @@ export class VirtualViewEntryData {
 
   // Count getters
   getChildCount(): number {
-    return this._childCount;
+    return this.children?.childCount ?? 0;
   }
 
   getChildCategoryCount(): number {
-    return this._childCategoryCount;
+    return this.children?.childCategoryCount ?? 0;
   }
 
   getChildDocumentCount(): number {
-    return this._childDocumentCount;
+    return this.children?.childDocumentCount ?? 0;
   }
 
   getDescendantCount(): number {
-    return this._descendantCount;
+    return this.children?.descendantCount ?? 0;
   }
 
   getDescendantDocumentCount(): number {
-    return this._descendantDocumentCount;
+    return this.children?.descendantDocumentCount ?? 0;
   }
 
   getDescendantCategoryCount(): number {
-    return this._descendantCategoryCount;
+    return this.children?.descendantCategoryCount ?? 0;
+  }
+
+  private childState(): ChildState {
+    return (this.children ??= new ChildState());
   }
 
   getSiblingCount(): number {
@@ -175,42 +208,44 @@ export class VirtualViewEntryData {
 
   // Column values
   getColumnValue(name: string): unknown {
-    return this.columnValues.get(name);
+    return hasOwn(this.columnValues, name) ? this.columnValues[name] : undefined;
   }
 
   getColumnValues(): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of this.columnValues) {
-      result[key] = value;
-    }
-    return result;
+    // Spread defines own properties (also `__proto__`); callers may mutate the copy.
+    return { ...this.columnValues };
   }
 
   setColumnValues(values: Record<string, unknown>): void {
-    this.columnValues.clear();
-    for (const [key, value] of Object.entries(values)) {
-      if (value !== undefined) {
-        this.columnValues.set(key, value);
-      }
-    }
+    this.columnValues = toValueRecord(values);
   }
 
   setColumnValue(name: string, value: unknown): void {
-    if (value === undefined) {
-      this.columnValues.delete(name);
-    } else {
-      this.columnValues.set(name, value);
+    if (value === undefined && !hasOwn(this.columnValues, name)) {
+      return;
     }
+    // Copy instead of mutating: keeps the record in fast mode (a delete
+    // would turn it into a dictionary) and never touches a shared record.
+    const next: Record<string, unknown> = {};
+    for (const key in this.columnValues) {
+      if (key !== name && hasOwn(this.columnValues, key)) {
+        next[key] = this.columnValues[key];
+      }
+    }
+    if (value !== undefined) {
+      next[name] = value;
+    }
+    this.columnValues = toValueRecord(next);
   }
 
   getAsString(name: string, defaultValue: string): string {
-    const val = this.columnValues.get(name);
+    const val = this.getColumnValue(name);
     if (val === null || val === undefined) return defaultValue;
     return String(val);
   }
 
   getAsNumber(name: string, defaultValue: number | null): number | null {
-    const val = this.columnValues.get(name);
+    const val = this.getColumnValue(name);
     if (val === null || val === undefined) return defaultValue;
     if (typeof val === "number") return val;
     const parsed = parseFloat(String(val));
@@ -218,7 +253,7 @@ export class VirtualViewEntryData {
   }
 
   getAsStringList(name: string, defaultValue: string[] | null): string[] | null {
-    const val = this.columnValues.get(name);
+    const val = this.getColumnValue(name);
     if (val === null || val === undefined) return defaultValue;
     if (Array.isArray(val)) {
       return val.map(v => String(v));
@@ -240,26 +275,30 @@ export class VirtualViewEntryData {
    * Get all child entries as a sorted array
    */
   getChildEntries(): VirtualViewEntryData[] {
-    if (this.sortedChildrenCache === null) {
-      const entries = Array.from(this.childEntriesBySortKey.values());
-      entries.sort((a, b) => this.childrenComparator.compare(a.sortKey, b.sortKey));
-      this.sortedChildrenCache = entries;
+    const children = this.children;
+    if (children === null) {
+      return EMPTY_CHILDREN as VirtualViewEntryData[];
     }
-    return this.sortedChildrenCache;
+    if (children.sortedChildrenCache === null) {
+      const entries = Array.from(children.childEntriesBySortKey.values());
+      entries.sort((a, b) => this.childrenComparator.compare(a.sortKey, b.sortKey));
+      children.sortedChildrenCache = entries;
+    }
+    return children.sortedChildrenCache;
   }
 
   /**
    * Get child entry by sort key
    */
   getChildEntry(sortKey: ViewEntrySortKey): VirtualViewEntryData | undefined {
-    return this.childEntriesBySortKey.get(sortKey.toKey());
+    return this.children?.childEntriesBySortKey.get(sortKey.toKey());
   }
 
   /**
    * Check if a child entry exists
    */
   hasChildEntry(sortKey: ViewEntrySortKey): boolean {
-    return this.childEntriesBySortKey.has(sortKey.toKey());
+    return this.children?.childEntriesBySortKey.has(sortKey.toKey()) ?? false;
   }
 
   /**
@@ -268,21 +307,22 @@ export class VirtualViewEntryData {
    */
   addChildEntry(entry: VirtualViewEntryData): boolean {
     const key = entry.sortKey.toKey();
-    if (this.childEntriesBySortKey.has(key)) {
+    const children = this.childState();
+    if (children.childEntriesBySortKey.has(key)) {
       return false;
     }
-    this.childEntriesBySortKey.set(key, entry);
-    if (this.sortedChildrenCache !== null) {
+    children.childEntriesBySortKey.set(key, entry);
+    if (children.sortedChildrenCache !== null) {
       // Maintain the sorted cache incrementally: O(log n) position lookup +
       // one splice instead of invalidation + full re-sort on next read.
-      const insertAt = this.findSortedInsertIndex(entry);
-      this.sortedChildrenCache.splice(insertAt, 0, entry);
+      const insertAt = this.findSortedInsertIndex(children.sortedChildrenCache, entry);
+      children.sortedChildrenCache.splice(insertAt, 0, entry);
     }
-    this._childCount++;
+    children.childCount++;
     if (entry.isCategory()) {
-      this._childCategoryCount++;
+      children.childCategoryCount++;
     } else {
-      this._childDocumentCount++;
+      children.childDocumentCount++;
     }
     return true;
   }
@@ -292,26 +332,30 @@ export class VirtualViewEntryData {
    * @returns true if the entry was removed
    */
   removeChildEntry(sortKey: ViewEntrySortKey): boolean {
+    const children = this.children;
+    if (children === null) {
+      return false;
+    }
     const key = sortKey.toKey();
-    const entry = this.childEntriesBySortKey.get(key);
+    const entry = children.childEntriesBySortKey.get(key);
     if (!entry) {
       return false;
     }
-    this.childEntriesBySortKey.delete(key);
-    if (this.sortedChildrenCache !== null) {
-      const removeAt = this.findSortedEntryIndex(entry);
+    children.childEntriesBySortKey.delete(key);
+    if (children.sortedChildrenCache !== null) {
+      const removeAt = this.findSortedEntryIndex(children.sortedChildrenCache, entry);
       if (removeAt >= 0) {
-        this.sortedChildrenCache.splice(removeAt, 1);
+        children.sortedChildrenCache.splice(removeAt, 1);
       } else {
         // Should not happen; fall back to a full re-sort on next read.
-        this.sortedChildrenCache = null;
+        children.sortedChildrenCache = null;
       }
     }
-    this._childCount--;
+    children.childCount--;
     if (entry.isCategory()) {
-      this._childCategoryCount--;
+      children.childCategoryCount--;
     } else {
-      this._childDocumentCount--;
+      children.childDocumentCount--;
     }
     return true;
   }
@@ -320,8 +364,7 @@ export class VirtualViewEntryData {
    * Binary search for the insertion position of `entry` in the sorted
    * children cache (first index whose sort key compares greater).
    */
-  private findSortedInsertIndex(entry: VirtualViewEntryData): number {
-    const sorted = this.sortedChildrenCache!;
+  private findSortedInsertIndex(sorted: VirtualViewEntryData[], entry: VirtualViewEntryData): number {
     let lo = 0;
     let hi = sorted.length;
     while (lo < hi) {
@@ -341,8 +384,7 @@ export class VirtualViewEntryData {
    * sort keys can compare equal, e.g. case-insensitive collation ties).
    * Returns -1 when not found.
    */
-  private findSortedEntryIndex(entry: VirtualViewEntryData): number {
-    const sorted = this.sortedChildrenCache!;
+  private findSortedEntryIndex(sorted: VirtualViewEntryData[], entry: VirtualViewEntryData): number {
     // Lower bound: first index with compare >= 0
     let lo = 0;
     let hi = sorted.length;
@@ -421,12 +463,7 @@ export class VirtualViewEntryData {
   }
 
   setSiblingIndex(index: number): void {
-    if (this.siblingIndex !== index) {
-      this.siblingIndex = index;
-      // Invalidate cached position
-      this._position = null;
-      this._positionStr = null;
-    }
+    this.siblingIndex = index;
   }
 
   // Indent levels
@@ -451,87 +488,87 @@ export class VirtualViewEntryData {
     return this._level;
   }
 
-  // Position
+  // Position (computed on demand from the sibling indexes: O(depth), and
+  // never cached per entry — a view keeps tens of thousands of entries)
   getPosition(): number[] {
-    if (this._position === null) {
-      if (this.isRoot()) {
-        this._position = [0];
-      } else {
-        const positions: number[] = [this.siblingIndex];
-        let parent = this._parent;
-        while (parent !== null) {
-          const parentSiblingIdx = parent.siblingIndex;
-          parent = parent._parent;
-          if (parent !== null) {
-            // Ignore root sibling position
-            positions.unshift(parentSiblingIdx);
-          }
-        }
-        this._position = positions;
+    if (this.isRoot()) {
+      return [0];
+    }
+    const positions: number[] = [this.siblingIndex];
+    let parent = this._parent;
+    while (parent !== null) {
+      const parentSiblingIdx = parent.siblingIndex;
+      parent = parent._parent;
+      if (parent !== null) {
+        // Ignore root sibling position
+        positions.unshift(parentSiblingIdx);
       }
     }
-    return this._position;
+    return positions;
   }
 
   getPositionStr(): string {
-    if (this._positionStr === null) {
-      this._positionStr = this.getPosition().join(".");
-    }
-    return this._positionStr;
+    return this.getPosition().join(".");
   }
 
   // Descendant count management
   incrementDescendantCount(isCategory: boolean): void {
-    this._descendantCount++;
+    const children = this.childState();
+    children.descendantCount++;
     if (isCategory) {
-      this._descendantCategoryCount++;
+      children.descendantCategoryCount++;
     } else {
-      this._descendantDocumentCount++;
+      children.descendantDocumentCount++;
     }
   }
 
   decrementDescendantCount(isCategory: boolean): void {
-    this._descendantCount--;
+    const children = this.childState();
+    children.descendantCount--;
     if (isCategory) {
-      this._descendantCategoryCount--;
+      children.descendantCategoryCount--;
     } else {
-      this._descendantDocumentCount--;
+      children.descendantDocumentCount--;
     }
   }
 
   // Total values (for category aggregations)
   addTotalValue(itemName: string, value: number): number {
     const key = itemName.toLowerCase();
-    const current = this.totalValues.get(key) ?? 0;
+    const children = this.childState();
+    const totals = (children.totalValues ??= new Map());
+    const current = totals.get(key) ?? 0;
     const newValue = current + value;
-    this.totalValues.set(key, newValue);
+    totals.set(key, newValue);
     return newValue;
   }
 
   getTotalValue(itemName: string): number | null {
     const key = itemName.toLowerCase();
-    return this.totalValues.get(key) ?? null;
+    return this.children?.totalValues?.get(key) ?? null;
   }
 
   getTotalValues(): Record<string, number> {
     const result: Record<string, number> = {};
-    for (const [key, value] of this.totalValues) {
-      result[key] = value;
+    const totals = this.children?.totalValues;
+    if (totals) {
+      for (const [key, value] of totals) {
+        result[key] = value;
+      }
     }
     return result;
   }
 
   // Invalidate caches when structure changes
   invalidatePositionCache(): void {
-    this._position = null;
-    this._positionStr = null;
     this._level = null;
   }
 
   /** @internal Add a pre-built child during cache restoration (bypasses incremental count tracking). */
   _addRestoredChild(entry: VirtualViewEntryData): void {
-    this.childEntriesBySortKey.set(entry.getSortKey().toKey(), entry);
-    this.sortedChildrenCache = null;
+    const children = this.childState();
+    children.childEntriesBySortKey.set(entry.getSortKey().toKey(), entry);
+    children.sortedChildrenCache = null;
   }
 
   /** @internal Set count values directly during cache restoration. */
@@ -539,20 +576,26 @@ export class VirtualViewEntryData {
     cc: number, ccc: number, cdc: number,
     dc: number, ddc: number, dcc: number,
   ): void {
-    this._childCount = cc;
-    this._childCategoryCount = ccc;
-    this._childDocumentCount = cdc;
-    this._descendantCount = dc;
-    this._descendantDocumentCount = ddc;
-    this._descendantCategoryCount = dcc;
+    if (this.children === null && cc === 0 && ccc === 0 && cdc === 0 && dc === 0 && ddc === 0 && dcc === 0) {
+      return;
+    }
+    const children = this.childState();
+    children.childCount = cc;
+    children.childCategoryCount = ccc;
+    children.childDocumentCount = cdc;
+    children.descendantCount = dc;
+    children.descendantDocumentCount = ddc;
+    children.descendantCategoryCount = dcc;
   }
 
   /** @internal Set total values directly during cache restoration. */
   _restoreTotalValues(totals: Record<string, number>): void {
-    this.totalValues.clear();
-    for (const [key, value] of Object.entries(totals)) {
-      this.totalValues.set(key, value);
+    const entries = Object.entries(totals);
+    if (entries.length === 0) {
+      if (this.children?.totalValues) this.children.totalValues = null;
+      return;
     }
+    this.childState().totalValues = new Map(entries);
   }
 
   toString(): string {

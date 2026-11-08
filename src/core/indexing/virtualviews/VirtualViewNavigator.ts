@@ -1124,6 +1124,14 @@ export class VirtualViewNavigator {
     return pos1.length - pos2.length;
   }
 
+  /** Sort entries by tree position, computing each position once. */
+  private static sortByPosition(entries: VirtualViewEntryData[]): VirtualViewEntryData[] {
+    return entries
+      .map((entry) => ({ entry, position: entry.getPosition() }))
+      .sort((a, b) => VirtualViewNavigator.comparePositions(a.position, b.position))
+      .map(({ entry }) => entry);
+  }
+
   /**
    * Get all occurrences of a document in the view, sorted by position
    * 
@@ -1133,9 +1141,7 @@ export class VirtualViewNavigator {
    */
   getSortedEntries(origin: string, docId: string): VirtualViewEntryData[] {
     const entries = this.view.getEntries(origin, docId);
-    return entries
-      .filter(e => this.isVisible(e))
-      .sort((a, b) => VirtualViewNavigator.comparePositions(a.getPosition(), b.getPosition()));
+    return VirtualViewNavigator.sortByPosition(entries.filter(e => this.isVisible(e)));
   }
 
   /**
@@ -1153,9 +1159,7 @@ export class VirtualViewNavigator {
       allEntries.push(...entries);
     }
     
-    return allEntries
-      .filter(e => this.isVisible(e))
-      .sort((a, b) => VirtualViewNavigator.comparePositions(a.getPosition(), b.getPosition()));
+    return VirtualViewNavigator.sortByPosition(allEntries.filter(e => this.isVisible(e)));
   }
 
   /**
@@ -1172,9 +1176,7 @@ export class VirtualViewNavigator {
       allEntries.push(...entries);
     }
     
-    return allEntries
-      .filter(e => this.isVisible(e))
-      .sort((a, b) => VirtualViewNavigator.comparePositions(a.getPosition(), b.getPosition()));
+    return VirtualViewNavigator.sortByPosition(allEntries.filter(e => this.isVisible(e)));
   }
 
   /**
