@@ -9,6 +9,7 @@ import type {
   SummaryConfig,
   SummaryCoverage,
   SummaryMetaPayload,
+  SummaryJournalSegment,
   SummaryStoreChanges,
   SummaryStorePosition,
 } from "./types";
@@ -92,7 +93,16 @@ export class DocumentSummaryStore implements ICacheable {
   private cacheManager: CacheManager | null = null;
   private cachePrefix: string | null = null;
   private readonly bucketCount: number = DEFAULT_BUCKET_COUNT;
+  /** Buckets changed since the last snapshot (rewritten by the next snapshot). */
   private dirtyBuckets: Set<number> = new Set();
+  // Journal (see flushToCache): entries changed since the last flush.
+  private journalPending: Map<string, DocumentSummaryEntry | null> = new Map();
+  private pendingTombstones: Array<[number, string]> = [];
+  /** Whether this instance wrote the current snapshot (else the next flush writes one). */
+  private ownSnapshot: boolean = false;
+  private journalEntriesSinceSnapshot: number = 0;
+  private nextJournalSegment: number = 0;
+  private readonly journalWriterId: string = generateRandomUuid().replace(/-/g, "").slice(0, 12);
   private metaDirty: boolean = false;
   /** Timestamp of the last completed (non-deferred) flush. */
   private lastFlushAt: number = 0;
@@ -433,6 +443,7 @@ export class DocumentSummaryStore implements ICacheable {
   private recordRemoval(docId: string): void {
     const seq = ++this.updateSeq;
     this.tombstones.push([seq, docId]);
+    this.pendingTombstones.push([seq, docId]);
     if (this.tombstones.length > MAX_TOMBSTONES) {
       const dropped = this.tombstones.splice(0, this.tombstones.length - MAX_TOMBSTONES);
       this.tombstoneHorizon = dropped[dropped.length - 1][0];
@@ -549,6 +560,10 @@ export class DocumentSummaryStore implements ICacheable {
     for (let i = 0; i < this.bucketCount; i++) {
       this.dirtyBuckets.add(i);
     }
+    // Everything changed: the next flush writes a full snapshot.
+    this.ownSnapshot = false;
+    this.journalPending.clear();
+    this.pendingTombstones = [];
     this.metaDirty = true;
     this.cacheManager?.markDirty();
   }
@@ -574,7 +589,7 @@ export class DocumentSummaryStore implements ICacheable {
   }
 
   hasDirtyState(): boolean {
-    return this.dirtyBuckets.size > 0 || this.metaDirty;
+    return this.journalPending.size > 0 || this.metaDirty || (!this.ownSnapshot && this.dirtyBuckets.size > 0);
   }
 
   clearDirty(): void {
@@ -594,6 +609,8 @@ export class DocumentSummaryStore implements ICacheable {
    */
   discardDirtyState(): void {
     this.dirtyBuckets.clear();
+    this.journalPending.clear();
+    this.pendingTombstones = [];
     this.metaDirty = false;
     this.flushHandledDirty = false;
   }
@@ -604,6 +621,7 @@ export class DocumentSummaryStore implements ICacheable {
 
   private markBucketDirty(docId: string): void {
     this.dirtyBuckets.add(this.bucketIndexFor(docId));
+    this.journalPending.set(docId, this.entries.get(docId) ?? null);
     this.metaDirty = true;
   }
 
@@ -621,13 +639,32 @@ export class DocumentSummaryStore implements ICacheable {
       return 0;
     }
 
+    // Snapshot + journal: normally only the entries changed since the last
+    // flush are appended as a small segment (`summaryj`); the dirty buckets
+    // and meta (the snapshot) are rewritten when this instance has no
+    // snapshot of its own yet (also right after a restore), when the
+    // journal outgrows 10 % of the buffer (min. 500 entries), and on forced
+    // flushes (close). Chains are per writer, like the view cache.
+    const prefix = this.getCachePrefix();
+    const wantSnapshot =
+      options?.force === true ||
+      !this.ownSnapshot ||
+      this.journalEntriesSinceSnapshot + this.journalPending.size > Math.max(500, this.entries.size * 0.1);
+    if (!wantSnapshot) {
+      return this.flushJournalSegment(store, prefix);
+    }
+
     // Snapshot everything synchronously before the first await: bucket
     // payloads and the meta cursor must describe the same state, and entries
     // an update run changes while the writes are in flight must stay dirty
     // for the next flush instead of being cleared with this one.
-    const prefix = this.getCachePrefix();
     const bucketsToWrite = this.dirtyBuckets;
     this.dirtyBuckets = new Set();
+    const pendingAtSnapshot = this.journalPending;
+    const tombstonesAtSnapshot = this.pendingTombstones;
+    this.journalPending = new Map();
+    this.pendingTombstones = [];
+    const journalBase = this.nextJournalSegment;
     this.metaDirty = false;
     this.flushHandledDirty = true;
 
@@ -658,6 +695,8 @@ export class DocumentSummaryStore implements ICacheable {
       tombstoneHorizon: this.tombstoneHorizon,
       tombstones: this.tombstones,
       lostSeqRanges: this.lostSeqRanges,
+      journalWriter: this.journalWriterId,
+      journalBase,
     };
 
     let written = 0;
@@ -679,13 +718,82 @@ export class DocumentSummaryStore implements ICacheable {
       for (const bucket of bucketsToWrite) {
         this.dirtyBuckets.add(bucket);
       }
+      this.restorePending(pendingAtSnapshot, tombstonesAtSnapshot);
       this.metaDirty = true;
       this.flushHandledDirty = false;
       throw error;
     }
 
+    this.ownSnapshot = true;
+    this.journalEntriesSinceSnapshot = 0;
+    try {
+      const journalPrefix = `${prefix}/journal/`;
+      for (const id of await store.list("summaryj")) {
+        if (id.startsWith(journalPrefix)) await store.delete("summaryj", id);
+      }
+    } catch {
+      // Stale segments are ignored on restore (other chain or before the base).
+    }
     this.lastFlushAt = Date.now();
     return written;
+  }
+
+  /** Append the entries changed since the last flush as one journal segment. */
+  private async flushJournalSegment(store: LocalCacheStore, prefix: string): Promise<number> {
+    const pending = this.journalPending;
+    const tombstones = this.pendingTombstones;
+    this.journalPending = new Map();
+    this.pendingTombstones = [];
+    this.metaDirty = false;
+    this.flushHandledDirty = true;
+    const segment: SummaryJournalSegment = {
+      entries: [],
+      removed: [],
+      tombstones,
+      meta: {
+        cursor: this.cursor,
+        configFingerprint: this.configFingerprint,
+        bucketCount: this.bucketCount,
+        needsBackfill: this.needsBackfill,
+        backfillCursor: this.backfillCursor,
+        generation: this.generation,
+        updateSeq: this.updateSeq,
+        tombstoneHorizon: this.tombstoneHorizon,
+        lostSeqRanges: this.lostSeqRanges,
+      },
+    };
+    for (const [docId, entry] of pending) {
+      if (entry) segment.entries.push(entry);
+      else segment.removed.push(docId);
+    }
+    const segmentNo = this.nextJournalSegment;
+    try {
+      await store.put(
+        "summaryj",
+        `${prefix}/journal/${this.journalWriterId}/${String(segmentNo).padStart(10, "0")}`,
+        new TextEncoder().encode(JSON.stringify(segment)),
+      );
+    } catch (error) {
+      // Nothing is lost: keep the changes for the next flush.
+      this.restorePending(pending, tombstones);
+      this.metaDirty = true;
+      this.flushHandledDirty = false;
+      throw error;
+    }
+    this.nextJournalSegment = segmentNo + 1;
+    this.journalEntriesSinceSnapshot += pending.size;
+    this.lastFlushAt = Date.now();
+    return 1;
+  }
+
+  /** Put changes of a failed write back in front of what changed meanwhile. */
+  private restorePending(pending: Map<string, DocumentSummaryEntry | null>, tombstones: Array<[number, string]>): void {
+    for (const [docId, entry] of pending) {
+      if (!this.journalPending.has(docId)) {
+        this.journalPending.set(docId, entry);
+      }
+    }
+    this.pendingTombstones = [...tombstones, ...this.pendingTombstones];
   }
 
   private async ensureRestored(): Promise<void> {
@@ -748,6 +856,49 @@ export class DocumentSummaryStore implements ICacheable {
       this.cursor = null;
       return;
     }
+
+    // Replay the journal chain continuing this snapshot: entries, removals
+    // and the newest meta (a missing or unreadable segment ends the replay;
+    // the changefeed catches up from the last good cursor).
+    if (typeof meta.journalWriter === "string") {
+      try {
+        const chainPrefix = `${prefix}/journal/${meta.journalWriter}/`;
+        const base = meta.journalBase ?? 0;
+        const numbers = (await store.list("summaryj"))
+          .filter((id) => id.startsWith(chainPrefix))
+          .map((id) => Number(id.slice(chainPrefix.length)))
+          .filter((n) => Number.isInteger(n) && n >= base)
+          .sort((a, b) => a - b);
+        let expected = base;
+        for (const n of numbers) {
+          if (n !== expected) break;
+          const bytes = await store.get("summaryj", `${chainPrefix}${String(n).padStart(10, "0")}`);
+          if (!bytes) break;
+          const segment = JSON.parse(new TextDecoder().decode(bytes)) as SummaryJournalSegment;
+          for (const entry of segment.entries) {
+            this.entries.set(entry.docId, entry);
+            this.dirtyBuckets.add(this.bucketIndexFor(entry.docId));
+          }
+          for (const docId of segment.removed) {
+            this.entries.delete(docId);
+            this.dirtyBuckets.add(this.bucketIndexFor(docId));
+          }
+          let tombstones = [...(meta.tombstones ?? []), ...(segment.tombstones ?? [])];
+          let horizon = segment.meta.tombstoneHorizon ?? meta.tombstoneHorizon ?? 0;
+          if (tombstones.length > MAX_TOMBSTONES) {
+            const dropped = tombstones.splice(0, tombstones.length - MAX_TOMBSTONES);
+            horizon = Math.max(horizon, dropped[dropped.length - 1][0]);
+          }
+          meta = { ...segment.meta, tombstones, tombstoneHorizon: horizon };
+          expected = n + 1;
+        }
+      } catch {
+        // Keep what was replayed.
+      }
+    }
+    // This instance continues with its own chain: its first flush writes a
+    // snapshot (the buckets the replay touched plus meta).
+    this.ownSnapshot = false;
 
     this.cursor = meta.cursor ?? null;
     if (typeof meta.generation === "string" && typeof meta.updateSeq === "number") {

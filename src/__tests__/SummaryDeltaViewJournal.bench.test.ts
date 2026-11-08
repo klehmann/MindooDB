@@ -51,6 +51,8 @@ run("benchmark: summary delta + view cache journal", () => {
 
     const cacheStore = new InMemoryLocalCacheStore();
     const cacheManager = new CacheManager(cacheStore, { flushIntervalMs: 3600000 });
+    // The summary buffer persists through the same store (as in Haven).
+    (db as unknown as { setCacheManager(cm: CacheManager): void }).setCacheManager(cacheManager);
     const view = await build();
     await view.setCacheManager(cacheManager, "bench", "v1", { minCacheFlushIntervalMs: 0 });
     let t = performance.now();
@@ -62,6 +64,8 @@ run("benchmark: summary delta + view cache journal", () => {
     const updateMs: number[] = [];
     const flushMs: number[] = [];
     const flushBytes: number[] = [];
+    const summaryFlushBytes: number[] = [];
+    await cacheManager.flush();
     const putSpy = jest.spyOn(cacheStore, "put");
     for (const id of ids) {
       const doc = await db.getDocument(id);
@@ -82,6 +86,13 @@ run("benchmark: summary delta + view cache journal", () => {
           .filter(([type]) => type === "vv" || type === "vvj")
           .reduce((sum, [, , bytes]) => sum + (bytes as Uint8Array).length, 0),
       );
+      putSpy.mockClear();
+      await db.getSummaryStore!().flushToCache(cacheStore);
+      summaryFlushBytes.push(
+        putSpy.mock.calls
+          .filter(([type]) => type === "summary" || type === "summaryj")
+          .reduce((sum, [, , bytes]) => sum + (bytes as Uint8Array).length, 0),
+      );
     }
     putSpy.mockRestore();
 
@@ -99,6 +110,7 @@ run("benchmark: summary delta + view cache journal", () => {
           updateAfterOneChangeMedianMs: Number(median(updateMs).toFixed(2)),
           cacheFlushAfterOneChangeMedianMs: Number(median(flushMs).toFixed(2)),
           cacheFlushAfterOneChangeMedianBytes: median(flushBytes),
+          summaryFlushAfterOneChangeMedianBytes: median(summaryFlushBytes),
           restoreMs: Math.round(restoreMs),
         },
         null,

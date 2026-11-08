@@ -237,4 +237,17 @@ export interface SummaryMetaPayload {
   tombstones?: Array<[number, string]>;
   /** Sequence ranges (start exclusive, end inclusive) a crashed run may have handed out. */
   lostSeqRanges?: Array<[number, number]>;
+  /** Journal chain continuing this snapshot (see DocumentSummaryStore.flushToCache). */
+  journalWriter?: string;
+  journalBase?: number;
+}
+
+/** One journal segment of the summary cache: what changed since the previous flush. */
+export interface SummaryJournalSegment {
+  entries: DocumentSummaryEntry[];
+  removed: string[];
+  /** Tombstones added since the previous flush (not the whole list). */
+  tombstones: Array<[number, string]>;
+  /** Meta at the time of the flush, without the tombstone list. */
+  meta: Omit<SummaryMetaPayload, "tombstones">;
 }
