@@ -77,6 +77,12 @@ export { ViewEntrySortKeyComparator } from "./ViewEntrySortKeyComparator";
 
 // Navigation
 export { VirtualViewNavigator } from "./VirtualViewNavigator";
+export {
+  VirtualViewMergedNavigator,
+  type MergedEntryKey,
+  type MergedNavigatorPage,
+  type MergedNavigatorOptions,
+} from "./VirtualViewMergedNavigator";
 
 // Data providers
 export {
