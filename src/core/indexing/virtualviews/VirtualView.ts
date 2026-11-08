@@ -17,6 +17,7 @@ import type { LocalCacheStore } from "../../cache/LocalCacheStore";
 import type { ICacheable } from "../../cache/CacheManager";
 import type { CacheManager } from "../../cache/CacheManager";
 import type { MindooDB } from "../../types";
+import { generateRandomUuid } from "../../utils/idGeneration";
 import { VirtualViewFilingJoin, isFilingAwareDataProvider, type FilingJoinState } from "./VirtualViewFilingJoin";
 
 /** Statistics passed to {@link VirtualView.onDidUpdate} listeners. */
@@ -205,6 +206,13 @@ export class VirtualView {
   /** Document entries in the last written/restored snapshot, `null` = none yet. */
   private snapshotDocCount: number | null = null;
   private nextJournalSegment: number = 0;
+  /**
+   * Journal chain of this instance. Several VirtualView instances may
+   * cache under the same key (several navigators over one definition,
+   * several browser tabs); each writes its own chain and a snapshot names
+   * the chain that continues it, so chains never interleave.
+   */
+  private readonly journalWriterId: string = generateRandomUuid().replace(/-/g, "").slice(0, 12);
   private replayingJournal: boolean = false;
 
   // Live-view support (see bindTo/onDidUpdate)
@@ -1157,9 +1165,10 @@ export class VirtualView {
       this.journalEntriesSinceSnapshot = 0;
       this.snapshotDocCount = this.countDocumentEntries();
       this.lastCacheFlushAt = now;
-      // Every existing segment is either folded into this snapshot or a
-      // leftover of an older state (e.g. after a failed restore).
-      await this.deleteJournalSegments(store, () => true);
+      // Every existing segment is either folded into this snapshot or
+      // belongs to a chain this snapshot replaced (another instance, an
+      // older state).
+      await this.deleteJournalSegments(store);
       return 1;
     }
 
@@ -1182,7 +1191,7 @@ export class VirtualView {
     const segmentNo = this.nextJournalSegment;
     await store.put(
       "vvj",
-      `${this.getCachePrefix()}/${String(segmentNo).padStart(10, "0")}`,
+      this.journalSegmentId(this.journalWriterId, segmentNo),
       new TextEncoder().encode(JSON.stringify(segment)),
     );
     this.nextJournalSegment = segmentNo + 1;
@@ -1223,30 +1232,33 @@ export class VirtualView {
     return providerStates;
   }
 
-  /** Journal segment numbers of this view in the store. */
-  private async listJournalSegments(store: LocalCacheStore): Promise<number[]> {
-    const prefix = `${this.getCachePrefix()}/`;
-    const segments: number[] = [];
-    for (const id of await store.list("vvj")) {
-      if (id.startsWith(prefix)) {
-        const segment = Number(id.slice(prefix.length));
-        if (Number.isInteger(segment)) {
-          segments.push(segment);
-        }
-      }
-    }
-    return segments.sort((a, b) => a - b);
+  private journalSegmentId(writer: string, segment: number): string {
+    return `${this.getCachePrefix()}/${writer}/${String(segment).padStart(10, "0")}`;
   }
 
-  private async deleteJournalSegments(store: LocalCacheStore, predicate: (segment: number) => boolean): Promise<void> {
+  /** Journal segments of this view in the store (all writers). */
+  private async listJournalSegments(store: LocalCacheStore): Promise<Array<{ writer: string; segment: number }>> {
+    const prefix = `${this.getCachePrefix()}/`;
+    const segments: Array<{ writer: string; segment: number }> = [];
+    for (const id of await store.list("vvj")) {
+      if (!id.startsWith(prefix)) continue;
+      const [writer, number, ...rest] = id.slice(prefix.length).split("/");
+      const segment = Number(number);
+      if (writer && rest.length === 0 && Number.isInteger(segment)) {
+        segments.push({ writer, segment });
+      }
+    }
+    return segments.sort((a, b) => a.segment - b.segment);
+  }
+
+  /** Drop every journal segment of this view (after a snapshot they are folded in or stale). */
+  private async deleteJournalSegments(store: LocalCacheStore): Promise<void> {
     try {
-      for (const segment of await this.listJournalSegments(store)) {
-        if (predicate(segment)) {
-          await store.delete("vvj", `${this.getCachePrefix()}/${String(segment).padStart(10, "0")}`);
-        }
+      for (const { writer, segment } of await this.listJournalSegments(store)) {
+        await store.delete("vvj", this.journalSegmentId(writer, segment));
       }
     } catch {
-      // Stale segments are ignored on restore (they predate the snapshot).
+      // Stale segments are ignored on restore (other chain or before the base).
     }
   }
 
@@ -1261,6 +1273,7 @@ export class VirtualView {
 
     const snapshot = {
       version: 2,
+      journalWriter: this.journalWriterId,
       journalBase,
       categoryIdCounter: this.categoryIdCounter,
       categorizationStyle: this.categorizationStyle,
@@ -1340,7 +1353,11 @@ export class VirtualView {
         if (!this.restoreFromTreeSnapshot(snapshot)) {
           return false;
         }
-        await this.replayJournal(store, typeof snapshot.journalBase === "number" ? snapshot.journalBase : 0);
+        await this.replayJournal(
+          store,
+          typeof snapshot.journalWriter === "string" ? snapshot.journalWriter : null,
+          typeof snapshot.journalBase === "number" ? snapshot.journalBase : 0,
+        );
         return true;
       }
 
@@ -1358,25 +1375,33 @@ export class VirtualView {
    * providers' cursors of the last good segment make the next update catch
    * up from there.
    */
-  private async replayJournal(store: LocalCacheStore, journalBase: number): Promise<void> {
-    this.snapshotDocCount = this.countDocumentEntries();
+  private async replayJournal(store: LocalCacheStore, writer: string | null, journalBase: number): Promise<void> {
+    // This instance continues with its OWN chain, so its first flush writes
+    // a fresh snapshot (another instance may have restored the same state
+    // and continue the restored chain concurrently otherwise).
+    this.snapshotDocCount = null;
     this.journalEntriesSinceSnapshot = 0;
-    this.nextJournalSegment = journalBase;
+    if (writer === null) {
+      return;
+    }
     let segments: number[];
     try {
-      segments = (await this.listJournalSegments(store)).filter((segment) => segment >= journalBase);
+      segments = (await this.listJournalSegments(store))
+        .filter((entry) => entry.writer === writer && entry.segment >= journalBase)
+        .map((entry) => entry.segment);
     } catch {
       return;
     }
+    let expected = journalBase;
     this.replayingJournal = true;
     // Only the last replayed segment's provider cursors matter.
     const lastProviderStates = new Map<string, unknown>();
     try {
       for (const segmentNo of segments) {
-        if (segmentNo !== this.nextJournalSegment) {
+        if (segmentNo !== expected) {
           break; // gap
         }
-        const bytes = await store.get("vvj", `${this.getCachePrefix()}/${String(segmentNo).padStart(10, "0")}`);
+        const bytes = await store.get("vvj", this.journalSegmentId(writer, segmentNo));
         if (!bytes) break;
         const segment = JSON.parse(new TextDecoder().decode(bytes)) as SerializedJournalSegment;
         for (const serialized of segment.changes ?? []) {
@@ -1395,7 +1420,7 @@ export class VirtualView {
         if (typeof segment.categoryIdCounter === "number") {
           this.categoryIdCounter = Math.max(this.categoryIdCounter, segment.categoryIdCounter);
         }
-        this.nextJournalSegment = segmentNo + 1;
+        expected = segmentNo + 1;
       }
     } catch {
       // Keep what was replayed; see above.

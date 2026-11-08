@@ -251,4 +251,73 @@ describe("view cache: snapshot + change journal", () => {
     expect(await rows(restored)).toEqual(await rows(view));
     await cacheManager.dispose();
   }, 60000);
+
+  it("keeps the journal chains of several instances on one cache key apart", async () => {
+    const ctx = await createWitnessingTenant("tenant-view-journal-writers");
+    const db = await ctx.tenant.openDB("main");
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      ids.push(await createDoc(db, { type: "message", subject: `m${i}`, folder: "f", n: i }));
+    }
+    const cacheStore = new InMemoryLocalCacheStore();
+    const cacheManager = new CacheManager(cacheStore, { flushIntervalMs: 600000 });
+    // Two navigators (or tabs) build the same view and cache under one key.
+    const a = await buildView(db);
+    const b = await buildView(db);
+    await a.setCacheManager(cacheManager, "shared-view", "v1", { minCacheFlushIntervalMs: 0 });
+    await b.setCacheManager(cacheManager, "shared-view", "v1", { minCacheFlushIntervalMs: 0 });
+    await a.update();
+    await b.update();
+    await a.flushToCache(cacheStore);
+    await b.flushToCache(cacheStore); // b's snapshot replaces a's
+    // a sees a change and journals it; b, still behind, journals its
+    // (older) cursor under the same segment number; a goes on.
+    await change(db, ids[0], { subject: "m0 changed" });
+    await a.update();
+    await a.flushToCache(cacheStore);
+    await b.flushToCache(cacheStore);
+    await change(db, ids[1], { subject: "m1 changed" });
+    await a.update();
+    await a.flushToCache(cacheStore);
+
+    const restored = await buildView(db);
+    expect(await restored.setCacheManager(cacheManager, "shared-view", "v1")).toBe(true);
+    await restored.update();
+    const truth = await buildView(db);
+    await truth.update();
+    expect(await rows(restored)).toEqual(await rows(truth));
+    await cacheManager.dispose();
+  }, 60000);
+
+  it("keeps unwritten changes after a failed journal write (e.g. disk full) and writes them later", async () => {
+    const ctx = await createWitnessingTenant("tenant-view-journal-diskfull");
+    const db = await ctx.tenant.openDB("main");
+    const ids: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      ids.push(await createDoc(db, { type: "message", subject: `m${i}`, folder: "f", n: i }));
+    }
+    const cacheStore = new InMemoryLocalCacheStore();
+    const cacheManager = new CacheManager(cacheStore, { flushIntervalMs: 600000 });
+    const view = await buildView(db);
+    await view.setCacheManager(cacheManager, "diskfull-view", "v1", { minCacheFlushIntervalMs: 0 });
+    await view.update();
+    await view.flushToCache(cacheStore);
+
+    await change(db, ids[0], { subject: "m0 changed" });
+    await view.update();
+    const put = jest.spyOn(cacheStore, "put").mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
+    await expect(view.flushToCache(cacheStore)).rejects.toThrow(/ENOSPC/);
+    put.mockRestore();
+    expect(await cacheStore.list("vvj")).toHaveLength(0);
+
+    await change(db, ids[1], { subject: "m1 changed" });
+    await view.update();
+    await view.flushToCache(cacheStore); // carries both changes
+    expect(await cacheStore.list("vvj")).toHaveLength(1);
+
+    const restored = await buildView(db);
+    expect(await restored.setCacheManager(cacheManager, "diskfull-view", "v1")).toBe(true);
+    expect(await rows(restored)).toEqual(await rows(view));
+    await cacheManager.dispose();
+  }, 60000);
 });
