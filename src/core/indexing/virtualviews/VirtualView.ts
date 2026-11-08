@@ -17,6 +17,7 @@ import type { LocalCacheStore } from "../../cache/LocalCacheStore";
 import type { ICacheable } from "../../cache/CacheManager";
 import type { CacheManager } from "../../cache/CacheManager";
 import type { MindooDB } from "../../types";
+import { generateRandomUuid } from "../../utils/idGeneration";
 import { VirtualViewFilingJoin, isFilingAwareDataProvider, type FilingJoinState } from "./VirtualViewFilingJoin";
 
 /** Statistics passed to {@link VirtualView.onDidUpdate} listeners. */
@@ -99,6 +100,29 @@ interface SerializedVirtualViewNode {
   dk?: string;
 }
 
+/** One applied change batch in the view-cache journal (compact keys). */
+interface SerializedViewChange {
+  /** Origin. */
+  o: string;
+  /** Removed doc ids. */
+  r: string[];
+  /** Additions: [docId, column values, decryption key id?]. */
+  a: Array<[string, Record<string, unknown>, string?] | [string, Record<string, unknown>]>;
+}
+
+/** One journal segment (`vvj` record) written by a cache flush. */
+interface SerializedJournalSegment {
+  changes: SerializedViewChange[];
+  providerStates: Record<string, unknown>;
+  filing?: FilingJoinState;
+  categoryIdCounter?: number;
+}
+
+/** Rewrite the snapshot once the journal holds more than this share of its entries. */
+const JOURNAL_COMPACT_RATIO = 0.1;
+/** ...but never for fewer journal entries than this (tiny views). */
+const JOURNAL_MIN_COMPACT_ENTRIES = 100;
+
 /**
  * VirtualView creates a hierarchical, sorted view of documents from one or more MindooDB instances.
  * Documents are organized into categories (tree structure) with sorting and optional totals.
@@ -172,6 +196,24 @@ export class VirtualView {
   private lastCacheFlushAt: number = 0;
   /** Whether the most recent flush attempt was deferred by the min interval. */
   private lastFlushDeferred: boolean = false;
+
+  // Change journal (see flushToCache): applied change batches since the
+  // last flush, appended to the cache as small segments instead of
+  // rewriting the whole tree; the snapshot is rewritten only when the
+  // journal outgrows JOURNAL_COMPACT_RATIO of it, or on forced flushes.
+  private journalPending: SerializedViewChange[] = [];
+  private journalEntriesSinceSnapshot: number = 0;
+  /** Document entries in the last written/restored snapshot, `null` = none yet. */
+  private snapshotDocCount: number | null = null;
+  private nextJournalSegment: number = 0;
+  /**
+   * Journal chain of this instance. Several VirtualView instances may
+   * cache under the same key (several navigators over one definition,
+   * several browser tabs); each writes its own chain and a snapshot names
+   * the chain that continues it, so chains never interleave.
+   */
+  private readonly journalWriterId: string = generateRandomUuid().replace(/-/g, "").slice(0, 12);
+  private replayingJournal: boolean = false;
 
   // Live-view support (see bindTo/onDidUpdate)
   private updateListeners: Set<(stats: VirtualViewUpdateStats) => void> = new Set();
@@ -430,6 +472,17 @@ export class VirtualView {
   applyChanges(change: VirtualViewDataChange): void {
     this.indexBuilt = true;
     let indexChanged = false;
+    if (this.cacheManager && !this.replayingJournal && change.hasChanges()) {
+      this.journalPending.push({
+        o: change.origin,
+        r: Array.from(change.getRemovals()),
+        a: Array.from(change.getAdditions().values(), (entry) =>
+          entry.decryptionKeyId !== undefined
+            ? [entry.docId, entry.values, entry.decryptionKeyId]
+            : [entry.docId, entry.values],
+        ),
+      });
+    }
 
     const origin = change.origin;
     const categoryEntriesToCheck: VirtualViewEntryData[] = [];
@@ -1067,28 +1120,146 @@ export class VirtualView {
   }
 
   /**
-   * Export the view state to the cache store.
+   * Export the view state to the cache store — as snapshot + change
+   * journal:
    *
-   * Full-tree serialization is throttled by {@link minCacheFlushIntervalMs}
-   * so active editing sessions don't serialize the entire view on every
-   * periodic flush; `force: true` (shutdown/deregister) bypasses the
-   * throttle.
+   * - Normally only the change batches applied since the last flush are
+   *   appended as a small journal segment (`vvj` records), together with
+   *   the data providers' cursors. Cost: O(changes), not O(view).
+   * - The full tree snapshot (`vv`) is rewritten when there is none yet,
+   *   when the journal holds more than {@link JOURNAL_COMPACT_RATIO} of
+   *   the snapshot's entries (compaction), and on forced flushes
+   *   (shutdown/deregister — "on close"). Full snapshots are still
+   *   throttled by {@link minCacheFlushIntervalMs}; a throttled compaction
+   *   writes a journal segment instead.
+   *
+   * Restoring loads the snapshot and replays the journal segments written
+   * after it.
    */
   async flushToCache(store: LocalCacheStore, options?: { force?: boolean }): Promise<number> {
     const now = Date.now();
-    if (
-      !options?.force
-      && this.lastCacheFlushAt > 0
-      && now - this.lastCacheFlushAt < this.minCacheFlushIntervalMs
-    ) {
+    const pending = this.journalPending;
+    const pendingCount = pending.reduce((sum, change) => sum + change.r.length + change.a.length, 0);
+    const journalTooLarge =
+      this.snapshotDocCount !== null &&
+      this.journalEntriesSinceSnapshot + pendingCount >
+        Math.max(JOURNAL_MIN_COMPACT_ENTRIES, this.snapshotDocCount * JOURNAL_COMPACT_RATIO);
+    const wantSnapshot = options?.force === true || this.snapshotDocCount === null || journalTooLarge;
+    const throttled =
+      !options?.force &&
+      this.lastCacheFlushAt > 0 &&
+      now - this.lastCacheFlushAt < this.minCacheFlushIntervalMs;
+
+    if (wantSnapshot && throttled && this.snapshotDocCount === null) {
+      // No snapshot to append to yet: defer as before.
       this.lastFlushDeferred = true;
       return 0;
     }
     this.lastFlushDeferred = false;
-    const state = this.exportCacheState();
-    await store.put("vv", this.getCachePrefix(), state);
-    this.lastCacheFlushAt = now;
+
+    if (wantSnapshot && !throttled) {
+      const journalBase = this.nextJournalSegment;
+      const state = this.exportCacheState(journalBase);
+      await store.put("vv", this.getCachePrefix(), state);
+      this.journalPending = [];
+      this.journalEntriesSinceSnapshot = 0;
+      this.snapshotDocCount = this.countDocumentEntries();
+      this.lastCacheFlushAt = now;
+      // Every existing segment is either folded into this snapshot or
+      // belongs to a chain this snapshot replaced (another instance, an
+      // older state).
+      await this.deleteJournalSegments(store);
+      return 1;
+    }
+
+    // Provider states without their `knownDocIds`: those equal the view's
+    // document entries of the provider's origin and are rebuilt from the
+    // tree on replay — writing them per segment would make every flush
+    // O(view) again.
+    const providerStates = this.exportProviderStates();
+    for (const [origin, state] of Object.entries(providerStates)) {
+      if (state && typeof state === "object" && Array.isArray((state as { knownDocIds?: unknown }).knownDocIds)) {
+        providerStates[origin] = { ...(state as object), knownDocIds: undefined, knownDocIdsFromTree: true };
+      }
+    }
+    const segment: SerializedJournalSegment = {
+      changes: pending,
+      providerStates,
+      filing: this.filingJoin?.exportState(),
+      categoryIdCounter: this.categoryIdCounter,
+    };
+    const segmentNo = this.nextJournalSegment;
+    await store.put(
+      "vvj",
+      this.journalSegmentId(this.journalWriterId, segmentNo),
+      new TextEncoder().encode(JSON.stringify(segment)),
+    );
+    this.nextJournalSegment = segmentNo + 1;
+    this.journalPending = this.journalPending.slice(pending.length);
+    this.journalEntriesSinceSnapshot += pendingCount;
     return 1;
+  }
+
+  /** Doc ids of the document entries an origin contributes to the view. */
+  private documentIdsOfOrigin(origin: string): string[] {
+    const docIds: string[] = [];
+    for (const [scopedKey, entries] of this.entriesByDocId) {
+      const parsed = parseScopedDocIdKey(scopedKey);
+      if (parsed.origin === origin && entries.some((entry) => entry.isDocument())) {
+        docIds.push(parsed.docId);
+      }
+    }
+    return docIds;
+  }
+
+  private countDocumentEntries(): number {
+    let count = 0;
+    for (const entries of this.entriesByDocId.values()) {
+      if (entries.some((entry) => entry.isDocument())) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private exportProviderStates(): Record<string, unknown> {
+    const providerStates: Record<string, unknown> = {};
+    for (const [origin, provider] of this.dataProviderByOrigin) {
+      if ("exportCacheState" in provider && typeof (provider as any).exportCacheState === "function") {
+        providerStates[origin] = (provider as any).exportCacheState();
+      }
+    }
+    return providerStates;
+  }
+
+  private journalSegmentId(writer: string, segment: number): string {
+    return `${this.getCachePrefix()}/${writer}/${String(segment).padStart(10, "0")}`;
+  }
+
+  /** Journal segments of this view in the store (all writers). */
+  private async listJournalSegments(store: LocalCacheStore): Promise<Array<{ writer: string; segment: number }>> {
+    const prefix = `${this.getCachePrefix()}/`;
+    const segments: Array<{ writer: string; segment: number }> = [];
+    for (const id of await store.list("vvj")) {
+      if (!id.startsWith(prefix)) continue;
+      const [writer, number, ...rest] = id.slice(prefix.length).split("/");
+      const segment = Number(number);
+      if (writer && rest.length === 0 && Number.isInteger(segment)) {
+        segments.push({ writer, segment });
+      }
+    }
+    return segments.sort((a, b) => a.segment - b.segment);
+  }
+
+  /** Drop every journal segment of this view (after a snapshot they are folded in or stale). */
+  private async deleteJournalSegments(store: LocalCacheStore): Promise<void> {
+    try {
+      for (const { writer, segment } of await this.listJournalSegments(store)) {
+        await store.delete("vvj", this.journalSegmentId(writer, segment));
+      }
+    } catch {
+      // Stale segments are ignored on restore (other chain or before the base).
+    }
   }
 
   /**
@@ -1096,18 +1267,14 @@ export class VirtualView {
    * Each node stores its sort key, column values, counts, totals,
    * and children — so restoration is O(n) without re-sorting.
    */
-  private exportCacheState(): Uint8Array {
+  private exportCacheState(journalBase: number): Uint8Array {
     const root = this.getRoot();
-
-    const providerStates: Record<string, unknown> = {};
-    for (const [origin, provider] of this.dataProviderByOrigin) {
-      if ("exportCacheState" in provider && typeof (provider as any).exportCacheState === "function") {
-        providerStates[origin] = (provider as any).exportCacheState();
-      }
-    }
+    const providerStates = this.exportProviderStates();
 
     const snapshot = {
       version: 2,
+      journalWriter: this.journalWriterId,
+      journalBase,
       categoryIdCounter: this.categoryIdCounter,
       categorizationStyle: this.categorizationStyle,
       docOrderDescending: [...this.docOrderDescending],
@@ -1183,12 +1350,93 @@ export class VirtualView {
       const snapshot = JSON.parse(new TextDecoder().decode(bytes));
 
       if (snapshot.version === 2) {
-        return this.restoreFromTreeSnapshot(snapshot);
+        if (!this.restoreFromTreeSnapshot(snapshot)) {
+          return false;
+        }
+        await this.replayJournal(
+          store,
+          typeof snapshot.journalWriter === "string" ? snapshot.journalWriter : null,
+          typeof snapshot.journalBase === "number" ? snapshot.journalBase : 0,
+        );
+        return true;
       }
 
       return false;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Replay the journal segments written after the snapshot (numbers >=
+   * `journalBase`), in order; the last segment's provider cursors and
+   * filing positions win. A missing or corrupt segment ends the replay:
+   * later segments would build on a state that never existed, and the
+   * providers' cursors of the last good segment make the next update catch
+   * up from there.
+   */
+  private async replayJournal(store: LocalCacheStore, writer: string | null, journalBase: number): Promise<void> {
+    // This instance continues with its OWN chain, so its first flush writes
+    // a fresh snapshot (another instance may have restored the same state
+    // and continue the restored chain concurrently otherwise).
+    this.snapshotDocCount = null;
+    this.journalEntriesSinceSnapshot = 0;
+    if (writer === null) {
+      return;
+    }
+    let segments: number[];
+    try {
+      segments = (await this.listJournalSegments(store))
+        .filter((entry) => entry.writer === writer && entry.segment >= journalBase)
+        .map((entry) => entry.segment);
+    } catch {
+      return;
+    }
+    let expected = journalBase;
+    this.replayingJournal = true;
+    // Only the last replayed segment's provider cursors matter.
+    const lastProviderStates = new Map<string, unknown>();
+    try {
+      for (const segmentNo of segments) {
+        if (segmentNo !== expected) {
+          break; // gap
+        }
+        const bytes = await store.get("vvj", this.journalSegmentId(writer, segmentNo));
+        if (!bytes) break;
+        const segment = JSON.parse(new TextDecoder().decode(bytes)) as SerializedJournalSegment;
+        for (const serialized of segment.changes ?? []) {
+          const change = new VirtualViewDataChange(serialized.o);
+          for (const docId of serialized.r) change.removeEntry(docId);
+          for (const [docId, values, decryptionKeyId] of serialized.a) {
+            change.addEntry(docId, values, decryptionKeyId);
+          }
+          this.applyChanges(change);
+          this.journalEntriesSinceSnapshot += serialized.r.length + serialized.a.length;
+        }
+        for (const [origin, rawState] of Object.entries(segment.providerStates ?? {})) {
+          lastProviderStates.set(origin, rawState);
+        }
+        this.filingJoin?.importState(segment.filing);
+        if (typeof segment.categoryIdCounter === "number") {
+          this.categoryIdCounter = Math.max(this.categoryIdCounter, segment.categoryIdCounter);
+        }
+        expected = segmentNo + 1;
+      }
+    } catch {
+      // Keep what was replayed; see above.
+    } finally {
+      for (const [origin, rawState] of lastProviderStates) {
+        const provider = this.dataProviderByOrigin.get(origin);
+        let state = rawState;
+        if (state && typeof state === "object" && (state as { knownDocIdsFromTree?: boolean }).knownDocIdsFromTree) {
+          state = { ...(state as object), knownDocIds: this.documentIdsOfOrigin(origin) };
+        }
+        if (provider && "importCacheState" in provider && typeof (provider as any).importCacheState === "function") {
+          (provider as any).importCacheState(state);
+        }
+      }
+      this.replayingJournal = false;
+      this.isDirty = false;
     }
   }
 

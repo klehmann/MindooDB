@@ -67,6 +67,29 @@ interface PersistedFilingIndex {
   logStartSeq: number;
   log: Array<[number, string[]]>;
   lostSeqRanges?: Array<[number, number]>;
+  /** Deletion tracking of filed documents (absent in older caches: rescanned). */
+  targetCursor?: ProcessChangesCursor | null;
+  deletedTargets?: Array<[string, number]>;
+  /** Journal chain continuing this snapshot (see flushToCache). */
+  journalWriter?: string;
+  journalBase?: number;
+}
+
+/** One journal segment: what changed since the previous flush (latest states). */
+interface FilingJournalSegment {
+  generation: string;
+  seq: number;
+  cursor: ProcessChangesCursor | null;
+  logStartSeq: number;
+  lostSeqRanges: Array<[number, number]>;
+  /** [sidecarId, ref, folders] or [sidecarId, null] for a removed sidecar. */
+  sidecars: Array<[string, string, Record<string, number>] | [string, null]>;
+  folders: Array<[string, FilingFolder & { deleted: boolean }]>;
+  folderIdByDocId: Array<[string, string]>;
+  log: Array<[number, string[]]>;
+  targetCursor?: ProcessChangesCursor | null;
+  /** Full list, only when it changed since the previous flush. */
+  deletedTargets?: Array<[string, number]>;
 }
 
 /** Keep at most this many changed refs in the change log (older consumers get "all"). */
@@ -95,6 +118,14 @@ export class FilingIndex implements ICacheable {
   private generation: string = generateRandomUuid();
   private seq: number = 0;
   private cursor: ProcessChangesCursor | null = null;
+  /**
+   * Deletions of filed documents in the filing database itself (physical
+   * key -> deleted at), read from the database's metadata changefeed. Feeds
+   * the automatic cleanup (MindooFilingStore). Not persisted: rebuilt from
+   * the (in-memory, cheap) metadata index once per session.
+   */
+  private deletedTargets: Map<string, number> = new Map();
+  private targetCursor: ProcessChangesCursor | null = null;
   private sidecars: Map<string, SidecarState> = new Map();
   private sidecarsByRef: Map<string, Set<string>> = new Map();
   private membersByFolder: Map<string, Set<string>> = new Map();
@@ -115,6 +146,18 @@ export class FilingIndex implements ICacheable {
   private cacheManager: CacheManager | null = null;
   private cachePrefix: string | null = null;
   private dirty: boolean = false;
+  // Journal (see flushToCache): changes since the last flush, as latest states.
+  private pendingSidecars: Map<string, SidecarState | null> = new Map();
+  private pendingFolders: Set<string> = new Set();
+  private pendingFolderDocIds: Map<string, string> = new Map();
+  private pendingLog: Array<[number, string[]]> = [];
+  /** deletedTargets changed since the last flush. */
+  private pendingDeletedTargets: boolean = false;
+  /** Whether this instance wrote the current snapshot (else the next flush writes one). */
+  private ownSnapshot: boolean = false;
+  private journalEntriesSinceSnapshot: number = 0;
+  private nextJournalSegment: number = 0;
+  private readonly journalWriterId: string = generateRandomUuid().replace(/-/g, "").slice(0, 12);
   private restored: boolean = false;
   private restorePromise: Promise<void> | null = null;
 
@@ -215,6 +258,7 @@ export class FilingIndex implements ICacheable {
           data.folderId
         ) {
           this.folderIdByDocId.set(docId, data.folderId);
+          this.pendingFolderDocIds.set(docId, data.folderId);
           foldersChanged = this.applyFolder(data.folderId, {
             folderId: data.folderId,
             name: typeof data.name === "string" ? data.name : data.folderId,
@@ -228,6 +272,28 @@ export class FilingIndex implements ICacheable {
       this.cursor = cursor;
       this.dirty = true;
     }
+    // Deletions (and undeletions) of filed documents of this database:
+    // metadata only, nothing is loaded or decrypted.
+    const targetPrefix = `${this.base.tenantId}/${this.base.dbId}/`;
+    let deletionsChanged = false;
+    for await (const { docId, isDeleted, lastModified, cursor } of this.db.iterateChangeMetadataSince(this.targetCursor)) {
+      const physRef = `${targetPrefix}${docId}`;
+      if (isDeleted && this.sidecarsByRef.has(physRef)) {
+        if (this.deletedTargets.get(physRef) !== lastModified) {
+          this.deletedTargets.set(physRef, lastModified);
+          deletionsChanged = true;
+        }
+      } else if (this.deletedTargets.delete(physRef)) {
+        deletionsChanged = true;
+      }
+      this.targetCursor = cursor;
+    }
+    if (deletionsChanged) {
+      foldersChanged = true;
+      this.pendingDeletedTargets = true;
+      this.dirty = true;
+    }
+
     if (changedRefs.size > 0) {
       this.appendLog(Array.from(changedRefs));
     }
@@ -283,6 +349,7 @@ export class FilingIndex implements ICacheable {
         changedRefs.add(ref);
       }
     }
+    this.pendingSidecars.set(sidecarId, next);
   }
 
   /** Recompute whether `ref` is a raw member of `folderId` (any sidecar has the key). */
@@ -332,12 +399,16 @@ export class FilingIndex implements ICacheable {
         changedRefs.add(ref);
       }
     }
+    if (this.folders.has(folderId)) {
+      this.pendingFolders.add(folderId);
+    }
     return JSON.stringify(previous ?? null) !== JSON.stringify(this.folders.get(folderId) ?? null);
   }
 
   private appendLog(refs: string[]): void {
     this.seq++;
     this.log.push([this.seq, refs]);
+    this.pendingLog.push([this.seq, refs]);
     this.logRefCount += refs.length;
     while (this.logRefCount > MAX_LOG_REFS && this.log.length > 1) {
       const [droppedSeq, droppedRefs] = this.log.shift()!;
@@ -422,6 +493,28 @@ export class FilingIndex implements ICacheable {
     return Array.from(this.membersByFolder.get(folderId) ?? []);
   }
 
+  /**
+   * Filed documents of the filing database itself whose latest state is
+   * "deleted", with the deletion time (physical key -> epoch ms).
+   */
+  getDeletedTargets(): ReadonlyMap<string, number> {
+    return this.deletedTargets;
+  }
+
+  /** Physical keys of every document with at least one membership key (also of deleted folders). */
+  allSidecarRefs(): string[] {
+    const result: string[] = [];
+    for (const [ref, ids] of this.sidecarsByRef) {
+      for (const id of ids) {
+        if (Object.keys(this.sidecars.get(id)?.folders ?? {}).length > 0) {
+          result.push(ref);
+          break;
+        }
+      }
+    }
+    return result;
+  }
+
   /** Physical keys of every document filed in any (visible) folder. */
   allFiledRefs(): string[] {
     const result: string[] = [];
@@ -497,21 +590,85 @@ export class FilingIndex implements ICacheable {
     this.dirty = false;
   }
 
-  async flushToCache(store: LocalCacheStore): Promise<number> {
-    const payload: PersistedFilingIndex = {
-      v: 1,
+  /**
+   * Persist the index as snapshot + journal: normally only what changed
+   * since the last flush is appended as a small segment (`filingj`); the
+   * full snapshot (`filing`) is written when this instance has none yet
+   * (also right after a restore), when the journal outgrows 10 % of the
+   * index (min. 200 changes), and on forced flushes (close). Each instance
+   * writes its own segment chain; the snapshot names the chain that
+   * continues it, so several instances on one key never interleave. A failed
+   * write keeps the pending changes for the next flush.
+   */
+  async flushToCache(store: LocalCacheStore, options?: { force?: boolean }): Promise<number> {
+    const pendingCount = this.pendingSidecars.size + this.pendingFolders.size;
+    const wantSnapshot =
+      options?.force === true ||
+      !this.ownSnapshot ||
+      this.journalEntriesSinceSnapshot + pendingCount > Math.max(200, this.sidecars.size * 0.1);
+    const scalars = {
       generation: this.generation,
       seq: this.seq,
       cursor: this.cursor,
-      sidecars: Array.from(this.sidecars, ([id, state]) => [id, state.ref, state.folders]),
-      folders: Array.from(this.folders),
-      folderIdByDocId: Array.from(this.folderIdByDocId),
       logStartSeq: this.logStartSeq,
-      log: this.log,
       lostSeqRanges: this.lostSeqRanges,
+      targetCursor: this.targetCursor,
     };
-    await store.put("filing", this.getCachePrefix(), new TextEncoder().encode(JSON.stringify(payload)));
+    if (wantSnapshot) {
+      const journalBase = this.nextJournalSegment;
+      const payload: PersistedFilingIndex = {
+        v: 1,
+        ...scalars,
+        sidecars: Array.from(this.sidecars, ([id, state]) => [id, state.ref, state.folders]),
+        folders: Array.from(this.folders),
+        folderIdByDocId: Array.from(this.folderIdByDocId),
+        log: this.log,
+        deletedTargets: Array.from(this.deletedTargets),
+        journalWriter: this.journalWriterId,
+        journalBase,
+      };
+      await store.put("filing", this.getCachePrefix(), new TextEncoder().encode(JSON.stringify(payload)));
+      this.clearPending();
+      this.ownSnapshot = true;
+      this.journalEntriesSinceSnapshot = 0;
+      try {
+        const prefix = `${this.getCachePrefix()}/`;
+        for (const id of await store.list("filingj")) {
+          if (id.startsWith(prefix)) await store.delete("filingj", id);
+        }
+      } catch {
+        // Stale segments are ignored on restore (other chain or before the base).
+      }
+      return 1;
+    }
+    const segment: FilingJournalSegment = {
+      ...scalars,
+      sidecars: Array.from(this.pendingSidecars, ([id, state]) =>
+        state ? ([id, state.ref, state.folders] as [string, string, Record<string, number>]) : ([id, null] as [string, null]),
+      ),
+      folders: Array.from(this.pendingFolders, (folderId) => [folderId, this.folders.get(folderId)!] as [string, FilingFolder & { deleted: boolean }]),
+      folderIdByDocId: Array.from(this.pendingFolderDocIds),
+      log: this.pendingLog,
+      ...(this.pendingDeletedTargets ? { deletedTargets: Array.from(this.deletedTargets) } : {}),
+    };
+    const segmentNo = this.nextJournalSegment;
+    await store.put(
+      "filingj",
+      `${this.getCachePrefix()}/${this.journalWriterId}/${String(segmentNo).padStart(10, "0")}`,
+      new TextEncoder().encode(JSON.stringify(segment)),
+    );
+    this.nextJournalSegment = segmentNo + 1;
+    this.journalEntriesSinceSnapshot += pendingCount;
+    this.clearPending();
     return 1;
+  }
+
+  private clearPending(): void {
+    this.pendingSidecars = new Map();
+    this.pendingFolders = new Set();
+    this.pendingFolderDocIds = new Map();
+    this.pendingLog = [];
+    this.pendingDeletedTargets = false;
   }
 
   private async ensureRestored(): Promise<void> {
@@ -552,34 +709,79 @@ export class FilingIndex implements ICacheable {
     this.folderIdByDocId = new Map(payload.folderIdByDocId);
     this.logStartSeq = payload.logStartSeq;
     this.log = payload.log ?? [];
+    this.lostSeqRanges = payload.lostSeqRanges ?? [];
+    // Older caches lack the deletion tracking: rescan it (metadata only).
+    if (payload.targetCursor !== undefined && Array.isArray(payload.deletedTargets)) {
+      this.targetCursor = payload.targetCursor;
+      this.deletedTargets = new Map(payload.deletedTargets);
+    }
+    const ignore = new Set<string>();
+    for (const [id, ref, folders] of payload.sidecars) {
+      this.applySidecar(id, { ref, folders }, ignore);
+    }
+
+    // Replay the journal chain that continues this snapshot (in order; a
+    // missing or unreadable segment ends the replay — the changefeed catches
+    // up from the last good cursor).
+    if (typeof payload.journalWriter === "string") {
+      try {
+        const prefix = `${this.getCachePrefix()}/${payload.journalWriter}/`;
+        const numbers = (await store.list("filingj"))
+          .filter((id) => id.startsWith(prefix))
+          .map((id) => Number(id.slice(prefix.length)))
+          .filter((n) => Number.isInteger(n) && n >= (payload.journalBase ?? 0))
+          .sort((a, b) => a - b);
+        let expected = payload.journalBase ?? 0;
+        for (const n of numbers) {
+          if (n !== expected) break;
+          const bytes = await store.get("filingj", `${prefix}${String(n).padStart(10, "0")}`);
+          if (!bytes) break;
+          const segment = JSON.parse(new TextDecoder().decode(bytes)) as FilingJournalSegment;
+          for (const entry of segment.sidecars) {
+            this.applySidecar(entry[0], entry[1] === null ? null : { ref: entry[1], folders: entry[2]! }, ignore);
+          }
+          for (const [folderId, folder] of segment.folders) this.folders.set(folderId, folder);
+          for (const [docId, folderId] of segment.folderIdByDocId) this.folderIdByDocId.set(docId, folderId);
+          this.log.push(...segment.log);
+          this.generation = segment.generation;
+          this.seq = segment.seq;
+          this.cursor = segment.cursor ?? null;
+          this.logStartSeq = segment.logStartSeq;
+          this.lostSeqRanges = segment.lostSeqRanges ?? this.lostSeqRanges;
+          if (segment.targetCursor !== undefined && payload.targetCursor !== undefined) {
+            this.targetCursor = segment.targetCursor;
+          }
+          if (Array.isArray(segment.deletedTargets) && payload.targetCursor !== undefined) {
+            this.deletedTargets = new Map(segment.deletedTargets);
+          }
+          expected = n + 1;
+        }
+      } catch {
+        // Keep what was replayed.
+      }
+    }
+    this.log = this.log.filter(([seq]) => seq > this.logStartSeq);
     this.logRefCount = this.log.reduce((sum, [, refs]) => sum + refs.length, 0);
+    while (this.logRefCount > MAX_LOG_REFS && this.log.length > 1) {
+      const [droppedSeq, droppedRefs] = this.log.shift()!;
+      this.logRefCount -= droppedRefs.length;
+      this.logStartSeq = droppedSeq;
+    }
+    this.clearPending();
+
     // A previous run may have handed out seqs after this persisted state
     // (and views may have consumed them): jump past them.
     const jump = 2 ** 30;
-    this.lostSeqRanges = [...(payload.lostSeqRanges ?? []), [this.seq, this.seq + jump]];
+    this.lostSeqRanges = [...this.lostSeqRanges, [this.seq, this.seq + jump]];
     if (this.lostSeqRanges.length > 20) {
       const dropped = this.lostSeqRanges.splice(0, this.lostSeqRanges.length - 20);
       this.logStartSeq = Math.max(this.logStartSeq, dropped[dropped.length - 1][1]);
     }
     this.seq += jump;
+    // This instance continues with its own chain: its first flush writes a
+    // snapshot.
+    this.ownSnapshot = false;
     this.dirty = true;
-    for (const [id, ref, folders] of payload.sidecars) {
-      this.sidecars.set(id, { ref, folders });
-      let ids = this.sidecarsByRef.get(ref);
-      if (!ids) {
-        ids = new Set();
-        this.sidecarsByRef.set(ref, ids);
-      }
-      ids.add(id);
-      for (const folderId of Object.keys(folders)) {
-        let members = this.membersByFolder.get(folderId);
-        if (!members) {
-          members = new Set();
-          this.membersByFolder.set(folderId, members);
-        }
-        members.add(ref);
-      }
-    }
   }
 }
 
