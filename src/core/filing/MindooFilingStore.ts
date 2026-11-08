@@ -1,5 +1,6 @@
 import type { MindooDB, MindooDoc } from "../types";
 import { MindooValue } from "../values";
+import { DocumentDeletedError } from "../errors";
 import { generateRandomUuid } from "../utils/idGeneration";
 import {
   FILING_FOLDER_FIELD_PREFIX as F,
@@ -27,6 +28,44 @@ export interface FilingStoreOptions {
    * `"default"` (the tenant key). All replicas must use the same key id.
    */
   decryptionKeyId?: string;
+  /**
+   * How long a deleted document stays in its folders before the cleanup
+   * removes it (so undeleting it within that time brings its folders back).
+   * Default: 30 days ({@link DEFAULT_FILING_PRUNE_GRACE_MS}); `0` = at once.
+   */
+  pruneGracePeriodMs?: number;
+  /**
+   * Clean up deleted documents of the filing database itself automatically
+   * (default `true`): the filing index sees their deletions in the
+   * database's changefeed; documents of other databases need
+   * {@link MindooFilingStore.prune} with those databases.
+   */
+  autoPrune?: boolean;
+}
+
+/** Default grace period before deleted documents leave their folders: 30 days. */
+export const DEFAULT_FILING_PRUNE_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Options of {@link MindooFilingStore.prune}. */
+export interface FilingPruneOptions {
+  /**
+   * Further open databases whose filed documents to check (documents of
+   * the filing database are always checked). Filed documents of databases
+   * not given here are left alone.
+   */
+  databases?: MindooDB[];
+  /** Overrides the store's grace period for this run. */
+  gracePeriodMs?: number;
+  /** Clock for tests. */
+  now?: number;
+}
+
+/** Result of {@link MindooFilingStore.prune}. */
+export interface FilingPruneResult {
+  /** Documents taken out of all their folders. */
+  removed: number;
+  /** Deleted documents still within the grace period. */
+  pending: number;
 }
 
 /** A filed document, as listed by {@link MindooFilingStore.contents}. */
@@ -103,6 +142,10 @@ export class MindooFilingStore {
   private readonly db: MindooDB;
   private readonly store: string;
   private readonly decryptionKeyId: string;
+  private readonly pruneGracePeriodMs: number;
+  private readonly autoPrune: boolean;
+  private autoPruneRunning: Promise<void> | null = null;
+  private autoPrunePending = false;
   private readonly base: FilingRefBase;
   private idPrefix: string | null = null;
   private index: FilingIndex | null = null;
@@ -122,6 +165,8 @@ export class MindooFilingStore {
     this.db = db;
     this.store = store;
     this.decryptionKeyId = options?.decryptionKeyId ?? "default";
+    this.pruneGracePeriodMs = Math.max(0, options?.pruneGracePeriodMs ?? DEFAULT_FILING_PRUNE_GRACE_MS);
+    this.autoPrune = options?.autoPrune !== false;
     this.base = { tenantId: db.getTenant().getId(), dbId: db.getStore().getId() };
     this.onIndexCreated = onIndexCreated;
   }
@@ -160,6 +205,11 @@ export class MindooFilingStore {
         this.idPrefix = `fil_${storeTag}`;
         this.index = new FilingIndex(this.db, this.store, this.idPrefix);
         this.onIndexCreated?.(this.index);
+        if (this.autoPrune) {
+          // Deleted documents of this database leave their folders once the
+          // grace period is over — checked whenever the index changes.
+          this.index.onDidChange(() => this.scheduleAutoPrune());
+        }
         return this.index;
       })();
       this.initPromise.catch(() => {
@@ -278,6 +328,96 @@ export class MindooFilingStore {
           delete values[F + folderId];
         }
       });
+    }
+  }
+
+  /**
+   * Take deleted documents out of all their folders (their memberships are
+   * removed; the sidecar stays, so re-filing reuses it).
+   *
+   * Only documents that are really deleted, and deleted longer ago than the
+   * grace period: a document this device cannot read, or whose database is
+   * not given/open, is never touched — otherwise a device without the key
+   * would empty a shared filing store. Checked are the filing database's own
+   * documents and those of `options.databases`.
+   */
+  async prune(options?: FilingPruneOptions): Promise<FilingPruneResult> {
+    const index = await this.currentIndex();
+    const now = options?.now ?? Date.now();
+    const grace = Math.max(0, options?.gracePeriodMs ?? this.pruneGracePeriodMs);
+    const databases = new Map<string, MindooDB>();
+    for (const db of [this.db, ...(options?.databases ?? [])]) {
+      databases.set(`${db.getTenant().getId()}/${db.getStore().getId()}`, db);
+    }
+    const byDb = new Map<string, string[]>();
+    for (const physRef of index.allSidecarRefs()) {
+      const target = parsePhysicalFilingRefKey(physRef);
+      const dbKey = `${target.tenantId}/${target.dbId}`;
+      if (!databases.has(dbKey)) continue;
+      let docIds = byDb.get(dbKey);
+      if (!docIds) {
+        docIds = [];
+        byDb.set(dbKey, docIds);
+      }
+      docIds.push(target.docId);
+    }
+    let removed = 0;
+    let pending = 0;
+    for (const [dbKey, docIds] of byDb) {
+      const db = databases.get(dbKey)!;
+      const deletedAt = await deletionTimes(db, new Set(docIds));
+      for (const [docId, at] of deletedAt) {
+        if (now - at < grace) {
+          pending++;
+          continue;
+        }
+        if (!(await isReallyDeleted(db, docId))) continue;
+        await this.removeFromSidecars(index, `${dbKey}/${docId}`, null);
+        removed++;
+      }
+    }
+    return { removed, pending };
+  }
+
+  /** Background cleanup for deleted documents of the filing database (single-flight). */
+  private scheduleAutoPrune(): void {
+    if (this.autoPruneRunning) {
+      this.autoPrunePending = true;
+      return;
+    }
+    const index = this.index;
+    if (!index || index.getDeletedTargets().size === 0) return;
+    const holder: { run?: Promise<void> } = {};
+    holder.run = (async () => {
+      // Yield first: the run must be registered before it can finish.
+      await Promise.resolve();
+      try {
+        do {
+          this.autoPrunePending = false;
+          const now = Date.now();
+          const due = [...index.getDeletedTargets()].filter(([, at]) => now - at >= this.pruneGracePeriodMs);
+          for (const [physRef] of due) {
+            const target = parsePhysicalFilingRefKey(physRef);
+            if (await isReallyDeleted(this.db, target.docId)) {
+              await this.removeFromSidecars(index, physRef, null);
+            }
+          }
+        } while (this.autoPrunePending);
+      } catch {
+        // Best effort (e.g. no write access to the filing database).
+      } finally {
+        if (this.autoPruneRunning === holder.run) {
+          this.autoPruneRunning = null;
+        }
+      }
+    })();
+    this.autoPruneRunning = holder.run;
+  }
+
+  /** Wait for a running background cleanup (tests). */
+  async whenIdle(): Promise<void> {
+    while (this.autoPruneRunning) {
+      await this.autoPruneRunning;
     }
   }
 
@@ -463,6 +603,27 @@ export class MindooFilingStore {
   /** All (not deleted) folders of this store. */
   async listFolders(): Promise<FilingFolder[]> {
     return (await this.currentIndex()).listFolders();
+  }
+}
+
+/** Deletion time (latest metadata entry) of those of `docIds` whose latest state is deleted. */
+async function deletionTimes(db: MindooDB, docIds: ReadonlySet<string>): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  for await (const { docId, isDeleted, lastModified } of db.iterateChangeMetadataSince(null)) {
+    if (!docIds.has(docId)) continue;
+    if (isDeleted) result.set(docId, lastModified);
+    else result.delete(docId);
+  }
+  return result;
+}
+
+/** Whether a document is deleted — not merely unreadable for this device. */
+async function isReallyDeleted(db: MindooDB, docId: string): Promise<boolean> {
+  try {
+    const doc = await db.getDocument(docId);
+    return doc.isDeleted();
+  } catch (error) {
+    return error instanceof DocumentDeletedError || (error as { name?: string })?.name === "DocumentDeletedError";
   }
 }
 
