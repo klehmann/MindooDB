@@ -5,6 +5,7 @@ export * from "./types";
 export * from "./databaseIdValidation";
 export * from "./values";
 export * from "./changeAttribution";
+export * from "./filing";
 export {
   evaluateBuiltinWrite,
   hasBuiltinWriteInvariant,
@@ -500,6 +501,14 @@ export {
   type VirtualViewUpdateStats,
   type ViewDataSourceInfo,
   type WithDBOptions,
+  VirtualViewFilingJoin,
+  VirtualViewMergedNavigator,
+  type MergedEntryKey,
+  type MergedNavigatorPage,
+  type MergedNavigatorOptions,
+  type FilingStoreSource,
+  type FilingRefChanges,
+  type IFilingAwareDataProvider,
 } from "./indexing/virtualviews";
 
 // Summary-first data provider factory (summary buffer when possible,

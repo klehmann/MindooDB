@@ -271,6 +271,48 @@ export function createViewLanguage<
     datePart(value: MindooDBAppExpressionInput, part: MindooDBAppViewExpressionDatePart): MindooDBAppExpression<string | number | null> {
       return { kind: "operation", op: "datePart", args: [toExpression(value)], part };
     },
+    /**
+     * Combine values into one de-duplicated list: every argument is
+     * flattened (single values and arrays), null/undefined/empty strings
+     * are dropped and duplicates removed (first occurrence wins). Typical
+     * use: a multi-value category built from several sources, e.g.
+     * provider folders stored in the document plus local filing folders.
+     */
+    union(...args: MindooDBAppExpressionInput[]): MindooDBAppExpression<unknown[]> {
+      return { kind: "operation", op: "union", args: toExpressionList(args) };
+    },
+    /**
+     * Split text at every occurrence of `separator`, dropping empty parts
+     * (so `"|a|b|"` split at `"|"` yields `["a", "b"]`). An array input is
+     * split element by element and flattened.
+     */
+    split(value: MindooDBAppExpressionInput, separator: MindooDBAppExpressionInput<string>): MindooDBAppExpression<string[]> {
+      return { kind: "operation", op: "split", args: [toExpression(value), toExpression(separator)] };
+    },
+    /**
+     * The ids of the folders the current document is filed in, for the
+     * filing store registered on the view under `store`
+     * (`VirtualViewBuilder.withFilingStore`). An empty array when the
+     * document is not filed. Filing lives in small sidecar documents, so
+     * the document itself never changes when it is filed or moved.
+     */
+    folders(store: string): MindooDBAppExpression<string[]> {
+      return { kind: "operation", op: "folders", args: [toExpression(store)] };
+    },
+    /**
+     * Whether the current document is filed in the filing store `store`:
+     * in any of its folders, or — with `folderId` — in that folder. As a
+     * filter (alone or as part of a top-level `and`) with a folder id the
+     * view reads only that folder's members instead of scanning the
+     * database.
+     */
+    inFolder(store: string, folderId?: string): MindooDBAppBooleanExpression {
+      const args: MindooDBAppExpression[] = [toExpression(store)];
+      if (folderId !== undefined) {
+        args.push(toExpression(folderId));
+      }
+      return { kind: "operation", op: "inFolder", args };
+    },
     decryptField(field: string, key?: MindooDBAppExpressionInput<string>): MindooDBAppExpression<string | null> {
       return { kind: "decrypt", field, key: key === undefined ? undefined : toExpression(key) };
     },

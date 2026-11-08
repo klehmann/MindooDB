@@ -77,6 +77,12 @@ export { ViewEntrySortKeyComparator } from "./ViewEntrySortKeyComparator";
 
 // Navigation
 export { VirtualViewNavigator } from "./VirtualViewNavigator";
+export {
+  VirtualViewMergedNavigator,
+  type MergedEntryKey,
+  type MergedNavigatorPage,
+  type MergedNavigatorOptions,
+} from "./VirtualViewMergedNavigator";
 
 // Data providers
 export {
@@ -88,6 +94,17 @@ export {
   MindooDBVirtualViewDataProvider,
   type MindooDBVirtualViewDataProviderOptions,
 } from "./MindooDBVirtualViewDataProvider";
+
+// Filing (folders) join
+export {
+  VirtualViewFilingJoin,
+  findDrivingFolder,
+  isFilingAwareDataProvider,
+  type FilingStoreSource,
+  type FilingRefChanges,
+  type FilingJoinState,
+  type IFilingAwareDataProvider,
+} from "./VirtualViewFilingJoin";
 
 // Access control
 export {

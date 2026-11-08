@@ -54,6 +54,10 @@ const OP_TO_HELPER: Record<MindooDBAppViewExpressionOperation, string> = {
   notExists: "notExists",
   pathJoin: "pathJoin",
   datePart: "datePart",
+  folders: "folders",
+  inFolder: "inFolder",
+  union: "union",
+  split: "split",
 };
 
 const BOOLEAN_HELPERS = new Set([
@@ -75,6 +79,7 @@ const BOOLEAN_HELPERS = new Set([
   "toBoolean",
   "isWitnessed",
   "isAwaitingWitness",
+  "inFolder",
 ]);
 
 const DATE_PARTS = new Set<MindooDBAppViewExpressionDatePart>(["year", "month", "day", "quarter"]);

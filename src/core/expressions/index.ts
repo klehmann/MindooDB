@@ -37,6 +37,7 @@ export {
   expressionToBoolean,
   expressionToNumber,
   VIEW_CONTEXT_OPERATIONS,
+  FILING_OPERATIONS,
   type ExpressionEvaluationContext,
   type ExpressionParentContext,
   type ExpressionViewRowCounts,

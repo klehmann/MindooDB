@@ -3,7 +3,10 @@ import type { MindooDBAppBooleanExpression } from "../expressions/types";
 import { analyzeExpressionRequirements, getReferencedFields } from "../expressions";
 import { evaluateExpression, expressionToBoolean } from "../expressions/evaluateExpression";
 import type { IVirtualViewDataProvider } from "./virtualviews/IVirtualViewDataProvider";
-import { MindooDBVirtualViewDataProvider } from "./virtualviews/MindooDBVirtualViewDataProvider";
+import {
+  MindooDBVirtualViewDataProvider,
+  type FilingAwareDocumentFilter,
+} from "./virtualviews/MindooDBVirtualViewDataProvider";
 import { VirtualViewColumn, type VirtualViewColumnOptions } from "./virtualviews/VirtualViewColumn";
 import type { DocumentFilterFunction } from "./virtualviews/types";
 import { SummaryVirtualViewDataProvider } from "./summary/SummaryVirtualViewDataProvider";
@@ -86,6 +89,7 @@ export async function createViewDataProvider(
   options: CreateViewDataProviderOptions
 ): Promise<CreateViewDataProviderResult> {
   const { origin, db, filter } = options;
+  const dbKey = physicalDbKeyOfDatabase(db);
 
   const buildDocumentProvider = (fallbackReasons: string[]): CreateViewDataProviderResult => ({
     provider: new MindooDBVirtualViewDataProvider({
@@ -94,6 +98,7 @@ export async function createViewDataProvider(
       filterFunction:
         typeof filter === "function" ? filter : filterExpressionToDocumentFilter(filter),
       includeAllDocumentFields: options.includeAllDocumentFields,
+      dbKey,
     }),
     source: "documents",
     fallbackReasons,
@@ -113,10 +118,26 @@ export async function createViewDataProvider(
       origin,
       summary: db.getSummaryStore!(),
       filter: filter as MindooDBAppBooleanExpression | undefined,
+      dbKey,
     }),
     source: "summary",
     fallbackReasons: [],
   };
+}
+
+/**
+ * Physical identity `"<tenantId>/<dbId>"` of a database (matched against
+ * filing references), or `undefined` for database implementations that
+ * cannot tell (e.g. test doubles) — their documents then count as not filed.
+ */
+export function physicalDbKeyOfDatabase(db: MindooDB): string | undefined {
+  try {
+    const tenantId = db.getTenant?.()?.getId?.();
+    const dbId = db.getStore?.()?.getId?.();
+    return typeof tenantId === "string" && typeof dbId === "string" ? `${tenantId}/${dbId}` : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -211,7 +232,10 @@ export function filterExpressionToDocumentFilter(
   if (!filter) {
     return undefined;
   }
-  return (doc) =>
+  const withFolders = (
+    doc: Parameters<DocumentFilterFunction>[0],
+    folders: ((store: string) => readonly string[]) | undefined,
+  ): boolean =>
     expressionToBoolean(
       evaluateExpression(filter, {
         doc: doc.getData() as Record<string, unknown>,
@@ -222,6 +246,12 @@ export function filterExpressionToDocumentFilter(
         lastModifiedAt: new Date(doc.getLastModified()).toISOString(),
         decryptionKeyId: doc.getDecryptionKeyId(),
         variables: {},
+        folders,
       })
     );
+  // `withFolders` lets the document provider pass the view's folder lookup
+  // (`folders()` / `inFolder()`); plain callers get "not filed".
+  const fn = ((doc) => withFolders(doc, undefined)) as DocumentFilterFunction & FilingAwareDocumentFilter;
+  fn.withFolders = withFolders;
+  return fn;
 }

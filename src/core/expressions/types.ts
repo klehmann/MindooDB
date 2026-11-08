@@ -55,7 +55,11 @@ export type MindooDBAppViewExpressionOperation =
   | "exists"
   | "notExists"
   | "pathJoin"
-  | "datePart";
+  | "datePart"
+  | "folders"
+  | "inFolder"
+  | "union"
+  | "split";
 
 /**
  * Marker interface carried by every expression node.

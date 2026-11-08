@@ -335,6 +335,43 @@ export class BaseMindooTenant implements MindooTenant {
     }
   }
 
+  /** Imported HMAC subkeys of {@link computeKeyedHash}, keyed by key id + purpose. */
+  private keyedHashKeyCache: Map<string, Promise<CryptoKey>> = new Map();
+
+  async computeKeyedHash(decryptionKeyId: string, purpose: string, data: string): Promise<string> {
+    const subtle = this.cryptoAdapter.getSubtle();
+    const cacheKey = `${decryptionKeyId}\u0000${purpose}`;
+    let subkeyPromise = this.keyedHashKeyCache.get(cacheKey);
+    if (!subkeyPromise) {
+      subkeyPromise = (async () => {
+        const symmetricKey = await this.getSymmetricKey(decryptionKeyId);
+        // Key separation: never use the encryption key itself as HMAC key,
+        // derive a purpose-bound subkey from it first.
+        const rootKey = await subtle.importKey(
+          "raw",
+          symmetricKey.slice(),
+          { name: "HMAC", hash: "SHA-256" },
+          false,
+          ["sign"],
+        );
+        const subkeyBytes = new Uint8Array(
+          await subtle.sign("HMAC", rootKey, new TextEncoder().encode(`mindoodb/keyed-hash/v1/${purpose}`)),
+        );
+        return subtle.importKey("raw", subkeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      })();
+      // A failed derivation (missing key) must not stick in the cache.
+      subkeyPromise.catch(() => this.keyedHashKeyCache.delete(cacheKey));
+      this.keyedHashKeyCache.set(cacheKey, subkeyPromise);
+    }
+    const subkey = await subkeyPromise;
+    const mac = new Uint8Array(await subtle.sign("HMAC", subkey, new TextEncoder().encode(data)));
+    let hex = "";
+    for (let i = 0; i < mac.length; i++) {
+      hex += mac[i].toString(16).padStart(2, "0");
+    }
+    return hex;
+  }
+
   getCryptoAdapter(): CryptoAdapter {
     return this.cryptoAdapter;
   }
@@ -3115,6 +3152,7 @@ export class BaseMindooTenant implements MindooTenant {
   /** Clear in-memory decrypted-key caches after a KeyBag mutation. */
   private invalidateDecryptedKeyCaches(): void {
     this.decryptedTenantKeyCache = undefined;
+    this.keyedHashKeyCache.clear();
   }
 
   /**

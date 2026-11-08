@@ -165,6 +165,12 @@ function validateQueryExpressions(expressions: MindooDBAppExpression[], allowFul
       );
     }
     const requirements = analyzeExpressionRequirements(expression);
+    if (requirements.filingStores.length > 0) {
+      throw new MindooQueryError(
+        `Query expressions cannot use folders() / inFolder(); they need a view that joins the filing store (VirtualViewBuilder.withFilingStore); ` +
+        `ad-hoc queries and ephemeral query views cannot evaluate them.`
+      );
+    }
     if (requirements.needsViewContext) {
       throw new MindooQueryError(
         `Query expressions cannot use view-tree operations (${requirements.viewContextOperations.join(", ")}); ` +
