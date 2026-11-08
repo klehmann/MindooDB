@@ -343,6 +343,38 @@ describe("BaseMindooDB L1/L2 document cache", () => {
     }
   }, 60000);
 
+  it("persists each evicted doc once while loads run concurrently", async () => {
+    const db = await tenant.openDB("evictconcurrent", {
+      documentCacheConfig: { maxEntries: 4 },
+    });
+    const created = await db.createDocuments(
+      Array.from({ length: 60 }, (_, i) => ({ initialValues: { idx: i, payload: `value-${i}` } })),
+    );
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+
+    const puts = new Map<string, number>();
+    const store = (tenant as any).cacheManager.getStore();
+    const originalPut = store.put.bind(store);
+    store.put = async (type: string, id: string, value: Uint8Array) => {
+      if (type === "doc") puts.set(id, (puts.get(id) ?? 0) + 1);
+      return originalPut(type, id, value);
+    };
+    try {
+      const db2 = await tenant.openDB("evictconcurrent", {
+        documentCacheConfig: { maxEntries: 4 },
+      });
+      // Loads documents in parallel windows, like a summary/index build.
+      const loaded = await Promise.all(created.map((doc) => db2.getDocument(doc.getId())));
+      expect(loaded.map((doc) => doc.getData().idx)).toEqual(created.map((_, i) => i));
+      expect(getL1Size(db2)).toBeLessThanOrEqual(4);
+      expect(puts.size).toBeGreaterThan(0);
+      expect(Math.max(...puts.values())).toBe(1);
+    } finally {
+      store.put = originalPut;
+    }
+  }, 60000);
+
   // ---------------------------------------------------------------------------
   // Test 5a: restoreToL2 leaves L1 empty at startup (Phase 3)
   // ---------------------------------------------------------------------------
