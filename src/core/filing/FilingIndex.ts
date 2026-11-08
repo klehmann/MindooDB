@@ -67,6 +67,9 @@ interface PersistedFilingIndex {
   logStartSeq: number;
   log: Array<[number, string[]]>;
   lostSeqRanges?: Array<[number, number]>;
+  /** Deletion tracking of filed documents (absent in older caches: rescanned). */
+  targetCursor?: ProcessChangesCursor | null;
+  deletedTargets?: Array<[string, number]>;
   /** Journal chain continuing this snapshot (see flushToCache). */
   journalWriter?: string;
   journalBase?: number;
@@ -84,6 +87,9 @@ interface FilingJournalSegment {
   folders: Array<[string, FilingFolder & { deleted: boolean }]>;
   folderIdByDocId: Array<[string, string]>;
   log: Array<[number, string[]]>;
+  targetCursor?: ProcessChangesCursor | null;
+  /** Full list, only when it changed since the previous flush. */
+  deletedTargets?: Array<[string, number]>;
 }
 
 /** Keep at most this many changed refs in the change log (older consumers get "all"). */
@@ -145,6 +151,8 @@ export class FilingIndex implements ICacheable {
   private pendingFolders: Set<string> = new Set();
   private pendingFolderDocIds: Map<string, string> = new Map();
   private pendingLog: Array<[number, string[]]> = [];
+  /** deletedTargets changed since the last flush. */
+  private pendingDeletedTargets: boolean = false;
   /** Whether this instance wrote the current snapshot (else the next flush writes one). */
   private ownSnapshot: boolean = false;
   private journalEntriesSinceSnapshot: number = 0;
@@ -282,6 +290,8 @@ export class FilingIndex implements ICacheable {
     }
     if (deletionsChanged) {
       foldersChanged = true;
+      this.pendingDeletedTargets = true;
+      this.dirty = true;
     }
 
     if (changedRefs.size > 0) {
@@ -602,6 +612,7 @@ export class FilingIndex implements ICacheable {
       cursor: this.cursor,
       logStartSeq: this.logStartSeq,
       lostSeqRanges: this.lostSeqRanges,
+      targetCursor: this.targetCursor,
     };
     if (wantSnapshot) {
       const journalBase = this.nextJournalSegment;
@@ -612,6 +623,7 @@ export class FilingIndex implements ICacheable {
         folders: Array.from(this.folders),
         folderIdByDocId: Array.from(this.folderIdByDocId),
         log: this.log,
+        deletedTargets: Array.from(this.deletedTargets),
         journalWriter: this.journalWriterId,
         journalBase,
       };
@@ -637,6 +649,7 @@ export class FilingIndex implements ICacheable {
       folders: Array.from(this.pendingFolders, (folderId) => [folderId, this.folders.get(folderId)!] as [string, FilingFolder & { deleted: boolean }]),
       folderIdByDocId: Array.from(this.pendingFolderDocIds),
       log: this.pendingLog,
+      ...(this.pendingDeletedTargets ? { deletedTargets: Array.from(this.deletedTargets) } : {}),
     };
     const segmentNo = this.nextJournalSegment;
     await store.put(
@@ -655,6 +668,7 @@ export class FilingIndex implements ICacheable {
     this.pendingFolders = new Set();
     this.pendingFolderDocIds = new Map();
     this.pendingLog = [];
+    this.pendingDeletedTargets = false;
   }
 
   private async ensureRestored(): Promise<void> {
@@ -696,6 +710,11 @@ export class FilingIndex implements ICacheable {
     this.logStartSeq = payload.logStartSeq;
     this.log = payload.log ?? [];
     this.lostSeqRanges = payload.lostSeqRanges ?? [];
+    // Older caches lack the deletion tracking: rescan it (metadata only).
+    if (payload.targetCursor !== undefined && Array.isArray(payload.deletedTargets)) {
+      this.targetCursor = payload.targetCursor;
+      this.deletedTargets = new Map(payload.deletedTargets);
+    }
     const ignore = new Set<string>();
     for (const [id, ref, folders] of payload.sidecars) {
       this.applySidecar(id, { ref, folders }, ignore);
@@ -729,6 +748,12 @@ export class FilingIndex implements ICacheable {
           this.cursor = segment.cursor ?? null;
           this.logStartSeq = segment.logStartSeq;
           this.lostSeqRanges = segment.lostSeqRanges ?? this.lostSeqRanges;
+          if (segment.targetCursor !== undefined && payload.targetCursor !== undefined) {
+            this.targetCursor = segment.targetCursor;
+          }
+          if (Array.isArray(segment.deletedTargets) && payload.targetCursor !== undefined) {
+            this.deletedTargets = new Map(segment.deletedTargets);
+          }
           expected = n + 1;
         }
       } catch {

@@ -79,4 +79,31 @@ describe("filing index cache: snapshot + journal", () => {
     expect(restored.membersOf("inbox").map((ref) => ref.split("/").pop()).sort()).toEqual(["doc_a", "doc_b", "doc_c"]);
     await cacheManager.dispose();
   }, 60000);
+  it("keeps the deletion tracking of filed documents across a restart", async () => {
+    const filing = db.filing!("mail", { autoPrune: false });
+    const kept = await db.createDocument();
+    const gone = await db.createDocument();
+    await filing.add(kept.getId(), "inbox");
+    await filing.add(gone.getId(), "inbox");
+    const store = new InMemoryLocalCacheStore();
+    const cacheManager = new CacheManager(store, { flushIntervalMs: 600000 });
+    const index = await freshIndex(db, cacheManager, "deletions");
+    await index.update();
+    await index.flushToCache(store); // snapshot
+    await db.deleteDocument(gone.getId());
+    await index.update();
+    const physical = (docId: string) => `${db.getTenant().getId()}/mail/${docId}`;
+    expect([...index.getDeletedTargets().keys()]).toEqual([physical(gone.getId())]);
+    await index.flushToCache(store); // journal segment with the deletion
+
+    const scan = jest.spyOn(db, "iterateChangeMetadataSince");
+    const restored = await freshIndex(db, cacheManager, "deletions");
+    await restored.update();
+    expect([...restored.getDeletedTargets().keys()]).toEqual([physical(gone.getId())]);
+    // Continued from the persisted cursor, not rescanned from the start.
+    expect(scan).toHaveBeenCalled();
+    expect(scan.mock.calls.every(([cursor]) => cursor !== null)).toBe(true);
+    scan.mockRestore();
+    await cacheManager.dispose();
+  }, 60000);
 });
