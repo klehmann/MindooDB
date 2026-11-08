@@ -449,6 +449,27 @@ console.log(entry?.getLevel());        // 2
 console.log(entry?.isCategory());      // true/false
 ```
 
+### Reading Several Categories as One List
+
+`VirtualViewFactory.createMergedNavigator(view, rootCategoryPaths)` reads the documents of several categories of one view as a single list, merged by the document sort columns (a k-way merge), each document once — e.g. the inbox folders of several mail accounts from one "mail by folder" view:
+
+```typescript
+const nav = VirtualViewFactory.createMergedNavigator(view, [["acc1/inbox"], ["acc2/INBOX"]]);
+let page = nav.readForward({ limit: 50 });          // { entries, nextKey }
+while (page.nextKey) {
+  page = nav.readForward({ after: page.nextKey, limit: 50 });
+}
+nav.readBackward({ limit: 50 });                    // newest-last order reversed
+nav.gotoFirst(); nav.gotoNext(); nav.getCurrentEntry();
+nav.gotoPos(entry.getPositionStr());                // tree positions work as tokens too
+```
+
+Paging is key-based, so a page stays correct when the view changes between two reads. Categories are resolved on every read, so a live view's new categories are picked up.
+
+## Folders
+
+Views can join **filing stores** — folders whose membership lives in small sidecar documents instead of the filed documents — with `withFilingStore(name, { db, store })`, and use `folders(name)` (e.g. as a multi-value category) and `inFolder(name, folderId?)` (as a filter) in their expressions. Filing changes re-evaluate exactly the affected documents. See **[Folders (Filing)](folders.md)** for the architecture, the comparison with HCL Domino folders and examples.
+
 ### Filtering Navigation
 
 ```typescript

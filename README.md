@@ -342,6 +342,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [React Native Guide](./docs/reactnative.md) — Native Automerge setup and troubleshooting
 - [Kotlin and Java](./docs/kotlin-jvm.md) — JVM backends via the Kotlin client and the Node.js sidecar
 - [Virtual Views](./docs/virtualview.md) — Aggregations and cross-database views
+- [Folders (Filing)](./docs/folders.md) — File documents into folders without changing them: sidecar documents, private and cross-database folders, folder views, comparison with HCL Domino folders
 - [Ad-hoc Queries & Reactive Updates](./docs/adhoc-queries.md) — Summary buffer, `db.query()`, nested `include` lookups, ephemeral views, live queries and change listeners
 - [Full-Text Search](./docs/fulltext-search.md) — Client-side encrypted full-text index, `db.searchText()`, the query `text` clause, attachment text extraction
 - [Data Indexing](./docs/dataindexing.md) — Incremental indexing and search integration
