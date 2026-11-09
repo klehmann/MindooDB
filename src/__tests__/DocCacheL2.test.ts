@@ -375,6 +375,71 @@ describe("BaseMindooDB L1/L2 document cache", () => {
     }
   }, 60000);
 
+  it("keeps documents of a scan iteration out of L2 (persistLoadedDocuments: false)", async () => {
+    const db = await tenant.openDB("scanpass", { documentCacheConfig: { maxEntries: 4 } });
+    const created = await db.createDocuments(
+      Array.from({ length: 30 }, (_, i) => ({ initialValues: { idx: i } })),
+    );
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+
+    const docPuts: string[] = [];
+    const store = (tenant as any).cacheManager.getStore();
+    const originalPut = store.put.bind(store);
+    store.put = async (type: string, id: string, value: Uint8Array) => {
+      if (type === "doc") docPuts.push(id);
+      return originalPut(type, id, value);
+    };
+    try {
+      const db2 = await tenant.openDB("scanpass", { documentCacheConfig: { maxEntries: 4 } });
+      const seen: number[] = [];
+      for await (const { doc } of db2.iterateChangesSince(null, { persistLoadedDocuments: false })) {
+        seen.push(doc.getData().idx as number);
+      }
+      expect(seen.sort((a, b) => a - b)).toEqual(created.map((_, i) => i));
+      await (tenant as any).cacheManager.flush();
+      expect(docPuts).toEqual([]);
+
+      // Regular reads still persist what they materialize.
+      for await (const _ of db2.iterateChangesSince(null)) {
+        // drain
+      }
+      await (tenant as any).cacheManager.flush();
+      expect(docPuts.length).toBeGreaterThan(0);
+    } finally {
+      store.put = originalPut;
+    }
+  }, 60000);
+
+  it("still persists a document a regular read shares with a running scan load", async () => {
+    const db = await tenant.openDB("scanshare", { documentCacheConfig: { maxEntries: 8 } });
+    const [doc] = await db.createDocuments([{ initialValues: { idx: 1 } }]);
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+    const db2 = (await tenant.openDB("scanshare", { documentCacheConfig: { maxEntries: 8 } })) as any;
+
+    const scan = db2.loadDocumentInternal(doc.getId(), false);
+    const regular = db2.loadDocumentInternal(doc.getId());
+    const [a, b] = await Promise.all([scan, regular]);
+    expect(a).toBe(b);
+    expect(db2.dirtyDocIds.has(doc.getId())).toBe(true);
+  }, 60000);
+
+  it("persists a scanned document once the app reads it regularly", async () => {
+    const db = await tenant.openDB("scanthenread", { documentCacheConfig: { maxEntries: 8 } });
+    const [doc] = await db.createDocuments([{ initialValues: { idx: 1 } }]);
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+    const db2 = (await tenant.openDB("scanthenread", { documentCacheConfig: { maxEntries: 8 } })) as any;
+
+    for await (const _ of db2.iterateChangesSince(null, { persistLoadedDocuments: false })) {
+      // scan
+    }
+    expect(db2.dirtyDocIds.has(doc.getId())).toBe(false);
+    await db2.getDocument(doc.getId()); // L1 hit
+    expect(db2.dirtyDocIds.has(doc.getId())).toBe(true);
+  }, 60000);
+
   // ---------------------------------------------------------------------------
   // Test 5a: restoreToL2 leaves L1 empty at startup (Phase 3)
   // ---------------------------------------------------------------------------

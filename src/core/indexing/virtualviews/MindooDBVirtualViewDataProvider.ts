@@ -8,6 +8,12 @@ import { evaluateExpression } from "../../expressions/evaluateExpression";
 import type { FilingRefChanges, IFilingAwareDataProvider } from "./VirtualViewFilingJoin";
 
 /**
+ * Index builds read every document once: keep what they materialize out of
+ * the persistent document cache (see IterateChangesOptions.persistLoadedDocuments).
+ */
+const SCAN = { persistLoadedDocuments: false } as const;
+
+/**
  * Options for creating a MindooDBVirtualViewDataProvider
  */
 export interface MindooDBVirtualViewDataProviderOptions {
@@ -216,7 +222,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     // inaccessible documents arrive as lightweight tombstones (never
     // materialized), and upcoming live documents are prefetched in parallel
     // by the iterator's built-in prefetch window.
-    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor)) {
+    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, SCAN)) {
       const docId = doc.getId();
       processedDocIds?.add(docId);
 
