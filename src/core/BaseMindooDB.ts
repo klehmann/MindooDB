@@ -1033,6 +1033,21 @@ export class BaseMindooDB implements MindooDB {
   private l2RecordChangeSeqs = new Map<string, number>();
 
   /**
+   * Whether {@link l2RecordChangeSeqs} lists every L2 record this instance
+   * may use: true for a fresh cache and for checkpoints that say so
+   * (`l2Tracked`), false for older checkpoints. When true, a document
+   * without an entry has no usable L2 record and the read skips the L2
+   * lookup instead of asking the cache store (one store round trip per
+   * document on a cold start). Records another tab wrote meanwhile are
+   * missed until the next restore; the document is then materialized from
+   * the store, as on any L2 miss.
+   */
+  private l2RecordsTracked = true;
+
+  /** L2 records fetched in one batch for a prefetch window (consumed by tryLoadFromL2). */
+  private l2Prefetched = new Map<string, Uint8Array | null>();
+
+  /**
    * Tenant KeyBag fingerprint observed at the time the in-memory index
    * was last reconciled with the underlying store.
    *
@@ -2625,6 +2640,10 @@ export class BaseMindooDB implements MindooDB {
         this.l2RecordChangeSeqs,
       );
     }
+    // The map above is complete only when it was complete on restore.
+    if (this.l2RecordsTracked) {
+      checkpoint.l2Tracked = true;
+    }
 
     // Persist the KeyBag fingerprint observed at the last reconciliation
     // so the next restore can decide whether to skip the visibility
@@ -2702,6 +2721,7 @@ export class BaseMindooDB implements MindooDB {
           : [],
       );
       this.l2RecordChangeSeqs.clear();
+      this.l2RecordsTracked = checkpoint.l2Tracked === true;
       if (
         checkpoint.l2RecordChangeSeqs &&
         typeof checkpoint.l2RecordChangeSeqs === "object"
@@ -13847,6 +13867,40 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Fetch the L2 records of a prefetch window in one batched read instead
+   * of one cache-store round trip per document. Only documents that may
+   * have a record are asked for (see {@link l2RecordsTracked}); the results
+   * are consumed by {@link tryLoadFromL2}. Best effort: on failure the
+   * loads fall back to their own reads.
+   */
+  private async prefetchL2Records(docIds: string[]): Promise<string[]> {
+    const store = this.cacheManager?.getStore() ?? null;
+    if (!store) {
+      return [];
+    }
+    const wanted = docIds.filter(
+      (docId) =>
+        !this.l2Prefetched.has(docId) &&
+        (!this.l2RecordsTracked || this.l2RecordChangeSeqs.has(docId)),
+    );
+    if (wanted.length === 0) {
+      return [];
+    }
+    const prefix = this.getCachePrefix();
+    try {
+      const records = await store.getMany(
+        "doc",
+        wanted.map((docId) => `${prefix}/${docId}`),
+      );
+      wanted.forEach((docId, i) => this.l2Prefetched.set(docId, records[i] ?? null));
+      return wanted;
+    } catch (err) {
+      this.logger.warn(`Batched L2 read for a prefetch window failed:`, err);
+      return [];
+    }
+  }
+
+  /**
    * Materialize a window of upcoming documents so iteration reads them from
    * the cache instead of the store.
    *
@@ -13945,6 +13999,7 @@ export class BaseMindooDB implements MindooDB {
       );
       this.materializationEntryBuffer = null;
     }
+    const prefetchedL2 = await this.prefetchL2Records(docIds);
     try {
       await Promise.all(
         docIds.map((docId) =>
@@ -13956,6 +14011,11 @@ export class BaseMindooDB implements MindooDB {
       );
     } finally {
       this.materializationEntryBuffer = null;
+      // Records a load did not consume (shared or failed load) must not be
+      // used by a later read: they may be outdated by then.
+      for (const docId of prefetchedL2) {
+        this.l2Prefetched.delete(docId);
+      }
     }
 
     return {
@@ -14914,13 +14974,21 @@ export class BaseMindooDB implements MindooDB {
     const key = `${prefix}/${docId}`;
 
     let bytes: Uint8Array | null;
-    try {
-      bytes = await store.get("doc", key);
-    } catch (e) {
-      this.logger.warn(
-        `L2 read failed for ${docId}; falling back to full materialization: ${e}`,
-      );
+    if (this.l2Prefetched.has(docId)) {
+      bytes = this.l2Prefetched.get(docId) ?? null;
+      this.l2Prefetched.delete(docId);
+    } else if (this.l2RecordsTracked && !this.l2RecordChangeSeqs.has(docId)) {
+      // Known to have no L2 record: skip the store round trip.
       return null;
+    } else {
+      try {
+        bytes = await store.get("doc", key);
+      } catch (e) {
+        this.logger.warn(
+          `L2 read failed for ${docId}; falling back to full materialization: ${e}`,
+        );
+        return null;
+      }
     }
     if (!bytes) return null;
 
