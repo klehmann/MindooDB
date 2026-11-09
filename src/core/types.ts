@@ -2241,6 +2241,20 @@ export interface IterateChangesOptions {
    * for no filter.
    */
   idPrefix?: string;
+
+  /**
+   * Whether documents this iteration has to materialize are kept in the
+   * persistent document cache (L2) like regular reads (default `true`).
+   *
+   * Pass `false` for one-pass scans such as index builds (summary buffer,
+   * full-text index, full-document views): the documents are then only held
+   * in the in-memory cache and are not written to L2 when they are evicted.
+   * A full pass would otherwise serialize, encrypt and store every document
+   * of the database once more. Regular reads are unaffected. While the
+   * background warmer (`startBackgroundWarmer`) runs, documents are
+   * persisted regardless, since it fills L2 anyway.
+   */
+  persistLoadedDocuments?: boolean;
 }
 
 /**

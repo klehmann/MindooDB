@@ -23,6 +23,12 @@ import { extractFulltextFields } from "./extractFulltextText";
 import { MiniSearchAdapter, type SearchEngineAdapter } from "./SearchEngineAdapter";
 
 /**
+ * Index builds read every document once: keep what they materialize out of
+ * the persistent document cache (see IterateChangesOptions.persistLoadedDocuments).
+ */
+const SCAN = { persistLoadedDocuments: false } as const;
+
+/**
  * Attachments above this size are skipped during text extraction: they
  * would have to be fully materialized in memory, and extractable text
  * that large exceeds any sensible per-field cap anyway.
@@ -354,7 +360,7 @@ export class DocumentFullTextIndex implements ICacheable {
     }
 
     // Pass 1: incremental changefeed consumption from the main cursor.
-    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor)) {
+    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, SCAN)) {
       await this.applyDocument(doc.getId(), doc as MindooDoc);
       this.cursor = cursor;
       processed++;
@@ -383,7 +389,7 @@ export class DocumentFullTextIndex implements ICacheable {
     while (this.needsBackfill) {
       const generation = this.backfillGeneration;
       let restarted = false;
-      for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor)) {
+      for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor, SCAN)) {
         await this.applyDocument(doc.getId(), doc as MindooDoc);
         if (generation !== this.backfillGeneration) {
           restarted = true;

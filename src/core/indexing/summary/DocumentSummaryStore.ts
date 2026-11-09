@@ -23,6 +23,12 @@ import {
 } from "./types";
 import { extractSummaryFields, isFieldPathCovered } from "./extractSummaryFields";
 
+/**
+ * Index builds read every document once: keep what they materialize out of
+ * the persistent document cache (see IterateChangesOptions.persistLoadedDocuments).
+ */
+const SCAN = { persistLoadedDocuments: false } as const;
+
 const DEFAULT_BUCKET_COUNT = 64;
 /** Keep at most this many removals for delta readers (older readers rescan). */
 const MAX_TOMBSTONES = 5000;
@@ -340,7 +346,7 @@ export class DocumentSummaryStore implements ICacheable {
     }
 
     // Pass 1: incremental changefeed consumption from the main cursor.
-    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor)) {
+    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, SCAN)) {
       this.applyDocument(doc.getId(), doc, cursor);
       this.cursor = cursor;
       processed++;
@@ -365,7 +371,7 @@ export class DocumentSummaryStore implements ICacheable {
     while (this.needsBackfill) {
       const generation = this.backfillGeneration;
       let restarted = false;
-      for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor)) {
+      for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor, SCAN)) {
         this.applyDocument(doc.getId(), doc, cursor);
         if (generation !== this.backfillGeneration) {
           restarted = true;

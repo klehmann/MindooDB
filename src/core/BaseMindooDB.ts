@@ -446,6 +446,12 @@ interface DeserializedCachedDoc {
 interface InternalDoc {
   id: string;
   doc: AutomergeTypes.Doc<MindooDocPayload>;
+  /**
+   * Materialized by a scan (index build) and therefore not marked for the
+   * persistent L2 cache; the first regular read promotes it (see
+   * loadDocumentInternal).
+   */
+  scanOnly?: boolean;
   createdAt: number;
   lastModified: number;
   decryptionKeyId: string;
@@ -13866,6 +13872,7 @@ export class BaseMindooDB implements MindooDB {
     startIndex: number,
     prefetchedThrough: number,
     idPrefix?: string,
+    persist: boolean = true,
   ): Promise<{ prefetchedThrough: number; prefetchedDocuments: number }> {
     const windowSize = this.iteratePrefetchWindowDocs;
     if (windowSize <= 0) {
@@ -13941,7 +13948,7 @@ export class BaseMindooDB implements MindooDB {
     try {
       await Promise.all(
         docIds.map((docId) =>
-          this.loadDocumentInternal(docId).catch((err) => {
+          this.loadDocumentInternal(docId, persist).catch((err) => {
             this.logger.warn(`Failed to prefetch document ${docId}:`, err);
             return null;
           }),
@@ -14506,6 +14513,7 @@ export class BaseMindooDB implements MindooDB {
       docId: "",
     };
     const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
+    const persistLoaded = options?.persistLoadedDocuments !== false;
     this.logger.debug(
       `Starting iteration from cursor ${JSON.stringify(actualCursor)}`,
     );
@@ -14528,6 +14536,7 @@ export class BaseMindooDB implements MindooDB {
         from,
         prefetchedThrough,
         idPrefix,
+        persistLoaded,
       );
       prefetchedThrough = result.prefetchedThrough;
       prefetchedDocuments += result.prefetchedDocuments;
@@ -14595,7 +14604,7 @@ export class BaseMindooDB implements MindooDB {
             this.logger.debug(
               `Document ${entry.docId} not in cache, loading from store`,
             );
-            internalDoc = await this.loadDocumentInternal(entry.docId);
+            internalDoc = await this.loadDocumentInternal(entry.docId, persistLoaded);
             if (internalDoc) {
               loadedDocuments++;
             }
@@ -16541,23 +16550,41 @@ export class BaseMindooDB implements MindooDB {
    * document were indexed since it started, so no caller gets a state older
    * than its call.
    */
-  private loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
+  private loadDocumentInternal(
+    docId: string,
+    persist: boolean = true,
+  ): Promise<InternalDoc | null> {
     const generation = this.docEntryGeneration.get(docId) ?? 0;
     const inFlight = this.documentLoadsInFlight.get(docId);
+    let promise: Promise<InternalDoc | null>;
     if (inFlight && inFlight.generation === generation) {
-      return inFlight.promise;
+      promise = inFlight.promise;
+    } else {
+      const started = this.loadDocumentUncoalesced(docId, persist).finally(() => {
+        if (this.documentLoadsInFlight.get(docId)?.promise === started) {
+          this.documentLoadsInFlight.delete(docId);
+        }
+      });
+      this.documentLoadsInFlight.set(docId, { generation, promise: started });
+      promise = started;
     }
-    const promise = this.loadDocumentUncoalesced(docId).finally(() => {
-      if (this.documentLoadsInFlight.get(docId)?.promise === promise) {
-        this.documentLoadsInFlight.delete(docId);
+    if (!persist) {
+      return promise;
+    }
+    // A regular read of a document a scan materialized (shared load or L1
+    // hit) wants it in the persistent cache as usual.
+    return promise.then((loaded) => {
+      if (loaded?.scanOnly && this.docCache.get(docId) === loaded) {
+        delete loaded.scanOnly;
+        this.markDocDirty(docId);
       }
+      return loaded;
     });
-    this.documentLoadsInFlight.set(docId, { generation, promise });
-    return promise;
   }
 
   private async loadDocumentUncoalesced(
     docId: string,
+    persist: boolean = true,
   ): Promise<InternalDoc | null> {
     const startedAt = Date.now();
     const cacheCheckStartedAt = Date.now();
@@ -17114,7 +17141,16 @@ export class BaseMindooDB implements MindooDB {
     // result is already outdated and the next read materializes again)
     if (this.isEntryGenerationCurrent(docId, entryGeneration)) {
       await this.storeCachedDocument(internalDoc);
-      this.markDocDirty(docId);
+      // Scan loads (index builds) keep the document in L1 only: marking it
+      // dirty would write every document of a full pass to the persistent
+      // L2 cache on eviction. While the background warmer is running, the
+      // L2 cache is being filled anyway: persist then, so the warmer does
+      // not materialize the same document a second time.
+      if (persist || this.warmerPromise !== null) {
+        this.markDocDirty(docId);
+      } else {
+        internalDoc.scanOnly = true;
+      }
       this.logger.debug(
         `===== Successfully loaded document ${docId} and cached it =====`,
       );
