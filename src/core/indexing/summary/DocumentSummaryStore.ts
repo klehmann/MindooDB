@@ -84,7 +84,12 @@ export class DocumentSummaryStore implements ICacheable {
   private generation: string = generateRandomUuid();
   private updateSeq: number = 0;
   /** [updateSeq, docId] in write order; may hold stale pairs (compacted lazily). */
-  private seqLog: Array<[number, string]> = [];
+  // Write log as two parallel arrays (seq, docId): one pair per write, so
+  // no tuple array per entry (see getChangesSince).
+  private seqLogSeqs: number[] = [];
+  private seqLogDocIds: string[] = [];
+  /** Shares repeated short field values between entries (see SummaryValueInterner). */
+  private readonly interner = new SummaryValueInterner();
   private tombstones: Array<[number, string]> = [];
   /** Readers older than this seq cannot get all removals: they rescan. */
   private tombstoneHorizon: number = 0;
@@ -434,15 +439,16 @@ export class DocumentSummaryStore implements ICacheable {
     }
 
     const updateSeq = ++this.updateSeq;
-    this.entries.set(docId, {
+    this.entries.set(docId, this.interner.internEntry({
       docId,
       fields: extractSummaryFields(doc.getData(), this.config),
       lastModified: doc.getLastModified(),
       changeSeq: cursor.changeSeq ?? 0,
       decryptionKeyId: doc.getDecryptionKeyId(),
       updateSeq,
-    });
-    this.seqLog.push([updateSeq, docId]);
+    }));
+    this.seqLogSeqs.push(updateSeq);
+    this.seqLogDocIds.push(docId);
     this.markBucketDirty(docId);
   }
 
@@ -488,18 +494,19 @@ export class DocumentSummaryStore implements ICacheable {
     this.compactSeqLog();
     // First log index with seq > position.seq (log is ordered by seq).
     let lo = 0;
-    let hi = this.seqLog.length;
+    let hi = this.seqLogSeqs.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.seqLog[mid][0] > position.seq) {
+      if (this.seqLogSeqs[mid] > position.seq) {
         hi = mid;
       } else {
         lo = mid + 1;
       }
     }
     const entries: DocumentSummaryEntry[] = [];
-    for (let i = lo; i < this.seqLog.length; i++) {
-      const [seq, docId] = this.seqLog[i];
+    for (let i = lo; i < this.seqLogSeqs.length; i++) {
+      const seq = this.seqLogSeqs[i];
+      const docId = this.seqLogDocIds[i];
       const entry = this.entries.get(docId);
       // Only the latest write of a document counts (older pairs are stale).
       if (entry && entry.updateSeq === seq) {
@@ -518,22 +525,32 @@ export class DocumentSummaryStore implements ICacheable {
 
   /** Drop stale log pairs once they make up more than half of the log. */
   private compactSeqLog(): void {
-    if (this.seqLog.length <= 1024 || this.seqLog.length < this.entries.size * 2) {
+    if (this.seqLogSeqs.length <= 1024 || this.seqLogSeqs.length < this.entries.size * 2) {
       return;
     }
-    this.seqLog = this.seqLog.filter(([seq, docId]) => this.entries.get(docId)?.updateSeq === seq);
+    const seqs: number[] = [];
+    const docIds: string[] = [];
+    for (let i = 0; i < this.seqLogSeqs.length; i++) {
+      if (this.entries.get(this.seqLogDocIds[i])?.updateSeq === this.seqLogSeqs[i]) {
+        seqs.push(this.seqLogSeqs[i]);
+        docIds.push(this.seqLogDocIds[i]);
+      }
+    }
+    this.seqLogSeqs = seqs;
+    this.seqLogDocIds = docIds;
   }
 
   /** Rebuild the write log from the entries (after restoring from the cache). */
   private rebuildSeqLog(): void {
-    const log: Array<[number, string]> = [];
+    const written: DocumentSummaryEntry[] = [];
     for (const entry of this.entries.values()) {
       if (typeof entry.updateSeq === "number") {
-        log.push([entry.updateSeq, entry.docId]);
+        written.push(entry);
       }
     }
-    log.sort((a, b) => a[0] - b[0]);
-    this.seqLog = log;
+    written.sort((a, b) => a.updateSeq! - b.updateSeq!);
+    this.seqLogSeqs = written.map((entry) => entry.updateSeq!);
+    this.seqLogDocIds = written.map((entry) => entry.docId);
   }
 
   /**
@@ -557,7 +574,9 @@ export class DocumentSummaryStore implements ICacheable {
     // Delta readers must rescan: start a new modification generation.
     this.generation = generateRandomUuid();
     this.updateSeq = 0;
-    this.seqLog = [];
+    this.seqLogSeqs = [];
+    this.seqLogDocIds = [];
+    this.interner.clear();
     this.tombstones = [];
     this.tombstoneHorizon = 0;
     this.lostSeqRanges = [];
@@ -852,7 +871,7 @@ export class DocumentSummaryStore implements ICacheable {
         }
         const payload = JSON.parse(new TextDecoder().decode(bytes)) as SummaryBucketPayload;
         for (const entry of payload.entries ?? []) {
-          this.entries.set(entry.docId, entry);
+          this.entries.set(entry.docId, this.interner.internEntry(entry));
         }
       }
     } catch {
@@ -882,7 +901,7 @@ export class DocumentSummaryStore implements ICacheable {
           if (!bytes) break;
           const segment = JSON.parse(new TextDecoder().decode(bytes)) as SummaryJournalSegment;
           for (const entry of segment.entries) {
-            this.entries.set(entry.docId, entry);
+            this.entries.set(entry.docId, this.interner.internEntry(entry));
             this.dirtyBuckets.add(this.bucketIndexFor(entry.docId));
           }
           for (const docId of segment.removed) {
@@ -948,5 +967,73 @@ export class DocumentSummaryStore implements ICacheable {
       this.needsBackfill = true;
       this.backfillCursor = meta.backfillCursor ?? null;
     }
+  }
+}
+
+/** Longest string value the interner considers (longer values are rarely repeated). */
+const INTERN_MAX_LENGTH = 256;
+/** Distinct values per field after which a field counts as unique-valued and is no longer interned. */
+const INTERN_MAX_DISTINCT = 1024;
+
+/**
+ * Shares repeated field values between summary entries: values like a
+ * type, a folder, a status or a recipient repeat across thousands of
+ * documents, but each extracted or restored entry would otherwise hold its
+ * own copy of the string. A field gets a pool until it shows more than
+ * {@link INTERN_MAX_DISTINCT} distinct values (subjects, dates, ids); its
+ * pool is then dropped, so unique values cost nothing extra.
+ */
+class SummaryValueInterner {
+  /** field -> pool (`null`: too many distinct values, not interned) */
+  private readonly pools = new Map<string, Map<string, string> | null>();
+
+  clear(): void {
+    this.pools.clear();
+  }
+
+  /** Intern the entry's string values in place and return it. */
+  internEntry(entry: DocumentSummaryEntry): DocumentSummaryEntry {
+    const fields = entry.fields;
+    for (const key in fields) {
+      if (!Object.prototype.hasOwnProperty.call(fields, key)) continue;
+      const value = fields[key];
+      if (typeof value === "string") {
+        fields[key] = this.intern(key, value);
+      } else if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+          if (typeof value[i] === "string") {
+            value[i] = this.intern(key, value[i]);
+          }
+        }
+      }
+    }
+    if (typeof entry.decryptionKeyId === "string") {
+      entry.decryptionKeyId = this.intern("\u0000decryptionKeyId", entry.decryptionKeyId);
+    }
+    return entry;
+  }
+
+  private intern(field: string, value: string): string {
+    if (value.length > INTERN_MAX_LENGTH) {
+      return value;
+    }
+    let pool = this.pools.get(field);
+    if (pool === null) {
+      return value;
+    }
+    if (pool === undefined) {
+      pool = new Map();
+      this.pools.set(field, pool);
+    }
+    const existing = pool.get(value);
+    if (existing !== undefined) {
+      return existing;
+    }
+    if (pool.size >= INTERN_MAX_DISTINCT) {
+      this.pools.set(field, null);
+      return value;
+    }
+    pool.set(value, value);
+    return value;
   }
 }
