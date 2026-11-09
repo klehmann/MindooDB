@@ -375,6 +375,71 @@ describe("BaseMindooDB L1/L2 document cache", () => {
     }
   }, 60000);
 
+  it("keeps documents of a scan iteration out of L2 (persistLoadedDocuments: false)", async () => {
+    const db = await tenant.openDB("scanpass", { documentCacheConfig: { maxEntries: 4 } });
+    const created = await db.createDocuments(
+      Array.from({ length: 30 }, (_, i) => ({ initialValues: { idx: i } })),
+    );
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+
+    const docPuts: string[] = [];
+    const store = (tenant as any).cacheManager.getStore();
+    const originalPut = store.put.bind(store);
+    store.put = async (type: string, id: string, value: Uint8Array) => {
+      if (type === "doc") docPuts.push(id);
+      return originalPut(type, id, value);
+    };
+    try {
+      const db2 = await tenant.openDB("scanpass", { documentCacheConfig: { maxEntries: 4 } });
+      const seen: number[] = [];
+      for await (const { doc } of db2.iterateChangesSince(null, { persistLoadedDocuments: false })) {
+        seen.push(doc.getData().idx as number);
+      }
+      expect(seen.sort((a, b) => a - b)).toEqual(created.map((_, i) => i));
+      await (tenant as any).cacheManager.flush();
+      expect(docPuts).toEqual([]);
+
+      // Regular reads still persist what they materialize.
+      for await (const _ of db2.iterateChangesSince(null)) {
+        // drain
+      }
+      await (tenant as any).cacheManager.flush();
+      expect(docPuts.length).toBeGreaterThan(0);
+    } finally {
+      store.put = originalPut;
+    }
+  }, 60000);
+
+  it("still persists a document a regular read shares with a running scan load", async () => {
+    const db = await tenant.openDB("scanshare", { documentCacheConfig: { maxEntries: 8 } });
+    const [doc] = await db.createDocuments([{ initialValues: { idx: 1 } }]);
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+    const db2 = (await tenant.openDB("scanshare", { documentCacheConfig: { maxEntries: 8 } })) as any;
+
+    const scan = db2.loadDocumentInternal(doc.getId(), false);
+    const regular = db2.loadDocumentInternal(doc.getId());
+    const [a, b] = await Promise.all([scan, regular]);
+    expect(a).toBe(b);
+    expect(db2.dirtyDocIds.has(doc.getId())).toBe(true);
+  }, 60000);
+
+  it("persists a scanned document once the app reads it regularly", async () => {
+    const db = await tenant.openDB("scanthenread", { documentCacheConfig: { maxEntries: 8 } });
+    const [doc] = await db.createDocuments([{ initialValues: { idx: 1 } }]);
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+    const db2 = (await tenant.openDB("scanthenread", { documentCacheConfig: { maxEntries: 8 } })) as any;
+
+    for await (const _ of db2.iterateChangesSince(null, { persistLoadedDocuments: false })) {
+      // scan
+    }
+    expect(db2.dirtyDocIds.has(doc.getId())).toBe(false);
+    await db2.getDocument(doc.getId()); // L1 hit
+    expect(db2.dirtyDocIds.has(doc.getId())).toBe(true);
+  }, 60000);
+
   // ---------------------------------------------------------------------------
   // Test 5a: restoreToL2 leaves L1 empty at startup (Phase 3)
   // ---------------------------------------------------------------------------
@@ -572,4 +637,107 @@ describe("BaseMindooDB L1/L2 document cache", () => {
     const reloaded = await db2.getDocument(docId);
     expect(reloaded.getData().title).toBe("with v2");
   }, 30000);
+
+  /** Count cache-store reads of doc records (single and batched). */
+  function spyOnDocReads(): { gets: number; batches: number; batchedKeys: number; restore: () => void } {
+    const store = (tenant as any).cacheManager.getStore();
+    const get = store.get.bind(store);
+    const getMany = store.getMany.bind(store);
+    const stats = { gets: 0, batches: 0, batchedKeys: 0, restore: () => {} };
+    store.get = async (type: string, id: string) => {
+      if (type === "doc") stats.gets++;
+      return get(type, id);
+    };
+    store.getMany = async (type: string, ids: string[]) => {
+      if (type === "doc") {
+        stats.batches++;
+        stats.batchedKeys += ids.length;
+      }
+      return getMany(type, ids);
+    };
+    stats.restore = () => {
+      store.get = get;
+      store.getMany = getMany;
+    };
+    return stats;
+  }
+
+  async function createAndRestart(dbId: string, count: number): Promise<string[]> {
+    const db = await tenant.openDB(dbId, { documentCacheConfig: { maxEntries: 64 } });
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const doc = await db.createDocument();
+      await db.changeDoc(doc, (d: MindooDoc) => {
+        d.getData().idx = i;
+      });
+      ids.push(doc.getId());
+    }
+    await (tenant as any).cacheManager.flush();
+    simulateRestartWithoutFlush();
+    return ids;
+  }
+
+  it("skips L2 reads on a cold cache (no records known)", async () => {
+    await createAndRestart("coldl2", 20);
+    await (tenant as any).cacheManager.getStore().clear();
+    const reads = spyOnDocReads();
+    try {
+      const db2 = await tenant.openDB("coldl2", { documentCacheConfig: { maxEntries: 64 } });
+      let count = 0;
+      for await (const _ of db2.iterateChangesSince(null)) count++;
+      expect(count).toBe(20);
+      expect(reads.gets).toBe(0);
+      expect(reads.batches).toBe(0);
+    } finally {
+      reads.restore();
+    }
+  }, 60000);
+
+  it("reads the L2 records of a prefetch window in one batch", async () => {
+    const ids = await createAndRestart("batchl2", 20);
+    const reads = spyOnDocReads();
+    try {
+      // No eager restore: reads go through the regular L2 path.
+      const db2 = await tenant.openDB("batchl2", { documentCacheConfig: { maxEntries: 64, restoreLimit: 0 } });
+      const heavySpy = spyOnHeavyMaterialization(db2);
+      const seen: string[] = [];
+      for await (const { doc } of db2.iterateChangesSince(null)) seen.push(doc.getId());
+      expect(seen.sort()).toEqual([...ids].sort());
+      expect(reads.gets).toBe(0);
+      expect(reads.batches).toBeGreaterThan(0);
+      expect(reads.batches).toBeLessThan(ids.length);
+      expect(reads.batchedKeys).toBe(ids.length);
+      // Fresh L2 hits: no replay.
+      expect(heavySpy).not.toHaveBeenCalled();
+      heavySpy.mockRestore();
+    } finally {
+      reads.restore();
+    }
+  }, 60000);
+
+  it("still finds L2 records of an older checkpoint that does not track them", async () => {
+    const ids = await createAndRestart("legacyl2", 10);
+    const store = (tenant as any).cacheManager.getStore();
+    const metaKeys = await store.list("db-meta");
+    for (const key of metaKeys) {
+      const checkpoint = JSON.parse(new TextDecoder().decode(await store.get("db-meta", key)));
+      delete checkpoint.l2Tracked;
+      delete checkpoint.l2RecordChangeSeqs;
+      await store.put("db-meta", key, new TextEncoder().encode(JSON.stringify(checkpoint)));
+    }
+    const reads = spyOnDocReads();
+    try {
+      // No eager restore: reads go through the regular L2 path.
+      const db2 = await tenant.openDB("legacyl2", { documentCacheConfig: { maxEntries: 64, restoreLimit: 0 } });
+      const heavySpy = spyOnHeavyMaterialization(db2);
+      for (const id of ids) {
+        expect((await db2.getDocument(id)).getId()).toBe(id);
+      }
+      expect(reads.gets).toBe(ids.length);
+      expect(heavySpy).not.toHaveBeenCalled();
+      heavySpy.mockRestore();
+    } finally {
+      reads.restore();
+    }
+  }, 60000);
 });

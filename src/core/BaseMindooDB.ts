@@ -446,6 +446,12 @@ interface DeserializedCachedDoc {
 interface InternalDoc {
   id: string;
   doc: AutomergeTypes.Doc<MindooDocPayload>;
+  /**
+   * Materialized by a scan (index build) and therefore not marked for the
+   * persistent L2 cache; the first regular read promotes it (see
+   * loadDocumentInternal).
+   */
+  scanOnly?: boolean;
   createdAt: number;
   lastModified: number;
   decryptionKeyId: string;
@@ -1025,6 +1031,21 @@ export class BaseMindooDB implements MindooDB {
    * Maintained only via {@link rememberL2Record} / {@link forgetL2Record}.
    */
   private l2RecordChangeSeqs = new Map<string, number>();
+
+  /**
+   * Whether {@link l2RecordChangeSeqs} lists every L2 record this instance
+   * may use: true for a fresh cache and for checkpoints that say so
+   * (`l2Tracked`), false for older checkpoints. When true, a document
+   * without an entry has no usable L2 record and the read skips the L2
+   * lookup instead of asking the cache store (one store round trip per
+   * document on a cold start). Records another tab wrote meanwhile are
+   * missed until the next restore; the document is then materialized from
+   * the store, as on any L2 miss.
+   */
+  private l2RecordsTracked = true;
+
+  /** L2 records fetched in one batch for a prefetch window (consumed by tryLoadFromL2). */
+  private l2Prefetched = new Map<string, Uint8Array | null>();
 
   /**
    * Tenant KeyBag fingerprint observed at the time the in-memory index
@@ -2619,6 +2640,10 @@ export class BaseMindooDB implements MindooDB {
         this.l2RecordChangeSeqs,
       );
     }
+    // The map above is complete only when it was complete on restore.
+    if (this.l2RecordsTracked) {
+      checkpoint.l2Tracked = true;
+    }
 
     // Persist the KeyBag fingerprint observed at the last reconciliation
     // so the next restore can decide whether to skip the visibility
@@ -2696,6 +2721,7 @@ export class BaseMindooDB implements MindooDB {
           : [],
       );
       this.l2RecordChangeSeqs.clear();
+      this.l2RecordsTracked = checkpoint.l2Tracked === true;
       if (
         checkpoint.l2RecordChangeSeqs &&
         typeof checkpoint.l2RecordChangeSeqs === "object"
@@ -13841,6 +13867,40 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Fetch the L2 records of a prefetch window in one batched read instead
+   * of one cache-store round trip per document. Only documents that may
+   * have a record are asked for (see {@link l2RecordsTracked}); the results
+   * are consumed by {@link tryLoadFromL2}. Best effort: on failure the
+   * loads fall back to their own reads.
+   */
+  private async prefetchL2Records(docIds: string[]): Promise<string[]> {
+    const store = this.cacheManager?.getStore() ?? null;
+    if (!store) {
+      return [];
+    }
+    const wanted = docIds.filter(
+      (docId) =>
+        !this.l2Prefetched.has(docId) &&
+        (!this.l2RecordsTracked || this.l2RecordChangeSeqs.has(docId)),
+    );
+    if (wanted.length === 0) {
+      return [];
+    }
+    const prefix = this.getCachePrefix();
+    try {
+      const records = await store.getMany(
+        "doc",
+        wanted.map((docId) => `${prefix}/${docId}`),
+      );
+      wanted.forEach((docId, i) => this.l2Prefetched.set(docId, records[i] ?? null));
+      return wanted;
+    } catch (err) {
+      this.logger.warn(`Batched L2 read for a prefetch window failed:`, err);
+      return [];
+    }
+  }
+
+  /**
    * Materialize a window of upcoming documents so iteration reads them from
    * the cache instead of the store.
    *
@@ -13866,6 +13926,7 @@ export class BaseMindooDB implements MindooDB {
     startIndex: number,
     prefetchedThrough: number,
     idPrefix?: string,
+    persist: boolean = true,
   ): Promise<{ prefetchedThrough: number; prefetchedDocuments: number }> {
     const windowSize = this.iteratePrefetchWindowDocs;
     if (windowSize <= 0) {
@@ -13938,10 +13999,11 @@ export class BaseMindooDB implements MindooDB {
       );
       this.materializationEntryBuffer = null;
     }
+    const prefetchedL2 = await this.prefetchL2Records(docIds);
     try {
       await Promise.all(
         docIds.map((docId) =>
-          this.loadDocumentInternal(docId).catch((err) => {
+          this.loadDocumentInternal(docId, persist).catch((err) => {
             this.logger.warn(`Failed to prefetch document ${docId}:`, err);
             return null;
           }),
@@ -13949,6 +14011,11 @@ export class BaseMindooDB implements MindooDB {
       );
     } finally {
       this.materializationEntryBuffer = null;
+      // Records a load did not consume (shared or failed load) must not be
+      // used by a later read: they may be outdated by then.
+      for (const docId of prefetchedL2) {
+        this.l2Prefetched.delete(docId);
+      }
     }
 
     return {
@@ -14506,6 +14573,7 @@ export class BaseMindooDB implements MindooDB {
       docId: "",
     };
     const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
+    const persistLoaded = options?.persistLoadedDocuments !== false;
     this.logger.debug(
       `Starting iteration from cursor ${JSON.stringify(actualCursor)}`,
     );
@@ -14528,6 +14596,7 @@ export class BaseMindooDB implements MindooDB {
         from,
         prefetchedThrough,
         idPrefix,
+        persistLoaded,
       );
       prefetchedThrough = result.prefetchedThrough;
       prefetchedDocuments += result.prefetchedDocuments;
@@ -14595,7 +14664,7 @@ export class BaseMindooDB implements MindooDB {
             this.logger.debug(
               `Document ${entry.docId} not in cache, loading from store`,
             );
-            internalDoc = await this.loadDocumentInternal(entry.docId);
+            internalDoc = await this.loadDocumentInternal(entry.docId, persistLoaded);
             if (internalDoc) {
               loadedDocuments++;
             }
@@ -14905,13 +14974,21 @@ export class BaseMindooDB implements MindooDB {
     const key = `${prefix}/${docId}`;
 
     let bytes: Uint8Array | null;
-    try {
-      bytes = await store.get("doc", key);
-    } catch (e) {
-      this.logger.warn(
-        `L2 read failed for ${docId}; falling back to full materialization: ${e}`,
-      );
+    if (this.l2Prefetched.has(docId)) {
+      bytes = this.l2Prefetched.get(docId) ?? null;
+      this.l2Prefetched.delete(docId);
+    } else if (this.l2RecordsTracked && !this.l2RecordChangeSeqs.has(docId)) {
+      // Known to have no L2 record: skip the store round trip.
       return null;
+    } else {
+      try {
+        bytes = await store.get("doc", key);
+      } catch (e) {
+        this.logger.warn(
+          `L2 read failed for ${docId}; falling back to full materialization: ${e}`,
+        );
+        return null;
+      }
     }
     if (!bytes) return null;
 
@@ -16541,23 +16618,41 @@ export class BaseMindooDB implements MindooDB {
    * document were indexed since it started, so no caller gets a state older
    * than its call.
    */
-  private loadDocumentInternal(docId: string): Promise<InternalDoc | null> {
+  private loadDocumentInternal(
+    docId: string,
+    persist: boolean = true,
+  ): Promise<InternalDoc | null> {
     const generation = this.docEntryGeneration.get(docId) ?? 0;
     const inFlight = this.documentLoadsInFlight.get(docId);
+    let promise: Promise<InternalDoc | null>;
     if (inFlight && inFlight.generation === generation) {
-      return inFlight.promise;
+      promise = inFlight.promise;
+    } else {
+      const started = this.loadDocumentUncoalesced(docId, persist).finally(() => {
+        if (this.documentLoadsInFlight.get(docId)?.promise === started) {
+          this.documentLoadsInFlight.delete(docId);
+        }
+      });
+      this.documentLoadsInFlight.set(docId, { generation, promise: started });
+      promise = started;
     }
-    const promise = this.loadDocumentUncoalesced(docId).finally(() => {
-      if (this.documentLoadsInFlight.get(docId)?.promise === promise) {
-        this.documentLoadsInFlight.delete(docId);
+    if (!persist) {
+      return promise;
+    }
+    // A regular read of a document a scan materialized (shared load or L1
+    // hit) wants it in the persistent cache as usual.
+    return promise.then((loaded) => {
+      if (loaded?.scanOnly && this.docCache.get(docId) === loaded) {
+        delete loaded.scanOnly;
+        this.markDocDirty(docId);
       }
+      return loaded;
     });
-    this.documentLoadsInFlight.set(docId, { generation, promise });
-    return promise;
   }
 
   private async loadDocumentUncoalesced(
     docId: string,
+    persist: boolean = true,
   ): Promise<InternalDoc | null> {
     const startedAt = Date.now();
     const cacheCheckStartedAt = Date.now();
@@ -17114,7 +17209,16 @@ export class BaseMindooDB implements MindooDB {
     // result is already outdated and the next read materializes again)
     if (this.isEntryGenerationCurrent(docId, entryGeneration)) {
       await this.storeCachedDocument(internalDoc);
-      this.markDocDirty(docId);
+      // Scan loads (index builds) keep the document in L1 only: marking it
+      // dirty would write every document of a full pass to the persistent
+      // L2 cache on eviction. While the background warmer is running, the
+      // L2 cache is being filled anyway: persist then, so the warmer does
+      // not materialize the same document a second time.
+      if (persist || this.warmerPromise !== null) {
+        this.markDocDirty(docId);
+      } else {
+        internalDoc.scanOnly = true;
+      }
       this.logger.debug(
         `===== Successfully loaded document ${docId} and cached it =====`,
       );
