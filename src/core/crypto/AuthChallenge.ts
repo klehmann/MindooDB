@@ -34,8 +34,9 @@ import { generateRandomUuid } from "../utils/idGeneration";
  *
  * Clients that predate v2 sign whatever string they get, so they answer a v2
  * challenge with a raw signature over it. Servers accept that as long as
- * `acceptLegacySignatures` is on (the default) — it is still safe, because the
- * server chose the bytes. Switch it off once no old clients remain.
+ * the legacy policy allows it (the default) — it is still safe, because the
+ * server chose the bytes. A server reports each such login
+ * ({@link LegacyChallengeSignaturePolicy}); switch it off once none remain.
  */
 
 /** Prefix of a v2 challenge. Not a signing domain: the client adds its own. */
@@ -110,23 +111,62 @@ export function authChallengeVerificationInputs(
   return options.acceptLegacySignatures === false ? [domainBytes(challenge)] : [domainBytes(challenge), raw];
 }
 
+/** Which login a challenge response belongs to, for {@link LegacyChallengeSignaturePolicy.onLegacySignature}. */
+export type AuthChallengeUse = "sync" | "device-discovery" | "system-admin" | "peer";
+
+/**
+ * A server process's stance on raw (pre-v2) signatures over v2 challenges.
+ * One policy per process: the tenant login, device discovery, the system
+ * admin login and the peer login all follow it.
+ */
+export interface LegacyChallengeSignaturePolicy {
+  /** Accept a raw signature over a v2 challenge. Default true (transition). */
+  accept: boolean;
+  /**
+   * Called for every raw signature that was accepted, so an operator can see
+   * which clients still need an update before switching `accept` off.
+   */
+  onLegacySignature?: (use: AuthChallengeUse | undefined) => void;
+}
+
+let legacyPolicy: LegacyChallengeSignaturePolicy = { accept: true };
+
+/** Set this process's policy (a server host calls it once at startup). */
+export function setLegacyChallengeSignaturePolicy(policy: LegacyChallengeSignaturePolicy): void {
+  legacyPolicy = { ...policy };
+}
+
+export function getLegacyChallengeSignaturePolicy(): LegacyChallengeSignaturePolicy {
+  return legacyPolicy;
+}
+
 /**
  * Verify a challenge response against an imported Ed25519 public key, trying
  * each form {@link authChallengeVerificationInputs} allows.
+ *
+ * `acceptLegacySignatures` overrides the process policy
+ * ({@link setLegacyChallengeSignaturePolicy}) when given. A raw signature over
+ * a v2 challenge that passes is reported to the policy's `onLegacySignature`.
  */
 export async function verifyAuthChallengeSignature(
   subtle: SubtleCrypto,
   publicKey: CryptoKey,
   challenge: string,
   signature: Uint8Array,
-  options: { acceptLegacySignatures?: boolean } = {},
+  options: { acceptLegacySignatures?: boolean; use?: AuthChallengeUse } = {},
 ): Promise<boolean> {
   const signatureBytes = signature.buffer.slice(
     signature.byteOffset,
     signature.byteOffset + signature.byteLength,
   ) as ArrayBuffer;
-  for (const message of authChallengeVerificationInputs(challenge, options)) {
-    if (await subtle.verify({ name: "Ed25519" }, publicKey, signatureBytes, message)) {
+  const acceptLegacySignatures = options.acceptLegacySignatures ?? legacyPolicy.accept;
+  const inputs = authChallengeVerificationInputs(challenge, { acceptLegacySignatures });
+  for (let index = 0; index < inputs.length; index += 1) {
+    if (await subtle.verify({ name: "Ed25519" }, publicKey, signatureBytes, inputs[index])) {
+      // For a v2 challenge the second input is the raw form of older clients.
+      if (index > 0) {
+        legacyPolicy.onLegacySignature?.(options.use);
+      }
       return true;
     }
   }

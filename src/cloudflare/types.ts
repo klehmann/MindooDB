@@ -91,6 +91,8 @@ export interface MindooCloudflareEnv {
   /** RFC 3161 providers, same syntax as on Node. */
   MINDOODB_TSA_PROVIDERS?: string;
   MINDOODB_ALLOW_INSECURE_SYNC_URLS?: string;
+  /** `0`/`false` refuses pre-v2 login challenge signatures, like on Node. */
+  MINDOODB_ACCEPT_LEGACY_CHALLENGE_SIGNATURES?: string;
 
   /** Optional rate limiters; without them the tier is not enforced. */
   MINDOODB_RATE_LIMIT_GLOBAL?: RateLimitBinding;

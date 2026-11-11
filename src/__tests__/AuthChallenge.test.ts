@@ -4,6 +4,7 @@ import {
   authChallengeForm,
   authChallengeSigningBytes,
   issueAuthChallenge,
+  setLegacyChallengeSignaturePolicy,
 } from "../core/crypto/AuthChallenge";
 import { buildEntrySigningBytes } from "../core/crypto/EntrySignature";
 import { AuthenticationService } from "../core/appendonlystores/network/AuthenticationService";
@@ -12,6 +13,10 @@ import type { NetworkTransport } from "../core/appendonlystores/network/NetworkT
 import { StoreKind } from "../core/appendonlystores/types";
 import type { MindooTenantDirectory } from "../core/types";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
+import {
+  acceptsLegacyChallengeSignatures,
+  configureLegacyChallengeSignatures,
+} from "../server/legacyChallengeSignatures";
 import { SystemAdminAuthService } from "../server/SystemAdminAuth";
 
 /**
@@ -150,6 +155,64 @@ describe("login challenge signing", () => {
       const challenge = await auth.generateChallenge("alice");
       const result = await auth.authenticate(challenge, await sign(new TextEncoder().encode(challenge)));
       expect(result.success).toBe(false);
+    });
+  });
+
+  describe("the server's switch for legacy signatures", () => {
+    afterEach(() => {
+      setLegacyChallengeSignaturePolicy({ accept: true });
+    });
+
+    async function login(kind: "raw" | "v2") {
+      const auth = new AuthenticationService(crypto, directoryWith("alice", publicKeyPem), "t1");
+      const challenge = await auth.generateChallenge("alice");
+      const bytes = kind === "raw" ? new TextEncoder().encode(challenge) : authChallengeSigningBytes(challenge);
+      return (await auth.authenticate(challenge, await sign(bytes))).success;
+    }
+
+    it("reads the setting: only an explicit off refuses", () => {
+      for (const value of [undefined, "", "1", "true", "anything"]) {
+        expect(acceptsLegacyChallengeSignatures(value)).toBe(true);
+      }
+      for (const value of ["0", "false", " FALSE ", "off", "no"]) {
+        expect(acceptsLegacyChallengeSignatures(value)).toBe(false);
+      }
+    });
+
+    it("refuses raw signatures for every login of the process when switched off", async () => {
+      expect(configureLegacyChallengeSignatures("0", { log: () => undefined })).toBe(false);
+      expect(await login("raw")).toBe(false);
+      expect(await login("v2")).toBe(true);
+
+      const admin = new SystemAdminAuthService(crypto, {
+        capabilities: { "ALL:*": [{ username: "cn=root", publicsignkey: publicKeyPem }] },
+      } as never);
+      const challenge = await admin.generateChallenge("cn=root", publicKeyPem);
+      const raw = await sign(new TextEncoder().encode(challenge));
+      expect((await admin.authenticate(challenge, raw)).success).toBe(false);
+    });
+
+    it("logs accepted legacy logins, at most once an hour per kind, with the count", async () => {
+      const lines: string[] = [];
+      let time = 1_000_000_000;
+      configureLegacyChallengeSignatures(undefined, { log: (line) => lines.push(line), now: () => time });
+
+      expect(await login("v2")).toBe(true);
+      expect(lines).toHaveLength(0);
+
+      expect(await login("raw")).toBe(true);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("1 sync login(s)");
+      expect(lines[0]).toContain("MINDOODB_ACCEPT_LEGACY_CHALLENGE_SIGNATURES");
+
+      expect(await login("raw")).toBe(true);
+      expect(await login("raw")).toBe(true);
+      expect(lines).toHaveLength(1);
+
+      time += 60 * 60 * 1000;
+      expect(await login("raw")).toBe(true);
+      expect(lines).toHaveLength(2);
+      expect(lines[1]).toContain("3 sync login(s)");
     });
   });
 

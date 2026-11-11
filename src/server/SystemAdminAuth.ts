@@ -254,7 +254,9 @@ export class SystemAdminAuthService {
         ["verify"],
       );
 
-      return await verifyAuthChallengeSignature(subtle, publicKey, message, signature);
+      return await verifyAuthChallengeSignature(subtle, publicKey, message, signature, {
+        use: "system-admin",
+      });
     } catch {
       return false;
     }

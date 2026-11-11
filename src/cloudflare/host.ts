@@ -4,6 +4,7 @@
 
 import { parseBodySizeLimitToBytes } from "../server/http/MindooDBServerCore";
 import { parseTsaProviders, type TsaProviderConfig } from "../server/timestampProxy";
+import { configureLegacyChallengeSignatures } from "../server/legacyChallengeSignatures";
 import type { ServerDataStore } from "../server/ServerDataStore";
 import { base64ToBytes } from "../core/utils/base64";
 import { INTERNAL_HEADER, jsonResponse } from "./http";
@@ -29,6 +30,8 @@ export interface HostSettings {
 export function createHostSettings(env: MindooCloudflareEnv): HostSettings {
   const jsonBodyLimit = env.MINDOODB_JSON_BODY_LIMIT?.trim() || "5mb";
   const allowInsecureSyncUrls = /^(1|true)$/i.test(env.MINDOODB_ALLOW_INSECURE_SYNC_URLS ?? "");
+  // One policy per isolate; every object in it reads the same binding.
+  configureLegacyChallengeSignatures(env.MINDOODB_ACCEPT_LEGACY_CHALLENGE_SIGNATURES);
   return {
     jsonBodyLimit,
     jsonBodyLimitBytes: parseBodySizeLimitToBytes(jsonBodyLimit),

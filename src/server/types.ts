@@ -292,4 +292,12 @@ export const ENV_VARS = {
    * client would turn the endpoint into an SSRF gadget.
    */
   TSA_PROVIDERS: "MINDOODB_TSA_PROVIDERS",
+  /**
+   * `0`/`false` refuses logins from clients that predate the v2 challenge
+   * signing domain (they sign the challenge raw). Unset or `1`/`true` accepts
+   * them and logs each kind of such login at most once an hour, so the
+   * setting can be switched off once the log stays quiet. See
+   * `server/legacyChallengeSignatures.ts`.
+   */
+  ACCEPT_LEGACY_CHALLENGE_SIGNATURES: "MINDOODB_ACCEPT_LEGACY_CHALLENGE_SIGNATURES",
 } as const;
