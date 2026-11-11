@@ -1000,6 +1000,7 @@ The server includes the following hardening measures:
 - **Error sanitization** -- internal errors never leak file paths or stack traces to clients. Only known auth/validation errors return specific messages.
 - **Request size limits** -- JSON body limited to 5MB. Array sizes capped (100k IDs, 10k entries for putEntries).
 - **Connection timeouts** -- idle connections are closed after 30 seconds.
+- **Container confinement** -- the Docker setup runs the server as a non-root user on a read-only filesystem, without Linux capabilities and with `no-new-privileges`. See [Container hardening](#container-hardening) and, for multi-organisation hosts, [Sandboxed runtime (gVisor)](#sandboxed-runtime-gvisor).
 - **Optional `/system/*` IP allowlist** — set `MINDOODB_ADMIN_ALLOWED_IPS` to a comma-separated list of IPs or IPv4/IPv6 CIDRs (e.g., `127.0.0.1,::1,10.0.0.0/8,2001:db8::/32`) to restrict which client addresses may call **any** `/system/*` route (including auth). If unset or `*`, there is no IP restriction at this layer. IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is normalized. Behind a reverse proxy, set `MINDOODB_TRUST_PROXY` so `req.ip` is accurate.
 
 For production deployments, also consider:
@@ -1148,6 +1149,38 @@ The generated override contains either published port bindings or `network_mode:
 If you only changed application code and do not need to adjust ports or bind addresses, `docker compose up -d --build` is usually enough.
 
 Linux **image builds** always use Docker host networking so `pnpm` can resolve `registry.npmjs.org`. That is independent of the runtime choice. To force the isolated default build network: `MINDOODB_DOCKER_BUILD_NETWORK=default bash serversetup.sh`. Skip the runtime prompt with `MINDOODB_DOCKER_NETWORK=host` or `bridge`. Health checks use `/health` — `GET /` is 404 unless a static UI is configured.
+
+### Container hardening
+
+`docker-compose.yml` runs the server with a small attack surface, in case a flaw in Node or a dependency ever gives an attacker code execution inside the server process:
+
+| Setting | Effect |
+|---|---|
+| non-root user (image, uid/gid from the override) | no root inside the container |
+| `read_only: true` + `tmpfs: /tmp` | the program files cannot be changed; the server writes only to `/data` |
+| `cap_drop: [ALL]` | no Linux capabilities (port 1661 needs none) |
+| `security_opt: no-new-privileges` | setuid binaries cannot raise rights |
+| `pids_limit: 512` | bounds runaway process creation |
+
+These need nothing on the host and also work on OpenWrt routers. A memory limit depends on the host and on how large your tenants are, so none is set; add one in `docker-compose.override.yml` if you want it (`mem_limit: 2g`).
+
+With plain `docker run`, the same flags are `--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --cap-drop ALL --security-opt no-new-privileges --pids-limit 512`.
+
+What the container can still reach is `/data`: the stores (end-to-end encrypted content, plus metadata) and the encrypted server identity, and the unlock password it was started with. Content keys never reach the server.
+
+### Sandboxed runtime (gVisor)
+
+The settings above confine the process, but it still talks to the host's Linux kernel directly. On a host that serves tenants of different organisations, [gVisor](https://gvisor.dev) adds a second boundary: the container's system calls go to a user-space kernel instead of the host's. It costs some I/O throughput and needs `runsc` installed on the host (x86-64 or arm64 Linux, not available on typical router firmware).
+
+After [installing runsc](https://gvisor.dev/docs/user_guide/install/) and registering it with Docker (`runsc install`, restart Docker), add to `docker-compose.override.yml`:
+
+```yaml
+services:
+  mindoodb:
+    runtime: runsc
+```
+
+`docker compose up -d` then starts the same image under gVisor; check with `docker inspect --format '{{.HostConfig.Runtime}}' <container>`. Iroh (QUIC over UDP) and the on-disk stores work under gVisor's default settings in principle, but this combination is not part of the project's test suite — try it against a copy of your data first.
 
 ### Manual Docker commands (without serversetup.sh)
 
