@@ -27,5 +27,25 @@ services:
       # docker-compose.override.yml (bridge ports or network_mode: host).
       network: host
     restart: unless-stopped
+    # Containment, should a flaw in Node or a dependency ever give an attacker
+    # code execution in the server process:
+    # - read-only root filesystem: the program files cannot be replaced. The
+    #   server writes only to /data (bind mount) and, at most, to /tmp.
+    # - no Linux capabilities: the process runs as a normal user on port 1661
+    #   and needs none.
+    # - no-new-privileges: setuid binaries cannot raise its rights.
+    # - a process limit against fork bombs.
+    # A memory limit depends on the host and the tenants' size; add
+    # `mem_limit: 2g` (or similar) in docker-compose.override.yml if wanted.
+    # For kernel isolation on top, see "Sandboxed runtime (gVisor)" in
+    # README-server.md.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     environment:
       MINDOODB_SERVER_PASSWORD_FILE: /run/secrets/server_unlock
