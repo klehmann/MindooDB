@@ -190,7 +190,9 @@ export class PeerAuthService {
         false,
         ["verify"],
       );
-      return await verifyAuthChallengeSignature(subtle, publicKey, message, signature);
+      return await verifyAuthChallengeSignature(subtle, publicKey, message, signature, {
+        use: "peer",
+      });
     } catch {
       return false;
     }

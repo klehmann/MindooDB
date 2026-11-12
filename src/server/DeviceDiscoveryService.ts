@@ -195,7 +195,9 @@ export class DeviceDiscoveryService {
         false,
         ["verify"],
       );
-      return await verifyAuthChallengeSignature(subtle, key, challenge, signature);
+      return await verifyAuthChallengeSignature(subtle, key, challenge, signature, {
+        use: "device-discovery",
+      });
     } catch {
       return false;
     }

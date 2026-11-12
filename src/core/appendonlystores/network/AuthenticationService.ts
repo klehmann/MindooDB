@@ -45,7 +45,7 @@ export class AuthenticationService {
   
   // Configuration
   private challengeExpirationMs: number;
-  private readonly acceptLegacyChallengeSignatures: boolean;
+  private readonly acceptLegacyChallengeSignatures: boolean | undefined;
   private tokenExpirationMs: number;
   private logger: Logger;
 
@@ -60,12 +60,13 @@ export class AuthenticationService {
       logger?: Logger;
       /**
        * Accept a raw signature over a v2 challenge from clients that predate
-       * the signing domain (see `crypto/AuthChallenge.ts`). Default true.
+       * the signing domain (see `crypto/AuthChallenge.ts`). Unset follows the
+       * process policy (`setLegacyChallengeSignaturePolicy`), which defaults to true.
        */
       acceptLegacyChallengeSignatures?: boolean;
     }
   ) {
-    this.acceptLegacyChallengeSignatures = options?.acceptLegacyChallengeSignatures !== false;
+    this.acceptLegacyChallengeSignatures = options?.acceptLegacyChallengeSignatures;
     this.cryptoAdapter = cryptoAdapter;
     this.directory = directory;
     this.tenantId = tenantId;
@@ -533,6 +534,7 @@ export class AuthenticationService {
       // The v2 domain form, plus the raw string from clients that predate it.
       return await verifyAuthChallengeSignature(subtle, publicKey, challenge, signature, {
         acceptLegacySignatures: this.acceptLegacyChallengeSignatures,
+        use: "sync",
       });
     } catch (error) {
       this.logger.error(`Signature verification error:`, error);

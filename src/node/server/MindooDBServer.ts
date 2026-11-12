@@ -47,6 +47,7 @@ import type { ServerConfig } from "../../server/types";
 import { createMindooDBServerIrohHandler } from "./IrohServerRpc";
 import { IrohServerEndpoint } from "./IrohServerEndpoint";
 import { ENV_VARS } from "../../server/types";
+import { configureLegacyChallengeSignatures } from "../../server/legacyChallengeSignatures";
 import {
   MAX_TIMESTAMP_REQUEST_BYTES,
   parseTsaProviders,
@@ -154,6 +155,10 @@ export class MindooDBServer {
           .map((provider) => provider.id)
           .join(", ")}`,
       );
+    }
+
+    if (!configureLegacyChallengeSignatures(process.env[ENV_VARS.ACCEPT_LEGACY_CHALLENGE_SIGNATURES])) {
+      console.log("[MindooDBServer] Legacy (pre-v2) login challenge signatures are refused");
     }
 
     this.serverConfig = config ?? { capabilities: {} };
