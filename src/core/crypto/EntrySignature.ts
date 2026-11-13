@@ -224,7 +224,7 @@ function pushInt64BE(parts: Uint8Array[], value: number): void {
  *  || len(sourceSigningBytes)       || sourceSigningBytes   (recursive layout)
  *  || len(sourceMetadataSignature)  || sourceMetadataSignature (raw bytes,
  *                                      zero-length when absent)
- *  -- trailing recipients block, PRESENT ONLY IF recipients.wraps.length > 0 --
+ *  -- trailing recipients block, PRESENT ONLY IF it wraps to anyone (wraps or partial tiers) --
  *  || 0x03                          (ENTRY_RECIPIENTS_BLOCK_TAG)
  *  || len(JSON.stringify(recipients)) || JSON.stringify(recipients)
  * ```
@@ -293,7 +293,7 @@ export function buildEntrySigningBytes(
   }
 
   const recipients = fields.recipients;
-  if (recipients && recipients.wraps.length > 0) {
+  if (recipients && (recipients.wraps.length > 0 || (recipients.partial ?? []).some((tier) => tier.wraps.length > 0))) {
     parts.push(new Uint8Array([ENTRY_RECIPIENTS_BLOCK_TAG]));
     pushString(parts, JSON.stringify(recipients));
   }

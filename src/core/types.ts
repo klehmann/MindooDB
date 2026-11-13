@@ -1136,8 +1136,14 @@ export interface MindooTenant {
    * result as a guard before attempting decryption.
    */
   hasDecryptionKey?(decryptionKeyId: string): Promise<boolean>;
-  rememberSealedGenerations?(keyId: string, generations: Uint8Array[]): void;
+  rememberSealedGenerations?(
+    keyId: string,
+    generations: Uint8Array[],
+    block?: import("./userkeys/sealedTypes").EntryRecipients,
+  ): void;
   getSealedGenerations?(keyId: string): Uint8Array[];
+  /** True when only the newer part of the series is held (`history: "none"`). */
+  isPartialSealedSeries?(keyId: string): boolean;
   ingestSealedRecipients?(
     keyId: string,
     recipients: import("./userkeys/sealedTypes").EntryRecipients,
@@ -5808,8 +5814,22 @@ export interface MindooDB {
    * rotation. The new readers can decrypt the whole history. Names are
    * canonicalized (`CN=alice/O=contoso`) and matched case-insensitively;
    * they must include `O=`.
+   *
+   * With `history: "none"` the key rotates first and the new readers only get
+   * the new generation: nothing written before they were added is readable for
+   * them (for a group document: no older group documents). See {@link revealHistory}.
    */
   addRecipients(
+    doc: MindooDoc,
+    recipients: import("./userkeys/sealedTypes").RecipientSpec[],
+    options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
+  ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
+  /**
+   * Give readers that were added with `history: "none"` the older key
+   * generations, so they can read the whole history after all. No rotation.
+   * The caller must hold the whole series.
+   */
+  revealHistory?(
     doc: MindooDoc,
     recipients: import("./userkeys/sealedTypes").RecipientSpec[],
     options?: import("./userkeys/sealedTypes").RecipientChangeOptions,

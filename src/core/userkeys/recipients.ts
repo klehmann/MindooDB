@@ -11,8 +11,11 @@ import { fingerprintEncryptionPublicKey } from "./fingerprint";
 import { sealBundle } from "./sealedCrypto";
 import {
   ENCRYPT_FOR_FIELD,
+  allRecipientWraps,
+  hasRecipientWraps,
   type EncryptForEntry,
   type EntryRecipients,
+  type EntryRecipientTier,
   type RecipientOptions,
   type RecipientSpec,
   type ResolvedRecipient,
@@ -27,6 +30,8 @@ export interface ResolvedWrapTarget {
   keyFingerprint: string;
   publicKeyPem: string;
   label?: string;
+  /** First generation (epoch) this target may hold; absent for the whole history. */
+  historyFrom?: number;
 }
 
 export function newestRecipientBlock(
@@ -34,7 +39,7 @@ export function newestRecipientBlock(
 ): EntryRecipients | undefined {
   let best: { recipients: EntryRecipients; createdAt: number } | undefined;
   for (const entry of entries) {
-    if (!entry.recipients?.wraps?.length) continue;
+    if (!entry.recipients || !hasRecipientWraps(entry.recipients)) continue;
     if (
       !best ||
       entry.recipients.epoch > best.recipients.epoch ||
@@ -62,7 +67,7 @@ export function resolveRecipientsFromPayload(
   payload: MindooDocPayload | Record<string, unknown>,
   recipientsBlock?: EntryRecipients,
 ): ResolvedRecipient[] {
-  const wraps = new Set((recipientsBlock?.wraps ?? []).map((wrap) => wrap.keyFingerprint));
+  const wraps = new Set(allRecipientWraps(recipientsBlock).map((wrap) => wrap.keyFingerprint));
   const epoch = recipientsBlock?.epoch ?? 1;
   return activeEncryptForEntries(readEncryptFor(payload)).map(([id, entry]) => ({
     kind: entry.kind === "device" ? "device" : "user",
@@ -71,6 +76,7 @@ export function resolveRecipientsFromPayload(
     label: entry.label,
     addedInEpoch: epoch,
     sealed: !!(entry.keyFingerprint && wraps.has(entry.keyFingerprint)),
+    ...(entry.historyFrom && entry.historyFrom > 1 ? { historyFrom: entry.historyFrom } : {}),
   }));
 }
 
@@ -251,22 +257,50 @@ async function resolveDeviceTarget(
   return null;
 }
 
+/**
+ * Seals `generations` (newest first) to `targets`. Targets with a `historyFrom`
+ * above 1 get their own bundle with only the generations from that epoch on.
+ */
 export async function sealToTargets(input: {
   tenant: BaseMindooTenant;
   generations: Uint8Array[];
   targets: ResolvedWrapTarget[];
   epoch: number;
 }): Promise<EntryRecipients> {
-  const sealed = await sealBundle({
-    crypto: input.tenant.getCryptoAdapter(),
-    generations: input.generations,
-    wrapsTo: input.targets.map((target) => ({
+  const crypto = input.tenant.getCryptoAdapter();
+  const wrapsOf = (targets: ResolvedWrapTarget[]) =>
+    targets.map((target) => ({
       kind: target.kind,
       fingerprint: target.keyFingerprint,
       publicKeyPem: target.publicKeyPem,
-    })),
+    }));
+  const limitOf = (target: ResolvedWrapTarget): number =>
+    target.historyFrom && target.historyFrom > 1 ? Math.min(target.historyFrom, input.epoch) : 1;
+  const sealed = await sealBundle({
+    crypto,
+    generations: input.generations,
+    wrapsTo: wrapsOf(input.targets.filter((target) => limitOf(target) === 1)),
   });
   sealed.epoch = input.epoch;
+  const byFrom = new Map<number, ResolvedWrapTarget[]>();
+  for (const target of input.targets) {
+    const from = limitOf(target);
+    if (from === 1) continue;
+    byFrom.set(from, [...(byFrom.get(from) ?? []), target]);
+  }
+  if (byFrom.size > 0) {
+    const tiers: EntryRecipientTier[] = [];
+    for (const [from, targets] of [...byFrom.entries()].sort((a, b) => a[0] - b[0])) {
+      // generations are newest first: epoch N is index 0, epoch `from` is index N - from.
+      const tier = await sealBundle({
+        crypto,
+        generations: input.generations.slice(0, input.epoch - from + 1),
+        wrapsTo: wrapsOf(targets),
+      });
+      tiers.push({ from, bundle: tier.bundle, wraps: tier.wraps });
+    }
+    sealed.partial = tiers;
+  }
   return sealed;
 }
 

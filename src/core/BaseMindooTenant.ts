@@ -37,7 +37,7 @@ import type {
 } from "./userkeys/types";
 import { currentUserKeyEpoch } from "./userkeys/types";
 import { asUserKeyPayload } from "./userkeys/validateUserKeyDocument";
-import { isSealedKeyId } from "./userkeys/sealedTypes";
+import { allRecipientWraps, isSealedKeyId } from "./userkeys/sealedTypes";
 import type { EntryRecipients } from "./userkeys/sealedTypes";
 import { newestRecipientBlock, resolveRecipientSpecs, sealToTargets } from "./userkeys/recipients";
 import type { RecipientOptions, RecipientSpec } from "./userkeys/sealedTypes";
@@ -165,6 +165,10 @@ export class BaseMindooTenant implements MindooTenant {
   private readonly backgroundTasks = new BackgroundTaskTracker();
   private readonly userKeys = new UserKeyManager(this);
   private readonly sealedGenerations = new Map<string, Uint8Array[]>();
+  /** Per sealed key id: the bundle of the recipient block last opened. */
+  private readonly sealedBlocks = new Map<string, string>();
+  /** Sealed key ids whose cached series lacks the older generations. */
+  private readonly sealedPartial = new Set<string>();
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -508,8 +512,30 @@ export class BaseMindooTenant implements MindooTenant {
     await this.userKeys.ensureLocalUserKeyPair(this.currentUser, this.currentUserPassword);
   }
 
-  rememberSealedGenerations(keyId: string, generations: Uint8Array[]): void {
+  /**
+   * `generations` newest first. `block` is the recipient block they were sealed
+   * into, so ingesting that same block again is skipped even for a reader with a
+   * history limit (who holds fewer generations than the epoch).
+   */
+  rememberSealedGenerations(keyId: string, generations: Uint8Array[], block?: EntryRecipients): void {
     this.sealedGenerations.set(keyId, generations);
+    if (block) this.sealedBlocks.set(keyId, block.bundle);
+    else this.sealedBlocks.delete(keyId);
+    this.setSealedPartial(keyId, generations.length, block?.epoch);
+  }
+
+  /**
+   * Whether this session holds only the newer part of a sealed key series
+   * (added with `history: "none"`): documents encrypted with an older
+   * generation are not readable although the key id is known.
+   */
+  isPartialSealedSeries(keyId: string): boolean {
+    return this.sealedPartial.has(keyId);
+  }
+
+  private setSealedPartial(keyId: string, held: number, epoch: number | undefined): void {
+    if (epoch !== undefined && held < epoch) this.sealedPartial.add(keyId);
+    else this.sealedPartial.delete(keyId);
   }
 
   getSealedGenerations(keyId: string): Uint8Array[] {
@@ -519,7 +545,7 @@ export class BaseMindooTenant implements MindooTenant {
   async ingestSealedRecipients(keyId: string, recipients: EntryRecipients): Promise<void> {
     const cached = this.sealedGenerations.get(keyId);
     const epoch = typeof recipients.epoch === "number" ? recipients.epoch : 0;
-    if (cached && cached.length >= epoch && epoch > 0) {
+    if (cached && ((cached.length >= epoch && epoch > 0) || this.sealedBlocks.get(keyId) === recipients.bundle)) {
       console.log("[sealed] ingest: cache already has generations", {
         keyId,
         cached: cached.length,
@@ -533,8 +559,8 @@ export class BaseMindooTenant implements MindooTenant {
     ].filter((k): k is CryptoKey => !!k);
     console.log("[sealed] ingest: trying unwrap", {
       keyId,
-      wrapCount: recipients.wraps?.length ?? 0,
-      wrapKinds: (recipients.wraps ?? []).map((wrap) => wrap.kind),
+      wrapCount: allRecipientWraps(recipients).length,
+      wrapKinds: allRecipientWraps(recipients).map((wrap) => wrap.kind),
       epoch,
       keyCount: keys.length,
       cached: cached?.length ?? 0,
@@ -553,6 +579,8 @@ export class BaseMindooTenant implements MindooTenant {
           privateKey: key,
         });
         this.sealedGenerations.set(keyId, gens);
+        this.sealedBlocks.set(keyId, recipients.bundle);
+        this.setSealedPartial(keyId, gens.length, epoch || undefined);
         console.log("[sealed] ingest: unwrapped", { keyId, generations: gens.length });
         return;
       } catch {
@@ -568,6 +596,8 @@ export class BaseMindooTenant implements MindooTenant {
       epoch,
     });
     this.sealedGenerations.delete(keyId);
+    this.sealedBlocks.delete(keyId);
+    this.sealedPartial.delete(keyId);
   }
 
   /**

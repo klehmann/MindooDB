@@ -535,8 +535,8 @@ await db.removeRecipients(group, ["CN=bob/O=contoso"]);   // rotates: Bob reads 
 
 - **Same key, same rules.** The documents are encrypted with the group's newest
   generation and decrypted with any of them, exactly like changes to the group
-  document itself (§7.5). Adding a member reveals the whole history, removing one is a
-  forward cutoff (§6.3).
+  document itself (§7.5). Adding a member reveals the whole history (unless added
+  with `history: "none"`, §6.7), removing one is a forward cutoff (§6.3).
 - **Membership changes touch one document.** The recipient block lives only on the
   group document; documents that use it carry none. A replica that is added or removed
   re-runs the key visibility reconcile once after the sync pass that changed its access,
@@ -551,6 +551,47 @@ await db.removeRecipients(group, ["CN=bob/O=contoso"]);   // rotates: Bob reads 
 - **What the server sees:** documents of a group carry only the key id
   `$sealed:<group id>`, no wraps; the group's member fingerprints are on the group
   document alone.
+
+### 6.7 Adding readers without the history
+
+By default a new reader gets every key generation and reads everything that was ever
+written. For a class chat that a family joins in the middle of the year, or a group
+that discussed something before a person was added, that is not wanted:
+
+```ts
+await db.addRecipients(group, ["CN=carol/O=contoso"], { history: "none" });
+// ... later, if it was a mistake or the group decides otherwise:
+await db.revealHistory(group, ["CN=carol/O=contoso"]);
+```
+
+- **`history: "none"` rotates first.** A new generation is created and Carol gets a
+  bundle of her own that holds only that generation. Everything encrypted before is
+  cryptographically unreadable for her, not just filtered out: older documents of the
+  group do not appear on her replica (their origin entry is test-decrypted once).
+- **The limit sticks.** Her entry in `_encryptFor` records `historyFrom` (the first
+  epoch she holds). Every later re-seal, by any member, honours it: a rotation after a
+  removal hands her only the generations from `historyFrom` on. `getRecipients()`
+  reports `historyFrom` for such readers.
+- **`revealHistory`** clears the limit and re-seals without a rotation; after the next
+  sync her replica reveals the older documents. It cannot be undone for what she has
+  already received: taking the history away again only protects later content
+  (remove and re-add with `history: "none"`).
+- **Who can change the list.** Re-sealing hands every reader their generations, so the
+  caller needs the whole series. A reader who was added without history gets "a member
+  who holds the whole history has to do this" from the recipient mutators until their
+  history was revealed.
+- **The document itself stays readable.** Its older entries are under the old
+  generations too, so `history: "none"` writes a snapshot of the current state under
+  the new key. For a group document the new reader therefore sees the group's current
+  content (name, member list) but none of the older documents that use its key.
+- **Limits.** Existing readers can of course pass on what they can read. A later
+  snapshot of an *older* group-encrypted document (written automatically after many
+  changes to that one document) is encrypted with the newest generation and so becomes
+  readable for readers without history; documents that are written once, like chat
+  messages, are never snapshotted.
+- **Wire format.** A recipient block gains an optional `partial` list: one bundle per
+  distinct `historyFrom` with its own wraps. Blocks without limited readers are
+  byte-identical to before.
 
 ## 7) Architecture
 

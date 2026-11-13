@@ -4240,8 +4240,10 @@ export class BaseMindooDB implements MindooDB {
         visibility.decryptionKeyId,
         metadataByDoc.get(docId)!,
       );
-      const canRead = await this.tenant.hasDecryptionKey(
+      const canRead = await this.canReadWithKey(
         visibility.decryptionKeyId,
+        docId,
+        metadataByDoc.get(docId)!,
       );
 
       if (canRead) {
@@ -4843,8 +4845,10 @@ export class BaseMindooDB implements MindooDB {
               representativeEntry.decryptionKeyId,
               sealedIngestEntries,
             );
-            const keyAvailable = await this.tenant.hasDecryptionKey(
+            const keyAvailable = await this.canReadWithKey(
               representativeEntry.decryptionKeyId,
+              docId,
+              coldSync ? entryMetadataList : fullDocMetadata,
             );
             if (!keyAvailable) {
               this.logger.debug(
@@ -6971,6 +6975,7 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<void> {
     if (!this.tenant.ingestSealedFromEntries) return;
     const hadKey = isSealedKeyId(keyId) ? await this.tenant.hasDecryptionKey(keyId) : false;
+    const heldBefore = this.tenant.getSealedGenerations?.(keyId).length ?? 0;
     this.sealedIngestDepth++;
     try {
       await this.tenant.ingestSealedFromEntries(keyId, entries);
@@ -6982,7 +6987,13 @@ export class BaseMindooDB implements MindooDB {
     } finally {
       this.sealedIngestDepth--;
     }
-    if (isSealedKeyId(keyId) && hadKey !== (await this.tenant.hasDecryptionKey(keyId))) {
+    if (
+      isSealedKeyId(keyId) &&
+      (hadKey !== (await this.tenant.hasDecryptionKey(keyId)) ||
+        (hadKey &&
+          heldBefore !== (this.tenant.getSealedGenerations?.(keyId).length ?? 0)))
+    ) {
+      this.partialSeriesProbes.clear();
       // Joined or left the key series: documents of a group document that were
       // hidden (or readable) until now have to follow (see reconcileGroupKeyAccess).
       this.groupKeyAccessChanged.add(keyId);
@@ -6995,6 +7006,47 @@ export class BaseMindooDB implements MindooDB {
    * next {@link reconcileGroupKeyAccess} re-runs the key visibility reconcile.
    */
   private groupKeyAccessChanged = new Set<string>();
+
+  /** Per document: whether its origin decrypted with the partial series held then. */
+  private partialSeriesProbes = new Map<string, boolean>();
+
+  /**
+   * Whether this replica can read a document of key `keyId`. Usually the key id
+   * alone decides; a reader added to a group without its history
+   * (`history: "none"`) knows the key id but holds only the newer generations,
+   * so the document's origin entry is test-decrypted (once per document).
+   */
+  private async canReadWithKey(
+    keyId: string,
+    docId: string,
+    metas: StoreEntryMetadata[] | undefined,
+  ): Promise<boolean> {
+    if (!(await this.tenant.hasDecryptionKey(keyId))) return false;
+    if (!isSealedKeyId(keyId) || !this.tenant.isPartialSealedSeries?.(keyId)) return true;
+    const known = this.partialSeriesProbes.get(docId);
+    if (known !== undefined) return known;
+    const all = metas ?? (await this.scanAllMetadata(this.store, { docId }));
+    // Loading starts from the newest snapshot when there is one (written under
+    // the new key when readers were added without history), else from the create.
+    const origin =
+      all
+        .filter((meta) => meta.entryType === "doc_snapshot")
+        .sort((a, b) => b.createdAt - a.createdAt)[0] ??
+      all.find((meta) => meta.entryType === "doc_create");
+    if (!origin) return true;
+    let ok = false;
+    try {
+      const [entry] = await this.store.getEntries([origin.id]);
+      if (entry) {
+        await this.tenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId);
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+    this.partialSeriesProbes.set(docId, ok);
+    return ok;
+  }
   /** Group key series last probed without success, by key id (ms), see ingestGroupKey. */
   private groupKeyMisses = new Map<string, number>();
   private static readonly GROUP_KEY_MISS_TTL_MS = 2000;
@@ -13378,6 +13430,8 @@ export class BaseMindooDB implements MindooDB {
     attachmentIds?: string[];
     bypassPrecheck?: boolean;
     recipients?: EntryRecipients;
+    /** Write a snapshot right away (current state under the newest key). */
+    forceSnapshot?: boolean;
   }): Promise<void> {
     const {
       internalDoc,
@@ -13424,6 +13478,7 @@ export class BaseMindooDB implements MindooDB {
         attachmentIds,
         bypassPrecheck,
         recipients: options.recipients,
+        forceSnapshot: options.forceSnapshot,
       });
     } catch (error) {
       // Automerge.change() outdated the cached document and moved its WASM
@@ -13452,6 +13507,7 @@ export class BaseMindooDB implements MindooDB {
     attachmentIds?: string[];
     bypassPrecheck?: boolean;
     recipients?: EntryRecipients;
+    forceSnapshot?: boolean;
   }): Promise<void> {
     const {
       internalDoc,
@@ -13595,8 +13651,9 @@ export class BaseMindooDB implements MindooDB {
             signingKeyPair,
             signingKeyPassword,
             createdByPublicKey: createdByPublicKey ?? "",
+            force: options.forceSnapshot,
           }
-        : { createdByPublicKey: createdByPublicKey ?? "" },
+        : { createdByPublicKey: createdByPublicKey ?? "", force: options.forceSnapshot },
     );
   }
 
@@ -13711,6 +13768,8 @@ export class BaseMindooDB implements MindooDB {
       signingKeyPair?: SigningKeyPair;
       signingKeyPassword?: string;
       createdByPublicKey: string;
+      /** Skip the change-count and cooldown thresholds. */
+      force?: boolean;
     },
   ): Promise<void> {
     const docId = internalDoc.id;
@@ -13720,7 +13779,7 @@ export class BaseMindooDB implements MindooDB {
       // An absent counter (first write this session) forces one scan to learn
       // the real backlog, after which the counter tracks it incrementally.
       const knownWrites = this.writesSinceSnapshotCheck.get(docId);
-      if (knownWrites !== undefined) {
+      if (knownWrites !== undefined && !options.force) {
         const writes = knownWrites + 1;
         if (writes < this.snapshotMinChanges) {
           this.writesSinceSnapshotCheck.set(docId, writes);
@@ -13741,10 +13800,11 @@ export class BaseMindooDB implements MindooDB {
         (em) => em.createdAt > latestSnapshotAt,
       ).length;
       this.writesSinceSnapshotCheck.set(docId, changesSinceSnapshot);
-      if (changesSinceSnapshot < this.snapshotMinChanges) {
+      if (changesSinceSnapshot < this.snapshotMinChanges && !options.force) {
         return;
       }
       if (
+        !options.force &&
         latestSnapshot &&
         Date.now() - latestSnapshot.createdAt < this.snapshotCooldownMs
       ) {
@@ -15932,6 +15992,14 @@ export class BaseMindooDB implements MindooDB {
     return this.mutateRecipients(doc, "set", recipients, options);
   }
 
+  async revealHistory(
+    doc: MindooDoc,
+    recipients: RecipientSpec[],
+    options?: RecipientChangeOptions,
+  ): Promise<RecipientChangeResult> {
+    return this.mutateRecipients(doc, "reveal", recipients, options);
+  }
+
   async canChangeRecipients(
     doc: MindooDoc,
     next: RecipientSpec[],
@@ -15945,7 +16013,7 @@ export class BaseMindooDB implements MindooDB {
 
   private async mutateRecipients(
     doc: MindooDoc,
-    mode: "add" | "remove" | "set",
+    mode: "add" | "remove" | "set" | "reveal",
     specs: RecipientSpec[],
     options?: RecipientChangeOptions,
   ): Promise<RecipientChangeResult> {
@@ -16013,6 +16081,15 @@ export class BaseMindooDB implements MindooDB {
           addedTargets.push(target);
       }
     }
+    const revealedIds: string[] = [];
+    if (mode === "reveal") {
+      for (const [id, entry] of Object.entries(currentMap)) {
+        if (entry.removedAt || !entry.historyFrom) continue;
+        if (resolved.targets.some((target) => matchesTarget(id, entry, target))) {
+          revealedIds.push(id);
+        }
+      }
+    }
     if (mode === "remove") {
       for (const [id, entry] of Object.entries(currentMap)) {
         if (entry.removedAt) continue;
@@ -16035,7 +16112,9 @@ export class BaseMindooDB implements MindooDB {
         if (!keep && !nextIds.has(base)) removedStableIds.push(base);
       }
     }
-    const rotate = removedStableIds.length > 0;
+    const withoutHistory =
+      mode === "add" && options?.history === "none" && addedTargets.length > 0;
+    const rotate = removedStableIds.length > 0 || withoutHistory;
     const currentGens = tenant.getSealedGenerations(
       internalDoc.decryptionKeyId,
     );
@@ -16045,7 +16124,22 @@ export class BaseMindooDB implements MindooDB {
       );
     }
     let generations = currentGens;
-    let epoch = internalDoc.sealedRecipients?.epoch ?? currentGens.length;
+    // The epoch comes from the store, not from the cached document: a cache
+    // entry without its recipient block would make a partial series look whole.
+    const newestBlock =
+      newestRecipientBlock(await this.scanAllMetadata(this.store, { docId })) ??
+      internalDoc.sealedRecipients;
+    let epoch = Math.max(newestBlock?.epoch ?? 0, currentGens.length);
+    if (
+      currentGens.length < epoch ||
+      tenant.isPartialSealedSeries?.(internalDoc.decryptionKeyId)
+    ) {
+      // Re-sealing hands every remaining reader its generations; with only part
+      // of the series we would cut the history of everyone else.
+      throw new Error(
+        "Cannot change recipients: you were added without the earlier history; a member who holds the whole history has to do this",
+      );
+    }
     if (rotate) {
       const nextDek = tenant
         .getCryptoAdapter()
@@ -16054,6 +16148,12 @@ export class BaseMindooDB implements MindooDB {
       epoch += 1;
     }
 
+    const historyFromByStable = new Map<string, number>();
+    for (const [id, entry] of Object.entries(currentMap)) {
+      if (entry.removedAt || !entry.historyFrom || revealedIds.includes(id)) continue;
+      historyFromByStable.set(id.split("#")[0], entry.historyFrom);
+      if (entry.keyFingerprint) historyFromByStable.set(entry.keyFingerprint, entry.historyFrom);
+    }
     const remainingByStable = new Map<string, ResolvedWrapTarget>();
     const existingSpecs = Object.entries(currentMap)
       .filter(([, e]) => !e.removedAt)
@@ -16073,8 +16173,17 @@ export class BaseMindooDB implements MindooDB {
       for (const target of existingResolved.targets)
         remainingByStable.set(target.stableId, target);
     }
+    for (const [stableId, target] of remainingByStable) {
+      const from =
+        historyFromByStable.get(stableId) ??
+        historyFromByStable.get(target.keyFingerprint);
+      if (from) remainingByStable.set(stableId, { ...target, historyFrom: from });
+    }
     for (const target of addedTargets)
-      remainingByStable.set(target.stableId, target);
+      remainingByStable.set(
+        target.stableId,
+        withoutHistory ? { ...target, historyFrom: epoch } : target,
+      );
     for (const id of removedStableIds) {
       remainingByStable.delete(id);
       for (const [stableId, target] of [...remainingByStable.entries()]) {
@@ -16097,7 +16206,11 @@ export class BaseMindooDB implements MindooDB {
       targets: remaining,
       epoch,
     });
-    tenant.rememberSealedGenerations(internalDoc.decryptionKeyId, generations);
+    tenant.rememberSealedGenerations(
+      internalDoc.decryptionKeyId,
+      generations,
+      recipientsBlock,
+    );
 
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
     const newDoc = Automerge.change(
@@ -16116,9 +16229,19 @@ export class BaseMindooDB implements MindooDB {
               addedBy: signer,
               keyFingerprint: target.keyFingerprint,
               ...(target.label ? { label: target.label } : {}),
+              ...(withoutHistory ? { historyFrom: epoch } : {}),
             };
           }
           applyEncryptForAdds(draft, addMap, epoch);
+        }
+        if (revealedIds.length > 0) {
+          const map = draft[ENCRYPT_FOR_FIELD] as Record<
+            string,
+            import("./userkeys/sealedTypes").EncryptForEntry
+          >;
+          for (const id of revealedIds) {
+            if (map[id]) delete map[id].historyFrom;
+          }
         }
         if (removedStableIds.length > 0) {
           applyEncryptForRemoves(draft, removedStableIds, now, signer);
@@ -16141,6 +16264,9 @@ export class BaseMindooDB implements MindooDB {
       successMessage: "recipients updated",
       bypassPrecheck: options?.bypassAccessControlPrecheck,
       recipients: recipientsBlock,
+      // Readers added without history cannot decrypt the older entries of this
+      // document itself: a snapshot under the new key gives them its current state.
+      forceSnapshot: withoutHistory,
     });
     if (options?.change) {
       await this.changeDoc(this.wrapDocument(internalDoc), options.change, {
