@@ -952,8 +952,16 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
    * other id in the batch is fetched with full frames as before.
    */
   private async getEntriesUsingScannedMetadata(ids: string[]): Promise<StoreEntry[]> {
-    const known = ids.filter((id) => this.scannedMetadata.has(id));
-    const unknown = ids.filter((id) => !this.scannedMetadata.has(id));
+    // Take this request's metadata now: a concurrent getEntries for the same ids
+    // (a live pull next to a manual sync) consumes the shared map while this one
+    // still waits for its payloads.
+    const knownMetadata = new Map<string, StoreEntryMetadata>();
+    for (const id of ids) {
+      const metadata = this.scannedMetadata.get(id);
+      if (metadata) knownMetadata.set(id, metadata);
+    }
+    const known = [...knownMetadata.keys()];
+    const unknown = ids.filter((id) => !knownMetadata.has(id));
     const token = await this.ensureAuthenticated();
 
     const [payloads, fullBatch] = await Promise.all([
@@ -966,7 +974,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
 
     const joined: NetworkSessionEncryptedEntry[] = [];
     for (const payload of payloads.entries) {
-      const metadata = this.scannedMetadata.get(payload.id);
+      const metadata = knownMetadata.get(payload.id);
       if (!metadata) {
         // The server answered for an id it was not asked for.
         throw new Error(`Remote returned a payload for unrequested entry ${payload.id}`);

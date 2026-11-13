@@ -728,6 +728,39 @@ describe("Network Sync", () => {
       expect(fullRequests).toEqual([["hash3"], ["hash1"]]);
     });
 
+    test("two concurrent fetches of the same scanned entries both succeed", async () => {
+      const entries = [createMockEntry("doc1", "hash1", 1000), createMockEntry("doc2", "hash2", 1001)];
+      await serverStore.putEntries(entries);
+      const baseGetCapabilities = mockTransport.getCapabilities.bind(mockTransport);
+      jest.spyOn(mockTransport, "getCapabilities").mockImplementation(async (token: string) => ({
+        ...(await baseGetCapabilities(token)),
+        supportsBinaryEntries: true,
+        supportsPayloadOnlyEntries: true,
+      }));
+      const transport = mockTransport as unknown as {
+        getEntriesBinary: NetworkTransport["getEntriesBinary"];
+        getEntryPayloadsBinary: NetworkTransport["getEntryPayloadsBinary"];
+      };
+      transport.getEntriesBinary = async (token, ids) => serverHandler.handleGetEntriesSessionWrapped(token, ids);
+      // Answers arrive in reverse order: the second request finishes first.
+      let delay = 30;
+      transport.getEntryPayloadsBinary = async (token, ids) => {
+        const wait = delay;
+        delay = 0;
+        const batch = await serverHandler.handleGetEntriesSessionWrapped(token, ids);
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        return {
+          wrappedSessionKey: batch.wrappedSessionKey,
+          entries: batch.entries.map((e) => ({ id: e.id, iv: e.iv, sessionEncryptedPayload: e.sessionEncryptedPayload })),
+        };
+      };
+
+      await clientStore.scanEntriesSince!(null, 2);
+      const [first, second] = await Promise.all([clientStore.getEntries(["hash1", "hash2"]), clientStore.getEntries(["hash1", "hash2"])]);
+      expect(first.map((e) => e.id).sort()).toEqual(["hash1", "hash2"]);
+      expect(second.map((e) => e.id).sort()).toEqual(["hash1", "hash2"]);
+    });
+
     // --- sync-v5 phase 5: live change subscription via the client store ---
 
     test("should forward change events from the transport and stop on unsubscribe", async () => {

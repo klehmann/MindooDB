@@ -110,7 +110,15 @@ describe("author-scoped read on a real server (HTTP, docs/accesscontrol.md §6.1
     const { tenant: karsten } = await founderFactory.createTenant({ tenantId, adminUser, adminPassword: PASSWORD, appUser: karstenUser, userPassword: PASSWORD });
     karsten.noteUserDirectoryFetched!();
     await karsten.reconcileUserKeys!({ allowSelfCreate: true });
-    await karsten.publishToServer(baseUrl, { systemAdminUser: systemAdmin, systemAdminPassword: SYSTEM_ADMIN_PASSWORD, adminUsername: adminUser.username });
+    // With the administration key the server becomes a trusted witness, as in a real tenant:
+    // with access control on, receipts of an untrusted server would quarantine every entry.
+    await karsten.publishToServer(baseUrl, {
+      systemAdminUser: systemAdmin,
+      systemAdminPassword: SYSTEM_ADMIN_PASSWORD,
+      adminUsername: adminUser.username,
+      adminSigningKey: adminUser.userSigningKeyPair.privateKey,
+      adminPassword: PASSWORD,
+    });
 
     const adminAuth = { networkAuthOverride: { user: adminUser, password: PASSWORD } };
     const push = async (tenant: MindooTenant, dbId: string) => {
