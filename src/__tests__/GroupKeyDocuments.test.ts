@@ -223,4 +223,35 @@ describe("group key documents (groupKeyDocId)", () => {
       (await db.getDocument(group.getId())).getRecipients().find((r) => r.id.includes("carol"))?.historyFrom,
     ).toBeUndefined();
   });
+
+  it("history none twice, by different members: the second late member loads the group; late members cannot re-seal", async () => {
+    const db = await alice.tenant.openDB("chat-no-history-twice");
+    const group = await db.createDocument({ recipients: [bob.username], initialValues: { name: "Team" } });
+    await syncAll(fixture, "chat-no-history-twice");
+
+    const dave = await addPerson(fixture, "dave", "tablet");
+    await syncAll(fixture, "directory");
+    await publishUserKey(dave);
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+
+    await db.addRecipients!(group, [dave.username], { history: "none" });
+    await syncAll(fixture, "chat-no-history-twice");
+    // Bob loaded the group from Alice's snapshot; his change depends on that snapshot entry.
+    const bobDb = await bob.tenant.openDB("chat-no-history-twice");
+    await bobDb.syncStoreChanges();
+    await bobDb.addRecipients!(await bobDb.getDocument(group.getId()), [carol.username], { history: "none" });
+    await syncAll(fixture, "chat-no-history-twice");
+
+    const carolDb = await carol.tenant.openDB("chat-no-history-twice");
+    expect(await visibleIds(carolDb)).toEqual([group.getId()]);
+    expect((await carolDb.getDocument(group.getId())).getData().name).toBe("Team");
+
+    // A re-seal that changes nothing (Bob is a member already) must not open a door for Carol.
+    await db.addRecipients!(await db.getDocument(group.getId()), [bob.username]);
+    await syncAll(fixture, "chat-no-history-twice");
+    await carolDb.syncStoreChanges();
+    const carolGroup = await carolDb.getDocument(group.getId());
+    await expect(carolDb.removeRecipients!(carolGroup, [bob.username])).rejects.toThrow(/whole history/);
+    await expect(carolDb.revealHistory!(carolGroup, [carol.username])).rejects.toThrow(/whole history/);
+  });
 });

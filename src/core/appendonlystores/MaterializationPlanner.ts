@@ -83,19 +83,25 @@ function buildLatestStateReachability(
  * 1) explicit `snapshotHeadEntryIds` (preferred; most accurate)
  * 2) snapshot `dependencyIds` (compatibility fallback)
  */
+function snapshotRoots(snapshot: StoreEntryMetadata): string[] {
+  return snapshot.snapshotHeadEntryIds && snapshot.snapshotHeadEntryIds.length > 0
+    ? snapshot.snapshotHeadEntryIds
+    : snapshot.dependencyIds;
+}
+
 function coveredBySnapshot(
   snapshot: StoreEntryMetadata | null,
   replayById: Map<string, StoreEntryMetadata>,
+  snapshotsById?: Map<string, StoreEntryMetadata>,
 ): Set<string> {
   if (!snapshot) {
     return new Set<string>();
   }
 
-  const roots = snapshot.snapshotHeadEntryIds && snapshot.snapshotHeadEntryIds.length > 0
-    ? snapshot.snapshotHeadEntryIds
-    : snapshot.dependencyIds;
+  const roots = snapshotRoots(snapshot);
 
   const covered = new Set<string>();
+  const seenSnapshots = new Set<string>([snapshot.id]);
   const stack = [...roots];
   while (stack.length > 0) {
     const id = stack.pop()!;
@@ -104,6 +110,14 @@ function coveredBySnapshot(
     }
     const entry = replayById.get(id);
     if (!entry) {
+      // A change written by a replica that loaded the document from a snapshot
+      // names that snapshot entry as its dependency. Whatever that snapshot
+      // covers is then behind this change too, so keep walking through it.
+      const viaSnapshot = snapshotsById?.get(id);
+      if (viaSnapshot && !seenSnapshots.has(id)) {
+        seenSnapshots.add(id);
+        stack.push(...snapshotRoots(viaSnapshot));
+      }
       continue;
     }
     covered.add(id);
@@ -257,6 +271,7 @@ export function computeDocumentMaterializationPlan(
   const replayEntries = allEntriesForDoc.filter(isReplayEntry);
   const replayById = new Map<string, StoreEntryMetadata>(replayEntries.map((e) => [e.id, e]));
   const snapshots = allEntriesForDoc.filter((e) => e.entryType === "doc_snapshot");
+  const snapshotsById = new Map<string, StoreEntryMetadata>(snapshots.map((e) => [e.id, e]));
 
   // ── Step 2: Handle empty replay set ─────────────────────────────────
   // After a dense sync the local store may contain only a snapshot with no
@@ -294,7 +309,7 @@ export function computeDocumentMaterializationPlan(
   let bestCoveredCount = -1;
 
   for (const snapshot of snapshots) {
-    const covered = coveredBySnapshot(snapshot, replayById);
+    const covered = coveredBySnapshot(snapshot, replayById, snapshotsById);
     let coveredLatest = 0;
     for (const id of latestReachable) {
       if (covered.has(id)) {
@@ -317,7 +332,7 @@ export function computeDocumentMaterializationPlan(
   // ── Step 5: Compute the uncovered set ─────────────────────────────
   // These are the entries that the selected snapshot does NOT already include.
   // If no snapshot was selected, the entire latestReachable set is uncovered.
-  const covered = coveredBySnapshot(bestSnapshot, replayById);
+  const covered = coveredBySnapshot(bestSnapshot, replayById, snapshotsById);
   const uncovered = new Set<string>();
   for (const id of latestReachable) {
     if (!covered.has(id)) {

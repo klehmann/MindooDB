@@ -16124,8 +16124,16 @@ export class BaseMindooDB implements MindooDB {
       );
     }
     let generations = currentGens;
-    let epoch = internalDoc.sealedRecipients?.epoch ?? currentGens.length;
-    if (currentGens.length < epoch) {
+    // The epoch comes from the store, not from the cached document: a cache
+    // entry without its recipient block would make a partial series look whole.
+    const newestBlock =
+      newestRecipientBlock(await this.scanAllMetadata(this.store, { docId })) ??
+      internalDoc.sealedRecipients;
+    let epoch = Math.max(newestBlock?.epoch ?? 0, currentGens.length);
+    if (
+      currentGens.length < epoch ||
+      tenant.isPartialSealedSeries?.(internalDoc.decryptionKeyId)
+    ) {
       // Re-sealing hands every remaining reader its generations; with only part
       // of the series we would cut the history of everyone else.
       throw new Error(
