@@ -4,6 +4,20 @@ import { PrivateUserId, MindooTenant, MindooDB, MindooDoc, AttachmentReference, 
 import { KeyBag } from "../core/keys/KeyBag";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 
+/**
+ * Byte comparison for attachment contents. Jest's `toEqual` walks a typed array
+ * element by element and takes seconds for 1 MB; this is a memcmp.
+ */
+function expectSameBytes(actual: Uint8Array, expected: Uint8Array): void {
+  expect(actual.length).toBe(expected.length);
+  const same =
+    Buffer.compare(
+      Buffer.from(actual.buffer, actual.byteOffset, actual.byteLength),
+      Buffer.from(expected.buffer, expected.byteOffset, expected.byteLength),
+    ) === 0;
+  expect(same).toBe(true);
+}
+
 describe("Attachments", () => {
   let factory: BaseMindooTenantFactory;
   let storeFactory: InMemoryContentAddressedStoreFactory;
@@ -177,7 +191,7 @@ describe("Attachments", () => {
       const reloadedDoc = await db.getDocument(doc.getId());
       const retrievedData = await reloadedDoc.getAttachment(attachmentId!);
       
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 30000);
 
     it("reloads the document when attachment reads outlive the document cache", async () => {
@@ -195,7 +209,7 @@ describe("Attachments", () => {
 
       const retrievedData = await reloadedDoc.getAttachment(attachmentId!);
 
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 30000);
 
     it("should throw error for non-existent attachment", async () => {
@@ -483,7 +497,7 @@ describe("Attachments", () => {
         result.set(chunk, offset);
         offset += chunk.length;
       }
-      expect(result).toEqual(testData);
+      expectSameBytes(result, testData);
     }, 30000);
 
     it("should stream from offset", async () => {
@@ -577,7 +591,7 @@ describe("Attachments", () => {
         offset += chunk.length;
       }
 
-      expect(result).toEqual(testData);
+      expectSameBytes(result, testData);
     }, 30000);
 
     it("uses metadata traversal instead of full dependency resolution for offset streams", async () => {
@@ -746,7 +760,7 @@ describe("Attachments", () => {
       const retrievedData = await reloadedDoc.getAttachment(attachmentId!);
       
       expect(retrievedData.length).toBe(testData.length);
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 180000); // ~30 s alone; the full suite runs it next to other heavy suites
   });
 
@@ -791,7 +805,7 @@ describe("Attachments", () => {
       // Verify data can be retrieved correctly
       const reloadedDoc = await db.getDocument(doc.getId());
       const retrievedData = await reloadedDoc.getAttachment(attachmentRef!.attachmentId);
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 30000);
 
     it("should throw error when addAttachmentStream is called outside changeDoc", async () => {
@@ -826,7 +840,7 @@ describe("Attachments", () => {
       const reloadedDoc = await db.getDocument(doc.getId());
       const retrievedData = await reloadedDoc.getAttachment(attachmentRef!.attachmentId);
       expect(retrievedData.length).toBe(testData.length);
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 180000); // ~30 s alone, see above
 
     it("should handle stream chunks larger than storage chunk size", async () => {
@@ -853,7 +867,7 @@ describe("Attachments", () => {
       const reloadedDoc = await db.getDocument(doc.getId());
       const retrievedData = await reloadedDoc.getAttachment(attachmentRef!.attachmentId);
       expect(retrievedData.length).toBe(testData.length);
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 60000);
 
     it("should handle empty stream", async () => {
@@ -890,7 +904,7 @@ describe("Attachments", () => {
       // Verify data
       const reloadedDoc = await db.getDocument(doc.getId());
       const retrievedData = await reloadedDoc.getAttachment(attachmentRef!.attachmentId);
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 30000);
 
     it("should work with ReadableStream via async iteration", async () => {
@@ -918,7 +932,7 @@ describe("Attachments", () => {
       // Verify data
       const reloadedDoc = await db.getDocument(doc.getId());
       const retrievedData = await reloadedDoc.getAttachment(attachmentRef!.attachmentId);
-      expect(retrievedData).toEqual(testData);
+      expectSameBytes(retrievedData, testData);
     }, 30000);
 
     it("should produce same result as addAttachment for same data", async () => {
@@ -951,7 +965,7 @@ describe("Attachments", () => {
       const data2 = await reloadedDoc2.getAttachment(ref2!.attachmentId);
       
       expect(data1).toEqual(data2);
-      expect(data1).toEqual(testData);
+      expectSameBytes(data1, testData);
     }, 60000);
   });
 
