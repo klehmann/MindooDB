@@ -747,7 +747,7 @@ describe("Attachments", () => {
       
       expect(retrievedData.length).toBe(testData.length);
       expect(retrievedData).toEqual(testData);
-    }, 60000); // Longer timeout for large file
+    }, 180000); // ~30 s alone; the full suite runs it next to other heavy suites
   });
 
   describe("addAttachmentStream", () => {
@@ -827,7 +827,7 @@ describe("Attachments", () => {
       const retrievedData = await reloadedDoc.getAttachment(attachmentRef!.attachmentId);
       expect(retrievedData.length).toBe(testData.length);
       expect(retrievedData).toEqual(testData);
-    }, 60000);
+    }, 180000); // ~30 s alone, see above
 
     it("should handle stream chunks larger than storage chunk size", async () => {
       const doc = await db.createDocument();
