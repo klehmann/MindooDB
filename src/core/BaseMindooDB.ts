@@ -230,6 +230,7 @@ import {
 } from "./userkeys/recipients";
 import {
   ENCRYPT_FOR_FIELD,
+  DEFAULT_RECIPIENT_HISTORY,
   groupKeyDocIdOf,
   isSealedKeyId,
   sealedKeyDocId,
@@ -6983,6 +6984,18 @@ export class BaseMindooDB implements MindooDB {
       // carries no recipient block of its own: the wraps are on the group document.
       if (isSealedKeyId(keyId) && !newestRecipientBlock(entries)) {
         await this.ingestGroupKey(keyId);
+      }
+      // A series that does not reach back to epoch 1 may be completed from the
+      // key document's older recipient blocks; `entries` is often just a batch.
+      if (isSealedKeyId(keyId) && this.tenant.needsDeepSealedIngest?.(keyId)) {
+        const keyDocId = sealedKeyDocId(keyId);
+        if (keyDocId) {
+          await this.tenant.ingestSealedFromEntries(
+            keyId,
+            await this.scanAllMetadata(this.store, { docId: keyDocId }),
+            { complete: true },
+          );
+        }
       }
     } finally {
       this.sealedIngestDepth--;
@@ -16113,46 +16126,71 @@ export class BaseMindooDB implements MindooDB {
       }
     }
     const withoutHistory =
-      mode === "add" && options?.history === "none" && addedTargets.length > 0;
+      (mode === "add" || mode === "set") &&
+      addedTargets.length > 0 &&
+      (options?.history ?? DEFAULT_RECIPIENT_HISTORY) === "none";
     const rotate = removedStableIds.length > 0 || withoutHistory;
-    const currentGens = tenant.getSealedGenerations(
-      internalDoc.decryptionKeyId,
-    );
-    if (currentGens.length === 0) {
+    const heldSeries = tenant.getSealedSeries
+      ? tenant.getSealedSeries(internalDoc.decryptionKeyId)
+      : tenant
+          .getSealedGenerations(internalDoc.decryptionKeyId)
+          .map((key, index, all) => ({ epoch: all.length - index, key }));
+    if (heldSeries.length === 0) {
       throw new Error(
         "Cannot change recipients: the current document key is not in this session",
       );
     }
-    let generations = currentGens;
-    // The epoch comes from the store, not from the cached document: a cache
-    // entry without its recipient block would make a partial series look whole.
+    // The epoch comes from the store, not from the cached document.
     const newestBlock =
       newestRecipientBlock(await this.scanAllMetadata(this.store, { docId })) ??
       internalDoc.sealedRecipients;
-    let epoch = Math.max(newestBlock?.epoch ?? 0, currentGens.length);
-    if (
-      currentGens.length < epoch ||
-      tenant.isPartialSealedSeries?.(internalDoc.decryptionKeyId)
-    ) {
-      // Re-sealing hands every remaining reader its generations; with only part
-      // of the series we would cut the history of everyone else.
+    let epoch = Math.max(newestBlock?.epoch ?? 0, heldSeries[0].epoch);
+    if (heldSeries[0].epoch < epoch) {
       throw new Error(
-        "Cannot change recipients: you were added without the earlier history; a member who holds the whole history has to do this",
+        "Cannot change recipients: this replica does not hold the current document key yet; sync first",
       );
+    }
+    // What this replica can seal: the contiguous run of generations that ends at
+    // the current epoch. A member who joined without the earlier history holds a
+    // shorter run; readers entitled to more keep taking the older generations
+    // from the earlier recipient blocks (see ingestSealedFromEntries).
+    let series = heldSeries;
+    let run: Array<{ epoch: number; key: Uint8Array }> = [];
+    for (const entry of heldSeries) {
+      if (run.length > 0 && entry.epoch !== run[run.length - 1].epoch - 1) break;
+      run.push(entry);
     }
     if (rotate) {
       const nextDek = tenant
         .getCryptoAdapter()
         .getRandomValues(new Uint8Array(32));
-      generations = [nextDek, ...currentGens];
       epoch += 1;
+      run = [{ epoch, key: nextDek }, ...run];
+      series = [{ epoch, key: nextDek }, ...heldSeries];
+    }
+    /** Oldest epoch this replica can hand to anyone. */
+    const sealFrom = run[run.length - 1].epoch;
+    const generations = run.map((entry) => entry.key);
+    const addedHistoryFrom = withoutHistory
+      ? epoch
+      : sealFrom > 1
+        ? sealFrom
+        : undefined;
+    // Revealing reaches as far back as the caller's own history.
+    const revealTo = sealFrom > 1 ? sealFrom : undefined;
+    for (const id of [...revealedIds]) {
+      if ((currentMap[id]?.historyFrom ?? 1) <= sealFrom) {
+        revealedIds.splice(revealedIds.indexOf(id), 1);
+      }
     }
 
     const historyFromByStable = new Map<string, number>();
     for (const [id, entry] of Object.entries(currentMap)) {
-      if (entry.removedAt || !entry.historyFrom || revealedIds.includes(id)) continue;
-      historyFromByStable.set(id.split("#")[0], entry.historyFrom);
-      if (entry.keyFingerprint) historyFromByStable.set(entry.keyFingerprint, entry.historyFrom);
+      if (entry.removedAt || !entry.historyFrom) continue;
+      const from = revealedIds.includes(id) ? revealTo : entry.historyFrom;
+      if (!from) continue;
+      historyFromByStable.set(id.split("#")[0], from);
+      if (entry.keyFingerprint) historyFromByStable.set(entry.keyFingerprint, from);
     }
     const remainingByStable = new Map<string, ResolvedWrapTarget>();
     const existingSpecs = Object.entries(currentMap)
@@ -16182,7 +16220,7 @@ export class BaseMindooDB implements MindooDB {
     for (const target of addedTargets)
       remainingByStable.set(
         target.stableId,
-        withoutHistory ? { ...target, historyFrom: epoch } : target,
+        addedHistoryFrom ? { ...target, historyFrom: addedHistoryFrom } : target,
       );
     for (const id of removedStableIds) {
       remainingByStable.delete(id);
@@ -16208,8 +16246,9 @@ export class BaseMindooDB implements MindooDB {
     });
     tenant.rememberSealedGenerations(
       internalDoc.decryptionKeyId,
-      generations,
+      series.map((entry) => entry.key),
       recipientsBlock,
+      series.map((entry) => entry.epoch),
     );
 
     const headsBeforeChange = Automerge.getHeads(internalDoc.doc);
@@ -16229,7 +16268,7 @@ export class BaseMindooDB implements MindooDB {
               addedBy: signer,
               keyFingerprint: target.keyFingerprint,
               ...(target.label ? { label: target.label } : {}),
-              ...(withoutHistory ? { historyFrom: epoch } : {}),
+              ...(addedHistoryFrom ? { historyFrom: addedHistoryFrom } : {}),
             };
           }
           applyEncryptForAdds(draft, addMap, epoch);
@@ -16240,7 +16279,9 @@ export class BaseMindooDB implements MindooDB {
             import("./userkeys/sealedTypes").EncryptForEntry
           >;
           for (const id of revealedIds) {
-            if (map[id]) delete map[id].historyFrom;
+            if (!map[id]) continue;
+            if (revealTo) map[id].historyFrom = revealTo;
+            else delete map[id].historyFrom;
           }
         }
         if (removedStableIds.length > 0) {

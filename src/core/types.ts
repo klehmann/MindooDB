@@ -1140,10 +1140,15 @@ export interface MindooTenant {
     keyId: string,
     generations: Uint8Array[],
     block?: import("./userkeys/sealedTypes").EntryRecipients,
+    epochs?: number[],
   ): void;
   getSealedGenerations?(keyId: string): Uint8Array[];
-  /** True when only the newer part of the series is held (`history: "none"`). */
+  /** The cached series with its epochs, newest first. */
+  getSealedSeries?(keyId: string): Array<{ epoch: number; key: Uint8Array }>;
+  /** True when some generation of the series is not held (joined without the history). */
   isPartialSealedSeries?(keyId: string): boolean;
+  /** True while a partial series was not yet completed from the key document's whole history. */
+  needsDeepSealedIngest?(keyId: string): boolean;
   ingestSealedRecipients?(
     keyId: string,
     recipients: import("./userkeys/sealedTypes").EntryRecipients,
@@ -1164,6 +1169,7 @@ export interface MindooTenant {
   ingestSealedFromEntries?(
     keyId: string,
     entries: Array<{ recipients?: import("./userkeys/sealedTypes").EntryRecipients; createdAt: number }>,
+    options?: { complete?: boolean },
   ): Promise<void>;
 
   /**

@@ -37,7 +37,7 @@ import type {
 } from "./userkeys/types";
 import { currentUserKeyEpoch } from "./userkeys/types";
 import { asUserKeyPayload } from "./userkeys/validateUserKeyDocument";
-import { allRecipientWraps, isSealedKeyId } from "./userkeys/sealedTypes";
+import { hasRecipientWraps, isSealedKeyId } from "./userkeys/sealedTypes";
 import type { EntryRecipients } from "./userkeys/sealedTypes";
 import { newestRecipientBlock, resolveRecipientSpecs, sealToTargets } from "./userkeys/recipients";
 import type { RecipientOptions, RecipientSpec } from "./userkeys/sealedTypes";
@@ -47,7 +47,7 @@ import {
   openSealedValueWithKeys,
   type SealedValue,
 } from "./userkeys/sealedValues";
-import { openBundle } from "./userkeys/sealedCrypto";
+import { openBundleRange } from "./userkeys/sealedCrypto";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
@@ -167,8 +167,12 @@ export class BaseMindooTenant implements MindooTenant {
   private readonly sealedGenerations = new Map<string, Uint8Array[]>();
   /** Per sealed key id: the bundle of the recipient block last opened. */
   private readonly sealedBlocks = new Map<string, string>();
-  /** Sealed key ids whose cached series lacks the older generations. */
-  private readonly sealedPartial = new Set<string>();
+  /** Per sealed key id: the epoch of each cached generation (same order). */
+  private readonly sealedEpochs = new Map<string, number[]>();
+  /** Per sealed key id: newest block for which the whole key document history was explored. */
+  private readonly sealedDeep = new Map<string, string>();
+  /** Per sealed key id: older recipient blocks already tried. */
+  private readonly sealedExplored = new Map<string, Set<string>>();
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -514,90 +518,129 @@ export class BaseMindooTenant implements MindooTenant {
 
   /**
    * `generations` newest first. `block` is the recipient block they were sealed
-   * into, so ingesting that same block again is skipped even for a reader with a
-   * history limit (who holds fewer generations than the epoch).
+   * into, so ingesting that same block again is skipped. `epochs` labels each
+   * generation; by default they are the contiguous run that ends at the block's
+   * epoch (or at `generations.length` without a block).
    */
-  rememberSealedGenerations(keyId: string, generations: Uint8Array[], block?: EntryRecipients): void {
+  rememberSealedGenerations(
+    keyId: string,
+    generations: Uint8Array[],
+    block?: EntryRecipients,
+    epochs?: number[],
+  ): void {
+    const top = block?.epoch && block.epoch >= generations.length ? block.epoch : generations.length;
     this.sealedGenerations.set(keyId, generations);
+    this.sealedEpochs.set(keyId, epochs ?? generations.map((_, index) => top - index));
     if (block) this.sealedBlocks.set(keyId, block.bundle);
     else this.sealedBlocks.delete(keyId);
-    this.setSealedPartial(keyId, generations.length, block?.epoch);
+  }
+
+  /** The cached series with its epochs, newest first. */
+  getSealedSeries(keyId: string): Array<{ epoch: number; key: Uint8Array }> {
+    const generations = this.sealedGenerations.get(keyId) ?? [];
+    const epochs = this.sealedEpochs.get(keyId) ?? generations.map((_, index) => generations.length - index);
+    return generations.map((key, index) => ({ epoch: epochs[index], key }));
   }
 
   /**
-   * Whether this session holds only the newer part of a sealed key series
-   * (added with `history: "none"`): documents encrypted with an older
-   * generation are not readable although the key id is known.
+   * Whether this session lacks some generation of a sealed key series (added
+   * without the history, or away for a while): documents encrypted with a
+   * missing generation are not readable although the key id is known.
    */
   isPartialSealedSeries(keyId: string): boolean {
-    return this.sealedPartial.has(keyId);
+    const epochs = this.sealedEpochs.get(keyId);
+    if (!epochs?.length) return false;
+    return epochs.length < Math.max(...epochs);
   }
 
-  private setSealedPartial(keyId: string, held: number, epoch: number | undefined): void {
-    if (epoch !== undefined && held < epoch) this.sealedPartial.add(keyId);
-    else this.sealedPartial.delete(keyId);
+  /**
+   * True while a partial series has not been completed from the key document's
+   * whole history yet: the older recipient blocks may hold more generations
+   * for this reader than the newest one (see {@link ingestSealedFromEntries}).
+   */
+  needsDeepSealedIngest(keyId: string): boolean {
+    return (
+      this.isPartialSealedSeries(keyId) &&
+      this.sealedDeep.get(keyId) !== this.sealedBlocks.get(keyId)
+    );
   }
 
   getSealedGenerations(keyId: string): Uint8Array[] {
     return this.sealedGenerations.get(keyId) ?? [];
   }
 
-  async ingestSealedRecipients(keyId: string, recipients: EntryRecipients): Promise<void> {
-    const cached = this.sealedGenerations.get(keyId);
-    const epoch = typeof recipients.epoch === "number" ? recipients.epoch : 0;
-    if (cached && ((cached.length >= epoch && epoch > 0) || this.sealedBlocks.get(keyId) === recipients.bundle)) {
-      console.log("[sealed] ingest: cache already has generations", {
-        keyId,
-        cached: cached.length,
-        epoch,
-      });
-      return;
-    }
-    const keys = [
+  private async sealedUnwrapKeys(): Promise<CryptoKey[]> {
+    return [
       ...(await this.userKeys.getUserKeyCryptoKeysForReconcile()),
       await this.getEncryptionPrivateKeyForReconcile(),
     ].filter((k): k is CryptoKey => !!k);
-    console.log("[sealed] ingest: trying unwrap", {
-      keyId,
-      wrapCount: allRecipientWraps(recipients).length,
-      wrapKinds: allRecipientWraps(recipients).map((wrap) => wrap.kind),
-      epoch,
-      keyCount: keys.length,
-      cached: cached?.length ?? 0,
-    });
+  }
+
+  private async openSealedBlock(
+    recipients: EntryRecipients,
+    keys: CryptoKey[],
+  ): Promise<Array<{ epoch: number; key: Uint8Array }> | null> {
+    for (const key of keys) {
+      try {
+        return await openBundleRange({ crypto: this.cryptoAdapter, recipients, privateKey: key });
+      } catch {
+        // try next key
+      }
+    }
+    return null;
+  }
+
+  /** Adds `range` to the cached series of `keyId` (a newer block wins per epoch). */
+  private mergeSealedSeries(
+    keyId: string,
+    range: Array<{ epoch: number; key: Uint8Array }>,
+    preferRange: boolean,
+  ): void {
+    const byEpoch = new Map<number, Uint8Array>();
+    const current = this.getSealedSeries(keyId);
+    for (const entry of preferRange ? current : range) byEpoch.set(entry.epoch, entry.key);
+    for (const entry of preferRange ? range : current) byEpoch.set(entry.epoch, entry.key);
+    const epochs = [...byEpoch.keys()].sort((a, b) => b - a);
+    this.sealedGenerations.set(keyId, epochs.map((epoch) => byEpoch.get(epoch)!));
+    this.sealedEpochs.set(keyId, epochs);
+  }
+
+  /**
+   * Opens the NEWEST recipient block of a key series. Opening it makes this
+   * replica a reader (its generations are merged into the session cache);
+   * failing to open it means removed or never added, and the cache is dropped.
+   */
+  async ingestSealedRecipients(keyId: string, recipients: EntryRecipients): Promise<void> {
+    const cached = this.sealedGenerations.get(keyId);
+    const epoch = typeof recipients.epoch === "number" ? recipients.epoch : 0;
+    if (
+      cached?.length &&
+      (this.sealedBlocks.get(keyId) === recipients.bundle ||
+        (epoch > 0 && cached.length >= epoch && !this.isPartialSealedSeries(keyId)))
+    ) {
+      return;
+    }
+    const keys = await this.sealedUnwrapKeys();
     if (keys.length === 0) {
       // Keep a create-time session DEK. Without unwrap keys we cannot prove
       // the wrap list excludes us, and deleting would make the author unable
       // to read a document they just sealed.
       return;
     }
-    for (const key of keys) {
-      try {
-        const gens = await openBundle({
-          crypto: this.cryptoAdapter,
-          recipients,
-          privateKey: key,
-        });
-        this.sealedGenerations.set(keyId, gens);
-        this.sealedBlocks.set(keyId, recipients.bundle);
-        this.setSealedPartial(keyId, gens.length, epoch || undefined);
-        console.log("[sealed] ingest: unwrapped", { keyId, generations: gens.length });
-        return;
-      } catch {
-        // try next key
-      }
+    const range = await this.openSealedBlock(recipients, keys);
+    if (range) {
+      this.mergeSealedSeries(keyId, range, true);
+      this.sealedBlocks.set(keyId, recipients.bundle);
+      return;
     }
     // Newest wrap list is not for us (removed, or never added). Drop any
     // session DEK so hasDecryptionKey / visibility reconcile hide the
     // document instead of leaving the last readable plaintext editable.
-    console.log("[sealed] ingest: unwrap failed, dropping session DEK", {
-      keyId,
-      cached: cached?.length ?? 0,
-      epoch,
-    });
     this.sealedGenerations.delete(keyId);
+    this.sealedEpochs.delete(keyId);
     this.sealedBlocks.delete(keyId);
-    this.sealedPartial.delete(keyId);
+    this.sealedDeep.delete(keyId);
+    this.sealedExplored.delete(keyId);
   }
 
   /**
@@ -641,14 +684,49 @@ export class BaseMindooTenant implements MindooTenant {
     return openSealedValueWithKeys({ crypto: this.cryptoAdapter, sealed, privateKeys });
   }
 
+  /**
+   * Hands a key document's recipient blocks to the session. The newest block
+   * decides membership. A reader whose newest bundle does not reach back to
+   * epoch 1 (it was sealed by a member without the older history, or the reader
+   * joined late) completes the series from the older blocks it can open.
+   * Pass `complete` when `entries` is the key document's whole history.
+   */
   async ingestSealedFromEntries(
     keyId: string,
     entries: Array<{ recipients?: EntryRecipients; createdAt: number }>,
+    options?: { complete?: boolean },
   ): Promise<void> {
     if (!isSealedKeyId(keyId)) return;
     const newest = newestRecipientBlock(entries);
     if (!newest) return;
     await this.ingestSealedRecipients(keyId, newest);
+    if (!this.sealedGenerations.get(keyId)?.length) return;
+    if (this.isPartialSealedSeries(keyId)) {
+      const explored = this.sealedExplored.get(keyId) ?? new Set<string>();
+      this.sealedExplored.set(keyId, explored);
+      const older = entries
+        .filter(
+          (entry): entry is { recipients: EntryRecipients; createdAt: number } =>
+            !!entry.recipients &&
+            hasRecipientWraps(entry.recipients) &&
+            entry.recipients.bundle !== newest.bundle &&
+            !explored.has(entry.recipients.bundle),
+        )
+        .sort((a, b) => b.recipients.epoch - a.recipients.epoch || b.createdAt - a.createdAt);
+      let keys: CryptoKey[] | null = null;
+      for (const entry of older) {
+        if (!this.isPartialSealedSeries(keyId)) break;
+        keys ??= await this.sealedUnwrapKeys();
+        if (keys.length === 0) break;
+        explored.add(entry.recipients.bundle);
+        const range = await this.openSealedBlock(entry.recipients, keys);
+        if (range) this.mergeSealedSeries(keyId, range, false);
+      }
+    }
+    if (options?.complete) {
+      const block = this.sealedBlocks.get(keyId);
+      if (block) this.sealedDeep.set(keyId, block);
+    }
   }
 
   getFactory(): MindooTenantFactory {

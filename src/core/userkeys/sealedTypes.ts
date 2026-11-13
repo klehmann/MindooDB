@@ -23,6 +23,13 @@ export function groupKeyDocIdOf(keyId: string, docId: string): string | undefine
   return owner !== undefined && owner !== docId ? owner : undefined;
 }
 
+/**
+ * What new readers get when the caller does not say (`RecipientChangeOptions.history`).
+ * `"all"` keeps a shared document complete: its existing attachments are encrypted
+ * with the older generations and stay unreadable for a reader added with `"none"`.
+ */
+export const DEFAULT_RECIPIENT_HISTORY: "all" | "none" = "all";
+
 export type RecipientSpec =
   | string
   | { user: string }
@@ -67,10 +74,13 @@ export interface RecipientChangeOptions {
   /** When setting the list, also keep the caller (default true). */
   includeSelf?: boolean;
   /**
-   * `addRecipients` only. `"all"` (default): new readers decrypt the whole
-   * history. `"none"`: the key rotates first and new readers get only the new
-   * generation, so nothing written before they joined is readable for them.
-   * `revealHistory` can hand them the older generations later.
+   * Adding readers (`addRecipients`, additions of `setRecipients`).
+   * `"all"` (default, {@link DEFAULT_RECIPIENT_HISTORY}): new readers decrypt
+   * the history, as far back as the caller holds it.
+   * `"none"`: the key rotates first and new readers get only the new
+   * generation, so nothing written before they joined is readable for them
+   * (including existing attachments); `revealHistory` can hand them the older
+   * generations later.
    */
   history?: "all" | "none";
 }
@@ -107,6 +117,12 @@ export interface EntryRecipients {
   bundle: string;
   wraps: EntryRecipientWrap[];
   namesEncrypted?: string;
+  /**
+   * First epoch in `bundle`; absent means 1 (the whole series). Above 1 when the
+   * replica that sealed this block did not hold the older generations itself:
+   * readers entitled to more take them from the earlier blocks they can open.
+   */
+  bundleFrom?: number;
   /** Bundles for readers with a history limit (`historyFrom`). */
   partial?: EntryRecipientTier[];
 }

@@ -258,8 +258,14 @@ async function resolveDeviceTarget(
 }
 
 /**
- * Seals `generations` (newest first) to `targets`. Targets with a `historyFrom`
- * above 1 get their own bundle with only the generations from that epoch on.
+ * Seals `generations` to `targets`. `generations` is newest first and is the
+ * contiguous run that ends at `epoch`; when the sealing replica does not hold
+ * the older ones, the run starts above epoch 1.
+ *
+ * Every target gets the run from its own first epoch on (`historyFrom`, at
+ * least the start of the run). Targets that share a first epoch share a
+ * bundle; the group that reaches back furthest is the block's main bundle
+ * (`bundleFrom` when that is not epoch 1), the others are `partial` tiers.
  */
 export async function sealToTargets(input: {
   tenant: BaseMindooTenant;
@@ -268,39 +274,37 @@ export async function sealToTargets(input: {
   epoch: number;
 }): Promise<EntryRecipients> {
   const crypto = input.tenant.getCryptoAdapter();
+  const runFrom = Math.max(1, input.epoch - input.generations.length + 1);
   const wrapsOf = (targets: ResolvedWrapTarget[]) =>
     targets.map((target) => ({
       kind: target.kind,
       fingerprint: target.keyFingerprint,
       publicKeyPem: target.publicKeyPem,
     }));
-  const limitOf = (target: ResolvedWrapTarget): number =>
-    target.historyFrom && target.historyFrom > 1 ? Math.min(target.historyFrom, input.epoch) : 1;
-  const sealed = await sealBundle({
-    crypto,
-    generations: input.generations,
-    wrapsTo: wrapsOf(input.targets.filter((target) => limitOf(target) === 1)),
-  });
-  sealed.epoch = input.epoch;
+  const fromOf = (target: ResolvedWrapTarget): number =>
+    Math.min(Math.max(target.historyFrom ?? 1, runFrom), input.epoch);
   const byFrom = new Map<number, ResolvedWrapTarget[]>();
   for (const target of input.targets) {
-    const from = limitOf(target);
-    if (from === 1) continue;
+    const from = fromOf(target);
     byFrom.set(from, [...(byFrom.get(from) ?? []), target]);
   }
-  if (byFrom.size > 0) {
-    const tiers: EntryRecipientTier[] = [];
-    for (const [from, targets] of [...byFrom.entries()].sort((a, b) => a[0] - b[0])) {
-      // generations are newest first: epoch N is index 0, epoch `from` is index N - from.
-      const tier = await sealBundle({
-        crypto,
-        generations: input.generations.slice(0, input.epoch - from + 1),
-        wrapsTo: wrapsOf(targets),
-      });
-      tiers.push({ from, bundle: tier.bundle, wraps: tier.wraps });
-    }
-    sealed.partial = tiers;
+  const froms = [...byFrom.keys()].sort((a, b) => a - b);
+  // generations are newest first: epoch N is index 0, epoch `from` is index N - from.
+  const slice = (from: number) => input.generations.slice(0, input.epoch - from + 1);
+  const mainFrom = froms[0] ?? runFrom;
+  const sealed = await sealBundle({
+    crypto,
+    generations: slice(mainFrom),
+    wrapsTo: wrapsOf(byFrom.get(mainFrom) ?? []),
+  });
+  sealed.epoch = input.epoch;
+  if (mainFrom > 1) sealed.bundleFrom = mainFrom;
+  const tiers: EntryRecipientTier[] = [];
+  for (const from of froms.slice(1)) {
+    const tier = await sealBundle({ crypto, generations: slice(from), wrapsTo: wrapsOf(byFrom.get(from)!) });
+    tiers.push({ from, bundle: tier.bundle, wraps: tier.wraps });
   }
+  if (tiers.length > 0) sealed.partial = tiers;
   return sealed;
 }
 

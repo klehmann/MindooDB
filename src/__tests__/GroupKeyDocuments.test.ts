@@ -200,15 +200,22 @@ describe("group key documents (groupKeyDocId)", () => {
     const bobDb = await bob.tenant.openDB("chat-no-history");
     expect(await visibleIds(bobDb)).toEqual([group.getId(), old.getId(), fresh.getId()].sort());
 
-    // Carol cannot re-seal with half the series.
-    const carolGroup = await carolDb.getDocument(group.getId());
-    await expect(carolDb.addRecipients!(carolGroup, [bob.username])).rejects.toThrow(/whole history/);
-
-    // A later rotation by Alice keeps Carol's limit.
-    await db.removeRecipients!(group, [bob.username]);
+    // Carol holds only the newer part of the series and can still remove Bob:
+    // her block carries the new generation, the others keep their older ones.
+    const removedByCarol = await carolDb.removeRecipients!(await carolDb.getDocument(group.getId()), [bob.username]);
+    expect(removedByCarol.rotated).toBe(true);
+    await syncAll(fixture, "chat-no-history");
+    expect(await visibleIds(bobDb)).toEqual([]);
+    // Alice still has the whole series (three generations) and writes with the newest.
+    expect(await visibleIds(db)).toEqual([group.getId(), old.getId(), fresh.getId()].sort());
+    expect(alice.tenant.getSealedGenerations!(group.getDecryptionKeyId())).toHaveLength(3);
+    expect(alice.tenant.getSealedGenerations!(group.getDecryptionKeyId())[0]).toEqual(
+      carol.tenant.getSealedGenerations!(group.getDecryptionKeyId())[0],
+    );
     const later = await db.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "later" } });
     await syncAll(fixture, "chat-no-history");
     expect(await visibleIds(carolDb)).toEqual([group.getId(), fresh.getId(), later.getId()].sort());
+    expect((await carolDb.getDocument(later.getId())).getData().text).toBe("later");
     expect(
       (await db.getDocument(group.getId())).getRecipients().find((r) => r.id.includes("carol"))?.historyFrom,
     ).toBe(2);
@@ -224,7 +231,7 @@ describe("group key documents (groupKeyDocId)", () => {
     ).toBeUndefined();
   });
 
-  it("history none twice, by different members: the second late member loads the group; late members cannot re-seal", async () => {
+  it("history none twice, by different members: the second late member loads the group and can add people from its own start on", async () => {
     const db = await alice.tenant.openDB("chat-no-history-twice");
     const group = await db.createDocument({ recipients: [bob.username], initialValues: { name: "Team" } });
     await syncAll(fixture, "chat-no-history-twice");
@@ -246,12 +253,27 @@ describe("group key documents (groupKeyDocId)", () => {
     expect(await visibleIds(carolDb)).toEqual([group.getId()]);
     expect((await carolDb.getDocument(group.getId())).getData().name).toBe("Team");
 
-    // A re-seal that changes nothing (Bob is a member already) must not open a door for Carol.
-    await db.addRecipients!(await db.getDocument(group.getId()), [bob.username]);
+    // Carol (joined at epoch 3) adds Dave's colleague with "all": that reaches back to her own start only.
+    const erin = await addPerson(fixture, "erin", "phone");
+    await syncAll(fixture, "directory");
+    await publishUserKey(erin);
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+    const added = await carolDb.addRecipients!(await carolDb.getDocument(group.getId()), [erin.username], {
+      history: "all",
+    });
+    expect(added.rotated).toBe(false);
+    expect(added.added[0]?.historyFrom).toBe(3);
+    // Revealing as Carol cannot hand out more than she has: Dave (from 2) keeps his limit.
+    await carolDb.revealHistory!(await carolDb.getDocument(group.getId()), [dave.username]);
     await syncAll(fixture, "chat-no-history-twice");
-    await carolDb.syncStoreChanges();
-    const carolGroup = await carolDb.getDocument(group.getId());
-    await expect(carolDb.removeRecipients!(carolGroup, [bob.username])).rejects.toThrow(/whole history/);
-    await expect(carolDb.revealHistory!(carolGroup, [carol.username])).rejects.toThrow(/whole history/);
+    const recipients = (await db.getDocument(group.getId())).getRecipients();
+    expect(recipients.find((r) => r.id.includes("dave"))?.historyFrom).toBe(2);
+    expect(recipients.find((r) => r.id.includes("erin"))?.historyFrom).toBe(3);
+    // Everyone still opens the group; Alice kept the whole series.
+    for (const device of [alice, bob, carol, dave, erin]) {
+      const deviceDb = await device.tenant.openDB("chat-no-history-twice");
+      expect(await visibleIds(deviceDb)).toEqual([group.getId()]);
+    }
+    expect(alice.tenant.getSealedGenerations!(group.getDecryptionKeyId())).toHaveLength(3);
   });
 });
