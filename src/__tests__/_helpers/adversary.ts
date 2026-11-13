@@ -1,6 +1,6 @@
 import type { EntryRecipients } from "../../core/userkeys/sealedTypes";
 import { sealedKeyId } from "../../core/userkeys/sealedTypes";
-import type { StoreEntryMetadata } from "../../core/types";
+import type { MindooTenant, StoreEntryMetadata } from "../../core/types";
 import type { DeviceHandle } from "./multiDevice";
 
 /**
@@ -20,10 +20,18 @@ export class KeyHoarder {
   /** key id -> generation (hex) -> bytes */
   private readonly hoard = new Map<string, Map<string, Uint8Array>>();
 
-  constructor(readonly device: DeviceHandle) {}
+  /**
+   * `session`: the tenant session the hoarder works in. Harvesting rewrites the
+   * session's key cache, so tests that also assert the honest view of the same
+   * device pass a separate session on the device's stores.
+   */
+  constructor(
+    readonly device: DeviceHandle,
+    private readonly session: MindooTenant = device.tenant,
+  ) {}
 
   private tenant() {
-    return this.device.tenant as unknown as {
+    return this.session as unknown as {
       getSealedGenerations(keyId: string): Uint8Array[];
       rememberSealedGenerations(keyId: string, generations: Uint8Array[], block?: EntryRecipients): void;
       ingestSealedRecipients(keyId: string, recipients: EntryRecipients): Promise<void>;
@@ -41,7 +49,7 @@ export class KeyHoarder {
 
   /** Raw entry metadata of a document on this device, whatever its visibility. */
   async entriesOf(dbId: string, docId: string): Promise<StoreEntryMetadata[]> {
-    const db = await this.device.tenant.openDB(dbId);
+    const db = await this.session.openDB(dbId);
     return db.getStore().findNewEntriesForDoc([], docId);
   }
 
@@ -76,7 +84,7 @@ export class KeyHoarder {
 
   /** True when one of the hoarded generations opens this raw entry. */
   async canDecryptEntry(dbId: string, entryId: string): Promise<boolean> {
-    const db = await this.device.tenant.openDB(dbId);
+    const db = await this.session.openDB(dbId);
     const [entry] = await db.getStore().getEntries([entryId]);
     if (!entry) {
       throw new Error(`KeyHoarder: entry ${entryId} never reached ${this.device.label}; sync first`);
