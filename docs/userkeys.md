@@ -515,6 +515,43 @@ Removal takes effect on the removed reader's very next sync; no follow-up edit i
 
 ---
 
+### 6.6 Group documents: one member list for many documents
+
+A chat has one member list and any number of messages. Making every message a sealed
+document would cost one wrap per member per message, put the member fingerprints on
+every message, and turn "remove Bob" into a change of every message. Instead, one
+sealed **group document** holds the members, and the other documents borrow its key
+series:
+
+```ts
+const group = await db.createDocument({ recipients: ["CN=bob/O=contoso"], initialValues: { name: "Project X" } });
+const message = await db.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "Hi" } });
+
+message.getDecryptionKeyId();   // "$sealed:<group id>"
+message.getGroupKeyDocId();     // the group id; isSealed() is false
+await db.addRecipients(group, ["CN=carol/O=contoso"]);    // Carol reads every message so far
+await db.removeRecipients(group, ["CN=bob/O=contoso"]);   // rotates: Bob reads nothing written afterwards
+```
+
+- **Same key, same rules.** The documents are encrypted with the group's newest
+  generation and decrypted with any of them, exactly like changes to the group
+  document itself (§7.5). Adding a member reveals the whole history, removing one is a
+  forward cutoff (§6.3).
+- **Membership changes touch one document.** The recipient block lives only on the
+  group document; documents that use it carry none. A replica that is added or removed
+  re-runs the key visibility reconcile once after the sync pass that changed its access,
+  so the documents appear or disappear (with cached plaintext purged) together with
+  the group.
+- **Creating** requires the group document to be a sealed document of the same
+  database and the caller to be a member (`createDocument` fails with "not a member"
+  otherwise). `groupKeyDocId` is mutually exclusive with `decryptionKeyId` and
+  `recipients`, and like `recipients` it needs `assumeUniqueId` with a custom id.
+- **Recipient mutators** refuse documents that use a group key: change the members on
+  the group document.
+- **What the server sees:** documents of a group carry only the key id
+  `$sealed:<group id>`, no wraps; the group's member fingerprints are on the group
+  document alone.
+
 ## 7) Architecture
 
 This section is for engineers who need to reason about correctness, concurrency, and failure behaviour rather than just call the API.

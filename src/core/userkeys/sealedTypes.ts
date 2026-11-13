@@ -9,6 +9,20 @@ export function isSealedKeyId(keyId: string): boolean {
   return keyId.startsWith(SEALED_KEY_PREFIX);
 }
 
+/** The document whose key series `keyId` names (`$sealed:<docId>`), or `undefined`. */
+export function sealedKeyDocId(keyId: string): string | undefined {
+  return isSealedKeyId(keyId) ? keyId.slice(SEALED_KEY_PREFIX.length) : undefined;
+}
+
+/**
+ * The group document of a document encrypted with another document's key series
+ * (`groupKeyDocId` on create), or `undefined` for an own series or a named key.
+ */
+export function groupKeyDocIdOf(keyId: string, docId: string): string | undefined {
+  const owner = sealedKeyDocId(keyId);
+  return owner !== undefined && owner !== docId ? owner : undefined;
+}
+
 export type RecipientSpec =
   | string
   | { user: string }

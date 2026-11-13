@@ -230,7 +230,9 @@ import {
 } from "./userkeys/recipients";
 import {
   ENCRYPT_FOR_FIELD,
+  groupKeyDocIdOf,
   isSealedKeyId,
+  sealedKeyDocId,
   sealedKeyId,
   type EntryRecipients,
   type RecipientChangeOptions,
@@ -4637,6 +4639,8 @@ export class BaseMindooDB implements MindooDB {
       this.beginChangeNotificationHold();
       try {
         await this.syncStoreChangesInternal();
+        // Joined or left a group document in this batch: its documents follow.
+        await this.reconcileGroupKeyAccess();
       } finally {
         this.endChangeNotificationHold();
       }
@@ -6094,6 +6098,12 @@ export class BaseMindooDB implements MindooDB {
             "pass assumeUniqueId for random ids.",
         );
       }
+      if (useDeterministicSeed && options.groupKeyDocId !== undefined) {
+        throw new Error(
+          "createDocument: groupKeyDocId is not supported together with a convergent custom id; " +
+            "pass assumeUniqueId for random ids.",
+        );
+      }
       if (useDeterministicSeed && (options.attachments?.length ?? 0) > 0) {
         throw new Error(
           "createDocument: attachments are not supported together with a convergent custom id; " +
@@ -6469,6 +6479,11 @@ export class BaseMindooDB implements MindooDB {
     if (useDeterministicSeed && options.recipients !== undefined) {
       throw new Error(
         "createDocuments: recipients is not supported together with a convergent custom id; pass assumeUniqueId",
+      );
+    }
+    if (useDeterministicSeed && options.groupKeyDocId !== undefined) {
+      throw new Error(
+        "createDocuments: groupKeyDocId is not supported together with a convergent custom id; pass assumeUniqueId",
       );
     }
 
@@ -6955,12 +6970,69 @@ export class BaseMindooDB implements MindooDB {
     entries: Array<{ recipients?: EntryRecipients; createdAt: number }>,
   ): Promise<void> {
     if (!this.tenant.ingestSealedFromEntries) return;
+    const hadKey = isSealedKeyId(keyId) ? await this.tenant.hasDecryptionKey(keyId) : false;
     this.sealedIngestDepth++;
     try {
       await this.tenant.ingestSealedFromEntries(keyId, entries);
+      // A document encrypted with a group document's key series (`groupKeyDocId`)
+      // carries no recipient block of its own: the wraps are on the group document.
+      if (isSealedKeyId(keyId) && !newestRecipientBlock(entries)) {
+        await this.ingestGroupKey(keyId);
+      }
     } finally {
       this.sealedIngestDepth--;
     }
+    if (isSealedKeyId(keyId) && hadKey !== (await this.tenant.hasDecryptionKey(keyId))) {
+      // Joined or left the key series: documents of a group document that were
+      // hidden (or readable) until now have to follow (see reconcileGroupKeyAccess).
+      this.groupKeyAccessChanged.add(keyId);
+    }
+  }
+
+  /**
+   * Key series this replica gained or lost during the current pass. Documents of
+   * a group document are not re-checked one by one when its wraps change; the
+   * next {@link reconcileGroupKeyAccess} re-runs the key visibility reconcile.
+   */
+  private groupKeyAccessChanged = new Set<string>();
+  /** Group key series last probed without success, by key id (ms), see ingestGroupKey. */
+  private groupKeyMisses = new Map<string, number>();
+  private static readonly GROUP_KEY_MISS_TTL_MS = 2000;
+
+  /**
+   * Makes the key series `$sealed:<groupDocId>` available from the group
+   * document's own entries when the session does not have it yet. A miss is
+   * remembered briefly, so a few hundred documents of a group this replica is not
+   * a member of cost one scan of the group document, not one each.
+   */
+  private async ingestGroupKey(keyId: string): Promise<void> {
+    const groupDocId = sealedKeyDocId(keyId);
+    if (!groupDocId || (await this.tenant.hasDecryptionKey(keyId))) return;
+    const lastMiss = this.groupKeyMisses.get(keyId);
+    if (lastMiss !== undefined && Date.now() - lastMiss < BaseMindooDB.GROUP_KEY_MISS_TTL_MS) return;
+    const groupEntries = await this.scanAllMetadata(this.store, { docId: groupDocId });
+    if (groupEntries.length > 0) {
+      await this.tenant.ingestSealedFromEntries!(keyId, groupEntries);
+    }
+    if (await this.tenant.hasDecryptionKey(keyId)) {
+      this.groupKeyMisses.delete(keyId);
+    } else {
+      this.groupKeyMisses.set(keyId, Date.now());
+    }
+  }
+
+  /**
+   * After a pass that changed access to a key series (added to or removed from a
+   * group document), reveal or hide the documents that use it. Runs the full key
+   * visibility reconcile, which is rare enough: it only happens when this
+   * replica's membership in a group changed.
+   */
+  private async reconcileGroupKeyAccess(): Promise<void> {
+    if (this.groupKeyAccessChanged.size === 0 || this.isTimeTravelMode()) return;
+    this.groupKeyAccessChanged.clear();
+    this.groupKeyMisses.clear();
+    await this.reconcileKeyVisibility();
+    this.groupKeyAccessChanged.clear();
   }
 
   /**
@@ -11765,7 +11837,10 @@ export class BaseMindooDB implements MindooDB {
       isAccessible: () => true,
       isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
       isWitnessed: () => internalDoc.witnessed ?? false,
-      isSealed: () => isSealedKeyId(internalDoc.decryptionKeyId),
+      isSealed: () =>
+        isSealedKeyId(internalDoc.decryptionKeyId) &&
+        groupKeyDocIdOf(internalDoc.decryptionKeyId, internalDoc.id) === undefined,
+      getGroupKeyDocId: () => groupKeyDocIdOf(internalDoc.decryptionKeyId, internalDoc.id),
       getRecipients: () =>
         resolveRecipientsFromPayload(
           internalDoc.doc as unknown as MindooDocPayload,
@@ -15599,6 +15674,14 @@ export class BaseMindooDB implements MindooDB {
         "createDocument: recipients and decryptionKeyId are mutually exclusive",
       );
     }
+    if (options.groupKeyDocId !== undefined) {
+      if (options.recipients !== undefined || options.decryptionKeyId !== undefined) {
+        throw new Error(
+          "createDocument: groupKeyDocId is mutually exclusive with recipients and decryptionKeyId",
+        );
+      }
+      return await this.requireGroupKey(options.groupKeyDocId);
+    }
     if (options.recipients !== undefined) {
       return sealedKeyId(docId ?? options.id ?? "pending");
     }
@@ -15619,6 +15702,32 @@ export class BaseMindooDB implements MindooDB {
       );
     }
     return "default";
+  }
+
+  /**
+   * The key id of a group document's key series, after checking that the group
+   * document is a sealed document of this database and that the caller is a member.
+   */
+  private async requireGroupKey(groupKeyDocId: string): Promise<string> {
+    if (!CUSTOM_DOC_ID_REGEX.test(groupKeyDocId) && !/^[a-z0-9_]+$/.test(groupKeyDocId)) {
+      throw new Error(`createDocument: invalid groupKeyDocId "${groupKeyDocId}"`);
+    }
+    const keyId = sealedKeyId(groupKeyDocId);
+    const groupEntries = await this.scanAllMetadata(this.store, { docId: groupKeyDocId });
+    const groupCreate = groupEntries.find((entry) => entry.entryType === "doc_create");
+    if (!groupCreate || groupCreate.decryptionKeyId !== keyId) {
+      throw new Error(
+        `createDocument: group document "${groupKeyDocId}" does not exist in this database or was not created with recipients`,
+      );
+    }
+    this.groupKeyMisses.delete(keyId);
+    await this.ingestSealed(keyId, groupEntries);
+    if (!(await this.tenant.hasDecryptionKey(keyId))) {
+      throw new Error(
+        `createDocument: you are not a member of group document "${groupKeyDocId}"`,
+      );
+    }
+    return keyId;
   }
 
   private async prepareSealedCreate(
@@ -15845,6 +15954,12 @@ export class BaseMindooDB implements MindooDB {
     if (!isSealedKeyId(doc.getDecryptionKeyId())) {
       throw new Error(
         "Recipient mutators require a document created with `recipients`",
+      );
+    }
+    const groupDocId = groupKeyDocIdOf(doc.getDecryptionKeyId(), doc.getId());
+    if (groupDocId !== undefined) {
+      throw new Error(
+        `Document ${doc.getId()} uses the key series of group document ${groupDocId}; change the recipients there`,
       );
     }
     const tenant = this.tenant as BaseMindooTenant;
@@ -17404,7 +17519,10 @@ export class BaseMindooDB implements MindooDB {
       isAccessible: () => internalDoc.accessible ?? true,
       isAwaitingWitness: () => internalDoc.awaitingWitness ?? false,
       isWitnessed: () => internalDoc.witnessed ?? false,
-      isSealed: () => isSealedKeyId(internalDoc.decryptionKeyId),
+      isSealed: () =>
+        isSealedKeyId(internalDoc.decryptionKeyId) &&
+        groupKeyDocIdOf(internalDoc.decryptionKeyId, internalDoc.id) === undefined,
+      getGroupKeyDocId: () => groupKeyDocIdOf(internalDoc.decryptionKeyId, internalDoc.id),
       getRecipients: () =>
         resolveRecipientsFromPayload(
           internalDoc.doc as unknown as MindooDocPayload,

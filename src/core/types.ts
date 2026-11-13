@@ -2029,6 +2029,21 @@ export interface CreateOptions {
   recipientOptions?: import("./userkeys/sealedTypes").RecipientOptions;
 
   /**
+   * Encrypt this document with the key series of a **group document**: a sealed
+   * document (created with `recipients`) in the same database whose recipient
+   * list is the group. The new document uses the group's newest key generation;
+   * everyone the group document is sealed to can read it, and adding or removing
+   * a member on the group document (`addRecipients` / `removeRecipients`) applies
+   * to every document that uses it, without touching them. Removal rotates the
+   * group key, so a removed member cannot read anything written afterwards.
+   *
+   * The document's `decryptionKeyId` becomes `$sealed:<groupKeyDocId>`.
+   * Mutually exclusive with `decryptionKeyId` and `recipients`. The caller must
+   * currently be a member of the group document.
+   */
+  groupKeyDocId?: string;
+
+  /**
    * Files to attach in the document's very first entry. They are encrypted
    * with the document's key and referenced from the `doc_create` entry, so a
    * writer that cannot change the document afterwards (a sealed create with
@@ -2368,7 +2383,13 @@ export interface MindooDoc {
    */
   isAccessible(): boolean;
 
+  /** The document has its own key series (created with `recipients`). */
   isSealed(): boolean;
+  /**
+   * The group document whose key series encrypts this document (created with
+   * `groupKeyDocId`), or `undefined`. Its recipients are this document's readers.
+   */
+  getGroupKeyDocId(): string | undefined;
   getRecipients(): import("./userkeys/sealedTypes").ResolvedRecipient[];
   getRecipientEpoch(): number;
   /**
