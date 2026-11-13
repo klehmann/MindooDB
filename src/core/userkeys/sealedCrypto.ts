@@ -81,6 +81,11 @@ export async function sealBundle(input: {
   };
 }
 
+/**
+ * Opens a recipient block with `privateKey`: the whole-history bundle first,
+ * then the partial tiers. Returns the generations newest first (index 0 is the
+ * current key), as they were sealed.
+ */
 export async function openBundle(input: {
   crypto: CryptoAdapter;
   recipients: EntryRecipients;
@@ -88,13 +93,19 @@ export async function openBundle(input: {
 }): Promise<Uint8Array[]> {
   const rsa = new RSAEncryption(input.crypto);
   let lastError: unknown;
-  for (const wrap of input.recipients.wraps) {
-    try {
-      const bundleKey = await rsa.decrypt(base64ToBytes(wrap.wrapped), input.privateKey);
-      const packed = await decryptAesGcm(input.crypto, bundleKey, base64ToBytes(input.recipients.bundle));
-      return splitGenerations(packed).reverse();
-    } catch (error) {
-      lastError = error;
+  const tiers = [
+    { bundle: input.recipients.bundle, wraps: input.recipients.wraps ?? [] },
+    ...(input.recipients.partial ?? []),
+  ];
+  for (const tier of tiers) {
+    for (const wrap of tier.wraps) {
+      try {
+        const bundleKey = await rsa.decrypt(base64ToBytes(wrap.wrapped), input.privateKey);
+        const packed = await decryptAesGcm(input.crypto, bundleKey, base64ToBytes(tier.bundle));
+        return splitGenerations(packed);
+      } catch (error) {
+        lastError = error;
+      }
     }
   }
   throw lastError ?? new Error("no recipient wrap opened");

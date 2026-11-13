@@ -48,6 +48,12 @@ export interface EncryptForEntry {
   viaGroup?: string;
   removedAt?: number;
   removedBy?: string;
+  /**
+   * First key generation (epoch) this reader holds. Absent: the whole history.
+   * Set by `addRecipients(..., { history: "none" })`, cleared by `revealHistory`.
+   * Every later re-seal honours it, so the reader never gets older generations.
+   */
+  historyFrom?: number;
 }
 
 export interface RecipientChangeOptions {
@@ -60,6 +66,13 @@ export interface RecipientChangeOptions {
   strict?: boolean;
   /** When setting the list, also keep the caller (default true). */
   includeSelf?: boolean;
+  /**
+   * `addRecipients` only. `"all"` (default): new readers decrypt the whole
+   * history. `"none"`: the key rotates first and new readers get only the new
+   * generation, so nothing written before they joined is readable for them.
+   * `revealHistory` can hand them the older generations later.
+   */
+  history?: "all" | "none";
 }
 
 export interface ResolvedRecipient {
@@ -69,6 +82,8 @@ export interface ResolvedRecipient {
   label?: string;
   addedInEpoch: number;
   sealed: boolean;
+  /** First generation this reader holds; absent for the whole history. */
+  historyFrom?: number;
 }
 
 export interface EntryRecipientWrap {
@@ -77,11 +92,36 @@ export interface EntryRecipientWrap {
   wrapped: string;
 }
 
+/**
+ * Readers without the whole history: their own bundle with only the
+ * generations from `from` (epoch, 1-based) up to the newest.
+ */
+export interface EntryRecipientTier {
+  from: number;
+  bundle: string;
+  wraps: EntryRecipientWrap[];
+}
+
 export interface EntryRecipients {
   epoch: number;
   bundle: string;
   wraps: EntryRecipientWrap[];
   namesEncrypted?: string;
+  /** Bundles for readers with a history limit (`historyFrom`). */
+  partial?: EntryRecipientTier[];
+}
+
+/** Whether a recipient block wraps to anyone (whole history or partial). */
+export function hasRecipientWraps(recipients: EntryRecipients | undefined): boolean {
+  if (!recipients) return false;
+  if (recipients.wraps?.length) return true;
+  return (recipients.partial ?? []).some((tier) => tier.wraps?.length);
+}
+
+/** All wraps of a recipient block, whole-history and partial. */
+export function allRecipientWraps(recipients: EntryRecipients | undefined): EntryRecipientWrap[] {
+  if (!recipients) return [];
+  return [...(recipients.wraps ?? []), ...(recipients.partial ?? []).flatMap((tier) => tier.wraps ?? [])];
 }
 
 export interface RecipientChangeResult {

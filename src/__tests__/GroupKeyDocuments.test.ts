@@ -161,4 +161,66 @@ describe("group key documents (groupKeyDocId)", () => {
     });
     await expect(db.addRecipients!(message, [bob.username])).rejects.toThrow(/change the recipients there/);
   });
+
+  it("after a rotation remaining members encrypt with the newest generation", async () => {
+    const db = await alice.tenant.openDB("chat-order-gens");
+    const group = await db.createDocument({ recipients: [bob.username, carol.username], initialValues: {} });
+    await db.removeRecipients!(group, [bob.username]);
+    await syncAll(fixture, "chat-order-gens");
+    const carolDb = await carol.tenant.openDB("chat-order-gens");
+    const written = await carolDb.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "new" } });
+    expect(written.getData().text).toBe("new");
+    const keyId = group.getDecryptionKeyId();
+    const hex = (u: Uint8Array) => Buffer.from(u).toString("hex");
+    const aliceGens = alice.tenant.getSealedGenerations!(keyId).map(hex);
+    const carolGens = carol.tenant.getSealedGenerations!(keyId).map(hex);
+    expect(aliceGens).toHaveLength(2);
+    // Index 0 is the key new content is encrypted with: the one Bob never got.
+    expect(carolGens).toEqual(aliceGens);
+  });
+
+  it("history none: new members read only what is written after they joined, until revealHistory", async () => {
+    const db = await alice.tenant.openDB("chat-no-history");
+    const group = await db.createDocument({ recipients: [bob.username], initialValues: { name: "Klasse" } });
+    const old = await db.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "old" } });
+    await syncAll(fixture, "chat-no-history");
+
+    const added = await db.addRecipients!(group, [carol.username], { history: "none" });
+    expect(added.rotated).toBe(true);
+    expect(added.added[0]?.historyFrom).toBe(2);
+    const fresh = await db.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "fresh" } });
+    await syncAll(fixture, "chat-no-history");
+
+    const carolDb = await carol.tenant.openDB("chat-no-history");
+    expect(await visibleIds(carolDb)).toEqual([group.getId(), fresh.getId()].sort());
+    await expect(carolDb.getDocument(old.getId())).rejects.toThrow();
+    // The group document itself is readable: a snapshot under the new key.
+    expect((await carolDb.getDocument(group.getId())).getData().name).toBe("Klasse");
+    expect((await carolDb.getDocument(fresh.getId())).getData().text).toBe("fresh");
+    const bobDb = await bob.tenant.openDB("chat-no-history");
+    expect(await visibleIds(bobDb)).toEqual([group.getId(), old.getId(), fresh.getId()].sort());
+
+    // Carol cannot re-seal with half the series.
+    const carolGroup = await carolDb.getDocument(group.getId());
+    await expect(carolDb.addRecipients!(carolGroup, [bob.username])).rejects.toThrow(/whole history/);
+
+    // A later rotation by Alice keeps Carol's limit.
+    await db.removeRecipients!(group, [bob.username]);
+    const later = await db.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "later" } });
+    await syncAll(fixture, "chat-no-history");
+    expect(await visibleIds(carolDb)).toEqual([group.getId(), fresh.getId(), later.getId()].sort());
+    expect(
+      (await db.getDocument(group.getId())).getRecipients().find((r) => r.id.includes("carol"))?.historyFrom,
+    ).toBe(2);
+
+    // Revealed: Carol reads the whole history, no rotation.
+    const revealed = await db.revealHistory!(await db.getDocument(group.getId()), [carol.username]);
+    expect(revealed.rotated).toBe(false);
+    await syncAll(fixture, "chat-no-history");
+    expect(await visibleIds(carolDb)).toEqual([group.getId(), old.getId(), fresh.getId(), later.getId()].sort());
+    expect((await carolDb.getDocument(old.getId())).getData().text).toBe("old");
+    expect(
+      (await db.getDocument(group.getId())).getRecipients().find((r) => r.id.includes("carol"))?.historyFrom,
+    ).toBeUndefined();
+  });
 });
