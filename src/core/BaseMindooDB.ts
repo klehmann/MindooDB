@@ -4719,6 +4719,37 @@ export class BaseMindooDB implements MindooDB {
             );
             return;
           }
+          // Full rebuild: drop the cached state and materialize the document
+          // again, through the access-control path when that is enforced.
+          const reloadFully = async () => {
+            this.docCache.delete(docId);
+            updatedDoc = await this.loadDocumentInternal(docId);
+            if (updatedDoc) {
+              // New entries triggered this reload, so force the re-emit.
+              this.updateIndex(
+                docId,
+                updatedDoc.lastModified,
+                updatedDoc.isDeleted,
+                updatedDoc.decryptionKeyId,
+                "visible",
+                updatedDoc.awaitingWitness ?? false,
+                updatedDoc.witnessed ?? false,
+                true,
+              );
+            }
+          };
+          if (await this.isAclEnforced()) {
+            // The incremental path below applies new entries without the
+            // access-control gate (docs/accesscontrol.md §10). With access
+            // control active, a change by someone the rules do not allow must be
+            // quarantined like on a fresh load, so rebuild the document through
+            // maybeMaterializeWithAccessControl instead.
+            this.logger.debug(
+              `Document ${docId} found in cache, access control enforced: full reload`,
+            );
+            await reloadFully();
+            return;
+          }
           // Document is cached - try incremental update
           this.logger.debug(
             `Document ${docId} found in cache, attempting incremental update`,
@@ -4760,21 +4791,7 @@ export class BaseMindooDB implements MindooDB {
               `Incremental update failed for document ${docId}, falling back to full reload:`,
               error,
             );
-            this.docCache.delete(docId);
-            updatedDoc = await this.loadDocumentInternal(docId);
-            if (updatedDoc) {
-              // New entries triggered this reload, so force the re-emit.
-              this.updateIndex(
-                docId,
-                updatedDoc.lastModified,
-                updatedDoc.isDeleted,
-                updatedDoc.decryptionKeyId,
-                "visible",
-                updatedDoc.awaitingWitness ?? false,
-                updatedDoc.witnessed ?? false,
-                true,
-              );
-            }
+            await reloadFully();
           }
         } else {
           // Metadata-first startup: avoid full materialization for uncached docs.
