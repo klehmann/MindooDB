@@ -337,6 +337,44 @@ llm?: LlmEndpointPolicy;
    * server; clients read it from the policy.
    */
   freeBusyWeeksAhead?: number;
+  /**
+   * Calendar sharing (§6.11, "Calendar sharing"): the highest level a member
+   * may share their calendar with colleagues, published by the member's client
+   * into their own `mbusy_<grantDocId>` (encrypted for the colleagues it is
+   * shared with). `"busy"`: free/busy only; `"business"`: also business
+   * appointments (title, time, place); `"all"` (default): also private ones.
+   * Not enforced by the server, which cannot read the documents; clients read
+   * it from the policy. Tenant default policy only.
+   */
+  calendarShareMax?: CalendarShareLevel;
+  /**
+   * The level a member's calendar is shared with all colleagues until the
+   * member chooses one (default `"busy"`). `"none"` shares nothing, not even
+   * free/busy. Capped by {@link calendarShareMax}. Not enforced by the server.
+   */
+  calendarShareDefault?: CalendarShareLevel | "none";
+}
+
+/** A calendar sharing level (see {@link DefaultAccessPolicyDoc.calendarShareMax}). */
+export type CalendarShareLevel = "busy" | "business" | "all";
+
+const CALENDAR_SHARE_LEVELS = ["busy", "business", "all"] as const;
+
+/** {@link DefaultAccessPolicyDoc.calendarShareMax} with its default `"all"`. */
+export function effectiveCalendarShareMax(policy: Pick<DefaultAccessPolicyDoc, "calendarShareMax"> | null | undefined): CalendarShareLevel {
+  const value = policy?.calendarShareMax;
+  return value && (CALENDAR_SHARE_LEVELS as readonly string[]).includes(value) ? value : "all";
+}
+
+/** {@link DefaultAccessPolicyDoc.calendarShareDefault} with its default `"busy"`, capped by `calendarShareMax`. */
+export function effectiveCalendarShareDefault(
+  policy: Pick<DefaultAccessPolicyDoc, "calendarShareMax" | "calendarShareDefault"> | null | undefined,
+): CalendarShareLevel | "none" {
+  const value = policy?.calendarShareDefault;
+  const wanted = value === "none" || (value && (CALENDAR_SHARE_LEVELS as readonly string[]).includes(value)) ? value : "busy";
+  if (wanted === "none") return "none";
+  const max = effectiveCalendarShareMax(policy);
+  return CALENDAR_SHARE_LEVELS.indexOf(wanted) > CALENDAR_SHARE_LEVELS.indexOf(max) ? max : wanted;
 }
 
 /** Default of {@link DefaultAccessPolicyDoc.freeBusyWeeksAhead}. */
@@ -406,6 +444,8 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "internalMailLimits"
     | "freeBusy"
     | "freeBusyWeeksAhead"
+    | "calendarShareMax"
+    | "calendarShareDefault"
   >
 > = {
   denyDocCreate: false,
@@ -742,6 +782,16 @@ export function validateAccessPolicy(
   ) {
     throw new Error("freeBusyWeeksAhead must be an integer from 1 to 52");
   }
+  if (policy.calendarShareMax !== undefined && !(CALENDAR_SHARE_LEVELS as readonly string[]).includes(policy.calendarShareMax)) {
+    throw new Error(`calendarShareMax "${String(policy.calendarShareMax)}" must be "busy", "business" or "all"`);
+  }
+  if (
+    policy.calendarShareDefault !== undefined &&
+    policy.calendarShareDefault !== "none" &&
+    !(CALENDAR_SHARE_LEVELS as readonly string[]).includes(policy.calendarShareDefault)
+  ) {
+    throw new Error(`calendarShareDefault "${String(policy.calendarShareDefault)}" must be "none", "busy", "business" or "all"`);
+  }
   if (policy.internalMailLimits !== undefined) {
     for (const [key, value] of Object.entries(policy.internalMailLimits)) {
       if (!["maxBytesPerMail", "maxMailsPerHour"].includes(key)) {
@@ -899,6 +949,8 @@ export function effectivePolicy(
     | "internalMailLimits"
     | "freeBusy"
     | "freeBusyWeeksAhead"
+    | "calendarShareMax"
+    | "calendarShareDefault"
   >
 > & {
   defaultCreateKeyId?: string;

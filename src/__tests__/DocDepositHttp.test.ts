@@ -9,7 +9,7 @@
  * documents sealed to someone else, with attachments in the create entry,
  * but it may not pull, list or change anything there.
  */
-import { docIdMatchesPrefixes, effectiveFreeBusyWeeksAhead, validateAclRule } from "../core/accesscontrol/types";
+import { docIdMatchesPrefixes, effectiveCalendarShareDefault, effectiveCalendarShareMax, effectiveFreeBusyWeeksAhead, validateAclRule } from "../core/accesscontrol/types";
 import fs from "fs";
 import { Server } from "http";
 
@@ -827,6 +827,25 @@ describe("doc_deposit on a real server (HTTP)", () => {
       expect(effectiveFreeBusyWeeksAhead({})).toBe(12);
       expect(effectiveFreeBusyWeeksAhead({ freeBusyWeeksAhead: 99 })).toBe(52);
       expect(effectiveFreeBusyWeeksAhead({ freeBusyWeeksAhead: 0 })).toBe(1);
+    });
+
+    test("calendarShareMax and calendarShareDefault are validated and projected", async () => {
+      const t = await setup({ acl: false });
+      await expect(
+        t.directory.setDefaultAccessPolicy!({ calendarShareMax: "none" as never }, t.adminKey, PASSWORD),
+      ).rejects.toThrow(/calendarShareMax/);
+      await expect(
+        t.directory.setDefaultAccessPolicy!({ calendarShareDefault: "everything" as never }, t.adminKey, PASSWORD),
+      ).rejects.toThrow(/calendarShareDefault/);
+      await t.directory.setDefaultAccessPolicy!({ calendarShareMax: "business", calendarShareDefault: "all" }, t.adminKey, PASSWORD);
+      const head = await (t.directory as unknown as { getDirectoryStateHead(): Promise<{ defaultPolicy?: { calendarShareMax?: string; calendarShareDefault?: string } }> }).getDirectoryStateHead();
+      expect(head.defaultPolicy?.calendarShareMax).toBe("business");
+      expect(head.defaultPolicy?.calendarShareDefault).toBe("all");
+      // The default is capped by the maximum.
+      expect(effectiveCalendarShareDefault(head.defaultPolicy as never)).toBe("business");
+      expect(effectiveCalendarShareMax({})).toBe("all");
+      expect(effectiveCalendarShareDefault({})).toBe("busy");
+      expect(effectiveCalendarShareDefault({ calendarShareDefault: "none", calendarShareMax: "busy" })).toBe("none");
     });
   });
 
