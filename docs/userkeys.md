@@ -554,8 +554,8 @@ await db.removeRecipients(group, ["CN=bob/O=contoso"]);   // rotates: Bob reads 
 
 ### 6.7 Adding readers without the history
 
-By default a new reader gets every key generation and reads everything that was ever
-written. For a class chat that a family joins in the middle of the year, or a group
+By default (`history: "all"`) a new reader gets every key generation and reads
+everything that was ever written, including the document's existing attachments. For a class chat that a family joins in the middle of the year, or a group
 that discussed something before a person was added, that is not wanted:
 
 ```ts
@@ -576,10 +576,14 @@ await db.revealHistory(group, ["CN=carol/O=contoso"]);
   sync her replica reveals the older documents. It cannot be undone for what she has
   already received: taking the history away again only protects later content
   (remove and re-add with `history: "none"`).
-- **Who can change the list.** Re-sealing hands every reader their generations, so the
-  caller needs the whole series. A reader who was added without history gets "a member
-  who holds the whole history has to do this" from the recipient mutators until their
-  history was revealed.
+- **Who can change the list.** Every reader, including one without the earlier
+  history. A replica seals what it holds: the unbroken run of generations that ends
+  at the current epoch. A late reader who removes someone rotates and publishes a
+  block whose bundles start at their own first epoch (`bundleFrom`); the other
+  readers keep taking the older generations from the earlier blocks they can open
+  and merge them. Adding with `history: "all"` and `revealHistory` reach back only as
+  far as the caller's own history; the new reader's `historyFrom` says how far.
+  Who is *allowed* to change the list is a matter of the access rules, not of keys.
 - **The document itself stays readable.** Its older entries are under the old
   generations too, so `history: "none"` writes a snapshot of the current state under
   the new key. For a group document the new reader therefore sees the group's current
@@ -589,9 +593,12 @@ await db.revealHistory(group, ["CN=carol/O=contoso"]);
   changes to that one document) is encrypted with the newest generation and so becomes
   readable for readers without history; documents that are written once, like chat
   messages, are never snapshotted.
-- **Wire format.** A recipient block gains an optional `partial` list: one bundle per
-  distinct `historyFrom` with its own wraps. Blocks without limited readers are
-  byte-identical to before.
+- **Wire format.** A recipient block gains an optional `partial` list (one bundle per
+  distinct first epoch, with its own wraps) and an optional `bundleFrom` (first epoch
+  of the main bundle when the sealing replica did not hold epoch 1). Blocks sealed by
+  a reader with the whole history for readers with the whole history are
+  byte-identical to before. A reader's series is the union of the newest block (which
+  decides membership) and the older blocks it can open.
 
 ## 7) Architecture
 

@@ -110,3 +110,20 @@ export async function openBundle(input: {
   }
   throw lastError ?? new Error("no recipient wrap opened");
 }
+
+/**
+ * Like {@link openBundle}, with the epochs the opened bundle covers: a bundle
+ * always holds a contiguous run that ends at the block's epoch.
+ */
+export async function openBundleRange(input: {
+  crypto: CryptoAdapter;
+  recipients: EntryRecipients;
+  privateKey: CryptoKey;
+}): Promise<Array<{ epoch: number; key: Uint8Array }>> {
+  const generations = await openBundle(input);
+  const top =
+    typeof input.recipients.epoch === "number" && input.recipients.epoch >= generations.length
+      ? input.recipients.epoch
+      : generations.length;
+  return generations.map((key, index) => ({ epoch: top - index, key }));
+}

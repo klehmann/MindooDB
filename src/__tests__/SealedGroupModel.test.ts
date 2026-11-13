@@ -2,12 +2,14 @@
  * Model-based test of group documents: random sequences of membership changes
  * and writes, checked after every step against a small reference model.
  *
- * The model knows, per person, which key generations (epochs) they ever held
- * and from which epoch their honest client reads. The engine must agree twice:
+ * The model knows, per person, which key generations (epochs) they ever held.
+ * Every member may add, remove and reveal; what they can hand to others reaches
+ * back only as far as their own unbroken run of generations. The engine must
+ * agree twice:
  *  - cryptographically: a {@link KeyHoarder} of each person decrypts a message
  *    iff the model says they ever held the epoch it was written in;
- *  - honestly: each member's `getAllDocumentIds` lists exactly the messages from
- *    their first epoch on, and non-members see nothing.
+ *  - honestly: each member's `getAllDocumentIds` lists exactly the messages of
+ *    the epochs they hold, and non-members see nothing.
  *
  * fast-check shrinks a failing sequence to the shortest one and prints the seed;
  * rerun it with `FC_SEED=<seed> FC_PATH=<path>`.
@@ -58,8 +60,6 @@ const commandArb: fc.Arbitrary<Command> = fc.oneof(
 
 interface PersonModel {
   member: boolean;
-  /** First epoch the honest client holds (1 = whole history). */
-  from: number;
   /** Every epoch this person ever held: what a hoarder can decrypt. */
   known: Set<number>;
 }
@@ -116,13 +116,16 @@ describe("group documents: model-based membership and history", () => {
         let epoch = 1;
         const model: PersonModel[] = people.map((_, index) => ({
           member: index <= 1,
-          from: 1,
           known: new Set(index <= 1 ? [1] : []),
         }));
         const messages: Array<{ id: string; epoch: number }> = [];
         const hoarders = people.map((device, index) => new KeyHoarder(device, hoardSessions[index]));
-        const full = (index: number) => model[index].member && model[index].from === 1;
-        const allEpochs = () => Array.from({ length: epoch }, (_, i) => i + 1);
+        /** The epochs `index` can hand to someone: their unbroken run that ends at the current epoch. */
+        const handable = (index: number): number[] => {
+          const epochs: number[] = [];
+          for (let e = epoch; e >= 1 && model[index].known.has(e); e--) epochs.push(e);
+          return epochs;
+        };
 
         const check = async (step: string) => {
           await syncAll(fixture, dbId);
@@ -141,7 +144,7 @@ describe("group documents: model-based membership and history", () => {
             await dbs[index].syncStoreChanges();
             const visible = new Set(await dbs[index].getAllDocumentIds());
             const expected = messages
-              .filter((message) => model[index].member && message.epoch >= model[index].from)
+              .filter((message) => model[index].member && model[index].known.has(message.epoch))
               .map((message) => message.id)
               .sort();
             expect({ label, visible: messages.map((m) => m.id).filter((id) => visible.has(id)).sort() }).toEqual({
@@ -172,36 +175,17 @@ describe("group documents: model-based membership and history", () => {
               continue;
             }
             const groupDoc = await loadGroup();
-            if (!full(command.actor)) {
-              // Whoever lacks the earlier history cannot re-seal for the others.
-              const change =
-                command.kind === "add"
-                  ? actorDb.addRecipients!(groupDoc, [target], { history: command.history })
-                  : command.kind === "remove"
-                    ? actorDb.removeRecipients!(groupDoc, [target])
-                    : actorDb.revealHistory!(groupDoc, [target]);
-              if (command.kind === "add" && model[command.target].member) {
-                // Adding someone who is a member already changes nothing (and may be a no-op re-seal).
-                await change.catch(() => undefined);
-              } else {
-                await expect(change).rejects.toThrow(/whole history/);
-              }
-              continue;
-            }
             const person = model[command.target];
             if (command.kind === "add") {
+              const handed = handable(command.actor);
               await actorDb.addRecipients!(groupDoc, [target], { history: command.history });
               if (!person.member) {
+                person.member = true;
                 if (command.history === "none") {
                   epoch += 1;
                   for (const other of model) if (other.member) other.known.add(epoch);
-                  person.member = true;
-                  person.from = epoch;
-                  person.known.add(epoch);
                 } else {
-                  person.member = true;
-                  person.from = 1;
-                  for (const e of allEpochs()) person.known.add(e);
+                  for (const e of handed) person.known.add(e);
                 }
               }
             } else if (command.kind === "remove") {
@@ -213,10 +197,10 @@ describe("group documents: model-based membership and history", () => {
                 for (const other of model) if (other.member) other.known.add(epoch);
               }
             } else {
+              const handed = handable(command.actor);
               await actorDb.revealHistory!(groupDoc, [target]);
-              if (person.member && person.from > 1) {
-                person.from = 1;
-                for (const e of allEpochs()) person.known.add(e);
+              if (person.member) {
+                for (const e of handed) person.known.add(e);
               }
             }
           }
