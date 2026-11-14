@@ -68,6 +68,7 @@ export class UserKeyManager {
   private resolvingOwnDeviceWrap = false;
   private reconcileInFlight: Promise<UserKeyEnrollmentStatus> | null = null;
   private decryptedSelfGrantBytes: Uint8Array | null = null;
+  private seededSelfGrantBytes: Uint8Array | null = null;
   private resolvingSelfGrantWrap = false;
 
   constructor(private readonly tenant: BaseMindooTenant) {}
@@ -133,6 +134,16 @@ export class UserKeyManager {
     this.seededBytesMatchLocalPublic = matches;
     this.seededBytesVerifiedForPublicKey = publicKeyPem;
     return matches;
+  }
+
+  /**
+   * Inject the device self-grant private key (PKCS8) the host decrypted from
+   * the identity (Haven unlock), for sessions opened with an empty password.
+   * Used only when it belongs to `PrivateUserId.deviceSelfGrantKeyPair`.
+   */
+  seedDecryptedSelfGrantKeyBytes(bytes: Uint8Array): void {
+    this.seededSelfGrantBytes = bytes.slice();
+    this.decryptedSelfGrantBytes = null;
   }
 
   hasFetchedUserDirectory(): boolean {
@@ -392,6 +403,17 @@ export class UserKeyManager {
     if (granted && pair && normalizePublicKeyPem(pair.publicKey) !== normalizePublicKeyPem(granted)) {
       const fromWrap = await this.importSelfGrantKeyFromWrap();
       if (fromWrap) return fromWrap;
+    }
+    if (pair && this.seededSelfGrantBytes) {
+      try {
+        const derived = await ed25519FromPkcs8(this.tenant.getCryptoAdapter(), this.seededSelfGrantBytes);
+        if (normalizePublicKeyPem(derived.publicKeyPem) === normalizePublicKeyPem(pair.publicKey)) {
+          this.decryptedSelfGrantBytes = this.seededSelfGrantBytes;
+          return this.decryptedSelfGrantBytes;
+        }
+      } catch {
+        // not a usable key; fall through
+      }
     }
     if (pair && password) {
       try {
