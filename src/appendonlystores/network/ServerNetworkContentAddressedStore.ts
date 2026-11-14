@@ -55,6 +55,8 @@ import type { AccessDecision } from "../../core/accesscontrol/types";
 import { DEFAULT_DEPOSIT_MAX_RECIPIENTS, docIdMatchesPrefixes } from "../../core/accesscontrol/types";
 import { sealedKeyId } from "../../core/userkeys/sealedTypes";
 import { StoreKind } from "../../core/types";
+import { signingKeysEqual } from "../../core/accesscontrol/DirectoryStateNode";
+import { isRootOnlyDirectoryDocId } from "../../core/accesscontrol/adminKeys";
 
 /**
  * Server-side Tier 1 access evaluator (docs/accesscontrol.md §7). Given a
@@ -285,6 +287,20 @@ export interface ServerAccessControlOptions {
    * (convergence invariant 2). Only consulted for peer pushes.
    */
   trustedWitnessResolver?: ServerTrustedWitnessResolver;
+  /**
+   * Admin check for pushes into the `directory` store (docs/accesscontrol.md
+   * §6.13): an entry is refused (rejection class `policy`) unless its signer is
+   * the root admin key or a delegated admin at the server's clock, and only the
+   * root may write admin-key and trusted-witness documents. Only wired for the
+   * `"directory"` store.
+   */
+  directoryAdminCheck?: ServerDirectoryAdminCheck;
+}
+
+/** See {@link ServerAccessControlOptions.directoryAdminCheck}. */
+export interface ServerDirectoryAdminCheck {
+  rootAdminKey: string;
+  isAdminAt: (signingKey: string, T: number) => Promise<boolean>;
 }
 
 /**
@@ -297,6 +313,12 @@ export interface ServerAccessControlOptions {
  */
 export interface BuiltinWriteContext {
   adminPublicKey: string;
+  /**
+   * Whether a signing key is a tenant admin at time `T` — the root, or a
+   * delegated admin key valid then (docs/accesscontrol.md §6.13). Absent: only
+   * `adminPublicKey` counts.
+   */
+  isAdminAt?: (signingKey: string, T: number) => Promise<boolean>;
   resolveDocumentUsernameHash?: (entry: StoreEntry) => Promise<string | null>;
   resolveCreatorSigningKey?: (entry: StoreEntry) => Promise<string | null>;
 }
@@ -342,6 +364,7 @@ export class ServerNetworkContentAddressedStore {
   private purgedDocResolver?: ServerPurgedDocResolver;
   /** Optional builtin write-invariant context for `userdirectory`. */
   private builtinWriteContext?: BuiltinWriteContext;
+  private directoryAdminCheck?: ServerDirectoryAdminCheck;
   /** Optional peer-token resolver enabling server-to-server replication. */
   private peerTokenResolver?: ServerPeerTokenResolver;
   /** Optional trusted-witness check used to preserve replicated receipts. */
@@ -406,6 +429,7 @@ export class ServerNetworkContentAddressedStore {
     this.revokedKeyResolver = accessControl?.revokedKeyResolver;
     this.purgedDocResolver = accessControl?.purgedDocResolver;
     this.builtinWriteContext = accessControl?.builtinWriteContext;
+    this.directoryAdminCheck = accessControl?.directoryAdminCheck;
     this.peerTokenResolver = accessControl?.peerTokenResolver;
     this.trustedWitnessResolver = accessControl?.trustedWitnessResolver;
     this.readScopeResolver = accessControl?.readScopeResolver;
@@ -1270,6 +1294,21 @@ export class ServerNetworkContentAddressedStore {
         }
       }
 
+      // Directory writes (docs/accesscontrol.md §6.13): only administrators, judged
+      // at this server's clock — a deactivated admin cannot push backdated
+      // entries. A peer delivery keeps the receipt of the server that first
+      // accepted it, so it is judged at that time.
+      if (this.directoryAdminCheck && (this.witnessDbid ?? this.localStore.getId()) === ServerNetworkContentAddressedStore.DIRECTORY_DB_ID) {
+        const denied = await this.evaluateDirectoryAdminWrite(
+          entry,
+          peerIngest && this.hasWitnessReceipt(entry) ? entry.receivedAt! : receivedAt,
+        );
+        if (denied) {
+          this.rejectEntry(rejected, entry.id, denied, "policy");
+          continue;
+        }
+      }
+
       // Verify the entry was created by a trusted user (baseline Tier 1).
       const isValidKey = await this.directory.validatePublicSigningKey(
         entry.createdByPublicKey,
@@ -1599,6 +1638,19 @@ export class ServerNetworkContentAddressedStore {
     return scope.ownsDocument(entry.createdByPublicKey, Date.now());
   }
 
+  /** Reason a `directory` entry is refused under §6.13, or null. */
+  private async evaluateDirectoryAdminWrite(entry: StoreEntry, at: number): Promise<string | null> {
+    const check = this.directoryAdminCheck!;
+    if (signingKeysEqual(entry.createdByPublicKey, check.rootAdminKey)) return null;
+    if (isRootOnlyDirectoryDocId(entry.docId)) {
+      return `Entry ${entry.id}: only the root admin key may write ${entry.docId}`;
+    }
+    if (!(await check.isAdminAt(entry.createdByPublicKey, at))) {
+      return `Entry ${entry.id}: the signing key is not a tenant administrator at the server's time`;
+    }
+    return null;
+  }
+
   private async evaluateUserdirectoryInvariant(
     entry: StoreEntry,
     trustedTime: number,
@@ -1635,6 +1687,9 @@ export class ServerNetworkContentAddressedStore {
       op,
       signerKey: entry.createdByPublicKey,
       adminPublicKey: this.builtinWriteContext.adminPublicKey,
+      signerIsAdmin: this.builtinWriteContext.isAdminAt
+        ? await this.builtinWriteContext.isAdminAt(entry.createdByPublicKey, trustedTime)
+        : undefined,
       documentUsernameHash,
       signerUsernameHash,
     });
@@ -1695,6 +1750,9 @@ export class ServerNetworkContentAddressedStore {
       op,
       signerKey: entry.createdByPublicKey,
       adminPublicKey: this.builtinWriteContext!.adminPublicKey,
+      signerIsAdmin: this.builtinWriteContext?.isAdminAt
+        ? await this.builtinWriteContext.isAdminAt(entry.createdByPublicKey, trustedTime)
+        : undefined,
       docId: entry.docId,
       signerUsernameHash,
       creatorUsernameHash,
