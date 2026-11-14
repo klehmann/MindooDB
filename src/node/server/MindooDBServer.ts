@@ -64,6 +64,7 @@ import {
 } from "../../server/rateLimits";
 import {
   formatSyncChangeEvent,
+  formatSyncLiveEvent,
   formatSyncHeartbeat,
   formatSyncHelloEvent,
   MindooDBServerCore,
@@ -225,6 +226,7 @@ export class MindooDBServer {
       capabilityMatcher: this.capabilityMatcher,
       deviceDiscovery: this.deviceDiscovery,
       syncEvents: this.syncEventBus,
+      liveChannel: true,
       configRepository: new FileServerConfigRepository(this.configPath),
       getServerConfig: () => this.serverConfig,
       reloadConfig: (newConfig) => this.reloadConfig(newConfig),
@@ -990,6 +992,16 @@ export class MindooDBServer {
       }
     });
 
+    // Live channels of the databases this stream asked for (`?live=`).
+    const unsubscribeLive = subscription.liveDbIds?.length
+      ? this.syncEventBus.subscribeLive((event) => {
+          const frame = formatSyncLiveEvent(subscription, event);
+          if (frame) {
+            res.write(frame);
+          }
+        })
+      : () => undefined;
+
     const heartbeat = setInterval(() => {
       res.write(formatSyncHeartbeat(Date.now()));
     }, SYNC_EVENT_HEARTBEAT_MS);
@@ -997,6 +1009,7 @@ export class MindooDBServer {
     const cleanup = () => {
       clearInterval(heartbeat);
       unsubscribe();
+      unsubscribeLive();
     };
     req.on("close", cleanup);
     res.on("close", cleanup);

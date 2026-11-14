@@ -105,6 +105,7 @@ Before starting sync, the client calls `GET /sync/capabilities` to learn what th
 - `supportsSessionKeyWrap` — whether `getEntries` can return the session-key transport format (sync-v5)
 - `supportsBinaryEntries` — whether the binary wire format v2 endpoints (`getEntriesBinary` / `putEntriesBinary`) are available (sync-v5)
 - `supportsChangeEvents` — whether the SSE live change feed (`GET /sync/:storeKind/events`) is available (sync-v5)
+- `supportsLiveChannel` — whether databases have a live channel for ephemeral messages (section 5.7.5a)
 
 If this endpoint is unavailable (e.g., the server is an older version), the client should assume no optional features are supported and use the baseline flow. Clients that require dense sync must check for `supportsBatchMaterializationPlanning`; if the server does not report this capability, the client should fall back to full sync or raise a clear error. All sync-v5 fast paths (see section 5.7) are strictly optional — a client simply falls back to the previous behavior when a capability is absent.
 
@@ -334,6 +335,29 @@ data: {"dbId":"contacts","storeKind":"docs","epoch":"019...","maxReceiptOrder":1
 Events carry only metadata — which database changed and up to which `receiptOrder` — never content, so a stream outliving its token is harmless. A heartbeat comment every 30 s keeps proxies from closing the connection. There is no history or replay: a client that reconnects simply runs one normal sync, which the persisted cursor of 5.7.1 turns into a single cheap head check when nothing is missing.
 
 The SDK's `ClientNetworkContentAddressedStore.subscribeToChanges(onChange)` wraps the stream with automatic reconnect and exponential backoff (1 s → 60 s) and deactivates itself silently when the server does not advertise the capability. SSE was chosen over WebSocket deliberately: the channel is strictly unidirectional, needs no upgrade handshake, and passes through HTTP/2 and proxies without extra connection management.
+
+#### 5.7.5a Live channel (`supportsLiveChannel`)
+
+Some data is worthless after seconds and must not end up in an append-only store: "is typing", who is present, a position on a map. For these, a database has a **live channel**: clients that have the database open exchange ephemeral messages through the server. Nothing is stored and nothing is replayed; the database and its sync stay the only source of truth.
+
+- **Subscribe:** the event stream of 5.7.5 with `&live=<dbId>[,<dbId>…]&client=<id>` (docs store, at most 8 databases per stream). Every listed database passes the same read gate as the stream itself. Messages arrive as
+
+  ```
+  event: live
+  data: {"dbId":"mchat_k3f9","sender":"cn=anna/o=acme","payload":"<base64>"}
+  ```
+
+  `sender` is the username from the publisher's token. A stream never gets the messages published with its own `client` id.
+- **Publish:** `POST /sync/docs/publishLive` with `{ dbId, payload, clientId }`, Bearer-authenticated, same read gate. `payload` is at most 22 000 base64 characters and opaque to the server. A caller may publish 40 messages per 10 s; beyond that the server answers `429`.
+- **What the server sees:** who publishes when, for which database, and how large the message is. It cannot read it.
+
+`ClientNetworkContentAddressedStore.subscribeToLive(onMessage, { onState })` and `publishLive(bytes)` wrap both with reconnect and re-authentication. Applications use `openLiveChannel(tenant, remoteStore, { keyId })` from `mindoodb` (`src/core/live/LiveChannel.ts`), which adds what the transport leaves out:
+
+- the message is **encrypted** with a key of the database's readers (`"default"`, a named key, or a group document's series `$sealed:<groupDocId>`), so a removed member of a private chat loses the channel together with the key;
+- it is **signed** by the sending device, and the receiver checks that the tenant directory grants that key to the user the server named as sender;
+- messages older than 60 s (sender's clock) are dropped.
+
+The live channel exists on the Node HTTP server. The Cloudflare host and the Iroh transport do not advertise it yet; `subscribeToLive` then reports `unavailable` and applications simply do without.
 
 #### 5.7.6 Per-entry rejection on push
 

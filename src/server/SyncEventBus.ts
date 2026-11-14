@@ -32,6 +32,25 @@ export interface SyncChangeEvent {
 
 export type SyncChangeListener = (event: SyncChangeEvent) => void;
 
+/**
+ * One message on a database's live channel (capability `supportsLiveChannel`):
+ * ephemeral, never stored, relayed to the subscribers of that database only.
+ * The server cannot read `payload`; clients encrypt it with a key of the
+ * database's readers.
+ */
+export interface SyncLiveEvent {
+  tenantId: string;
+  dbId: string;
+  /** Base64 of the client-encrypted message. */
+  payload: string;
+  /** Username from the publisher's token (the server's word, not the message's). */
+  sender: string;
+  /** The publisher's stream id, so its own stream does not echo the message. */
+  clientId?: string;
+}
+
+export type SyncLiveListener = (event: SyncLiveEvent) => void;
+
 export class SyncEventBus {
   private listeners = new Set<SyncChangeListener>();
 
@@ -56,5 +75,29 @@ export class SyncEventBus {
 
   get listenerCount(): number {
     return this.listeners.size;
+  }
+
+  private liveListeners = new Set<SyncLiveListener>();
+
+  /** Register a live-channel listener; returns an unsubscribe function. */
+  subscribeLive(listener: SyncLiveListener): () => void {
+    this.liveListeners.add(listener);
+    return () => {
+      this.liveListeners.delete(listener);
+    };
+  }
+
+  publishLive(event: SyncLiveEvent): void {
+    for (const listener of this.liveListeners) {
+      try {
+        listener(event);
+      } catch {
+        // as in publish(): one broken subscriber affects nobody else
+      }
+    }
+  }
+
+  get liveListenerCount(): number {
+    return this.liveListeners.size;
   }
 }

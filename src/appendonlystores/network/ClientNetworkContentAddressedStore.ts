@@ -27,10 +27,12 @@ import type {
   NetworkSessionEncryptedEntry,
   SessionEncryptedEntriesBatch,
   StoreChangeEvent,
+  StoreLiveEvent,
   NetworkSyncCapabilities,
 } from "../../core/appendonlystores/network/types";
 import { NetworkError, NetworkErrorType } from "../../core/appendonlystores/network/types";
 import { RSAEncryption } from "../../core/crypto/RSAEncryption";
+import { bytesToBase64 } from "../../core/utils/base64";
 import { Logger, MindooLogger, getDefaultLogLevel } from "../../core/logging";
 import { createIdBloomSummary } from "../../core/appendonlystores/bloom";
 import { negotiateSync } from "../../core/accesscontrol/receiptValidation";
@@ -634,10 +636,68 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     return () => controller.abort();
   }
 
+  /** This client's id on live channels, so the server does not echo its own messages. */
+  private readonly liveClientId = Array.from(
+    globalThis.crypto.getRandomValues(new Uint8Array(12)),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+
+  /**
+   * Subscribe to this store's live channel (capability `supportsLiveChannel`):
+   * ephemeral messages other clients publish with {@link publishLive}. Nothing
+   * is replayed after a reconnect. `onState` reports `connected`,
+   * `connecting` (reconnecting with backoff) and `unavailable` (the server has
+   * no live channel; the subscription then ends).
+   *
+   * @returns an unsubscribe function that closes the stream.
+   */
+  subscribeToLive(
+    onMessage: (event: StoreLiveEvent) => void,
+    options?: { onState?: (state: "connecting" | "connected" | "unavailable") => void },
+  ): () => void {
+    const controller = new AbortController();
+    const report = (state: "connecting" | "connected" | "unavailable") => {
+      try {
+        options?.onState?.(state);
+      } catch (error) {
+        this.logger.warn("Live subscription onState callback failed", error);
+      }
+    };
+    report("connecting");
+    void this.runChangeSubscriptionLoop(
+      () => undefined,
+      controller.signal,
+      () => report("connected"),
+      { onLive: onMessage, onDown: () => report("connecting"), onUnavailable: () => report("unavailable") },
+    );
+    return () => controller.abort();
+  }
+
+  /** Publish one message (already encrypted by the caller) on this store's live channel. */
+  async publishLive(payload: Uint8Array): Promise<void> {
+    const capabilities = await this.getCapabilities();
+    if (!capabilities.supportsLiveChannel || !this.transport.publishLive) {
+      throw new NetworkError(NetworkErrorType.SERVER_ERROR, "The server has no live channel");
+    }
+    const send = async () =>
+      this.transport.publishLive!(await this.ensureAuthenticated(), bytesToBase64(payload), this.liveClientId);
+    try {
+      await send();
+    } catch (error) {
+      if (!this.isInvalidTokenError(error)) {
+        throw error;
+      }
+      // Expired token: sign in again once.
+      this.clearAuthCache();
+      await send();
+    }
+  }
+
   private async runChangeSubscriptionLoop(
     onChange: (event: StoreChangeEvent) => void,
     signal: AbortSignal,
     onConnected?: () => void,
+    live?: { onLive: (event: StoreLiveEvent) => void; onDown: () => void; onUnavailable: () => void },
   ): Promise<void> {
     const initialBackoffMs = 1_000;
     const maxBackoffMs = 60_000;
@@ -650,6 +710,12 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
           this.logger.info(
             "Remote does not support change events; live subscription disabled",
           );
+          live?.onUnavailable();
+          return;
+        }
+        if (live && !capabilities.supportsLiveChannel) {
+          this.logger.info("Remote has no live channel");
+          live.onUnavailable();
           return;
         }
         const token = await this.ensureAuthenticated();
@@ -669,6 +735,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
                 this.logger.warn("Change subscription onConnected callback failed", error);
               }
             },
+            ...(live ? { live: { clientId: this.liveClientId, onLive: live.onLive } } : {}),
           },
         );
         // Orderly stream end (server restart / idle close): reconnect quickly.
@@ -690,6 +757,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       if (signal.aborted) {
         return;
       }
+      live?.onDown();
       await ClientNetworkContentAddressedStore.sleepWithAbort(backoffMs, signal);
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
     }

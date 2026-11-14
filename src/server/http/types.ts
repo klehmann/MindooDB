@@ -10,7 +10,7 @@
  */
 
 import type { StoreKind } from "../../core/appendonlystores/types";
-import type { SyncChangeEvent } from "../SyncEventBus";
+import type { SyncChangeEvent, SyncLiveEvent } from "../SyncEventBus";
 
 export interface ServerRequest {
   /** Upper-case HTTP method. */
@@ -51,6 +51,13 @@ export interface ServerRequest {
 export interface SyncEventStreamSpec {
   tenantId: string;
   storeKind: StoreKind;
+  /**
+   * Databases whose live channel this stream also carries (`?live=`); the
+   * caller passed the read gate of each. Absent: change events only.
+   */
+  liveDbIds?: string[];
+  /** The subscriber's stream id (`?client=`): its own live messages are not echoed. */
+  liveClientId?: string;
 }
 
 export type ServerResponse =
@@ -83,6 +90,8 @@ export interface SyncEventPublisher {
   publish(event: SyncChangeEvent): void;
   /** Publishing is skipped entirely while nobody listens. */
   readonly listenerCount: number;
+  /** Relay a live-channel message (hosts with `liveChannel` enabled). */
+  publishLive?(event: SyncLiveEvent): void;
 }
 
 export function jsonResponse(

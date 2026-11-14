@@ -13,6 +13,7 @@ export {
   MindooDBServerCore,
   errorResponse,
   formatSyncChangeEvent,
+  formatSyncLiveEvent,
   formatSyncHeartbeat,
   formatSyncHelloEvent,
   parseBodySizeLimitToBytes,
@@ -40,7 +41,13 @@ export {
   type TenantStoreFactory,
 } from "./ServerDataStore";
 export { PurgedDocRegistry } from "./PurgedDocRegistry";
-export { SyncEventBus, type SyncChangeEvent, type SyncChangeListener } from "./SyncEventBus";
+export {
+  SyncEventBus,
+  type SyncChangeEvent,
+  type SyncChangeListener,
+  type SyncLiveEvent,
+  type SyncLiveListener,
+} from "./SyncEventBus";
 export { CapabilityMatcher, parseSystemTenantItemPath } from "./CapabilityMatcher";
 export { SystemAdminAuthService, type SystemAdminTokenPayload } from "./SystemAdminAuth";
 export {

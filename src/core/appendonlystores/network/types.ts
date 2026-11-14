@@ -90,6 +90,18 @@ export interface StoreChangeEvent {
 }
 
 /**
+ * One message from a database's live channel (capability
+ * `supportsLiveChannel`): ephemeral, never stored, never replayed.
+ */
+export interface StoreLiveEvent {
+  dbId: string;
+  /** Username the server took from the publisher's token. */
+  sender: string;
+  /** Base64 of the client-encrypted message. */
+  payload: string;
+}
+
+/**
  * User public keys retrieved from the tenant directory.
  * Used for authentication (signature verification) and encryption (transport encryption).
  */
@@ -315,6 +327,8 @@ export interface NetworkSyncCapabilities {
    * subscribe instead of polling.
    */
   supportsChangeEvents?: boolean;
+  /** Live channel available: `publishLive` and `event: live` on the event stream. */
+  supportsLiveChannel?: boolean;
 }
 
 /**
