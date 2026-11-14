@@ -496,6 +496,10 @@ export class BaseMindooTenant implements MindooTenant {
     return this.userKeys.rotateUserKey();
   }
 
+  async getDeviceSelfGrantPublicKey(): Promise<string | null> {
+    return this.userKeys.getDeviceSelfGrantPublicKey();
+  }
+
   async reconcileUserKeys(options?: { allowSelfCreate?: boolean }): Promise<UserKeyEnrollmentStatus> {
     return this.userKeys.reconcile(options);
   }
@@ -2028,6 +2032,21 @@ export class BaseMindooTenant implements MindooTenant {
       const wrapDefault =
         options.sharedDocKeyIds === undefined ||
         options.sharedDocKeyIds.includes(DEFAULT_TENANT_KEY_ID);
+      // The person's first device brings their device self-grant key. Only
+      // then is it the person's own key; an additional device's request
+      // carries a key nobody else holds (docs/userkeys.md §9).
+      const selfGrantKey =
+        typeof request.deviceSelfGrantPublicKey === "string"
+          ? request.deviceSelfGrantPublicKey.trim()
+          : "";
+      if (options.allowDeviceSelfGrant && selfGrantKey && publishedPublicKey === userPublicKey) {
+        await (directory as BaseMindooTenantDirectory).setDeviceSelfGrant(
+          username,
+          selfGrantKey,
+          options.adminSigningKey,
+          options.adminPassword,
+        );
+      }
       if (wrapDefault && publishedPublicKey === userPublicKey) {
         await (directory as BaseMindooTenantDirectory).autoDistributeKeysToUser(
           username,

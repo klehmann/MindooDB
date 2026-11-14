@@ -27,7 +27,8 @@ import { CryptoAdapter } from "./crypto/CryptoAdapter";
 import { authChallengeSigningBytes } from "./crypto/AuthChallenge";
 import { decryptPrivateKey as decryptPrivateKeyWithPassword, encryptPrivateKey as encryptPrivateKeyWithPassword } from "./crypto/privateKeyEncryption";
 import { generateRsaOaep3072 } from "./crypto/rsaOaep3072";
-import { USERKEY_PRIVATE_SALT } from "./userkeys/types";
+import { DEVICE_SELF_GRANT_PRIVATE_SALT, USERKEY_PRIVATE_SALT } from "./userkeys/types";
+import { generateSelfGrantKeyPair } from "./userkeys/generationSignature";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { unwrapDeviceJoinBootstrap } from "./join/deviceJoinBootstrap";
 import { DEFAULT_PBKDF2_ITERATIONS, resolvePbkdf2Iterations } from "./crypto/pbkdf2Iterations";
@@ -297,6 +298,20 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       publicKey: generated.publicKeyPem,
       privateKey: encrypted,
     };
+    // The person's device self-grant key is born with their User-Key on the
+    // same (first) device; later devices receive it wrapped (docs/userkeys.md §9).
+    if (!user.deviceSelfGrantKeyPair) {
+      const selfGrant = await generateSelfGrantKeyPair(this.cryptoAdapter);
+      user.deviceSelfGrantKeyPair = {
+        publicKey: selfGrant.publicKeyPem,
+        privateKey: await encryptPrivateKeyWithPassword(
+          this.cryptoAdapter,
+          selfGrant.privateKeyBytes,
+          password,
+          DEVICE_SELF_GRANT_PRIVATE_SALT,
+        ),
+      };
+    }
     return user.userKeyPair;
   }
 
@@ -378,6 +393,31 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       }
     }
 
+    let deviceSelfGrantKeyPair: SigningKeyPair | undefined;
+    if (identity.deviceSelfGrantKeyPair) {
+      try {
+        deviceSelfGrantKeyPair = {
+          publicKey: identity.deviceSelfGrantKeyPair.publicKey,
+          privateKey: await encryptPrivateKeyWithPassword(
+            this.cryptoAdapter,
+            new Uint8Array(
+              await decryptPrivateKeyWithPassword(
+                this.cryptoAdapter,
+                identity.deviceSelfGrantKeyPair.privateKey,
+                oldPassword,
+                DEVICE_SELF_GRANT_PRIVATE_SALT,
+              ),
+            ),
+            newPassword,
+            DEVICE_SELF_GRANT_PRIVATE_SALT,
+          ),
+        };
+      } catch {
+        // Same as the User-Key: an unreadable copy must not block unlocking.
+        // The key is restored from this device's wrap on the next reconcile.
+      }
+    }
+
     return {
       username: identity.username,
       userSigningKeyPair: {
@@ -389,6 +429,7 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         privateKey: encryptedEncryptionKey,
       },
       ...(userKeyPair ? { userKeyPair } : {}),
+      ...(deviceSelfGrantKeyPair ? { deviceSelfGrantKeyPair } : {}),
     };
   }
 
@@ -567,6 +608,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
         {
           disableAllAccessChecksAndPolicies: true,
           requireMetadataSignatureSince: semanticNow(),
+          // Every client that can create a tenant signs User-Key generations,
+          // so unsigned ones never need to count here (docs/userkeys.md §9.3).
+          requireUserKeyGenerationSignatureSince: semanticNow(),
         },
         adminUser.userSigningKeyPair.privateKey,
         options.adminPassword,
@@ -642,6 +686,9 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     }
     if (user.userKeyPair?.publicKey) {
       joinRequest.userPublicKey = user.userKeyPair.publicKey;
+    }
+    if (user.deviceSelfGrantKeyPair?.publicKey) {
+      joinRequest.deviceSelfGrantPublicKey = user.deviceSelfGrantKeyPair.publicKey;
     }
     const requestedDocKeyIds = normalizeRequestedDocKeyIds(options?.requestedDocKeyIds);
     if (requestedDocKeyIds) {

@@ -7,7 +7,19 @@ import { generateRsaOaep3072, importRsaOaepPrivateKey } from "../crypto/rsaOaep3
 import type { EncryptionKeyPair, MindooDB, MindooDoc, PrivateUserId, SigningKeyPair } from "../types";
 import { DEFAULT_TENANT_KEY_ID, USER_DIRECTORY_DB_ID } from "../types";
 import { fingerprintEncryptionPublicKey } from "./fingerprint";
-import { resolveUserKeyDocument } from "./resolveUserKeyDocument";
+import {
+  applyGenerationValidity,
+  resolveUserKeyDocument,
+  type ResolvedUserKeyDocument,
+} from "./resolveUserKeyDocument";
+import {
+  deriveGenerationSigningKey,
+  ed25519FromPkcs8,
+  generateSelfGrantKeyPair,
+  signEd25519,
+  userKeyGenerationSigningMessage,
+} from "./generationSignature";
+import { normalizePublicKeyPem } from "./fingerprint";
 import { asUserKeyPayload } from "./validateUserKeyDocument";
 import {
   buildPendingUserKeyPayload,
@@ -21,6 +33,7 @@ import {
   writeDeviceWrap,
 } from "./UserKeyDocument";
 import {
+  DEVICE_SELF_GRANT_PRIVATE_SALT,
   USERKEY_PRIVATE_SALT,
   USERKEY_USERNAME_HASH_VERSION,
   UserKeyDecryptError,
@@ -30,7 +43,10 @@ import {
   userKeyDocumentId,
   type PendingUserKeyDevice,
   type UserKeyDeviceRow,
+  type UserKeyDeviceWrap,
   type UserKeyDocumentPayload,
+  type UserKeyGeneration,
+  type UserKeyGenerationSignature,
   type UserKeyEnrollmentStatus,
   type UserKeyWaitState,
 } from "./types";
@@ -44,6 +60,8 @@ export class UserKeyManager {
   private seededBytesVerifiedForPublicKey: string | null = null;
   private resolvingOwnDeviceWrap = false;
   private reconcileInFlight: Promise<UserKeyEnrollmentStatus> | null = null;
+  private decryptedSelfGrantBytes: Uint8Array | null = null;
+  private resolvingSelfGrantWrap = false;
 
   constructor(private readonly tenant: BaseMindooTenant) {}
 
@@ -169,7 +187,339 @@ export class UserKeyManager {
     this.decryptedUserKeyCache = null;
     this.seededBytesMatchLocalPublic = true;
     this.seededBytesVerifiedForPublicKey = pair.publicKey;
+    if (!user.deviceSelfGrantKeyPair) {
+      await this.generateLocalSelfGrantKey(user, password);
+    }
     return pair;
+  }
+
+  // ==================== Device self-grant key (docs/userkeys.md §9) ====================
+
+  private async generateLocalSelfGrantKey(user: PrivateUserId, password: string): Promise<void> {
+    const crypto = this.tenant.getCryptoAdapter();
+    const generated = await generateSelfGrantKeyPair(crypto);
+    user.deviceSelfGrantKeyPair = {
+      publicKey: generated.publicKeyPem,
+      privateKey: await encryptPrivateKey(
+        crypto,
+        generated.privateKeyBytes,
+        password,
+        DEVICE_SELF_GRANT_PRIVATE_SALT,
+      ),
+    };
+    this.decryptedSelfGrantBytes = generated.privateKeyBytes;
+  }
+
+  /**
+   * Public half of this person's device self-grant key, as held by this
+   * device (docs/userkeys.md §9). The admin names it in the grant with
+   * `directory.setDeviceSelfGrant`. `null` while this device holds none.
+   */
+  async getDeviceSelfGrantPublicKey(): Promise<string | null> {
+    const bytes = await this.getSelfGrantPrivateKeyBytes();
+    if (!bytes) return null;
+    return this.tenant.getCurrentPrivateUser().deviceSelfGrantKeyPair?.publicKey ?? null;
+  }
+
+  /**
+   * The self-grant private key (PKCS8): from memory, the password-encrypted
+   * copy on the identity, or this device's wrap in the own User-Key document.
+   * When the admin named a key in the grant, a held key that differs is not
+   * returned as long as a wrap of the granted key exists.
+   */
+  async getSelfGrantPrivateKeyBytes(): Promise<Uint8Array | null> {
+    if (this.decryptedSelfGrantBytes) return this.decryptedSelfGrantBytes;
+    const user = this.tenant.getCurrentPrivateUser();
+    const pair = user.deviceSelfGrantKeyPair;
+    const password = this.tenant.getCurrentUserPassword();
+    // A device that made its own key before joining holds one nobody else
+    // knows; the person's key (the one in the grant) comes from a wrap.
+    const granted = await this.grantedSelfGrantKey();
+    if (granted && pair && normalizePublicKeyPem(pair.publicKey) !== normalizePublicKeyPem(granted)) {
+      const fromWrap = await this.importSelfGrantKeyFromWrap();
+      if (fromWrap) return fromWrap;
+    }
+    if (pair && password) {
+      try {
+        const bytes = new Uint8Array(
+          await this.tenant.decryptPrivateKey(pair.privateKey, password, DEVICE_SELF_GRANT_PRIVATE_SALT),
+        );
+        const derived = await ed25519FromPkcs8(this.tenant.getCryptoAdapter(), bytes);
+        if (normalizePublicKeyPem(derived.publicKeyPem) === normalizePublicKeyPem(pair.publicKey)) {
+          this.decryptedSelfGrantBytes = bytes;
+          return bytes;
+        }
+      } catch {
+        // fall through to the wrap
+      }
+    }
+    return this.importSelfGrantKeyFromWrap();
+  }
+
+  /** Unwrap the self-grant key from this device's wrap and keep it on the identity. */
+  private async importSelfGrantKeyFromWrap(): Promise<Uint8Array | null> {
+    if (this.resolvingSelfGrantWrap) return null;
+    this.resolvingSelfGrantWrap = true;
+    try {
+      if (!this.canReconcileAgainstUserDirectory()) return null;
+      const deviceKey = await this.tenant.getEncryptionPrivateKeyForReconcile();
+      if (!deviceKey) return null;
+      const resolved = await this.resolveOwnUserKeyDocument();
+      if (!resolved) return null;
+      const crypto = this.tenant.getCryptoAdapter();
+      const user = this.tenant.getCurrentPrivateUser();
+      const deviceFp = await fingerprintEncryptionPublicKey(
+        user.userEncryptionKeyPair.publicKey,
+        crypto.getSubtle(),
+      );
+      const granted = await this.grantedSelfGrantKey();
+      let fallback: { bytes: Uint8Array; publicKeyPem: string } | null = null;
+      for (const epoch of this.epochsNewestFirst(resolved.payload)) {
+        const wrapped = resolved.payload.userKeys[epoch]?.deviceWraps?.[deviceFp]?.wrappedSelfGrantKey;
+        if (!wrapped) continue;
+        try {
+          const bytes = await unwrapPrivateKeyFromDevice({
+            cryptoAdapter: crypto,
+            wrappedKeyB64: wrapped,
+            deviceEncryptionPrivateKey: deviceKey,
+          });
+          const { publicKeyPem } = await ed25519FromPkcs8(crypto, bytes);
+          if (!granted || normalizePublicKeyPem(publicKeyPem) === normalizePublicKeyPem(granted)) {
+            fallback = { bytes, publicKeyPem };
+            break;
+          }
+          fallback ??= { bytes, publicKeyPem };
+        } catch (error) {
+          console.warn("[userkeys] self-grant key unwrap failed", { epoch }, error);
+        }
+      }
+      if (!fallback) return null;
+      user.deviceSelfGrantKeyPair = {
+        publicKey: fallback.publicKeyPem,
+        privateKey: await encryptPrivateKey(
+          crypto,
+          fallback.bytes,
+          this.tenant.getCurrentUserPassword(),
+          DEVICE_SELF_GRANT_PRIVATE_SALT,
+        ),
+      };
+      this.decryptedSelfGrantBytes = fallback.bytes;
+      return fallback.bytes;
+    } finally {
+      this.resolvingSelfGrantWrap = false;
+    }
+  }
+
+  /** The self-grant key the admin named in this person's grant, or `null`. */
+  private async grantedSelfGrantKey(): Promise<string | null> {
+    try {
+      const directory = await this.directory();
+      const username = (await this.tenant.getCurrentUserId()).username;
+      const grant = await directory.getDeviceSelfGrant(username);
+      return grant && grant.revokedAt === undefined ? grant.signingPublicKey : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Self-grant signer for this device, if it holds the key. */
+  private async selfGrantSigner(): Promise<{ privateKey: CryptoKey; publicKeyPem: string } | null> {
+    const bytes = await this.getSelfGrantPrivateKeyBytes();
+    if (!bytes) return null;
+    try {
+      return await ed25519FromPkcs8(this.tenant.getCryptoAdapter(), bytes);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Wrap the self-grant key to a device, when this device holds it. */
+  private async wrapSelfGrantKeyFor(deviceEncryptionPublicKey: string): Promise<string | undefined> {
+    const bytes = await this.getSelfGrantPrivateKeyBytes();
+    if (!bytes) return undefined;
+    return wrapPrivateKeyForDevice({
+      cryptoAdapter: this.tenant.getCryptoAdapter(),
+      privateKeyBytes: bytes,
+      deviceEncryptionPublicKey,
+    });
+  }
+
+  /**
+   * Signing key and signatures for a generation (docs/userkeys.md §9.3).
+   * `ownBytes` derive the generation's own signing key. Signs with the
+   * previous generation's key when `previous` is given, with the self-grant
+   * key when this device holds it, and with its own key when `selfSign`
+   * (pending adoption; harmless otherwise).
+   */
+  private async generationSignatureFields(input: {
+    usernameHash: string;
+    epoch: string;
+    gen: Pick<UserKeyGeneration, "publicKey" | "fingerprint" | "createdAt">;
+    ownBytes: Uint8Array;
+    previous?: { gen: UserKeyGeneration; bytes: Uint8Array } | null;
+    selfSign?: boolean;
+  }): Promise<{ signingPublicKey: string; signatures: UserKeyGenerationSignature[] }> {
+    const crypto = this.tenant.getCryptoAdapter();
+    const own = await deriveGenerationSigningKey(crypto, input.ownBytes);
+    const message = userKeyGenerationSigningMessage(input.usernameHash, input.epoch, {
+      ...input.gen,
+      signingPublicKey: own.publicKeyPem,
+    });
+    const signatures: UserKeyGenerationSignature[] = [];
+    if (input.previous?.gen.signingPublicKey) {
+      const prev = await deriveGenerationSigningKey(crypto, input.previous.bytes);
+      if (
+        normalizePublicKeyPem(prev.publicKeyPem) ===
+        normalizePublicKeyPem(input.previous.gen.signingPublicKey)
+      ) {
+        signatures.push({
+          signerPublicKey: prev.publicKeyPem,
+          signature: await signEd25519(crypto, prev.privateKey, message),
+        });
+      }
+    }
+    const selfGrant = await this.selfGrantSigner();
+    if (selfGrant) {
+      signatures.push({
+        signerPublicKey: selfGrant.publicKeyPem,
+        signature: await signEd25519(crypto, selfGrant.privateKey, message),
+      });
+    }
+    if (input.selfSign) {
+      signatures.push({
+        signerPublicKey: own.publicKeyPem,
+        signature: await signEd25519(crypto, own.privateKey, message),
+      });
+    }
+    return { signingPublicKey: own.publicKeyPem, signatures };
+  }
+
+  /** The document's generations that count (docs/userkeys.md §9.3). */
+  private async validated(doc: MindooDoc): Promise<ResolvedUserKeyDocument | null> {
+    const raw = asUserKeyPayload(doc.getData());
+    if (!raw) return null;
+    return applyGenerationValidity(doc, raw, {
+      db: doc.getDatabase(),
+      directory: await this.directory(),
+    });
+  }
+
+  /** Effective cutoff for unsigned generations of this person (tenant policy, self-grant). */
+  private async generationSignatureCutoff(usernameHash: string): Promise<number | undefined> {
+    const directory = await this.directory();
+    const tenantCutoff = await directory.getRequireUserKeyGenerationSignatureSince();
+    const selfGrant = await directory.getDeviceSelfGrantForUsernameHash(usernameHash);
+    const cutoffs = [tenantCutoff, selfGrant?.grantedAt].filter(
+      (t): t is number => typeof t === "number" && Number.isFinite(t),
+    );
+    return cutoffs.length > 0 ? Math.min(...cutoffs) : undefined;
+  }
+
+  /**
+   * Give the current generation its signing key when it has none (or one this
+   * device cannot derive), so the next rotation can be chained to it. Written
+   * only when the change will count: while the person's document is pending,
+   * before the cutoff, or signed by a granted self-grant key.
+   */
+  private async ensureCurrentGenerationSigningKey(
+    resolved: ResolvedUserKeyDocument,
+  ): Promise<void> {
+    const epoch = currentUserKeyEpoch(resolved.payload);
+    if (!epoch) return;
+    const gen = resolved.payload.userKeys[epoch];
+    const bytes = await this.privateKeyBytesForEpoch(resolved.payload, epoch);
+    if (!gen || !bytes) return;
+    const crypto = this.tenant.getCryptoAdapter();
+    const derived = await deriveGenerationSigningKey(crypto, bytes);
+    if (
+      gen.signingPublicKey &&
+      normalizePublicKeyPem(gen.signingPublicKey) === normalizePublicKeyPem(derived.publicKeyPem)
+    ) {
+      return;
+    }
+    const usernameHash = resolved.payload.username_hash;
+    const pending = isPendingUserKeyDocument(resolved.rawPayload);
+    const cutoff = await this.generationSignatureCutoff(usernameHash);
+    const granted = await this.grantedSelfGrantKey();
+    const selfGrant = granted ? await this.selfGrantSigner() : null;
+    const holdsGranted =
+      !!selfGrant && normalizePublicKeyPem(selfGrant.publicKeyPem) === normalizePublicKeyPem(granted!);
+    const lowest = this.epochsNewestFirst(resolved.payload).reverse()[0] === epoch;
+    const counts = (pending && lowest) || cutoff === undefined || Date.now() < cutoff || holdsGranted;
+    if (!counts) return;
+    const fields = await this.generationSignatureFields({
+      usernameHash,
+      epoch,
+      gen,
+      ownBytes: bytes,
+      selfSign: pending && lowest,
+    });
+    const live = asUserKeyPayload(resolved.doc.getData()) ?? resolved.rawPayload;
+    await replaceUserKeys(resolved.doc.getDatabase(), resolved.doc, {
+      ...live.userKeys,
+      [epoch]: { ...(live.userKeys[epoch] ?? gen), ...fields },
+    });
+  }
+
+  /**
+   * Make sure this person has a self-grant key and every approved device of
+   * the current generation holds it (docs/userkeys.md §9). The first updated
+   * device that holds the User-Key and finds no wrapped self-grant key creates
+   * one; every device wraps the key it holds to devices that lack it.
+   */
+  private async ensureSelfGrantKeyDistributed(resolved: ResolvedUserKeyDocument): Promise<void> {
+    const epoch = currentUserKeyEpoch(resolved.payload);
+    if (!epoch) return;
+    const gen = resolved.payload.userKeys[epoch];
+    if (!gen) return;
+    const userKeyBytes = await this.privateKeyBytesForEpoch(resolved.payload, epoch);
+    if (!userKeyBytes) return;
+    let bytes = await this.getSelfGrantPrivateKeyBytes();
+    const anyWrapped = Object.values(gen.deviceWraps ?? {}).some((w) => !!w.wrappedSelfGrantKey);
+    if (!bytes && !anyWrapped) {
+      const user = this.tenant.getCurrentPrivateUser();
+      await this.generateLocalSelfGrantKey(user, this.tenant.getCurrentUserPassword());
+      bytes = this.decryptedSelfGrantBytes;
+    }
+    if (!bytes) return;
+    const directory = await this.directory();
+    const username = (await this.tenant.getCurrentUserId()).username;
+    const overview = await directory.getUserGrantOverview(username);
+    const crypto = this.tenant.getCryptoAdapter();
+    const db = resolved.doc.getDatabase();
+    for (const device of overview.activeDevices) {
+      const fp = await fingerprintEncryptionPublicKey(device.encryptionPublicKey, crypto.getSubtle());
+      const wrap = gen.deviceWraps?.[fp];
+      if (!wrap?.wrappedKey || wrap.wrappedSelfGrantKey) continue;
+      await writeDeviceWrap({
+        db,
+        doc: resolved.doc,
+        epoch,
+        deviceFingerprint: fp,
+        wrap: { ...wrap, wrappedSelfGrantKey: await this.wrapSelfGrantKeyFor(device.encryptionPublicKey) },
+      });
+    }
+    // Wraps written by other devices may not be in the grant overview yet
+    // (directory not pulled). This device's own wrap is covered either way.
+    const user = this.tenant.getCurrentPrivateUser();
+    const ownFp = await fingerprintEncryptionPublicKey(
+      user.userEncryptionKeyPair.publicKey,
+      crypto.getSubtle(),
+    );
+    const live = asUserKeyPayload(resolved.doc.getData());
+    const ownWrap = live?.userKeys[epoch]?.deviceWraps?.[ownFp];
+    if (ownWrap?.wrappedKey && !ownWrap.wrappedSelfGrantKey) {
+      await writeDeviceWrap({
+        db,
+        doc: resolved.doc,
+        epoch,
+        deviceFingerprint: ownFp,
+        wrap: {
+          ...ownWrap,
+          wrappedSelfGrantKey: await this.wrapSelfGrantKeyFor(user.userEncryptionKeyPair.publicKey),
+        },
+      });
+    }
   }
 
   async getLocalUserPublicKey(): Promise<string | null> {
@@ -333,10 +683,7 @@ export class UserKeyManager {
     return this.tenant.openDB(USER_DIRECTORY_DB_ID);
   }
 
-  async resolveOwnUserKeyDocument(): Promise<{
-    doc: MindooDoc;
-    payload: UserKeyDocumentPayload;
-  } | null> {
+  async resolveOwnUserKeyDocument(): Promise<ResolvedUserKeyDocument | null> {
     const db = await this.openUserDirectory();
     const directory = await this.directory();
     const username = (await this.tenant.getCurrentUserId()).username;
@@ -430,6 +777,17 @@ export class UserKeyManager {
     if (!binding) return null;
     const { grantDocId, usernameHash, usernameHashVersion } = binding;
     const fingerprint = await fingerprintUserPublicKey(pair.publicKey, this.tenant.getCryptoAdapter());
+    const mintBytes = await this.getDecryptedUserKeyBytes();
+    const createdAt = Date.now();
+    const signed = mintBytes
+      ? await this.generationSignatureFields({
+          usernameHash,
+          epoch: "1",
+          gen: { publicKey: pair.publicKey, fingerprint, createdAt },
+          ownBytes: mintBytes,
+          selfSign: true,
+        })
+      : undefined;
     const db = await this.openUserDirectory();
     let doc;
     let mintedHere = false;
@@ -449,7 +807,8 @@ export class UserKeyManager {
           usernameHashVersion,
           publicKey: pair.publicKey,
           fingerprint,
-          createdAt: Date.now(),
+          createdAt,
+          ...signed,
         });
         doc = await db.createDocument({
           idPrefix: "userkey",
@@ -464,6 +823,8 @@ export class UserKeyManager {
           usernameHashVersion,
           publicKey: pair.publicKey,
           fingerprint,
+          createdAt,
+          ...signed,
         });
       }
       mintedHere = true;
@@ -507,9 +868,11 @@ export class UserKeyManager {
     }
     const live = asUserKeyPayload(doc.getData()) ?? payload;
     const localPublic = await this.getLocalUserPublicKey();
-    const epoch = currentUserKeyEpoch(live);
+    // "Current" only among generations that count (§9.3); write into `live`.
+    const valid = (await this.validated(doc))?.payload ?? payload;
+    const epoch = currentUserKeyEpoch(valid);
     if (!epoch || !localPublic) return;
-    const gen = live.userKeys[epoch];
+    const gen = live.userKeys[epoch] ?? valid.userKeys[epoch];
     if (!gen || gen.publicKey !== localPublic) return;
     const directory = await this.directory();
     const signer = await this.tenant.getCurrentUserId();
@@ -545,16 +908,13 @@ export class UserKeyManager {
         }
         continue;
       }
-      deviceWraps[deviceFp] = {
-        wrappedKey: await wrapPrivateKeyForDevice({
-          cryptoAdapter: this.tenant.getCryptoAdapter(),
-          privateKeyBytes: bytes,
-          deviceEncryptionPublicKey: device.encryptionPublicKey,
-        }),
-        ...(device.label ? { label: device.label } : {}),
+      deviceWraps[deviceFp] = await this.buildDeviceWrap({
+        userKeyBytes: bytes,
+        deviceEncryptionPublicKey: device.encryptionPublicKey,
+        label: device.label,
         approvedAt: now,
         approvedBySigningPublicKey: signer.userSigningPublicKey,
-      };
+      });
       changed = true;
     }
     if (!changed) return;
@@ -562,6 +922,28 @@ export class UserKeyManager {
       ...live.userKeys,
       [epoch]: { ...gen, deviceWraps },
     });
+  }
+
+  /** A device wrap of the User-Key, plus the self-grant key when this device holds it. */
+  private async buildDeviceWrap(input: {
+    userKeyBytes: Uint8Array;
+    deviceEncryptionPublicKey: string;
+    label?: string;
+    approvedAt: number;
+    approvedBySigningPublicKey: string;
+  }): Promise<UserKeyDeviceWrap> {
+    const wrappedSelfGrantKey = await this.wrapSelfGrantKeyFor(input.deviceEncryptionPublicKey);
+    return {
+      wrappedKey: await wrapPrivateKeyForDevice({
+        cryptoAdapter: this.tenant.getCryptoAdapter(),
+        privateKeyBytes: input.userKeyBytes,
+        deviceEncryptionPublicKey: input.deviceEncryptionPublicKey,
+      }),
+      ...(input.label ? { label: input.label } : {}),
+      approvedAt: input.approvedAt,
+      approvedBySigningPublicKey: input.approvedBySigningPublicKey,
+      ...(wrappedSelfGrantKey ? { wrappedSelfGrantKey } : {}),
+    };
   }
 
   private async tryImportUserKeyFromWrap(payload: UserKeyDocumentPayload): Promise<boolean> {
@@ -596,6 +978,12 @@ export class UserKeyManager {
         this.decryptedUserKeyCache = null;
         this.seededBytesMatchLocalPublic = true;
         this.seededBytesVerifiedForPublicKey = gen.publicKey;
+        // The person's self-grant key travels with their User-Key and
+        // replaces one this device may have made for itself before joining.
+        if (wrap.wrappedSelfGrantKey) {
+          this.decryptedSelfGrantBytes = null;
+          await this.importSelfGrantKeyFromWrap().catch(() => null);
+        }
         return true;
       } catch {
         // wrap is not for this device or is corrupt; try next generation
@@ -611,7 +999,7 @@ export class UserKeyManager {
         "This device has no local User-Key to compare against the published document",
       );
     }
-    const live = asUserKeyPayload(doc.getData()) ?? payload;
+    const live = (await this.validated(doc))?.payload ?? asUserKeyPayload(doc.getData()) ?? payload;
     const currentEpoch = currentUserKeyEpoch(live);
     if (!currentEpoch) {
       throw new UserKeyMismatchError("Published user-key document has no generations");
@@ -647,22 +1035,18 @@ export class UserKeyManager {
       if (!bytes) {
         throw new UserKeyMismatchError("Local User-Key private material is unavailable");
       }
-      const wrapped = await wrapPrivateKeyForDevice({
-        cryptoAdapter: this.tenant.getCryptoAdapter(),
-        privateKeyBytes: bytes,
-        deviceEncryptionPublicKey: user.userEncryptionKeyPair.publicKey,
-      });
       await writeDeviceWrap({
         db,
         doc,
         epoch,
         deviceFingerprint: deviceFp,
-        wrap: {
-          wrappedKey: wrapped,
-          ...(ownLabel ? { label: ownLabel } : {}),
+        wrap: await this.buildDeviceWrap({
+          userKeyBytes: bytes,
+          deviceEncryptionPublicKey: user.userEncryptionKeyPair.publicKey,
+          label: ownLabel,
           approvedAt: Date.now(),
           approvedBySigningPublicKey: signer.userSigningPublicKey,
-        },
+        }),
       });
     }
   }
@@ -681,13 +1065,27 @@ export class UserKeyManager {
     const epoch = currentUserKeyEpoch(payload) ?? "1";
     const gen = payload.userKeys[epoch];
     const fingerprint = await fingerprintUserPublicKey(pair.publicKey, this.tenant.getCryptoAdapter());
+    const createdAt = gen?.createdAt ?? Date.now();
+    const bytes = await this.getDecryptedUserKeyBytes();
+    // Adopting a pending document counts only self-signed (§9.3, rule 3).
+    const signed = bytes
+      ? await this.generationSignatureFields({
+          usernameHash: payload.username_hash,
+          epoch,
+          gen: { publicKey: pair.publicKey, fingerprint, createdAt },
+          ownBytes: bytes,
+          selfSign: true,
+        })
+      : {};
+    const raw = asUserKeyPayload(doc.getData()) ?? payload;
     await replaceUserKeys(doc.getDatabase(), doc, {
-      ...payload.userKeys,
+      ...raw.userKeys,
       [epoch]: {
         publicKey: pair.publicKey,
         fingerprint,
-        createdAt: gen?.createdAt ?? Date.now(),
+        createdAt,
         deviceWraps: {},
+        ...signed,
       },
     });
     const db = await this.openUserDirectory();
@@ -726,6 +1124,10 @@ export class UserKeyManager {
     );
     try {
       if (canUsePlantedKey) {
+        // While still pending, give generation 1 its signing key first, so the
+        // self-signed change counts as an adoption (§9.3, rule 3).
+        const current = await this.validated(doc);
+        if (current) await this.ensureCurrentGenerationSigningKey(current);
         await this.writeOwnDeviceWrap(doc, payload);
         await this.wrapPrivateKeyForActiveGrantDevices(doc, payload, {
           legacyUnstampedOnly: true,
@@ -792,7 +1194,8 @@ export class UserKeyManager {
         this.lastUserDirectoryFetchError = null;
       }
 
-      let resolved = await this.resolveOwnUserKeyDocument();
+      let resolved: { doc: MindooDoc; payload: UserKeyDocumentPayload } | null =
+        await this.resolveOwnUserKeyDocument();
       if (!resolved) {
         resolved = await this.ensureOwnUserKeyDocument(options);
       }
@@ -856,6 +1259,18 @@ export class UserKeyManager {
       }
 
       await this.dropRevokedDeviceWraps(resolved.doc, resolved.payload);
+      try {
+        const latest =
+          (await this.resolveOwnUserKeyDocument()) ?? (await this.validated(resolved.doc));
+        if (latest) {
+          await this.ensureCurrentGenerationSigningKey(latest);
+          const afterSign = (await this.resolveOwnUserKeyDocument()) ?? latest;
+          await this.ensureSelfGrantKeyDistributed(afterSign);
+          resolved = (await this.resolveOwnUserKeyDocument()) ?? afterSign;
+        }
+      } catch (error) {
+        console.warn("[userkeys] generation signing key / self-grant key upkeep failed", error);
+      }
       return this.enrollmentStatus(resolved.payload, this.waitState());
     } catch (error) {
       if (error instanceof UserKeyMismatchError || error instanceof UserKeyDecryptError) throw error;
@@ -972,22 +1387,18 @@ export class UserKeyManager {
         hasPrivateKeyBytes: !!bytes,
       });
       if (!bytes) continue;
-      const wrapped = await wrapPrivateKeyForDevice({
-        cryptoAdapter: this.tenant.getCryptoAdapter(),
-        privateKeyBytes: bytes,
-        deviceEncryptionPublicKey: encryptionPublicKey,
-      });
       await writeDeviceWrap({
         db,
         doc: resolved.doc,
         epoch,
         deviceFingerprint: fingerprint,
-        wrap: {
-          wrappedKey: wrapped,
-          ...(label ? { label } : {}),
+        wrap: await this.buildDeviceWrap({
+          userKeyBytes: bytes,
+          deviceEncryptionPublicKey: encryptionPublicKey,
+          label,
           approvedAt: Date.now(),
           approvedBySigningPublicKey: signer.userSigningPublicKey,
-        },
+        }),
       });
       wroteWrap = true;
     }
@@ -1017,22 +1428,18 @@ export class UserKeyManager {
     for (const epoch of this.epochsNewestFirst(resolved.payload).reverse()) {
       const bytes = await this.privateKeyBytesForEpoch(resolved.payload, epoch);
       if (!bytes) continue;
-      const wrapped = await wrapPrivateKeyForDevice({
-        cryptoAdapter: this.tenant.getCryptoAdapter(),
-        privateKeyBytes: bytes,
-        deviceEncryptionPublicKey: match.encryptionPublicKey,
-      });
       await writeDeviceWrap({
         db,
         doc: resolved.doc,
         epoch,
         deviceFingerprint: fingerprint,
-        wrap: {
-          wrappedKey: wrapped,
-          ...(match.label ? { label: match.label } : {}),
+        wrap: await this.buildDeviceWrap({
+          userKeyBytes: bytes,
+          deviceEncryptionPublicKey: match.encryptionPublicKey,
+          label: match.label,
           approvedAt: Date.now(),
           approvedBySigningPublicKey: signer.userSigningPublicKey,
-        },
+        }),
       });
       wroteWrap = true;
     }
@@ -1079,10 +1486,13 @@ export class UserKeyManager {
     if (!current) {
       throw new Error("Cannot rotate: user-key document has no generations");
     }
-    const nextEpoch = (BigInt(current) + 1n).toString();
-    if (resolved.payload.userKeys[nextEpoch]) {
-      throw new Error(`Cannot rotate: epoch ${nextEpoch} already exists`);
-    }
+    // Above every stored epoch, including ones that do not count (§9.3).
+    const highestStored = Object.keys(resolved.rawPayload.userKeys ?? {})
+      .filter((e) => /^\d+$/.test(e))
+      .reduce((max, e) => (BigInt(e) > max ? BigInt(e) : max), BigInt(current));
+    const nextEpoch = (highestStored + 1n).toString();
+    const previousGen = resolved.payload.userKeys[current];
+    const previousBytes = await this.privateKeyBytesForEpoch(resolved.payload, current);
     const user = this.tenant.getCurrentPrivateUser();
     const generated = await generateRsaOaep3072(this.tenant.getCryptoAdapter());
     const encrypted = await encryptPrivateKey(
@@ -1103,6 +1513,21 @@ export class UserKeyManager {
     );
     const signer = await this.tenant.getCurrentUserId();
     const now = Date.now();
+    const signed = await this.generationSignatureFields({
+      usernameHash: resolved.payload.username_hash,
+      epoch: nextEpoch,
+      gen: { publicKey: generated.publicKeyPem, fingerprint, createdAt: now },
+      ownBytes: generated.privateKeyBytes,
+      previous: previousGen && previousBytes ? { gen: previousGen, bytes: previousBytes } : null,
+    });
+    if (signed.signatures.length === 0) {
+      const cutoff = await this.generationSignatureCutoff(resolved.payload.username_hash);
+      if (cutoff !== undefined && now >= cutoff) {
+        throw new Error(
+          "Cannot rotate: this device can sign the new User-Key generation neither with the previous generation nor with a granted device self-grant key, so it would not count.",
+        );
+      }
+    }
     const directory = await this.directory();
     const overview = await directory.getUserGrantOverview(signer.username);
     const previousWraps = resolved.payload.userKeys[current]?.deviceWraps ?? {};
@@ -1113,25 +1538,24 @@ export class UserKeyManager {
         this.tenant.getCryptoAdapter().getSubtle(),
       );
       if (!previousWraps[deviceFp]) continue;
-      deviceWraps[deviceFp] = {
-        wrappedKey: await wrapPrivateKeyForDevice({
-          cryptoAdapter: this.tenant.getCryptoAdapter(),
-          privateKeyBytes: generated.privateKeyBytes,
-          deviceEncryptionPublicKey: device.encryptionPublicKey,
-        }),
-        ...(device.label ? { label: device.label } : {}),
+      deviceWraps[deviceFp] = await this.buildDeviceWrap({
+        userKeyBytes: generated.privateKeyBytes,
+        deviceEncryptionPublicKey: device.encryptionPublicKey,
+        label: device.label,
         approvedAt: now,
         approvedBySigningPublicKey: signer.userSigningPublicKey,
-      };
+      });
     }
+    const raw = asUserKeyPayload(resolved.doc.getData()) ?? resolved.rawPayload;
     await replaceUserKeys(resolved.doc.getDatabase(), resolved.doc, {
-      ...resolved.payload.userKeys,
-      [current]: { ...resolved.payload.userKeys[current], retiredAt: now },
+      ...raw.userKeys,
+      [current]: { ...(raw.userKeys[current] ?? previousGen), retiredAt: now },
       [nextEpoch]: {
         publicKey: generated.publicKeyPem,
         fingerprint,
         createdAt: now,
         deviceWraps,
+        ...signed,
       },
     });
   }
@@ -1336,7 +1760,9 @@ export class UserKeyManager {
     if (revokedFps.size === 0) return;
     let changed = false;
     const userKeys: UserKeyDocumentPayload["userKeys"] = {};
-    for (const [epoch, gen] of Object.entries(payload.userKeys ?? {})) {
+    // Write back every stored generation, also those that do not count.
+    const raw = asUserKeyPayload(doc.getData()) ?? payload;
+    for (const [epoch, gen] of Object.entries(raw.userKeys ?? {})) {
       const deviceWraps = { ...(gen.deviceWraps ?? {}) };
       for (const fp of Object.keys(deviceWraps)) {
         if (revokedFps.has(fp)) {
