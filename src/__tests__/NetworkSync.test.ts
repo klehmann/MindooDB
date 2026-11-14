@@ -1066,6 +1066,43 @@ describe("Network Sync", () => {
       expect(authenticateSpyA.mock.calls.length + authenticateSpyB.mock.calls.length).toBe(1);
     });
 
+    test("a store that joined another store's authentication authenticates again once that token expires", async () => {
+      await serverStore.putEntries([createMockEntry("doc1", "hash1", 1000)]);
+
+      const sharedTransportIdentity = "shared-auth-expiry-scope";
+      const transportA = new MockNetworkTransport(serverHandler, sharedTransportIdentity);
+      const transportB = new MockNetworkTransport(serverHandler, sharedTransportIdentity);
+      const makeStore = (transport: MockNetworkTransport) =>
+        new ClientNetworkContentAddressedStore(
+          "test-db",
+          StoreKind.docs,
+          transport,
+          cryptoAdapter,
+          "testuser",
+          userSigningKeyPair.privateKey,
+          userEncryptionPrivateKeyPem,
+        );
+      const owner = makeStore(transportA);
+      const joiner = makeStore(transportB);
+
+      // The joiner waits on the owner's in-flight authentication.
+      await Promise.all([owner.findNewEntries([]), joiner.findNewEntries([])]);
+
+      // Two hours later the first token has expired on both sides.
+      const realNow = Date.now;
+      const later = realNow() + 2 * 60 * 60 * 1000;
+      const nowSpy = jest.spyOn(Date, "now").mockImplementation(() => later);
+      try {
+        const authenticateSpyA = jest.spyOn(transportA, "authenticate");
+        const authenticateSpyB = jest.spyOn(transportB, "authenticate");
+        const entries = await joiner.findNewEntries([]);
+        expect(entries.length).toBe(1);
+        expect(authenticateSpyA.mock.calls.length + authenticateSpyB.mock.calls.length).toBe(1);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
     test("should coalesce concurrent capability fetches", async () => {
       const getCapabilitiesSpy = jest.spyOn(mockTransport, "getCapabilities");
 
