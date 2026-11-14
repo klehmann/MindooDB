@@ -69,4 +69,14 @@ export interface PrivateUserId {
    * request and included in paper backups of this object.
    */
   userKeyPair?: EncryptionKeyPair;
+
+  /**
+   * Person-level Ed25519 "device self-grant" key (docs/userkeys.md §9).
+   * Generated together with the User-Key on the person's first device,
+   * password-encrypted with salt `"deviceselfgrant"`, and wrapped to every
+   * approved device inside the User-Key document. When the admin names its
+   * public key in the person's grant (`deviceSelfGrant`), it signs device
+   * certificates and new User-Key generations.
+   */
+  deviceSelfGrantKeyPair?: SigningKeyPair;
 }

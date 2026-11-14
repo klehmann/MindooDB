@@ -282,6 +282,12 @@ interface CreateTenantPasswords {
    */
   requireV2Entries?: boolean;
   /**
+   * Name the founding app user's device self-grant key in their grant, so
+   * they may add their own devices (docs/userkeys.md §9.4). Defaults to
+   * `true`; ignored when the identity has no self-grant key.
+   */
+  allowDeviceSelfGrantForAppUser?: boolean;
+  /**
    * Optional human-readable tenant label stored in the directory document
    * `tenantsetup` (doc under `$publicinfos`; label field-encrypted under
    * `default`). When omitted, no setup document is written at create time.
@@ -382,6 +388,12 @@ export interface JoinRequest {
    */
   userPublicKey?: string;
   /**
+   * Public half of the person's device self-grant key (Ed25519 PEM,
+   * docs/userkeys.md §9). The admin may name it in the grant with
+   * {@link ApproveJoinRequestOptions.allowDeviceSelfGrant}.
+   */
+  deviceSelfGrantPublicKey?: string;
+  /**
    * Hint for the approving admin: which document keys this device is asking
    * for. Not a grant — the admin remains the authority. `$publicinfos` is
    * always implied. Omitting `default` is how a service (for example the mail
@@ -389,6 +401,19 @@ export interface JoinRequest {
    * box unchecked.
    */
   requestedDocKeyIds?: string[];
+}
+
+/**
+ * Admin-signed delegation on a person's grant (`grantaccess.deviceSelfGrant`,
+ * docs/userkeys.md §9): the person may certify their own devices with the
+ * named Ed25519 key. Revoking keeps the key and sets `revokedAt`; certificates
+ * and generations signed before that trusted time stay valid.
+ */
+export interface DeviceSelfGrant {
+  /** Ed25519 public key (PEM) of the person's device self-grant key. */
+  signingPublicKey: string;
+  grantedAt: number;
+  revokedAt?: number;
 }
 
 /**
@@ -443,6 +468,13 @@ export interface ApproveJoinRequestOptions {
    * its grant (`accessPrefixes`), admin-signed. Omit for ordinary members.
    */
   accessPrefixes?: string[];
+  /**
+   * Name the person's device self-grant key from the request
+   * ({@link JoinRequest.deviceSelfGrantPublicKey}) in their grant, so they may
+   * certify further devices themselves (docs/userkeys.md §9). Ignored when the
+   * request carries no such key.
+   */
+  allowDeviceSelfGrant?: boolean;
   /**
    * Human-readable label for the joining device's key pair. When set,
    * it overrides any label the joining user suggested in the join request and
@@ -829,6 +861,12 @@ export interface MindooTenantFactory {
    * the identity so paper backup includes it.
    */
   ensureUserKeyPair?(user: PrivateUserId, password: string): Promise<EncryptionKeyPair>;
+
+  /**
+   * Generate the person's device self-grant key (Ed25519) on `user` if absent
+   * (docs/userkeys.md §9). Password-encrypted with salt `"deviceselfgrant"`.
+   */
+  ensureDeviceSelfGrantKeyPair?(user: PrivateUserId, password: string): Promise<SigningKeyPair>;
 
   /**
    * Join a tenant using a join response from an admin.
@@ -1236,6 +1274,12 @@ export interface MindooTenant {
   declineUserKeyDevice?(fingerprint: string): Promise<void>;
   undoDeclineUserKeyDevice?(fingerprint: string): Promise<void>;
   rotateUserKey?(): Promise<void>;
+  /**
+   * Public half of this person's device self-grant key as held by this device
+   * (docs/userkeys.md §9), for the admin to name in the grant. `null` while
+   * this device holds none.
+   */
+  getDeviceSelfGrantPublicKey?(): Promise<string | null>;
   reconcileUserKeys?(options?: { allowSelfCreate?: boolean }): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   getUserKeyEnrollmentStatus?(): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   noteUserDirectoryFetched?(): void;
@@ -3705,6 +3749,20 @@ export interface MindooTenantDirectory {
    * time `T`, or `null` when the key was not an active grant member then.
    */
   resolveUsernameHashForSigningKey?(signingKey: string, trustedTime: number): Promise<string | null>;
+
+  /**
+   * The person's admin-granted device self-grant delegation
+   * (docs/userkeys.md §9), read from the grant(s) with `usernameHash`, or
+   * `null` when the admin never granted it.
+   */
+  getDeviceSelfGrantForUsernameHash?(usernameHash: string): Promise<DeviceSelfGrant | null>;
+
+  /**
+   * The tenant-wide trusted-time cutoff from which a new User-Key generation
+   * must be signed to count (`requireUserKeyGenerationSignatureSince` in the
+   * default policy, docs/userkeys.md §9.3), or `undefined` when none is set.
+   */
+  getRequireUserKeyGenerationSignatureSince?(): Promise<number | undefined>;
 
   /**
    * Whether a Tier 2 (`withfields`) content rule exists for `op` on `dbid` at

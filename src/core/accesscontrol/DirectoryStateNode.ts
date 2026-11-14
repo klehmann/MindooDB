@@ -39,6 +39,11 @@ export interface UserGrantSnapshot {
   wipeRequestedSigningKeys: string[];
   /** Whether the grant is active (not revoked, has at least one signing key). */
   active: boolean;
+  /**
+   * Admin-signed delegation: the person may certify their own devices
+   * (docs/userkeys.md §9). Newest `grantedAt` wins across grant documents.
+   */
+  deviceSelfGrant?: { signingPublicKey: string; grantedAt: number; revokedAt?: number };
 }
 
 /** A group as projected into a node, mirroring the directory's offline merge (§8.1). */
@@ -461,6 +466,7 @@ export class DirectoryStateChainBuilder {
     // (encryption arrays alone can omit empty keys and are not a reliable zip).
     const encBySigning = new Map<string, string>();
     const wipeRequested = new Set<string>();
+    let deviceSelfGrant: UserGrantSnapshot["deviceSelfGrant"];
     let hasContribution = false;
     for (const contribution of this.grantContributions.values()) {
       if (contribution.usernameHash !== usernameHash) continue;
@@ -473,6 +479,12 @@ export class DirectoryStateChainBuilder {
       for (const wipeKey of contribution.wipeRequestedSigningKeys) {
         wipeRequested.add(wipeKey);
       }
+      if (
+        contribution.deviceSelfGrant &&
+        (!deviceSelfGrant || contribution.deviceSelfGrant.grantedAt > deviceSelfGrant.grantedAt)
+      ) {
+        deviceSelfGrant = contribution.deviceSelfGrant;
+      }
     }
     this.push(trustedTime, (next) => {
       next.usersByHash = new Map(this.head.usersByHash);
@@ -484,6 +496,7 @@ export class DirectoryStateChainBuilder {
           encryptionKeys: signingKeys.map((key) => encBySigning.get(key) ?? ""),
           wipeRequestedSigningKeys: [...wipeRequested],
           active: signingKeys.length > 0,
+          ...(deviceSelfGrant ? { deviceSelfGrant } : {}),
         });
       } else {
         next.usersByHash.delete(usernameHash);

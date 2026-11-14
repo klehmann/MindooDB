@@ -336,3 +336,39 @@ export function primaryEncryptionPublicKey(data: Record<string, unknown>): strin
 export function extractWipeRequestedSigningKeys(data: Record<string, unknown>): string[] {
   return Array.from(new Set(asStringArray(data.wipeRequestedForSigningKeys)));
 }
+
+/**
+ * The `deviceSelfGrant` delegation on a grant document (docs/userkeys.md §9),
+ * or `null` when absent or malformed.
+ */
+export function extractDeviceSelfGrant(
+  data: Record<string, unknown>,
+): { signingPublicKey: string; grantedAt: number; revokedAt?: number } | null {
+  const raw = data.deviceSelfGrant;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const v = raw as Record<string, unknown>;
+  if (typeof v.signingPublicKey !== "string" || v.signingPublicKey.trim().length === 0) return null;
+  if (typeof v.grantedAt !== "number" || !Number.isFinite(v.grantedAt)) return null;
+  return {
+    signingPublicKey: v.signingPublicKey,
+    grantedAt: v.grantedAt,
+    ...(typeof v.revokedAt === "number" && Number.isFinite(v.revokedAt)
+      ? { revokedAt: v.revokedAt }
+      : {}),
+  };
+}
+
+/**
+ * Pick one delegation from several grant documents of the same person: the
+ * most recently granted one wins.
+ */
+export function newestDeviceSelfGrant<T extends { grantedAt: number }>(
+  grants: Array<T | null | undefined>,
+): T | null {
+  let best: T | null = null;
+  for (const grant of grants) {
+    if (!grant) continue;
+    if (!best || grant.grantedAt > best.grantedAt) best = grant;
+  }
+  return best;
+}

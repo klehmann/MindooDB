@@ -1,6 +1,7 @@
 import type { MindooDB, MindooDoc, MindooTenantDirectory } from "../types";
 import { userKeyDocumentId, type UserKeyDocumentPayload } from "./types";
 import { validateUserKeyDocument } from "./validateUserKeyDocument";
+import { filterValidGenerations, loadGenerationHistory } from "./generationValidity";
 
 export interface ResolveUserKeyDocumentInput {
   db: MindooDB;
@@ -13,7 +14,15 @@ export interface ResolveUserKeyDocumentInput {
 
 export interface ResolvedUserKeyDocument {
   doc: MindooDoc;
+  /**
+   * The document with only the generations that count (docs/userkeys.md
+   * §9.3). Use this to decide what is current.
+   */
   payload: UserKeyDocumentPayload;
+  /** The document as stored, including generations that do not count. */
+  rawPayload: UserKeyDocumentPayload;
+  /** Epochs present in the document that do not count. */
+  rejectedEpochs: string[];
 }
 
 /**
@@ -72,7 +81,55 @@ async function validateLoaded(
     adminPublicKey: input.adminPublicKey,
   });
   if (!payload) return null;
-  return { doc, payload };
+  return applyGenerationValidity(doc, payload, input);
+}
+
+/**
+ * Drop generations nobody may rely on (docs/userkeys.md §9.3). Exported so
+ * callers that already hold a validated payload use the same rule.
+ */
+export async function applyGenerationValidity(
+  doc: MindooDoc,
+  payload: UserKeyDocumentPayload,
+  input: { db: MindooDB; directory: MindooTenantDirectory },
+): Promise<ResolvedUserKeyDocument> {
+  const directory = input.directory;
+  const selfGrant =
+    typeof directory.getDeviceSelfGrantForUsernameHash === "function"
+      ? await directory.getDeviceSelfGrantForUsernameHash(payload.username_hash)
+      : null;
+  const tenantCutoff =
+    typeof directory.getRequireUserKeyGenerationSignatureSince === "function"
+      ? await directory.getRequireUserKeyGenerationSignatureSince()
+      : undefined;
+  const cutoffs = [tenantCutoff, selfGrant?.grantedAt].filter(
+    (t): t is number => typeof t === "number" && Number.isFinite(t),
+  );
+  const history = await loadGenerationHistory(input.db, doc.getId());
+  const filtered = await filterValidGenerations({
+    payload,
+    history,
+    crypto: input.db.getTenant().getCryptoAdapter(),
+    policy: {
+      usernameHash: payload.username_hash,
+      cutoff: cutoffs.length > 0 ? Math.min(...cutoffs) : undefined,
+      selfGrant: selfGrant
+        ? { signingPublicKey: selfGrant.signingPublicKey, revokedAt: selfGrant.revokedAt }
+        : null,
+    },
+  });
+  if (filtered.rejectedEpochs.length > 0) {
+    console.warn("[userkeys] ignoring User-Key generations that do not count", {
+      docId: doc.getId(),
+      rejectedEpochs: filtered.rejectedEpochs,
+    });
+  }
+  return {
+    doc,
+    payload: filtered.payload,
+    rawPayload: payload,
+    rejectedEpochs: filtered.rejectedEpochs,
+  };
 }
 
 async function creatorSigningKey(db: MindooDB, docId: string): Promise<string | null> {
