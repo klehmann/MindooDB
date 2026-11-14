@@ -583,6 +583,30 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
       "First device",
     );
 
+    // The founder may add their own devices (docs/userkeys.md §9.4): their
+    // self-grant key is named in their grant from the start.
+    const founderSelfGrantKey = appUser.deviceSelfGrantKeyPair?.publicKey;
+    const selfGrantDirectory = directory as {
+      setDeviceSelfGrant?: (
+        username: string,
+        key: string | null,
+        adminKey: EncryptedPrivateKey,
+        password: string,
+      ) => Promise<void>;
+    };
+    if (
+      options.allowDeviceSelfGrantForAppUser !== false &&
+      founderSelfGrantKey &&
+      typeof selfGrantDirectory.setDeviceSelfGrant === "function"
+    ) {
+      await selfGrantDirectory.setDeviceSelfGrant(
+        this.toPublicUserId(appUser).username,
+        founderSelfGrantKey,
+        adminUser.userSigningKeyPair.privateKey,
+        options.adminPassword,
+      );
+    }
+
     // Mint the founder's User-Key while admin can still sign the `default`
     // wrap into `acl_keydistribution_default` (User-Key target, not per
     // device). Later devices import `default` from that document after they
