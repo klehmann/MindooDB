@@ -4,6 +4,11 @@ import {
   RuleType,
   TrustedWitnessDoc,
 } from "./types";
+import {
+  AdminKeySnapshot,
+  isAdminKeySnapshotValidAt,
+  normalizeSigningKey,
+} from "./adminKeys";
 
 /**
  * Time-travel directory state (docs/accesscontrol.md §8).
@@ -79,6 +84,11 @@ export interface DirectoryStateNode {
   bySigningKey: Map<string, UserGrantSnapshot>;
   /** Trusted witness public keys -> witness doc. */
   trustedWitnessKeys: Map<string, TrustedWitnessDoc>;
+  /**
+   * Delegated admin keys (§6.13), keyed by the whitespace-free signing key PEM.
+   * The root admin key is never listed here; it is an admin at every time.
+   */
+  adminKeys: Map<string, AdminKeySnapshot>;
 
   /** Previous node in the chain, or null for the genesis node. */
   prev: DirectoryStateNode | null;
@@ -95,8 +105,37 @@ export function createGenesisNode(): DirectoryStateNode {
     usersByHash: new Map(),
     bySigningKey: new Map(),
     trustedWitnessKeys: new Map(),
+    adminKeys: new Map(),
     prev: null,
   };
+}
+
+/**
+ * The delegated admin-key snapshot for `signingKey` in `node`, or undefined.
+ * Nodes restored from caches written before §6.13 carry no map.
+ */
+export function adminKeyForSigningKey(
+  node: DirectoryStateNode,
+  signingKey: string,
+): AdminKeySnapshot | undefined {
+  return node.adminKeys?.get(normalizeSigningKey(signingKey));
+}
+
+/**
+ * Whether `signingKey` is a tenant admin at time `T` according to `node`
+ * (§6.13): the root key always is; a delegated key is when `node` holds its
+ * admin-key document with `validFrom ≤ T < validUntil`. Callers pass the node
+ * covering `T` (or the head for live decisions).
+ */
+export function isAdminInNode(
+  node: DirectoryStateNode,
+  rootAdminKey: string,
+  signingKey: string,
+  T: number,
+): boolean {
+  if (signingKeysEqual(signingKey, rootAdminKey)) return true;
+  const snapshot = adminKeyForSigningKey(node, signingKey);
+  return !!snapshot && isAdminKeySnapshotValidAt(snapshot, T);
 }
 
 /**
@@ -219,6 +258,8 @@ export type DirectoryRevisionDelta =
   | { op: "removeRule"; t: number; ruleId: string; ruleType: RuleType }
   | { op: "trustedWitness"; t: number; witness: TrustedWitnessDoc }
   | { op: "removeTrustedWitness"; t: number; witnessPublicKey: string }
+  | { op: "adminKey"; t: number; adminKey: AdminKeySnapshot }
+  | { op: "removeAdminKey"; t: number; signingPublicKey: string }
   | { op: "grant"; t: number; grant: UserGrantSnapshot }
   | { op: "grantDoc"; t: number; docId: string; grant: UserGrantSnapshot }
   | { op: "removeGrantDoc"; t: number; docId: string }
@@ -314,6 +355,12 @@ export class DirectoryStateChainBuilder {
         case "removeTrustedWitness":
           this.removeTrustedWitness(d.witnessPublicKey, d.t);
           break;
+        case "adminKey":
+          this.applyAdminKey(d.adminKey, d.t);
+          break;
+        case "removeAdminKey":
+          this.removeAdminKey(d.signingPublicKey, d.t);
+          break;
         case "grant":
           this.applyGrant(d.grant, d.t);
           break;
@@ -359,6 +406,7 @@ export class DirectoryStateChainBuilder {
       usersByHash: this.head.usersByHash,
       bySigningKey: this.head.bySigningKey,
       trustedWitnessKeys: this.head.trustedWitnessKeys,
+      adminKeys: this.head.adminKeys ?? new Map(),
       prev: this.head,
     };
     mutate(next);
@@ -422,6 +470,24 @@ export class DirectoryStateChainBuilder {
     this.push(trustedTime, (next) => {
       next.trustedWitnessKeys = new Map(this.head.trustedWitnessKeys);
       next.trustedWitnessKeys.delete(witnessPublicKey);
+    });
+  }
+
+  /** Apply (insert or replace) a delegated admin key (§6.13). */
+  applyAdminKey(adminKey: AdminKeySnapshot, trustedTime: number): void {
+    this.deltaLog.push({ op: "adminKey", t: trustedTime, adminKey });
+    this.push(trustedTime, (next) => {
+      next.adminKeys = new Map(this.head.adminKeys ?? []);
+      next.adminKeys.set(normalizeSigningKey(adminKey.signingPublicKey), adminKey);
+    });
+  }
+
+  /** Remove a delegated admin key (its document was deleted). */
+  removeAdminKey(signingPublicKey: string, trustedTime: number): void {
+    this.deltaLog.push({ op: "removeAdminKey", t: trustedTime, signingPublicKey });
+    this.push(trustedTime, (next) => {
+      next.adminKeys = new Map(this.head.adminKeys ?? []);
+      next.adminKeys.delete(normalizeSigningKey(signingPublicKey));
     });
   }
 

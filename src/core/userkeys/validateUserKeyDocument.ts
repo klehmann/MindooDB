@@ -31,6 +31,15 @@ export async function validateUserKeyDocument(
   if (input.adminPublicKey && input.signerKey === input.adminPublicKey) {
     return payload;
   }
+  // A delegated admin (docs/accesscontrol.md §6.13) may create pending
+  // documents as well, while its window covers the create's time.
+  if (
+    input.adminPublicKey &&
+    typeof input.directory.isAdminAt === "function" &&
+    (await input.directory.isAdminAt(input.signerKey, input.trustedTime ?? Number.MAX_SAFE_INTEGER))
+  ) {
+    return payload;
+  }
   if (typeof input.directory.resolveUsernameHashForSigningKey !== "function") {
     return null;
   }
