@@ -33,6 +33,7 @@ enterprise-ready infrastructure.
 | End-to-end encryption, local-first sync, zero-trust server | ✅ | ✅ |
 | Read access by key possession | ✅ | ✅ |
 | **Built-in database invariants** — `directory` (admin-only writes), `userdirectory` (owner-only key documents), **personal databases** such as MindooMail's `mmail_<grantDocId>` (owner-only sync, deposit by designated gateways) | ✅ (§6.11) | ✅ |
+| **Further administrators** — the root admin delegates administration to more keys and switches them off as of a date, judged in witness time | ✅ (§6.13) | ✅ |
 | **Write governance** — who may create / change / delete / snapshot, scoped to database *and* content | — | ✅ (§2–§12) |
 | **Read governance** — who may *see* which data, by encryption-key possession (admin-blind key distribution + revoke/rotate) | — | ✅ (§13) |
 | **Group & identity management** — DN-hierarchy identities, nested groups, wildcard targeting | — | ✅ (§6.5, §8.1) |
@@ -150,11 +151,14 @@ organization. For practical guidance on **which tier to use for which requiremen
 ## 3. Trust chain
 
 ```
-Admin Ed25519 key                                   ← root of trust (already exists)
-   │ signs
+Root admin Ed25519 key                              ← root of trust (already exists)
+   │ signs (root only)
+   ▼
+Admin keys (acl_adminkey_*), trusted-witness list   ← who else may administer, whose clock counts
+   │ delegated admins sign, valid in witness time
    ▼
 Directory entries: default policy, DB policies,      ← admin-signed, synced to everyone
-   rules, groups, grants, trusted-witness list
+   rules, groups, grants
    │ defines
    ▼
 Trusted witness keys (your sync servers)             ← added on first publish, or manually
@@ -167,8 +171,11 @@ Witness receipt on every entry from elsewhere        ← new StoreEntry fields (
  satisfied Tier 1 at that moment"                    ← other replicas trust this attestation
 ```
 
-The admin signing key is the existing root of trust. The only new cryptographic
-primitive is the **witness receipt**: an attestation, signed by a trusted witness
+The admin signing key (`administrationPublicKey`) is the existing root of trust
+and stays the only fixed anchor. It may delegate administration to further keys
+(§6.13); a delegated key is judged against the witness time of what it signs, so
+it can be switched off as of a date without touching anything it signed before.
+The only new cryptographic primitive is the **witness receipt**: an attestation, signed by a trusted witness
 (the sync server), that an entry was accepted at a specific time. Everything else
 is rule data stored in the directory database that all participants already sync.
 
@@ -354,7 +361,8 @@ signature:
 
 ## 6. Directory schema
 
-All access-control state lives in the admin-only `directory` database and syncs to
+All access-control state lives in the admin-only `directory` database (writable by
+the root admin key and delegated admins, §6.13) and syncs to
 every participant. Several documents use **fixed document IDs** so they can be read
 by direct lookup without building an index/view.
 
@@ -392,6 +400,7 @@ one place that decides which id space this applies to.
 | Default tenant policy | `acl_defaultpolicy` | yes |
 | Per-database policy | `acl_dbpolicy_<dbid>` | per DB |
 | Trusted witness entry | `acl_trustedwitness_<fingerprint>` | per witness |
+| Delegated admin key (root only, §6.13) | `acl_adminkey_<fingerprint>` | per admin key |
 | ACL rule | `acl_rule_<ruleId>` | per rule |
 | Tenant label + administrators | `tenantsetup` | yes |
 
@@ -403,8 +412,9 @@ one place that decides which id space this applies to.
 > also carries that admin's device keys in the same `userKeyPairs` shape a grant
 > uses (§6.5), so the same extractors read both. An admin has no grant document
 > of its own, so this list is what lets a member name the administration key
-> instead of showing a fingerprint — and it is where additional admins or admin
-> devices will be recorded.
+> instead of showing a fingerprint. Delegated admins (§6.13) are recorded here
+> too, in the same step that writes their admin-key document. The list is for
+> display only: what makes a key an admin is its `acl_adminkey_*` document.
 >
 > **Healing older tenants.** Tenants created before the `administrators` field
 > have no entry. `approveJoinRequest` therefore calls
@@ -1443,6 +1453,106 @@ documents, so a deposit into an own-scoped database passes the write check; it
 still cannot read anything (deposit mode). The built-in personal databases
 (§6.11) are owner-only already; `docReadScope` adds nothing there.
 
+
+### 6.13 Delegated administrators (`acl_adminkey_<fingerprint>`)
+
+The root admin key can make further keys administrators, and switch them off
+again as of a date. Each delegated admin key gets one document in `directory`,
+encrypted under `$publicinfos` so the server can read it:
+
+```ts
+interface AdminKeyDoc {
+  form: "accesscontrol";
+  type: "adminkey";
+  signingPublicKey: string;      // Ed25519 PEM of the admin identity
+  encryptionPublicKey: string;   // RSA-OAEP PEM
+  name_encrypted: string;        // the admin's name, field-encrypted under "default"
+  label?: string;                // device label
+  validFrom?: number;            // witness time (ms); absent = this revision's receivedAt
+  validUntil?: number;           // witness time (ms); absent = no end
+}
+```
+
+The id is `acl_adminkey_` plus the hex SHA-256 of the whitespace-free PEM, passed
+through `encodeAclIdComponent`. The directory-state chain projects these
+documents into `DirectoryStateNode.adminKeys`.
+
+**The rule.** `isAdminAt(key, T)` is true when `key` is the root, or when the
+directory state at `T` holds an admin-key document for `key` with
+`validFrom ≤ T < validUntil`. `T` is the witness time (`receivedAt`) of a stored
+entry; for live decisions — server sign-in, the read gate, the push check — it is
+the server's clock now. Wherever the code used to compare a key with the root
+key, it now asks this question.
+
+| Who | May write | Notes |
+|-----|-----------|-------|
+| Root admin key | everything in `directory`, including `acl_adminkey_*` and `acl_trustedwitness_*` | unchanged; Join responses keep naming the root |
+| Delegated admin, inside its window | everything in `directory` except `acl_adminkey_*` and `acl_trustedwitness_*` | grants, groups, rules, policies, purge, wipe, key and app distribution |
+| Delegated admin, outside its window | nothing in `directory` | the server refuses with rejection class `policy` |
+
+Delegated admins get the same exceptions as the root: `$admin` in rules, reading
+personal databases (§6.11) and therefore a full tenant backup, the read gate
+(§6.8) and the database allowlist (§6.7). Deleting the tenant on a server
+(`SystemAdminAuth`) stays with the root. The feature exists in Community and
+Enterprise.
+
+**Rules that keep witness time honest.**
+
+1. **No stamp, no effect elsewhere.** A directory entry signed by a delegated
+   admin counts on another replica only with a valid receipt of a witness that
+   was trusted at `receivedAt`, and only if the key was an admin at
+   `receivedAt`. Without a receipt it is visible on the device that wrote it
+   only. A backdated `createdAt` therefore helps nothing, and an entry relayed
+   peer to peer before any server saw it does not count. This holds whatever
+   the ACL master switch says, in both editions. Root entries keep their
+   previous behavior.
+2. **The server refuses.** A push into `directory` whose signer is not an admin
+   at the server's clock is refused per entry with rejection class `policy`; so
+   is any write to a root-only document by a non-root key.
+3. **No retroactive effect.** A `validUntil` before the witness time of the
+   deactivating revision is raised to that time. Entries accepted before keep
+   counting, and deactivation in the future is allowed.
+4. **Reactivation is a new window.** A revision that finds the key ended starts
+   a new window at its own witness time. Entries stamped in the gap stay
+   invalid, because at their `T` the deactivating revision is in effect. A
+   revision that finds the key active keeps its start (a deactivation does not
+   move `validFrom`).
+5. **Only the root manages admins.** `acl_adminkey_*` and
+   `acl_trustedwitness_*` are root-only on the client and on the server. A
+   delegated admin who could trust another witness could backdate its own
+   entries.
+
+The directory's own load path cannot ask the materialized directory whether a
+signer is an admin (that would recurse into the load being decided). It reads
+the root-signed `acl_adminkey_*` and `acl_trustedwitness_*` entries straight from
+the store instead (`DirectoryAdminKeyResolver`); the same resolver answers the
+server's live checks.
+
+**API** (`MindooTenantDirectory`, root key only where noted):
+
+| Method | Purpose |
+|--------|---------|
+| `addAdminKey({ signingPublicKey, encryptionPublicKey, name, label?, validFrom? }, rootKey, password)` | root only; writes the admin-key document and the `tenantsetup` entry |
+| `setAdminKeyValidity(signingPublicKey, { validUntil?, validFrom? }, rootKey, password)` | root only; deactivate as of a date (future allowed), `validUntil: null` reactivates |
+| `listAdminKeys()` | delegated keys at the head: window, name, `status` (`active`, `ending`, `ended`, `scheduled`), `pending` while the latest revision awaits a witness |
+| `getAdminKeysAt(T)` | the same, as of trusted time `T` |
+| `isAdminAt(signingKey, T)` | the rule above |
+
+**Handing over.** The future admin creates a dedicated admin identity and sends
+an admin request; the root approves it and returns an admin response:
+
+- `factory.createAdminRequest(adminIdentity, { tenantId, name, label, format: "uri" })`
+  → `mdb://admin-request/...` with public keys only.
+- `tenant.approveAdminRequest(request, { adminSigningKey, adminPassword, ... })`
+  (root) writes the documents and returns `mdb://admin-response/...`, which names
+  the root as `adminSigningPublicKey` and wraps `default` and `$publicinfos`
+  RSA-OAEP to the new admin key, like a v3 join response.
+- `factory.acceptAdminResponse(response, { adminIdentity, password, keyBag? })`
+  checks the response belongs to this identity and, given a KeyBag, imports the keys.
+
+The new admin's directory writes count elsewhere once the server has stamped
+the admin-key document and then their own entries; until then a UI shows
+"waiting for server" (`pending`).
 
 ## 7. Evaluation algorithm
 
@@ -2508,6 +2618,9 @@ can spin up an ungoverned database" and "only the databases we intended exist".
 | Revoke a device | `updateUserGrant` moves the pair into `revokedUserKeyPairs` with `revokedAt` | section 6.5 |
 | Fully offboard a user | revoke all pairs; they can rejoin later with fresh keys | section 6.5 |
 | Stolen device | set `wipeRequestedForSigningKeys`; the device drops the whole local tenant on next connect | section 6.5 |
+| Add an administrator | the person sends an admin request from a dedicated admin identity; the root approves it (`approveAdminRequest` → `addAdminKey`) | section 6.13 |
+| Remove an administrator | the root calls `setAdminKeyValidity` with `validUntil` (now or a later date); what the admin signed before stays valid. Optionally wipe their devices and rotate `default` | sections 6.13, 6.5, 13.6 |
+| Admin key suspected compromised | deactivate now, then review and revert the admin's entries since the suspected time one by one; deactivation never reaches back | section 6.13 |
 | Lose read access | move the user to `pullfrom` in `acl_keydistribution_<keyId>` and rotate; clients drop the key and forget its docs on reconcile, the server blacklist withholds them | sections 13.3, 13.4, 13.6 |
 
 Note that **revocation and wipe are independent and both opt-in** (section 6.5): removing

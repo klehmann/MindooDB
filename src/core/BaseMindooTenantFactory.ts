@@ -35,6 +35,13 @@ import { KeyBag } from "./keys/KeyBag";
 import { Logger, LogLevel, MindooLogger, getDefaultLogLevel } from "./logging";
 import { encodeMindooURI, decodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import { encodeJoinRequestUri, normalizeRequestedDocKeyIds } from "./uri/joinRequestUri";
+import {
+  decodeAdminResponseUri,
+  encodeAdminRequestUri,
+  type AdminRequest,
+  type AdminResponse,
+} from "./uri/adminUri";
+import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
 import { validateTenantId } from "./tenantIdValidation";
 import { semanticNow } from "./utils/timeSource";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
@@ -653,6 +660,59 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     }
 
     return joinRequest;
+  }
+
+  /**
+   * Create a delegated-admin request (docs/accesscontrol.md §6.13) from a
+   * dedicated admin identity. Carries public keys only; the root admin
+   * approves it with `tenant.approveAdminRequest`.
+   */
+  createAdminRequest(
+    adminIdentity: PrivateUserId,
+    options?: { tenantId?: string; name?: string; label?: string; format?: "object" | "uri" },
+  ): AdminRequest | string {
+    const request: AdminRequest = {
+      v: 1,
+      signingPublicKey: adminIdentity.userSigningKeyPair.publicKey,
+      encryptionPublicKey: adminIdentity.userEncryptionKeyPair.publicKey,
+    };
+    const tenantId = options?.tenantId?.trim();
+    const name = (options?.name ?? adminIdentity.username ?? "").trim();
+    const label = options?.label?.trim();
+    if (tenantId) request.tenantId = tenantId;
+    if (name) request.name = name;
+    if (label) request.label = label;
+    return options?.format === "uri" ? encodeAdminRequestUri(request) : request;
+  }
+
+  /**
+   * Read an admin response (§6.13) for `adminIdentity`: checks that it approves
+   * this identity's signing key, and imports the wrapped `default` and
+   * `$publicinfos` keys into `keyBag` when one is given (a device that is not a
+   * member of the tenant yet). Returns the decoded response.
+   */
+  async acceptAdminResponse(
+    adminResponse: AdminResponse | string,
+    options: { adminIdentity: PrivateUserId; password: string; keyBag?: KeyBag },
+  ): Promise<AdminResponse> {
+    const response = decodeAdminResponseUri(adminResponse);
+    if (!signingKeysEqual(response.signingPublicKey, options.adminIdentity.userSigningKeyPair.publicKey)) {
+      throw new Error("This admin response approves a different admin key");
+    }
+    if (options.keyBag) {
+      await this.importRsaWrappedJoinKeys(
+        {
+          v: 3,
+          tenantId: response.tenantId,
+          adminSigningPublicKey: response.adminSigningPublicKey,
+          adminEncryptionPublicKey: response.adminEncryptionPublicKey,
+          encryptedDocKeys: response.encryptedDocKeys,
+        },
+        { user: options.adminIdentity, password: options.password } as JoinTenantOptions,
+        options.keyBag,
+      );
+    }
+    return response;
   }
 
   /**

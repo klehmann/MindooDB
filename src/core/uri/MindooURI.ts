@@ -23,7 +23,9 @@ export type MindooURIType =
   | "key-distribution"
   | "app-distribution"
   | "sync-setup-policy"
-  | "doc-history-purge";
+  | "doc-history-purge"
+  | "admin-request"
+  | "admin-response";
 
 const VALID_TYPES: ReadonlySet<string> = new Set<MindooURIType>([
   "join-request",
@@ -32,6 +34,8 @@ const VALID_TYPES: ReadonlySet<string> = new Set<MindooURIType>([
   "app-distribution",
   "sync-setup-policy",
   "doc-history-purge",
+  "admin-request",
+  "admin-response",
 ]);
 
 const MDB_SCHEME = "mdb://";

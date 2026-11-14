@@ -29,6 +29,7 @@ import type {
   ServerDocCreatorResolver,
   ServerPurgeRequestValidator,
   BuiltinWriteContext,
+  ServerDirectoryAdminCheck,
   ServerPeerTokenResolver,
   ServerTrustedWitnessResolver,
 } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
@@ -215,6 +216,11 @@ export class SimpleMindooDirectory implements Pick<
     return this.revokedUsers.has(username.toLowerCase());
   }
 
+  /** A config-based directory knows no delegated admins (§6.13): only the root. */
+  async isAdminSigningKeyAt(signingKey: string, _T: number): Promise<boolean> {
+    return signingKeysEqual(signingKey, this.adminSigningPublicKey);
+  }
+
   async validatePublicSigningKey(
     publicKey: string,
     _opts?: { forceRefresh?: boolean },
@@ -239,6 +245,11 @@ export class SimpleMindooDirectory implements Pick<
 // ---------------------------------------------------------------------------
 // CompositeMindooDirectory — wraps tenant directory + trusted servers
 // ---------------------------------------------------------------------------
+
+/** Principal name of a delegated admin key on the server (no cleartext name exists there). */
+function delegatedAdminPrincipal(signingPublicKey: string): string {
+  return `$adminkey:${signingPublicKey.replace(/\s+/g, "")}`;
+}
 
 /**
  * Wraps a per-tenant directory (real or config-based) and also checks
@@ -275,6 +286,8 @@ class CompositeMindooDirectory implements Pick<
           | "evaluateAccessForSigningKey"
           | "isSamePerson"
           | "evaluateReadScopeForSigningKey"
+          | "isAdminSigningKeyAt"
+          | "getDelegatedAdminKeyAt"
         >
       >,
     private trustedServers: TrustedServer[],
@@ -307,6 +320,9 @@ class CompositeMindooDirectory implements Pick<
       };
     }
 
+    const delegated = await this.delegatedAdminForPrincipal(username);
+    if (delegated) return delegated;
+
     const result = await this.inner.getUserPublicKeys(username);
     if (result) return result;
 
@@ -335,6 +351,10 @@ class CompositeMindooDirectory implements Pick<
       if (server.name.toLowerCase() === normalizedUsername) {
         return false;
       }
+    }
+    // A delegated admin principal (§6.13) is "revoked" exactly when its window ended.
+    if (this.delegatedAdminKeysByPrincipal.has(username)) {
+      return (await this.delegatedAdminForPrincipal(username)) === null;
     }
     return this.inner.isUserRevoked(username);
   }
@@ -379,6 +399,24 @@ class CompositeMindooDirectory implements Pick<
     if (typeof this.inner.getUserBySigningPublicKey === "function") {
       const innerLookup = await this.inner.getUserBySigningPublicKey(publicKey);
       if (innerLookup) return innerLookup;
+    }
+
+    // A delegated admin key (docs/accesscontrol.md §6.13) holds no grant. While
+    // its window covers now it authenticates as a principal of its own, named
+    // after the key, so it can read what admins may read (personal databases,
+    // a full tenant backup). Its token stops validating when the window ends.
+    if (typeof this.inner.getDelegatedAdminKeyAt === "function") {
+      const admin = await this.inner.getDelegatedAdminKeyAt(publicKey, Date.now());
+      if (admin) {
+        const principal = delegatedAdminPrincipal(admin.signingPublicKey);
+        this.delegatedAdminKeysByPrincipal.set(principal, admin.signingPublicKey);
+        return {
+          username: principal,
+          signingPublicKey: admin.signingPublicKey,
+          encryptionPublicKey: admin.encryptionPublicKey,
+          details: null,
+        };
+      }
     }
 
     // Bootstrap/config fallback: the admin and trusted-server identities can be
@@ -426,6 +464,10 @@ class CompositeMindooDirectory implements Pick<
     // in this active set) does not reject a freshly-issued admin/config token.
     // We reuse getUserPublicKeys, which already applies exactly those fallbacks.
     const active = new Set(base.active);
+    const delegated = await this.delegatedAdminForPrincipal(username);
+    if (delegated) {
+      return { active: [delegated.signingPublicKey], wipeRequested: [] };
+    }
     const fallback = await this.getUserPublicKeys(username);
     if (fallback) active.add(fallback.signingPublicKey);
     return { active: Array.from(active), wipeRequested: base.wipeRequested };
@@ -532,6 +574,42 @@ class CompositeMindooDirectory implements Pick<
     return typeof inner.evaluateReadScopeForSigningKey === "function"
       ? (input) => inner.evaluateReadScopeForSigningKey!(input)
       : undefined;
+  }
+
+  /** Signing key per delegated-admin principal name, filled as keys authenticate. */
+  private readonly delegatedAdminKeysByPrincipal = new Map<string, string>();
+
+  /**
+   * The keys of a delegated-admin principal (see {@link getUserBySigningPublicKey})
+   * while the key is an admin now, or null.
+   */
+  private async delegatedAdminForPrincipal(
+    principal: string,
+  ): Promise<{ signingPublicKey: string; encryptionPublicKey: string } | null> {
+    const signingKey = this.delegatedAdminKeysByPrincipal.get(principal);
+    if (!signingKey || typeof this.inner.getDelegatedAdminKeyAt !== "function") return null;
+    const admin = await this.inner.getDelegatedAdminKeyAt(signingKey, Date.now());
+    return admin
+      ? { signingPublicKey: admin.signingPublicKey, encryptionPublicKey: admin.encryptionPublicKey }
+      : null;
+  }
+
+  /**
+   * Admin check at time `T` (docs/accesscontrol.md §6.13): the root, or a
+   * delegated admin key valid at `T`. Forwarded to the inner directory; the
+   * bootstrap admin identity always counts.
+   */
+  async isAdminSigningKeyAt(signingKey: string, T: number): Promise<boolean> {
+    if (
+      this.adminBootstrapIdentity &&
+      signingKeysEqual(this.adminBootstrapIdentity.signingPublicKey, signingKey)
+    ) {
+      return true;
+    }
+    if (typeof this.inner.isAdminSigningKeyAt === "function") {
+      return this.inner.isAdminSigningKeyAt(signingKey, T);
+    }
+    return false;
   }
 
   /**
@@ -1331,6 +1409,16 @@ export class TenantManager {
         ? this.buildUserdirectoryWriteContext(tenant, localStore)
         : undefined;
 
+    // Directory writes only by administrators at the server's clock, and
+    // admin keys / trusted witnesses only by the root (docs/accesscontrol.md §6.13).
+    const directoryAdminCheck: ServerDirectoryAdminCheck | undefined =
+      dbId === "directory"
+        ? {
+            rootAdminKey: tenant.context.config.adminSigningPublicKey,
+            isAdminAt: (signingKey, T) => this.isTenantAdminKeyAt(tenant, signingKey, T),
+          }
+        : undefined;
+
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
       directory,
@@ -1350,6 +1438,7 @@ export class TenantManager {
         docCreatorResolver,
         purgeRequestValidator,
         builtinWriteContext,
+        directoryAdminCheck,
         ...this.peerAccessControl,
       },
     );
@@ -1385,6 +1474,26 @@ export class TenantManager {
   }
 
   /**
+   * Whether `signingKey` is an administrator of `tenant` at `T` (§6.13): the
+   * root admin key from the tenant config, or a delegated admin key valid at
+   * `T` according to the directory. Tenant deletion (`SystemAdminAuth`) stays
+   * root-only and does not use this.
+   */
+  private async isTenantAdminKeyAt(tenant: LoadedTenant, signingKey: string, T: number): Promise<boolean> {
+    if (signingKeysEqual(signingKey, tenant.context.config.adminSigningPublicKey)) return true;
+    const directory = tenant.directory as unknown as {
+      isAdminSigningKeyAt?: (signingKey: string, T: number) => Promise<boolean>;
+    };
+    if (typeof directory.isAdminSigningKeyAt !== "function") return false;
+    try {
+      return await directory.isAdminSigningKeyAt(signingKey, T);
+    } catch (error) {
+      console.warn(`[TenantManager] admin check failed, refusing: ${error}`);
+      return false;
+    }
+  }
+
+  /**
    * Builtin `userdirectory` write invariant: admin may create/delete, only the
    * owning person may change. `username_hash` is read from the decrypted
    * `doc_create` payload (`$publicinfos`). Personal documents are sealed to
@@ -1400,6 +1509,7 @@ export class TenantManager {
     const mindooTenant = tenant.mindooTenant;
     return {
       adminPublicKey,
+      isAdminAt: (signingKey, T) => this.isTenantAdminKeyAt(tenant, signingKey, T),
       resolveCreatorSigningKey: async (entry: StoreEntry) => {
         const createEntry = await this.findCreateEntry(localStore, entry);
         return createEntry?.createdByPublicKey ?? null;

@@ -135,6 +135,14 @@ export class AuthenticationService {
       if (universe.wipeRequested.length > 0) {
         return this.storeChallenge({ username, signingPublicKey });
       }
+      // The name is unknown, but the key may be: a delegated admin key
+      // (docs/accesscontrol.md §6.13) has no grant and no name on the server.
+      if (signingPublicKey && typeof this.directory.getUserBySigningPublicKey === "function") {
+        const lookup = await this.directory.getUserBySigningPublicKey(signingPublicKey);
+        if (lookup) {
+          return this.storeChallenge({ username: lookup.username, signingPublicKey });
+        }
+      }
       // Check if user was revoked or never existed
       const isRevoked = await this.directory.isUserRevoked(username);
       if (isRevoked) {

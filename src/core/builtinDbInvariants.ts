@@ -1,5 +1,6 @@
 import { Automerge } from "./automerge-adapter";
 import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
+import { isRootOnlyDirectoryDocId } from "./accesscontrol/adminKeys";
 import { DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID } from "./types";
 
 /**
@@ -8,7 +9,9 @@ import { DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID } from "./types";
  * that function short-circuits to allow when no policy exists or the master
  * switch is on.
  *
- * `directory`: only the tenant admin may write.
+ * `directory`: only a tenant admin may write — the root admin key, or a
+ * delegated admin key valid at the entry's time (docs/accesscontrol.md §6.13).
+ * Admin-key and trusted-witness documents are root-only.
  * `userdirectory`: admin may create and delete; only the person named by the
  * document's `username_hash` may change. The tenant founder signs with the
  * admin key, so an owner match still allows a change (they must wrap their
@@ -54,7 +57,15 @@ export interface BuiltinWriteInput {
   dbId: string;
   op: BuiltinWriteOp;
   signerKey: string;
+  /** The root admin key (the tenant's `administrationPublicKey`). */
   adminPublicKey: string;
+  /**
+   * Whether the signer is a tenant admin at the entry's time — the root, or a
+   * delegated admin key valid then (docs/accesscontrol.md §6.13). Resolved by
+   * the caller, which knows the time and the directory state. Absent: only the
+   * root counts.
+   */
+  signerIsAdmin?: boolean;
   /** `username_hash` stored on the userkey document, when known. */
   documentUsernameHash?: string | null;
   /** `username_hash` of the signer's grant at the entry's trusted time. */
@@ -135,16 +146,28 @@ export function hasBuiltinWriteInvariant(dbId: string): boolean {
   return dbId === DIRECTORY_DB_ID || dbId === USER_DIRECTORY_DB_ID;
 }
 
+/** Whether the signer of a builtin write counts as a tenant admin (root or delegated). */
+function signerIsAdmin(input: { signerKey: string; adminPublicKey: string; signerIsAdmin?: boolean }): boolean {
+  if (signingKeysEqual(input.signerKey, input.adminPublicKey)) return true;
+  return input.signerIsAdmin === true;
+}
+
 export function evaluateBuiltinWrite(input: BuiltinWriteInput): BuiltinWriteDecision {
   if (input.dbId === DIRECTORY_DB_ID) {
-    if (!signingKeysEqual(input.signerKey, input.adminPublicKey)) {
+    if (!signerIsAdmin(input)) {
       return { allowed: false, reason: "Admin-only database: only the admin key can modify data" };
+    }
+    if (!signingKeysEqual(input.signerKey, input.adminPublicKey) && isRootOnlyDirectoryDocId(input.docId)) {
+      return {
+        allowed: false,
+        reason: `Only the root admin key may write ${input.docId} (admin keys and trusted witnesses)`,
+      };
     }
     return { allowed: true, reason: "directory admin write" };
   }
 
   if (input.dbId === USER_DIRECTORY_DB_ID) {
-    const isAdmin = signingKeysEqual(input.signerKey, input.adminPublicKey);
+    const isAdmin = signerIsAdmin(input);
     if (isPersonalUserdirectoryDocId(input.docId)) {
       return evaluatePersonalDocWrite(input, isAdmin);
     }
@@ -331,16 +354,19 @@ export function shouldSkipLoadedEntry(input: {
   entryType: string;
   signerKey: string;
   adminPublicKey: string;
+  /** See {@link BuiltinWriteInput.signerIsAdmin}. */
+  signerIsAdmin?: boolean;
   documentUsernameHash?: string | null;
   signerUsernameHash?: string | null;
   docId?: string;
   creatorUsernameHash?: string | null;
 }): boolean {
   if (input.dbId === DIRECTORY_DB_ID) {
-    return !signingKeysEqual(input.signerKey, input.adminPublicKey);
+    if (!signerIsAdmin(input)) return true;
+    return !signingKeysEqual(input.signerKey, input.adminPublicKey) && isRootOnlyDirectoryDocId(input.docId);
   }
   if (input.dbId === USER_DIRECTORY_DB_ID) {
-    const isAdmin = signingKeysEqual(input.signerKey, input.adminPublicKey);
+    const isAdmin = signerIsAdmin(input);
     if (isPersonalUserdirectoryDocId(input.docId)) {
       // Ownership of a personal document comes from its creator, so a create
       // can never be illegal here, and a delete by its owner must survive the

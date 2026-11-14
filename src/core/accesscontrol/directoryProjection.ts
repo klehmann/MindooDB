@@ -14,7 +14,9 @@ import {
   WithFieldClause,
   decodeAclIdComponent,
 } from "./types";
+import { ADMIN_KEY_TYPE, adminKeyWindowFromDoc } from "./adminKeys";
 import {
+  adminKeyForSigningKey,
   DirectoryStateChainBuilder,
   UserGrantSnapshot,
 } from "./DirectoryStateNode";
@@ -262,6 +264,19 @@ function projectAccessControlDoc(
   // and the sync server read them directly during the post-sync purge reconcile);
   // skip them here.
   if (data.type === "dochistorypurge") {
+    return;
+  }
+
+  // Delegated admin key (§6.13). Only root-signed revisions reach this point:
+  // the directory load path drops these documents from any other signer.
+  if (data.type === ADMIN_KEY_TYPE && typeof data.signingPublicKey === "string") {
+    if (deleted) {
+      builder.removeAdminKey(data.signingPublicKey, trustedTime);
+      return;
+    }
+    const previous = adminKeyForSigningKey(builder.getHead(), data.signingPublicKey) ?? null;
+    const snapshot = adminKeyWindowFromDoc(data, trustedTime, previous);
+    if (snapshot) builder.applyAdminKey(snapshot, trustedTime);
     return;
   }
 
