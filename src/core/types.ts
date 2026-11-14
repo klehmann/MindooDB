@@ -282,6 +282,12 @@ interface CreateTenantPasswords {
    */
   requireV2Entries?: boolean;
   /**
+   * Name the founding app user's device self-grant key in their grant, so
+   * they may add their own devices (docs/userkeys.md §9.4). Defaults to
+   * `true`; ignored when the identity has no self-grant key.
+   */
+  allowDeviceSelfGrantForAppUser?: boolean;
+  /**
    * Optional human-readable tenant label stored in the directory document
    * `tenantsetup` (doc under `$publicinfos`; label field-encrypted under
    * `default`). When omitted, no setup document is written at create time.
