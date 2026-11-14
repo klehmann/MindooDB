@@ -5,7 +5,7 @@ import { encryptPrivateKey } from "../crypto/privateKeyEncryption";
 import { RSAEncryption } from "../crypto/RSAEncryption";
 import { generateRsaOaep3072, importRsaOaepPrivateKey } from "../crypto/rsaOaep3072";
 import type { EncryptionKeyPair, MindooDB, MindooDoc, PrivateUserId, SigningKeyPair } from "../types";
-import { DEFAULT_TENANT_KEY_ID, USER_DIRECTORY_DB_ID } from "../types";
+import { DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID, USER_DIRECTORY_DB_ID } from "../types";
 import { fingerprintEncryptionPublicKey } from "./fingerprint";
 import {
   applyGenerationValidity,
@@ -19,7 +19,14 @@ import {
   signEd25519,
   userKeyGenerationSigningMessage,
 } from "./generationSignature";
-import { normalizePublicKeyPem } from "./fingerprint";
+import { fingerprintPublicKeyPem, normalizePublicKeyPem } from "./fingerprint";
+import {
+  DEVICE_CERT_DOC_ID_PREFIX,
+  asDeviceCertificate,
+  deviceCertificateDocId,
+  signDeviceCertificate,
+  type DeviceCertificatePayload,
+} from "./deviceCertificate";
 import { asUserKeyPayload } from "./validateUserKeyDocument";
 import {
   buildPendingUserKeyPayload,
@@ -191,6 +198,153 @@ export class UserKeyManager {
       await this.generateLocalSelfGrantKey(user, password);
     }
     return pair;
+  }
+
+  // ==================== Device certificates (docs/userkeys.md §9.6) ====================
+
+  /**
+   * Vouch for another device of this person (docs/userkeys.md §9.6): write a
+   * `dcert_<fingerprint>` certificate signed with the person's self-grant key
+   * and wrap the User-Key (and self-grant key) to the device, so it can sync,
+   * write and read without the admin. Requires the admin to have granted
+   * device self-grant with the key this device holds.
+   */
+  async issueDeviceCertificate(
+    device: { signingPublicKey: string; encryptionPublicKey: string },
+    label?: string,
+  ): Promise<{ docId: string; certificate: DeviceCertificatePayload }> {
+    const granted = await this.grantedSelfGrantKey();
+    if (!granted) {
+      throw new Error(
+        "Cannot certify a device: the administrator has not granted device self-grant to this person.",
+      );
+    }
+    const signer = await this.selfGrantSigner();
+    if (!signer || normalizePublicKeyPem(signer.publicKeyPem) !== normalizePublicKeyPem(granted)) {
+      throw new Error(
+        "Cannot certify a device: this device does not hold the self-grant key named in the grant.",
+      );
+    }
+    const resolved = await this.resolveOwnUserKeyDocument();
+    const usernameHash =
+      resolved?.payload.username_hash ??
+      (await this.mintBindingForUsername((await this.tenant.getCurrentUserId()).username))?.usernameHash;
+    if (!usernameHash) throw new Error("Cannot certify a device: no grant for this person");
+    const crypto = this.tenant.getCryptoAdapter();
+    const me = await this.tenant.getCurrentUserId();
+    const trimmedLabel = label?.trim();
+    const certificate = await signDeviceCertificate(crypto, signer.privateKey, {
+      username_hash: usernameHash,
+      deviceSigningPublicKey: device.signingPublicKey,
+      deviceEncryptionPublicKey: device.encryptionPublicKey,
+      ...(trimmedLabel ? { label: trimmedLabel } : {}),
+      issuedAt: Date.now(),
+      issuedBySigningPublicKey: me.userSigningPublicKey,
+      selfGrantPublicKey: signer.publicKeyPem,
+    });
+    const fingerprint = await fingerprintPublicKeyPem(device.signingPublicKey, crypto.getSubtle());
+    const db = await this.openUserDirectory();
+    const create = {
+      decryptionKeyId: PUBLIC_INFOS_KEY_ID,
+      initialValues: certificate as unknown as Record<string, unknown>,
+    };
+    let doc: MindooDoc;
+    try {
+      doc = await db.createDocument({
+        ...create,
+        id: deviceCertificateDocId(fingerprint),
+        // The certificate must be in the doc_create itself: readers take it
+        // from there only (see deviceCertificate.ts).
+        assumeUniqueId: true,
+      });
+    } catch {
+      // Id taken (an earlier, withdrawn certificate): any `dcert_` id works.
+      doc = await db.createDocument({ ...create, idPrefix: "dcert" });
+    }
+    if (resolved) {
+      await this.wrapUserKeyForGrantDevice(device.encryptionPublicKey, trimmedLabel);
+    }
+    return { docId: doc.getId(), certificate };
+  }
+
+  /** This person's device certificates in the local `userdirectory` replica. */
+  async listOwnDeviceCertificates(): Promise<Array<{ docId: string; fingerprint: string; certificate: DeviceCertificatePayload }>> {
+    const resolved = await this.resolveOwnUserKeyDocument();
+    if (!resolved) return [];
+    const db = await this.openUserDirectory();
+    const crypto = this.tenant.getCryptoAdapter();
+    const result: Array<{ docId: string; fingerprint: string; certificate: DeviceCertificatePayload }> = [];
+    for (const id of await db.getAllDocumentIds()) {
+      if (!id.startsWith(DEVICE_CERT_DOC_ID_PREFIX)) continue;
+      try {
+        const doc = await db.getDocument(id);
+        if (doc.isDeleted()) continue;
+        const cert = asDeviceCertificate(doc.getData());
+        if (!cert || cert.username_hash !== resolved.payload.username_hash) continue;
+        result.push({
+          docId: id,
+          fingerprint: await fingerprintPublicKeyPem(cert.deviceSigningPublicKey, crypto.getSubtle()),
+          certificate: cert,
+        });
+      } catch {
+        // unreadable
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Withdraw a certificate this person issued (a device they sold or retired):
+   * delete its document, so the device stops counting from the delete's
+   * trusted time. `fingerprint` is the device's signing-key fingerprint or the
+   * document id. Any device of the person can do this, so against a stolen
+   * device the admin revokes the key on the grant instead.
+   */
+  async revokeOwnDeviceCertificate(fingerprint: string): Promise<number> {
+    const certs = await this.listOwnDeviceCertificates();
+    const db = await this.openUserDirectory();
+    let removed = 0;
+    for (const entry of certs) {
+      if (entry.fingerprint !== fingerprint && entry.docId !== fingerprint) continue;
+      await db.deleteDocument(entry.docId);
+      removed += 1;
+    }
+    if (removed === 0) {
+      throw new Error(`No device certificate of this person matches "${fingerprint}"`);
+    }
+    return removed;
+  }
+
+  /**
+   * Grant devices plus devices this person certified, for wrapping the
+   * User-Key and the self-grant key (rotation, self-grant distribution).
+   */
+  private async devicesForWrapping(
+    username: string,
+  ): Promise<Array<{ signingPublicKey: string; encryptionPublicKey: string; label?: string; wipeRequested?: boolean }>> {
+    const directory = await this.directory();
+    const overview = await directory.getUserGrantOverview(username);
+    const devices: Array<{ signingPublicKey: string; encryptionPublicKey: string; label?: string; wipeRequested?: boolean }> = [
+      ...overview.activeDevices,
+    ];
+    const hashes = new Set<string>();
+    for (const grant of await directory.findGrantAccessDocuments(username)) {
+      const hash = grant.getData().username_hash;
+      if (typeof hash === "string") hashes.add(hash);
+    }
+    for (const hash of hashes) {
+      for (const cert of await directory.listCertifiedDevices(hash)) {
+        if (devices.some((d) => normalizePublicKeyPem(d.signingPublicKey) === normalizePublicKeyPem(cert.deviceSigningPublicKey))) {
+          continue;
+        }
+        devices.push({
+          signingPublicKey: cert.deviceSigningPublicKey,
+          encryptionPublicKey: cert.deviceEncryptionPublicKey,
+          ...(cert.label ? { label: cert.label } : {}),
+        });
+      }
+    }
+    return devices;
   }
 
   // ==================== Device self-grant key (docs/userkeys.md §9) ====================
@@ -482,12 +636,11 @@ export class UserKeyManager {
       bytes = this.decryptedSelfGrantBytes;
     }
     if (!bytes) return;
-    const directory = await this.directory();
     const username = (await this.tenant.getCurrentUserId()).username;
-    const overview = await directory.getUserGrantOverview(username);
+    const devices = await this.devicesForWrapping(username);
     const crypto = this.tenant.getCryptoAdapter();
     const db = resolved.doc.getDatabase();
-    for (const device of overview.activeDevices) {
+    for (const device of devices) {
       const fp = await fingerprintEncryptionPublicKey(device.encryptionPublicKey, crypto.getSubtle());
       const wrap = gen.deviceWraps?.[fp];
       if (!wrap?.wrappedKey || wrap.wrappedSelfGrantKey) continue;
@@ -1528,11 +1681,10 @@ export class UserKeyManager {
         );
       }
     }
-    const directory = await this.directory();
-    const overview = await directory.getUserGrantOverview(signer.username);
+    const devices = await this.devicesForWrapping(signer.username);
     const previousWraps = resolved.payload.userKeys[current]?.deviceWraps ?? {};
     const deviceWraps: UserKeyDocumentPayload["userKeys"][string]["deviceWraps"] = {};
-    for (const device of overview.activeDevices) {
+    for (const device of devices) {
       const deviceFp = await fingerprintEncryptionPublicKey(
         device.encryptionPublicKey,
         this.tenant.getCryptoAdapter().getSubtle(),

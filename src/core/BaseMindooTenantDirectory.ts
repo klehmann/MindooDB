@@ -18,6 +18,15 @@ import {
   USER_DIRECTORY_DB_ID,
 } from "./types";
 import { DocumentDeletedError, DocumentNotFoundError } from "./errors";
+import { entryTrustedTime } from "./storeEntryTime";
+import type { StoreEntryMetadata } from "./types";
+import { normalizePublicKeyPem } from "./userkeys/fingerprint";
+import {
+  DEVICE_CERT_DOC_ID_PREFIX,
+  asDeviceCertificate,
+  verifyDeviceCertificate,
+  type DeviceCertificatePayload,
+} from "./userkeys/deviceCertificate";
 import { BaseMindooTenant } from "./BaseMindooTenant";
 import { semanticNow } from "./utils/timeSource";
 import { SingleFlight } from "./utils/singleFlight";
@@ -45,11 +54,14 @@ import {
   BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES,
   PERSONAL_DATABASE_PREFIX_REGEX,
   personalDatabaseOwner,
+  recordFromCreateChangeBytes,
 } from "./builtinDbInvariants";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import {
   DirectoryStateNode,
   grantForSigningKey,
+  grantAtOrBefore,
+  type UserGrantSnapshot,
   isSamePerson,
   signingKeysEqual,
 } from "./accesscontrol/DirectoryStateNode";
@@ -126,6 +138,14 @@ interface GroupDocEntry {
   seenOrder: number;
 }
 
+/** One device certificate as read from `userdirectory` (docs/userkeys.md §9.6). */
+interface DeviceCertRecord {
+  cert: DeviceCertificatePayload;
+  docId: string;
+  createMeta: StoreEntryMetadata;
+  deleteMetas: StoreEntryMetadata[];
+}
+
 /**
  * Grant documents by `username_hash`, maintained by the unified cache pass.
  * Keeps ids only, never documents, so its size is independent of the
@@ -190,6 +210,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   // Best-effort reverse lookup cache for public signing key -> user details.
   // Entries remain available even after revocation so historical UIs can still show identity labels.
   private userLookupCache: Map<string, DirectoryUserLookup> = new Map();
+  // Device certificates read from `userdirectory` (docs/userkeys.md §9.6),
+  // keyed by the certified device's normalized signing key.
+  private deviceCertIndex: {
+    stamp: string | null;
+    at: number;
+    byKey: Map<string, DeviceCertRecord[]>;
+  } | null = null;
+  private buildingDeviceCertIndex: Promise<Map<string, DeviceCertRecord[]>> | null = null;
   // Remote-wipe directive index (docs/accesscontrol.md §6.5): signing public key
   // targeted for wipe -> id of the admin-signed grant document carrying the
   // directive. Self-contained key values survive key removal, so this stays
@@ -850,6 +878,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       return cachedResult;
     }
     
+    // Not on any grant: it may be a device the person certified (§9.6 of userkeys.md).
+    if (await this.resolveSignerToGrant(publicKey, Number.MAX_SAFE_INTEGER)) {
+      return true;
+    }
     // Key not found in cache means it was never granted access
     this.logger.debug(`Public key not found in cache, returning false`);
     return false;
@@ -1445,6 +1477,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const node = await this.getDirectoryStateAt(input.trustedTime);
     const identity = await this.identitySetForSigningKey(input.signingKey, node, {
       isAuthor: input.op === "doc_create" || !!input.isAuthor,
+      trustedTime: input.trustedTime,
     });
     return evaluateAccess({
       op: input.op,
@@ -1473,6 +1506,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const node = await this.getDirectoryStateAt(input.trustedTime);
     const identity = await this.identitySetForSigningKey(input.signingKey, node, {
       isAuthor: input.op === "doc_create" || input.isAuthor,
+      trustedTime: input.trustedTime,
     });
     return evaluateAccess({
       op: input.op,
@@ -1500,12 +1534,20 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       input.signerTrustedTime === input.creatorTrustedTime
         ? creatorNode
         : await this.getDirectoryStateAt(input.signerTrustedTime);
-    return isSamePerson(
-      creatorNode,
-      signerNode,
-      input.creatorSigningKey,
-      input.signerSigningKey,
-    );
+    if (isSamePerson(creatorNode, signerNode, input.creatorSigningKey, input.signerSigningKey)) {
+      return true;
+    }
+    // Certified devices (userkeys.md §9.6): compare the persons they act for.
+    // The creator is looked up without revocation, like a retired grant device.
+    const creatorHash =
+      grantAtOrBefore(creatorNode, input.creatorSigningKey)?.usernameHash ??
+      (await this.certifiedGrantInNode(creatorNode, input.creatorSigningKey, input.creatorTrustedTime, {
+        enforceRevocation: false,
+      }))?.grant.usernameHash;
+    const signerHash = (
+      await this.resolveSignerInNode(signerNode, input.signerSigningKey, input.signerTrustedTime)
+    )?.grant.usernameHash;
+    return !!creatorHash && creatorHash === signerHash;
   }
 
   /**
@@ -1516,8 +1558,193 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     signingKey: string,
     trustedTime: number,
   ): Promise<string | null> {
+    return (await this.resolveSignerToGrant(signingKey, trustedTime))?.grant.usernameHash ?? null;
+  }
+
+  /**
+   * The grant a signing key acts under at trusted time `T`
+   * (docs/userkeys.md §9.6): a device listed on the grant, or a device with a
+   * valid certificate. A certificate counts when
+   *
+   * - it verifies with the self-grant key that the person's grant names at `T`,
+   * - its `doc_create` was accepted (trusted time) at or before `T`, and
+   *   before the delegation's `revokedAt`,
+   * - the person did not delete it at or before `T`, and
+   * - the device is not in the grant's `revokedUserKeyPairs` at `T`.
+   *
+   * The one place that answers "which person is this key"; server auth, ACL
+   * evaluation, ownership and attribution go through it.
+   */
+  async resolveSignerToGrant(
+    signingKey: string,
+    trustedTime: number,
+  ): Promise<{
+    grant: UserGrantSnapshot;
+    via: "grant" | "certificate";
+    certificate?: DeviceCertificatePayload;
+  } | null> {
     const node = await this.getDirectoryStateAt(trustedTime);
-    return grantForSigningKey(node, signingKey)?.usernameHash ?? null;
+    return this.resolveSignerInNode(node, signingKey, trustedTime);
+  }
+
+  private async resolveSignerInNode(
+    node: DirectoryStateNode,
+    signingKey: string,
+    trustedTime: number,
+  ): Promise<{
+    grant: UserGrantSnapshot;
+    via: "grant" | "certificate";
+    certificate?: DeviceCertificatePayload;
+  } | null> {
+    const listed = grantForSigningKey(node, signingKey);
+    if (listed) return { grant: listed, via: "grant" };
+    const certified = await this.certifiedGrantInNode(node, signingKey, trustedTime, {
+      enforceRevocation: true,
+    });
+    return certified ? { grant: certified.grant, via: "certificate", certificate: certified.cert } : null;
+  }
+
+  /** Device certificates valid for `signingKey` in `node` (see {@link resolveSignerToGrant}). */
+  private async certifiedGrantInNode(
+    node: DirectoryStateNode,
+    signingKey: string,
+    trustedTime: number,
+    options: { enforceRevocation: boolean },
+  ): Promise<{ grant: UserGrantSnapshot; cert: DeviceCertificatePayload } | null> {
+    if (!signingKey) return null;
+    const records = (await this.loadDeviceCertificateIndex()).get(normalizePublicKeyPem(signingKey));
+    if (!records?.length) return null;
+    const now = Date.now();
+    for (const record of records) {
+      const grant = node.usersByHash.get(record.cert.username_hash);
+      if (!grant) continue;
+      const delegation = grant.deviceSelfGrant;
+      if (
+        !delegation ||
+        normalizePublicKeyPem(delegation.signingPublicKey) !==
+          normalizePublicKeyPem(record.cert.selfGrantPublicKey)
+      ) {
+        continue;
+      }
+      const issuedAt = entryTrustedTime(record.createMeta, now);
+      if (delegation.revokedAt !== undefined && issuedAt >= delegation.revokedAt) continue;
+      if (options.enforceRevocation) {
+        if (!grant.active) continue;
+        if (issuedAt > trustedTime) continue;
+        const deletedAt = record.deleteMetas.length
+          ? Math.min(...record.deleteMetas.map((m) => entryTrustedTime(m, now)))
+          : undefined;
+        if (deletedAt !== undefined && deletedAt <= trustedTime) continue;
+        if ((grant.revokedSigningKeys ?? []).some((key) => signingKeysEqual(key, signingKey))) continue;
+      }
+      return { grant, cert: record.cert };
+    }
+    return null;
+  }
+
+  /**
+   * Every certificate of the person with `usernameHash` that their current
+   * self-grant key signed, including revoked devices (for revoke and wipe).
+   */
+  private async certificatesOfPerson(usernameHash: string): Promise<DeviceCertificatePayload[]> {
+    const head = await this.getDirectoryStateHead();
+    const result: DeviceCertificatePayload[] = [];
+    for (const records of (await this.loadDeviceCertificateIndex()).values()) {
+      const record = records.find((r) => r.cert.username_hash === usernameHash);
+      if (!record) continue;
+      const hit = await this.certifiedGrantInNode(head, record.cert.deviceSigningPublicKey, Number.MAX_SAFE_INTEGER, {
+        enforceRevocation: false,
+      });
+      if (hit?.grant.usernameHash === usernameHash) result.push(hit.cert);
+    }
+    return result;
+  }
+
+  /**
+   * Certified devices of the person with `usernameHash` that count at the head
+   * state, with their certificates.
+   */
+  async listCertifiedDevices(usernameHash: string): Promise<DeviceCertificatePayload[]> {
+    const head = await this.getDirectoryStateHead();
+    const index = await this.loadDeviceCertificateIndex();
+    const result: DeviceCertificatePayload[] = [];
+    const seen = new Set<string>();
+    for (const [key, records] of index) {
+      if (!records.some((r) => r.cert.username_hash === usernameHash)) continue;
+      const hit = await this.certifiedGrantInNode(head, records[0].cert.deviceSigningPublicKey, Number.MAX_SAFE_INTEGER, {
+        enforceRevocation: true,
+      });
+      if (hit && hit.grant.usernameHash === usernameHash && !seen.has(key)) {
+        seen.add(key);
+        result.push(hit.cert);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Read every `dcert_*` certificate from the `userdirectory` store without
+   * materializing that database (whose own trust checks call back into this
+   * index). Only `doc_create` entries carry a certificate; deletes withdraw
+   * it. Rebuilt when the store head moves, at most every two seconds for
+   * stores that cannot report a head.
+   */
+  private async loadDeviceCertificateIndex(): Promise<Map<string, DeviceCertRecord[]>> {
+    if (this.buildingDeviceCertIndex) {
+      // Re-entry while building: answer from what is known.
+      return this.deviceCertIndex?.byKey ?? new Map();
+    }
+    const baseTenant = this.tenant as BaseMindooTenant;
+    if (typeof baseTenant.getDocStoreForDb !== "function") return new Map();
+    let store: ReturnType<BaseMindooTenant["getDocStoreForDb"]>;
+    try {
+      store = baseTenant.getDocStoreForDb(USER_DIRECTORY_DB_ID);
+    } catch {
+      return new Map();
+    }
+    const head = await store.getStoreHead?.().catch(() => undefined);
+    const stamp = head ? `${head.epoch}:${head.maxReceiptOrder}` : null;
+    const cached = this.deviceCertIndex;
+    if (cached && stamp !== null && cached.stamp === stamp) return cached.byKey;
+    if (cached && stamp === null && Date.now() - cached.at < 2000) return cached.byKey;
+
+    const build = (async () => {
+      const byKey = new Map<string, DeviceCertRecord[]>();
+      const isCert = (m: StoreEntryMetadata): boolean => m.docId.startsWith(DEVICE_CERT_DOC_ID_PREFIX);
+      const creates = (await store.findEntries("doc_create", null, null)).filter(isCert);
+      if (creates.length === 0) return byKey;
+      const deletes = (await store.findEntries("doc_delete", null, null)).filter(isCert);
+      const entries = await store.getEntries(creates.map((m) => m.id));
+      const crypto = this.tenant.getCryptoAdapter();
+      for (const entry of entries) {
+        try {
+          const plaintext = await baseTenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId);
+          const cert = asDeviceCertificate(recordFromCreateChangeBytes(plaintext));
+          if (!cert || !(await verifyDeviceCertificate(crypto, cert))) continue;
+          const createMeta = creates.find((m) => m.id === entry.id) ?? entry;
+          const key = normalizePublicKeyPem(cert.deviceSigningPublicKey);
+          const list = byKey.get(key) ?? [];
+          list.push({
+            cert,
+            docId: entry.docId,
+            createMeta,
+            deleteMetas: deletes.filter((m) => m.docId === entry.docId),
+          });
+          byKey.set(key, list);
+        } catch {
+          // Not readable here (no $publicinfos) or not a certificate.
+        }
+      }
+      return byKey;
+    })();
+    this.buildingDeviceCertIndex = build;
+    try {
+      const byKey = await build;
+      this.deviceCertIndex = { stamp, at: Date.now(), byKey };
+      return byKey;
+    } finally {
+      this.buildingDeviceCertIndex = null;
+    }
   }
 
   /**
@@ -1936,6 +2163,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     if (grant && extractActiveKeyPairs(grant).some((pair) => signingKeysEqual(pair.signingPublicKey, input.signingKey))) {
       return { mode: "read", reason: "a device of the owner" };
     }
+    if (grant && typeof grant.username_hash === "string") {
+      const certified = await this.resolveSignerInNode(head, input.signingKey, Number.MAX_SAFE_INTEGER);
+      if (certified?.via === "certificate" && certified.grant.usernameHash === grant.username_hash) {
+        return { mode: "read", reason: "a certified device of the owner" };
+      }
+    }
     // Free/busy (§6.11): the tenant admin reads every person's busy times but,
     // like every other member, does not write them (unless the admin key is a
     // device of the owner, checked above).
@@ -2033,10 +2266,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const lookup = await this.getUserBySigningPublicKey(signingKey);
     if (!lookup) return [];
     const grants = await this.findGrantAccessDocuments(lookup.username);
-    return grants
+    const live = grants
       .filter((doc) => !doc.isDeleted())
-      .map((doc) => doc.getData() as Record<string, unknown>)
-      .filter((data) => extractActiveKeyPairs(data).some((pair) => signingKeysEqual(pair.signingPublicKey, signingKey)));
+      .map((doc) => doc.getData() as Record<string, unknown>);
+    const listed = live.filter((data) =>
+      extractActiveKeyPairs(data).some((pair) => signingKeysEqual(pair.signingPublicKey, signingKey)),
+    );
+    if (listed.length > 0) return listed;
+    // A certified device acts under its person's grants (userkeys.md §9.6).
+    const certified = await this.resolveSignerToGrant(signingKey, Number.MAX_SAFE_INTEGER);
+    if (certified?.via !== "certificate") return [];
+    return live.filter((data) => data.username_hash === certified.grant.usernameHash);
   }
 
   /**
@@ -2760,6 +3000,15 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         )
       : null;
     const identityHashes = await this.computeIdentityHashes(username);
+    // Devices this person certified (userkeys.md §9.6) can be revoked and
+    // wiped here like listed ones, although they are not on the grant.
+    const certifiedByHash = new Map<string, DeviceCertificatePayload[]>();
+    for (const grant of await this.findGrantAccessDocuments(username)) {
+      const hash = grant.getData().username_hash;
+      if (typeof hash === "string" && !certifiedByHash.has(hash)) {
+        certifiedByHash.set(hash, await this.certificatesOfPerson(hash));
+      }
+    }
 
     await this.editGrantArrays(
       username,
@@ -2795,11 +3044,36 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
           }
           return p;
         });
-        applyKeyPairFields(data, next);
+        const certified =
+          typeof data.username_hash === "string" ? certifiedByHash.get(data.username_hash) ?? [] : [];
+        const isCertifiedOnly = (key: string) =>
+          certified.some((c) => signingKeysEqual(c.deviceSigningPublicKey, key)) &&
+          !extractActiveKeyPairs(data).some((pair) => signingKeysEqual(pair.signingPublicKey, key));
+        for (const cert of certified) {
+          const key = cert.deviceSigningPublicKey;
+          if (!revokeSet.has(key) || next.some((p) => signingKeysEqual(p.signingPublicKey, key))) continue;
+          next.push({
+            signingPublicKey: key,
+            encryptionPublicKey: cert.deviceEncryptionPublicKey,
+            ...(cert.label ? { label: cert.label } : {}),
+            revoked: true,
+            revokedAt: now,
+          });
+        }
+        // Restoring a certified device only lifts the revocation; it does not
+        // turn it into a device listed on the grant.
+        const kept = next.filter(
+          (p) => !(restoreSet.has(p.signingPublicKey) && isCertifiedOnly(p.signingPublicKey) && !p.revoked),
+        );
+        applyKeyPairFields(data, kept);
 
         // Remote-wipe set: authoritative when supplied (else preserve existing),
-        // restricted to keys present on this grant doc and never for restored keys.
-        const present = new Set(next.map((p) => p.signingPublicKey));
+        // restricted to keys present on this grant doc or certified by its
+        // person, and never for restored keys.
+        const present = new Set([
+          ...kept.map((p) => p.signingPublicKey),
+          ...certified.map((c) => c.deviceSigningPublicKey),
+        ]);
         const desiredWipe = changes.wipeSigningKeys ?? extractWipeRequestedSigningKeys(data);
         data.wipeRequestedForSigningKeys = Array.from(
           new Set(desiredWipe.filter((k) => present.has(k) && !restoreSet.has(k))),
@@ -4244,7 +4518,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   private async identitySetForSigningKey(
     signingKey: string,
     node: DirectoryStateNode,
-    opts: { isAuthor?: boolean },
+    opts: { isAuthor?: boolean; trustedTime?: number },
   ): Promise<IdentitySet> {
     // The tenant admin key is the root of trust and is resolved even without a
     // grant document (it authors the directory itself).
@@ -4260,7 +4534,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // allow-rules until the trust cache refreshed (up to
     // DIRECTORY_SYNC_INTERVAL_MS later). The `node` is the time-`T` snapshot
     // whose `bySigningKey` only contains keys whose grant is active at `T`.
-    const grantedAtT = !!grantForSigningKey(node, signingKey);
+    // A certified device (userkeys.md §9.6) acts for its person like a listed one.
+    const grantedAtT = !!(await this.resolveSignerInNode(
+      node,
+      signingKey,
+      opts.trustedTime ?? node.trustedTimeUpperBound,
+    ));
 
     // Resolve the author's username from their signing key. Trusted non-user
     // keys (e.g. server-to-server sync identities) have no grant; treat them as
@@ -4523,6 +4802,37 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     for (const [key, lookup] of this.userLookupCache) {
       if (key.replace(/\s+/g, "") === needle) return lookup;
     }
+    // A device the person certified (userkeys.md §9.6). Like the cache above,
+    // this keeps naming the person after the device was revoked; callers that
+    // need "active" check the signing-key universe or resolveSignerToGrant.
+    const certified = await this.certifiedGrantInNode(
+      await this.getDirectoryStateHead(),
+      publicKey,
+      Number.MAX_SAFE_INTEGER,
+      { enforceRevocation: false },
+    );
+    if (!certified) return null;
+    const personKeys = [
+      ...certified.grant.signingKeys,
+      ...(certified.grant.revokedSigningKeys ?? []),
+    ];
+    for (const personKey of personKeys) {
+      const lookup =
+        this.userLookupCache.get(personKey) ??
+        [...this.userLookupCache.entries()].find(([k]) => signingKeysEqual(k, personKey))?.[1];
+      if (lookup) {
+        // Device-specific fields come from the certificate; a join response
+        // wrapped for another device of the person must not be handed out.
+        const { joinResponseWrapped: _other, ...personLookup } = lookup as DirectoryUserLookup & {
+          joinResponseWrapped?: string;
+        };
+        return {
+          ...personLookup,
+          signingPublicKey: certified.cert.deviceSigningPublicKey,
+          encryptionPublicKey: certified.cert.deviceEncryptionPublicKey,
+        };
+      }
+    }
     return null;
   }
 
@@ -4543,10 +4853,16 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const grants = await this.findGrantAccessDocuments(username);
     const active = new Set<string>();
     const wipeRequested = new Set<string>();
+    const hashes = new Set<string>();
     for (const grant of grants) {
       const data = grant.getData();
       for (const key of extractSigningPublicKeys(data)) active.add(key);
       for (const key of extractWipeRequestedSigningKeys(data)) wipeRequested.add(key);
+      if (typeof data.username_hash === "string") hashes.add(data.username_hash);
+    }
+    // Devices the person certified count as active (userkeys.md §9.6).
+    for (const hash of hashes) {
+      for (const cert of await this.listCertifiedDevices(hash)) active.add(cert.deviceSigningPublicKey);
     }
     return { active: Array.from(active), wipeRequested: Array.from(wipeRequested) };
   }

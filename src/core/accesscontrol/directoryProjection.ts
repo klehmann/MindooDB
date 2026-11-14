@@ -1,6 +1,7 @@
 import {
   extractActiveKeyPairs,
   extractDeviceSelfGrant,
+  extractRevokedKeyPairs,
   extractWipeRequestedSigningKeys,
 } from "./grantKeys";
 import {
@@ -197,6 +198,8 @@ export function projectDirectoryRevision(
       };
       const deviceSelfGrant = extractDeviceSelfGrant(data);
       if (deviceSelfGrant) grant.deviceSelfGrant = deviceSelfGrant;
+      const revoked = extractRevokedKeyPairs(data).map((pair) => pair.signingPublicKey);
+      if (revoked.length > 0) grant.revokedSigningKeys = revoked;
       builder.applyGrantDoc(docId, grant, trustedTime);
     }
     return;

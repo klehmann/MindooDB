@@ -1268,6 +1268,24 @@ export interface MindooTenant {
    * this device holds none.
    */
   getDeviceSelfGrantPublicKey?(): Promise<string | null>;
+  /**
+   * Certify another device of this person with their device self-grant key
+   * (docs/userkeys.md §9.6) and wrap the User-Key to it. Requires
+   * `deviceSelfGrant` on the person's grant.
+   */
+  issueDeviceCertificate?(
+    device: { signingPublicKey: string; encryptionPublicKey: string },
+    label?: string,
+  ): Promise<{ docId: string; certificate: import("./userkeys/deviceCertificate").DeviceCertificatePayload }>;
+  /** Withdraw an own device certificate by device fingerprint or document id. */
+  revokeOwnDeviceCertificate?(fingerprint: string): Promise<number>;
+  listOwnDeviceCertificates?(): Promise<
+    Array<{
+      docId: string;
+      fingerprint: string;
+      certificate: import("./userkeys/deviceCertificate").DeviceCertificatePayload;
+    }>
+  >;
   reconcileUserKeys?(options?: { allowSelfCreate?: boolean }): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   getUserKeyEnrollmentStatus?(): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   noteUserDirectoryFetched?(): void;
@@ -3744,6 +3762,16 @@ export interface MindooTenantDirectory {
    * `null` when the admin never granted it.
    */
   getDeviceSelfGrantForUsernameHash?(usernameHash: string): Promise<DeviceSelfGrant | null>;
+
+  /**
+   * The person a signing key acts for at trusted time `T`: a device on their
+   * grant, or a device with a valid certificate (docs/userkeys.md §9.6).
+   * `null` when neither.
+   */
+  resolveSignerToGrant?(
+    signingKey: string,
+    trustedTime: number,
+  ): Promise<{ grant: { usernameHash: string }; via: "grant" | "certificate" } | null>;
 
   /**
    * The tenant-wide trusted-time cutoff from which a new User-Key generation

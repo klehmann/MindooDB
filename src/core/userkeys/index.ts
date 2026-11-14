@@ -79,3 +79,13 @@ export {
   readSealedValue,
   type SealedValue,
 } from "./sealedValues";
+export {
+  DEVICE_CERT_DOC_ID_PREFIX,
+  DEVICE_CERT_TYPE,
+  asDeviceCertificate,
+  deviceCertificateDocId,
+  deviceCertificateMessage,
+  signDeviceCertificate,
+  verifyDeviceCertificate,
+  type DeviceCertificatePayload,
+} from "./deviceCertificate";
