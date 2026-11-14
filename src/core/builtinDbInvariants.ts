@@ -35,6 +35,9 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * `dev_` — one device's peer-sync record (Iroh endpoint id and label).
  * `qtn_` — one device's record of entries a server refused (one document per
  *   author, database, document and rejection class).
+ * `dcert_` — a device certificate the person issued with their device
+ *   self-grant key (docs/userkeys.md §9.6), encrypted with `$publicinfos` so
+ *   the server can verify it.
  *
  * They differ in who may *read* them, which this rule does not care about:
  * `wks_` documents are sealed to their owner, while `dev_` and `qtn_` are
@@ -42,7 +45,7 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * and audit refused writes while the hoster still sees ciphertext. Ownership is
  * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {
@@ -286,6 +289,26 @@ function usernameHashFromRecord(doc: Record<string, unknown>): string | null {
  * binary instead. The server must accept both — otherwise every later change
  * is denied as "not the owning person" because the hash looks missing.
  */
+export function recordFromCreateChangeBytes(changeBytes: Uint8Array): Record<string, unknown> | null {
+  try {
+    const [doc] = Automerge.applyChanges(
+      Automerge.init<Record<string, unknown>>(),
+      [changeBytes],
+    );
+    const record = JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
+    if (Object.keys(record).length > 0) return record;
+  } catch {
+    // Payload may be a full Automerge document rather than a change.
+  }
+  try {
+    return JSON.parse(
+      JSON.stringify(Automerge.load<Record<string, unknown>>(changeBytes)),
+    ) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 export function usernameHashFromCreateChangeBytes(changeBytes: Uint8Array): string | null {
   try {
     const [doc] = Automerge.applyChanges(
