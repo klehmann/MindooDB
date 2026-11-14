@@ -23,6 +23,7 @@ export {
   USERKEY_SCHEMA_VERSION,
   USERKEY_DOC_ID_PREFIX,
   USERKEY_PRIVATE_SALT,
+  DEVICE_SELF_GRANT_PRIVATE_SALT,
   userKeyDocumentId,
   currentUserKeyEpoch,
   isPendingUserKeyDocument,
@@ -31,6 +32,7 @@ export {
   USERKEY_USERNAME_HASH_VERSION,
   type UserKeyDeviceWrap,
   type UserKeyGeneration,
+  type UserKeyGenerationSignature,
   type RejectedUserKeyDevice,
   type UserKeyDocumentPayload,
   type PendingUserKeyDevice,
@@ -48,7 +50,19 @@ export {
   base64ToBytes,
 } from "./fingerprint";
 export { validateUserKeyDocument, asUserKeyPayload } from "./validateUserKeyDocument";
-export { resolveUserKeyDocument } from "./resolveUserKeyDocument";
+export { resolveUserKeyDocument, applyGenerationValidity } from "./resolveUserKeyDocument";
+export {
+  deriveGenerationSigningKey,
+  generateSelfGrantKeyPair,
+  userKeyGenerationSigningMessage,
+  signEd25519,
+  verifyEd25519,
+} from "./generationSignature";
+export {
+  filterValidGenerations,
+  loadGenerationHistory,
+  type GenerationValidityPolicy,
+} from "./generationValidity";
 export type { ResolveUserKeyDocumentInput, ResolvedUserKeyDocument } from "./resolveUserKeyDocument";
 export {
   buildPendingUserKeyPayload,

@@ -638,7 +638,7 @@ Each person has one document holding every generation of their key. Generations 
 
 The private half of each generation appears only as RSA wraps to specific device encryption keys. Old generations are never dropped: a device that loses grant access is removed from the wraps, but the remaining devices keep their wrap of the retired key so that content encrypted to it stays readable.
 
-The current generation is the highest epoch present. It is derived rather than stored, because a scalar "current epoch" field is exactly the value two concurrently rotating devices would overwrite for each other. The full schema is in section 9.2.
+The current generation is the highest epoch present. It is derived rather than stored, because a scalar "current epoch" field is exactly the value two concurrently rotating devices would overwrite for each other. The full schema is in section 10.2. Section 9.3 explains which generations count; the current one is the highest of those.
 
 **Document identity has a fast path and a fallback.** The canonical id is derived from the person's grant document id. But no access control rule can express "this id belongs to that signer" — rules match on database, operation, and identity, not on document ids — and grant ids are visible to every member. So anyone could occupy Alice's canonical id before she does.
 
@@ -656,7 +656,7 @@ That reframing answers most of the failure cases. Deleting the document costs on
 
 Because all of these repairs are idempotent, clients run them unconditionally. On every startup and after every `userdirectory` sync, a client compares the published state against the private key it holds and fixes the difference: republish if missing, undelete if tombstoned, add its own wrap if absent, drop wraps for devices no longer on the grant.
 
-**Losing every device is the one genuinely unrecoverable case.** If no device holds the private key, no wrap in the document can be opened. A replacement device may write to the same document and add a new generation for itself, so nothing blocks recovery of the *account* — but content encrypted to the dead generations stays unreadable until it is written again. Flag those generations so your interface can explain the gap rather than showing broken content.
+**Losing every device is the one genuinely unrecoverable case.** If no device holds the private key, no wrap in the document can be opened. A replacement device may write to the same document and add a new generation for itself — once signed generations are required (section 9.3) only after the administrator deleted the old document — so nothing blocks recovery of the *account* — but content encrypted to the dead generations stays unreadable until it is written again. Flag those generations so your interface can explain the gap rather than showing broken content.
 
 This is also why deleting or purging an unopenable document would be actively harmful: the wraps of the dead generations are exactly what makes an old device backup valuable. Restore that device's identity and its wrap still opens the old key, and with it the whole history. Where your platform already has an identity backup mechanism, that mechanism is the user key recovery story too — a separate user-key recovery code would add a second secret with the same failure mode.
 
@@ -749,7 +749,7 @@ User keys add a person-level addressing layer to a system that already encrypts 
 ### 8.1 What the design defends against
 
 - **Administrators and the sync server cannot read content addressed to user keys.** The private half never leaves the devices a human approved.
-- **A planted grant device gains nothing.** An administrator who adds a device to a person's grant obtains neither that person's user key nor named keys addressed to it, absent human approval on an already-enrolled device.
+- **A planted grant device gains nothing.** An administrator who adds a device to a person's grant obtains neither that person's user key nor named keys addressed to it, absent human approval on an already-enrolled device. This holds for new content only once generations must be signed (section 9.3): before that, a planted device could write a generation of its own at a higher epoch, and new content would be encrypted to it.
 - **Planting a device is never quiet.** It requires an admin-signed grant change, which stays in the append-only directory permanently and is attributable.
 - **A planted public key cannot be swapped in later.** Administrators may create and delete key documents but may not change somebody else's.
 - **Forged key documents are rejected** by grant binding, and squatting a canonical document id costs a scan rather than access.
@@ -766,6 +766,7 @@ These are properties of the design, not defects to be fixed later. State them in
 - **Approval is only as strong as the human performing it.** A user who confirms a device without comparing fingerprints can authorize a planted one, handing over every key they hold at once.
 - **The first device is trusted on first use.** A trust chain rooted in a planted device is compromised from the start, and the initial publish wraps every device already on the grant.
 - **The policy plane stays administrator-trusted.** An administrator can still edit groups or add themselves to a distribution. User key addressing stops device planting, not malicious policy.
+- **A copied identity is the same device.** A restored backup, a paper recovery or an exported `.json` identity carries the same device keys, user key and self-grant key. Revoking or wiping that device hits every copy, and a stolen copy cannot be cut off alone (section 9.5).
 - **An approved device can always export the private key.** This is an exfiltration path at the application layer, not a protocol flaw.
 - **An administrator can repeatedly purge a key document** as denial of service. It never grants read access.
 - **There is no administrator recovery.** User private keys are deliberately not wrapped to an administrator or a recovery quorum. If that is ever offered it must be opt-in and visually distinct from device approval, so that "approve my phone" is never confused with "give IT a copy".
@@ -785,9 +786,104 @@ Two exposures are worth calling out because they are structural. Because key doc
 
 ---
 
-## 9) Reference Appendix
+## 9) Device Self-Grant and Signed Generations
 
-### 9.1 API reference
+Section 4 describes two separate decisions per device: the administrator puts its signing key on the person's grant (sync and write access), and the person approves it on an already-enrolled device (the user key, and with it read access). This section adds two things on top of that model. Generations of the user key now have to be signed, which closes a gap in section 8.1. And a person can receive a **device self-grant key**, an admin-signed right to vouch for their own devices.
+
+### 9.1 The gap signed generations close
+
+Anyone whose signing key is on Alice's grant may change Alice's key document (section 7.2). That includes a device the administrator added but Alice never approved. Before signed generations, such a device could write a new generation with a key pair only it knew at a higher epoch. Every client takes the highest epoch as current, so new sealed documents for Alice and new key distributions to her would have been encrypted to that device. `UserKeyGenerationSignature.test.ts` reproduces this.
+
+The fix makes every generation accountable to a holder of the previous one, or to the person's self-grant key.
+
+### 9.2 The keys involved
+
+| Key | Type | Where it lives | Who holds the private half |
+|---|---|---|---|
+| Device signing key | Ed25519 | grant (`userKeyPairs`) | one device |
+| User key, one per generation | RSA-OAEP 3072 | key document (`userKeys[epoch].publicKey`) | approved devices, via wraps |
+| Generation signing key | Ed25519 | key document (`userKeys[epoch].signingPublicKey`) | derived by every holder of that generation |
+| Device self-grant key | Ed25519 | grant (`deviceSelfGrant.signingPublicKey`), admin-signed | approved devices, via wraps |
+
+The **generation signing key** is not stored anywhere. Every device that holds a generation's private user key derives it with HKDF-SHA-256 (`info = "mindoodb-userkey-generation-signing-v1"`) and uses the result as an Ed25519 seed. Only the public half is written to the generation. A signature with it therefore proves "this was written by someone holding generation N", and nobody can check the derivation without the private key, which is exactly the point.
+
+The **device self-grant key** is one key per person. `factory.ensureUserKeyPair()` creates it together with the user key, stores it password-encrypted on the identity (`PrivateUserId.deviceSelfGrantKeyPair`, salt `"deviceselfgrant"`), and `createJoinRequest()` sends its public half (`deviceSelfGrantPublicKey`). Every approved device receives it next to its user key wrap (`deviceWraps[fp].wrappedSelfGrantKey`), so it is bound to the same approval as the user key. A person who has a user key but no self-grant key gets one from the first updated device that holds the user key; that device wraps it to the other approved devices on its next reconcile.
+
+The private half is generated on the person's device, never by the administrator. If the administrator generated it, they could vouch for devices in the person's name.
+
+### 9.3 When a generation counts
+
+A generation counts only when the change that gave it its current value (`publicKey` and `signingPublicKey`) meets one of these rules:
+
+1. **Root.** The value was already in the document's `doc_create`. Only the administrator (from the join request) or the person may create the document.
+2. **Signed.** One of its `signatures` verifies over the generation with the `signingPublicKey` of the previous generation that counts, or with the person's self-grant key from the grant. The self-grant key does not count for changes after its `revokedAt`.
+3. **Adoption.** The lowest epoch was replaced while the document had no device wrap at all, self-signed with its new `signingPublicKey`. This is the pending document of section 4.2, which nobody could use yet.
+4. **Legacy.** The change's trusted time (its witness time, section 8 of [accesscontrol.md](accesscontrol.md)) is before the cutoff.
+
+The **cutoff** is the earlier of two values. The first is the tenant-wide `requireUserKeyGenerationSignatureSince` in the admin-signed default policy. New tenants are created with it set; for an existing tenant, `directory.requireUserKeyGenerationSignatures(adminKey, password)` sets it once. The second is the person's `deviceSelfGrant.grantedAt`. Without either, every generation counts as before, so existing tenants keep working until the administrator turns the check on.
+
+Generations that do not count are ignored when clients decide what is current: `resolveUserKeyDocument()` returns them in `rejectedEpochs`, `payload` lists only the generations that count, and `rawPayload` is the document as stored. If a device overwrites a generation in place, the last earlier value of that epoch that counted is used instead. Rotation always picks an epoch above every stored one, so a planted epoch cannot block it.
+
+The signed bytes are `JSON.stringify(["mindoodb-userkey-generation-v1", username_hash, epoch, publicKey, fingerprint, signingPublicKey, createdAt])`, with whitespace removed from both PEM keys. Wraps and `retiredAt` are left out because they change during a generation's life.
+
+What the client does for you:
+
+- `rotateUserKey()` signs the new generation with the previous generation's key and, when held, with the self-grant key. When it can sign with neither and the cutoff has passed, it refuses: the generation would not count.
+- `reconcileUserKeys()` gives the current generation its `signingPublicKey` when it has none, but only when that change will count (pending document, before the cutoff, or signed with a granted self-grant key). A generation created before signed generations existed therefore gets its key on the first reconcile of an updated device.
+- A person who loses every device cannot add a new generation after the cutoff, because there is nothing to sign it with. The administrator deletes the key document (`deletePublishedUserKeyFor`) and the new device creates a new one, which counts as a root.
+
+### 9.4 Granting the right to vouch for own devices
+
+The delegation lives only in the admin-signed grant:
+
+```ts
+// grantaccess document
+deviceSelfGrant?: {
+  signingPublicKey: string,   // the person's self-grant key, PEM
+  grantedAt: number,
+  revokedAt?: number,         // set on revoke, the key stays
+}
+```
+
+The key document never carries this right. The administrator may create a key document but never change it, so a copy there could neither be revoked nor be kept from being swapped by the person.
+
+| Call | Effect |
+|---|---|
+| `tenant.approveJoinRequest(request, { ..., allowDeviceSelfGrant: true })` | Names the self-grant key from the request in the grant, only for the person's first device (the request's user key became the published one). |
+| `tenant.getDeviceSelfGrantPublicKey()` | The person's key as held by this device, for an administrator to grant later. |
+| `directory.setDeviceSelfGrant(username, publicKey, adminKey, password)` | Grant or replace the delegation. |
+| `directory.setDeviceSelfGrant(username, null, adminKey, password)` | Revoke: sets `revokedAt` and keeps the key, so what was signed before stays valid. |
+| `directory.getDeviceSelfGrant(username)` | Read it. |
+| `directory.updateUserGrant(username, { deviceSelfGrant }, ...)` | The same as part of a batched grant edit. |
+
+Granting it also moves the person's cutoff to `grantedAt`: from then on their unsigned generations stop counting, whatever the tenant policy says.
+
+### 9.5 Cloned identities and backups
+
+A device, as far as MindooDB is concerned, is its signing and encryption key pair, not a piece of hardware. The identity object holds those keys, the user key and the self-grant key. Whoever copies the identity copies all of them. Haven offers three official ways to do that: the encrypted backup, paper recovery per tenant, and the identity export as `.json`.
+
+So **a restored backup is the same device today**, not a new one:
+
+- the grant shows one device where there are two,
+- revoking or wiping its signing key hits every copy (see [accesscontrol.md](accesscontrol.md) §6.5),
+- writes cannot be told apart, because `createdByPublicKey` is the same,
+- per-device records keyed by the signing key, such as `dev_<fingerprint>`, overwrite each other,
+- a stolen copy cannot be cut off without cutting off the original.
+
+For a second device, the join and approval flow of section 4 is the right path. Device certificates signed with the self-grant key, which turn a restore into a new device with its own keys, are the next step of this design.
+
+### 9.6 Limits
+
+- **The pending window.** Until the first device seals a new person's document, any device on the grant may adopt it, as before.
+- **Legacy generations stay as trustworthy as they were.** A generation that counts because of the cutoff is not more trustworthy than before; the cutoff only stops new unsigned ones.
+- **Unwitnessed changes.** A change no trusted witness has stamped yet takes the current time as its trusted time, so it counts as after the cutoff. In tenants without a witness, every unsigned generation stops counting once a cutoff is set. New tenants avoid this because all their generations are signed or roots.
+- **Several self-grant keys.** Two devices without a self-grant key that reconcile at the same time may each create one. The key the administrator grants decides; devices prefer a wrap of the granted key.
+
+---
+
+## 10) Reference Appendix
+
+### 10.1 API reference
 
 Ordering rule for the whole table: sync the directory databases, then reconcile user keys, then reconcile key distributions. Reversing the last two leaves `default` unimported, because its wrap is addressed to the key the first call delivers.
 
@@ -814,7 +910,18 @@ Ordering rule for the whole table: sync the directory databases, then reconcile 
 | `tenant.approveUserKeyDevice(fingerprint)` | Write the private key wrap for every generation. |
 | `tenant.declineUserKeyDevice(fingerprint)` | Record a persistent, synced refusal. |
 | `tenant.undoDeclineUserKeyDevice(fingerprint)` | Reverse a refusal and return the device to pending. |
-| `tenant.rotateUserKey()` | Create a new generation for the remaining devices and retire the current one. |
+| `tenant.rotateUserKey()` | Create a new generation for the remaining devices and retire the current one. Signs it (section 9.3). |
+| `tenant.getDeviceSelfGrantPublicKey()` | The person's device self-grant key as held by this device (section 9.4). |
+
+**Device self-grant and signed generations (section 9)**
+
+| Call | Purpose |
+|---|---|
+| `tenant.approveJoinRequest(request, { ..., allowDeviceSelfGrant: true })` | Also name the person's self-grant key from the request in the grant (first device only). |
+| `directory.setDeviceSelfGrant(username, publicKey \| null, adminKey, password)` | Grant, replace or revoke the delegation on the grant. |
+| `directory.getDeviceSelfGrant(username)` | Read the delegation. |
+| `directory.requireUserKeyGenerationSignatures(adminKey, password)` | Set the tenant cutoff for unsigned generations to now (idempotent). |
+| `directory.getRequireUserKeyGenerationSignatureSince()` | Read that cutoff. |
 
 **Queries and per-document recipients**
 
@@ -830,7 +937,7 @@ Ordering rule for the whole table: sync the directory databases, then reconcile 
 
 `RecipientChangeResult` reports `epoch`, `rotated`, `added`, `removed`, `skipped`, and `entryId`. `skipped` lists recipients passed over because they have no published user key; pass `strict: true` to fail instead.
 
-### 9.2 User key document schema
+### 10.2 User key document schema
 
 One document per person in `userdirectory`, encrypted with `$publicinfos`.
 
@@ -863,7 +970,16 @@ One document per person in `userdirectory`, encrypted with `$publicinfos`.
       label?: string,           // from the grant, shown in the approval dialog
       approvedAt: number,
       approvedBySigningPublicKey: string,
+      // The person's device self-grant key (Ed25519 PKCS8), wrapped to the
+      // same device key (section 9.2).
+      wrappedSelfGrantKey?: string,
     }>,
+
+    // Ed25519 key derived from this generation's private key (section 9.2),
+    // and signatures over the generation by the previous generation's key
+    // and/or the person's self-grant key (section 9.3).
+    signingPublicKey?: string,
+    signatures?: Array<{ signerPublicKey: string, signature: string }>,
   }>,
 
   // Written by "don't ask about this device again" and cleared by
@@ -883,10 +999,11 @@ Invariants the publisher maintains:
 - A newly approved device receives a wrap for **every generation the approving device can open**, not only the newest — otherwise it cannot read older content.
 - A generation's `publicKey` and `fingerprint` match the private key sealed in its wraps.
 - Epochs only ever grow; reusing or lowering one is rejected.
+- A new generation is signed (section 9.3); one that does not count is ignored, not deleted.
 - Wraps for devices no longer active on the grant are dropped on the next reconcile.
 - A document with no wraps in any generation is **pending**: published but not yet openable.
 
-### 9.3 Recipient specs and types
+### 10.3 Recipient specs and types
 
 ```ts
 type RecipientSpec =
@@ -924,7 +1041,7 @@ Names are display only — fingerprints stay authoritative for every access deci
 
 Older documents may carry a `viaGroup` field on recipient entries, left from when recipients could be expanded from a directory group. It is ignored on read and no longer written.
 
-### 9.4 What users see
+### 10.4 What users see
 
 Wording matters here more than in most features, because the concepts are unfamiliar and the consequences are permanent. Use **device** language throughout; never say "user key", "wrap", or "KeyBag" in an interface.
 
@@ -944,7 +1061,7 @@ Wording matters here more than in most features, because the concepts are unfami
 
 The recurring dialog is the safety net against a planted device. *Don't ask again* exists so that repetition never becomes the reason somebody approves.
 
-### 9.5 Verified behaviour
+### 10.5 Verified behaviour
 
 The behaviour described in this document is covered by the SDK test suite. Run it with:
 
@@ -972,11 +1089,17 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 | Another person's device stays pending until they wrap it | 4.4 | `JoinUserKeyWrap` |
 | An unapproved device does not import `default`; an approved one does | 4.4 | `KeyDistributionUserKeyTargets` |
 | An approved device holds the identical private half | 4.4 | `UserKeyDeviceRemovalRotation` |
-| Approval wraps every generation | 9.2 | `UserKeyDeviceRemovalRotation`, `UserKeyDeviceEnrollment` |
+| Approval wraps every generation | 10.2 | `UserKeyDeviceRemovalRotation`, `UserKeyDeviceEnrollment` |
 | A grant-only device is never wrapped automatically | 4.7 | `UserKeyDeviceEnrollment` |
 | A first publish wraps every device already on the grant | 4.5 | `UserKeyDeviceEnrollment` |
 | No document is published before `userdirectory` has been fetched | 3.3 | `UserKeyDeviceEnrollment` |
 | Declining hides the device everywhere; undo restores it | 4.7 | `UserKeyDeviceEnrollment` |
+| A planted, unsigned generation is ignored once signatures are required; without a cutoff it still counts | 9.1, 9.3 | `UserKeyGenerationSignature` |
+| A planted generation signed with its own key is ignored | 9.3 | `UserKeyGenerationSignature` |
+| An overwritten generation falls back to its earlier value | 9.3 | `UserKeyGenerationSignature` |
+| Granting device self-grant closes the gap for that person; rotation stays signed and counts | 9.3, 9.4 | `UserKeyGenerationSignature` |
+| The join request carries the self-grant key; approval names it in the grant; revoke keeps the key | 9.4 | `UserKeyGenerationSignature` |
+| An approved device receives the person's self-grant key, replacing one it made before joining | 9.2 | `UserKeyGenerationSignature` |
 | Removal drops wraps from every generation but does not rotate | 5.1 | `UserKeyDeviceRemovalRotation` |
 | Rotation excludes the removed device from the new generation | 5.2 | `UserKeyDeviceRemovalRotation` |
 | A removed device cannot obtain the rotated generation | 5.2 | `UserKeyDeviceRemovalRotation` |
@@ -992,7 +1115,7 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 
 ---
 
-## 10) Related Documents
+## 11) Related Documents
 
 - [accesscontrol.md](accesscontrol.md) — who may read and write, the directory, grants, and key distribution. User keys decide who can decrypt; these rules decide who can change state.
 - [getting-started.md](getting-started.md) — tenant creation, the join flow, the KeyBag, and identity persistence.

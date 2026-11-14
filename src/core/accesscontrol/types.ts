@@ -285,6 +285,15 @@ export interface DefaultAccessPolicyDoc {
    */
   requireMetadataSignatureSince?: number;
   /**
+   * **Tenant-level only.** Trusted (witness) time from which a new User-Key
+   * generation must carry a valid signature to count (docs/userkeys.md §9.3):
+   * by the person's device self-grant key or by the previous generation's
+   * signing key. Generations introduced before stay valid unsigned. Unset
+   * means unsigned generations always count (the behaviour before signed
+   * generations existed). New tenants are created with this set.
+   */
+  requireUserKeyGenerationSignatureSince?: number;
+  /**
    * Which language-model endpoints clients may send tenant data to (an AI
    * assistant built into the client, such as Haven's). **Tenant-level only**:
    * read from the tenant default policy (`acl_defaultpolicy`), never layered
@@ -438,6 +447,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "databaseCreationPolicy"
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
+    | "requireUserKeyGenerationSignatureSince"
     | "llm"
     | "personalDatabasePrefixes"
     | "internalMail"
@@ -853,6 +863,18 @@ export function validateAccessPolicy(
     }
   }
 
+  if (policy.requireUserKeyGenerationSignatureSince !== undefined) {
+    if (
+      typeof policy.requireUserKeyGenerationSignatureSince !== "number" ||
+      !Number.isFinite(policy.requireUserKeyGenerationSignatureSince) ||
+      policy.requireUserKeyGenerationSignatureSince < 0
+    ) {
+      throw new Error(
+        "requireUserKeyGenerationSignatureSince must be a non-negative epoch-millisecond timestamp",
+      );
+    }
+  }
+
   if (policy.llm !== undefined) {
     validateLlmEndpointPolicy(policy.llm);
   }
@@ -943,6 +965,7 @@ export function effectivePolicy(
     | "databaseCreationPolicy"
     | "allowedDbIds"
     | "requireMetadataSignatureSince"
+    | "requireUserKeyGenerationSignatureSince"
     | "llm"
     | "personalDatabasePrefixes"
     | "internalMail"

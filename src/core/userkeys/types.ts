@@ -5,6 +5,8 @@ export const USERKEY_TYPE = "userkey";
 export const USERKEY_SCHEMA_VERSION = 1;
 export const USERKEY_DOC_ID_PREFIX = "userkey_";
 export const USERKEY_PRIVATE_SALT = "userkey";
+/** PBKDF2 salt for the person's device self-grant key on {@link PrivateUserId}. */
+export const DEVICE_SELF_GRANT_PRIVATE_SALT = "deviceselfgrant";
 /** Matches `BaseMindooTenantDirectory.USERNAME_HASH_VERSION` (write version 3). */
 export const USERKEY_USERNAME_HASH_VERSION = 3;
 
@@ -45,9 +47,27 @@ export function userKeyDocumentId(grantDocId: string): string {
 
 export interface UserKeyDeviceWrap {
   wrappedKey: string;
+  /**
+   * The person's device self-grant private key (Ed25519 PKCS8), RSA-OAEP
+   * wrapped to the same device key as {@link wrappedKey}. Present when the
+   * writing device held the self-grant key (docs/userkeys.md §9).
+   */
+  wrappedSelfGrantKey?: string;
   label?: string;
   approvedAt: number;
   approvedBySigningPublicKey: string;
+}
+
+/**
+ * Signature over a generation's identity (docs/userkeys.md §9.3). `signerPublicKey`
+ * is either the person's device self-grant key named in their admin-signed
+ * grant, or the {@link UserKeyGeneration.signingPublicKey} of the previous
+ * accepted generation.
+ */
+export interface UserKeyGenerationSignature {
+  signerPublicKey: string;
+  /** Base64 Ed25519 signature over {@link userKeyGenerationSigningMessage}. */
+  signature: string;
 }
 
 export interface UserKeyGeneration {
@@ -56,6 +76,13 @@ export interface UserKeyGeneration {
   createdAt: number;
   retiredAt?: number;
   deviceWraps: Record<string, UserKeyDeviceWrap>;
+  /**
+   * Ed25519 public key derived from this generation's private User-Key
+   * (HKDF, docs/userkeys.md §9.3). Only holders of the generation can sign
+   * with it, which is what lets them sign the next generation.
+   */
+  signingPublicKey?: string;
+  signatures?: UserKeyGenerationSignature[];
 }
 
 export interface RejectedUserKeyDevice {

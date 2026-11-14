@@ -12,6 +12,7 @@ import {
   type UserKeyDeviceWrap,
   type UserKeyDocumentPayload,
   type UserKeyGeneration,
+  type UserKeyGenerationSignature,
 } from "./types";
 import { base64ToBytes, bytesToBase64, fingerprintEncryptionPublicKey } from "./fingerprint";
 
@@ -37,6 +38,9 @@ export function buildPendingUserKeyPayload(input: {
   publicKey: string;
   fingerprint: string;
   createdAt: number;
+  /** Generation signing key and signatures (docs/userkeys.md §9.3). */
+  signingPublicKey?: string;
+  signatures?: UserKeyGenerationSignature[];
 }): UserKeyDocumentPayload {
   return {
     form: USERKEY_FORM,
@@ -50,6 +54,8 @@ export function buildPendingUserKeyPayload(input: {
         fingerprint: input.fingerprint,
         createdAt: input.createdAt,
         deviceWraps: {},
+        ...(input.signingPublicKey ? { signingPublicKey: input.signingPublicKey } : {}),
+        ...(input.signatures?.length ? { signatures: input.signatures } : {}),
       },
     },
   };
@@ -84,6 +90,9 @@ export async function createPendingUserKeyDocument(input: {
   usernameHashVersion: number;
   publicKey: string;
   fingerprint: string;
+  createdAt?: number;
+  signingPublicKey?: string;
+  signatures?: UserKeyGenerationSignature[];
   signingKeyPair?: SigningKeyPair;
   signingKeyPassword?: string;
   assumeUniqueId?: boolean;
@@ -93,7 +102,9 @@ export async function createPendingUserKeyDocument(input: {
     usernameHashVersion: input.usernameHashVersion,
     publicKey: input.publicKey,
     fingerprint: input.fingerprint,
-    createdAt: Date.now(),
+    createdAt: input.createdAt ?? Date.now(),
+    signingPublicKey: input.signingPublicKey,
+    signatures: input.signatures,
   });
   const id = userKeyDocumentId(input.grantDocId);
   const create = {
@@ -146,8 +157,14 @@ export async function writeDeviceWrap(input: {
   gen.deviceWraps = { ...(gen.deviceWraps ?? {}) };
   const existing = gen.deviceWraps[input.deviceFingerprint];
   if (existing?.wrappedKey) {
-    if (!existing.label && input.wrap.label) {
-      gen.deviceWraps[input.deviceFingerprint] = { ...existing, label: input.wrap.label };
+    const addLabel = !existing.label && !!input.wrap.label;
+    const addSelfGrant = !existing.wrappedSelfGrantKey && !!input.wrap.wrappedSelfGrantKey;
+    if (addLabel || addSelfGrant) {
+      gen.deviceWraps[input.deviceFingerprint] = {
+        ...existing,
+        ...(addLabel ? { label: input.wrap.label } : {}),
+        ...(addSelfGrant ? { wrappedSelfGrantKey: input.wrap.wrappedSelfGrantKey } : {}),
+      };
       userKeys[input.epoch] = gen;
       await replaceTopLevelField(input.db, input.doc, "userKeys", userKeys);
     }
@@ -158,6 +175,7 @@ export async function writeDeviceWrap(input: {
     approvedAt: input.wrap.approvedAt,
     approvedBySigningPublicKey: input.wrap.approvedBySigningPublicKey,
     ...(input.wrap.label ? { label: input.wrap.label } : {}),
+    ...(input.wrap.wrappedSelfGrantKey ? { wrappedSelfGrantKey: input.wrap.wrappedSelfGrantKey } : {}),
   };
   userKeys[input.epoch] = gen;
   await replaceTopLevelField(input.db, input.doc, "userKeys", userKeys);

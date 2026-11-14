@@ -155,8 +155,11 @@ export function encodeJoinRequestUri(request: JoinRequest): string {
   const signing = toCompactKey(request.signingPublicKey);
   const encryption = toCompactKey(request.encryptionPublicKey);
   const userKey = request.userPublicKey ? toCompactKey(request.userPublicKey) : true;
+  const selfGrantKey = request.deviceSelfGrantPublicKey
+    ? toCompactKey(request.deviceSelfGrantPublicKey)
+    : true;
 
-  if (!signing || !encryption || userKey === null) {
+  if (!signing || !encryption || userKey === null || selfGrantKey === null) {
     return encodeMindooURI("join-request", request as unknown as Record<string, unknown>);
   }
 
@@ -172,6 +175,9 @@ export function encodeJoinRequestUri(request: JoinRequest): string {
   }
   if (typeof userKey === "string") {
     payload.k = userKey;
+  }
+  if (typeof selfGrantKey === "string") {
+    payload.g = selfGrantKey;
   }
   const requestedDocKeyIds = normalizeRequestedDocKeyIds(request.requestedDocKeyIds);
   if (requestedDocKeyIds) {
@@ -222,6 +228,9 @@ export function normalizeJoinRequestPayload(
     if (typeof payload.k === "string" && payload.k) {
       request.userPublicKey = readCompactKey(payload.k, "k");
     }
+    if (typeof payload.g === "string" && payload.g) {
+      request.deviceSelfGrantPublicKey = readCompactKey(payload.g, "g");
+    }
     const requestedDocKeyIds = normalizeRequestedDocKeyIds(payload.d);
     if (requestedDocKeyIds) {
       request.requestedDocKeyIds = requestedDocKeyIds;
@@ -246,6 +255,13 @@ export function normalizeJoinRequestPayload(
     const userPublicKey = readOptionalText(payload.userPublicKey, MAX_KEY_BASE64_CHARS * 2);
     if (userPublicKey) {
       request.userPublicKey = userPublicKey;
+    }
+    const deviceSelfGrantPublicKey = readOptionalText(
+      payload.deviceSelfGrantPublicKey,
+      MAX_KEY_BASE64_CHARS * 2,
+    );
+    if (deviceSelfGrantPublicKey) {
+      request.deviceSelfGrantPublicKey = deviceSelfGrantPublicKey;
     }
     const requestedDocKeyIds = normalizeRequestedDocKeyIds(payload.requestedDocKeyIds);
     if (requestedDocKeyIds) {

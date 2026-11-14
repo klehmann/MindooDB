@@ -1,5 +1,6 @@
 import {
   DEFAULT_TENANT_KEY_ID,
+  type DeviceSelfGrant,
   type DirectoryUserDetails,
   type DirectoryUserLookup,
   type GrantKeyPair,
@@ -28,6 +29,8 @@ import {
   extractKeyPairs,
   extractActiveKeyPairs,
   extractRevokedKeyPairs,
+  extractDeviceSelfGrant,
+  newestDeviceSelfGrant,
   applyKeyPairFields,
   mergeKeyPairs,
 } from "./accesscontrol/grantKeys";
@@ -1518,6 +1521,81 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * The person's device self-grant delegation at the head state
+   * (docs/userkeys.md §9), or `null` when the admin never granted it.
+   */
+  async getDeviceSelfGrantForUsernameHash(usernameHash: string): Promise<DeviceSelfGrant | null> {
+    const head = await this.getDirectoryStateHead();
+    return head.usersByHash.get(usernameHash)?.deviceSelfGrant ?? null;
+  }
+
+  /** {@link getDeviceSelfGrantForUsernameHash} by username (newest grant wins). */
+  async getDeviceSelfGrant(username: string): Promise<DeviceSelfGrant | null> {
+    const grants = await this.findGrantAccessDocuments(username);
+    return newestDeviceSelfGrant(grants.map((g) => extractDeviceSelfGrant(g.getData())));
+  }
+
+  /**
+   * Grant or revoke the person's right to certify their own devices
+   * (docs/userkeys.md §9). `signingPublicKey` is the public half of their
+   * device self-grant key (from the join request, or
+   * `tenant.getDeviceSelfGrantPublicKey()` on one of their devices). `null`
+   * revokes: the key stays on the grant with `revokedAt`, so certificates and
+   * generations signed before stay valid; certificates issued later do not.
+   */
+  async setDeviceSelfGrant(
+    username: string,
+    signingPublicKey: string | null,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    await this.updateUserGrant(
+      username,
+      { deviceSelfGrant: signingPublicKey },
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+  }
+
+  /**
+   * Trusted time from which new User-Key generations must be signed
+   * (`requireUserKeyGenerationSignatureSince`, docs/userkeys.md §9.3), or
+   * `undefined`. Read from the `acl_defaultpolicy` head regardless of the
+   * master switch, like {@link getRequireMetadataSignatureSince}.
+   */
+  async getRequireUserKeyGenerationSignatureSince(): Promise<number | undefined> {
+    const head = await this.getDirectoryStateHead();
+    const since = head.defaultPolicy?.requireUserKeyGenerationSignatureSince;
+    return typeof since === "number" && Number.isFinite(since) ? since : undefined;
+  }
+
+  /**
+   * Require signed User-Key generations from now on (docs/userkeys.md §9.3).
+   * Idempotent: an existing cutoff is kept. Run it once every device of the
+   * tenant runs a client that signs generations; unsigned generations
+   * introduced before stay valid.
+   */
+  async requireUserKeyGenerationSignatures(
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<{ since: number; changed: boolean }> {
+    const head = await this.getDirectoryStateHead();
+    const existing = head.defaultPolicy?.requireUserKeyGenerationSignatureSince;
+    if (typeof existing === "number" && Number.isFinite(existing)) {
+      return { since: existing, changed: false };
+    }
+    const since = semanticNow();
+    await this.setDefaultAccessPolicy(
+      head.defaultPolicy
+        ? { requireUserKeyGenerationSignatureSince: since }
+        : { disableAllAccessChecksAndPolicies: true, requireUserKeyGenerationSignatureSince: since },
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+    return { since, changed: true };
+  }
+
+  /**
    * Whether the active policy has any Tier 2 (`withfields`) content rule for
    * operation `op` in database `dbid` at the current head state. Lets the
    * client write prechecks skip the (potentially costly) Automerge -> JS
@@ -2661,6 +2739,11 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       revokeSigningKeys?: string[];
       restoreSigningKeys?: string[];
       wipeSigningKeys?: string[];
+      /**
+       * Device self-grant delegation (docs/userkeys.md §9): a public key
+       * grants (or replaces) it, `null` revokes it, `undefined` leaves it.
+       */
+      deviceSelfGrant?: string | null;
     },
     administrationPrivateKey: EncryptedPrivateKey,
     administrationPrivateKeyPassword: string,
@@ -2721,6 +2804,25 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         data.wipeRequestedForSigningKeys = Array.from(
           new Set(desiredWipe.filter((k) => present.has(k) && !restoreSet.has(k))),
         );
+
+        if (changes.deviceSelfGrant !== undefined) {
+          const existing = extractDeviceSelfGrant(data);
+          if (changes.deviceSelfGrant === null) {
+            if (existing && existing.revokedAt === undefined) {
+              data.deviceSelfGrant = { ...existing, revokedAt: now };
+            }
+          } else {
+            const key = changes.deviceSelfGrant.trim();
+            if (!key) throw new Error("deviceSelfGrant must be a PEM public key or null");
+            if (
+              !existing ||
+              existing.revokedAt !== undefined ||
+              existing.signingPublicKey.replace(/\s+/g, "") !== key.replace(/\s+/g, "")
+            ) {
+              data.deviceSelfGrant = { signingPublicKey: key, grantedAt: now };
+            }
+          }
+        }
       },
     );
   }

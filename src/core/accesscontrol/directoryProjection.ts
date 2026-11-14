@@ -1,5 +1,6 @@
 import {
   extractActiveKeyPairs,
+  extractDeviceSelfGrant,
   extractWipeRequestedSigningKeys,
 } from "./grantKeys";
 import {
@@ -53,6 +54,11 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
       typeof data.requireMetadataSignatureSince === "number" &&
       Number.isFinite(data.requireMetadataSignatureSince)
         ? data.requireMetadataSignatureSince
+        : undefined,
+    requireUserKeyGenerationSignatureSince:
+      typeof data.requireUserKeyGenerationSignatureSince === "number" &&
+      Number.isFinite(data.requireUserKeyGenerationSignatureSince)
+        ? data.requireUserKeyGenerationSignatureSince
         : undefined,
     llm: parseLlmEndpointPolicy(data.llm),
     personalDatabasePrefixes: stringArray(data.personalDatabasePrefixes)?.filter((prefix) => /^[a-z][a-z0-9]*_$/.test(prefix)),
@@ -189,6 +195,8 @@ export function projectDirectoryRevision(
         wipeRequestedSigningKeys: extractWipeRequestedSigningKeys(data),
         active: signingKeys.length > 0,
       };
+      const deviceSelfGrant = extractDeviceSelfGrant(data);
+      if (deviceSelfGrant) grant.deviceSelfGrant = deviceSelfGrant;
       builder.applyGrantDoc(docId, grant, trustedTime);
     }
     return;

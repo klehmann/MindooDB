@@ -66,6 +66,11 @@ describe("createTenant mints the identity User-Key", () => {
     const wrap = await directory.wrapKeyForUser!(DEFAULT_TENANT_KEY_ID, appUser.username);
     expect(wrap).not.toBeNull();
     expect(Object.keys(wrap!.devices)).toEqual([identityFingerprint]);
+    // The founder may add their own devices (docs/userkeys.md §9.4).
+    const selfGrant = await (
+      directory as unknown as { getDeviceSelfGrant(username: string): Promise<{ signingPublicKey: string } | null> }
+    ).getDeviceSelfGrant(appUser.username);
+    expect(selfGrant?.signingPublicKey).toBe(appUser.deviceSelfGrantKeyPair!.publicKey);
   });
 
   test("refuses to mint a second pair when the identity User-Key cannot be opened", async () => {

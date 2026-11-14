@@ -723,6 +723,18 @@ two refinements.
   // user). Explicit/opt-in: NOT implied by key removal. Self-contained copies of the
   // key values, NOT references into userKeyPairs.
   wipeRequestedForSigningKeys?: string[],
+
+  // Device self-grant (userkeys.md §9.4): the person may vouch for their own
+  // devices with this Ed25519 key, and it may sign their User-Key generations.
+  // The private half was generated on the person's device. Revoking sets
+  // `revokedAt` and keeps the key, so what was signed before stays valid.
+  // Granting also makes the person's unsigned User-Key generations stop
+  // counting from `grantedAt` (userkeys.md §9.3).
+  deviceSelfGrant?: {
+    signingPublicKey: string,
+    grantedAt: number,
+    revokedAt?: number,
+  },
 }
 ```
 
@@ -744,9 +756,13 @@ instead of writing separate revocation documents:
   `userKeyPairs` (dropping its `revokedAt` and any pending wipe flag).
 - **Revoke all key pairs** → fully revoke the user (no active pairs remain);
   they can rejoin later with new keys.
+- **Grant or revoke device self-grant** → `setDeviceSelfGrant(username, key | null)`
+  writes `deviceSelfGrant` (userkeys.md §9.4); `approveJoinRequest` does the same
+  for a new person with `allowDeviceSelfGrant: true`.
 - **Batch edit** → `updateUserGrant` applies a whole staged diff in one
   admin-signed change: rewrite user details, recompute `identity_hashes`, set
-  per-device labels, revoke/restore devices, and set the remote-wipe set. This
+  per-device labels, revoke/restore devices, set the remote-wipe set, and
+  grant or revoke device self-grant (`deviceSelfGrant`). This
   backs the admin "Manage user" dialog's single Save and is the per-user
   `identity_hashes` backfill trigger.
 
@@ -781,6 +797,10 @@ field on purpose for any data to be destroyed.
 
 Three properties are essential:
 
+- **A wipe hits every installation with that key.** A device is its key pair, not
+  its hardware. A restored backup, a paper recovery or an exported identity carries
+  the same signing key, so the wipe — like revocation — hits the original and every
+  copy alike. Individual copies cannot be told apart (userkeys.md §9.5).
 - **Self-contained key values.** The wipe list stores the actual signing public key,
   not a reference into `userSigningPublicKeys`. Revocation removes keys from those
   arrays, so a reference would vanish exactly when it is needed; a copied value
@@ -2502,12 +2522,16 @@ can spin up an ungoverned database" and "only the databases we intended exist".
 
 | Event | Action | Mechanism |
 |-------|--------|-----------|
-| New user / new device | `addUserKeys` (or the join-request flow) appends a key pair, optionally labeled | section 6.5 |
+| New user | the join-request flow registers the grant and publishes the person's User-Key document; pass `allowDeviceSelfGrant: true` to also name their device self-grant key | section 6.5, userkeys.md §3, §9.4 |
+| New device of an existing person | `addUserKeys` (or the join-request flow) appends a key pair, optionally labeled. It syncs, but reads only after the person approves it on one of their own devices, which wraps their User-Key to it | section 6.5, userkeys.md §4 |
+| Restore from backup / copied identity | nothing: it is the **same** device (same signing key, same User-Key). Revocation and wipe hit every copy. For a separate device use the new-device path | userkeys.md §9.5 |
+| Let a person vouch for their own devices | `setDeviceSelfGrant(username, key)`, key from `tenant.getDeviceSelfGrantPublicKey()` on one of their devices; `null` revokes and keeps what was signed before | userkeys.md §9.4 |
+| Require signed User-Key generations (existing tenant) | once all clients sign generations: `requireUserKeyGenerationSignatures()` sets the cutoff to now; new tenants have it from creation | userkeys.md §9.3 |
 | User-identity key rollover | append the new signing/encryption pair on the grant, then revoke the old | section 6.5 |
 | Doc-key rotation (`default` or named) | mint a new version in the KeyBag, republish `acl_keydistribution_<keyId>` (re-wrap to all `pushto` devices); clients merge on reconcile | sections 13.1, 13.6 |
 | Revoke a device | `updateUserGrant` moves the pair into `revokedUserKeyPairs` with `revokedAt` | section 6.5 |
 | Fully offboard a user | revoke all pairs; they can rejoin later with fresh keys | section 6.5 |
-| Stolen device | set `wipeRequestedForSigningKeys`; the device drops the whole local tenant on next connect | section 6.5 |
+| Stolen device | set `wipeRequestedForSigningKeys`; the device drops the whole local tenant on next connect. Copies of that identity (backups) are wiped too. If the person had device self-grant, revoke it and grant a fresh key from a remaining device | section 6.5, userkeys.md §9.4 |
 | Lose read access | move the user to `pullfrom` in `acl_keydistribution_<keyId>` and rotate; clients drop the key and forget its docs on reconcile, the server blacklist withholds them | sections 13.3, 13.4, 13.6 |
 
 Note that **revocation and wipe are independent and both opt-in** (section 6.5): removing
