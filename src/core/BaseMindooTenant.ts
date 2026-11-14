@@ -16,6 +16,7 @@ import {
   JoinResponseEncryptedDocKey,
   JoinResponseEncryptedDocKeyVersion,
   ApproveJoinRequestOptions,
+  ApproveAdminRequestOptions,
   ConnectToServerOptions,
   DEFAULT_TENANT_KEY_ID,
   PublishToServerOptions,
@@ -67,12 +68,20 @@ import { SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { encodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import { decodeJoinRequestUri } from "./uri/joinRequestUri";
+import {
+  decodeAdminRequestUri,
+  encodeAdminResponseUri,
+  type AdminRequest,
+  type AdminResponse,
+} from "./uri/adminUri";
 import { InMemoryLocalCacheStore, type LocalCacheStore } from "./cache/LocalCacheStore";
 import { EncryptedLocalCacheStore } from "./cache/EncryptedLocalCacheStore";
 import { CacheManager } from "./cache/CacheManager";
 import { validateDatabaseId } from "./databaseIdValidation";
 import { BackgroundTaskTracker } from "./BackgroundTaskTracker";
 import { SingleFlight } from "./utils/singleFlight";
+import { DirectoryAdminKeyResolver } from "./accesscontrol/directoryAdminResolver";
+import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
 import { namedExport } from "./utils/dynamicImportInterop";
 
 /**
@@ -748,6 +757,123 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   /**
+   * Signing keys this process writes with besides the current user's (e.g. a
+   * delegated admin key, docs/accesscontrol.md §6.13). Directory entries such a
+   * key wrote here count locally before a witness stamped them.
+   */
+  private readonly localSigningKeys = new Set<string>();
+  /** Store-level admin-key resolver of the open `directory` database (§6.13). */
+  private directoryAdminResolver: DirectoryAdminKeyResolver | null = null;
+  /** Public keys derived from admin private keys handed to directory methods. */
+  private readonly adminPublicKeyByPrivateKey = new WeakMap<EncryptedPrivateKey, string>();
+
+  /** Remember that this process signs with `publicKey` (see {@link isLocalSigningKey}). */
+  noteLocalSigningKey(publicKey: string): void {
+    this.localSigningKeys.add(publicKey.replace(/\s+/g, ""));
+  }
+
+  /** Whether this process signs with `publicKey`: the current user or a noted key. */
+  isLocalSigningKey(publicKey: string): boolean {
+    const normalized = publicKey.replace(/\s+/g, "");
+    if (this.currentUser.userSigningKeyPair.publicKey.replace(/\s+/g, "") === normalized) return true;
+    return this.localSigningKeys.has(normalized);
+  }
+
+  /**
+   * The store-level admin-key resolver for this tenant's `directory` database,
+   * created on first use for `store`. Used by the directory load path and by
+   * {@link isAdminSigningKeyAt}; it reads root-signed admin-key documents
+   * straight from the store, so it never recurses into directory materialization.
+   */
+  getDirectoryAdminResolver(store: ContentAddressedStore): DirectoryAdminKeyResolver {
+    if (!this.directoryAdminResolver) {
+      this.directoryAdminResolver = new DirectoryAdminKeyResolver({
+        store,
+        rootAdminKey: () => this.administrationPublicKey,
+        decryptPayload: (encrypted, keyId) => this.decryptPayload(encrypted, keyId),
+        subtle: this.cryptoAdapter.getSubtle(),
+        isLocalSigningKey: (key) => this.isLocalSigningKey(key),
+        now: () => semanticNow(),
+      });
+    }
+    return this.directoryAdminResolver;
+  }
+
+  /**
+   * Whether `signingKey` is a tenant admin at time `T` (docs/accesscontrol.md
+   * §6.13): the root admin key always is; a delegated admin key is while its
+   * admin-key document's window covers `T`. `T` is a witness time, or "now"
+   * for live decisions.
+   */
+  async isAdminSigningKeyAt(signingKey: string, T: number): Promise<boolean> {
+    if (signingKeysEqual(signingKey, this.administrationPublicKey)) return true;
+    if (!this.directoryAdminResolver) {
+      // Opening the directory registers the resolver. Never awaited from the
+      // directory's own load path: that path uses its resolver directly.
+      await this.openDB(DIRECTORY_DB_ID, { adminOnlyDb: true });
+    }
+    if (!this.directoryAdminResolver) return false;
+    return this.directoryAdminResolver.isDelegatedAdminAt(signingKey, T);
+  }
+
+  /**
+   * Whether `signingKey` has ever been a delegated admin key of this tenant (an
+   * admin-key document exists, whatever its window). Such a key holds no grant,
+   * so its trust is decided by {@link isAdminSigningKeyAt} alone.
+   */
+  async isKnownDelegatedAdminKey(signingKey: string): Promise<boolean> {
+    if (!this.directoryAdminResolver) return false;
+    return this.directoryAdminResolver.hasAdminKeyDocument(signingKey);
+  }
+
+  /**
+   * The signing key pair for an admin private key passed to a directory method.
+   * The root admin key pair is the default; for a delegated admin key
+   * (§6.13) the public key is derived from the private key once and cached.
+   * The derived key is remembered as a local signing key, so the directory
+   * entries it writes count here before a witness stamps them.
+   */
+  async resolveAdminSigningKeyPair(
+    privateKey: EncryptedPrivateKey,
+    password: string,
+  ): Promise<SigningKeyPair> {
+    let publicKey = this.adminPublicKeyByPrivateKey.get(privateKey);
+    if (!publicKey) {
+      try {
+        publicKey = await this.derivePublicSigningKey(privateKey, password);
+      } catch (error) {
+        this.logger.debug(`resolveAdminSigningKeyPair: could not derive public key, assuming root: ${error}`);
+        publicKey = this.administrationPublicKey;
+      }
+      this.adminPublicKeyByPrivateKey.set(privateKey, publicKey);
+    }
+    if (!signingKeysEqual(publicKey, this.administrationPublicKey)) {
+      this.noteLocalSigningKey(publicKey);
+    }
+    return { publicKey: signingKeysEqual(publicKey, this.administrationPublicKey) ? this.administrationPublicKey : publicKey, privateKey };
+  }
+
+  /** Ed25519 public key (SPKI PEM) of an encrypted private signing key. */
+  private async derivePublicSigningKey(privateKey: EncryptedPrivateKey, password: string): Promise<string> {
+    const subtle = this.cryptoAdapter.getSubtle();
+    const pkcs8 = await this.decryptPrivateKey(privateKey, password, "signing");
+    const key = await subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, true, ["sign"]);
+    const jwk = (await subtle.exportKey("jwk", key)) as JsonWebKey;
+    if (!jwk.x) throw new Error("Ed25519 JWK export carries no public key");
+    const base64 = jwk.x.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const raw = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+    const spkiPrefix = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+    const spki = new Uint8Array(spkiPrefix.length + raw.length);
+    spki.set(spkiPrefix, 0);
+    spki.set(raw, spkiPrefix.length);
+    let binary = "";
+    for (const byte of spki) binary += String.fromCharCode(byte);
+    const body = btoa(binary).match(/.{1,64}/g)!.join("\n");
+    return `-----BEGIN PUBLIC KEY-----\n${body}\n-----END PUBLIC KEY-----`;
+  }
+
+  /**
    * Get the administration encryption public key for this tenant.
    * Used for encrypting sensitive data in the directory that only admins can decrypt
    * (e.g., usernames in access control documents).
@@ -1169,7 +1295,21 @@ export class BaseMindooTenant implements MindooTenant {
   async verifyEntrySignature(entry: StoreEntryMetadata, encryptedData: Uint8Array): Promise<boolean> {
     // The author key must be trusted by the tenant directory.
     const directory = await this.openDirectory();
-    const isTrusted = await directory.validatePublicSigningKey(entry.createdByPublicKey);
+    // A delegated admin key (docs/accesscontrol.md §6.13) holds no grant. It is
+    // trusted for what it signed while it was an admin (judged at the witness
+    // time, or now for an un-witnessed entry), also after its window ended.
+    // Checked first for keys the trust cache does not know as grant keys: the
+    // store-level check never waits for the directory cache pass that may be
+    // verifying this very entry.
+    const peek = (directory as { peekTrustedKey?: (key: string) => boolean | undefined }).peekTrustedKey;
+    let isTrusted =
+      signingKeysEqual(entry.createdByPublicKey, this.administrationPublicKey) ||
+      (typeof peek === "function" &&
+        peek.call(directory, entry.createdByPublicKey) !== true &&
+        (await this.isAdminSigningKeyAt(entry.createdByPublicKey, entry.receivedAt ?? semanticNow())));
+    if (!isTrusted) {
+      isTrusted = await directory.validatePublicSigningKey(entry.createdByPublicKey);
+    }
     if (!isTrusted) {
       this.logger.warn(`Public key not trusted: ${entry.createdByPublicKey}`);
       return false;
@@ -1391,7 +1531,7 @@ export class BaseMindooTenant implements MindooTenant {
     }
 
     const currentUser = await this.getCurrentUserId();
-    if (currentUser.userSigningPublicKey === this.getAdministrationPublicKey()) {
+    if (await this.isAdminSigningKeyAt(currentUser.userSigningPublicKey, semanticNow())) {
       return;
     }
 
@@ -1961,6 +2101,10 @@ export class BaseMindooTenant implements MindooTenant {
     console.log(`[approveJoinRequest] Approving join request for user "${username}"`);
     this.logger.info(`Approving join request for user: ${username}`);
 
+    // The approving admin: the root, or a delegated admin (§6.13).
+    const approverKeyPair = await this.resolveAdminSigningKeyPair(options.adminSigningKey, options.adminPassword);
+    const approverIsRoot = signingKeysEqual(approverKeyPair.publicKey, this.administrationPublicKey);
+
     // 1. Register the user in the directory
     const directory = await this.openDirectory();
     const publicUserId: PublicUserId = {
@@ -2010,10 +2154,7 @@ export class BaseMindooTenant implements MindooTenant {
       const userKeyDoc = await this.userKeys.createPendingFromJoin({
         username,
         userPublicKey,
-        signingKeyPair: {
-          publicKey: this.administrationPublicKey,
-          privateKey: options.adminSigningKey,
-        },
+        signingKeyPair: approverKeyPair,
         signingKeyPassword: options.adminPassword,
       });
       const payload = asUserKeyPayload(userKeyDoc.getData());
@@ -2158,7 +2299,7 @@ export class BaseMindooTenant implements MindooTenant {
     // Tenants created before `tenantsetup` recorded administrators have no
     // entry, leaving members with a fingerprint instead of a name. A grant is
     // where the admin supplies both its name and its keys, so heal it here.
-    if (options.adminUsername) {
+    if (options.adminUsername && approverIsRoot) {
       try {
         const directoryDb = await this.openDB("directory", { adminOnlyDb: true });
         const written = await ensureTenantSetupAdministrator(
@@ -2199,6 +2340,73 @@ export class BaseMindooTenant implements MindooTenant {
     }
 
     return joinResponse;
+  }
+
+  /**
+   * Approve a delegated-admin request (docs/accesscontrol.md §6.13). Root admin
+   * key only: writes the admin-key document and the `tenantsetup` entry, then
+   * returns an admin response with `default` and `$publicinfos` wrapped to the
+   * new admin's encryption key. The response names the ROOT key as
+   * `adminSigningPublicKey`; the trust anchor never changes.
+   */
+  async approveAdminRequest(
+    adminRequest: AdminRequest | string,
+    options: ApproveAdminRequestOptions,
+  ): Promise<AdminResponse | string> {
+    const request = decodeAdminRequestUri(adminRequest);
+    if (request.tenantId && request.tenantId !== this.tenantId) {
+      throw new Error(
+        `This admin request is for tenant "${request.tenantId}", not "${this.tenantId}"`,
+      );
+    }
+    const name = (options.name ?? request.name ?? "").trim();
+    if (!name) {
+      throw new Error("Cannot approve admin request: no name in the request and none supplied via options.name");
+    }
+    const label = (options.label ?? request.label ?? "").trim();
+    const directory = (await this.openDirectory()) as BaseMindooTenantDirectory;
+    await directory.addAdminKey(
+      {
+        signingPublicKey: request.signingPublicKey,
+        encryptionPublicKey: request.encryptionPublicKey,
+        name,
+        ...(label ? { label } : {}),
+        ...(typeof options.validFrom === "number" ? { validFrom: options.validFrom } : {}),
+      },
+      options.adminSigningKey,
+      options.adminPassword,
+    );
+
+    const encryptedDocKeys = await Promise.all(
+      [DEFAULT_TENANT_KEY_ID, PUBLIC_INFOS_KEY_ID].map((keyId) =>
+        this.exportJoinResponseDocKeyVersions(keyId, request.encryptionPublicKey),
+      ),
+    );
+    const response: AdminResponse = {
+      v: 1,
+      tenantId: this.tenantId,
+      adminSigningPublicKey: this.administrationPublicKey,
+      adminEncryptionPublicKey: this.administrationEncryptionPublicKey,
+      signingPublicKey: request.signingPublicKey,
+      name,
+      encryptedDocKeys,
+    };
+    if (label) response.label = label;
+    if (options.serverUrl) response.serverUrl = options.serverUrl;
+    const tenantLabel = options.tenantLabel?.trim();
+    if (tenantLabel) {
+      response.tenantLabel = tenantLabel;
+    } else {
+      try {
+        const directoryDb = await this.openDB(DIRECTORY_DB_ID, { adminOnlyDb: true });
+        const setupLabel = await readTenantSetupLabel(directoryDb, this);
+        if (setupLabel) response.tenantLabel = setupLabel;
+      } catch {
+        // Best-effort, as for join responses.
+      }
+    }
+    this.logger.info(`Admin request approved for "${name}"`);
+    return options.format === "uri" ? encodeAdminResponseUri(response) : response;
   }
 
   /**

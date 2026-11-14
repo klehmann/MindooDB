@@ -1134,6 +1134,12 @@ export class BaseMindooDB implements MindooDB {
       attachmentConfig?.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
     this._isAdminOnlyDb = adminOnlyDb;
     this.timeTravelDate = timeTravelDate;
+    // Register the store-level admin-key resolver (§6.13) before anything loads,
+    // so admin checks reached from this directory's own load path never have to
+    // open the directory again.
+    if (adminOnlyDb && store.getId() === DIRECTORY_DB_ID) {
+      tenant.getDirectoryAdminResolver(store);
+    }
     this.maxCachedDocs = Math.max(
       1,
       Math.floor(documentCacheConfig?.maxEntries ?? DEFAULT_MAX_CACHED_DOCS),
@@ -1304,11 +1310,20 @@ export class BaseMindooDB implements MindooDB {
             : await this.ensurePersonalDocCreatorHash(docId!);
       }
     }
+    // A delegated admin (§6.13) writes here and pushes later: its own entries
+    // count on this device until a witness stamps them.
+    const signerIsAdmin =
+      this.isAdminKey(signerPublicKey) ||
+      (await this.tenant.isAdminSigningKeyAt(signerPublicKey, semanticNow()));
+    if (signerIsAdmin && !this.isAdminKey(signerPublicKey)) {
+      this.tenant.noteLocalSigningKey(signerPublicKey);
+    }
     const decision = evaluateBuiltinWrite({
       dbId,
       op,
       signerKey: signerPublicKey,
       adminPublicKey: this.getAdminPublicKey(),
+      signerIsAdmin,
       documentUsernameHash,
       signerUsernameHash,
       docId,
@@ -1325,11 +1340,7 @@ export class BaseMindooDB implements MindooDB {
    * on the server. Admin-signed changes load only when the signer is also the
    * person named by the document (the tenant founder wrapping their own key).
    */
-  private async shouldSkipLoadedEntryForBuiltin(entry: {
-    entryType?: string;
-    createdByPublicKey: string;
-    docId?: string;
-  }): Promise<boolean> {
+  private async shouldSkipLoadedEntryForBuiltin(entry: BuiltinIngestEntry): Promise<boolean> {
     const dbId = this.effectiveBuiltinDbId();
     const entryType = entry.entryType ?? "doc_change";
     let documentUsernameHash: string | null = null;
@@ -1357,11 +1368,20 @@ export class BaseMindooDB implements MindooDB {
         entry.createdByPublicKey,
       );
     }
+    // Delegated admins (§6.13). In `userdirectory` the admin flag only keeps
+    // lifecycle entries alive on this lenient path (the server enforced the
+    // write), so the store lookup is skipped for everything else.
+    const signerIsAdmin =
+      dbId === DIRECTORY_DB_ID ||
+      (dbId === USER_DIRECTORY_DB_ID && (entryType === "doc_delete" || entryType === "doc_undelete"))
+        ? await this.builtinSignerIsAdmin(entry, { allowLocalUnwitnessed: true })
+        : false;
     return shouldSkipLoadedEntry({
       dbId,
       entryType,
       signerKey: entry.createdByPublicKey,
       adminPublicKey: this.getAdminPublicKey(),
+      signerIsAdmin,
       documentUsernameHash,
       signerUsernameHash,
       docId: entry.docId,
@@ -1413,7 +1433,10 @@ export class BaseMindooDB implements MindooDB {
       // Not a document lifecycle entry (attachment chunks and the like). The
       // admin-only rule still holds for `directory`; `userdirectory` has no
       // rule for them, exactly as on the server.
-      if (dbId === DIRECTORY_DB_ID && !this.isAdminKey(entry.createdByPublicKey)) {
+      if (
+        dbId === DIRECTORY_DB_ID &&
+        !(await this.builtinSignerIsAdmin(entry, { allowLocalUnwitnessed: false }))
+      ) {
         return "Admin-only database: only the admin key can modify data";
       }
       return null;
@@ -1453,6 +1476,7 @@ export class BaseMindooDB implements MindooDB {
       op,
       signerKey: entry.createdByPublicKey,
       adminPublicKey: this.getAdminPublicKey(),
+      signerIsAdmin: await this.builtinSignerIsAdmin(entry, { allowLocalUnwitnessed: false }),
       documentUsernameHash,
       signerUsernameHash,
       docId: entry.docId,
@@ -1463,6 +1487,46 @@ export class BaseMindooDB implements MindooDB {
 
   private isAdminKey(publicKey: string): boolean {
     return signingKeysEqual(publicKey, this.getAdminPublicKey());
+  }
+
+  /**
+   * Whether the signer of a builtin `directory` / `userdirectory` entry counts as
+   * a tenant admin (docs/accesscontrol.md §6.13). The root always does. A
+   * delegated admin key does when it was an admin at the entry's witness time,
+   * which needs a valid receipt of a trusted witness — or, for an entry this
+   * process wrote and has not pushed yet, when it is an admin now. Peer
+   * deliveries (`allowLocalUnwitnessed: false`) never get the local exception.
+   */
+  private async builtinSignerIsAdmin(
+    entry: BuiltinIngestEntry | StoreEntryMetadata,
+    options: { allowLocalUnwitnessed: boolean },
+  ): Promise<boolean> {
+    if (this.isAdminKey(entry.createdByPublicKey)) return true;
+    const resolver = this.tenant.getDirectoryAdminResolver(
+      this.effectiveBuiltinDbId() === DIRECTORY_DB_ID
+        ? this.store
+        : ((await this.tenant.openDB(DIRECTORY_DB_ID, { adminOnlyDb: true })) as BaseMindooDB).getStore(),
+    );
+    const decision = await resolver.judgeEntry(
+      {
+        id: (entry as StoreEntryMetadata).id ?? "",
+        docId: entry.docId ?? "",
+        entryType: (entry.entryType ?? "doc_change") as StoreEntryMetadata["entryType"],
+        contentHash: (entry as StoreEntryMetadata).contentHash ?? "",
+        decryptionKeyId: (entry as StoreEntryMetadata).decryptionKeyId ?? "",
+        createdAt: (entry as StoreEntryMetadata).createdAt ?? 0,
+        createdByPublicKey: entry.createdByPublicKey,
+        receivedAt: entry.receivedAt,
+        receivedByPublicKey: entry.receivedByPublicKey,
+        receivedDateSignature: entry.receivedDateSignature,
+        receiptScheme: entry.receiptScheme as StoreEntryMetadata["receiptScheme"],
+      },
+      { dbid: this.store.getId(), allowLocalUnwitnessed: options.allowLocalUnwitnessed },
+    );
+    if (!decision.allowed && this.isDebugEnabled()) {
+      this.logger.debug(`Builtin admin check refused ${entry.docId ?? ""}: ${decision.reason}`);
+    }
+    return decision.allowed;
   }
 
   /** `username_hash` out of a userkey document's `doc_create` payload. */
@@ -3090,7 +3154,13 @@ export class BaseMindooDB implements MindooDB {
       const node = await directory.getDirectoryStateAt(trustedTime);
       isTrusted =
         !!grantForSigningKey(node, publicKey) ||
-        publicKey === this.getAdminPublicKey();
+        publicKey === this.getAdminPublicKey() ||
+        // A delegated admin key (§6.13) is trusted while its window covers
+        // the entry's time (a provisional entry is judged now).
+        (await this.tenant.isAdminSigningKeyAt(
+          publicKey,
+          trustedTime >= Number.MAX_SAFE_INTEGER ? semanticNow() : trustedTime,
+        ));
     } else {
       isTrusted = await directory.validatePublicSigningKey(publicKey);
     }

@@ -182,10 +182,31 @@ export {
   isSamePerson,
   grantForSigningKey,
   signingKeysEqual,
+  isAdminInNode,
+  adminKeyForSigningKey,
   type DirectoryStateNode,
   type UserGrantSnapshot,
   type GroupSnapshot,
 } from "./accesscontrol/DirectoryStateNode";
+// Delegated administrators (docs/accesscontrol.md §6.13).
+export {
+  ADMIN_KEY_TYPE,
+  ACL_ADMIN_KEY_PREFIX,
+  ROOT_ONLY_DIRECTORY_DOC_PREFIXES,
+  isRootOnlyDirectoryDocId,
+  aclAdminKeyDocId,
+  aclAdminKeyDocIdForKey,
+  adminKeyFingerprint,
+  adminKeyWindowFromDoc,
+  adminKeySnapshotAt,
+  adminKeyStatusAt,
+  isAdminKeySnapshotValidAt,
+  type AdminKeyDoc,
+  type AdminKeySnapshot,
+  type AdminKeyInfo,
+  type AdminKeyStatus,
+  type AdminKeyRevision,
+} from "./accesscontrol/adminKeys";
 export { AccessDeniedError } from "./accesscontrol/AccessDeniedError";
 // The inbound half of the quarantine view (docs/accesscontrol.md §10): entries
 // this device refused at materialization, read via MindooDB.getQuarantineLog.
@@ -355,6 +376,14 @@ export {
   normalizeJoinRequestPayload,
   normalizeRequestedDocKeyIds,
 } from "./uri/joinRequestUri";
+export {
+  encodeAdminRequestUri,
+  decodeAdminRequestUri,
+  encodeAdminResponseUri,
+  decodeAdminResponseUri,
+  type AdminRequest,
+  type AdminResponse,
+} from "./uri/adminUri";
 
 // Errors
 export {

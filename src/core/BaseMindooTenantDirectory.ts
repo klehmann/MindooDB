@@ -47,6 +47,7 @@ import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import {
   DirectoryStateNode,
   grantForSigningKey,
+  isAdminInNode,
   isSamePerson,
   signingKeysEqual,
 } from "./accesscontrol/DirectoryStateNode";
@@ -104,7 +105,17 @@ import {
 import { IdentitySet, evaluateAccess, evaluateLlmUse } from "./accesscontrol/evaluate";
 import { AccessDecision } from "./accesscontrol/types";
 import { RSAEncryption } from "./crypto/RSAEncryption";
-import { decryptEncryptedField } from "./crypto/encryptedFields";
+import { decryptEncryptedField, encryptEncryptedField } from "./crypto/encryptedFields";
+import { ensureTenantSetupAdministrator } from "./tenantSetup";
+import {
+  ADMIN_KEY_TYPE,
+  type AdminKeyInfo,
+  type AdminKeySnapshot,
+  aclAdminKeyDocIdForKey,
+  adminDecisionTime,
+  adminKeyStatusAt,
+  isAdminKeySnapshotValidAt,
+} from "./accesscontrol/adminKeys";
 
 const DIRECTORY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_UNKNOWN_KEYS_TRACKED = 1000;
@@ -439,10 +450,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const baseTenant = this.tenant as BaseMindooTenant;
 
     // Create SigningKeyPair for the administration key
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
 
     // Compute username hash (salted v2 for new documents) and encrypted user
     // details before creating the document.
@@ -549,8 +557,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     ];
     if (filtered.length === 0) return;
 
-    const baseTenant = this.tenant as BaseMindooTenant;
-    const preparedBy = baseTenant.getAdministrationPublicKey();
+    const preparedBy = (await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword)).publicKey;
 
     for (const keyId of filtered) {
       const keyVersions = await this.getKeyVersionManifest(keyId);
@@ -810,6 +817,22 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }
     }
     
+    // A delegated admin key (docs/accesscontrol.md §6.13) holds no grant; it is
+    // trusted while its admin window covers now. Checked before the poll below:
+    // the admin-key resolver reads the store directly, while the poll may wait
+    // for a directory cache pass that is itself verifying this key's entries.
+    if (this.trustedKeysCache.get(publicKey) !== true) {
+      if (await this.isAdminKeyNow(publicKey)) {
+        this.logger.debug(`Public key is an active delegated admin key, trusted`);
+        return true;
+      }
+      // An ended delegated admin key holds no grant either: nothing to poll for.
+      if (await (this.tenant as BaseMindooTenant).isKnownDelegatedAdminKey(publicKey)) {
+        this.logger.debug(`Public key is a delegated admin key outside its window, not trusted now`);
+        return false;
+      }
+    }
+
     // Store poll: discovers entries this process has not seen yet, so it is
     // throttled to once per interval — unless the caller forces it (audit #4):
     // the server push path must observe a freshly pushed revocation
@@ -850,6 +873,299 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // Key not found in cache means it was never granted access
     this.logger.debug(`Public key not found in cache, returning false`);
     return false;
+  }
+
+  // ==================== Delegated administrators (§6.13) ====================
+
+  /** The signing key pair for an admin private key: the root's, or a delegated admin's. */
+  private async adminKeyPair(
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<SigningKeyPair> {
+    const pair = await (this.tenant as BaseMindooTenant).resolveAdminSigningKeyPair(
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+    );
+    if (
+      !signingKeysEqual(pair.publicKey, this.getRootAdminPublicKey()) &&
+      !(await this.isAdminKeyNow(pair.publicKey))
+    ) {
+      throw new Error(
+        "Signing key pair mismatch: the private key belongs to neither the root admin key nor an active delegated admin of this tenant",
+      );
+    }
+    return pair;
+  }
+
+  /** Like {@link adminKeyPair}, but refuses anything but the root admin key. */
+  private async rootKeyPair(
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+    action: string,
+  ): Promise<SigningKeyPair> {
+    const pair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
+    if (!signingKeysEqual(pair.publicKey, (this.tenant as BaseMindooTenant).getAdministrationPublicKey())) {
+      throw new Error(`Only the root admin key may ${action}`);
+    }
+    return pair;
+  }
+
+  /**
+   * What the trust cache already knows about `publicKey` (true: an active
+   * grant key), without polling. Lets entry verification try the store-level
+   * admin check first for keys that are not grant keys (§6.13).
+   */
+  peekTrustedKey(publicKey: string): boolean | undefined {
+    return this.trustedKeysCache.get(publicKey);
+  }
+
+  /** The tenant's root admin key (the fixed trust anchor). */
+  getRootAdminPublicKey(): string {
+    return (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
+  }
+
+  /**
+   * Live admin check (auth, read gate, push check): root, or a delegated admin
+   * key whose window covers now. Reads the root-signed admin-key documents from
+   * the directory store, so it is safe on the directory's own load path.
+   */
+  private async isAdminKeyNow(signingKey: string): Promise<boolean> {
+    return (this.tenant as BaseMindooTenant).isAdminSigningKeyAt(signingKey, semanticNow());
+  }
+
+  /**
+   * Whether `signingKey` is a tenant admin at trusted time `T` (§6.13): the
+   * root always; a delegated admin key while the directory state at `T` holds
+   * its admin-key document with `validFrom ≤ T < validUntil`. Pass
+   * `Number.MAX_SAFE_INTEGER` for the directory head judged at "now".
+   */
+  async isAdminAt(signingKey: string, T: number): Promise<boolean> {
+    const root = this.getRootAdminPublicKey();
+    if (signingKeysEqual(signingKey, root)) return true;
+    const node = await this.getDirectoryStateAt(T);
+    return isAdminInNode(node, root, signingKey, adminDecisionTime(T, semanticNow()));
+  }
+
+  /**
+   * Like {@link isAdminAt}, but read from the root-signed admin-key documents in
+   * the directory store rather than the time-travel chain (§6.13). This is the
+   * form the sync server uses for push and auth decisions: it never waits for a
+   * chain rebuild and is safe to call while the directory itself loads.
+   */
+  async isAdminSigningKeyAt(signingKey: string, T: number): Promise<boolean> {
+    return (this.tenant as BaseMindooTenant).isAdminSigningKeyAt(signingKey, adminDecisionTime(T, semanticNow()));
+  }
+
+  /**
+   * The delegated admin key `signingKey` as valid at `T` (its encryption key and
+   * window), or null when it is not a delegated admin then. Store-level like
+   * {@link isAdminSigningKeyAt}; the sync server uses it to let an admin key
+   * authenticate without a grant.
+   */
+  async getDelegatedAdminKeyAt(signingKey: string, T: number): Promise<AdminKeySnapshot | null> {
+    const tenant = this.tenant as BaseMindooTenant;
+    if (!(await tenant.isAdminSigningKeyAt(signingKey, adminDecisionTime(T, semanticNow())))) return null;
+    const directoryDB = await this.getDirectoryDB();
+    return tenant
+      .getDirectoryAdminResolver(directoryDB.getStore())
+      .delegatedAdminKeyAt(signingKey, adminDecisionTime(T, semanticNow()));
+  }
+
+  /**
+   * The delegated admin keys at the directory head, with their windows, names
+   * (when this replica holds `default`) and status at "now". `pending` is true
+   * while the latest revision of a key's document carries no witness receipt
+   * yet: other replicas do not see it until a trusted witness stamped it.
+   */
+  async listAdminKeys(): Promise<AdminKeyInfo[]> {
+    return this.adminKeysFromNode(await this.getDirectoryStateHead(), semanticNow(), true);
+  }
+
+  /** The delegated admin keys as the directory knew them at trusted time `T`. */
+  async getAdminKeysAt(T: number): Promise<AdminKeyInfo[]> {
+    return this.adminKeysFromNode(await this.getDirectoryStateAt(T), adminDecisionTime(T, semanticNow()), false);
+  }
+
+  private async adminKeysFromNode(
+    node: DirectoryStateNode,
+    at: number,
+    withPending: boolean,
+  ): Promise<AdminKeyInfo[]> {
+    const directoryDB = await this.getDirectoryDB();
+    const subtle = this.tenant.getCryptoAdapter().getSubtle();
+    const out: AdminKeyInfo[] = [];
+    for (const snapshot of node.adminKeys?.values() ?? []) {
+      const docId = await aclAdminKeyDocIdForKey(snapshot.signingPublicKey, subtle);
+      let name: string | undefined;
+      try {
+        const doc = await directoryDB.getDocument(docId);
+        const decrypted = await decryptEncryptedField(this.tenant, doc.getData(), "name_encrypted");
+        if (typeof decrypted === "string" && decrypted.trim()) name = decrypted.trim();
+      } catch {
+        // No `default` key here, or the document is not materialized.
+      }
+      let pending = false;
+      if (withPending) {
+        try {
+          const entries = await directoryDB.getStore().findNewEntriesForDoc([], docId);
+          const latest = entries
+            .filter((e) => signingKeysEqual(e.createdByPublicKey, this.getRootAdminPublicKey()))
+            .sort((a, b) => a.createdAt - b.createdAt)
+            .pop();
+          pending = !!latest && latest.receivedAt === undefined;
+        } catch {
+          pending = false;
+        }
+      }
+      out.push({
+        ...snapshot,
+        ...(name ? { name } : {}),
+        status: adminKeyStatusAt(snapshot, at),
+        active: isAdminKeySnapshotValidAt(snapshot, at),
+        pending,
+      });
+    }
+    return out.sort((a, b) => a.validFrom - b.validFrom);
+  }
+
+  /**
+   * Make `signingPublicKey` a delegated admin (§6.13). Root only. Writes the
+   * `acl_adminkey_<fingerprint>` document (under `$publicinfos`) and records the
+   * admin in `tenantsetup.administrators` for display. Adding a key whose
+   * document already exists starts a new window (reactivation): entries signed
+   * between the old end and the new start stay invalid.
+   *
+   * The key becomes effective at the witness time of this write (or at
+   * `validFrom`, if later). Other replicas honor it once a trusted witness has
+   * stamped the document.
+   */
+  async addAdminKey(
+    admin: {
+      signingPublicKey: string;
+      encryptionPublicKey: string;
+      name: string;
+      label?: string;
+      validFrom?: number;
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const rootPair = await this.rootKeyPair(
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      "add administrators",
+    );
+    const name = admin.name.trim();
+    if (!name) throw new Error("addAdminKey: name is required");
+    if (!admin.signingPublicKey.trim() || !admin.encryptionPublicKey.trim()) {
+      throw new Error("addAdminKey: signingPublicKey and encryptionPublicKey are required");
+    }
+    if (signingKeysEqual(admin.signingPublicKey, rootPair.publicKey)) {
+      throw new Error("addAdminKey: the root admin key is always an administrator");
+    }
+    const directoryDB = await this.getDirectoryDB();
+    const subtle = this.tenant.getCryptoAdapter().getSubtle();
+    const docId = await aclAdminKeyDocIdForKey(admin.signingPublicKey, subtle);
+    const nameEncrypted = await encryptEncryptedField(this.tenant, name);
+    const label = admin.label?.trim();
+    const doc = await this.getOrCreateAclDoc(directoryDB, docId, rootPair, administrationPrivateKeyPassword);
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        data.form = ACCESS_CONTROL_FORM;
+        data.type = ADMIN_KEY_TYPE;
+        data.signingPublicKey = admin.signingPublicKey;
+        data.encryptionPublicKey = admin.encryptionPublicKey;
+        data.name_encrypted = nameEncrypted;
+        data.name_encrypted_key = DEFAULT_TENANT_KEY_ID;
+        if (label) data.label = label;
+        else delete data.label;
+        if (typeof admin.validFrom === "number" && Number.isFinite(admin.validFrom)) {
+          data.validFrom = admin.validFrom;
+        } else {
+          delete data.validFrom;
+        }
+        delete data.validUntil;
+      },
+      { signingKeyPair: rootPair, signingKeyPassword: administrationPrivateKeyPassword },
+    );
+    try {
+      await ensureTenantSetupAdministrator(
+        directoryDB,
+        {
+          username: name,
+          keyPairs: [
+            {
+              signingPublicKey: admin.signingPublicKey,
+              encryptionPublicKey: admin.encryptionPublicKey,
+              ...(label ? { label } : {}),
+              addedAt: semanticNow(),
+            },
+          ],
+        },
+        rootPair,
+        administrationPrivateKeyPassword,
+        this.tenant,
+      );
+    } catch (error) {
+      this.logger.warn(`addAdminKey: recording the administrator in tenantsetup failed: ${error}`);
+    }
+    await this.updateUnifiedCache();
+  }
+
+  /**
+   * Change the window of a delegated admin key (§6.13). Root only.
+   *
+   * - `validUntil: <ms>` deactivates the key as of that witness time; a future
+   *   date schedules the end. A date before the witness time of this write is
+   *   raised to it — deactivation never reaches back.
+   * - `validUntil: null` removes the end. On a key that has already ended this
+   *   reactivates it from the witness time of this write on.
+   * - `validFrom: <ms>` / `null` sets or clears a later start.
+   */
+  async setAdminKeyValidity(
+    signingPublicKey: string,
+    validity: { validFrom?: number | null; validUntil?: number | null },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const rootPair = await this.rootKeyPair(
+      administrationPrivateKey,
+      administrationPrivateKeyPassword,
+      "change administrators",
+    );
+    const directoryDB = await this.getDirectoryDB();
+    const docId = await aclAdminKeyDocIdForKey(signingPublicKey, this.tenant.getCryptoAdapter().getSubtle());
+    let doc: MindooDoc;
+    try {
+      doc = await directoryDB.getDocument(docId);
+    } catch {
+      throw new Error("setAdminKeyValidity: this key is not a delegated administrator");
+    }
+    const ended = (() => {
+      const data = doc.getData();
+      return typeof data.validUntil === "number" && data.validUntil <= semanticNow();
+    })();
+    await directoryDB.changeDoc(
+      doc,
+      async (d: MindooDoc) => {
+        const data = d.getData();
+        if (validity.validUntil === null) delete data.validUntil;
+        else if (typeof validity.validUntil === "number" && Number.isFinite(validity.validUntil)) {
+          data.validUntil = validity.validUntil;
+        }
+        if (validity.validFrom === null) delete data.validFrom;
+        else if (typeof validity.validFrom === "number" && Number.isFinite(validity.validFrom)) {
+          data.validFrom = validity.validFrom;
+        } else if (validity.validUntil === null && ended) {
+          // Reactivation: a new window starting at this revision's witness time.
+          delete data.validFrom;
+        }
+      },
+      { signingKeyPair: rootPair, signingKeyPassword: administrationPrivateKeyPassword },
+    );
+    await this.updateUnifiedCache();
   }
 
   /**
@@ -1442,6 +1758,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const node = await this.getDirectoryStateAt(input.trustedTime);
     const identity = await this.identitySetForSigningKey(input.signingKey, node, {
       isAuthor: input.op === "doc_create" || !!input.isAuthor,
+      at: input.trustedTime,
     });
     return evaluateAccess({
       op: input.op,
@@ -1470,6 +1787,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const node = await this.getDirectoryStateAt(input.trustedTime);
     const identity = await this.identitySetForSigningKey(input.signingKey, node, {
       isAuthor: input.op === "doc_create" || input.isAuthor,
+      at: input.trustedTime,
     });
     return evaluateAccess({
       op: input.op,
@@ -1624,8 +1942,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    */
   async canUseLlm(): Promise<AccessDecision> {
     const currentUser = await this.tenant.getCurrentUserId();
-    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
-    if (currentUser.userSigningPublicKey === adminKey) {
+    if (await this.isAdminKeyNow(currentUser.userSigningPublicKey)) {
       return { allowed: true, reason: "tenant admin", tier: "tier1" };
     }
     // Head selector, NOT Date.now() — see canDo.
@@ -1695,8 +2012,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     if (mode === "open") return true;
     if (allowedDbIds.includes(dbid)) return true;
     if (opts?.signingKey !== undefined) {
-      const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
-      if (opts.signingKey === adminKey) return true;
+      if (await this.isAdminKeyNow(opts.signingKey)) return true;
     }
     return false;
   }
@@ -1726,9 +2042,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     // The directory database is never read-gated (it must always sync so the
     // policy that defines the read gate can be read at all).
     if (input.dbid === DIRECTORY_DB_ID || input.dbid === USER_DIRECTORY_DB_ID) return true;
-    // The tenant admin is exempt from the read gate.
-    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
-    if (input.signingKey === adminKey) return true;
+    // Tenant admins (root and active delegated admins, §6.13) are exempt from the read gate.
+    if (await this.isAdminKeyNow(input.signingKey)) return true;
     // Gate 2 — per-user/group database read gate (`doc_read`, §6.6). Evaluated
     // server-side (Tier 1) from the principal's signing key at acceptance time.
     // A denied principal cannot pull or push the database, which also prevents
@@ -1756,8 +2071,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     signingKey: string;
   }): Promise<"all" | "own"> {
     if (input.dbid === DIRECTORY_DB_ID || input.dbid === USER_DIRECTORY_DB_ID) return "all";
-    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
-    if (input.signingKey === adminKey) return "all";
+    if (await this.isAdminKeyNow(input.signingKey)) return "all";
     const decision = await this.evaluateAccessForSigningKey({
       op: "doc_read_all",
       dbid: input.dbid,
@@ -1793,7 +2107,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const personal = await this.evaluatePersonalDatabaseAccess(input);
     if (personal) {
       if (personal.mode === "none") return personal;
-      if (signingKeysEqual(input.signingKey, (this.tenant as BaseMindooTenant).getAdministrationPublicKey())) {
+      if (await this.isAdminKeyNow(input.signingKey)) {
         return personal;
       }
       if (personal.mode === "read") {
@@ -1850,7 +2164,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const head = await this.getDirectoryStateHead();
     const owner = personalDatabaseOwner(input.dbid, head.defaultPolicy?.personalDatabasePrefixes ?? []);
     if (!owner) return null;
-    const isAdmin = signingKeysEqual(input.signingKey, (this.tenant as BaseMindooTenant).getAdministrationPublicKey());
+    const isAdmin = await this.isAdminKeyNow(input.signingKey);
     if (isAdmin && owner.prefix !== "mbusy_") {
       return { mode: "read", reason: "tenant admin" };
     }
@@ -2013,10 +2327,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const grants = (await this.findGrantAccessDocuments(username)).filter((doc) => !doc.isDeleted());
     if (grants.length === 0) throw new Error(`No grant for ${username}`);
     const directoryDB = await this.getDirectoryDB();
-    const signingKeyPair: SigningKeyPair = {
-      publicKey: (this.tenant as BaseMindooTenant).getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const signingKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     for (const grant of grants) {
       await directoryDB.changeDoc(
         grant,
@@ -2066,8 +2377,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async canReadDatabase(dbid: string): Promise<boolean> {
     if (dbid === DIRECTORY_DB_ID || dbid === USER_DIRECTORY_DB_ID) return true;
     const currentUser = await this.tenant.getCurrentUserId();
-    const adminKey = (this.tenant as BaseMindooTenant).getAdministrationPublicKey();
-    if (currentUser.userSigningPublicKey === adminKey) return true;
+    if (await this.isAdminKeyNow(currentUser.userSigningPublicKey)) return true;
     // The personal-database invariant (§6.11) decides first, policy on top.
     const personal = await this.evaluatePersonalDatabaseAccess({ dbid, signingKey: currentUser.userSigningPublicKey });
     if (personal && personal.mode !== "read") return false;
@@ -2158,10 +2468,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     const doc = await this.getOrCreateAclDoc(
       directoryDB,
       docId,
@@ -2238,10 +2545,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     const doc = await this.getOrCreateAclDoc(
       directoryDB,
       aclRuleDocId(rule.ruleId),
@@ -2302,10 +2606,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     try {
       await directoryDB.deleteDocument(aclRuleDocId(ruleId), {
         signingKeyPair: adminSigningKeyPair,
@@ -2328,10 +2629,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
+    // Trusted witnesses decide whose receipt times count (§6.13): root only.
+    await this.rootKeyPair(administrationPrivateKey, administrationPrivateKeyPassword, "add trusted witnesses");
     const fingerprint = await this.sha256Hex(witness.witnessPublicKey);
     const doc = await this.getOrCreateAclDoc(
       directoryDB,
@@ -2361,10 +2661,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
+    await this.rootKeyPair(administrationPrivateKey, administrationPrivateKeyPassword, "remove trusted witnesses");
     const fingerprint = await this.sha256Hex(witnessPublicKey);
     try {
       await directoryDB.deleteDocument(aclTrustedWitnessDocId(fingerprint), {
@@ -3052,10 +3350,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const docId = aclKeyDistributionDocId(keyId);
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     const doc = await this.getOrCreateAclDoc(
       directoryDB,
       docId,
@@ -3189,10 +3484,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     try {
       await directoryDB.deleteDocument(aclKeyDistributionDocId(keyId), {
         signingKeyPair: adminSigningKeyPair,
@@ -3515,10 +3807,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const docId = aclAppDistributionDocId(appId);
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     const doc = await this.getOrCreateAclDoc(
       directoryDB,
       docId,
@@ -3641,10 +3930,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     try {
       await directoryDB.deleteDocument(aclAppDistributionDocId(appId), {
         signingKeyPair: adminSigningKeyPair,
@@ -3800,10 +4086,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const docId = aclSyncSetupPolicyDocId(policyId);
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     const doc = await this.getOrCreateAclDoc(
       directoryDB,
       docId,
@@ -3927,10 +4210,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     try {
       await directoryDB.deleteDocument(aclSyncSetupPolicyDocId(policyId), {
         signingKeyPair: adminSigningKeyPair,
@@ -4013,7 +4293,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * server-readable and carries every variant.
    */
   async getRevokedDecryptionKeyIdsForSigningKey(signingKey: string): Promise<string[]> {
-    if (signingKey === this.tenant.getAdministrationPublicKey()) return [];
+    if (await this.isAdminKeyNow(signingKey)) return [];
     const lookup = await this.getUserBySigningPublicKey(signingKey);
     if (!lookup) return [];
     const myHashes = await this.identityHashesForLookup(lookup);
@@ -4097,10 +4377,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     for (const grant of grants) {
       const doc = await directoryDB.getDocument(grant.getId());
       await directoryDB.changeDoc(
@@ -4142,12 +4419,17 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   private async identitySetForSigningKey(
     signingKey: string,
     node: DirectoryStateNode,
-    opts: { isAuthor?: boolean },
+    opts: { isAuthor?: boolean; at?: number },
   ): Promise<IdentitySet> {
     // The tenant admin key is the root of trust and is resolved even without a
-    // grant document (it authors the directory itself).
-    const adminKey = this.tenant.getAdministrationPublicKey();
-    const isAdmin = signingKey === adminKey;
+    // grant document (it authors the directory itself). Delegated admin keys
+    // (§6.13) count while their window covers the evaluation time.
+    const isAdmin = isAdminInNode(
+      node,
+      this.getRootAdminPublicKey(),
+      signingKey,
+      adminDecisionTime(opts.at ?? Number.MAX_SAFE_INTEGER, semanticNow()),
+    );
 
     // Audit #4 (revocation lag): resolve the acting identity strictly from the
     // directory state at the entry's trusted time `T`. A signing key that was
@@ -4545,10 +4827,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const requestedAt = semanticNow();
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     const doc = await this.getOrCreateAclDoc(
       directoryDB,
       docId,
@@ -4641,10 +4920,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   ): Promise<void> {
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     try {
       await directoryDB.deleteDocument(aclDocHistoryPurgeDocId(requestId), {
         signingKeyPair: adminSigningKeyPair,
@@ -4718,10 +4994,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
     
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     
     // Get cached settings doc or create new one
     let settingsDoc = await this.getTenantSettings();
@@ -4764,10 +5037,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
     
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     
     // Get cached settings doc for this dbId or create new one
     let settingsDoc = await this.getDBSettings(dbId);
@@ -4850,10 +5120,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const baseTenant = this.tenant as BaseMindooTenant;
     const directoryDB = await this.getDirectoryDB();
     
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     
     // Compute hashes (salted v2 for new writes) and encrypted values for all
     // new usernames. Reads match both v1 and v2 forms (docs/accesscontrol.md §6.5).
@@ -4951,10 +5218,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       return;
     }
     
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     
     // Compute hashes of usernames to remove. Include both legacy (v1) and
     // salted (v2) forms so members stored under either scheme are removed.
@@ -5036,10 +5300,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       return;
     }
     
-    const adminSigningKeyPair: SigningKeyPair = {
-      publicKey: baseTenant.getAdministrationPublicKey(),
-      privateKey: administrationPrivateKey,
-    };
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
     
     // Delete the document using the proper API
     await directoryDB.deleteDocument(cachedGroup.docId, {

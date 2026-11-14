@@ -1,3 +1,4 @@
+import type { AdminKeyInfo } from "./accesscontrol/adminKeys";
 import type { KeyBag } from "./keys/KeyBag";
 import type { KeyType } from "./keys/KeyContext";
 import type { PublicUserId, PrivateUserId } from "./userid";
@@ -484,6 +485,24 @@ export interface JoinResponseEncryptedDocKeyVersion {
    * `encryptionPublicKey` (standard base64). Absent on v2 responses.
    */
   wrappedKey?: string;
+}
+
+/** Options of {@link MindooTenant.approveAdminRequest} (docs/accesscontrol.md §6.13). */
+export interface ApproveAdminRequestOptions {
+  /** The ROOT administration private key. */
+  adminSigningKey: EncryptedPrivateKey;
+  /** Password of {@link adminSigningKey}. */
+  adminPassword: string;
+  /** The admin's name; defaults to the name suggested in the request. */
+  name?: string;
+  /** Device label; defaults to the label suggested in the request. */
+  label?: string;
+  /** Witness time (ms) the admin key becomes effective, if later than the approval. */
+  validFrom?: number;
+  serverUrl?: string;
+  tenantLabel?: string;
+  /** "uri" returns a mdb://admin-response/... string. */
+  format?: "object" | "uri";
 }
 
 export interface JoinResponseEncryptedDocKey {
@@ -1228,6 +1247,21 @@ export interface MindooTenant {
    */
   approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions & { format: "uri" }): Promise<string>;
   approveJoinRequest(joinRequest: JoinRequest | string, options: ApproveJoinRequestOptions): Promise<JoinResponse>;
+
+  /**
+   * Approve a delegated-admin request (docs/accesscontrol.md §6.13). Root admin
+   * key only. Writes the `acl_adminkey_<fingerprint>` document and the
+   * `tenantsetup` entry, and returns an admin response that wraps the tenant
+   * `default` and `$publicinfos` keys to the new admin key.
+   *
+   * @param request An AdminRequest object or a mdb://admin-request/... URI string.
+   * @param options The ROOT admin key and password, the admin's name (overrides the suggested one) and optional label, server URL and tenant label.
+   * @returns The AdminResponse, or a mdb://admin-response/... URI string when `format` is "uri".
+   */
+  approveAdminRequest?(
+    request: import("./uri/adminUri").AdminRequest | string,
+    options: ApproveAdminRequestOptions,
+  ): Promise<import("./uri/adminUri").AdminResponse | string>;
 
   /** Devices on this person's grant that still need a User-Key wrap. */
   listPendingUserKeyDevices?(): Promise<import("./userkeys/types").PendingUserKeyDevice[]>;
@@ -3735,6 +3769,74 @@ export interface MindooTenantDirectory {
    * @returns The set of trusted witness Ed25519 signing public keys (PEM) in effect at `T`.
    */
   getTrustedWitnessKeysAt?(T: number): Promise<Set<string>>;
+
+  /**
+   * Whether `signingKey` is a tenant admin at trusted time `T`
+   * (docs/accesscontrol.md §6.13): the root admin key (`administrationPublicKey`)
+   * always; a delegated admin key while its admin-key document's window
+   * (`validFrom ≤ T < validUntil`, witness time) covers `T`.
+   *
+   * @param signingKey Ed25519 signing public key (PEM).
+   * @param T Trusted time (ms epoch); `Number.MAX_SAFE_INTEGER` means the directory head judged now.
+   * @returns True when the key may act as an administrator at `T`.
+   */
+  isAdminAt?(signingKey: string, T: number): Promise<boolean>;
+
+  /**
+   * The delegated admin keys at the directory head, with window, name and
+   * status at "now" (§6.13). The root admin key is not listed.
+   *
+   * @returns One entry per delegated admin key, oldest first.
+   */
+  listAdminKeys?(): Promise<AdminKeyInfo[]>;
+
+  /**
+   * The delegated admin keys as the directory knew them at trusted time `T` (§6.13).
+   *
+   * @param T Trusted time (ms epoch).
+   * @returns One entry per delegated admin key known at `T`, status judged at `T`.
+   */
+  getAdminKeysAt?(T: number): Promise<AdminKeyInfo[]>;
+
+  /**
+   * Make a signing key a delegated administrator (§6.13). Root admin key only.
+   * Writes `acl_adminkey_<fingerprint>` and records the admin in
+   * `tenantsetup.administrators`. Re-adding a deactivated key reactivates it
+   * from the witness time of this write on.
+   *
+   * @param admin The admin device: its public keys, the admin's name, an optional device label and an optional later start.
+   * @param administrationPrivateKey The ROOT administration private key.
+   * @param administrationPrivateKeyPassword Its password.
+   */
+  addAdminKey?(
+    admin: {
+      signingPublicKey: string;
+      encryptionPublicKey: string;
+      name: string;
+      label?: string;
+      validFrom?: number;
+    },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
+   * Set or clear the window of a delegated admin key (§6.13). Root admin key
+   * only. `validUntil` in the future schedules the end; a value before this
+   * write's witness time is raised to it (no retroactive deactivation).
+   * `validUntil: null` on an ended key reactivates it from now on.
+   *
+   * @param signingPublicKey The delegated admin's signing public key (PEM).
+   * @param validity New `validFrom` / `validUntil` (ms, witness time); `null` clears a bound.
+   * @param administrationPrivateKey The ROOT administration private key.
+   * @param administrationPrivateKeyPassword Its password.
+   */
+  setAdminKeyValidity?(
+    signingPublicKey: string,
+    validity: { validFrom?: number | null; validUntil?: number | null },
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
 
   /**
    * The canonical write-time hash for `username` (the value stored in a
@@ -6494,4 +6596,16 @@ export interface BuiltinIngestEntry {
   docId?: string;
   encryptedData?: Uint8Array;
   decryptionKeyId?: string;
+  /**
+   * Witness receipt and the metadata it signs. An entry of a delegated admin
+   * (docs/accesscontrol.md §6.13) only passes with a valid receipt of a trusted
+   * witness; a full {@link StoreEntry} carries all of these.
+   */
+  id?: string;
+  contentHash?: string;
+  createdAt?: number;
+  receivedAt?: number;
+  receivedByPublicKey?: string;
+  receivedDateSignature?: Uint8Array;
+  receiptScheme?: string;
 }
