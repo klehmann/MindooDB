@@ -836,14 +836,20 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
 
     if (sharedState.authenticationPromise) {
       this.logger.info(`[auth-share] Awaiting shared in-flight authentication for ${sharedKey}`);
-      this.authenticationPromise = sharedState.authenticationPromise;
+      const joined = sharedState.authenticationPromise;
+      this.authenticationPromise = joined;
       try {
-        const token = await sharedState.authenticationPromise;
+        const token = await joined;
         this.accessToken = sharedState.accessToken ?? token;
         this.tokenExpiry = sharedState.tokenExpiry;
         return token;
       } finally {
-        if (this.authenticationPromise === sharedState.authenticationPromise) {
+        // Compare with the promise we joined, not with the shared slot: the
+        // owning store clears that slot as soon as its own await resumes, which
+        // happens before ours. Comparing with the slot left the settled promise
+        // here for good, and once its token expired every later call (and the
+        // re-authentication after a 401) got that expired token back.
+        if (this.authenticationPromise === joined) {
           this.authenticationPromise = null;
         }
       }
