@@ -44,6 +44,12 @@ export interface UserGrantSnapshot {
    * (docs/userkeys.md §9). Newest `grantedAt` wins across grant documents.
    */
   deviceSelfGrant?: { signingPublicKey: string; grantedAt: number; revokedAt?: number };
+  /**
+   * Signing keys in `revokedUserKeyPairs` and not active on any of the
+   * person's grant documents. A certified device listed here no longer
+   * counts (docs/userkeys.md §9.6).
+   */
+  revokedSigningKeys?: string[];
 }
 
 /** A group as projected into a node, mirroring the directory's offline merge (§8.1). */
@@ -467,6 +473,7 @@ export class DirectoryStateChainBuilder {
     const encBySigning = new Map<string, string>();
     const wipeRequested = new Set<string>();
     let deviceSelfGrant: UserGrantSnapshot["deviceSelfGrant"];
+    const revokedKeys = new Set<string>();
     let hasContribution = false;
     for (const contribution of this.grantContributions.values()) {
       if (contribution.usernameHash !== usernameHash) continue;
@@ -479,6 +486,7 @@ export class DirectoryStateChainBuilder {
       for (const wipeKey of contribution.wipeRequestedSigningKeys) {
         wipeRequested.add(wipeKey);
       }
+      for (const key of contribution.revokedSigningKeys ?? []) revokedKeys.add(key);
       if (
         contribution.deviceSelfGrant &&
         (!deviceSelfGrant || contribution.deviceSelfGrant.grantedAt > deviceSelfGrant.grantedAt)
@@ -497,6 +505,9 @@ export class DirectoryStateChainBuilder {
           wipeRequestedSigningKeys: [...wipeRequested],
           active: signingKeys.length > 0,
           ...(deviceSelfGrant ? { deviceSelfGrant } : {}),
+          ...(revokedKeys.size > 0
+            ? { revokedSigningKeys: [...revokedKeys].filter((key) => !encBySigning.has(key)) }
+            : {}),
         });
       } else {
         next.usersByHash.delete(usernameHash);
