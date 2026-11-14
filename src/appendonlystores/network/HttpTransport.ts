@@ -30,6 +30,7 @@ import type {
   SessionEncryptedPayloadBatch,
   NetworkSessionEncryptedPayload,
   StoreChangeEvent,
+  StoreLiveEvent,
   AuthResult,
   NetworkSyncCapabilities,
 } from "../../core/appendonlystores/network/types";
@@ -898,10 +899,17 @@ export class HttpTransport implements NetworkTransport {
   async subscribeToChanges(
     token: string,
     onEvent: (event: StoreChangeEvent) => void,
-    options?: { signal?: AbortSignal; onOpen?: () => void },
+    options?: {
+      signal?: AbortSignal;
+      onOpen?: () => void;
+      live?: { clientId: string; onLive: (event: StoreLiveEvent) => void };
+    },
   ): Promise<void> {
     const dbId = this.config.dbId ?? "directory";
-    const url = `${this.getSyncBasePath()}/events?dbId=${encodeURIComponent(dbId)}`;
+    const live = options?.live
+      ? `&live=${encodeURIComponent(dbId)}&client=${encodeURIComponent(options.live.clientId)}`
+      : "";
+    const url = `${this.getSyncBasePath()}/events?dbId=${encodeURIComponent(dbId)}${live}`;
     this.logger.debug(`Subscribing to change events at ${url}`);
 
     const response = await this.safeFetch(url, {
@@ -954,7 +962,7 @@ export class HttpTransport implements NetworkTransport {
         while ((separatorIndex = buffer.indexOf("\n\n")) >= 0) {
           const rawMessage = buffer.slice(0, separatorIndex);
           buffer = buffer.slice(separatorIndex + 2);
-          this.dispatchSseMessage(rawMessage, onEvent);
+          this.dispatchSseMessage(rawMessage, onEvent, options?.live?.onLive);
         }
       }
     } catch (error) {
@@ -971,6 +979,7 @@ export class HttpTransport implements NetworkTransport {
   private dispatchSseMessage(
     rawMessage: string,
     onEvent: (event: StoreChangeEvent) => void,
+    onLive?: (event: StoreLiveEvent) => void,
   ): void {
     let eventName = "message";
     const dataLines: string[] = [];
@@ -984,6 +993,22 @@ export class HttpTransport implements NetworkTransport {
         dataLines.push(line.slice(5).trimStart());
       }
     }
+    if (eventName === "live" && onLive && dataLines.length > 0) {
+      try {
+        const message = JSON.parse(dataLines.join("\n")) as StoreLiveEvent;
+        if (
+          message &&
+          typeof message.dbId === "string" &&
+          typeof message.sender === "string" &&
+          typeof message.payload === "string"
+        ) {
+          onLive(message);
+        }
+      } catch (error) {
+        this.logger.warn("Ignoring malformed live event payload", error);
+      }
+      return;
+    }
     if (eventName !== "change" || dataLines.length === 0) {
       return;
     }
@@ -994,6 +1019,34 @@ export class HttpTransport implements NetworkTransport {
       }
     } catch (error) {
       this.logger.warn("Ignoring malformed change event payload", error);
+    }
+  }
+
+  /**
+   * Publish one message on this store's live channel. Not retried: a live
+   * message that does not get through at once is stale anyway.
+   */
+  async publishLive(token: string, payload: string, clientId: string): Promise<void> {
+    const response = await this.safeFetch(`${this.getSyncBasePath()}/publishLive`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+      },
+      body: JSON.stringify({ tenantId: this.config.tenantId, dbId: this.config.dbId, payload, clientId }),
+    });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        throw new NetworkError(NetworkErrorType.INVALID_TOKEN, errorData.error || "Unauthorized");
+      }
+      if (response.status === 403) {
+        throw new NetworkError(NetworkErrorType.USER_REVOKED, errorData.error || "Access denied");
+      }
+      throw new NetworkError(
+        NetworkErrorType.SERVER_ERROR,
+        errorData.error || `Live channel returned HTTP ${response.status}`,
+      );
     }
   }
 

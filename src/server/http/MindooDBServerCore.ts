@@ -53,7 +53,7 @@ import { CapabilityMatcher, parseSystemTenantItemPath } from "../CapabilityMatch
 import type { SystemAdminAuthService } from "../SystemAdminAuth";
 import { DeviceDiscoveryAuthError, type DeviceDiscoveryService } from "../DeviceDiscoveryService";
 import { isConfigBackupFilename, validateServerConfig, type ServerConfigRepository } from "../serverConfig";
-import type { SyncChangeEvent } from "../SyncEventBus";
+import type { SyncChangeEvent, SyncLiveEvent } from "../SyncEventBus";
 import { isPeerAttachmentMode, isPeerRole, isPeerSyncDirection } from "../peer/types";
 import type {
   ListTenantsResponse,
@@ -142,6 +142,11 @@ export interface MindooDBServerCoreOptions {
   capabilityMatcher: CapabilityMatcher;
   deviceDiscovery: DeviceDiscoveryService;
   syncEvents: SyncEventPublisher;
+  /**
+   * The host's event streams forward live-channel messages (`event: live`):
+   * enables `publishLive` and the `supportsLiveChannel` capability.
+   */
+  liveChannel?: boolean;
   configRepository: ServerConfigRepository;
   /** Current `config.json`; read on every request so hot reloads take effect. */
   getServerConfig(): ServerConfig;
@@ -247,6 +252,36 @@ export function formatSyncChangeEvent(
   })}\n\n`;
 }
 
+/** Most databases one event stream may carry live messages for. */
+export const MAX_LIVE_DBS_PER_STREAM = 8;
+/** Longest live-channel payload (base64 characters; about 16 KB of ciphertext). */
+export const MAX_LIVE_PAYLOAD_LENGTH = 22_000;
+/** Live messages one caller may publish per {@link LIVE_RATE_WINDOW_MS}. */
+export const LIVE_RATE_MAX = 40;
+export const LIVE_RATE_WINDOW_MS = 10_000;
+
+/**
+ * `event: live` frame for a subscriber of that database's live channel, or
+ * null when the message is for someone else (or is the subscriber's own).
+ */
+export function formatSyncLiveEvent(
+  subscription: { tenantId: string; liveDbIds?: string[]; liveClientId?: string },
+  event: SyncLiveEvent,
+): string | null {
+  if (
+    event.tenantId !== subscription.tenantId ||
+    !subscription.liveDbIds?.includes(event.dbId) ||
+    (event.clientId !== undefined && event.clientId === subscription.liveClientId)
+  ) {
+    return null;
+  }
+  return `event: live\ndata: ${JSON.stringify({
+    dbId: event.dbId,
+    sender: event.sender,
+    payload: event.payload,
+  })}\n\n`;
+}
+
 /** Comment frame that keeps proxies from closing an idle stream. */
 export function formatSyncHeartbeat(now: number): string {
   return `: heartbeat ${now}\n\n`;
@@ -268,6 +303,9 @@ export const SYNC_ROUTES = [
   // SSE live change feed (sync-v5, phase 5): one long-lived GET per
   // subscriber; putEntries publishes into the event bus.
   { method: "GET", name: "events" },
+  // Live channel: relay one ephemeral, client-encrypted message to the
+  // database's live subscribers. Nothing is stored.
+  { method: "POST", name: "publishLive" },
   { method: "POST", name: "getEntries" },
   // Binary wire format v2 (sync-v5, phase 3): octet-stream framing for the
   // two payload-heavy endpoints. putEntriesBinary takes a raw body.
@@ -1072,6 +1110,7 @@ export class MindooDBServerCore {
       case "getCompactionStatus": return this.getCompactionStatus(req, storeKind);
       case "capabilities": return this.getCapabilities(req, storeKind);
       case "events": return this.syncEvents(req, storeKind);
+      case "publishLive": return this.publishLive(req, storeKind);
       case "getEntries": return this.getEntries(req, storeKind);
       case "getEntriesBinary": return this.getEntriesBinary(req, storeKind);
       case "putEntriesBinary": return this.putEntriesBinary(req, storeKind);
@@ -1229,6 +1268,7 @@ export class MindooDBServerCore {
           supportsBinaryEntries: true,
           supportsPayloadOnlyEntries: true,
           supportsChangeEvents: true,
+          ...(this.liveChannelEnabled() ? { supportsLiveChannel: true } : {}),
         },
       });
     } catch (error) {
@@ -1264,7 +1304,104 @@ export class MindooDBServerCore {
       const serverStore = await this.serverStore(req, gateDbId, storeKind);
       await serverStore.handleGetCapabilities(token);
 
-      return { status: 200, events: { tenantId, storeKind } };
+      // `?live=<dbId>[,<dbId>…]`: also carry these databases' live channels.
+      // Unlike change hints, live messages are per database, so each one
+      // passes the same read gate as the stream itself.
+      const liveDbIds: string[] = [];
+      if (this.liveChannelEnabled() && typeof req.query.live === "string" && req.query.live) {
+        const requested = [...new Set(req.query.live.split(",").filter(Boolean))];
+        if (requested.length > MAX_LIVE_DBS_PER_STREAM) {
+          return jsonResponse(400, { error: `At most ${MAX_LIVE_DBS_PER_STREAM} live databases per stream` });
+        }
+        for (const dbId of requested) {
+          const validDbId = validateDbId(dbId);
+          if (validDbId !== gateDbId) {
+            await (await this.serverStore(req, validDbId, storeKind)).handleGetCapabilities(token);
+          }
+          liveDbIds.push(validDbId);
+        }
+      }
+      const liveClientId =
+        typeof req.query.client === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(req.query.client)
+          ? req.query.client
+          : undefined;
+
+      return {
+        status: 200,
+        events: {
+          tenantId,
+          storeKind,
+          ...(liveDbIds.length > 0 ? { liveDbIds, ...(liveClientId ? { liveClientId } : {}) } : {}),
+        },
+      };
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private liveChannelEnabled(): boolean {
+    return this.options.liveChannel === true && typeof this.options.syncEvents.publishLive === "function";
+  }
+
+  /** Recent publishes per caller, for {@link publishLive}'s rate limit. */
+  private readonly liveRate = new Map<string, number[]>();
+
+  /**
+   * `POST /:tenantId/sync/docs/publishLive` — relay one message on a
+   * database's live channel: `{ dbId, payload, clientId? }`.
+   *
+   * The caller must pass the database's read gate, exactly like a subscriber.
+   * `payload` is opaque to the server (clients encrypt it with a key of the
+   * database's readers) and is neither stored nor replayed; whoever is not
+   * subscribed right now never sees it. The sender name relayed with it comes
+   * from the caller's token.
+   */
+  async publishLive(req: ServerRequest, storeKind: StoreKind): Promise<ServerResponse> {
+    try {
+      if (!this.liveChannelEnabled() || storeKind !== StoreKind.docs) {
+        return jsonResponse(404, { error: "Live channel not available" });
+      }
+      const token = extractToken(req);
+      const { dbId, payload, clientId } = req.body as { dbId?: unknown; payload?: unknown; clientId?: unknown };
+      const validDbId = validateDbId(dbId);
+      if (typeof payload !== "string" || payload.length === 0 || payload.length > MAX_LIVE_PAYLOAD_LENGTH) {
+        return jsonResponse(400, { error: `payload must be a string of at most ${MAX_LIVE_PAYLOAD_LENGTH} characters` });
+      }
+
+      // Token, revocation and the database's read gate.
+      const serverStore = await this.serverStore(req, validDbId, storeKind);
+      await serverStore.handleGetCapabilities(token);
+
+      const authService = await this.tenantManager.getAuthService(req.tenantId!);
+      const issued = await authService.readIssuedToken(token);
+      if (!issued || issued.tenantId !== req.tenantId) {
+        return jsonResponse(401, { error: "Invalid or expired token" });
+      }
+
+      const rateKey = `${req.tenantId}:${issued.deviceSigningKey ?? issued.sub}`;
+      const now = Date.now();
+      const recent = (this.liveRate.get(rateKey) ?? []).filter((time) => time > now - LIVE_RATE_WINDOW_MS);
+      if (recent.length >= LIVE_RATE_MAX) {
+        this.liveRate.set(rateKey, recent);
+        return jsonResponse(429, { error: "Too many live messages, slow down" });
+      }
+      recent.push(now);
+      this.liveRate.set(rateKey, recent);
+      if (this.liveRate.size > 10_000) {
+        // Forget callers that have been quiet for a window.
+        for (const [key, times] of this.liveRate) {
+          if (times.every((time) => time <= now - LIVE_RATE_WINDOW_MS)) this.liveRate.delete(key);
+        }
+      }
+
+      this.options.syncEvents.publishLive!({
+        tenantId: req.tenantId!,
+        dbId: validDbId,
+        payload,
+        sender: issued.sub,
+        ...(typeof clientId === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(clientId) ? { clientId } : {}),
+      });
+      return jsonResponse(200, { ok: true });
     } catch (error) {
       return errorResponse(error);
     }

@@ -23,6 +23,7 @@ import type {
   SessionEncryptedEntriesBatch,
   SessionEncryptedPayloadBatch,
   StoreChangeEvent,
+  StoreLiveEvent,
   AuthResult,
   NetworkSyncCapabilities,
 } from "./types";
@@ -331,8 +332,24 @@ export interface NetworkTransport {
   subscribeToChanges?(
     token: string,
     onEvent: (event: StoreChangeEvent) => void,
-    options?: { signal?: AbortSignal; onOpen?: () => void }
+    options?: {
+      signal?: AbortSignal;
+      onOpen?: () => void;
+      /**
+       * Also carry this store's live channel on the stream (capability
+       * `supportsLiveChannel`): `onLive` gets every message other clients
+       * publish; `clientId` keeps the server from echoing this client's own.
+       */
+      live?: { clientId: string; onLive: (event: StoreLiveEvent) => void };
+    }
   ): Promise<void>;
+
+  /**
+   * Publish one message on this store's live channel (capability
+   * `supportsLiveChannel`). `payload` is base64 of bytes the server cannot
+   * read; it is relayed to current subscribers and never stored.
+   */
+  publishLive?(token: string, payload: string, clientId: string): Promise<void>;
 
   /**
    * Check which of the provided IDs exist in the remote store.

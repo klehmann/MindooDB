@@ -31,6 +31,7 @@ export {
   type Tier1Directory,
 } from "./accesscontrol/tier1Evaluator";
 export * from "./userkeys";
+export * from "./live/LiveChannel";
 export {
   PEER_DEVICE_DOC_ID_PREFIX,
   PEER_DEVICE_FORM,
