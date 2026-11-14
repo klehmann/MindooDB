@@ -857,6 +857,12 @@ export interface MindooTenantFactory {
   ensureUserKeyPair?(user: PrivateUserId, password: string): Promise<EncryptionKeyPair>;
 
   /**
+   * Generate the person's device self-grant key (Ed25519) on `user` if absent
+   * (docs/userkeys.md §9). Password-encrypted with salt `"deviceselfgrant"`.
+   */
+  ensureDeviceSelfGrantKeyPair?(user: PrivateUserId, password: string): Promise<SigningKeyPair>;
+
+  /**
    * Join a tenant using a join response from an admin.
    * This orchestrates:
    * 1. Parsing the join response (object or mdb:// URI string)

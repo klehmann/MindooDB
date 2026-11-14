@@ -300,19 +300,29 @@ export class BaseMindooTenantFactory implements MindooTenantFactory {
     };
     // The person's device self-grant key is born with their User-Key on the
     // same (first) device; later devices receive it wrapped (docs/userkeys.md §9).
-    if (!user.deviceSelfGrantKeyPair) {
-      const selfGrant = await generateSelfGrantKeyPair(this.cryptoAdapter);
-      user.deviceSelfGrantKeyPair = {
-        publicKey: selfGrant.publicKeyPem,
-        privateKey: await encryptPrivateKeyWithPassword(
-          this.cryptoAdapter,
-          selfGrant.privateKeyBytes,
-          password,
-          DEVICE_SELF_GRANT_PRIVATE_SALT,
-        ),
-      };
-    }
+    await this.ensureDeviceSelfGrantKeyPair(user, password);
     return user.userKeyPair;
+  }
+
+  /**
+   * Create the person's device self-grant key on the identity if absent
+   * (docs/userkeys.md §9), password-encrypted with salt `"deviceselfgrant"`.
+   * Call before `createJoinRequest` for identities made before the key
+   * existed, so the request carries `deviceSelfGrantPublicKey`.
+   */
+  async ensureDeviceSelfGrantKeyPair(user: PrivateUserId, password: string): Promise<SigningKeyPair> {
+    if (user.deviceSelfGrantKeyPair) return user.deviceSelfGrantKeyPair;
+    const selfGrant = await generateSelfGrantKeyPair(this.cryptoAdapter);
+    user.deviceSelfGrantKeyPair = {
+      publicKey: selfGrant.publicKeyPem,
+      privateKey: await encryptPrivateKeyWithPassword(
+        this.cryptoAdapter,
+        selfGrant.privateKeyBytes,
+        password,
+        DEVICE_SELF_GRANT_PRIVATE_SALT,
+      ),
+    };
+    return user.deviceSelfGrantKeyPair;
   }
 
   /**
