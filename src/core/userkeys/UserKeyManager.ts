@@ -652,8 +652,10 @@ export class UserKeyManager {
     if (!userKeyBytes) return;
     let bytes = await this.getSelfGrantPrivateKeyBytes();
     const anyWrapped = Object.values(gen.deviceWraps ?? {}).some((w) => !!w.wrappedSelfGrantKey);
-    if (!bytes && !anyWrapped) {
-      const user = this.tenant.getCurrentPrivateUser();
+    const user = this.tenant.getCurrentPrivateUser();
+    // Generate only for an identity that has none: one this session merely
+    // cannot open (host without seed, empty password) must not be replaced.
+    if (!bytes && !anyWrapped && !user.deviceSelfGrantKeyPair) {
       await this.generateLocalSelfGrantKey(user, this.tenant.getCurrentUserPassword());
       bytes = this.decryptedSelfGrantBytes;
     }
@@ -676,7 +678,6 @@ export class UserKeyManager {
     }
     // Wraps written by other devices may not be in the grant overview yet
     // (directory not pulled). This device's own wrap is covered either way.
-    const user = this.tenant.getCurrentPrivateUser();
     const ownFp = await fingerprintEncryptionPublicKey(
       user.userEncryptionKeyPair.publicKey,
       crypto.getSubtle(),
