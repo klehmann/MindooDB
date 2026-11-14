@@ -3091,6 +3091,10 @@ export class BaseMindooDB implements MindooDB {
       isTrusted =
         !!grantForSigningKey(node, publicKey) ||
         publicKey === this.getAdminPublicKey();
+      // A device its person certified (docs/userkeys.md §9.6).
+      if (!isTrusted && typeof directory.resolveSignerToGrant === "function") {
+        isTrusted = !!(await directory.resolveSignerToGrant(publicKey, trustedTime));
+      }
     } else {
       isTrusted = await directory.validatePublicSigningKey(publicKey);
     }

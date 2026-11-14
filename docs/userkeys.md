@@ -685,6 +685,7 @@ Once documents can be sealed to a person, `userdirectory` becomes the natural ho
 | `wks_` | The roamed workspace and application list, one document per save id | sealed to its owner | generated |
 | `dev_` | Where a device can be dialled over Iroh (§7.6.1) | every member, via the tenant `default` key | derived from the device key fingerprint |
 | `qtn_` | A write the server turned away, kept so it can be found and offered again (§7.6.2) | every member, via the tenant `default` key | derived from author, database, document and rejection class |
+| `dcert_` | A device certificate the person issued with their self-grant key (§9.6) | every member and the sync server, via `$publicinfos` | derived from the certified device's signing-key fingerprint |
 
 These documents need the opposite of what a key document needs. A key document is published: everybody must read it, and its owner is named inside it by `username_hash`. A personal document is not: it is encrypted so that the hoster cannot read it, which means ownership cannot be read out of the payload — exactly what the rule in section 7.2 does.
 
@@ -870,9 +871,67 @@ So **a restored backup is the same device today**, not a new one:
 - per-device records keyed by the signing key, such as `dev_<fingerprint>`, overwrite each other,
 - a stolen copy cannot be cut off without cutting off the original.
 
-For a second device, the join and approval flow of section 4 is the right path. Device certificates signed with the self-grant key, which turn a restore into a new device with its own keys, are the next step of this design.
+For a second device, the join and approval flow of section 4 is the right path, or a device certificate (section 9.6) when the person has device self-grant. A restore that should become its own device creates new device keys and gets a certificate from the person; Haven does not do that automatically yet.
 
-### 9.6 Limits
+### 9.6 Device certificates
+
+With device self-grant, a person adds devices without the administrator. A device that holds the person's self-grant key writes a **device certificate** for the new device and wraps the user key to it in the same step:
+
+```ts
+// On one of the person's devices (holds the granted self-grant key)
+const { docId } = await tenant.issueDeviceCertificate(
+  { signingPublicKey, encryptionPublicKey },   // the new device's public keys
+  "Karsten's iPad",
+);
+```
+
+The certificate is a personal document `dcert_<fingerprint>` in `userdirectory` (section 7.6), encrypted with `$publicinfos` so the sync server can read and verify it:
+
+```ts
+{
+  form: "userdirectory",
+  type: "devicecert",
+  schemaVersion: 1,
+  username_hash: string,               // the person, as on the grant
+  deviceSigningPublicKey: string,
+  deviceEncryptionPublicKey: string,
+  label?: string,
+  issuedAt: number,
+  issuedBySigningPublicKey: string,    // the issuing device
+  selfGrantPublicKey: string,          // must match the grant's deviceSelfGrant
+  signature: string,                   // Ed25519, over all fields above
+}
+```
+
+Only the document's `doc_create` counts. Readers take the certificate from it and ignore later changes, so nobody can edit one in place.
+
+**One place decides who a key is.** `directory.resolveSignerToGrant(signingKey, T)` returns the grant a key acts under at trusted time `T`: a device listed on the grant, or a device with a certificate that counts. A certificate counts when
+
+- its signature verifies with the self-grant key that the person's grant names at `T`,
+- its `doc_create` was accepted (trusted time) at or before `T`, and before the delegation's `revokedAt`,
+- the person has not withdrawn it (deleted the document) at or before `T`, and
+- the device is not in the grant's `revokedUserKeyPairs` at `T`.
+
+Server authentication, device discovery (`discoverTenantsOnServer`), access-control evaluation, the `userdirectory` write rule, `$author` and personal databases, change attribution and entry signature checks all go through it. A certified device therefore syncs, writes and reads like a device listed on the grant, while the grant itself still lists only the devices the administrator added.
+
+| Call | Purpose |
+|---|---|
+| `tenant.issueDeviceCertificate(keys, label?)` | Certify a device and wrap the user key and self-grant key to it. Fails without a granted self-grant key on this device. |
+| `tenant.listOwnDeviceCertificates()` | The person's certificates in the local replica. |
+| `tenant.revokeOwnDeviceCertificate(fingerprint)` | Withdraw one (a sold or retired device): deletes the document. It stops counting at the delete's trusted time; an undelete does not bring it back. |
+| `directory.resolveSignerToGrant(key, T)` | The grant a key acts under, `via: "grant"` or `"certificate"`. |
+| `directory.listCertifiedDevices(usernameHash)` | Certified devices that count now. |
+| `directory.updateUserGrant(username, { revokeSigningKeys, wipeSigningKeys })` | Revokes and wipes certified devices like listed ones: the key goes into `revokedUserKeyPairs` and the wipe list. |
+
+Things to know:
+
+- **Withdrawing is not a defence against theft.** Any device of the person can delete or recreate certificates, including a stolen one. Against theft the administrator revokes the key on the grant, wipes it, and revokes the delegation (`setDeviceSelfGrant(username, null)`): a thief holding the self-grant key could otherwise certify more devices. Certificates accepted before stay valid. Re-anchoring the person with a new self-grant key (generate it, wrap it to the remaining devices, grant it) has no single call yet.
+- **Revoking the delegation keeps what was issued before.** `setDeviceSelfGrant(username, null)` stops new certificates. Certificates accepted before `revokedAt` keep counting.
+- **A certificate needs a witness to predate a revocation.** An unwitnessed certificate takes the current time as its trusted time, so it counts as issued after any revocation that comes up.
+- **Rotation includes certified devices.** `rotateUserKey()` wraps the new generation to certified devices that held the previous one.
+- **Old servers and clients do not know certificates.** A server without this version rejects a certified device as unknown; it then waits like a device that has not been granted.
+
+### 9.7 Limits
 
 - **The pending window.** Until the first device seals a new person's document, any device on the grant may adopt it, as before.
 - **Legacy generations stay as trustworthy as they were.** A generation that counts because of the cutoff is not more trustworthy than before; the cutoff only stops new unsigned ones.
@@ -922,6 +981,9 @@ Ordering rule for the whole table: sync the directory databases, then reconcile 
 | `directory.getDeviceSelfGrant(username)` | Read the delegation. |
 | `directory.requireUserKeyGenerationSignatures(adminKey, password)` | Set the tenant cutoff for unsigned generations to now (idempotent). |
 | `directory.getRequireUserKeyGenerationSignatureSince()` | Read that cutoff. |
+| `tenant.issueDeviceCertificate(keys, label?)` | Certify another device of this person (section 9.6). |
+| `tenant.listOwnDeviceCertificates()` / `tenant.revokeOwnDeviceCertificate(fingerprint)` | List and withdraw own certificates. |
+| `directory.resolveSignerToGrant(key, T)` | Grant or certificate a signing key acts under at `T`. |
 
 **Queries and per-document recipients**
 
@@ -1100,6 +1162,11 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 | Granting device self-grant closes the gap for that person; rotation stays signed and counts | 9.3, 9.4 | `UserKeyGenerationSignature` |
 | The join request carries the self-grant key; approval names it in the grant; revoke keeps the key | 9.4 | `UserKeyGenerationSignature` |
 | An approved device receives the person's self-grant key, replacing one it made before joining | 9.2 | `UserKeyGenerationSignature` |
+| A certified device resolves to its person, syncs, writes and reads; its owner's personal databases are its own | 9.6 | `DeviceCertificates` |
+| Certifying needs a granted self-grant key; forged certificates are ignored | 9.6 | `DeviceCertificates` |
+| The admin revokes and wipes a certified device; the person withdraws one | 9.6 | `DeviceCertificates` |
+| Revoking the delegation keeps earlier certificates and stops new ones | 9.6 | `DeviceCertificates` |
+| A certified device discovers the tenant on a server, reads and writes over HTTP | 9.6 | `DeviceCertificatesServer` |
 | Removal drops wraps from every generation but does not rotate | 5.1 | `UserKeyDeviceRemovalRotation` |
 | Rotation excludes the removed device from the new generation | 5.2 | `UserKeyDeviceRemovalRotation` |
 | A removed device cannot obtain the rotated generation | 5.2 | `UserKeyDeviceRemovalRotation` |

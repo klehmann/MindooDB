@@ -407,6 +407,17 @@ export class BaseMindooTenant implements MindooTenant {
     return this.userKeys;
   }
 
+  /**
+   * The document store of `dbId` without opening (materializing) the
+   * database: the open database's store, or a store handle from the factory.
+   * For readers that only scan entries, such as the device-certificate index.
+   */
+  getDocStoreForDb(dbId: string): ContentAddressedStore {
+    const live = this.databaseCache.get(dbId);
+    if (live) return (live as BaseMindooDB).getStore();
+    return this.storeFactory.createStore(dbId).docStore;
+  }
+
   isDatabaseOpen(dbId: string): boolean {
     return this.databaseCache.has(dbId) || this.databaseOpenInFlight.has(dbId);
   }
@@ -498,6 +509,27 @@ export class BaseMindooTenant implements MindooTenant {
 
   async getDeviceSelfGrantPublicKey(): Promise<string | null> {
     return this.userKeys.getDeviceSelfGrantPublicKey();
+  }
+
+  async issueDeviceCertificate(
+    device: { signingPublicKey: string; encryptionPublicKey: string },
+    label?: string,
+  ): Promise<{ docId: string; certificate: import("./userkeys/deviceCertificate").DeviceCertificatePayload }> {
+    return this.userKeys.issueDeviceCertificate(device, label);
+  }
+
+  async revokeOwnDeviceCertificate(fingerprint: string): Promise<number> {
+    return this.userKeys.revokeOwnDeviceCertificate(fingerprint);
+  }
+
+  async listOwnDeviceCertificates(): Promise<
+    Array<{
+      docId: string;
+      fingerprint: string;
+      certificate: import("./userkeys/deviceCertificate").DeviceCertificatePayload;
+    }>
+  > {
+    return this.userKeys.listOwnDeviceCertificates();
   }
 
   async reconcileUserKeys(options?: { allowSelfCreate?: boolean }): Promise<UserKeyEnrollmentStatus> {
@@ -1415,6 +1447,13 @@ export class BaseMindooTenant implements MindooTenant {
       hasMatchingGrant =
         registeredUser?.signingPublicKey === currentUser.userSigningPublicKey &&
         registeredUser?.encryptionPublicKey === currentUser.userEncryptionPublicKey;
+    }
+    // A device its person certified (docs/userkeys.md §9.6).
+    if (!hasMatchingGrant && typeof directory.resolveSignerToGrant === "function") {
+      hasMatchingGrant = !!(await directory.resolveSignerToGrant(
+        currentUser.userSigningPublicKey,
+        Number.MAX_SAFE_INTEGER,
+      ));
     }
 
     if (!hasMatchingGrant) {
