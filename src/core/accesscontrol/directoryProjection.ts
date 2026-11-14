@@ -67,6 +67,17 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
       typeof data.freeBusyWeeksAhead === "number" && Number.isFinite(data.freeBusyWeeksAhead)
         ? data.freeBusyWeeksAhead
         : undefined,
+    calendarShareMax:
+      data.calendarShareMax === "busy" || data.calendarShareMax === "business" || data.calendarShareMax === "all"
+        ? data.calendarShareMax
+        : undefined,
+    calendarShareDefault:
+      data.calendarShareDefault === "none" ||
+      data.calendarShareDefault === "busy" ||
+      data.calendarShareDefault === "business" ||
+      data.calendarShareDefault === "all"
+        ? data.calendarShareDefault
+        : undefined,
   };
 }
 

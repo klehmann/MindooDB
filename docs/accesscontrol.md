@@ -1293,6 +1293,37 @@ await directory.createAccessRule({
 }, adminKey, adminPassword);
 ```
 
+**Calendar sharing.** On top of free/busy a member can show colleagues their
+appointments, at a level per colleague: nothing, free/busy only, business
+appointments (title, time, place) or all appointments including private
+ones. Appointments that are not shared at a colleague's level show to that
+colleague as busy. The client publishes into the same `mbusy_<grantDocId>`,
+with the same owner-only write rule:
+
+- **Group keys per level.** One group document per level (§6.6 of
+  userkeys.md, `groupKeyDocId`), sealed to the colleagues of that level; the
+  week documents of the level use its key. The groups nest (whoever sees all
+  appointments is also in the business group). Removing a colleague rotates
+  the group key, and the client republishes the level's weeks with the new key
+  and purges the old ones.
+- **No history**, as for free/busy: a changed week is a new document, the old
+  one is deleted and purged.
+- **"Nothing" for some colleagues.** Plain free/busy (`default` key) cannot
+  keep a single member out, so once a member shares nothing with someone, the
+  busy times move into a sealed group as well.
+- **Policy.** `calendarShareMax` (`"busy"`, `"business"`, `"all"`, default
+  `"all"`) caps the level a member may choose; `calendarShareDefault`
+  (`"none"`, `"busy"` (default), `"business"`, `"all"`) is the level for all
+  colleagues until a member chooses one (`effectiveCalendarShareMax`,
+  `effectiveCalendarShareDefault`). The server cannot read the documents and
+  does not enforce either; clients read them from the policy.
+- **What the server sees:** document ids per week and level, their sizes and
+  times, and the fingerprints of each group's members, never what is in them.
+
+```ts
+await directory.setDefaultAccessPolicy({ calendarShareMax: "business", calendarShareDefault: "busy" }, adminKey, adminPassword);
+```
+
 **Purge (hard delete) in personal databases.** Deleting only writes a
 tombstone; the history stays in the append-only store. A personal database
 carries its own purge requests, so the owner (and a service working on it)
