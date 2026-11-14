@@ -725,7 +725,8 @@ two refinements.
   wipeRequestedForSigningKeys?: string[],
 
   // Device self-grant (userkeys.md §9.4): the person may vouch for their own
-  // devices with this Ed25519 key, and it may sign their User-Key generations.
+  // devices with this Ed25519 key (device certificates, userkeys.md §9.6), and
+  // it may sign their User-Key generations.
   // The private half was generated on the person's device. Revoking sets
   // `revokedAt` and keeps the key, so what was signed before stays valid.
   // Granting also makes the person's unsigned User-Key generations stop
@@ -758,7 +759,11 @@ instead of writing separate revocation documents:
   they can rejoin later with new keys.
 - **Grant or revoke device self-grant** → `setDeviceSelfGrant(username, key | null)`
   writes `deviceSelfGrant` (userkeys.md §9.4); `approveJoinRequest` does the same
-  for a new person with `allowDeviceSelfGrant: true`.
+  for a new person with `allowDeviceSelfGrant: true`. Devices the person then
+  certifies (userkeys.md §9.6) are not added to `userKeyPairs`; every reader
+  resolves them through `resolveSignerToGrant`. Revoking or wiping one works
+  like for a listed device: `updateUserGrant` puts its key into
+  `revokedUserKeyPairs` or `wipeRequestedForSigningKeys`.
 - **Batch edit** → `updateUserGrant` applies a whole staged diff in one
   admin-signed change: rewrite user details, recompute `identity_hashes`, set
   per-device labels, revoke/restore devices, set the remote-wipe set, and
@@ -2524,6 +2529,7 @@ can spin up an ungoverned database" and "only the databases we intended exist".
 |-------|--------|-----------|
 | New user | the join-request flow registers the grant and publishes the person's User-Key document; pass `allowDeviceSelfGrant: true` to also name their device self-grant key | section 6.5, userkeys.md §3, §9.4 |
 | New device of an existing person | `addUserKeys` (or the join-request flow) appends a key pair, optionally labeled. It syncs, but reads only after the person approves it on one of their own devices, which wraps their User-Key to it | section 6.5, userkeys.md §4 |
+| New device, person has device self-grant | nothing for the admin: one of the person's devices calls `issueDeviceCertificate`; the device syncs, writes and reads at once. It does not appear in `userKeyPairs`; `listCertifiedDevices` shows it | userkeys.md §9.6 |
 | Restore from backup / copied identity | nothing: it is the **same** device (same signing key, same User-Key). Revocation and wipe hit every copy. For a separate device use the new-device path | userkeys.md §9.5 |
 | Let a person vouch for their own devices | `setDeviceSelfGrant(username, key)`, key from `tenant.getDeviceSelfGrantPublicKey()` on one of their devices; `null` revokes and keeps what was signed before | userkeys.md §9.4 |
 | Require signed User-Key generations (existing tenant) | once all clients sign generations: `requireUserKeyGenerationSignatures()` sets the cutoff to now; new tenants have it from creation | userkeys.md §9.3 |
@@ -2531,7 +2537,7 @@ can spin up an ungoverned database" and "only the databases we intended exist".
 | Doc-key rotation (`default` or named) | mint a new version in the KeyBag, republish `acl_keydistribution_<keyId>` (re-wrap to all `pushto` devices); clients merge on reconcile | sections 13.1, 13.6 |
 | Revoke a device | `updateUserGrant` moves the pair into `revokedUserKeyPairs` with `revokedAt` | section 6.5 |
 | Fully offboard a user | revoke all pairs; they can rejoin later with fresh keys | section 6.5 |
-| Stolen device | set `wipeRequestedForSigningKeys`; the device drops the whole local tenant on next connect. Copies of that identity (backups) are wiped too. If the person had device self-grant, revoke it and grant a fresh key from a remaining device | section 6.5, userkeys.md §9.4 |
+| Stolen device | set `wipeRequestedForSigningKeys` (listed or certified device); the device drops the whole local tenant on next connect. Copies of that identity (backups) are wiped too. If the person had device self-grant, also revoke the device key on the grant (`updateUserGrant`) and the delegation (`setDeviceSelfGrant(username, null)`): a thief holding the self-grant key could otherwise certify more devices | section 6.5, userkeys.md §9.4, §9.6 |
 | Lose read access | move the user to `pullfrom` in `acl_keydistribution_<keyId>` and rotate; clients drop the key and forget its docs on reconcile, the server blacklist withholds them | sections 13.3, 13.4, 13.6 |
 
 Note that **revocation and wipe are independent and both opt-in** (section 6.5): removing
