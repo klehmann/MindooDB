@@ -394,6 +394,8 @@ export {
   isDocumentMissingError,
   MissingDependencyError,
   isMissingDependencyError,
+  DeviceAccessRevokedError,
+  isDeviceAccessRevokedError,
 } from "./errors";
 
 // Cache

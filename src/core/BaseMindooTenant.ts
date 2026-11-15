@@ -30,7 +30,7 @@ import { authChallengeSigningBytes } from "./crypto/AuthChallenge";
 import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
-import { extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
+import { extractRevokedKeyPairs, extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
 import { UserKeyManager } from "./userkeys/UserKeyManager";
 import type {
   PendingUserKeyDevice,
@@ -64,7 +64,7 @@ import { entryTrustedTime } from "./storeEntryTime";
 import { computeContentHash } from "./utils/idGeneration";
 import { semanticNow } from "./utils/timeSource";
 import { ensureTenantSetupAdministrator, readTenantSetupLabel } from "./tenantSetup";
-import { SymmetricKeyNotFoundError } from "./errors";
+import { DeviceAccessRevokedError, SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
 import { encodeMindooURI, isMindooURI } from "./uri/MindooURI";
 import { decodeJoinRequestUri } from "./uri/joinRequestUri";
@@ -1460,6 +1460,38 @@ export class BaseMindooTenant implements MindooTenant {
    * @returns true if a wipe was applied (the tenant is now gone locally), false
    *   if this device is not targeted.
    */
+  /**
+   * Whether the admin revoked this device (docs/accesscontrol.md §6.5): its
+   * signing key is kept on one of the person's grants as a revoked pair, or is
+   * the target of a remote wipe. Returns null for a device that was never
+   * granted, so callers can tell the two apart.
+   */
+  private async findRevocationOfCurrentDevice(
+    username: string,
+  ): Promise<{ wipeRequested: boolean } | null> {
+    const directory = await this.openDirectory();
+    const finder = directory as unknown as {
+      findGrantAccessDocuments?: (username: string) => Promise<Array<{ getData(): Record<string, unknown> }>>;
+    };
+    if (typeof finder.findGrantAccessDocuments !== "function") {
+      return null;
+    }
+    const normalize = (key: string) => key.replace(/\s+/g, "");
+    const myKey = normalize(this.currentUser.userSigningKeyPair.publicKey);
+    let revoked = false;
+    let wipeRequested = false;
+    for (const grant of await finder.findGrantAccessDocuments(username)) {
+      const data = grant.getData();
+      if (extractRevokedKeyPairs(data).some((pair) => normalize(pair.signingPublicKey) === myKey)) {
+        revoked = true;
+      }
+      if (extractWipeRequestedSigningKeys(data).some((key) => normalize(key) === myKey)) {
+        wipeRequested = true;
+      }
+    }
+    return revoked || wipeRequested ? { wipeRequested } : null;
+  }
+
   async checkAndApplyRemoteWipe(): Promise<boolean> {
     const directory = await this.openDirectory();
     const myKey = this.currentUser.userSigningKeyPair.publicKey;
@@ -1597,6 +1629,15 @@ export class BaseMindooTenant implements MindooTenant {
     }
 
     if (!hasMatchingGrant) {
+      // A revoked device (its key kept on the grant as a revoked pair, or
+      // targeted for remote wipe) is told so, not asked to request access.
+      const revoked = await this.findRevocationOfCurrentDevice(currentUser.username);
+      if (revoked) {
+        this.logger.warn(
+          `Denied database open for revoked device of ${currentUser.username} on database ${id}`,
+        );
+        throw new DeviceAccessRevokedError(currentUser.username, revoked.wipeRequested);
+      }
       this.logger.warn(
         `Denied database open for ungranted user ${currentUser.username} on database ${id}`,
       );

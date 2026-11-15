@@ -17,6 +17,7 @@ import {
   DEFAULT_TENANT_KEY_ID,
   PUBLIC_INFOS_KEY_ID,
 } from "../core/types";
+import { DeviceAccessRevokedError, isDeviceAccessRevokedError } from "../core/errors";
 
 /**
  * Tests for the transport-side remote-wipe feature (docs/accesscontrol.md §6.5):
@@ -411,5 +412,46 @@ describe("remote wipe — client tenant deletion (§6.5)", () => {
 
     expect(wiped).toBe(false);
     expect((await storeFactory.get("crm")!.docStore.getAllIds()).length).toBe(before);
+  }, 60000);
+
+  type GrantDir = MindooTenantDirectory & {
+    updateUserGrant(
+      username: string,
+      changes: { revokeSigningKeys?: string[]; wipeSigningKeys?: string[] },
+      pk: unknown,
+      pw: string,
+    ): Promise<void>;
+  };
+
+  it("tells a revoked device that its access was revoked (not that it was never granted)", async () => {
+    const carol = await factory.createUserId("CN=carol/O=wipe", "carolpass123");
+    await setupDir.registerUser(factory.toPublicUserId(carol), admin.userSigningKeyPair.privateKey, adminPassword);
+    await (setupDir as unknown as GrantDir).updateUserGrant(
+      carol.username,
+      { revokeSigningKeys: [carol.userSigningKeyPair.publicKey], wipeSigningKeys: [carol.userSigningKeyPair.publicKey] },
+      admin.userSigningKeyPair.privateKey,
+      adminPassword,
+    );
+
+    const carolTenant = await openTenantAs(carol, "carolpass123");
+    const error = await carolTenant.openDB("crm").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(DeviceAccessRevokedError);
+    expect((error as DeviceAccessRevokedError).wipeRequested).toBe(true);
+    expect(isDeviceAccessRevokedError(error)).toBe(true);
+    expect(isDeviceAccessRevokedError(new Error((error as Error).message))).toBe(true);
+  }, 60000);
+
+  it("keeps the 'not granted yet' error for a device that was never granted", async () => {
+    const dave = await factory.createUserId("CN=dave/O=wipe", "davepass123");
+    const daveTenant = await openTenantAs(dave, "davepass123");
+    const error = await daveTenant.openDB("crm").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(isDeviceAccessRevokedError(error)).toBe(false);
+    expect((error as Error).message).toContain("does not have tenant access yet");
   }, 60000);
 });
