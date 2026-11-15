@@ -670,6 +670,13 @@ export interface TenantManagerOptions {
   publicInfosKeysResolver?: (tenantId: string) => Promise<Uint8Array[]>;
 }
 
+/** Usage of one tenant, for unloading idle tenants (see {@link TenantManager.evictIdleTenants}). */
+interface TenantActivity {
+  lastUsedAt: number;
+  /** Store calls that have not settled yet. */
+  inFlight: number;
+}
+
 export interface ExecutePendingPurgesOptions {
   /**
    * Only purge in these databases; requests for other databases stay
@@ -703,6 +710,16 @@ export class TenantManager {
    * directories, and the receipt-order write lock only holds per instance.
    */
   private loadingTenants: Map<string, Promise<LoadedTenant>> = new Map();
+  /** Last use and running store calls per tenant (kept across unloads). */
+  private tenantActivity: Map<string, TenantActivity> = new Map();
+  /** Tracked store handles handed out per loaded tenant, so callers get stable identities. */
+  private trackedStores: WeakMap<LoadedTenant, Map<string, object>> = new WeakMap();
+  /**
+   * Token secret per tenant when no {@link TenantManagerOptions.jwtSecretForTenant}
+   * is configured. Kept across unloads and reloads so tokens stay valid.
+   */
+  private tenantJwtSecrets: Map<string, Uint8Array> = new Map();
+  private idleEvictionTimer: ReturnType<typeof setInterval> | undefined;
 
   private serverIdentity: PrivateUserId | null = null;
   private trustedServers: TrustedServer[] = [];
@@ -1216,6 +1233,7 @@ export class TenantManager {
 
   async getTenant(tenantId: string): Promise<LoadedTenant> {
     const normalizedId = tenantId.toLowerCase();
+    this.touchTenant(normalizedId);
 
     const cached = this.loadedTenants.get(normalizedId);
     if (cached) {
@@ -1252,6 +1270,155 @@ export class TenantManager {
   private forgetTenant(normalizedId: string): void {
     this.loadedTenants.delete(normalizedId);
     this.loadingTenants.delete(normalizedId);
+  }
+
+  // =======================================================================
+  // Unloading idle tenants
+  // =======================================================================
+
+  private touchTenant(normalizedId: string): TenantActivity {
+    let activity = this.tenantActivity.get(normalizedId);
+    if (!activity) {
+      activity = { lastUsedAt: Date.now(), inFlight: 0 };
+      this.tenantActivity.set(normalizedId, activity);
+    } else {
+      activity.lastUsedAt = Date.now();
+    }
+    return activity;
+  }
+
+  /**
+   * Wrap a store of a loaded tenant so that its use counts as tenant activity
+   * and a running call keeps the tenant loaded. A caller that keeps the handle
+   * after the tenant was unloaded or reloaded is routed to the current
+   * instance (`reopen`), so there is never more than one live store instance
+   * per store directory.
+   */
+  private trackStore<T extends object>(
+    normalizedId: string,
+    owner: LoadedTenant,
+    cacheKey: string,
+    target: T,
+    reopen: () => Promise<T>,
+  ): T {
+    let handles = this.trackedStores.get(owner);
+    if (!handles) {
+      handles = new Map();
+      this.trackedStores.set(owner, handles);
+    }
+    const existing = handles.get(cacheKey);
+    if (existing) {
+      return existing as T;
+    }
+    const proxy = new Proxy(target, {
+      get: (obj, prop) => {
+        const value = Reflect.get(obj, prop, obj) as unknown;
+        if (typeof value !== "function") {
+          return value;
+        }
+        const fn = value as (...args: unknown[]) => unknown;
+        if (prop === "getId" || prop === "getStoreKind" || prop === "constructor") {
+          return fn.bind(obj);
+        }
+        return (...args: unknown[]) => {
+          const activity = this.touchTenant(normalizedId);
+          if (this.loadedTenants.get(normalizedId) !== owner) {
+            // Unloaded or reloaded since this handle was handed out.
+            return reopen().then((fresh) =>
+              (Reflect.get(fresh, prop, fresh) as (...a: unknown[]) => unknown).apply(fresh, args),
+            );
+          }
+          activity.inFlight++;
+          let result: unknown;
+          try {
+            result = fn.apply(obj, args);
+          } catch (error) {
+            activity.inFlight--;
+            throw error;
+          }
+          if (result && typeof (result as Promise<unknown>).then === "function") {
+            return (result as Promise<unknown>).finally(() => {
+              activity.inFlight--;
+              activity.lastUsedAt = Date.now();
+            });
+          }
+          activity.inFlight--;
+          return result;
+        };
+      },
+    });
+    handles.set(cacheKey, proxy);
+    return proxy;
+  }
+
+  /**
+   * Unload every tenant that was not used for `idleMs`: its stores (with
+   * their in-memory metadata indexes), its directory and its caches. The next
+   * request loads it again. A tenant with running store calls or purges stays.
+   * Returns the ids of the unloaded tenants.
+   */
+  evictIdleTenants(idleMs: number, now: number = Date.now()): string[] {
+    const evicted: string[] = [];
+    for (const [tenantId, tenant] of this.loadedTenants) {
+      const activity = this.tenantActivity.get(tenantId);
+      if (activity && (activity.inFlight > 0 || now - activity.lastUsedAt < idleMs)) {
+        continue;
+      }
+      if (this.hasPurgeInFlight(tenantId)) {
+        continue;
+      }
+      this.loadedTenants.delete(tenantId);
+      evicted.push(tenantId);
+      void (tenant.mindooTenant as { disposeCacheManager?: () => Promise<void> } | undefined)
+        ?.disposeCacheManager?.()
+        .catch(() => undefined);
+    }
+    if (evicted.length > 0) {
+      console.log(
+        `[TenantManager] Unloaded ${evicted.length} idle tenant(s): ${evicted.join(", ")} (${this.loadedTenants.size} still loaded)`,
+      );
+    }
+    return evicted;
+  }
+
+  /**
+   * Periodically unload tenants idle for `idleMs` (see {@link evictIdleTenants}).
+   * `idleMs <= 0` turns it off. The timer does not keep the process alive.
+   */
+  startIdleEviction(idleMs: number, intervalMs: number = Math.min(idleMs, 60_000)): void {
+    this.stopIdleEviction();
+    if (!(idleMs > 0)) {
+      return;
+    }
+    this.idleEvictionTimer = setInterval(() => {
+      try {
+        this.evictIdleTenants(idleMs);
+      } catch (error) {
+        console.error("[TenantManager] Unloading idle tenants failed:", error);
+      }
+    }, Math.max(1_000, intervalMs));
+    (this.idleEvictionTimer as { unref?: () => void }).unref?.();
+  }
+
+  stopIdleEviction(): void {
+    if (this.idleEvictionTimer !== undefined) {
+      clearInterval(this.idleEvictionTimer);
+      this.idleEvictionTimer = undefined;
+    }
+  }
+
+  /** Number of tenants currently held in memory. */
+  getLoadedTenantCount(): number {
+    return this.loadedTenants.size;
+  }
+
+  private hasPurgeInFlight(normalizedId: string): boolean {
+    for (const key of this.purgeInFlight.keys()) {
+      if (key === normalizedId || key.startsWith(`${normalizedId}\u0000`)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   tenantExists(tenantId: string): boolean {
@@ -1356,6 +1523,8 @@ export class TenantManager {
     }
     this.dataStore.deleteTree(tenantKey);
     await this.storeProvider.removeTenantStores?.(normalizedId);
+    this.tenantJwtSecrets.delete(normalizedId);
+    this.tenantActivity.delete(normalizedId);
 
     console.log(`[TenantManager] Removed tenant: ${normalizedId}`);
   }
@@ -1369,8 +1538,20 @@ export class TenantManager {
     dbId: string,
     storeKind: StoreKind,
   ): Promise<ServerNetworkContentAddressedStore> {
-    const tenant = await this.getTenant(tenantId);
+    const normalizedId = tenantId.toLowerCase();
+    const tenant = await this.getTenant(normalizedId);
+    const raw = await this.getRawServerStore(tenant, tenantId, dbId, storeKind);
+    return this.trackStore(normalizedId, tenant, `server:${dbId}:${storeKind}`, raw, () =>
+      this.getServerStore(tenantId, dbId, storeKind),
+    );
+  }
 
+  private async getRawServerStore(
+    tenant: LoadedTenant,
+    tenantId: string,
+    dbId: string,
+    storeKind: StoreKind,
+  ): Promise<ServerNetworkContentAddressedStore> {
     const cacheKey = `${dbId}:${storeKind}`;
     const cached = tenant.serverStores.get(cacheKey);
     if (cached) {
@@ -1734,8 +1915,15 @@ export class TenantManager {
     dbId: string,
     storeKind: StoreKind,
   ): Promise<ContentAddressedStore> {
-    const tenant = await this.getTenant(tenantId);
-    return tenant.storeFactory.getStore(dbId, storeKind);
+    const normalizedId = tenantId.toLowerCase();
+    const tenant = await this.getTenant(normalizedId);
+    return this.trackStore(
+      normalizedId,
+      tenant,
+      `local:${dbId}:${storeKind}`,
+      tenant.storeFactory.getStore(dbId, storeKind),
+      () => this.getStore(tenantId, dbId, storeKind),
+    );
   }
 
   /**
@@ -2103,9 +2291,7 @@ export class TenantManager {
       this.cryptoAdapter,
       directory,
       tenantId,
-      this.jwtSecretForTenant
-        ? { jwtSecret: await this.jwtSecretForTenant(tenantId) }
-        : undefined,
+      { jwtSecret: await this.getJwtSecret(tenantId) },
     );
 
     console.log(`[TenantManager] Loaded tenant: ${tenantId}`);
@@ -2118,6 +2304,18 @@ export class TenantManager {
       mindooTenant,
       serverStores: new Map(),
     };
+  }
+
+  private async getJwtSecret(tenantId: string): Promise<Uint8Array> {
+    if (this.jwtSecretForTenant) {
+      return this.jwtSecretForTenant(tenantId);
+    }
+    let secret = this.tenantJwtSecrets.get(tenantId);
+    if (!secret) {
+      secret = this.cryptoAdapter.getRandomValues(new Uint8Array(32));
+      this.tenantJwtSecrets.set(tenantId, secret);
+    }
+    return secret;
   }
 
   /**
