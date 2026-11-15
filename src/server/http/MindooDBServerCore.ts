@@ -13,6 +13,8 @@
  */
 
 import { personalDatabaseOwner } from "../../core/builtinDbInvariants";
+import { JOIN_REQUESTS_DB_ID } from "../../core/joinrequests/types";
+import { JoinRequestError, JoinRequestService } from "../JoinRequestService";
 import { isMissingDependencyError } from "../../core/errors";
 import {
   BINARY_ENTRIES_CONTENT_TYPE,
@@ -167,6 +169,19 @@ export interface MindooDBServerCoreOptions {
    * other databases elsewhere passes the change on to them instead.
    */
   onDirectoryWrite?: (tenantId: string) => Promise<void>;
+  /** Join-request inbox (docs/invitations.md); built from the tenant manager when omitted. */
+  joinRequests?: JoinRequestService;
+}
+
+function joinRequestErrorResponse(error: unknown): ServerResponse {
+  if (error instanceof JoinRequestError) {
+    return jsonResponse(error.status, { error: error.message, code: error.code });
+  }
+  if (error instanceof ValidationError) {
+    return jsonResponse(400, { error: error.message, code: "bad_request" });
+  }
+  console.error("[MindooDBServer] join request failed:", error);
+  return jsonResponse(500, { error: "Join request failed", code: "internal" });
 }
 
 /** HTTP status of each {@link NetworkError} type. */
@@ -332,6 +347,78 @@ export class MindooDBServerCore {
   constructor(options: MindooDBServerCoreOptions) {
     this.options = options;
     this.jsonBodyLimitBytes = parseBodySizeLimitToBytes(options.jsonBodyLimit);
+    this.joinRequests =
+      options.joinRequests ??
+      new JoinRequestService(options.tenantManager.joinRequestAccess(), options.getServerConfig().joinRequests ?? {});
+  }
+
+  /** Join-request inbox (docs/invitations.md). */
+  readonly joinRequests: JoinRequestService;
+  private readonly lastJoinRequestSweep = new Map<string, number>();
+
+  /** Sweep a tenant's join requests at most every five minutes. */
+  private async maybeSweepJoinRequests(tenantId: string): Promise<void> {
+    const now = Date.now();
+    if (now - (this.lastJoinRequestSweep.get(tenantId) ?? 0) < 5 * 60_000) return;
+    this.lastJoinRequestSweep.set(tenantId, now);
+    try {
+      await this.joinRequests.sweep(tenantId);
+    } catch (error) {
+      console.warn(`[MindooDBServer] join-request sweep failed for ${tenantId}: ${error}`);
+    }
+  }
+
+  // ==================== Invitations / join requests (docs/invitations.md) ====================
+
+  /** `GET /:tenantId/invitations/:invitationId` — public part of an invitation. Unauthenticated. */
+  async getInvitation(req: ServerRequest): Promise<ServerResponse> {
+    try {
+      const tenantId = (req.tenantId ?? req.params.tenantId ?? "").toLowerCase();
+      return jsonResponse(200, await this.joinRequests.getInvitation(tenantId, String(req.params.invitationId ?? "")));
+    } catch (error) {
+      return joinRequestErrorResponse(error);
+    }
+  }
+
+  /** `GET /:tenantId/join-requests/:requestId` — outcome of a request (device polling). */
+  async joinRequestStatus(req: ServerRequest): Promise<ServerResponse> {
+    try {
+      const tenantId = (req.tenantId ?? req.params.tenantId ?? "").toLowerCase();
+      return jsonResponse(200, await this.joinRequests.status(tenantId, String(req.params.requestId ?? "")));
+    } catch (error) {
+      return joinRequestErrorResponse(error);
+    }
+  }
+
+  /** `POST /:tenantId/join-requests/:requestId/withdraw` — the sending device takes its request back. */
+  async withdrawJoinRequest(req: ServerRequest): Promise<ServerResponse> {
+    try {
+      const tenantId = (req.tenantId ?? req.params.tenantId ?? "").toLowerCase();
+      return jsonResponse(200, await this.joinRequests.withdraw(tenantId, String(req.params.requestId ?? ""), req.body));
+    } catch (error) {
+      return joinRequestErrorResponse(error);
+    }
+  }
+
+  /** `POST /:tenantId/join-requests/summary` — pending count for a member device (signed). */
+  async joinRequestSummary(req: ServerRequest): Promise<ServerResponse> {
+    try {
+      const tenantId = (req.tenantId ?? req.params.tenantId ?? "").toLowerCase();
+      return jsonResponse(200, await this.joinRequests.summary(tenantId, req.body));
+    } catch (error) {
+      return joinRequestErrorResponse(error);
+    }
+  }
+
+  /** `POST /:tenantId/join-requests` — store a join request for the admins. Unauthenticated, rate-limited. */
+  async submitJoinRequest(req: ServerRequest): Promise<ServerResponse> {
+    try {
+      const tenantId = (req.tenantId ?? req.params.tenantId ?? "").toLowerCase();
+      const result = await this.joinRequests.submit(tenantId, req.body, req.clientIp ?? "unknown");
+      return jsonResponse(201, result);
+    } catch (error) {
+      return joinRequestErrorResponse(error);
+    }
   }
 
   private get tenantManager(): TenantManager {
@@ -1099,7 +1186,12 @@ export class MindooDBServerCore {
   // ==================== Sync ====================
 
   /** Dispatch one of {@link SYNC_ROUTES} for a store kind. */
-  sync(name: SyncRouteName, req: ServerRequest, storeKind: StoreKind): Promise<ServerResponse> {
+  async sync(name: SyncRouteName, req: ServerRequest, storeKind: StoreKind): Promise<ServerResponse> {
+    // Expired join requests leave before an admin reads the inbox (docs/invitations.md).
+    const syncDbId = (req.body?.dbId ?? req.query?.dbId) as unknown;
+    if (syncDbId === JOIN_REQUESTS_DB_ID && req.tenantId) {
+      await this.maybeSweepJoinRequests(req.tenantId);
+    }
     switch (name) {
       case "findNewEntries": return this.findNewEntries(req, storeKind);
       case "findNewEntriesForDoc": return this.findNewEntriesForDoc(req, storeKind);
@@ -1471,6 +1563,14 @@ export class MindooDBServerCore {
       this.runInBackground(
         onDirectoryWrite(tenantId).catch((error) => {
           console.error(`[MindooDBServer] executePendingPurges failed for ${tenantId}:`, error);
+        }),
+      );
+    }
+    // Decided join requests are purged right away (docs/invitations.md).
+    if (receiptCount > 0 && storeKind === StoreKind.docs && dbId === JOIN_REQUESTS_DB_ID) {
+      this.runInBackground(
+        this.joinRequests.sweep(tenantId).then(() => undefined).catch((error) => {
+          console.error(`[MindooDBServer] join-request sweep failed for ${tenantId}:`, error);
         }),
       );
     }
