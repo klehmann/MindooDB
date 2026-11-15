@@ -4067,7 +4067,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
       if (!meInPush) {
         if (keyId === DEFAULT_TENANT_KEY_ID) {
-          this.logger.warn(
+          // Debug only: the server's own identity is never in pushto, so on a
+          // server this is logged for every tenant it opens.
+          this.logger.debug(
             `reconcileKeyDistributions: "${keyId}" exists but current user is not in pushto ` +
               `(hashes=${entry.pushto_users_hashes.length})`,
           );

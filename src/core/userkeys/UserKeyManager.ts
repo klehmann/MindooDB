@@ -28,6 +28,7 @@ import {
   type DeviceCertificatePayload,
 } from "./deviceCertificate";
 import { asUserKeyPayload } from "./validateUserKeyDocument";
+import { getDefaultLogLevel, LogLevel } from "../logging/LogLevel";
 import {
   buildPendingUserKeyPayload,
   createPendingUserKeyDocument,
@@ -845,7 +846,7 @@ export class UserKeyManager {
       const current = await this.getDecryptedUserKey();
       if (current) keys.push(current);
     }
-    console.log("[userkeys] getUserKeyCryptoKeysForReconcile", {
+    if (getDefaultLogLevel() >= LogLevel.DEBUG) console.debug("[userkeys] getUserKeyCryptoKeysForReconcile", {
       canUseUserDirectory,
       usedPublishedDocument,
       resolvedDocId,

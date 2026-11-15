@@ -76,6 +76,7 @@ import {
 import type { PrivateUserId } from "../core/userid";
 import type { CryptoAdapter } from "../core/crypto/CryptoAdapter";
 import { base64ToBytes, bytesToBase64 } from "../core/utils/base64";
+import { getDefaultLogLevel, LogLevel } from "../core/logging/LogLevel";
 
 import type {
   ServerDataStore,
@@ -696,6 +697,12 @@ export class TenantManager {
   private readonly jwtSecretForTenant: TenantManagerOptions["jwtSecretForTenant"];
   private readonly publicInfosKeysResolver: TenantManagerOptions["publicInfosKeysResolver"];
   private loadedTenants: Map<string, LoadedTenant> = new Map();
+  /**
+   * Tenant loads in progress. Parallel first requests for one tenant share a
+   * single load: two loads would open two store instances on the same
+   * directories, and the receipt-order write lock only holds per instance.
+   */
+  private loadingTenants: Map<string, Promise<LoadedTenant>> = new Map();
 
   private serverIdentity: PrivateUserId | null = null;
   private trustedServers: TrustedServer[] = [];
@@ -1215,10 +1222,36 @@ export class TenantManager {
       return cached;
     }
 
-    const loaded = await this.loadTenant(normalizedId);
-    this.loadedTenants.set(normalizedId, loaded);
+    const inFlight = this.loadingTenants.get(normalizedId);
+    if (inFlight) {
+      return inFlight;
+    }
 
-    return loaded;
+    const loading = this.loadTenant(normalizedId).then(
+      (loaded) => {
+        // Only cache if nobody invalidated the tenant while it was loading
+        // (config update, removal, reload, clearCache).
+        if (this.loadingTenants.get(normalizedId) === loading) {
+          this.loadingTenants.delete(normalizedId);
+          this.loadedTenants.set(normalizedId, loaded);
+        }
+        return loaded;
+      },
+      (error) => {
+        if (this.loadingTenants.get(normalizedId) === loading) {
+          this.loadingTenants.delete(normalizedId);
+        }
+        throw error;
+      },
+    );
+    this.loadingTenants.set(normalizedId, loading);
+    return loading;
+  }
+
+  /** Drop a tenant from the cache, including a load that is still running. */
+  private forgetTenant(normalizedId: string): void {
+    this.loadedTenants.delete(normalizedId);
+    this.loadingTenants.delete(normalizedId);
   }
 
   tenantExists(tenantId: string): boolean {
@@ -1299,7 +1332,7 @@ export class TenantManager {
     }
 
     this.writeTenantConfig(normalizedId, config);
-    this.loadedTenants.delete(normalizedId);
+    this.forgetTenant(normalizedId);
     console.log(`[TenantManager] Updated tenant config: ${normalizedId}`);
   }
 
@@ -1311,7 +1344,7 @@ export class TenantManager {
       throw new Error(`Tenant ${normalizedId} does not exist`);
     }
 
-    this.loadedTenants.delete(normalizedId);
+    this.forgetTenant(normalizedId);
     if (
       this.serverIdentity &&
       this.serverPassword &&
@@ -1447,10 +1480,18 @@ export class TenantManager {
       },
     );
 
+    // A parallel request for the same store may have finished first while
+    // this one awaited above; keep a single instance per store.
+    const raced = tenant.serverStores.get(cacheKey);
+    if (raced) {
+      return raced;
+    }
     tenant.serverStores.set(cacheKey, serverStore);
-    console.log(
-      `[TenantManager] Created server store for ${tenantId}/${dbId}/${storeKind}`,
-    );
+    if (getDefaultLogLevel() >= LogLevel.DEBUG) {
+      console.debug(
+        `[TenantManager] Created server store for ${tenantId}/${dbId}/${storeKind}`,
+      );
+    }
 
     return serverStore;
   }
@@ -1976,12 +2017,13 @@ export class TenantManager {
 
   async reloadTenant(tenantId: string): Promise<LoadedTenant> {
     const normalizedId = tenantId.toLowerCase();
-    this.loadedTenants.delete(normalizedId);
+    this.forgetTenant(normalizedId);
     return this.getTenant(normalizedId);
   }
 
   clearCache(): void {
     this.loadedTenants.clear();
+    this.loadingTenants.clear();
     console.log(`[TenantManager] Cleared tenant cache`);
   }
 

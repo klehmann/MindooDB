@@ -6,6 +6,7 @@ import { InMemoryContentAddressedStore } from "../../core/appendonlystores/InMem
 import { BasicOnDiskContentAddressedStore } from "../appendonlystores/BasicOnDiskContentAddressedStore";
 import { StoreKind, type ContentAddressedStore } from "../../core/types";
 import type { StoreType, TenantConfig } from "../../server/types";
+import { getDefaultLogLevel, LogLevel } from "../../core/logging/LogLevel";
 
 /**
  * Factory for creating ContentAddressedStore instances based on configuration.
@@ -50,7 +51,9 @@ export class StoreFactory {
     
     // Cache and return
     this.stores.set(cacheKey, store);
-    console.log(`[StoreFactory] Created ${storeType} ${storeKind} store for ${this.tenantId}/${dbId}`);
+    if (getDefaultLogLevel() >= LogLevel.DEBUG) {
+      console.debug(`[StoreFactory] Created ${storeType} ${storeKind} store for ${this.tenantId}/${dbId}`);
+    }
     
     return store;
   }

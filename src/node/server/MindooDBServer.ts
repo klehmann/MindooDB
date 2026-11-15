@@ -74,6 +74,7 @@ import {
 } from "../../server/http/MindooDBServerCore";
 import { guard, route, sendServerResponse, toServerRequest } from "./expressAdapter";
 import { isEventStreamResponse, type SyncEventStreamSpec } from "../../server/http/types";
+import { getDefaultLogLevel, LogLevel } from "../../core/logging/LogLevel";
 
 /**
  * Augment Express Request with fields populated by our middleware:
@@ -459,7 +460,13 @@ export class MindooDBServer {
       },
     }));
 
+    // Per-request access log only with MINDOO_LOG_LEVEL=debug (or trace).
+    const logRequests = getDefaultLogLevel() >= LogLevel.DEBUG;
     this.app.use((req: Request, res: Response, next: NextFunction) => {
+      if (!logRequests) {
+        next();
+        return;
+      }
       const contentType = req.headers["content-type"] ?? "-";
       const contentLength = req.headers["content-length"] ?? "-";
       console.log(
