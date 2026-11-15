@@ -281,6 +281,12 @@ export const ENV_VARS = {
    */
   ALLOW_INSECURE_SYNC_URLS: "MINDOODB_ALLOW_INSECURE_SYNC_URLS",
   /**
+   * Minutes after which a tenant nobody used is unloaded from memory (its
+   * stores, their metadata indexes and its directory); the next request loads
+   * it again. Default 30, `0` keeps every loaded tenant until restart.
+   */
+  TENANT_IDLE_MINUTES: "MINDOODB_TENANT_IDLE_MINUTES",
+  /**
    * Comma-separated RFC 3161 Time-Stamping Authorities the proxy at
    * `POST /:tenantId/timestamps/rfc3161` may contact. Each entry is a built-in
    * id (`aimoda`, `opentsa`, `freetsa`, ...) or a custom `id=url` pair; suffix

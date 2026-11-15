@@ -142,6 +142,8 @@ Options:
 Environment variables:
   MINDOODB_SERVER_PASSWORD or MINDOODB_SERVER_PASSWORD_FILE — decrypt server identity
                                (required if server.identity.json exists)
+  MINDOODB_TENANT_IDLE_MINUTES — unload tenants unused for this long (default 30, 0 = never)
+  MINDOO_LOG_LEVEL=debug       — log every HTTP request and store creation
 
 Examples:
   # Start server with default settings

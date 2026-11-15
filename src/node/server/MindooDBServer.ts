@@ -98,6 +98,20 @@ declare global {
 
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
 
+
+const DEFAULT_TENANT_IDLE_MINUTES = 30;
+
+/** Idle time before a tenant is unloaded, from `MINDOODB_TENANT_IDLE_MINUTES` (0 = never). */
+export function tenantIdleMs(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw) return DEFAULT_TENANT_IDLE_MINUTES * 60_000;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    console.warn(`[MindooDBServer] Ignoring invalid MINDOODB_TENANT_IDLE_MINUTES=${raw}`);
+    return DEFAULT_TENANT_IDLE_MINUTES * 60_000;
+  }
+  return minutes * 60_000;
+}
 export class MindooDBServer {
   private app: express.Application;
   /** In-process change feed backing the SSE endpoint (sync-v5, phase 5). */
@@ -141,6 +155,7 @@ export class MindooDBServer {
     this.app = express();
     this.syncEventBus = new SyncEventBus();
     this.tenantManager = new TenantManager(dataDir, serverPassword);
+    this.tenantManager.startIdleEviction(tenantIdleMs(process.env[ENV_VARS.TENANT_IDLE_MINUTES]));
     this.staticDir = staticDir;
     this.configPath = configPath ?? path.join(dataDir, "config.json");
     this.jsonBodyLimit = process.env.MINDOODB_JSON_BODY_LIMIT?.trim() || "5mb";
