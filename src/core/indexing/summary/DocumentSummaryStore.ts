@@ -1,4 +1,4 @@
-import type { MindooDB, ProcessChangesCursor } from "../../types";
+import type { IterateChangesOptions, MindooDB, ProcessChangesCursor } from "../../types";
 import type { LocalCacheStore } from "../../cache/LocalCacheStore";
 import type { CacheManager, ICacheable } from "../../cache/CacheManager";
 import type { VirtualViewUpdateOptions } from "../virtualviews/IVirtualViewDataProvider";
@@ -13,7 +13,7 @@ import type {
   SummaryStoreChanges,
   SummaryStorePosition,
 } from "./types";
-import { generateRandomUuid } from "../../utils/idGeneration";
+import { generateRandomUuid, matchesAnyDocIdPrefix } from "../../utils/idGeneration";
 import {
   computeSummaryConfigFingerprint,
   resolveSummaryConfig,
@@ -164,6 +164,41 @@ export class DocumentSummaryStore implements ICacheable {
   }
 
   /**
+   * The id-prefix scope of this summary (`SummaryConfig.idPrefixes`,
+   * normalized), or `null` when every document is summarized.
+   */
+  getIdPrefixScope(): readonly string[] | null {
+    return this.config.idPrefixes;
+  }
+
+  /**
+   * Changefeed options for this store's scans: one-pass (no L2 spill) and,
+   * with a scope, restricted to it before any document is loaded. The setup
+   * document always stays visible, since it carries the configuration.
+   */
+  private scanOptions(): IterateChangesOptions {
+    const scope = this.config.idPrefixes;
+    return scope
+      ? { persistLoadedDocuments: false, idPrefix: [...scope, DB_SETUP_DOC_ID] }
+      : SCAN;
+  }
+
+  /** Drop entries outside the current id-prefix scope (after a scope change). */
+  private pruneOutOfScope(): void {
+    const scope = this.config.idPrefixes;
+    if (!scope) {
+      return;
+    }
+    for (const docId of [...this.entries.keys()]) {
+      if (!matchesAnyDocIdPrefix(docId, scope)) {
+        this.entries.delete(docId);
+        this.recordRemoval(docId);
+        this.markBucketDirty(docId);
+      }
+    }
+  }
+
+  /**
    * Replace the summary configuration. When the fingerprint changes and
    * entries already exist, the store keeps serving the previous state and
    * schedules a resumable backfill that re-extracts all documents with the
@@ -186,6 +221,7 @@ export class DocumentSummaryStore implements ICacheable {
     }
     this.config = resolved;
     this.configFingerprint = fingerprint;
+    this.pruneOutOfScope();
     if (this.entries.size > 0 || this.cursor !== null) {
       this.scheduleBackfill();
     }
@@ -317,7 +353,7 @@ export class DocumentSummaryStore implements ICacheable {
     if (!this.restored || this.needsBackfill) {
       return false;
     }
-    const remaining = this.db.countChangesSince?.(this.cursor);
+    const remaining = this.db.countChangesSince?.(this.cursor, this.scanOptions());
     return remaining !== undefined && remaining === 0;
   }
 
@@ -330,7 +366,7 @@ export class DocumentSummaryStore implements ICacheable {
     const signal = options?.signal;
 
     const countAfter = (cursor: ProcessChangesCursor | null): number =>
-      this.db.countChangesSince?.(cursor) ?? 0;
+      this.db.countChangesSince?.(cursor, this.scanOptions()) ?? 0;
 
     const total = onProgress
       ? countAfter(this.cursor) + (this.needsBackfill ? countAfter(this.backfillCursor) : 0)
@@ -351,7 +387,7 @@ export class DocumentSummaryStore implements ICacheable {
     }
 
     // Pass 1: incremental changefeed consumption from the main cursor.
-    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, SCAN)) {
+    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, this.scanOptions())) {
       this.applyDocument(doc.getId(), doc, cursor);
       this.cursor = cursor;
       processed++;
@@ -376,7 +412,7 @@ export class DocumentSummaryStore implements ICacheable {
     while (this.needsBackfill) {
       const generation = this.backfillGeneration;
       let restarted = false;
-      for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor, SCAN)) {
+      for await (const { doc, cursor } of this.db.iterateChangesSince(this.backfillCursor, this.scanOptions())) {
         this.applyDocument(doc.getId(), doc, cursor);
         if (generation !== this.backfillGeneration) {
           restarted = true;
@@ -435,6 +471,13 @@ export class DocumentSummaryStore implements ICacheable {
         this.recordRemoval(docId);
         this.markBucketDirty(docId);
       }
+      return;
+    }
+
+    // A scan started before a scope change may still yield documents
+    // outside the new scope: never summarize them.
+    const scope = this.config.idPrefixes;
+    if (scope && !matchesAnyDocIdPrefix(docId, scope)) {
       return;
     }
 
@@ -959,7 +1002,9 @@ export class DocumentSummaryStore implements ICacheable {
 
     if (meta.configFingerprint !== this.configFingerprint) {
       // Entries were extracted with a different configuration: keep them
-      // usable, re-extract everything in the background.
+      // usable, re-extract everything in the background. Entries outside a
+      // (new) id-prefix scope are dropped right away.
+      this.pruneOutOfScope();
       this.scheduleBackfill();
       this.metaDirty = true;
     } else if (meta.needsBackfill) {

@@ -135,6 +135,15 @@ export interface MindooQuery {
    * explicit `sortBy`, results are ordered best score first.
    */
   text?: MindooQueryTextClause;
+  /**
+   * Restrict the query to documents whose id matches this prefix or one of
+   * these prefixes (boundary-aware: `"m_r3"` matches `m_r3` and `m_r3_…`;
+   * list several for e.g. a range of months). With `allowFullScan`
+   * non-matching documents are skipped before they are loaded or
+   * decrypted. When the summary is scoped (`SummaryConfig.idPrefixes`),
+   * summary-backed queries must pass prefixes inside that scope.
+   */
+  idPrefix?: string | string[];
   sortBy?: MindooQuerySortKey[];
   limit?: number;
   offset?: number;

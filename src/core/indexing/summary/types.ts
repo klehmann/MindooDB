@@ -1,4 +1,5 @@
 import type { ProcessChangesCursor } from "../../types";
+import { matchesAnyDocIdPrefix, normalizeDocIdPrefixes } from "../../utils/idGeneration";
 
 /**
  * Fixed ID of the per-database setup document. It syncs like any other
@@ -77,6 +78,26 @@ export interface SummaryConfig {
    * databases that do not use per-document recipients.
    */
   includeRecipients?: boolean;
+
+  /**
+   * Restrict the summary to documents whose id matches one of these
+   * prefixes (boundary-aware, see `matchesDocIdPrefix`: `"m"` matches `m`
+   * and `m_…`, `"m_r3"` matches `m_r3_…`). Documents outside the scope are
+   * skipped BEFORE they are loaded or decrypted, so a database that mixes
+   * queryable records with bulky internal documents (spreadsheet chunks,
+   * attachment helpers, archives) only pays materialization for the part
+   * its views and queries actually need.
+   *
+   * Summary-backed reads (`db.query()`, `db.queryView()`, summary views)
+   * see only documents inside the scope. A view or query that asks for an
+   * `idPrefix` outside the scope falls back to (views) or requires
+   * (queries, `allowFullScan`) the materialized-document path.
+   *
+   * Omit or pass an empty list for no restriction (default). Changing the
+   * scope triggers the usual resumable backfill; entries that fall out of
+   * the scope are dropped immediately.
+   */
+  idPrefixes?: string[];
 }
 
 /** {@link SummaryConfig} with all defaults applied. */
@@ -87,6 +108,8 @@ export interface ResolvedSummaryConfig {
   exclude: string[];
   includeAttachments: boolean;
   includeRecipients: boolean;
+  /** Normalized id-prefix scope, or `null` for every document. */
+  idPrefixes: string[] | null;
 }
 
 export const DEFAULT_SUMMARY_MAX_VALUE_BYTES = 1024;
@@ -99,7 +122,23 @@ export function resolveSummaryConfig(config?: SummaryConfig): ResolvedSummaryCon
     exclude: [...(config?.exclude ?? [])],
     includeAttachments: config?.includeAttachments ?? true,
     includeRecipients: config?.includeRecipients ?? true,
+    idPrefixes: normalizeDocIdPrefixes(config?.idPrefixes)?.sort() ?? null,
   };
+}
+
+/**
+ * Whether every document matching `prefixes` (a view's or query's id
+ * filter; `undefined` = all documents) lies inside the summary `scope`
+ * (`null` = unrestricted). A requested prefix is inside the scope when it
+ * equals a scope prefix or extends one at a `_` boundary.
+ */
+export function isIdPrefixFilterCoveredByScope(
+  prefixes: readonly string[] | undefined,
+  scope: readonly string[] | null,
+): boolean {
+  if (scope === null) return true;
+  if (prefixes === undefined) return false;
+  return prefixes.every((prefix) => matchesAnyDocIdPrefix(prefix, scope));
 }
 
 /**
@@ -140,6 +179,10 @@ export function sanitizeSummaryConfig(value: unknown): SummaryConfig | undefined
   if (typeof raw.includeRecipients === "boolean") {
     config.includeRecipients = raw.includeRecipients;
   }
+  const idPrefixes = stringList(raw.idPrefixes);
+  if (idPrefixes) {
+    config.idPrefixes = idPrefixes;
+  }
   return config;
 }
 
@@ -169,6 +212,8 @@ export function computeSummaryConfigFingerprint(config: ResolvedSummaryConfig): 
     exclude: [...config.exclude].sort(),
     includeAttachments: config.includeAttachments,
     includeRecipients: config.includeRecipients,
+    // Only present when set, so unscoped caches of older builds stay valid.
+    ...(config.idPrefixes ? { idPrefixes: config.idPrefixes } : {}),
   });
 }
 

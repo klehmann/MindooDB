@@ -165,7 +165,8 @@ import {
   computeContentHash,
   parseDocEntryId,
   generateDocId,
-  matchesDocIdPrefix,
+  matchesAnyDocIdPrefix,
+  normalizeDocIdPrefixes,
   generateUniqueAttachmentChunkId,
   generateAttachmentId,
   generateRandomUuid,
@@ -3980,7 +3981,7 @@ export class BaseMindooDB implements MindooDB {
   ): Promise<InaccessibleDocumentInfo[]> {
     const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
     const docIds = [...this.inaccessibleDocIds].filter(
-      (docId) => !idPrefix || matchesDocIdPrefix(docId, idPrefix),
+      (docId) => !idPrefix || matchesAnyDocIdPrefix(docId, idPrefix),
     );
     if (docIds.length === 0) {
       return [];
@@ -6074,13 +6075,12 @@ export class BaseMindooDB implements MindooDB {
    * and makes `matchesDocIdPrefix` re-add the single boundary `_` consistently.
    * Returns `undefined` for an absent or now-empty prefix (i.e. "no filter").
    */
-  private normalizeIdPrefixFilter(idPrefix?: string): string | undefined {
-    if (idPrefix === undefined) {
-      return undefined;
-    }
-    const stripped = idPrefix.replace(/_+$/, "");
-    return stripped.length > 0 ? stripped : undefined;
+  private normalizeIdPrefixFilter(
+    idPrefix?: string | readonly string[],
+  ): string[] | undefined {
+    return normalizeDocIdPrefixes(idPrefix);
   }
+
 
   /**
    * Generate a fresh document id (`<prefix>_<24-char-objectid>`, or the
@@ -10236,12 +10236,12 @@ export class BaseMindooDB implements MindooDB {
 
   async getAllDocumentIds(options?: ListDocumentIdsOptions): Promise<string[]> {
     // Return all non-deleted document IDs from index, optionally narrowed to a
-    // single id prefix (matched on the `<prefix>_` boundary; see matchesDocIdPrefix).
+    // list of id prefixes (matched on the `<prefix>_` boundary; see matchesDocIdPrefix).
     const idPrefix = this.normalizeIdPrefixFilter(options?.idPrefix);
     const docIds: string[] = [];
     for (const entry of this.index) {
       if (entry.accessState === "visible" && !entry.isDeleted) {
-        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
+        if (idPrefix && !matchesAnyDocIdPrefix(entry.docId, idPrefix)) continue;
         docIds.push(entry.docId);
       }
     }
@@ -10255,7 +10255,7 @@ export class BaseMindooDB implements MindooDB {
     const docIds: string[] = [];
     for (const entry of this.index) {
       if (entry.accessState === "visible" && entry.isDeleted) {
-        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
+        if (idPrefix && !matchesAnyDocIdPrefix(entry.docId, idPrefix)) continue;
         docIds.push(entry.docId);
       }
     }
@@ -10279,7 +10279,7 @@ export class BaseMindooDB implements MindooDB {
       (entry) =>
         entry.accessState === "visible" &&
         matchesLifecycle(entry.isDeleted) &&
-        (idPrefix === undefined || matchesDocIdPrefix(entry.docId, idPrefix)),
+        (idPrefix === undefined || matchesAnyDocIdPrefix(entry.docId, idPrefix)),
     );
     if (candidates.length === 0) {
       return [];
@@ -14164,7 +14164,7 @@ export class BaseMindooDB implements MindooDB {
     }>,
     startIndex: number,
     prefetchedThrough: number,
-    idPrefix?: string,
+    idPrefix?: readonly string[],
     persist: boolean = true,
   ): Promise<{ prefetchedThrough: number; prefetchedDocuments: number }> {
     const windowSize = this.iteratePrefetchWindowDocs;
@@ -14198,7 +14198,7 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
       // Don't prefetch bodies the prefix-filtered iteration will never yield.
-      if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) {
+      if (idPrefix && !matchesAnyDocIdPrefix(entry.docId, idPrefix)) {
         continue;
       }
       const docId = entry.docId;
@@ -14733,7 +14733,7 @@ export class BaseMindooDB implements MindooDB {
     try {
       for (let i = startIndex; i < indexSnapshot.length; i++) {
         const entry = indexSnapshot[i];
-        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
+        if (idPrefix && !matchesAnyDocIdPrefix(entry.docId, idPrefix)) continue;
         const currentCursor: ProcessChangesCursor = {
           changeSeq: entry.changeSeq,
           lastModified: entry.lastModified,
@@ -14794,7 +14794,7 @@ export class BaseMindooDB implements MindooDB {
     // (changeSeq, docId), not by docId, so matches are not contiguous.
     let count = 0;
     for (let i = startIndex; i < this.index.length; i++) {
-      if (matchesDocIdPrefix(this.index[i].docId, idPrefix)) count++;
+      if (matchesAnyDocIdPrefix(this.index[i].docId, idPrefix)) count++;
     }
     return count;
   }
@@ -14850,7 +14850,7 @@ export class BaseMindooDB implements MindooDB {
         const entry = indexSnapshot[i];
         // Skip entries outside the requested id prefix before any body load,
         // so prefix-filtered iteration never decrypts/materializes unrelated docs.
-        if (idPrefix && !matchesDocIdPrefix(entry.docId, idPrefix)) continue;
+        if (idPrefix && !matchesAnyDocIdPrefix(entry.docId, idPrefix)) continue;
         if (entry.accessState !== "visible") {
           // The document was readable before but the current KeyBag can no
           // longer decrypt it (e.g. a revoked key, §13). Emit a tombstone so

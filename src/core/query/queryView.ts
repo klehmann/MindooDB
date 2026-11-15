@@ -1,3 +1,5 @@
+import { normalizeDocIdPrefixes } from "../utils/idGeneration";
+import { isIdPrefixFilterCoveredByScope } from "../indexing/summary/types";
 import type { MindooDB } from "../types";
 import type { MindooDBAppBooleanExpression, MindooDBAppExpression } from "../expressions/types";
 import type { DocumentFullTextIndex } from "../indexing/fulltext/DocumentFullTextIndex";
@@ -40,6 +42,14 @@ export interface MindooQueryViewDefinition {
    * `_textScoreRaw` (engine-specific raw score).
    */
   text?: MindooQueryTextClause;
+  /**
+   * Restrict the view to documents whose id matches this prefix or one of
+   * these prefixes (boundary-aware: `"m_r3"` matches `m_r3` and `m_r3_…`).
+   * Applies to every source unless a source provides its own `idPrefix`.
+   * When a source's summary is scoped (`SummaryConfig.idPrefixes`), the
+   * prefixes must lie inside that scope.
+   */
+  idPrefix?: string | string[];
   /** View columns (categories/sorting/totals work as in persistent views). */
   columns: Array<VirtualViewColumn | VirtualViewColumnOptions>;
   categorizationStyle?: CategorizationStyle;
@@ -68,6 +78,12 @@ export interface EphemeralViewSource {
   text?: MindooQueryTextClause;
 
   /**
+   * Per-source id-prefix filter. When set it replaces the definition-level
+   * `idPrefix` for this source.
+   */
+  idPrefix?: string | string[];
+
+  /**
    * Origin identifier for entries of this source. Must be unique within
    * the view. Defaults to `<tenantId>/<storeId>#ephemeral`, which is
    * already unique across databases and tenants.
@@ -82,6 +98,7 @@ interface ResolvedViewSource {
   origin: string;
   filter?: MindooDBAppBooleanExpression;
   text?: MindooQueryTextClause;
+  idPrefix?: string | string[];
 }
 
 function defaultEphemeralOrigin(db: MindooDB): string {
@@ -111,6 +128,7 @@ function resolveSources(sources: EphemeralViewSource[]): ResolvedViewSource[] {
       origin,
       filter: source.filter,
       text: source.text,
+      idPrefix: source.idPrefix,
     });
   }
   return resolved;
@@ -162,11 +180,20 @@ export class EphemeralSummaryView {
         }
         text = { index: source.db.getFullTextIndex(), clause: textClause };
       }
+      const idPrefix = source.idPrefix ?? definition.idPrefix;
+      const scope = source.summary.getIdPrefixScope?.() ?? null;
+      if (!isIdPrefixFilterCoveredByScope(normalizeDocIdPrefixes(idPrefix), scope)) {
+        throw new MindooQueryError(
+          `View source "${source.origin}": its summary only covers documents with id prefix ` +
+          `${scope!.map((p) => `"${p}"`).join(", ")}; pass an idPrefix inside that scope.`
+        );
+      }
       const provider = new SummaryVirtualViewDataProvider({
         origin: source.origin,
         summary: source.summary,
         filter: source.filter ?? definition.filter,
         text,
+        idPrefix,
       });
       provider.init(view);
       view.addDataProvider(provider);
