@@ -123,3 +123,45 @@ export function isMissingDependencyError(error: unknown): boolean {
     (error.name === "MissingDependencyError" || error.message.includes("Missing dependency:"))
   );
 }
+
+/**
+ * Error thrown when this device's access to a tenant was revoked by the tenant
+ * admin (docs/accesscontrol.md §6.5): its signing key is retained on the
+ * person's grant only as a revoked pair, or is the target of a remote wipe.
+ * Distinct from a device that was never granted, so apps can tell the user
+ * what happened instead of asking them to request access.
+ *
+ * The message starts with `"Device access revoked"` so a caller can still
+ * recognise it after a network hop; use {@link isDeviceAccessRevokedError}.
+ */
+export class DeviceAccessRevokedError extends Error {
+  /** The username whose device was revoked. */
+  public readonly username: string;
+  /** True when the admin also requested a remote wipe of this device. */
+  public readonly wipeRequested: boolean;
+
+  constructor(username: string, wipeRequested: boolean) {
+    super(
+      `Device access revoked: the tenant admin revoked this device's access for "${username}"` +
+        (wipeRequested ? " and requested that its local tenant data be deleted." : "."),
+    );
+    this.name = "DeviceAccessRevokedError";
+    this.username = username;
+    this.wipeRequested = wipeRequested;
+  }
+}
+
+/**
+ * True when `error` is a {@link DeviceAccessRevokedError}, also when it crossed
+ * a network or RPC boundary and arrives as a plain error carrying its message,
+ * or when two module copies of mindoodb are loaded.
+ */
+export function isDeviceAccessRevokedError(error: unknown): boolean {
+  if (error instanceof DeviceAccessRevokedError) {
+    return true;
+  }
+  return (
+    error instanceof Error &&
+    (error.name === "DeviceAccessRevokedError" || error.message.startsWith("Device access revoked"))
+  );
+}

@@ -837,6 +837,21 @@ Three properties are essential:
   with the revocation trade-offs in the README and the limitations section. The wipe
   is also idempotent: once the local tenant is gone there is nothing left to delete.
 
+**What a revoked device sees.** Opening a database on a device whose signing key is
+kept on the person's grant only as a revoked pair, or is wipe-targeted, throws
+`DeviceAccessRevokedError` (`isDeviceAccessRevokedError()` also recognises it after
+a network hop, by its `"Device access revoked"` message prefix). Its
+`wipeRequested` flag says whether a wipe directive is pending. A device that was
+never granted keeps the "does not have tenant access yet" error, so apps can tell
+the user that access was taken away instead of asking them to request it. The
+sync server does the same: a revoked device that is not wipe-targeted cannot sign
+in, and its challenge is refused with a `USER_REVOKED` error whose message starts
+with `"Device access revoked"` (the directory reports such keys in the optional
+`revoked` list of `getUserSigningKeyUniverse`). Apps
+apply the directive with `tenant.checkAndApplyRemoteWipe()` after a directory sync
+(or `tenant.wipeLocalTenant(dbIds)` to also clear databases this tenant object has
+not opened).
+
 **Username hashing (backward compatible).** Today usernames are hashed as unsalted
 `SHA-256(lowercase(canonicalUsername))` (hex). Going forward we add a tenant salt:
 

@@ -4206,11 +4206,13 @@ export interface MindooTenantDirectory {
    * independent. Optional: directories without remote-wipe support omit it.
    *
    * @param username The user whose signing-key universe to resolve (format: "CN=<username>/O=<tenantId>").
-   * @returns The `active` (currently-granted) and `wipeRequested` (remote-wipe-targeted) signing public keys.
+   * @returns The `active` (currently-granted) and `wipeRequested` (remote-wipe-targeted) signing public keys,
+   *   and optionally the `revoked` keys (kept on a grant as revoked pairs and not active anywhere), so a
+   *   server can tell a revoked device why it is refused.
    */
   getUserSigningKeyUniverse?(
     username: string,
-  ): Promise<{ active: string[]; wipeRequested: string[] }>;
+  ): Promise<{ active: string[]; wipeRequested: string[]; revoked?: string[] }>;
 
   /**
    * If `signingKey` is the target of an admin-requested remote wipe (§6.5),

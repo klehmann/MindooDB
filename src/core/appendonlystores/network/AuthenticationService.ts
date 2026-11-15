@@ -168,6 +168,10 @@ export class AuthenticationService {
     if (signingPublicKey) {
       const known = await this.candidateSigningKeys(username);
       if (!known.has(this.normalizeSigningPublicKey(signingPublicKey))) {
+        const revokedMessage = await this.revokedDeviceMessage(username, signingPublicKey);
+        if (revokedMessage) {
+          throw new NetworkError(NetworkErrorType.USER_REVOKED, revokedMessage);
+        }
         throw new NetworkError(
           NetworkErrorType.USER_NOT_FOUND,
           `This device's signing key is not yet in the tenant directory on this server for user "${username}". `
@@ -341,6 +345,12 @@ export class AuthenticationService {
       this.logger.debug(
         `Device signing key not in grant on this server for: ${principalLabel}`,
       );
+      const revokedMessage = resolvedUsername
+        ? await this.revokedDeviceMessage(resolvedUsername, authChallenge.signingPublicKey!)
+        : null;
+      if (revokedMessage) {
+        return { success: false, error: revokedMessage };
+      }
       return {
         success: false,
         error:
@@ -403,12 +413,27 @@ export class AuthenticationService {
   }
 
   /**
+   * The refusal for a device whose key an admin revoked (kept on the grant as a
+   * revoked pair), or null when the key was never granted. Starts with
+   * "Device access revoked" like `DeviceAccessRevokedError`, so clients can
+   * tell the user their access was revoked instead of "not granted yet".
+   */
+  private async revokedDeviceMessage(username: string, signingPublicKey: string): Promise<string | null> {
+    const universe = await this.getSigningKeyUniverse(username);
+    const needle = this.normalizeSigningPublicKey(signingPublicKey);
+    const revoked = (universe.revoked ?? []).some((key) => this.normalizeSigningPublicKey(key) === needle);
+    if (!revoked) return null;
+    return `Device access revoked: the tenant administrator revoked this device's access for user "${username}". `
+      + `It can no longer sync with this server.`;
+  }
+
+  /**
    * Resolve the user's signing-key universe (active + wipe-targeted) via the
    * optional directory API, returning empty sets when unsupported.
    */
   private async getSigningKeyUniverse(
     username: string,
-  ): Promise<{ active: string[]; wipeRequested: string[] }> {
+  ): Promise<{ active: string[]; wipeRequested: string[]; revoked?: string[] }> {
     if (typeof this.directory.getUserSigningKeyUniverse === "function") {
       try {
         return await this.directory.getUserSigningKeyUniverse(username);

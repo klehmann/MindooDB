@@ -921,6 +921,7 @@ Server authentication, device discovery (`discoverTenantsOnServer`), access-cont
 | `tenant.revokeOwnDeviceCertificate(fingerprint)` | Withdraw one (a sold or retired device): deletes the document. It stops counting at the delete's trusted time; an undelete does not bring it back. |
 | `directory.resolveSignerToGrant(key, T)` | The grant a key acts under, `via: "grant"` or `"certificate"`. |
 | `directory.listCertifiedDevices(usernameHash)` | Certified devices that count now. |
+| `directory.listDeviceCertificates()` | Every certificate with its trusted `issuedAt` and, if withdrawn, `deletedAt`; nothing filtered, for audit and time-travel views. |
 | `directory.updateUserGrant(username, { revokeSigningKeys, wipeSigningKeys })` | Revokes and wipes certified devices like listed ones: the key goes into `revokedUserKeyPairs` and the wipe list. |
 
 Things to know:
