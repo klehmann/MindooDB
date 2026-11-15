@@ -1585,7 +1585,10 @@ Enterprise.
    is any write to a root-only document by a non-root key.
 3. **No retroactive effect.** A `validUntil` before the witness time of the
    deactivating revision is raised to that time. Entries accepted before keep
-   counting, and deactivation in the future is allowed.
+   counting, and deactivation in the future is allowed. This covers the
+   pending `userkey_*` documents (`userdirectory`) a delegated admin creates
+   when it approves a join request: their `doc_create` is judged at its witness
+   time, so the person's user key stays valid after the admin's deactivation.
 4. **Reactivation is a new window.** A revision that finds the key ended starts
    a new window at its own witness time. Entries stamped in the gap stay
    invalid, because at their `T` the deactivating revision is in effect. A
@@ -1611,6 +1614,7 @@ server's live checks.
 | `listAdminKeys()` | delegated keys at the head: window, name, `status` (`active`, `ending`, `ended`, `scheduled`), `pending` while the latest revision awaits a witness |
 | `getAdminKeysAt(T)` | the same, as of trusted time `T` |
 | `isAdminAt(signingKey, T)` | the rule above |
+| `isAdminSignedEntry(entry, dbid)` | whether a stored entry's signer counts as admin for it: root, or a delegated admin at the entry's verified witness time (an un-stamped entry only on the device that wrote it) |
 
 **Handing over.** The future admin creates a dedicated admin identity and sends
 an admin request; the root approves it and returns an admin response:

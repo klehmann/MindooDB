@@ -1,4 +1,4 @@
-import type { MindooDB, MindooDoc, MindooTenantDirectory } from "../types";
+import type { MindooDB, MindooDoc, MindooTenantDirectory, StoreEntryMetadata } from "../types";
 import { userKeyDocumentId, type UserKeyDocumentPayload } from "./types";
 import { validateUserKeyDocument } from "./validateUserKeyDocument";
 import { filterValidGenerations, loadGenerationHistory } from "./generationValidity";
@@ -71,14 +71,15 @@ async function validateLoaded(
   doc: MindooDoc,
   input: ResolveUserKeyDocumentInput,
 ): Promise<ResolvedUserKeyDocument | null> {
-  const signerKey = await creatorSigningKey(input.db, doc.getId());
-  if (!signerKey) return null;
+  const create = await createEntryMeta(input.db, doc.getId());
+  if (!create) return null;
   const payload = await validateUserKeyDocument({
     payload: doc.getData(),
-    signerKey,
+    signerKey: create.createdByPublicKey,
     usernameHashCandidates: input.usernameHashCandidates,
     directory: input.directory,
     adminPublicKey: input.adminPublicKey,
+    createEntry: { meta: create, dbid: input.db.getStore().getId() },
   });
   if (!payload) return null;
   return applyGenerationValidity(doc, payload, input);
@@ -132,11 +133,10 @@ export async function applyGenerationValidity(
   };
 }
 
-async function creatorSigningKey(db: MindooDB, docId: string): Promise<string | null> {
+async function createEntryMeta(db: MindooDB, docId: string): Promise<StoreEntryMetadata | null> {
   const store = db.getStore();
   const metas = await store.findNewEntriesForDoc([], docId);
-  const create = metas.find((m) => m.entryType === "doc_create");
-  return create?.createdByPublicKey ?? null;
+  return metas.find((m) => m.entryType === "doc_create") ?? null;
 }
 
 function compareResolved(a: ResolvedUserKeyDocument, b: ResolvedUserKeyDocument): number {
