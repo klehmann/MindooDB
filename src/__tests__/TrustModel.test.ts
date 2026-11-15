@@ -199,7 +199,7 @@ describe("Trust Model Security", () => {
       await syncDirectoryFromAdmin(trustedTenant);
 
       await expect(trustedTenant.openDB("revoked-db")).rejects.toThrow(
-        `User "${trustedUser.username}" does not have tenant access yet; the tenant admin must grant access first.`
+        `Device access revoked: the tenant admin revoked this device's access for "${trustedUser.username}".`
       );
     }, 30000);
 
@@ -215,7 +215,7 @@ describe("Trust Model Security", () => {
       );
 
       await expect(tenant.openDB("cached-db")).rejects.toThrow(
-        `User "${currentUser.username}" does not have tenant access yet; the tenant admin must grant access first.`
+        `Device access revoked: the tenant admin revoked this device's access for "${currentUser.username}".`
       );
     }, 30000);
   });
