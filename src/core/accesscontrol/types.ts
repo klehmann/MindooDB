@@ -305,6 +305,16 @@ export interface DefaultAccessPolicyDoc {
    */
 llm?: LlmEndpointPolicy;
   /**
+   * The tenant's media gateway for calls: where clients get access to the
+   * media server, and which media server that is. **Tenant-level only**, like
+   * `llm`. Clients read it; the sync server does not interpret it.
+   *
+   * Absent or `{}` = the tenant names no gateway (clients may fall back to one
+   * of their own, or offer no calls). The whole object is replaced on write.
+   * See {@link MediaGatewayPolicy}.
+   */
+  media?: MediaGatewayPolicy;
+  /**
    * More personal-database prefixes (§6.11), in addition to the built-in ones
    * (`mmail_`). Tenant default policy only. Adding a prefix only ever makes
    * databases more private: the built-in rule applies to every database id
@@ -433,6 +443,31 @@ export interface LlmEndpointPolicy {
 }
 
 /**
+ * The `media` block of the tenant default policy: the media gateway members'
+ * clients use for calls.
+ *
+ * The gateway is itself a member of the tenant (it joined with `$publicinfos`
+ * only) and hands out short-lived access tokens for the media server to
+ * members who may read the chat a call belongs to. Naming it here, in an
+ * admin-signed directory document, is what tells clients which service to ask
+ * and which media server they will then connect to, so a client can let an
+ * app reach exactly those two and nothing else.
+ */
+export interface MediaGatewayPolicy {
+  /**
+   * Origin of the media gateway, e.g. `https://calls.example.com`: `https`
+   * (or `http` on a loopback host), no path, credentials, query or fragment.
+   */
+  gatewayUrl?: string;
+  /**
+   * Origins of the media server(s) the gateway's tokens are for, e.g.
+   * `wss://media.example.com`: `wss`/`https` (or `ws`/`http` on a loopback
+   * host), no path, credentials, query or fragment.
+   */
+  mediaUrls?: string[];
+}
+
+/**
  * The effective baseline defaults when a policy document exists but omits a
  * field (§6.1). Snapshot and purge default to denied (admin-only).
  */
@@ -449,6 +484,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "requireMetadataSignatureSince"
     | "requireUserKeyGenerationSignatureSince"
     | "llm"
+    | "media"
     | "personalDatabasePrefixes"
     | "internalMail"
     | "internalMailLimits"
@@ -878,6 +914,92 @@ export function validateAccessPolicy(
   if (policy.llm !== undefined) {
     validateLlmEndpointPolicy(policy.llm);
   }
+
+  if (policy.media !== undefined) {
+    validateMediaGatewayPolicy(policy.media);
+  }
+}
+
+const MEDIA_URLS_MAX = 10;
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+/**
+ * True for a bare origin with one of the `secure` schemes, or one of the
+ * `plain` schemes on a loopback host: no credentials, path, query or fragment.
+ */
+function isBareOrigin(value: string, secure: readonly string[], plain: readonly string[]): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  const allowed = secure.includes(url.protocol) || (plain.includes(url.protocol) && isLoopbackHost(url.hostname));
+  return (
+    allowed &&
+    // A plain host name or an IP literal. The URL parser lets `*` through, and
+    // an origin with a wildcard would open a whole domain where it is used as
+    // a network allowlist entry.
+    /^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?|\[[0-9a-f:.]+\])$/i.test(url.hostname) &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash &&
+    (url.pathname === "/" || url.pathname === "") &&
+    // No trailing slash or anything else `new URL` would have tidied away.
+    value === `${url.protocol}//${url.host}`
+  );
+}
+
+/** True for a media gateway origin: `https`, or `http` on a loopback host. */
+export function isValidMediaGatewayUrl(value: string): boolean {
+  return isBareOrigin(value, ["https:"], ["http:"]);
+}
+
+/** True for a media server origin: `wss`/`https`, or `ws`/`http` on a loopback host. */
+export function isValidMediaServerUrl(value: string): boolean {
+  return isBareOrigin(value, ["wss:", "https:"], ["ws:", "http:"]);
+}
+
+/** Validate the `media` block of a policy before it is written. Throws on violation. */
+export function validateMediaGatewayPolicy(media: unknown): void {
+  if (typeof media !== "object" || media === null || Array.isArray(media)) {
+    throw new Error("media must be an object");
+  }
+  for (const key of Object.keys(media)) {
+    if (key !== "gatewayUrl" && key !== "mediaUrls") {
+      throw new Error(`media.${key} is not a known field`);
+    }
+  }
+  const { gatewayUrl, mediaUrls } = media as MediaGatewayPolicy;
+  if (gatewayUrl !== undefined) {
+    if (typeof gatewayUrl !== "string" || !isValidMediaGatewayUrl(gatewayUrl)) {
+      throw new Error(
+        "media.gatewayUrl must be an https origin (http on localhost) without path, credentials, query or fragment",
+      );
+    }
+  }
+  if (mediaUrls !== undefined) {
+    if (!Array.isArray(mediaUrls)) {
+      throw new Error("media.mediaUrls must be an array of origins");
+    }
+    if (mediaUrls.length > MEDIA_URLS_MAX) {
+      throw new Error(`media.mediaUrls may list at most ${MEDIA_URLS_MAX} origins`);
+    }
+    for (const entry of mediaUrls) {
+      if (typeof entry !== "string" || !isValidMediaServerUrl(entry)) {
+        throw new Error(
+          `media.mediaUrls entry "${String(entry)}" must be a wss or https origin (ws/http on localhost) without path, credentials, query or fragment`,
+        );
+      }
+    }
+  }
+  if (mediaUrls?.length && gatewayUrl === undefined) {
+    throw new Error("media.mediaUrls needs media.gatewayUrl");
+  }
 }
 
 const LLM_ENDPOINT_PATTERN_MAX_LENGTH = 2048;
@@ -967,6 +1089,7 @@ export function effectivePolicy(
     | "requireMetadataSignatureSince"
     | "requireUserKeyGenerationSignatureSince"
     | "llm"
+    | "media"
     | "personalDatabasePrefixes"
     | "internalMail"
     | "internalMailLimits"

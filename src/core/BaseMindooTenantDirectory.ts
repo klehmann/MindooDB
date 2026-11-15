@@ -88,11 +88,14 @@ import {
   RuleType,
   WithFieldClause,
   LlmEndpointPolicy,
+  MediaGatewayPolicy,
   aclRuleDocId,
   aclDbPolicyDocId,
   aclKeyDistributionDocId,
   effectivePolicy,
   validateAccessPolicy,
+  isValidMediaGatewayUrl,
+  isValidMediaServerUrl,
   validateAclRule,
   validateKeyDistribution,
   ACL_APP_DISTRIBUTION_PREFIX,
@@ -2265,6 +2268,30 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * The tenant's media gateway for calls: the `media` block of the default
+   * policy at the directory head, or `null` when it names no gateway.
+   *
+   * Like the `llm` block it does not follow the master switch
+   * `disableAllAccessChecksAndPolicies`; new tenants are created with that on.
+   *
+   * Only valid origins are returned (the same checks as on write), so an entry
+   * a newer or a tampering writer got past another client's validation cannot
+   * widen what a reader lets an app reach.
+   */
+  async getMediaGatewayPolicy(): Promise<MediaGatewayPolicy | null> {
+    const head = await this.getDirectoryStateHead();
+    const media = head.defaultPolicy?.media;
+    if (!media?.gatewayUrl || !isValidMediaGatewayUrl(media.gatewayUrl)) {
+      return null;
+    }
+    const mediaUrls = (media.mediaUrls ?? []).filter((entry) => isValidMediaServerUrl(entry));
+    return {
+      gatewayUrl: media.gatewayUrl,
+      ...(mediaUrls.length ? { mediaUrls } : {}),
+    };
+  }
+
+  /**
    * Whether the current user may use a client's AI assistant with this
    * tenant's data (`llm_use`, §6.9), at the directory head. The baseline is
    * `llm.denyUse`; `llm_use` allow/deny rules target users and groups like any
@@ -2798,6 +2825,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
     if (policy.llm !== undefined) {
       throw new Error("llm is a tenant-level setting; set it on the default policy");
+    }
+    if (policy.media !== undefined) {
+      throw new Error("media is a tenant-level setting; set it on the default policy");
     }
     await this.writePolicyDoc(
       aclDbPolicyDocId(dbid),

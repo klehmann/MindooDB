@@ -10,6 +10,7 @@ import {
   AclRuleDoc,
   DefaultAccessPolicyDoc,
   LlmEndpointPolicy,
+  MediaGatewayPolicy,
   RULE_TYPES,
   RuleType,
   TrustedWitnessDoc,
@@ -64,6 +65,7 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
         ? data.requireUserKeyGenerationSignatureSince
         : undefined,
     llm: parseLlmEndpointPolicy(data.llm),
+    media: parseMediaGatewayPolicy(data.media),
     personalDatabasePrefixes: stringArray(data.personalDatabasePrefixes)?.filter((prefix) => /^[a-z][a-z0-9]*_$/.test(prefix)),
     internalMail:
       data.internalMail === "off" || data.internalMail === "members" || data.internalMail === "rules"
@@ -119,6 +121,29 @@ export function parseLlmEndpointPolicy(value: unknown): LlmEndpointPolicy | unde
   }
   if (typeof raw.denyUse === "boolean") {
     result.denyUse = raw.denyUse;
+  }
+  return result;
+}
+
+/**
+ * Parse the `media` block of a policy document. A malformed member is dropped
+ * rather than failing the whole policy. Nothing is validated here beyond the
+ * type; `getMediaGatewayPolicy` decides what a reader is given.
+ */
+export function parseMediaGatewayPolicy(value: unknown): MediaGatewayPolicy | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as Record<string, unknown>;
+  const result: MediaGatewayPolicy = {};
+  if (typeof raw.gatewayUrl === "string" && raw.gatewayUrl.trim()) {
+    result.gatewayUrl = raw.gatewayUrl.trim();
+  }
+  if (Array.isArray(raw.mediaUrls)) {
+    result.mediaUrls = raw.mediaUrls
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
   }
   return result;
 }
