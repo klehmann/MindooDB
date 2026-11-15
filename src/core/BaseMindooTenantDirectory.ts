@@ -5161,22 +5161,26 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    */
   async getUserSigningKeyUniverse(
     username: string,
-  ): Promise<{ active: string[]; wipeRequested: string[] }> {
+  ): Promise<{ active: string[]; wipeRequested: string[]; revoked: string[] }> {
     const grants = await this.findGrantAccessDocuments(username);
     const active = new Set<string>();
     const wipeRequested = new Set<string>();
+    const revokedPairs = new Set<string>();
     const hashes = new Set<string>();
     for (const grant of grants) {
       const data = grant.getData();
       for (const key of extractSigningPublicKeys(data)) active.add(key);
       for (const key of extractWipeRequestedSigningKeys(data)) wipeRequested.add(key);
+      for (const pair of extractRevokedKeyPairs(data)) revokedPairs.add(pair.signingPublicKey);
       if (typeof data.username_hash === "string") hashes.add(data.username_hash);
     }
     // Devices the person certified count as active (userkeys.md §9.6).
     for (const hash of hashes) {
       for (const cert of await this.listCertifiedDevices(hash)) active.add(cert.deviceSigningPublicKey);
     }
-    return { active: Array.from(active), wipeRequested: Array.from(wipeRequested) };
+    // A key revoked on one grant but active on another (or restored) is active.
+    const revoked = [...revokedPairs].filter((key) => ![...active].some((other) => signingKeysEqual(other, key)));
+    return { active: Array.from(active), wipeRequested: Array.from(wipeRequested), revoked };
   }
 
   /**

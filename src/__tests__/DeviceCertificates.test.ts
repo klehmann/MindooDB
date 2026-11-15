@@ -212,6 +212,9 @@ describe("device certificates", () => {
     const universe = await directory.getUserSigningKeyUniverse(alice1.username);
     expect(universe.active).not.toContain(tabletKey);
     expect(universe.wipeRequested).toContain(tabletKey);
+    // The server tells the tablet its access was revoked (not "not granted yet").
+    expect(universe.revoked).toContain(tabletKey);
+    expect(universe.revoked).not.toContain(alice1.user.userSigningKeyPair.publicKey);
     expect(await directory.getWipeGrantDocId(tabletKey)).not.toBeNull();
     // The person is still known for the key, so the device can be told to wipe.
     expect((await directory.getUserBySigningPublicKey(tabletKey))?.username).toBe(alice1.username);

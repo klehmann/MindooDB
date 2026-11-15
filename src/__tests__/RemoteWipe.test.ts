@@ -245,6 +245,26 @@ describe("remote wipe — authentication identifies the device key (§6.5)", () 
     expect(payload!.sub).toBe("CN=alice");
   });
 
+  it("tells a revoked device that its access was revoked, not that it is not granted yet", async () => {
+    const laptop = await makeDeviceKey();
+    const tablet = await makeDeviceKey();
+    const stranger = await makeDeviceKey();
+    const dir = {
+      getUserPublicKeys: async () => ({ signingPublicKey: laptop.pem, encryptionPublicKey: "y" }),
+      getUserSigningKeyUniverse: async () => ({ active: [laptop.pem], wipeRequested: [], revoked: [tablet.pem] }),
+      isUserRevoked: async () => false,
+    } as unknown as MindooTenantDirectory;
+    const auth = new AuthenticationService(cryptoAdapter, dir, "t");
+
+    await expect(auth.generateChallenge("CN=alice", { signingPublicKey: tablet.pem })).rejects.toThrow(
+      /^Device access revoked/,
+    );
+    // A key that was never on the grant keeps the "not yet in the directory" hint.
+    await expect(auth.generateChallenge("CN=alice", { signingPublicKey: stranger.pem })).rejects.toThrow(
+      /not yet in the tenant directory/,
+    );
+  });
+
   it("issues a non-wipe token for an active, non-targeted device", async () => {
     const device = await makeDeviceKey();
     const auth = new AuthenticationService(

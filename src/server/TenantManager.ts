@@ -450,8 +450,8 @@ class CompositeMindooDirectory implements Pick<
 
   async getUserSigningKeyUniverse(
     username: string,
-  ): Promise<{ active: string[]; wipeRequested: string[] }> {
-    const base =
+  ): Promise<{ active: string[]; wipeRequested: string[]; revoked?: string[] }> {
+    const base: { active: string[]; wipeRequested: string[]; revoked?: string[] } =
       typeof this.inner.getUserSigningKeyUniverse === "function"
         ? await this.inner.getUserSigningKeyUniverse(username)
         : { active: [] as string[], wipeRequested: [] as string[] };
@@ -470,7 +470,11 @@ class CompositeMindooDirectory implements Pick<
     }
     const fallback = await this.getUserPublicKeys(username);
     if (fallback) active.add(fallback.signingPublicKey);
-    return { active: Array.from(active), wipeRequested: base.wipeRequested };
+    return {
+      active: Array.from(active),
+      wipeRequested: base.wipeRequested,
+      ...(base.revoked ? { revoked: base.revoked } : {}),
+    };
   }
 
   async getUserKeyPairs(username: string): Promise<GrantKeyPairInfo[]> {

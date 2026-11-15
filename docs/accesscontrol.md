@@ -843,7 +843,11 @@ kept on the person's grant only as a revoked pair, or is wipe-targeted, throws
 a network hop, by its `"Device access revoked"` message prefix). Its
 `wipeRequested` flag says whether a wipe directive is pending. A device that was
 never granted keeps the "does not have tenant access yet" error, so apps can tell
-the user that access was taken away instead of asking them to request it. Apps
+the user that access was taken away instead of asking them to request it. The
+sync server does the same: a revoked device that is not wipe-targeted cannot sign
+in, and its challenge is refused with a `USER_REVOKED` error whose message starts
+with `"Device access revoked"` (the directory reports such keys in the optional
+`revoked` list of `getUserSigningKeyUniverse`). Apps
 apply the directive with `tenant.checkAndApplyRemoteWipe()` after a directory sync
 (or `tenant.wipeLocalTenant(dbIds)` to also clear databases this tenant object has
 not opened).
