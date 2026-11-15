@@ -1,3 +1,4 @@
+import { DeviceAccessRevokedError, isDeviceAccessRevokedError } from "../core/errors";
 import {
   addDevice,
   addPerson,
@@ -219,6 +220,19 @@ describe("device certificates", () => {
     expect(overview.activeDevices.map((d) => d.signingPublicKey)).toEqual([
       alice1.user.userSigningKeyPair.publicKey,
     ]);
+    // Audit views still see the certificate, with its trusted issue time.
+    const listed = await directory.listDeviceCertificates();
+    expect(listed.map((entry) => entry.certificate.deviceSigningPublicKey)).toContain(tabletKey);
+    expect(listed.every((entry) => typeof entry.issuedAt === "number" && entry.deletedAt === undefined)).toBe(true);
+
+    // The revoked tablet is told its access was revoked, not that it was never granted.
+    await syncAll(fixture, "directory");
+    const error = await tablet.tenant.openDB("contacts").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(isDeviceAccessRevokedError(error)).toBe(true);
+    expect((error as DeviceAccessRevokedError).wipeRequested).toBe(true);
   });
 
   it("keeps certificates issued before the self-grant was revoked, and stops new ones", async () => {
@@ -264,5 +278,9 @@ describe("device certificates", () => {
     await syncAll(fixture, USER_DIRECTORY_DB_ID);
     expect(await directory.resolveSignerToGrant(tabletKey, Number.MAX_SAFE_INTEGER)).toBeNull();
     expect(await alice1.tenant.listOwnDeviceCertificates!()).toHaveLength(0);
+    const [withdrawn] = (await directory.listDeviceCertificates()).filter(
+      (entry) => entry.certificate.deviceSigningPublicKey === tabletKey,
+    );
+    expect(withdrawn.deletedAt).toBeGreaterThanOrEqual(withdrawn.issuedAt);
   });
 });
