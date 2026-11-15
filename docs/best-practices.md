@@ -390,6 +390,39 @@ callbacks. Expressions keep the view on the fast path, and because they are plai
 JSON data they can also be stored, transmitted, and evaluated safely, which is
 what lets Haven hand a view definition to a sandboxed app.
 
+### 4.7 Encode where a document belongs in its id, then filter by prefix
+
+Document ids are known from the changefeed index before anything is loaded,
+verified or decrypted, so an id prefix is the one filter that saves
+materialization itself. When a database holds groups that are read separately
+(chat messages per room and month, invoices next to bulky spreadsheet chunks),
+put the group into the id — `createDocument({ idPrefix })`, or a custom id such as
+`m_<roomId>_<yyyymm>_<ulid>` — and let reads name the groups they need:
+
+```typescript
+await db.query({ idPrefix: ["m_r3_202610", "m_r3_202611"], sortBy: [{ field: "sentAt" }] });
+VirtualViewFactory.createView()
+  .addSortedColumn("sentAt", ColumnSorting.ASCENDING)
+  .withDB("room", chatDb, undefined, { idPrefix: "m_r3" });
+```
+
+- `idPrefix` takes one prefix or a list and works on `iterateChangesSince`,
+  `getAllDocumentIds`, `db.query()`, `db.queryView()` and `withDB()` /
+  `createViewDataProvider()`. On the materialized-document path non-matching
+  documents are skipped before they are loaded; the cost of a first build scales
+  with the matching share (10 % of 20k documents took about a tenth of the
+  full-scan time).
+- Matching is boundary-aware and ends at a `_` segment: `"m_r3"` matches `m_r3_…`
+  but not `m_r30_…`, and `"m_r3_2026"` does **not** match `m_r3_202611_x`. Design
+  the segments for the slices you will read (a month is a segment, a year is a
+  list of months).
+- The summary buffer is shared by all views of a database and covers every
+  document by default. When a database mixes the records your queries need with
+  bulk nobody queries, scope it with `setSummarySetup({ idPrefixes: [...] })`.
+  Summary-backed reads must then name a prefix inside the scope (queries throw,
+  views fall back to the document path), so choose the scope to cover everything
+  your lists show.
+
 ---
 
 ## 5. Read Access Is Encryption, Not Filtering
@@ -1066,6 +1099,10 @@ Protocol](network-sync-protocol.md).
       row.
 - [ ] Every field used in a filter or sort is summary-covered (top-level scalar,
       or an explicit `include` path).
+- [ ] Ids carry the group a document belongs to when groups are read separately,
+      and queries/views over one group pass `idPrefix`; databases mixing records
+      with bulk scope their summary with `idPrefixes`
+      ([§4.7](#47-encode-where-a-document-belongs-in-its-id-then-filter-by-prefix)).
 - [ ] `coverage: "rebuilding"` renders as a hint, not an error.
 - [ ] `"fulltext-not-enabled"` is caught and hides the search UI.
 - [ ] Writes mutate individual fields inside `changeDoc`, not whole payloads.
