@@ -1080,6 +1080,40 @@ a language model at all. It follows the same pattern as the database read gate
   been read. The built-in assistant starts a conversation over when a tenant
   whose data it may already hold forbids agents.
 
+### 6.9a Media gateway for calls (`media`)
+
+A tenant can name the **media gateway** its members' clients use for calls. The
+gateway is a service that has joined the tenant with `$publicinfos` only (like a
+mail bridge) and hands out short-lived access tokens for a media server to
+members who may read the chat a call belongs to. Naming it in the directory
+means members do not have to enter an address, and a client knows exactly which
+two services an app needs to reach for a call.
+
+```ts
+media?: {
+  gatewayUrl?: string;   // e.g. "https://calls.example.com"
+  mediaUrls?: string[];  // e.g. ["wss://media.example.com"]
+}
+```
+
+- **Tenant-level only**, read from `acl_defaultpolicy`, like `llm`.
+- **Origins only.** `gatewayUrl` is an `https` origin, `mediaUrls` are `wss` or
+  `https` origins (`http`/`ws` are accepted on a loopback host for local
+  development). No path, credentials, query or fragment, and no wildcard: the
+  values are meant to be used as a network allowlist, so `wss://*.example.com`
+  is refused. At most 10 media origins. `mediaUrls` needs a `gatewayUrl`.
+- **Read** with `MindooTenantDirectory.getMediaGatewayPolicy()`. It returns
+  `null` when the tenant names no gateway, and leaves out entries that are not
+  valid origins, so a value written past another client's validation cannot
+  widen what a reader allows. Like `llm` it ignores the master switch.
+- **Write** with `setDefaultAccessPolicy({ media })`. The block is replaced as a
+  whole; `{ media: {} }` clears it. `setDatabaseAccessPolicy` rejects `media`.
+- **Not interpreted by the sync server.** The directory only accepts
+  admin-signed entries, so a client can trust that an admin chose the gateway.
+  What the gateway may see is decided by its own membership, not by this block.
+- **Backward compatibility**: absent means "none named". Older clients ignore
+  the field.
+
 ### 6.10 Deposit without read access (`doc_deposit`)
 
 Some writers should be able to add data to a database they must never read. A

@@ -20,6 +20,7 @@ import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import type {
   DefaultAccessPolicyDoc,
   LlmEndpointPolicy,
+  MediaGatewayPolicy,
   KeyDistributionPushRecipient,
   KeyDistributionRequest,
   KeyDistributionView,
@@ -4394,6 +4395,22 @@ export interface MindooTenantDirectory {
    * @returns The admin-signed `llm` block at the current head, or `null`.
    */
   getLlmEndpointPolicy?(): Promise<LlmEndpointPolicy | null>;
+
+  /**
+   * Returns the tenant's media gateway for calls (the `media` block of the
+   * access-control default policy): the gateway clients ask for access to a
+   * call, and the media server(s) they then connect to. `null` when the tenant
+   * names none. Independent of `disableAllAccessChecksAndPolicies`.
+   *
+   * The directory only accepts admin-signed entries, so the result is what a
+   * tenant admin wrote. Entries that are not valid origins are left out, so a
+   * caller can hand the result to a network allowlist as it is.
+   *
+   * Optional capability: implementations that predate this policy may omit it.
+   *
+   * @returns The admin-signed `media` block at the current head, or `null`.
+   */
+  getMediaGatewayPolicy?(): Promise<MediaGatewayPolicy | null>;
 
   /**
    * Whether the current user may use a client's AI assistant with this
