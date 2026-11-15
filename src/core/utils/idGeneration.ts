@@ -144,6 +144,47 @@ export function matchesDocIdPrefix(docId: string, idPrefix: string): boolean {
 }
 
 /**
+ * Normalize a caller-supplied id-prefix filter (one prefix or a list) for
+ * {@link matchesAnyDocIdPrefix}. Trailing `_` are trimmed (`"cls_"` →
+ * `"cls"`), duplicates removed. Returns `undefined` for "no filter": an
+ * absent value, an empty list, or any entry that is empty after trimming
+ * (an empty prefix matches every id, so the whole filter is a no-op).
+ */
+export function normalizeDocIdPrefixes(
+  idPrefix?: string | readonly string[] | null,
+): string[] | undefined {
+  if (idPrefix === undefined || idPrefix === null) return undefined;
+  const list = typeof idPrefix === "string" ? [idPrefix] : idPrefix;
+  if (list.length === 0) return undefined;
+  const result: string[] = [];
+  for (const raw of list) {
+    const stripped = String(raw).replace(/_+$/, "");
+    if (stripped.length === 0) return undefined;
+    if (!result.includes(stripped)) result.push(stripped);
+  }
+  return result;
+}
+
+/**
+ * True when `docId` matches at least one of the (normalized) prefixes, with
+ * the boundary-aware semantics of {@link matchesDocIdPrefix}.
+ */
+export function matchesAnyDocIdPrefix(docId: string, prefixes: readonly string[]): boolean {
+  for (const prefix of prefixes) {
+    if (matchesDocIdPrefix(docId, prefix)) return true;
+  }
+  return false;
+}
+
+/** Whether two normalized id-prefix filters select the same documents. */
+export function sameIdPrefixes(a: readonly string[] | undefined | null, b: readonly string[] | undefined | null): boolean {
+  const left = a && a.length > 0 ? [...a].sort() : null;
+  const right = b && b.length > 0 ? [...b].sort() : null;
+  if (left === null || right === null) return left === right;
+  return left.length === right.length && left.every((prefix, i) => prefix === right[i]);
+}
+
+/**
  * Generate a document entry ID with blockchain-like chaining.
  * Format: <docId>_d_<depsFingerprint>_<automergeHash>
  * 

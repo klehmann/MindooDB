@@ -7,6 +7,7 @@ export {
   resolveSummaryConfig,
   computeSummaryConfigFingerprint,
   sanitizeSummaryConfig,
+  isIdPrefixFilterCoveredByScope,
   DEFAULT_SUMMARY_MAX_VALUE_BYTES,
   DB_SETUP_DOC_ID,
   SUMMARY_SETUP_FIELD,

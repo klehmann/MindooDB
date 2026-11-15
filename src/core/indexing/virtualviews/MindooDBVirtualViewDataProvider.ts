@@ -1,4 +1,5 @@
-import type { MindooDB, MindooDoc, ProcessChangesCursor } from "../../types";
+import type { IterateChangesOptions, MindooDB, MindooDoc, ProcessChangesCursor } from "../../types";
+import { matchesAnyDocIdPrefix, normalizeDocIdPrefixes, sameIdPrefixes } from "../../utils/idGeneration";
 import type { IVirtualViewDataProvider, VirtualViewUpdateOptions } from "./IVirtualViewDataProvider";
 import type { VirtualView } from "./VirtualView";
 import type { VirtualViewColumn } from "./VirtualViewColumn";
@@ -43,6 +44,15 @@ export interface MindooDBVirtualViewDataProviderOptions {
    * own tenant and store id.
    */
   dbKey?: string;
+
+  /**
+   * Restrict the view to documents whose id matches this prefix or one of
+   * these prefixes (boundary-aware, see `matchesDocIdPrefix`). Documents
+   * outside are skipped by the changefeed BEFORE they are loaded or
+   * decrypted, so a view over a slice of a large database only pays for
+   * that slice.
+   */
+  idPrefix?: string | readonly string[];
 }
 
 /** `"<tenantId>/<dbId>"`, or `null` for database doubles without that identity. */
@@ -85,6 +95,13 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
   private knownDocIds: Set<string> = new Set();
 
   private readonly dbKey: string | null;
+  /** Normalized id-prefix filter, `undefined` for all documents. */
+  private readonly idPrefixes: string[] | undefined;
+  /**
+   * Rows restored from a cache built with a different id-prefix filter
+   * must be dropped when they fall outside the current one (next update).
+   */
+  private pruneOutsideIdPrefix: boolean = false;
   /** Documents whose folder membership changed (see onFilingChanges). */
   private pendingFilingDocIds: Set<string> = new Set();
   /** Rescan the whole changefeed on the next update (first build, log overflow). */
@@ -96,6 +113,16 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     this.filterFunction = options.filterFunction ?? null;
     this.includeAllDocumentFields = options.includeAllDocumentFields ?? false;
     this.dbKey = options.dbKey ?? physicalDbKey(options.db);
+    this.idPrefixes = normalizeDocIdPrefixes(options.idPrefix);
+    this.scan = this.idPrefixes ? { ...SCAN, idPrefix: this.idPrefixes } : SCAN;
+  }
+
+  /** Changefeed options of this provider (one-pass scan, id-prefix filter). */
+  private readonly scan: IterateChangesOptions;
+
+  /** Whether a document id passes this provider's id-prefix filter. */
+  private inIdScope(docId: string): boolean {
+    return this.idPrefixes === undefined || matchesAnyDocIdPrefix(docId, this.idPrefixes);
   }
 
   onFilingChanges(changes: FilingRefChanges): void {
@@ -110,7 +137,10 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     const prefix = `${this.dbKey}/`;
     for (const ref of changes) {
       if (ref.startsWith(prefix)) {
-        this.pendingFilingDocIds.add(ref.slice(prefix.length));
+        const docId = ref.slice(prefix.length);
+        if (this.inIdScope(docId)) {
+          this.pendingFilingDocIds.add(docId);
+        }
       }
     }
   }
@@ -178,7 +208,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     const signal = options?.signal;
     // Best-effort total for progress reporting; changes arriving mid-run
     // are not counted. Only computed when someone listens for progress.
-    const total = onProgress ? (this.db.countChangesSince?.(this.cursor) ?? 0) : 0;
+    const total = onProgress ? (this.db.countChangesSince?.(this.cursor, this.scan) ?? 0) : 0;
 
     const columns = view.getColumns();
     let change = new VirtualViewDataChange(this.origin);
@@ -215,6 +245,15 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
       this.pendingFilingDocIds.clear();
       this.cursor = null;
     }
+    if (this.pruneOutsideIdPrefix) {
+      this.pruneOutsideIdPrefix = false;
+      for (const docId of [...this.knownDocIds]) {
+        if (!this.inIdScope(docId)) {
+          change.removeEntry(docId);
+          this.knownDocIds.delete(docId);
+        }
+      }
+    }
     const filingDocIds = this.pendingFilingDocIds;
     const processedDocIds = filingDocIds.size > 0 ? new Set<string>() : null;
 
@@ -222,7 +261,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     // inaccessible documents arrive as lightweight tombstones (never
     // materialized), and upcoming live documents are prefetched in parallel
     // by the iterator's built-in prefetch window.
-    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, SCAN)) {
+    for await (const { doc, cursor } of this.db.iterateChangesSince(this.cursor, this.scan)) {
       const docId = doc.getId();
       processedDocIds?.add(docId);
 
@@ -371,6 +410,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     return {
       cursor: this.cursor,
       knownDocIds: Array.from(this.knownDocIds),
+      idPrefixes: this.idPrefixes,
       pendingFilingAll: this.pendingFilingAll || undefined,
       pendingFilingDocIds: this.pendingFilingDocIds.size > 0 ? Array.from(this.pendingFilingDocIds) : undefined,
     };
@@ -382,6 +422,7 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
       knownDocIds?: string[];
       pendingFilingAll?: boolean;
       pendingFilingDocIds?: string[];
+      idPrefixes?: string[];
     };
     this.cursor = s.cursor ?? null;
     if (s.knownDocIds) {
@@ -389,5 +430,11 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
     }
     this.pendingFilingAll = s.pendingFilingAll === true;
     this.pendingFilingDocIds = new Set(s.pendingFilingDocIds ?? []);
+    // Built with a different id-prefix filter: rescan with the current one
+    // and drop restored rows outside it.
+    if (!sameIdPrefixes(s.idPrefixes, this.idPrefixes)) {
+      this.cursor = null;
+      this.pruneOutsideIdPrefix = true;
+    }
   }
 }

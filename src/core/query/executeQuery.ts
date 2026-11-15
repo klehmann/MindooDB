@@ -1,3 +1,5 @@
+import { matchesAnyDocIdPrefix, normalizeDocIdPrefixes } from "../utils/idGeneration";
+import { isIdPrefixFilterCoveredByScope } from "../indexing/summary/types";
 import type { MindooDB, MindooDoc } from "../types";
 import type { MindooDBAppExpression } from "../expressions/types";
 import {
@@ -288,6 +290,16 @@ export async function executeQuery(
     }
   }
 
+  const idPrefixes = normalizeDocIdPrefixes(query.idPrefix);
+  const scope = summary.getIdPrefixScope?.() ?? null;
+  if (!isIdPrefixFilterCoveredByScope(idPrefixes, scope)) {
+    throw new MindooQueryError(
+      `The summary of this database only covers documents with id prefix ` +
+      `${scope!.map((p) => `"${p}"`).join(", ")}: pass an idPrefix inside that scope ` +
+      `(or re-run with allowFullScan: true).`
+    );
+  }
+
   const textMatch = await resolveTextClauseScores(db, query, options);
   if (options?.signal?.aborted) {
     throw new MindooQueryError("Query aborted while updating the full-text index.");
@@ -303,6 +315,9 @@ export async function executeQuery(
   const candidates: CandidateRow[] = [];
 
   for (const entry of summary.getAllEntries()) {
+    if (idPrefixes && !matchesAnyDocIdPrefix(entry.docId, idPrefixes)) {
+      continue;
+    }
     let textScore: number | undefined;
     if (textMatch) {
       textScore = textMatch.scores.get(entry.docId);
@@ -421,12 +436,13 @@ async function executeFullScanQuery(
 
   const onProgress = options?.onProgress;
   const signal = options?.signal;
-  const total = onProgress ? (db.countChangesSince?.(null) ?? 0) : 0;
+  const scan = { idPrefix: normalizeDocIdPrefixes(query.idPrefix) };
+  const total = onProgress ? (db.countChangesSince?.(null, scan) ?? 0) : 0;
   let processed = 0;
 
   const candidates: CandidateRow[] = [];
 
-  for await (const { doc } of db.iterateChangesSince(null)) {
+  for await (const { doc } of db.iterateChangesSince(null, scan)) {
     processed++;
     if (signal?.aborted) {
       throw new MindooQueryError("Query aborted during full scan.");

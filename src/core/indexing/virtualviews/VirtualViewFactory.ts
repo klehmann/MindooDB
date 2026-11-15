@@ -39,6 +39,14 @@ export interface WithDBOptions {
    * {@link MindooDBVirtualViewDataProviderOptions}).
    */
   includeAllDocumentFields?: boolean;
+
+  /**
+   * Restrict this source to documents whose id matches this prefix or one
+   * of these prefixes (boundary-aware: `"m_r3"` matches `m_r3` and
+   * `m_r3_…`). On the document path non-matching documents are skipped
+   * before they are loaded or decrypted; see `createViewDataProvider`.
+   */
+  idPrefix?: string | readonly string[];
 }
 
 /** A `withDB` source awaiting summary-vs-documents resolution at build time. */
@@ -244,6 +252,7 @@ export class VirtualViewBuilder {
         filter: source.filter,
         useFullDocuments: source.options?.useFullDocuments,
         includeAllDocumentFields: source.options?.includeAllDocumentFields,
+        idPrefix: source.options?.idPrefix,
       });
       providers.push(provider);
       dataSourceInfos.set(source.origin, { source: chosenSource, fallbackReasons });

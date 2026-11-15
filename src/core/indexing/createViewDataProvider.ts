@@ -10,6 +10,8 @@ import {
 import { VirtualViewColumn, type VirtualViewColumnOptions } from "./virtualviews/VirtualViewColumn";
 import type { DocumentFilterFunction } from "./virtualviews/types";
 import { SummaryVirtualViewDataProvider } from "./summary/SummaryVirtualViewDataProvider";
+import { isIdPrefixFilterCoveredByScope } from "./summary/types";
+import { normalizeDocIdPrefixes } from "../utils/idGeneration";
 
 /**
  * Options for {@link createViewDataProvider} — the summary-first data
@@ -51,6 +53,16 @@ export interface CreateViewDataProviderOptions {
    * {@link MindooDBVirtualViewDataProvider}).
    */
   includeAllDocumentFields?: boolean;
+
+  /**
+   * Restrict the view to documents whose id matches this prefix or one of
+   * these prefixes (boundary-aware: `"m_r3"` matches `m_r3` and `m_r3_…`).
+   * On the document path non-matching documents are skipped before they
+   * are loaded or decrypted. On the summary path the prefixes must lie
+   * inside the summary's scope (`SummaryConfig.idPrefixes`), otherwise the
+   * factory falls back to the document path.
+   */
+  idPrefix?: string | readonly string[];
 }
 
 /** Where a created view data provider reads its data from. */
@@ -99,6 +111,7 @@ export async function createViewDataProvider(
         typeof filter === "function" ? filter : filterExpressionToDocumentFilter(filter),
       includeAllDocumentFields: options.includeAllDocumentFields,
       dbKey,
+      idPrefix: options.idPrefix,
     }),
     source: "documents",
     fallbackReasons,
@@ -119,6 +132,7 @@ export async function createViewDataProvider(
       summary: db.getSummaryStore!(),
       filter: filter as MindooDBAppBooleanExpression | undefined,
       dbKey,
+      idPrefix: options.idPrefix,
     }),
     source: "summary",
     fallbackReasons: [],
@@ -146,7 +160,7 @@ export function physicalDbKeyOfDatabase(db: MindooDB): string | undefined {
  * to surface the decision in a UI.
  */
 export async function collectSummaryFallbackReasons(
-  options: Pick<CreateViewDataProviderOptions, "db" | "columns" | "filter" | "includeAllDocumentFields">
+  options: Pick<CreateViewDataProviderOptions, "db" | "columns" | "filter" | "includeAllDocumentFields" | "idPrefix">
 ): Promise<string[]> {
   const reasons: string[] = [];
   const { db, filter } = options;
@@ -217,6 +231,15 @@ export async function collectSummaryFallbackReasons(
     if (!summary.isFieldCovered(path)) {
       reasons.push(`field "${path}" is not covered by the summary configuration`);
     }
+  }
+  const scope = summary.getIdPrefixScope?.() ?? null;
+  const requested = normalizeDocIdPrefixes(options.idPrefix);
+  if (!isIdPrefixFilterCoveredByScope(requested, scope)) {
+    reasons.push(
+      requested
+        ? `id prefix ${requested.map((p) => `"${p}"`).join(", ")} is outside the summary scope (${scope!.map((p) => `"${p}"`).join(", ")})`
+        : `the summary only covers id prefixes ${scope!.map((p) => `"${p}"`).join(", ")}; pass a matching idPrefix`
+    );
   }
 
   return reasons;

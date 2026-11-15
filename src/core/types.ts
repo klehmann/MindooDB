@@ -2301,9 +2301,11 @@ export interface ListDocumentIdsOptions {
    * boundary-aware: an id matches when it equals `idPrefix` exactly or begins
    * with `<idPrefix>_`, mirroring the `<prefix>_<objectId>` id scheme produced by
    * `createDocument({ idPrefix })`. So `"cls"` matches `cls_…` documents but not
-   * an unrelated `classroom_…` id. Omit (or pass an empty string) for no filter.
+   * an unrelated `classroom_…` id. Pass a list to match any of several
+   * prefixes (e.g. `["m_r3_202610", "m_r3_202611"]`). Omit (or pass an empty
+   * string / empty list) for no filter.
    */
-  idPrefix?: string;
+  idPrefix?: string | readonly string[];
 }
 
 /**
@@ -2360,10 +2362,10 @@ export interface IterateChangesOptions {
    * For {@link MindooDB.iterateChangesSince} this skips non-matching documents
    * *before* their body is loaded or decrypted, so filtering by content-type
    * prefix avoids materializing unrelated documents — and, across the app-SDK
-   * bridge, avoids shipping them to the client. Omit (or pass an empty string)
-   * for no filter.
+   * bridge, avoids shipping them to the client. A list matches any of its
+   * prefixes. Omit (or pass an empty string / empty list) for no filter.
    */
-  idPrefix?: string;
+  idPrefix?: string | readonly string[];
 
   /**
    * Whether documents this iteration has to materialize are kept in the

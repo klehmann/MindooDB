@@ -8,6 +8,8 @@ export {
   generateDocId,
   generateTenantId,
   matchesDocIdPrefix,
+  matchesAnyDocIdPrefix,
+  normalizeDocIdPrefixes,
   generateDocEntryId,
   generateDepsFingerprint,
   generateAttachmentChunkId,

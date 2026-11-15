@@ -19,6 +19,7 @@ import {
   type IFilingAwareDataProvider,
 } from "../virtualviews/VirtualViewFilingJoin";
 import type { DocumentSummaryEntry, SummaryStorePosition } from "./types";
+import { matchesAnyDocIdPrefix, normalizeDocIdPrefixes, sameIdPrefixes } from "../../utils/idGeneration";
 
 export interface SummaryVirtualViewDataProviderOptions {
   /** Unique origin identifier for this data provider */
@@ -55,6 +56,16 @@ export interface SummaryVirtualViewDataProviderOptions {
    * every document as not filed.
    */
   dbKey?: string;
+
+  /**
+   * Restrict the view to documents whose id matches this prefix or one of
+   * these prefixes (boundary-aware, see `matchesDocIdPrefix`). Applied
+   * before filter and column evaluation. Note that the summary buffer
+   * itself is shared by all views of the database; to keep documents out
+   * of it entirely (and skip their materialization), configure
+   * `SummaryConfig.idPrefixes`.
+   */
+  idPrefix?: string | readonly string[];
 }
 
 /**
@@ -90,6 +101,8 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
    */
   private lastTextScores: Map<string, number> | null = null;
   private readonly dbKey: string | null;
+  /** Normalized id-prefix filter, `undefined` for all documents. */
+  private readonly idPrefixes: string[] | undefined;
   /**
    * Documents (ids of this database) whose folder membership changed and
    * that must be re-evaluated on the next update even when their summary
@@ -105,6 +118,12 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
     this.filter = options.filter ?? null;
     this.text = options.text ?? null;
     this.dbKey = options.dbKey ?? null;
+    this.idPrefixes = normalizeDocIdPrefixes(options.idPrefix);
+  }
+
+  /** Whether a document id passes this provider's id-prefix filter. */
+  private inIdScope(docId: string): boolean {
+    return this.idPrefixes === undefined || matchesAnyDocIdPrefix(docId, this.idPrefixes);
   }
 
   onFilingChanges(changes: FilingRefChanges): void {
@@ -301,6 +320,15 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
     }
 
     for (const entry of this.candidateEntries(forced, delta)) {
+      if (!this.inIdScope(entry.docId)) {
+        // Only reachable for rows restored from a cache built with a
+        // different prefix filter (see importCacheState).
+        if (this.knownDocIds.has(entry.docId)) {
+          change.removeEntry(entry.docId);
+          this.knownDocIds.delete(entry.docId);
+        }
+        continue;
+      }
       let evaluationDoc = buildSummaryEvaluationDoc(entry.fields, entry.lastModified);
       // Mirror the full-text relevance as managed pseudo-fields (like
       // `_lastModified`), so column/category formulas can grade match
@@ -397,6 +425,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
     return {
       appliedPosition: this.appliedPosition,
       knownDocIds: Array.from(this.knownDocIds),
+      idPrefixes: this.idPrefixes,
       pendingFilingAll: this.pendingFilingAll || undefined,
       pendingFilingDocIds: this.pendingFilingDocIds.size > 0 ? Array.from(this.pendingFilingDocIds) : undefined,
     };
@@ -409,6 +438,7 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
       cursor?: ProcessChangesCursor | null;
       pendingFilingAll?: boolean;
       pendingFilingDocIds?: string[];
+      idPrefixes?: string[];
     };
     // Older caches stored a changefeed watermark instead: rescan once.
     this.appliedPosition =
@@ -418,5 +448,11 @@ export class SummaryVirtualViewDataProvider implements IVirtualViewDataProvider,
     }
     this.pendingFilingAll = s.pendingFilingAll === true;
     this.pendingFilingDocIds = new Set(s.pendingFilingDocIds ?? []);
+    // Built with a different id-prefix filter: re-evaluate every entry once
+    // (the full run also drops rows outside the new filter).
+    if (!sameIdPrefixes(s.idPrefixes, this.idPrefixes)) {
+      this.appliedPosition = null;
+    }
   }
 }
+

@@ -132,6 +132,30 @@ const info = view.getDataSourceInfo("employees");
 view.getAllDataSourceInfos(); // Map<origin, ViewDataSourceInfo>
 ```
 
+### Restricting a source to document id prefixes
+
+When document ids encode where a document belongs (e.g. `m_<roomId>_<yyyymm>_<ulid>`
+for chat messages), `idPrefix` limits a source to one prefix or a list of prefixes:
+
+```typescript
+.withDB("room", chatDb, undefined, { idPrefix: ["m_r3_202610", "m_r3_202611"] })
+```
+
+Matching is boundary-aware (`"m_r3"` matches `m_r3` and `m_r3_…`, not
+`m_r30_…`; a prefix must end at a `_` segment boundary). On the document path the
+changefeed skips non-matching documents **before** they are loaded or decrypted,
+so a view over a slice of a large database only pays for that slice — the cost of
+the first build scales with the share of matching documents. On the summary path
+the prefix is a cheap pre-filter; the summary itself is shared by all views of
+the database, so to keep bulky documents out of it entirely, scope it with
+[`idPrefixes` in `dbsetup`](adhoc-queries.md#scoping-the-summary-by-document-id-prefix-idprefixes).
+A source whose `idPrefix` is not inside that scope (or that has none while the
+summary is scoped) falls back to the document path.
+
+The prefix filter is part of the provider's cache state: a persisted view
+restored with a different `idPrefix` rescans once and drops rows outside the new
+filter.
+
 For manual provider wiring, `createViewDataProvider()` exposes the same
 decision (returning the chosen `source` and, on fallback, the reasons) and
 `collectSummaryFallbackReasons()` lets UIs explain why a view runs on the slow
@@ -679,7 +703,7 @@ builder
   .addColumnFromOptions(options)         // Add column with full options
   .withCategorizationStyle(style)        // Categories before/after documents
   .withDB(origin, db, filter?, options?) // Add MindooDB data source (expression or JS filter;
-                                         // options: { useFullDocuments, includeAllDocumentFields })
+                                         // options: { useFullDocuments, includeAllDocumentFields, idPrefix })
   .withMindooDB(options)                 // Add MindooDB with full options (always document path)
   .withDataProvider(provider)            // Add custom data provider
   .build(): Promise<VirtualView>         // Build the view (summary-first for withDB sources)

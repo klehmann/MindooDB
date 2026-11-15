@@ -174,6 +174,36 @@ Behavior:
   the index instead of appearing in query results); read it via
   `db.getDocument(DB_SETUP_DOC_ID)` when needed.
 
+### Scoping the summary by document id prefix: `idPrefixes`
+
+A database often mixes the records its views and queries are about with bulky
+documents nobody queries: spreadsheet chunks, import helpers, archived months.
+Without a scope, the first summary build loads and decrypts **all** of them.
+`idPrefixes` restricts the summary to documents whose id matches one of the
+given prefixes:
+
+```typescript
+await db.setSummarySetup({ idPrefixes: ["m", "room"] });
+```
+
+- The filter runs on the in-memory changefeed index, **before** a document is
+  loaded or decrypted, so documents outside the scope cost (almost) nothing.
+  Build time scales with the share of documents inside the scope (measured:
+  20k documents, 10 % in scope → about a tenth of the full-scan time).
+- Matching is boundary-aware, like everywhere else ids are filtered: `"m"`
+  matches `m` and `m_…`, `"m_r3"` matches `m_r3_…` but not `m_r30_…`. A prefix
+  must end at a `_` segment boundary: `"m_r3_2026"` does **not** match
+  `m_r3_202611_x` — list the months instead (`["m_r3_202610", "m_r3_202611"]`).
+- Summary-backed reads only see documents inside the scope, so they must say
+  which part they want: `db.query()` and `db.queryView()` throw a
+  `MindooQueryError` unless their `idPrefix` lies inside the scope (or the query
+  uses `allowFullScan`), and persistent views without a matching `idPrefix` fall
+  back to the materialized-document path (with a reason in
+  `getDataSourceInfo()`).
+- Changing the scope triggers the usual resumable backfill; entries that fall
+  out of a narrowed scope are dropped immediately. An unscoped summary keeps its
+  configuration fingerprint, so existing persisted buffers stay valid.
+
 ### Persistence
 
 The summary persists through the tenant's `LocalCacheStore` (and therefore through
@@ -312,6 +342,21 @@ exactly like a correct query over data that isn't there.
 
 Sort keys are either summary field paths or expressions
 (`{ expression: v.mul(v.field("amount"), -1) }`).
+
+### Restricting a query to id prefixes: `idPrefix`
+
+When document ids encode where a document belongs (e.g. chat messages
+`m_<roomId>_<yyyymm>_<ulid>`), `idPrefix` narrows the query to one prefix or a
+list of prefixes (boundary-aware, see
+[the summary scope](#scoping-the-summary-by-document-id-prefix-idprefixes)):
+
+```typescript
+await db.query({ idPrefix: ["m_r3_202610", "m_r3_202611"], sortBy: [{ field: "sentAt" }] });
+```
+
+On the summary path this is a cheap pre-filter before the expression filter.
+With `allowFullScan` it decides which documents are materialized at all:
+non-matching documents are skipped before they are loaded or decrypted.
 
 ### Nested lookups: the `include` clause
 
@@ -575,6 +620,9 @@ view.dispose();
   re-sorting without reloading anything.
 - Ephemeral views are not registered with the CacheManager; `dispose()` releases
   them.
+- An optional **`idPrefix`** (one prefix or a list, per view or per source of
+  `queryViewAcross()`) restricts the view to matching document ids — see
+  [`idPrefix` on queries](#restricting-a-query-to-id-prefixes-idprefix).
 - An optional **`text` clause** pre-filters the view source with a full-text
   search (ANDed with the filter), so categories/totals aggregate only the
   matching documents. Matching documents expose their relevance to
