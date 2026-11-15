@@ -3872,6 +3872,19 @@ export interface MindooTenantDirectory {
   isAdminAt?(signingKey: string, T: number): Promise<boolean>;
 
   /**
+   * Whether the signer of a stored entry counts as a tenant admin for that
+   * entry (docs/accesscontrol.md §6.13): the root always; a delegated admin key
+   * when it was an admin at the entry's witness time (the receipt is
+   * verified), so what it signed inside its window stays valid after a
+   * deactivation and an entry stamped in a gap never counts. An entry without a
+   * receipt counts only when this process signed it and the key is an admin now.
+   *
+   * @param entry Metadata of the entry, with its witness receipt fields.
+   * @param dbid Database the entry belongs to (part of the signed receipt).
+   */
+  isAdminSignedEntry?(entry: StoreEntryMetadata, dbid: string): Promise<boolean>;
+
+  /**
    * The delegated admin keys at the directory head, with window, name and
    * status at "now" (§6.13). The root admin key is not listed.
    *

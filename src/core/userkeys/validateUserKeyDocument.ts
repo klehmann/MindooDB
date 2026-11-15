@@ -1,4 +1,4 @@
-import type { MindooTenantDirectory } from "../types";
+import type { MindooTenantDirectory, StoreEntryMetadata } from "../types";
 import {
   USERKEY_FORM,
   USERKEY_TYPE,
@@ -14,6 +14,17 @@ export interface ValidateUserKeyInput {
   /** Admin create of a pending document is valid even though the signer is not the person. */
   adminPublicKey?: string;
   trustedTime?: number;
+  /**
+   * The `doc_create` entry being judged, with its witness receipt, and its
+   * database. When the entry carries a receipt, a delegated admin signer is
+   * judged at the witness time (docs/accesscontrol.md §6.13) instead of now, so
+   * a pending document it created stays valid after its deactivation.
+   */
+  createEntry?: { meta: StoreEntryMetadata; dbid: string };
+}
+
+function hasWitnessReceipt(meta: StoreEntryMetadata): boolean {
+  return meta.receivedAt !== undefined && !!meta.receivedByPublicKey && !!meta.receivedDateSignature;
 }
 
 /**
@@ -32,13 +43,23 @@ export async function validateUserKeyDocument(
     return payload;
   }
   // A delegated admin (docs/accesscontrol.md §6.13) may create pending
-  // documents as well, while its window covers the create's time.
-  if (
-    input.adminPublicKey &&
-    typeof input.directory.isAdminAt === "function" &&
-    (await input.directory.isAdminAt(input.signerKey, input.trustedTime ?? Number.MAX_SAFE_INTEGER))
-  ) {
-    return payload;
+  // documents as well, while its window covers the create's time: the witness
+  // time when the create carries a receipt, otherwise now.
+  if (input.adminPublicKey) {
+    const stamped =
+      input.createEntry &&
+      hasWitnessReceipt(input.createEntry.meta) &&
+      typeof input.directory.isAdminSignedEntry === "function";
+    if (stamped) {
+      if (await input.directory.isAdminSignedEntry!(input.createEntry!.meta, input.createEntry!.dbid)) {
+        return payload;
+      }
+    } else if (
+      typeof input.directory.isAdminAt === "function" &&
+      (await input.directory.isAdminAt(input.signerKey, input.trustedTime ?? Number.MAX_SAFE_INTEGER))
+    ) {
+      return payload;
+    }
   }
   if (typeof input.directory.resolveUsernameHashForSigningKey !== "function") {
     return null;

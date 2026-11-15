@@ -994,6 +994,16 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return (this.tenant as BaseMindooTenant).isAdminSigningKeyAt(signingKey, adminDecisionTime(T, semanticNow()));
   }
 
+  /** See {@link MindooTenantDirectory.isAdminSignedEntry}. */
+  async isAdminSignedEntry(entry: StoreEntryMetadata, dbid: string): Promise<boolean> {
+    if (signingKeysEqual(entry.createdByPublicKey, this.getRootAdminPublicKey())) return true;
+    const directoryDB = await this.getDirectoryDB();
+    const decision = await (this.tenant as BaseMindooTenant)
+      .getDirectoryAdminResolver(directoryDB.getStore())
+      .judgeEntry(entry, { dbid, allowLocalUnwitnessed: true });
+    return decision.allowed;
+  }
+
   /**
    * The delegated admin key `signingKey` as valid at `T` (its encryption key and
    * window), or null when it is not a delegated admin then. Store-level like

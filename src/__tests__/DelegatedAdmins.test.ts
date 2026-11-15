@@ -432,6 +432,36 @@ describe("delegated administrators (§6.13)", () => {
     expect((await t.karstenDirectory.listAdminKeys())[0]).toMatchObject({ status: "ended" });
   });
 
+  test("a userkey document a delegated admin created stays valid after the deactivation", async () => {
+    const t = await setup();
+    // Jane approves Bob's join request with her admin key: the pending userkey
+    // document for Bob is signed by that key.
+    const bobFactory = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
+    const bobUser = await bobFactory.createUserId(`cn=bob/o=${t.tenantId}`, PASSWORD);
+    await bobFactory.ensureUserKeyPair(bobUser, PASSWORD);
+    await t.jane.approveJoinRequest(bobFactory.createJoinRequest(bobUser, { label: "Bob" }), {
+      adminSigningKey: t.janeAdminKey,
+      adminPassword: PASSWORD,
+      label: "Bob",
+      serverUrl: baseUrl,
+    });
+    expect(policyRejections(await t.push(t.jane, "directory"))).toHaveLength(0);
+    expect(policyRejections(await t.push(t.jane, USER_DIRECTORY_DB_ID))).toHaveLength(0);
+    await t.syncKarstenDirectory();
+    await t.pull(t.karsten, USER_DIRECTORY_DB_ID);
+    const karstenUserKeys = t.karsten.getUserKeyManager();
+    const before = await karstenUserKeys.publishedUserKeyFor(bobUser.username);
+    expect(before).toBeTruthy();
+
+    // The deactivation ends Jane's window, not what she signed inside it.
+    await t.deactivateJane(Date.now());
+    await sleep(20);
+    await t.syncKarstenDirectory();
+    expect(await t.karstenDirectory.isAdminAt(t.janeAdminPub, Number.MAX_SAFE_INTEGER)).toBe(false);
+    const after = await t.karsten.getUserKeyManager().publishedUserKeyFor(bobUser.username);
+    expect(after?.fingerprint).toBe(before!.fingerprint);
+  });
+
   test("reactivation starts a new window; the gap stays a gap", async () => {
     const t = await setup();
     await t.janeWritesRule("before_gap");
