@@ -52,8 +52,10 @@ function json(response: ServerResponse): any {
 /** Every tenant database is an in-memory store, kept for the test's lifetime. */
 class MemoryStoreProvider implements ServerStoreProvider {
   readonly stores = new Map<string, ContentAddressedStore>();
+  createTenantStoresCalls = 0;
 
   createTenantStores(tenantId: string) {
+    this.createTenantStoresCalls++;
     return {
       getStore: (dbId: string, storeKind: StoreKind) => {
         const key = `${tenantId}/${dbId}/${storeKind}`;
@@ -89,6 +91,7 @@ describe("MindooDBServerCore without a host framework", () => {
   let dataStore: MemoryServerDataStore;
   let storeProvider: MemoryStoreProvider;
   let core: MindooDBServerCore;
+  let tenantManager: TenantManager;
 
   beforeAll(async () => {
     const factory = new BaseMindooTenantFactory(
@@ -102,7 +105,7 @@ describe("MindooDBServerCore without a host framework", () => {
     dataStore.writeText("server.identity.json", JSON.stringify(serverIdentity));
     storeProvider = new MemoryStoreProvider();
 
-    const tenantManager = new TenantManager({
+    tenantManager = new TenantManager({
       dataStore,
       storeProvider,
       cryptoAdapter,
@@ -212,5 +215,47 @@ describe("MindooDBServerCore without a host framework", () => {
     expect(removed.status).toBe(200);
     expect(dataStore.exists("core-tenant")).toBe(false);
     expect(storeProvider.listDatabases("core-tenant")).toEqual([]);
+  }, 60_000);
+  test("parallel first requests share one tenant load and one server store", async () => {
+    const registered = await core.registerTenant(
+      request({
+        params: { tenantId: "race-tenant" },
+        systemAdmin: { username: "operator", publicsignkey: "-" },
+        body: {
+          adminUsername: adminUser.username,
+          adminSigningPublicKey: adminUser.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: adminUser.userEncryptionKeyPair.publicKey,
+          publicInfosKey: bytesToBase64(cryptoAdapter.getRandomValues(new Uint8Array(32))),
+        },
+      }),
+    );
+    expect(registered.status).toBe(201);
+    tenantManager.clearCache();
+
+    const callsBefore = storeProvider.createTenantStoresCalls;
+    const tenants = await Promise.all([
+      tenantManager.getTenant("race-tenant"),
+      tenantManager.getTenant("RACE-TENANT"),
+      tenantManager.getTenant("race-tenant"),
+    ]);
+    expect(storeProvider.createTenantStoresCalls - callsBefore).toBe(1);
+    expect(tenants[1]).toBe(tenants[0]);
+    expect(tenants[2]).toBe(tenants[0]);
+    expect(await tenantManager.getTenant("race-tenant")).toBe(tenants[0]);
+
+    const stores = await Promise.all([
+      tenantManager.getServerStore("race-tenant", "notes", StoreKind.docs),
+      tenantManager.getServerStore("race-tenant", "notes", StoreKind.docs),
+    ]);
+    expect(stores[1]).toBe(stores[0]);
+
+    // A reload while a load is running must not resurrect the stale load.
+    tenantManager.clearCache();
+    const stale = tenantManager.getTenant("race-tenant");
+    const reloaded = await tenantManager.reloadTenant("race-tenant");
+    await stale;
+    expect(await tenantManager.getTenant("race-tenant")).toBe(reloaded);
+
+    await core.deleteTenant(request({ params: { tenantId: "race-tenant" } }));
   }, 60_000);
 });
