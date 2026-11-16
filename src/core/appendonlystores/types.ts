@@ -103,6 +103,14 @@ export interface StoreScanResult {
   entries: StoreEntryMetadata[];
   nextCursor: StoreScanCursor | null;
   hasMore: boolean;
+  /**
+   * Cursor epoch of the store that answered the page (as in
+   * {@link StoreHead.epoch}). Servers send it with every page, so a client
+   * whose cursor lineage broke mid-run (the store was reset or moved to
+   * another backend) notices at once and rescans instead of trusting a cursor
+   * from the old numbering. Optional: older servers leave it out.
+   */
+  epoch?: string;
 }
 
 /**
