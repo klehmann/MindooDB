@@ -1160,12 +1160,23 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     return results;
   }
 
-  private buildSharedAuthenticationKey(username: string): string {
-    return `${resolveTransportIdentity(this.transport)}::${username}`;
+  /**
+   * Tokens are shared per server, person AND device key: two devices of the
+   * same person in one runtime (a recovery runs the rescue device and the new
+   * device side by side, docs/userkeys.md §12) must not share a session, or
+   * the server wraps the second one's transport key to the first one's
+   * encryption key.
+   */
+  private buildSharedAuthenticationKey(username: string, signingPublicKeyPem?: string): string {
+    const device = signingPublicKeyPem ? signingPublicKeyPem.replace(/\s+/g, "") : "";
+    return `${resolveTransportIdentity(this.transport)}::${username}::${device}`;
   }
 
   private getSharedAuthenticationKey(): string {
-    return this.buildSharedAuthenticationKey(this.getActiveAuthUsername());
+    return this.buildSharedAuthenticationKey(
+      this.getActiveAuthUsername(),
+      this.getActiveSigningPublicKeyPem(),
+    );
   }
 
   private static getSharedAuthenticationRegistry(): Map<string, SharedAuthenticationState> {
@@ -1192,10 +1203,8 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
     return created;
   }
 
-  private clearSharedAuthenticationState(username: string): void {
-    const existing = ClientNetworkContentAddressedStore.getSharedAuthenticationRegistry().get(
-      this.buildSharedAuthenticationKey(username),
-    );
+  private clearSharedAuthenticationState(sharedKey: string): void {
+    const existing = ClientNetworkContentAddressedStore.getSharedAuthenticationRegistry().get(sharedKey);
     if (!existing) {
       return;
     }
@@ -1266,7 +1275,7 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       privateEncryptionKey?: CryptoKey | string;
     } | null
   ): void {
-    const previousUsername = this.getActiveAuthUsername();
+    const previousKey = this.getSharedAuthenticationKey();
     this.syncAuthOverride = override
       ? {
           ...override,
@@ -1277,15 +1286,15 @@ export class ClientNetworkContentAddressedStore implements ContentAddressedStore
       : null;
     // Changing auth identity requires token refresh.
     this.clearAuthCache();
-    this.clearSharedAuthenticationState(previousUsername);
+    this.clearSharedAuthenticationState(previousKey);
   }
 
   clearSyncAuthOverride(): void {
     if (this.syncAuthOverride) {
-      const previousUsername = this.syncAuthOverride.username;
+      const previousKey = this.getSharedAuthenticationKey();
       this.syncAuthOverride = null;
       this.clearAuthCache();
-      this.clearSharedAuthenticationState(previousUsername);
+      this.clearSharedAuthenticationState(previousKey);
     }
   }
 

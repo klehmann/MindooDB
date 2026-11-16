@@ -1346,6 +1346,30 @@ export interface MindooTenant {
       certificate: import("./userkeys/deviceCertificate").DeviceCertificatePayload;
     }>
   >;
+  /**
+   * Name recovery contacts (docs/userkeys.md §12): any two of them can later
+   * help this person onto a new device. Needs device self-grant. Replaces an
+   * earlier setup and withdraws its rescue device.
+   */
+  setupRecoveryContacts?(
+    contacts: string[],
+    options?: import("./recovery/RecoveryContactsManager").SetupRecoveryContactsOptions,
+  ): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup>;
+  /** This person's current recovery contacts, or `null`. */
+  getRecoveryContactsSetup?(): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup | null>;
+  /** Remove the recovery contacts and withdraw the rescue device. */
+  removeRecoveryContacts?(options?: { withdrawRescueDevices?: string[] }): Promise<number>;
+  /** People who named this person as a recovery contact. */
+  listRecoveryContactRequests?(): Promise<import("./recovery/RecoveryContactsManager").RecoveryContactRequest[]>;
+  /** This contact's share for `person` (username or setup id), as a plaintext package. */
+  createRecoveryHelperPackage?(
+    person: string,
+    options?: { serverUrl?: string },
+  ): Promise<import("./recovery/recoveryPackage").RecoveryHelperPackage>;
+  /** Whether this device holds the granted self-grant key (docs/userkeys.md §9.6). */
+  canIssueDeviceCertificates?(): Promise<boolean>;
+  /** Signing keys of every verified rescue device in the tenant, by person. */
+  listRescueDeviceSigningKeys?(): Promise<Array<{ username: string; signingPublicKey: string }>>;
   reconcileUserKeys?(options?: { allowSelfCreate?: boolean }): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   getUserKeyEnrollmentStatus?(): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   noteUserDirectoryFetched?(): void;
