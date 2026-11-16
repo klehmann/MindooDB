@@ -8,7 +8,7 @@ import type { PeerSyncDirection, PeerRole, PeerAttachmentMode } from "./peer/typ
 /**
  * Store type for content-addressed stores.
  */
-export type StoreType = "inmemory" | "file";
+export type StoreType = "inmemory" | "file" | "sqlite";
 
 /**
  * Configuration for a user registered in the tenant.
