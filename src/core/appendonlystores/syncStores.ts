@@ -132,6 +132,12 @@ export interface SyncStoresContext {
    * the next page is processed; errors abort the sync like transfer errors.
    */
   onPageTransferred?: () => Promise<void>;
+  /**
+   * Set on the one rescan started after the source's epoch changed mid-run;
+   * a second change in the same sync is reported as an error instead of
+   * looping.
+   */
+  restartedAfterEpochChange?: boolean;
 }
 
 /**
@@ -822,6 +828,37 @@ export async function syncEntriesBetweenStores(
           ? prefetched(sourceStore.scanEntriesSince!(page.nextCursor, pageSize))
           : null;
         currentPage++;
+
+        // The source's cursor lineage broke mid-run (its store was reset or
+        // moved to another backend): this cursor belongs to the old numbering
+        // and could skip entries. Restart once with a full scan.
+        if (page.epoch !== undefined && sourceHead && page.epoch !== sourceHead.epoch) {
+          discardPrefetch();
+          await settlePageProcessing();
+          cursors.delete(cursorKey);
+          if (ctx.restartedAfterEpochChange) {
+            throw new Error(
+              `source store epoch changed again during sync (${sourceHead.epoch} -> ${page.epoch}); try again later (${cursorKey})`,
+            );
+          }
+          logger.info(
+            `Sync restart: source epoch changed mid-run (${sourceHead.epoch} -> ${page.epoch}), full rescan (${cursorKey})`,
+          );
+          const rest = await syncEntriesBetweenStores(
+            sourceStore,
+            targetStore,
+            { ...options, forceFullScan: true },
+            { ...ctx, restartedAfterEpochChange: true },
+          );
+          return {
+            ...rest,
+            transferred: transferred + rest.transferred,
+            transferredBytes: transferredBytes + (rest.transferredBytes ?? 0),
+            scanned: scanned + rest.scanned,
+            rejected: [...rejected, ...(rest.rejected ?? [])],
+            abandoned: [...abandoned, ...(rest.abandoned ?? [])],
+          };
+        }
 
         // Clamp the page to the scan bound. Pages are ordered by
         // (receiptOrder, id), so everything past the first out-of-bound entry is

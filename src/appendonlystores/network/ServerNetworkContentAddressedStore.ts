@@ -847,8 +847,16 @@ export class ServerNetworkContentAddressedStore {
     // The read scope (§6.12) filters the same way: a page may come back empty
     // while `nextCursor`/`hasMore` still move on over hidden entries.
     if (this.localStore.scanEntriesSince) {
+      // The epoch is read before the page: a store switched in between then
+      // shows the old epoch with a page from the new numbering at worst, and
+      // the next page reveals the switch.
+      const epoch = await this.scanEpochFor(tokenPayload);
       const result = await this.localStore.scanEntriesSince(cursor, effectiveLimit, filters);
-      return { ...result, entries: await this.filterMetasForReader(result.entries, tokenPayload) };
+      return {
+        ...result,
+        entries: await this.filterMetasForReader(result.entries, tokenPayload),
+        ...(epoch !== undefined ? { epoch } : {}),
+      };
     }
 
     // Fallback: emulate cursor scan using existing metadata query.
@@ -955,6 +963,20 @@ export class ServerNetworkContentAddressedStore {
    * client with a persisted scan cursor can decide to skip the pull entirely.
    * Cheap: token validation + an in-memory read on the local store.
    */
+  /**
+   * The epoch a scan page reports: the store head's epoch, scoped like
+   * {@link handleGetStoreHead}, so it compares equal to the head the client
+   * fetched at the start of its sync.
+   */
+  private async scanEpochFor(tokenPayload: ResolvedTokenPayload): Promise<string | undefined> {
+    if (!this.localStore.getStoreHead) {
+      return undefined;
+    }
+    const head = await this.localStore.getStoreHead();
+    const scope = await this.resolveReadScope(tokenPayload);
+    return scope ? `${head.epoch}:scope:${scope.scopeId}` : head.epoch;
+  }
+
   async handleGetStoreHead(token: string): Promise<StoreHead> {
     const tokenPayload = await this.validateToken(token);
     if (!this.localStore.getStoreHead) {

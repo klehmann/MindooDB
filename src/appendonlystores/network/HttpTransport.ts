@@ -389,6 +389,7 @@ export class HttpTransport implements NetworkTransport {
       entries,
       nextCursor: data.nextCursor ?? null,
       hasMore: data.hasMore === true,
+      ...(typeof data.epoch === "string" ? { epoch: data.epoch } : {}),
     };
   }
 
