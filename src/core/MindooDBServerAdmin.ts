@@ -109,7 +109,7 @@ interface RegisterTenantBody {
   adminUsername?: string;
   publicInfosKey?: string;
   encryptedPublicInfosKey?: string;
-  defaultStoreType?: "inmemory" | "file";
+  defaultStoreType?: "inmemory" | "file" | "sqlite";
   users?: Array<{
     username: string;
     signingPublicKey: string;
