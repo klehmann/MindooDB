@@ -31,6 +31,7 @@ export {
   type Tier1Directory,
 } from "./accesscontrol/tier1Evaluator";
 export * from "./userkeys";
+export * from "./recovery";
 export * from "./live/LiveChannel";
 export {
   PEER_DEVICE_DOC_ID_PREFIX,
@@ -648,3 +649,6 @@ export {
   sanitizeExtractionConfig,
   type ExtractionConfig,
 } from "./extraction/types";
+
+// Invitation links and the join-request inbox (docs/invitations.md)
+export * from "./joinrequests";

@@ -499,6 +499,40 @@ export class UserKeyManager {
     }
   }
 
+  /**
+   * Whether this device can certify devices right now: the grant names a
+   * self-grant key that is not revoked, and this device holds exactly that
+   * key (docs/userkeys.md §9.6).
+   */
+  async canIssueDeviceCertificates(): Promise<boolean> {
+    const granted = await this.grantedSelfGrantKey();
+    if (!granted) return false;
+    const signer = await this.selfGrantSigner();
+    return !!signer && normalizePublicKeyPem(signer.publicKeyPem) === normalizePublicKeyPem(granted);
+  }
+
+  /**
+   * Every User-Key generation this device can open, with its fingerprint, for
+   * opening data sealed to an older generation (recovery shares, §12).
+   */
+  async ownUserKeyGenerations(): Promise<Array<{ epoch: string; fingerprint: string; privateKey: CryptoKey }>> {
+    const resolved = await this.resolveOwnUserKeyDocument();
+    if (!resolved) return [];
+    const out: Array<{ epoch: string; fingerprint: string; privateKey: CryptoKey }> = [];
+    for (const epoch of this.epochsNewestFirst(resolved.payload)) {
+      const fingerprint = resolved.payload.userKeys[epoch]?.fingerprint;
+      if (!fingerprint) continue;
+      const bytes = await this.privateKeyBytesForEpoch(resolved.payload, epoch);
+      if (!bytes) continue;
+      out.push({
+        epoch,
+        fingerprint,
+        privateKey: await importRsaOaepPrivateKey(this.tenant.getCryptoAdapter(), bytes.slice(), false),
+      });
+    }
+    return out;
+  }
+
   /** Self-grant signer for this device, if it holds the key. */
   private async selfGrantSigner(): Promise<{ privateKey: CryptoKey; publicKeyPem: string } | null> {
     const bytes = await this.getSelfGrantPrivateKeyBytes();
@@ -937,7 +971,12 @@ export class UserKeyManager {
     // the published User-Key. Minting a second pair (this device's locally
     // generated key) desyncs dist — Device 2 would publish a key that cannot
     // unwrap `default`. Wait for the userkey document and import from wrap.
-    if (await this.defaultAlreadyWrappedForCurrentUser()) {
+    // Not so for a person from before User-Keys (§4.5): see
+    // holdsDefaultFromBeforeUserKeys.
+    if (
+      (await this.defaultAlreadyWrappedForCurrentUser()) &&
+      !(await this.holdsDefaultFromBeforeUserKeys())
+    ) {
       return null;
     }
 
@@ -2010,6 +2049,31 @@ export class UserKeyManager {
       )?.label;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Scenario D (docs/userkeys.md §4.5) for people who already got `default`
+   * before User-Keys existed: their name is in the `default` distribution, so
+   * {@link defaultAlreadyWrappedForCurrentUser} is true, yet no User-Key was
+   * ever published for them, and without this they never get one (sealed
+   * documents then fail with "No published User-Key is available").
+   *
+   * Minting is safe when this device already holds `default` itself (it is no
+   * waiting additional device) and the distribution reaches the person only
+   * through per-device wraps, never through a User-Key. The caller has already
+   * checked that no User-Key document exists and that `userdirectory` was
+   * fetched (or self-create was allowed for a local-only tenant).
+   */
+  private async holdsDefaultFromBeforeUserKeys(): Promise<boolean> {
+    try {
+      if (!(await this.tenant.hasDecryptionKey(DEFAULT_TENANT_KEY_ID))) return false;
+      const directory = await this.directory();
+      if (typeof directory.isKeyDistributedViaUserKey !== "function") return false;
+      const username = (await this.tenant.getCurrentUserId()).username;
+      return !(await directory.isKeyDistributedViaUserKey(DEFAULT_TENANT_KEY_ID, username));
+    } catch {
+      return false;
     }
   }
 

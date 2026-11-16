@@ -214,6 +214,15 @@ export interface ServerConfig {
    * Off when omitted. HTTP listen stays unchanged.
    */
   iroh?: ServerIrohConfig;
+  /** Limits of the join-request inbox (docs/invitations.md). */
+  joinRequests?: {
+    /** Requests per client IP and hour. Default 5. */
+    maxRequestsPerIpPerHour?: number;
+    /** Pending requests per tenant. Default 500. */
+    maxPendingPerTenant?: number;
+    /** Pending requests over all tenants. Default 10 000. */
+    maxPendingServerWide?: number;
+  };
 }
 
 /** Optional Iroh listen settings in config.json. Default is disabled. */
@@ -280,6 +289,12 @@ export const ENV_VARS = {
    * pointed at internal services (SSRF). Enable only for local development.
    */
   ALLOW_INSECURE_SYNC_URLS: "MINDOODB_ALLOW_INSECURE_SYNC_URLS",
+  /**
+   * Minutes after which a tenant nobody used is unloaded from memory (its
+   * stores, their metadata indexes and its directory); the next request loads
+   * it again. Default 30, `0` keeps every loaded tenant until restart.
+   */
+  TENANT_IDLE_MINUTES: "MINDOODB_TENANT_IDLE_MINUTES",
   /**
    * Comma-separated RFC 3161 Time-Stamping Authorities the proxy at
    * `POST /:tenantId/timestamps/rfc3161` may contact. Each entry is a built-in

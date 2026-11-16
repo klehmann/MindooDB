@@ -763,6 +763,18 @@ export interface ConnectToServerOptions {
   irohTicket?: string;
   /** Byte-stream adapter used instead of HTTP. */
   irohStreamIO?: import("./appendonlystores/network/IrohStreamIO").IrohStreamIO;
+  /**
+   * Authenticate as another key pair than the current user's device, e.g. an
+   * admin key for the admin-only `joinrequests` database (docs/invitations.md).
+   * The server resolves the principal from `signingPublicKey`.
+   */
+  authAs?: {
+    signingPublicKey: string;
+    signingKey: CryptoKey;
+    encryptionKey: CryptoKey;
+    /** Name sent with the challenge; the server falls back to the key. */
+    username?: string;
+  };
 }
 
 /**
@@ -1086,7 +1098,8 @@ export interface MindooTenant {
    */
   verifyEntrySignature(
     entry: StoreEntryMetadata,
-    encryptedData: Uint8Array
+    encryptedData: Uint8Array,
+    options?: { dbId?: string },
   ): Promise<boolean>;
 
   /**
@@ -1333,6 +1346,40 @@ export interface MindooTenant {
       certificate: import("./userkeys/deviceCertificate").DeviceCertificatePayload;
     }>
   >;
+  /**
+   * Name recovery contacts (docs/userkeys.md §12): any two of them can later
+   * help this person onto a new device. Needs device self-grant. Replaces an
+   * earlier setup and withdraws its rescue device.
+   */
+  setupRecoveryContacts?(
+    contacts: string[],
+    options?: import("./recovery/RecoveryContactsManager").SetupRecoveryContactsOptions,
+  ): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup>;
+  /** This person's current recovery contacts, or `null`. */
+  getRecoveryContactsSetup?(): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup | null>;
+  /** Remove the recovery contacts and withdraw the rescue device. */
+  removeRecoveryContacts?(options?: { withdrawRescueDevices?: string[] }): Promise<number>;
+  /** People who named this person as a recovery contact. */
+  listRecoveryContactRequests?(): Promise<import("./recovery/RecoveryContactsManager").RecoveryContactRequest[]>;
+  /** This contact's share for `person` (username or setup id), as a plaintext package. */
+  createRecoveryHelperPackage?(
+    person: string,
+    options?: { serverUrl?: string },
+  ): Promise<import("./recovery/recoveryPackage").RecoveryHelperPackage>;
+  /** Whether this device holds the granted self-grant key (docs/userkeys.md §9.6). */
+  canIssueDeviceCertificates?(): Promise<boolean>;
+  /** Signing keys of every verified rescue device in the tenant, by person. */
+  listRescueDeviceSigningKeys?(): Promise<Array<{ username: string; signingPublicKey: string }>>;
+  /**
+   * A new paper rescue device for a printed recovery sheet (docs/userkeys.md
+   * §12.8): certified like any device, its secret goes onto the sheet. Earlier
+   * paper rescue devices of this person are withdrawn. Needs device self-grant.
+   */
+  createPaperRescueDevice?(options?: { label?: string }): Promise<import("./recovery/PaperRescueDevice").PaperRescueSecret>;
+  /** This person's paper rescue devices (public half). */
+  listPaperRescueDevices?(): Promise<import("./recovery/PaperRescueDevice").PaperRescueRecord[]>;
+  /** Withdraw every paper rescue device of this person. */
+  removePaperRescueDevices?(): Promise<number>;
   reconcileUserKeys?(options?: { allowSelfCreate?: boolean }): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   getUserKeyEnrollmentStatus?(): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   noteUserDirectoryFetched?(): void;
@@ -3870,6 +3917,19 @@ export interface MindooTenantDirectory {
    * @returns True when the key may act as an administrator at `T`.
    */
   isAdminAt?(signingKey: string, T: number): Promise<boolean>;
+
+  /**
+   * Whether the signer of a stored entry counts as a tenant admin for that
+   * entry (docs/accesscontrol.md §6.13): the root always; a delegated admin key
+   * when it was an admin at the entry's witness time (the receipt is
+   * verified), so what it signed inside its window stays valid after a
+   * deactivation and an entry stamped in a gap never counts. An entry without a
+   * receipt counts only when this process signed it and the key is an admin now.
+   *
+   * @param entry Metadata of the entry, with its witness receipt fields.
+   * @param dbid Database the entry belongs to (part of the signed receipt).
+   */
+  isAdminSignedEntry?(entry: StoreEntryMetadata, dbid: string): Promise<boolean>;
 
   /**
    * The delegated admin keys at the directory head, with window, name and

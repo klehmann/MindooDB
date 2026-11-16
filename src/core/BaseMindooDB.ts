@@ -119,6 +119,7 @@ import {
 import { commonUpdateBaseHeads } from "./types";
 import type { BuiltinIngestEntry } from "./types";
 import { BaseMindooTenant } from "./BaseMindooTenant";
+import { JOIN_REQUESTS_DB_ID } from "./joinrequests/types";
 import { StoreKind } from "./appendonlystores/types";
 import type {
   ContentAddressedStore,
@@ -1319,6 +1320,10 @@ export class BaseMindooDB implements MindooDB {
     if (signerIsAdmin && !this.isAdminKey(signerPublicKey)) {
       this.tenant.noteLocalSigningKey(signerPublicKey);
     }
+    const signerIsJoinRequestServer =
+      dbId === JOIN_REQUESTS_DB_ID
+        ? await (this.tenant as BaseMindooTenant).isJoinRequestServerKey(signerPublicKey)
+        : false;
     const decision = evaluateBuiltinWrite({
       dbId,
       op,
@@ -1329,6 +1334,7 @@ export class BaseMindooDB implements MindooDB {
       signerUsernameHash,
       docId,
       creatorUsernameHash,
+      signerIsJoinRequestServer,
     });
     if (!decision.allowed) {
       throw new Error(decision.reason);
@@ -1374,10 +1380,16 @@ export class BaseMindooDB implements MindooDB {
     // write), so the store lookup is skipped for everything else.
     const signerIsAdmin =
       dbId === DIRECTORY_DB_ID ||
+      dbId === JOIN_REQUESTS_DB_ID ||
       (dbId === USER_DIRECTORY_DB_ID && (entryType === "doc_delete" || entryType === "doc_undelete"))
         ? await this.builtinSignerIsAdmin(entry, { allowLocalUnwitnessed: true })
         : false;
+    const signerIsJoinRequestServer =
+      dbId === JOIN_REQUESTS_DB_ID && !signerIsAdmin
+        ? await (this.tenant as BaseMindooTenant).isJoinRequestServerKey(entry.createdByPublicKey)
+        : false;
     return shouldSkipLoadedEntry({
+      signerIsJoinRequestServer,
       dbId,
       entryType,
       signerKey: entry.createdByPublicKey,
@@ -1482,6 +1494,10 @@ export class BaseMindooDB implements MindooDB {
       signerUsernameHash,
       docId: entry.docId,
       creatorUsernameHash,
+      signerIsJoinRequestServer:
+        dbId === JOIN_REQUESTS_DB_ID
+          ? await (this.tenant as BaseMindooTenant).isJoinRequestServerKey(entry.createdByPublicKey)
+          : false,
     });
     return decision.allowed ? null : decision.reason;
   }
@@ -3142,6 +3158,11 @@ export class BaseMindooDB implements MindooDB {
    * directory node covering that time, or the tenant admin key). Callers that
    * omit it keep the historical HEAD check via `validatePublicSigningKey`.
    */
+  /** Entry signature check that knows this database (join-request trust, docs/invitations.md). */
+  private verifyEntrySignatureForDb(entry: StoreEntryMetadata, encryptedData: Uint8Array): Promise<boolean> {
+    return this.tenant.verifyEntrySignature(entry, encryptedData, { dbId: this.store.getId() });
+  }
+
   private async getOrImportPublicKey(
     publicKey: string,
     trustedTime?: number,
@@ -3168,6 +3189,9 @@ export class BaseMindooDB implements MindooDB {
       }
     } else {
       isTrusted = await directory.validatePublicSigningKey(publicKey);
+    }
+    if (!isTrusted && this.store.getId() === JOIN_REQUESTS_DB_ID) {
+      isTrusted = await (this.tenant as BaseMindooTenant).isJoinRequestServerKey(publicKey);
     }
     if (!isTrusted) {
       this.logger.warn(`Public key not trusted: ${publicKey}`);
@@ -6901,7 +6925,7 @@ export class BaseMindooDB implements MindooDB {
             `Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`,
           );
         } else {
-          isValid = await this.tenant.verifyEntrySignature(
+          isValid = await this.verifyEntrySignatureForDb(
             snapshotData,
             snapshotData.encryptedData,
           );
@@ -6975,7 +6999,7 @@ export class BaseMindooDB implements MindooDB {
         continue;
       }
 
-      const isValid = await this.tenant.verifyEntrySignature(
+      const isValid = await this.verifyEntrySignatureForDb(
         entryData,
         entryData.encryptedData,
       );
@@ -7311,7 +7335,7 @@ export class BaseMindooDB implements MindooDB {
       }
 
       // Verify signature
-      const isValid = await this.tenant.verifyEntrySignature(
+      const isValid = await this.verifyEntrySignatureForDb(
         entryData,
         entryData.encryptedData,
       );
@@ -7757,7 +7781,7 @@ export class BaseMindooDB implements MindooDB {
         );
         const prepared = await Promise.all(
           batch.map(async (entry) => {
-            const isValid = await this.tenant.verifyEntrySignature(
+            const isValid = await this.verifyEntrySignatureForDb(
               entry,
               entry.encryptedData,
             );
@@ -7978,7 +8002,7 @@ export class BaseMindooDB implements MindooDB {
       );
       return null;
     }
-    const isValid = await this.tenant.verifyEntrySignature(
+    const isValid = await this.verifyEntrySignatureForDb(
       snapshotData,
       snapshotData.encryptedData,
     );
@@ -8044,7 +8068,7 @@ export class BaseMindooDB implements MindooDB {
         );
         continue;
       }
-      const isValid = await this.tenant.verifyEntrySignature(
+      const isValid = await this.verifyEntrySignatureForDb(
         entryData,
         entryData.encryptedData,
       );
@@ -8134,7 +8158,7 @@ export class BaseMindooDB implements MindooDB {
     entry: StoreEntry,
   ): Promise<ChangeAttribution | undefined> {
     try {
-      if (!(await this.tenant.verifyEntrySignature(entry, entry.encryptedData))) {
+      if (!(await this.verifyEntrySignatureForDb(entry, entry.encryptedData))) {
         return undefined;
       }
       const payload = await this.tenant.decryptPayload(
@@ -8287,7 +8311,7 @@ export class BaseMindooDB implements MindooDB {
         result.set(metadata.id, null);
         continue;
       }
-      const isValid = await this.tenant.verifyEntrySignature(
+      const isValid = await this.verifyEntrySignatureForDb(
         entry,
         entry.encryptedData,
       );
@@ -8808,7 +8832,7 @@ export class BaseMindooDB implements MindooDB {
             `Admin-only DB: skipping DAG details for ${entry.id} not signed by admin key`,
           );
         } else {
-          isValid = await this.tenant.verifyEntrySignature(
+          isValid = await this.verifyEntrySignatureForDb(
             entry,
             entry.encryptedData,
           );
@@ -9717,7 +9741,7 @@ export class BaseMindooDB implements MindooDB {
         );
         continue;
       }
-      const isValid = await this.tenant.verifyEntrySignature(
+      const isValid = await this.verifyEntrySignatureForDb(
         entry,
         entry.encryptedData,
       );
@@ -14592,7 +14616,7 @@ export class BaseMindooDB implements MindooDB {
             `Admin-only DB: skipping snapshot ${snapshotData.id} not signed by admin key`,
           );
         } else {
-          isValid = await this.tenant.verifyEntrySignature(
+          isValid = await this.verifyEntrySignatureForDb(
             snapshotData,
             snapshotData.encryptedData,
           );
@@ -14659,7 +14683,7 @@ export class BaseMindooDB implements MindooDB {
         );
         continue;
       }
-      const isValid = await this.tenant.verifyEntrySignature(
+      const isValid = await this.verifyEntrySignatureForDb(
         entryData,
         entryData.encryptedData,
       );
@@ -17287,7 +17311,7 @@ export class BaseMindooDB implements MindooDB {
           // Verify signature against the encrypted snapshot (no decryption needed)
           // We sign the encrypted payload, so anyone can verify signatures without decryption keys
           const signatureStartedAt = Date.now();
-          isValid = await this.tenant.verifyEntrySignature(
+          isValid = await this.verifyEntrySignatureForDb(
             snapshotData,
             snapshotData.encryptedData,
           );
@@ -18006,7 +18030,7 @@ export class BaseMindooDB implements MindooDB {
       );
     }
 
-    const isValid = await this.tenant.verifyEntrySignature(
+    const isValid = await this.verifyEntrySignatureForDb(
       chunk,
       chunk.encryptedData,
     );

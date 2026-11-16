@@ -1,3 +1,4 @@
+import { INVITATION_DOC_ID_PREFIX, JOIN_REQUESTS_DB_ID } from "./joinrequests/types";
 import {
   MindooTenant,
   EncryptedPrivateKey,
@@ -31,6 +32,8 @@ import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { extractRevokedKeyPairs, extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
+import { PaperRescueManager } from "./recovery/PaperRescueDevice";
+import { RecoveryContactsManager } from "./recovery/RecoveryContactsManager";
 import { UserKeyManager } from "./userkeys/UserKeyManager";
 import type {
   PendingUserKeyDevice,
@@ -173,6 +176,8 @@ export class BaseMindooTenant implements MindooTenant {
   /** Fire-and-forget work of this tenant; see {@link whenBackgroundIdle}. */
   private readonly backgroundTasks = new BackgroundTaskTracker();
   private readonly userKeys = new UserKeyManager(this);
+  private readonly recoveryContacts = new RecoveryContactsManager(this, this.userKeys);
+  private readonly paperRescue = new PaperRescueManager(this, this.userKeys);
   private readonly sealedGenerations = new Map<string, Uint8Array[]>();
   /** Per sealed key id: the bundle of the recipient block last opened. */
   private readonly sealedBlocks = new Map<string, string>();
@@ -539,6 +544,60 @@ export class BaseMindooTenant implements MindooTenant {
     }>
   > {
     return this.userKeys.listOwnDeviceCertificates();
+  }
+
+  // ==================== Recovery contacts (docs/userkeys.md §12) ====================
+
+  async setupRecoveryContacts(
+    contacts: string[],
+    options?: import("./recovery/RecoveryContactsManager").SetupRecoveryContactsOptions,
+  ): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup> {
+    return this.recoveryContacts.setup(contacts, options);
+  }
+
+  async getRecoveryContactsSetup(): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup | null> {
+    return this.recoveryContacts.getSetup();
+  }
+
+  async removeRecoveryContacts(options?: { withdrawRescueDevices?: string[] }): Promise<number> {
+    return this.recoveryContacts.remove(options);
+  }
+
+  async listRecoveryContactRequests(): Promise<import("./recovery/RecoveryContactsManager").RecoveryContactRequest[]> {
+    return this.recoveryContacts.listRequests();
+  }
+
+  async createRecoveryHelperPackage(
+    person: string,
+    options?: { serverUrl?: string },
+  ): Promise<import("./recovery/recoveryPackage").RecoveryHelperPackage> {
+    return this.recoveryContacts.createHelperPackage(person, options);
+  }
+
+  async canIssueDeviceCertificates(): Promise<boolean> {
+    return this.userKeys.canIssueDeviceCertificates();
+  }
+
+  async listRescueDeviceSigningKeys(): Promise<Array<{ username: string; signingPublicKey: string }>> {
+    const paper = (await this.paperRescue.listAll()).map((r) => ({
+      username: r.payload.username,
+      signingPublicKey: r.payload.rescueDevice.signingPublicKey,
+    }));
+    return [...(await this.recoveryContacts.rescueDeviceSigningKeys()), ...paper];
+  }
+
+  async createPaperRescueDevice(options?: {
+    label?: string;
+  }): Promise<import("./recovery/PaperRescueDevice").PaperRescueSecret> {
+    return this.paperRescue.create(options);
+  }
+
+  async listPaperRescueDevices(): Promise<import("./recovery/PaperRescueDevice").PaperRescueRecord[]> {
+    return this.paperRescue.list();
+  }
+
+  async removePaperRescueDevices(): Promise<number> {
+    return this.paperRescue.remove();
   }
 
   async reconcileUserKeys(options?: { allowSelfCreate?: boolean }): Promise<UserKeyEnrollmentStatus> {
@@ -1328,7 +1387,60 @@ export class BaseMindooTenant implements MindooTenant {
     return cryptoKey;
   }
 
-  async verifyEntrySignature(entry: StoreEntryMetadata, encryptedData: Uint8Array): Promise<boolean> {
+  /** Server keys allowed to sign `jr_` documents, cached briefly (docs/invitations.md). */
+  private joinRequestServerKeys: { loadedAt: number; keys: Set<string> } | null = null;
+
+  /**
+   * Whether `publicKey` may sign join-request documents in `joinrequests`
+   * (docs/invitations.md): a trusted witness of the tenant, or the server an
+   * admin named in an invitation (`serverSigningPublicKey` of an `invite_`
+   * document in `directory`). Never consulted for any other database.
+   */
+  async isJoinRequestServerKey(publicKey: string): Promise<boolean> {
+    const normalized = publicKey.replace(/\s+/g, "");
+    const now = Date.now();
+    const lookup = async (): Promise<Set<string>> => {
+      const keys = new Set<string>();
+      const directory = await this.openDirectory();
+      try {
+        if (typeof directory.getTrustedWitnessKeysAt === "function") {
+          for (const key of await directory.getTrustedWitnessKeysAt(Number.MAX_SAFE_INTEGER)) {
+            keys.add(key.replace(/\s+/g, ""));
+          }
+        }
+      } catch (error) {
+        this.logger.debug(`isJoinRequestServerKey: witness lookup failed: ${error}`);
+      }
+      try {
+        const directoryDb = await this.openDB(DIRECTORY_DB_ID, { adminOnlyDb: true });
+        for (const docId of await directoryDb.getAllDocumentIds()) {
+          if (!docId.startsWith(INVITATION_DOC_ID_PREFIX)) continue;
+          const doc = await directoryDb.getDocument(docId).catch(() => null);
+          const key = doc?.getData()?.serverSigningPublicKey;
+          if (typeof key === "string" && key) keys.add(key.replace(/\s+/g, ""));
+        }
+      } catch (error) {
+        this.logger.debug(`isJoinRequestServerKey: invitation lookup failed: ${error}`);
+      }
+      return keys;
+    };
+    if (!this.joinRequestServerKeys || now - this.joinRequestServerKeys.loadedAt > 30_000) {
+      this.joinRequestServerKeys = { loadedAt: now, keys: await lookup() };
+    }
+    if (this.joinRequestServerKeys.keys.has(normalized)) return true;
+    // A just-synced invitation: refresh once, at most every few seconds.
+    if (now - this.joinRequestServerKeys.loadedAt > 3_000) {
+      this.joinRequestServerKeys = { loadedAt: now, keys: await lookup() };
+      return this.joinRequestServerKeys.keys.has(normalized);
+    }
+    return false;
+  }
+
+  async verifyEntrySignature(
+    entry: StoreEntryMetadata,
+    encryptedData: Uint8Array,
+    options?: { dbId?: string },
+  ): Promise<boolean> {
     // The author key must be trusted by the tenant directory.
     const directory = await this.openDirectory();
     // A delegated admin key (docs/accesscontrol.md §6.13) holds no grant. It is
@@ -1345,6 +1457,9 @@ export class BaseMindooTenant implements MindooTenant {
         (await this.isAdminSigningKeyAt(entry.createdByPublicKey, entry.receivedAt ?? semanticNow())));
     if (!isTrusted) {
       isTrusted = await directory.validatePublicSigningKey(entry.createdByPublicKey);
+    }
+    if (!isTrusted && options?.dbId === JOIN_REQUESTS_DB_ID) {
+      isTrusted = await this.isJoinRequestServerKey(entry.createdByPublicKey);
     }
     if (!isTrusted) {
       this.logger.warn(`Public key not trusted: ${entry.createdByPublicKey}`);
@@ -1600,6 +1715,10 @@ export class BaseMindooTenant implements MindooTenant {
 
     const currentUser = await this.getCurrentUserId();
     if (await this.isAdminSigningKeyAt(currentUser.userSigningPublicKey, semanticNow())) {
+      return;
+    }
+    // The server's own tenant instance stores join requests (docs/invitations.md).
+    if (id === JOIN_REQUESTS_DB_ID && (await this.isJoinRequestServerKey(currentUser.userSigningPublicKey))) {
       return;
     }
 
@@ -2910,7 +3029,9 @@ export class BaseMindooTenant implements MindooTenant {
 
     const normalizedServerUrl = serverUrl.replace(/\/$/, "");
     const irohTarget = this.resolveIrohDial(serverUrl, options);
-    const cacheKey = `${normalizedServerUrl}::${validDbId}::${storeKind}${irohTarget ? `::iroh:${irohTarget.ticket}` : ""}`;
+    const cacheKey = `${normalizedServerUrl}::${validDbId}::${storeKind}${irohTarget ? `::iroh:${irohTarget.ticket}` : ""}${
+      options?.authAs ? `::as:${options.authAs.signingPublicKey.replace(/\s+/g, "")}` : ""
+    }`;
     const cachedStore = this.remoteStoreCache.get(cacheKey);
     if (cachedStore) {
       this.logger.debug(`Reusing cached remote store for ${normalizedServerUrl}, db: ${validDbId}`);
@@ -2949,11 +3070,12 @@ export class BaseMindooTenant implements MindooTenant {
             this.logger.createChild("HttpTransport"),
           );
 
-      // Get the current user's decrypted signing key
-      const signingKey = await this.getDecryptedSigningKey();
+      // Get the current user's decrypted signing key (or the override's)
+      const authAs = options?.authAs;
+      const signingKey = authAs ? authAs.signingKey : await this.getDecryptedSigningKey();
 
       // Get the current user's decrypted RSA encryption private key (for decrypting entries)
-      const decryptedEncryptionKey = await this.getDecryptedEncryptionKey();
+      const decryptedEncryptionKey = authAs ? authAs.encryptionKey : await this.getDecryptedEncryptionKey();
 
       // Create the client network store. Pass the device signing public key so
       // auth challenges can identify this specific device on multi-device grants.
@@ -2962,11 +3084,11 @@ export class BaseMindooTenant implements MindooTenant {
         storeKind,
         transport,
         this.cryptoAdapter,
-        this.currentUser.username,
+        authAs ? (authAs.username ?? `$adminkey:${authAs.signingPublicKey.replace(/\s+/g, "")}`) : this.currentUser.username,
         signingKey,
         decryptedEncryptionKey,
         this.logger.createChild(`ClientNetworkStore:${validDbId}:${storeKind}`),
-        this.currentUser.userSigningKeyPair.publicKey,
+        authAs ? authAs.signingPublicKey : this.currentUser.userSigningKeyPair.publicKey,
       );
 
       console.log(`[connectToServer] ✓ Connected to server for db "${validDbId}"`);

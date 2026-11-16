@@ -57,6 +57,7 @@ import { sealedKeyId } from "../../core/userkeys/sealedTypes";
 import { StoreKind } from "../../core/types";
 import { signingKeysEqual } from "../../core/accesscontrol/DirectoryStateNode";
 import { isRootOnlyDirectoryDocId } from "../../core/accesscontrol/adminKeys";
+import { evaluateJoinRequestsWrite } from "../../core/builtinDbInvariants";
 
 /**
  * Server-side Tier 1 access evaluator (docs/accesscontrol.md §7). Given a
@@ -295,6 +296,18 @@ export interface ServerAccessControlOptions {
    * `"directory"` store.
    */
   directoryAdminCheck?: ServerDirectoryAdminCheck;
+  /**
+   * Write rule for pushes into `joinrequests` (docs/invitations.md): creates
+   * only by a join-request server key, changes and undeletes only by admins,
+   * deletes by either. Only wired for the `"joinrequests"` store.
+   */
+  joinRequestsWriteCheck?: ServerJoinRequestsWriteCheck;
+}
+
+/** See {@link ServerAccessControlOptions.joinRequestsWriteCheck}. */
+export interface ServerJoinRequestsWriteCheck {
+  isAdminAt: (signingKey: string, T: number) => Promise<boolean>;
+  isJoinRequestServerKey: (signingKey: string) => Promise<boolean>;
 }
 
 /** See {@link ServerAccessControlOptions.directoryAdminCheck}. */
@@ -365,6 +378,7 @@ export class ServerNetworkContentAddressedStore {
   /** Optional builtin write-invariant context for `userdirectory`. */
   private builtinWriteContext?: BuiltinWriteContext;
   private directoryAdminCheck?: ServerDirectoryAdminCheck;
+  private joinRequestsWriteCheck?: ServerJoinRequestsWriteCheck;
   /** Optional peer-token resolver enabling server-to-server replication. */
   private peerTokenResolver?: ServerPeerTokenResolver;
   /** Optional trusted-witness check used to preserve replicated receipts. */
@@ -430,6 +444,7 @@ export class ServerNetworkContentAddressedStore {
     this.purgedDocResolver = accessControl?.purgedDocResolver;
     this.builtinWriteContext = accessControl?.builtinWriteContext;
     this.directoryAdminCheck = accessControl?.directoryAdminCheck;
+    this.joinRequestsWriteCheck = accessControl?.joinRequestsWriteCheck;
     this.peerTokenResolver = accessControl?.peerTokenResolver;
     this.trustedWitnessResolver = accessControl?.trustedWitnessResolver;
     this.readScopeResolver = accessControl?.readScopeResolver;
@@ -1291,6 +1306,24 @@ export class ServerNetworkContentAddressedStore {
         if (stored) {
           stampedMetadata.push(stored);
           continue;
+        }
+      }
+
+      // Join requests (docs/invitations.md): the server creates, admins decide.
+      if (this.joinRequestsWriteCheck) {
+        const op = entryTypeToBuiltinOp(entry.entryType);
+        const T = peerIngest && this.hasWitnessReceipt(entry) ? entry.receivedAt! : receivedAt;
+        if (op) {
+          const decision = evaluateJoinRequestsWrite({
+            op,
+            docId: entry.docId,
+            signerIsAdmin: await this.joinRequestsWriteCheck.isAdminAt(entry.createdByPublicKey, T),
+            signerIsJoinRequestServer: await this.joinRequestsWriteCheck.isJoinRequestServerKey(entry.createdByPublicKey),
+          });
+          if (!decision.allowed) {
+            this.rejectEntry(rejected, entry.id, `Entry ${entry.id}: ${decision.reason}`, "policy");
+            continue;
+          }
         }
       }
 

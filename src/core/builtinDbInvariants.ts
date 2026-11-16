@@ -2,6 +2,7 @@ import { Automerge } from "./automerge-adapter";
 import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
 import { isRootOnlyDirectoryDocId } from "./accesscontrol/adminKeys";
 import { DIRECTORY_DB_ID, USER_DIRECTORY_DB_ID } from "./types";
+import { JOIN_REQUESTS_DB_ID, JOIN_REQUEST_DOC_ID_PREFIX } from "./joinrequests/types";
 
 /**
  * Builtin database write invariants that hold even when the ACL master switch
@@ -41,6 +42,11 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * `dcert_` — a device certificate the person issued with their device
  *   self-grant key (docs/userkeys.md §9.6), encrypted with `$publicinfos` so
  *   the server can verify it.
+ * `rcv_` — a person's recovery contacts (docs/userkeys.md §12): the
+ *   encrypted rescue device and one sealed secret share per contact,
+ *   encrypted with the tenant `default` key.
+ * `rpp_` — the public half of a person's paper rescue device (docs/userkeys.md
+ *   §12.8), so a new printout can withdraw the previous one.
  *
  * They differ in who may *read* them, which this rule does not care about:
  * `wks_` documents are sealed to their owner, while `dev_` and `qtn_` are
@@ -48,7 +54,7 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * and audit refused writes while the hoster still sees ciphertext. Ownership is
  * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {
@@ -83,6 +89,12 @@ export interface BuiltinWriteInput {
    * Ownership of a personal document, resolvable without decrypting it.
    */
   creatorUsernameHash?: string | null;
+  /**
+   * `joinrequests` only: whether the signer is a server allowed to store join
+   * requests — a trusted witness, or the server named by an invitation
+   * (docs/invitations.md). Resolved by the caller.
+   */
+  signerIsJoinRequestServer?: boolean;
 }
 
 export interface BuiltinWriteDecision {
@@ -146,7 +158,37 @@ export function personalDatabaseOwner(
 }
 
 export function hasBuiltinWriteInvariant(dbId: string): boolean {
-  return dbId === DIRECTORY_DB_ID || dbId === USER_DIRECTORY_DB_ID;
+  return dbId === DIRECTORY_DB_ID || dbId === USER_DIRECTORY_DB_ID || dbId === JOIN_REQUESTS_DB_ID;
+}
+
+/**
+ * `joinrequests` (docs/invitations.md): the server creates `jr_` documents
+ * (signed with its own key, which the tenant trusts as a witness or names in
+ * an invitation); only admins change them (status) or undelete; admins and
+ * the server delete. Nobody else writes at all.
+ */
+export function evaluateJoinRequestsWrite(input: {
+  op: BuiltinWriteOp;
+  docId?: string;
+  signerIsAdmin: boolean;
+  signerIsJoinRequestServer: boolean;
+}): BuiltinWriteDecision {
+  if (input.op === "doc_create") {
+    if (!input.docId || !input.docId.startsWith(JOIN_REQUEST_DOC_ID_PREFIX)) {
+      return { allowed: false, reason: `joinrequests: document ids must start with "${JOIN_REQUEST_DOC_ID_PREFIX}"` };
+    }
+    return input.signerIsJoinRequestServer
+      ? { allowed: true, reason: "joinrequests server create" }
+      : { allowed: false, reason: "joinrequests: only the server stores join requests" };
+  }
+  if (input.op === "doc_delete") {
+    return input.signerIsAdmin || input.signerIsJoinRequestServer
+      ? { allowed: true, reason: "joinrequests delete" }
+      : { allowed: false, reason: "joinrequests: only an admin or the server can delete" };
+  }
+  return input.signerIsAdmin
+    ? { allowed: true, reason: `joinrequests admin ${input.op}` }
+    : { allowed: false, reason: "joinrequests: only an admin can change a join request" };
 }
 
 /** Whether the signer of a builtin write counts as a tenant admin (root or delegated). */
@@ -156,6 +198,14 @@ function signerIsAdmin(input: { signerKey: string; adminPublicKey: string; signe
 }
 
 export function evaluateBuiltinWrite(input: BuiltinWriteInput): BuiltinWriteDecision {
+  if (input.dbId === JOIN_REQUESTS_DB_ID) {
+    return evaluateJoinRequestsWrite({
+      op: input.op,
+      docId: input.docId,
+      signerIsAdmin: signerIsAdmin(input),
+      signerIsJoinRequestServer: input.signerIsJoinRequestServer === true,
+    });
+  }
   if (input.dbId === DIRECTORY_DB_ID) {
     if (!signerIsAdmin(input)) {
       return { allowed: false, reason: "Admin-only database: only the admin key can modify data" };
@@ -383,7 +433,19 @@ export function shouldSkipLoadedEntry(input: {
   signerUsernameHash?: string | null;
   docId?: string;
   creatorUsernameHash?: string | null;
+  /** See {@link BuiltinWriteInput.signerIsJoinRequestServer}. */
+  signerIsJoinRequestServer?: boolean;
 }): boolean {
+  if (input.dbId === JOIN_REQUESTS_DB_ID) {
+    const op = entryTypeToBuiltinOp(input.entryType);
+    if (!op) return false;
+    return !evaluateJoinRequestsWrite({
+      op,
+      docId: input.docId,
+      signerIsAdmin: signerIsAdmin(input),
+      signerIsJoinRequestServer: input.signerIsJoinRequestServer === true,
+    }).allowed;
+  }
   if (input.dbId === DIRECTORY_DB_ID) {
     if (!signerIsAdmin(input)) return true;
     return !signingKeysEqual(input.signerKey, input.adminPublicKey) && isRootOnlyDirectoryDocId(input.docId);

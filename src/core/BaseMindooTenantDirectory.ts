@@ -1,3 +1,4 @@
+import { JOIN_REQUESTS_DB_ID } from "./joinrequests/types";
 import {
   DEFAULT_TENANT_KEY_ID,
   type DeviceSelfGrant,
@@ -992,6 +993,16 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    */
   async isAdminSigningKeyAt(signingKey: string, T: number): Promise<boolean> {
     return (this.tenant as BaseMindooTenant).isAdminSigningKeyAt(signingKey, adminDecisionTime(T, semanticNow()));
+  }
+
+  /** See {@link MindooTenantDirectory.isAdminSignedEntry}. */
+  async isAdminSignedEntry(entry: StoreEntryMetadata, dbid: string): Promise<boolean> {
+    if (signingKeysEqual(entry.createdByPublicKey, this.getRootAdminPublicKey())) return true;
+    const directoryDB = await this.getDirectoryDB();
+    const decision = await (this.tenant as BaseMindooTenant)
+      .getDirectoryAdminResolver(directoryDB.getStore())
+      .judgeEntry(entry, { dbid, allowLocalUnwitnessed: true });
+    return decision.allowed;
   }
 
   /**
@@ -2464,6 +2475,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     dbid: string;
     signingKey: string;
   }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason?: string }> {
+    // Join requests (docs/invitations.md): tenant admins only, whatever a
+    // policy says. The server writes there with its own key, not via sync.
+    if (input.dbid === JOIN_REQUESTS_DB_ID) {
+      return (await this.isAdminKeyNow(input.signingKey))
+        ? { mode: "read", reason: "tenant admin" }
+        : { mode: "none", reason: "joinrequests: tenant admins only" };
+    }
     // Built-in personal-database invariant (§6.11): decides first, and a
     // configured policy can only take away what it grants.
     const personal = await this.evaluatePersonalDatabaseAccess(input);
@@ -3656,6 +3674,30 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       username_hash: await this.hashUsernameForWrite(username),
       devices: { [fingerprint]: wrappedByVersion },
     };
+  }
+
+  /**
+   * Whether the distribution of `keyId` reaches `username` through a User-Key:
+   * one of their wrap entries is addressed to a fingerprint that is not an
+   * encryption key of their own grant devices. False when the person is not in
+   * `pushto`, has no wrap entries, or only has per-device wraps from before
+   * User-Keys (docs/userkeys.md §4.5).
+   */
+  async isKeyDistributedViaUserKey(keyId: string, username: string): Promise<boolean> {
+    await this.updateUnifiedCache();
+    const entry = this.keyDistributionCache.get(keyId);
+    if (!entry) return false;
+    const myHashes = new Set(await this.usernameHashCandidates(username));
+    const wrapFingerprints = Object.keys(entry.pushto_users_keys)
+      .map((entryKey) => entryKey.split("|"))
+      .filter(([hash, fingerprint]) => myHashes.has(hash) && Boolean(fingerprint))
+      .map(([, fingerprint]) => fingerprint);
+    if (wrapFingerprints.length === 0) return false;
+    const deviceFingerprints = new Set<string>();
+    for (const pem of await this.getUserEncryptionPublicKeys(username)) {
+      deviceFingerprints.add(await this.encryptionKeyFingerprint(pem));
+    }
+    return wrapFingerprints.some((fingerprint) => !deviceFingerprints.has(fingerprint));
   }
 
   /**

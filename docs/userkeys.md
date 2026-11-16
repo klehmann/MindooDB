@@ -308,6 +308,8 @@ A person whose devices predate user keys has several grant entries and no key do
 
 This is a deliberate one-time convenience: without it, every existing device of every existing user would need a manual approval before anything worked. The trade-off is that it trusts the grant as it stands at that moment. A device already on the grant when the key is first published is included; a device added afterwards is not, and falls back to Scenario C.
 
+This also holds when an administrator distributed `default` to that person before user keys existed. Such a distribution wraps `default` to each grant device rather than to a user key, so it is no sign of a key on another device. A device mints in that case only if it holds `default` itself and has fetched `userdirectory` in this session (or self-create was allowed for a local-only tenant); a device whose `default` would come through a user key keeps waiting for that key instead (`isKeyDistributedViaUserKey` on the directory tells the two apart). Two devices that mint at the same time converge on one key after the next sync.
+
 ### 4.6 What a waiting device should say
 
 A device that is on the grant but holds no wrap can detect this itself at startup: the key document exists and its own fingerprint is not in it. Rather than showing databases that look empty or broken, it should say what is happening and what to do — "This device can't open your personal data yet. Open the app on your other device and confirm this one."
@@ -656,7 +658,7 @@ That reframing answers most of the failure cases. Deleting the document costs on
 
 Because all of these repairs are idempotent, clients run them unconditionally. On every startup and after every `userdirectory` sync, a client compares the published state against the private key it holds and fixes the difference: republish if missing, undelete if tombstoned, add its own wrap if absent, drop wraps for devices no longer on the grant.
 
-**Losing every device is the one genuinely unrecoverable case.** If no device holds the private key, no wrap in the document can be opened. A replacement device may write to the same document and add a new generation for itself — once signed generations are required (section 9.3) only after the administrator deleted the old document — so nothing blocks recovery of the *account* — but content encrypted to the dead generations stays unreadable until it is written again. Flag those generations so your interface can explain the gap rather than showing broken content.
+**Losing every device is the one genuinely unrecoverable case** — unless the person named recovery contacts (section 12). If no device holds the private key, no wrap in the document can be opened. A replacement device may write to the same document and add a new generation for itself — once signed generations are required (section 9.3) only after the administrator deleted the old document — so nothing blocks recovery of the *account* — but content encrypted to the dead generations stays unreadable until it is written again. Flag those generations so your interface can explain the gap rather than showing broken content.
 
 This is also why deleting or purging an unopenable document would be actively harmful: the wraps of the dead generations are exactly what makes an old device backup valuable. Restore that device's identity and its wrap still opens the old key, and with it the whole history. Where your platform already has an identity backup mechanism, that mechanism is the user key recovery story too — a separate user-key recovery code would add a second secret with the same failure mode.
 
@@ -678,7 +680,7 @@ The key material itself is stored efficiently. Only entries that *change* the re
 
 ### 7.6 Personal documents
 
-Once documents can be sealed to a person, `userdirectory` becomes the natural home for a person's own data — the kind that should follow them between devices without any administrator provisioning a database for it. Three prefixes exist so far, and the shared property that makes `userdirectory` the right home is not privacy but **writability**: it is the one database where every member can create their own documents without anybody granting them anything.
+Once documents can be sealed to a person, `userdirectory` becomes the natural home for a person's own data — the kind that should follow them between devices without any administrator provisioning a database for it. Several prefixes exist, and the shared property that makes `userdirectory` the right home is not privacy but **writability**: it is the one database where every member can create their own documents without anybody granting them anything.
 
 | Prefix | What it is | Who may read it | Id |
 |---|---|---|---|
@@ -686,6 +688,8 @@ Once documents can be sealed to a person, `userdirectory` becomes the natural ho
 | `dev_` | Where a device can be dialled over Iroh (§7.6.1) | every member, via the tenant `default` key | derived from the device key fingerprint |
 | `qtn_` | A write the server turned away, kept so it can be found and offered again (§7.6.2) | every member, via the tenant `default` key | derived from author, database, document and rejection class |
 | `dcert_` | A device certificate the person issued with their self-grant key (§9.6) | every member and the sync server, via `$publicinfos` | derived from the certified device's signing-key fingerprint |
+| `rcv_` | The person's recovery contacts: encrypted rescue device and sealed shares (§12) | every member, via the tenant `default` key | generated |
+| `rpp_` | Public half of the person's paper rescue device (§12.8) | every member, via the tenant `default` key | generated |
 
 These documents need the opposite of what a key document needs. A key document is published: everybody must read it, and its owner is named inside it by `username_hash`. A personal document is not: it is encrypted so that the hoster cannot read it, which means ownership cannot be read out of the payload — exactly what the rule in section 7.2 does.
 
@@ -767,10 +771,10 @@ These are properties of the design, not defects to be fixed later. State them in
 - **Approval is only as strong as the human performing it.** A user who confirms a device without comparing fingerprints can authorize a planted one, handing over every key they hold at once.
 - **The first device is trusted on first use.** A trust chain rooted in a planted device is compromised from the start, and the initial publish wraps every device already on the grant.
 - **The policy plane stays administrator-trusted.** An administrator can still edit groups or add themselves to a distribution. User key addressing stops device planting, not malicious policy.
-- **A copied identity is the same device.** A restored backup, a paper recovery or an exported `.json` identity carries the same device keys, user key and self-grant key. Revoking or wiping that device hits every copy, and a stolen copy cannot be cut off alone (section 9.5).
+- **A copied identity is the same device.** A restored backup, a paper recovery made without a paper rescue device (section 12.8) or an exported `.json` identity carries the same device keys, user key and self-grant key. Revoking or wiping that device hits every copy, and a stolen copy cannot be cut off alone (section 9.5).
 - **An approved device can always export the private key.** This is an exfiltration path at the application layer, not a protocol flaw.
 - **An administrator can repeatedly purge a key document** as denial of service. It never grants read access.
-- **There is no administrator recovery.** User private keys are deliberately not wrapped to an administrator or a recovery quorum. If that is ever offered it must be opt-in and visually distinct from device approval, so that "approve my phone" is never confused with "give IT a copy".
+- **There is no administrator recovery.** User private keys are deliberately not wrapped to an administrator. The opt-in alternative is recovery contacts (section 12): colleagues the person picks, any two of whom can recover together. It is visually distinct from device approval, so that "approve my phone" is never confused with "give two colleagues a way in".
 
 ### 8.3 What each party can see
 
@@ -1190,3 +1194,170 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 - [network-sync-protocol.md](network-sync-protocol.md) — how encrypted entries move between devices and servers, and how device discovery works.
 - [attachments.md](attachments.md) — attachment encryption, which follows the document's key.
 - [specification.md](specification.md) — the underlying data model and entry format.
+
+---
+
+## 12) Recovery Contacts
+
+Section 7.4 calls losing every device "the one genuinely unrecoverable case", and section 8.2 says user keys are deliberately not wrapped to an administrator or a recovery quorum. Recovery contacts are the opt-in quorum that section asks for: a person names colleagues, and **any two of them together** can bring the person onto a new device. One contact alone can do nothing, and the administrator is not involved at all.
+
+### 12.1 The idea: a rescue device nobody holds
+
+The design adds no new kind of key and no new trust path. It reuses device certificates (section 9.6):
+
+1. The person's device creates a **rescue device**: an Ed25519 signing key and an RSA-OAEP 3072 encryption key, like any device.
+2. It certifies the rescue device with the person's self-grant key. From then on the rescue device receives the User-Key wraps of every generation and the self-grant key wrap like any approved device, `rotateUserKey()` keeps wrapping it, and key distributions to the User-Key reach it. A rescue device therefore never goes stale.
+3. Its private keys are encrypted with a fresh random 32-byte secret `K` (AES-256-GCM). `K` is split with Shamir's secret sharing into one share per contact, threshold 2, and each share is sealed (RSA-OAEP) to that contact's current User-Key.
+4. The encrypted rescue device and the sealed shares are published in a personal document `rcv_…` in `userdirectory`.
+
+Recovering means: two contacts each open their share and hand it over, the new device combines `K`, opens the rescue device, signs in to the server *as the rescue device*, and uses the self-grant key the rescue device holds to certify the new device. After that the new device is an ordinary device of the person.
+
+Because the rescue device is a certified device, everything section 9.6 says about certificates applies: it needs the person's device self-grant, the administrator can revoke and wipe it, and withdrawing its certificate (`revokeOwnDeviceCertificate`) ends it.
+
+### 12.2 The `rcv_` document
+
+```ts
+{
+  form: "userdirectory",
+  type: "recoverycontacts",
+  schemaVersion: 1,
+  username: string,                 // the person
+  username_hash: string,            // as on their grant
+  threshold: 2,
+  createdAt: number,
+  rescueDevice: {
+    signingPublicKey: string,
+    encryptionPublicKey: string,
+    signingKeyFingerprint: string,
+    certificateDocId: string,       // its dcert_ document
+  },
+  rescueBlob: string,               // base64 AES-256-GCM: Ed25519 seed + the two RSA primes, under K
+  contacts: Array<{
+    username: string,
+    userKeyFingerprint: string,     // the contact's User-Key generation the share is sealed to
+    sealedShare: string,            // base64 RSA-OAEP ciphertext of the share
+  }>,
+}
+```
+
+- **Prefix `rcv_`, generated ids.** `rcv_` is one of the personal-document prefixes (section 7.6), so only the person who created it may change it, and the person or the administrator may delete it.
+- **Encrypted with the tenant `default` key**, like `dev_` and `qtn_`. Contacts must read it to find their share. `$publicinfos` would tell the hoster who would vouch for whom, which is not its business. The recovering device never reads it: everything it needs travels in the packages.
+- **A document is a claim until verified.** `verifyRecoveryContactsDoc` accepts one only when its `doc_create` was signed by a device that resolves to the grant of the person it names (`resolveSignerToGrant`, grant device or certified device) and the named username hashes to that same `username_hash`. Anyone can create an `rcv_` document naming anyone; it is ignored.
+- **One setup per person.** A new contact list is a new rescue device with a new `K`: `setupRecoveryContacts` publishes the new document first and only then deletes the old one and withdraws the old rescue device. Contacts use the person's newest setup.
+- **The rescue blob is small on purpose.** It holds the 32-byte Ed25519 seed and the two 1536-bit RSA primes; modulus, private exponent, CRT values and both public keys are derived on recovery. The whole helper package stays around 1.3 KB of text and fits a QR code.
+
+### 12.3 Helping
+
+A contact's device lists the people who named it (`listRecoveryContactRequests`, matched by the fingerprints of the contact's own User-Key generations) and builds a package for one of them (`createRecoveryHelperPackage`):
+
+```ts
+{
+  v: 1, kind: "mindoodb-recovery-share",
+  tenantId, serverUrl?,             // where the tenant syncs, as the helper knows it
+  username, setupDocId, threshold,
+  rescueSigningKeyFingerprint, rescueBlob,
+  share,                            // the contact's Shamir share, base64
+  helper, createdAt,
+}
+```
+
+The share is unsealed with whichever of the contact's User-Key generations it was sealed to, so a contact who rotated their key since still helps. The package is encrypted with a one-time password before it leaves the device (`encryptRecoveryHelperPackage`): PBKDF2-SHA-256 with the default iteration count, AES-256-GCM, text form `mdbrescue1.<base64url>`. `generateRecoveryPackagePassword` makes a 12-character password from an alphabet without look-alikes (about 59 bits), shown as `abcd-efgh-jkmn`; case, spaces and dashes do not matter when it is typed. Package and password should travel separately.
+
+### 12.4 Recovering
+
+```ts
+const packages = [
+  await decryptRecoveryHelperPackage(crypto, textFromBob, passwordFromBob),
+  await decryptRecoveryHelperPackage(crypto, textFromCarol, passwordFromCarol),
+];
+const recovery = await combineRecoveryHelperPackages(crypto, packages);
+
+// New device keys, nothing on any grant yet.
+const user = await factory.createUserId(recovery.username, newPassword);
+await certifyDeviceWithRescueDevice({
+  cryptoAdapter: crypto,
+  recovery,
+  device: {
+    signingPublicKey: user.userSigningKeyPair.publicKey,
+    encryptionPublicKey: user.userEncryptionKeyPair.publicKey,
+  },
+  label: "New phone",
+});
+
+// From here on the new device is certified: join like any certified device.
+const [delivery] = (await factory.discoverTenantsOnServer(recovery.serverUrl!, { user, password: newPassword }))
+  .filter((d) => d.tenantId === recovery.tenantId);
+const { tenant } = await factory.bootstrapTenantFromDelivery(delivery, { user, password: newPassword, serverUrl: recovery.serverUrl });
+
+// The rescue device was opened on this device: replace it with a new one.
+const previous = await tenant.getRecoveryContactsSetup();
+await tenant.setupRecoveryContacts(previous!.payload.contacts.map((c) => c.username), {
+  withdrawRescueDevices: [recovery.rescueDevice.signingKeyFingerprint],
+});
+// Push userdirectory now: the withdrawal only counts once the server has it.
+```
+
+`combineRecoveryHelperPackages` refuses packages of different setups (`mismatch`), the same share twice (`duplicate`) and fewer than two packages (`too-few`). Below the threshold Shamir yields a wrong secret rather than an error; AES-GCM on the rescue blob is what turns that into `cannot-open`.
+
+`certifyDeviceWithRescueDevice` runs the rescue device in throwaway in-memory storage: device discovery with the rescue keys, `bootstrapTenantFromDelivery` with the server URL (pulls `directory` and `userdirectory`, opens the wraps addressed to the rescue device), `issueDeviceCertificate` for the new device, push `userdirectory`. A rescue device whose certificate was withdrawn still finds the tenant through discovery — discovery keeps naming revoked devices so they can learn about a wipe — but the server refuses its sync, and the call fails with `RecoveryError` code `not-certified`.
+
+Renewing the setup afterwards matters: on the recovering device the rescue device's private keys were in memory, and the two helpers now know each other's role. `setupRecoveryContacts` with the same contacts creates a new rescue device and new shares and withdraws the used one. When renewal is not possible, `removeRecoveryContacts()` at least withdraws it.
+
+### 12.5 Noticing a recovery
+
+A certificate whose `issuedBySigningPublicKey` is a rescue device's signing key means a recovery happened. `tenant.listRescueDeviceSigningKeys()` returns the rescue devices of every verified setup, so an application can flag such certificates on the person's other devices. Withdrawn setups are not in that list; an application that wants to recognise them later should remember the keys it has seen.
+
+### 12.6 What it defends against, and what not
+
+- **One contact alone learns nothing.** A single share is a uniformly random value; the rescue blob stays closed without `K`.
+- **The server learns nothing.** `rcv_` is encrypted with `default`; shares are sealed to User-Keys; packages are encrypted with a password the server never sees.
+- **The administrator is not part of it** and gains nothing from it. Revoking the person's self-grant (`setDeviceSelfGrant(username, null)`) stops a rescue device from certifying anyone.
+- **Two colluding contacts can become the person.** That is the feature, stated plainly: two contacts together can read everything the person can read and act in the person's name. Applications must say so when the person picks contacts, and should show how long each account has existed, so that a freshly created look-alike account is noticed.
+- **A contact who lost their own keys cannot help**, and a contact who left the tenant can still open their share if they kept a device. The person should renew the setup when contacts change; the threshold of two keeps one departure from mattering.
+- **Packages are only as private as their password channel.** A package and its password sent through the same channel are one secret, not two.
+- **It needs device self-grant.** Without it there is no way to certify the rescue device. An administrator-approved rescue device (placed on the grant) would remove that requirement and is a possible extension.
+
+### 12.7 API
+
+| Call | Purpose |
+|---|---|
+| `tenant.setupRecoveryContacts(usernames, { rescueDeviceLabel?, withdrawRescueDevices? })` | New rescue device, certificate, shares, `rcv_` document; replaces and withdraws an earlier setup, plus the rescue devices named in `withdrawRescueDevices` (the one a recovery just used, in case its setup is not in this replica). Errors: `RecoveryContactsError` with `code` `too-few-contacts`, `contact-is-self`, `contact-without-key` (`usernames` lists them), `self-grant-required`, `no-user-key`, `no-default-key`. |
+| `tenant.getRecoveryContactsSetup()` | The person's current setup or `null`. |
+| `tenant.removeRecoveryContacts({ withdrawRescueDevices? })` | Delete every own setup and withdraw their rescue devices. |
+| `tenant.listRecoveryContactRequests()` | People who named this person as a contact (newest setup each). |
+| `tenant.createRecoveryHelperPackage(person, { serverUrl? })` | This contact's package for `person` (username or setup id), plaintext. Errors `no-setup`, `not-a-contact`. |
+| `tenant.canIssueDeviceCertificates()` | Whether this device holds the granted self-grant key. |
+| `tenant.listRescueDeviceSigningKeys()` | Rescue devices of every verified setup, by person (12.5). |
+| `generateRecoveryPackagePassword(crypto)` / `encryptRecoveryHelperPackage` / `decryptRecoveryHelperPackage` | One-time password and package encryption. |
+| `combineRecoveryHelperPackages(crypto, packages)` | Combine shares and open the rescue device; `RecoveryPackageError` codes `too-few`, `mismatch`, `duplicate`, `cannot-open`, `wrong-password`, `malformed`. |
+| `certifyDeviceWithRescueDevice({ cryptoAdapter, recovery, device, label?, serverUrl? })` | Certify a new device as the rescue device; `RecoveryError` codes `no-server`, `tenant-not-found`, `not-certified`, `sync-failed`. |
+| `splitSecret` / `combineShares` | Shamir over GF(2^8), share layout `[y…, x]`, compatible with the audited `shamir-secret-sharing` package. |
+
+### 12.8 Paper rescue device
+
+A printed recovery sheet used to carry a copy of the device's own keys. Restoring it brought back *the same device* (section 9.5), and once the User-Key rotated away from that device the sheet could no longer open new content. A **paper rescue device** replaces that copy: a rescue device of its own, certified with the self-grant key exactly like the one of recovery contacts, so it receives every User-Key generation and never goes stale.
+
+```ts
+// Printing: a new paper rescue device; earlier ones of this person are withdrawn.
+const sheet = await tenant.createPaperRescueDevice({ label: "Recovery printout" });
+// sheet = { tenantId, username, secret, rescueBlob, rescueSigningKeyFingerprint, docId }
+// The application encrypts `sheet` with the printout's own secret and prints it.
+
+// Restoring on a new device: open the sheet and certify the new device with it.
+const recovery = await openPaperRescueSecret(crypto, sheet, serverUrl);
+await certifyDeviceWithRescueDevice({ cryptoAdapter: crypto, recovery, device });
+```
+
+- **Independent of recovery contacts.** It is a different rescue device with a different secret. Changing contacts does not invalidate the sheet, and a new sheet does not touch the contacts.
+- **One sheet at a time.** The tenant keeps only the public half in a personal document `rpp_…` (tenant `default` key). `createPaperRescueDevice` withdraws every earlier one of the person, so printing a new sheet retires the old one; `removePaperRescueDevices()` retires all.
+- **A sheet stays valid after use**, like a printout in a drawer. Whoever holds it and its secret can become the person, so a sheet that may have been seen should be replaced by printing a new one.
+- **The restored device is a new device** with its own keys, not a copy of the old one: revoking or wiping one no longer hits the other.
+- Like every rescue device it needs device self-grant; without it applications keep printing the device's own keys.
+
+| Call | Purpose |
+|---|---|
+| `tenant.createPaperRescueDevice({ label? })` | Certify a new paper rescue device, publish its `rpp_` document, withdraw earlier ones. Returns the sheet secret. |
+| `tenant.listPaperRescueDevices()` / `tenant.removePaperRescueDevices()` | The person's paper rescue devices; withdraw them all. |
+| `openPaperRescueSecret(crypto, sheet, serverUrl?)` | Open a sheet into the input of `certifyDeviceWithRescueDevice`. |
+
+Covered by `RecoveryShamirAndPackages.test.ts` (Shamir, rescue blob, packages), `PaperRescueServer.test.ts` (sheet survives a rotation, a new sheet withdraws the old one) and `RecoveryContactsServer.test.ts` (2-of-3 recovery over HTTP, also after a User-Key rotation; one package alone fails; renewal withdraws the used rescue device, whose packages are refused afterwards).

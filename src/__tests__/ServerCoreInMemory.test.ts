@@ -258,4 +258,96 @@ describe("MindooDBServerCore without a host framework", () => {
 
     await core.deleteTenant(request({ params: { tenantId: "race-tenant" } }));
   }, 60_000);
+  test("idle tenants are unloaded and come back on the next request", async () => {
+    const tenantId = "idle-tenant";
+    const registered = await core.registerTenant(
+      request({
+        params: { tenantId },
+        systemAdmin: { username: "operator", publicsignkey: "-" },
+        body: {
+          adminUsername: adminUser.username,
+          adminSigningPublicKey: adminUser.userSigningKeyPair.publicKey,
+          adminEncryptionPublicKey: adminUser.userEncryptionKeyPair.publicKey,
+          publicInfosKey: bytesToBase64(cryptoAdapter.getRandomValues(new Uint8Array(32))),
+        },
+      }),
+    );
+    expect(registered.status).toBe(201);
+
+    const tenantRequest = (overrides: Partial<ServerRequest>) => {
+      const req = request({ params: { tenantId }, ...overrides });
+      expect(core.tenantGuard(req)).toBeNull();
+      return req;
+    };
+
+    // Log in once; the token must survive unloading the tenant.
+    const challenge = json(
+      await core.challenge(
+        tenantRequest({
+          body: { signingPublicKey: adminUser.userSigningKeyPair.publicKey },
+        }),
+      ),
+    ).challenge as string;
+    const signingKeyBytes = await decryptPrivateKey(
+      cryptoAdapter,
+      adminUser.userSigningKeyPair.privateKey as EncryptedPrivateKey,
+      ADMIN_PASSWORD,
+      "signing",
+    );
+    const subtle = cryptoAdapter.getSubtle();
+    const signingKey = await subtle.importKey("pkcs8", signingKeyBytes, { name: "Ed25519" }, false, ["sign"]);
+    const signature = new Uint8Array(
+      await subtle.sign({ name: "Ed25519" }, signingKey, new TextEncoder().encode(challenge)),
+    );
+    const token = json(
+      await core.authenticate(
+        tenantRequest({ body: { challenge, signature: bytesToBase64(signature) } }),
+      ),
+    ).token as string;
+    const storeHead = () =>
+      core.sync(
+        "getStoreHead",
+        tenantRequest({
+          headers: { authorization: `Bearer ${token}` },
+          body: { dbId: "directory" },
+        }),
+        StoreKind.docs,
+      );
+    expect((await storeHead()).status).toBe(200);
+
+    const loaded = await tenantManager.getTenant(tenantId);
+    const handle = await tenantManager.getStore(tenantId, "notes", StoreKind.docs);
+
+    // Recently used: stays.
+    expect(tenantManager.evictIdleTenants(60_000)).not.toContain(tenantId);
+
+    // A running store call keeps the tenant loaded, however old the last use.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const rawStore = loaded.storeFactory.getStore("notes", StoreKind.docs);
+    const originalGetAllIds = rawStore.getAllIds.bind(rawStore);
+    rawStore.getAllIds = async () => {
+      await gate;
+      return originalGetAllIds();
+    };
+    const running = handle.getAllIds();
+    expect(tenantManager.evictIdleTenants(0, Date.now() + 3_600_000)).not.toContain(tenantId);
+    release();
+    await running;
+
+    // Idle: unloaded.
+    const callsBefore = storeProvider.createTenantStoresCalls;
+    expect(tenantManager.evictIdleTenants(0, Date.now() + 3_600_000)).toContain(tenantId);
+
+    // An old handle is routed to a freshly loaded tenant instead of the unloaded one.
+    expect(await handle.getAllIds()).toEqual([]);
+    expect(storeProvider.createTenantStoresCalls - callsBefore).toBe(1);
+    const reloaded = await tenantManager.getTenant(tenantId);
+    expect(reloaded).not.toBe(loaded);
+
+    // The token issued before the unload is still accepted.
+    expect((await storeHead()).status).toBe(200);
+
+    await core.deleteTenant(request({ params: { tenantId } }));
+  }, 60_000);
 });

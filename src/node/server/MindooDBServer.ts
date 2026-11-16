@@ -98,6 +98,20 @@ declare global {
 
 const DEFAULT_SERVER_SOCKET_TIMEOUT_MS = 120_000;
 
+
+const DEFAULT_TENANT_IDLE_MINUTES = 30;
+
+/** Idle time before a tenant is unloaded, from `MINDOODB_TENANT_IDLE_MINUTES` (0 = never). */
+export function tenantIdleMs(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw) return DEFAULT_TENANT_IDLE_MINUTES * 60_000;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    console.warn(`[MindooDBServer] Ignoring invalid MINDOODB_TENANT_IDLE_MINUTES=${raw}`);
+    return DEFAULT_TENANT_IDLE_MINUTES * 60_000;
+  }
+  return minutes * 60_000;
+}
 export class MindooDBServer {
   private app: express.Application;
   /** In-process change feed backing the SSE endpoint (sync-v5, phase 5). */
@@ -141,6 +155,7 @@ export class MindooDBServer {
     this.app = express();
     this.syncEventBus = new SyncEventBus();
     this.tenantManager = new TenantManager(dataDir, serverPassword);
+    this.tenantManager.startIdleEviction(tenantIdleMs(process.env[ENV_VARS.TENANT_IDLE_MINUTES]));
     this.staticDir = staticDir;
     this.configPath = configPath ?? path.join(dataDir, "config.json");
     this.jsonBodyLimit = process.env.MINDOODB_JSON_BODY_LIMIT?.trim() || "5mb";
@@ -757,6 +772,31 @@ export class MindooDBServer {
     console.log(
       `[MindooDBServer] Tenant auth rate limit configured windowMs=${authRateLimitConfig.windowMs} max=${authRateLimitConfig.max}`,
     );
+
+    // Invitations / join requests (docs/invitations.md). Unauthenticated: the
+    // joining device has no grant yet. The service rate-limits per IP itself
+    // (5/h); this limiter only caps bursts against the public invitation read.
+    const inviteLimit = rateLimit({
+      windowMs: 60_000,
+      max: 30,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many requests, please try again later" },
+    });
+    router.get("/invitations/:invitationId", inviteLimit, route((req) => core.getInvitation(req)));
+    router.post("/join-requests", inviteLimit, route((req) => core.submitJoinRequest(req)));
+    router.post("/join-requests/summary", inviteLimit, route((req) => core.joinRequestSummary(req)));
+    // Waiting devices poll their status; many can sit behind one school or
+    // office NAT, so this cheap read gets a wider budget than the writes.
+    const inviteStatusLimit = rateLimit({
+      windowMs: 60_000,
+      max: 240,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many requests, please try again later" },
+    });
+    router.get("/join-requests/:requestId", inviteStatusLimit, route((req) => core.joinRequestStatus(req)));
+    router.post("/join-requests/:requestId/withdraw", inviteLimit, route((req) => core.withdrawJoinRequest(req)));
 
     router.post("/auth/challenge", challengeRateLimit, route((req) => core.challenge(req)));
     router.post("/auth/authenticate", authenticateRateLimit, route((req) => core.authenticate(req)));
