@@ -15,6 +15,7 @@ import {
 } from "../node/appendonlystores/sqlite/ServerSqliteStore";
 import { copyStoreResumable } from "../core/appendonlystores/migration/StoreMigration";
 import { StoreFactory } from "../node/server/StoreFactory";
+import { defaultStoreTypeFromEnv } from "../node/server/TenantManager";
 import { StoreKind, type ContentAddressedStore, type StoreEntry } from "../core/types";
 import type { StoreScanCursor } from "../core/appendonlystores/types";
 import type { Logger } from "../core/logging";
@@ -210,5 +211,16 @@ describe("server sqlite store", () => {
     const reopened = fileFactory.getStore("db", StoreKind.docs);
     expect(reopened.getCacheIdentity!()).toBe("sqlite:db:docs");
     expect(await reopened.getAllIds()).toHaveLength(3);
+  });
+});
+
+describe("MINDOODB_DEFAULT_STORE_TYPE", () => {
+  it("defaults new tenants to file and accepts sqlite, case-insensitively", () => {
+    expect(defaultStoreTypeFromEnv({})).toBe("file");
+    expect(defaultStoreTypeFromEnv({ MINDOODB_DEFAULT_STORE_TYPE: " SQLite " })).toBe("sqlite");
+  });
+
+  it("rejects unknown values instead of silently using file", () => {
+    expect(() => defaultStoreTypeFromEnv({ MINDOODB_DEFAULT_STORE_TYPE: "postgres" })).toThrow(/must be one of/);
   });
 });

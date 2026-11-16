@@ -783,7 +783,7 @@ This file is the whole replication topology. An entry with a `url` becomes one r
 
 #### Store types (`defaultStoreType`, `databaseStores`)
 
-`defaultStoreType` sets how the tenant's databases are stored; `databaseStores` overrides it per database id (`{ "databaseStores": { "<dbId>": { "storeType": "sqlite" } } }`). Every store lives in `<dataDir>/<tenantId>/stores/<dbId>/<docs|attachments>/`.
+`defaultStoreType` sets how the tenant's databases are stored (a new tenant gets the value of `MINDOODB_DEFAULT_STORE_TYPE`, else `file`, unless its registration names one); `databaseStores` overrides it per database id (`{ "databaseStores": { "<dbId>": { "storeType": "sqlite" } } }`). Every store lives in `<dataDir>/<tenantId>/stores/<dbId>/<docs|attachments>/`.
 
 | Type | Layout | Use |
 |------|--------|-----|
@@ -811,6 +811,7 @@ extra field) for human-readable notes. Entries are matched solely by
 |----------|----------|-------------|
 | `MINDOODB_SERVER_PASSWORD` | If `server.identity.json` exists and `MINDOODB_SERVER_PASSWORD_FILE` is unset | Password to decrypt server identity and per-tenant keybags |
 | `MINDOODB_SERVER_PASSWORD_FILE` | No | Path to a file whose contents are the server password (trimmed). If set, **used instead of** `MINDOODB_SERVER_PASSWORD`. Prefer for Docker: env only holds the path, not the secret. |
+| `MINDOODB_DEFAULT_STORE_TYPE` | No | Store type written into the `config.json` of a **newly registered** tenant: `file` (default), `sqlite` or `inmemory`. Existing tenants keep the type in their `config.json`. See [Store types](#store-types-defaultstoretype-databasestores). |
 | `MINDOODB_SYSTEM_ADMIN_PASSWORD` | No | For `server:add-to-network`: password for `--identity` (if not using `--password-file` or interactive prompt). May be visible in `ps` on shared hosts. |
 | `MINDOODB_CORS_ORIGIN` | No | Allowed CORS origin or comma-separated allowlist (e.g., `https://app.example.com` or `http://localhost:4174,https://otherserver.com`). If not set, CORS is disabled. |
 | `MINDOODB_ACCEPT_LEGACY_CHALLENGE_SIGNATURES` | No | `0` or `false` refuses logins from clients that predate the v2 login-challenge signing domain (MindooDB before 0.0.87). Unset, they are accepted and the server logs each kind of such login (sync, device discovery, system admin, peer) at most once an hour with a count. Switch it off once that log line stays away. |

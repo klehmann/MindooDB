@@ -87,6 +87,7 @@ import type {
   TenantStoreFactory,
 } from "./ServerDataStore";
 import type {
+  StoreType,
   TenantConfig,
   TenantContext,
   RegisterTenantRequest,
@@ -671,6 +672,11 @@ export interface TenantManagerOptions {
    * tenant database and gets the keys from a central registry).
    */
   publicInfosKeysResolver?: (tenantId: string) => Promise<Uint8Array[]>;
+  /**
+   * Store type written into the config of a newly registered tenant when
+   * the registration does not name one (default `"file"`).
+   */
+  defaultStoreTypeForNewTenants?: StoreType;
 }
 
 /** Usage of one tenant, for unloading idle tenants (see {@link TenantManager.evictIdleTenants}). */
@@ -740,6 +746,8 @@ export class TenantManager {
   /** In-flight purge executions, keyed by normalized tenant id (serializes runs). */
   private purgeInFlight: Map<string, Promise<void>> = new Map();
 
+  private readonly defaultStoreTypeForNewTenants: StoreType;
+
   constructor(options: TenantManagerOptions) {
     this.dataStore = options.dataStore;
     this.storeProvider = options.storeProvider;
@@ -747,6 +755,7 @@ export class TenantManager {
     this.cryptoAdapter = options.cryptoAdapter;
     this.jwtSecretForTenant = options.jwtSecretForTenant;
     this.publicInfosKeysResolver = options.publicInfosKeysResolver;
+    this.defaultStoreTypeForNewTenants = options.defaultStoreTypeForNewTenants ?? "file";
 
     // Load global server identity
     const identityJson = this.dataStore.readText(SERVER_IDENTITY_KEY);
@@ -1213,7 +1222,7 @@ export class TenantManager {
       adminUsername: request.adminUsername,
       adminSigningPublicKey: request.adminSigningPublicKey,
       adminEncryptionPublicKey: request.adminEncryptionPublicKey,
-      defaultStoreType: request.defaultStoreType || "file",
+      defaultStoreType: request.defaultStoreType || this.defaultStoreTypeForNewTenants,
       users: [],
     };
     try {
