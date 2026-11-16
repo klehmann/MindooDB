@@ -3677,6 +3677,30 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * Whether the distribution of `keyId` reaches `username` through a User-Key:
+   * one of their wrap entries is addressed to a fingerprint that is not an
+   * encryption key of their own grant devices. False when the person is not in
+   * `pushto`, has no wrap entries, or only has per-device wraps from before
+   * User-Keys (docs/userkeys.md §4.5).
+   */
+  async isKeyDistributedViaUserKey(keyId: string, username: string): Promise<boolean> {
+    await this.updateUnifiedCache();
+    const entry = this.keyDistributionCache.get(keyId);
+    if (!entry) return false;
+    const myHashes = new Set(await this.usernameHashCandidates(username));
+    const wrapFingerprints = Object.keys(entry.pushto_users_keys)
+      .map((entryKey) => entryKey.split("|"))
+      .filter(([hash, fingerprint]) => myHashes.has(hash) && Boolean(fingerprint))
+      .map(([, fingerprint]) => fingerprint);
+    if (wrapFingerprints.length === 0) return false;
+    const deviceFingerprints = new Set<string>();
+    for (const pem of await this.getUserEncryptionPublicKeys(username)) {
+      deviceFingerprints.add(await this.encryptionKeyFingerprint(pem));
+    }
+    return wrapFingerprints.some((fingerprint) => !deviceFingerprints.has(fingerprint));
+  }
+
+  /**
    * The canonical write-time hash for `username` (the value stored in
    * `pushto_users_hashes` / `pullfrom_users_hashes`). Exposed so callers (the
    * Haven dialog/session) can build `pullfrom` entries for users they are
