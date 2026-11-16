@@ -1187,6 +1187,7 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 
 ## 11) Related Documents
 
+- [recovery.md](recovery.md) — every way back after losing all devices, and why they are built as they are (§12 is the protocol reference).
 - [accesscontrol.md](accesscontrol.md) — who may read and write, the directory, grants, and key distribution. User keys decide who can decrypt; these rules decide who can change state.
 - [getting-started.md](getting-started.md) — tenant creation, the join flow, the KeyBag, and identity persistence.
 - [network-sync-protocol.md](network-sync-protocol.md) — how encrypted entries move between devices and servers, and how device discovery works.
@@ -1196,6 +1197,8 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 ---
 
 ## 12) Recovery Contacts
+
+> For an overview of every recovery path (recovery contacts, paper rescue devices, legacy printouts, with and without self-grant) and the design rationale behind them — why a recovery ends with fresh device keys, why there is no administrator recovery, why the threshold is fixed at two — see [recovery.md](recovery.md). This section is the protocol reference.
 
 Section 7.4 calls losing every device "the one genuinely unrecoverable case", and section 8.2 says user keys are deliberately not wrapped to an administrator or a recovery quorum. Recovery contacts are the opt-in quorum that section asks for: a person names colleagues, and **any two of them together** can bring the person onto a new device. One contact alone can do nothing, and the administrator is not involved at all.
 
