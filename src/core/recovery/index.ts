@@ -35,13 +35,17 @@ export {
 } from "./recoveryPackage";
 export {
   RecoveryContactsError,
+  rescueAttestationHolds,
   type RecoveryContactsErrorCode,
+  type RescueDeviceStatus,
+  type SetupRecoveryContactsResult,
   type RecoveryContactRequest,
   type SetupRecoveryContactsOptions,
 } from "./RecoveryContactsManager";
 export {
   RecoveryError,
   certifyDeviceWithRescueDevice,
+  approveDeviceWithRescueDevice,
   type CertifyDeviceWithRescueDeviceInput,
   type CertifyDeviceWithRescueDeviceResult,
 } from "./recoverWithContacts";
@@ -54,4 +58,14 @@ export {
   type PaperRescuePayload,
   type PaperRescueRecord,
   type PaperRescueSecret,
+  type CreatePaperRescueResult,
 } from "./PaperRescueDevice";
+export {
+  rescueAttestationMessage,
+  rescueDeviceJoinRequestUri,
+  isRescueDeviceRef,
+  rescueApprovalOf,
+  type RescueDeviceRef,
+  type RescueDeviceApproval,
+  type RescueDeviceAttestation,
+} from "./rescueApproval";

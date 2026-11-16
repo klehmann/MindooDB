@@ -10,7 +10,7 @@ import type { BaseMindooTenantDirectory } from "../BaseMindooTenantDirectory";
 import { RSAEncryption } from "../crypto/RSAEncryption";
 import { DEFAULT_TENANT_KEY_ID, USER_DIRECTORY_DB_ID, type MindooDB } from "../types";
 import type { UserKeyManager } from "../userkeys/UserKeyManager";
-import { base64ToBytes, bytesToBase64 } from "../userkeys/fingerprint";
+import { base64ToBytes, bytesToBase64, fingerprintPublicKeyPem, normalizePublicKeyPem } from "../userkeys/fingerprint";
 import { USERKEY_FORM } from "../userkeys/types";
 import {
   RECOVERY_CONTACTS_DOC_ID_PREFIX,
@@ -24,6 +24,11 @@ import {
 } from "./RecoveryContactsDocument";
 import type { RecoveryHelperPackage } from "./recoveryPackage";
 import { generateRescueDevice } from "./rescueDevice";
+import {
+  rescueAttestationMessage,
+  rescueDeviceJoinRequestUri,
+  type RescueDeviceRef,
+} from "./rescueApproval";
 import { splitSecret } from "./shamir";
 
 export type RecoveryContactsErrorCode =
@@ -66,6 +71,165 @@ export interface SetupRecoveryContactsOptions {
    * the one a recovery just used, in case its setup is not in this replica.
    */
   withdrawRescueDevices?: string[];
+  /**
+   * Without device self-grant, let the administrator admit the rescue device
+   * (docs/userkeys.md §12.9). Default true; false fails with
+   * `self-grant-required` instead.
+   */
+  allowAdminApproval?: boolean;
+}
+
+/** What {@link RecoveryContactsManager.setup} returns. */
+export interface SetupRecoveryContactsResult extends RecoveryContactsSetup {
+  /**
+   * Set when the rescue device waits for the administrator: hand this join
+   * request to the admin, who grants it under this person's name.
+   */
+  joinRequestUri?: string;
+  /**
+   * Signing-key fingerprints of earlier rescue devices on the grant that only
+   * the administrator can remove (they were admitted by the admin).
+   */
+  rescueDevicesToRemove: string[];
+}
+
+/** Where a rescue device stands (see {@link rescueDeviceStatus}). */
+export type RescueDeviceStatus =
+  /** Certified with the self-grant key, or on the grant and holding the User-Key. */
+  | "active"
+  /** Waiting for the administrator to put it on the grant. */
+  | "waiting-for-admin"
+  /** On the grant; this person's device has not wrapped the User-Key yet. */
+  | "waiting-for-key"
+  /** Neither certified nor on the grant any more. */
+  | "withdrawn";
+
+/**
+ * Admit a rescue device: certify it with the self-grant key, or — without
+ * self-grant — attest it with the User-Key for the administrator to grant
+ * (docs/userkeys.md §12.9).
+ */
+export async function admitRescueDevice(input: {
+  userKeys: UserKeyManager;
+  rescue: { signingPublicKey: string; encryptionPublicKey: string; signingKeyFingerprint: string };
+  label: string;
+  usernameHash: string;
+  allowAdminApproval?: boolean;
+}): Promise<{ ref: RescueDeviceRef; joinRequestUri?: string }> {
+  const keys = { signingPublicKey: input.rescue.signingPublicKey, encryptionPublicKey: input.rescue.encryptionPublicKey };
+  if (await input.userKeys.canIssueDeviceCertificates()) {
+    const { docId } = await input.userKeys.issueDeviceCertificate(keys, input.label);
+    return {
+      ref: { ...keys, signingKeyFingerprint: input.rescue.signingKeyFingerprint, approval: "certificate", certificateDocId: docId },
+    };
+  }
+  if (input.allowAdminApproval === false) {
+    throw new RecoveryContactsError(
+      "self-grant-required",
+      "A rescue device needs device self-grant: the administrator must allow this person to add own devices.",
+    );
+  }
+  const attestation = await input.userKeys.signWithOwnUserKey(
+    rescueAttestationMessage({ usernameHash: input.usernameHash, ...keys }),
+  );
+  if (!attestation) {
+    throw new RecoveryContactsError("no-user-key", "This device cannot open the person's User-Key.");
+  }
+  return {
+    ref: { ...keys, signingKeyFingerprint: input.rescue.signingKeyFingerprint, approval: "admin", attestation },
+    joinRequestUri: rescueDeviceJoinRequestUri({ ...keys, label: input.label }),
+  };
+}
+
+/** Whether an admin-approved rescue device was set up by a holder of the person's User-Key. */
+export async function rescueAttestationHolds(
+  userKeys: UserKeyManager,
+  usernameHash: string,
+  ref: RescueDeviceRef,
+): Promise<boolean> {
+  if (ref.approval !== "admin" || !ref.attestation) return false;
+  return userKeys.verifyOwnUserKeySignature(
+    ref.attestation.epoch,
+    ref.attestation.signature,
+    rescueAttestationMessage({
+      usernameHash,
+      signingPublicKey: ref.signingPublicKey,
+      encryptionPublicKey: ref.encryptionPublicKey,
+    }),
+  );
+}
+
+/**
+ * Whether the rescue device a `rcv_`/`rpp_` document names is genuine: an
+ * admin-approved one must carry an attestation by the person's User-Key, a
+ * certified one must be certified now. A device on the person's grant can
+ * write documents under their name, so the document alone proves nothing.
+ */
+export async function rescueRefIsGenuine(input: {
+  tenant: BaseMindooTenant;
+  userKeys: UserKeyManager;
+  username: string;
+  usernameHash: string;
+  ref: RescueDeviceRef;
+}): Promise<boolean> {
+  const { ref } = input;
+  if (ref.approval === "admin") {
+    if (!ref.attestation) return false;
+    return input.userKeys.verifyUserKeySignatureOf(
+      input.username,
+      ref.attestation.epoch,
+      ref.attestation.signature,
+      rescueAttestationMessage({
+        usernameHash: input.usernameHash,
+        signingPublicKey: ref.signingPublicKey,
+        encryptionPublicKey: ref.encryptionPublicKey,
+      }),
+    );
+  }
+  const directory = (await input.tenant.openDirectory()) as BaseMindooTenantDirectory;
+  const resolved = await directory.resolveSignerToGrant(ref.signingPublicKey, Number.MAX_SAFE_INTEGER);
+  return resolved?.via === "certificate" && resolved.grant.usernameHash === input.usernameHash;
+}
+
+/** Where a rescue device of this person stands. */
+export async function rescueDeviceStatus(
+  tenant: BaseMindooTenant,
+  userKeys: UserKeyManager,
+  ref: RescueDeviceRef,
+): Promise<RescueDeviceStatus> {
+  const directory = (await tenant.openDirectory()) as BaseMindooTenantDirectory;
+  const resolved = await directory.resolveSignerToGrant(ref.signingPublicKey, Number.MAX_SAFE_INTEGER);
+  if (!resolved) return ref.approval === "admin" ? "waiting-for-admin" : "withdrawn";
+  if (resolved.via === "certificate") return "active";
+  const fingerprint = await fingerprintPublicKeyPem(ref.encryptionPublicKey, tenant.getCryptoAdapter().getSubtle());
+  const row = (await userKeys.listUserKeyDevices()).find((r) => r.fingerprint === fingerprint);
+  return row?.status === "approved" ? "active" : "waiting-for-key";
+}
+
+/**
+ * Wrap the User-Key to this person's own admin-approved rescue devices that
+ * reached the grant (no dialog: their attestation proves this person set them
+ * up). Returns how many were approved.
+ */
+export async function approveOwnRescueDevices(
+  userKeys: UserKeyManager,
+  usernameHash: string,
+  refs: RescueDeviceRef[],
+): Promise<number> {
+  const admin = refs.filter((ref) => ref.approval === "admin");
+  if (admin.length === 0) return 0;
+  const pending = await userKeys.listPendingUserKeyDevices();
+  let approved = 0;
+  for (const ref of admin) {
+    const match = pending.find(
+      (device) => normalizePublicKeyPem(device.encryptionPublicKey) === normalizePublicKeyPem(ref.encryptionPublicKey),
+    );
+    if (!match) continue;
+    if (!(await rescueAttestationHolds(userKeys, usernameHash, ref))) continue;
+    await userKeys.approveUserKeyDevice(match.fingerprint);
+    approved += 1;
+  }
+  return approved;
 }
 
 export class RecoveryContactsManager {
@@ -92,7 +256,18 @@ export class RecoveryContactsManager {
       try {
         const doc = await db.getDocument(id);
         const setup = await verifyRecoveryContactsDoc({ db, doc, directory });
-        if (setup) out.push(setup);
+        if (
+          setup &&
+          (await rescueRefIsGenuine({
+            tenant: this.tenant,
+            userKeys: this.userKeys,
+            username: setup.payload.username,
+            usernameHash: setup.payload.username_hash,
+            ref: setup.payload.rescueDevice,
+          }))
+        ) {
+          out.push(setup);
+        }
       } catch {
         // unreadable (no `default` yet) or damaged: not a setup
       }
@@ -127,7 +302,7 @@ export class RecoveryContactsManager {
   async setup(
     contactUsernames: string[],
     options?: SetupRecoveryContactsOptions,
-  ): Promise<RecoveryContactsSetup> {
+  ): Promise<SetupRecoveryContactsResult> {
     const me = await this.tenant.getCurrentUserId();
     const directory = await this.directory();
     const ownResolved = await this.userKeys.resolveOwnUserKeyDocument();
@@ -163,7 +338,7 @@ export class RecoveryContactsManager {
         `Name at least ${RECOVERY_CONTACTS_MIN} recovery contacts.`,
       );
     }
-    if (!(await this.userKeys.canIssueDeviceCertificates())) {
+    if (options?.allowAdminApproval === false && !(await this.userKeys.canIssueDeviceCertificates())) {
       throw new RecoveryContactsError(
         "self-grant-required",
         "Recovery contacts need device self-grant: the administrator must allow this person to add own devices.",
@@ -192,10 +367,13 @@ export class RecoveryContactsManager {
     const crypto = this.tenant.getCryptoAdapter();
     const rescue = await generateRescueDevice(crypto);
     const label = options?.rescueDeviceLabel?.trim() || "Rescue device";
-    const { docId: certificateDocId } = await this.userKeys.issueDeviceCertificate(
-      { signingPublicKey: rescue.signingPublicKey, encryptionPublicKey: rescue.encryptionPublicKey },
+    const admitted = await admitRescueDevice({
+      userKeys: this.userKeys,
+      rescue,
       label,
-    );
+      usernameHash: ownHash,
+      ...(options?.allowAdminApproval !== undefined ? { allowAdminApproval: options.allowAdminApproval } : {}),
+    });
 
     const shares = splitSecret(crypto, rescue.secret, recipients.length, RECOVERY_CONTACTS_THRESHOLD);
     rescue.secret.fill(0);
@@ -208,12 +386,7 @@ export class RecoveryContactsManager {
       username_hash: ownHash,
       threshold: RECOVERY_CONTACTS_THRESHOLD,
       createdAt: Date.now(),
-      rescueDevice: {
-        signingPublicKey: rescue.signingPublicKey,
-        encryptionPublicKey: rescue.encryptionPublicKey,
-        signingKeyFingerprint: rescue.signingKeyFingerprint,
-        certificateDocId,
-      },
+      rescueDevice: admitted.ref,
       rescueBlob: rescue.blob,
       contacts: [],
     };
@@ -241,7 +414,35 @@ export class RecoveryContactsManager {
       await this.retire(db, old);
     }
     await this.withdrawExtra(options?.withdrawRescueDevices, previous);
-    return { docId: doc.getId(), payload: JSON.parse(JSON.stringify(payload)) as RecoveryContactsPayload };
+    return {
+      docId: doc.getId(),
+      payload: JSON.parse(JSON.stringify(payload)) as RecoveryContactsPayload,
+      ...(admitted.joinRequestUri ? { joinRequestUri: admitted.joinRequestUri } : {}),
+      rescueDevicesToRemove: await this.adminRescueDevicesOnGrant(previous.map((p) => p.payload.rescueDevice)),
+    };
+  }
+
+  /** Fingerprints of admin-approved rescue devices among `refs` that are still on the grant. */
+  private async adminRescueDevicesOnGrant(refs: RescueDeviceRef[]): Promise<string[]> {
+    const out: string[] = [];
+    for (const ref of refs) {
+      if (ref.approval !== "admin") continue;
+      const status = await rescueDeviceStatus(this.tenant, this.userKeys, ref);
+      if (status === "active" || status === "waiting-for-key") out.push(ref.signingKeyFingerprint);
+    }
+    return out;
+  }
+
+  /** Where this person's current rescue device stands (`null` without a setup). */
+  async status(): Promise<RescueDeviceStatus | null> {
+    const setup = await this.getSetup();
+    return setup ? rescueDeviceStatus(this.tenant, this.userKeys, setup.payload.rescueDevice) : null;
+  }
+
+  /** The rescue devices of all own setups (for {@link approveOwnRescueDevices}). */
+  async ownRescueDevices(): Promise<{ usernameHash: string | null; refs: RescueDeviceRef[] }> {
+    const usernameHash = await this.ownUsernameHash();
+    return { usernameHash, refs: (await this.ownSetups()).map((s) => s.payload.rescueDevice) };
   }
 
   /** Delete a setup and withdraw its rescue device. */
@@ -366,6 +567,7 @@ export class RecoveryContactsManager {
       setupDocId: setup.docId,
       threshold: setup.payload.threshold,
       rescueSigningKeyFingerprint: setup.payload.rescueDevice.signingKeyFingerprint,
+      ...(setup.payload.rescueDevice.approval === "admin" ? { rescueApproval: "admin" as const } : {}),
       rescueBlob: setup.payload.rescueBlob,
       share: bytesToBase64(share),
       helper: me.username,

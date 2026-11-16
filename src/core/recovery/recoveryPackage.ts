@@ -38,6 +38,12 @@ export interface RecoveryHelperPackage {
   setupDocId: string;
   threshold: number;
   rescueSigningKeyFingerprint: string;
+  /**
+   * `admin` when the rescue device is on the person's grant instead of
+   * certified (docs/userkeys.md §12.9): the new device then needs the
+   * administrator's approval, and the rescue device wraps the User-Key to it.
+   */
+  rescueApproval?: "admin";
   rescueBlob: string;
   /** Base64 Shamir share. */
   share: string;
@@ -53,6 +59,8 @@ export interface CombinedRecoveryPackages {
   username: string;
   setupDocId: string;
   helpers: string[];
+  /** See {@link RecoveryHelperPackage.rescueApproval}. Default `certificate`. */
+  rescueApproval?: "admin";
   rescueDevice: OpenedRescueDevice;
 }
 
@@ -269,6 +277,7 @@ export async function combineRecoveryHelperPackages(
     username: first.username,
     setupDocId: first.setupDocId,
     helpers: packages.map((pkg) => pkg.helper),
+    ...(packages.some((pkg) => pkg.rescueApproval === "admin") ? { rescueApproval: "admin" as const } : {}),
     rescueDevice,
   };
 }

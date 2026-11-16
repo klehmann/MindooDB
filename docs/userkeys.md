@@ -1189,6 +1189,7 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 
 ## 11) Related Documents
 
+- [recovery.md](recovery.md) — every way back after losing all devices, and why they are built as they are (§12 is the protocol reference).
 - [accesscontrol.md](accesscontrol.md) — who may read and write, the directory, grants, and key distribution. User keys decide who can decrypt; these rules decide who can change state.
 - [getting-started.md](getting-started.md) — tenant creation, the join flow, the KeyBag, and identity persistence.
 - [network-sync-protocol.md](network-sync-protocol.md) — how encrypted entries move between devices and servers, and how device discovery works.
@@ -1198,6 +1199,8 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 ---
 
 ## 12) Recovery Contacts
+
+> For an overview of every recovery path (recovery contacts, paper rescue devices, legacy printouts, with and without self-grant) and the design rationale behind them — why a recovery ends with fresh device keys, why there is no administrator recovery, why the threshold is fixed at two — see [recovery.md](recovery.md). This section is the protocol reference.
 
 Section 7.4 calls losing every device "the one genuinely unrecoverable case", and section 8.2 says user keys are deliberately not wrapped to an administrator or a recovery quorum. Recovery contacts are the opt-in quorum that section asks for: a person names colleagues, and **any two of them together** can bring the person onto a new device. One contact alone can do nothing, and the administrator is not involved at all.
 
@@ -1315,7 +1318,7 @@ A certificate whose `issuedBySigningPublicKey` is a rescue device's signing key 
 - **Two colluding contacts can become the person.** That is the feature, stated plainly: two contacts together can read everything the person can read and act in the person's name. Applications must say so when the person picks contacts, and should show how long each account has existed, so that a freshly created look-alike account is noticed.
 - **A contact who lost their own keys cannot help**, and a contact who left the tenant can still open their share if they kept a device. The person should renew the setup when contacts change; the threshold of two keeps one departure from mattering.
 - **Packages are only as private as their password channel.** A package and its password sent through the same channel are one secret, not two.
-- **It needs device self-grant.** Without it there is no way to certify the rescue device. An administrator-approved rescue device (placed on the grant) would remove that requirement and is a possible extension.
+- **Without device self-grant** the administrator admits the rescue device instead of the self-grant key (§12.9).
 
 ### 12.7 API
 
@@ -1352,7 +1355,7 @@ await certifyDeviceWithRescueDevice({ cryptoAdapter: crypto, recovery, device })
 - **One sheet at a time.** The tenant keeps only the public half in a personal document `rpp_…` (tenant `default` key). `createPaperRescueDevice` withdraws every earlier one of the person, so printing a new sheet retires the old one; `removePaperRescueDevices()` retires all.
 - **A sheet stays valid after use**, like a printout in a drawer. Whoever holds it and its secret can become the person, so a sheet that may have been seen should be replaced by printing a new one.
 - **The restored device is a new device** with its own keys, not a copy of the old one: revoking or wiping one no longer hits the other.
-- Like every rescue device it needs device self-grant; without it applications keep printing the device's own keys.
+- Without device self-grant the administrator admits it instead (§12.9).
 
 | Call | Purpose |
 |---|---|
@@ -1360,4 +1363,23 @@ await certifyDeviceWithRescueDevice({ cryptoAdapter: crypto, recovery, device })
 | `tenant.listPaperRescueDevices()` / `tenant.removePaperRescueDevices()` | The person's paper rescue devices; withdraw them all. |
 | `openPaperRescueSecret(crypto, sheet, serverUrl?)` | Open a sheet into the input of `certifyDeviceWithRescueDevice`. |
 
-Covered by `RecoveryShamirAndPackages.test.ts` (Shamir, rescue blob, packages), `PaperRescueServer.test.ts` (sheet survives a rotation, a new sheet withdraws the old one) and `RecoveryContactsServer.test.ts` (2-of-3 recovery over HTTP, also after a User-Key rotation; one package alone fails; renewal withdraws the used rescue device, whose packages are refused afterwards).
+### 12.9 Without device self-grant: the administrator admits the rescue device
+
+A person without device self-grant cannot certify a rescue device. Recovery contacts and paper rescue devices still work; the administrator takes the role of the self-grant key, exactly as for any additional device (scenario C, §4.4):
+
+1. **Setup.** `setupRecoveryContacts` and `createPaperRescueDevice` notice that this device cannot certify and return a `joinRequestUri` for the rescue device instead (`approval: "admin"`, no certificate). The person hands it to the administrator, who grants it under the person's name; Haven labels it as a rescue device and the admin views recognise it from the person's `rcv_`/`rpp_` document.
+2. **No dialog for the person.** A device on the grant normally waits for the person to approve it (§4.7). An admin-approved rescue device is wrapped automatically on the person's next `reconcileUserKeys()` — but only because its document carries an **attestation**: a signature over the rescue device's keys made with the generation signing key of the person's current User-Key (§9.2). Only a holder of the User-Key can make it. A device the administrator plants on the grant can write an `rcv_` document under the person's name, but not the attestation, so it stays pending and its forged setup is ignored by everyone (also by contacts, who verify the attestation against the person's published User-Key).
+3. **Recovery.** The packages or the sheet say `rescueApproval: "admin"`. The new device joins with a normal join request and the administrator approves it under the person's name. Then `approveDeviceWithRescueDevice` signs in as the rescue device, which holds the User-Key, and wraps it to the new device (it fails with `device-not-on-grant` until the admin has approved). The new device then joins through device discovery like any approved device.
+4. **Clean-up is the administrator's.** Only the admin can take the used rescue device off the grant (`updateUserGrant(..., { revokeSigningKeys })`); until then its packages keep working. A new setup returns `rescueDevicesToRemove` with the earlier admin-approved rescue devices still on the grant, for the same reason.
+
+The guarantees of §8.1 hold: the administrator still cannot read anything. Approving the new device puts it on the grant, but it only gets the User-Key from the rescue device, which needs two contacts or the sheet.
+
+| Call | Purpose |
+|---|---|
+| `setupRecoveryContacts(..., { allowAdminApproval? })` / `createPaperRescueDevice({ allowAdminApproval? })` | Without self-grant: returns `joinRequestUri` and `rescueDevicesToRemove`; `allowAdminApproval: false` fails with `self-grant-required` instead. |
+| `getRecoveryContactsStatus()` / `getPaperRescueStatus()` | `active`, `waiting-for-admin`, `waiting-for-key`, `withdrawn`. |
+| `approveOwnRescueDevices()` | Wrap the User-Key to own attested rescue devices on the grant (also runs after every `reconcileUserKeys`). |
+| `approveDeviceWithRescueDevice({ cryptoAdapter, recovery, deviceEncryptionPublicKey })` | Recovery step after the admin approved the new device. |
+| `rescueDeviceJoinRequestUri(...)` | The join request for a rescue device (for showing it again). |
+
+Covered by `RecoveryShamirAndPackages.test.ts` (Shamir, rescue blob, packages), `PaperRescueServer.test.ts` (sheet survives a rotation, a new sheet withdraws the old one), `RecoveryAdminApprovalServer.test.ts` (no self-grant: admin admits, attested auto-wrap, a planted device with a forged setup gets nothing, recovery after admin approval, old packages fail once the admin removed the rescue device) and `RecoveryContactsServer.test.ts` (2-of-3 recovery over HTTP, also after a User-Key rotation; one package alone fails; renewal withdraws the used rescue device, whose packages are refused afterwards).
