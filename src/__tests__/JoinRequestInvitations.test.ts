@@ -104,6 +104,22 @@ describe("invitation primitives", () => {
     );
     expect(open?.nonce).toBeUndefined();
     expect(parseInvitationLinkFragment("#s=ftp://x&t=a&i=bad&f=x")).toBeNull();
+
+    // Optional tenant label: round trip, cleaned and capped.
+    const labelled = parseInvitationLinkFragment(
+      buildInvitationLinkFragment({
+        serverUrl: "https://s",
+        tenantId: "acme",
+        invitationId,
+        keyFingerprint: "abcdefghijklmnopqrstuv",
+        tenantLabel: "  Schule am See & Co.\n",
+      }),
+    );
+    expect(labelled?.tenantLabel).toBe("Schule am See & Co.");
+    const long = parseInvitationLinkFragment(
+      `s=https%3A%2F%2Fs&t=acme&i=${invitationId}&f=abcdefghijklmnopqrstuv&l=${"x".repeat(200)}`,
+    );
+    expect(long?.tenantLabel).toHaveLength(80);
   });
 
   test("HMAC binds the request to the nonce", async () => {

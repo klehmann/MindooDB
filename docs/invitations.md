@@ -40,10 +40,12 @@ invite_<id>  (directory, $publicinfos)
 ### The link
 
 ```text
-https://<haven>/welcome/join#s=<server>&t=<tenantId>&i=<invitationId>&n=<nonce>&f=<keyFingerprint>
+https://<haven>/welcome/join#s=<server>&t=<tenantId>&i=<invitationId>&n=<nonce>&f=<keyFingerprint>&l=<tenant label>
 ```
 
 Everything after `#` stays in the browser; the web server that serves Haven never sees it. `f` is the first 128 bits of SHA-256 over the invitation's public key. The joining device fetches the public part from the server (`GET /:tenantId/invitations/:invitationId`) and refuses to continue when the key does not match `f`: a server cannot hand out a key of its own and read the requests. Shared links have no `n`.
+
+`l` is the tenant label for "Invitation to …" (optional, at most 80 characters). The real label is encrypted under `default`, which neither the joining device nor the server holds, so the admin's device puts it into the link. Being in the fragment, it never reaches the server. It is for display only: whoever forwards a link can change it, and nothing depends on it — the key fingerprint `f` is what protects the request.
 
 ### The request
 
@@ -118,7 +120,9 @@ const invitation = await createInvitation(tenant, admin, {
   rows: [{ firstName: "Anna", lastName: "Muster", username: "Anna Muster/Schule", email: "anna@example.com" }],
 });
 // push `directory`, then send each row its link:
-const link = `https://haven.example/welcome/join#${invitationLinkFragment(tenant.getId(), invitation, invitation.rows![0])}`;
+const link = `https://haven.example/welcome/join#${invitationLinkFragment(tenant.getId(), invitation, invitation.rows![0], {
+  tenantLabel: "Schule am See",
+})}`;
 
 // later
 await syncJoinRequestInbox(tenant, serverUrl, admin);

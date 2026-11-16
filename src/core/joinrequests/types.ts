@@ -137,12 +137,6 @@ export interface InvitationDoc {
   serverSigningPublicKey?: string;
   /** Server URL the link points to (informational). */
   serverUrl?: string;
-  /**
-   * Tenant name shown on the joining device ("Invitation to …"). Public on
-   * purpose — the server and the invited people see it — so the admin chooses
-   * it; the tenant's own label stays encrypted under `default`.
-   */
-  tenantLabel?: string;
   /** JSON of {@link AdminSealedBlob}. */
   sealed: string;
 }
@@ -157,8 +151,6 @@ export interface InvitationPublicInfo {
   expiresAt: number;
   ended: boolean;
   maxUses?: number;
-  /** Human-readable tenant label, when the server can tell (field-encrypted labels stay hidden). */
-  tenantLabel?: string;
 }
 
 /** What a joining device sends (`POST /:tenantId/join-requests`). */
@@ -226,4 +218,10 @@ export interface InvitationLink {
   /** Absent for open (shared) links. */
   nonce?: string;
   keyFingerprint: string;
+  /**
+   * Tenant name for "Invitation to …" (`l=`). Rides in the fragment only, so
+   * the server never sees it. Display only: it is not authenticated, the key
+   * fingerprint is what protects the request.
+   */
+  tenantLabel?: string;
 }

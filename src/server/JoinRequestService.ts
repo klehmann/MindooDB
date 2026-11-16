@@ -134,7 +134,6 @@ export class JoinRequestService {
       expiresAt: invitation.expiresAt,
       ended: invitation.ended === true,
       ...(typeof invitation.maxUses === "number" ? { maxUses: invitation.maxUses } : {}),
-      ...(typeof invitation.tenantLabel === "string" && invitation.tenantLabel ? { tenantLabel: invitation.tenantLabel } : {}),
     };
   }
 

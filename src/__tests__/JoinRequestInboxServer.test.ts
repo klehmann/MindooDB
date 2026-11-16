@@ -119,7 +119,6 @@ describe("join-request inbox over local HTTP server", () => {
         kind: "personal",
         serverUrl: baseUrl,
         label: "Kollegium",
-        tenantLabel: "Schule am See",
         rows: [
           { firstName: "Jane", lastName: "Doe", username: `Jane Doe/${tenantId}`, email: "jane@example.com" },
           { firstName: "Max", lastName: "Muster", username: `Max Muster/${tenantId}` },
@@ -140,7 +139,12 @@ describe("join-request inbox over local HTTP server", () => {
         `https://haven.example/welcome/join#${invitationLinkFragment(tenantId, personal, janeRow)}`,
       )!;
       expect(link.nonce).toBe(janeRow.nonce);
-      expect((await fetchInvitationForLink(cryptoAdapter, link)).tenantLabel).toBe("Schule am See");
+      // The tenant label rides in the fragment; the server's answer does not carry it.
+      const labelled = parseInvitationLinkFragment(
+        invitationLinkFragment(tenantId, personal, janeRow, { tenantLabel: "Schule am See" }),
+      )!;
+      expect(labelled.tenantLabel).toBe("Schule am See");
+      expect(await fetchInvitationForLink(cryptoAdapter, labelled)).not.toHaveProperty("tenantLabel");
 
       // A server handing out another key is caught by the fingerprint.
       await expect(

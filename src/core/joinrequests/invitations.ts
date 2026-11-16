@@ -168,8 +168,6 @@ export interface CreateInvitationOptions {
   serverUrl: string;
   rows?: InvitationRowInput[];
   label?: string;
-  /** Public tenant name for the joining device (see {@link InvitationDoc.tenantLabel}). */
-  tenantLabel?: string;
   /** Absolute expiry (ms); default 30 days from now. */
   expiresAt?: number;
   /** Open links: cap on distinct devices. */
@@ -194,7 +192,6 @@ export interface InvitationView {
   maxUses?: number;
   serverUrl?: string;
   serverSigningPublicKey?: string;
-  tenantLabel?: string;
   /** Present when the admin could open the seal. */
   label?: string;
   rows?: InvitationRow[];
@@ -286,7 +283,6 @@ export async function createInvitation(
     ended: false,
     serverSigningPublicKey: options.serverSigningPublicKey ?? (await fetchServerSigningKey(options.serverUrl)),
     serverUrl: options.serverUrl.replace(/\/$/, ""),
-    ...(options.tenantLabel?.trim() ? { tenantLabel: options.tenantLabel.trim().slice(0, 200) } : {}),
     sealed: JSON.stringify(blob),
   };
   const directoryDb = await tenant.openDB(DIRECTORY_DB_ID, { adminOnlyDb: true });
@@ -312,7 +308,6 @@ function viewFromDoc(doc: InvitationDoc): InvitationView {
     ...(typeof doc.maxUses === "number" ? { maxUses: doc.maxUses } : {}),
     ...(doc.serverUrl ? { serverUrl: doc.serverUrl } : {}),
     ...(doc.serverSigningPublicKey ? { serverSigningPublicKey: doc.serverSigningPublicKey } : {}),
-    ...(doc.tenantLabel ? { tenantLabel: doc.tenantLabel } : {}),
     readable: false,
   };
 }
@@ -500,9 +495,13 @@ export function invitationLinkFragment(
   tenantId: string,
   invitation: Pick<InvitationView, "invitationId" | "keyFingerprint" | "serverUrl">,
   row?: Pick<InvitationRow, "nonce">,
-  serverUrl?: string,
+  options?: {
+    serverUrl?: string;
+    /** Tenant label for "Invitation to …"; carried in the fragment as `l=`, never sent to the server. */
+    tenantLabel?: string;
+  },
 ): string {
-  const server = serverUrl ?? invitation.serverUrl;
+  const server = options?.serverUrl ?? invitation.serverUrl;
   if (!server) throw new Error("No server URL for this invitation");
   return buildInvitationLinkFragment({
     serverUrl: server,
@@ -510,6 +509,7 @@ export function invitationLinkFragment(
     invitationId: invitation.invitationId,
     ...(row?.nonce ? { nonce: row.nonce } : {}),
     keyFingerprint: invitation.keyFingerprint,
+    ...(options?.tenantLabel ? { tenantLabel: options.tenantLabel } : {}),
   });
 }
 

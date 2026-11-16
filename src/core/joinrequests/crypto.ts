@@ -408,9 +408,19 @@ export function decodeJson<T>(bytes: Uint8Array): T {
 // Link fragment
 // ---------------------------------------------------------------------------
 
+/** Longest tenant label carried in a link (keeps mailto links short). */
+export const MAX_INVITATION_LINK_LABEL_CHARS = 80;
+
+/** Trimmed, control-character-free label, cut to {@link MAX_INVITATION_LINK_LABEL_CHARS}. */
+function cleanInvitationLabel(value: string | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned ? cleaned.slice(0, MAX_INVITATION_LINK_LABEL_CHARS) : undefined;
+}
+
 /**
- * `s=<server>&t=<tenantId>&i=<inviteId>&n=<nonce>&f=<keyFingerprint>`, no
- * leading `#`. Shared (open) links have no `n`. Everything after `#` stays in
+ * `s=<server>&t=<tenantId>&i=<inviteId>&n=<nonce>&f=<keyFingerprint>&l=<label>`, no
+ * leading `#`. Shared (open) links have no `n`; `l` (tenant label) is optional. Everything after `#` stays in
  * the browser: the fragment never reaches the web server that serves Haven.
  */
 export function buildInvitationLinkFragment(link: InvitationLink): string {
@@ -420,6 +430,8 @@ export function buildInvitationLinkFragment(link: InvitationLink): string {
   params.set("i", link.invitationId);
   if (link.nonce) params.set("n", link.nonce);
   params.set("f", link.keyFingerprint);
+  const label = cleanInvitationLabel(link.tenantLabel);
+  if (label) params.set("l", label);
   return params.toString();
 }
 
@@ -437,5 +449,13 @@ export function parseInvitationLinkFragment(input: string): InvitationLink | nul
   if (!/^https?:\/\//i.test(serverUrl) || !tenantId || !isValidInvitationId(invitationId)) return null;
   if (!FINGERPRINT_PATTERN.test(keyFingerprint)) return null;
   if (nonce !== undefined && !NONCE_PATTERN.test(nonce)) return null;
-  return { serverUrl: serverUrl.replace(/\/$/, ""), tenantId, invitationId, nonce, keyFingerprint };
+  const tenantLabel = cleanInvitationLabel(params.get("l") ?? undefined);
+  return {
+    serverUrl: serverUrl.replace(/\/$/, ""),
+    tenantId,
+    invitationId,
+    nonce,
+    keyFingerprint,
+    ...(tenantLabel ? { tenantLabel } : {}),
+  };
 }
