@@ -33,15 +33,49 @@ function serializeMetadata(meta: StoreEntryMetadata): string {
     ...meta,
     signature: bytesToBase64(meta.signature),
     metadataSignature: meta.metadataSignature ? bytesToBase64(meta.metadataSignature) : undefined,
+    receivedDateSignature: meta.receivedDateSignature
+      ? bytesToBase64(toBytes(meta.receivedDateSignature))
+      : undefined,
   });
 }
 
+/**
+ * Bytes from a stored binary field: base64 (current form) or the
+ * index-keyed object `{"0":172,"1":92,…}` that `JSON.stringify` makes of a
+ * Uint8Array, which earlier versions wrote for `receivedDateSignature`.
+ */
+function toBytes(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return base64ToBytes(value);
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, number>;
+    const length = Object.keys(record).length;
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i++) {
+      bytes[i] = record[String(i)] ?? 0;
+    }
+    return bytes;
+  }
+  throw new Error("Expected a binary metadata field");
+}
+
 function deserializeMetadata(json: string): StoreEntryMetadata {
-  const parsed = JSON.parse(json) as StoreEntryMetadata & { signature: string; metadataSignature?: string };
+  const parsed = JSON.parse(json) as StoreEntryMetadata & {
+    signature: string;
+    metadataSignature?: string;
+    receivedDateSignature?: unknown;
+  };
   return {
     ...parsed,
     signature: base64ToBytes(parsed.signature),
     metadataSignature: parsed.metadataSignature ? base64ToBytes(parsed.metadataSignature) : undefined,
+    receivedDateSignature: parsed.receivedDateSignature
+      ? toBytes(parsed.receivedDateSignature)
+      : undefined,
   };
 }
 
