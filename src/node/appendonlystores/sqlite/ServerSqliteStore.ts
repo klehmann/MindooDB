@@ -37,6 +37,8 @@ export const STORE_BACKEND_FILE = "store-backend.json";
 export const SQLITE_MIGRATION_STATE_FILE = "sqlite-migration.json";
 export const LEGACY_FILE_STORE_DIR = "legacy-file-store";
 export const MAX_MIGRATION_ATTEMPTS = 3;
+/** How often a running move logs its progress. */
+const PROGRESS_LOG_INTERVAL_MS = 5_000;
 
 /** What `BasicOnDiskContentAddressedStore` keeps in a store directory. */
 const FILE_STORE_PARTS = ["entries", "content", "metadata-index.json", "metadata-segments", "store-epoch.json"];
@@ -164,14 +166,28 @@ async function migrateFileStore(
       removeSqliteFiles(dir);
     }
     target = openNodeSqliteStore(dir, dbId, storeKind, logger, { blobThresholdBytes: options.blobThresholdBytes });
-    if (state.checkpoint) {
-      logger.info(`Resuming move of ${dbId}/${storeKind} to sqlite after ${state.checkpoint.copied} entries`);
-    }
+    const total = (await source.getAllIds()).length;
+    logger.info(
+      state.checkpoint
+        ? `Resuming move of ${dbId}/${storeKind} to sqlite at ${state.checkpoint.copied}/${total} entries ` +
+            `(attempt ${state.attempts}/${MAX_MIGRATION_ATTEMPTS})`
+        : `Moving ${dbId}/${storeKind} from file to sqlite: ${total} entries ` +
+            `(attempt ${state.attempts}/${MAX_MIGRATION_ATTEMPTS})`,
+    );
+    let lastProgressAt = Date.now();
     const done = await copyStoreResumable(source, target.store, {
       batchSize: options.migrationBatchSize,
       checkpoint: state.checkpoint,
-      onCheckpoint: (checkpoint) => writeJsonDurably(statePath, { ...state, checkpoint }),
+      onCheckpoint: async (checkpoint) => {
+        await writeJsonDurably(statePath, { ...state, checkpoint });
+        if (Date.now() - lastProgressAt >= PROGRESS_LOG_INTERVAL_MS) {
+          lastProgressAt = Date.now();
+          const percent = total > 0 ? Math.round((checkpoint.copied / total) * 100) : 100;
+          logger.info(`Moving ${dbId}/${storeKind} to sqlite: ${checkpoint.copied}/${total} entries (${percent} %)`);
+        }
+      },
     });
+    logger.info(`Moving ${dbId}/${storeKind} to sqlite: copied ${done.copied} entries, verifying`);
     const verification = await verifyStoreCopy(source, target.store, {
       payloadSample: options.migrationPayloadSample ?? 200,
     });
