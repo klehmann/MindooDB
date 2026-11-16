@@ -16,6 +16,7 @@ export {
   isRecoveryContactsDocId,
   asRecoveryContactsPayload,
   verifyRecoveryContactsDoc,
+  personalDocBelongsTo,
   type RecoveryContactEntry,
   type RecoveryContactsPayload,
   type RecoveryContactsSetup,
@@ -44,3 +45,13 @@ export {
   type CertifyDeviceWithRescueDeviceInput,
   type CertifyDeviceWithRescueDeviceResult,
 } from "./recoverWithContacts";
+export {
+  PAPER_RESCUE_DOC_ID_PREFIX,
+  PAPER_RESCUE_TYPE,
+  PAPER_RESCUE_SCHEMA_VERSION,
+  openPaperRescueSecret,
+  verifyPaperRescueDoc,
+  type PaperRescuePayload,
+  type PaperRescueRecord,
+  type PaperRescueSecret,
+} from "./PaperRescueDevice";

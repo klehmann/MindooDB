@@ -1370,6 +1370,16 @@ export interface MindooTenant {
   canIssueDeviceCertificates?(): Promise<boolean>;
   /** Signing keys of every verified rescue device in the tenant, by person. */
   listRescueDeviceSigningKeys?(): Promise<Array<{ username: string; signingPublicKey: string }>>;
+  /**
+   * A new paper rescue device for a printed recovery sheet (docs/userkeys.md
+   * §12.8): certified like any device, its secret goes onto the sheet. Earlier
+   * paper rescue devices of this person are withdrawn. Needs device self-grant.
+   */
+  createPaperRescueDevice?(options?: { label?: string }): Promise<import("./recovery/PaperRescueDevice").PaperRescueSecret>;
+  /** This person's paper rescue devices (public half). */
+  listPaperRescueDevices?(): Promise<import("./recovery/PaperRescueDevice").PaperRescueRecord[]>;
+  /** Withdraw every paper rescue device of this person. */
+  removePaperRescueDevices?(): Promise<number>;
   reconcileUserKeys?(options?: { allowSelfCreate?: boolean }): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   getUserKeyEnrollmentStatus?(): Promise<import("./userkeys/types").UserKeyEnrollmentStatus>;
   noteUserDirectoryFetched?(): void;

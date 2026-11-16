@@ -122,11 +122,28 @@ export async function verifyRecoveryContactsDoc(input: {
   if (!isRecoveryContactsDocId(docId) || doc.isDeleted()) return null;
   const payload = asRecoveryContactsPayload(doc.getData());
   if (!payload) return null;
-  const creator = await resolveCreateSigner(db, docId);
-  if (!creator) return null;
-  const resolved = await directory.resolveSignerToGrant(creator, Number.MAX_SAFE_INTEGER);
-  if (!resolved || resolved.grant.usernameHash !== payload.username_hash) return null;
-  const candidates = await directory.getUsernameHashCandidates(payload.username);
-  if (!candidates.includes(payload.username_hash)) return null;
+  if (!(await personalDocBelongsTo({ db, docId, directory, username: payload.username, usernameHash: payload.username_hash }))) {
+    return null;
+  }
   return { docId, payload: JSON.parse(JSON.stringify(payload)) as RecoveryContactsPayload };
+}
+
+/**
+ * Whether a personal document was created by the person it names: its
+ * `doc_create` signer resolves (grant device or certified device) to the grant
+ * with `usernameHash`, and `username` hashes to that same value.
+ */
+export async function personalDocBelongsTo(input: {
+  db: MindooDB;
+  docId: string;
+  directory: BaseMindooTenantDirectory;
+  username: string;
+  usernameHash: string;
+}): Promise<boolean> {
+  const creator = await resolveCreateSigner(input.db, input.docId);
+  if (!creator) return false;
+  const resolved = await input.directory.resolveSignerToGrant(creator, Number.MAX_SAFE_INTEGER);
+  if (!resolved || resolved.grant.usernameHash !== input.usernameHash) return false;
+  const candidates = await input.directory.getUsernameHashCandidates(input.username);
+  return candidates.includes(input.usernameHash);
 }

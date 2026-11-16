@@ -687,6 +687,7 @@ Once documents can be sealed to a person, `userdirectory` becomes the natural ho
 | `qtn_` | A write the server turned away, kept so it can be found and offered again (§7.6.2) | every member, via the tenant `default` key | derived from author, database, document and rejection class |
 | `dcert_` | A device certificate the person issued with their self-grant key (§9.6) | every member and the sync server, via `$publicinfos` | derived from the certified device's signing-key fingerprint |
 | `rcv_` | The person's recovery contacts: encrypted rescue device and sealed shares (§12) | every member, via the tenant `default` key | generated |
+| `rpp_` | Public half of the person's paper rescue device (§12.8) | every member, via the tenant `default` key | generated |
 
 These documents need the opposite of what a key document needs. A key document is published: everybody must read it, and its owner is named inside it by `username_hash`. A personal document is not: it is encrypted so that the hoster cannot read it, which means ownership cannot be read out of the payload — exactly what the rule in section 7.2 does.
 
@@ -768,7 +769,7 @@ These are properties of the design, not defects to be fixed later. State them in
 - **Approval is only as strong as the human performing it.** A user who confirms a device without comparing fingerprints can authorize a planted one, handing over every key they hold at once.
 - **The first device is trusted on first use.** A trust chain rooted in a planted device is compromised from the start, and the initial publish wraps every device already on the grant.
 - **The policy plane stays administrator-trusted.** An administrator can still edit groups or add themselves to a distribution. User key addressing stops device planting, not malicious policy.
-- **A copied identity is the same device.** A restored backup, a paper recovery or an exported `.json` identity carries the same device keys, user key and self-grant key. Revoking or wiping that device hits every copy, and a stolen copy cannot be cut off alone (section 9.5).
+- **A copied identity is the same device.** A restored backup, a paper recovery made without a paper rescue device (section 12.8) or an exported `.json` identity carries the same device keys, user key and self-grant key. Revoking or wiping that device hits every copy, and a stolen copy cannot be cut off alone (section 9.5).
 - **An approved device can always export the private key.** This is an exfiltration path at the application layer, not a protocol flaw.
 - **An administrator can repeatedly purge a key document** as denial of service. It never grants read access.
 - **There is no administrator recovery.** User private keys are deliberately not wrapped to an administrator. The opt-in alternative is recovery contacts (section 12): colleagues the person picks, any two of whom can recover together. It is visually distinct from device approval, so that "approve my phone" is never confused with "give two colleagues a way in".
@@ -1330,4 +1331,31 @@ A certificate whose `issuedBySigningPublicKey` is a rescue device's signing key 
 | `certifyDeviceWithRescueDevice({ cryptoAdapter, recovery, device, label?, serverUrl? })` | Certify a new device as the rescue device; `RecoveryError` codes `no-server`, `tenant-not-found`, `not-certified`, `sync-failed`. |
 | `splitSecret` / `combineShares` | Shamir over GF(2^8), share layout `[y…, x]`, compatible with the audited `shamir-secret-sharing` package. |
 
-Covered by `RecoveryShamirAndPackages.test.ts` (Shamir, rescue blob, packages) and `RecoveryContactsServer.test.ts` (2-of-3 recovery over HTTP, also after a User-Key rotation; one package alone fails; renewal withdraws the used rescue device, whose packages are refused afterwards).
+### 12.8 Paper rescue device
+
+A printed recovery sheet used to carry a copy of the device's own keys. Restoring it brought back *the same device* (section 9.5), and once the User-Key rotated away from that device the sheet could no longer open new content. A **paper rescue device** replaces that copy: a rescue device of its own, certified with the self-grant key exactly like the one of recovery contacts, so it receives every User-Key generation and never goes stale.
+
+```ts
+// Printing: a new paper rescue device; earlier ones of this person are withdrawn.
+const sheet = await tenant.createPaperRescueDevice({ label: "Recovery printout" });
+// sheet = { tenantId, username, secret, rescueBlob, rescueSigningKeyFingerprint, docId }
+// The application encrypts `sheet` with the printout's own secret and prints it.
+
+// Restoring on a new device: open the sheet and certify the new device with it.
+const recovery = await openPaperRescueSecret(crypto, sheet, serverUrl);
+await certifyDeviceWithRescueDevice({ cryptoAdapter: crypto, recovery, device });
+```
+
+- **Independent of recovery contacts.** It is a different rescue device with a different secret. Changing contacts does not invalidate the sheet, and a new sheet does not touch the contacts.
+- **One sheet at a time.** The tenant keeps only the public half in a personal document `rpp_…` (tenant `default` key). `createPaperRescueDevice` withdraws every earlier one of the person, so printing a new sheet retires the old one; `removePaperRescueDevices()` retires all.
+- **A sheet stays valid after use**, like a printout in a drawer. Whoever holds it and its secret can become the person, so a sheet that may have been seen should be replaced by printing a new one.
+- **The restored device is a new device** with its own keys, not a copy of the old one: revoking or wiping one no longer hits the other.
+- Like every rescue device it needs device self-grant; without it applications keep printing the device's own keys.
+
+| Call | Purpose |
+|---|---|
+| `tenant.createPaperRescueDevice({ label? })` | Certify a new paper rescue device, publish its `rpp_` document, withdraw earlier ones. Returns the sheet secret. |
+| `tenant.listPaperRescueDevices()` / `tenant.removePaperRescueDevices()` | The person's paper rescue devices; withdraw them all. |
+| `openPaperRescueSecret(crypto, sheet, serverUrl?)` | Open a sheet into the input of `certifyDeviceWithRescueDevice`. |
+
+Covered by `RecoveryShamirAndPackages.test.ts` (Shamir, rescue blob, packages), `PaperRescueServer.test.ts` (sheet survives a rotation, a new sheet withdraws the old one) and `RecoveryContactsServer.test.ts` (2-of-3 recovery over HTTP, also after a User-Key rotation; one package alone fails; renewal withdraws the used rescue device, whose packages are refused afterwards).

@@ -45,6 +45,8 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * `rcv_` — a person's recovery contacts (docs/userkeys.md §12): the
  *   encrypted rescue device and one sealed secret share per contact,
  *   encrypted with the tenant `default` key.
+ * `rpp_` — the public half of a person's paper rescue device (docs/userkeys.md
+ *   §12.8), so a new printout can withdraw the previous one.
  *
  * They differ in who may *read* them, which this rule does not care about:
  * `wks_` documents are sealed to their owner, while `dev_` and `qtn_` are
@@ -52,7 +54,7 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * and audit refused writes while the hoster still sees ciphertext. Ownership is
  * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {
