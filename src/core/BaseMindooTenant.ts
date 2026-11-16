@@ -33,7 +33,7 @@ import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { extractRevokedKeyPairs, extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
 import { PaperRescueManager } from "./recovery/PaperRescueDevice";
-import { RecoveryContactsManager } from "./recovery/RecoveryContactsManager";
+import { RecoveryContactsManager, approveOwnRescueDevices } from "./recovery/RecoveryContactsManager";
 import { UserKeyManager } from "./userkeys/UserKeyManager";
 import type {
   PendingUserKeyDevice,
@@ -551,7 +551,7 @@ export class BaseMindooTenant implements MindooTenant {
   async setupRecoveryContacts(
     contacts: string[],
     options?: import("./recovery/RecoveryContactsManager").SetupRecoveryContactsOptions,
-  ): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup> {
+  ): Promise<import("./recovery/RecoveryContactsManager").SetupRecoveryContactsResult> {
     return this.recoveryContacts.setup(contacts, options);
   }
 
@@ -588,7 +588,8 @@ export class BaseMindooTenant implements MindooTenant {
 
   async createPaperRescueDevice(options?: {
     label?: string;
-  }): Promise<import("./recovery/PaperRescueDevice").PaperRescueSecret> {
+    allowAdminApproval?: boolean;
+  }): Promise<import("./recovery/PaperRescueDevice").CreatePaperRescueResult> {
     return this.paperRescue.create(options);
   }
 
@@ -601,7 +602,40 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   async reconcileUserKeys(options?: { allowSelfCreate?: boolean }): Promise<UserKeyEnrollmentStatus> {
-    return this.userKeys.reconcile(options);
+    const status = await this.userKeys.reconcile(options);
+    if (status.state === "approved") await this.approveOwnRescueDevicesSafe();
+    return status;
+  }
+
+  /**
+   * Wrap the User-Key to this person's own admin-approved rescue devices that
+   * reached the grant (docs/userkeys.md §12.9). Runs after every reconcile;
+   * the attestation in their `rcv_`/`rpp_` document is what allows skipping
+   * the approval dialog.
+   */
+  async approveOwnRescueDevices(): Promise<number> {
+    if (!(await this.hasDecryptionKey(DEFAULT_TENANT_KEY_ID))) return 0;
+    const contacts = await this.recoveryContacts.ownRescueDevices();
+    if (!contacts.usernameHash) return 0;
+    const paper = (await this.paperRescue.list()).map((r) => r.payload.rescueDevice);
+    return approveOwnRescueDevices(this.userKeys, contacts.usernameHash, [...contacts.refs, ...paper]);
+  }
+
+  private async approveOwnRescueDevicesSafe(): Promise<void> {
+    try {
+      const approved = await this.approveOwnRescueDevices();
+      if (approved > 0) this.logger.info(`Wrapped the User-Key to ${approved} own rescue device(s)`);
+    } catch (error) {
+      this.logger.warn(`approveOwnRescueDevices: ${error}`);
+    }
+  }
+
+  async getRecoveryContactsStatus(): Promise<import("./recovery/RecoveryContactsManager").RescueDeviceStatus | null> {
+    return this.recoveryContacts.status();
+  }
+
+  async getPaperRescueStatus(): Promise<import("./recovery/RecoveryContactsManager").RescueDeviceStatus | null> {
+    return this.paperRescue.status();
   }
 
   async reconcileUserKeysSafe(): Promise<void> {

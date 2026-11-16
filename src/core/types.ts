@@ -1354,7 +1354,7 @@ export interface MindooTenant {
   setupRecoveryContacts?(
     contacts: string[],
     options?: import("./recovery/RecoveryContactsManager").SetupRecoveryContactsOptions,
-  ): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup>;
+  ): Promise<import("./recovery/RecoveryContactsManager").SetupRecoveryContactsResult>;
   /** This person's current recovery contacts, or `null`. */
   getRecoveryContactsSetup?(): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup | null>;
   /** Remove the recovery contacts and withdraw the rescue device. */
@@ -1375,7 +1375,18 @@ export interface MindooTenant {
    * §12.8): certified like any device, its secret goes onto the sheet. Earlier
    * paper rescue devices of this person are withdrawn. Needs device self-grant.
    */
-  createPaperRescueDevice?(options?: { label?: string }): Promise<import("./recovery/PaperRescueDevice").PaperRescueSecret>;
+  createPaperRescueDevice?(options?: {
+    label?: string;
+    allowAdminApproval?: boolean;
+  }): Promise<import("./recovery/PaperRescueDevice").CreatePaperRescueResult>;
+  /**
+   * Wrap the User-Key to own admin-approved rescue devices on the grant
+   * (docs/userkeys.md §12.9). Also runs after every `reconcileUserKeys`.
+   */
+  approveOwnRescueDevices?(): Promise<number>;
+  /** Where the rescue device of the recovery contacts / the newest paper sheet stands. */
+  getRecoveryContactsStatus?(): Promise<import("./recovery/RecoveryContactsManager").RescueDeviceStatus | null>;
+  getPaperRescueStatus?(): Promise<import("./recovery/RecoveryContactsManager").RescueDeviceStatus | null>;
   /** This person's paper rescue devices (public half). */
   listPaperRescueDevices?(): Promise<import("./recovery/PaperRescueDevice").PaperRescueRecord[]>;
   /** Withdraw every paper rescue device of this person. */

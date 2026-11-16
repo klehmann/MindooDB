@@ -24,6 +24,7 @@
 import type { BaseMindooTenantDirectory } from "../BaseMindooTenantDirectory";
 import type { MindooDB, MindooDoc } from "../types";
 import { USERKEY_FORM } from "../userkeys/types";
+import { isRescueDeviceRef, type RescueDeviceRef } from "./rescueApproval";
 
 export const RECOVERY_CONTACTS_DOC_ID_PREFIX = "rcv_";
 export const RECOVERY_CONTACTS_TYPE = "recoverycontacts";
@@ -51,13 +52,7 @@ export interface RecoveryContactsPayload {
   username_hash: string;
   threshold: number;
   createdAt: number;
-  rescueDevice: {
-    signingPublicKey: string;
-    encryptionPublicKey: string;
-    signingKeyFingerprint: string;
-    /** The `dcert_` document that certifies it. */
-    certificateDocId: string;
-  };
+  rescueDevice: RescueDeviceRef;
   /** The rescue device's private keys, AES-256-GCM under the recovery secret. */
   rescueBlob: string;
   contacts: RecoveryContactEntry[];
@@ -83,9 +78,7 @@ export function asRecoveryContactsPayload(data: unknown): RecoveryContactsPayloa
   if (typeof d.threshold !== "number" || typeof d.createdAt !== "number") return null;
   const rescue = d.rescueDevice as Record<string, unknown> | undefined;
   if (!rescue || typeof rescue !== "object") return null;
-  for (const key of ["signingPublicKey", "encryptionPublicKey", "signingKeyFingerprint", "certificateDocId"]) {
-    if (typeof rescue[key] !== "string" || !(rescue[key] as string)) return null;
-  }
+  if (!isRescueDeviceRef(rescue)) return null;
   if (!Array.isArray(d.contacts)) return null;
   for (const entry of d.contacts as unknown[]) {
     const c = entry as Record<string, unknown>;

@@ -23,8 +23,15 @@ import { DEFAULT_TENANT_KEY_ID, USER_DIRECTORY_DB_ID, type MindooDB, type Mindoo
 import type { UserKeyManager } from "../userkeys/UserKeyManager";
 import { base64ToBytes, bytesToBase64 } from "../userkeys/fingerprint";
 import { USERKEY_FORM } from "../userkeys/types";
+import { isRescueDeviceRef, type RescueDeviceRef } from "./rescueApproval";
 import { personalDocBelongsTo } from "./RecoveryContactsDocument";
-import { RecoveryContactsError } from "./RecoveryContactsManager";
+import {
+  RecoveryContactsError,
+  admitRescueDevice,
+  rescueDeviceStatus,
+  rescueRefIsGenuine,
+  type RescueDeviceStatus,
+} from "./RecoveryContactsManager";
 import type { CombinedRecoveryPackages } from "./recoveryPackage";
 import { generateRescueDevice, openRescueDevice } from "./rescueDevice";
 
@@ -39,12 +46,7 @@ export interface PaperRescuePayload {
   username: string;
   username_hash: string;
   createdAt: number;
-  rescueDevice: {
-    signingPublicKey: string;
-    encryptionPublicKey: string;
-    signingKeyFingerprint: string;
-    certificateDocId: string;
-  };
+  rescueDevice: RescueDeviceRef;
 }
 
 /** What goes onto the sheet (the application encrypts it). */
@@ -56,8 +58,18 @@ export interface PaperRescueSecret {
   /** The rescue device's private keys, AES-256-GCM under `secret`. */
   rescueBlob: string;
   rescueSigningKeyFingerprint: string;
+  /** `admin`: the rescue device is on the grant, not certified (docs/userkeys.md §12.9). */
+  approval?: "admin";
   /** The `rpp_` document of this sheet. */
   docId: string;
+}
+
+/** What {@link PaperRescueManager.create} returns: the sheet, and how it gets admitted. */
+export interface CreatePaperRescueResult extends PaperRescueSecret {
+  /** Set when the administrator must put the rescue device on the grant. */
+  joinRequestUri?: string;
+  /** Earlier admin-approved paper rescue devices still on the grant (only the admin can remove them). */
+  rescueDevicesToRemove: string[];
 }
 
 export interface PaperRescueRecord {
@@ -74,9 +86,7 @@ function asPaperRescuePayload(data: unknown): PaperRescuePayload | null {
   }
   const rescue = d.rescueDevice as Record<string, unknown> | undefined;
   if (!rescue || typeof rescue !== "object") return null;
-  for (const key of ["signingPublicKey", "encryptionPublicKey", "signingKeyFingerprint", "certificateDocId"]) {
-    if (typeof rescue[key] !== "string" || !(rescue[key] as string)) return null;
-  }
+  if (!isRescueDeviceRef(rescue)) return null;
   return d as unknown as PaperRescuePayload;
 }
 
@@ -107,7 +117,7 @@ export async function verifyPaperRescueDoc(input: {
  */
 export async function openPaperRescueSecret(
   crypto: CryptoAdapter,
-  sheet: Pick<PaperRescueSecret, "tenantId" | "username" | "secret" | "rescueBlob" | "rescueSigningKeyFingerprint" | "docId">,
+  sheet: Pick<PaperRescueSecret, "tenantId" | "username" | "secret" | "rescueBlob" | "rescueSigningKeyFingerprint" | "docId" | "approval">,
   serverUrl?: string,
 ): Promise<CombinedRecoveryPackages> {
   const rescueDevice = await openRescueDevice(crypto, base64ToBytes(sheet.secret), sheet.rescueBlob);
@@ -120,6 +130,7 @@ export async function openPaperRescueSecret(
     username: sheet.username,
     setupDocId: sheet.docId,
     helpers: [],
+    ...(sheet.approval === "admin" ? { rescueApproval: "admin" as const } : {}),
     rescueDevice,
   };
 }
@@ -150,7 +161,18 @@ export class PaperRescueManager {
       if (!id.startsWith(PAPER_RESCUE_DOC_ID_PREFIX)) continue;
       try {
         const record = await verifyPaperRescueDoc({ db, doc: await db.getDocument(id), directory });
-        if (record) out.push(record);
+        if (
+          record &&
+          (await rescueRefIsGenuine({
+            tenant: this.tenant,
+            userKeys: this.userKeys,
+            username: record.payload.username,
+            usernameHash: record.payload.username_hash,
+            ref: record.payload.rescueDevice,
+          }))
+        ) {
+          out.push(record);
+        }
       } catch {
         // unreadable or damaged
       }
@@ -163,7 +185,7 @@ export class PaperRescueManager {
    * public half and withdraw every earlier paper rescue device of this person.
    * Returns what the sheet must carry. Needs device self-grant.
    */
-  async create(options?: { label?: string }): Promise<PaperRescueSecret> {
+  async create(options?: { label?: string; allowAdminApproval?: boolean }): Promise<CreatePaperRescueResult> {
     const resolved = await this.userKeys.resolveOwnUserKeyDocument();
     if (!resolved) {
       throw new RecoveryContactsError("no-user-key", "This person has no published User-Key yet.");
@@ -171,19 +193,16 @@ export class PaperRescueManager {
     if (!(await this.tenant.hasDecryptionKey(DEFAULT_TENANT_KEY_ID))) {
       throw new RecoveryContactsError("no-default-key", "This device does not hold the tenant key yet.");
     }
-    if (!(await this.userKeys.canIssueDeviceCertificates())) {
-      throw new RecoveryContactsError(
-        "self-grant-required",
-        "A paper rescue device needs device self-grant: the administrator must allow this person to add own devices.",
-      );
-    }
     const previous = await this.list();
     const me = await this.tenant.getCurrentUserId();
     const rescue = await generateRescueDevice(this.tenant.getCryptoAdapter());
-    const { docId: certificateDocId } = await this.userKeys.issueDeviceCertificate(
-      { signingPublicKey: rescue.signingPublicKey, encryptionPublicKey: rescue.encryptionPublicKey },
-      options?.label?.trim() || "Paper rescue device",
-    );
+    const admitted = await admitRescueDevice({
+      userKeys: this.userKeys,
+      rescue,
+      label: options?.label?.trim() || "Paper rescue device",
+      usernameHash: resolved.payload.username_hash,
+      ...(options?.allowAdminApproval !== undefined ? { allowAdminApproval: options.allowAdminApproval } : {}),
+    });
     const payload: PaperRescuePayload = {
       form: USERKEY_FORM,
       type: PAPER_RESCUE_TYPE,
@@ -191,12 +210,7 @@ export class PaperRescueManager {
       username: me.username,
       username_hash: resolved.payload.username_hash,
       createdAt: Date.now(),
-      rescueDevice: {
-        signingPublicKey: rescue.signingPublicKey,
-        encryptionPublicKey: rescue.encryptionPublicKey,
-        signingKeyFingerprint: rescue.signingKeyFingerprint,
-        certificateDocId,
-      },
+      rescueDevice: admitted.ref,
     };
     const db = await this.userDirectory();
     const doc = await db.createDocument({
@@ -205,13 +219,24 @@ export class PaperRescueManager {
       initialValues: payload as unknown as Record<string, unknown>,
     });
     for (const old of previous) await this.retire(db, old);
-    const sheet: PaperRescueSecret = {
+    const rescueDevicesToRemove: string[] = [];
+    for (const old of previous) {
+      if (old.payload.rescueDevice.approval !== "admin") continue;
+      const status = await rescueDeviceStatus(this.tenant, this.userKeys, old.payload.rescueDevice);
+      if (status === "active" || status === "waiting-for-key") {
+        rescueDevicesToRemove.push(old.payload.rescueDevice.signingKeyFingerprint);
+      }
+    }
+    const sheet: CreatePaperRescueResult = {
       tenantId: this.tenant.getId(),
       username: me.username,
       secret: bytesToBase64(rescue.secret),
       rescueBlob: rescue.blob,
       rescueSigningKeyFingerprint: rescue.signingKeyFingerprint,
+      ...(admitted.ref.approval === "admin" ? { approval: "admin" as const } : {}),
       docId: doc.getId(),
+      ...(admitted.joinRequestUri ? { joinRequestUri: admitted.joinRequestUri } : {}),
+      rescueDevicesToRemove,
     };
     rescue.secret.fill(0);
     rescue.signingPkcs8.fill(0);
@@ -230,6 +255,12 @@ export class PaperRescueManager {
     } catch {
       // already deleted
     }
+  }
+
+  /** Where this person's newest paper rescue device stands (`null` without one). */
+  async status(): Promise<RescueDeviceStatus | null> {
+    const newest = (await this.list())[0];
+    return newest ? rescueDeviceStatus(this.tenant, this.userKeys, newest.payload.rescueDevice) : null;
   }
 
   /** Withdraw every paper rescue device of this person (all printed sheets stop working). */

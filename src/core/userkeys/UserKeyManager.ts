@@ -18,6 +18,7 @@ import {
   generateSelfGrantKeyPair,
   signEd25519,
   userKeyGenerationSigningMessage,
+  verifyEd25519,
 } from "./generationSignature";
 import { fingerprintPublicKeyPem, normalizePublicKeyPem } from "./fingerprint";
 import {
@@ -531,6 +532,62 @@ export class UserKeyManager {
       });
     }
     return out;
+  }
+
+  /**
+   * Sign `message` with the generation signing key of this person's current
+   * User-Key generation (docs/userkeys.md §9.2). Only a holder of the
+   * User-Key can produce it, which is what makes it an attestation by the
+   * person rather than by any device on their grant. `null` while this device
+   * cannot open the current generation.
+   */
+  async signWithOwnUserKey(message: Uint8Array): Promise<{ epoch: string; signature: string } | null> {
+    const resolved = await this.resolveOwnUserKeyDocument();
+    if (!resolved) return null;
+    const epoch = currentUserKeyEpoch(resolved.payload);
+    if (!epoch) return null;
+    const bytes = await this.privateKeyBytesForEpoch(resolved.payload, epoch);
+    if (!bytes) return null;
+    const crypto = this.tenant.getCryptoAdapter();
+    const signer = await deriveGenerationSigningKey(crypto, bytes);
+    const generation = resolved.payload.userKeys[epoch];
+    if (
+      !generation?.signingPublicKey ||
+      normalizePublicKeyPem(generation.signingPublicKey) !== normalizePublicKeyPem(signer.publicKeyPem)
+    ) {
+      return null;
+    }
+    return { epoch, signature: await signEd25519(crypto, signer.privateKey, message) };
+  }
+
+  /** Verify a {@link signWithOwnUserKey} signature against a generation that counts. */
+  async verifyOwnUserKeySignature(epoch: string, signature: string, message: Uint8Array): Promise<boolean> {
+    return this.verifyUserKeySignature(await this.resolveOwnUserKeyDocument(), epoch, signature, message);
+  }
+
+  /** Verify a {@link signWithOwnUserKey} signature of another person. */
+  async verifyUserKeySignatureOf(
+    username: string,
+    epoch: string,
+    signature: string,
+    message: Uint8Array,
+  ): Promise<boolean> {
+    return this.verifyUserKeySignature(await this.resolvePublishedUserKeyDocument(username), epoch, signature, message);
+  }
+
+  private async verifyUserKeySignature(
+    resolved: ResolvedUserKeyDocument | null,
+    epoch: string,
+    signature: string,
+    message: Uint8Array,
+  ): Promise<boolean> {
+    const generation = resolved?.payload.userKeys[epoch];
+    if (!generation?.signingPublicKey) return false;
+    try {
+      return await verifyEd25519(this.tenant.getCryptoAdapter(), generation.signingPublicKey, signature, message);
+    } catch {
+      return false;
+    }
   }
 
   /** Self-grant signer for this device, if it holds the key. */
