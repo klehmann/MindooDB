@@ -559,6 +559,11 @@ describe("Network Sync", () => {
       const page2 = await clientStore.scanEntriesSince!(page1.nextCursor, 2);
       expect(page2.entries.length).toBe(1);
       expect(page2.hasMore).toBe(false);
+
+      // Every page reports the server store's epoch, matching its head.
+      const head = await clientStore.getStoreHead!();
+      expect(page1.epoch).toBe(head.epoch);
+      expect(page2.epoch).toBe(head.epoch);
     });
 
     test("should get bloom summary from remote", async () => {

@@ -4,6 +4,11 @@
 
 import { InMemoryContentAddressedStore } from "../../core/appendonlystores/InMemoryContentAddressedStore";
 import { BasicOnDiskContentAddressedStore } from "../appendonlystores/BasicOnDiskContentAddressedStore";
+import {
+  isSqliteStoreDirectory,
+  openServerSqliteStore,
+  storeDirectory,
+} from "../appendonlystores/sqlite/ServerSqliteStore";
 import { StoreKind, type ContentAddressedStore } from "../../core/types";
 import type { StoreType, TenantConfig } from "../../server/types";
 import { getDefaultLogLevel, LogLevel } from "../../core/logging/LogLevel";
@@ -11,8 +16,10 @@ import { getDefaultLogLevel, LogLevel } from "../../core/logging/LogLevel";
 /**
  * Factory for creating ContentAddressedStore instances based on configuration.
  * 
- * Supports "inmemory" stores (volatile, for testing) and "file" stores
- * (persistent, backed by BasicOnDiskContentAddressedStore).
+ * Supports "inmemory" stores (volatile, for testing), "file" stores (one file
+ * per entry, BasicOnDiskContentAddressedStore) and "sqlite" stores (SQLite
+ * plus one file per large payload; an existing file store is moved into it
+ * on first use, see ServerSqliteStore).
  */
 export class StoreFactory {
   private config: TenantConfig;
@@ -81,13 +88,28 @@ export class StoreFactory {
         return new InMemoryContentAddressedStore(dbId, storeKind);
       
       case "file": {
-        const basePath = `${this.dataDir}/${this.tenantId}/stores`;
+        const basePath = this.storesBasePath();
+        if (isSqliteStoreDirectory(storeDirectory(basePath, dbId, storeKind))) {
+          // Already moved to sqlite: its file data is gone (legacy-file-store/).
+          console.warn(
+            `[StoreFactory] ${this.tenantId}/${dbId}/${storeKind} was moved to sqlite; ` +
+              `serving it as sqlite although its store type is "file"`,
+          );
+          return openServerSqliteStore(dbId, storeKind, { basePath });
+        }
         return new BasicOnDiskContentAddressedStore(dbId, storeKind, undefined, { basePath });
       }
+
+      case "sqlite":
+        return openServerSqliteStore(dbId, storeKind, { basePath: this.storesBasePath() });
       
       default:
         throw new Error(`Unknown store type: ${storeType}`);
     }
+  }
+
+  private storesBasePath(): string {
+    return `${this.dataDir}/${this.tenantId}/stores`;
   }
 
   /**

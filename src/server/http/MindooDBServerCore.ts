@@ -1309,6 +1309,7 @@ export class MindooDBServerCore {
         entries: result.entries.map((e: StoreEntryMetadata) => serializeEntryMetadata(e)),
         nextCursor: result.nextCursor,
         hasMore: result.hasMore,
+        ...(result.epoch !== undefined ? { epoch: result.epoch } : {}),
       });
     } catch (error) {
       return errorResponse(error);

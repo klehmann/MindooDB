@@ -10,6 +10,7 @@ import { join } from "path";
 import { NodeCryptoAdapter } from "../crypto/NodeCryptoAdapter";
 import { TenantManager as CoreTenantManager } from "../../server/TenantManager";
 import type { ServerStoreProvider } from "../../server/ServerDataStore";
+import type { StoreType } from "../../server/types";
 import { FsServerDataStore } from "./FsServerDataStore";
 import { StoreFactory } from "./StoreFactory";
 
@@ -49,6 +50,25 @@ export class NodeServerStoreProvider implements ServerStoreProvider {
   }
 }
 
+const STORE_TYPES: readonly StoreType[] = ["file", "sqlite", "inmemory"];
+
+/**
+ * Store type for newly registered tenants from `MINDOODB_DEFAULT_STORE_TYPE`
+ * (`file` when unset). Existing tenants keep the type in their config.json.
+ */
+export function defaultStoreTypeFromEnv(env: NodeJS.ProcessEnv = process.env): StoreType {
+  const raw = env.MINDOODB_DEFAULT_STORE_TYPE?.trim().toLowerCase();
+  if (!raw) {
+    return "file";
+  }
+  if (!(STORE_TYPES as readonly string[]).includes(raw)) {
+    throw new Error(
+      `MINDOODB_DEFAULT_STORE_TYPE must be one of ${STORE_TYPES.join(", ")}, got "${env.MINDOODB_DEFAULT_STORE_TYPE}"`,
+    );
+  }
+  return raw as StoreType;
+}
+
 function ensureDataDir(dataDir: string): string {
   if (!existsSync(dataDir)) {
     mkdirSync(dataDir, { recursive: true });
@@ -67,6 +87,7 @@ export class TenantManager extends CoreTenantManager {
       storeProvider: new NodeServerStoreProvider(dataDir, dataStore),
       cryptoAdapter: new NodeCryptoAdapter(),
       serverPassword,
+      defaultStoreTypeForNewTenants: defaultStoreTypeFromEnv(),
     });
     this.dataDir = dataDir;
   }

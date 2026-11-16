@@ -781,6 +781,20 @@ This file is the whole replication topology. An entry with a `url` becomes one r
 }
 ```
 
+#### Store types (`defaultStoreType`, `databaseStores`)
+
+`defaultStoreType` sets how the tenant's databases are stored (a new tenant gets the value of `MINDOODB_DEFAULT_STORE_TYPE`, else `file`, unless its registration names one); `databaseStores` overrides it per database id (`{ "databaseStores": { "<dbId>": { "storeType": "sqlite" } } }`). Every store lives in `<dataDir>/<tenantId>/stores/<dbId>/<docs|attachments>/`.
+
+| Type | Layout | Use |
+|------|--------|-----|
+| `file` | one JSON file per entry and one file per payload, plus an in-memory index rebuilt on start | default; simple, but many small files and a full index in RAM |
+| `sqlite` | `store.db` (WAL, `synchronous=FULL`) with metadata, indexes and payloads below 64 KB; larger payloads as immutable files in `blobs/ab/cd/<hash>` | recommended for larger tenants: far fewer files, starts in milliseconds |
+| `inmemory` | nothing on disk | tests |
+
+**Switching an existing database from `file` to `sqlite`** needs only the config change and a restart. On first use the server copies the store into SQLite in receipt order, saving a checkpoint after every batch (`sqlite-migration.json`, so a crash resumes where it stopped), then verifies ids, metadata (signatures, witness receipts) and a sample of payloads. Only after that it writes `store-backend.json` and moves the old files into `legacy-file-store/`, which you can delete once you are satisfied (or move back for a rollback, after deleting `store.db*`, `blobs/` and `store-backend.json`). If copying or verifying fails, the file store keeps serving and the move is retried on the next start, at most three times; delete `sqlite-migration.json` to try again after that. Requests to a database wait while it is being moved, so prefer a restart over changing the type at runtime. A directory that was moved stays on SQLite even if its type is set back to `file`. Clients rescan the moved database once (its scan cursors start a new epoch).
+
+**Backups.** The blob files never change once written, so any incremental file backup handles them well. Do not copy a live `store.db` with plain file tools: take a consistent copy with `sqlite3 store.db "VACUUM INTO '/backup/store.db'"`, or replicate it continuously with [Litestream](https://litestream.io/), which streams the WAL to S3-compatible storage or a local path and restores to any point in time.
+
 Replication is not configured here. It is a property of the peer (`trusted-servers.json`), and a tenant is mirrored simply by existing on both servers.
 
 The `users` array is a **public-key allowlist**: each entry's identity is its
@@ -797,6 +811,7 @@ extra field) for human-readable notes. Entries are matched solely by
 |----------|----------|-------------|
 | `MINDOODB_SERVER_PASSWORD` | If `server.identity.json` exists and `MINDOODB_SERVER_PASSWORD_FILE` is unset | Password to decrypt server identity and per-tenant keybags |
 | `MINDOODB_SERVER_PASSWORD_FILE` | No | Path to a file whose contents are the server password (trimmed). If set, **used instead of** `MINDOODB_SERVER_PASSWORD`. Prefer for Docker: env only holds the path, not the secret. |
+| `MINDOODB_DEFAULT_STORE_TYPE` | No | Store type written into the `config.json` of a **newly registered** tenant: `file` (default), `sqlite` or `inmemory`. Existing tenants keep the type in their `config.json`. See [Store types](#store-types-defaultstoretype-databasestores). |
 | `MINDOODB_SYSTEM_ADMIN_PASSWORD` | No | For `server:add-to-network`: password for `--identity` (if not using `--password-file` or interactive prompt). May be visible in `ps` on shared hosts. |
 | `MINDOODB_CORS_ORIGIN` | No | Allowed CORS origin or comma-separated allowlist (e.g., `https://app.example.com` or `http://localhost:4174,https://otherserver.com`). If not set, CORS is disabled. |
 | `MINDOODB_ACCEPT_LEGACY_CHALLENGE_SIGNATURES` | No | `0` or `false` refuses logins from clients that predate the v2 login-challenge signing domain (MindooDB before 0.0.87). Unset, they are accepted and the server logs each kind of such login (sync, device discovery, system admin, peer) at most once an hour with a count. Switch it off once that log line stays away. |
