@@ -460,6 +460,8 @@ A restore on another computer gives you a copy of the old device rather than a n
 
 Restoring from a tenant recovery printout uses the second card and the same two-step caution. Scan the QR codes with the device's camera or paste their contents, answer the secret question, and Haven puts the identities, KeyBag material, server URL, and sync setup back. Nothing else travels on paper, so run a sync afterwards to pull the tenant's documents down again. This is also the way back when every approved device for a tenant is gone and there is nobody left to approve a new one.
 
+If you may add your own devices, a printout made now no longer carries a copy of this device's keys for you, but a rescue device of its own: it keeps working when your keys change, and restoring it sets up a new device of its own instead of a copy (unlocked with the answer to the secret question; you can change that later). Each new printout of a tenant makes the earlier ones stop working, so keep only the newest. Admin ids, and people who may not add their own devices, are still printed as before.
+
 Factory reset is at the bottom of the tab. It wipes everything Haven knows in this browser — identities, tenants, applications, hosted app files, virtual views, workspace layout, and all synced MindooDB data — and returns Haven to its brand-new state. Because it is irreversible, Haven asks you to type a confirmation phrase before the button becomes active, and then asks the browser for one more confirmation. Treat factory reset as a last resort and only after a known-good backup exists.
 
 ### Stats

@@ -460,6 +460,8 @@ En gjenoppretting på en annen datamaskin gir deg en kopi av den gamle enheten, 
 
 Å gjenopprette fra en tenant-nødutskrift bruker det andre kortet og den samme tosteg-forsiktigheten. Skann QR-kodene med enhetens kamera eller lim inn innholdet deres, svar på det hemmelige spørsmålet, og Haven legger identitetene, KeyBag-materialet, server-URL-en og synkroniseringsoppsettet tilbake. Ingenting annet reiser på papir, så kjør en synkronisering etterpå for å hente tenantens dokumenter ned igjen. Dette er også veien tilbake når hver godkjente enhet for en tenant er borte og det ikke er noen igjen til å godkjenne en ny.
 
+Hvis du kan legge til egne enheter, inneholder en ny utskrift ikke lenger en kopi av nøklene til denne enheten for deg, men en egen redningsenhet: Den fortsetter å virke når nøklene dine endres, og gjenoppretting setter opp en egen ny enhet i stedet for en kopi (låst opp med svaret på det hemmelige spørsmålet; det kan du endre senere). Hver ny utskrift for en tenant gjør de tidligere ugyldige, så ta bare vare på den nyeste. Administrator-ID-er og personer som ikke kan legge til egne enheter, skrives ut som før.
+
 Fabrikktilbakestilling ligger nederst på fanen. Den tømmer alt Haven kjenner til i denne nettleseren — identiteter, tenanter, applikasjoner, hostede appfiler, virtuelle visninger, arbeidsområdeoppsett og alle synkroniserte MindooDB-data — og setter Haven tilbake til den helt nye tilstanden sin. Fordi det ikke kan angres, ber Haven deg skrive en bekreftelsesfrase før knappen blir aktiv, og spør så nettleseren om enda en bekreftelse. Behandle fabrikktilbakestilling som en siste utvei, og bare etter at en kjent god backup finnes.
 
 ### Statistikk

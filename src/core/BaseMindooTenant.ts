@@ -32,6 +32,7 @@ import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { extractRevokedKeyPairs, extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
+import { PaperRescueManager } from "./recovery/PaperRescueDevice";
 import { RecoveryContactsManager } from "./recovery/RecoveryContactsManager";
 import { UserKeyManager } from "./userkeys/UserKeyManager";
 import type {
@@ -176,6 +177,7 @@ export class BaseMindooTenant implements MindooTenant {
   private readonly backgroundTasks = new BackgroundTaskTracker();
   private readonly userKeys = new UserKeyManager(this);
   private readonly recoveryContacts = new RecoveryContactsManager(this, this.userKeys);
+  private readonly paperRescue = new PaperRescueManager(this, this.userKeys);
   private readonly sealedGenerations = new Map<string, Uint8Array[]>();
   /** Per sealed key id: the bundle of the recipient block last opened. */
   private readonly sealedBlocks = new Map<string, string>();
@@ -577,7 +579,25 @@ export class BaseMindooTenant implements MindooTenant {
   }
 
   async listRescueDeviceSigningKeys(): Promise<Array<{ username: string; signingPublicKey: string }>> {
-    return this.recoveryContacts.rescueDeviceSigningKeys();
+    const paper = (await this.paperRescue.listAll()).map((r) => ({
+      username: r.payload.username,
+      signingPublicKey: r.payload.rescueDevice.signingPublicKey,
+    }));
+    return [...(await this.recoveryContacts.rescueDeviceSigningKeys()), ...paper];
+  }
+
+  async createPaperRescueDevice(options?: {
+    label?: string;
+  }): Promise<import("./recovery/PaperRescueDevice").PaperRescueSecret> {
+    return this.paperRescue.create(options);
+  }
+
+  async listPaperRescueDevices(): Promise<import("./recovery/PaperRescueDevice").PaperRescueRecord[]> {
+    return this.paperRescue.list();
+  }
+
+  async removePaperRescueDevices(): Promise<number> {
+    return this.paperRescue.remove();
   }
 
   async reconcileUserKeys(options?: { allowSelfCreate?: boolean }): Promise<UserKeyEnrollmentStatus> {
