@@ -971,7 +971,12 @@ export class UserKeyManager {
     // the published User-Key. Minting a second pair (this device's locally
     // generated key) desyncs dist — Device 2 would publish a key that cannot
     // unwrap `default`. Wait for the userkey document and import from wrap.
-    if (await this.defaultAlreadyWrappedForCurrentUser()) {
+    // Not so for a person from before User-Keys (§4.5): see
+    // holdsDefaultFromBeforeUserKeys.
+    if (
+      (await this.defaultAlreadyWrappedForCurrentUser()) &&
+      !(await this.holdsDefaultFromBeforeUserKeys())
+    ) {
       return null;
     }
 
@@ -2044,6 +2049,31 @@ export class UserKeyManager {
       )?.label;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Scenario D (docs/userkeys.md §4.5) for people who already got `default`
+   * before User-Keys existed: their name is in the `default` distribution, so
+   * {@link defaultAlreadyWrappedForCurrentUser} is true, yet no User-Key was
+   * ever published for them, and without this they never get one (sealed
+   * documents then fail with "No published User-Key is available").
+   *
+   * Minting is safe when this device already holds `default` itself (it is no
+   * waiting additional device) and the distribution reaches the person only
+   * through per-device wraps, never through a User-Key. The caller has already
+   * checked that no User-Key document exists and that `userdirectory` was
+   * fetched (or self-create was allowed for a local-only tenant).
+   */
+  private async holdsDefaultFromBeforeUserKeys(): Promise<boolean> {
+    try {
+      if (!(await this.tenant.hasDecryptionKey(DEFAULT_TENANT_KEY_ID))) return false;
+      const directory = await this.directory();
+      if (typeof directory.isKeyDistributedViaUserKey !== "function") return false;
+      const username = (await this.tenant.getCurrentUserId()).username;
+      return !(await directory.isKeyDistributedViaUserKey(DEFAULT_TENANT_KEY_ID, username));
+    } catch {
+      return false;
     }
   }
 

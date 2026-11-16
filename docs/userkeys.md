@@ -308,6 +308,8 @@ A person whose devices predate user keys has several grant entries and no key do
 
 This is a deliberate one-time convenience: without it, every existing device of every existing user would need a manual approval before anything worked. The trade-off is that it trusts the grant as it stands at that moment. A device already on the grant when the key is first published is included; a device added afterwards is not, and falls back to Scenario C.
 
+This also holds when an administrator distributed `default` to that person before user keys existed. Such a distribution wraps `default` to each grant device rather than to a user key, so it is no sign of a key on another device. A device mints in that case only if it holds `default` itself and has fetched `userdirectory` in this session (or self-create was allowed for a local-only tenant); a device whose `default` would come through a user key keeps waiting for that key instead (`isKeyDistributedViaUserKey` on the directory tells the two apart). Two devices that mint at the same time converge on one key after the next sync.
+
 ### 4.6 What a waiting device should say
 
 A device that is on the grant but holds no wrap can detect this itself at startup: the key document exists and its own fingerprint is not in it. Rather than showing databases that look empty or broken, it should say what is happening and what to do — "This device can't open your personal data yet. Open the app on your other device and confirm this one."
