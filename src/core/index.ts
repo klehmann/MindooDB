@@ -648,3 +648,6 @@ export {
   sanitizeExtractionConfig,
   type ExtractionConfig,
 } from "./extraction/types";
+
+// Invitation links and the join-request inbox (docs/invitations.md)
+export * from "./joinrequests";

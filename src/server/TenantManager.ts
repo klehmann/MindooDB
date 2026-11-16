@@ -30,10 +30,13 @@ import type {
   ServerPurgeRequestValidator,
   BuiltinWriteContext,
   ServerDirectoryAdminCheck,
+  ServerJoinRequestsWriteCheck,
   ServerPeerTokenResolver,
   ServerTrustedWitnessResolver,
 } from "../appendonlystores/network/ServerNetworkContentAddressedStore";
 import { PurgedDocRegistry } from "./PurgedDocRegistry";
+import type { JoinRequestTenantAccess } from "./JoinRequestService";
+import { JOIN_REQUESTS_DB_ID } from "../core/joinrequests/types";
 import { purgeDocumentHistoryFromStores } from "../core/appendonlystores/purgeDocumentHistory";
 import type { WitnessSigner } from "../core/crypto/WitnessReceipt";
 import type { AccessDecision, RuleType } from "../core/accesscontrol/types";
@@ -1637,6 +1640,18 @@ export class TenantManager {
           }
         : undefined;
 
+    // Join requests (docs/invitations.md): server-created, admin-decided.
+    const joinRequestsWriteCheck: ServerJoinRequestsWriteCheck | undefined =
+      dbId === JOIN_REQUESTS_DB_ID
+        ? {
+            isAdminAt: (signingKey, T) => this.isTenantAdminKeyAt(tenant, signingKey, T),
+            isJoinRequestServerKey: async (signingKey) => {
+              const base = tenant.mindooTenant as unknown as { isJoinRequestServerKey?: (k: string) => Promise<boolean> } | undefined;
+              return typeof base?.isJoinRequestServerKey === "function" ? base.isJoinRequestServerKey(signingKey) : false;
+            },
+          }
+        : undefined;
+
     const serverStore = new ServerNetworkContentAddressedStore(
       localStore,
       directory,
@@ -1657,6 +1672,7 @@ export class TenantManager {
         purgeRequestValidator,
         builtinWriteContext,
         directoryAdminCheck,
+        joinRequestsWriteCheck,
         ...this.peerAccessControl,
       },
     );
@@ -1932,6 +1948,32 @@ export class TenantManager {
    */
   getPurgedDocIds(tenantId: string, dbId: string): ReadonlySet<string> {
     return this.getPurgedDocRegistry(tenantId).getPurgedDocIds(dbId);
+  }
+
+  /**
+   * What the join-request inbox needs from this manager (docs/invitations.md).
+   */
+  joinRequestAccess(): JoinRequestTenantAccess {
+    return {
+      tenantExists: (tenantId) => this.tenantExists(tenantId),
+      getServerTenant: async (tenantId) => (await this.getTenant(tenantId)).mindooTenant,
+      getServerSigningPublicKey: () => this.getServerPublicInfo()?.signingPublicKey ?? null,
+      isTenantMemberKey: async (tenantId, signingKey) => {
+        const tenant = await this.getTenant(tenantId);
+        if (await this.isTenantAdminKeyAt(tenant, signingKey, Date.now())) return true;
+        const directory = tenant.directory as unknown as {
+          getUserBySigningPublicKey?: (key: string) => Promise<unknown>;
+        };
+        return typeof directory.getUserBySigningPublicKey === "function"
+          ? (await directory.getUserBySigningPublicKey(signingKey)) !== null
+          : false;
+      },
+      recordPurgedDocument: (tenantId, dbId, docId) =>
+        this.getPurgedDocRegistry(tenantId).recordPurgedDoc(dbId, docId),
+      dataStore: this.dataStore,
+      tenantDataKey: (tenantId, name) => `${this.tenantKey(tenantId.toLowerCase())}/${name}`,
+      cryptoAdapter: this.cryptoAdapter,
+    };
   }
 
   /** The (lazily-loaded, cached) purge registry for a tenant. */
@@ -2278,9 +2320,12 @@ export class TenantManager {
     const directory = new CompositeMindooDirectory(
       innerDirectory,
       this.trustedServers,
-      config.adminUsername
+      // Without a configured name the root key still authenticates by key, as a
+      // principal named after it (like a delegated admin, §6.13): admin-only
+      // databases such as `joinrequests` (docs/invitations.md) need that.
+      config.adminSigningPublicKey && config.adminEncryptionPublicKey
         ? {
-            username: config.adminUsername,
+            username: config.adminUsername ?? delegatedAdminPrincipal(config.adminSigningPublicKey),
             signingPublicKey: config.adminSigningPublicKey,
             encryptionPublicKey: config.adminEncryptionPublicKey,
           }

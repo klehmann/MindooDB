@@ -1,3 +1,4 @@
+import { JOIN_REQUESTS_DB_ID } from "./joinrequests/types";
 import {
   DEFAULT_TENANT_KEY_ID,
   type DeviceSelfGrant,
@@ -2474,6 +2475,13 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     dbid: string;
     signingKey: string;
   }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason?: string }> {
+    // Join requests (docs/invitations.md): tenant admins only, whatever a
+    // policy says. The server writes there with its own key, not via sync.
+    if (input.dbid === JOIN_REQUESTS_DB_ID) {
+      return (await this.isAdminKeyNow(input.signingKey))
+        ? { mode: "read", reason: "tenant admin" }
+        : { mode: "none", reason: "joinrequests: tenant admins only" };
+    }
     // Built-in personal-database invariant (§6.11): decides first, and a
     // configured policy can only take away what it grants.
     const personal = await this.evaluatePersonalDatabaseAccess(input);

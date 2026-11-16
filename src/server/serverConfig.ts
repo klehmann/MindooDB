@@ -96,6 +96,23 @@ export function validateServerConfig(raw: unknown, filePath: string): ServerConf
     config.iroh = iroh;
   }
 
+  if (obj.joinRequests !== undefined) {
+    if (typeof obj.joinRequests !== "object" || obj.joinRequests === null || Array.isArray(obj.joinRequests)) {
+      throw new Error(`config.json at ${filePath}: "joinRequests" must be an object`);
+    }
+    const limits = obj.joinRequests as Record<string, unknown>;
+    const joinRequests: NonNullable<ServerConfig["joinRequests"]> = {};
+    for (const key of ["maxRequestsPerIpPerHour", "maxPendingPerTenant", "maxPendingServerWide"] as const) {
+      const value = limits[key];
+      if (value === undefined) continue;
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+        throw new Error(`config.json at ${filePath}: "joinRequests.${key}" must be a non-negative integer`);
+      }
+      joinRequests[key] = value;
+    }
+    config.joinRequests = joinRequests;
+  }
+
   const principalCount = Object.values(capabilities).reduce(
     (sum, arr) => sum + arr.length,
     0,

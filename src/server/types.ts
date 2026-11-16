@@ -214,6 +214,15 @@ export interface ServerConfig {
    * Off when omitted. HTTP listen stays unchanged.
    */
   iroh?: ServerIrohConfig;
+  /** Limits of the join-request inbox (docs/invitations.md). */
+  joinRequests?: {
+    /** Requests per client IP and hour. Default 5. */
+    maxRequestsPerIpPerHour?: number;
+    /** Pending requests per tenant. Default 500. */
+    maxPendingPerTenant?: number;
+    /** Pending requests over all tenants. Default 10 000. */
+    maxPendingServerWide?: number;
+  };
 }
 
 /** Optional Iroh listen settings in config.json. Default is disabled. */

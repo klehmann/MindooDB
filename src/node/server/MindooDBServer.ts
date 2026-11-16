@@ -773,6 +773,31 @@ export class MindooDBServer {
       `[MindooDBServer] Tenant auth rate limit configured windowMs=${authRateLimitConfig.windowMs} max=${authRateLimitConfig.max}`,
     );
 
+    // Invitations / join requests (docs/invitations.md). Unauthenticated: the
+    // joining device has no grant yet. The service rate-limits per IP itself
+    // (5/h); this limiter only caps bursts against the public invitation read.
+    const inviteLimit = rateLimit({
+      windowMs: 60_000,
+      max: 30,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many requests, please try again later" },
+    });
+    router.get("/invitations/:invitationId", inviteLimit, route((req) => core.getInvitation(req)));
+    router.post("/join-requests", inviteLimit, route((req) => core.submitJoinRequest(req)));
+    router.post("/join-requests/summary", inviteLimit, route((req) => core.joinRequestSummary(req)));
+    // Waiting devices poll their status; many can sit behind one school or
+    // office NAT, so this cheap read gets a wider budget than the writes.
+    const inviteStatusLimit = rateLimit({
+      windowMs: 60_000,
+      max: 240,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many requests, please try again later" },
+    });
+    router.get("/join-requests/:requestId", inviteStatusLimit, route((req) => core.joinRequestStatus(req)));
+    router.post("/join-requests/:requestId/withdraw", inviteLimit, route((req) => core.withdrawJoinRequest(req)));
+
     router.post("/auth/challenge", challengeRateLimit, route((req) => core.challenge(req)));
     router.post("/auth/authenticate", authenticateRateLimit, route((req) => core.authenticate(req)));
 

@@ -763,6 +763,18 @@ export interface ConnectToServerOptions {
   irohTicket?: string;
   /** Byte-stream adapter used instead of HTTP. */
   irohStreamIO?: import("./appendonlystores/network/IrohStreamIO").IrohStreamIO;
+  /**
+   * Authenticate as another key pair than the current user's device, e.g. an
+   * admin key for the admin-only `joinrequests` database (docs/invitations.md).
+   * The server resolves the principal from `signingPublicKey`.
+   */
+  authAs?: {
+    signingPublicKey: string;
+    signingKey: CryptoKey;
+    encryptionKey: CryptoKey;
+    /** Name sent with the challenge; the server falls back to the key. */
+    username?: string;
+  };
 }
 
 /**
@@ -1086,7 +1098,8 @@ export interface MindooTenant {
    */
   verifyEntrySignature(
     entry: StoreEntryMetadata,
-    encryptedData: Uint8Array
+    encryptedData: Uint8Array,
+    options?: { dbId?: string },
   ): Promise<boolean>;
 
   /**
