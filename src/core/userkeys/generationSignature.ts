@@ -53,7 +53,7 @@ function base64UrlToBytes(value: string): Uint8Array {
 }
 
 /** Ed25519 key pair from a 32-byte seed. */
-async function ed25519FromSeed(
+export async function ed25519FromSeed(
   crypto: CryptoAdapter,
   seed: Uint8Array,
 ): Promise<{ privateKey: CryptoKey; pkcs8: Uint8Array; publicKeyPem: string }> {

@@ -32,6 +32,7 @@ import { KeyBag, type KeyBagChangeCursor } from "./keys/KeyBag";
 import { BaseMindooDB } from "./BaseMindooDB";
 import { BaseMindooTenantDirectory } from "./BaseMindooTenantDirectory";
 import { extractRevokedKeyPairs, extractWipeRequestedSigningKeys } from "./accesscontrol/grantKeys";
+import { RecoveryContactsManager } from "./recovery/RecoveryContactsManager";
 import { UserKeyManager } from "./userkeys/UserKeyManager";
 import type {
   PendingUserKeyDevice,
@@ -174,6 +175,7 @@ export class BaseMindooTenant implements MindooTenant {
   /** Fire-and-forget work of this tenant; see {@link whenBackgroundIdle}. */
   private readonly backgroundTasks = new BackgroundTaskTracker();
   private readonly userKeys = new UserKeyManager(this);
+  private readonly recoveryContacts = new RecoveryContactsManager(this, this.userKeys);
   private readonly sealedGenerations = new Map<string, Uint8Array[]>();
   /** Per sealed key id: the bundle of the recipient block last opened. */
   private readonly sealedBlocks = new Map<string, string>();
@@ -540,6 +542,42 @@ export class BaseMindooTenant implements MindooTenant {
     }>
   > {
     return this.userKeys.listOwnDeviceCertificates();
+  }
+
+  // ==================== Recovery contacts (docs/userkeys.md §12) ====================
+
+  async setupRecoveryContacts(
+    contacts: string[],
+    options?: import("./recovery/RecoveryContactsManager").SetupRecoveryContactsOptions,
+  ): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup> {
+    return this.recoveryContacts.setup(contacts, options);
+  }
+
+  async getRecoveryContactsSetup(): Promise<import("./recovery/RecoveryContactsDocument").RecoveryContactsSetup | null> {
+    return this.recoveryContacts.getSetup();
+  }
+
+  async removeRecoveryContacts(options?: { withdrawRescueDevices?: string[] }): Promise<number> {
+    return this.recoveryContacts.remove(options);
+  }
+
+  async listRecoveryContactRequests(): Promise<import("./recovery/RecoveryContactsManager").RecoveryContactRequest[]> {
+    return this.recoveryContacts.listRequests();
+  }
+
+  async createRecoveryHelperPackage(
+    person: string,
+    options?: { serverUrl?: string },
+  ): Promise<import("./recovery/recoveryPackage").RecoveryHelperPackage> {
+    return this.recoveryContacts.createHelperPackage(person, options);
+  }
+
+  async canIssueDeviceCertificates(): Promise<boolean> {
+    return this.userKeys.canIssueDeviceCertificates();
+  }
+
+  async listRescueDeviceSigningKeys(): Promise<Array<{ username: string; signingPublicKey: string }>> {
+    return this.recoveryContacts.rescueDeviceSigningKeys();
   }
 
   async reconcileUserKeys(options?: { allowSelfCreate?: boolean }): Promise<UserKeyEnrollmentStatus> {

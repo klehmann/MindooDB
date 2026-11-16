@@ -42,6 +42,9 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * `dcert_` — a device certificate the person issued with their device
  *   self-grant key (docs/userkeys.md §9.6), encrypted with `$publicinfos` so
  *   the server can verify it.
+ * `rcv_` — a person's recovery contacts (docs/userkeys.md §12): the
+ *   encrypted rescue device and one sealed secret share per contact,
+ *   encrypted with the tenant `default` key.
  *
  * They differ in who may *read* them, which this rule does not care about:
  * `wks_` documents are sealed to their owner, while `dev_` and `qtn_` are
@@ -49,7 +52,7 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * and audit refused writes while the hoster still sees ciphertext. Ownership is
  * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {
