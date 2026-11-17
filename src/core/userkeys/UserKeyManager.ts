@@ -57,11 +57,15 @@ import {
   type UserKeyGeneration,
   type UserKeyGenerationSignature,
   type UserKeyEnrollmentStatus,
+  type UserKeySelfCreateBlock,
   type UserKeyWaitState,
 } from "./types";
+import { findSelfGrantKeyRecord, publishSelfGrantKeyRecord, type SelfGrantKeyRecord } from "./selfGrantKeyRecord";
 
 export class UserKeyManager {
   private userDirectoryFetched = false;
+  /** Why the last self-create attempt minted nothing (diagnostics only). */
+  private lastSelfCreateBlock: UserKeySelfCreateBlock | null = null;
   private lastUserDirectoryFetchError: unknown = null;
   private decryptedUserKeyCache: CryptoKey | null = null;
   private decryptedUserKeyBytes: Uint8Array | null = null;
@@ -432,6 +436,59 @@ export class UserKeyManager {
       }
     }
     return this.importSelfGrantKeyFromWrap();
+  }
+
+  /**
+   * Publish the self-grant key this device holds (docs/userkeys.md §9.4), so
+   * the admin can allow device self-grant without the person copying the key
+   * over. Only while the person's grant names no active self-grant key and
+   * this device is on that grant. Best effort: a failure never fails reconcile.
+   */
+  private async publishOwnSelfGrantKeyIfUngranted(): Promise<boolean> {
+    try {
+      if (await this.grantedSelfGrantKey()) return false;
+      const me = await this.tenant.getCurrentUserId();
+      const directory = await this.directory();
+      const overview = await directory.getUserGrantOverview(me.username);
+      const onGrant = overview.activeDevices.some(
+        (device) => normalizePublicKeyPem(device.signingPublicKey) === normalizePublicKeyPem(me.userSigningPublicKey),
+      );
+      if (!onGrant) return false;
+      const signer = await this.selfGrantSigner();
+      if (!signer) return false;
+      const { wrote } = await publishSelfGrantKeyRecord({
+        db: await this.openUserDirectory(),
+        crypto: this.tenant.getCryptoAdapter(),
+        tenantId: this.tenant.getId(),
+        deviceSigningPublicKey: me.userSigningPublicKey,
+        selfGrant: signer,
+      });
+      return wrote;
+    } catch (error) {
+      console.warn("[userkeys] publishing the self-grant key failed", error);
+      return false;
+    }
+  }
+
+  /**
+   * The self-grant key one of `username`'s active devices published
+   * (docs/userkeys.md §9.4), newest first, or `null`. The admin names it in
+   * the grant with `directory.setDeviceSelfGrant`.
+   */
+  async findPublishedDeviceSelfGrantKey(username: string): Promise<SelfGrantKeyRecord | null> {
+    const directory = await this.directory();
+    const overview = await directory.getUserGrantOverview(username);
+    const keys = overview.activeDevices.map((device) => device.signingPublicKey);
+    if (keys.length === 0) return null;
+    const db = await this.openUserDirectory();
+    // Pick up entries a sync wrote to the store since this replica last looked.
+    await db.syncStoreChanges();
+    return findSelfGrantKeyRecord({
+      db,
+      crypto: this.tenant.getCryptoAdapter(),
+      tenantId: this.tenant.getId(),
+      deviceSigningPublicKeys: keys,
+    });
   }
 
   /** Unwrap the self-grant key from this device's wrap and keep it on the identity. */
@@ -1020,9 +1077,10 @@ export class UserKeyManager {
   } | null> {
     const existing = await this.resolveOwnUserKeyDocument();
     if (existing) return existing;
+    this.lastSelfCreateBlock = null;
     const allow =
       options?.allowSelfCreate === true || this.userDirectoryFetched;
-    if (!allow) return null;
+    if (!allow) return this.blockSelfCreate("userDirectoryNotFetched");
 
     // Additional device: `acl_keydistribution_default` is already wrapped to
     // the published User-Key. Minting a second pair (this device's locally
@@ -1034,7 +1092,7 @@ export class UserKeyManager {
       (await this.defaultAlreadyWrappedForCurrentUser()) &&
       !(await this.holdsDefaultFromBeforeUserKeys())
     ) {
-      return null;
+      return this.blockSelfCreate("waitingForPublishedUserKey");
     }
 
     const user = this.tenant.getCurrentPrivateUser();
@@ -1042,12 +1100,15 @@ export class UserKeyManager {
     try {
       pair = await this.ensureLocalUserKeyPair(user, this.tenant.getCurrentUserPassword());
     } catch (error) {
-      if (error instanceof UserKeyDecryptError) return null;
+      if (error instanceof UserKeyDecryptError) return this.blockSelfCreate("localUserKeyLocked");
       throw error;
     }
     const userId = await this.tenant.getCurrentUserId();
     const binding = await this.mintBindingForUsername(userId.username, userId.userSigningPublicKey);
-    if (!binding) return null;
+    if (!binding) {
+      const grants = await (await this.directory()).findGrantAccessDocuments(userId.username);
+      return this.blockSelfCreate(grants.length === 0 ? "noGrantForUsername" : "signingKeyNotOnGrant");
+    }
     const { grantDocId, usernameHash, usernameHashVersion } = binding;
     const fingerprint = await fingerprintUserPublicKey(pair.publicKey, this.tenant.getCryptoAdapter());
     const mintBytes = await this.getDecryptedUserKeyBytes();
@@ -1449,7 +1510,14 @@ export class UserKeyManager {
       const inFlight = await this.reconcileInFlight;
       if (options?.allowSelfCreate !== true) return inFlight;
     }
-    const run = this.reconcileInner(options).finally(() => {
+    // Publishing the self-grant key comes after the User-Key decision: its
+    // userdirectory write may pull keys in that the mint guard looks at.
+    const run = this.reconcileInner(options)
+      .then(async (status) => {
+        if (this.canReconcileAgainstUserDirectory()) await this.publishOwnSelfGrantKeyIfUngranted();
+        return status;
+      })
+      .finally(() => {
       if (this.reconcileInFlight === run) this.reconcileInFlight = null;
     });
     this.reconcileInFlight = run;
@@ -1477,10 +1545,19 @@ export class UserKeyManager {
         // key distribution, so minting a User-Key is refused. That is not
         // "unknown" and not "waiting for another device" — this device can
         // already unwrap tenant content.
+        const selfCreateBlocked = this.lastSelfCreateBlock ?? undefined;
         if (await this.defaultAlreadyWrappedForCurrentUser()) {
-          return { state: "approved", pending: false, missingKeys: [] };
+          return {
+            state: "approved",
+            pending: false,
+            missingKeys: [],
+            ...(selfCreateBlocked ? { selfCreateBlocked } : {}),
+          };
         }
-        return this.enrollmentStatus(null, this.userDirectoryFetched ? "waiting" : "unknown");
+        return {
+          ...this.enrollmentStatus(null, this.userDirectoryFetched ? "waiting" : "unknown"),
+          ...(selfCreateBlocked ? { selfCreateBlocked } : {}),
+        };
       }
 
       if (isPendingUserKeyDocument(resolved.payload)) {
@@ -2122,6 +2199,12 @@ export class UserKeyManager {
    * checked that no User-Key document exists and that `userdirectory` was
    * fetched (or self-create was allowed for a local-only tenant).
    */
+  private blockSelfCreate(reason: UserKeySelfCreateBlock): null {
+    this.lastSelfCreateBlock = reason;
+    console.info("[userkeys] no User-Key minted on this device", { reason });
+    return null;
+  }
+
   private async holdsDefaultFromBeforeUserKeys(): Promise<boolean> {
     try {
       if (!(await this.tenant.hasDecryptionKey(DEFAULT_TENANT_KEY_ID))) return false;

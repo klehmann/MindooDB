@@ -863,6 +863,24 @@ The key document never carries this right. The administrator may create a key do
 
 Granting it also moves the person's cutoff to `grantedAt`: from then on their unsigned generations stop counting, whatever the tenant policy says.
 
+**Published self-grant keys.** People who joined with a request that carried no self-grant key, or before the request did, would otherwise have to copy their key to the administrator by hand. Instead, every device that holds a self-grant key publishes its public half while the person's grant names none: a personal `userdirectory` document `sgk_…`, encrypted with `$publicinfos` (written during `reconcileUserKeys`, once per device and key). The record lives entirely in its `doc_create` and is never changed; a device whose key changes deletes its old record and creates a new one, so two replicas never edit the same record concurrently.
+
+```ts
+{
+  form: "userdirectory",
+  type: "selfgrantkey",
+  schemaVersion: 1,
+  deviceSigningPublicKey: string,   // the publishing device
+  selfGrantPublicKey: string,
+  publishedAt: number,
+  signature: string,                // Ed25519 with the self-grant key: proof of possession
+}
+```
+
+`tenant.findPublishedDeviceSelfGrantKey(username)` returns the newest record that verifies: the device key it names signed the `doc_create` and is an active device on the person's grant, and the signature (over tenant, device key and self-grant key) checks out with the published key. The administrator then calls `setDeviceSelfGrant(username, record.selfGrantPublicKey, ...)`, so allowing self-grant is one checkbox. Servers need this version to accept `sgk_` documents from members; an older server refuses them, and the person's device simply keeps trying on later reconciles.
+
+When a person has no User-Key yet and this device mints none, `reconcileUserKeys()` says why in `status.selfCreateBlocked` (`userDirectoryNotFetched`, `waitingForPublishedUserKey`, `localUserKeyLocked`, `noGrantForUsername`, `signingKeyNotOnGrant`).
+
 ### 9.5 Cloned identities and backups
 
 A device, as far as MindooDB is concerned, is its signing and encryption key pair, not a piece of hardware. The identity object holds those keys, the user key and the self-grant key. Whoever copies the identity copies all of them. Haven offers three official ways to do that: the encrypted backup, paper recovery per tenant, and the identity export as `.json`.

@@ -1,3 +1,4 @@
+import type { SelfGrantKeyRecord } from "./userkeys/selfGrantKeyRecord";
 import { INVITATION_DOC_ID_PREFIX, JOIN_REQUESTS_DB_ID } from "./joinrequests/types";
 import {
   MindooTenant,
@@ -524,6 +525,15 @@ export class BaseMindooTenant implements MindooTenant {
 
   async getDeviceSelfGrantPublicKey(): Promise<string | null> {
     return this.userKeys.getDeviceSelfGrantPublicKey();
+  }
+
+  /**
+   * The self-grant key one of `username`'s active devices published in
+   * `userdirectory` (docs/userkeys.md §9.4), or `null`. Admin use: pass its
+   * `selfGrantPublicKey` to `directory.setDeviceSelfGrant`.
+   */
+  async findPublishedDeviceSelfGrantKey(username: string): Promise<SelfGrantKeyRecord | null> {
+    return this.userKeys.findPublishedDeviceSelfGrantKey(username);
   }
 
   async issueDeviceCertificate(
