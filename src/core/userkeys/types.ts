@@ -31,11 +31,32 @@ export interface UserKeyDeviceRow {
   status: UserKeyDeviceStatus;
 }
 
+/**
+ * Why this device did not mint a User-Key for a person who has none
+ * (diagnostics, docs/userkeys.md §4.5):
+ *
+ * - `userDirectoryNotFetched`: `userdirectory` was not pulled this session
+ *   (minting from local emptiness is refused).
+ * - `waitingForPublishedUserKey`: `default` reaches this person through a
+ *   User-Key, so another device has to publish it.
+ * - `localUserKeyLocked`: this device cannot open the identity's User-Key.
+ * - `noGrantForUsername`: the directory has no grant for this username.
+ * - `signingKeyNotOnGrant`: grants exist, but none names this device's signing key.
+ */
+export type UserKeySelfCreateBlock =
+  | "userDirectoryNotFetched"
+  | "waitingForPublishedUserKey"
+  | "localUserKeyLocked"
+  | "noGrantForUsername"
+  | "signingKeyNotOnGrant";
+
 export interface UserKeyEnrollmentStatus {
   state: UserKeyWaitState;
   /** True while the published document has no person-written wrap. */
   pending: boolean;
   missingKeys: string[];
+  /** Set when no User-Key exists and this device did not mint one; see {@link UserKeySelfCreateBlock}. */
+  selfCreateBlocked?: UserKeySelfCreateBlock;
 }
 
 export function userKeyDocumentId(grantDocId: string): string {

@@ -39,6 +39,7 @@ export {
   type UserKeyDeviceRow,
   type UserKeyDeviceStatus,
   type UserKeyEnrollmentStatus,
+  type UserKeySelfCreateBlock,
   type UserKeyWaitState,
 } from "./types";
 export { canonicalizeUsername, usernamesEqual } from "../userid/canonicalUsername";
@@ -89,3 +90,17 @@ export {
   verifyDeviceCertificate,
   type DeviceCertificatePayload,
 } from "./deviceCertificate";
+export {
+  SELF_GRANT_KEY_DOC_ID_PREFIX,
+  SELF_GRANT_KEY_SCHEMA_VERSION,
+  SELF_GRANT_KEY_TYPE,
+  asSelfGrantKeyRecord,
+  findSelfGrantKeyRecord,
+  isSelfGrantKeyRecordDocId,
+  listSelfGrantKeyRecords,
+  publishSelfGrantKeyRecord,
+  selfGrantKeyRecordMessage,
+  verifySelfGrantKeyRecord,
+  type SelfGrantKeyRecord,
+  type SelfGrantKeyRecordPayload,
+} from "./selfGrantKeyRecord";

@@ -47,6 +47,9 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  *   encrypted with the tenant `default` key.
  * `rpp_` — the public half of a person's paper rescue device (docs/userkeys.md
  *   §12.8), so a new printout can withdraw the previous one.
+ * `sgk_` — the public half of the self-grant key one device holds
+ *   (docs/userkeys.md §9.4), so the admin can allow device self-grant without
+ *   the person copying the key over.
  *
  * They differ in who may *read* them, which this rule does not care about:
  * `wks_` documents are sealed to their owner, while `dev_` and `qtn_` are
@@ -54,7 +57,7 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * and audit refused writes while the hoster still sees ciphertext. Ownership is
  * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_", "sgk_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {

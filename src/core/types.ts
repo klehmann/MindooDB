@@ -1328,6 +1328,10 @@ export interface MindooTenant {
    * this device holds none.
    */
   getDeviceSelfGrantPublicKey?(): Promise<string | null>;
+  /** See `BaseMindooTenant.findPublishedDeviceSelfGrantKey` (docs/userkeys.md §9.4). */
+  findPublishedDeviceSelfGrantKey?(
+    username: string,
+  ): Promise<import("./userkeys/selfGrantKeyRecord").SelfGrantKeyRecord | null>;
   /**
    * Certify another device of this person with their device self-grant key
    * (docs/userkeys.md §9.6) and wrap the User-Key to it. Requires
