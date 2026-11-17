@@ -66,6 +66,7 @@ import { buildDomainStatementBytes } from "./crypto/DomainStatement";
 import { entryTrustedTime } from "./storeEntryTime";
 import { computeContentHash } from "./utils/idGeneration";
 import { semanticNow } from "./utils/timeSource";
+import { Ed25519WitnessProvider } from "./accesscontrol/timestamp/Ed25519WitnessProvider";
 import { ensureTenantSetupAdministrator, readTenantSetupLabel } from "./tenantSetup";
 import { DeviceAccessRevokedError, SymmetricKeyNotFoundError } from "./errors";
 import { Logger, MindooLogger, getDefaultLogLevel, LogLevel } from "./logging";
@@ -1470,6 +1471,43 @@ export class BaseMindooTenant implements MindooTenant {
     return false;
   }
 
+  /**
+   * A device certificate counts until the person withdraws it
+   * (docs/userkeys.md §9.6), and what the device signed while it was certified
+   * stays valid: a used rescue device certifies the recovered device and wraps
+   * the User-Key to it, and is withdrawn right after. Judged at the entry's
+   * witness time, and only with a valid receipt of a witness trusted then, so a
+   * withdrawn device cannot backdate new entries.
+   */
+  private async wasCertifiedWhenWitnessed(
+    directory: MindooTenantDirectory,
+    entry: StoreEntryMetadata,
+    dbId: string,
+  ): Promise<boolean> {
+    if (entry.receivedAt === undefined || !entry.receivedByPublicKey) return false;
+    if (
+      typeof directory.resolveSignerToGrant !== "function" ||
+      typeof directory.getTrustedWitnessKeysAt !== "function"
+    ) {
+      return false;
+    }
+    try {
+      const resolved = await directory.resolveSignerToGrant(entry.createdByPublicKey, entry.receivedAt);
+      if (resolved?.via !== "certificate") return false;
+      const receipt = await new Ed25519WitnessProvider({ subtle: this.cryptoAdapter.getSubtle() })
+        .createVerifier()
+        .validate(entry, {
+          dbid: dbId,
+          trustedWitnessKeys: await directory.getTrustedWitnessKeysAt(entry.receivedAt),
+          nowMs: semanticNow(),
+        });
+      return receipt.ok;
+    } catch (error) {
+      this.logger.debug(`wasCertifiedWhenWitnessed: ${error}`);
+      return false;
+    }
+  }
+
   async verifyEntrySignature(
     entry: StoreEntryMetadata,
     encryptedData: Uint8Array,
@@ -1491,6 +1529,9 @@ export class BaseMindooTenant implements MindooTenant {
         (await this.isAdminSigningKeyAt(entry.createdByPublicKey, entry.receivedAt ?? semanticNow())));
     if (!isTrusted) {
       isTrusted = await directory.validatePublicSigningKey(entry.createdByPublicKey);
+    }
+    if (!isTrusted && options?.dbId) {
+      isTrusted = await this.wasCertifiedWhenWitnessed(directory, entry, options.dbId);
     }
     if (!isTrusted && options?.dbId === JOIN_REQUESTS_DB_ID) {
       isTrusted = await this.isJoinRequestServerKey(entry.createdByPublicKey);

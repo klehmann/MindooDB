@@ -1096,7 +1096,7 @@ export class BaseMindooDB implements MindooDB {
   /** `username_hash` per userdirectory document, filled from creates. */
   private userdirectoryHashByDocId = new Map<string, string>();
   /** Grant `username_hash` for a signing public key at "now". */
-  private signerUsernameHashByKey = new Map<string, string | null>();
+  private signerUsernameHashByKey = new Map<string, string>();
   /** Owning person per personal userdirectory document (its create signer). */
   private personalDocCreatorHashByDocId = new Map<string, string>();
 
@@ -1304,7 +1304,7 @@ export class BaseMindooDB implements MindooDB {
     if (dbId === USER_DIRECTORY_DB_ID) {
       signerUsernameHash =
         await this.resolveSignerUsernameHash(signerPublicKey);
-      this.signerUsernameHashByKey.set(signerPublicKey, signerUsernameHash);
+      if (signerUsernameHash) this.signerUsernameHashByKey.set(signerPublicKey, signerUsernameHash);
       if (isPersonalUserdirectoryDocId(docId)) {
         creatorUsernameHash =
           op === "doc_create"
@@ -1565,11 +1565,14 @@ export class BaseMindooDB implements MindooDB {
   private async ensureSignerUsernameHash(
     signerKey: string,
   ): Promise<string | null> {
-    if (this.signerUsernameHashByKey.has(signerKey)) {
-      return this.signerUsernameHashByKey.get(signerKey) ?? null;
-    }
+    const cached = this.signerUsernameHashByKey.get(signerKey);
+    if (cached) return cached;
     const hash = await this.resolveSignerUsernameHash(signerKey);
-    this.signerUsernameHashByKey.set(signerKey, hash);
+    // Only a resolved person is remembered. A miss is often a device whose
+    // certificate has not arrived yet (docs/userkeys.md §9.6); remembering it
+    // would later refuse that person's own writes, such as withdrawing a
+    // certificate the device issued.
+    if (hash) this.signerUsernameHashByKey.set(signerKey, hash);
     return hash;
   }
 
@@ -15075,8 +15078,13 @@ export class BaseMindooDB implements MindooDB {
       validEntries.map(async (entryData) => {
         const cryptoKey = keyMap.get(entryData.createdByPublicKey);
         if (!cryptoKey) {
-          // Key was not trusted or failed to import
-          return { entryData, isValid: false };
+          // Not trusted now. A device whose certificate was withdrawn later
+          // still counts for what it signed while certified (judged per
+          // entry at its witness time, docs/userkeys.md §9.6).
+          return {
+            entryData,
+            isValid: await this.verifyEntrySignatureForDb(entryData, entryData.encryptedData),
+          };
         }
 
         const isValid = await this.verifyEntrySignatureWithKey(
@@ -17464,8 +17472,13 @@ export class BaseMindooDB implements MindooDB {
         validEntries.map(async (entryData) => {
           const cryptoKey = keyMap.get(entryData.createdByPublicKey);
           if (!cryptoKey) {
-            // Key was not trusted or failed to import
-            return { entryData, isValid: false };
+            // Not trusted now. A device whose certificate was withdrawn later
+            // still counts for what it signed while certified (judged per
+            // entry at its witness time, docs/userkeys.md §9.6).
+            return {
+              entryData,
+              isValid: await this.verifyEntrySignatureForDb(entryData, entryData.encryptedData),
+            };
           }
 
           const isValid = await this.verifyEntrySignatureWithKey(
