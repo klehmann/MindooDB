@@ -268,6 +268,34 @@ describe("device certificates", () => {
     await expect(alice1.tenant.issueDeviceCertificate!(keysOf(phone), "phone")).rejects.toThrow();
   });
 
+  it("withdraws a certificate a certified device issued, also after its key was looked up before it was certified", async () => {
+    const { fixture, alice1 } = await setup("tenant-dcert-withdraw-chain");
+    const tablet = await newUncertifiedDevice(fixture, alice1, "tablet");
+    const tabletKey = tablet.user.userSigningKeyPair.publicKey;
+    // The laptop meets the tablet's key before the certificate arrives (a
+    // recovered device loads entries while its directory is still filling).
+    const laptopDb = await alice1.tenant.openDB(USER_DIRECTORY_DB_ID);
+    expect(
+      await (laptopDb as unknown as {
+        ensureSignerUsernameHash(key: string): Promise<string | null>;
+      }).ensureSignerUsernameHash(tabletKey),
+    ).toBeNull();
+
+    await alice1.tenant.issueDeviceCertificate!(keysOf(tablet), "tablet");
+    await syncAll(fixture, "directory");
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+    tablet.tenant.noteUserDirectoryFetched!();
+    await tablet.tenant.reconcileUserKeys!();
+    // The tablet certifies a phone; the laptop later withdraws that certificate.
+    const phone = await newUncertifiedDevice(fixture, alice1, "phone");
+    const issued = await tablet.tenant.issueDeviceCertificate!(keysOf(phone), "phone");
+    await syncAll(fixture, USER_DIRECTORY_DB_ID);
+    expect((await alice1.tenant.listOwnDeviceCertificates!()).map((c) => c.docId)).toContain(issued.docId);
+
+    const phoneFp = await fingerprintPublicKeyPem(phone.user.userSigningKeyPair.publicKey, fixture.crypto.getSubtle());
+    await expect(alice1.tenant.revokeOwnDeviceCertificate!(phoneFp)).resolves.toBe(1);
+  });
+
   it("lets the person withdraw a certificate", async () => {
     const { fixture, alice1, directory } = await setup("tenant-dcert-withdraw");
     const tablet = await newUncertifiedDevice(fixture, alice1, "tablet");

@@ -930,6 +930,7 @@ Server authentication, device discovery (`discoverTenantsOnServer`), access-cont
 
 Things to know:
 
+- **What a withdrawn device signed before stays valid.** Every replica, also one set up later, judges such an entry at its witness time: it counts when the device was certified then and the entry carries a valid receipt of a witness trusted at that time. A used rescue device relies on this: it certifies the recovered device and wraps the User-Key to it, and is withdrawn right after. Without a trusted witness there is no provable time, and a withdrawn device's entries do not count.
 - **Withdrawing is not a defence against theft.** Any device of the person can delete or recreate certificates, including a stolen one. Against theft the administrator revokes the key on the grant, wipes it, and revokes the delegation (`setDeviceSelfGrant(username, null)`): a thief holding the self-grant key could otherwise certify more devices. Certificates accepted before stay valid. Re-anchoring the person with a new self-grant key (generate it, wrap it to the remaining devices, grant it) has no single call yet.
 - **Revoking the delegation keeps what was issued before.** `setDeviceSelfGrant(username, null)` stops new certificates. Certificates accepted before `revokedAt` keep counting.
 - **A certificate needs a witness to predate a revocation.** An unwitnessed certificate takes the current time as its trusted time, so it counts as issued after any revocation that comes up.

@@ -97,7 +97,20 @@ describe("recovery contacts over a local HTTP server", () => {
         ],
       },
     };
+    // Two recoveries run more device discoveries than the per-IP limit allows
+    // in a minute; lift it for this server only.
+    const serverPrototype = MindooDBServer.prototype as unknown as {
+      rateLimitPolicy(): { device: { windowMs: number; max: number } };
+    };
+    const resolvePolicy = serverPrototype.rateLimitPolicy;
+    const policySpy = jest.spyOn(serverPrototype, "rateLimitPolicy").mockImplementation(function (
+      this: MindooDBServer,
+    ) {
+      const policy = resolvePolicy.call(this);
+      return { ...policy, device: { ...policy.device, max: 100 } };
+    });
     const server = new MindooDBServer(dataDir, SERVER_PASSWORD, undefined, config);
+    policySpy.mockRestore();
     const { httpServer, baseUrl } = await startServer(server);
 
     try {
@@ -120,6 +133,10 @@ describe("recovery contacts over a local HTTP server", () => {
         systemAdminUser: systemAdmin,
         systemAdminPassword: SYSTEM_ADMIN_PASSWORD,
         adminUsername: adminUser.username,
+        // The server becomes a trusted witness: its receipts date what a
+        // rescue device signed before it was withdrawn.
+        adminSigningKey: adminUser.userSigningKeyPair.privateKey,
+        adminPassword: PASSWORD,
       });
       const adminAuth = { user: adminUser, password: PASSWORD };
 
@@ -308,6 +325,72 @@ describe("recovery contacts over a local HTTP server", () => {
       // Bob sees the renewed setup and can help again with it.
       await pull(bob.tenant, baseUrl, USER_DIRECTORY_DB_ID);
       expect((await bob.tenant.listRecoveryContactRequests!())[0]?.docId).toBe(renewed.docId);
+
+      // A second recovery with the renewed contacts. The new rescue device
+      // was certified by the recovered device, whose own certificate (and
+      // User-Key wrap) the now withdrawn first rescue device wrote: a fresh
+      // replica must still count those entries, they predate the withdrawal.
+      await pull(dave.tenant, baseUrl, USER_DIRECTORY_DB_ID);
+      const secondFromBob = await helperText(bob);
+      const secondFromDave = await helperText(dave);
+      const secondCombined = await combineRecoveryHelperPackages(crypto, [
+        await decryptRecoveryHelperPackage(crypto, secondFromBob.text, secondFromBob.password),
+        await decryptRecoveryHelperPackage(crypto, secondFromDave.text, secondFromDave.password),
+      ]);
+      expect(secondCombined.rescueDevice.signingKeyFingerprint).toBe(
+        renewed.payload.rescueDevice.signingKeyFingerprint,
+      );
+      const thirdFactory = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
+      const thirdUser = await thirdFactory.createUserId(aliceUser.username, "third-device-pass");
+      const secondCertified = await certifyDeviceWithRescueDevice({
+        cryptoAdapter: crypto,
+        recovery: secondCombined,
+        device: {
+          signingPublicKey: thirdUser.userSigningKeyPair.publicKey,
+          encryptionPublicKey: thirdUser.userEncryptionKeyPair.publicKey,
+        },
+        label: "Second new phone",
+      });
+      expect(secondCertified.username).toBe(aliceUser.username);
+      const thirdDelivery = (
+        await thirdFactory.discoverTenantsOnServer(baseUrl, { user: thirdUser, password: "third-device-pass" })
+      ).find((d) => d.tenantId === tenantId)!;
+      const third = (
+        await thirdFactory.bootstrapTenantFromDelivery(thirdDelivery, {
+          user: thirdUser,
+          password: "third-device-pass",
+          serverUrl: baseUrl,
+        })
+      ).tenant;
+      expect(await third.hasDecryptionKey!(DEFAULT_TENANT_KEY_ID)).toBe(true);
+      await pull(third, baseUrl, "notes");
+      const thirdNotes = await third.openDB("notes");
+      expect((await thirdNotes.getDocument(sealedBefore.getId())).getData().text).toBe("before");
+      expect((await thirdNotes.getDocument(sealedAfter.getId())).getData().text).toBe("after");
+      expect(await third.canIssueDeviceCertificates!()).toBe(true);
+
+      // The third device renews too, and the packages of the second round stop working.
+      const secondPrevious = await third.getRecoveryContactsSetup!();
+      expect(secondPrevious?.docId).toBe(renewed.docId);
+      const renewedAgain = await third.setupRecoveryContacts!(
+        secondPrevious!.payload.contacts.map((c) => c.username),
+        { withdrawRescueDevices: [secondCertified.rescueSigningKeyFingerprint] },
+      );
+      expect(renewedAgain.docId).not.toBe(renewed.docId);
+      await push(third, baseUrl, USER_DIRECTORY_DB_ID);
+      const fourthDevice = await thirdFactory.createUserId(aliceUser.username, "y-pass");
+      await expect(
+        certifyDeviceWithRescueDevice({
+          cryptoAdapter: crypto,
+          recovery: secondCombined,
+          device: {
+            signingPublicKey: fourthDevice.userSigningKeyPair.publicKey,
+            encryptionPublicKey: fourthDevice.userEncryptionKeyPair.publicKey,
+          },
+        }),
+      ).rejects.toEqual(expect.objectContaining({ name: "RecoveryError", code: "not-certified" }));
+      // The renewed setup is still the current one on the recovered device.
+      await pull(recovered, baseUrl, USER_DIRECTORY_DB_ID);
 
       // Removing recovery contacts withdraws the rescue device.
       expect(await recovered.removeRecoveryContacts!()).toBe(1);
