@@ -146,4 +146,39 @@ describe("WitnessReceipt", () => {
       receivedByPublicKey: "witness",
     });
   });
+
+  describe("stored signature forms", () => {
+    async function signed() {
+      const witness = await generateWitnessKeyPair();
+      const fields = { ...baseFields, receivedByPublicKey: witness.publicKeyPem };
+      const signature = await signWitnessReceipt(fields, witness.privateKey, subtle);
+      return { fields, signature, witness };
+    }
+
+    it("verifies the index-keyed object older SQLite stores returned", async () => {
+      const { fields, signature, witness } = await signed();
+      const stored = JSON.parse(JSON.stringify(signature)) as unknown as Uint8Array;
+      expect(Array.isArray(stored)).toBe(false);
+      await expect(verifyWitnessReceipt(fields, stored, witness.publicKeyPem, subtle)).resolves.toBe(true);
+    });
+
+    it("verifies base64 and a view into a larger buffer", async () => {
+      const { fields, signature, witness } = await signed();
+      const base64 = Buffer.from(signature).toString("base64") as unknown as Uint8Array;
+      await expect(verifyWitnessReceipt(fields, base64, witness.publicKeyPem, subtle)).resolves.toBe(true);
+      const padded = new Uint8Array(signature.length + 8);
+      padded.set(signature, 4);
+      const view = padded.subarray(4, 4 + signature.length);
+      await expect(verifyWitnessReceipt(fields, view, witness.publicKeyPem, subtle)).resolves.toBe(true);
+    });
+
+    it("returns false instead of throwing for a signature or key that is no Ed25519 input", async () => {
+      const { fields, signature, witness } = await signed();
+      const garbage = { a: 1 } as unknown as Uint8Array;
+      await expect(verifyWitnessReceipt(fields, garbage, witness.publicKeyPem, subtle)).resolves.toBe(false);
+      const badKey = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----";
+      await expect(verifyWitnessReceipt(fields, signature, badKey, subtle)).resolves.toBe(false);
+    });
+  });
 });
+

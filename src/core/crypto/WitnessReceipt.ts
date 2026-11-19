@@ -1,4 +1,5 @@
 import { StoreEntryMetadata } from "../types";
+import { base64ToBytes } from "../utils/base64";
 
 /**
  * Witness receipts (docs/accesscontrol.md §5).
@@ -262,18 +263,74 @@ export async function verifyWitnessReceipt(
   if (version !== WITNESS_RECEIPT_LAYOUT_VERSION) {
     return false;
   }
+  const signatureBytes = witnessSignatureBytes(signature);
+  if (!signatureBytes) {
+    return false;
+  }
   const bytes = buildWitnessSigningBytes(fields, version);
-  const cryptoKey = await subtle.importKey(
-    "spki",
-    pemToArrayBuffer(witnessPublicKeyPem),
-    { name: "Ed25519" },
-    false,
-    ["verify"]
-  );
-  return subtle.verify(
-    { name: "Ed25519" },
-    cryptoKey,
-    signature.buffer as ArrayBuffer,
-    bytes.buffer as ArrayBuffer
-  );
+  try {
+    const cryptoKey = await subtle.importKey(
+      "spki",
+      pemToArrayBuffer(witnessPublicKeyPem),
+      { name: "Ed25519" },
+      false,
+      ["verify"]
+    );
+    return await subtle.verify(
+      { name: "Ed25519" },
+      cryptoKey,
+      exactArrayBuffer(signatureBytes),
+      exactArrayBuffer(bytes)
+    );
+  } catch {
+    // A malformed key or signature is an invalid receipt, never an error:
+    // WebKit throws a TypeError where other engines return false, and a
+    // throw here made a whole User-Key document count as invalid.
+    return false;
+  }
+}
+
+/**
+ * The receipt signature as bytes. Stores of MindooDB before 0.1.0 (the
+ * SQLite store of Haven's shells) handed it back as the index-keyed object
+ * `{"0":90,"1":50,…}` that `JSON.stringify` makes of a Uint8Array; a
+ * base64 string or a plain array are accepted as well. Null when it is none
+ * of these.
+ */
+export function witnessSignatureBytes(value: unknown): Uint8Array | null {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (typeof value === "string") {
+    try {
+      return base64ToBytes(value);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(value)) {
+    return Uint8Array.from(value as number[]);
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const length = Object.keys(record).length;
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i++) {
+      const byte = record[String(i)];
+      if (typeof byte !== "number") return null;
+      bytes[i] = byte;
+    }
+    return bytes;
+  }
+  return null;
+}
+
+/** The bytes of a view as their own ArrayBuffer (a view's `.buffer` may be larger). */
+function exactArrayBuffer(view: Uint8Array): ArrayBuffer {
+  return view.byteOffset === 0 && view.byteLength === view.buffer.byteLength
+    ? (view.buffer as ArrayBuffer)
+    : (view.slice().buffer as ArrayBuffer);
 }
