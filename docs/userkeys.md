@@ -827,7 +827,7 @@ A generation counts only when the change that gave it its current value (`public
 
 The **cutoff** is the earlier of two values. The first is the tenant-wide `requireUserKeyGenerationSignatureSince` in the admin-signed default policy. New tenants are created with it set; for an existing tenant, `directory.requireUserKeyGenerationSignatures(adminKey, password)` sets it once. The second is the person's `deviceSelfGrant.grantedAt`. Without either, every generation counts as before, so existing tenants keep working until the administrator turns the check on.
 
-Generations that do not count are ignored when clients decide what is current: `resolveUserKeyDocument()` returns them in `rejectedEpochs`, `payload` lists only the generations that count, and `rawPayload` is the document as stored. If a device overwrites a generation in place, the last earlier value of that epoch that counted is used instead. Rotation always picks an epoch above every stored one, so a planted epoch cannot block it.
+Generations that do not count are ignored when clients decide what is current: `resolveUserKeyDocument()` returns them in `rejectedEpochs`, `payload` lists only the generations that count, and `rawPayload` is the document as stored. If a device overwrites a generation in place, the last earlier value of that epoch that counted is used instead. When that earlier value has the same public key as the stored one (for example the value from `doc_create`, after a later signing-key change stopped counting), it keeps the stored device wraps: wraps are added in later changes and only open that public key's private key, so without them the person would look pending and nobody could seal to them. Rotation always picks an epoch above every stored one, so a planted epoch cannot block it.
 
 The signed bytes are `JSON.stringify(["mindoodb-userkey-generation-v1", username_hash, epoch, publicKey, fingerprint, signingPublicKey, createdAt])`, with whitespace removed from both PEM keys. Wraps and `retiredAt` are left out because they change during a generation's life.
 
@@ -1183,6 +1183,7 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 | A planted, unsigned generation is ignored once signatures are required; without a cutoff it still counts | 9.1, 9.3 | `UserKeyGenerationSignature` |
 | A planted generation signed with its own key is ignored | 9.3 | `UserKeyGenerationSignature` |
 | An overwritten generation falls back to its earlier value | 9.3 | `UserKeyGenerationSignature` |
+| A fallback to the created value keeps the device wraps of the same public key | 9.3 | `UserKeyFallbackKeepsWraps` |
 | Granting device self-grant closes the gap for that person; rotation stays signed and counts | 9.3, 9.4 | `UserKeyGenerationSignature` |
 | The join request carries the self-grant key; approval names it in the grant; revoke keeps the key | 9.4 | `UserKeyGenerationSignature` |
 | An approved device receives the person's self-grant key, replacing one it made before joining | 9.2 | `UserKeyGenerationSignature` |

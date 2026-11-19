@@ -198,7 +198,7 @@ export async function filterValidGenerations(input: {
     let chosen: UserKeyGeneration | null = null;
     for (const candidate of candidates) {
       if (await counts(candidate.gen, candidate.version, epoch, previous, policy, crypto)) {
-        chosen = candidate.gen;
+        chosen = candidate.gen === live ? live : withLiveWraps(candidate.gen, live);
         break;
       }
     }
@@ -210,6 +210,27 @@ export async function filterValidGenerations(input: {
     }
   }
   return { payload: { ...payload, userKeys: accepted }, rejectedEpochs };
+}
+
+/**
+ * An earlier value of an epoch with the live value's public key: device wraps
+ * are not part of a value (they are added in later changes, e.g. the first
+ * wrap right after a pending `doc_create`), and a wrap only opens the private
+ * key of that public key. So the live wraps stay valid for it. Without them a
+ * fallback to the created value would look pending, and nobody could seal to
+ * the person any more.
+ */
+function withLiveWraps(earlier: UserKeyGeneration, live: UserKeyGeneration): UserKeyGeneration {
+  if (
+    !live?.publicKey ||
+    normalizePublicKeyPem(earlier.publicKey) !== normalizePublicKeyPem(live.publicKey)
+  ) {
+    return earlier;
+  }
+  return {
+    ...earlier,
+    deviceWraps: { ...(earlier.deviceWraps ?? {}), ...(live.deviceWraps ?? {}) },
+  };
 }
 
 async function counts(
