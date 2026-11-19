@@ -349,6 +349,7 @@ See: [Use Cases Documentation](./docs/usecases/README.md)
 - [Time Travel](./docs/timetravel.md) — Historical document retrieval and history traversal
 - [Change Attribution](./docs/change-attribution.md) — Marking changes made by AI agents, stored encrypted inside the change
 - [Document Copy & Sharding](./docs/document-copy.md) — Copying documents between databases with or without history, verifiable provenance, and splitting a growing database into shards as a keyless operation
+- [Document Archives](./docs/document-archive.md) — Exporting documents with full history, attachments and authors for support, and importing them elsewhere with verifiable provenance
 - [Access Control & Governance](./docs/accesscontrol.md) — Encryption-key read access, admin-signed write policies, the two-tier model, witness receipts and trusted-time enforcement
 - [Invitations](./docs/invitations.md) — Invitation links and the admin-only join-request inbox: requests go to the server sealed to the admins, the admin admits matching ones in bulk, discovery brings the device in
 - [P2P Sync](./docs/p2psync.md) — Peer-to-peer synchronization

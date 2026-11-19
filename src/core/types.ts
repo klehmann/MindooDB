@@ -16,6 +16,14 @@ import type {
   CopyDocumentsResult,
   CopyFeasibility,
 } from "./copy/types";
+import type {
+  DocumentArchive,
+  DocumentArchiveFiles,
+  DocumentArchiveImportCheck,
+  ExportDocumentArchiveOptions,
+  ImportDocumentArchiveOptions,
+  ImportDocumentArchiveResult,
+} from "./archive/documentArchive";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import type {
   DefaultAccessPolicyDoc,
@@ -6746,6 +6754,41 @@ export interface MindooDB {
     target: MindooDB,
     options?: CopyDocumentsOptions,
   ): Promise<CopyDocumentsResult>;
+
+  /**
+   * Export documents with their whole revision history, attachment chunks and
+   * authors into a plain document archive (`.mdbdocs` once zipped). Payloads
+   * are decrypted, so protect the result before it leaves the device. See
+   * `archive/documentArchive.ts` for the layout.
+   *
+   * @param docIds The documents to export.
+   * @return The archive as a map of relative paths to file contents.
+   */
+  exportDocumentArchive(
+    docIds: string[],
+    options?: ExportDocumentArchiveOptions,
+  ): Promise<DocumentArchiveFiles>;
+
+  /**
+   * Parse a document archive and verify its file hashes and the exporter's
+   * manifest signature. Throws `DocumentArchiveFormatError` when it is not
+   * intact.
+   */
+  readDocumentArchive(files: DocumentArchiveFiles): Promise<DocumentArchive>;
+
+  /** Which of the archive's documents already exist in this database. */
+  checkDocumentArchiveImport(archive: DocumentArchive): Promise<DocumentArchiveImportCheck>;
+
+  /**
+   * Import a document archive. Refuses with `DocumentArchiveConflictError`
+   * when any of its documents exists here already. Entry ids and dependencies
+   * are kept; entries are re-encrypted, signed by the current user and carry a
+   * provenance record naming their original author.
+   */
+  importDocumentArchive(
+    archive: DocumentArchive,
+    options?: ImportDocumentArchiveOptions,
+  ): Promise<ImportDocumentArchiveResult>;
 
   /**
    * Pull changes from a remote content-addressed store or another MindooDB instance.
