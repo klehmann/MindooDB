@@ -224,17 +224,28 @@ describe("document loads during index catch-up", () => {
       docCache: Map<string, unknown>;
       loadDocumentUncoalesced: (docId: string) => Promise<unknown>;
     };
+    // Background work of the tenant (reconciles, change events) may load
+    // documents too; let it finish first.
+    await fixture.host.tenant.whenBackgroundIdle?.();
     internals.docCache.clear();
     const original = internals.loadDocumentUncoalesced.bind(db);
     let materializations = 0;
+    // Count only the loads the two calls start: both reach
+    // loadDocumentUncoalesced synchronously, while background work scheduled
+    // on a loaded machine could start its own load before `Promise.all`
+    // settles and is not what this test is about.
+    let counting = false;
     internals.loadDocumentUncoalesced = async (docId: string) => {
-      materializations++;
+      if (counting) materializations++;
       return original(docId);
     };
 
     // What the summary buffer and the full-text index do when they follow
     // the same changefeed page.
-    const [a, b] = await Promise.all([db.getDocument(doc.getId()), db.getDocument(doc.getId())]);
+    counting = true;
+    const loads = [db.getDocument(doc.getId()), db.getDocument(doc.getId())];
+    counting = false;
+    const [a, b] = await Promise.all(loads);
 
     expect(a.getData().title).toBe("shared");
     expect(b.getData().title).toBe("shared");
