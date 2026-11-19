@@ -351,6 +351,24 @@ export {
   type ProvenanceVerificationStatus,
 } from "./copy/provenance";
 export { buildDocHistoryPurgeRequest } from "./copy/copyDocuments";
+export {
+  DOCUMENT_ARCHIVE_EXTENSION,
+  DOCUMENT_ARCHIVE_FORMAT,
+  DOCUMENT_ARCHIVE_VERSION,
+  DocumentArchiveConflictError,
+  DocumentArchiveFormatError,
+  type DocumentArchive,
+  type DocumentArchiveAuthor,
+  type DocumentArchiveDocument,
+  type DocumentArchiveDocumentSummary,
+  type DocumentArchiveEntryRecord,
+  type DocumentArchiveFiles,
+  type DocumentArchiveImportCheck,
+  type DocumentArchiveManifest,
+  type ExportDocumentArchiveOptions,
+  type ImportDocumentArchiveOptions,
+  type ImportDocumentArchiveResult,
+} from "./archive/documentArchive";
 export type { FlattenedDocumentProvenance } from "./copy/flatten";
 export type {
   CopyAdmissionCheck,

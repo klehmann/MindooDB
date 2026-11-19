@@ -187,6 +187,18 @@ import type { EntryProvenance } from "./crypto/EntrySignature";
 import type { CopyEngineHost } from "./copy/host";
 import { canCopyDocument, copyDocument } from "./copy/copyDocument";
 import { copyDocuments } from "./copy/copyDocuments";
+import {
+  checkDocumentArchiveImport,
+  exportDocumentArchive,
+  importDocumentArchive,
+  readDocumentArchive,
+  type DocumentArchive,
+  type DocumentArchiveFiles,
+  type DocumentArchiveImportCheck,
+  type ExportDocumentArchiveOptions,
+  type ImportDocumentArchiveOptions,
+  type ImportDocumentArchiveResult,
+} from "./archive/documentArchive";
 import type {
   CopyDocumentOptions,
   CopyDocumentResult,
@@ -19119,6 +19131,35 @@ export class BaseMindooDB implements MindooDB {
       selector,
       options,
     );
+  }
+
+  /** See {@link MindooDB.exportDocumentArchive}. */
+  async exportDocumentArchive(
+    docIds: string[],
+    options?: ExportDocumentArchiveOptions,
+  ): Promise<DocumentArchiveFiles> {
+    return exportDocumentArchive(this.getCopyEngineHost(), docIds, options);
+  }
+
+  /** See {@link MindooDB.readDocumentArchive}. */
+  async readDocumentArchive(files: DocumentArchiveFiles): Promise<DocumentArchive> {
+    return readDocumentArchive(files, this.tenant.getCryptoAdapter().getSubtle());
+  }
+
+  /** See {@link MindooDB.checkDocumentArchiveImport}. */
+  async checkDocumentArchiveImport(
+    archive: DocumentArchive,
+  ): Promise<DocumentArchiveImportCheck> {
+    return checkDocumentArchiveImport(this.getCopyEngineHost(), archive);
+  }
+
+  /** See {@link MindooDB.importDocumentArchive}. */
+  async importDocumentArchive(
+    archive: DocumentArchive,
+    options?: ImportDocumentArchiveOptions,
+  ): Promise<ImportDocumentArchiveResult> {
+    this.assertWritable("importDocumentArchive");
+    return importDocumentArchive(this.getCopyEngineHost(), archive, options);
   }
 
   /**
