@@ -1184,6 +1184,7 @@ The `NODE_OPTIONS` flag is needed only by `JoinSecondDeviceServer.test.ts`, whic
 | A planted generation signed with its own key is ignored | 9.3 | `UserKeyGenerationSignature` |
 | An overwritten generation falls back to its earlier value | 9.3 | `UserKeyGenerationSignature` |
 | A fallback to the created value keeps the device wraps of the same public key | 9.3 | `UserKeyFallbackKeepsWraps` |
+| The person stays usable in every order of document origin, cutoff, later step (device, rotation, approver revoked) and trusted-time mode (local, witnessed, stamped at a later push) | 9.3 | `UserKeyOrderMatrix*` |
 | Granting device self-grant closes the gap for that person; rotation stays signed and counts | 9.3, 9.4 | `UserKeyGenerationSignature` |
 | The join request carries the self-grant key; approval names it in the grant; revoke keeps the key | 9.4 | `UserKeyGenerationSignature` |
 | An approved device receives the person's self-grant key, replacing one it made before joining | 9.2 | `UserKeyGenerationSignature` |
