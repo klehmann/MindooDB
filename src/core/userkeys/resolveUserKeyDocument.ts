@@ -2,6 +2,7 @@ import type { MindooDB, MindooDoc, MindooTenantDirectory, StoreEntryMetadata } f
 import { userKeyDocumentId, type UserKeyDocumentPayload } from "./types";
 import { validateUserKeyDocument } from "./validateUserKeyDocument";
 import { filterValidGenerations, loadGenerationHistory } from "./generationValidity";
+import { isSealedKeyId } from "./sealedTypes";
 
 export interface ResolveUserKeyDocumentInput {
   db: MindooDB;
@@ -52,6 +53,12 @@ export async function resolveUserKeyDocument(
     for (const id of ids) {
       if (valid.some((v) => v.doc.getId() === id)) continue;
       try {
+        // User-Key documents are never sealed. Loading a sealed document needs
+        // the User-Key, whose lookup lands here again and waited for its own
+        // load (Mindoo Mail hung at "Loading…" when the canonical document
+        // failed validation).
+        const create = await createEntryMeta(input.db, id);
+        if (!create || isSealedKeyId(create.decryptionKeyId)) continue;
         const doc = await input.db.getDocument(id);
         if (doc.isDeleted()) continue;
         const resolved = await validateLoaded(doc, input);
