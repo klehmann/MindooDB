@@ -1,7 +1,7 @@
 /**
  * Device discovery: challenge / discover without a tenant id in the path.
  */
-import { describe, expect, test } from "@jest/globals";
+import { describe, expect, jest, test } from "@jest/globals";
 import { DeviceDiscoveryAuthError, DeviceDiscoveryService } from "../server/DeviceDiscoveryService";
 import { NodeCryptoAdapter } from "../node/crypto/NodeCryptoAdapter";
 import { BaseMindooTenantFactory } from "../core/BaseMindooTenantFactory";
@@ -126,6 +126,60 @@ describe("DeviceDiscoveryService", () => {
     expect(result.tenants[0]?.tenantId).toBe("tenant-a");
     expect(result.tenants[0]?.wrappedJoinResponse).toBe("device-join-blob");
     expect(result.tenants[0]?.wrappedPublicInfosKey).toBeTruthy();
+  }, 60000);
+
+  test("a tenant whose lookup hangs is skipped instead of holding the answer", async () => {
+    const cryptoAdapter = new NodeCryptoAdapter();
+    const factory = new BaseMindooTenantFactory(
+      new InMemoryContentAddressedStoreFactory(),
+      cryptoAdapter,
+    );
+    const user = await factory.createUserId("cn=bob/o=discover", "bob-pass-123");
+    const subtle = cryptoAdapter.getSubtle();
+    const signingKey = await subtle.importKey(
+      "pkcs8",
+      await decryptPrivateKey(cryptoAdapter, user.userSigningKeyPair.privateKey, "bob-pass-123", "signing"),
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+    const aesKey = cryptoAdapter.getRandomValues(new Uint8Array(32));
+    const granted = {
+      directory: {
+        getUserBySigningPublicKey: async () => ({
+          username: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          signingPublicKey: user.userSigningKeyPair.publicKey,
+          encryptionPublicKey: user.userEncryptionKeyPair.publicKey,
+          details: null,
+        }),
+      },
+      context: { config: { adminSigningPublicKey: "admin-sign", adminEncryptionPublicKey: "admin-enc" } },
+    };
+    const hanging = {
+      directory: { getUserBySigningPublicKey: () => new Promise(() => {}) },
+      context: granted.context,
+    };
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const service = new DeviceDiscoveryService(
+        {
+          listTenants: () => ["tenant-hangs", "tenant-a"],
+          getTenant: async (id: string) => (id === "tenant-hangs" ? hanging : granted),
+          getPublicInfosKeysForTenant: async () => [aesKey],
+        } as never,
+        cryptoAdapter,
+        { tenantLookupTimeoutMs: 200 },
+      );
+      const challenge = service.createChallenge(user.userSigningKeyPair.publicKey);
+      const sigBuf = await subtle.sign("Ed25519", signingKey, new TextEncoder().encode(challenge));
+      const started = Date.now();
+      const result = await service.discover(challenge, new Uint8Array(sigBuf));
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(result.tenants.map((t) => t.tenantId)).toEqual(["tenant-a"]);
+      expect(warn.mock.calls.some(([line]) => String(line).includes("tenant-hangs: skipped"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   }, 60000);
 
   test("rejects invalid signatures", async () => {
