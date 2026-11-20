@@ -29,7 +29,7 @@ folder only holds the Worker's configuration. To update, bump `mindoodb` in
   verifies and wraps keys on every sync request, and that does not fit the
   free plan's CPU time per request.
 - Node.js 22+ on your machine for the one-time setup.
-- `mindoodb` 0.0.86 or later (the first release with `mindoodb/cloudflare`).
+- `mindoodb` 0.1.3 or later (`package.json` already asks for it).
 
 ## Deploy
 
@@ -52,6 +52,8 @@ folder only holds the Worker's configuration. To update, bump `mindoodb` in
    its password) to create tenants. Use `--admin <name>` for another admin
    name, or `--admin-public <identity.json>` to make an existing identity the
    admin.
+   To start with other settings, e.g. a demo server, pass
+   `--config <config.json>` (see [Server settings](#server-settings-configjson)).
 4. Check it:
    ```bash
    curl https://<name>.<account>.workers.dev/.well-known/mindoodb-server-info
@@ -84,9 +86,50 @@ origins of your web apps, comma-separated, e.g. `https://haven.example.com`.
 
 As on the Node server: a client publishes a tenant with the system admin's
 identity (`tenant.publishToServer(url, { systemAdminUser, systemAdminPassword, ... })`
-in the SDK, or Haven's "publish to server"). `config.json` follows the format
-of the Node server (see `README-server.md` in the MindooDB repository) and can
-be changed at runtime with `PUT /system/config`.
+in the SDK, or Haven's "publish to server"). Who else may create tenants is
+set in `config.json` (next section).
+
+## Server settings (config.json)
+
+`config.json` has the format of the Node server (see `README-server.md` in the
+MindooDB repository): `capabilities` decide who may call which `/system/*`
+route, `cluster` enables peer replication. There is no file on Cloudflare; the
+server object keeps the config in its storage:
+
+1. `npm run setup` stores the first config as the `MINDOODB_SERVER_CONFIG`
+   secret (the system admin gets `ALL:/system/*`; add your own rules with
+   `--config <file>`). The server uses it as long as it has no stored config.
+2. From then on, change it at runtime as system admin. It applies
+   immediately, without a redeploy, and the previous version is kept as a
+   backup:
+   ```bash
+   npm run config -- --url https://<name>.<account>.workers.dev get > config.json
+   # edit config.json
+   npm run config -- --url https://<name>.<account>.workers.dev put config.json
+   ```
+   After the first `put`, the stored config wins; changing the
+   `MINDOODB_SERVER_CONFIG` secret no longer has an effect.
+
+**Demo server** (anyone may create a tenant; nobody but the admin may list
+tenants or change the config, and each tenant's own admin may delete it):
+
+```json
+{
+  "capabilities": {
+    "ALL:/system/*": [{ "username": "cn=sysadmin", "publicsignkey": "<admin key from get>" }],
+    "POST:/system/tenants/*": [{ "username": "*", "publicsignkey": "*" }]
+  }
+}
+```
+
+Use `POST:/system/tenants/demo_*` to allow only tenant ids with that prefix.
+For a fresh server the rule can go into the initial config instead:
+`npm run setup -- --config demo.json` with only the `POST:/system/tenants/*`
+entry (setup adds the admin).
+
+Settings that are not in `config.json` are Worker variables in
+`wrangler.jsonc` or the dashboard (table at the end), and rate limits are
+the `ratelimits` bindings.
 
 ## Replicating with other servers
 
@@ -114,7 +157,8 @@ Node.
 
 ```bash
 npm run setup -- --local   # writes .dev.vars instead of secrets
-npm run dev                # wrangler dev, storage stays local
+npm run dev                # wrangler dev on http://localhost:8787, storage stays local in .wrangler/
+npm run config -- --url http://localhost:8787 get
 ```
 
 ## Differences from the Node server

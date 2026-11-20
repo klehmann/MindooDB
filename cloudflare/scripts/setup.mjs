@@ -8,7 +8,8 @@
  *   MINDOODB_SERVER_IDENTITY  server.identity.json (password-encrypted keys)
  *   MINDOODB_SERVER_PASSWORD  random password of that identity
  *   MINDOODB_JWT_SECRET       random key from which sync-token keys derive
- *   MINDOODB_SERVER_CONFIG    initial config.json (system admin capabilities)
+ *   MINDOODB_SERVER_CONFIG    initial config.json (system admin capabilities,
+ *                             merged with --config)
  *
  * Usage:
  *   npm run setup                    # store secrets with `wrangler secret put`
@@ -19,8 +20,15 @@
  *   --admin <username>         system admin to create (default: cn=sysadmin)
  *   --admin-public <file>      use an existing identity (public part) as admin instead
  *   --out <dir>                where to write the admin identity (default: .)
+ *   --config <file>            initial config.json to start from (e.g. a demo
+ *                              server's open tenant creation); the admin is
+ *                              added to "ALL:/system/*"
  *
  * The admin password is read from MINDOODB_ADMIN_PASSWORD or prompted for.
+ *
+ * The config only seeds the server: once the server has stored a config
+ * (`PUT /system/config`, e.g. `npm run config -- put <file>`), that one wins
+ * and a new MINDOODB_SERVER_CONFIG secret is ignored.
  *
  * Workers' WebCrypto allows at most 100 000 PBKDF2 iterations, so the server
  * identity is encrypted with that count (the Node server uses 310 000). The
@@ -50,6 +58,7 @@ function parseArgs(argv) {
     else if (arg === "--admin") options.admin = next();
     else if (arg === "--admin-public") options.adminPublic = next();
     else if (arg === "--out") options.out = next();
+    else if (arg === "--config") options.config = next();
     else throw new Error(`Unknown option ${arg}`);
   }
   return options;
@@ -124,11 +133,18 @@ if (options.adminPublic) {
   admin = { username: options.admin, publicsignkey: identity.userSigningKeyPair.publicKey };
 }
 
+const serverConfig = options.config ? JSON.parse(readFileSync(options.config, "utf-8")) : {};
+serverConfig.capabilities ??= {};
+const adminRule = (serverConfig.capabilities["ALL:/system/*"] ??= []);
+if (!adminRule.some((p) => p.username === admin.username && p.publicsignkey === admin.publicsignkey)) {
+  adminRule.push(admin);
+}
+
 const secrets = {
   MINDOODB_SERVER_IDENTITY: JSON.stringify(serverIdentity),
   MINDOODB_SERVER_PASSWORD: serverPassword,
   MINDOODB_JWT_SECRET: randomBytes(32).toString("base64"),
-  MINDOODB_SERVER_CONFIG: JSON.stringify({ capabilities: { "ALL:/system/*": [admin] } }),
+  MINDOODB_SERVER_CONFIG: JSON.stringify(serverConfig),
 };
 
 if (options.local) {
