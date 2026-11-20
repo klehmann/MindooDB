@@ -3,6 +3,7 @@ import {
   IdentitySet,
   evaluateAccess,
   defaultWhenForOp,
+  deepEqual,
 } from "../core/accesscontrol/evaluate";
 import { AclRuleDoc, DefaultAccessPolicyDoc, RuleType } from "../core/accesscontrol/types";
 
@@ -274,6 +275,207 @@ describe("evaluateAccess", () => {
       expect(evalClause("gte", 5, { f: 5 })).toBe(true);
       expect(evalClause("lt", 5, { f: 4 })).toBe(true);
       expect(evalClause("lte", 5, { f: 5 })).toBe(true);
+    });
+  });
+
+  describe("unchanged", () => {
+    // Room booking: the author may change the booking, but not the decision.
+    const nodeFor = (op: RuleType, key = "status") =>
+      nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocChange: true, denyDocCreate: true }), 1);
+        b.applyRule(
+          rule({ ruleId: "u", type: op, action: "allow", withfields: [{ key, op: "unchanged" }] }),
+          2,
+        );
+      });
+    const change = (
+      beforeDoc: Record<string, unknown> | null,
+      afterDoc: Record<string, unknown> | null,
+      key = "status",
+    ) =>
+      evaluateAccess({ op: "doc_change", dbid: "db", identity: identity(), node: nodeFor("doc_change", key), beforeDoc, afterDoc })
+        .allowed;
+
+    it("passes when the field keeps its value and fails when it changes", () => {
+      expect(change({ status: "pending", title: "a" }, { status: "pending", title: "b" })).toBe(true);
+      expect(change({ status: "pending" }, { status: "approved" })).toBe(false);
+    });
+
+    it("treats a field missing on both sides as unchanged, but adding or removing it as a change", () => {
+      expect(change({ title: "a" }, { title: "b" })).toBe(true);
+      expect(change({ title: "a" }, { title: "a", status: "approved" })).toBe(false);
+      expect(change({ status: "pending" }, {})).toBe(false);
+    });
+
+    it("compares nested dot paths", () => {
+      expect(change({ decision: { by: "x", at: 1 } }, { decision: { by: "x", at: 1 }, t: 2 }, "decision.by")).toBe(true);
+      expect(change({ decision: { by: "x" } }, { decision: { by: "y" } }, "decision.by")).toBe(false);
+    });
+
+    it("compares objects deeply regardless of key order", () => {
+      expect(change({ status: { a: 1, b: [1, { c: 2 }] } }, { status: { b: [1, { c: 2 }], a: 1 } })).toBe(true);
+      expect(change({ status: { a: 1, b: [1, { c: 2 }] } }, { status: { a: 1, b: [1, { c: 3 }] } })).toBe(false);
+      expect(change({ status: { a: 1 } }, { status: { a: 1, b: 2 } })).toBe(false);
+    });
+
+    it("compares arrays order-sensitively", () => {
+      expect(change({ status: ["a", "b"] }, { status: ["a", "b"] })).toBe(true);
+      expect(change({ status: ["a", "b"] }, { status: ["b", "a"] })).toBe(false);
+      expect(change({ status: ["a"] }, { status: ["a", "a"] })).toBe(false);
+    });
+
+    it("does not confuse values of different types", () => {
+      expect(change({ status: 1 }, { status: "1" })).toBe(false);
+      expect(change({ status: null }, {})).toBe(false);
+      expect(change({ status: [] }, { status: {} })).toBe(false);
+    });
+
+    it("on doc_create passes only when the field is absent after", () => {
+      const create = (afterDoc: Record<string, unknown> | null) =>
+        evaluateAccess({ op: "doc_create", dbid: "db", identity: identity(), node: nodeFor("doc_create"), beforeDoc: null, afterDoc })
+          .allowed;
+      expect(create({ title: "a" })).toBe(true);
+      expect(create({ title: "a", status: "approved" })).toBe(false);
+      expect(create(null)).toBe(false);
+    });
+
+    it("fails closed when a state is not supplied", () => {
+      expect(change(null, { status: "x" })).toBe(false);
+      expect(change({ status: "x" }, null)).toBe(false);
+      expect(change(null, null)).toBe(false);
+    });
+
+    it("combines with other clauses: author may change everything but the decision", () => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocChange: true }), 1);
+        b.applyRule(
+          rule({
+            ruleId: "author-edits",
+            action: "allow",
+            users_hashes: ["$author"],
+            withfields: [
+              { key: "status", op: "unchanged" },
+              { key: "decidedBy", op: "unchanged" },
+            ],
+          }),
+          2,
+        );
+      });
+      const author = identity({ hashes: new Set(["hashAlice", "$everyone", "$author"]) });
+      const run = (afterDoc: Record<string, unknown>) =>
+        evaluateAccess({
+          op: "doc_change",
+          dbid: "db",
+          identity: author,
+          node,
+          beforeDoc: { title: "Meeting", status: "pending" },
+          afterDoc,
+        }).allowed;
+      expect(run({ title: "Team meeting", status: "pending" })).toBe(true);
+      expect(run({ title: "Meeting", status: "approved" })).toBe(false);
+      expect(run({ title: "Meeting", status: "pending", decidedBy: "cn=alice/o=acme" })).toBe(false);
+    });
+  });
+
+  describe("memberOfFieldGroup", () => {
+    const run = (
+      doc: Record<string, unknown>,
+      groups: string[],
+      opts: { key?: string; template?: string; when?: "before" | "after" } = {},
+    ) => {
+      const node = nodeWith((b) => {
+        b.applyDefaultPolicy(policy({ denyDocChange: true }), 1);
+        b.applyRule(
+          rule({
+            ruleId: "approvers",
+            action: "allow",
+            withfields: [
+              {
+                key: opts.key ?? "roomId",
+                op: "memberOfFieldGroup",
+                value: opts.template ?? "roomapprovers-{value}",
+                ...(opts.when ? { when: opts.when } : {}),
+              },
+            ],
+          }),
+          2,
+        );
+      });
+      return evaluateAccess({
+        op: "doc_change",
+        dbid: "db",
+        identity: identity({ groups }),
+        node,
+        beforeDoc: doc,
+        afterDoc: { ...doc, roomId: "changed", rooms: ["changed"] },
+      }).allowed;
+    };
+
+    it("matches a scalar field against the user's groups", () => {
+      expect(run({ roomId: "r1" }, ["roomapprovers-r1"])).toBe(true);
+      expect(run({ roomId: "r2" }, ["roomapprovers-r1"])).toBe(false);
+      expect(run({ roomId: "r1" }, [])).toBe(false);
+    });
+
+    it("matches if any string of an array field yields a group of the user", () => {
+      expect(run({ rooms: ["r3", "r1"] }, ["roomapprovers-r1"], { key: "rooms" })).toBe(true);
+      expect(run({ rooms: ["r3", "r4"] }, ["roomapprovers-r1"], { key: "rooms" })).toBe(false);
+      expect(run({ rooms: [1, null, "r1"] }, ["roomapprovers-r1"], { key: "rooms" })).toBe(true);
+      expect(run({ rooms: [] }, ["roomapprovers-r1"], { key: "rooms" })).toBe(false);
+    });
+
+    it("works with nested group membership already resolved into identity.groups", () => {
+      // The directory resolves nested groups upwards, so a member of a group
+      // that is itself in roomapprovers-r1 carries both names.
+      expect(run({ roomId: "r1" }, ["facility-team", "roomapprovers-r1"])).toBe(true);
+    });
+
+    it("supports the token anywhere in the template and nested field paths", () => {
+      expect(run({ room: { id: "r1" } }, ["approvers-r1-rooms"], { key: "room.id", template: "approvers-{value}-rooms" })).toBe(true);
+      expect(run({ room: { id: "r1" } }, ["r1"], { key: "room.id", template: "{value}" })).toBe(true);
+    });
+
+    it("compares group names case-insensitively and NFKC-normalized", () => {
+      expect(run({ roomId: "R1" }, ["roomapprovers-r1"])).toBe(true);
+      expect(run({ roomId: "r1" }, ["RoomApprovers-R1"])).toBe(true);
+      // Fullwidth "ｒ１" NFKC-normalizes to "r1".
+      expect(run({ roomId: "\uFF52\uFF11" }, ["roomapprovers-r1"])).toBe(true);
+      // "ﬁ" ligature NFKC-normalizes to "fi".
+      expect(run({ roomId: "of\uFB01ce" }, ["roomapprovers-office"])).toBe(true);
+    });
+
+    it("never matches a missing, empty or non-string field", () => {
+      expect(run({}, ["roomapprovers-"])).toBe(false);
+      expect(run({ roomId: "" }, ["roomapprovers-"])).toBe(false);
+      expect(run({ roomId: 1 }, ["roomapprovers-1"])).toBe(false);
+      expect(run({ roomId: { id: "r1" } }, ["roomapprovers-r1"])).toBe(false);
+      expect(run({ roomId: null }, ["roomapprovers-null"])).toBe(false);
+    });
+
+    it("reads the state selected by `when` (default before for doc_change)", () => {
+      // afterDoc has roomId "changed": the default (before) reads r1.
+      expect(run({ roomId: "r1" }, ["roomapprovers-r1"], { when: "before" })).toBe(true);
+      expect(run({ roomId: "r1" }, ["roomapprovers-r1"], { when: "after" })).toBe(false);
+      expect(run({ roomId: "r1" }, ["roomapprovers-changed"], { when: "after" })).toBe(true);
+    });
+
+    it("rejects an invalid template at evaluation time (fails closed)", () => {
+      expect(run({ roomId: "r1" }, ["roomapprovers-r1"], { template: "roomapprovers-r1" })).toBe(false);
+      expect(run({ roomId: "r1" }, ["r1r1"], { template: "{value}{value}" })).toBe(false);
+    });
+  });
+
+  describe("deepEqual", () => {
+    it("is deterministic for JSON-like values", () => {
+      expect(deepEqual({ a: [1, { b: 2 }], c: "x" }, { c: "x", a: [1, { b: 2 }] })).toBe(true);
+      expect(deepEqual([1, 2], [2, 1])).toBe(false);
+      expect(deepEqual({ a: undefined }, {})).toBe(true);
+      expect(deepEqual(new Date(5), new Date(5))).toBe(true);
+      expect(deepEqual(new Date(5), new Date(6))).toBe(false);
+      expect(deepEqual(new Uint8Array([1, 2]), new Uint8Array([1, 2]))).toBe(true);
+      expect(deepEqual(new Uint8Array([1, 2]), new Uint8Array([1, 3]))).toBe(false);
+      expect(deepEqual(NaN, NaN)).toBe(true);
+      expect(deepEqual(0, -0)).toBe(true);
     });
   });
 

@@ -122,7 +122,7 @@ import {
   validateDocHistoryPurge,
 } from "./accesscontrol/types";
 import { IdentitySet, evaluateAccess, evaluateLlmUse } from "./accesscontrol/evaluate";
-import { AccessDecision } from "./accesscontrol/types";
+import { AccessDecision, normalizeAclGroupName } from "./accesscontrol/types";
 import { RSAEncryption } from "./crypto/RSAEncryption";
 import { decryptEncryptedField, encryptEncryptedField } from "./crypto/encryptedFields";
 import { ensureTenantSetupAdministrator } from "./tenantSetup";
@@ -3481,7 +3481,10 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
    * Predict whether the current user may perform `op` on `dbid` (§9). Pure read;
    * evaluates Tier 1 + Tier 2 against the head directory state, treating the
    * caller as the prospective author. `candidateDoc` supplies the content that
-   * `withfields` clauses are checked against.
+   * `withfields` clauses are checked against; it stands for both the before and
+   * the after state, so an `unchanged` clause always passes here (use
+   * `MindooDB.canChange` to predict a concrete change). Without a
+   * `candidateDoc`, `unchanged` fails closed.
    */
   async canDo(op: RuleType, dbid: string, candidateDoc?: Record<string, unknown>): Promise<AccessDecision> {
     const currentUser = await this.tenant.getCurrentUserId();
@@ -5010,8 +5013,8 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   private normalizeGroupName(name: string): string {
     // NFKC-normalize before lowercasing so visually-equivalent Unicode group
     // names collapse to one key (homoglyph/normalization defense). ASCII names
-    // are unchanged.
-    return name.normalize("NFKC").toLowerCase();
+    // are unchanged. Shared with the `memberOfFieldGroup` operator (§6.3).
+    return normalizeAclGroupName(name);
   }
 
   /**

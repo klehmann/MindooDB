@@ -119,6 +119,38 @@ describe("access-control schema", () => {
       ).toThrow(/before/i);
     });
 
+    it("accepts unchanged without a value and rejects `when` on it", () => {
+      expect(() => validateWithFieldClause({ key: "status", op: "unchanged" }, "doc_change")).not.toThrow();
+      expect(() => validateWithFieldClause({ key: "status", op: "unchanged" }, "doc_create")).not.toThrow();
+      expect(() => validateWithFieldClause({ key: "status", op: "unchanged", when: "after" }, "doc_change")).toThrow(
+        /does not accept `when`/,
+      );
+      expect(() => validateWithFieldClause({ key: "status", op: "unchanged", when: "before" }, "doc_change")).toThrow(
+        /does not accept `when`/,
+      );
+    });
+
+    it("validates the memberOfFieldGroup template", () => {
+      expect(() =>
+        validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup", value: "roomapprovers-{value}", when: "before" }, "doc_change"),
+      ).not.toThrow();
+      expect(() => validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup", value: "{value}" }, "doc_create")).not.toThrow();
+      expect(() => validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup" }, "doc_change")).toThrow(/template string/);
+      expect(() => validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup", value: 5 }, "doc_change")).toThrow(/template string/);
+      expect(() =>
+        validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup", value: ["a-{value}"] }, "doc_change"),
+      ).toThrow(/template string/);
+      expect(() =>
+        validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup", value: "${user.groups}" }, "doc_change"),
+      ).toThrow(/template string/);
+      expect(() => validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup", value: "roomapprovers" }, "doc_change")).toThrow(
+        /exactly once/,
+      );
+      expect(() =>
+        validateWithFieldClause({ key: "roomId", op: "memberOfFieldGroup", value: "{value}-{value}" }, "doc_change"),
+      ).toThrow(/exactly once/);
+    });
+
     it("rejects an invalid action and empty users_hashes", () => {
       expect(() =>
         validateAclRule({ type: "doc_change", dbid: "*", action: "maybe" as unknown as never, users_hashes: ["$everyone"] }),

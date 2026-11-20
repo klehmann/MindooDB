@@ -549,7 +549,9 @@ type Operator =
   | "equals" | "notEquals"
   | "contains" | "containsAny" | "containsAll"
   | "exists" | "notExists"
-  | "gt" | "gte" | "lt" | "lte";
+  | "gt" | "gte" | "lt" | "lte"
+  | "unchanged"            // field is deep-equal before and after the change
+  | "memberOfFieldGroup";  // user is in the group named by a template + field value
 
 /** Placeholders are resolved at evaluation time against the acting user.
  *  NOTE: there is deliberately NO "${now}" / wall-clock placeholder. ACL
@@ -565,7 +567,9 @@ type Placeholder =
 interface WithFieldClause {
   key: string;                                   // dot-path inside the document
   op: Operator;
-  value: string | number | boolean | string[] | Placeholder;
+  /** Not used by exists / notExists / unchanged. For memberOfFieldGroup: a
+   *  group-name template containing "{value}" exactly once. */
+  value?: string | number | boolean | string[] | Placeholder;
 
   /** Which document state the clause is evaluated against:
    *  - "before": the document as it currently exists, before the candidate change
@@ -574,7 +578,8 @@ interface WithFieldClause {
    *              (result constraint — "the creator must add themselves").
    *  Defaults are op-appropriate (see withfields semantics below):
    *  doc_create => "after" (no before state exists);
-   *  doc_change / doc_delete / doc_undelete => "before". */
+   *  doc_change / doc_delete / doc_undelete => "before".
+   *  Not allowed on "unchanged", which always compares both states. */
   when?: "before" | "after";
 }
 
@@ -636,6 +641,90 @@ with `("owner","equals","${user.username}")` — also works but is **Tier 2**
   array shares any value with the acting user's resolved usernames list.
 - Operators and placeholders are a **closed set**; an unknown operator or
   placeholder is a validation error at rule-creation time. No regex in v1.
+
+**Operators**
+
+`key` is a dot path into the document (`meta.owner`); a missing path segment
+reads as "absent". Every operator except `unchanged` reads the field from the one
+state selected by `when` (default as above); `unchanged` always compares both
+states and rejects `when`. An operator that meets a value of the wrong type
+(e.g. `gt` on a string) does not match — a deny rule then does not fire, an allow
+rule does not grant.
+
+| Operator | Passes when | `value` | Placeholders | Example |
+|---|---|---|---|---|
+| `equals` | the field is strictly equal (`===`) to `value` | string, number or boolean | `${user.username}` | `{ key: "owner", op: "equals", value: "${user.username}" }` |
+| `notEquals` | the field is not strictly equal to `value` (also when the field is absent) | string, number or boolean | `${user.username}` | `{ key: "status", op: "notEquals", value: "archived" }` |
+| `contains` | the field is an array that includes `value`, or a string that contains `value` as a substring | string, number or boolean | `${user.username}` | `{ key: "myeditors", op: "contains", value: "${user.username}" }` |
+| `containsAny` | the field is an array that shares at least one element with `value` | string or string array | all three | `{ key: "myeditors", op: "containsAny", value: "${user.usernames}" }` |
+| `containsAll` | the field is an array that includes every element of `value` | string or string array | all three | `{ key: "tags", op: "containsAll", value: ["approved", "public"] }` |
+| `exists` | the field is present (any value, including `null`) | not used | — | `{ key: "approvedBy", op: "exists" }` |
+| `notExists` | the field is absent | not used | — | `{ key: "lockedBy", op: "notExists" }` |
+| `gt` / `gte` / `lt` / `lte` | the field and `value` are numbers and the comparison holds (`field > value`, …) | number | — | `{ key: "amount", op: "lte", value: 1000 }` |
+| `unchanged` | the field is deep-equal in the before and the after state; absent on both sides counts as equal. On `doc_create` (no before state) it passes only when the field is absent after | not used | — | `{ key: "status", op: "unchanged" }` |
+| `memberOfFieldGroup` | the field is a non-empty string, or an array of strings, and the acting user is a member of a group whose name is `value` with `{value}` replaced by one of those strings | template string with `{value}` exactly once | — | `{ key: "roomId", op: "memberOfFieldGroup", value: "roomapprovers-{value}", when: "before" }` |
+
+Details:
+
+- `${user.usernames}` and `${user.groups}` resolve to lists, so they only make
+  sense with `containsAny` / `containsAll`. With `equals` or `contains` a list
+  placeholder never matches, and with `notEquals` it always passes.
+- `unchanged` compares deterministically: arrays are order-sensitive, objects
+  compare by key and value regardless of key order, values of different types are
+  never equal (`1` ≠ `"1"`, `null` ≠ absent). Its verdict needs both states; an
+  evaluation path that cannot supply them (e.g. a prediction without a candidate
+  document) fails closed — the clause does not pass.
+- `memberOfFieldGroup` compares group names the way the directory stores them:
+  NFKC-normalized and lowercased, on both sides. Group membership is the acting
+  user's resolved `${user.groups}`, so nested groups count, and a group that lists
+  the member `*` contains every registered user. A missing, empty or non-string
+  field (and non-string array elements) never matches. The template is validated
+  at rule-creation time: it must be a string, must not be a placeholder and must
+  contain `{value}` exactly once.
+
+**Example — room bookings.** Bookings live in database `rooms`; changes are denied
+by default. The author of a booking may edit it, but not the decision fields; the
+approvers of a room are the members of the directory group
+`roomapprovers-<roomId>` (group names are stored lowercase, so the room ids in
+`roomId` match case-insensitively) and may change anything, including the
+decision:
+
+```ts
+await directory.setDatabaseAccessPolicy("rooms", { denyDocChange: true }, adminKey, adminPw);
+
+// The author may change the booking, but not the decision.
+await directory.createAccessRule({
+  ruleId: "booking-author",
+  type: "doc_change",
+  dbid: "rooms",
+  action: "allow",
+  users_hashes: ["$author"],
+  withfields: [
+    { key: "status", op: "unchanged" },
+    { key: "decidedBy", op: "unchanged" },
+  ],
+}, adminKey, adminPw);
+
+// Approvers of the booked room may change anything. `when: "before"` reads the
+// room from the existing booking, so moving a booking to another room needs an
+// approver of the room it is in now.
+await directory.createAccessRule({
+  ruleId: "room-approvers",
+  type: "doc_change",
+  dbid: "rooms",
+  action: "allow",
+  users_hashes: ["$everyone"],
+  withfields: [
+    { key: "roomId", op: "memberOfFieldGroup", value: "roomapprovers-{value}", when: "before" },
+  ],
+}, adminKey, adminPw);
+
+await directory.addUsersToGroup("roomapprovers-r1", ["CN=alice/O=acme"], adminKey, adminPw);
+```
+
+Alice may now approve bookings of room `r1`. The author of a booking may rename it,
+but a change that sets `status` is quarantined on every honest client unless the
+signer is an approver of the room.
 
 ### 6.4 Trusted witness (`acl_trustedwitness_<fingerprint>`)
 

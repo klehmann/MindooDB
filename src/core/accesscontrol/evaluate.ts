@@ -1,6 +1,7 @@
 import {
   AccessDecision,
   AclRuleDoc,
+  FIELD_GROUP_TEMPLATE_TOKEN,
   Operator,
   PSEUDO_TOKEN_ADMIN,
   PSEUDO_TOKEN_AUTHOR,
@@ -11,6 +12,7 @@ import {
   WithFieldWhen,
   effectivePolicy,
   isPlaceholder,
+  normalizeAclGroupName,
   ruleMatchesDbid,
 } from "./types";
 import { DirectoryStateNode } from "./DirectoryStateNode";
@@ -280,6 +282,10 @@ function intersects(hashes: string[], set: Set<string>): boolean {
  */
 function withFieldsPass(rule: AclRuleDoc, input: EvaluateAccessInput): boolean {
   for (const clause of rule.withfields ?? []) {
+    if (clause.op === "unchanged") {
+      if (!fieldUnchanged(clause.key, input)) return false;
+      continue;
+    }
     const when = clause.when ?? defaultWhenForOp(input.op);
     const doc = when === "after" ? input.afterDoc : input.beforeDoc;
     if (!evaluateClause(clause, doc ?? null, input.identity)) {
@@ -287,6 +293,92 @@ function withFieldsPass(rule: AclRuleDoc, input: EvaluateAccessInput): boolean {
     }
   }
   return true;
+}
+
+/**
+ * `unchanged` (§6.3): the value at `key` is deep-equal in the before and the
+ * after state; missing on both sides counts as equal. For `doc_create` there is
+ * no before state, so the clause passes only when the field is absent after.
+ * Fails closed when a state the comparison needs was not supplied (`null`):
+ * an unknown state must never count as "unchanged".
+ */
+function fieldUnchanged(key: string, input: EvaluateAccessInput): boolean {
+  const after = input.afterDoc ?? null;
+  if (after === null) return false;
+  if (input.op === "doc_create") {
+    return readPath(after, key) === undefined;
+  }
+  const before = input.beforeDoc ?? null;
+  if (before === null) return false;
+  return deepEqual(readPath(before, key), readPath(after, key));
+}
+
+/**
+ * Deterministic structural equality for JSON-like document values: arrays are
+ * order-sensitive, objects compare by key set regardless of key order, and an
+ * object key holding `undefined` counts as absent. `Date` and typed arrays
+ * compare by value.
+ */
+export function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a === "number" && typeof b === "number") {
+    return Number.isNaN(a) && Number.isNaN(b);
+  }
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+    return false;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+  }
+  if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+    if (!ArrayBuffer.isView(a) || !ArrayBuffer.isView(b)) return false;
+    if (a.constructor !== b.constructor) return false;
+    const x = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    const y = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) {
+      if (x[i] !== y[i]) return false;
+    }
+    return true;
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const aKeys = Object.keys(ao).filter((k) => ao[k] !== undefined);
+  const bKeys = Object.keys(bo).filter((k) => bo[k] !== undefined);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(bo, k) || !deepEqual(ao[k], bo[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * `memberOfFieldGroup` (§6.3): build a group name from the template by putting
+ * each string value of the field in place of `{value}`, and pass if the acting
+ * user is a member of any resulting group. Names are compared in the
+ * directory's normalized form (NFKC + lowercase). A missing, empty or
+ * non-string field (or array element) never matches.
+ */
+function memberOfFieldGroup(
+  template: WithFieldClause["value"],
+  docValue: unknown,
+  identity: IdentitySet
+): boolean {
+  if (typeof template !== "string" || isPlaceholder(template)) return false;
+  const parts = template.split(FIELD_GROUP_TEMPLATE_TOKEN);
+  if (parts.length !== 2) return false;
+  const values = Array.isArray(docValue) ? docValue : [docValue];
+  const fieldValues = values.filter((v): v is string => typeof v === "string" && v.length > 0);
+  if (fieldValues.length === 0 || identity.groups.length === 0) return false;
+  const groups = new Set(identity.groups.map(normalizeAclGroupName));
+  return fieldValues.some((v) => groups.has(normalizeAclGroupName(parts[0] + v + parts[1])));
 }
 
 /** Resolve a clause value, expanding placeholders against the identity set. */
@@ -334,6 +426,7 @@ function evaluateClause(
   // Existence operators don't need the value.
   if (op === "exists") return docValue !== undefined;
   if (op === "notExists") return docValue === undefined;
+  if (op === "memberOfFieldGroup") return memberOfFieldGroup(clause.value, docValue, identity);
 
   const resolved = resolveValue(clause.value, identity);
 
