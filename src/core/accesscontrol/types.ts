@@ -97,7 +97,9 @@ export type Operator =
   | "gt"
   | "gte"
   | "lt"
-  | "lte";
+  | "lte"
+  | "unchanged"
+  | "memberOfFieldGroup";
 
 /** All valid {@link Operator} values. */
 export const OPERATORS: readonly Operator[] = [
@@ -112,7 +114,24 @@ export const OPERATORS: readonly Operator[] = [
   "gte",
   "lt",
   "lte",
+  "unchanged",
+  "memberOfFieldGroup",
 ];
+
+/**
+ * The token a `memberOfFieldGroup` template must contain exactly once; it is
+ * replaced by the field value to build a group name (§6.3).
+ */
+export const FIELD_GROUP_TEMPLATE_TOKEN = "{value}" as const;
+
+/**
+ * Normalize a group name the same way the directory does when it stores and
+ * resolves groups (NFKC, then lowercase), so names built by
+ * `memberOfFieldGroup` compare equal to `identity.groups`.
+ */
+export function normalizeAclGroupName(name: string): string {
+  return name.normalize("NFKC").toLowerCase();
+}
 
 /**
  * Placeholders resolved at evaluation time against the acting user.
@@ -168,13 +187,18 @@ export interface WithFieldClause {
   /** Dot-path inside the document, e.g. `myeditors` or `meta.owner`. */
   key: string;
   op: Operator;
-  /** Literal value or a {@link Placeholder} resolved against the acting user. */
-  value: string | number | boolean | string[] | Placeholder;
+  /**
+   * Literal value or a {@link Placeholder} resolved against the acting user.
+   * Not used by `exists`, `notExists` and `unchanged`. For `memberOfFieldGroup`
+   * it is a group-name template containing `{value}` exactly once.
+   */
+  value?: string | number | boolean | string[] | Placeholder;
   /**
    * Which document state to evaluate against. Op-appropriate defaults when
    * omitted: `doc_create` => "after" (no before state exists); all other ops
    * => "before" (authorization must look at the existing document, otherwise a
    * user could self-authorize within the same change).
+   * Not allowed on `unchanged`, which always compares both states.
    */
   when?: WithFieldWhen;
 }
@@ -697,6 +721,24 @@ export function validateWithFieldClause(clause: WithFieldClause, ruleType: RuleT
   }
   if (ruleType === "doc_create" && clause.when === "before") {
     throw new Error('doc_create rules cannot use `when: "before"` (no before state exists)');
+  }
+  if (clause.op === "unchanged" && clause.when !== undefined) {
+    throw new Error(
+      'withfields operator "unchanged" compares the before and after states and does not accept `when`',
+    );
+  }
+  if (clause.op === "memberOfFieldGroup") {
+    const template = clause.value;
+    if (typeof template !== "string" || isPlaceholder(template)) {
+      throw new Error(
+        'withfields operator "memberOfFieldGroup" requires a group-name template string as `value`, e.g. "roomapprovers-{value}"',
+      );
+    }
+    if (template.split(FIELD_GROUP_TEMPLATE_TOKEN).length !== 2) {
+      throw new Error(
+        `withfields operator "memberOfFieldGroup" requires \`value\` to contain "${FIELD_GROUP_TEMPLATE_TOKEN}" exactly once (got "${template}")`,
+      );
+    }
   }
 }
 
