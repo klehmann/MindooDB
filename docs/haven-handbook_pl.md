@@ -38,7 +38,7 @@ KeyBag to lokalny, zaszyfrowany magazyn kluczy szyfrujących, których potrzebuj
 
 Widok wirtualny to drzewo w stylu arkusza kalkulacyjnego, które filtruje, kategoryzuje, sortuje i podsumowuje dokumenty. Widok może czerpać z jednej bazy danych, z kilku baz danych, a nawet z kilku tenantów — i właśnie tak odpowiadasz na pytania przekrojowe, a nie tylko na pytania wewnątrz jednej bazy danych.
 
-Obszar roboczy składa się z kafelków na stronach, zebranych w grupy. Kafelek — nazywany też Chicklet — to przeciągalna karta o zmiennym rozmiarze, która otwiera bazę danych, uruchamia aplikację albo pokazuje notatkę, stronę internetową, wideo lub diagram. Strona to karta pełna kafelków. Grupa skupia powiązane kafelki pod wspólnym, oznaczonym kolorem nagłówkiem.
+Obszar roboczy składa się z kafelków na stronach, zebranych w grupy. Kafelek — nazywany też Chicklet — to przeciągalna karta o zmiennym rozmiarze, która uruchamia aplikację albo pokazuje notatkę, stronę internetową, wideo lub diagram. Strona to karta pełna kafelków. Grupa skupia powiązane kafelki pod wspólnym, oznaczonym kolorem nagłówkiem.
 
 Rejestracja aplikacji to zapisana po stronie Haven definicja aplikacji MindooDB: gdzie leży, jak się uruchamia i które bazy danych lub widoki wolno jej zobaczyć. Gdy aplikacja się uruchamia, rozmawia z Haven przez mostek (nazywany też app connectorem), czyli bezpieczny kanał, który pozwala Haven wymuszać przyznane przez Ciebie uprawnienia. Piaskownica to izolacja wymuszana przez przeglądarkę, która nie dopuszcza aplikacji do magazynu Haven, jego ciasteczek ani innych aplikacji.
 
@@ -98,7 +98,7 @@ Krok czwarty, jesteś w środku. Haven wrzuca Cię do świeżo dołączonego ten
 
 Gdy kreator powitalny się skończy, codzienna droga jest taka sama, którąkolwiek trasą poszedłeś.
 
-Otwórz obszar roboczy. Start ma już swoje sześć kafelków skrótów; czego jeszcze nie ma, to czegokolwiek Twojego. Dodaj stronę obok Startu z menu dodawania, a potem tym samym menu połóż na niej kafelek bazy danych wskazujący na jedną z baz danych w Twoim tenancie. Kliknij kafelek dwukrotnie, aby otworzyć Przeglądarkę baz danych i zobaczyć jego dokumenty.
+Otwórz obszar roboczy. Start ma już swoje sześć kafelków skrótów; czego jeszcze nie ma, to czegokolwiek Twojego. Dodaj stronę obok Startu z menu dodawania, a potem tym samym menu połóż na niej pierwszy własny kafelek — notatkę, stronę internetową albo zainstalowaną aplikację.
 
 Zainstaluj aplikację. Otwórz ze Startu Haven App Store, wybierz coś, co wygląda przydatnie, i zainstaluj. Pojawi się od razu jako kafelek na Starcie, a stamtąd możesz ją położyć na jednej ze swoich stron.
 
@@ -154,7 +154,7 @@ Kontakty odzyskiwania to druga droga powrotu, gdy wszystkie urządzenia przepad�
 
 ## Obszar roboczy
 
-Obszar roboczy jest Twoim codziennym domem. Układasz w nim bazy danych, aplikacje, notatki, strony internetowe, filmy i diagramy jako przeciągalne kafelki na wielu stronach, jak ekrany główne w telefonie. Układ jest osobisty: domyślnie jest przechowywany tylko w tej przeglądarce, więc ładuje się natychmiast i działa offline. Jeśli chcesz mieć ten sam układ na innych urządzeniach, ustawienie Przenoszony obszar roboczy w Ustawienia → Ogólne zapisuje go w Twoim tenancie, zaszyfrowany tylko dla Ciebie.
+Obszar roboczy jest Twoim codziennym domem. Układasz w nim aplikacje, notatki, strony internetowe, filmy i diagramy jako przeciągalne kafelki na wielu stronach, jak ekrany główne w telefonie. Układ jest osobisty: domyślnie jest przechowywany tylko w tej przeglądarce, więc ładuje się natychmiast i działa offline. Jeśli chcesz mieć ten sam układ na innych urządzeniach, ustawienie Przenoszony obszar roboczy w Ustawienia → Ogólne zapisuje go w Twoim tenancie, zaszyfrowany tylko dla Ciebie.
 
 Strony to karty u góry obszaru roboczego. Pierwszą jest zawsze Start, opisany w sekcji o poruszaniu się po Haven: sześć własnych skrótów Haven plus kafelek dla każdej zainstalowanej aplikacji. Start jest tylko do odczytu, więc nie możesz rzucić na niego własnych kafelków ani przestawić tego, co na nim jest, i jest jedyną stroną, która zawsze wygląda tak samo.
 
@@ -162,17 +162,17 @@ Wszystko inne jest Twoje. Dodaj obok Startu dowolnie wiele stron — jedną na p
 
 Kafelki to karty na siatce. Przeciągnij kafelek za nagłówek, aby go przesunąć, przeciągnij narożnik, aby zmienić rozmiar, albo kliknij prawym przyciskiem, aby dostać pełne menu kontekstowe. Upuść kafelek na kartę innej strony, aby go tam przenieść. Upuść kafelek na inny kafelek, aby zacząć grupę.
 
-Grupy skupiają powiązane kafelki pod wspólnym, oznaczonym kolorem nagłówkiem. Grupa jest świetnym sposobem na wizualne trzymanie razem kafelków jednego projektu — na przykład bazy danych, działającej aplikacji i notatki referencyjnej tego samego zespołu. Kliknij nagłówek grupy prawym przyciskiem, aby zmienić jej nazwę, zmienić kolor albo rozgrupować kafelki z powrotem w zwykłe karty.
+Grupy skupiają powiązane kafelki pod wspólnym, oznaczonym kolorem nagłówkiem. Grupa jest świetnym sposobem na wizualne trzymanie razem kafelków jednego projektu — na przykład działającej aplikacji, strony internetowej, z którą pracuje, i notatki referencyjnej tego samego zespołu. Kliknij nagłówek grupy prawym przyciskiem, aby zmienić jej nazwę, zmienić kolor albo rozgrupować kafelki z powrotem w zwykłe karty.
 
 Na tej samej siatce mieszka kilka rodzajów kafelków.
-
-Kafelek bazy danych wskazuje na jedną bazę danych MindooDB. Kliknij go dwukrotnie, aby otworzyć Przeglądarkę baz danych. Menu kontekstowe pozwala przełączyć, którą kopię bazy danych kafelek pokazuje — lokalną replikę dla szybkości i pracy offline albo żywy cel serwerowy dla najświeższego stanu. Kafelki baz danych pamiętają tenanta, bazę danych i źródło, którego użyłeś ostatnio, więc są też wygodną zakładką z powrotem do resztek MindooDB.
 
 Kafelek aplikacji uruchamia aplikację MindooDB, a o jej zachowaniu decydują dwa osobne ustawienia. Tryb wyświetlania samego kafelka to albo Uruchamianie — karta, którą klikasz dwukrotnie — albo Osadzona, czyli uruchomienie aplikacji wprost w karcie obszaru roboczego, co idealnie pasuje do małych narzędzi do rzucenia okiem, jak formularz do szybkiego zapisu albo mini pulpit. Tryb uruchamiania z rejestracji decyduje z kolei, co właściwie robi uruchomienie: Osadź w Haven otwiera aplikację na całą szerokość wewnątrz okna Haven, gdzie przełączaniem zajmuje się szuflada aplikacji, a Otwórz w nowym oknie daje jej samodzielną kartę przeglądarki — przydatne przy drugim monitorze albo do czytania Haven i aplikacji obok siebie. Aplikacje otwarte wewnątrz Haven działają dalej w tle, gdy nawigujesz gdzieś indziej, więc po powrocie ich pozycja przewijania, niezapisane zmiany i otwarte karty nadal tam są.
 
 Kafelki tekstowe trzymają sformatowane notatki. Kafelki treści internetowej osadzają dowolny adres URL jako mini przeglądarkę — i tak trzymasz system partnera albo pulpit innego zespołu obok danych MindooDB, które ten pulpit dokumentuje. Kafelki wideo odtwarzają treści z YouTube na potrzeby samouczków i przewodników. Kafelki Mermaid renderują na żywo diagramy architektury i schematy przebiegów wprost na siatce. Te kafelki z treścią są osobiste — leżą wyłącznie w tej przeglądarce — więc idealnie pasują do ściągawek, codziennych linków i materiałów referencyjnych na żywo.
 
-Pasek wyszukiwania u góry obszaru roboczego filtruje kafelki na wszystkich stronach po nazwie, bazie danych, tenancie, tagu albo serwerze. Na Starcie możesz dodatkowo sortować to, co tam wymienione, według ostatniego użycia, według tenanta albo alfabetycznie, co staje się najszybszą drogą do znalezienia czegoś, gdy zainstalujesz więcej niż kilka aplikacji.
+Kafelka dla bazy danych nie ma. Baza danych należy do aplikacji, które z niej korzystają, i z jej danymi pracujesz przez te aplikacje. Programiści, którzy muszą zobaczyć surowe dokumenty stojące za aplikacją, otwierają zamiast tego Dodaj... > Sprawdź bazy danych, opisane niżej w części Sprawdź bazy danych (dla programistów).
+
+Pasek wyszukiwania u góry obszaru roboczego filtruje kafelki na wszystkich stronach po nazwie, tenancie, tagu albo serwerze. Na Starcie możesz dodatkowo sortować to, co tam wymienione, według ostatniego użycia, według tenanta albo alfabetycznie, co staje się najszybszą drogą do znalezienia czegoś, gdy zainstalujesz więcej niż kilka aplikacji.
 
 ## Aplikacje i Haven App Store
 
@@ -338,7 +338,7 @@ Skan nie musi być jedną kartką. Naciśnij Dodaj stronę i sfotografuj następ
 
 Wszystko to odbywa się w karcie przeglądarki. Szybki skan działa offline, nic nie jest przesyłane do żadnej usługi w celu przetworzenia, a obraz nie opuszcza urządzenia inaczej niż przez pobranie albo udostępnienie, które sam wybierzesz.
 
-Czego Szybki skan nie robi, to odłożenie wyniku na miejsce za Ciebie. Ma dwa wyjścia — przycisk pobierania i systemowy arkusz udostępniania — i oba wydają Ci plik; nic nie jest zapisywane do bazy danych. Gdy chcesz, żeby skan wylądował wewnątrz dokumentu, uruchom go z tego, co ten dokument posiada. Przeglądarka baz danych skanuje bezpośrednio do otwartego dokumentu, a aplikacja może otworzyć ten sam skaner przez App SDK i dołączyć wynik do jednego ze swoich dokumentów. We wszystkich trzech miejscach to ten sam skaner i ta sama korekcja perspektywy; różni się tylko ostatni krok.
+Czego Szybki skan nie robi, to odłożenie wyniku na miejsce za Ciebie. Ma dwa wyjścia — przycisk pobierania i systemowy arkusz udostępniania — i oba wydają Ci plik; nic nie jest zapisywane do bazy danych. Gdy chcesz, żeby skan wylądował wewnątrz dokumentu, uruchom go z tego, co ten dokument posiada. Aplikacja może otworzyć ten sam skaner przez App SDK i dołączyć wynik do jednego ze swoich dokumentów, a programiści mogą też skanować bezpośrednio do dokumentu otwartego w Sprawdź bazy danych. We wszystkich trzech miejscach to ten sam skaner i ta sama korekcja perspektywy; różni się tylko ostatni krok.
 
 ## Widoki wirtualne
 
@@ -356,9 +356,15 @@ Ponieważ widok może obejmować miliony wierszy, Haven indeksuje go lokalnie i 
 
 W drzewie wyników możesz rozwijać kategorie, wchodzić w dokumenty i budować zaznaczenie polami wyboru. Zaznaczenie kategorii zaznacza niejawnie każdy widoczny dokument potomny pod nią. Eksportuj .xlsx produkuje prawdziwy arkusz .xlsx: zachowuje pasujące wiersze kategorii nad zaznaczonymi dokumentami i zawiera zarówno metadane źródła, jak i wszystkie obliczone kolumny widoku, więc możesz przekazać plik wprost narzędziu niezwiązanemu z MindooDB.
 
-## Przeglądarka baz danych i eksplorator DAG
+## Sprawdź bazy danych (dla programistów)
 
-Przeglądarka baz danych służy do zaglądania w głąb jednej bazy danych. To tam wymieniasz dokumenty, przeglądasz historię, porównujesz obok siebie dowolne dwie rewizje i edytujesz tę żywą. Jest najprzydatniejszym ekranem, gdy debugujesz dane, sprawdzasz, co się zmieniło, albo wyciągasz załącznik z konkretnej rewizji.
+Sprawdź bazy danych to narzędzie dla programistów. Otwierasz je z obszaru roboczego przez Dodaj... > Sprawdź bazy danych. Zbiera w jednym miejscu wszystkie bazy danych, z których korzystają Twoje aplikacje — na tym urządzeniu i na serwerach, z którymi się synchronizujesz — i wyświetla je Według lokalizacji (to urządzenie albo serwer, a pod nim tenant) albo Według aplikacji (aplikacje, które z nich korzystają). Każda baza danych otwiera się we własnej karcie, więc możesz położyć kilka obok siebie, a ekran działa dalej w tle i pojawia się w szufladzie aplikacji.
+
+Jego głównym celem jest zajrzenie pod spód aplikacji. Gdy zmieniasz model danych aplikacji — zmieniasz nazwę pola, dzielisz typ dokumentu, migrujesz starsze dokumenty — Sprawdź bazy danych pokazuje, jak zapisane dokumenty naprawdę wyglądają, przed i po, we wszystkich bazach danych, z którymi pracuje aplikacja. Tu też sprawdzasz, co przyniosła synchronizacja albo co naprawdę zapisała automatyczna zmiana lub agent AI.
+
+Nie jest przeznaczone dla użytkowników końcowych i dlatego bazy danych nie pojawiają się już jako kafelki w obszarze roboczym. Sprawdź bazy danych działa na surowych dokumentach, poniżej wszystkich reguł, które egzekwuje aplikacja: edycja zrobiona tutaj nie jest sprawdzana względem modelu danych aplikacji, a usuwanie, czyszczenie (Wyczyść) czy importowanie dokumentów całkowicie omija aplikację. Pole o złym typie, zerwane odwołanie albo brakujący dokument mogą zostawić dane, których aplikacja już nie rozumie, a ponieważ każda zmiana się synchronizuje, szkoda dociera do każdego członka tenanta. Oglądaj, ile chcesz; zmieniaj coś tylko wtedy, gdy znasz model danych aplikacji, a najlepiej w testowym tenancie.
+
+Każda karta to Przeglądarka baz danych dla jednej bazy danych. To tam wymieniasz dokumenty, przeglądasz historię, porównujesz obok siebie dowolne dwie rewizje i edytujesz tę żywą. Jest najprzydatniejszym ekranem, gdy debugujesz dane, sprawdzasz, co się zmieniło, albo wyciągasz załącznik z konkretnej rewizji.
 
 Lista dokumentów ma trzy tryby: Wszystkie, Istniejące i Usunięte. Pole filtra przyjmuje jeden identyfikator, identyfikatory rozdzielone przecinkami albo po jednym identyfikatorze w wierszu, co jest wygodne, gdy masz listę identyfikatorów od kolegi albo ze skryptu. Każdy wiersz pokazuje bieżącą rewizję plus małą plakietkę przy dokumentach, które mają jeszcze otwartą historię.
 
@@ -576,7 +582,7 @@ Punkt końcowy — adres, pod który dzwoni się do urządzenia przy synchroniza
 
 Iroh — sieć, której Haven używa, gdy nie ma osiągalnego adresu, pod który można się połączyć. Niesie synchronizację peer-to-peer między dwoma urządzeniami i może też nieść zwykłą synchronizację klient-serwer do serwera MindooDB, który do niej przystąpił — takiego za routerem z NAT, powiedzmy, bez przekierowanego portu i bez certyfikatu. Oba końce spotykają się przez relay, który widzi, że rozmawiają, ale nie to, co mówią.
 
-Szybki skan — wbudowany skaner dokumentów Haven. Znajduje krawędzie strony, koryguje perspektywę i bierze do jednego skanu tyle stron, ile potrzebujesz. Działa w całości w karcie przeglądarki, także offline. Wydaje wynik jako plik — wielostronicowy PDF albo PNG lub JPEG dla jednej strony — przez pobranie albo systemowy arkusz udostępniania; dołączenie skanu do dokumentu robi się z Przeglądarki baz danych albo przez aplikację korzystającą z App SDK.
+Szybki skan — wbudowany skaner dokumentów Haven. Znajduje krawędzie strony, koryguje perspektywę i bierze do jednego skanu tyle stron, ile potrzebujesz. Działa w całości w karcie przeglądarki, także offline. Wydaje wynik jako plik — wielostronicowy PDF albo PNG lub JPEG dla jednej strony — przez pobranie albo systemowy arkusz udostępniania; dołączenie skanu do dokumentu robi aplikacja korzystająca z App SDK albo programista w Sprawdź bazy danych.
 
 IndexedDB — wbudowana baza danych przeglądarki. Haven trzyma w IndexedDB niemal wszystko, żeby móc działać offline.
 
@@ -592,7 +598,7 @@ Chroniona baza danych — baza danych, której Haven potrzebuje do działania (n
 
 Start — nieruchoma pierwsza karta obszaru roboczego. Nosi sześć kafelków skrótów Haven i po jednym kafelku na zainstalowaną aplikację. Nie da się jej przestawiać; Twoje własne kafelki idą na strony obok niej.
 
-Kafelek — przeciągalna karta o zmiennym rozmiarze na siatce obszaru roboczego. Każdy kafelek trzyma bazę danych, aplikację, notatkę, osadzoną stronę internetową, wideo albo diagram. Nazywany też Chicklet.
+Kafelek — przeciągalna karta o zmiennym rozmiarze na siatce obszaru roboczego. Każdy kafelek trzyma aplikację, notatkę, osadzoną stronę internetową, wideo albo diagram. Nazywany też Chicklet.
 
 Strona — karta obszaru roboczego, która zawiera własną siatkę kafelków. Używaj wielu stron jak ekranów głównych w smartfonie.
 
@@ -601,6 +607,8 @@ Grupa — wizualny pojemnik, który skupia powiązane kafelki pod wspólnym, ozn
 Szuflada aplikacji — panel za uchwytem ze strzałką u góry obszaru treści. Wymienia otwarte ekrany Haven i aktualnie działające aplikacje, z drogą powrotną do obszaru roboczego nad jednym i drugim. `Cmd+Shift+Space` ją otwiera, a `Cmd+Shift+Enter` wraca do obszaru roboczego; w systemach Windows i Linux naciskaj `Ctrl` zamiast `Cmd`.
 
 Baza danych — zbiór powiązanych dokumentów wewnątrz tenanta. Tenant może mieć wiele baz danych (na przykład kontakty, faktury, notatki).
+
+Sprawdź bazy danych — narzędzie dla programistów w menu Dodaj... obszaru roboczego, które pokazuje surowe dokumenty wszystkich baz danych używanych przez Twoje aplikacje, jedna karta na bazę danych. Nie jest przeznaczone dla użytkowników końcowych: zmiany zrobione tam omijają reguły samych aplikacji.
 
 Baza danych katalogu — specjalna chroniona baza danych w każdym tenancie, która przechowuje rejestracje użytkowników i ustawienia całego tenanta.
 
