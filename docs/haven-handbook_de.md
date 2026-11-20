@@ -38,7 +38,7 @@ Ein KeyBag ist ein lokaler, verschlüsselter Speicher für die Verschlüsselungs
 
 Eine virtuelle Ansicht ist ein tabellenartiger Baum, der Dokumente filtert, kategorisiert, sortiert und summiert. Eine Ansicht kann aus einer Datenbank, aus mehreren Datenbanken oder sogar aus mehreren Tenants lesen, und so beantwortest du Fragen quer über deine Daten statt nur innerhalb einer Datenbank.
 
-Der Arbeitsbereich besteht aus Kacheln auf Seiten, die zu Gruppen zusammengefasst sind. Eine Kachel — manchmal auch Chicklet genannt — ist eine verschiebbare, größenveränderbare Karte, die eine Datenbank öffnet, eine Anwendung startet oder eine Notiz, eine Webseite, ein Video oder ein Diagramm zeigt. Eine Seite ist ein Tab voller Kacheln. Eine Gruppe fasst verwandte Kacheln unter einer gemeinsamen, farbig gekennzeichneten Kopfzeile zusammen.
+Der Arbeitsbereich besteht aus Kacheln auf Seiten, die zu Gruppen zusammengefasst sind. Eine Kachel — manchmal auch Chicklet genannt — ist eine verschiebbare, größenveränderbare Karte, die eine Anwendung startet oder eine Notiz, eine Webseite, ein Video oder ein Diagramm zeigt. Eine Seite ist ein Tab voller Kacheln. Eine Gruppe fasst verwandte Kacheln unter einer gemeinsamen, farbig gekennzeichneten Kopfzeile zusammen.
 
 Eine Anwendungsregistrierung ist die auf Haven-Seite gespeicherte Definition einer MindooDB-App: wo sie liegt, wie sie läuft und welche Datenbanken oder Ansichten sie sehen darf. Wenn eine App startet, spricht sie über eine Bridge (manchmal auch App-Connector genannt) mit Haven, also über den sicheren Kanal, mit dem Haven die von dir erteilten Berechtigungen durchsetzt. Die Sandbox ist die vom Browser erzwungene Isolation, die eine App davon abhält, an Havens Speicher, Cookies oder andere Apps zu kommen.
 
@@ -98,7 +98,7 @@ Schritt vier, du bist drin. Haven setzt dich in den frisch beigetretenen Tenant,
 
 Sobald der Willkommensassistent durch ist, ist der Alltagsweg derselbe, welche Route du auch genommen hast.
 
-Öffne den Arbeitsbereich. Start hat seine sechs Verknüpfungskacheln schon; was es noch nicht hat, ist irgendetwas von dir. Füge über das Menü Hinzufügen eine Seite neben Start hinzu und lege dann über dasselbe Menü eine Datenbank-Kachel darauf, die auf eine der Datenbanken in deinem Tenant zeigt. Doppelklicke die Kachel, um den Datenbank-Browser zu öffnen und ihre Dokumente zu sehen.
+Öffne den Arbeitsbereich. Start hat seine sechs Verknüpfungskacheln schon; was es noch nicht hat, ist irgendetwas von dir. Füge über das Menü Hinzufügen eine Seite neben Start hinzu und lege dann über dasselbe Menü eine erste eigene Kachel darauf — eine Notiz, eine Webseite oder eine Anwendung, die du installiert hast.
 
 Installiere eine App. Öffne Haven App Store von Start aus, wähle etwas, das nützlich aussieht, und installiere es. Es erscheint sofort als Kachel auf Start, und von dort kannst du es auf eine deiner eigenen Seiten legen.
 
@@ -154,7 +154,7 @@ Rettungskontakte sind ein zweiter Weg zurück, wenn alle Geräte weg sind – oh
 
 ## Arbeitsbereich
 
-Der Arbeitsbereich ist dein tägliches Zuhause. Du ordnest Datenbanken, Anwendungen, Notizen, Webseiten, Videos und Diagramme als verschiebbare Kacheln über mehrere Seiten an, wie Startbildschirme auf einem Handy. Das Layout ist persönlich: Standardmäßig liegt es nur in diesem Browser, lädt daher sofort und funktioniert offline. Wenn du dieselbe Anordnung auf deinen anderen Geräten willst, speichert die Einstellung Mitgeführter Arbeitsbereich unter Einstellungen → Allgemein sie in deinem Tenant, verschlüsselt nur für dich.
+Der Arbeitsbereich ist dein tägliches Zuhause. Du ordnest Anwendungen, Notizen, Webseiten, Videos und Diagramme als verschiebbare Kacheln über mehrere Seiten an, wie Startbildschirme auf einem Handy. Das Layout ist persönlich: Standardmäßig liegt es nur in diesem Browser, lädt daher sofort und funktioniert offline. Wenn du dieselbe Anordnung auf deinen anderen Geräten willst, speichert die Einstellung Mitgeführter Arbeitsbereich unter Einstellungen → Allgemein sie in deinem Tenant, verschlüsselt nur für dich.
 
 Seiten sind die Tabs oben im Arbeitsbereich. Der erste ist immer Start, beschrieben unter „Sich in Haven zurechtfinden“: Havens eigene sechs Verknüpfungen plus eine Kachel für jede installierte Anwendung. Start ist schreibgeschützt, du kannst also keine eigenen Kacheln darauf ablegen und das Vorhandene nicht umsortieren, und es ist die eine Seite, die immer gleich aussieht.
 
@@ -162,17 +162,17 @@ Alles andere ist deins. Füge so viele Seiten neben Start hinzu, wie du magst �
 
 Kacheln sind die Karten auf dem Raster. Zieh eine Kachel an ihrer Kopfzeile, um sie zu verschieben, zieh an der Ecke, um ihre Größe zu ändern, oder rechtsklicke für das vollständige Kontextmenü. Lege eine Kachel auf einem anderen Seiten-Tab ab, um sie dorthin zu verschieben. Lege eine Kachel auf einer anderen Kachel ab, um eine Gruppe zu starten.
 
-Gruppen fassen verwandte Kacheln unter einer gemeinsamen, farbig gekennzeichneten Kopfzeile zusammen. Eine Gruppe ist ein großartiger Weg, die Kacheln für ein Projekt optisch zusammenzuhalten — zum Beispiel die Datenbank, die laufende App und eine Referenznotiz für dasselbe Team. Rechtsklicke die Gruppenkopfzeile, um sie umzubenennen, ihre Farbe zu ändern oder die Gruppierung aufzuheben, sodass die Kacheln wieder normale Karten sind.
+Gruppen fassen verwandte Kacheln unter einer gemeinsamen, farbig gekennzeichneten Kopfzeile zusammen. Eine Gruppe ist ein großartiger Weg, die Kacheln für ein Projekt optisch zusammenzuhalten — zum Beispiel die laufende App, eine Webseite, mit der sie arbeitet, und eine Referenznotiz für dasselbe Team. Rechtsklicke die Gruppenkopfzeile, um sie umzubenennen, ihre Farbe zu ändern oder die Gruppierung aufzuheben, sodass die Kacheln wieder normale Karten sind.
 
 Auf demselben Raster leben mehrere Arten von Kacheln.
-
-Eine Datenbank-Kachel zeigt auf eine MindooDB-Datenbank. Doppelklicke sie, um den Datenbank-Browser zu öffnen. Über das Kontextmenü wechselst du, welche Kopie der Datenbank die Kachel zeigt — eine lokale Replik für Geschwindigkeit und Offline-Betrieb oder ein Live-Serverziel für den frischesten Stand. Datenbank-Kacheln merken sich den Tenant, die Datenbank und die Quelle, die du zuletzt verwendet hast, und sind damit auch ein praktisches Lesezeichen zurück in den Rest von MindooDB.
 
 Eine Anwendungs-Kachel startet eine MindooDB-App, und zwei getrennte Einstellungen bestimmen, wie sie sich verhält. Der Anzeigemodus der Kachel selbst ist entweder Launcher, eine Karte, die du doppelklickst, oder Eingebettet, was die App direkt in der Arbeitsbereich-Karte laufen lässt und perfekt für kleine Werkzeuge mit einem Blick ist, etwa ein Erfassungsformular oder ein Mini-Dashboard. Der Laufzeitmodus der Registrierung entscheidet dann, was ein Start tatsächlich tut: In Haven einbetten öffnet die App in voller Breite im Haven-Fenster, wo der App-Drawer das Umschalten übernimmt, während In neuem Fenster öffnen ihr einen eigenständigen Browser-Tab gibt — nützlich für einen zweiten Monitor oder um Haven und die App nebeneinander zu lesen. Apps, die in Haven geöffnet werden, laufen im Hintergrund weiter, während du woandershin navigierst, ihre Scrollposition, ungespeicherten Änderungen und offenen Tabs sind also noch da, wenn du zurückwechselst.
 
 Text-Kacheln enthalten formatierte Notizen. Web-Kacheln binden eine beliebige URL als Mini-Browser ein, und so hältst du ein Partnersystem oder das Dashboard eines anderen Teams neben den MindooDB-Daten, die es dokumentiert. Video-Kacheln spielen YouTube-Inhalte für Tutorials und Rundgänge. Mermaid-Kacheln rendern Architekturdiagramme und Flussdiagramme live direkt auf dem Raster. Diese Inhaltskacheln sind persönlich — sie liegen nur in diesem Browser — und eignen sich daher ideal für Merkzettel, tägliche Links und lebendes Referenzmaterial.
 
-Eine Suchleiste quer über den Arbeitsbereich filtert Kacheln seitenübergreifend nach Name, Datenbank, Tenant, Tag oder Server. Auf Start kannst du das Aufgelistete außerdem nach zuletzt verwendet, nach Tenant oder alphabetisch sortieren, und das wird der schnellste Weg, etwas zu finden, sobald du mehr als eine Handvoll Anwendungen installiert hast.
+Eine Kachel für eine Datenbank gibt es nicht. Eine Datenbank gehört zu den Apps, die sie nutzen, und mit ihren Daten arbeitest du über diese Apps. Entwickler, die die Rohdokumente hinter einer App sehen müssen, öffnen stattdessen Hinzufügen … > Datenbanken untersuchen, beschrieben weiter unten unter Datenbanken untersuchen (für Entwickler).
+
+Eine Suchleiste quer über den Arbeitsbereich filtert Kacheln seitenübergreifend nach Name, Tenant, Tag oder Server. Auf Start kannst du das Aufgelistete außerdem nach zuletzt verwendet, nach Tenant oder alphabetisch sortieren, und das wird der schnellste Weg, etwas zu finden, sobald du mehr als eine Handvoll Anwendungen installiert hast.
 
 ## Anwendungen und der Haven App Store
 
@@ -338,7 +338,7 @@ Ein Scan muss nicht ein einzelnes Blatt sein. Drücke Seite hinzufügen und nimm
 
 All das passiert im Browser-Tab. Der Schnellscan funktioniert offline, nichts wird zur Verarbeitung an einen Dienst geschickt, und das Bild verlässt das Gerät nie, außer über den Download oder die Freigabe, die du selbst wählst.
 
-Was der Schnellscan nicht tut, ist das Ergebnis für dich ablegen. Er hat zwei Wege hinaus — eine Download-Schaltfläche und das Freigabefenster des Systems — und beide geben dir eine Datei; nichts wird in eine Datenbank geschrieben. Wenn der Scan stattdessen in einem Dokument landen soll, starte ihn von dort, wo dieses Dokument zu Hause ist. Der Datenbank-Browser scannt direkt auf das Dokument, das du offen hast, und eine Anwendung kann denselben Scanner über das App SDK öffnen und das Ergebnis an eines ihrer eigenen Dokumente anhängen. Es ist an allen drei Stellen derselbe Scanner und dieselbe Perspektivkorrektur; nur der letzte Schritt unterscheidet sich.
+Was der Schnellscan nicht tut, ist das Ergebnis für dich ablegen. Er hat zwei Wege hinaus — eine Download-Schaltfläche und das Freigabefenster des Systems — und beide geben dir eine Datei; nichts wird in eine Datenbank geschrieben. Wenn der Scan stattdessen in einem Dokument landen soll, starte ihn von dort, wo dieses Dokument zu Hause ist. Eine Anwendung kann denselben Scanner über das App SDK öffnen und das Ergebnis an eines ihrer eigenen Dokumente anhängen, und Entwickler können auch direkt auf ein Dokument scannen, das sie in Datenbanken untersuchen offen haben. Es ist an allen drei Stellen derselbe Scanner und dieselbe Perspektivkorrektur; nur der letzte Schritt unterscheidet sich.
 
 ## Virtuelle Ansichten
 
@@ -356,9 +356,15 @@ Weil eine Ansicht Millionen Zeilen umfassen kann, indiziert Haven sie lokal und 
 
 Im Ergebnisbaum kannst du Kategorien aufklappen, in Dokumente hineinspringen und mit den Häkchen eine Auswahl bauen. Eine Kategorie auszuwählen wählt implizit jedes sichtbare Dokument darunter mit aus. Als .xlsx exportieren erzeugt eine echte .xlsx-Arbeitsmappe: Sie behält die passenden Kategoriezeilen über den ausgewählten Dokumenten und enthält sowohl die Metadaten der Quelle als auch alle berechneten Ansichtsspalten, sodass du die Datei direkt an ein Werkzeug außerhalb von MindooDB geben kannst.
 
-## Datenbank-Browser und DAG-Explorer
+## Datenbanken untersuchen (für Entwickler)
 
-Der Datenbank-Browser ist zum Graben in einer einzelnen Datenbank da. Dort listest du Dokumente auf, blätterst durch die Historie, vergleichst zwei beliebige Revisionen nebeneinander und bearbeitest die aktuelle. Es ist der nützlichste Bildschirm, wenn du Daten untersuchst, prüfst, was sich geändert hat, oder einen Anhang aus einer bestimmten Revision holst.
+Datenbanken untersuchen ist ein Werkzeug für Entwickler. Du öffnest es im Arbeitsbereich über Hinzufügen … > Datenbanken untersuchen. Es versammelt alle Datenbanken, die deine Apps nutzen, an einem Ort — auf diesem Gerät und auf den Servern, mit denen du synchronisierst — und listet sie Nach Ort (dieses Gerät oder ein Server, darunter der Tenant) oder Nach App (die Apps, die sie nutzen). Jede Datenbank öffnet sich in einem eigenen Tab, sodass du mehrere nebeneinanderlegen kannst, und der Bildschirm läuft im Hintergrund weiter und erscheint im App-Drawer.
+
+Sein Hauptzweck ist der Blick unter eine App. Wenn du das Datenmodell einer App änderst — ein Feld umbenennst, einen Dokumenttyp aufteilst, ältere Dokumente migrierst —, zeigt dir Datenbanken untersuchen, wie die gespeicherten Dokumente tatsächlich aussehen, vorher und nachher, über alle Datenbanken hinweg, mit denen die App arbeitet. Hier prüfst du auch, was eine Synchronisierung hereingebracht oder was eine automatische Änderung oder ein KI-Agent wirklich geschrieben hat.
+
+Für Endnutzer ist es nicht gedacht, und deshalb erscheinen Datenbanken auch nicht mehr als Kacheln im Arbeitsbereich. Datenbanken untersuchen arbeitet auf den Rohdokumenten, unterhalb aller Regeln, die eine App durchsetzt: Eine Bearbeitung hier wird nicht gegen das Datenmodell der App geprüft, und Löschen, Purgen oder Importieren von Dokumenten geht vollständig an der App vorbei. Ein Feld mit falschem Typ, ein kaputter Verweis oder ein fehlendes Dokument können Daten hinterlassen, die die App nicht mehr versteht, und weil jede Änderung synchronisiert wird, erreicht der Schaden jedes Mitglied des Tenants. Schau dir an, so viel du willst; ändere nur etwas, wenn du das Datenmodell der App kennst, und am besten in einem Test-Tenant.
+
+Jeder Tab ist ein Datenbank-Browser für eine Datenbank. Dort listest du Dokumente auf, blätterst durch die Historie, vergleichst zwei beliebige Revisionen nebeneinander und bearbeitest die aktuelle. Es ist der nützlichste Bildschirm, wenn du Daten untersuchst, prüfst, was sich geändert hat, oder einen Anhang aus einer bestimmten Revision holst.
 
 Die Dokumentliste hat drei Modi: Alle, Vorhanden und Gelöscht. Das Filterfeld nimmt eine einzelne ID, mit Komma getrennte IDs oder eine ID pro Zeile, was praktisch ist, wenn du eine Liste von IDs von einer Kollegin oder aus einem Skript hast. Jede Zeile zeigt die aktuelle Revision plus ein kleines Abzeichen für Dokumente, die noch offene Historie haben.
 
@@ -576,7 +582,7 @@ Endpunkt — die Adresse, unter der ein Gerät für Peer-to-Peer-Sync gewählt w
 
 Iroh — das Netzwerk, das Haven nutzt, wenn es keine erreichbare Adresse gibt, zu der man verbinden könnte. Es trägt Peer-to-Peer-Sync zwischen zwei Geräten, und es kann auch gewöhnlichen Client-Server-Sync zu einem MindooDB-Server tragen, der daran teilnimmt — einem hinter einem NAT-Router etwa, ohne weitergeleiteten Port und ohne Zertifikat. Beide Enden treffen sich über ein Relay, das sieht, dass sie sprechen, aber nicht, was sie sagen.
 
-Schnellscan — Havens eingebauter Dokumentenscanner. Findet die Kanten einer Seite, korrigiert die Perspektive und nimmt so viele Seiten in einen Scan, wie du brauchst. Läuft vollständig im Browser-Tab, offline inklusive. Er gibt das Ergebnis als Datei heraus — ein mehrseitiges PDF oder ein PNG oder JPEG für eine einzelne Seite — über einen Download oder das Freigabefenster des Systems; einen Scan an ein Dokument anzuhängen geschieht aus dem Datenbank-Browser heraus oder von einer App über das App SDK.
+Schnellscan — Havens eingebauter Dokumentenscanner. Findet die Kanten einer Seite, korrigiert die Perspektive und nimmt so viele Seiten in einen Scan, wie du brauchst. Läuft vollständig im Browser-Tab, offline inklusive. Er gibt das Ergebnis als Datei heraus — ein mehrseitiges PDF oder ein PNG oder JPEG für eine einzelne Seite — über einen Download oder das Freigabefenster des Systems; einen Scan an ein Dokument anzuhängen erledigt eine App über das App SDK oder ein Entwickler in Datenbanken untersuchen.
 
 IndexedDB — die eingebaute Datenbank des Browsers. Haven speichert fast alles in IndexedDB, damit es offline arbeiten kann.
 
@@ -592,7 +598,7 @@ Geschützte Datenbank — eine Datenbank, die Haven zum Arbeiten braucht (zum Be
 
 Start — der feste erste Tab des Arbeitsbereichs. Trägt Havens sechs Verknüpfungskacheln und eine Kachel pro installierter Anwendung. Er lässt sich nicht umsortieren; deine eigenen Kacheln gehen auf die Seiten daneben.
 
-Kachel — eine verschiebbare, größenveränderbare Karte auf dem Raster des Arbeitsbereichs. Jede Kachel enthält eine Datenbank, eine Anwendung, eine Notiz, eine eingebettete Webseite, ein Video oder ein Diagramm. Auch Chicklet genannt.
+Kachel — eine verschiebbare, größenveränderbare Karte auf dem Raster des Arbeitsbereichs. Jede Kachel enthält eine Anwendung, eine Notiz, eine eingebettete Webseite, ein Video oder ein Diagramm. Auch Chicklet genannt.
 
 Seite — ein Arbeitsbereich-Tab, der sein eigenes Raster aus Kacheln enthält. Nutze mehrere Seiten wie Startbildschirme auf einem Smartphone.
 
@@ -601,6 +607,8 @@ Gruppe — ein visueller Behälter, der verwandte Kacheln unter einer gemeinsame
 App-Drawer — der Bereich hinter dem Pfeil-Griff oben im Inhaltsbereich. Listet die Haven-Bildschirme auf, die du offen hast, und die gerade laufenden Anwendungen, mit einem Weg zurück zum Arbeitsbereich über beiden. Cmd+Shift+Space öffnet ihn und Cmd+Shift+Enter bringt dich zurück zum Arbeitsbereich; auf Windows und Linux drücke Ctrl statt Cmd.
 
 Datenbank — eine Sammlung zusammengehörender Dokumente in einem Tenant. Ein Tenant kann viele Datenbanken haben (zum Beispiel Kontakte, Rechnungen, Notizen).
+
+Datenbanken untersuchen — das Entwicklerwerkzeug unter Hinzufügen … im Arbeitsbereich, das die Rohdokumente aller Datenbanken zeigt, die deine Apps nutzen, ein Tab pro Datenbank. Nicht für Endnutzer gedacht: Änderungen dort gehen an den Regeln der Apps vorbei.
 
 Verzeichnisdatenbank — eine besondere, geschützte Datenbank in jedem Tenant, die Benutzerregistrierungen und tenantweite Einstellungen speichert.
 

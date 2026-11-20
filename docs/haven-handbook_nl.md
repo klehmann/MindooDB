@@ -38,7 +38,7 @@ Een KeyBag is een lokale, versleutelde opslag van de versleutelingssleutels die 
 
 Een virtuele weergave is een spreadsheetachtige boomstructuur die documenten filtert, categoriseert, sorteert en optelt. Een weergave kan uit één database, uit meerdere databases of zelfs uit meerdere tenants trekken; zo beantwoord je vragen over je gegevens heen in plaats van alleen binnen één database.
 
-De werkruimte bestaat uit tegels op pagina's, gebundeld in groepen. Een tegel — soms een chicklet genoemd — is een versleepbare, vergrootbare kaart die een database opent, een app start of een notitie, een webpagina, een video of een diagram toont. Een pagina is een tabblad vol tegels. Een groep clustert gerelateerde tegels onder een gedeelde, kleurgecodeerde kop.
+De werkruimte bestaat uit tegels op pagina's, gebundeld in groepen. Een tegel — soms een chicklet genoemd — is een versleepbare, vergrootbare kaart die een app start of een notitie, een webpagina, een video of een diagram toont. Een pagina is een tabblad vol tegels. Een groep clustert gerelateerde tegels onder een gedeelde, kleurgecodeerde kop.
 
 Een applicatieregistratie is de aan Havens kant opgeslagen definitie van een MindooDB-app: waar die staat, hoe die draait, en welke databases of weergaven die mag zien. Wanneer een app start, praat die met Haven via een bridge (soms de app-connector genoemd), het beveiligde kanaal waarmee Haven de rechten die je hebt gegeven kan handhaven. De sandbox is de door de browser gehandhaafde isolatie die voorkomt dat een app bij Havens opslag, cookies of andere apps kan komen.
 
@@ -98,7 +98,7 @@ Stap vier, je bent binnen. Haven zet je in de net toegetreden tenant en de werkr
 
 Zodra de welkomstwizard klaar is, is het dagelijkse pad hetzelfde, welke route je ook hebt genomen.
 
-Open de werkruimte. Start heeft al zijn zes snelkoppelingstegels; wat er nog niet is, is iets van jezelf. Voeg via het toevoegmenu een pagina naast Start toe en gebruik daarna hetzelfde menu om er een databasetegel op te zetten die naar een van de databases in je tenant wijst. Dubbelklik op de tegel om de databasebrowser te openen en de documenten te bekijken.
+Open de werkruimte. Start heeft al zijn zes snelkoppelingstegels; wat er nog niet is, is iets van jezelf. Voeg via het toevoegmenu een pagina naast Start toe en gebruik daarna hetzelfde menu om er een eerste eigen tegel op te zetten — een notitie, een webpagina of een applicatie die je hebt geïnstalleerd.
 
 Installeer een app. Open Haven App Store vanaf Start, kies iets dat nuttig lijkt en installeer het. Het verschijnt direct als tegel op Start, en vanaf daar kun je het op een van je eigen pagina's plaatsen.
 
@@ -154,7 +154,7 @@ Herstelcontacten zijn een tweede weg terug als al je apparaten weg zijn, zonder 
 
 ## Werkruimte
 
-De werkruimte is je dagelijkse thuis. Je richt databases, applicaties, notities, webpagina's, video's en diagrammen in als versleepbare tegels over meerdere pagina's, zoals beginschermen op een telefoon. De indeling is persoonlijk: standaard wordt die alleen in deze browser bewaard, zodat die direct laadt en offline werkt. Wil je dezelfde indeling op je andere apparaten, dan slaat de instelling Meereizende werkruimte onder Instellingen → Algemeen die op in je tenant, versleuteld voor jou alleen.
+De werkruimte is je dagelijkse thuis. Je richt applicaties, notities, webpagina's, video's en diagrammen in als versleepbare tegels over meerdere pagina's, zoals beginschermen op een telefoon. De indeling is persoonlijk: standaard wordt die alleen in deze browser bewaard, zodat die direct laadt en offline werkt. Wil je dezelfde indeling op je andere apparaten, dan slaat de instelling Meereizende werkruimte onder Instellingen → Algemeen die op in je tenant, versleuteld voor jou alleen.
 
 Pagina's zijn de tabbladen bovenaan de werkruimte. De eerste is altijd Start, beschreven onder Je weg vinden in Haven: Havens eigen zes snelkoppelingen plus een tegel voor elke geïnstalleerde applicatie. Start is alleen-lezen, dus je kunt er geen eigen tegels op neerzetten en niets herschikken, en het is de ene pagina die er altijd hetzelfde uitziet.
 
@@ -162,17 +162,17 @@ Al het andere is van jou. Voeg zoveel pagina's naast Start toe als je wilt — �
 
 Tegels zijn de kaarten op het raster. Sleep een tegel aan zijn kop om die te verplaatsen, sleep aan de hoek om de grootte te wijzigen, of klik met de rechtermuisknop voor het volledige contextmenu. Laat een tegel op een ander paginatabblad vallen om die daarheen te verplaatsen. Laat een tegel op een andere tegel vallen om een groep te beginnen.
 
-Groepen clusteren gerelateerde tegels onder een gedeelde, kleurgecodeerde kop. Een groep is een prima manier om de tegels van één project visueel bij elkaar te houden — bijvoorbeeld de database, de draaiende app en een referentienotitie voor hetzelfde team. Klik met de rechtermuisknop op de groepskop om die te hernoemen, de kleur te wijzigen of de groep op te heffen zodat de tegels weer gewone kaarten worden.
+Groepen clusteren gerelateerde tegels onder een gedeelde, kleurgecodeerde kop. Een groep is een prima manier om de tegels van één project visueel bij elkaar te houden — bijvoorbeeld de draaiende app, een webpagina waarmee die werkt en een referentienotitie voor hetzelfde team. Klik met de rechtermuisknop op de groepskop om die te hernoemen, de kleur te wijzigen of de groep op te heffen zodat de tegels weer gewone kaarten worden.
 
 Er leven verschillende soorten tegels op hetzelfde raster.
-
-Een databasetegel wijst naar één MindooDB-database. Dubbelklik erop om de databasebrowser te openen. Gebruik het contextmenu om te wisselen welke kopie van de database de tegel toont — een lokale replica voor snelheid en offline werken, of een live serverlocatie voor de meest actuele stand. Databasetegels onthouden de tenant, de database en de bron die je het laatst gebruikte, dus ze zijn ook een handige bladwijzer terug naar de rest van MindooDB.
 
 Een applicatietegel start een MindooDB-app, en twee afzonderlijke instellingen bepalen hoe die zich gedraagt. De Weergavemodus van de tegel zelf is of Launcher, een kaart waarop je dubbelklikt, of Ingesloten, waarbij de app rechtstreeks in de werkruimtekaart draait — perfect voor kleine tools die je in één oogopslag bekijkt, zoals een invulformulier of een minidashboard. De Runtimemodus van de registratie bepaalt vervolgens wat een start werkelijk doet: Insluiten in Haven opent de app over de volle breedte binnen het Haven-venster, waar de app-lade het wisselen verzorgt, terwijl Openen in nieuw venster de app een eigen browsertabblad geeft — nuttig voor een tweede monitor, of om Haven en de app naast elkaar te lezen. Apps die binnen Haven zijn geopend blijven op de achtergrond draaien terwijl je ergens anders navigeert, dus hun scrollpositie, niet-opgeslagen bewerkingen en open tabbladen zijn er nog wanneer je terugschakelt.
 
 Teksttegels bevatten opgemaakte notities. Webtegels sluiten een willekeurige URL in als minibrowser, waarmee je een partnersysteem of het dashboard van een ander team naast de MindooDB-gegevens houdt die het documenteert. Videotegels spelen YouTube-inhoud voor tutorials en rondleidingen. Mermaid-tegels renderen live architectuurdiagrammen en flowcharts direct op het raster. Deze inhoudstegels zijn persoonlijk — ze leven alleen in deze browser — en zijn daarmee ideaal voor cheatsheets, dagelijkse links en actueel referentiemateriaal.
 
-Een zoekbalk bovenaan de werkruimte filtert tegels over pagina's heen op naam, database, tenant, tag of server. Op Start kun je wat er staat ook sorteren op laatst gebruikt, op tenant of alfabetisch, wat de snelste manier wordt om iets te vinden zodra je meer dan een handvol applicaties hebt geïnstalleerd.
+Een tegel voor een database bestaat niet. Een database hoort bij de apps die hem gebruiken, en met zijn gegevens werk je via die apps. Ontwikkelaars die de ruwe documenten achter een app moeten zien, openen in plaats daarvan Toevoegen... > Databases inspecteren, verderop beschreven onder Databases inspecteren (voor ontwikkelaars).
+
+Een zoekbalk bovenaan de werkruimte filtert tegels over pagina's heen op naam, tenant, tag of server. Op Start kun je wat er staat ook sorteren op laatst gebruikt, op tenant of alfabetisch, wat de snelste manier wordt om iets te vinden zodra je meer dan een handvol applicaties hebt geïnstalleerd.
 
 ## Applicaties en de Haven App Store
 
@@ -338,7 +338,7 @@ Een scan hoeft geen enkel blad te zijn. Druk op Pagina toevoegen en leg de volge
 
 Het gebeurt allemaal in het browsertabblad. De snelscan werkt offline, er wordt niets naar een dienst geüpload om te verwerken, en de afbeelding verlaat het apparaat alleen via de download of het delen dat je zelf kiest.
 
-Wat de snelscan niet doet, is het resultaat voor je opbergen. Hij heeft twee uitgangen — een downloadknop en het deelvenster van het systeem — en beide geven je een bestand; er wordt niets in een database geschreven. Wil je dat de scan in een document terechtkomt, start hem dan vanaf wat dat document bezit. De databasebrowser scant direct naar het document dat je open hebt, en een applicatie kan dezelfde scanner via de App SDK openen en het resultaat aan een van zijn eigen documenten hangen. Het is in alle drie de gevallen dezelfde scanner en dezelfde perspectiefcorrectie; alleen de laatste stap verschilt.
+Wat de snelscan niet doet, is het resultaat voor je opbergen. Hij heeft twee uitgangen — een downloadknop en het deelvenster van het systeem — en beide geven je een bestand; er wordt niets in een database geschreven. Wil je dat de scan in een document terechtkomt, start hem dan vanaf wat dat document bezit. Een applicatie kan dezelfde scanner via de App SDK openen en het resultaat aan een van zijn eigen documenten hangen, en ontwikkelaars kunnen ook direct scannen naar een document dat ze open hebben in Databases inspecteren. Het is in alle drie de gevallen dezelfde scanner en dezelfde perspectiefcorrectie; alleen de laatste stap verschilt.
 
 ## Virtuele weergaven
 
@@ -356,9 +356,15 @@ Omdat een weergave miljoenen rijen kan omspannen, indexeert Haven die lokaal en 
 
 In de resultaatboom kun je categorieën uitklappen, in documenten duiken en met de aanvinkvakjes een selectie opbouwen. Een categorie selecteren selecteert impliciet elk zichtbaar onderliggend document eronder. Exporteren als .xlsx levert een echte .xlsx-werkmap: de bijbehorende categorierijen blijven boven de geselecteerde documenten staan en zowel de metadata van de bron als de berekende weergavekolommen gaan mee, zodat je het bestand rechtstreeks aan een tool buiten MindooDB kunt geven.
 
-## Databasebrowser en DAG-verkenner
+## Databases inspecteren (voor ontwikkelaars)
 
-De databasebrowser is er om in één database te graven. Daar toon je documenten, blader je door de geschiedenis, vergelijk je twee willekeurige revisies naast elkaar en bewerk je de actuele. Het is het nuttigste scherm wanneer je gegevens aan het uitzoeken bent, controleert wat er is gewijzigd, of een bijlage uit een specifieke revisie haalt.
+Databases inspecteren is een hulpmiddel voor ontwikkelaars. Je opent het vanuit de werkruimte via Toevoegen... > Databases inspecteren. Het brengt alle databases die je apps gebruiken samen op één plek — op dit apparaat en op de servers waarmee je synchroniseert — en toont ze Per locatie (dit apparaat of een server, daaronder de tenant) of Per app (de apps die ze gebruiken). Elke database opent in een eigen tabblad, zodat je er meerdere naast elkaar kunt zetten, en het scherm blijft op de achtergrond draaien en verschijnt in de app-lade.
+
+Het belangrijkste doel is onder een app kijken. Wanneer je het datamodel van een app wijzigt — een veld hernoemen, een documenttype splitsen, oudere documenten migreren — laat Databases inspecteren zien hoe de opgeslagen documenten er echt uitzien, voor en na, in alle databases waarmee de app werkt. Hier controleer je ook wat een synchronisatie binnenbracht, of wat een automatische wijziging of een AI-agent werkelijk schreef.
+
+Het is niet bedoeld voor eindgebruikers, en daarom verschijnen databases ook niet meer als tegels in de werkruimte. Databases inspecteren werkt op de ruwe documenten, onder alle regels die een app afdwingt: een bewerking hier wordt niet gecontroleerd tegen het datamodel van de app, en documenten verwijderen, purgen of importeren gaat volledig langs de app heen. Een veld met het verkeerde type, een kapotte verwijzing of een ontbrekend document kan gegevens achterlaten die de app niet meer begrijpt, en omdat elke wijziging wordt gesynchroniseerd, bereikt de schade elk lid van de tenant. Kijk zoveel je wilt; verander alleen iets als je het datamodel van de app kent, en bij voorkeur in een testtenant.
+
+Elk tabblad is een databasebrowser voor één database. Daar toon je documenten, blader je door de geschiedenis, vergelijk je twee willekeurige revisies naast elkaar en bewerk je de actuele. Het is het nuttigste scherm wanneer je gegevens aan het uitzoeken bent, controleert wat er is gewijzigd, of een bijlage uit een specifieke revisie haalt.
 
 De documentenlijst heeft drie modi: Alle, Bestaand en Verwijderd. Het filtervak accepteert één ID, kommagescheiden ID's, of één ID per regel, wat handig is wanneer je een lijst ID's van een collega of uit een script hebt. Elke rij toont de huidige revisie plus een klein badge voor documenten die nog open geschiedenis hebben.
 
@@ -576,7 +582,7 @@ Eindpunt — het adres waarop een apparaat voor peer-to-peer-synchronisatie word
 
 Iroh — het netwerk dat Haven gebruikt wanneer er geen bereikbaar adres is om mee te verbinden. Het draagt peer-to-peer-synchronisatie tussen twee apparaten, en het kan ook gewone client-serversynchronisatie dragen naar een MindooDB-server die eraan deelneemt — bijvoorbeeld een server achter een NAT-router, zonder doorgestuurde poort en zonder certificaat. Beide kanten ontmoeten elkaar via een relay, die ziet dát ze praten maar niet wát ze zeggen.
 
-Snelscan — Havens ingebouwde documentscanner. Vindt de randen van een pagina, corrigeert het perspectief en neemt zoveel pagina's als je nodig hebt in één scan mee. Draait volledig in het browsertabblad, offline inbegrepen. Het geeft het resultaat als bestand af — een PDF van meerdere pagina's, of een PNG of JPEG voor één pagina — via een download of het deelvenster van het systeem; een scan aan een document hangen doe je vanuit de databasebrowser of door een app via de App SDK.
+Snelscan — Havens ingebouwde documentscanner. Vindt de randen van een pagina, corrigeert het perspectief en neemt zoveel pagina's als je nodig hebt in één scan mee. Draait volledig in het browsertabblad, offline inbegrepen. Het geeft het resultaat als bestand af — een PDF van meerdere pagina's, of een PNG of JPEG voor één pagina — via een download of het deelvenster van het systeem; een scan aan een document hangen doet een app via de App SDK, of een ontwikkelaar in Databases inspecteren.
 
 IndexedDB — de ingebouwde database van de browser. Haven slaat bijna alles in IndexedDB op zodat het offline kan werken.
 
@@ -592,7 +598,7 @@ Beschermde database — een database die Haven nodig heeft om te werken (bijvoor
 
 Start — het vaste eerste tabblad van de werkruimte. Draagt Havens zes snelkoppelingstegels en één tegel per geïnstalleerde applicatie. Het kan niet worden herschikt; je eigen tegels gaan op de pagina's ernaast.
 
-Tegel — een versleepbare, vergrootbare kaart op het raster van de werkruimte. Elke tegel bevat een database, een applicatie, een notitie, een ingesloten webpagina, een video of een diagram. Ook chicklet genoemd.
+Tegel — een versleepbare, vergrootbare kaart op het raster van de werkruimte. Elke tegel bevat een applicatie, een notitie, een ingesloten webpagina, een video of een diagram. Ook chicklet genoemd.
 
 Pagina — een tabblad in de werkruimte met zijn eigen raster van tegels. Gebruik meerdere pagina's zoals beginschermen op een smartphone.
 
@@ -601,6 +607,8 @@ Groep — een visuele container die gerelateerde tegels onder een gedeelde, kleu
 App-lade — het paneel achter het pijlgreepje bovenaan het inhoudsgebied. Toont de Haven-schermen die je open hebt en de applicaties die op dat moment draaien, met boven beide een weg terug naar de werkruimte. Cmd+Shift+Space opent hem en Cmd+Shift+Enter brengt je terug naar de werkruimte; druk op Windows en Linux op Ctrl in plaats van Cmd.
 
 Database — een verzameling gerelateerde documenten binnen een tenant. Een tenant kan veel databases hebben (bijvoorbeeld contacten, facturen, notities).
+
+Databases inspecteren — het ontwikkelaarshulpmiddel onder Toevoegen... in de werkruimte dat de ruwe documenten toont van alle databases die je apps gebruiken, één tabblad per database. Niet bedoeld voor eindgebruikers: wijzigingen daar gaan langs de eigen regels van de apps heen.
 
 Directory-database — een speciale beschermde database in elke tenant die gebruikersregistraties en tenantbrede instellingen bewaart.
 
