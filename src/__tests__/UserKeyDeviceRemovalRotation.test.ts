@@ -181,4 +181,31 @@ describe("userkey device removal and rotation", () => {
     expect(published!.fingerprint).toBe(doc.payload.userKeys[rotatedEpoch].fingerprint);
     expect(published!.fingerprint).not.toBe(doc.payload.userKeys[enrolledEpoch].fingerprint);
   });
+
+  it("warns only when a published User-Key exists but none of its epochs opens", async () => {
+    const cannotOpen = (call: unknown[]) => String(call[0]).includes("can open none of its epochs");
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Normal cases stay quiet: the device that stayed opens every epoch, the
+      // removed one still opens the retired generation it was enrolled in.
+      expect((await alice1.tenant.getUserKeyManager().getUserKeyCryptoKeysForReconcile()).length).toBeGreaterThan(0);
+      expect((await alice2.tenant.getUserKeyManager().getUserKeyCryptoKeysForReconcile()).length).toBeGreaterThan(0);
+      expect(warn.mock.calls.filter(cannotOpen)).toHaveLength(0);
+
+      // A device that can open no epoch of its published User-Key is a real
+      // problem (User-Key wraps cannot be imported there): one warning.
+      const manager = alice2.tenant.getUserKeyManager();
+      const noEpoch = jest
+        .spyOn(manager as unknown as { privateKeyBytesForEpoch: () => Promise<null> }, "privateKeyBytesForEpoch")
+        .mockResolvedValue(null);
+      try {
+        await manager.getUserKeyCryptoKeysForReconcile();
+      } finally {
+        noEpoch.mockRestore();
+      }
+      expect(warn.mock.calls.filter(cannotOpen)).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });

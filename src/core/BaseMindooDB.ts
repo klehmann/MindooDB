@@ -15947,7 +15947,8 @@ export class BaseMindooDB implements MindooDB {
       now,
     });
     const dek = tenant.getCryptoAdapter().getRandomValues(new Uint8Array(32));
-    console.log("[sealed] prepareSealedCreate", {
+    // Once per sealed create (a mail gateway logs one per delivered message).
+    this.logger.debug("[sealed] prepareSealedCreate", {
       docId,
       keyId,
       includeSelf: options.recipientOptions?.includeSelf !== false,

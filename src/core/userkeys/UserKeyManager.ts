@@ -994,6 +994,17 @@ export class UserKeyManager {
       const current = await this.getDecryptedUserKey();
       if (current) keys.push(current);
     }
+    // The one case worth a warning: this person published a User-Key, yet this
+    // device can open none of its epochs, so wraps addressed to the User-Key
+    // cannot be imported here. An empty result without a published document
+    // is normal (no User-Key yet, or a device that relies on its own device
+    // key) and stays at DEBUG below.
+    if (usedPublishedDocument && seen.size === 0) {
+      console.warn("[userkeys] getUserKeyCryptoKeysForReconcile: published User-Key found but this device can open none of its epochs", {
+        resolvedDocId,
+        fallbackToLocalUserKey: keys.length > 0,
+      });
+    }
     if (getDefaultLogLevel() >= LogLevel.DEBUG) console.debug("[userkeys] getUserKeyCryptoKeysForReconcile", {
       canUseUserDirectory,
       usedPublishedDocument,
