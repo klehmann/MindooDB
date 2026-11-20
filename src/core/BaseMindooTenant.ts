@@ -3109,8 +3109,8 @@ export class BaseMindooTenant implements MindooTenant {
   ): Promise<ContentAddressedStore> {
     const validDbId = validateDatabaseId(dbId, "dbId");
 
-    console.log(`[connectToServer] Connecting to server: ${serverUrl}, db: ${validDbId}, storeKind: ${storeKind}`);
-    this.logger.info(`Connecting to server: ${serverUrl}, db: ${validDbId}, storeKind: ${storeKind}`);
+    // Runs for every store of every sync: DEBUG, not INFO.
+    this.logger.debug(`Connecting to server: ${serverUrl}, db: ${validDbId}, storeKind: ${storeKind}`);
 
     const normalizedServerUrl = serverUrl.replace(/\/$/, "");
     const irohTarget = this.resolveIrohDial(serverUrl, options);
@@ -3176,8 +3176,7 @@ export class BaseMindooTenant implements MindooTenant {
         authAs ? authAs.signingPublicKey : this.currentUser.userSigningKeyPair.publicKey,
       );
 
-      console.log(`[connectToServer] ✓ Connected to server for db "${validDbId}"`);
-      this.logger.info(`Connected to server for db "${validDbId}"`);
+      this.logger.debug(`Connected to server for db "${validDbId}"`);
 
       return store;
     })();
