@@ -13,6 +13,31 @@ import type { TenantManager } from "./TenantManager";
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const MAX_CHALLENGES = 10_000;
+/**
+ * Budget per tenant for "is this signing key granted here?". One tenant whose
+ * directory hangs or rebuilds slowly must not hold the whole request: behind
+ * a proxy (Cloudflare gives up after 100–120 s) the device would only see a
+ * 5xx page and never learn about the tenants that did answer.
+ */
+const DEFAULT_TENANT_LOOKUP_TIMEOUT_MS = 10_000;
+const DEFAULT_TENANT_LOOKUP_CONCURRENCY = 4;
+/** Lookups slower than this are logged with the tenant id, to find the culprit. */
+const SLOW_TENANT_LOOKUP_MS = 2_000;
+
+export interface DeviceDiscoveryOptions {
+  tenantLookupTimeoutMs?: number;
+  tenantLookupConcurrency?: number;
+}
+
+class TenantLookupTimeout extends Error {}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new TenantLookupTimeout(`no answer within ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 interface DeviceChallenge {
   challenge: string;
@@ -38,10 +63,20 @@ export class DeviceDiscoveryAuthError extends Error {
 export class DeviceDiscoveryService {
   private challenges = new Map<string, DeviceChallenge>();
 
+  private readonly tenantLookupTimeoutMs: number;
+  private readonly tenantLookupConcurrency: number;
+
   constructor(
     private readonly tenantManager: TenantManager,
     private readonly cryptoAdapter: CryptoAdapter,
-  ) {}
+    options: DeviceDiscoveryOptions = {},
+  ) {
+    this.tenantLookupTimeoutMs = options.tenantLookupTimeoutMs ?? DEFAULT_TENANT_LOOKUP_TIMEOUT_MS;
+    this.tenantLookupConcurrency = Math.max(
+      1,
+      options.tenantLookupConcurrency ?? DEFAULT_TENANT_LOOKUP_CONCURRENCY,
+    );
+  }
 
   /**
    * Issue a short-lived, single-use challenge bound to `signingPublicKey`.
@@ -107,31 +142,58 @@ export class DeviceDiscoveryService {
     };
     const matches: Match[] = [];
 
-    for (const tenantId of tenantIds) {
-      try {
-        const loaded = await this.tenantManager.getTenant(tenantId);
-        const lookup = await loaded.directory.getUserBySigningPublicKey(signingPublicKey);
-        if (!lookup?.encryptionPublicKey) continue;
+    const lookupTenant = async (tenantId: string): Promise<Match | null> => {
+      const loaded = await this.tenantManager.getTenant(tenantId);
+      const lookup = await loaded.directory.getUserBySigningPublicKey(signingPublicKey);
+      if (!lookup?.encryptionPublicKey) return null;
+      return {
+        tenantId,
+        adminSigningPublicKey: loaded.context.config.adminSigningPublicKey,
+        adminEncryptionPublicKey: loaded.context.config.adminEncryptionPublicKey,
+        encryptionPublicKey: lookup.encryptionPublicKey,
+        username_hash:
+          typeof lookup.username === "string" && /^[a-f0-9]{64}$/i.test(lookup.username)
+            ? lookup.username
+            : undefined,
+        identity_hashes: lookup.identityHashes,
+        joinResponseWrapped:
+          typeof lookup.joinResponseWrapped === "string" && lookup.joinResponseWrapped.trim()
+            ? lookup.joinResponseWrapped.trim()
+            : undefined,
+      };
+    };
 
-        matches.push({
-          tenantId,
-          adminSigningPublicKey: loaded.context.config.adminSigningPublicKey,
-          adminEncryptionPublicKey: loaded.context.config.adminEncryptionPublicKey,
-          encryptionPublicKey: lookup.encryptionPublicKey,
-          username_hash:
-            typeof lookup.username === "string" && /^[a-f0-9]{64}$/i.test(lookup.username)
-              ? lookup.username
-              : undefined,
-          identity_hashes: lookup.identityHashes,
-          joinResponseWrapped:
-            typeof lookup.joinResponseWrapped === "string" && lookup.joinResponseWrapped.trim()
-              ? lookup.joinResponseWrapped.trim()
-              : undefined,
-        });
-      } catch {
-        // Tenant missing directory / not loadable — skip.
+    // Tenants are checked a few at a time, each within its own time budget.
+    // A lookup that times out keeps running in the background (it cannot be
+    // cancelled) but no longer delays the answer.
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < tenantIds.length) {
+        const tenantId = tenantIds[next++]!;
+        const started = Date.now();
+        try {
+          const match = await withTimeout(lookupTenant(tenantId), this.tenantLookupTimeoutMs);
+          if (match) matches.push(match);
+          const elapsed = Date.now() - started;
+          if (elapsed >= SLOW_TENANT_LOOKUP_MS) {
+            console.warn(`[DeviceDiscovery] tenant ${tenantId}: lookup took ${elapsed} ms`);
+          }
+        } catch (error) {
+          if (error instanceof TenantLookupTimeout) {
+            console.warn(
+              `[DeviceDiscovery] tenant ${tenantId}: skipped, ${error.message} (directory lookup still running)`,
+            );
+          }
+          // Otherwise: tenant missing directory / not loadable — skip.
+        }
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(this.tenantLookupConcurrency, tenantIds.length) }, worker),
+    );
+
+    // Workers finish in any order; answer in the server's tenant order.
+    matches.sort((a, b) => tenantIds.indexOf(a.tenantId) - tenantIds.indexOf(b.tenantId));
 
     if (matches.length === 0) {
       return { tenants: [] };
