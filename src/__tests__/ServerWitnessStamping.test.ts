@@ -612,4 +612,198 @@ describe("ServerNetworkContentAddressedStore witness + Tier 1", () => {
       expect(await localStore.getAllIds()).toHaveLength(0);
     });
   });
+
+  /**
+   * First trusted receipt wins, for client pushes too (§5.3, convergence
+   * invariant 2): a client that synced an entry with server A and then pushes
+   * it to server B must not get a second, different receipt from B.
+   */
+  describe("client push of an entry that already carries another server's receipt", () => {
+    function makeServer(
+      signer: WitnessSigner,
+      opts: {
+        trusts?: string[];
+        store?: InMemoryContentAddressedStore;
+        db?: string;
+        peer?: boolean;
+        directoryAdminCheck?: { rootAdminKey: string; isAdminAt: (k: string, T: number) => Promise<boolean> };
+      } = {},
+    ) {
+      const db = opts.db ?? dbid;
+      const store = opts.store ?? new InMemoryContentAddressedStore(db, StoreKind.docs);
+      const auth = opts.peer
+        ? ({ validateToken: async () => null } as unknown as AuthenticationService)
+        : fakeAuth();
+      const server = new ServerNetworkContentAddressedStore(store, fakeDirectory(), auth, cryptoAdapter, undefined, {
+        timestampProvider: new Ed25519WitnessProvider({ signer, subtle: signer.subtle }),
+        witnessDbid: db,
+        trustedWitnessResolver: (key) => (opts.trusts ?? []).includes(key),
+        peerTokenResolver: opts.peer
+          ? async () => ({ name: "CN=peer-a", signingPublicKey: "peer-sign", encryptionPublicKey: "peer-enc" })
+          : undefined,
+        directoryAdminCheck: opts.directoryAdminCheck,
+      });
+      return { server, store };
+    }
+
+    /** Run `fn` with `Date.now()` pinned to `at`. */
+    async function at<T>(atMs: number, fn: () => Promise<T>): Promise<T> {
+      const spy = jest.spyOn(Date, "now").mockReturnValue(atMs);
+      try {
+        return await fn();
+      } finally {
+        spy.mockRestore();
+      }
+    }
+
+    const T_A = 1_800_000_000_000;
+    const T_B = T_A + 3_600_000;
+
+    /** The client writes an entry locally and syncs it with server A. */
+    async function clientSyncedWithA(signerA: WitnessSigner) {
+      const { server: serverA } = makeServer(signerA);
+      const client = new InMemoryContentAddressedStore(dbid, StoreKind.docs);
+      const e = await makeEntry();
+      await client.putEntries([e]);
+      const ackA = await at(T_A, () => serverA.handlePutEntries("token", [e]));
+      expect(ackA.rejected).toHaveLength(0);
+      await client.applyWitnessReceipts(ackA.receipts);
+      const local = (await client.getEntries([e.id]))[0];
+      expect(local.receivedAt).toBe(T_A);
+      expect(local.receivedByPublicKey).toBe(signerA.publicKeyPem);
+      return { client, local };
+    }
+
+    it("keeps A's receipt when B trusts A, and the client's metadata stays unchanged", async () => {
+      const signerA = await generateSigner();
+      const signerB = await generateSigner();
+      const { client, local } = await clientSyncedWithA(signerA);
+      const metaBefore = await client.getEntryMetadata(local.id);
+
+      const { server: serverB, store: storeB } = makeServer(signerB, { trusts: [signerA.publicKeyPem] });
+      const ackB = await at(T_B, () => serverB.handlePutEntries("token", [local]));
+
+      expect(ackB.rejected).toHaveLength(0);
+      expect(ackB.receipts).toHaveLength(1);
+      expect(ackB.receipts[0].receivedAt).toBe(T_A);
+      expect(ackB.receipts[0].receivedByPublicKey).toBe(signerA.publicKeyPem);
+      expect(ackB.receipts[0].receivedDateSignature).toEqual(local.receivedDateSignature);
+
+      const storedB = (await storeB.getEntries([local.id]))[0];
+      expect(storedB.receivedAt).toBe(T_A);
+      expect(storedB.receivedByPublicKey).toBe(signerA.publicKeyPem);
+
+      // Applying B's ack is a no-op on the client: same receipt, same
+      // receiptOrder, so the entry is not re-anchored or re-pushed.
+      await client.applyWitnessReceipts(ackB.receipts);
+      expect(await client.getEntryMetadata(local.id)).toEqual(metaBefore);
+
+      // The kept receipt still validates against A's key.
+      const result = await new WitnessReceiptValidator().validate(
+        storedB,
+        { dbid, trustedWitnessKeys: new Set([signerA.publicKeyPem]), nowMs: T_B },
+        subtle,
+      );
+      expect(result.ok).toBe(true);
+      expect(result.noReceipt).toBeFalsy();
+    });
+
+    it("keeps its own receipt on a client push (own witness key)", async () => {
+      const signerA = await generateSigner();
+      const { local } = await clientSyncedWithA(signerA);
+      // A fresh store under the same witness key (e.g. A after a restore).
+      const { server } = makeServer(signerA);
+      const ack = await at(T_B, () => server.handlePutEntries("token", [local]));
+      expect(ack.receipts[0].receivedAt).toBe(T_A);
+    });
+
+    it("re-stamps when B does not trust A (old behaviour)", async () => {
+      const signerA = await generateSigner();
+      const signerB = await generateSigner();
+      const { local } = await clientSyncedWithA(signerA);
+
+      const { server: serverB, store: storeB } = makeServer(signerB);
+      const ackB = await at(T_B, () => serverB.handlePutEntries("token", [local]));
+
+      expect(ackB.rejected).toHaveLength(0);
+      expect(ackB.receipts[0].receivedAt).toBe(T_B);
+      expect(ackB.receipts[0].receivedByPublicKey).toBe(signerB.publicKeyPem);
+      const storedB = (await storeB.getEntries([local.id]))[0];
+      expect(storedB.receivedByPublicKey).toBe(signerB.publicKeyPem);
+      const result = await new WitnessReceiptValidator().validate(
+        storedB,
+        { dbid, trustedWitnessKeys: new Set([signerB.publicKeyPem]), nowMs: T_B },
+        subtle,
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    it("re-stamps a client-pushed receipt with a broken signature instead of storing it", async () => {
+      const signerA = await generateSigner();
+      const signerB = await generateSigner();
+      const { local } = await clientSyncedWithA(signerA);
+      const forged: StoreEntry = { ...local, receivedAt: T_A - 86_400_000 };
+
+      const { server: serverB, store: storeB } = makeServer(signerB, { trusts: [signerA.publicKeyPem] });
+      const ackB = await at(T_B, () => serverB.handlePutEntries("token", [forged]));
+
+      expect(ackB.rejected).toHaveLength(0);
+      expect(ackB.receipts[0].receivedAt).toBe(T_B);
+      expect(ackB.receipts[0].receivedByPublicKey).toBe(signerB.publicKeyPem);
+      const storedB = (await storeB.getEntries([local.id]))[0];
+      expect(storedB.receivedAt).toBe(T_B);
+      expect(storedB.receivedByPublicKey).toBe(signerB.publicKeyPem);
+    });
+
+    it("judges a kept client receipt at its receivedAt, an unverifiable one at the server's clock", async () => {
+      const signerA = await generateSigner();
+      const signerB = await generateSigner();
+      const author = await generateSigner();
+      const seenAt: number[] = [];
+      const directoryAdminCheck = {
+        rootAdminKey: "root-key",
+        isAdminAt: async (_key: string, T: number) => {
+          seenAt.push(T);
+          return true;
+        },
+      };
+      const db = "directory";
+      const { server: serverA } = makeServer(signerA, { db, directoryAdminCheck });
+      const e = await makeEntry({}, { signingKey: author.signingPrivateKey, publicKeyPem: author.publicKeyPem });
+      const ackA = await at(T_A, () => serverA.handlePutEntries("token", [e]));
+      const withReceipt: StoreEntry = { ...e, ...ackA.receipts[0], encryptedData: e.encryptedData };
+
+      seenAt.length = 0;
+      const { server: trusting } = makeServer(signerB, { db, directoryAdminCheck, trusts: [signerA.publicKeyPem] });
+      const kept = await at(T_B, () => trusting.handlePutEntries("token", [withReceipt]));
+      expect(kept.receipts[0].receivedAt).toBe(T_A);
+      expect(seenAt).toEqual([T_A]);
+
+      seenAt.length = 0;
+      const { server: stranger } = makeServer(signerB, { db, directoryAdminCheck });
+      const restamped = await at(T_B, () => stranger.handlePutEntries("token", [withReceipt]));
+      expect(restamped.receipts[0].receivedAt).toBe(T_B);
+      expect(seenAt).toEqual([T_B]);
+    });
+
+    it("leaves the peer path unchanged: trusted receipt kept, unverifiable receipt rejected", async () => {
+      const signerA = await generateSigner();
+      const signerB = await generateSigner();
+      const { local } = await clientSyncedWithA(signerA);
+
+      const { server: trusting } = makeServer(signerB, { peer: true, trusts: [signerA.publicKeyPem] });
+      const kept = await at(T_B, () => trusting.handlePutEntries("peer-token", [local]));
+      expect(kept.rejected).toHaveLength(0);
+      expect(kept.receipts[0].receivedAt).toBe(T_A);
+      expect(kept.receipts[0].receivedByPublicKey).toBe(signerA.publicKeyPem);
+
+      const { server: stranger, store } = makeServer(signerB, { peer: true });
+      const refused = await at(T_B, () => stranger.handlePutEntries("peer-token", [local]));
+      expect(refused.receipts).toHaveLength(0);
+      expect(refused.rejected).toEqual([
+        { id: local.id, reason: expect.stringContaining("not verifiable"), rejectionClass: "signature" },
+      ]);
+      expect(await store.getAllIds()).toHaveLength(0);
+    });
+  });
 });

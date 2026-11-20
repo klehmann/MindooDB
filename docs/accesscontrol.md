@@ -282,6 +282,16 @@ Rules:
   (dual-control: the witness does not witness its own authored entries).
 - After stamping, the witness returns the fields in the sync response so they
   propagate back to the author and on to other servers the author syncs with.
+- **First trusted receipt wins.** A server that receives an entry already
+  carrying a complete receipt keeps it when the receipt verifies against its own
+  witness key or a server it trusts (`trusted-servers.json`), whether a peer
+  replicates the entry or a client pushes it. It stores the entry unchanged and
+  returns that same receipt, so every replica — and the author — agree on
+  `receivedAt`. A receipt that does not verify is a rejection on peer pushes; on
+  client pushes it is replaced by the receiving server's own receipt (the client
+  may carry a receipt from a witness outside this cluster). Time-dependent write
+  checks judge an entry with a kept receipt at its `receivedAt`. See
+  [network-sync-protocol.md](network-sync-protocol.md), convergence invariant 3.
 
 ### 5.2 Canonical signing layout
 

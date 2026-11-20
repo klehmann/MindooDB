@@ -27,7 +27,8 @@
  *    `rejectionPolicy: "hold"`, which clamps the cursor so the next run
  *    re-offers the entry once the missing trust has replicated.
  * 3. **Receipts are preserved, not re-stamped.** Enforced on the receiving side
- *    in `ServerNetworkContentAddressedStore`; this side just transports.
+ *    in `ServerNetworkContentAddressedStore`; this side just transports. The
+ *    store applies the same rule to client pushes (first trusted receipt wins).
  */
 
 import { HttpTransport } from "../../appendonlystores/network/HttpTransport";
