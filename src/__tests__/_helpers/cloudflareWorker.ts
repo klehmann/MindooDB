@@ -70,6 +70,9 @@ export async function startCloudflareWorker(options: {
   const packageDir = process.env.MINDOODB_CLOUDFLARE_PACKAGE_DIR;
   if (packageDir) {
     fs.symlinkSync(path.join(packageDir, "node_modules"), path.join(dir, "node_modules"));
+    // The template's package.json decides how the bundler imports the
+    // CommonJS package (an ESM project would lose the default export).
+    fs.copyFileSync(path.join(REPO_ROOT, "cloudflare", "package.json"), path.join(dir, "package.json"));
   }
   fs.writeFileSync(
     path.join(dir, "entry.ts"),
