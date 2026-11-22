@@ -285,7 +285,8 @@ export interface ServerAccessControlOptions {
   peerTokenResolver?: ServerPeerTokenResolver;
   /**
    * Decides whether a witness key on an incoming entry is trusted
-   * (convergence invariant 2). Only consulted for peer pushes.
+   * (convergence invariant 3). Consulted for peer pushes and for client pushes
+   * of entries that already carry another server's receipt.
    */
   trustedWitnessResolver?: ServerTrustedWitnessResolver;
   /**
@@ -1286,6 +1287,7 @@ export class ServerNetworkContentAddressedStore {
     // updates the shared trust cache, so subsequent entries in the batch reuse
     // it without re-syncing.
     let forceTrustRefresh = true;
+    const dbId = this.witnessDbid ?? this.localStore.getId();
     for (const entry of entries) {
       // Reject a push carrying a revoked decryptionKeyId (§13). The user has
       // been removed from this key's distribution, so the server refuses to
@@ -1331,10 +1333,36 @@ export class ServerNetworkContentAddressedStore {
         }
       }
 
+      // First trusted receipt wins (docs/accesscontrol.md §5.1, convergence
+      // invariant 3). An entry that already carries the receipt of a server
+      // this node trusts keeps it, whether a peer replicates it or a client
+      // pushes it here after syncing with another server of the cluster.
+      // Re-stamping would give the same entry a different `receivedAt` on
+      // every server it reaches, and the replicas would never agree on its
+      // trusted time.
+      //
+      // - Peer push: the receipt is verified at the end of the loop, and a
+      //   receipt that does not verify rejects the entry (a peer only relays
+      //   what a trusted server accepted; anything else is tampering).
+      // - Client push: verified here, before the time-based checks, because
+      //   the outcome decides which time those checks use. A receipt that does
+      //   NOT verify (witness outside this cluster, unknown key, bad signature)
+      //   is not an error: a client may legitimately carry a receipt from a
+      //   server this node does not know. Such an entry is judged and stamped
+      //   as a fresh write, as before.
+      const carriesReceipt = this.hasWitnessReceipt(entry);
+      const keepClientReceipt =
+        !peerIngest && carriesReceipt && (await this.verifyReplicatedReceipt(entry, dbId));
+      const keepsReceipt = peerIngest ? carriesReceipt : keepClientReceipt;
+      // Time at which the time-dependent checks below judge the entry: the
+      // kept receipt's `receivedAt` (the trusted server accepted it then, under
+      // the policy in force at that time), otherwise this batch's clock.
+      const judgedAt = keepsReceipt ? entry.receivedAt! : receivedAt;
+
       // Join requests (docs/invitations.md): the server creates, admins decide.
       if (this.joinRequestsWriteCheck) {
         const op = entryTypeToBuiltinOp(entry.entryType);
-        const T = peerIngest && this.hasWitnessReceipt(entry) ? entry.receivedAt! : receivedAt;
+        const T = judgedAt;
         if (op) {
           const decision = evaluateJoinRequestsWrite({
             op,
@@ -1351,13 +1379,10 @@ export class ServerNetworkContentAddressedStore {
 
       // Directory writes (docs/accesscontrol.md §6.13): only administrators, judged
       // at this server's clock — a deactivated admin cannot push backdated
-      // entries. A peer delivery keeps the receipt of the server that first
-      // accepted it, so it is judged at that time.
-      if (this.directoryAdminCheck && (this.witnessDbid ?? this.localStore.getId()) === ServerNetworkContentAddressedStore.DIRECTORY_DB_ID) {
-        const denied = await this.evaluateDirectoryAdminWrite(
-          entry,
-          peerIngest && this.hasWitnessReceipt(entry) ? entry.receivedAt! : receivedAt,
-        );
+      // entries. An entry that keeps the receipt of the trusted server that
+      // first accepted it (peer or client push) is judged at that time.
+      if (this.directoryAdminCheck && dbId === ServerNetworkContentAddressedStore.DIRECTORY_DB_ID) {
+        const denied = await this.evaluateDirectoryAdminWrite(entry, judgedAt);
         if (denied) {
           this.rejectEntry(rejected, entry.id, denied, "policy");
           continue;
@@ -1457,7 +1482,6 @@ export class ServerNetworkContentAddressedStore {
 
       // Builtin `userdirectory` write invariant (docs/userkeys.md §6.5). Runs
       // before Tier 1 so it holds even when the ACL master switch is on.
-      const dbId = this.witnessDbid ?? this.localStore.getId();
       if (dbId === USER_DIRECTORY_DB_ID && this.builtinWriteContext) {
         const denied = await this.evaluateUserdirectoryInvariant(entry, receivedAt, entries);
         if (denied) {
@@ -1509,7 +1533,7 @@ export class ServerNetworkContentAddressedStore {
       // "access since: today" bug. Only witness-era writers (`entryVersion`
       // present) are eligible for a receipt.
       //
-      // Convergence invariant 2 (peer replication): an entry arriving from a
+      // Convergence invariant 3 (peer replication): an entry arriving from a
       // trusted peer usually already carries the receipt of the server that
       // first accepted it. Re-stamping it would set `receivedAt = now` on
       // documents that are years old — exactly the "access since: today" bug
@@ -1520,7 +1544,14 @@ export class ServerNetworkContentAddressedStore {
       // entry and database. So verify the signature against a witness we trust
       // and keep it. A receipt that fails verification is a rejection, never a
       // silent overwrite.
-      if (peerIngest && this.hasWitnessReceipt(entry)) {
+      //
+      // The same rule holds for client pushes (first trusted receipt wins, see
+      // `keepClientReceipt` above): a client that synced the entry with server
+      // A and now pushes it to server B hands B A's receipt. B keeps it, so
+      // the client's ack carries the receipt it already holds and A and B agree
+      // on `receivedAt` when they replicate later. An unverifiable client
+      // receipt falls through to the stamp below and is replaced.
+      if (peerIngest && carriesReceipt) {
         const preserved = await this.verifyReplicatedReceipt(entry, dbId);
         if (!preserved) {
           this.rejectEntry(
@@ -1530,6 +1561,9 @@ export class ServerNetworkContentAddressedStore {
           );
           continue;
         }
+        toStore.push(entry);
+        stampedMetadata.push(this.toMetadata(entry));
+      } else if (keepClientReceipt) {
         toStore.push(entry);
         stampedMetadata.push(this.toMetadata(entry));
       } else if (
@@ -1837,7 +1871,7 @@ export class ServerNetworkContentAddressedStore {
 
   /**
    * Verify a receipt that travelled with an entry from another server
-   * (convergence invariant 2).
+   * (convergence invariant 3).
    *
    * Two conditions, both required: the witness key must be one this node
    * trusts (its own, or an entry in `trusted-servers.json`), and the signature

@@ -38,7 +38,7 @@ A KeyBag is a local, encrypted store of the encryption keys a tenant needs, open
 
 A virtual view is a spreadsheet-like tree that filters, categorizes, sorts, and totals documents. A view can pull from one database, several databases, or even several tenants, which is how you answer questions across data rather than just inside one database.
 
-The Workspace is made of tiles on pages, grouped into groups. A tile — sometimes called a chicklet — is a draggable, resizable card that opens a database, launches an app, or shows a note, a web page, a video, or a diagram. A page is a tab full of tiles. A group clusters related tiles under a shared, color-coded header.
+The Workspace is made of tiles on pages, grouped into groups. A tile — sometimes called a chicklet — is a draggable, resizable card that launches an app or shows a note, a web page, a video, or a diagram. A page is a tab full of tiles. A group clusters related tiles under a shared, color-coded header.
 
 An application registration is the saved Haven-side definition of a MindooDB app: where it lives, how it runs, and which databases or views it is allowed to see. When an app launches, it talks to Haven through a bridge (sometimes called the app connector), which is the secure channel that lets Haven enforce the permissions you granted. The sandbox is the browser-enforced isolation that prevents an app from reaching Haven's storage, cookies, or other apps.
 
@@ -98,7 +98,7 @@ Step four, you are in. Haven drops you into the freshly joined tenant and the Wo
 
 Once the Welcome wizard is done, the day-to-day path is the same whichever route you took.
 
-Open the Workspace. Start already has its six shortcut tiles; what it does not have yet is anything of yours. Add a page next to Start from the Add menu, then use the same menu to put a database tile on it pointing at one of the databases in your tenant. Double-click the tile to open the Database Browser and see its documents.
+Open the Workspace. Start already has its six shortcut tiles; what it does not have yet is anything of yours. Add a page next to Start from the Add menu, then use the same menu to put a first tile of your own on it — a note, a web page, or an application you have installed.
 
 Install an app. Open Haven App Store from Start, pick something that looks useful, and install it. It appears as a tile on Start straight away, and you can place it on one of your own pages from there.
 
@@ -154,7 +154,7 @@ Recovery contacts are a second way back when every device is gone, without the p
 
 ## Workspace
 
-The Workspace is your daily home. You arrange databases, applications, notes, web pages, videos, and diagrams as draggable tiles across multiple pages, like home screens on a phone. The layout is personal: by default it is stored only in this browser, so it loads instantly and works offline. If you want the same arrangement on your other devices, the Roamed workspace setting under Preferences → General saves it into your tenant, encrypted for you alone.
+The Workspace is your daily home. You arrange applications, notes, web pages, videos, and diagrams as draggable tiles across multiple pages, like home screens on a phone. The layout is personal: by default it is stored only in this browser, so it loads instantly and works offline. If you want the same arrangement on your other devices, the Roamed workspace setting under Preferences → General saves it into your tenant, encrypted for you alone.
 
 Pages are the tabs across the top of the Workspace. The first one is always Start, described under Getting around Haven: Haven's own six shortcuts plus a tile for every installed application. Start is read-only, so you cannot drop your own tiles on it or rearrange what is there, and it is the one page that always looks the same.
 
@@ -162,17 +162,17 @@ Everything else is yours. Add as many pages next to Start as you like — one pe
 
 Tiles are the cards on the grid. Drag a tile by its header to move it, drag the corner to resize it, or right-click for the full context menu. Drop a tile onto another page tab to move it there. Drop a tile onto another tile to start a group.
 
-Groups cluster related tiles under a shared, color-coded header. A group is a great way to keep the tiles for one project visually together — for example, the database, the running app, and a reference note for the same team. Right-click the group header to rename it, change its color, or ungroup the tiles back into normal cards.
+Groups cluster related tiles under a shared, color-coded header. A group is a great way to keep the tiles for one project visually together — for example, the running app, a web page it works with, and a reference note for the same team. Right-click the group header to rename it, change its color, or ungroup the tiles back into normal cards.
 
 Several kinds of tile live on the same grid.
-
-A database tile points at one MindooDB database. Double-click it to open the Database Browser. Use the context menu to switch which copy of the database the tile is showing — a local replica for speed and offline, or a live server target for the freshest state. Database tiles remember the tenant, the database, and the source you last used, so they are also a handy bookmark back into the rest of MindooDB.
 
 An application tile launches a MindooDB app, and two separate settings decide how it behaves. The tile's own Display mode is either Launcher, a card you double-click, or Embedded, which runs the app right inside the workspace card and is perfect for small glanceable tools like a capture form or a mini dashboard. The registration's Runtime mode then decides what a launch actually does: Embed in Haven opens the app full-width inside the Haven window, where the App Drawer handles switching, while Open in new window gives it a standalone browser tab — useful for a second monitor, or for reading Haven and the app side by side. Apps opened inside Haven keep running in the background while you navigate elsewhere, so their scroll position, unsaved edits, and open tabs are still there when you switch back.
 
 Text tiles hold formatted notes. Web tiles embed any URL as a mini browser, which is how you keep a partner system or another team's dashboard next to the MindooDB data it documents. Video tiles play YouTube content for tutorials and walkthroughs. Mermaid tiles render live architecture diagrams and flowcharts right on the grid. These content tiles are personal — they live in this browser only — so they are ideal for cheat sheets, daily links, and live reference material.
 
-A search bar across the top of the Workspace filters tiles across pages by name, database, tenant, tag, or server. On Start you can also sort what is listed there by last used, by tenant, or alphabetically, which becomes the fastest way to find something once you have installed more than a handful of applications.
+There is no tile for a database. A database belongs to the apps that use it, and you work with its data through those apps. Developers who need to see the raw documents behind an app open Add… > Inspect databases instead, described under Inspect databases (for developers) below.
+
+A search bar across the top of the Workspace filters tiles across pages by name, tenant, tag, or server. On Start you can also sort what is listed there by last used, by tenant, or alphabetically, which becomes the fastest way to find something once you have installed more than a handful of applications.
 
 ## Applications and the Haven App Store
 
@@ -338,7 +338,7 @@ A scan does not have to be a single sheet. Press Add page and capture the next o
 
 All of it happens in the browser tab. Quick Scan works offline, nothing is uploaded to a service for processing, and the image never leaves the device except through the download or share you choose yourself.
 
-What Quick Scan does not do is file the result for you. It has two ways out — a download button and the system share sheet — and both hand you a file; nothing is written into a database. When you want the scan to land inside a document instead, start it from whatever owns that document. The Database Browser scans directly onto the document you have open, and an application can open the same scanner through the App SDK and attach the result to one of its own documents. It is the same scanner and the same perspective correction in all three places; only the last step differs.
+What Quick Scan does not do is file the result for you. It has two ways out — a download button and the system share sheet — and both hand you a file; nothing is written into a database. When you want the scan to land inside a document instead, start it from whatever owns that document. An application can open the same scanner through the App SDK and attach the result to one of its own documents, and developers can also scan straight onto a document they have open in Inspect databases. It is the same scanner and the same perspective correction in all three places; only the last step differs.
 
 ## Virtual Views
 
@@ -356,9 +356,15 @@ Because a view can span millions of rows, Haven indexes it locally and increment
 
 In the result tree you can expand categories, drill into documents, and use the checkboxes to build a selection. Selecting a category implicitly selects every visible descendant document under it. Export .xlsx turns that selection into a real workbook: it keeps the matching category rows above the selected documents and includes both the source metadata and any computed view columns, so you can hand the file straight to a non-MindooDB tool.
 
-## Database Browser and DAG Explorer
+## Inspect databases (for developers)
 
-The Database Browser is for digging into a single database. It is where you list documents, browse history, compare any two revisions side by side, and edit the live one. It is the most useful screen when you are debugging data, checking what changed, or pulling an attachment out of a specific revision.
+Inspect databases is a tool for developers. You open it from the Workspace through Add… > Inspect databases. It gathers every database your apps use in one place — on this device and on the servers you sync with — and lists them By location (this device or a server, then tenant) or By app (the apps that use them). Each database opens in a tab of its own, so you can put several side by side, and the screen keeps running in the background and appears in the App Drawer.
+
+Its main purpose is looking underneath an app. When you change an app's data model — rename a field, split a document type, migrate older documents — Inspect databases shows you what the stored documents really look like, before and after, across every database the app works with. It is also where you check what a sync brought in, or what an automated change or an AI agent actually wrote.
+
+It is not meant for end users, which is why databases no longer appear as tiles on the Workspace. Inspect databases works on the raw documents, beneath every rule an app enforces: an edit made here is not checked against the app's data model, and deleting, purging, or importing documents bypasses the app entirely. A field with the wrong type, a broken reference, or a missing document can leave data the app no longer understands, and because every change syncs, the damage reaches every member of the tenant. Look as much as you like; change things only when you know the app's data model, and preferably in a test tenant.
+
+Each tab is a Database Browser for one database. It is where you list documents, browse history, compare any two revisions side by side, and edit the live one. It is the most useful screen when you are debugging data, checking what changed, or pulling an attachment out of a specific revision.
 
 The document list has three modes: All, Existing, and Deleted. The filter box accepts a single id, comma-separated ids, or one id per line, which is handy when you have a list of ids from a colleague or a script. Each row shows the current revision plus a small badge for documents that still have open history.
 
@@ -576,7 +582,7 @@ Endpoint — the address a device is dialled at for peer-to-peer sync. Haven gen
 
 Iroh — the network Haven uses when there is no reachable address to connect to. It carries peer-to-peer sync between two devices, and it can also carry ordinary client-server sync to a MindooDB server that has joined it — one behind a NAT router, say, with no forwarded port and no certificate. Both ends meet through a relay, which sees that they are talking but not what they say.
 
-Quick Scan — Haven's built-in document scanner. Finds the edges of a page, corrects the perspective, and takes as many pages as you need into one scan. Runs entirely in the browser tab, offline included. It hands the result out as a file — a multi-page PDF, or a PNG or JPEG for one page — through a download or the system share sheet; attaching a scan to a document is done from the Database Browser or by an app through the App SDK.
+Quick Scan — Haven's built-in document scanner. Finds the edges of a page, corrects the perspective, and takes as many pages as you need into one scan. Runs entirely in the browser tab, offline included. It hands the result out as a file — a multi-page PDF, or a PNG or JPEG for one page — through a download or the system share sheet; attaching a scan to a document is done by an app through the App SDK, or by a developer in Inspect databases.
 
 IndexedDB — the browser's built-in database. Haven stores almost everything inside IndexedDB so it can work offline.
 
@@ -592,7 +598,7 @@ Protected database — a database that Haven needs in order to operate (for exam
 
 Start — the fixed first tab of the Workspace. Carries Haven's six shortcut tiles and one tile per installed application. It cannot be rearranged; your own tiles go on the pages next to it.
 
-Tile — a draggable, resizable card on the workspace grid. Each tile holds a database, an application, a note, an embedded web page, a video, or a diagram. Also called a chicklet.
+Tile — a draggable, resizable card on the workspace grid. Each tile holds an application, a note, an embedded web page, a video, or a diagram. Also called a chicklet.
 
 Page — a workspace tab that contains its own grid of tiles. Use multiple pages like home screens on a smartphone.
 
@@ -601,6 +607,8 @@ Group — a visual container that clusters related tiles under a shared, color-c
 App Drawer — the panel behind the arrow handle at the top of the content area. Lists the Haven screens you have open and the applications currently running, with a way back to the Workspace above both. Cmd+Shift+Space opens it and Cmd+Shift+Enter returns to the Workspace; press Ctrl instead of Cmd on Windows and Linux.
 
 Database — a collection of related documents inside a tenant. A tenant can have many databases (for example contacts, invoices, notes).
+
+Inspect databases — the developer tool under Add… on the Workspace that shows the raw documents of every database your apps use, one tab per database. Not meant for end users: changes made there bypass the apps' own rules.
 
 Directory database — a special protected database in every tenant that stores user registrations and tenant-wide settings.
 

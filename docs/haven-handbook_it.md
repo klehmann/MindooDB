@@ -38,7 +38,7 @@ Un KeyBag è un archivio locale e cifrato delle chiavi di crittografia che servo
 
 Una vista virtuale è un albero simile a un foglio di calcolo che filtra, categorizza, ordina e totalizza i documenti. Una vista può attingere da un database, da più database o persino da più tenant, ed è così che rispondi a domande che attraversano i dati invece di restare dentro un solo database.
 
-L'Area di lavoro è fatta di riquadri disposti su pagine e raccolti in gruppi. Un riquadro — a volte chiamato Chicklet — è una scheda trascinabile e ridimensionabile che apre un database, avvia un'app oppure mostra una nota, una pagina web, un video o un diagramma. Una pagina è una scheda piena di riquadri. Un gruppo raccoglie riquadri collegati sotto un'intestazione comune contrassegnata da un colore.
+L'Area di lavoro è fatta di riquadri disposti su pagine e raccolti in gruppi. Un riquadro — a volte chiamato Chicklet — è una scheda trascinabile e ridimensionabile che avvia un'app oppure mostra una nota, una pagina web, un video o un diagramma. Una pagina è una scheda piena di riquadri. Un gruppo raccoglie riquadri collegati sotto un'intestazione comune contrassegnata da un colore.
 
 Una registrazione dell'applicazione è la definizione di un'app MindooDB salvata da Haven: dove si trova, come viene eseguita e quali database o viste le è consentito vedere. Quando un'app parte, dialoga con Haven attraverso un bridge (a volte chiamato app connector), il canale sicuro che permette a Haven di far rispettare i permessi che hai concesso. La sandbox è l'isolamento imposto dal browser che impedisce a un'app di raggiungere l'archiviazione di Haven, i cookie o le altre app.
 
@@ -98,7 +98,7 @@ Passo quattro, ci sei. Haven ti lascia nel tenant appena raggiunto e l'Area di l
 
 Una volta terminata la procedura guidata di benvenuto, il percorso quotidiano è lo stesso qualunque strada tu abbia preso.
 
-Apri l'Area di lavoro. Inizio ha già i suoi sei riquadri di scelta rapida; quello che ancora non ha è qualcosa di tuo. Aggiungi una pagina accanto a Inizio dal menu Aggiungi..., poi usa lo stesso menu per metterci un riquadro database che punti a uno dei database del tuo tenant. Fai doppio clic sul riquadro per aprire il Browser database e vedere i suoi documenti.
+Apri l'Area di lavoro. Inizio ha già i suoi sei riquadri di scelta rapida; quello che ancora non ha è qualcosa di tuo. Aggiungi una pagina accanto a Inizio dal menu Aggiungi..., poi usa lo stesso menu per metterci un primo riquadro tuo: una nota, una pagina web o un'applicazione che hai installato.
 
 Installa un'app. Apri Haven App Store da Inizio, scegli qualcosa che ti sembra utile e installalo. Compare subito come riquadro su Inizio, e da lì puoi collocarlo su una delle tue pagine.
 
@@ -154,7 +154,7 @@ I contatti di recupero sono una seconda via di ritorno quando tutti i dispositiv
 
 ## Area di lavoro
 
-L'Area di lavoro è la tua casa di ogni giorno. Disponi database, applicazioni, note, pagine web, video e diagrammi come riquadri trascinabili su più pagine, come le schermate Home di un telefono. La disposizione è personale: per impostazione predefinita è salvata solo in questo browser, quindi si carica all'istante e funziona offline. Se vuoi la stessa disposizione sugli altri tuoi dispositivi, l'impostazione Area di lavoro condivisa tra dispositivi in Preferenze → Generale la salva nel tuo tenant, cifrata per te soltanto.
+L'Area di lavoro è la tua casa di ogni giorno. Disponi applicazioni, note, pagine web, video e diagrammi come riquadri trascinabili su più pagine, come le schermate Home di un telefono. La disposizione è personale: per impostazione predefinita è salvata solo in questo browser, quindi si carica all'istante e funziona offline. Se vuoi la stessa disposizione sugli altri tuoi dispositivi, l'impostazione Area di lavoro condivisa tra dispositivi in Preferenze → Generale la salva nel tuo tenant, cifrata per te soltanto.
 
 Le pagine sono le schede in cima all'Area di lavoro. La prima è sempre Inizio, descritta sotto Muoversi dentro Haven: le sei scorciatoie di Haven più un riquadro per ogni applicazione installata. Inizio è in sola lettura, quindi non puoi lasciarci i tuoi riquadri né riordinare ciò che c'è, ed è l'unica pagina che ha sempre lo stesso aspetto.
 
@@ -162,17 +162,17 @@ Tutto il resto è tuo. Aggiungi accanto a Inizio tutte le pagine che vuoi — un
 
 I riquadri sono le schede sulla griglia. Trascina un riquadro per la sua intestazione per spostarlo, trascina l'angolo per ridimensionarlo, oppure fai clic con il tasto destro per il menu contestuale completo. Rilascia un riquadro sulla scheda di un'altra pagina per spostarlo lì. Rilascia un riquadro su un altro riquadro per creare un gruppo.
 
-I gruppi raccolgono riquadri collegati sotto un'intestazione comune contrassegnata da un colore. Un gruppo è un ottimo modo per tenere visivamente insieme i riquadri di un progetto — per esempio il database, l'app in esecuzione e una nota di riferimento per la stessa squadra. Fai clic con il tasto destro sull'intestazione del gruppo per rinominarlo, cambiarne il colore o separare i riquadri riportandoli a schede normali.
+I gruppi raccolgono riquadri collegati sotto un'intestazione comune contrassegnata da un colore. Un gruppo è un ottimo modo per tenere visivamente insieme i riquadri di un progetto — per esempio l'app in esecuzione, una pagina web con cui lavora e una nota di riferimento per la stessa squadra. Fai clic con il tasto destro sull'intestazione del gruppo per rinominarlo, cambiarne il colore o separare i riquadri riportandoli a schede normali.
 
 Sulla stessa griglia convivono diversi tipi di riquadro.
-
-Un riquadro database punta a un database MindooDB. Fai doppio clic per aprire il Browser database. Usa il menu contestuale per cambiare quale copia del database il riquadro sta mostrando: una replica locale per velocità e uso offline, oppure una destinazione server dal vivo per lo stato più fresco. I riquadri database ricordano il tenant, il database e la sorgente che hai usato per ultima, quindi sono anche un comodo segnalibro verso il resto di MindooDB.
 
 Un riquadro applicazione avvia un'app MindooDB, e due impostazioni distinte decidono come si comporta. La Modalità di visualizzazione del riquadro è Launcher, una scheda su cui fai doppio clic, oppure Incorporata, che esegue l'app direttamente dentro la scheda dell'area di lavoro ed è perfetta per piccoli strumenti da consultare al volo, come un modulo di inserimento o una mini dashboard. La Modalità di esecuzione della registrazione decide poi che cosa succede davvero all'avvio: Incorpora in Haven apre l'app a tutta larghezza dentro la finestra di Haven, dove il cassetto applicazioni gestisce il passaggio da una all'altra, mentre Apri in nuova finestra le dà una scheda del browser a sé — utile per un secondo monitor, o per leggere Haven e l'app affiancati. Le app aperte dentro Haven continuano a girare in secondo piano mentre navighi altrove, quindi la posizione di scorrimento, le modifiche non salvate e le schede aperte sono ancora lì quando torni.
 
 I riquadri di testo contengono note formattate. I riquadri web incorporano un qualsiasi URL come mini browser, ed è così che tieni un sistema partner o la dashboard di un'altra squadra accanto ai dati MindooDB che documenta. I riquadri video riproducono contenuti YouTube per tutorial e guide. I riquadri Mermaid disegnano dal vivo diagrammi di architettura e diagrammi di flusso direttamente sulla griglia. Questi riquadri di contenuto sono personali — vivono solo in questo browser — quindi sono ideali per promemoria, link quotidiani e materiale di riferimento aggiornato.
 
-Una barra di ricerca in cima all'Area di lavoro filtra i riquadri di tutte le pagine per nome, database, tenant, tag o server. Su Inizio puoi anche ordinare ciò che vi è elencato per ultimo utilizzo, per tenant o alfabeticamente, e diventa il modo più rapido per trovare qualcosa una volta che hai installato più di una manciata di applicazioni.
+Non esiste un riquadro per un database. Un database appartiene alle app che lo usano, e con i suoi dati lavori attraverso quelle app. Gli sviluppatori che hanno bisogno di vedere i documenti grezzi dietro un'app aprono invece Aggiungi... > Ispeziona database, descritto più avanti in Ispeziona database (per sviluppatori).
+
+Una barra di ricerca in cima all'Area di lavoro filtra i riquadri di tutte le pagine per nome, tenant, tag o server. Su Inizio puoi anche ordinare ciò che vi è elencato per ultimo utilizzo, per tenant o alfabeticamente, e diventa il modo più rapido per trovare qualcosa una volta che hai installato più di una manciata di applicazioni.
 
 ## Le applicazioni e l'Haven App Store
 
@@ -338,7 +338,7 @@ Una scansione non deve essere per forza un foglio solo. Premi Aggiungi pagina e 
 
 Tutto avviene nella scheda del browser. Scansione rapida funziona offline, nulla viene caricato su un servizio per l'elaborazione e l'immagine non lascia mai il dispositivo se non attraverso il download o la condivisione che scegli tu.
 
-Ciò che Scansione rapida non fa è archiviare il risultato al posto tuo. Ha due vie d'uscita — un pulsante di download e il pannello di condivisione di sistema — ed entrambe ti consegnano un file; nulla viene scritto dentro un database. Quando vuoi che la scansione finisca dentro un documento, avviala da ciò che possiede quel documento. Il Browser database esegue la scansione direttamente sul documento che hai aperto, e un'applicazione può aprire lo stesso scanner attraverso l'App SDK e allegare il risultato a uno dei propri documenti. È lo stesso scanner e la stessa correzione della prospettiva in tutti e tre i casi; cambia solo l'ultimo passaggio.
+Ciò che Scansione rapida non fa è archiviare il risultato al posto tuo. Ha due vie d'uscita — un pulsante di download e il pannello di condivisione di sistema — ed entrambe ti consegnano un file; nulla viene scritto dentro un database. Quando vuoi che la scansione finisca dentro un documento, avviala da ciò che possiede quel documento. Un'applicazione può aprire lo stesso scanner attraverso l'App SDK e allegare il risultato a uno dei propri documenti, e gli sviluppatori possono anche eseguire la scansione direttamente su un documento aperto in Ispeziona database. È lo stesso scanner e la stessa correzione della prospettiva in tutti e tre i casi; cambia solo l'ultimo passaggio.
 
 ## Viste virtuali
 
@@ -356,9 +356,15 @@ Poiché una vista può coprire milioni di righe, Haven la indicizza in locale e 
 
 Nell'albero dei risultati puoi espandere le categorie, entrare nei documenti e usare le caselle di spunta per costruire una selezione. Selezionare una categoria seleziona implicitamente ogni documento visibile che le sta sotto. Esporta .xlsx produce una vera cartella di lavoro .xlsx: mantiene le righe di categoria corrispondenti sopra i documenti selezionati e include sia i metadati della sorgente sia le eventuali colonne calcolate della vista, così puoi consegnare il file direttamente a uno strumento che non conosce MindooDB.
 
-## Browser database ed Esploratore DAG
+## Ispeziona database (per sviluppatori)
 
-Il Browser database serve a scavare dentro un singolo database. È il posto in cui elenchi i documenti, sfogli la cronologia, confronti due revisioni qualsiasi affiancate e modifichi quella viva. È la schermata più utile quando stai correggendo dei dati, controllando che cosa è cambiato o estraendo un allegato da una revisione precisa.
+Ispeziona database è uno strumento per sviluppatori. Lo apri dall'Area di lavoro con Aggiungi... > Ispeziona database. Riunisce in un unico posto tutti i database usati dalle tue app — su questo dispositivo e sui server con cui sincronizzi — e li elenca Per posizione (questo dispositivo o un server, poi il tenant) o Per app (le app che li usano). Ogni database si apre in una scheda propria, così puoi affiancarne diversi, e la schermata resta attiva in background e compare nel cassetto applicazioni.
+
+Il suo scopo principale è guardare sotto un'app. Quando cambi il modello dati di un'app — rinomini un campo, dividi un tipo di documento, migri documenti più vecchi — Ispeziona database ti mostra come sono davvero i documenti salvati, prima e dopo, in tutti i database con cui l'app lavora. È anche il posto in cui verifichi che cosa ha portato una sincronizzazione, o che cosa ha scritto davvero una modifica automatica o un agente IA.
+
+Non è pensato per gli utenti finali, ed è per questo che i database non compaiono più come riquadri nell'Area di lavoro. Ispeziona database lavora sui documenti grezzi, al di sotto di tutte le regole che un'app impone: una modifica fatta qui non viene verificata rispetto al modello dati dell'app, ed eliminare, eseguire il purge o importare documenti scavalca del tutto l'app. Un campo del tipo sbagliato, un riferimento rotto o un documento mancante possono lasciare dati che l'app non capisce più, e poiché ogni modifica si sincronizza, il danno raggiunge tutti i membri del tenant. Guarda quanto vuoi; modifica qualcosa solo se conosci il modello dati dell'app, e preferibilmente in un tenant di prova.
+
+Ogni scheda è un Browser database per un singolo database. È il posto in cui elenchi i documenti, sfogli la cronologia, confronti due revisioni qualsiasi affiancate e modifichi quella viva. È la schermata più utile quando stai correggendo dei dati, controllando che cosa è cambiato o estraendo un allegato da una revisione precisa.
 
 L'elenco dei documenti ha tre modalità: Tutti, Esistenti ed Eliminati. La casella di filtro accetta un singolo ID, ID separati da virgola oppure un ID per riga, il che è comodo quando hai un elenco di ID da un collega o da uno script. Ogni riga mostra la revisione corrente più un piccolo contrassegno per i documenti che hanno ancora cronologia aperta.
 
@@ -576,7 +582,7 @@ Endpoint — l'indirizzo a cui un dispositivo viene contattato per la sincronizz
 
 Iroh — la rete che Haven usa quando non c'è alcun indirizzo raggiungibile a cui collegarsi. Trasporta la sincronizzazione peer-to-peer fra due dispositivi, e può trasportare anche la normale sincronizzazione client-server verso un server MindooDB che vi si sia collegato — uno dietro un router NAT, per esempio, senza porta inoltrata e senza certificato. Le due estremità si incontrano attraverso un relay, che vede che si stanno parlando ma non che cosa si dicono.
 
-Scansione rapida — lo scanner di documenti integrato in Haven. Trova i bordi di una pagina, corregge la prospettiva e raccoglie in un'unica scansione tutte le pagine che ti servono. Gira interamente nella scheda del browser, offline compreso. Consegna il risultato come file — un PDF di più pagine, oppure un PNG o un JPEG per una pagina sola — tramite un download o il pannello di condivisione di sistema; allegare una scansione a un documento si fa dal Browser database o da un'app attraverso l'App SDK.
+Scansione rapida — lo scanner di documenti integrato in Haven. Trova i bordi di una pagina, corregge la prospettiva e raccoglie in un'unica scansione tutte le pagine che ti servono. Gira interamente nella scheda del browser, offline compreso. Consegna il risultato come file — un PDF di più pagine, oppure un PNG o un JPEG per una pagina sola — tramite un download o il pannello di condivisione di sistema; allegare una scansione a un documento lo fa un'app attraverso l'App SDK, oppure uno sviluppatore in Ispeziona database.
 
 IndexedDB — il database integrato del browser. Haven conserva quasi tutto dentro IndexedDB così da poter funzionare offline.
 
@@ -592,7 +598,7 @@ Database protetto — un database di cui Haven ha bisogno per funzionare (per es
 
 Inizio — la prima scheda fissa dell'Area di lavoro. Porta i sei riquadri di scelta rapida di Haven e un riquadro per ogni applicazione installata. Non può essere riordinata; i tuoi riquadri vanno sulle pagine accanto a essa.
 
-Riquadro — una scheda trascinabile e ridimensionabile sulla griglia dell'area di lavoro. Ogni riquadro contiene un database, un'applicazione, una nota, una pagina web incorporata, un video o un diagramma. Chiamato anche Chicklet.
+Riquadro — una scheda trascinabile e ridimensionabile sulla griglia dell'area di lavoro. Ogni riquadro contiene un'applicazione, una nota, una pagina web incorporata, un video o un diagramma. Chiamato anche Chicklet.
 
 Pagina — una scheda dell'area di lavoro che contiene la propria griglia di riquadri. Usa più pagine come le schermate Home di uno smartphone.
 
@@ -601,6 +607,8 @@ Gruppo — un contenitore visivo che raccoglie riquadri collegati sotto un'intes
 Cassetto applicazioni — il pannello dietro la maniglia a freccia in cima all'area dei contenuti. Elenca le schermate di Haven che hai aperto e le applicazioni attualmente in esecuzione, con sopra a entrambe una via di ritorno all'Area di lavoro. `Cmd+Shift+Space` lo apre e `Cmd+Shift+Enter` riporta all'Area di lavoro; su Windows e Linux premi `Ctrl` invece di `Cmd`.
 
 Database — una raccolta di documenti collegati fra loro dentro un tenant. Un tenant può avere molti database (per esempio contatti, fatture, note).
+
+Ispeziona database — lo strumento per sviluppatori sotto Aggiungi... nell'Area di lavoro che mostra i documenti grezzi di tutti i database usati dalle tue app, una scheda per database. Non è pensato per gli utenti finali: le modifiche fatte lì scavalcano le regole delle app stesse.
 
 Database directory — un database speciale e protetto, presente in ogni tenant, che conserva le registrazioni degli utenti e le impostazioni valide per tutto il tenant.
 

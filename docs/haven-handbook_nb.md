@@ -38,7 +38,7 @@ En KeyBag er et lokalt, kryptert lager for krypteringsnøklene en tenant trenger
 
 En virtuell visning er et regnearklignende tre som filtrerer, kategoriserer, sorterer og summerer dokumenter. En visning kan hente fra én database, flere databaser eller til og med flere tenanter, og det er slik du svarer på spørsmål på tvers av data i stedet for bare inne i én database.
 
-Arbeidsområdet består av fliser på sider, samlet i grupper. En flis — også kalt en chicklet — er et kort du kan dra og endre størrelsen på, og som åpner en database, starter en app eller viser et notat, en nettside, en video eller et diagram. En side er en fane full av fliser. En gruppe samler beslektede fliser under en felles, fargekodet overskrift.
+Arbeidsområdet består av fliser på sider, samlet i grupper. En flis — også kalt en chicklet — er et kort du kan dra og endre størrelsen på, og som starter en app eller viser et notat, en nettside, en video eller et diagram. En side er en fane full av fliser. En gruppe samler beslektede fliser under en felles, fargekodet overskrift.
 
 En applikasjonsregistrering er den lagrede definisjonen Haven har av en MindooDB-app: hvor den ligger, hvordan den kjører, og hvilke databaser eller visninger den får se. Når en app starter, snakker den med Haven gjennom en bridge (noen ganger kalt app-connectoren), den sikre kanalen som lar Haven håndheve rettighetene du ga. Sandkassen er isolasjonen nettleseren håndhever, og som hindrer en app i å nå Havens lagring, informasjonskapsler eller andre apper.
 
@@ -98,7 +98,7 @@ Trinn fire, du er inne. Haven slipper deg inn i den nylig påmeldte tenanten, og
 
 Når velkomstveiviseren er ferdig, er den daglige veien den samme, uansett hvilken rute du tok.
 
-Åpne Arbeidsområdet. Start har allerede sine seks snarveisfliser; det den ennå ikke har, er noe av ditt. Legg til en side ved siden av Start fra Legg til-menyen, og bruk så den samme menyen til å sette en databaseflis på den, pekende mot en av databasene i tenanten din. Dobbeltklikk flisen for å åpne Databaseutforskeren og se dokumentene i den.
+Åpne Arbeidsområdet. Start har allerede sine seks snarveisfliser; det den ennå ikke har, er noe av ditt. Legg til en side ved siden av Start fra Legg til-menyen, og bruk så den samme menyen til å sette en første egen flis på den — et notat, en nettside eller en applikasjon du har installert.
 
 Installer en app. Åpne Haven App Store fra Start, finn noe som ser nyttig ut, og installer det. Den dukker opp som en flis på Start med én gang, og derfra kan du plassere den på en av dine egne sider.
 
@@ -154,7 +154,7 @@ Gjenopprettingskontakter er en annen vei tilbake når alle enhetene er borte –
 
 ## Arbeidsområde
 
-Arbeidsområdet er hjemmet ditt til daglig. Du ordner databaser, applikasjoner, notater, nettsider, videoer og diagrammer som fliser du kan dra rundt på flere sider, som hjemskjermer på en telefon. Oppsettet er personlig: som standard lagres det bare i denne nettleseren, så det lastes umiddelbart og virker offline. Vil du ha den samme organiseringen på de andre enhetene dine, lagrer innstillingen Arbeidsflate som følger med under Innstillinger → Generelt det i tenanten din, kryptert for deg alene.
+Arbeidsområdet er hjemmet ditt til daglig. Du ordner applikasjoner, notater, nettsider, videoer og diagrammer som fliser du kan dra rundt på flere sider, som hjemskjermer på en telefon. Oppsettet er personlig: som standard lagres det bare i denne nettleseren, så det lastes umiddelbart og virker offline. Vil du ha den samme organiseringen på de andre enhetene dine, lagrer innstillingen Arbeidsflate som følger med under Innstillinger → Generelt det i tenanten din, kryptert for deg alene.
 
 Sider er fanene øverst i Arbeidsområdet. Den første er alltid Start, beskrevet under Finn fram i Haven: Havens egne seks snarveier pluss en flis for hver installerte applikasjon. Start er skrivebeskyttet, så du kan ikke slippe dine egne fliser på den eller flytte om på det som er der, og det er den ene siden som alltid ser lik ut.
 
@@ -162,17 +162,17 @@ Alt annet er ditt. Legg til så mange sider ved siden av Start som du vil — é
 
 Fliser er kortene i rutenettet. Dra en flis etter overskriften for å flytte den, dra i hjørnet for å endre størrelsen, eller høyreklikk for hele hurtigmenyen. Slipp en flis på en annen sidefane for å flytte den dit. Slipp en flis på en annen flis for å starte en gruppe.
 
-Grupper samler beslektede fliser under en felles, fargekodet overskrift. En gruppe er en god måte å holde flisene for ett prosjekt visuelt samlet på — for eksempel databasen, appen som kjører, og et referansenotat for det samme teamet. Høyreklikk gruppeoverskriften for å gi den nytt navn, endre farge eller oppheve grupperingen så flisene blir vanlige kort igjen.
+Grupper samler beslektede fliser under en felles, fargekodet overskrift. En gruppe er en god måte å holde flisene for ett prosjekt visuelt samlet på — for eksempel appen som kjører, en nettside den jobber med, og et referansenotat for det samme teamet. Høyreklikk gruppeoverskriften for å gi den nytt navn, endre farge eller oppheve grupperingen så flisene blir vanlige kort igjen.
 
 Flere flistyper bor i det samme rutenettet.
-
-En databaseflis peker på én MindooDB-database. Dobbeltklikk den for å åpne Databaseutforskeren. Bruk hurtigmenyen til å bytte hvilken kopi av databasen flisen viser — en lokal replika for fart og offline-bruk, eller et direkte servermål for den ferskeste tilstanden. Databasefliser husker tenanten, databasen og kilden du sist brukte, så de fungerer også som et praktisk bokmerke tilbake til resten av MindooDB.
 
 En applikasjonsflis starter en MindooDB-app, og to separate innstillinger avgjør hvordan den oppfører seg. Flisens egen Visningsmodus er enten Startikon, et kort du dobbeltklikker, eller Innebygd, som kjører appen rett inne i arbeidsområdekortet og er perfekt for små verktøy man bare kaster et blikk på, som et registreringsskjema eller et minidashbord. Registreringens Kjøremodus avgjør så hva en start faktisk gjør: Innebygd i Haven åpner appen i full bredde inne i Haven-vinduet, der Appskuffen håndterer bytting, mens Åpne i nytt vindu gir den en egen nettleserfane — nyttig for en ekstra skjerm, eller for å lese Haven og appen side om side. Apper som åpnes inne i Haven, fortsetter å kjøre i bakgrunnen mens du navigerer andre steder, så rulleposisjon, ulagrede endringer og åpne faner er der fortsatt når du bytter tilbake.
 
 Tekstfliser rommer formaterte notater. Webfliser bygger inn hvilken som helst URL som en mininettleser, og det er slik du holder et partnersystem eller et annet teams dashbord ved siden av MindooDB-dataene det dokumenterer. Videofliser spiller av YouTube-innhold til opplæring og gjennomganger. Mermaid-fliser gjengir levende arkitekturdiagrammer og flytskjemaer rett i rutenettet. Disse innholdsflisene er personlige — de bor bare i denne nettleseren — så de er ideelle for jukselapper, daglige lenker og levende referansemateriale.
 
-En søkelinje øverst i Arbeidsområdet filtrerer fliser på tvers av sider etter navn, database, tenant, etikett eller server. På Start kan du også sortere det som listes der, etter sist brukt, etter tenant eller alfabetisk, noe som blir den raskeste måten å finne fram på når du har installert mer enn en håndfull applikasjoner.
+Det finnes ingen flis for en database. En database hører til appene som bruker den, og du jobber med dataene dens gjennom disse appene. Utviklere som trenger å se de rå dokumentene bak en app, åpner i stedet Legg til... > Undersøk databaser, beskrevet lenger ned under Undersøk databaser (for utviklere).
+
+En søkelinje øverst i Arbeidsområdet filtrerer fliser på tvers av sider etter navn, tenant, etikett eller server. På Start kan du også sortere det som listes der, etter sist brukt, etter tenant eller alfabetisk, noe som blir den raskeste måten å finne fram på når du har installert mer enn en håndfull applikasjoner.
 
 ## Applikasjoner og Haven App Store
 
@@ -338,7 +338,7 @@ Et skann trenger ikke å være ett enkelt ark. Trykk Legg til side og ta den nes
 
 Alt sammen skjer i nettleserfanen. Hurtigskann virker offline, ingenting lastes opp til en tjeneste for behandling, og bildet forlater aldri enheten annet enn gjennom nedlastingen eller delingen du selv velger.
 
-Det Hurtigskann ikke gjør, er å arkivere resultatet for deg. Den har to veier ut — en nedlastingsknapp og systemets delingsark — og begge gir deg en fil; ingenting skrives inn i en database. Vil du at skannet skal havne inne i et dokument, start det fra det som eier dokumentet. Databaseutforskeren skanner rett inn på dokumentet du har åpent, og en applikasjon kan åpne den samme skanneren gjennom App SDK og feste resultatet til et av sine egne dokumenter. Det er den samme skanneren og den samme perspektivkorreksjonen alle tre stedene; bare det siste trinnet er forskjellig.
+Det Hurtigskann ikke gjør, er å arkivere resultatet for deg. Den har to veier ut — en nedlastingsknapp og systemets delingsark — og begge gir deg en fil; ingenting skrives inn i en database. Vil du at skannet skal havne inne i et dokument, start det fra det som eier dokumentet. En applikasjon kan åpne den samme skanneren gjennom App SDK og feste resultatet til et av sine egne dokumenter, og utviklere kan også skanne rett inn på et dokument de har åpent i Undersøk databaser. Det er den samme skanneren og den samme perspektivkorreksjonen alle tre stedene; bare det siste trinnet er forskjellig.
 
 ## Virtuelle visninger
 
@@ -356,9 +356,15 @@ Fordi en visning kan spenne over millioner av rader, indekserer Haven den lokalt
 
 I resultattreet kan du utvide kategorier, bore ned i dokumenter og bruke avkrysningsboksene til å bygge et utvalg. Å velge en kategori velger implisitt hvert synlige dokument under den. Eksporter .xlsx lager en ekte .xlsx-arbeidsbok: den beholder de tilhørende kategoriradene over de valgte dokumentene og tar med både kildemetadata og eventuelle beregnede visningskolonner, så du kan gi filen rett videre til et verktøy utenfor MindooDB.
 
-## Databaseutforsker og DAG-utforsker
+## Undersøk databaser (for utviklere)
 
-Databaseutforskeren er for å grave i én enkelt database. Det er der du lister opp dokumenter, blar i historikk, sammenligner to revisjoner side om side og redigerer den levende. Det er den mest nyttige skjermen når du feilsøker data, sjekker hva som endret seg, eller henter et vedlegg ut av en bestemt revisjon.
+Undersøk databaser er et verktøy for utviklere. Du åpner det fra Arbeidsområdet via Legg til... > Undersøk databaser. Det samler alle databasene appene dine bruker, på ett sted — på denne enheten og på serverne du synkroniserer med — og lister dem Etter plassering (denne enheten eller en server, deretter tenant) eller Etter app (appene som bruker dem). Hver database åpnes i sin egen fane, så du kan legge flere side om side, og skjermen fortsetter å kjøre i bakgrunnen og vises i Appskuffen.
+
+Hovedformålet er å se under en app. Når du endrer datamodellen til en app — gir et felt nytt navn, deler opp en dokumenttype, migrerer eldre dokumenter — viser Undersøk databaser deg hvordan de lagrede dokumentene faktisk ser ut, før og etter, i alle databasene appen jobber med. Det er også her du sjekker hva en synkronisering hentet inn, eller hva en automatisk endring eller en KI-agent faktisk skrev.
+
+Det er ikke ment for sluttbrukere, og derfor vises databaser ikke lenger som fliser i Arbeidsområdet. Undersøk databaser jobber på de rå dokumentene, under alle reglene en app håndhever: en redigering gjort her blir ikke sjekket mot appens datamodell, og å slette, purge eller importere dokumenter går helt utenom appen. Et felt med feil type, en brutt referanse eller et manglende dokument kan etterlate data appen ikke lenger forstår, og fordi hver endring synkroniseres, når skaden hvert medlem av tenanten. Se så mye du vil; endre noe bare når du kjenner appens datamodell, og helst i en testtenant.
+
+Hver fane er en Databaseutforsker for én database. Det er der du lister opp dokumenter, blar i historikk, sammenligner to revisjoner side om side og redigerer den levende. Det er den mest nyttige skjermen når du feilsøker data, sjekker hva som endret seg, eller henter et vedlegg ut av en bestemt revisjon.
 
 Dokumentlisten har tre moduser: Alle, Eksisterende og Slettet. Filterfeltet godtar én ID, kommaseparerte ID-er eller én ID per linje, noe som er praktisk når du har en liste med ID-er fra en kollega eller et skript. Hver rad viser gjeldende revisjon pluss et lite merke for dokumenter som fortsatt har åpen historikk.
 
@@ -576,7 +582,7 @@ Endepunkt — adressen en enhet ringes på for node-til-node-synkronisering. Hav
 
 Iroh — nettverket Haven bruker når det ikke finnes noen tilgjengelig adresse å koble til. Det bærer node-til-node-synkronisering mellom to enheter, og det kan også bære vanlig klient-server-synkronisering til en MindooDB-server som har blitt med i det — en bak en NAT-ruter, for eksempel, uten videresendt port og uten sertifikat. Begge ender møtes gjennom et relé, som ser at de snakker sammen, men ikke hva de sier.
 
-Hurtigskann — Havens innebygde dokumentskanner. Finner kantene på en side, retter opp perspektivet, og tar så mange sider du trenger, inn i ett skann. Kjører helt og holdent i nettleserfanen, offline inkludert. Den gir resultatet ut som en fil — en flersidig PDF, eller en PNG eller JPEG for én side — gjennom en nedlasting eller systemets delingsark; å feste et skann til et dokument gjøres fra Databaseutforskeren eller av en app gjennom App SDK.
+Hurtigskann — Havens innebygde dokumentskanner. Finner kantene på en side, retter opp perspektivet, og tar så mange sider du trenger, inn i ett skann. Kjører helt og holdent i nettleserfanen, offline inkludert. Den gir resultatet ut som en fil — en flersidig PDF, eller en PNG eller JPEG for én side — gjennom en nedlasting eller systemets delingsark; å feste et skann til et dokument gjøres av en app gjennom App SDK, eller av en utvikler i Undersøk databaser.
 
 IndexedDB — nettleserens innebygde database. Haven lagrer nesten alt inne i IndexedDB så den kan virke offline.
 
@@ -592,7 +598,7 @@ Beskyttet database — en database Haven trenger for å virke (for eksempel tena
 
 Start — den faste første fanen i Arbeidsområdet. Bærer Havens seks snarveisfliser og én flis per installerte applikasjon. Den kan ikke omorganiseres; dine egne fliser hører hjemme på sidene ved siden av.
 
-Flis — et kort på arbeidsområderutenettet som kan dras og endre størrelse. Hver flis holder en database, en applikasjon, et notat, en innebygd nettside, en video eller et diagram. Kalles også chicklet.
+Flis — et kort på arbeidsområderutenettet som kan dras og endre størrelse. Hver flis holder en applikasjon, et notat, en innebygd nettside, en video eller et diagram. Kalles også chicklet.
 
 Side — en arbeidsområdefane som inneholder sitt eget rutenett av fliser. Bruk flere sider som hjemskjermer på en smarttelefon.
 
@@ -601,6 +607,8 @@ Gruppe — en visuell beholder som samler beslektede fliser under en delt, farge
 Appskuff — panelet bak pilhåndtaket øverst i innholdsområdet. Lister opp Haven-skjermene du har åpne og applikasjonene som kjører nå, med en vei tilbake til Arbeidsområdet over begge. Cmd+Shift+Space åpner den og Cmd+Shift+Enter går tilbake til Arbeidsområdet; trykk Ctrl i stedet for Cmd på Windows og Linux.
 
 Database — en samling beslektede dokumenter inne i en tenant. En tenant kan ha mange databaser (for eksempel kontakter, fakturaer, notater).
+
+Undersøk databaser — utviklerverktøyet under Legg til... i Arbeidsområdet som viser de rå dokumentene i alle databasene appene dine bruker, én fane per database. Ikke ment for sluttbrukere: endringer gjort der går utenom appenes egne regler.
 
 Katalogdatabase — en spesiell, beskyttet database i hver tenant som lagrer brukerregistreringer og innstillinger for hele tenanten.
 

@@ -38,7 +38,7 @@ Un KeyBag es un almacén local y cifrado de las claves de cifrado que necesita u
 
 Una vista virtual es un árbol parecido a una hoja de cálculo que filtra, categoriza, ordena y totaliza documentos. Una vista puede leer de una base de datos, de varias o incluso de varios tenants, que es la forma de responder preguntas que atraviesan los datos en lugar de quedarse dentro de una sola base de datos.
 
-El espacio de trabajo está hecho de teselas repartidas en páginas y reunidas en grupos. Una tesela —a veces llamada chicklet— es una tarjeta que se puede arrastrar y redimensionar y que abre una base de datos, lanza una app o muestra una nota, una página web, un vídeo o un diagrama. Una página es una pestaña llena de teselas. Un grupo reúne teselas relacionadas bajo una cabecera compartida con un color propio.
+El espacio de trabajo está hecho de teselas repartidas en páginas y reunidas en grupos. Una tesela —a veces llamada chicklet— es una tarjeta que se puede arrastrar y redimensionar y que lanza una app o muestra una nota, una página web, un vídeo o un diagrama. Una página es una pestaña llena de teselas. Un grupo reúne teselas relacionadas bajo una cabecera compartida con un color propio.
 
 Un registro de aplicación es la definición que Haven guarda de una app de MindooDB: dónde vive, cómo se ejecuta y qué bases de datos o vistas tiene permitido ver. Cuando una app arranca, habla con Haven a través de un puente (a veces llamado el conector de apps), que es el canal seguro que permite a Haven aplicar los permisos que concediste. La sandbox es el aislamiento que impone el navegador y que evita que una app llegue al almacenamiento de Haven, a sus cookies o a otras apps.
 
@@ -98,7 +98,7 @@ Paso cuatro, ya estás dentro. Haven te deja en el tenant al que acabas de unirt
 
 Una vez terminado el asistente de bienvenida, el camino del día a día es el mismo, hayas tomado la ruta que sea.
 
-Abre el espacio de trabajo. Inicio ya tiene sus seis teselas de acceso rápido; lo que todavía no tiene es nada tuyo. Añade una página al lado de Inicio desde el menú Añadir y usa el mismo menú para poner en ella una tesela de base de datos que apunte a una de las bases de datos de tu tenant. Haz doble clic en la tesela para abrir el Explorador de bases de datos y ver sus documentos.
+Abre el espacio de trabajo. Inicio ya tiene sus seis teselas de acceso rápido; lo que todavía no tiene es nada tuyo. Añade una página al lado de Inicio desde el menú Añadir y usa el mismo menú para poner en ella una primera tesela tuya: una nota, una página web o una aplicación que hayas instalado.
 
 Instala una app. Abre Haven App Store desde Inicio, elige algo que te parezca útil e instálalo. Aparece como tesela en Inicio al momento, y desde ahí puedes colocarla en una de tus propias páginas.
 
@@ -154,7 +154,7 @@ Los contactos de recuperación son una segunda vía de vuelta cuando todos los d
 
 ## Espacio de trabajo
 
-El espacio de trabajo es tu casa del día a día. Organizas bases de datos, aplicaciones, notas, páginas web, vídeos y diagramas como teselas que se arrastran por varias páginas, como las pantallas de inicio de un teléfono. La disposición es personal: por defecto se guarda solo en este navegador, así que carga al instante y funciona sin conexión. Si quieres la misma disposición en tus otros dispositivos, el ajuste Espacio de trabajo compartido entre dispositivos, en Preferencias → General, la guarda dentro de tu tenant, cifrada solo para ti.
+El espacio de trabajo es tu casa del día a día. Organizas aplicaciones, notas, páginas web, vídeos y diagramas como teselas que se arrastran por varias páginas, como las pantallas de inicio de un teléfono. La disposición es personal: por defecto se guarda solo en este navegador, así que carga al instante y funciona sin conexión. Si quieres la misma disposición en tus otros dispositivos, el ajuste Espacio de trabajo compartido entre dispositivos, en Preferencias → General, la guarda dentro de tu tenant, cifrada solo para ti.
 
 Las páginas son las pestañas de la parte de arriba del espacio de trabajo. La primera es siempre Inicio, descrita en Cómo moverte por Haven: los seis accesos rápidos propios de Haven más una tesela por cada aplicación instalada. Inicio es de solo lectura, así que no puedes dejar tus propias teselas en ella ni reordenar lo que hay, y es la única página que tiene siempre el mismo aspecto.
 
@@ -162,17 +162,17 @@ Todo lo demás es tuyo. Añade tantas páginas junto a Inicio como quieras —un
 
 Las teselas son las tarjetas de la cuadrícula. Arrastra una tesela por su cabecera para moverla, arrastra la esquina para redimensionarla o haz clic derecho para el menú contextual completo. Suelta una tesela sobre la pestaña de otra página para moverla allí. Suelta una tesela sobre otra tesela para crear un grupo.
 
-Los grupos reúnen teselas relacionadas bajo una cabecera compartida con un color propio. Un grupo es una forma excelente de mantener juntas visualmente las teselas de un proyecto: por ejemplo, la base de datos, la app en ejecución y una nota de referencia del mismo equipo. Haz clic derecho en la cabecera del grupo para renombrarlo, cambiar su color o desagrupar las teselas y devolverlas a tarjetas normales.
+Los grupos reúnen teselas relacionadas bajo una cabecera compartida con un color propio. Un grupo es una forma excelente de mantener juntas visualmente las teselas de un proyecto: por ejemplo, la app en ejecución, una página web con la que trabaja y una nota de referencia del mismo equipo. Haz clic derecho en la cabecera del grupo para renombrarlo, cambiar su color o desagrupar las teselas y devolverlas a tarjetas normales.
 
 En la misma cuadrícula conviven varios tipos de tesela.
-
-Una tesela de base de datos apunta a una base de datos de MindooDB. Haz doble clic para abrir el Explorador de bases de datos. Usa el menú contextual para cambiar qué copia de la base de datos muestra la tesela: una réplica local, por velocidad y para trabajar sin conexión, o un destino de servidor en vivo, para el estado más reciente. Las teselas de base de datos recuerdan el tenant, la base de datos y la fuente que usaste por última vez, así que sirven también de marcador de vuelta al resto de MindooDB.
 
 Una tesela de aplicación lanza una app de MindooDB, y dos ajustes distintos deciden cómo se comporta. El Modo de visualización de la propia tesela es Lanzador, una tarjeta en la que haces doble clic, o Integrada, que ejecuta la app dentro mismo de la tarjeta del espacio de trabajo y es perfecto para herramientas pequeñas de un vistazo, como un formulario de captura o un mini panel. El Modo de ejecución del registro decide después qué hace realmente un lanzamiento: Integrar en Haven abre la app a todo el ancho dentro de la ventana de Haven, donde el cajón de aplicaciones se encarga de cambiar entre unas y otras, mientras que Abrir en ventana nueva le da una pestaña de navegador propia, útil para un segundo monitor o para leer Haven y la app en paralelo. Las apps abiertas dentro de Haven siguen ejecutándose en segundo plano mientras navegas por otro sitio, así que su posición de scroll, sus ediciones sin guardar y sus pestañas abiertas siguen ahí cuando vuelves.
 
 Las teselas de texto contienen notas con formato. Las teselas web incrustan cualquier URL como un mini navegador, que es la forma de tener un sistema de un socio o el panel de otro equipo junto a los datos de MindooDB que documenta. Las teselas de vídeo reproducen contenido de YouTube para tutoriales y recorridos. Las teselas Mermaid renderizan diagramas de arquitectura y diagramas de flujo en vivo sobre la propia cuadrícula. Estas teselas de contenido son personales —viven solo en este navegador—, así que son ideales para chuletas, enlaces del día y material de referencia en vivo.
 
-Una barra de búsqueda en la parte de arriba del espacio de trabajo filtra teselas de todas las páginas por nombre, base de datos, tenant, etiqueta o servidor. En Inicio puedes además ordenar lo que aparece por último uso, por tenant o alfabéticamente, que se convierte en la forma más rápida de encontrar algo en cuanto tienes instaladas más de un puñado de aplicaciones.
+No hay teselas para bases de datos. Una base de datos pertenece a las apps que la usan, y trabajas con sus datos a través de esas apps. Los desarrolladores que necesitan ver los documentos sin procesar que hay detrás de una app abren en su lugar Añadir... > Inspeccionar bases de datos, que se describe más abajo en Inspeccionar bases de datos (para desarrolladores).
+
+Una barra de búsqueda en la parte de arriba del espacio de trabajo filtra teselas de todas las páginas por nombre, tenant, etiqueta o servidor. En Inicio puedes además ordenar lo que aparece por último uso, por tenant o alfabéticamente, que se convierte en la forma más rápida de encontrar algo en cuanto tienes instaladas más de un puñado de aplicaciones.
 
 ## Aplicaciones y la Haven App Store
 
@@ -338,7 +338,7 @@ Un escaneo no tiene que ser una sola hoja. Pulsa Añadir página y captura la si
 
 Todo ocurre dentro de la pestaña del navegador. Escaneo rápido funciona sin conexión, nada se sube a un servicio para procesarlo y la imagen nunca sale del dispositivo salvo por la descarga o la compartición que elijas tú.
 
-Lo que Escaneo rápido no hace es archivar el resultado por ti. Tiene dos salidas —un botón de descarga y la hoja de compartición del sistema— y las dos te entregan un archivo; nada se escribe en una base de datos. Cuando quieras que el escaneo aterrice dentro de un documento, arráncalo desde lo que sea dueño de ese documento. El Explorador de bases de datos escanea directamente sobre el documento que tienes abierto, y una aplicación puede abrir el mismo escáner a través del App SDK y adjuntar el resultado a uno de sus propios documentos. Es el mismo escáner y la misma corrección de perspectiva en los tres sitios; solo el último paso es distinto.
+Lo que Escaneo rápido no hace es archivar el resultado por ti. Tiene dos salidas —un botón de descarga y la hoja de compartición del sistema— y las dos te entregan un archivo; nada se escribe en una base de datos. Cuando quieras que el escaneo aterrice dentro de un documento, arráncalo desde lo que sea dueño de ese documento. Una aplicación puede abrir el mismo escáner a través del App SDK y adjuntar el resultado a uno de sus propios documentos, y los desarrolladores también pueden escanear directamente sobre un documento que tengan abierto en Inspeccionar bases de datos. Es el mismo escáner y la misma corrección de perspectiva en los tres sitios; solo el último paso es distinto.
 
 ## Vistas virtuales
 
@@ -356,9 +356,15 @@ Como una vista puede abarcar millones de filas, Haven la indexa localmente y de 
 
 En el árbol de resultados puedes expandir categorías, entrar en los documentos y usar las casillas para construir una selección. Seleccionar una categoría selecciona implícitamente todos los documentos descendientes visibles bajo ella. Exportar .xlsx produce un libro .xlsx de verdad: mantiene las filas de categoría correspondientes encima de los documentos seleccionados e incluye tanto los metadatos de la fuente como cualquier columna calculada de la vista, así que puedes entregar el archivo directamente a una herramienta ajena a MindooDB.
 
-## Explorador de bases de datos y Explorador DAG
+## Inspeccionar bases de datos (para desarrolladores)
 
-El Explorador de bases de datos sirve para hurgar en una sola base de datos. Es donde listas documentos, recorres el historial, comparas dos revisiones cualesquiera en paralelo y editas la vigente. Es la pantalla más útil cuando estás depurando datos, comprobando qué cambió o sacando un adjunto de una revisión concreta.
+Inspeccionar bases de datos es una herramienta para desarrolladores. La abres desde el espacio de trabajo con Añadir... > Inspeccionar bases de datos. Reúne en un solo lugar todas las bases de datos que usan tus apps —en este dispositivo y en los servidores con los que sincronizas— y las lista Por ubicación (este dispositivo o un servidor, y después el tenant) o Por app (las apps que las usan). Cada base de datos se abre en su propia pestaña, así que puedes poner varias una al lado de otra, y la pantalla sigue abierta en segundo plano y aparece en el cajón de aplicaciones.
+
+Su propósito principal es mirar por debajo de una app. Cuando cambias el modelo de datos de una app —renombras un campo, divides un tipo de documento, migras documentos antiguos—, Inspeccionar bases de datos te muestra cómo son de verdad los documentos guardados, antes y después, en todas las bases de datos con las que trabaja la app. También es donde compruebas qué trajo una sincronización, o qué escribió realmente un cambio automático o un agente de IA.
+
+No está pensada para usuarios finales, y por eso las bases de datos ya no aparecen como teselas en el espacio de trabajo. Inspeccionar bases de datos trabaja sobre los documentos sin procesar, por debajo de todas las reglas que impone una app: una edición hecha aquí no se comprueba contra el modelo de datos de la app, y eliminar, purgar o importar documentos pasa por completo por encima de la app. Un campo con el tipo equivocado, una referencia rota o un documento que falta pueden dejar datos que la app ya no entiende, y como cada cambio se sincroniza, el daño llega a todos los miembros del tenant. Mira todo lo que quieras; cambia algo solo cuando conozcas el modelo de datos de la app, y preferiblemente en un tenant de pruebas.
+
+Cada pestaña es un Explorador de bases de datos para una base de datos. Es donde listas documentos, recorres el historial, comparas dos revisiones cualesquiera en paralelo y editas la vigente. Es la pantalla más útil cuando estás depurando datos, comprobando qué cambió o sacando un adjunto de una revisión concreta.
 
 La lista de documentos tiene tres modos: Todos, Existentes y Eliminados. La caja de filtro acepta un solo ID, IDs separados por comas o un ID por línea, lo que resulta práctico cuando tienes una lista de IDs de un compañero o de un script. Cada fila muestra la revisión actual más un pequeño distintivo para los documentos que aún tienen historial abierto.
 
@@ -576,7 +582,7 @@ Punto final — la dirección a la que se llama a un dispositivo para la sincron
 
 Iroh — la red que usa Haven cuando no hay ninguna dirección alcanzable a la que conectarse. Transporta la sincronización entre pares entre dos dispositivos, y puede transportar también la sincronización cliente-servidor corriente hacia un servidor MindooDB que se haya unido a ella: uno detrás de un router con NAT, por ejemplo, sin ningún puerto redirigido y sin certificado. Los dos extremos se encuentran a través de un relay, que ve que están hablando pero no lo que dicen.
 
-Escaneo rápido — el escáner de documentos integrado de Haven. Encuentra los bordes de una página, corrige la perspectiva y admite tantas páginas como necesites en un solo escaneo. Funciona por completo en la pestaña del navegador, sin conexión incluida. Entrega el resultado como archivo —un PDF de varias páginas, o un PNG o JPEG para una sola página— mediante una descarga o la hoja de compartición del sistema; adjuntar un escaneo a un documento se hace desde el Explorador de bases de datos o desde una app a través del App SDK.
+Escaneo rápido — el escáner de documentos integrado de Haven. Encuentra los bordes de una página, corrige la perspectiva y admite tantas páginas como necesites en un solo escaneo. Funciona por completo en la pestaña del navegador, sin conexión incluida. Entrega el resultado como archivo —un PDF de varias páginas, o un PNG o JPEG para una sola página— mediante una descarga o la hoja de compartición del sistema; adjuntar un escaneo a un documento lo hace una app a través del App SDK, o un desarrollador en Inspeccionar bases de datos.
 
 IndexedDB — la base de datos integrada del navegador. Haven guarda casi todo dentro de IndexedDB para poder funcionar sin conexión.
 
@@ -592,7 +598,7 @@ Base de datos protegida — una base de datos que Haven necesita para funcionar 
 
 Inicio — la primera pestaña fija del espacio de trabajo. Lleva las seis teselas de acceso rápido de Haven y una tesela por aplicación instalada. No se puede reordenar; tus propias teselas van en las páginas de al lado.
 
-Tesela — una tarjeta que se puede arrastrar y redimensionar en la cuadrícula del espacio de trabajo. Cada tesela contiene una base de datos, una aplicación, una nota, una página web incrustada, un vídeo o un diagrama. También se la llama chicklet.
+Tesela — una tarjeta que se puede arrastrar y redimensionar en la cuadrícula del espacio de trabajo. Cada tesela contiene una aplicación, una nota, una página web incrustada, un vídeo o un diagrama. También se la llama chicklet.
 
 Página — una pestaña del espacio de trabajo que contiene su propia cuadrícula de teselas. Usa varias páginas como las pantallas de inicio de un teléfono.
 
@@ -601,6 +607,8 @@ Grupo — un contenedor visual que reúne teselas relacionadas bajo una cabecera
 Cajón de aplicaciones — el panel que hay detrás del tirador con la flecha en la parte de arriba del área de contenido. Lista las pantallas de Haven que tienes abiertas y las aplicaciones que se están ejecutando, con una vía de vuelta al espacio de trabajo sobre ambas. Cmd+Shift+Space lo abre y Cmd+Shift+Enter vuelve al espacio de trabajo; en Windows y Linux pulsa Ctrl en lugar de Cmd.
 
 Base de datos — un conjunto de documentos relacionados dentro de un tenant. Un tenant puede tener muchas bases de datos (por ejemplo contactos, facturas, notas).
+
+Inspeccionar bases de datos — la herramienta para desarrolladores en Añadir... del espacio de trabajo que muestra los documentos sin procesar de todas las bases de datos que usan tus apps, una pestaña por base de datos. No está pensada para usuarios finales: los cambios hechos allí se saltan las reglas de las propias apps.
 
 Base de datos de directorio — una base de datos especial y protegida que hay en cada tenant y que guarda los registros de usuario y los ajustes de todo el tenant.
 

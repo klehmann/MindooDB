@@ -38,7 +38,7 @@ Un KeyBag est un magasin local et chiffré des clés de chiffrement dont un tena
 
 Une vue virtuelle est une arborescence de type tableur qui filtre, catégorise, trie et totalise des documents. Une vue peut puiser dans une base de données, dans plusieurs bases de données, voire dans plusieurs tenants : c'est ainsi que vous répondez à des questions qui traversent vos données au lieu de rester à l'intérieur d'une seule base.
 
-L'espace de travail est fait de tuiles posées sur des pages, regroupées en groupes. Une tuile — parfois appelée chicklet — est une carte déplaçable et redimensionnable qui ouvre une base de données, lance une application ou affiche une note, une page web, une vidéo ou un diagramme. Une page est un onglet rempli de tuiles. Un groupe rassemble des tuiles apparentées sous un en-tête commun, identifié par une couleur.
+L'espace de travail est fait de tuiles posées sur des pages, regroupées en groupes. Une tuile — parfois appelée chicklet — est une carte déplaçable et redimensionnable qui lance une application ou affiche une note, une page web, une vidéo ou un diagramme. Une page est un onglet rempli de tuiles. Un groupe rassemble des tuiles apparentées sous un en-tête commun, identifié par une couleur.
 
 Un enregistrement d'application est la définition d'une app MindooDB telle que Haven la conserve : où elle se trouve, comment elle s'exécute, et quelles bases de données ou quelles vues elle a le droit de voir. Quand une app démarre, elle dialogue avec Haven à travers un pont (parfois appelé connecteur d'application), le canal sécurisé qui permet à Haven de faire respecter les autorisations que vous avez accordées. Le bac à sable est l'isolation imposée par le navigateur, qui empêche une app d'atteindre le stockage de Haven, ses cookies ou les autres apps.
 
@@ -98,7 +98,7 @@ Si un collègue a déjà mis en place un tenant sur un serveur MindooDB, appuyez
 
 Une fois l'assistant de bienvenue terminé, le parcours quotidien est le même quel que soit le chemin emprunté.
 
-Ouvrez l'espace de travail. Accueil a déjà ses six tuiles de raccourci ; ce qu'il n'a pas encore, c'est quoi que ce soit qui vous appartienne. Ajoutez une page à côté d'Accueil depuis le menu Ajouter, puis utilisez le même menu pour y poser une tuile de base de données pointant vers l'une des bases de données de votre tenant. Double-cliquez sur la tuile pour ouvrir le navigateur de bases de données et voir ses documents.
+Ouvrez l'espace de travail. Accueil a déjà ses six tuiles de raccourci ; ce qu'il n'a pas encore, c'est quoi que ce soit qui vous appartienne. Ajoutez une page à côté d'Accueil depuis le menu Ajouter, puis utilisez le même menu pour y poser une première tuile à vous — une note, une page web ou une application que vous avez installée.
 
 Installez une app. Ouvrez le Haven App Store depuis Accueil, choisissez quelque chose qui vous semble utile et installez-le. L'app apparaît aussitôt sous forme de tuile sur Accueil, et vous pouvez la placer de là sur l'une de vos propres pages.
 
@@ -154,7 +154,7 @@ Les contacts de récupération offrent un second chemin de retour quand tous les
 
 ## Espace de travail
 
-L'espace de travail est votre foyer quotidien. Vous y disposez bases de données, applications, notes, pages web, vidéos et diagrammes sous forme de tuiles déplaçables réparties sur plusieurs pages, comme les écrans d'accueil d'un téléphone. La disposition est personnelle : par défaut elle n'est stockée que dans ce navigateur, elle se charge donc instantanément et fonctionne hors ligne. Si vous voulez la même disposition sur vos autres appareils, le réglage Espace de travail itinérant sous Préférences → Général l'enregistre dans votre tenant, chiffrée pour vous seul.
+L'espace de travail est votre foyer quotidien. Vous y disposez applications, notes, pages web, vidéos et diagrammes sous forme de tuiles déplaçables réparties sur plusieurs pages, comme les écrans d'accueil d'un téléphone. La disposition est personnelle : par défaut elle n'est stockée que dans ce navigateur, elle se charge donc instantanément et fonctionne hors ligne. Si vous voulez la même disposition sur vos autres appareils, le réglage Espace de travail itinérant sous Préférences → Général l'enregistre dans votre tenant, chiffrée pour vous seul.
 
 Les pages sont les onglets en haut de l'espace de travail. La première est toujours Accueil, décrite sous Se repérer dans Haven : les six raccourcis propres à Haven, plus une tuile pour chaque application installée. Accueil est en lecture seule : vous ne pouvez pas y déposer vos propres tuiles ni réorganiser ce qui s'y trouve, et c'est la seule page qui a toujours la même allure.
 
@@ -162,17 +162,17 @@ Tout le reste vous appartient. Ajoutez autant de pages que vous voulez à côté
 
 Les tuiles sont les cartes posées sur la grille. Faites glisser une tuile par son en-tête pour la déplacer, tirez sur son coin pour la redimensionner, ou faites un clic droit pour ouvrir le menu contextuel complet. Déposez une tuile sur l'onglet d'une autre page pour l'y déplacer. Déposez une tuile sur une autre tuile pour créer un groupe.
 
-Les groupes rassemblent des tuiles apparentées sous un en-tête commun, identifié par une couleur. Un groupe est un excellent moyen de garder visuellement ensemble les tuiles d'un même projet — par exemple la base de données, l'application en cours d'exécution et une note de référence pour la même équipe. Un clic droit sur l'en-tête du groupe permet de le renommer, de changer sa couleur ou de dégrouper les tuiles pour en refaire des cartes ordinaires.
+Les groupes rassemblent des tuiles apparentées sous un en-tête commun, identifié par une couleur. Un groupe est un excellent moyen de garder visuellement ensemble les tuiles d'un même projet — par exemple l'application en cours d'exécution, une page web avec laquelle elle travaille et une note de référence pour la même équipe. Un clic droit sur l'en-tête du groupe permet de le renommer, de changer sa couleur ou de dégrouper les tuiles pour en refaire des cartes ordinaires.
 
 Plusieurs sortes de tuiles cohabitent sur la même grille.
-
-Une tuile de base de données pointe vers une base de données MindooDB. Double-cliquez dessus pour ouvrir le navigateur de bases de données. Le menu contextuel permet de changer la copie de la base que la tuile affiche — une réplique locale pour la vitesse et le hors-ligne, ou une cible serveur en direct pour l'état le plus frais. Les tuiles de base de données retiennent le tenant, la base de données et la source utilisée en dernier : ce sont donc aussi de commodes signets vers le reste de MindooDB.
 
 Une tuile d'application lance une app MindooDB, et deux réglages distincts décident de son comportement. Le Mode d'affichage propre à la tuile est soit Lanceur, une carte sur laquelle vous double-cliquez, soit Intégrée, qui exécute l'app directement dans la carte de l'espace de travail — parfait pour de petits outils que l'on consulte d'un coup d'œil, comme un formulaire de saisie ou un mini tableau de bord. Le Mode d'exécution de l'enregistrement décide ensuite de ce que fait réellement un lancement : Intégrer dans Haven ouvre l'app sur toute la largeur à l'intérieur de la fenêtre Haven, où le tiroir d'applications gère la bascule, tandis qu'Ouvrir dans une nouvelle fenêtre lui donne un onglet de navigateur autonome — utile pour un second écran, ou pour lire Haven et l'app côte à côte. Les apps ouvertes à l'intérieur de Haven continuent de tourner en arrière-plan pendant que vous naviguez ailleurs : leur position de défilement, leurs modifications non enregistrées et leurs onglets ouverts sont encore là quand vous y revenez.
 
 Les tuiles de texte contiennent des notes mises en forme. Les tuiles web intègrent n'importe quelle URL sous forme de mini-navigateur, ce qui permet de garder un système partenaire ou le tableau de bord d'une autre équipe à côté des données MindooDB qu'il documente. Les tuiles vidéo lisent du contenu YouTube pour les tutoriels et les démonstrations. Les tuiles Mermaid affichent en direct des diagrammes d'architecture et des organigrammes, à même la grille. Ces tuiles de contenu sont personnelles — elles ne vivent que dans ce navigateur — ce qui en fait un choix idéal pour les aide-mémoire, les liens du jour et la documentation de référence vivante.
 
-Une barre de recherche en haut de l'espace de travail filtre les tuiles de toutes les pages par nom, base de données, tenant, étiquette ou serveur. Sur Accueil, vous pouvez aussi trier ce qui y est listé par dernière utilisation, par tenant ou par ordre alphabétique, ce qui devient la façon la plus rapide de retrouver quelque chose dès que vous avez installé plus d'une poignée d'applications.
+Il n'existe pas de tuile pour une base de données. Une base de données appartient aux applications qui l'utilisent, et c'est à travers elles que vous travaillez avec ses données. Les développeurs qui ont besoin de voir les documents bruts derrière une application ouvrent plutôt Ajouter... > Inspecter les bases de données, décrit plus bas sous Inspecter les bases de données (pour les développeurs).
+
+Une barre de recherche en haut de l'espace de travail filtre les tuiles de toutes les pages par nom, tenant, étiquette ou serveur. Sur Accueil, vous pouvez aussi trier ce qui y est listé par dernière utilisation, par tenant ou par ordre alphabétique, ce qui devient la façon la plus rapide de retrouver quelque chose dès que vous avez installé plus d'une poignée d'applications.
 
 ## Les applications et le Haven App Store
 
@@ -338,7 +338,7 @@ Un scan n'est pas forcément une feuille unique. Appuyez sur Ajouter une page et
 
 Tout cela se passe dans l'onglet du navigateur. Scan rapide fonctionne hors ligne, rien n'est téléversé vers un service pour traitement, et l'image ne quitte jamais l'appareil autrement que par le téléchargement ou le partage que vous choisissez vous-même.
 
-Ce que Scan rapide ne fait pas, c'est classer le résultat à votre place. Il a deux sorties — un bouton de téléchargement et la feuille de partage du système — et toutes deux vous remettent un fichier ; rien n'est écrit dans une base de données. Quand vous voulez que le scan atterrisse dans un document, lancez-le depuis ce qui possède ce document. Le navigateur de bases de données scanne directement sur le document que vous avez ouvert, et une application peut ouvrir le même scanner via l'App SDK et joindre le résultat à l'un de ses propres documents. C'est le même scanner et la même correction de perspective dans les trois cas ; seule la dernière étape diffère.
+Ce que Scan rapide ne fait pas, c'est classer le résultat à votre place. Il a deux sorties — un bouton de téléchargement et la feuille de partage du système — et toutes deux vous remettent un fichier ; rien n'est écrit dans une base de données. Quand vous voulez que le scan atterrisse dans un document, lancez-le depuis ce qui possède ce document. Une application peut ouvrir le même scanner via l'App SDK et joindre le résultat à l'un de ses propres documents, et les développeurs peuvent aussi scanner directement sur un document ouvert dans Inspecter les bases de données. C'est le même scanner et la même correction de perspective dans les trois cas ; seule la dernière étape diffère.
 
 ## Vues virtuelles
 
@@ -356,9 +356,15 @@ Parce qu'une vue peut couvrir des millions de lignes, Haven l'indexe localement 
 
 Dans l'arborescence des résultats, vous pouvez déplier les catégories, entrer dans les documents et utiliser les cases à cocher pour constituer une sélection. Sélectionner une catégorie sélectionne implicitement tous les documents descendants visibles sous elle. Exporter en .xlsx produit un véritable classeur .xlsx : il conserve les lignes de catégorie correspondantes au-dessus des documents sélectionnés et inclut à la fois les métadonnées de source et les colonnes calculées de la vue, de sorte que vous pouvez remettre le fichier tel quel à un outil extérieur à MindooDB.
 
-## Navigateur de bases de données et Explorateur DAG
+## Inspecter les bases de données (pour les développeurs)
 
-Le navigateur de bases de données sert à fouiller une base de données précise. C'est là que vous listez les documents, parcourez l'historique, comparez deux révisions côte à côte et modifiez la révision vivante. C'est l'écran le plus utile quand vous déboguez des données, vérifiez ce qui a changé ou extrayez une pièce jointe d'une révision particulière.
+Inspecter les bases de données est un outil pour les développeurs. Vous l'ouvrez depuis l'espace de travail par Ajouter... > Inspecter les bases de données. Il rassemble au même endroit toutes les bases de données qu'utilisent vos applications — sur cet appareil et sur les serveurs avec lesquels vous synchronisez — et les liste Par emplacement (cet appareil ou un serveur, puis le tenant) ou Par app (les applications qui les utilisent). Chaque base de données s'ouvre dans son propre onglet, ce qui permet d'en placer plusieurs côte à côte, et l'écran continue de tourner en arrière-plan et apparaît dans le tiroir d'applications.
+
+Son usage principal est de regarder sous une application. Quand vous modifiez le modèle de données d'une application — renommer un champ, scinder un type de document, migrer d'anciens documents —, Inspecter les bases de données vous montre à quoi ressemblent vraiment les documents stockés, avant et après, dans toutes les bases de données avec lesquelles l'application travaille. C'est aussi là que vous vérifiez ce qu'une synchronisation a apporté, ou ce qu'une modification automatique ou un agent IA a réellement écrit.
+
+Il n'est pas destiné aux utilisateurs finaux, et c'est pourquoi les bases de données n'apparaissent plus comme tuiles dans l'espace de travail. Inspecter les bases de données travaille sur les documents bruts, en dessous de toutes les règles qu'une application impose : une modification faite ici n'est pas vérifiée par rapport au modèle de données de l'application, et supprimer, purger ou importer des documents contourne entièrement l'application. Un champ du mauvais type, une référence cassée ou un document manquant peuvent laisser des données que l'application ne comprend plus, et comme chaque modification se synchronise, les dégâts atteignent tous les membres du tenant. Regardez autant que vous voulez ; ne modifiez rien sans connaître le modèle de données de l'application, et de préférence dans un tenant de test.
+
+Chaque onglet est un navigateur de bases de données pour une base de données. C'est là que vous listez les documents, parcourez l'historique, comparez deux révisions côte à côte et modifiez la révision vivante. C'est l'écran le plus utile quand vous déboguez des données, vérifiez ce qui a changé ou extrayez une pièce jointe d'une révision particulière.
 
 La liste des documents a trois modes : Tous, Existants et Supprimés. Le champ de filtre accepte un ID unique, des ID séparés par des virgules ou un ID par ligne, ce qui est pratique quand vous avez une liste d'ID fournie par un collègue ou par un script. Chaque ligne indique la révision actuelle, plus un petit badge pour les documents dont l'historique est encore ouvert.
 
@@ -576,7 +582,7 @@ Point de terminaison — l'adresse à laquelle un appareil est appelé pour la s
 
 Iroh — le réseau qu'utilise Haven quand il n'y a aucune adresse joignable à contacter. Il transporte la synchronisation pair-à-pair entre deux appareils, et il peut aussi transporter une synchronisation client-serveur ordinaire vers un serveur MindooDB qui l'a rejoint — un serveur derrière un routeur NAT, par exemple, sans port redirigé ni certificat. Les deux bouts se rejoignent via un relais, qui voit qu'ils se parlent mais pas ce qu'ils se disent.
 
-Scan rapide — le scanner de documents intégré à Haven. Il repère les bords d'une page, corrige la perspective, et regroupe autant de pages que nécessaire dans un seul scan. Il fonctionne entièrement dans l'onglet du navigateur, y compris hors ligne. Il remet le résultat sous forme de fichier — un PDF multipage, ou un PNG ou un JPEG pour une page unique — via un téléchargement ou la feuille de partage du système ; joindre un scan à un document se fait depuis le navigateur de bases de données ou par une app via l'App SDK.
+Scan rapide — le scanner de documents intégré à Haven. Il repère les bords d'une page, corrige la perspective, et regroupe autant de pages que nécessaire dans un seul scan. Il fonctionne entièrement dans l'onglet du navigateur, y compris hors ligne. Il remet le résultat sous forme de fichier — un PDF multipage, ou un PNG ou un JPEG pour une page unique — via un téléchargement ou la feuille de partage du système ; joindre un scan à un document se fait par une app via l'App SDK, ou par un développeur dans Inspecter les bases de données.
 
 IndexedDB — la base de données intégrée au navigateur. Haven y stocke presque tout, pour pouvoir fonctionner hors ligne.
 
@@ -592,7 +598,7 @@ Base de données protégée — une base de données dont Haven a besoin pour fo
 
 Accueil — le premier onglet, fixe, de l'espace de travail. Il porte les six tuiles de raccourci de Haven et une tuile par application installée. Il ne peut pas être réorganisé ; vos propres tuiles vont sur les pages voisines.
 
-Tuile — une carte déplaçable et redimensionnable sur la grille de l'espace de travail. Chaque tuile contient une base de données, une application, une note, une page web intégrée, une vidéo ou un diagramme. Aussi appelée chicklet.
+Tuile — une carte déplaçable et redimensionnable sur la grille de l'espace de travail. Chaque tuile contient une application, une note, une page web intégrée, une vidéo ou un diagramme. Aussi appelée chicklet.
 
 Page — un onglet de l'espace de travail qui contient sa propre grille de tuiles. Utilisez plusieurs pages comme les écrans d'accueil d'un smartphone.
 
@@ -601,6 +607,8 @@ Groupe — un conteneur visuel qui rassemble des tuiles apparentées sous un en-
 Tiroir d'applications — le panneau caché derrière la poignée en forme de flèche en haut de la zone de contenu. Il liste les écrans de Haven que vous avez ouverts et les applications en cours d'exécution, avec un retour vers l'espace de travail au-dessus des deux. Cmd+Shift+Space l'ouvre et Cmd+Shift+Enter ramène à l'espace de travail ; appuyez sur Ctrl au lieu de Cmd sous Windows et Linux.
 
 Base de données — un ensemble de documents apparentés à l'intérieur d'un tenant. Un tenant peut avoir de nombreuses bases de données (par exemple contacts, factures, notes).
+
+Inspecter les bases de données — l'outil pour développeurs sous Ajouter... dans l'espace de travail, qui montre les documents bruts de toutes les bases de données qu'utilisent vos applications, un onglet par base de données. Pas destiné aux utilisateurs finaux : les modifications faites là contournent les règles propres des applications.
 
 Base de données d'annuaire — une base de données protégée particulière, présente dans chaque tenant, qui stocke les enregistrements d'utilisateurs et les réglages valables pour tout le tenant.
 
