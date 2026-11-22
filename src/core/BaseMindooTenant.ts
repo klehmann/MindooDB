@@ -1901,9 +1901,17 @@ export class BaseMindooTenant implements MindooTenant {
       ? { ...options, adminOnlyDb: true }
       : options ?? {};
     const normalizedTimeTravelDate = this.normalizeTimeTravelDate(effectiveOptions.timeTravelDate);
-    const databaseCacheKey = normalizedTimeTravelDate == null
-      ? validDbId
-      : `${validDbId}::tt:${normalizedTimeTravelDate}`;
+    const ephemeral = effectiveOptions.ephemeral === true;
+    if (ephemeral && (normalizedTimeTravelDate != null || validDbId === DIRECTORY_DB_ID)) {
+      throw new Error("ephemeral opens are not available for time travel or the directory");
+    }
+    // An ephemeral instance never shares the live one: it has its own
+    // (in-memory) stores and is closed on its own (closeEphemeralDB).
+    const databaseCacheKey = ephemeral
+      ? BaseMindooTenant.ephemeralCacheKey(validDbId)
+      : normalizedTimeTravelDate == null
+        ? validDbId
+        : `${validDbId}::tt:${normalizedTimeTravelDate}`;
 
     await this.assertCurrentUserCanOpenDB(validDbId);
 
@@ -1969,7 +1977,7 @@ export class BaseMindooTenant implements MindooTenant {
     
     // Snapshot opens can share an already-open live store instance. This keeps
     // in-memory factories usable while the snapshot DB maintains isolated state.
-    const liveDbForSnapshot = normalizedTimeTravelDate == null
+    const liveDbForSnapshot = normalizedTimeTravelDate == null || storeOptions.ephemeral === true
       ? null
       : this.databaseCache.get(validDbId);
     const { docStore, attachmentStore } = liveDbForSnapshot
@@ -1997,8 +2005,10 @@ export class BaseMindooTenant implements MindooTenant {
     // `persistTimeTravelCache` — the snapshot then writes under a
     // cutoff-scoped prefix (see BaseMindooDB.computeCachePrefix) and the
     // caller owns the lifecycle via `purgeTimeTravelCache`.
+    // An ephemeral database persists nothing, derived state included.
     const attachCacheManager =
-      normalizedTimeTravelDate == null || persistTimeTravelCache === true;
+      storeOptions.ephemeral !== true &&
+      (normalizedTimeTravelDate == null || persistTimeTravelCache === true);
     if (this.cacheManager && attachCacheManager) {
       db.setCacheManager(this.cacheManager);
     }
@@ -2014,6 +2024,30 @@ export class BaseMindooTenant implements MindooTenant {
     // Cache the database for future use
     this.databaseCache.set(databaseCacheKey, db);
     return db;
+  }
+
+  private static ephemeralCacheKey(dbId: string): string {
+    return `${dbId}::ephemeral`;
+  }
+
+  async closeEphemeralDB(id: string): Promise<boolean> {
+    const validDbId = validateDatabaseId(id, "dbId");
+    const key = BaseMindooTenant.ephemeralCacheKey(validDbId);
+    const inFlight = this.databaseOpenInFlight.get(key);
+    if (inFlight) {
+      await inFlight.catch(() => undefined);
+    }
+    const db = this.databaseCache.get(key);
+    if (!db) {
+      return false;
+    }
+    // Gone from the cache first, so no new caller picks up the closing instance.
+    this.databaseCache.delete(key);
+    const idle = (db as { whenBackgroundIdle?: () => Promise<boolean> }).whenBackgroundIdle;
+    if (idle) {
+      await idle.call(db);
+    }
+    return true;
   }
 
   /**

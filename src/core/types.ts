@@ -1145,6 +1145,15 @@ export interface MindooTenant {
   openDB(id: string, options?: OpenDBOptions): Promise<MindooDB>;
 
   /**
+   * Closes a database opened with `ephemeral: true` (see
+   * {@link OpenStoreOptions.ephemeral}): waits for its background work, then
+   * drops the instance, so its in-memory stores can be garbage collected.
+   * The next ephemeral open of `id` starts empty. Returns false when no
+   * ephemeral instance of `id` was open. Optional.
+   */
+  closeEphemeralDB?(id: string): Promise<boolean>;
+
+  /**
    * Ids of the documents that admin-signed purge requests in the tenant
    * directory removed from database `dbId` (docs/accesscontrol.md §13), as
    * known to the local directory replica. `MindooDB.pullChangesFrom` refuses
