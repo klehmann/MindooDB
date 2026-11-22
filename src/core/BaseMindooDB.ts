@@ -7085,7 +7085,7 @@ export class BaseMindooDB implements MindooDB {
    */
   private async ingestSealed(
     keyId: string,
-    entries: Array<{ recipients?: EntryRecipients; createdAt: number }>,
+    entries: Array<{ recipients?: EntryRecipients; createdAt: number; entryType?: string }>,
   ): Promise<void> {
     if (!this.tenant.ingestSealedFromEntries) return;
     const hadKey = isSealedKeyId(keyId) ? await this.tenant.hasDecryptionKey(keyId) : false;

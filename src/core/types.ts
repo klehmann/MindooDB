@@ -1247,7 +1247,7 @@ export interface MindooTenant {
   openSealedValue?(sealed: import("./userkeys/sealedValues").SealedValue): Promise<Uint8Array | null>;
   ingestSealedFromEntries?(
     keyId: string,
-    entries: Array<{ recipients?: import("./userkeys/sealedTypes").EntryRecipients; createdAt: number }>,
+    entries: Array<{ recipients?: import("./userkeys/sealedTypes").EntryRecipients; createdAt: number; entryType?: string }>,
     options?: { complete?: boolean },
   ): Promise<void>;
 

@@ -53,6 +53,13 @@ import {
   type SealedValue,
 } from "./userkeys/sealedValues";
 import { openBundleRange } from "./userkeys/sealedCrypto";
+
+/** Compare form of raw key bytes. */
+function bytesKey(bytes: Uint8Array): string {
+  let out = "";
+  for (const byte of bytes) out += byte.toString(16).padStart(2, "0");
+  return out;
+}
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
 import { MindooDocSigner } from "./crypto/MindooDocSigner";
 import { RSAEncryption } from "./crypto/RSAEncryption";
@@ -189,6 +196,14 @@ export class BaseMindooTenant implements MindooTenant {
   private readonly sealedDeep = new Map<string, string>();
   /** Per sealed key id: older recipient blocks already tried. */
   private readonly sealedExplored = new Map<string, Set<string>>();
+  /**
+   * Per sealed key id: keys of extra `doc_create` entries (bundle -> keys).
+   * Two replicas (or two concurrent writers on one) that create the same id
+   * with `assumeUniqueId` each seal their own document key; both creates stay
+   * in the document, so both keys are needed to read it
+   * (see {@link ingestForkedSealedCreates}).
+   */
+  private readonly sealedForkKeys = new Map<string, Map<string, Uint8Array[]>>();
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -790,6 +805,7 @@ export class BaseMindooTenant implements MindooTenant {
     this.sealedBlocks.delete(keyId);
     this.sealedDeep.delete(keyId);
     this.sealedExplored.delete(keyId);
+    this.sealedForkKeys.delete(keyId);
   }
 
   /**
@@ -842,7 +858,7 @@ export class BaseMindooTenant implements MindooTenant {
    */
   async ingestSealedFromEntries(
     keyId: string,
-    entries: Array<{ recipients?: EntryRecipients; createdAt: number }>,
+    entries: Array<{ recipients?: EntryRecipients; createdAt: number; entryType?: string }>,
     options?: { complete?: boolean },
   ): Promise<void> {
     if (!isSealedKeyId(keyId)) return;
@@ -875,6 +891,49 @@ export class BaseMindooTenant implements MindooTenant {
     if (options?.complete) {
       const block = this.sealedBlocks.get(keyId);
       if (block) this.sealedDeep.set(keyId, block);
+    }
+    await this.ingestForkedSealedCreates(keyId, entries);
+  }
+
+  /**
+   * A sealed document normally has one `doc_create`. Creating the same id
+   * twice with `assumeUniqueId` (two devices, or two concurrent writers)
+   * leaves two creates, each sealed with its own document key, and the series
+   * holds only one of them: the other create could not be decrypted and every
+   * load of the document (and every query of its database) failed. The keys
+   * of such a create are opened from its own recipient block and kept as
+   * extra decryption candidates; they never change the series or membership.
+   * Only creates whose block is not the series' newest are opened, once each.
+   */
+  private async ingestForkedSealedCreates(
+    keyId: string,
+    entries: Array<{ recipients?: EntryRecipients; createdAt: number; entryType?: string }>,
+  ): Promise<void> {
+    if (!this.sealedGenerations.get(keyId)?.length) return;
+    const current = this.sealedBlocks.get(keyId);
+    const known = this.sealedForkKeys.get(keyId);
+    const creates = entries.filter(
+      (entry): entry is { recipients: EntryRecipients; createdAt: number; entryType?: string } =>
+        entry.entryType === "doc_create" &&
+        !!entry.recipients &&
+        hasRecipientWraps(entry.recipients) &&
+        entry.recipients.bundle !== current &&
+        !known?.has(entry.recipients.bundle),
+    );
+    if (creates.length === 0) return;
+    const keys = await this.sealedUnwrapKeys();
+    if (keys.length === 0) return;
+    const held = new Set(this.getSealedGenerations(keyId).map((key) => bytesKey(key)));
+    for (const entry of creates) {
+      const range = await this.openSealedBlock(entry.recipients, keys);
+      const extra = (range ?? []).map((item) => item.key).filter((key) => !held.has(bytesKey(key)));
+      let map = this.sealedForkKeys.get(keyId);
+      if (!map) {
+        map = new Map();
+        this.sealedForkKeys.set(keyId, map);
+      }
+      // Also remembered when nothing new came out: not opened again.
+      map.set(entry.recipients.bundle, extra);
     }
   }
 
@@ -1235,7 +1294,10 @@ export class BaseMindooTenant implements MindooTenant {
    */
   private async getDecryptionKeyCandidates(decryptionKeyId: string): Promise<Uint8Array[]> {
     if (isSealedKeyId(decryptionKeyId)) {
-      return this.sealedGenerations.get(decryptionKeyId) ?? [];
+      const generations = this.sealedGenerations.get(decryptionKeyId) ?? [];
+      const forks = this.sealedForkKeys.get(decryptionKeyId);
+      if (!forks?.size || generations.length === 0) return generations;
+      return [...generations, ...[...forks.values()].flat()];
     }
     const id = decryptionKeyId === "default" ? DEFAULT_TENANT_KEY_ID : decryptionKeyId;
     const versions = await this.keyBag.getAllKeys("doc", this.tenantId, id);
