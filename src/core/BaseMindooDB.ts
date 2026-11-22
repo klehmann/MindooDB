@@ -1773,6 +1773,30 @@ export class BaseMindooDB implements MindooDB {
   }
 
   /**
+   * Detach this DB (and its summary, full-text and filing cacheables) from
+   * the CacheManager, flushing their pending state first, so a later open of
+   * the same database restores it. Used by `MindooTenant.closeDB`.
+   *
+   * @internal
+   */
+  async detachCacheManager(): Promise<void> {
+    const cacheManager = this.cacheManager;
+    if (!cacheManager) {
+      return;
+    }
+    const cacheables: ICacheable[] = [
+      this as unknown as ICacheable,
+      ...(this.summaryStore ? [this.summaryStore] : []),
+      ...(this.fulltextIndex ? [this.fulltextIndex] : []),
+      ...this.filingIndexes,
+    ];
+    for (const cacheable of cacheables) {
+      await cacheManager.deregister(cacheable);
+    }
+    this.cacheManager = null;
+  }
+
+  /**
    * Detach this DB (and its summary/full-text cacheables) from the
    * CacheManager WITHOUT flushing pending state. Used by the tenant's
    * time-travel cache purge: the persisted records are about to be

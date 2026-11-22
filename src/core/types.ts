@@ -1145,6 +1145,24 @@ export interface MindooTenant {
   openDB(id: string, options?: OpenDBOptions): Promise<MindooDB>;
 
   /**
+   * Closes an open database: waits for its background work, drops the
+   * instance from the tenant and, for a live database, flushes its cached
+   * state (document cache, summary, full-text and filing indexes) and
+   * detaches it from the CacheManager, so a later {@link openDB} restores it
+   * instead of rebuilding. With `ephemeral: true` it closes the instance an
+   * `openDB(id, { ephemeral: true })` returned (see
+   * {@link OpenStoreOptions.ephemeral}); its in-memory stores can then be
+   * garbage collected and the next ephemeral open starts empty.
+   *
+   * The closed instance must not be used afterwards; later opens return a
+   * new one. Time-travel instances are not affected (see
+   * `purgeTimeTravelCache`). The directory cannot be closed.
+   *
+   * @returns false when no such instance was open. Optional.
+   */
+  closeDB?(id: string, options?: CloseDBOptions): Promise<boolean>;
+
+  /**
    * Ids of the documents that admin-signed purge requests in the tenant
    * directory removed from database `dbId` (docs/accesscontrol.md §13), as
    * known to the local directory replica. `MindooDB.pullChangesFrom` refuses
@@ -4848,6 +4866,12 @@ export interface ChangeRevisionResult {
 /**
  * Options for opening a database
  */
+/** Options for {@link MindooTenant.closeDB}. */
+export interface CloseDBOptions {
+  /** Close the ephemeral instance of the database, not the live one. */
+  ephemeral?: boolean;
+}
+
 export interface OpenDBOptions extends OpenStoreOptions {
   /**
    * If true, only entries signed by the administration key will be loaded.
