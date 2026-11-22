@@ -1,5 +1,6 @@
 import type { MindooDB, ProcessChangesCursor } from "../types";
 import type { CacheManager, ICacheable } from "../cache/CacheManager";
+import { isPreEpochFeedCursor } from "../utils/feedCursor";
 import type { LocalCacheStore } from "../cache/LocalCacheStore";
 import { generateRandomUuid } from "../utils/idGeneration";
 import { formatFilingRef, physicalFilingRefKey, resolveFilingRef, type FilingRefBase } from "./refs";
@@ -768,6 +769,9 @@ export class FilingIndex implements ICacheable {
       this.logStartSeq = droppedSeq;
     }
     this.clearPending();
+    // Rescan once: the cursors may belong to an older numbering of the feed.
+    if (isPreEpochFeedCursor(this.cursor)) this.cursor = null;
+    if (isPreEpochFeedCursor(this.targetCursor)) this.targetCursor = null;
 
     // A previous run may have handed out seqs after this persisted state
     // (and views may have consumed them): jump past them.

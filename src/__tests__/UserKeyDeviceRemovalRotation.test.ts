@@ -199,7 +199,8 @@ describe("userkey device removal and rotation", () => {
         .spyOn(manager as unknown as { privateKeyBytesForEpoch: () => Promise<null> }, "privateKeyBytesForEpoch")
         .mockResolvedValue(null);
       try {
-        await manager.getUserKeyCryptoKeysForReconcile();
+        // Uncached: the keys of the call above are reused otherwise.
+        await manager.getUserKeyCryptoKeysForReconcile({ fresh: true });
       } finally {
         noEpoch.mockRestore();
       }

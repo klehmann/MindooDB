@@ -1,5 +1,6 @@
 import type { IterateChangesOptions, MindooDB, ProcessChangesCursor } from "../../types";
 import type { LocalCacheStore } from "../../cache/LocalCacheStore";
+import { isPreEpochFeedCursor } from "../../utils/feedCursor";
 import type { CacheManager, ICacheable } from "../../cache/CacheManager";
 import type { VirtualViewUpdateOptions } from "../virtualviews/IVirtualViewDataProvider";
 import type {
@@ -969,6 +970,10 @@ export class DocumentSummaryStore implements ICacheable {
     this.ownSnapshot = false;
 
     this.cursor = meta.cursor ?? null;
+    // Rescan once: the cursor may belong to an older numbering of the feed.
+    if (isPreEpochFeedCursor(this.cursor)) {
+      this.cursor = null;
+    }
     if (typeof meta.generation === "string" && typeof meta.updateSeq === "number") {
       this.generation = meta.generation;
       this.updateSeq = meta.updateSeq;

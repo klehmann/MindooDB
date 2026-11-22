@@ -76,6 +76,11 @@ export class UserKeyManager {
   private decryptedSelfGrantBytes: Uint8Array | null = null;
   private seededSelfGrantBytes: Uint8Array | null = null;
   private resolvingSelfGrantWrap = false;
+  /**
+   * Result of {@link getUserKeyCryptoKeysForReconcile}, reused while nothing
+   * it depends on moved (see {@link reconcileKeysStamp}).
+   */
+  private reconcileKeysCache: { stamp: ReconcileKeysStamp; keys: CryptoKey[] } | null = null;
 
   constructor(private readonly tenant: BaseMindooTenant) {}
 
@@ -959,7 +964,63 @@ export class UserKeyManager {
    * All epochs this device can open, newest first. Used by key-distribution
    * reconcile so wraps addressed to a retired fingerprint still import.
    */
-  async getUserKeyCryptoKeysForReconcile(): Promise<CryptoKey[]> {
+  async getUserKeyCryptoKeysForReconcile(options?: { fresh?: boolean }): Promise<CryptoKey[]> {
+    // Every sealed document asks for these keys when it is opened. Resolving
+    // them reads the directory and the userkey document (one request each on
+    // a remote store) and imports an RSA key, so the result is kept until the
+    // directory, the user directory or this device's key material changed.
+    const stamp = await this.reconcileKeysStamp();
+    const cached = this.reconcileKeysCache;
+    if (!options?.fresh && cached && sameReconcileKeysStamp(cached.stamp, stamp)) {
+      return [...cached.keys];
+    }
+    const keys = await this.loadUserKeyCryptoKeysForReconcile();
+    // Read the stamp again: resolving may have pulled directory changes.
+    this.reconcileKeysCache = { stamp: await this.reconcileKeysStamp(), keys };
+    return [...keys];
+  }
+
+  /** Forget the cached reconcile keys (key material of this device changed). */
+  invalidateReconcileKeys(): void {
+    this.reconcileKeysCache = null;
+  }
+
+  /**
+   * What the reconcile keys depend on, read from local state only: whether the
+   * user directory may be used, the change positions of the directory and the
+   * user directory, and this device's decrypted User-Key bytes.
+   */
+  private async reconcileKeysStamp(): Promise<ReconcileKeysStamp> {
+    const canUseUserDirectory = this.canReconcileAgainstUserDirectory();
+    let userDirectorySeq: number | null = null;
+    let directorySeq: number | null = null;
+    if (canUseUserDirectory) {
+      try {
+        const db = await this.openUserDirectory();
+        userDirectorySeq = db.getLatestChangeCursor?.()?.changeSeq ?? null;
+      } catch {
+        userDirectorySeq = null;
+      }
+    }
+    // Only a directory that is already open: the stamp must never open it.
+    if (this.tenant.isDatabaseOpen?.("directory") === true) {
+      try {
+        const directoryDb = await (await this.directory()).getDirectoryDB();
+        directorySeq = directoryDb.getLatestChangeCursor?.()?.changeSeq ?? null;
+      } catch {
+        directorySeq = null;
+      }
+    }
+    return {
+      canUseUserDirectory,
+      userDirectorySeq,
+      directorySeq,
+      userKeyBytes: this.decryptedUserKeyBytes,
+      userKey: this.decryptedUserKeyCache,
+    };
+  }
+
+  private async loadUserKeyCryptoKeysForReconcile(): Promise<CryptoKey[]> {
     const keys: CryptoKey[] = [];
     const seen = new Set<string>();
     let usedPublishedDocument = false;
@@ -2245,3 +2306,20 @@ export class UserKeyManager {
   }
 }
 
+interface ReconcileKeysStamp {
+  canUseUserDirectory: boolean;
+  userDirectorySeq: number | null;
+  directorySeq: number | null;
+  userKeyBytes: Uint8Array | null;
+  userKey: CryptoKey | null;
+}
+
+function sameReconcileKeysStamp(a: ReconcileKeysStamp, b: ReconcileKeysStamp): boolean {
+  return (
+    a.canUseUserDirectory === b.canUseUserDirectory &&
+    a.userDirectorySeq === b.userDirectorySeq &&
+    a.directorySeq === b.directorySeq &&
+    a.userKeyBytes === b.userKeyBytes &&
+    a.userKey === b.userKey
+  );
+}

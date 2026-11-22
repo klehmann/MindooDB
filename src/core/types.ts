@@ -4687,6 +4687,13 @@ export interface ProcessChangesCursor {
    */
   changeSeq?: number;
   /**
+   * Identity of the changefeed numbering `changeSeq` belongs to. A database
+   * whose index was rebuilt numbers its documents anew; a cursor of the old
+   * numbering is then read from the beginning instead of skipping documents.
+   * Absent on cursors written before epochs existed.
+   */
+  feedEpoch?: string;
+  /**
    * The timestamp of the last processed change (milliseconds since Unix epoch)
    * Legacy compatibility field. New code should use `changeSeq`.
    */
