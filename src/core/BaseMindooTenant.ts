@@ -111,6 +111,9 @@ import { namedExport } from "./utils/dynamicImportInterop";
  *   - RSA/ECDH encryption (for encrypting named symmetric keys map)
  *   - PBKDF2 key derivation (for password-based key derivation)
  */
+/** Least time between two uncached lookups of the sealed-block unwrap keys. */
+const FRESH_UNWRAP_KEYS_INTERVAL_MS = 30_000;
+
 export class BaseMindooTenant implements MindooTenant {
   private factory: MindooTenantFactory;
   private tenantId: string;
@@ -734,12 +737,27 @@ export class BaseMindooTenant implements MindooTenant {
     return this.sealedGenerations.get(keyId) ?? [];
   }
 
-  private async sealedUnwrapKeys(): Promise<CryptoKey[]> {
+  private async sealedUnwrapKeys(options?: { fresh?: boolean }): Promise<CryptoKey[]> {
+    if (options?.fresh) this.lastFreshSealedUnwrapKeysAt = Date.now();
     return [
-      ...(await this.userKeys.getUserKeyCryptoKeysForReconcile()),
+      ...(await this.userKeys.getUserKeyCryptoKeysForReconcile(options)),
       await this.getEncryptionPrivateKeyForReconcile(),
     ].filter((k): k is CryptoKey => !!k);
   }
+
+  /**
+   * The unwrap keys are cached (see `getUserKeyCryptoKeysForReconcile`). When
+   * a block does not open with them, the keys may be outdated (a User-Key
+   * epoch this replica has not pulled yet): resolve them once more, at most
+   * every {@link FRESH_UNWRAP_KEYS_INTERVAL_MS}, so blocks that are really not
+   * for us (other people's sealed documents) do not each pay the full lookup.
+   */
+  private async freshSealedUnwrapKeysIfDue(): Promise<CryptoKey[] | null> {
+    if (Date.now() - this.lastFreshSealedUnwrapKeysAt < FRESH_UNWRAP_KEYS_INTERVAL_MS) return null;
+    return this.sealedUnwrapKeys({ fresh: true });
+  }
+
+  private lastFreshSealedUnwrapKeysAt = 0;
 
   private async openSealedBlock(
     recipients: EntryRecipients,
@@ -792,7 +810,11 @@ export class BaseMindooTenant implements MindooTenant {
       // to read a document they just sealed.
       return;
     }
-    const range = await this.openSealedBlock(recipients, keys);
+    let range = await this.openSealedBlock(recipients, keys);
+    if (!range) {
+      const fresh = await this.freshSealedUnwrapKeysIfDue();
+      if (fresh?.length) range = await this.openSealedBlock(recipients, fresh);
+    }
     if (range) {
       this.mergeSealedSeries(keyId, range, true);
       this.sealedBlocks.set(keyId, recipients.bundle);
