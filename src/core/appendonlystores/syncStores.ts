@@ -652,7 +652,8 @@ export async function syncEntriesBetweenStores(
     // practice: one of the two stores is always local.
     const sourceHead = await getStoreHeadSafe(sourceStore, logger);
     if (sourceHead && sourceHead.maxReceiptOrder === 0) {
-      logger.info(`Sync skip: source store is empty (${cursorKey})`);
+      // Routine on every sync of an untouched store: DEBUG.
+      logger.debug(`Sync skip: source store is empty (${cursorKey})`);
       onProgress?.({
         phase: "preparing",
         message: "Source is empty, nothing to sync",
@@ -678,7 +679,7 @@ export async function syncEntriesBetweenStores(
         if (sourceHead.maxReceiptOrder <= persisted.cursor.receiptOrder) {
           cursorDecision = "skip";
           cursorReason = `source head ${sourceHead.maxReceiptOrder} already covered by cursor ${persisted.cursor.receiptOrder}`;
-          logger.info(`Sync ${cursorDecision}: ${cursorReason} (${cursorKey})`);
+          logger.debug(`Sync ${cursorDecision}: ${cursorReason} (${cursorKey})`);
           onProgress?.({
             phase: "preparing",
             message: "Source unchanged since last sync, nothing to scan",
