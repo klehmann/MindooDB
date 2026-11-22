@@ -46,7 +46,7 @@ export interface OpenStoreOptions {
    * out in-memory stores, and the tenant attaches no CacheManager. Used for
    * databases a device only writes into and pushes, never reads, such as a
    * recipient's mailbox for a deposit (docs/accesscontrol.md §6.10). Close the
-   * instance with `MindooTenant.closeEphemeralDB` when done.
+   * instance with `MindooTenant.closeDB(id, { ephemeral: true })` when done.
    */
   ephemeral?: boolean;
 

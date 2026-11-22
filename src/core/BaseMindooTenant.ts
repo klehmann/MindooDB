@@ -9,6 +9,7 @@ import {
   OpenStoreOptions,
   StoreKind,
   OpenDBOptions,
+  CloseDBOptions,
   MindooTenantFactory,
   MindooTenantDirectory,
   StoreEntryMetadata,
@@ -1906,7 +1907,7 @@ export class BaseMindooTenant implements MindooTenant {
       throw new Error("ephemeral opens are not available for time travel or the directory");
     }
     // An ephemeral instance never shares the live one: it has its own
-    // (in-memory) stores and is closed on its own (closeEphemeralDB).
+    // (in-memory) stores and is closed on its own (closeDB with ephemeral).
     const databaseCacheKey = ephemeral
       ? BaseMindooTenant.ephemeralCacheKey(validDbId)
       : normalizedTimeTravelDate == null
@@ -2030,9 +2031,13 @@ export class BaseMindooTenant implements MindooTenant {
     return `${dbId}::ephemeral`;
   }
 
-  async closeEphemeralDB(id: string): Promise<boolean> {
+  async closeDB(id: string, options?: CloseDBOptions): Promise<boolean> {
     const validDbId = validateDatabaseId(id, "dbId");
-    const key = BaseMindooTenant.ephemeralCacheKey(validDbId);
+    const ephemeral = options?.ephemeral === true;
+    if (!ephemeral && validDbId === DIRECTORY_DB_ID) {
+      throw new Error("The directory database cannot be closed");
+    }
+    const key = ephemeral ? BaseMindooTenant.ephemeralCacheKey(validDbId) : validDbId;
     const inFlight = this.databaseOpenInFlight.get(key);
     if (inFlight) {
       await inFlight.catch(() => undefined);
@@ -2046,6 +2051,11 @@ export class BaseMindooTenant implements MindooTenant {
     const idle = (db as { whenBackgroundIdle?: () => Promise<boolean> }).whenBackgroundIdle;
     if (idle) {
       await idle.call(db);
+    }
+    // A live database keeps its cached state for the next open (an ephemeral one has none).
+    const detach = (db as { detachCacheManager?: () => Promise<void> }).detachCacheManager;
+    if (detach) {
+      await detach.call(db);
     }
     return true;
   }

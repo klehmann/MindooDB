@@ -109,25 +109,52 @@ describe("ephemeral databases", () => {
     expect(await cacheRecordCount(cacheStore)).toBe(before);
   });
 
-  test("closeEphemeralDB drops the instance; the next open starts empty", async () => {
+  test("closeDB with ephemeral drops the instance; the next open starts empty", async () => {
     const { tenant } = await setup("ephemeral-close");
     const first = await tenant.openDB("mailbox", { ephemeral: true });
     await first.createDocument();
     expect(await tenant.openDB("mailbox", { ephemeral: true })).toBe(first);
 
-    expect(await tenant.closeEphemeralDB!("mailbox")).toBe(true);
-    expect(await tenant.closeEphemeralDB!("mailbox")).toBe(false);
+    expect(await tenant.closeDB!("mailbox", { ephemeral: true })).toBe(true);
+    expect(await tenant.closeDB!("mailbox", { ephemeral: true })).toBe(false);
 
     const second = await tenant.openDB("mailbox", { ephemeral: true });
     expect(second).not.toBe(first);
     expect(await second.getAllDocumentIds()).toEqual([]);
   });
 
-  test("closeEphemeralDB leaves the live database open", async () => {
+  test("closeDB with ephemeral leaves the live database open", async () => {
     const { tenant } = await setup("ephemeral-live");
     const live = await tenant.openDB("mailbox");
-    expect(await tenant.closeEphemeralDB!("mailbox")).toBe(false);
+    expect(await tenant.closeDB!("mailbox", { ephemeral: true })).toBe(false);
     expect(await tenant.openDB("mailbox")).toBe(live);
+  });
+
+  test("closeDB flushes a live database's cache and reopens it from there", async () => {
+    const { tenant, cacheStore } = await setup("close-live");
+    const live = await tenant.openDB("notes");
+    const ephemeral = await tenant.openDB("notes", { ephemeral: true });
+    const doc = await live.createDocument();
+    await live.changeDoc(doc, (d) => {
+      d.getData().title = "survives the close";
+    });
+    const before = await cacheRecordCount(cacheStore);
+
+    // No explicit flush: closing writes the pending cache state.
+    expect(await tenant.closeDB!("notes")).toBe(true);
+    expect(await cacheRecordCount(cacheStore)).toBeGreaterThan(before);
+    expect(await tenant.closeDB!("notes")).toBe(false);
+    // The ephemeral instance of the same id stays open.
+    expect(await tenant.openDB("notes", { ephemeral: true })).toBe(ephemeral);
+
+    const reopened = await tenant.openDB("notes");
+    expect(reopened).not.toBe(live);
+    expect((await reopened.getDocument(doc.getId())).getData().title).toBe("survives the close");
+  });
+
+  test("closeDB refuses the directory", async () => {
+    const { tenant } = await setup("close-directory");
+    await expect(tenant.closeDB!("directory")).rejects.toThrow(/directory/);
   });
 
   test("are refused for time travel and the directory", async () => {
