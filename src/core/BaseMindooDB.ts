@@ -4313,6 +4313,17 @@ export class BaseMindooDB implements MindooDB {
    * dirty so the new visibility state survives a process restart.
    */
   public async reconcileKeyVisibility(): Promise<void> {
+    await this.reconcileKeyVisibilityOf();
+  }
+
+  /**
+   * {@link reconcileKeyVisibility}, limited to the documents encrypted with one
+   * of `keyIds` when given. Each document of a sealed key series is checked by
+   * unwrapping its recipient block (an RSA decryption on a cold session), so a
+   * pass over every document of a large database costs seconds; a pass for a
+   * few changed key series only touches the documents that use them.
+   */
+  private async reconcileKeyVisibilityOf(keyIds?: ReadonlySet<string>): Promise<void> {
     if (this.isTimeTravelMode()) {
       return;
     }
@@ -4345,6 +4356,9 @@ export class BaseMindooDB implements MindooDB {
         metadataByDoc.get(docId)!,
       );
       if (!visibility) {
+        continue;
+      }
+      if (keyIds && !keyIds.has(visibility.decryptionKeyId)) {
         continue;
       }
 
@@ -4417,10 +4431,13 @@ export class BaseMindooDB implements MindooDB {
     // Whatever path triggered the reconcile (init, KeyBag listener,
     // explicit caller), record the fingerprint observed during this
     // pass so a subsequent warm start with identical bag composition
-    // can skip the scan.
-    this.markKeyBagFingerprintReconciled(
-      await this.computeCurrentKeyBagFingerprint(),
-    );
+    // can skip the scan. A pass limited to some key series did not
+    // look at the other documents, so it proves nothing about them.
+    if (!keyIds) {
+      this.markKeyBagFingerprintReconciled(
+        await this.computeCurrentKeyBagFingerprint(),
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -7201,15 +7218,22 @@ export class BaseMindooDB implements MindooDB {
 
   /**
    * After a pass that changed access to a key series (added to or removed from a
-   * group document), reveal or hide the documents that use it. Runs the full key
-   * visibility reconcile, which is rare enough: it only happens when this
-   * replica's membership in a group changed.
+   * group document), reveal or hide the documents that use it.
+   *
+   * Only the documents of the changed key series are reconciled. A fresh session
+   * starts with an empty sealed-key cache, so every sealed document in the
+   * open-time delta "gains" its key here; a reconcile of every document then
+   * unwrapped the recipient block of each sealed document in the database (one
+   * RSA decryption each), which made opening a database with thousands of
+   * per-document sealed documents (a mail store) take many seconds, again after
+   * almost every sync batch.
    */
   private async reconcileGroupKeyAccess(): Promise<void> {
     if (this.groupKeyAccessChanged.size === 0 || this.isTimeTravelMode()) return;
+    const keyIds = new Set(this.groupKeyAccessChanged);
     this.groupKeyAccessChanged.clear();
     this.groupKeyMisses.clear();
-    await this.reconcileKeyVisibility();
+    await this.reconcileKeyVisibilityOf(keyIds);
     this.groupKeyAccessChanged.clear();
   }
 
