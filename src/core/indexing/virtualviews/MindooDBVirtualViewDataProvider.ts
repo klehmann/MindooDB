@@ -1,5 +1,6 @@
 import type { IterateChangesOptions, MindooDB, MindooDoc, ProcessChangesCursor } from "../../types";
 import { matchesAnyDocIdPrefix, normalizeDocIdPrefixes, sameIdPrefixes } from "../../utils/idGeneration";
+import { isPreEpochFeedCursor } from "../../utils/feedCursor";
 import type { IVirtualViewDataProvider, VirtualViewUpdateOptions } from "./IVirtualViewDataProvider";
 import type { VirtualView } from "./VirtualView";
 import type { VirtualViewColumn } from "./VirtualViewColumn";
@@ -425,6 +426,10 @@ export class MindooDBVirtualViewDataProvider implements IVirtualViewDataProvider
       idPrefixes?: string[];
     };
     this.cursor = s.cursor ?? null;
+    // Rescan once: the cursor may belong to an older numbering of the feed.
+    if (isPreEpochFeedCursor(this.cursor)) {
+      this.cursor = null;
+    }
     if (s.knownDocIds) {
       this.knownDocIds = new Set(s.knownDocIds);
     }

@@ -674,6 +674,9 @@ function hasDocumentOrigin(metadata: readonly StoreEntryMetadata[]): boolean {
  * - Automerge.load(bytes) - verify method name for snapshots
  * - Automerge.applyChanges(doc, changes) - verify method signature
  */
+/** How far the changefeed numbering jumps when restored from a checkpoint. */
+const CHANGE_SEQ_RESTORE_JUMP = 2 ** 30;
+
 export class BaseMindooDB implements MindooDB {
   private tenant: BaseMindooTenant;
   private store: ContentAddressedStore;
@@ -735,6 +738,13 @@ export class BaseMindooDB implements MindooDB {
    */
   private indexLookupStaleFrom: number | null = null;
   private nextChangeSeq: number = 1;
+  /**
+   * Identity of this changefeed numbering. Cursors carry it (`feedEpoch`): a
+   * cursor of another numbering (the index was rebuilt from the store, or
+   * built without a checkpoint) cannot be compared by `changeSeq` and starts
+   * from the beginning instead of silently skipping documents.
+   */
+  private changeFeedEpoch: string = generateRandomUuid();
 
   // Cache of loaded documents: Map<docId, InternalDoc>
   private docCache: Map<string, InternalDoc> = new Map();
@@ -2728,6 +2738,7 @@ export class BaseMindooDB implements MindooDB {
       processedEntryCursor: this.processedEntryCursor,
       index: this.index,
       nextChangeSeq: this.nextChangeSeq,
+      changeFeedEpoch: this.changeFeedEpoch,
     };
 
     // Serialize automergeHashToEntryId: Map<string, Map<string,string>> -> nested object
@@ -2988,6 +2999,19 @@ export class BaseMindooDB implements MindooDB {
         this.nextChangeSeq =
           Math.max(...this.index.map((e) => e.changeSeq)) + 1;
       }
+      // A checkpoint without an epoch predates epochs: its cursors (held by
+      // views, summaries, filing indexes) cannot be trusted, give it a new one.
+      this.changeFeedEpoch =
+        typeof checkpoint.changeFeedEpoch === "string" && checkpoint.changeFeedEpoch
+          ? checkpoint.changeFeedEpoch
+          : generateRandomUuid();
+      // The previous process may have handed out sequence numbers after this
+      // checkpoint was written (and a view may have persisted a cursor past
+      // it, e.g. a tab closed between the view flush and this one). Never
+      // hand them out again: entries replayed from the store would otherwise
+      // get numbers at or below such a cursor and be skipped by it.
+      this.nextChangeSeq += CHANGE_SEQ_RESTORE_JUMP;
+      this.cacheMetaDirty = true;
 
       // Restore automergeHashToEntryId
       if (checkpoint.automergeHashToEntryId) {
@@ -4741,6 +4765,8 @@ export class BaseMindooDB implements MindooDB {
     this.processedEntryCursor = null;
     this.locallyIndexedEntryIds.clear();
     this.nextChangeSeq = 1;
+    // A new numbering: cursors of the old one start over (see changeFeedEpoch).
+    this.changeFeedEpoch = generateRandomUuid();
     this.cacheMetaDirty = true;
     this.cacheManager?.markDirty();
 
@@ -14366,6 +14392,14 @@ export class BaseMindooDB implements MindooDB {
 
     const cursorSeq =
       typeof actualCursor.changeSeq === "number" ? actualCursor.changeSeq : 0;
+    // A cursor of another numbering, or one past every number this feed ever
+    // handed out, cannot be placed: start over rather than skip documents.
+    if (
+      (actualCursor.feedEpoch !== undefined && actualCursor.feedEpoch !== this.changeFeedEpoch) ||
+      cursorSeq >= this.nextChangeSeq
+    ) {
+      return 0;
+    }
 
     let left = 0;
     let right = indexSnapshot.length - 1;
@@ -14825,6 +14859,7 @@ export class BaseMindooDB implements MindooDB {
           changeSeq: entry.changeSeq,
           lastModified: entry.lastModified,
           docId: entry.docId,
+          feedEpoch: this.changeFeedEpoch,
         };
         yieldedDocuments++;
         yield {
@@ -14855,6 +14890,7 @@ export class BaseMindooDB implements MindooDB {
       changeSeq: latestEntry.changeSeq,
       lastModified: latestEntry.lastModified,
       docId: latestEntry.docId,
+      feedEpoch: this.changeFeedEpoch,
     };
   }
 
@@ -14949,6 +14985,7 @@ export class BaseMindooDB implements MindooDB {
             changeSeq: entry.changeSeq,
             lastModified: entry.lastModified,
             docId: entry.docId,
+            feedEpoch: this.changeFeedEpoch,
           };
           yieldedDocuments++;
           yield {
@@ -14970,6 +15007,7 @@ export class BaseMindooDB implements MindooDB {
             changeSeq: entry.changeSeq,
             lastModified: entry.lastModified,
             docId: entry.docId,
+            feedEpoch: this.changeFeedEpoch,
           };
           yieldedDocuments++;
           yield { doc: this.buildDeletedDoc(entry), cursor: deletedCursor };
@@ -15012,6 +15050,7 @@ export class BaseMindooDB implements MindooDB {
             changeSeq: entry.changeSeq,
             lastModified: entry.lastModified,
             docId: entry.docId,
+            feedEpoch: this.changeFeedEpoch,
           };
 
           // Yield immediately - this allows the caller to break early after each document
