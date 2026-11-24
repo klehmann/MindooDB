@@ -4,6 +4,7 @@
 import { MindooFilingStore, type FilingStoreOptions } from "./filing/MindooFilingStore";
 import type { FilingIndex } from "./filing/FilingIndex";
 import { Automerge } from "./automerge-adapter";
+import { applyChangesInSlices } from "./applyChangesInSlices";
 import { ChangeDocDraft, diffTextSplice, fieldTypeOf, type DraftOp } from "./ChangeDocDraft";
 import {
   MINDOO_VALUE_TAG,
@@ -8184,8 +8185,7 @@ export class BaseMindooDB implements MindooDB {
     if (changes.length === 0) {
       return doc;
     }
-    const [applied] = Automerge.applyChanges(doc, changes);
-    return applied;
+    return applyChangesInSlices(doc, changes);
   }
 
   /** Touch the revision-feed LRU, moving `docId` to most-recently-used. */
@@ -15243,12 +15243,11 @@ export class BaseMindooDB implements MindooDB {
     // Automerge marks documents as outdated when they're accessed, preventing direct mutation
     const clonedDoc = Automerge.clone(cachedDoc.doc);
 
-    // Apply all changes at once (Automerge handles dependency ordering)
-    const result = Automerge.applyChanges<MindooDocPayload>(
+    // Apply in bounded slices (Automerge handles dependency ordering)
+    const updatedDoc = applyChangesInSlices<MindooDocPayload>(
       clonedDoc,
       changeBytes,
     );
-    const updatedDoc = result[0] as AutomergeTypes.Doc<MindooDocPayload>;
 
     // Check if document actually changed
     const headsAfter = Automerge.getHeads(updatedDoc);
@@ -17641,15 +17640,13 @@ export class BaseMindooDB implements MindooDB {
         // Batch apply all changes at once - Automerge handles dependency ordering
         if (changeBytes.length > 0) {
           this.logger.debug(
-            `Applying ${changeBytes.length} changes to document ${docId} using batch applyChanges`,
+            `Applying ${changeBytes.length} changes to document ${docId} using applyChangesInSlices`,
           );
           try {
             const automergeStartedAt = Date.now();
-            const result = Automerge.applyChanges<MindooDocPayload>(
-              doc!,
-              changeBytes,
-            );
-            doc = result[0] as AutomergeTypes.Doc<MindooDocPayload>;
+            // In slices: one huge batch can exhaust Automerge's memory
+            // (see applyChangesInSlices).
+            doc = applyChangesInSlices<MindooDocPayload>(doc!, changeBytes);
             automergeTime += Date.now() - automergeStartedAt;
             this.logger.debug(
               `Successfully applied ${changeBytes.length} changes to document ${docId}`,
